@@ -1,0 +1,35 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "buildCargo",
+            "type": "shell",
+            "command": "cargo build",
+            "args": [],
+            "presentation": {
+                "reveal": "always",
+            },
+            "problemMatcher": [],
+			"options": {
+				"shell": {
+					"executable": "powershell.exe"
+				}
+			}
+        },
+        {
+            "label": "run",
+            "type": "shell",
+            "command": "./${workspaceRoot}/target/debug/${workspaceRootFolderName}",
+            "args": [],
+            "presentation": {
+                "reveal": "always",
+            },
+            "problemMatcher": [],
+			"options": {
+				"shell": {
+					"executable": "nu"
+				}
+			}
+        }
+    ]
+}

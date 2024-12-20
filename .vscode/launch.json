@@ -1,0 +1,16 @@
+{
+    "version": "0.2.0",
+    "configurations": [        
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug",
+            "program": "${workspaceRoot}/target/debug/${workspaceRootFolderName}",
+            "args": [],
+            "cwd": "${workspaceRoot}/target/debug",
+            "sourceLanguages": ["rust"],
+            "console": "integratedTerminal",
+            "preLaunchTask": "buildCargo"
+        }
+    ]
+}
