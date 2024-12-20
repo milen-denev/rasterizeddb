@@ -1,4 +1,4 @@
-use std::{fmt::{Debug, Display}, io::{self, Cursor, Read, Write}, marker::PhantomData};
+use std::{fmt::{Debug, Display}, io::{self, Cursor, Read, Write}};
 
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt, WriteBytesExt};
 
