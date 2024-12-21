@@ -10,9 +10,23 @@ use crate::{core::helpers::delete_row_file, HEADER_SIZE, POSITIONS_CACHE};
 use super::{
     super::rql::{
         models::Token, parser::ParserResult, tokenizer::evaluate_column_result
-    }, column::{Column, DowngradeType}, db_type::DbType, file_handlers::{save_data, IOOperationsAsync, IOOperationsSync}, helpers::{
-        add_in_memory_index, add_last_in_memory_index, indexed_row_fetching_file, read_row_cursor, read_row_file, row_prefetching_cursor, row_prefetching_file, row_prefetching_file_index
-    }, row::{InsertRow, Row}, support_types::FileChunk, table_header::TableHeader
+    }, 
+    column::{Column, DowngradeType}, 
+    db_type::DbType, 
+    file_handlers::{IOOperationsAsync, IOOperationsSync}, 
+    helpers::{
+        add_in_memory_index, 
+        add_last_in_memory_index, 
+        indexed_row_fetching_file, 
+        read_row_columns, 
+        read_row_cursor, 
+        row_prefetching, 
+        row_prefetching_cursor, 
+        row_prefetching_file_index
+    }, 
+    row::{InsertRow, Row}, 
+    support_types::FileChunk, 
+    table_header::TableHeader
 };
 
 pub struct Table<'a, S: IOOperationsSync, A: IOOperationsAsync<'a>> {
@@ -39,7 +53,7 @@ impl<'a, S: IOOperationsSync, A: IOOperationsAsync<'a>> Table<'a, S, A> {
 
         if table_file_len >= HEADER_SIZE as u64 {
             
-            let buffer = io_sync.read_data(0, HEADER_SIZE as u32);
+            let buffer = io_sync.read_data(&mut 0, HEADER_SIZE as u32);
             let mut table_header = TableHeader::from_buffer(buffer.to_vec()).unwrap();
 
             let last_row_id: u64 = table_header.last_row_id;
@@ -84,7 +98,11 @@ impl<'a, S: IOOperationsSync, A: IOOperationsAsync<'a>> Table<'a, S, A> {
     pub fn get_current_table_length(&mut self) -> u64 {
         let file_length = loop {
             if let Ok(len) = self.current_file_length.try_read() {
-                break *len - (HEADER_SIZE as u64);
+                if *len < HEADER_SIZE as u64 {
+                    break 0;
+                } else {
+                    break *len - (HEADER_SIZE as u64);
+                }
             }
         };
 
@@ -141,8 +159,6 @@ impl<'a, S: IOOperationsSync, A: IOOperationsAsync<'a>> Table<'a, S, A> {
         //DbType END
         buffer.push(255);
 
-        let buffer_len = buffer.len();
-      
         self.io_async.append_data_own(Box::new(buffer)).await;
 
         let table_header = self.table_header.clone();
@@ -154,8 +170,11 @@ impl<'a, S: IOOperationsSync, A: IOOperationsAsync<'a>> Table<'a, S, A> {
             } 
         };
 
-        table_header_w.last_row_id = row_id + 1;
-        table_header_w.total_file_length = total_row_size + buffer_len as u64;
+        table_header_w.last_row_id = row_id;
+
+        let new_header = table_header_w.to_bytes().unwrap();
+
+        self.io_sync.write_data(0, &new_header);
     }
 
     pub fn first_or_default_by_id(&mut self, id: u64) -> io::Result<Option<Row>> {
@@ -195,7 +214,7 @@ impl<'a, S: IOOperationsSync, A: IOOperationsAsync<'a>> Table<'a, S, A> {
                     next_row_id: 0
                 };
 
-                let cursor = chunk.read_chunk_to_end_sync(file_length - chunks_ended_position, &mut self.io_sync);
+                let mut cursor = chunk.read_chunk_to_end_sync(file_length - chunks_ended_position, &mut self.io_sync);
 
                 loop {
                     if let Some(prefetch_result) = row_prefetching_cursor(&mut cursor, &chunk).unwrap() {
@@ -219,24 +238,25 @@ impl<'a, S: IOOperationsSync, A: IOOperationsAsync<'a>> Table<'a, S, A> {
         } else {
             let mut position = HEADER_SIZE as u64;
             loop {       
-                
-
-                if let Some(prefetch_result) = row_prefetching_file(
-                    &mut file,
-                    file_postion,
+                if let Some(prefetch_result) = row_prefetching(
+                    &mut self.io_sync,
+                    &mut position,
                     file_length).unwrap() {
-                      
+                    
+                    println!("{:?}", prefetch_result);
+
                     if id == prefetch_result.found_id {
-                        let row = read_row_file(
-                            file.stream_position().unwrap(), 
+                        //+1 because of the END db type.
+                        let row = read_row_columns(
+                            &mut self.io_sync,
+                            position,
                             prefetch_result.found_id,
-                            prefetch_result.length,
-                            &mut file).unwrap();
+                            prefetch_result.length + 1).unwrap();
 
                         return Ok(Some(row));
                     } else {
                         //+1 because of the END db type.
-                        file.seek(SeekFrom::Current((prefetch_result.length + 1) as i64)).unwrap();
+                        position += (prefetch_result.length + 1) as u64;
                     }
                 } else {
                     break;
@@ -246,7 +266,7 @@ impl<'a, S: IOOperationsSync, A: IOOperationsAsync<'a>> Table<'a, S, A> {
 
         return Ok(None);
     }
-
+/* 
     pub fn first_or_default_by_column<T>(&mut self, column_index: u32, value: T) -> io::Result<Option<Row>> 
     where
         T: Display {
@@ -478,7 +498,7 @@ impl<'a, S: IOOperationsSync, A: IOOperationsAsync<'a>> Table<'a, S, A> {
                             let column = Column::from_raw(column_type, data_buffer, None);
 
                             if value_column.eq(&column) {
-                                let row = read_row_file(
+                                let row = read_row_columns(
                                     first_column_index, 
                                     prefetch_result.found_id,
                                     prefetch_result.length,
@@ -858,7 +878,7 @@ impl<'a, S: IOOperationsSync, A: IOOperationsAsync<'a>> Table<'a, S, A> {
                         required_columns.clear();
 
                         if evaluation {
-                            let row = read_row_file(
+                            let row = read_row_columns(
                                 first_column_index, 
                                 prefetch_result.found_id,
                                 prefetch_result.length,
@@ -1041,4 +1061,6 @@ impl<'a, S: IOOperationsSync, A: IOOperationsAsync<'a>> Table<'a, S, A> {
 
         add_last_in_memory_index(current_chunk_size, file_position, file_length, &mut self.in_memory_index);
     }
+
+    */
 }

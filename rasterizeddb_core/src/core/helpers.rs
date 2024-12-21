@@ -3,16 +3,26 @@ use std::{fs::File, io::{self, Cursor, Read, Seek, SeekFrom, Write}};
 use byteorder::{LittleEndian, ReadBytesExt};
 
 use crate::{CHUNK_SIZE, EMPTY_BUFFER, HEADER_SIZE};
-use super::{column::Column, db_type::DbType, row::Row, support_types::{FileChunk, RowPrefetchResult}};
+use super::{column::Column, db_type::DbType, file_handlers::IOOperationsSync, row::Row, support_types::{FileChunk, RowPrefetchResult}};
 
-pub(crate) fn read_row_file(first_column_index: u64, id: u64, length: u32, file: &mut File) -> io::Result<Row> {
-    file.seek(SeekFrom::Start(first_column_index)).unwrap();
+pub(crate) fn read_row_columns(
+    io_sync: &mut impl IOOperationsSync, 
+    first_column_index: u64, 
+    id: u64, 
+    length: u32) -> io::Result<Row> {
+    let mut io_sync = io_sync.clone();
+
+    io_sync.seek(SeekFrom::Start(first_column_index));
 
     let mut columns: Vec<Column> = Vec::default();
     
-    loop {
-        let column_type = file.read_u8().unwrap();
+    let mut position = first_column_index;
 
+    let mut cursor = io_sync.read_data_to_cursor(&mut position, length);
+
+    loop {
+        let column_type = cursor.read_u8().unwrap();
+      
         let db_type = DbType::from_byte(column_type);
 
         if db_type == DbType::END {
@@ -25,12 +35,15 @@ pub(crate) fn read_row_file(first_column_index: u64, id: u64, length: u32, file:
             let db_size = db_type.get_size();
 
             let mut preset_buffer = vec![0; db_size as usize];
-            file.read(&mut preset_buffer).unwrap();
+            cursor.read_exact(&mut preset_buffer)?;
+
             data_buffer.append(&mut preset_buffer.to_vec());
         } else {
-            let str_length = file.read_u32::<LittleEndian>().unwrap();
+            let str_length = cursor.read_u32::<LittleEndian>().unwrap();
+
             let mut preset_buffer = vec![0; str_length as usize];
-            file.read(&mut preset_buffer).unwrap();
+            cursor.read_exact(&mut preset_buffer)?;
+          
             data_buffer.append(&mut preset_buffer.to_vec());
         }
         
@@ -120,23 +133,23 @@ pub(crate) fn delete_row_file(first_column_index: u64, file: &mut File) -> io::R
 }
 
 pub(crate) fn skip_empty_spaces_file(
-    file: &mut File,
-    file_position: u64,
-    file_length: u64) -> io::Result<()> {
-    if file_length == file_position || file_length < file_position {
-        return Ok(());
-    }
-    
-    let mut check_next_buffer = vec![0; 8];
+    io_sync: &mut impl IOOperationsSync, 
+    file_position: &mut u64,
+    file_length: u64) -> Result<impl IOOperationsSync, String> {
+    let mut io_sync = io_sync.clone();
 
-    file.read(&mut check_next_buffer).unwrap();
- 
+    if file_length == *file_position || file_length < *file_position {
+        return Ok(io_sync);
+    }
+
+    let mut check_next_buffer = io_sync.read_data(file_position, 8);
+
     if check_next_buffer == EMPTY_BUFFER {
         loop {
-            file.read(&mut check_next_buffer).unwrap();
+            io_sync.read_data_into_buffer(file_position, &mut check_next_buffer);
 
-            if file_length == file_position || file_length < file_position {
-                return Ok(());
+            if file_length == *file_position || file_length < *file_position {
+                return Ok(io_sync);
             }
 
             if check_next_buffer != EMPTY_BUFFER {
@@ -148,22 +161,25 @@ pub(crate) fn skip_empty_spaces_file(
 
         let move_back = -8 as i64 + index_of_row_start as i64;
 
-        file.seek(SeekFrom::Current(move_back)).unwrap();
+        io_sync.seek(SeekFrom::Current(move_back));
+        *file_position = ((*file_position) as i64 + move_back) as u64;
 
-        return Ok(());
+        return Ok(io_sync);
     } else {
         let index_of_row_start = check_next_buffer.iter().position(|x| *x == DbType::START.to_byte());
        
         if let Some(index_of_row_start) = index_of_row_start {
             let deduct = (index_of_row_start as i64 - 8) * -1;
 
-            file.seek(SeekFrom::Current(deduct * -1)).unwrap();
+            io_sync.seek(SeekFrom::Current(deduct * -1));
+
+            *file_position = ((*file_position) as i64 - deduct) as u64;
         } else {
             panic!("FILE -> 254 DbType::START not found: {:?}", check_next_buffer);
         }
     }
 
-    return Ok(());
+    return Ok(io_sync);
 }
 
 pub(crate) fn skip_empty_spaces_file_index(
@@ -269,13 +285,17 @@ pub(crate) fn skip_empty_spaces_cursor(cursor: &mut Cursor<Vec<u8>>, cursor_leng
     return Ok(());
 }
 
-pub(crate) fn row_prefetching_file(
-    file: &mut File, 
-    file_position: u64, 
+pub(crate) fn row_prefetching(
+    io_sync: &mut impl IOOperationsSync, 
+    file_position: &mut u64, 
     file_length: u64) -> io::Result<Option<RowPrefetchResult>> {
-    skip_empty_spaces_file(file, file_position, file_length).unwrap();
+    let mut io_sync = skip_empty_spaces_file(io_sync, file_position, file_length).unwrap();
 
-    let start_now_byte = file.read_u8();
+    io_sync.seek(SeekFrom::Start(*file_position));
+
+    let start_now_byte = io_sync.read_u8();
+
+    *file_position += 1;
 
     if start_now_byte.is_err() {
         return Ok(None);
@@ -287,8 +307,13 @@ pub(crate) fn row_prefetching_file(
         panic!("Start row signal not present.");
     }
 
-    let found_id = file.read_u64::<LittleEndian>().unwrap();
-    let length = file.read_u32::<LittleEndian>().unwrap();
+    let found_id = io_sync.read_u64().unwrap();
+
+    *file_position += 8;
+
+    let length = io_sync.read_u32().unwrap();
+
+    *file_position += 4;
 
     return Ok(Some(RowPrefetchResult {
         found_id: found_id,

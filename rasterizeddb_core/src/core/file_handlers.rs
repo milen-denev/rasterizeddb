@@ -1,4 +1,5 @@
-use std::{future::Future, io::{Read, Seek, SeekFrom, Write}, marker::PhantomData, path::Path, sync::Arc};
+use std::{future::Future, io::{Cursor, Read, Seek, SeekFrom, Write}, marker::PhantomData, os::windows::fs::FileExt, path::Path, sync::Arc};
+use byteorder::{LittleEndian, ReadBytesExt};
 use tokio::{fs::File, io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt}};
 
 pub async fn save_data(file: &mut File, buffer: &mut Vec<u8>) {
@@ -7,10 +8,19 @@ pub async fn save_data(file: &mut File, buffer: &mut Vec<u8>) {
     file.sync_all().await.unwrap();
 }
 
-pub(crate) struct LocalStorageProvider {
-    pub(crate) read_file: std::fs::File,
-    pub(crate) append_file: std::fs::File,
-    pub(crate) write_file: std::fs::File,
+pub struct LocalStorageProvider {
+    pub(super) read_file: std::fs::File,
+    pub(super) append_file: std::fs::File,
+    pub(super) write_file: std::fs::File,
+}
+
+impl Clone for LocalStorageProvider {
+    fn clone(&self) -> Self {
+        Self { 
+            read_file: self.read_file.try_clone().unwrap(), 
+            append_file: self.append_file.try_clone().unwrap(), 
+            write_file: self.write_file.try_clone().unwrap() }
+    }
 }
 
 unsafe impl Send for LocalStorageProvider {}
@@ -30,7 +40,7 @@ impl LocalStorageProvider {
         
         let path = Path::new(&file_str);
 
-        if path.exists() && path.is_file() {
+        if !path.exists() && !path.is_file() {
             _ = std::fs::File::create(&file_str).unwrap();
         }
 
@@ -45,6 +55,9 @@ impl LocalStorageProvider {
         }
     }
 }
+
+type IOError = std::io::Error;
+type IOResult<T> = std::result::Result<T, IOError>;
 
 impl IOOperationsSync for LocalStorageProvider {
     fn write_data(&mut self,  
@@ -66,12 +79,13 @@ impl IOOperationsSync for LocalStorageProvider {
     }
 
     fn read_data(&mut self,
-        position: u64,  
+        position: &mut u64,  
         length: u32) -> Vec<u8> {
         let mut file = &self.read_file;
-        file.seek(SeekFrom::Start(position)).unwrap();
+        file.seek(SeekFrom::Start(*position)).unwrap();
         let mut buffer: Vec<u8> = vec![0; length as usize];
         file.read_exact(&mut buffer).unwrap();
+        *position += length as u64;
         return buffer;
     }
     
@@ -109,9 +123,62 @@ impl IOOperationsSync for LocalStorageProvider {
             return false;
         }
     }
+    
+    fn read_data_into_buffer(&mut self,
+        position: &mut u64,
+        buffer: &mut [u8]) {
+        let mut file = &self.read_file;
+        file.seek(SeekFrom::Start(*position)).unwrap();
+        file.seek_read(buffer, *position).unwrap();
+        *position += buffer.len() as u64;
+    }
+    
+    fn seek(&mut self, seek: SeekFrom) {
+        self.read_file.seek(seek).unwrap();
+    }
+    
+    fn read_u8(&mut self) -> IOResult<u8> {
+        let num_result = self.read_file.read_u8();
+        if let Ok(num) = num_result {
+            IOResult::Ok(num)
+        } else {
+            IOResult::Err(num_result.unwrap_err())
+        }
+    }
+    
+    fn read_u32(&mut self) -> IOResult<u32> {
+        let num_result = self.read_file.read_u32::<LittleEndian>();
+        if let Ok(num) = num_result {
+            IOResult::Ok(num)
+        } else {
+            IOResult::Err(num_result.unwrap_err())
+        }
+    }
+    
+    fn read_u64(&mut self) -> IOResult<u64> {
+        let num_result = self.read_file.read_u64::<LittleEndian>();
+        if let Ok(num) = num_result {
+            IOResult::Ok(num)
+        } else {
+            IOResult::Err(num_result.unwrap_err())
+        }
+    }
+    
+    fn read_data_to_cursor(&mut self,
+        position: &mut u64,  
+        length: u32) -> Cursor<Vec<u8>> {
+        let mut file = &self.read_file;
+        file.seek(SeekFrom::Start(*position)).unwrap();
+        let mut buffer: Vec<u8> = vec![0; length as usize];
+        file.read_exact(&mut buffer).unwrap();
+        *position += length as u64;
+        let mut cursor = Cursor::new(buffer);
+        cursor.set_position(0);
+        return cursor;
+    }
 }
 
-pub(crate) struct LocalStorageProviderAsync {
+pub struct LocalStorageProviderAsync {
     pub(crate) read_file: tokio::fs::File,
     pub(crate) append_file: tokio::fs::File,
     pub(crate) write_file: tokio::fs::File
@@ -119,6 +186,16 @@ pub(crate) struct LocalStorageProviderAsync {
 
 unsafe impl Send for LocalStorageProviderAsync {}
 unsafe impl Sync for LocalStorageProviderAsync {}
+
+impl TryCloneAsync for LocalStorageProviderAsync {
+    async fn try_clone(&self) -> Self {
+        LocalStorageProviderAsync {
+            read_file: self.read_file.try_clone().await.unwrap(),
+            append_file: self.append_file.try_clone().await.unwrap(),
+            write_file: self.write_file.try_clone().await.unwrap()
+        }
+    }
+}
 
 impl LocalStorageProviderAsync {
     pub async fn new(location: &str, table_name: &str) -> LocalStorageProviderAsync {
@@ -134,7 +211,7 @@ impl LocalStorageProviderAsync {
         
         let path = Path::new(&file_str);
 
-        if path.exists() && path.is_file() {
+        if !path.exists() && !path.is_file() {
             _ = tokio::fs::File::create(&file_str).await.unwrap();
         }
 
@@ -177,6 +254,16 @@ impl<'a> IOOperationsAsync<'a> for LocalStorageProviderAsync {
         file.sync_all().await.unwrap();
     }
 
+    async fn write_data_own(&'a mut self,
+        position: u64,  
+        buffer: Box<Vec<u8>>) {
+        let file = &mut self.append_file;
+        file.seek(SeekFrom::Start(position)).await.unwrap();
+        file.write(&buffer).await.unwrap();
+        file.flush().await.unwrap();
+        file.sync_all().await.unwrap();
+    }
+
     async fn read_data(&'a mut self,
         position: u64,  
         length: u32) -> Vec<u8> {
@@ -214,14 +301,22 @@ impl<'a> IOOperationsAsync<'a> for LocalStorageProviderAsync {
     }
 }
 
-pub trait IOOperationsSync {
+pub trait IOOperationsSync: Clone {
     fn write_data(&mut self,  
         position: u64, 
         buffer: &[u8]);
 
     fn read_data(&mut self,
-        position: u64,  
+        position: &mut u64,  
         length: u32) -> Vec<u8>;
+
+    fn read_data_into_buffer(&mut self,
+        position: &mut u64,  
+        buffer: &mut [u8]);
+
+    fn read_data_to_cursor(&mut self,
+        position: &mut u64,  
+        length: u32) -> Cursor<Vec<u8>>;
 
     fn read_data_to_end(&mut self,
         position: u64) -> Vec<u8>;
@@ -232,12 +327,24 @@ pub trait IOOperationsSync {
     fn get_len(&mut self) -> u64;
 
     fn exists(location: &str, table_name: &str) -> bool;
+
+    fn seek(&mut self, seek: SeekFrom);
+
+    fn read_u8(&mut self) -> IOResult<u8>;
+
+    fn read_u32(&mut self) -> IOResult<u32>;
+
+    fn read_u64(&mut self) -> IOResult<u64>;
 }
 
-pub trait IOOperationsAsync<'a> {
+pub trait IOOperationsAsync<'a>: TryCloneAsync {
     fn write_data(&'a mut self,  
         position: u64, 
         buffer: &[u8]) -> impl Future<Output = ()> + Send;
+
+    fn write_data_own(&'a mut self,  
+        position: u64, 
+        buffer: Box<Vec<u8>>) -> impl Future<Output = ()> + Send;
 
     fn read_data(&'a mut self,
         position: u64,  
@@ -252,4 +359,8 @@ pub trait IOOperationsAsync<'a> {
     fn get_len(&'a mut self) -> impl Future<Output = u64> + Send;
 
     fn exists(location: &'a str, table_name: &'a str) -> impl Future<Output = bool> + Send;
+}
+
+pub trait TryCloneAsync {
+    fn try_clone(&self) -> impl Future<Output = Self> + Send;
 }

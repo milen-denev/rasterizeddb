@@ -2,6 +2,7 @@ use std::io::Cursor;
 
 use super::file_handlers::{IOOperationsAsync, IOOperationsSync};
 
+#[derive(Debug)]
 pub struct RowPrefetchResult {
     pub found_id: u64,
     pub length: u32
@@ -16,7 +17,9 @@ pub(crate) struct FileChunk {
 
 impl FileChunk {
     pub fn read_chunk_sync(&self, io_sync: &mut impl IOOperationsSync) -> Cursor<Vec<u8>> {
-        let buffer = io_sync.read_data(self.current_file_position, self.chunk_size as u32);
+        let mut current_file_position = self.current_file_position.clone();
+
+        let buffer = io_sync.read_data(&mut current_file_position, self.chunk_size as u32);
         
         if buffer.len() == 0 {
             panic!("Error reading the file to buffer.");
