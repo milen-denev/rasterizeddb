@@ -516,6 +516,8 @@ pub(crate) fn columns_cursor_to_row(
     length: u32) -> io::Result<Row> {
     let mut columns: Vec<Column> = Vec::default();
     
+    columns_cursor.set_position(0);
+
     loop {
         let column_type = columns_cursor.read_u8().unwrap();
 
