@@ -78,9 +78,13 @@ impl IOOperationsSync for LocalStorageProvider {
         let mut file = &self.read_file;
         file.seek(SeekFrom::Start(*position)).unwrap();
         let mut buffer: Vec<u8> = vec![0; length as usize];
-        file.read_exact(&mut buffer).unwrap();
-        *position += length as u64;
-        return buffer;
+        let read_result = file.read_exact(&mut buffer);
+        if read_result.is_err() {
+            return Vec::default()
+        } else {
+            *position += length as u64;
+            return buffer;
+        }
     }
     
     fn read_data_to_end(&mut self,

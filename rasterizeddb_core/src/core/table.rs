@@ -948,20 +948,16 @@ impl<'a, S: IOOperationsSync, A: IOOperationsAsync<'a>> Table<'a, S, A> {
         let mut position = HEADER_SIZE as u64;
 
         loop {       
-            #[allow(unused_assignments)]
-            let mut current_id: u64 = 0;
-
             if let Some(prefetch_result) = row_prefetching(
                 &mut self.io_sync,
                 &mut position,
                 file_length).unwrap() {
-                    
-                current_id = prefetch_result.found_id;
 
-                position += (prefetch_result.length + 1) as u64;
-                current_chunk_size += prefetch_result.length + 1;
+                position += prefetch_result.length as u64 + 1;
+                //START (1), ROWID (8), LEN (4), COLUMNS (X), END (1)
+                current_chunk_size += 1 + 8 + 4 + prefetch_result.length + 1;
 
-                add_in_memory_index(&mut current_chunk_size, current_id, position, &mut self.in_memory_index);
+                add_in_memory_index(&mut current_chunk_size, prefetch_result.found_id, position, &mut self.in_memory_index);
             } else {
                 break;
             }

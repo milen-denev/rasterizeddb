@@ -292,30 +292,34 @@ pub(crate) fn row_prefetching(
     io_sync: &mut impl IOOperationsSync, 
     file_position: &mut u64, 
     file_length: u64) -> io::Result<Option<RowPrefetchResult>> {
-    let mut io_sync = skip_empty_spaces_file(io_sync, file_position, file_length).unwrap();
+    if *file_position < file_length {
+        let mut io_sync = skip_empty_spaces_file(io_sync, file_position, file_length).unwrap();
 
-    let mut cursor = io_sync.read_data_to_cursor(file_position, 1 + 8 + 4);
-
-    let start_now_byte = cursor.read_u8();
-
-    if start_now_byte.is_err() {
+        let mut cursor = io_sync.read_data_to_cursor(file_position, 1 + 8 + 4);
+    
+        let start_now_byte = cursor.read_u8();
+    
+        if start_now_byte.is_err() {
+            return Ok(None);
+        }
+    
+        let start_row = DbType::from_byte(start_now_byte.unwrap());
+    
+        if start_row != DbType::START {
+            panic!("Start row signal not present.");
+        }
+    
+        let found_id = cursor.read_u64::<LittleEndian>().unwrap();
+    
+        let length = cursor.read_u32::<LittleEndian>().unwrap();
+    
+        return Ok(Some(RowPrefetchResult {
+            found_id: found_id,
+            length: length
+        }));
+    } else {
         return Ok(None);
     }
-
-    let start_row = DbType::from_byte(start_now_byte.unwrap());
-
-    if start_row != DbType::START {
-        panic!("Start row signal not present.");
-    }
-
-    let found_id = cursor.read_u64::<LittleEndian>().unwrap();
-
-    let length = cursor.read_u32::<LittleEndian>().unwrap();
-
-    return Ok(Some(RowPrefetchResult {
-        found_id: found_id,
-        length: length
-    }));
 }
 
 pub(crate) fn row_prefetching_file_index(
