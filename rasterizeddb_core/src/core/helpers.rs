@@ -297,11 +297,9 @@ pub(crate) fn row_prefetching(
     file_length: u64) -> io::Result<Option<RowPrefetchResult>> {
     let mut io_sync = skip_empty_spaces_file(io_sync, file_position, file_length).unwrap();
 
-    io_sync.seek(SeekFrom::Start(*file_position));
+    let mut cursor = io_sync.read_data_to_cursor(file_position, 1 + 8 + 4);
 
-    let start_now_byte = io_sync.read_u8();
-
-    *file_position += 1;
+    let start_now_byte = cursor.read_u8();
 
     if start_now_byte.is_err() {
         return Ok(None);
@@ -313,13 +311,9 @@ pub(crate) fn row_prefetching(
         panic!("Start row signal not present.");
     }
 
-    let found_id = io_sync.read_u64().unwrap();
+    let found_id = cursor.read_u64::<LittleEndian>().unwrap();
 
-    *file_position += 8;
-
-    let length = io_sync.read_u32().unwrap();
-
-    *file_position += 4;
+    let length = cursor.read_u32::<LittleEndian>().unwrap();
 
     return Ok(Some(RowPrefetchResult {
         found_id: found_id,

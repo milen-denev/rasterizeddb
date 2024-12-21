@@ -1,11 +1,11 @@
 use std::{
     fmt::Display, 
-    io::{self, Seek, SeekFrom}, 
+    io::{self, Read, Seek, SeekFrom}, 
     marker::PhantomData, 
     sync::Arc
 };
 
-use byteorder::{LittleEndian, WriteBytesExt};
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use itertools::Itertools;
 use tokio::sync::{RwLock, RwLockWriteGuard};
 
@@ -26,8 +26,8 @@ use super::{
 };
 
 pub struct Table<'a, S: IOOperationsSync, A: IOOperationsAsync<'a>> {
-    io_sync: S,
-    io_async: A,
+    pub(crate) io_sync: S,
+    pub(crate) io_async: A,
     pub(crate) table_header: Arc<RwLock<TableHeader>>,
     pub(crate) in_memory_index: Option<Vec<FileChunk>>,
     pub(crate) current_file_length: Arc<RwLock<u64>>,
@@ -134,7 +134,7 @@ impl<'a, S: IOOperationsSync, A: IOOperationsAsync<'a>> Table<'a, S, A> {
         return last_row_id;
     }
 
-    pub async fn insert_row(&'a mut self, row: &'a mut InsertRow) {
+    pub async fn insert_row(&mut self, row: InsertRow) {
         let columns_len = row.columns_data.len();
 
         //START (1) + END (1) + u64 ID (8) + u32 LENGTH (4) + VEC SIZE 
@@ -150,12 +150,14 @@ impl<'a, S: IOOperationsSync, A: IOOperationsAsync<'a>> Table<'a, S, A> {
         WriteBytesExt::write_u64::<LittleEndian>(&mut buffer, row_id).unwrap();
         WriteBytesExt::write_u32::<LittleEndian>(&mut buffer, columns_len as u32).unwrap();
 
-        buffer.append(&mut row.columns_data);
+        let mut columns_data = row.columns_data;
+
+        buffer.append(&mut columns_data);
 
         //DbType END
         buffer.push(255);
 
-        self.io_async.append_data_own(Box::new(buffer)).await;
+        self.io_sync.append_data(&buffer);
 
         let table_header = self.table_header.clone();
 
@@ -262,34 +264,17 @@ impl<'a, S: IOOperationsSync, A: IOOperationsAsync<'a>> Table<'a, S, A> {
 
         return Ok(None);
     }
-/* 
+
     pub fn first_or_default_by_column<T>(&mut self, column_index: u32, value: T) -> io::Result<Option<Row>> 
     where
         T: Display {
-        let mut file = self.file_connection_read.try_clone().unwrap();
-
+        let file_length = self.get_current_table_length();
         let value_column = Column::new(value).unwrap();
-
-        let file_length =  loop {
-            if let Ok(header) = self.table_header.try_read() {
-                break header.total_file_length - HEADER_SIZE;
-            }
-        };
-
-        file.seek(SeekFrom::Start(HEADER_SIZE)).unwrap();
 
         if let Some(chunks) = self.in_memory_index.as_ref() {
             let mut chunks_ended_position: u64 = 0;
-
             for chunk in chunks {
-                let mut buffer = vec![0; chunk.chunk_size as usize];
-                file.seek_read(&mut buffer, chunk.current_file_position).unwrap();
-
-                if buffer.len() == 0 {
-                    panic!("Error reading the file to buffer.");
-                }
-
-                let mut cursor = Cursor::new(&buffer);
+                let mut cursor = chunk.read_chunk_sync(&mut self.io_sync);
 
                 loop {
                     if let Some(prefetch_result) = row_prefetching_cursor(&mut cursor, chunk).unwrap() {
@@ -326,7 +311,7 @@ impl<'a, S: IOOperationsSync, A: IOOperationsAsync<'a>> Table<'a, S, A> {
                                 
                                 let column = Column::from_raw(column_type, data_buffer, None);
 
-                                if value_column.eq(&column) {
+                                if value_column.equals(&column) {
                                     let row = read_row_cursor(
                                         first_column_index, 
                                         prefetch_result.found_id,
@@ -365,20 +350,15 @@ impl<'a, S: IOOperationsSync, A: IOOperationsAsync<'a>> Table<'a, S, A> {
             }
 
             if chunks_ended_position < file_length {
-                let mut buffer: Vec<u8> = Vec::default();
-                file.read_to_end(&mut buffer).unwrap();
+                let chunk = FileChunk {
+                    current_file_position: 0,
+                    chunk_size: 0,
+                    next_row_id: 0
+                };
 
-                let cursor_size = buffer.len();
-
-                let mut cursor = Cursor::new(&buffer);
+                let mut cursor = chunk.read_chunk_to_end_sync(file_length - chunks_ended_position, &mut self.io_sync);
 
                 loop {
-                    let chunk = FileChunk {
-                        current_file_position: 0,
-                        chunk_size: cursor_size as u64,
-                        next_row_id: 0
-                    };
-
                     if let Some(prefetch_result) = row_prefetching_cursor(&mut cursor, &chunk).unwrap() {
                         //Current column index
                         let mut index = 0;
@@ -414,7 +394,7 @@ impl<'a, S: IOOperationsSync, A: IOOperationsAsync<'a>> Table<'a, S, A> {
                                 
                                 let column = Column::from_raw(column_type, data_buffer, None);
 
-                                if value_column.eq(&column) {
+                                if value_column.equals(&column) {
                                     let row = read_row_cursor(
                                         first_column_index, 
                                         prefetch_result.found_id,
@@ -451,23 +431,25 @@ impl<'a, S: IOOperationsSync, A: IOOperationsAsync<'a>> Table<'a, S, A> {
                 }
             }
         } else {
-
+            let mut position = HEADER_SIZE as u64;
             loop {
-                let file_postion = file.stream_position()?;
-
-                if let Some(prefetch_result) = row_prefetching_file(
-                    &mut file,
-                    file_postion,
+                if let Some(prefetch_result) = row_prefetching(
+                    &mut self.io_sync,
+                    &mut position,
                     file_length).unwrap() {
 
                     let mut column_index_inner = 0;
-                    let first_column_index = file.stream_position().unwrap();
 
-                    loop {  
+                    let mut columns_cursor = self.io_sync.read_data_to_cursor(
+                        &mut position, 
+                        prefetch_result.length + 1);
+
+                    loop {
                         if column_index == column_index_inner {
+                            //+1 END Signal
                             column_index_inner += 1;
 
-                            let column_type = file.read_u8().unwrap();
+                            let column_type =  columns_cursor.read_u8().unwrap();
                           
                             let db_type = DbType::from_byte(column_type);
 
@@ -479,33 +461,31 @@ impl<'a, S: IOOperationsSync, A: IOOperationsAsync<'a>> Table<'a, S, A> {
 
                             if db_type != DbType::STRING {
                                 let db_size = db_type.get_size();
-
                                 let mut preset_buffer = vec![0; db_size as usize];
-                                file.read(&mut preset_buffer).unwrap();
-                                data_buffer.append(&mut preset_buffer.to_vec());
+                                columns_cursor.read(&mut preset_buffer).unwrap();
+                                data_buffer.append(&mut preset_buffer);
                             } else {
-                                let str_length = file.read_u32::<LittleEndian>().unwrap();
-                               
+                                let str_length = columns_cursor.read_u32::<LittleEndian>().unwrap();
                                 let mut preset_buffer = vec![0; str_length as usize];
-                                file.read(&mut preset_buffer).unwrap();
+                                columns_cursor.read(&mut preset_buffer).unwrap();
                                 data_buffer.append(&mut preset_buffer.to_vec());
                             }
                             
-                            let column = Column::from_raw(column_type, data_buffer, None);
+                            let column = Column::from_raw(column_type, data_buffer.clone(), None);
 
-                            if value_column.eq(&column) {
-                                let row = read_row_columns(
-                                    first_column_index, 
-                                    prefetch_result.found_id,
-                                    prefetch_result.length,
-                                    &mut file).unwrap();
-
-                                return Ok(Some(row));
+                            if value_column.equals(&column) {
+                                return Ok(Some(Row {
+                                    id: prefetch_result.found_id,
+                                    length: prefetch_result.length,
+                                    columns_data: data_buffer
+                                }));
+                            } else {
+                                continue;
                             }
                         } else {
                             column_index_inner += 1;
 
-                            let column_type = file.read_u8().unwrap();
+                            let column_type = columns_cursor.read_u8().unwrap();
                            
                             let db_type = DbType::from_byte(column_type);
 
@@ -516,12 +496,12 @@ impl<'a, S: IOOperationsSync, A: IOOperationsAsync<'a>> Table<'a, S, A> {
                             if db_type != DbType::STRING {
                                 let db_size = db_type.get_size();
 
-                                file.seek(SeekFrom::Current(db_size as i64)).unwrap();
+                                columns_cursor.seek(SeekFrom::Current(db_size as i64)).unwrap();
                                
                             } else {
-                                let str_length = file.read_u32::<LittleEndian>().unwrap();
+                                let str_length = columns_cursor.read_u32::<LittleEndian>().unwrap();
                                
-                                file.seek(SeekFrom::Current(str_length as i64)).unwrap();
+                                columns_cursor.seek(SeekFrom::Current(str_length as i64)).unwrap();
                             }
                         }
                     }
@@ -534,7 +514,7 @@ impl<'a, S: IOOperationsSync, A: IOOperationsAsync<'a>> Table<'a, S, A> {
 
         return Ok(None);    
     }
-
+/* 
     pub async fn first_or_default_by_query(&mut self, parser_result: ParserResult) -> io::Result<Option<Row>> {
         if let ParserResult::HashIndexes(hash_indexes) = parser_result {
             let mut file = self.file_connection_read.try_clone().unwrap();

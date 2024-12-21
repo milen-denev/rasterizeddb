@@ -164,10 +164,14 @@ impl IOOperationsSync for LocalStorageProvider {
         let mut file = &self.read_file;
         file.seek(SeekFrom::Start(*position)).unwrap();
         let mut buffer: Vec<u8> = vec![0; length as usize];
-        file.read_exact(&mut buffer).unwrap();
-        *position += length as u64;
-        let mut cursor = Cursor::new(buffer);
-        cursor.set_position(0);
-        return cursor;
+        let result = file.read_exact(&mut buffer);
+        if result.is_err() {
+            Cursor::new(Vec::default())
+        } else {
+            *position += length as u64;
+            let mut cursor = Cursor::new(buffer);
+            cursor.set_position(0);
+            return cursor;
+        }
     }
 }
