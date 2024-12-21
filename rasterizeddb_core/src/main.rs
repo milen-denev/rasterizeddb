@@ -1,8 +1,8 @@
-use std::sync::{Arc, LazyLock};
-
-use rasterizeddb_core::core::{column::Column, row::InsertRow, table::Table};
-use tokio::sync::RwLock;
-use rasterizeddb_core::core::file_handlers::{LocalStorageProvider, LocalStorageProviderAsync};
+use rasterizeddb_core::core::{column::Column, row::InsertRow, storage_providers::{
+    file_async::LocalStorageProviderAsync, 
+    file_sync::LocalStorageProvider}, 
+    table::Table
+};
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {

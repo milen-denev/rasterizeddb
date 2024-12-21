@@ -3,7 +3,13 @@ use std::{fs::File, io::{self, Cursor, Read, Seek, SeekFrom, Write}};
 use byteorder::{LittleEndian, ReadBytesExt};
 
 use crate::{CHUNK_SIZE, EMPTY_BUFFER, HEADER_SIZE};
-use super::{column::Column, db_type::DbType, file_handlers::IOOperationsSync, row::Row, support_types::{FileChunk, RowPrefetchResult}};
+use super::{
+    column::Column, 
+    db_type::DbType, 
+    row::Row, 
+    storage_providers::traits::IOOperationsSync, 
+    support_types::{FileChunk, RowPrefetchResult}
+};
 
 pub(crate) fn read_row_columns(
     io_sync: &mut impl IOOperationsSync, 

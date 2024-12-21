@@ -1,20 +1,19 @@
 use std::{
-    fmt::Display, fs::File, io::{self, BufReader, Cursor, Read, Seek, SeekFrom}, marker::PhantomData, os::windows::fs::FileExt, path::Path, sync::Arc
+    fmt::Display, 
+    io::{self, Seek, SeekFrom}, 
+    marker::PhantomData, 
+    sync::Arc
 };
 
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::{LittleEndian, WriteBytesExt};
 use itertools::Itertools;
-use tokio::{io::AsyncWriteExt, sync::{RwLock, RwLockWriteGuard}};
+use tokio::sync::{RwLock, RwLockWriteGuard};
 
 use crate::{core::helpers::delete_row_file, HEADER_SIZE, POSITIONS_CACHE};
 use super::{
     super::rql::{
         models::Token, parser::ParserResult, tokenizer::evaluate_column_result
-    }, 
-    column::{Column, DowngradeType}, 
-    db_type::DbType, 
-    file_handlers::{IOOperationsAsync, IOOperationsSync}, 
-    helpers::{
+    }, column::{Column, DowngradeType}, db_type::DbType, helpers::{
         add_in_memory_index, 
         add_last_in_memory_index, 
         indexed_row_fetching_file, 
@@ -23,10 +22,7 @@ use super::{
         row_prefetching, 
         row_prefetching_cursor, 
         row_prefetching_file_index
-    }, 
-    row::{InsertRow, Row}, 
-    support_types::FileChunk, 
-    table_header::TableHeader
+    }, row::{InsertRow, Row}, storage_providers::traits::{IOOperationsAsync, IOOperationsSync}, support_types::FileChunk, table_header::TableHeader
 };
 
 pub struct Table<'a, S: IOOperationsSync, A: IOOperationsAsync<'a>> {

@@ -1,6 +1,6 @@
 use std::io::Cursor;
 
-use super::file_handlers::{IOOperationsAsync, IOOperationsSync};
+use super::storage_providers::traits::IOOperationsSync;
 
 #[derive(Debug)]
 pub struct RowPrefetchResult {
