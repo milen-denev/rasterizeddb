@@ -8,6 +8,10 @@ pub trait IOOperationsSync: Clone {
         position: u64, 
         buffer: &[u8]);
 
+    fn write_data_seek(&mut self,  
+        seek: SeekFrom, 
+        buffer: &[u8]);
+
     fn read_data(&mut self,
         position: &mut u64,  
         length: u32) -> Vec<u8>;

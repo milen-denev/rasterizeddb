@@ -118,22 +118,19 @@ pub(crate) fn read_row_cursor(first_column_index: u64, id: u64, length: u32, cur
     });
 }
 
-pub(crate) fn delete_row_file(first_column_index: u64, file: &mut File) -> io::Result<()> {
-    file.seek(SeekFrom::Start(first_column_index - 4)).unwrap();
+pub(crate) fn delete_row_file(
+    first_column_index: u64, 
+    io_sync: &mut impl IOOperationsSync) -> io::Result<()> {
+    io_sync.seek(SeekFrom::Start(first_column_index - 4));
 
-    let columns_length = file.read_u32::<LittleEndian>().unwrap();
+    let columns_length = io_sync.read_u32().unwrap();
 
     //ID (8) LEN (4) COLUMNS (columns_length) START (1) END (1)
     let empty_buffer = vec![0; (columns_length + 4 + 8 + 1 + 1) as usize];
 
-    //ID (8) LEN (4) START (1)
-    file.seek(SeekFrom::Start(first_column_index - 4 - 8 - 1)).unwrap();
-
     // Write the empty buffer to overwrite the data
-    file.write_all(&empty_buffer).unwrap();
-
-    // Flush to ensure changes are written to disk
-    file.flush().unwrap();
+    //ID (8) LEN (4) START (1)
+    io_sync.write_data_seek(SeekFrom::Start(first_column_index - 4 - 8 - 1), &empty_buffer);
 
     return Ok(());
 }
@@ -448,15 +445,10 @@ pub(crate) fn add_last_in_memory_index(
 }
 
 pub(crate) fn indexed_row_fetching_file( 
-    file: &mut File, 
-    position: u64, 
+    io_sync: &mut impl IOOperationsSync, 
+    position: &mut u64, 
     length: u32) -> io::Result<Row> {
-    let mut buffer: Vec<u8> = vec![0; (length + 1 + 1 + 8 + 4) as usize];
-
-    file.seek(SeekFrom::Start(position))?;
-    file.read(&mut buffer).unwrap();
-
-    let mut cursor = Cursor::new(buffer);
+    let mut cursor = io_sync.read_data_to_cursor(position, (length + 1 + 1 + 8 + 4) as u32);
 
     let start_now_byte = cursor.read_u8();
 
@@ -509,6 +501,54 @@ pub(crate) fn indexed_row_fetching_file(
 
     return Ok(Row {
         id: found_id,
+        length: length,
+        columns_data: columns_buffer
+    });
+}
+
+pub(crate) fn columns_cursor_to_row( 
+    mut columns_cursor: Cursor<Vec<u8>>, 
+    id: u64,
+    length: u32) -> io::Result<Row> {
+    let mut columns: Vec<Column> = Vec::default();
+    
+    loop {
+        let column_type = columns_cursor.read_u8().unwrap();
+
+        let db_type = DbType::from_byte(column_type);
+
+        if db_type == DbType::END {
+            break;
+        }
+
+        let mut data_buffer = Vec::default();
+
+        if db_type != DbType::STRING {
+            let db_size = db_type.get_size();
+
+            let mut preset_buffer = vec![0; db_size as usize];
+            columns_cursor.read(&mut preset_buffer).unwrap();
+            data_buffer.append(&mut preset_buffer.to_vec());
+        } else {
+            let str_length = columns_cursor.read_u32::<LittleEndian>().unwrap();
+            let mut preset_buffer = vec![0; str_length as usize];
+            columns_cursor.read(&mut preset_buffer).unwrap();
+            data_buffer.append(&mut preset_buffer.to_vec());
+        }
+        
+        let column = Column::from_raw(column_type, data_buffer, None);
+
+        columns.push(column);
+    }
+
+    let mut columns_buffer: Vec<u8> = Vec::default();
+
+    for mut column in columns {
+        columns_buffer.append(&mut column.into_vec().unwrap());
+    }
+
+    return Ok(Row {
+        id: id,
         length: length,
         columns_data: columns_buffer
     });

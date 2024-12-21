@@ -174,4 +174,14 @@ impl IOOperationsSync for LocalStorageProvider {
             return cursor;
         }
     }
+    
+    fn write_data_seek(&mut self,  
+        seek: SeekFrom, 
+        buffer: &[u8]) {
+        let mut file = &self.write_file;
+        file.seek(seek).unwrap();
+        file.write_all(buffer).unwrap();
+        file.flush().unwrap();
+        file.sync_all().unwrap();
+    }
 }
