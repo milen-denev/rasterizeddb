@@ -2,8 +2,8 @@ use ahash::RandomState;
 use moka::sync::Cache;
 use once_cell::sync::Lazy;
 
-pub(crate) const HEADER_SIZE: u64 = 30;
-pub(crate) const CHUNK_SIZE: u64 = 1_000_000;
+pub(crate) const HEADER_SIZE: u16 = 30;
+pub(crate) const CHUNK_SIZE: u32 = 1_000_000;
 
 pub(crate) const EMPTY_BUFFER: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
 

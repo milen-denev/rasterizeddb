@@ -1,8 +1,5 @@
 use std::{
-    fmt::Display, fs::File, io::{self, BufReader, Cursor, Read, Seek, SeekFrom}, 
-    os::windows::fs::FileExt, 
-    path::Path, 
-    sync::Arc
+    fmt::Display, fs::File, io::{self, BufReader, Cursor, Read, Seek, SeekFrom}, marker::PhantomData, os::windows::fs::FileExt, path::Path, sync::Arc
 };
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -11,75 +8,87 @@ use tokio::{io::AsyncWriteExt, sync::{RwLock, RwLockWriteGuard}};
 
 use crate::{core::helpers::delete_row_file, HEADER_SIZE, POSITIONS_CACHE};
 use super::{
-    column::{Column, DowngradeType}, 
-    db_type::DbType, helpers::{
-        add_in_memory_index, add_last_in_memory_index, indexed_row_fetching_file, read_row_cursor, read_row_file, row_prefetching_cursor, row_prefetching_file, row_prefetching_file_index
-    }, 
-    row::{InsertRow, Row}, 
     super::rql::{
         models::Token, parser::ParserResult, tokenizer::evaluate_column_result
-    }, 
-    support_types::FileChunk, 
-    table_header::TableHeader
+    }, column::{Column, DowngradeType}, db_type::DbType, file_handlers::{save_data, IOOperationsAsync, IOOperationsSync}, helpers::{
+        add_in_memory_index, add_last_in_memory_index, indexed_row_fetching_file, read_row_cursor, read_row_file, row_prefetching_cursor, row_prefetching_file, row_prefetching_file_index
+    }, row::{InsertRow, Row}, support_types::FileChunk, table_header::TableHeader
 };
 
-pub struct Table {
-    pub(crate) location: String,
+pub struct Table<'a, S: IOOperationsSync, A: IOOperationsAsync<'a>> {
+    io_sync: S,
+    io_async: A,
     pub(crate) table_header: Arc<RwLock<TableHeader>>,
-    pub(crate) file_connection_read: File,
     pub(crate) in_memory_index: Option<Vec<FileChunk>>,
     pub(crate) current_file_length: Arc<RwLock<u64>>,
-    pub(crate) current_row_id: Arc<RwLock<u64>>
+    pub(crate) current_row_id: Arc<RwLock<u64>>,
+    pub(crate) immutable: bool,
+    _marker: PhantomData<&'a ()>,
 }
 
-impl Table {
-    pub fn init(file_name: &str, compressed: bool) -> io::Result<Table> {
-        let path = Path::new(file_name);
+unsafe impl<'a, S: IOOperationsSync, A: IOOperationsAsync<'a>> Send for Table<'a, S, A> {}
+unsafe impl<'a, S: IOOperationsSync, A: IOOperationsAsync<'a>> Sync for Table<'a, S, A> {}
 
-        if path.exists() && path.is_file() {
-            let file = File::options().read(true).open(file_name).unwrap();
+impl<'a, S: IOOperationsSync, A: IOOperationsAsync<'a>> Table<'a, S, A> {
+    pub fn init(
+        mut io_sync: S,
+        io_async: A, 
+        compressed: bool,
+        immutable: bool) -> io::Result<Table<'a, S, A>> {
+        let table_file_len = io_sync.get_len();
 
-            let mut buffer: [u8; HEADER_SIZE as usize] = [0; HEADER_SIZE as usize];
-
-            file.seek_read(&mut buffer, 0).unwrap();
-
+        if table_file_len >= HEADER_SIZE as u64 {
+            
+            let buffer = io_sync.read_data(0, HEADER_SIZE as u32);
             let mut table_header = TableHeader::from_buffer(buffer.to_vec()).unwrap();
 
             let last_row_id: u64 = table_header.last_row_id;
 
-            table_header.total_file_length = file.metadata().unwrap().len();
+            table_header.total_file_length = table_file_len;
 
             let table = Table {
-                location: file_name.to_string(),
+                io_sync: io_sync,
+                io_async: io_async,
                 table_header: Arc::new(RwLock::const_new(table_header)),
-                file_connection_read: File::options().read(true).open(&file_name).unwrap(),
                 in_memory_index: None,
-                current_file_length: Arc::new(RwLock::const_new(file.metadata().unwrap().len())),
-                current_row_id: Arc::new(RwLock::const_new(last_row_id))
+                current_file_length: Arc::new(RwLock::const_new(table_file_len)),
+                current_row_id: Arc::new(RwLock::const_new(last_row_id)),
+                immutable: immutable,
+                _marker: PhantomData::default()
             };
 
             Ok(table)
         } else {
-            let file = File::create(file_name).unwrap();
-            
-            let table_header = TableHeader::new(HEADER_SIZE, 0, compressed, 0, 0, false);
+            let table_header = TableHeader::new(HEADER_SIZE as u64, 0, compressed, 0, 0, false);
 
             // Serialize the header and write it to the file
             let header_bytes = table_header.to_bytes().unwrap();
 
-            file.seek_write(&header_bytes, 0).unwrap();
+            io_sync.write_data(0, &header_bytes);
 
             let table = Table {
-                location: file_name.to_string(),
+                io_sync: io_sync,
+                io_async: io_async,
                 table_header: Arc::new(RwLock::const_new(table_header)),
-                file_connection_read: File::options().read(true).open(&file_name).unwrap(),
                 in_memory_index: None,
-                current_file_length: Arc::new(RwLock::const_new(file.metadata().unwrap().len())),
-                current_row_id: Arc::new(RwLock::const_new(0))
+                current_file_length: Arc::new(RwLock::const_new(table_file_len)),
+                current_row_id: Arc::new(RwLock::const_new(0)),
+                immutable: immutable,
+                _marker: PhantomData::default()
             };
 
             Ok(table)
         }
+    }
+
+    pub fn get_current_table_length(&mut self) -> u64 {
+        let file_length = loop {
+            if let Ok(len) = self.current_file_length.try_read() {
+                break *len - (HEADER_SIZE as u64);
+            }
+        };
+
+        return file_length;
     }
 
     /// (End Of File, Row Id)
@@ -111,9 +120,7 @@ impl Table {
         return last_row_id;
     }
 
-    pub async fn insert_row(&mut self, row: &mut InsertRow) -> io::Result<()>{
-        let mut file = tokio::fs::File::options().append(true).open(&self.location).await?;
-        
+    pub async fn insert_row(&'a mut self, row: &'a mut InsertRow) {
         let columns_len = row.columns_data.len();
 
         //START (1) + END (1) + u64 ID (8) + u32 LENGTH (4) + VEC SIZE 
@@ -134,7 +141,9 @@ impl Table {
         //DbType END
         buffer.push(255);
 
-        file.write(&buffer).await?;
+        let buffer_len = buffer.len();
+      
+        self.io_async.append_data_own(Box::new(buffer)).await;
 
         let table_header = self.table_header.clone();
 
@@ -146,33 +155,16 @@ impl Table {
         };
 
         table_header_w.last_row_id = row_id + 1;
-        table_header_w.total_file_length = total_row_size + buffer.len() as u64;
-
-        Ok(())
+        table_header_w.total_file_length = total_row_size + buffer_len as u64;
     }
 
     pub fn first_or_default_by_id(&mut self, id: u64) -> io::Result<Option<Row>> {
-        let mut file = self.file_connection_read.try_clone().unwrap();
-
-        let file_length = loop {
-            if let Ok(header) = self.table_header.try_read() {
-                break header.total_file_length - HEADER_SIZE;
-            }
-        };
-
-        file.seek(SeekFrom::Start(HEADER_SIZE)).unwrap();
+        let file_length = self.get_current_table_length();
 
         if let Some(chunks) = self.in_memory_index.as_ref() {
             let mut chunks_ended_position: u64 = 0;
             for chunk in chunks {
-                let mut buffer = vec![0; chunk.chunk_size as usize];
-                file.seek_read(&mut buffer, chunk.current_file_position).unwrap();
-
-                if buffer.len() == 0 {
-                    panic!("Error reading the file to buffer.");
-                }
-
-                let mut cursor = Cursor::new(&buffer);
+                let mut cursor = chunk.read_chunk_sync(&mut self.io_sync);
 
                 loop {
                     if let Some(prefetch_result) = row_prefetching_cursor(&mut cursor, chunk).unwrap() {
@@ -197,20 +189,15 @@ impl Table {
             }
 
             if chunks_ended_position < file_length {
-                let mut buffer: Vec<u8> = Vec::default();
-                file.read_to_end(&mut buffer).unwrap();
+                let chunk = FileChunk {
+                    current_file_position: 0,
+                    chunk_size: 0,
+                    next_row_id: 0
+                };
 
-                let cursor_size = buffer.len();
-
-                let mut cursor = Cursor::new(&buffer);
+                let cursor = chunk.read_chunk_to_end_sync(file_length - chunks_ended_position, &mut self.io_sync);
 
                 loop {
-                    let chunk = FileChunk {
-                        current_file_position: 0,
-                        chunk_size: cursor_size as u64,
-                        next_row_id: 0
-                    };
-
                     if let Some(prefetch_result) = row_prefetching_cursor(&mut cursor, &chunk).unwrap() {
                         if id == prefetch_result.found_id {
                             let row = read_row_cursor(
@@ -230,8 +217,9 @@ impl Table {
                 }
             }
         } else {
+            let mut position = HEADER_SIZE as u64;
             loop {       
-                let file_postion = file.stream_position()?;
+                
 
                 if let Some(prefetch_result) = row_prefetching_file(
                     &mut file,

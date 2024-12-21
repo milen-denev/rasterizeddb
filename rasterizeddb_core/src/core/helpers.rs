@@ -52,7 +52,7 @@ pub(crate) fn read_row_file(first_column_index: u64, id: u64, length: u32, file:
     });
 }
 
-pub(crate) fn read_row_cursor(first_column_index: u64, id: u64, length: u32, cursor: &mut Cursor<&Vec<u8>>) -> io::Result<Row> {
+pub(crate) fn read_row_cursor(first_column_index: u64, id: u64, length: u32, cursor: &mut Cursor<Vec<u8>>) -> io::Result<Row> {
     cursor.seek(SeekFrom::Start(first_column_index)).unwrap();
 
     let mut columns: Vec<Column> = Vec::default();
@@ -226,9 +226,9 @@ pub(crate) fn skip_empty_spaces_file_index(
     return Ok(());
 }
 
-pub(crate) fn skip_empty_spaces_cursor(cursor: &mut Cursor<&Vec<u8>>, cursor_length: u64) -> io::Result<()> {
+pub(crate) fn skip_empty_spaces_cursor(cursor: &mut Cursor<Vec<u8>>, cursor_length: u32) -> io::Result<()> {
     let cursor_position = cursor.position();
-    if cursor_length == cursor_position || cursor_length < cursor_position {
+    if cursor_length == cursor_position as u32 || cursor_length < cursor_position as u32 {
         return Ok(());
     }
 
@@ -240,7 +240,7 @@ pub(crate) fn skip_empty_spaces_cursor(cursor: &mut Cursor<&Vec<u8>>, cursor_len
             cursor.read(&mut check_next_buffer).unwrap();
 
             let cursor_position = cursor.position();
-            if cursor_length == cursor_position || cursor_length < cursor_position {
+            if cursor_length == cursor_position as u32 || cursor_length < cursor_position as u32 {
                 return Ok(());
             }
 
@@ -335,7 +335,7 @@ pub(crate) fn row_prefetching_file_index(
 }
 
 pub(crate) fn row_prefetching_cursor(
-    cursor: &mut Cursor<&Vec<u8>>, 
+    cursor: &mut Cursor<Vec<u8>>, 
     chunk: &FileChunk) -> io::Result<Option<RowPrefetchResult>> {
 
     skip_empty_spaces_cursor(cursor, chunk.chunk_size).unwrap();
@@ -363,7 +363,7 @@ pub(crate) fn row_prefetching_cursor(
 }
 
 pub(crate) fn add_in_memory_index(
-    current_chunk_size: &mut u64,
+    current_chunk_size: &mut u32,
     current_id: u64,
     file_position: u64,
     in_memory_index: &mut Option<Vec<FileChunk>>) {
@@ -380,7 +380,7 @@ pub(crate) fn add_in_memory_index(
             let mut chunks_vec: Vec<FileChunk> = Vec::default();
 
             let first_entry = FileChunk {
-                current_file_position: HEADER_SIZE,
+                current_file_position: HEADER_SIZE as u64,
                 chunk_size: *current_chunk_size,
                 next_row_id: current_id
             };
@@ -394,7 +394,7 @@ pub(crate) fn add_in_memory_index(
 }
 
 pub(crate) fn add_last_in_memory_index(
-    current_chunk_size: u64,
+    current_chunk_size: u32,
     file_position: u64,
     file_length: u64,
     in_memory_index: &mut Option<Vec<FileChunk>>) {
@@ -411,7 +411,7 @@ pub(crate) fn add_last_in_memory_index(
             let mut chunks_vec: Vec<FileChunk> = Vec::default();
 
             let first_entry = FileChunk {
-                current_file_position: HEADER_SIZE,
+                current_file_position: HEADER_SIZE as u64,
                 chunk_size: current_chunk_size,
                 next_row_id: 0
             };
