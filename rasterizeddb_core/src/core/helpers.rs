@@ -16,8 +16,6 @@ pub(crate) fn read_row_columns(
     first_column_index: u64, 
     id: u64, 
     length: u32) -> io::Result<Row> {
-    let mut io_sync = io_sync.clone();
-
     let mut columns: Vec<Column> = Vec::default();
     
     let mut position = first_column_index;
@@ -137,11 +135,9 @@ pub(crate) fn delete_row_file(
 pub(crate) fn skip_empty_spaces_file(
     io_sync: &mut impl IOOperationsSync, 
     file_position: &mut u64,
-    file_length: u64) -> Result<impl IOOperationsSync, String> {
-    let mut io_sync = io_sync.clone();
-
+    file_length: u64) -> u64 {
     if file_length == *file_position || file_length < *file_position {
-        return Ok(io_sync);
+        return *file_position;
     }
 
     let mut check_next_buffer = io_sync.read_data(file_position, 8);
@@ -151,7 +147,7 @@ pub(crate) fn skip_empty_spaces_file(
             io_sync.read_data_into_buffer(file_position, &mut check_next_buffer);
 
             if file_length == *file_position || file_length < *file_position {
-                return Ok(io_sync);
+                return *file_position;
             }
 
             if check_next_buffer != EMPTY_BUFFER {
@@ -165,7 +161,7 @@ pub(crate) fn skip_empty_spaces_file(
 
         *file_position = ((*file_position) as i64 + move_back) as u64;
 
-        return Ok(io_sync);
+        return *file_position;
     } else {
         let index_of_row_start = check_next_buffer.iter().position(|x| *x == DbType::START.to_byte());
        
@@ -178,7 +174,7 @@ pub(crate) fn skip_empty_spaces_file(
         }
     }
 
-    return Ok(io_sync);
+    return *file_position;
 }
 
 pub(crate) fn skip_empty_spaces_cursor(cursor: &mut Cursor<Vec<u8>>, cursor_length: u32) -> io::Result<()> {
@@ -229,7 +225,7 @@ pub(crate) fn row_prefetching(
     file_position: &mut u64, 
     file_length: u64) -> io::Result<Option<RowPrefetchResult>> {
     if *file_position < file_length {
-        let mut io_sync = skip_empty_spaces_file(io_sync, file_position, file_length).unwrap();
+        *file_position = skip_empty_spaces_file(io_sync, file_position, file_length);
 
         let mut cursor = io_sync.read_data_to_cursor(file_position, 1 + 8 + 4);
     

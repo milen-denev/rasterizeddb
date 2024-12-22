@@ -89,5 +89,6 @@ pub(crate) static POSITIONS_CACHE: Lazy<Cache<u64, Vec<(u64, u32)>, RandomState>
 /// ```
 pub mod core;
 
+pub mod simds;
 pub mod rql;
 pub(crate) mod instructions;

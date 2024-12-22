@@ -617,10 +617,14 @@ impl<S: IOOperationsSync> Table<S> {
                                     prefetch_result.length,
                                     &mut cursor).unwrap();
 
-                                let mut row_vec: Vec<(u64, u32)> = Vec::with_capacity(1);
-                                row_vec.push((chunk.current_file_position + first_column_index - 1 - 8 - 4, prefetch_result.length));
-                                POSITIONS_CACHE.insert(hash, row_vec);
-
+                                    
+                                    #[cfg(feature = "enable_index_caching")]
+                                    {
+                                        let mut row_vec: Vec<(u64, u32)> = Vec::with_capacity(1);
+                                        row_vec.push((chunk.current_file_position + first_column_index - 1 - 8 - 4, prefetch_result.length));
+                                        POSITIONS_CACHE.insert(hash, row_vec);
+                                    }
+                                
                                 return Ok(Some(row));
                             }
                         } else {
@@ -718,10 +722,13 @@ impl<S: IOOperationsSync> Table<S> {
                                     prefetch_result.length,
                                     &mut cursor).unwrap();
 
-                                let mut row_vec: Vec<(u64, u32)> = Vec::with_capacity(1);
-                                row_vec.push((chunks_ended_position + first_column_index - 1 - 8 - 4, prefetch_result.length));
-                                POSITIONS_CACHE.insert(hash, row_vec);
-
+                                #[cfg(feature = "enable_index_caching")]
+                                {
+                                    let mut row_vec: Vec<(u64, u32)> = Vec::with_capacity(1);
+                                    row_vec.push((chunks_ended_position + first_column_index - 1 - 8 - 4, prefetch_result.length));
+                                    POSITIONS_CACHE.insert(hash, row_vec);
+                                }
+                                
                                 return Ok(Some(row));
                             }
                         } else {
@@ -827,9 +834,12 @@ impl<S: IOOperationsSync> Table<S> {
                                 prefetch_result.found_id,
                                 prefetch_result.length).unwrap();
 
-                            let mut row_vec: Vec<(u64, u32)> = Vec::with_capacity(1);
-                            row_vec.push((first_column_index - 1 - 8 - 4, prefetch_result.length));
-                            POSITIONS_CACHE.insert(hash, row_vec);
+                            #[cfg(feature = "enable_index_caching")]
+                            {  
+                                let mut row_vec: Vec<(u64, u32)> = Vec::with_capacity(1);
+                                row_vec.push((first_column_index - 1 - 8 - 4, prefetch_result.length));
+                                POSITIONS_CACHE.insert(hash, row_vec);
+                            }
 
                             return Ok(Some(row));
                         }
