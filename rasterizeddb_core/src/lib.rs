@@ -20,9 +20,15 @@ pub(crate) static POSITIONS_CACHE: Lazy<Cache<u64, Vec<(u64, u32)>, RandomState>
 /// 
 /// #### Create a static TABLE
 /// ```rust
-/// static TABLE: LazyLock<Arc<tokio::sync::RwLock<Table>>> = LazyLock::new(|| 
-///     Arc::new(RwLock::const_new(Table::init("Some\\Folder", false).unwrap()))
+/// //Local File Storage Database
+/// let io_sync = LocalStorageProvider::new(
+///     "Some\\Folder",
+///     "database.db"
 /// );
+/// //In-Memory Database
+/// let io_sync = MemoryStorageProvider::new();
+/// 
+/// let mut table = Table::init(io_sync, false, false).unwrap();
 /// ```
 /// 
 /// #### Create columns, rows and insert them
