@@ -1,8 +1,6 @@
 use std::{io::{Cursor, Read, Seek, SeekFrom, Write}, os::windows::fs::FileExt, path::Path};
 
-use byteorder::{LittleEndian, ReadBytesExt};
-
-use super::traits::{IOOperationsSync, IOResult};
+use super::traits::IOOperationsSync;
 
 pub struct LocalStorageProvider {
     pub(super) read_file: std::fs::File,
@@ -129,37 +127,6 @@ impl IOOperationsSync for LocalStorageProvider {
         file.seek(SeekFrom::Start(*position)).unwrap();
         file.seek_read(buffer, *position).unwrap();
         *position += buffer.len() as u64;
-    }
-    
-    fn seek(&mut self, seek: SeekFrom) {
-        self.read_file.seek(seek).unwrap();
-    }
-    
-    fn read_u8(&mut self) -> IOResult<u8> {
-        let num_result = self.read_file.read_u8();
-        if let Ok(num) = num_result {
-            IOResult::Ok(num)
-        } else {
-            IOResult::Err(num_result.unwrap_err())
-        }
-    }
-    
-    fn read_u32(&mut self) -> IOResult<u32> {
-        let num_result = self.read_file.read_u32::<LittleEndian>();
-        if let Ok(num) = num_result {
-            IOResult::Ok(num)
-        } else {
-            IOResult::Err(num_result.unwrap_err())
-        }
-    }
-    
-    fn read_u64(&mut self) -> IOResult<u64> {
-        let num_result = self.read_file.read_u64::<LittleEndian>();
-        if let Ok(num) = num_result {
-            IOResult::Ok(num)
-        } else {
-            IOResult::Err(num_result.unwrap_err())
-        }
     }
     
     fn read_data_to_cursor(&mut self,

@@ -1,7 +1,7 @@
 use std::{future::Future, io::{Cursor, SeekFrom}};
 
-pub(crate) type IOError = std::io::Error;
-pub(crate) type IOResult<T> = std::result::Result<T, IOError>;
+pub type IOError = std::io::Error;
+pub type IOResult<T> = std::result::Result<T, IOError>;
 
 pub trait IOOperationsSync: Clone {
     fn write_data(&mut self,  
@@ -33,14 +33,6 @@ pub trait IOOperationsSync: Clone {
     fn get_len(&mut self) -> u64;
 
     fn exists(location: &str, table_name: &str) -> bool;
-
-    fn seek(&mut self, seek: SeekFrom);
-
-    fn read_u8(&mut self) -> IOResult<u8>;
-
-    fn read_u32(&mut self) -> IOResult<u32>;
-
-    fn read_u64(&mut self) -> IOResult<u64>;
 }
 
 pub trait IOOperationsAsync<'a>: TryCloneAsync {

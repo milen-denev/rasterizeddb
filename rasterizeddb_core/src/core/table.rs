@@ -1,7 +1,6 @@
 use std::{
     fmt::Display, 
-    io::{self, Read, Seek, SeekFrom}, 
-    marker::PhantomData, 
+    io::{self, Read, Seek, SeekFrom},
     sync::Arc
 };
 
@@ -14,30 +13,34 @@ use super::{
     super::rql::{
         models::Token, parser::ParserResult, tokenizer::evaluate_column_result
     }, column::{Column, DowngradeType}, db_type::DbType, helpers::{
-        add_in_memory_index, add_last_in_memory_index, columns_cursor_to_row, indexed_row_fetching_file, read_row_columns, read_row_cursor, row_prefetching, row_prefetching_cursor, row_prefetching_file_index
-    }, row::{InsertRow, Row}, storage_providers::traits::{IOOperationsAsync, IOOperationsSync}, support_types::FileChunk, table_header::TableHeader
+        add_in_memory_index, 
+        add_last_in_memory_index, 
+        columns_cursor_to_row, 
+        indexed_row_fetching_file, 
+        read_row_columns, 
+        read_row_cursor, 
+        row_prefetching, 
+        row_prefetching_cursor
+    }, row::{InsertRow, Row}, storage_providers::traits::IOOperationsSync, support_types::FileChunk, table_header::TableHeader
 };
 
-pub struct Table<'a, S: IOOperationsSync, A: IOOperationsAsync<'a>> {
+pub struct Table<S: IOOperationsSync> {
     pub(crate) io_sync: S,
-    pub(crate) io_async: A,
     pub(crate) table_header: Arc<RwLock<TableHeader>>,
     pub(crate) in_memory_index: Option<Vec<FileChunk>>,
     pub(crate) current_file_length: Arc<RwLock<u64>>,
     pub(crate) current_row_id: Arc<RwLock<u64>>,
-    pub(crate) immutable: bool,
-    _marker: PhantomData<&'a ()>,
+    pub(crate) immutable: bool
 }
 
-unsafe impl<'a, S: IOOperationsSync, A: IOOperationsAsync<'a>> Send for Table<'a, S, A> {}
-unsafe impl<'a, S: IOOperationsSync, A: IOOperationsAsync<'a>> Sync for Table<'a, S, A> {}
+unsafe impl<S: IOOperationsSync> Send for Table<S> {}
+unsafe impl<S: IOOperationsSync> Sync for Table<S> {}
 
-impl<'a, S: IOOperationsSync, A: IOOperationsAsync<'a>> Table<'a, S, A> {
+impl<S: IOOperationsSync> Table<S> {
     pub fn init(
         mut io_sync: S,
-        io_async: A, 
         compressed: bool,
-        immutable: bool) -> io::Result<Table<'a, S, A>> {
+        immutable: bool) -> io::Result<Table<S>> {
         let table_file_len = io_sync.get_len();
 
         if table_file_len >= HEADER_SIZE as u64 {
@@ -51,13 +54,11 @@ impl<'a, S: IOOperationsSync, A: IOOperationsAsync<'a>> Table<'a, S, A> {
 
             let table = Table {
                 io_sync: io_sync,
-                io_async: io_async,
                 table_header: Arc::new(RwLock::const_new(table_header)),
                 in_memory_index: None,
                 current_file_length: Arc::new(RwLock::const_new(table_file_len)),
                 current_row_id: Arc::new(RwLock::const_new(last_row_id)),
-                immutable: immutable,
-                _marker: PhantomData::default()
+                immutable: immutable
             };
 
             Ok(table)
@@ -71,13 +72,11 @@ impl<'a, S: IOOperationsSync, A: IOOperationsAsync<'a>> Table<'a, S, A> {
 
             let table = Table {
                 io_sync: io_sync,
-                io_async: io_async,
                 table_header: Arc::new(RwLock::const_new(table_header)),
                 in_memory_index: None,
                 current_file_length: Arc::new(RwLock::const_new(table_file_len)),
                 current_row_id: Arc::new(RwLock::const_new(0)),
-                immutable: immutable,
-                _marker: PhantomData::default()
+                immutable: immutable
             };
 
             Ok(table)

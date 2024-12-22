@@ -1,8 +1,7 @@
 use std::marker::PhantomData;
 
-use super::storage_providers::traits::{IOOperationsAsync, IOOperationsSync};
+use super::storage_providers::traits::IOOperationsSync;
 
-pub struct Database<'a, S: IOOperationsSync, A: IOOperationsAsync<'a>> {
-    io_sync: PhantomData<S>,
-    io_async: &'a PhantomData<A>,
+pub struct Database<S: IOOperationsSync> {
+    io_sync: PhantomData<S>
 }
