@@ -38,7 +38,9 @@ Yes, a standalone ORM for Rust is planned, with a C# version to follow soon afte
 
 The following features are currently missing but are planned for future updates:
 
+- Inserting rows (through RQL)
 - Updating rows
+- Deleting rows (through RQL)
 - Vacuuming empty space
 - UUID (GUID) support
 - Fully functional RETURN, LIMIT, and SELECT commands among many other SQL features missing
@@ -56,9 +58,15 @@ Short answer, no. It will get through many refinements and even changes to the t
 
 #### Create a static TABLE
 ```rust
-static TABLE: LazyLock<Arc<tokio::sync::RwLock<Table>>> = LazyLock::new(|| 
-    Arc::new(RwLock::const_new(Table::init("Some\\Folder", false).unwrap()))
+//Local File Storage Database
+let io_sync = LocalStorageProvider::new(
+    "Some\\Folder",
+    "database.db"
 );
+//In-Memory Database
+let io_sync = MemoryStorageProvider::new();
+
+let mut table = Table::init(io_sync, false, false).unwrap();
 ```
 
 #### Create columns, rows and insert them
@@ -84,6 +92,7 @@ mutable_table.insert_row(&mut InsertRow {
     columns_data: columns_buffer
 }).await.unwrap();
 ```
+
 #### Build in-memory file indexes
 ```rust
 mutable_table.rebuild_in_memory_indexes();
