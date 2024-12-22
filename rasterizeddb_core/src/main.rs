@@ -1,3 +1,5 @@
+use std::io::stdin;
+
 use rasterizeddb_core::{
     core::{
         column::Column, row::InsertRow, storage_providers::{file_sync::LocalStorageProvider, memory::MemoryStorageProvider}, table::Table
@@ -13,11 +15,11 @@ async fn main() -> std::io::Result<()> {
         "database.db"
     );
 
-    let io_sync = MemoryStorageProvider::new();
+    //let io_sync = MemoryStorageProvider::new();
 
     let mut table = Table::init(io_sync, false, false).unwrap();
 
-    for i in 0..10_000 {
+    for i in 0..100 {
         let mut c1 = Column::new(i).unwrap();
         let mut c2 = Column::new(i * -1).unwrap();
 
@@ -62,6 +64,11 @@ async fn main() -> std::io::Result<()> {
     for column in Column::from_buffer(&row.columns_data).unwrap() {
         println!("{}", column.into_value());
     }
+
+    println!("DONE");
+
+    let mut buffer = String::new();
+    stdin().read_line(&mut buffer).unwrap();
 
     Ok(())
 }
