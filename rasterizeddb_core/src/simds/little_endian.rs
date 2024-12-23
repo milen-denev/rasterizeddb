@@ -1,8 +1,8 @@
 use std::arch::x86_64::*;
 
 /// Converts a slice of 4 `u8` to a `u32` using little-endian ordering.
-/// This function requires AVX2 support.
-#[target_feature(enable = "avx2")]
+/// This function requires SSE2 support.
+#[target_feature(enable = "sse2")]
 pub unsafe fn slice_to_u32_avx2(slice: &[u8]) -> u32 {
     assert!(slice.len() >= 4, "Slice must have at least 4 bytes");
 
