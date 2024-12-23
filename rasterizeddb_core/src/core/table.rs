@@ -517,7 +517,7 @@ impl<S: IOOperationsSync> Table<S> {
             }
             todo!("Support many results.");
         } else if let ParserResult::EvaluationTokens(evaluation_tokens) = parser_result {
-            let hash = evaluation_tokens.0;
+
             let evaluation_tokens = evaluation_tokens.1;
 
             let file_length = self.get_current_table_length();
@@ -536,11 +536,11 @@ impl<S: IOOperationsSync> Table<S> {
                         _ => panic!()
                     }).collect_vec();
 
-                    for chunk in chunks {
-                        let mut cursor = chunk.read_chunk_sync(&mut self.io_sync);
-        
-                        loop {
-                            if let Some(prefetch_result) = row_prefetching_cursor(&mut cursor, chunk).unwrap() {
+                for chunk in chunks {
+                    let mut cursor = chunk.read_chunk_sync(&mut self.io_sync);
+    
+                    loop {
+                        if let Some(prefetch_result) = row_prefetching_cursor(&mut cursor, chunk).unwrap() {
                         
                             let mut current_column_index: u32 = 0;
                             let first_column_index = cursor.stream_position().unwrap();
@@ -620,6 +620,7 @@ impl<S: IOOperationsSync> Table<S> {
                                     
                                     #[cfg(feature = "enable_index_caching")]
                                     {
+                                        let hash = evaluation_tokens.0;
                                         let mut row_vec: Vec<(u64, u32)> = Vec::with_capacity(1);
                                         row_vec.push((chunk.current_file_position + first_column_index - 1 - 8 - 4, prefetch_result.length));
                                         POSITIONS_CACHE.insert(hash, row_vec);
@@ -636,16 +637,16 @@ impl<S: IOOperationsSync> Table<S> {
                 }
 
                 if chunks_ended_position < file_length {
-                let chunk = FileChunk {
-                    current_file_position: 0,
-                    chunk_size: 0,
-                    next_row_id: 0
-                };
+                    let chunk = FileChunk {
+                        current_file_position: 0,
+                        chunk_size: 0,
+                        next_row_id: 0
+                    };
 
-                let mut cursor = chunk.read_chunk_to_end_sync(file_length - chunks_ended_position, &mut self.io_sync);
+                    let mut cursor = chunk.read_chunk_to_end_sync(file_length - chunks_ended_position, &mut self.io_sync);
 
-                loop {
-                    if let Some(prefetch_result) = row_prefetching_cursor(&mut cursor, &chunk).unwrap() {
+                    loop {
+                        if let Some(prefetch_result) = row_prefetching_cursor(&mut cursor, &chunk).unwrap() {
                                 
                             let mut current_column_index: u32 = 0;
                             let first_column_index = cursor.stream_position().unwrap();
@@ -724,6 +725,7 @@ impl<S: IOOperationsSync> Table<S> {
 
                                 #[cfg(feature = "enable_index_caching")]
                                 {
+                                    let hash = evaluation_tokens.0;
                                     let mut row_vec: Vec<(u64, u32)> = Vec::with_capacity(1);
                                     row_vec.push((chunks_ended_position + first_column_index - 1 - 8 - 4, prefetch_result.length));
                                     POSITIONS_CACHE.insert(hash, row_vec);
@@ -757,7 +759,6 @@ impl<S: IOOperationsSync> Table<S> {
                         file_length).unwrap() {
     
                         let mut column_index_inner = 0;
-                        let first_column_index = position;
 
                         let mut columns_cursor = self.io_sync.read_data_to_cursor(
                             &mut position, 
@@ -836,6 +837,7 @@ impl<S: IOOperationsSync> Table<S> {
 
                             #[cfg(feature = "enable_index_caching")]
                             {  
+                                let hash = evaluation_tokens.0;
                                 let mut row_vec: Vec<(u64, u32)> = Vec::with_capacity(1);
                                 row_vec.push((first_column_index - 1 - 8 - 4, prefetch_result.length));
                                 POSITIONS_CACHE.insert(hash, row_vec);

@@ -20,65 +20,77 @@ async fn main() -> std::io::Result<()> {
 
     let mut table = Table::init(io_sync, false, false).unwrap();
 
-    for i in 0..5000 {
-        let mut c1 = Column::new(i).unwrap();
-        let mut c2 = Column::new(i * -1).unwrap();
-        let mut c3 = Column::new("This is awesome.").unwrap();
-        let mut c4 = Column::new("Another column just for fun.").unwrap();
-
-        let mut columns_buffer: Vec<u8> = Vec::with_capacity(
-            c1.len() + 
-            c2.len() + 
-            c3.len() + 
-            c4.len()
-        );
+    // for i in 0..100 {
+    //     if i == 99 {
+    //         let mut c1 = Column::new(1000).unwrap();
+    //         let mut c2 = Column::new(i * -1).unwrap();
     
-        columns_buffer.append(&mut c1.into_vec().unwrap());
-        columns_buffer.append(&mut c2.into_vec().unwrap());
-        columns_buffer.append(&mut c3.into_vec().unwrap());
-        columns_buffer.append(&mut c4.into_vec().unwrap());
+    //         let mut columns_buffer: Vec<u8> = Vec::with_capacity(
+    //             c1.len() + 
+    //             c2.len() 
+    //         );
+        
+    //         columns_buffer.append(&mut c1.into_vec().unwrap());
+    //         columns_buffer.append(&mut c2.into_vec().unwrap());
+        
+    //         let insert_row = InsertRow {
+    //             columns_data: columns_buffer
+    //         };
+        
+    //         table.insert_row(insert_row).await;
+    //     } else {
+    //         let mut c1 = Column::new(i).unwrap();
+    //         let mut c2 = Column::new(i * -1).unwrap();
     
-        let insert_row = InsertRow {
-            columns_data: columns_buffer
-        };
-    
-        table.insert_row(insert_row).await;
-    }
+    //         let mut columns_buffer: Vec<u8> = Vec::with_capacity(
+    //             c1.len() + 
+    //             c2.len()
+    //         );
+        
+    //         columns_buffer.append(&mut c1.into_vec().unwrap());
+    //         columns_buffer.append(&mut c2.into_vec().unwrap());
+        
+    //         let insert_row = InsertRow {
+    //             columns_data: columns_buffer
+    //         };
+        
+    //         table.insert_row(insert_row).await;
+    //     }
+    // }
 
     //table.rebuild_in_memory_indexes();
 
-    // let row = table.first_or_default_by_id(10)?.unwrap();
+    let row = table.first_or_default_by_id(99)?.unwrap();
 
-    // for column in Column::from_buffer(&row.columns_data).unwrap() {
-    //     println!("{}", column.into_value());
-    // }
+    for column in Column::from_buffer(&row.columns_data).unwrap() {
+        println!("{}", column.into_value());
+    }
 
-    // let row = table.first_or_default_by_column(0, 10)?.unwrap();
+    let row = table.first_or_default_by_column(0, 1000)?.unwrap();
 
-    // for column in Column::from_buffer(&row.columns_data).unwrap() {
-    //     println!("{}", column.into_value());
-    // }
+    for column in Column::from_buffer(&row.columns_data).unwrap() {
+        println!("{}", column.into_value());
+    }
 
     let mut stopwatch = Stopwatch::new();
 
+    stopwatch.start();
     for _ in 0..1000 {
-        stopwatch.start();
         let query_evaluation = parse_rql(&format!(r#"
             BEGIN
             SELECT FROM NAME_DOESNT_MATTER_FOR_NOW
-            WHERE COL(2) = 'This is awesome.'
+            WHERE COL(0) = 1000
             END
         "#)).unwrap();
 
-        let row = table.first_or_default_by_query(query_evaluation).await?.unwrap();
-        stopwatch.stop();
-        println!("{}ms", stopwatch.elapsed_ms());
-        stopwatch.reset();
-        for column in Column::from_buffer(&row.columns_data).unwrap() {
-            println!("{}", column.into_value());
-        }
+        let _row = table.first_or_default_by_query(query_evaluation).await?.unwrap();
+        // for column in Column::from_buffer(&row.columns_data).unwrap() {
+        //     println!("{}", column.into_value());
+        // }
     }
-
+    stopwatch.stop();
+    println!("{}ms", stopwatch.elapsed_ms());
+    stopwatch.reset();
     println!("DONE");
 
     let mut buffer = String::new();
