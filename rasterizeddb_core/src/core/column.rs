@@ -184,7 +184,11 @@ impl Column {
     pub fn into_vec(&mut self) -> io::Result<Vec<u8>> {
         let content_len = self.content.len();
 
-        let mut buffer: Vec<u8> = Vec::with_capacity(content_len + 1);
+        let mut buffer: Vec<u8> = if self.data_type != DbType::STRING {
+            Vec::with_capacity(content_len + 1) 
+        } else {
+            Vec::with_capacity(content_len + 1 + 4) 
+        };
 
         buffer.push(self.data_type.to_byte());
 

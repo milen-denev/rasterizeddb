@@ -30,11 +30,19 @@ impl LocalStorageProvider {
             panic!("OS not supported");
         };
 
+        let location_str = format!("{}", location);
+
+        let location_path = Path::new(&location_str);
+
+        if !location_path.exists() {
+            _ = std::fs::create_dir(location_path);
+        }
+
         let file_str = format!("{}{}{}", location, delimiter, table_name);
         
-        let path = Path::new(&file_str);
+        let file_path = Path::new(&file_str);
 
-        if !path.exists() && !path.is_file() {
+        if !file_path.exists() && !file_path.is_file() {
             _ = std::fs::File::create(&file_str).unwrap();
         }
 

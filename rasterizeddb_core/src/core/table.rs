@@ -46,7 +46,7 @@ impl<S: IOOperationsSync> Table<S> {
         if table_file_len >= HEADER_SIZE as u64 {
             
             let buffer = io_sync.read_data(&mut 0, HEADER_SIZE as u32);
-            let mut table_header = TableHeader::from_buffer(buffer.to_vec()).unwrap();
+            let mut table_header = TableHeader::from_buffer(buffer).unwrap();
 
             let last_row_id: u64 = table_header.last_row_id;
 
@@ -291,12 +291,12 @@ impl<S: IOOperationsSync> Table<S> {
     
                                     let mut preset_buffer = vec![0; db_size as usize];
                                     cursor.read(&mut preset_buffer).unwrap();
-                                    data_buffer.append(&mut preset_buffer.to_vec());
+                                    data_buffer.append(&mut preset_buffer);
                                 } else {
                                     let str_length = cursor.read_u32::<LittleEndian>().unwrap();
                                     let mut preset_buffer = vec![0; str_length as usize];
                                     cursor.read(&mut preset_buffer).unwrap();
-                                    data_buffer.append(&mut preset_buffer.to_vec());
+                                    data_buffer.append(&mut preset_buffer);
                                 }
                                 
                                 let column = Column::from_raw(column_type, data_buffer, None);
@@ -374,12 +374,12 @@ impl<S: IOOperationsSync> Table<S> {
     
                                     let mut preset_buffer = vec![0; db_size as usize];
                                     cursor.read(&mut preset_buffer).unwrap();
-                                    data_buffer.append(&mut preset_buffer.to_vec());
+                                    data_buffer.append(&mut preset_buffer);
                                 } else {
                                     let str_length = cursor.read_u32::<LittleEndian>().unwrap();
                                     let mut preset_buffer = vec![0; str_length as usize];
                                     cursor.read(&mut preset_buffer).unwrap();
-                                    data_buffer.append(&mut preset_buffer.to_vec());
+                                    data_buffer.append(&mut preset_buffer);
                                 }
                                 
                                 let column = Column::from_raw(column_type, data_buffer, None);
@@ -457,7 +457,7 @@ impl<S: IOOperationsSync> Table<S> {
                                 let str_length = columns_cursor.read_u32::<LittleEndian>().unwrap();
                                 let mut preset_buffer = vec![0; str_length as usize];
                                 columns_cursor.read(&mut preset_buffer).unwrap();
-                                data_buffer.append(&mut preset_buffer.to_vec());
+                                data_buffer.append(&mut preset_buffer);
                             }
                             
                             let column = Column::from_raw(column_type, data_buffer.clone(), None);
@@ -538,7 +538,6 @@ impl<S: IOOperationsSync> Table<S> {
 
                 for chunk in chunks {
                     let mut cursor = chunk.read_chunk_sync(&mut self.io_sync);
-    
                     loop {
                         if let Some(prefetch_result) = row_prefetching_cursor(&mut cursor, chunk).unwrap() {
                         
@@ -546,6 +545,7 @@ impl<S: IOOperationsSync> Table<S> {
                             let first_column_index = cursor.stream_position().unwrap();
 
                             loop {  
+
                                 if column_indexes.iter().any(|x| *x == current_column_index) {
                                     let column_type = cursor.read_u8().unwrap();
         
@@ -562,13 +562,13 @@ impl<S: IOOperationsSync> Table<S> {
         
                                         let mut preset_buffer = vec![0; db_size as usize];
                                         cursor.read(&mut preset_buffer).unwrap();
-                                        data_buffer.append(&mut preset_buffer.to_vec());
+                                        data_buffer.append(&mut preset_buffer);
                                     } else {
                                         let str_length = cursor.read_u32::<LittleEndian>().unwrap();
         
                                         let mut preset_buffer = vec![0; str_length as usize];
                                         cursor.read(&mut preset_buffer).unwrap();
-                                        data_buffer.append(&mut preset_buffer.to_vec());
+                                        data_buffer.append(&mut preset_buffer);
                                     }
                                     
                                     let type_byte = db_type.to_byte();
@@ -593,17 +593,13 @@ impl<S: IOOperationsSync> Table<S> {
         
                                     if db_type != DbType::STRING {
                                         let db_size = db_type.get_size();
-        
                                         cursor.seek(SeekFrom::Current(db_size as i64)).unwrap();
-                                    
                                     } else {
                                         let str_length = cursor.read_u32::<LittleEndian>().unwrap();
-        
-        
                                         cursor.seek(SeekFrom::Current(str_length as i64)).unwrap();
                                     }
                                 }
-        
+
                                 current_column_index += 1;
                             }
 
@@ -668,13 +664,13 @@ impl<S: IOOperationsSync> Table<S> {
         
                                         let mut preset_buffer = vec![0; db_size as usize];
                                         cursor.read(&mut preset_buffer).unwrap();
-                                        data_buffer.append(&mut preset_buffer.to_vec());
+                                        data_buffer.append(&mut preset_buffer);
                                     } else {
                                         let str_length = cursor.read_u32::<LittleEndian>().unwrap();
         
                                         let mut preset_buffer = vec![0; str_length as usize];
                                         cursor.read(&mut preset_buffer).unwrap();
-                                        data_buffer.append(&mut preset_buffer.to_vec());
+                                        data_buffer.append(&mut preset_buffer);
                                     }
                                     
                                     let type_byte = db_type.to_byte();
@@ -781,13 +777,13 @@ impl<S: IOOperationsSync> Table<S> {
 
                                     let mut preset_buffer = vec![0; db_size as usize];
                                     columns_cursor.read(&mut preset_buffer).unwrap();
-                                    data_buffer.append(&mut preset_buffer.to_vec());
+                                    data_buffer.append(&mut preset_buffer);
                                 } else {
                                     let str_length = columns_cursor.read_u32::<LittleEndian>().unwrap();
 
                                     let mut preset_buffer = vec![0; str_length as usize];
                                     columns_cursor.read(&mut preset_buffer).unwrap();
-                                    data_buffer.append(&mut preset_buffer.to_vec());
+                                    data_buffer.append(&mut preset_buffer);
                                 }
                                 
                                 let type_byte = db_type.to_byte();
