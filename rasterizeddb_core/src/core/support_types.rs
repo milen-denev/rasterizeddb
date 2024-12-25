@@ -22,7 +22,7 @@ impl FileChunk {
         let buffer = io_sync.read_data(&mut current_file_position, self.chunk_size as u32);
     
         if buffer.len() == 0 {
-            return Cursor::new(Vec::default());
+            panic!("Tried to read larger buffer than available.")
         }
 
         let cursor = Cursor::new(buffer);
