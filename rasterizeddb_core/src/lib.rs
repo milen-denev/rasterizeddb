@@ -18,6 +18,9 @@ pub(crate) static POSITIONS_CACHE: Lazy<Cache<u64, Vec<(u64, u32)>, RandomState>
 /// # Rasterized DB (Alpha)
 /// ## A new schemaless high-performance database written in Rust from scratch.
 /// 
+/// #### Features:
+/// `enable_index_caching` to enable query caching
+/// 
 /// #### Create a static TABLE
 /// ```rust
 /// //Local File Storage Database

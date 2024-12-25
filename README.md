@@ -56,6 +56,9 @@ Short answer, no. It will get through many refinements and even changes to the t
 
 ### How to use the current API?
 
+#### Features:
+`enable_index_caching` to enable query caching
+
 #### Create a static TABLE
 ```rust
 //Local File Storage Database
