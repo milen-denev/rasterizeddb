@@ -28,9 +28,9 @@ pub(crate) fn evaluate_column_result(
                         if let Some(left_value) = current_value.as_mut() {
                             // Get the next token for the right operand
                             let iter_result = token_iter.next();
-    
                             if let Some(Token::Value(column)) = iter_result {
                                 let right_value = column;
+                                let left_value =left_value;
                                 // Perform the math operation
                                 match operation {
                                     MathOperation::Add => left_value.add(&right_value),
