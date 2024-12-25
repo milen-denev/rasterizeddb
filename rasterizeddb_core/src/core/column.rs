@@ -1,15 +1,34 @@
-use std::{fmt::{Debug, Display}, io::{self, Cursor, Read, Write}};
+use std::{fmt::{Debug, Display}, io::{self, Cursor, Read, Write}, ops::{Deref, DerefMut}};
 
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt, WriteBytesExt};
+use once_cell::sync::Lazy;
 
 use crate::instructions::{compare_vecs_ends_with, compare_vecs_eq, compare_vecs_ne, compare_vecs_starts_with, contains_subsequence};
 
 use super::db_type::DbType;
 
+pub(crate) const ZERO_VALUE: Lazy<Column> = Lazy::new(|| {
+    Column::new(0 as i128).unwrap()
+});
+
 #[derive(PartialEq, Clone)]
 pub struct Column {
     pub data_type: DbType,
     pub content: Vec<u8>
+}
+
+impl Deref for Column {
+    type Target = Vec<u8>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.content
+    }
+}
+
+impl DerefMut for Column {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.content
+    }
 }
 
 impl Debug for Column {
@@ -408,6 +427,10 @@ impl Column {
             _ => todo!(),
         }
     } 
+
+    pub fn is_zero(&self) -> bool {
+        self.equals(&ZERO_VALUE)
+    }
 
     pub fn equals(&self, column: &Column) -> bool {
         compare_vecs_eq(&self.content, &column.content)
