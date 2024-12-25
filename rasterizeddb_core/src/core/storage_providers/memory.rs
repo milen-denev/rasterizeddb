@@ -149,4 +149,49 @@ impl IOOperationsSync for MemoryStorageProvider {
         let _table_name = table_name;
         true
     }
+    
+    fn write_data_unsync(
+        &mut self,
+        position: u64, 
+        buffer: &[u8]) {
+        let end = position + buffer.len() as u64;
+
+        let mut x = 0;
+
+        let needed_len = buffer.len();
+        let current_len = self.vec.len();
+
+        if current_len < needed_len {
+            self.vec.extend(vec![0; needed_len as usize]);
+        }
+
+        for i in position..end {
+            let u8_value = buffer[x];
+            self.vec[i as usize].update(|x| *x = u8_value);
+            x += 1;
+        }
+    }
+    
+    fn verify_data(&mut self,
+        position: u64, 
+        buffer: &[u8]) -> bool {
+        let _position = position;
+        let _buffer = buffer;
+        true
+    }
+
+    fn verify_data_and_sync(&mut self,
+        position: u64, 
+        buffer: &[u8]) -> bool {
+        let _position = position;
+        let _buffer = buffer;
+        true
+    }
+    
+    fn append_data_unsync(&mut self,  
+        buffer: &[u8]) {
+        for u8_value in buffer {
+            self.vec.extend(vec![*u8_value; 1]);
+        }
+    }
 }

@@ -179,6 +179,7 @@ pub(crate) fn skip_empty_spaces_file(
 
 pub(crate) fn skip_empty_spaces_cursor(cursor: &mut Cursor<Vec<u8>>, cursor_length: u32) -> io::Result<()> {
     let cursor_position = cursor.position();
+
     if cursor_length == cursor_position as u32 || cursor_length < cursor_position as u32 {
         return Ok(());
     }
@@ -319,7 +320,7 @@ pub(crate) fn add_last_in_memory_index(
     file_length: u64,
     in_memory_index: &mut Option<Vec<FileChunk>>) {
 
-    if file_position < file_length {
+    if file_position <= file_length {
         if let Some(file_chunks_indexes) = in_memory_index.as_mut() {
             let entry = FileChunk {
                 current_file_position: file_position,
