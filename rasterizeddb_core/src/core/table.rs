@@ -6,9 +6,9 @@ use std::{
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use itertools::Itertools;
-use tokio::sync::{RwLock, RwLockWriteGuard};
+use tokio::sync::{RwLock, RwLockWriteGuard, RwLockReadGuard};
 
-use crate::{core::helpers::delete_row_file, HEADER_SIZE, POSITIONS_CACHE};
+use crate::{core::helpers::delete_row_file, CHUNK_SIZE, HEADER_SIZE, POSITIONS_CACHE};
 use super::{
     super::rql::{
         models::Token, parser::ParserResult, tokenizer::evaluate_column_result
@@ -104,7 +104,11 @@ impl<S: IOOperationsSync> Table<S> {
 
         let mut end_of_file : RwLockWriteGuard<u64> = loop {
             let result = end_of_file_c.try_write();
-            if let Ok(end_of_file) = result  {
+            if let Ok(mut end_of_file) = result {
+                if *end_of_file == 0 {
+                    *end_of_file = HEADER_SIZE as u64;
+                    break end_of_file;
+                }
                 break end_of_file;
             } 
         };
@@ -133,6 +137,16 @@ impl<S: IOOperationsSync> Table<S> {
         let mut buffer: Vec<u8> = Vec::with_capacity(1 + 1 + 8 + 4 + columns_len);
 
         let total_row_size = buffer.capacity() as u64;
+        let current_file_len: u64 = loop {
+            let result = self.current_file_length.try_read();
+            if let Ok(current_len) = result {
+                if *current_len == 0 {
+                    break (current_len.clone() + HEADER_SIZE as u64);
+                } else {
+                    break current_len.clone();
+                }
+            } 
+        };
 
         let row_id = self.update_eof_and_id(total_row_size).await;
 
@@ -149,7 +163,14 @@ impl<S: IOOperationsSync> Table<S> {
         //DbType END
         buffer.push(255);
 
-        self.io_sync.append_data(&buffer);
+        self.io_sync.append_data_unsync(&buffer);
+        let verify_result = self.io_sync.verify_data_and_sync(current_file_len, &buffer);
+
+        #[allow(unreachable_code)]
+        if !verify_result {
+            panic!("DB file contains error.");
+            todo!("Add rollback.");
+        }
 
         let table_header = self.table_header.clone();
 
@@ -606,21 +627,20 @@ impl<S: IOOperationsSync> Table<S> {
                             let evaluation = evaluate_column_result(&required_columns, &evaluation_tokens);
                             required_columns.clear();
 
-                            if evaluation {
+                            if evaluation {   
                                 let row = read_row_cursor(
                                     first_column_index, 
                                     prefetch_result.found_id,
                                     prefetch_result.length,
                                     &mut cursor).unwrap();
 
-                                    
-                                    #[cfg(feature = "enable_index_caching")]
-                                    {
-                                        let hash = evaluation_tokens.0;
-                                        let mut row_vec: Vec<(u64, u32)> = Vec::with_capacity(1);
-                                        row_vec.push((chunk.current_file_position + first_column_index - 1 - 8 - 4, prefetch_result.length));
-                                        POSITIONS_CACHE.insert(hash, row_vec);
-                                    }
+                                #[cfg(feature = "enable_index_caching")]
+                                {
+                                    let hash = evaluation_tokens.0;
+                                    let mut row_vec: Vec<(u64, u32)> = Vec::with_capacity(1);
+                                    row_vec.push((chunk.current_file_position + first_column_index - 1 - 8 - 4, prefetch_result.length));
+                                    POSITIONS_CACHE.insert(hash, row_vec);
+                                }
                                 
                                 return Ok(Some(row));
                             }
@@ -628,10 +648,9 @@ impl<S: IOOperationsSync> Table<S> {
                             break;
                         }
                     }
-
                     chunks_ended_position = chunk.current_file_position;
                 }
-
+       
                 if chunks_ended_position < file_length {
                     let chunk = FileChunk {
                         current_file_position: 0,
@@ -965,6 +984,9 @@ impl<S: IOOperationsSync> Table<S> {
                 current_chunk_size += 1 + 8 + 4 + prefetch_result.length + 1;
 
                 add_in_memory_index(&mut current_chunk_size, prefetch_result.found_id, position, &mut self.in_memory_index);
+                if (position + CHUNK_SIZE as u64) >= file_length {
+                    break;
+                }
             } else {
                 break;
             }
