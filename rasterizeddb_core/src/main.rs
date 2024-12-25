@@ -24,49 +24,49 @@ async fn main() -> std::io::Result<()> {
 
     let mut table = Table::init(io_sync, false, false).unwrap();
 
-    for i in 0..50_000 {
-        if i == 49_990 {
-            let mut c1 = Column::new(1000).unwrap();
-            let mut c2 = Column::new(i * -1).unwrap();
-            let mut c3 = Column::new("This is awesome 2.").unwrap();
+    // for i in 0..100_000 {
+    //     if i == 99_990 {
+    //         let mut c1 = Column::new(1000).unwrap();
+    //         let mut c2 = Column::new(i * -1).unwrap();
+    //         let mut c3 = Column::new("This is awesome 2.").unwrap();
     
-            let mut columns_buffer: Vec<u8> = Vec::with_capacity(
-                c1.len() + 
-                c2.len() +
-                c3.len() 
-            );
+    //         let mut columns_buffer: Vec<u8> = Vec::with_capacity(
+    //             c1.len() + 
+    //             c2.len() +
+    //             c3.len() 
+    //         );
         
-            columns_buffer.append(&mut c1.into_vec().unwrap());
-            columns_buffer.append(&mut c2.into_vec().unwrap());
-            columns_buffer.append(&mut c3.into_vec().unwrap());
+    //         columns_buffer.append(&mut c1.into_vec().unwrap());
+    //         columns_buffer.append(&mut c2.into_vec().unwrap());
+    //         columns_buffer.append(&mut c3.into_vec().unwrap());
         
-            let insert_row = InsertRow {
-                columns_data: columns_buffer
-            };
+    //         let insert_row = InsertRow {
+    //             columns_data: columns_buffer
+    //         };
         
-            table.insert_row(insert_row).await;
-        } else {
-            let mut c1 = Column::new(i).unwrap();
-            let mut c2 = Column::new(i * -1).unwrap();
-            let mut c3 = Column::new("This is also awesome.").unwrap();
+    //         table.insert_row(insert_row).await;
+    //     } else {
+    //         let mut c1 = Column::new(i).unwrap();
+    //         let mut c2 = Column::new(i * -1).unwrap();
+    //         let mut c3 = Column::new("This is also awesome.").unwrap();
     
-            let mut columns_buffer: Vec<u8> = Vec::with_capacity(
-                c1.len() + 
-                c2.len() +
-                c3.len() 
-            );
+    //         let mut columns_buffer: Vec<u8> = Vec::with_capacity(
+    //             c1.len() + 
+    //             c2.len() +
+    //             c3.len() 
+    //         );
         
-            columns_buffer.append(&mut c1.into_vec().unwrap());
-            columns_buffer.append(&mut c2.into_vec().unwrap());
-            columns_buffer.append(&mut c3.into_vec().unwrap());
+    //         columns_buffer.append(&mut c1.into_vec().unwrap());
+    //         columns_buffer.append(&mut c2.into_vec().unwrap());
+    //         columns_buffer.append(&mut c3.into_vec().unwrap());
         
-            let insert_row = InsertRow {
-                columns_data: columns_buffer
-            };
+    //         let insert_row = InsertRow {
+    //             columns_data: columns_buffer
+    //         };
         
-            table.insert_row(insert_row).await;
-        }
-    }
+    //         table.insert_row(insert_row).await;
+    //     }
+    // }
 
     table.rebuild_in_memory_indexes();
 
