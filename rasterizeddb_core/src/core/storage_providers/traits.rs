@@ -4,6 +4,18 @@ pub type IOError = std::io::Error;
 pub type IOResult<T> = std::result::Result<T, IOError>;
 
 pub trait IOOperationsSync: Clone {
+    fn write_data_unsync(&mut self,
+        position: u64, 
+        buffer: &[u8]);
+
+    fn verify_data(&mut self,
+        position: u64, 
+        buffer: &[u8]) -> bool;
+
+    fn verify_data_and_sync(&mut self,
+        position: u64, 
+        buffer: &[u8]) -> bool;
+
     fn write_data(&mut self,  
         position: u64, 
         buffer: &[u8]);
@@ -28,6 +40,9 @@ pub trait IOOperationsSync: Clone {
         position: u64) -> Vec<u8>;
 
     fn append_data(&mut self,  
+        buffer: &[u8]);
+
+    fn append_data_unsync(&mut self,  
         buffer: &[u8]);
 
     fn get_len(&mut self) -> u64;

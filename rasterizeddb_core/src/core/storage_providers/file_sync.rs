@@ -59,7 +59,25 @@ impl LocalStorageProvider {
 }
 
 
-impl IOOperationsSync for LocalStorageProvider {
+impl IOOperationsSync for LocalStorageProvider {  
+    fn write_data_unsync(&mut self,
+        position: u64, 
+        buffer: &[u8]) {
+        let mut file = &self.write_file;
+        file.seek(SeekFrom::Start(position)).unwrap();
+        file.write_all(buffer).unwrap();
+    }
+    
+    fn verify_data(&mut self,
+        position: u64, 
+        buffer: &[u8]) -> bool {
+        let mut file = &self.write_file;
+        file.seek(SeekFrom::Start(position)).unwrap();
+        let mut file_buffer = vec![0; buffer.len() as usize];
+        file.read_exact(&mut file_buffer).unwrap();
+        buffer.eq(&file_buffer)
+    }
+
     fn write_data(&mut self,  
         position: u64, 
         buffer: &[u8]) {
@@ -162,5 +180,26 @@ impl IOOperationsSync for LocalStorageProvider {
         file.write_all(buffer).unwrap();
         file.flush().unwrap();
         file.sync_all().unwrap();
+    }
+    
+    fn verify_data_and_sync(&mut self,
+        position: u64, 
+        buffer: &[u8]) -> bool {
+        let mut file = &self.write_file;
+        file.seek(SeekFrom::Start(position)).unwrap();
+        let mut file_buffer = vec![0; buffer.len() as usize];
+        file.read_exact(&mut file_buffer).unwrap();
+        if buffer.eq(&file_buffer) {
+            self.write_file.sync_data().unwrap();  
+            true
+        } else {
+            false
+        }
+    }
+
+    fn append_data_unsync(&mut self,  
+        buffer: &[u8]) {
+        let mut file = &self.append_file;
+        file.write_all(&buffer).unwrap();
     }
 }
