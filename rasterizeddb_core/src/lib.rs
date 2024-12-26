@@ -48,6 +48,10 @@ pub(crate) static POSITIONS_CACHE: Lazy<Cache<u64, Vec<(u64, u32)>, RandomState>
 /// columns_buffer.append(&mut c2.into_vec().unwrap());
 /// columns_buffer.append(&mut c3.into_vec().unwrap());
 /// 
+/// let insert_row = InsertOrUpdateRow {
+///    columns_data: columns_buffer
+/// };
+/// 
 /// table.insert_row(insert_row).await;
 /// ```
 /// #### Build in-memory file indexes
@@ -77,6 +81,14 @@ pub(crate) static POSITIONS_CACHE: Lazy<Cache<u64, Vec<(u64, u32)>, RandomState>
 /// 
 /// // Uses cache: If the same query is repeated, the time to retrieve a row should be in the single-digit range.
 /// let row_by_query = table.first_or_default_by_query(query_evaluation).await.unwrap().unwrap();
+/// ```
+/// #### Update a row
+/// ```rust
+/// let update_row = InsertOrUpdateRow {
+///     columns_data: columns_buffer_update // Same as insert_row
+/// };
+/// 
+/// table.update_row_by_id(3, update_row).await;
 /// ```
 /// 
 /// #### Delete a row

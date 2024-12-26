@@ -3,7 +3,7 @@ use tokio::runtime;
 
 use rasterizeddb_core::core::{
     column::Column, 
-    row::InsertRow, 
+    row::InsertOrUpdateRow, 
     storage_providers::{file_sync::LocalStorageProvider, memory::MemoryStorageProvider}, 
     table::Table
 };
@@ -37,7 +37,7 @@ pub fn rebuild_indexes_file() {
                 columns_buffer.append(&mut c2.into_vec().unwrap());
                 columns_buffer.append(&mut c3.into_vec().unwrap());
             
-                let insert_row = InsertRow {
+                let insert_row = InsertOrUpdateRow {
                     columns_data: columns_buffer
                 };
             
@@ -57,7 +57,7 @@ pub fn rebuild_indexes_file() {
                 columns_buffer.append(&mut c2.into_vec().unwrap());
                 columns_buffer.append(&mut c3.into_vec().unwrap());
             
-                let insert_row = InsertRow {
+                let insert_row = InsertOrUpdateRow {
                     columns_data: columns_buffer
                 };
             
@@ -93,7 +93,7 @@ pub fn rebuild_indexes_memory() {
                 columns_buffer.append(&mut c2.into_vec().unwrap());
                 columns_buffer.append(&mut c3.into_vec().unwrap());
             
-                let insert_row = InsertRow {
+                let insert_row = InsertOrUpdateRow {
                     columns_data: columns_buffer
                 };
             
@@ -113,7 +113,7 @@ pub fn rebuild_indexes_memory() {
                 columns_buffer.append(&mut c2.into_vec().unwrap());
                 columns_buffer.append(&mut c3.into_vec().unwrap());
             
-                let insert_row = InsertRow {
+                let insert_row = InsertOrUpdateRow {
                     columns_data: columns_buffer
                 };
             

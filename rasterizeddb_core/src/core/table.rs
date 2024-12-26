@@ -6,7 +6,7 @@ use std::{
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use itertools::Itertools;
-use tokio::sync::{RwLock, RwLockWriteGuard, RwLockReadGuard};
+use tokio::sync::{RwLock, RwLockWriteGuard};
 
 use crate::{core::helpers::delete_row_file, CHUNK_SIZE, HEADER_SIZE, POSITIONS_CACHE};
 use super::{
@@ -21,13 +21,13 @@ use super::{
         read_row_cursor, 
         row_prefetching, 
         row_prefetching_cursor
-    }, row::{InsertRow, Row}, storage_providers::traits::IOOperationsSync, support_types::FileChunk, table_header::TableHeader
+    }, row::{InsertOrUpdateRow, Row}, storage_providers::traits::IOOperationsSync, support_types::FileChunk, table_header::TableHeader
 };
 
 pub struct Table<S: IOOperationsSync> {
     pub(crate) io_sync: S,
     pub(crate) table_header: Arc<RwLock<TableHeader>>,
-    pub(crate) in_memory_index: Option<Vec<FileChunk>>,
+    pub(crate) in_memory_index: Arc<RwLock<Option<Vec<FileChunk>>>>,
     pub(crate) current_file_length: Arc<RwLock<u64>>,
     pub(crate) current_row_id: Arc<RwLock<u64>>,
     pub(crate) immutable: bool
@@ -55,7 +55,7 @@ impl<S: IOOperationsSync> Table<S> {
             let table = Table {
                 io_sync: io_sync,
                 table_header: Arc::new(RwLock::const_new(table_header)),
-                in_memory_index: None,
+                in_memory_index: Arc::new(RwLock::const_new(None)),
                 current_file_length: Arc::new(RwLock::const_new(table_file_len)),
                 current_row_id: Arc::new(RwLock::const_new(last_row_id)),
                 immutable: immutable
@@ -73,7 +73,7 @@ impl<S: IOOperationsSync> Table<S> {
             let table = Table {
                 io_sync: io_sync,
                 table_header: Arc::new(RwLock::const_new(table_header)),
-                in_memory_index: None,
+                in_memory_index: Arc::new(RwLock::const_new(None)),
                 current_file_length: Arc::new(RwLock::const_new(table_file_len)),
                 current_row_id: Arc::new(RwLock::const_new(0)),
                 immutable: immutable
@@ -86,11 +86,7 @@ impl<S: IOOperationsSync> Table<S> {
     pub fn get_current_table_length(&mut self) -> u64 {
         let file_length = loop {
             if let Ok(len) = self.current_file_length.try_read() {
-                if *len < HEADER_SIZE as u64 {
-                    break 0;
-                } else {
-                    break *len - (HEADER_SIZE as u64);
-                }
+                break *len;
             }
         };
 
@@ -130,20 +126,25 @@ impl<S: IOOperationsSync> Table<S> {
         return last_row_id;
     }
 
-    pub async fn insert_row(&mut self, row: InsertRow) {
+    pub async fn insert_row(&mut self, row: InsertOrUpdateRow) {
         let columns_len = row.columns_data.len();
 
         //START (1) + END (1) + u64 ID (8) + u32 LENGTH (4) + VEC SIZE 
         let mut buffer: Vec<u8> = Vec::with_capacity(1 + 1 + 8 + 4 + columns_len);
 
         let total_row_size = buffer.capacity() as u64;
+
         let current_file_len: u64 = loop {
             let result = self.current_file_length.try_read();
             if let Ok(current_len) = result {
                 if *current_len == 0 {
-                    break (current_len.clone() + HEADER_SIZE as u64);
+                    let len = current_len.clone() + HEADER_SIZE as u64;
+                    drop(current_len);
+                    break len;
                 } else {
-                    break current_len.clone();
+                    let len = current_len.clone();
+                    drop(current_len);
+                    break len;
                 }
             } 
         };
@@ -191,44 +192,21 @@ impl<S: IOOperationsSync> Table<S> {
     pub fn first_or_default_by_id(&mut self, id: u64) -> io::Result<Option<Row>> {
         let file_length = self.get_current_table_length();
 
-        if let Some(chunks) = self.in_memory_index.as_ref() {
-            let mut chunks_ended_position: u64 = 0;
+        let chunks_arc_clone = self.in_memory_index.clone();
+
+        let chunks_result = loop {
+            let result = chunks_arc_clone.try_read();
+            if let Ok(in_memory_index) = result {
+                break in_memory_index;
+            } 
+        };
+
+        if let Some(chunks) = chunks_result.as_ref() {
             for chunk in chunks {
                 let mut cursor = chunk.read_chunk_sync(&mut self.io_sync);
 
                 loop {
                     if let Some(prefetch_result) = row_prefetching_cursor(&mut cursor, chunk).unwrap() {
-                        if id == prefetch_result.found_id {
-                            let row = read_row_cursor(
-                                cursor.stream_position().unwrap(), 
-                                prefetch_result.found_id,
-                                prefetch_result.length,
-                                &mut cursor).unwrap();
-        
-                            return Ok(Some(row));
-                        } else {
-                            //+1 because of the END db type.
-                            cursor.seek(SeekFrom::Current((prefetch_result.length + 1) as i64)).unwrap();
-                        }
-                    } else {
-                        break;
-                    }
-                }
-              
-                chunks_ended_position = chunk.current_file_position;
-            }
-
-            if chunks_ended_position < file_length {
-                let chunk = FileChunk {
-                    current_file_position: 0,
-                    chunk_size: 0,
-                    next_row_id: 0
-                };
-
-                let mut cursor = chunk.read_chunk_to_end_sync(file_length - chunks_ended_position, &mut self.io_sync);
-
-                loop {
-                    if let Some(prefetch_result) = row_prefetching_cursor(&mut cursor, &chunk).unwrap() {
                         if id == prefetch_result.found_id {
                             let row = read_row_cursor(
                                 cursor.stream_position().unwrap(), 
@@ -282,8 +260,16 @@ impl<S: IOOperationsSync> Table<S> {
         let file_length = self.get_current_table_length();
         let value_column = Column::new(value).unwrap();
 
-        if let Some(chunks) = self.in_memory_index.as_ref() {
-            let mut chunks_ended_position: u64 = 0;
+        let chunks_arc_clone = self.in_memory_index.clone();
+
+        let chunks_result = loop {
+            let result = chunks_arc_clone.try_read();
+            if let Ok(in_memory_index) = result {
+                break in_memory_index;
+            } 
+        };
+
+        if let Some(chunks) = chunks_result.as_ref() {
             for chunk in chunks {
                 let mut cursor = chunk.read_chunk_sync(&mut self.io_sync);
 
@@ -355,90 +341,6 @@ impl<S: IOOperationsSync> Table<S> {
                     } else {
                         break;
                     }
-                }
-
-                chunks_ended_position = chunk.current_file_position;
-            }
-
-            if chunks_ended_position < file_length {
-                let chunk = FileChunk {
-                    current_file_position: 0,
-                    chunk_size: 0,
-                    next_row_id: 0
-                };
-
-                let mut cursor = chunk.read_chunk_to_end_sync(file_length - chunks_ended_position, &mut self.io_sync);
-
-                loop {
-                    if let Some(prefetch_result) = row_prefetching_cursor(&mut cursor, &chunk).unwrap() {
-                        //Current column index
-                        let mut index = 0;
-                        
-                        let first_column_index = cursor.stream_position().unwrap();
-
-                        loop {  
-                            if column_index == index {
-                                index += 1;
-
-                                let column_type = cursor.read_u8().unwrap();
-
-                                let db_type = DbType::from_byte(column_type);
-        
-                                if db_type == DbType::END {
-                                    break;
-                                }
-        
-                                let mut data_buffer = Vec::default();
-
-                                if db_type != DbType::STRING {
-                                    let db_size = db_type.get_size();
-    
-                                    let mut preset_buffer = vec![0; db_size as usize];
-                                    cursor.read(&mut preset_buffer).unwrap();
-                                    data_buffer.append(&mut preset_buffer);
-                                } else {
-                                    let str_length = cursor.read_u32::<LittleEndian>().unwrap();
-                                    let mut preset_buffer = vec![0; str_length as usize];
-                                    cursor.read(&mut preset_buffer).unwrap();
-                                    data_buffer.append(&mut preset_buffer);
-                                }
-                                
-                                let column = Column::from_raw(column_type, data_buffer, None);
-
-                                if value_column.equals(&column) {
-                                    let row = read_row_cursor(
-                                        first_column_index, 
-                                        prefetch_result.found_id,
-                                        prefetch_result.length,
-                                        &mut cursor).unwrap();
-        
-                                    return Ok(Some(row));
-                                }
-                            } else {
-                                index += 1;
-
-                                let column_type = cursor.read_u8().unwrap();
-                                
-                                let db_type = DbType::from_byte(column_type);
-
-                                if db_type == DbType::END {
-                                    break;
-                                }
-
-                                if db_type != DbType::STRING {
-                                    let db_size = db_type.get_size();
-    
-                                    cursor.seek(SeekFrom::Current(db_size as i64)).unwrap();
-                                } else {
-                                    let str_length = cursor.read_u32::<LittleEndian>().unwrap();
-                                    cursor.seek(SeekFrom::Current(str_length as i64)).unwrap();
-                                }
-                            }
-                        }
-                    } else {
-                        break;
-                    }
-
                 }
             }
         } else {
@@ -543,8 +445,16 @@ impl<S: IOOperationsSync> Table<S> {
 
             let file_length = self.get_current_table_length();
     
-            if let Some(chunks) = self.in_memory_index.as_ref() {
-                let mut chunks_ended_position: u64 = 0;
+            let chunks_arc_clone = self.in_memory_index.clone();
+
+            let chunks_result = loop {
+                let result = chunks_arc_clone.try_read();
+                if let Ok(in_memory_index) = result {
+                    break in_memory_index;
+                } 
+            };
+
+            if let Some(chunks) = chunks_result.as_ref() {
                 let mut required_columns: Vec<(u32, Column)> = Vec::default();
 
                 let column_indexes = evaluation_tokens.iter()
@@ -639,110 +549,6 @@ impl<S: IOOperationsSync> Table<S> {
                                     let hash = evaluation_tokens.0;
                                     let mut row_vec: Vec<(u64, u32)> = Vec::with_capacity(1);
                                     row_vec.push((chunk.current_file_position + first_column_index - 1 - 8 - 4, prefetch_result.length));
-                                    POSITIONS_CACHE.insert(hash, row_vec);
-                                }
-                                
-                                return Ok(Some(row));
-                            }
-                        } else {
-                            break;
-                        }
-                    }
-                    chunks_ended_position = chunk.current_file_position;
-                }
-       
-                if chunks_ended_position < file_length {
-                    let chunk = FileChunk {
-                        current_file_position: 0,
-                        chunk_size: 0,
-                        next_row_id: 0
-                    };
-
-                    let mut cursor = chunk.read_chunk_to_end_sync(file_length - chunks_ended_position, &mut self.io_sync);
-
-                    loop {
-                        if let Some(prefetch_result) = row_prefetching_cursor(&mut cursor, &chunk).unwrap() {
-                                
-                            let mut current_column_index: u32 = 0;
-                            let first_column_index = cursor.stream_position().unwrap();
-
-                            loop {  
-                                if column_indexes.iter().any(|x| *x == current_column_index) {
-                                    let column_type = cursor.read_u8().unwrap();
-        
-                                    let db_type = DbType::from_byte(column_type);
-        
-                                    if db_type == DbType::END {
-                                        break;
-                                    }
-        
-                                    let mut data_buffer = Vec::default();
-        
-                                    if db_type != DbType::STRING {
-                                        let db_size = db_type.get_size();
-        
-                                        let mut preset_buffer = vec![0; db_size as usize];
-                                        cursor.read(&mut preset_buffer).unwrap();
-                                        data_buffer.append(&mut preset_buffer);
-                                    } else {
-                                        let str_length = cursor.read_u32::<LittleEndian>().unwrap();
-        
-                                        let mut preset_buffer = vec![0; str_length as usize];
-                                        cursor.read(&mut preset_buffer).unwrap();
-                                        data_buffer.append(&mut preset_buffer);
-                                    }
-                                    
-                                    let type_byte = db_type.to_byte();
-                                        
-                                    let column = if type_byte >= 1 && type_byte <= 10 {
-                                        Column::from_raw(column_type, data_buffer, Some(DowngradeType::I128))
-                                    } else if type_byte >= 11 && type_byte <= 12 {
-                                        Column::from_raw(column_type, data_buffer, Some(DowngradeType::F64))
-                                    } else {
-                                        Column::from_raw(column_type, data_buffer, None)
-                                    };
-        
-                                    required_columns.push((current_column_index, column));
-                                } else {
-                                    let column_type = cursor.read_u8().unwrap();
-        
-                                    let db_type = DbType::from_byte(column_type);
-        
-                                    if db_type == DbType::END {
-                                        break;
-                                    }
-        
-                                    if db_type != DbType::STRING {
-                                        let db_size = db_type.get_size();
-        
-                                        cursor.seek(SeekFrom::Current(db_size as i64)).unwrap();
-                                    
-                                    } else {
-                                        let str_length = cursor.read_u32::<LittleEndian>().unwrap();
-        
-        
-                                        cursor.seek(SeekFrom::Current(str_length as i64)).unwrap();
-                                    }
-                                }
-        
-                                current_column_index += 1;
-                            }
-
-                            let evaluation = evaluate_column_result(&required_columns, &evaluation_tokens);
-                            required_columns.clear();
-
-                            if evaluation {
-                                let row = read_row_cursor(
-                                    first_column_index, 
-                                    prefetch_result.found_id,
-                                    prefetch_result.length,
-                                    &mut cursor).unwrap();
-
-                                #[cfg(feature = "enable_index_caching")]
-                                {
-                                    let hash = evaluation_tokens.0;
-                                    let mut row_vec: Vec<(u64, u32)> = Vec::with_capacity(1);
-                                    row_vec.push((chunks_ended_position + first_column_index - 1 - 8 - 4, prefetch_result.length));
                                     POSITIONS_CACHE.insert(hash, row_vec);
                                 }
                                 
@@ -875,7 +681,16 @@ impl<S: IOOperationsSync> Table<S> {
     pub fn delete_row_by_id(&mut self, id: u64) -> io::Result<()> {
         let file_length = self.get_current_table_length();
 
-        if let Some(chunks) = self.in_memory_index.as_ref() {
+        let chunks_arc_clone = self.in_memory_index.clone();
+
+        let chunks_result = loop {
+            let result = chunks_arc_clone.try_read();
+            if let Ok(in_memory_index) = result {
+                break in_memory_index;
+            } 
+        };
+
+        if let Some(chunks) = chunks_result.as_ref() {
             let mut chunks_ended_position: u64 = 0;
             for chunk in chunks {
                 let mut cursor = chunk.read_chunk_sync(&mut self.io_sync);
@@ -967,13 +782,28 @@ impl<S: IOOperationsSync> Table<S> {
     pub fn rebuild_in_memory_indexes(&mut self) {
         let file_length = self.get_current_table_length();
 
-        self.in_memory_index = None;
+        let chunks_arc_clone = self.in_memory_index.clone();
+
+        let chunks_result = loop {
+            let result = chunks_arc_clone.try_read();
+            if let Ok(in_memory_index) = result {
+                break in_memory_index;
+            } 
+        };
+
+        let mut current_chunk_options = if let Some(chunks) = chunks_result.clone() {
+            Some(chunks)
+        } else {
+            None
+        };
+
+        drop(chunks_result);
 
         let mut current_chunk_size: u32 = 0;
 
         let mut position = HEADER_SIZE as u64;
 
-        loop {       
+        loop {
             if let Some(prefetch_result) = row_prefetching(
                 &mut self.io_sync,
                 &mut position,
@@ -983,15 +813,198 @@ impl<S: IOOperationsSync> Table<S> {
                 //START (1), ROWID (8), LEN (4), COLUMNS (X), END (1)
                 current_chunk_size += 1 + 8 + 4 + prefetch_result.length + 1;
 
-                add_in_memory_index(&mut current_chunk_size, prefetch_result.found_id, position, &mut self.in_memory_index);
+                add_in_memory_index(&mut current_chunk_size, prefetch_result.found_id, position, &mut current_chunk_options);
                 if (position + CHUNK_SIZE as u64) >= file_length {
                     break;
                 }
             } else {
                 break;
-            }
+            } 
         }
 
-        add_last_in_memory_index(current_chunk_size, position, file_length, &mut self.in_memory_index);
+        if file_length > position {
+            add_last_in_memory_index(position, file_length, &mut current_chunk_options);
+        }
+
+        let chunks_arc_clone = self.in_memory_index.clone();
+
+        let mut chunks_write_result = loop {
+            let result = chunks_arc_clone.try_write();
+            if let Ok(in_memory_index) = result {
+                break in_memory_index;
+            } 
+        };
+
+        *chunks_write_result = current_chunk_options;
+
+        drop(chunks_write_result);
+    }
+
+    pub async fn update_row_by_id(&mut self, id: u64, row: InsertOrUpdateRow) {
+        let columns_len = row.columns_data.len();
+
+        //START (1) + END (1) + u64 ID (8) + u32 LENGTH (4) + VEC SIZE 
+        let mut buffer: Vec<u8> = Vec::with_capacity(1 + 1 + 8 + 4 + columns_len);
+
+        let update_row_size = buffer.capacity() as u32;
+
+        let current_file_len: u64 = loop {
+            let result = self.current_file_length.try_read();
+            if let Ok(current_len) = result {
+                if *current_len == 0 {
+                    break (current_len.clone() + HEADER_SIZE as u64);
+                } else {
+                    break current_len.clone();
+                }
+            } 
+        };
+
+        let file_length = self.get_current_table_length();
+        let mut position = HEADER_SIZE as u64;
+
+        loop {
+            if let Some(prefetch_result) = row_prefetching(
+                &mut self.io_sync,
+                &mut position,
+                file_length).unwrap() {
+                if prefetch_result.found_id == id {
+                    // START (1) + END (1) + u64 ID (8) + u32 LENGTH (4) + VEC SIZE 
+                    let current_row_len = (1 + 1 + 8 + 4 + prefetch_result.length) as u32; 
+                    if update_row_size == current_row_len {
+                        //DbType START
+                        buffer.push(254);
+
+                        WriteBytesExt::write_u64::<LittleEndian>(&mut buffer, prefetch_result.found_id).unwrap();
+                        WriteBytesExt::write_u32::<LittleEndian>(&mut buffer, columns_len as u32).unwrap();
+
+                        let mut columns_data = row.columns_data.clone();
+
+                        buffer.append(&mut columns_data);
+
+                        //DbType END
+                        buffer.push(255);
+
+                        let new_position = position - 8 - 4 - 1;
+
+                        self.io_sync.write_data_unsync(new_position, &buffer);
+                        let verify_result = self.io_sync.verify_data_and_sync(new_position, &buffer);
+
+                        #[allow(unreachable_code)]
+                        if !verify_result {
+                            panic!("DB file contains error.");
+                            todo!("Add rollback.");
+                        }
+
+                        break;
+                    } else if update_row_size < current_row_len {
+                        //DbType START
+                        buffer.push(254);
+
+                        WriteBytesExt::write_u64::<LittleEndian>(&mut buffer, prefetch_result.found_id).unwrap();
+                        WriteBytesExt::write_u32::<LittleEndian>(&mut buffer, columns_len as u32).unwrap();
+
+                        let mut columns_data = row.columns_data.clone();
+
+                        buffer.append(&mut columns_data);
+
+                        //DbType END
+                        buffer.push(255);
+
+                        let new_position = position - 8 - 4 - 1;
+
+                        self.io_sync.write_data_unsync(new_position, &buffer);
+                        let verify_result = self.io_sync.verify_data_and_sync(new_position, &buffer);
+
+                        #[allow(unreachable_code)]
+                        if !verify_result {
+                            panic!("DB file contains error.");
+                            todo!("Add rollback.");
+                        }
+
+                        let empty_buffer = vec![0 as u8; (current_row_len - update_row_size) as usize];
+
+                        self.io_sync.write_data_unsync(new_position + update_row_size as u64, &empty_buffer);
+                        let clean_up_verify_result = self.io_sync.verify_data_and_sync(new_position + update_row_size as u64, &empty_buffer);
+
+                        #[allow(unreachable_code)]
+                        if !clean_up_verify_result {
+                            panic!("DB file contains error.");
+                            todo!("Add rollback.");
+                        }
+
+                        break;
+                    } else {
+                        let row_id = self.update_eof_and_id(update_row_size as u64).await;
+
+                        //DbType START
+                        buffer.push(254);
+
+                        WriteBytesExt::write_u64::<LittleEndian>(&mut buffer, row_id).unwrap();
+                        WriteBytesExt::write_u32::<LittleEndian>(&mut buffer, columns_len as u32).unwrap();
+
+                        let mut columns_data = row.columns_data.clone();
+
+                        buffer.append(&mut columns_data);
+
+                        //DbType END
+                        buffer.push(255);
+
+                        self.io_sync.append_data_unsync(&buffer);
+                        let verify_result = self.io_sync.verify_data_and_sync(current_file_len, &buffer);
+
+                        #[allow(unreachable_code)]
+                        if !verify_result {
+                            panic!("DB file contains error.");
+                            todo!("Add rollback.");
+                        }
+
+                        let empty_buffer = vec![0 as u8; (current_row_len) as usize];
+
+                        let new_position = position - 8 - 4 - 1;
+
+                        self.io_sync.write_data_unsync(new_position, &empty_buffer);
+                        let clean_up_verify_result = self.io_sync.verify_data_and_sync(new_position, &empty_buffer);
+
+                        #[allow(unreachable_code)]
+                        if !clean_up_verify_result {
+                            panic!("DB file contains error.");
+                            todo!("Add rollback.");
+                        }
+
+                        let chunks_arc_clone = self.in_memory_index.clone();
+
+                        let mut chunks_write_result = loop {
+                            let result = chunks_arc_clone.try_write();
+                            if let Ok(in_memory_index) = result {
+                                break in_memory_index;
+                            } 
+                        };
+
+                        if let Some(ref mut chunks) = *chunks_write_result {
+                            let last_chunk = chunks.last_mut().unwrap();
+
+                            if last_chunk.chunk_size + update_row_size <= CHUNK_SIZE as u32 {
+                                last_chunk.chunk_size = last_chunk.chunk_size + update_row_size;
+                                last_chunk.next_row_id = last_chunk.next_row_id + 1;
+                            } else {
+                                let new_chunk = FileChunk {
+                                    current_file_position: current_file_len, //+ last_chunk.chunk_size as u64,
+                                    chunk_size: update_row_size,
+                                    next_row_id: row_id
+                                };
+
+                                chunks.push(new_chunk);
+                            }
+                        }
+
+                        drop(chunks_write_result);
+
+                        break;
+                    }
+                } else {
+                    position += prefetch_result.length as u64 + 1;
+                }
+            }
+        }
     }
 }

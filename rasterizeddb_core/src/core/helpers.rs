@@ -292,14 +292,13 @@ pub(crate) fn add_in_memory_index(
     if *current_chunk_size > CHUNK_SIZE {
         if let Some(file_chunks_indexes) = in_memory_index.as_mut() {
             let entry = FileChunk {
-                current_file_position: file_position,
+                current_file_position: file_position - *current_chunk_size as u64,
                 chunk_size: *current_chunk_size,
                 next_row_id: current_id
             };
             file_chunks_indexes.push(entry);
         } else {
             let mut chunks_vec: Vec<FileChunk> = Vec::default();
-
             let first_entry = FileChunk {
                 current_file_position: HEADER_SIZE as u64,
                 chunk_size: *current_chunk_size,
@@ -315,7 +314,6 @@ pub(crate) fn add_in_memory_index(
 }
 
 pub(crate) fn add_last_in_memory_index(
-    current_chunk_size: u32,
     file_position: u64,
     file_length: u64,
     in_memory_index: &mut Option<Vec<FileChunk>>) {
@@ -324,7 +322,7 @@ pub(crate) fn add_last_in_memory_index(
         if let Some(file_chunks_indexes) = in_memory_index.as_mut() {
             let entry = FileChunk {
                 current_file_position: file_position,
-                chunk_size: current_chunk_size,
+                chunk_size: file_length as u32 - file_position as u32,
                 next_row_id: 0
             };
             file_chunks_indexes.push(entry);
@@ -333,7 +331,7 @@ pub(crate) fn add_last_in_memory_index(
 
             let first_entry = FileChunk {
                 current_file_position: HEADER_SIZE as u64,
-                chunk_size: current_chunk_size,
+                chunk_size: file_length as u32 - file_position as u32,
                 next_row_id: 0
             };
             

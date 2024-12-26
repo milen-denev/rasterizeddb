@@ -59,7 +59,19 @@ Short answer, no. It will get through many refinements and even changes to the t
 #### Features:
 `enable_index_caching` to enable query caching
 
-#### Create a static TABLE
+```rust
+// Imports
+use rasterizeddb_core::{
+    core::{
+        column::Column, 
+        row::InsertOrUpdateRow, 
+        storage_providers::{file_sync::LocalStorageProvider, memory::MemoryStorageProvider}, 
+        table::Table
+    }, rql::parser::parse_rql
+};
+```
+
+#### Create a table
 ```rust
 //Local File Storage Database
 let io_sync = LocalStorageProvider::new(
@@ -87,23 +99,21 @@ columns_buffer.append(&mut c1.into_vec().unwrap());
 columns_buffer.append(&mut c2.into_vec().unwrap());
 columns_buffer.append(&mut c3.into_vec().unwrap());
 
-let table_clone = TABLE.clone();
-let mut mutable_table = table_clone.write().await;
-
-// Can be combined with tokio::Spawn as well
-mutable_table.insert_row(&mut InsertRow {
+let insert_row = InsertOrUpdateRow {
     columns_data: columns_buffer
-}).await.unwrap();
+};
+
+table.insert_row(insert_row).await;
 ```
 
 #### Build in-memory file indexes
 ```rust
-mutable_table.rebuild_in_memory_indexes();
+table.rebuild_in_memory_indexes();
 ```
 
 #### Retrieve a row
 ```rust
-let row_by_id = mutable_table.first_or_default_by_id(10).unwrap().unwrap();
+let row_by_id = table.first_or_default_by_id(10).unwrap().unwrap();
 
 // Read columns
 for column in Column::from_buffer(&row2.columns_data).unwrap().iter() {
@@ -111,7 +121,7 @@ for column in Column::from_buffer(&row2.columns_data).unwrap().iter() {
 }
 
 // Column index, value that must be equal
-let row_by_column_value = mutable_table.first_or_default_by_column(2, "This is awesome").unwrap().unwrap();
+let row_by_column_value = table.first_or_default_by_column(2, "This is awesome").unwrap().unwrap();
 
 //Rasterized Query Language (Alpha)
 let query_evaluation = parse_rql(&format!(r#"
@@ -122,13 +132,22 @@ let query_evaluation = parse_rql(&format!(r#"
 "#)).unwrap();
 
 // Uses cache: If the same query is repeated, the time to retrieve a row should be in the single-digit range.
-let row_by_query = mutable_table.first_or_default_by_query(query_evaluation).await.unwrap().unwrap();
+let row_by_query = table.first_or_default_by_query(query_evaluation).await.unwrap().unwrap();
+```
+
+#### Update a row
+```rust
+let update_row = InsertOrUpdateRow {
+    columns_data: columns_buffer_update
+};
+
+table.update_row_by_id(3, update_row).await;
 ```
 
 #### Delete a row
 ```rust
 // Invalidates cache automatically
-mutable_table.delete_row_by_id(10).unwrap();
+table.delete_row_by_id(10).unwrap();
 ```
 
 ### License
