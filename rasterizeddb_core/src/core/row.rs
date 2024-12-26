@@ -6,6 +6,6 @@ pub struct Row {
 }
 
 #[derive(Debug)]
-pub struct InsertRow {
+pub struct InsertOrUpdateRow {
     pub columns_data: Vec<u8>
 }

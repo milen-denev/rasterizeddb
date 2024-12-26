@@ -132,6 +132,12 @@ impl Column {
                     buffer.write_all(string_value.as_bytes()).unwrap();
                     Ok(buffer)
                 },
+                "&alloc::string::String" => {
+                    let mut buffer: Vec<u8> = Vec::new();
+                    let string_value = str::parse::<String>(value.as_ref()).unwrap();
+                    buffer.write_all(string_value.as_bytes()).unwrap();
+                    Ok(buffer)
+                },
                 "&str" => {
                     let mut buffer: Vec<u8> = Vec::new();
                     let string_value = str::parse::<String>(value.as_ref()).unwrap();
@@ -184,6 +190,8 @@ impl Column {
             } else if value_type == "char" {
                 DbType::CHAR
             } else if value_type == "alloc::string::String" {
+                DbType::STRING
+            } else if value_type == "&alloc::string::String" {
                 DbType::STRING
             } else if value_type == "&str" {
                 DbType::STRING
