@@ -117,7 +117,8 @@ pub(crate) fn read_row_cursor(first_column_index: u64, id: u64, length: u32, cur
 pub(crate) fn delete_row_file(
     first_column_index: u64, 
     io_sync: &mut impl IOOperationsSync) -> io::Result<()> {
-    let mut position = first_column_index.clone();
+    // LEN (4)
+    let mut position = first_column_index.clone() - 4;
 
     let columns_length = io_sync.read_data(&mut position, 4);
     let columns_length = Cursor::new(columns_length).read_u32::<LittleEndian>().unwrap();
@@ -128,6 +129,7 @@ pub(crate) fn delete_row_file(
     // Write the empty buffer to overwrite the data
     //ID (8) LEN (4) START (1)
     io_sync.write_data_seek(SeekFrom::Start(first_column_index - 4 - 8 - 1), &empty_buffer);
+    io_sync.verify_data_and_sync(first_column_index - 4 - 8 - 1, &empty_buffer);
 
     return Ok(());
 }
