@@ -150,5 +150,16 @@ table.update_row_by_id(3, update_row).await;
 table.delete_row_by_id(10).unwrap();
 ```
 
+#### Table Maintanance
+```rust
+// Vacuum the table
+// Note: The removed row's ids will be sorted back in use. 
+// So deleted row ID(3) and following rows ID(4), ID(5), ID(X) will become row ID(3), ID(4), ID(X - 1)
+table.vacuum_table().await;
+
+// Must rebuild in-memory file indexes after vacuum
+table.rebuild_in_memory_indexes();
+```
+
 ### License
 Everything in this directory is distributed under GNU GENERAL PUBLIC LICENSE version 3.
