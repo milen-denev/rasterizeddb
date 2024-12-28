@@ -96,6 +96,15 @@ pub(crate) static POSITIONS_CACHE: Lazy<Cache<u64, Vec<(u64, u32)>, RandomState>
 /// // Invalidates cache automatically
 /// table.delete_row_by_id(10).unwrap();
 /// ```
+/// 
+/// #### Table Maintanance
+/// ```rust
+/// // Vacuum the table
+/// table.vacuum_table().await;
+/// 
+/// // Must rebuild in-memory file indexes after vacuum
+/// table.rebuild_in_memory_indexes();
+/// ```
 pub mod core;
 
 pub mod simds;

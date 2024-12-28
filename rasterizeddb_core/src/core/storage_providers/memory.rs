@@ -194,4 +194,18 @@ impl IOOperationsSync for MemoryStorageProvider {
             self.vec.extend(vec![*u8_value; 1]);
         }
     }
+    
+    fn create_temp(&self) -> Self {
+        Self {
+            vec: ConcurrentVec::with_doubling_growth()
+        }
+    }
+    
+    fn swap_temp(&mut self, temp_io_sync: &mut Self) {
+        self.vec = temp_io_sync.vec.clone();
+        self.vec.clear();
+        let iter = temp_io_sync.vec.clone_to_vec();
+        self.vec.extend(iter);
+        temp_io_sync.vec.clear();
+    }
 }

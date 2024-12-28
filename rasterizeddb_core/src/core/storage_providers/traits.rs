@@ -48,6 +48,10 @@ pub trait IOOperationsSync: Clone {
     fn get_len(&mut self) -> u64;
 
     fn exists(location: &str, table_name: &str) -> bool;
+
+    fn create_temp(&self) -> Self;
+
+    fn swap_temp(&mut self, temp_io_sync: &mut Self);
 }
 
 pub trait IOOperationsAsync<'a>: TryCloneAsync {

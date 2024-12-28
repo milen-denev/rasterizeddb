@@ -73,7 +73,7 @@ async fn main() -> std::io::Result<()> {
 
     table.rebuild_in_memory_indexes();
 
-    let row = table.first_or_default_by_id(5)?.unwrap();
+    let row = table.first_or_default_by_id(1)?.unwrap();
 
     // for column in Column::from_buffer(&row.columns_data).unwrap() {
     //     println!("{}", column.into_value());
@@ -85,18 +85,18 @@ async fn main() -> std::io::Result<()> {
 
     let mut c1_update = Column::new(21).unwrap();
     let mut c2_update = Column::new(x * -1).unwrap();
-    let large_string = "A".repeat(1024);
-    let mut c3_update = Column::new(&large_string).unwrap();
+    //let large_string = "A".repeat(1024);
+    //let mut c3_update = Column::new(&large_string).unwrap();
 
     let mut columns_buffer_update: Vec<u8> = Vec::with_capacity(
         c1_update.len() + 
-        c2_update.len() +
-        c3_update.len() 
+        c2_update.len()
+        //c3_update.len() 
     );
 
     columns_buffer_update.append(&mut c1_update.into_vec().unwrap());
     columns_buffer_update.append(&mut c2_update.into_vec().unwrap());
-    columns_buffer_update.append(&mut c3_update.into_vec().unwrap());
+    //columns_buffer_update.append(&mut c3_update.into_vec().unwrap());
 
     let update_row = InsertOrUpdateRow {
         columns_data: columns_buffer_update
@@ -104,19 +104,25 @@ async fn main() -> std::io::Result<()> {
 
     table.update_row_by_id(3, update_row).await;
 
+    table.delete_row_by_id(3).unwrap();
+
+    table.vacuum_table().await;
+
+    table.first_or_default_by_id(3)?.unwrap();
+
     // END UPDATE ROW(3)
 
-    let row = table.first_or_default_by_id(6)?.unwrap();
+    let row = table.first_or_default_by_id(4)?.unwrap();
 
     // for column in Column::from_buffer(&row.columns_data).unwrap() {
     //     println!("{}", column.into_value());
     // }
 
-    let row = table.first_or_default_by_column(0, 1000)?.unwrap();
+    let row = table.first_or_default_by_column(0, 21)?.unwrap();
 
-    // for column in Column::from_buffer(&row.columns_data).unwrap() {
-    //     println!("{}", column.into_value());
-    // }
+    for column in Column::from_buffer(&row.columns_data).unwrap() {
+        println!("{}", column.into_value());
+    }
 
     let mut stopwatch = Stopwatch::new();
 
@@ -125,7 +131,7 @@ async fn main() -> std::io::Result<()> {
         let query_evaluation = parse_rql(&format!(r#"
             BEGIN
             SELECT FROM NAME_DOESNT_MATTER_FOR_NOW
-            WHERE COL(2) = '{large_string}' 
+            WHERE COL(0) = 21
             END
         "#)).unwrap();
 

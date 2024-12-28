@@ -1,7 +1,5 @@
 use std::{
-    fmt::Display, 
-    io::{self, Read, Seek, SeekFrom},
-    sync::Arc
+    fmt::Display, io::{self, Read, Seek, SeekFrom}, sync::Arc
 };
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -30,13 +28,16 @@ pub struct Table<S: IOOperationsSync> {
     pub(crate) in_memory_index: Arc<RwLock<Option<Vec<FileChunk>>>>,
     pub(crate) current_file_length: Arc<RwLock<u64>>,
     pub(crate) current_row_id: Arc<RwLock<u64>>,
-    pub(crate) immutable: bool
+    pub(crate) immutable: bool,
+    pub(crate) locked: Arc<RwLock<bool>>
 }
 
 unsafe impl<S: IOOperationsSync> Send for Table<S> {}
 unsafe impl<S: IOOperationsSync> Sync for Table<S> {}
 
 impl<S: IOOperationsSync> Table<S> {
+    /// #### STABILIZED
+    /// Initializes a new table. compressed and immutable are not implemented yet.
     pub fn init(
         mut io_sync: S,
         compressed: bool,
@@ -58,7 +59,8 @@ impl<S: IOOperationsSync> Table<S> {
                 in_memory_index: Arc::new(RwLock::const_new(None)),
                 current_file_length: Arc::new(RwLock::const_new(table_file_len)),
                 current_row_id: Arc::new(RwLock::const_new(last_row_id)),
-                immutable: immutable
+                immutable: immutable,
+                locked: Arc::new(RwLock::const_new(false))
             };
 
             Ok(table)
@@ -76,14 +78,16 @@ impl<S: IOOperationsSync> Table<S> {
                 in_memory_index: Arc::new(RwLock::const_new(None)),
                 current_file_length: Arc::new(RwLock::const_new(table_file_len)),
                 current_row_id: Arc::new(RwLock::const_new(0)),
-                immutable: immutable
+                immutable: immutable,
+                locked: Arc::new(RwLock::const_new(false))
             };
 
             Ok(table)
         }
     }
 
-    pub fn get_current_table_length(&mut self) -> u64 {
+    /// #### STABILIZED
+    fn get_current_table_length(&mut self) -> u64 {
         let file_length = loop {
             if let Ok(len) = self.current_file_length.try_read() {
                 break *len;
@@ -93,7 +97,7 @@ impl<S: IOOperationsSync> Table<S> {
         return file_length;
     }
 
-    /// (End Of File, Row Id)
+    /// #### STABILIZED
     async fn update_eof_and_id(&mut self, buffer_size: u64) -> u64 {
         
         let end_of_file_c = self.current_file_length.clone();
@@ -126,7 +130,19 @@ impl<S: IOOperationsSync> Table<S> {
         return last_row_id;
     }
 
+    /// #### STABILIZED
+    /// Inserts a new row.
     pub async fn insert_row(&mut self, row: InsertOrUpdateRow) {
+        loop {
+            let result = self.locked.try_read();
+            if let Ok(locked) = result {
+                if *locked {
+                    continue;
+                }
+                break;
+            }
+        }
+
         let columns_len = row.columns_data.len();
 
         //START (1) + END (1) + u64 ID (8) + u32 LENGTH (4) + VEC SIZE 
@@ -189,6 +205,8 @@ impl<S: IOOperationsSync> Table<S> {
         self.io_sync.write_data(0, &new_header);
     }
 
+    /// #### STABILIZED
+    /// Get first row by columns value.
     pub fn first_or_default_by_id(&mut self, id: u64) -> io::Result<Option<Row>> {
         let file_length = self.get_current_table_length();
 
@@ -254,6 +272,8 @@ impl<S: IOOperationsSync> Table<S> {
         return Ok(None);
     }
 
+    /// #### STABILIZED
+    /// Get first row by columns value (EQUALS operations performed).
     pub fn first_or_default_by_column<T>(&mut self, column_index: u32, value: T) -> io::Result<Option<Row>> 
     where
         T: Display {
@@ -428,6 +448,8 @@ impl<S: IOOperationsSync> Table<S> {
         return Ok(None);    
     }
  
+    /// #### STABILIZED
+    /// Get first row by query.
     pub async fn first_or_default_by_query(&mut self, parser_result: ParserResult) -> io::Result<Option<Row>> {
         if let ParserResult::HashIndexes(hash_indexes) = parser_result {
             for record in hash_indexes {
@@ -678,7 +700,19 @@ impl<S: IOOperationsSync> Table<S> {
         }
     }
 
+    /// #### STABILIZED
+    /// Deletes the row by the given id.
     pub fn delete_row_by_id(&mut self, id: u64) -> io::Result<()> {
+        loop {
+            let result = self.locked.try_read();
+            if let Ok(locked) = result {
+                if *locked {
+                    continue;
+                }
+                break;
+            }
+        }
+
         let file_length = self.get_current_table_length();
 
         let chunks_arc_clone = self.in_memory_index.clone();
@@ -698,7 +732,7 @@ impl<S: IOOperationsSync> Table<S> {
                 loop {
                     if let Some(prefetch_result) = row_prefetching_cursor(&mut cursor, chunk).unwrap() {
                         if id == prefetch_result.found_id {
-                            let starting_column_position = cursor.stream_position().unwrap() as u64 + chunk.chunk_size as u64;
+                            let starting_column_position = cursor.stream_position().unwrap() as u64 + chunk.current_file_position as u64;
                             
                             if let Some(record) = POSITIONS_CACHE.iter().find(|x| x.1.iter().any(|&(key, _)| key == (starting_column_position - 1 - 4 - 8) as u64)) {
                                 POSITIONS_CACHE.invalidate(&record.0);
@@ -779,7 +813,19 @@ impl<S: IOOperationsSync> Table<S> {
         return Ok(());    
     }
 
+    /// #### STABILIZED
+    /// Rebuilds the in-memory indexes.
     pub fn rebuild_in_memory_indexes(&mut self) {
+        loop {
+            let result = self.locked.try_read();
+            if let Ok(locked) = result {
+                if *locked {
+                    continue;
+                }
+                break;
+            }
+        }
+
         let file_length = self.get_current_table_length();
 
         let chunks_arc_clone = self.in_memory_index.clone();
@@ -840,7 +886,19 @@ impl<S: IOOperationsSync> Table<S> {
         drop(chunks_write_result);
     }
 
+    /// #### STABILIZED
+    /// Updates the row by the given id.
     pub async fn update_row_by_id(&mut self, id: u64, row: InsertOrUpdateRow) {
+        loop {
+            let result = self.locked.try_read();
+            if let Ok(locked) = result {
+                if *locked {
+                    continue;
+                }
+                break;
+            }
+        }
+
         let columns_len = row.columns_data.len();
 
         //START (1) + END (1) + u64 ID (8) + u32 LENGTH (4) + VEC SIZE 
@@ -1006,5 +1064,57 @@ impl<S: IOOperationsSync> Table<S> {
                 }
             }
         }
+    }
+
+    /// #### STABILIZED
+    /// This function will remove all empty spaces from the table and squash the ROW ID pool.
+    /// So deleted row ID(3) and following rows ID(4), ID(5), ID(X) will become row ID(3), ID(4), ID(X - 1)
+    /// Vacuuming currently locks the table and inserts, updates, rebuild cache indexes, and deletes will be waiting until the vacuum is done.
+    pub async fn vacuum_table(&mut self) {
+        loop { 
+            let result = self.locked.try_write();
+            if let Ok(mut locked) = result {
+                if *locked {
+                    continue;
+                } else {
+                    *locked = true;
+                    break;
+                }
+            }
+        }
+
+        let file_length = self.get_current_table_length();
+        let mut position: u64 = HEADER_SIZE as u64;
+
+        let temp_io_sync = self.io_sync.create_temp();
+        let mut temp_table = Table::init(temp_io_sync, false, false).unwrap();
+
+        loop {
+            if let Some(prefetch_result) = row_prefetching(
+                &mut self.io_sync,
+                &mut position,
+                file_length).unwrap() {
+
+                let row = read_row_columns(
+                    &mut self.io_sync,
+                    position,
+                    prefetch_result.found_id,
+                    prefetch_result.length + 1).unwrap();
+                
+                println!("id: {}", prefetch_result.found_id);
+
+                // END (1)
+                position += prefetch_result.length as u64 + 1;
+                temp_table.insert_row(InsertOrUpdateRow { columns_data: row.columns_data }).await;
+            } else {
+                break;
+            }
+        }
+
+        self.io_sync.swap_temp(&mut temp_table.io_sync);
+
+        drop(temp_table);
+
+        self.in_memory_index = Arc::new(RwLock::const_new(None));
     }
 }
