@@ -1101,8 +1101,6 @@ impl<S: IOOperationsSync> Table<S> {
                     prefetch_result.found_id,
                     prefetch_result.length + 1).unwrap();
                 
-                println!("id: {}", prefetch_result.found_id);
-
                 // END (1)
                 position += prefetch_result.length as u64 + 1;
                 temp_table.insert_row(InsertOrUpdateRow { columns_data: row.columns_data }).await;
