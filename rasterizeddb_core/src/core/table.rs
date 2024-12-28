@@ -1114,5 +1114,13 @@ impl<S: IOOperationsSync> Table<S> {
         drop(temp_table);
 
         self.in_memory_index = Arc::new(RwLock::const_new(None));
+
+        loop { 
+            let result = self.locked.try_write();
+            if let Ok(mut locked) = result {
+                *locked = false;
+                break;
+            }
+        }
     }
 }
