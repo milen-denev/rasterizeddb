@@ -1,0 +1,12 @@
+[package]
+name = "test_db_web"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = "0.7.9"
+tokio = "1"
+rasterizeddb_core = { git = "https://github.com/milen-denev/rasterizeddb.git", branch = "0.0.7" }
+tower = "0.5.2"
+once_cell = "1.20.2"
+rand = "0.8.5"
