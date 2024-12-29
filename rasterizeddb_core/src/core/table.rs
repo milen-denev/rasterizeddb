@@ -98,9 +98,9 @@ impl<S: IOOperationsSync> Table<S> {
     }
 
     /// #### STABILIZED
-    async fn update_eof_and_id(&mut self, buffer_size: u64) -> u64 {
-        
+    async fn update_eof_and_id(&mut self, buffer_size: u64) -> u64 {    
         let end_of_file_c = self.current_file_length.clone();
+        let last_row_id_c = self.current_row_id.clone();
 
         let mut end_of_file : RwLockWriteGuard<u64> = loop {
             let result = end_of_file_c.try_write();
@@ -112,8 +112,6 @@ impl<S: IOOperationsSync> Table<S> {
                 break end_of_file;
             } 
         };
-        
-        let last_row_id_c = self.current_row_id.clone();
 
         let mut last_row_id : RwLockWriteGuard<u64> = loop {
             let result = last_row_id_c.try_write();
@@ -150,21 +148,6 @@ impl<S: IOOperationsSync> Table<S> {
 
         let total_row_size = buffer.capacity() as u64;
 
-        let current_file_len: u64 = loop {
-            let result = self.current_file_length.try_read();
-            if let Ok(current_len) = result {
-                if *current_len == 0 {
-                    let len = current_len.clone() + HEADER_SIZE as u64;
-                    drop(current_len);
-                    break len;
-                } else {
-                    let len = current_len.clone();
-                    drop(current_len);
-                    break len;
-                }
-            } 
-        };
-
         let row_id = self.update_eof_and_id(total_row_size).await;
 
         //DbType START
@@ -180,14 +163,14 @@ impl<S: IOOperationsSync> Table<S> {
         //DbType END
         buffer.push(255);
 
-        self.io_sync.append_data_unsync(&buffer);
-        let verify_result = self.io_sync.verify_data_and_sync(current_file_len, &buffer);
+        self.io_sync.append_data(&buffer);
+        // let verify_result = self.io_sync.verify_data_and_sync(current_file_len, &buffer);
 
-        #[allow(unreachable_code)]
-        if !verify_result {
-            panic!("DB file contains error.");
-            todo!("Add rollback.");
-        }
+        // #[allow(unreachable_code)]
+        // if !verify_result {
+        //     panic!("DB file contains error.");
+        //     todo!("Add rollback.");
+        // }
 
         let table_header = self.table_header.clone();
 
