@@ -1,9 +1,11 @@
 use std::{fs, io::{Cursor, Read, Seek, SeekFrom, Write}, os::windows::fs::FileExt, path::Path};
 
+use tokio::{io::{AsyncReadExt, AsyncSeekExt}, runtime::Handle};
+
 use super::traits::IOOperationsSync;
 
 pub struct LocalStorageProvider {
-    pub(super) read_file: std::fs::File,
+    pub(super) read_file: tokio::fs::File,
     pub(super) append_file: std::fs::File,
     pub(super) write_file: std::fs::File,
     pub(crate) location: String,
@@ -12,8 +14,12 @@ pub struct LocalStorageProvider {
 
 impl Clone for LocalStorageProvider {
     fn clone(&self) -> Self {
+        let handle = Handle::current();
+        _ = handle.enter();
+        let read_file = futures::executor::block_on(self.read_file.try_clone()).unwrap();
+        
         Self { 
-            read_file: self.read_file.try_clone().unwrap(), 
+            read_file: read_file, 
             append_file: self.append_file.try_clone().unwrap(), 
             write_file: self.write_file.try_clone().unwrap(),
             location: self.location.clone(),
@@ -25,7 +31,7 @@ unsafe impl Send for LocalStorageProvider {}
 unsafe impl Sync for LocalStorageProvider {}
 
 impl LocalStorageProvider {
-    pub fn new(location: &str, table_name: &str) -> LocalStorageProvider {
+    pub async fn new(location: &str, table_name: &str) -> LocalStorageProvider {
         let delimiter = if cfg!(unix) {
             "/"
         } else if cfg!(windows) {
@@ -50,7 +56,7 @@ impl LocalStorageProvider {
             _ = std::fs::File::create(&file_str).unwrap();
         }
 
-        let file_read = std::fs::File::options().read(true).open(&file_str).unwrap();
+        let file_read = tokio::fs::File::options().read(true).open(&file_str).await.unwrap();
         let file_append = std::fs::File::options().read(true).append(true).open(&file_str).unwrap();
         let file_write = std::fs::File::options().read(true).write(true).open(&file_str).unwrap();
 
@@ -108,13 +114,12 @@ impl IOOperationsSync for LocalStorageProvider {
         file.sync_all().unwrap();
     }
 
-    fn read_data(&mut self,
+    async fn read_data(&mut self,
         position: &mut u64,  
         length: u32) -> Vec<u8> {
-        let mut file = &self.read_file;
-        file.seek(SeekFrom::Start(*position)).unwrap();
+        self.read_file.seek(SeekFrom::Start(*position)).await.unwrap();
         let mut buffer: Vec<u8> = vec![0; length as usize];
-        let read_result = file.read_exact(&mut buffer);
+        let read_result = self.read_file.read_exact(&mut buffer).await;
         if read_result.is_err() {
             return Vec::default()
         } else {
@@ -123,18 +128,16 @@ impl IOOperationsSync for LocalStorageProvider {
         }
     }
     
-    fn read_data_to_end(&mut self,
+    async fn read_data_to_end(&mut self,
         position: u64) -> Vec<u8> {
-        let mut file = &self.read_file;
-        file.seek(SeekFrom::Start(position)).unwrap();
+        self.read_file.seek(SeekFrom::Start(position)).await.unwrap();
         let mut buffer: Vec<u8> = Vec::default();
-        file.read_to_end(&mut buffer).unwrap();
+        self.read_file.read_to_end(&mut buffer).await.unwrap();
         return buffer;
     }
 
-    fn get_len(&mut self) -> u64 {
-        let file = &self.read_file;
-        let len = file.metadata().unwrap().len();
+    async fn get_len(&mut self) -> u64 {
+        let len = self.read_file.metadata().await.unwrap().len();
         len
     }
     
@@ -158,22 +161,20 @@ impl IOOperationsSync for LocalStorageProvider {
         }
     }
     
-    fn read_data_into_buffer(&mut self,
+    async fn read_data_into_buffer(&mut self,
         position: &mut u64,
         buffer: &mut [u8]) {
-        let mut file = &self.read_file;
-        file.seek(SeekFrom::Start(*position)).unwrap();
-        file.seek_read(buffer, *position).unwrap();
+        self.read_file.seek(SeekFrom::Start(*position)).await.unwrap();
+        self.read_file.read(buffer).await.unwrap();
         *position += buffer.len() as u64;
     }
     
-    fn read_data_to_cursor(&mut self,
+    async fn read_data_to_cursor(&mut self,
         position: &mut u64,  
         length: u32) -> Cursor<Vec<u8>> {
-        let mut file = &self.read_file;
-        file.seek(SeekFrom::Start(*position)).unwrap();
+            self.read_file.seek(SeekFrom::Start(*position)).await.unwrap();
         let mut buffer: Vec<u8> = vec![0; length as usize];
-        let result = file.read_exact(&mut buffer);
+        let result = self.read_file.read_exact(&mut buffer).await;
         if result.is_err() {
             Cursor::new(Vec::default())
         } else {
@@ -215,7 +216,7 @@ impl IOOperationsSync for LocalStorageProvider {
         file.write_all(&buffer).unwrap();
     }
     
-    fn create_temp(&self) -> Self {
+    async fn create_temp(&self) -> Self {
         let delimiter = if cfg!(unix) {
             "/"
         } else if cfg!(windows) {
@@ -236,7 +237,7 @@ impl IOOperationsSync for LocalStorageProvider {
         
         _ = std::fs::File::create(&file_str).unwrap();
 
-        let file_read = std::fs::File::options().read(true).open(&file_str).unwrap();
+        let file_read = tokio::fs::File::options().read(true).open(&file_str).await.unwrap();
         let file_append = std::fs::File::options().read(true).append(true).open(&file_str).unwrap();
         let file_write = std::fs::File::options().read(true).write(true).open(&file_str).unwrap();
 
@@ -249,7 +250,7 @@ impl IOOperationsSync for LocalStorageProvider {
         }
     }
     
-    fn swap_temp(&mut self, temp_io_sync: &mut Self) {
+    async fn swap_temp(&mut self, temp_io_sync: &mut Self) {
         let delimiter = if cfg!(unix) {
             "/"
         } else if cfg!(windows) {
@@ -268,7 +269,7 @@ impl IOOperationsSync for LocalStorageProvider {
         self.close_files();
 
         // Reopen the files with the new actual file name
-        let file_read = std::fs::File::options().read(true).open(&actual_file_str).unwrap();
+        let file_read = tokio::fs::File::options().read(true).open(&actual_file_str).await.unwrap();
         let file_append = std::fs::File::options().append(true).open(&actual_file_str).unwrap();
         let file_write = std::fs::File::options().write(true).open(&actual_file_str).unwrap();
 

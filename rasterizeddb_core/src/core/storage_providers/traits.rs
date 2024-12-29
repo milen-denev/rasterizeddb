@@ -3,6 +3,7 @@ use std::{future::Future, io::{Cursor, SeekFrom}};
 pub type IOError = std::io::Error;
 pub type IOResult<T> = std::result::Result<T, IOError>;
 
+#[allow(async_fn_in_trait)]
 pub trait IOOperationsSync: Clone {
     fn write_data_unsync(&mut self,
         position: u64, 
@@ -24,19 +25,19 @@ pub trait IOOperationsSync: Clone {
         seek: SeekFrom, 
         buffer: &[u8]);
 
-    fn read_data(&mut self,
+    async fn read_data(&mut self,
         position: &mut u64,  
         length: u32) -> Vec<u8>;
 
-    fn read_data_into_buffer(&mut self,
+    async fn read_data_into_buffer(&mut self,
         position: &mut u64,  
         buffer: &mut [u8]);
 
-    fn read_data_to_cursor(&mut self,
+    async fn read_data_to_cursor(&mut self,
         position: &mut u64,  
         length: u32) -> Cursor<Vec<u8>>;
 
-    fn read_data_to_end(&mut self,
+    async fn read_data_to_end(&mut self,
         position: u64) -> Vec<u8>;
 
     fn append_data(&mut self,  
@@ -45,13 +46,13 @@ pub trait IOOperationsSync: Clone {
     fn append_data_unsync(&mut self,  
         buffer: &[u8]);
 
-    fn get_len(&mut self) -> u64;
+    async fn get_len(&mut self) -> u64;
 
     fn exists(location: &str, table_name: &str) -> bool;
 
-    fn create_temp(&self) -> Self;
+    async fn create_temp(&self) -> Self;
 
-    fn swap_temp(&mut self, temp_io_sync: &mut Self);
+    async fn swap_temp(&mut self, temp_io_sync: &mut Self);
 }
 
 pub trait IOOperationsAsync<'a>: TryCloneAsync {

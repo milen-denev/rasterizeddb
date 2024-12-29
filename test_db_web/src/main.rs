@@ -11,14 +11,22 @@ use axum::{response::Response, routing::get};
 use axum::Router;
 use rasterizeddb_core::rql::parser::parse_rql;
 
-static mut TABLE: Lazy<Table<LocalStorageProvider>> = Lazy::new(|| {
+// static mut TABLE: Lazy<Table<LocalStorageProvider>> = Lazy::new(|| {
+    
+// });
+
+static mut TABLE: async_lazy::Lazy<Table<LocalStorageProvider>> = async_lazy::Lazy::const_new(|| Box::pin(async {
     let io_sync = LocalStorageProvider::new(
         "C:\\Users\\mspc6\\OneDrive\\Professional\\Desktop",
         "database.db"
-    );
+    ).await;
 
-    Table::init(io_sync, false, false).unwrap()
-});
+    let mut table = Table::init(io_sync, false, false).await.unwrap();
+
+    table.rebuild_in_memory_indexes().await;
+
+    table
+}));
 
 static mut RANDOM: Lazy<ThreadRng> = Lazy::new(|| {
     rand::rngs::ThreadRng::default()
@@ -62,7 +70,9 @@ async fn index() -> Response {
         columns_data: columns_buffer_update
     };
 
-    unsafe { _ = TABLE.insert_row(update_row).await };
+    let table = unsafe { TABLE.force_mut().await };
+
+    _ = table.insert_row(update_row).await;
 
     Response::new("".into())
 }
@@ -71,16 +81,20 @@ async fn index() -> Response {
 async fn query() -> Response {
     let x = unsafe { RANDOM.gen_range(-100_000..100_000) } as f64;
     let y = unsafe { RANDOM.gen_range(-100_000..100_000) } as f64;
-    let z = unsafe { RANDOM.gen_range(-100_000..100_000) } as f64;
+    //let z = unsafe { RANDOM.gen_range(-100_000..100_000) } as f64;
 
+    //OR COL(1) = {x} / {y} * {z}
+    
     let query_evaluation = parse_rql(&format!(r#"
             BEGIN
             SELECT FROM NAME_DOESNT_MATTER_FOR_NOW
-            WHERE COL(0) = {x} + {y} OR COL(1) = {x} / {y} * {z}
+            WHERE COL(0) = {x} + {y}
             END
         "#)).unwrap();
 
-    unsafe { _ = TABLE.first_or_default_by_query(query_evaluation).await; };
+    let table = unsafe { TABLE.force_mut().await };
+
+    _ = table.first_or_default_by_query(query_evaluation).await;
 
     Response::new("".into())
 }
