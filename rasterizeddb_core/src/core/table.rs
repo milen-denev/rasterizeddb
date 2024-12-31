@@ -132,11 +132,10 @@ impl<S: IOOperationsSync> Table<S> {
     /// Inserts a new row.
     pub async fn insert_row(&mut self, row: InsertOrUpdateRow) {
         loop {
-            let result = self.locked.try_read();
-            if let Ok(locked) = result {
-                if *locked {
-                    continue;
-                }
+            let table_locked = self.locked.read().await;
+            if *table_locked {
+                continue;
+            } else {
                 break;
             }
         }
@@ -687,11 +686,10 @@ impl<S: IOOperationsSync> Table<S> {
     /// Deletes the row by the given id.
     pub async fn delete_row_by_id(&mut self, id: u64) -> io::Result<()> {
         loop {
-            let result = self.locked.try_read();
-            if let Ok(locked) = result {
-                if *locked {
-                    continue;
-                }
+            let table_locked = self.locked.read().await;
+            if *table_locked {
+                continue;
+            } else {
                 break;
             }
         }
@@ -800,11 +798,10 @@ impl<S: IOOperationsSync> Table<S> {
     /// Rebuilds the in-memory indexes.
     pub async fn rebuild_in_memory_indexes(&mut self) {
         loop {
-            let result = self.locked.try_read();
-            if let Ok(locked) = result {
-                if *locked {
-                    continue;
-                }
+            let table_locked = self.locked.read().await;
+            if *table_locked {
+                continue;
+            } else {
                 break;
             }
         }
@@ -873,11 +870,10 @@ impl<S: IOOperationsSync> Table<S> {
     /// Updates the row by the given id.
     pub async fn update_row_by_id(&mut self, id: u64, row: InsertOrUpdateRow) {
         loop {
-            let result = self.locked.try_read();
-            if let Ok(locked) = result {
-                if *locked {
-                    continue;
-                }
+            let table_locked = self.locked.read().await;
+            if *table_locked {
+                continue;
+            } else {
                 break;
             }
         }
@@ -1054,15 +1050,13 @@ impl<S: IOOperationsSync> Table<S> {
     /// So deleted row ID(3) and following rows ID(4), ID(5), ID(X) will become row ID(3), ID(4), ID(X - 1)
     /// Vacuuming currently locks the table and inserts, updates, rebuild cache indexes, and deletes will be waiting until the vacuum is done.
     pub async fn vacuum_table(&mut self) {
-        loop { 
-            let result = self.locked.try_write();
-            if let Ok(mut locked) = result {
-                if *locked {
-                    continue;
-                } else {
-                    *locked = true;
-                    break;
-                }
+        loop {
+            let mut table_locked = self.locked.write().await;
+            if *table_locked {
+                continue;
+            } else {
+                *table_locked = true;
+                break;
             }
         }
 
@@ -1098,12 +1092,7 @@ impl<S: IOOperationsSync> Table<S> {
 
         self.in_memory_index = Arc::new(RwLock::const_new(None));
 
-        loop { 
-            let result = self.locked.try_write();
-            if let Ok(mut locked) = result {
-                *locked = false;
-                break;
-            }
-        }
+        let mut table_locked = self.locked.write().await;
+        *table_locked = false;
     }
 }
