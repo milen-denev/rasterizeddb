@@ -16,7 +16,7 @@ use std::fs::remove_file;
 async fn main() -> std::io::Result<()> {
     std::env::set_var("RUST_BACKTRACE","0");
 
-    //_ = remove_file("C:\\Users\\mspc6\\OneDrive\\Professional\\Desktop\\database.db");
+    _ = remove_file("C:\\Users\\mspc6\\OneDrive\\Professional\\Desktop\\database.db");
 
     let io_sync = LocalStorageProvider::new(
         "C:\\Users\\mspc6\\OneDrive\\Professional\\Desktop",
@@ -71,7 +71,7 @@ async fn main() -> std::io::Result<()> {
     //     }
     // }
 
-    //table.rebuild_in_memory_indexes();
+    table.rebuild_in_memory_indexes().await;
 
     let row = table.first_or_default_by_id(1).await?.unwrap();
 
@@ -112,7 +112,7 @@ async fn main() -> std::io::Result<()> {
 
     // END UPDATE ROW(3)
 
-    let row = table.first_or_default_by_id(4).await?.unwrap();
+    //let row = table.first_or_default_by_id(4).await?.unwrap();
 
     // for column in Column::from_buffer(&row.columns_data).unwrap() {
     //     println!("{}", column.into_value());
@@ -131,14 +131,14 @@ async fn main() -> std::io::Result<()> {
         let query_evaluation = parse_rql(&format!(r#"
             BEGIN
             SELECT FROM NAME_DOESNT_MATTER_FOR_NOW
-            WHERE COL(0) = 21 + 13905
+            WHERE COL(0) >= 1000
             END
         "#)).unwrap();
 
-        let _row = table.first_or_default_by_query(query_evaluation).await?;
-        // for column in Column::from_buffer(&row.columns_data).unwrap() {
-        //     println!("{}", column.into_value());
-        // }
+        let row = table.first_or_default_by_query(query_evaluation).await?.unwrap();
+        for column in Column::from_buffer(&row.columns_data).unwrap() {
+            println!("{}", column.into_value());
+        }
     }
     stopwatch.stop();
     println!("{}ms", stopwatch.elapsed_ms());

@@ -11,7 +11,7 @@ description = "A schemaless, high-performance database written in Rust, designed
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 byteorder = "1.5"
-itertools = "0.13"
+itertools = "0.14"
 moka =  { version = "0.12", features = ["sync"] }
 ahash = "0.8"
 once_cell = "1.20"
