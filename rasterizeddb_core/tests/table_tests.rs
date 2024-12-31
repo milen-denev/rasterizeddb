@@ -17,9 +17,9 @@ pub fn rebuild_indexes_file() {
         let io_sync = LocalStorageProvider::new(
             "C:\\Tests",
             "database.db"
-        );
+        ).await;
 
-        let mut table = Table::init(io_sync, false, false).unwrap();
+        let mut table = Table::init(io_sync, false, false).await.unwrap();
 
         for i in 0..500 {
             if i == 450 {
@@ -65,7 +65,7 @@ pub fn rebuild_indexes_file() {
             }
         }
 
-        table.rebuild_in_memory_indexes();
+        table.rebuild_in_memory_indexes().await;
     });
 }
 
@@ -75,7 +75,7 @@ pub fn rebuild_indexes_memory() {
     rt.block_on(async { 
         let io_sync = MemoryStorageProvider::new();
 
-        let mut table = Table::init(io_sync, false, false).unwrap();
+        let mut table = Table::init(io_sync, false, false).await.unwrap();
 
         for i in 0..500 {
             if i == 450 {
@@ -121,6 +121,6 @@ pub fn rebuild_indexes_memory() {
             }
         }
 
-        table.rebuild_in_memory_indexes();
+        table.rebuild_in_memory_indexes().await;
     });
 }

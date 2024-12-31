@@ -38,15 +38,15 @@ unsafe impl<S: IOOperationsSync> Sync for Table<S> {}
 impl<S: IOOperationsSync> Table<S> {
     /// #### STABILIZED
     /// Initializes a new table. compressed and immutable are not implemented yet.
-    pub fn init(
+    pub async fn init(
         mut io_sync: S,
         compressed: bool,
         immutable: bool) -> io::Result<Table<S>> {
-        let table_file_len = io_sync.get_len();
+        let table_file_len = io_sync.get_len().await;
 
         if table_file_len >= HEADER_SIZE as u64 {
             
-            let buffer = io_sync.read_data(&mut 0, HEADER_SIZE as u32);
+            let buffer = io_sync.read_data(&mut 0, HEADER_SIZE as u32).await;
             let mut table_header = TableHeader::from_buffer(buffer).unwrap();
 
             let last_row_id: u64 = table_header.last_row_id;
@@ -98,9 +98,9 @@ impl<S: IOOperationsSync> Table<S> {
     }
 
     /// #### STABILIZED
-    async fn update_eof_and_id(&mut self, buffer_size: u64) -> u64 {
-        
+    async fn update_eof_and_id(&mut self, buffer_size: u64) -> u64 {    
         let end_of_file_c = self.current_file_length.clone();
+        let last_row_id_c = self.current_row_id.clone();
 
         let mut end_of_file : RwLockWriteGuard<u64> = loop {
             let result = end_of_file_c.try_write();
@@ -112,8 +112,6 @@ impl<S: IOOperationsSync> Table<S> {
                 break end_of_file;
             } 
         };
-        
-        let last_row_id_c = self.current_row_id.clone();
 
         let mut last_row_id : RwLockWriteGuard<u64> = loop {
             let result = last_row_id_c.try_write();
@@ -134,11 +132,10 @@ impl<S: IOOperationsSync> Table<S> {
     /// Inserts a new row.
     pub async fn insert_row(&mut self, row: InsertOrUpdateRow) {
         loop {
-            let result = self.locked.try_read();
-            if let Ok(locked) = result {
-                if *locked {
-                    continue;
-                }
+            let table_locked = self.locked.read().await;
+            if *table_locked {
+                continue;
+            } else {
                 break;
             }
         }
@@ -149,21 +146,6 @@ impl<S: IOOperationsSync> Table<S> {
         let mut buffer: Vec<u8> = Vec::with_capacity(1 + 1 + 8 + 4 + columns_len);
 
         let total_row_size = buffer.capacity() as u64;
-
-        let current_file_len: u64 = loop {
-            let result = self.current_file_length.try_read();
-            if let Ok(current_len) = result {
-                if *current_len == 0 {
-                    let len = current_len.clone() + HEADER_SIZE as u64;
-                    drop(current_len);
-                    break len;
-                } else {
-                    let len = current_len.clone();
-                    drop(current_len);
-                    break len;
-                }
-            } 
-        };
 
         let row_id = self.update_eof_and_id(total_row_size).await;
 
@@ -180,14 +162,14 @@ impl<S: IOOperationsSync> Table<S> {
         //DbType END
         buffer.push(255);
 
-        self.io_sync.append_data_unsync(&buffer);
-        let verify_result = self.io_sync.verify_data_and_sync(current_file_len, &buffer);
+        self.io_sync.append_data(&buffer);
+        // let verify_result = self.io_sync.verify_data_and_sync(current_file_len, &buffer);
 
-        #[allow(unreachable_code)]
-        if !verify_result {
-            panic!("DB file contains error.");
-            todo!("Add rollback.");
-        }
+        // #[allow(unreachable_code)]
+        // if !verify_result {
+        //     panic!("DB file contains error.");
+        //     todo!("Add rollback.");
+        // }
 
         let table_header = self.table_header.clone();
 
@@ -207,7 +189,7 @@ impl<S: IOOperationsSync> Table<S> {
 
     /// #### STABILIZED
     /// Get first row by columns value.
-    pub fn first_or_default_by_id(&mut self, id: u64) -> io::Result<Option<Row>> {
+    pub async fn first_or_default_by_id(&mut self, id: u64) -> io::Result<Option<Row>> {
         let file_length = self.get_current_table_length();
 
         let chunks_arc_clone = self.in_memory_index.clone();
@@ -221,7 +203,7 @@ impl<S: IOOperationsSync> Table<S> {
 
         if let Some(chunks) = chunks_result.as_ref() {
             for chunk in chunks {
-                let mut cursor = chunk.read_chunk_sync(&mut self.io_sync);
+                let mut cursor = chunk.read_chunk_sync(&mut self.io_sync).await;
 
                 loop {
                     if let Some(prefetch_result) = row_prefetching_cursor(&mut cursor, chunk).unwrap() {
@@ -248,7 +230,7 @@ impl<S: IOOperationsSync> Table<S> {
                 if let Some(prefetch_result) = row_prefetching(
                     &mut self.io_sync,
                     &mut position,
-                    file_length).unwrap() {
+                    file_length).await.unwrap() {
                     
                     if id == prefetch_result.found_id {
                         //+1 because of the END db type.
@@ -256,7 +238,7 @@ impl<S: IOOperationsSync> Table<S> {
                             &mut self.io_sync,
                             position,
                             prefetch_result.found_id,
-                            prefetch_result.length + 1).unwrap();
+                            prefetch_result.length + 1).await.unwrap();
 
                         return Ok(Some(row));
                     } else {
@@ -274,7 +256,7 @@ impl<S: IOOperationsSync> Table<S> {
 
     /// #### STABILIZED
     /// Get first row by columns value (EQUALS operations performed).
-    pub fn first_or_default_by_column<T>(&mut self, column_index: u32, value: T) -> io::Result<Option<Row>> 
+    pub async fn first_or_default_by_column<T>(&mut self, column_index: u32, value: T) -> io::Result<Option<Row>> 
     where
         T: Display {
         let file_length = self.get_current_table_length();
@@ -291,7 +273,7 @@ impl<S: IOOperationsSync> Table<S> {
 
         if let Some(chunks) = chunks_result.as_ref() {
             for chunk in chunks {
-                let mut cursor = chunk.read_chunk_sync(&mut self.io_sync);
+                let mut cursor = chunk.read_chunk_sync(&mut self.io_sync).await;
 
                 loop {
                     if let Some(prefetch_result) = row_prefetching_cursor(&mut cursor, chunk).unwrap() {
@@ -369,13 +351,13 @@ impl<S: IOOperationsSync> Table<S> {
                 if let Some(prefetch_result) = row_prefetching(
                     &mut self.io_sync,
                     &mut position,
-                    file_length).unwrap() {
+                    file_length).await.unwrap() {
 
                     let mut column_index_inner = 0;
 
                     let mut columns_cursor = self.io_sync.read_data_to_cursor(
                         &mut position, 
-                        prefetch_result.length + 1);
+                        prefetch_result.length + 1).await;
 
                     loop {
                         if column_index == column_index_inner {
@@ -458,7 +440,7 @@ impl<S: IOOperationsSync> Table<S> {
                 return Ok(Some(indexed_row_fetching_file(
                     &mut self.io_sync,
                     &mut position,
-                    length).unwrap()));
+                    length).await.unwrap()));
             }
             todo!("Support many results.");
         } else if let ParserResult::EvaluationTokens(evaluation_tokens) = parser_result {
@@ -490,7 +472,7 @@ impl<S: IOOperationsSync> Table<S> {
                     }).collect_vec();
 
                 for chunk in chunks {
-                    let mut cursor = chunk.read_chunk_sync(&mut self.io_sync);
+                    let mut cursor = chunk.read_chunk_sync(&mut self.io_sync).await;
                     loop {
                         if let Some(prefetch_result) = row_prefetching_cursor(&mut cursor, chunk).unwrap() {
                         
@@ -599,13 +581,13 @@ impl<S: IOOperationsSync> Table<S> {
                     if let Some(prefetch_result) = row_prefetching(
                         &mut self.io_sync,
                         &mut position,
-                        file_length).unwrap() {
+                        file_length).await.unwrap() {
     
                         let mut column_index_inner = 0;
 
                         let mut columns_cursor = self.io_sync.read_data_to_cursor(
                             &mut position, 
-                            prefetch_result.length + 1);
+                            prefetch_result.length + 1).await;
     
                         loop {
                             if column_indexes.iter().any(|x| *x == column_index_inner) {
@@ -702,13 +684,12 @@ impl<S: IOOperationsSync> Table<S> {
 
     /// #### STABILIZED
     /// Deletes the row by the given id.
-    pub fn delete_row_by_id(&mut self, id: u64) -> io::Result<()> {
+    pub async fn delete_row_by_id(&mut self, id: u64) -> io::Result<()> {
         loop {
-            let result = self.locked.try_read();
-            if let Ok(locked) = result {
-                if *locked {
-                    continue;
-                }
+            let table_locked = self.locked.read().await;
+            if *table_locked {
+                continue;
+            } else {
                 break;
             }
         }
@@ -727,7 +708,7 @@ impl<S: IOOperationsSync> Table<S> {
         if let Some(chunks) = chunks_result.as_ref() {
             let mut chunks_ended_position: u64 = 0;
             for chunk in chunks {
-                let mut cursor = chunk.read_chunk_sync(&mut self.io_sync);
+                let mut cursor = chunk.read_chunk_sync(&mut self.io_sync).await;
 
                 loop {
                     if let Some(prefetch_result) = row_prefetching_cursor(&mut cursor, chunk).unwrap() {
@@ -740,7 +721,7 @@ impl<S: IOOperationsSync> Table<S> {
 
                             delete_row_file(
                                 starting_column_position, 
-                                &mut self.io_sync).unwrap();
+                                &mut self.io_sync).await.unwrap();
             
                             return Ok(());
                         } else {
@@ -763,7 +744,7 @@ impl<S: IOOperationsSync> Table<S> {
                     next_row_id: 0
                 };
 
-                let mut cursor = chunk.read_chunk_to_end_sync(file_length - chunks_ended_position, &mut self.io_sync);
+                let mut cursor = chunk.read_chunk_to_end_sync(file_length - chunks_ended_position, &mut self.io_sync).await;
 
                 loop {
                     if let Some(prefetch_result) = row_prefetching_cursor(&mut cursor, &chunk).unwrap() {
@@ -772,7 +753,7 @@ impl<S: IOOperationsSync> Table<S> {
                     
                             delete_row_file(
                                 starting_column_position, 
-                                &mut self.io_sync).unwrap();
+                                &mut self.io_sync).await.unwrap();
             
                             return Ok(());
                         } else {
@@ -790,14 +771,14 @@ impl<S: IOOperationsSync> Table<S> {
                 if let Some(prefetch_result) = row_prefetching(
                     &mut self.io_sync,
                     &mut position,
-                    file_length).unwrap() {
+                    file_length).await.unwrap() {
                         
                     if id == prefetch_result.found_id {
                         let starting_column_position = position;
                         
                         delete_row_file(
                             starting_column_position, 
-                            &mut self.io_sync).unwrap();
+                            &mut self.io_sync).await.unwrap();
         
                         return Ok(());
                     } else {
@@ -815,13 +796,12 @@ impl<S: IOOperationsSync> Table<S> {
 
     /// #### STABILIZED
     /// Rebuilds the in-memory indexes.
-    pub fn rebuild_in_memory_indexes(&mut self) {
+    pub async fn rebuild_in_memory_indexes(&mut self) {
         loop {
-            let result = self.locked.try_read();
-            if let Ok(locked) = result {
-                if *locked {
-                    continue;
-                }
+            let table_locked = self.locked.read().await;
+            if *table_locked {
+                continue;
+            } else {
                 break;
             }
         }
@@ -853,7 +833,7 @@ impl<S: IOOperationsSync> Table<S> {
             if let Some(prefetch_result) = row_prefetching(
                 &mut self.io_sync,
                 &mut position,
-                file_length).unwrap() {
+                file_length).await.unwrap() {
 
                 position += prefetch_result.length as u64 + 1;
                 //START (1), ROWID (8), LEN (4), COLUMNS (X), END (1)
@@ -890,11 +870,10 @@ impl<S: IOOperationsSync> Table<S> {
     /// Updates the row by the given id.
     pub async fn update_row_by_id(&mut self, id: u64, row: InsertOrUpdateRow) {
         loop {
-            let result = self.locked.try_read();
-            if let Ok(locked) = result {
-                if *locked {
-                    continue;
-                }
+            let table_locked = self.locked.read().await;
+            if *table_locked {
+                continue;
+            } else {
                 break;
             }
         }
@@ -924,7 +903,7 @@ impl<S: IOOperationsSync> Table<S> {
             if let Some(prefetch_result) = row_prefetching(
                 &mut self.io_sync,
                 &mut position,
-                file_length).unwrap() {
+                file_length).await.unwrap() {
                 if prefetch_result.found_id == id {
                     // START (1) + END (1) + u64 ID (8) + u32 LENGTH (4) + VEC SIZE 
                     let current_row_len = (1 + 1 + 8 + 4 + prefetch_result.length) as u32; 
@@ -1071,35 +1050,33 @@ impl<S: IOOperationsSync> Table<S> {
     /// So deleted row ID(3) and following rows ID(4), ID(5), ID(X) will become row ID(3), ID(4), ID(X - 1)
     /// Vacuuming currently locks the table and inserts, updates, rebuild cache indexes, and deletes will be waiting until the vacuum is done.
     pub async fn vacuum_table(&mut self) {
-        loop { 
-            let result = self.locked.try_write();
-            if let Ok(mut locked) = result {
-                if *locked {
-                    continue;
-                } else {
-                    *locked = true;
-                    break;
-                }
+        loop {
+            let mut table_locked = self.locked.write().await;
+            if *table_locked {
+                continue;
+            } else {
+                *table_locked = true;
+                break;
             }
         }
 
         let file_length = self.get_current_table_length();
         let mut position: u64 = HEADER_SIZE as u64;
 
-        let temp_io_sync = self.io_sync.create_temp();
-        let mut temp_table = Table::init(temp_io_sync, false, false).unwrap();
+        let temp_io_sync = self.io_sync.create_temp().await;
+        let mut temp_table = Table::init(temp_io_sync, false, false).await.unwrap();
 
         loop {
             if let Some(prefetch_result) = row_prefetching(
                 &mut self.io_sync,
                 &mut position,
-                file_length).unwrap() {
+                file_length).await.unwrap() {
 
                 let row = read_row_columns(
                     &mut self.io_sync,
                     position,
                     prefetch_result.found_id,
-                    prefetch_result.length + 1).unwrap();
+                    prefetch_result.length + 1).await.unwrap();
                 
                 // END (1)
                 position += prefetch_result.length as u64 + 1;
@@ -1109,18 +1086,13 @@ impl<S: IOOperationsSync> Table<S> {
             }
         }
 
-        self.io_sync.swap_temp(&mut temp_table.io_sync);
+        self.io_sync.swap_temp(&mut temp_table.io_sync).await;
 
         drop(temp_table);
 
         self.in_memory_index = Arc::new(RwLock::const_new(None));
 
-        loop { 
-            let result = self.locked.try_write();
-            if let Ok(mut locked) = result {
-                *locked = false;
-                break;
-            }
-        }
+        let mut table_locked = self.locked.write().await;
+        *table_locked = false;
     }
 }

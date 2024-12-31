@@ -11,7 +11,7 @@ use super::{
     support_types::{FileChunk, RowPrefetchResult}
 };
 
-pub(crate) fn read_row_columns(
+pub(crate) async fn read_row_columns(
     io_sync: &mut impl IOOperationsSync, 
     first_column_index: u64, 
     id: u64, 
@@ -20,7 +20,7 @@ pub(crate) fn read_row_columns(
     
     let mut position = first_column_index;
 
-    let mut cursor = io_sync.read_data_to_cursor(&mut position, length);
+    let mut cursor = io_sync.read_data_to_cursor(&mut position, length).await;
 
     loop {
         let column_type = cursor.read_u8().unwrap();
@@ -114,13 +114,13 @@ pub(crate) fn read_row_cursor(first_column_index: u64, id: u64, length: u32, cur
     });
 }
 
-pub(crate) fn delete_row_file(
+pub(crate) async fn delete_row_file(
     first_column_index: u64, 
     io_sync: &mut impl IOOperationsSync) -> io::Result<()> {
     // LEN (4)
     let mut position = first_column_index.clone() - 4;
 
-    let columns_length = io_sync.read_data(&mut position, 4);
+    let columns_length = io_sync.read_data(&mut position, 4).await;
     let columns_length = Cursor::new(columns_length).read_u32::<LittleEndian>().unwrap();
 
     //ID (8) LEN (4) COLUMNS (columns_length) START (1) END (1)
@@ -134,7 +134,7 @@ pub(crate) fn delete_row_file(
     return Ok(());
 }
 
-pub(crate) fn skip_empty_spaces_file(
+pub(crate) async fn skip_empty_spaces_file(
     io_sync: &mut impl IOOperationsSync, 
     file_position: &mut u64,
     file_length: u64) -> u64 {
@@ -142,11 +142,11 @@ pub(crate) fn skip_empty_spaces_file(
         return *file_position;
     }
 
-    let mut check_next_buffer = io_sync.read_data(file_position, 8);
+    let mut check_next_buffer = io_sync.read_data(file_position, 8).await;
 
     if check_next_buffer == EMPTY_BUFFER {
         loop {
-            io_sync.read_data_into_buffer(file_position, &mut check_next_buffer);
+            io_sync.read_data_into_buffer(file_position, &mut check_next_buffer).await;
 
             if file_length == *file_position || file_length < *file_position {
                 return *file_position;
@@ -223,14 +223,14 @@ pub(crate) fn skip_empty_spaces_cursor(cursor: &mut Cursor<Vec<u8>>, cursor_leng
     return Ok(());
 }
 
-pub(crate) fn row_prefetching(
+pub(crate) async fn row_prefetching(
     io_sync: &mut impl IOOperationsSync, 
     file_position: &mut u64, 
     file_length: u64) -> io::Result<Option<RowPrefetchResult>> {
     if *file_position < file_length {
-        *file_position = skip_empty_spaces_file(io_sync, file_position, file_length);
+        *file_position = skip_empty_spaces_file(io_sync, file_position, file_length).await;
 
-        let mut cursor = io_sync.read_data_to_cursor(file_position, 1 + 8 + 4);
+        let mut cursor = io_sync.read_data_to_cursor(file_position, 1 + 8 + 4).await;
     
         let start_now_byte = cursor.read_u8();
     
@@ -343,11 +343,11 @@ pub(crate) fn add_last_in_memory_index(
     }
 }
 
-pub(crate) fn indexed_row_fetching_file( 
+pub(crate) async fn indexed_row_fetching_file( 
     io_sync: &mut impl IOOperationsSync, 
     position: &mut u64, 
     length: u32) -> io::Result<Row> {
-    let mut cursor = io_sync.read_data_to_cursor(position, (length + 1 + 1 + 8 + 4) as u32);
+    let mut cursor = io_sync.read_data_to_cursor(position, (length + 1 + 1 + 8 + 4) as u32).await;
 
     let start_now_byte = cursor.read_u8();
 
