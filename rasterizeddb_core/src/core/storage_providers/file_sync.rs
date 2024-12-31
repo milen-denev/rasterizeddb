@@ -1,11 +1,11 @@
-use std::{fs, io::{Cursor, Read, Seek, SeekFrom, Write}, os::windows::fs::FileExt, path::Path};
+use std::{fs, io::{Cursor, Read, Seek, SeekFrom, Write}, path::Path, sync::Arc};
 
-use tokio::{io::{AsyncReadExt, AsyncSeekExt}, runtime::Handle};
+use tokio::{io::{AsyncReadExt, AsyncSeekExt}, runtime::Handle, sync::RwLock};
 
 use super::traits::IOOperationsSync;
 
 pub struct LocalStorageProvider {
-    pub(super) read_file: tokio::fs::File,
+    pub(super) read_file: Arc<RwLock<tokio::fs::File>>,
     pub(super) append_file: std::fs::File,
     pub(super) write_file: std::fs::File,
     pub(crate) location: String,
@@ -16,10 +16,11 @@ impl Clone for LocalStorageProvider {
     fn clone(&self) -> Self {
         let handle = Handle::current();
         _ = handle.enter();
-        let read_file = futures::executor::block_on(self.read_file.try_clone()).unwrap();
+        let read_guard_file = futures::executor::block_on(self.read_file.read());
+        let read_file = futures::executor::block_on(read_guard_file.try_clone()).unwrap();
         
         Self { 
-            read_file: read_file, 
+            read_file: Arc::new(RwLock::new(read_file)), 
             append_file: self.append_file.try_clone().unwrap(), 
             write_file: self.write_file.try_clone().unwrap(),
             location: self.location.clone(),
@@ -61,7 +62,7 @@ impl LocalStorageProvider {
         let file_write = std::fs::File::options().read(true).write(true).open(&file_str).unwrap();
 
         LocalStorageProvider {
-            read_file: file_read,
+            read_file: Arc::new(RwLock::new(file_read)),
             append_file: file_append,
             write_file: file_write,
             location: location.to_string(),
@@ -69,13 +70,14 @@ impl LocalStorageProvider {
         }
     }
 
-    pub fn close_files(&mut self) {
-        _ = self.read_file.sync_all();
+    pub async fn close_files(&mut self) {
+        let read_file = self.read_file.read().await;
+
+        _ = read_file.sync_all();
         _ = self.append_file.sync_all();
         _ = self.write_file.sync_all();
     }
 }
-
 
 impl IOOperationsSync for LocalStorageProvider {  
     fn write_data_unsync(&mut self,
@@ -117,9 +119,11 @@ impl IOOperationsSync for LocalStorageProvider {
     async fn read_data(&mut self,
         position: &mut u64,  
         length: u32) -> Vec<u8> {
-        self.read_file.seek(SeekFrom::Start(*position)).await.unwrap();
+        let read_file_clone = self.read_file.clone();
+        let mut read_file = read_file_clone.write().await;
+        read_file.seek(SeekFrom::Start(*position)).await.unwrap();
         let mut buffer: Vec<u8> = vec![0; length as usize];
-        let read_result = self.read_file.read_exact(&mut buffer).await;
+        let read_result = read_file.read_exact(&mut buffer).await;
         if read_result.is_err() {
             return Vec::default()
         } else {
@@ -130,14 +134,17 @@ impl IOOperationsSync for LocalStorageProvider {
     
     async fn read_data_to_end(&mut self,
         position: u64) -> Vec<u8> {
-        self.read_file.seek(SeekFrom::Start(position)).await.unwrap();
+            let read_file_clone = self.read_file.clone();
+        let mut read_file = read_file_clone.write().await;
+        read_file.seek(SeekFrom::Start(position)).await.unwrap();
         let mut buffer: Vec<u8> = Vec::default();
-        self.read_file.read_to_end(&mut buffer).await.unwrap();
+        read_file.read_to_end(&mut buffer).await.unwrap();
         return buffer;
     }
 
     async fn get_len(&mut self) -> u64 {
-        let len = self.read_file.metadata().await.unwrap().len();
+        let read_file = self.read_file.read().await;
+        let len = read_file.metadata().await.unwrap().len();
         len
     }
     
@@ -164,17 +171,21 @@ impl IOOperationsSync for LocalStorageProvider {
     async fn read_data_into_buffer(&mut self,
         position: &mut u64,
         buffer: &mut [u8]) {
-        self.read_file.seek(SeekFrom::Start(*position)).await.unwrap();
-        self.read_file.read(buffer).await.unwrap();
+        let read_file_clone = self.read_file.clone();
+        let mut read_file = read_file_clone.write().await;
+        read_file.seek(SeekFrom::Start(*position)).await.unwrap();
+        read_file.read(buffer).await.unwrap();
         *position += buffer.len() as u64;
     }
     
     async fn read_data_to_cursor(&mut self,
         position: &mut u64,  
         length: u32) -> Cursor<Vec<u8>> {
-            self.read_file.seek(SeekFrom::Start(*position)).await.unwrap();
+        let read_file_clone = self.read_file.clone();
+        let mut read_file = read_file_clone.write().await;
+        read_file.seek(SeekFrom::Start(*position)).await.unwrap();
         let mut buffer: Vec<u8> = vec![0; length as usize];
-        let result = self.read_file.read_exact(&mut buffer).await;
+        let result = read_file.read_exact(&mut buffer).await;
         if result.is_err() {
             Cursor::new(Vec::default())
         } else {
@@ -242,7 +253,7 @@ impl IOOperationsSync for LocalStorageProvider {
         let file_write = std::fs::File::options().read(true).write(true).open(&file_str).unwrap();
 
         Self {
-            read_file: file_read,
+            read_file: Arc::new(RwLock::new(file_read)),
             append_file: file_append,
             write_file: file_write,
             location: self.location.to_string(),
@@ -266,14 +277,14 @@ impl IOOperationsSync for LocalStorageProvider {
         _ = fs::remove_file(&actual_file_str);
         _ = fs::rename(&temp_file_str, &actual_file_str);
 
-        self.close_files();
+        self.close_files().await;
 
         // Reopen the files with the new actual file name
         let file_read = tokio::fs::File::options().read(true).open(&actual_file_str).await.unwrap();
         let file_append = std::fs::File::options().append(true).open(&actual_file_str).unwrap();
         let file_write = std::fs::File::options().write(true).open(&actual_file_str).unwrap();
 
-        self.read_file = file_read;
+        self.read_file = Arc::new(RwLock::new(file_read));
         self.append_file = file_append;
         self.write_file = file_write;
     }
