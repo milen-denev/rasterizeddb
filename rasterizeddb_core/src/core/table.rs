@@ -473,6 +473,9 @@ impl<S: IOOperationsSync> Table<S> {
 
                 for chunk in chunks {
                     let mut cursor = chunk.read_chunk_sync(&mut self.io_sync).await;
+                    
+                    let mut data_buffer = Vec::default();
+        
                     loop {
                         if let Some(prefetch_result) = row_prefetching_cursor(&mut cursor, chunk).unwrap() {
                         
@@ -489,8 +492,6 @@ impl<S: IOOperationsSync> Table<S> {
                                     if db_type == DbType::END {
                                         break;
                                     }
-        
-                                    let mut data_buffer = Vec::default();
         
                                     if db_type != DbType::STRING {
                                         let db_size = db_type.get_size();
@@ -509,11 +510,11 @@ impl<S: IOOperationsSync> Table<S> {
                                     let type_byte = db_type.to_byte();
                                         
                                     let column = if type_byte >= 1 && type_byte <= 10 {
-                                        Column::from_raw(column_type, data_buffer, Some(DowngradeType::I128))
+                                        Column::from_raw(column_type, data_buffer.to_vec(), Some(DowngradeType::I128))
                                     } else if type_byte >= 11 && type_byte <= 12 {
-                                        Column::from_raw(column_type, data_buffer, Some(DowngradeType::F64))
+                                        Column::from_raw(column_type, data_buffer.to_vec(), Some(DowngradeType::F64))
                                     } else {
-                                        Column::from_raw(column_type, data_buffer, None)
+                                        Column::from_raw(column_type, data_buffer.to_vec(), None)
                                     };
         
                                     required_columns.push((current_column_index, column));
@@ -536,6 +537,7 @@ impl<S: IOOperationsSync> Table<S> {
                                 }
 
                                 current_column_index += 1;
+                                data_buffer.clear();
                             }
 
                             let evaluation = evaluate_column_result(&required_columns, &evaluation_tokens);
