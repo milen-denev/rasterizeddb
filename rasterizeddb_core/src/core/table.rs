@@ -445,7 +445,259 @@ impl<S: IOOperationsSync> Table<S> {
             todo!("Support many results.");
         } else if let ParserResult::EvaluationTokens(evaluation_tokens) = parser_result {
 
-            let evaluation_tokens = evaluation_tokens.1;
+            let evaluation_tokens = evaluation_tokens.tokens;
+
+            let file_length = self.get_current_table_length();
+    
+            let chunks_arc_clone = self.in_memory_index.clone();
+
+            let chunks_result = loop {
+                let result = chunks_arc_clone.try_read();
+                if let Ok(in_memory_index) = result {
+                    break in_memory_index;
+                } 
+            };
+
+            if let Some(chunks) = chunks_result.as_ref() {
+                let mut required_columns: Vec<(u32, Column)> = Vec::default();
+
+                let column_indexes = evaluation_tokens.iter()
+                    .flat_map(|(tokens, _)| tokens.iter())
+                    .filter(|x|  match **x {
+                        Token::Column(_) => true,
+                        _ => false
+                    }).map(|x| match *x {
+                        Token::Column(column_index) => column_index,
+                        _ => panic!()
+                    }).collect_vec();
+
+                for chunk in chunks {
+                    let mut cursor = chunk.read_chunk_sync(&mut self.io_sync).await;
+                    
+                    let mut data_buffer = Vec::default();
+        
+                    loop {
+                        if let Some(prefetch_result) = row_prefetching_cursor(&mut cursor, chunk).unwrap() {
+                        
+                            let mut current_column_index: u32 = 0;
+                            let first_column_index = cursor.stream_position().unwrap();
+
+                            loop {  
+
+                                if column_indexes.iter().any(|x| *x == current_column_index) {
+                                    let column_type = cursor.read_u8().unwrap();
+        
+                                    let db_type = DbType::from_byte(column_type);
+        
+                                    if db_type == DbType::END {
+                                        break;
+                                    }
+        
+                                    if db_type != DbType::STRING {
+                                        let db_size = db_type.get_size();
+        
+                                        let mut preset_buffer = vec![0; db_size as usize];
+                                        cursor.read(&mut preset_buffer).unwrap();
+                                        data_buffer.append(&mut preset_buffer);
+                                    } else {
+                                        let str_length = cursor.read_u32::<LittleEndian>().unwrap();
+        
+                                        let mut preset_buffer = vec![0; str_length as usize];
+                                        cursor.read(&mut preset_buffer).unwrap();
+                                        data_buffer.append(&mut preset_buffer);
+                                    }
+                                    
+                                    let type_byte = db_type.to_byte();
+                                        
+                                    let column = if type_byte >= 1 && type_byte <= 10 {
+                                        Column::from_raw(column_type, data_buffer.to_vec(), Some(DowngradeType::I128))
+                                    } else if type_byte >= 11 && type_byte <= 12 {
+                                        Column::from_raw(column_type, data_buffer.to_vec(), Some(DowngradeType::F64))
+                                    } else {
+                                        Column::from_raw(column_type, data_buffer.to_vec(), None)
+                                    };
+        
+                                    required_columns.push((current_column_index, column));
+                                } else {
+                                    let column_type = cursor.read_u8().unwrap();
+        
+                                    let db_type = DbType::from_byte(column_type);
+        
+                                    if db_type == DbType::END {
+                                        break;
+                                    }
+        
+                                    if db_type != DbType::STRING {
+                                        let db_size = db_type.get_size();
+                                        cursor.seek(SeekFrom::Current(db_size as i64)).unwrap();
+                                    } else {
+                                        let str_length = cursor.read_u32::<LittleEndian>().unwrap();
+                                        cursor.seek(SeekFrom::Current(str_length as i64)).unwrap();
+                                    }
+                                }
+
+                                current_column_index += 1;
+                                data_buffer.clear();
+                            }
+
+                            let evaluation = evaluate_column_result(&required_columns, &evaluation_tokens);
+                            required_columns.clear();
+
+                            if evaluation {   
+                                let row = read_row_cursor(
+                                    first_column_index, 
+                                    prefetch_result.found_id,
+                                    prefetch_result.length,
+                                    &mut cursor).unwrap();
+
+                                #[cfg(feature = "enable_index_caching")]
+                                {
+                                    let hash = evaluation_tokens.0;
+                                    let mut row_vec: Vec<(u64, u32)> = Vec::with_capacity(1);
+                                    row_vec.push((chunk.current_file_position + first_column_index - 1 - 8 - 4, prefetch_result.length));
+                                    POSITIONS_CACHE.insert(hash, row_vec);
+                                }
+                                
+                                return Ok(Some(row));
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                let column_indexes = evaluation_tokens.iter()
+                    .flat_map(|(tokens, _)| tokens.iter())
+                    .filter(|x|  match **x {
+                        Token::Column(_) => true,
+                        _ => false
+                    }).map(|x| match *x {
+                        Token::Column(column_index) => column_index,
+                        _ => panic!()
+                    }).collect_vec();
+
+                let mut required_columns: Vec<(u32, Column)> = Vec::default();
+                let mut position = HEADER_SIZE as u64;
+
+                loop {
+                    if let Some(prefetch_result) = row_prefetching(
+                        &mut self.io_sync,
+                        &mut position,
+                        file_length).await.unwrap() {
+    
+                        let mut column_index_inner = 0;
+
+                        let mut columns_cursor = self.io_sync.read_data_to_cursor(
+                            &mut position, 
+                            prefetch_result.length + 1).await;
+    
+                        loop {
+                            if column_indexes.iter().any(|x| *x == column_index_inner) {
+                                let column_type = columns_cursor.read_u8().unwrap();
+
+                                let db_type = DbType::from_byte(column_type);
+
+                                if db_type == DbType::END {
+                                    break;
+                                }
+
+                                let mut data_buffer = Vec::default();
+
+                                if db_type != DbType::STRING {
+                                    let db_size = db_type.get_size();
+
+                                    let mut preset_buffer = vec![0; db_size as usize];
+                                    columns_cursor.read(&mut preset_buffer).unwrap();
+                                    data_buffer.append(&mut preset_buffer);
+                                } else {
+                                    let str_length = columns_cursor.read_u32::<LittleEndian>().unwrap();
+
+                                    let mut preset_buffer = vec![0; str_length as usize];
+                                    columns_cursor.read(&mut preset_buffer).unwrap();
+                                    data_buffer.append(&mut preset_buffer);
+                                }
+                                
+                                let type_byte = db_type.to_byte();
+                                    
+                                let column = if type_byte >= 1 && type_byte <= 10 {
+                                    Column::from_raw(column_type, data_buffer, Some(DowngradeType::I128))
+                                } else if type_byte >= 11 && type_byte <= 12 {
+                                    Column::from_raw(column_type, data_buffer, Some(DowngradeType::F64))
+                                } else {
+                                    Column::from_raw(column_type, data_buffer, None)
+                                };
+
+                                required_columns.push((column_index_inner, column));
+                            } else {
+                                let column_type = columns_cursor.read_u8().unwrap();
+
+                                let db_type = DbType::from_byte(column_type);
+
+                                if db_type == DbType::END {
+                                    break;
+                                }
+
+                                if db_type != DbType::STRING {
+                                    let db_size = db_type.get_size();
+
+                                    columns_cursor.seek(SeekFrom::Current(db_size as i64)).unwrap();
+                                
+                                } else {
+                                    let str_length = columns_cursor.read_u32::<LittleEndian>().unwrap();
+
+
+                                    columns_cursor.seek(SeekFrom::Current(str_length as i64)).unwrap();
+                                }
+                            }
+
+                            column_index_inner += 1;
+                        }
+
+                        let evaluation = evaluate_column_result(&required_columns, &evaluation_tokens);
+                        required_columns.clear();
+
+                        if evaluation {
+                            let row = columns_cursor_to_row(
+                                columns_cursor, 
+                                prefetch_result.found_id,
+                                prefetch_result.length).unwrap();
+
+                            #[cfg(feature = "enable_index_caching")]
+                            {  
+                                let hash = evaluation_tokens.0;
+                                let mut row_vec: Vec<(u64, u32)> = Vec::with_capacity(1);
+                                row_vec.push((first_column_index - 1 - 8 - 4, prefetch_result.length));
+                                POSITIONS_CACHE.insert(hash, row_vec);
+                            }
+
+                            return Ok(Some(row));
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            return Ok(None);    
+        } else {
+            panic!() //Don't show error.
+        }
+    }
+
+    pub async fn execute_query(&mut self, parser_result: ParserResult) -> io::Result<Option<Row>> {
+        if let ParserResult::HashIndexes(hash_indexes) = parser_result {
+            for record in hash_indexes {
+                let mut position = record.0;
+                let length = record.1;
+                return Ok(Some(indexed_row_fetching_file(
+                    &mut self.io_sync,
+                    &mut position,
+                    length).await.unwrap()));
+            }
+            todo!("Support many results.");
+        } else if let ParserResult::EvaluationTokens(evaluation_tokens) = parser_result {
+
+            let evaluation_tokens = evaluation_tokens.tokens;
 
             let file_length = self.get_current_table_length();
     

@@ -16,8 +16,6 @@ pub fn parse_rql(query: &str) -> Result<ParserResult, String> {
         return Ok(ParserResult::HashIndexes(file_positions));
     }
 
-    let query = query.replace("\n", " ").replace("\t", " ");
-
     let begin_result = query.find("BEGIN");
     let begin;
 
@@ -69,6 +67,29 @@ pub fn parse_rql(query: &str) -> Result<ParserResult, String> {
         end = end_result.unwrap();
     }
 
+    let limit_result = query.find("LIMIT");
+    let mut limit_i64 = i64::MAX;
+
+    if let Some(limit_start) = limit_result {
+        // Find the starting index of the number after "LIMIT"
+        let limit_str = &query[limit_start + 5..].trim(); // +5 to skip "LIMIT"
+        
+        // Find the end of the number using a space or newline as a delimiter
+        let limit_end = limit_str.find(|c: char| c.is_whitespace()).unwrap_or(limit_str.len());
+        
+        // Extract the substring and parse it as i64
+        let limit_value = &limit_str[..limit_end];
+        if let Ok(limit_number) = str::parse::<i64>(limit_value) {
+            if limit_number <= 0 {
+                limit_i64 = i64::MAX;
+            } else {
+                limit_i64 = limit_number;
+            }
+        } else {
+            return Err("LIMIT statement is invalid.".into());
+        }
+    }
+
     // Step 1: Parse WHERE clause
     if where_result.is_some() && return_result.is_some()  && return_all && select_all {
         let select_clause = &query[begin + 5..where_i].trim();
@@ -86,8 +107,19 @@ pub fn parse_rql(query: &str) -> Result<ParserResult, String> {
 
         let mut where_tokens_iter = where_tokens.into_iter();
 
+        let  mut double_continue = false;
+        
         while let Some(token) = where_tokens_iter.next() {
-            
+            if double_continue {
+                double_continue = false;
+                continue;
+            }
+
+            if token.eq("LIMIT") {
+                double_continue = true;
+                continue;
+            }
+
             index_token += token.len() as u32;
 
             if token.starts_with("COL(") {
@@ -135,18 +167,18 @@ pub fn parse_rql(query: &str) -> Result<ParserResult, String> {
                 tokens_vector.push((new_vector, Some(Next::Or)));
             } else if token.starts_with('\'') && token.ends_with('\'') {
                 let string = &token[1..token.len() -1];
-                let val = Token::Value(Column::new(string).unwrap());
+                let val = Token::Value(Box::new(Column::new(string).unwrap()));
                 token_vector.push(val);
             } else if !token.contains(".") {
                 if let Ok(token_number) = str::parse::<i128>(&token) {
-                    let val = Token::Value(Column::new(token_number).unwrap());
+                    let val = Token::Value(Box::new(Column::new(token_number).unwrap()));
                     token_vector.push(val);
                 } else {
                     panic!()
                 }
             } else if token.contains(".") {
                 if let Ok(token_number) = str::parse::<f64>(&token) {
-                    let val = Token::Value(Column::new(token_number).unwrap());
+                    let val = Token::Value(Box::new(Column::new(token_number).unwrap()));
                     token_vector.push(val);
                 } else {
                     panic!()
@@ -156,7 +188,11 @@ pub fn parse_rql(query: &str) -> Result<ParserResult, String> {
 
         tokens_vector.push((token_vector, None));
 
-        return Ok(ParserResult::EvaluationTokens((hash, tokens_vector)));
+        return Ok(ParserResult::EvaluationTokens(EvaluationResult {
+            query_hash: hash,
+            tokens: tokens_vector,
+            limit: limit_i64
+        }));
     } else {
         let select_clause = &query[begin + 5..end].trim();
         todo!()
@@ -165,5 +201,11 @@ pub fn parse_rql(query: &str) -> Result<ParserResult, String> {
 
 pub enum ParserResult {
     HashIndexes(Vec<(u64, u32)>),
-    EvaluationTokens((u64, Vec<(Vec<Token>, Option<Next>)>))
+    EvaluationTokens(EvaluationResult)
+}
+
+pub struct EvaluationResult {
+    pub query_hash: u64,
+    pub tokens: Vec<(Vec<Token>, Option<Next>)>,
+    pub limit: i64
 }

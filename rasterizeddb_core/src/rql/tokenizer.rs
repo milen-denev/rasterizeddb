@@ -1,12 +1,18 @@
+use std::cell::LazyCell;
+
 use crate::core::column::Column;
 
 use super::models::{ComparerOperation, MathOperation, Next, Token};
+
+const ZERO_VALUE: LazyCell<Column> = LazyCell::new(|| {
+    Column::new(0).unwrap()
+});
 
 pub(crate) fn evaluate_column_result(
     required_columns: &Vec<(u32, Column)>, 
     evaluation_tokens: &Vec<(Vec<Token>, Option<Next>)>) -> bool {
     
-    let mut iter = evaluation_tokens.into_iter();
+    let mut iter = evaluation_tokens.iter();
     let mut token_results: Vec<(bool, Option<Next>)> = Vec::with_capacity(evaluation_tokens.len());
 
     while let Some(tokens) = iter.next() {
@@ -37,7 +43,7 @@ pub(crate) fn evaluate_column_result(
                                     MathOperation::Subtract => left_value.subtract(&right_value),
                                     MathOperation::Multiply => left_value.multiply(&right_value),
                                     MathOperation::Divide => {
-                                        if right_value.eq(&Column::new(0).unwrap())  {
+                                        if right_value.equals(&ZERO_VALUE)  {
                                             panic!("Division with zero is not allowed.")
                                         }
                                         left_value.divide(&right_value)
@@ -56,7 +62,7 @@ pub(crate) fn evaluate_column_result(
                                         MathOperation::Subtract => left_value.subtract(&right_value),
                                         MathOperation::Multiply => left_value.multiply(&right_value),
                                         MathOperation::Divide => {
-                                            if right_value.eq(&Column::new(0).unwrap())  {
+                                            if right_value.equals(&ZERO_VALUE)  {
                                                 panic!("Division with zero is not allowed.")
                                             }
                                             left_value.divide(&right_value)

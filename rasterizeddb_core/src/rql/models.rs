@@ -33,6 +33,6 @@ pub enum MathOperation {
 pub enum Token {
     Column(u32),
     Math(MathOperation),
-    Value(Column),
+    Value(Box<Column>),
     Operation(ComparerOperation)
 }
