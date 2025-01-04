@@ -28,7 +28,7 @@ async fn main() -> std::io::Result<()> {
     let mut table = Table::init(io_sync, false, false).await.unwrap();
 
     for i in 0..500 {
-        if i == 3 {
+        if i == 300 {
             let mut c1 = Column::new(1000).unwrap();
             let mut c2 = Column::new(i * -1).unwrap();
             //let mut c3 = Column::new("This is awesome 2.").unwrap();
@@ -126,24 +126,29 @@ async fn main() -> std::io::Result<()> {
 
     let mut stopwatch = Stopwatch::new();
 
-    stopwatch.start();
-    for _ in 0..5 {
+    for _ in 0..100 {
+        stopwatch.start();
         let query_evaluation = parse_rql(&format!(r#"
             BEGIN
             SELECT FROM NAME_DOESNT_MATTER_FOR_NOW
-            WHERE COL(0) >= 1000 LIMIT -1
+            WHERE COL(0) >= 0 LIMIT 20
             END
         "#)).unwrap();
 
-        let row = table.first_or_default_by_query(query_evaluation).await?.unwrap();
-        for column in Column::from_buffer(&row.columns_data).unwrap() {
-            println!("{}", column.into_value());
-        }
+        let _rows = table.execute_query(query_evaluation).await?.unwrap();
+        stopwatch.stop();
+        println!("{}ms", stopwatch.elapsed_ms());
+        stopwatch.reset();
+        println!("DONE");
     }
-    stopwatch.stop();
-    println!("{}ms", stopwatch.elapsed_ms());
-    stopwatch.reset();
-    println!("DONE");
+
+    // for row in rows {
+    //     for column in Column::from_buffer(&row.columns_data).unwrap() {
+    //         println!("{}", column.into_value());
+    //     }
+    // }
+
+    println!("Press any key to continue...");
 
     let mut buffer = String::new();
     stdin().read_line(&mut buffer).unwrap();

@@ -442,9 +442,10 @@ impl<S: IOOperationsSync> Table<S> {
                     &mut position,
                     length).await.unwrap()));
             }
-            todo!("Support many results.");
+            panic!("hash_indexes is empty.");
         } else if let ParserResult::EvaluationTokens(evaluation_tokens) = parser_result {
 
+            let hash = evaluation_tokens.query_hash;
             let evaluation_tokens = evaluation_tokens.tokens;
 
             let file_length = self.get_current_table_length();
@@ -552,7 +553,6 @@ impl<S: IOOperationsSync> Table<S> {
 
                                 #[cfg(feature = "enable_index_caching")]
                                 {
-                                    let hash = evaluation_tokens.0;
                                     let mut row_vec: Vec<(u64, u32)> = Vec::with_capacity(1);
                                     row_vec.push((chunk.current_file_position + first_column_index - 1 - 8 - 4, prefetch_result.length));
                                     POSITIONS_CACHE.insert(hash, row_vec);
@@ -586,6 +586,8 @@ impl<S: IOOperationsSync> Table<S> {
                         file_length).await.unwrap() {
     
                         let mut column_index_inner = 0;
+
+                        let first_column_index = position + 4 + 8 + 1;
 
                         let mut columns_cursor = self.io_sync.read_data_to_cursor(
                             &mut position, 
@@ -664,7 +666,6 @@ impl<S: IOOperationsSync> Table<S> {
 
                             #[cfg(feature = "enable_index_caching")]
                             {  
-                                let hash = evaluation_tokens.0;
                                 let mut row_vec: Vec<(u64, u32)> = Vec::with_capacity(1);
                                 row_vec.push((first_column_index - 1 - 8 - 4, prefetch_result.length));
                                 POSITIONS_CACHE.insert(hash, row_vec);
@@ -684,19 +685,29 @@ impl<S: IOOperationsSync> Table<S> {
         }
     }
 
-    pub async fn execute_query(&mut self, parser_result: ParserResult) -> io::Result<Option<Row>> {
+    pub async fn execute_query(&mut self, parser_result: ParserResult) -> io::Result<Option<Vec<Row>>> {
         if let ParserResult::HashIndexes(hash_indexes) = parser_result {
+            let mut rows: Vec<Row> = Vec::with_capacity(hash_indexes.len());
             for record in hash_indexes {
                 let mut position = record.0;
                 let length = record.1;
-                return Ok(Some(indexed_row_fetching_file(
+                rows.push(indexed_row_fetching_file(
                     &mut self.io_sync,
                     &mut position,
-                    length).await.unwrap()));
+                    length).await.unwrap());
             }
-            todo!("Support many results.");
-        } else if let ParserResult::EvaluationTokens(evaluation_tokens) = parser_result {
 
+            return Ok(Some(rows));
+        } else if let ParserResult::EvaluationTokens(evaluation_tokens) = parser_result {
+            let limit = evaluation_tokens.limit;
+
+            let mut rows: Vec<Row> = if limit < 1024 && limit > 0 {
+                Vec::with_capacity(limit as usize)
+            } else {
+                Vec::default()
+            };
+
+            let hash = evaluation_tokens.query_hash;
             let evaluation_tokens = evaluation_tokens.tokens;
 
             let file_length = self.get_current_table_length();
@@ -709,6 +720,11 @@ impl<S: IOOperationsSync> Table<S> {
                     break in_memory_index;
                 } 
             };
+
+            let mut current_limit: i64 = 0;
+
+            #[cfg(feature = "enable_index_caching")]
+            let mut result_row_vec: Vec<(u64, u32)> = Vec::default();
 
             if let Some(chunks) = chunks_result.as_ref() {
                 let mut required_columns: Vec<(u32, Column)> = Vec::default();
@@ -727,7 +743,7 @@ impl<S: IOOperationsSync> Table<S> {
                     let mut cursor = chunk.read_chunk_sync(&mut self.io_sync).await;
                     
                     let mut data_buffer = Vec::default();
-        
+
                     loop {
                         if let Some(prefetch_result) = row_prefetching_cursor(&mut cursor, chunk).unwrap() {
                         
@@ -796,21 +812,29 @@ impl<S: IOOperationsSync> Table<S> {
                             required_columns.clear();
 
                             if evaluation {   
+                                
                                 let row = read_row_cursor(
                                     first_column_index, 
                                     prefetch_result.found_id,
                                     prefetch_result.length,
                                     &mut cursor).unwrap();
 
+                                rows.push(row);
+
                                 #[cfg(feature = "enable_index_caching")]
                                 {
-                                    let hash = evaluation_tokens.0;
-                                    let mut row_vec: Vec<(u64, u32)> = Vec::with_capacity(1);
-                                    row_vec.push((chunk.current_file_position + first_column_index - 1 - 8 - 4, prefetch_result.length));
-                                    POSITIONS_CACHE.insert(hash, row_vec);
+                                    result_row_vec.push((chunk.current_file_position + first_column_index - 1 - 8 - 4, prefetch_result.length));
                                 }
                                 
-                                return Ok(Some(row));
+                                current_limit += 1;
+
+                                if current_limit >= limit {
+                                    #[cfg(feature = "enable_index_caching")]
+                                    {
+                                        POSITIONS_CACHE.insert(hash, result_row_vec);
+                                    }
+                                    return Ok(Some(rows));
+                                }
                             }
                         } else {
                             break;
@@ -838,6 +862,8 @@ impl<S: IOOperationsSync> Table<S> {
                         file_length).await.unwrap() {
     
                         let mut column_index_inner = 0;
+
+                        let first_column_index = position + 4 + 8 + 1;
 
                         let mut columns_cursor = self.io_sync.read_data_to_cursor(
                             &mut position, 
@@ -914,15 +940,22 @@ impl<S: IOOperationsSync> Table<S> {
                                 prefetch_result.found_id,
                                 prefetch_result.length).unwrap();
 
-                            #[cfg(feature = "enable_index_caching")]
-                            {  
-                                let hash = evaluation_tokens.0;
-                                let mut row_vec: Vec<(u64, u32)> = Vec::with_capacity(1);
-                                row_vec.push((first_column_index - 1 - 8 - 4, prefetch_result.length));
-                                POSITIONS_CACHE.insert(hash, row_vec);
-                            }
+                            rows.push(row);
 
-                            return Ok(Some(row));
+                            #[cfg(feature = "enable_index_caching")]
+                            {
+                                result_row_vec.push((first_column_index - 1 - 8 - 4, prefetch_result.length));
+                            }
+                            
+                            current_limit += 1;
+
+                            if current_limit >= limit {
+                                #[cfg(feature = "enable_index_caching")]
+                                {
+                                    POSITIONS_CACHE.insert(hash, result_row_vec);
+                                }
+                                return Ok(Some(rows));
+                            }
                         }
                     } else {
                         break;

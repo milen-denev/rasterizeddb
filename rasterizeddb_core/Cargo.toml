@@ -37,4 +37,5 @@ codegen-units = 1
 lto = "fat"
 
 [features]
+default = ["enable_index_caching"]
 enable_index_caching = []
