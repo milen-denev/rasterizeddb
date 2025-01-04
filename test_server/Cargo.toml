@@ -7,5 +7,4 @@ edition = "2021"
 tokio = { version = "1", features = ["full"] }
 rand = "0.8.5"
 dashmap = "6.1.0"
-concurrent-queue = "2.5.0"
 async-lazy = { version = "0.1.0", features = ["parking_lot"] }
