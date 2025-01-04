@@ -87,27 +87,4 @@ impl Receiver {
             }
         }
     }
-
-    // pub async fn start_processing<F>(&self, function: F) 
-    // where
-    //     F: Fn(Vec<u8>) -> () {
-    //     loop {
-    //         if self.concurrent_queue.len() > 0 {
-    //             if let Ok(message) = self.concurrent_queue.pop() {
-    //                 function(message);
-    //             }
-    //         }
-    //     }
-    // }
-
-    // pub async fn start_processing_async<F, Fut>(&self, function: F)
-    // where
-    //     F: Fn(Vec<u8>) -> Fut + Send + Sync,
-    //     Fut: Future<Output = ()> + Send {
-    //     loop {
-    //         if let Ok(message) = self.concurrent_queue.pop() {
-    //             function(message).await;
-    //         }
-    //     }
-    // }
 }
