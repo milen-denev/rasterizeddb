@@ -1,7 +1,5 @@
 use receiver::Receiver;
-use tokio::net::UdpSocket;
 use tokio::io;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 pub mod receiver;
@@ -11,7 +9,6 @@ static RECEIVER: async_lazy::Lazy<Arc<Receiver>> = async_lazy::Lazy::const_new(|
     let receiver = Receiver::new("127.0.0.1:8080").await.unwrap();
     Arc::new(receiver)
 }));
-
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
