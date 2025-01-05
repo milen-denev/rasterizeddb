@@ -161,5 +161,9 @@ table.vacuum_table().await;
 table.rebuild_in_memory_indexes();
 ```
 
+##### Sponsor
+
+[![Buy me a coffe](https://raw.githubusercontent.com/vasundhasauras/badge-bmc/1bf9f937862f918818d3528cce12256be0116570/badges/coffee/buy%20me%20a%20coffee/bm_coffee.svg "Buy me a coffe")](https://buymeacoffee.com/milen.denev)
+
 ### License
 Everything in this directory is distributed under GNU GENERAL PUBLIC LICENSE version 3.
