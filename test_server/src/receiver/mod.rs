@@ -1,21 +1,33 @@
 use std::{future::Future, sync::Arc};
 
 use dashmap::DashMap;
-use tokio::{io, net::UdpSocket};
+use tokio::{io, net::UdpSocket, sync::RwLock};
+
+use crate::{message_status::MessageStatus, HEADER_SIZE};
 
 #[derive(Clone)]
 pub struct Receiver {
     receiver: Arc<UdpSocket>,
-    message_buffers: Arc<DashMap<u64, Vec<(usize, Vec<u8>)>>>
+    message_buffers: Arc<DashMap<u64, Vec<(usize, Vec<u8>)>>>,
+    _secure: bool,
+    _compress: bool,
+    _message_status: Arc<RwLock<MessageStatus>>,
+    _public_key: Option<String>,
+    _private_key: Option<String>
 }
 
 impl Receiver {
-    pub async fn new(local_addr: &str) -> io::Result<Self> {
+    pub async fn new(local_addr: &str, secure: bool, compress: bool) -> io::Result<Self> {
         let socket = UdpSocket::bind(local_addr).await?;
 
         Ok(Self {
             receiver: Arc::new(socket),
-            message_buffers: Arc::new(DashMap::new())
+            message_buffers: Arc::new(DashMap::new()),
+            _secure: secure,
+            _compress: compress,
+            _message_status: Arc::new(RwLock::new(MessageStatus::NotSecured)),
+            _public_key: None,
+            _private_key: None
         })
     }
 
@@ -32,7 +44,7 @@ impl Receiver {
                 let received_data = &buf[..len];
 
                 // Parse sequence number and total parts
-                let header = &received_data[..12];
+                let header = &received_data[..HEADER_SIZE];
                 let sequence_number = u16::from_be_bytes([header[0], header[1]]) as usize;
                 let total_parts = u16::from_be_bytes([header[2], header[3]]) as usize;
                 let session_id = u64::from_be_bytes(
@@ -47,7 +59,10 @@ impl Receiver {
                         header[11]
                     ]);
 
-                let payload = received_data[8..].to_vec();
+                let _message_status = header[12];
+                let _compressed = header[13];
+
+                let payload = received_data[HEADER_SIZE..].to_vec();
 
                 println!(
                     "Received chunk {}/{} from session {} from {}",

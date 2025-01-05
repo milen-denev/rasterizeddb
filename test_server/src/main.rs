@@ -1,12 +1,9 @@
-use receiver::Receiver;
+use test_server::receiver::Receiver;
 use tokio::io;
 use std::sync::Arc;
 
-pub mod receiver;
-pub mod sender;
-
 static RECEIVER: async_lazy::Lazy<Arc<Receiver>> = async_lazy::Lazy::const_new(|| Box::pin(async {
-    let receiver = Receiver::new("127.0.0.1:8080").await.unwrap();
+    let receiver = Receiver::new("127.0.0.1:8080", false, false).await.unwrap();
     Arc::new(receiver)
 }));
 
