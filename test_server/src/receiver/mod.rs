@@ -64,10 +64,10 @@ impl Receiver {
 
                 let payload = received_data[HEADER_SIZE..].to_vec();
 
-                println!(
-                    "Received chunk {}/{} from session {} from {}",
-                    sequence_number, total_parts, session_id, addr
-                );
+                // println!(
+                //     "Received chunk {}/{} from session {} from {}",
+                //     sequence_number, total_parts, session_id, addr
+                // );
 
                 // Add the chunk to the message buffer
                 let mut buffer = message_buffers
@@ -83,11 +83,11 @@ impl Receiver {
                     
                     drop(buffer);
 
-                    println!(
-                        "Reassembled message from session {}: {}",
-                        session_id,
-                        String::from_utf8_lossy(&message)
-                    );
+                    // println!(
+                    //     "Reassembled message from session {}: {}",
+                    //     session_id,
+                    //     String::from_utf8_lossy(&message)
+                    // );
 
                     //GET MESSAGE
                     //_ = String::from_utf8_lossy(&message);

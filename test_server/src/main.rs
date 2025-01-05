@@ -21,5 +21,5 @@ async fn main() -> io::Result<()> {
 }
 
 async fn test(buf: Vec<u8>) {
-    println!("Hello, world! len: {}", buf.len());
+    //println!("Hello, world! len: {}", buf.len());
 }
