@@ -40,8 +40,7 @@ impl Sender {
     pub async fn send_message(&self, message: &[u8]) -> io::Result<()> {
         let total_chunks = (message.len() + MESSAGE_SIZE as usize - 1) / MESSAGE_SIZE as usize;
 
-        let mut rng = rand::thread_rng();
-        let session_id = rng.gen::<u64>();
+        let session_id = rand::thread_rng().gen_range(0..u64::MAX);
         let session_id_bytes = session_id.to_be_bytes();
         let total_parts = (total_chunks as u16).to_be_bytes();
         let compressed_bytes = [self.compress as u8];
