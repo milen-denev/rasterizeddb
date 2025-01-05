@@ -1,5 +1,6 @@
 use std::{future::Future, sync::Arc};
 
+use ahash::RandomState;
 use dashmap::DashMap;
 use tokio::{io, net::UdpSocket, sync::RwLock};
 
@@ -8,7 +9,7 @@ use crate::{message_status::MessageStatus, HEADER_SIZE};
 #[derive(Clone)]
 pub struct Receiver {
     receiver: Arc<UdpSocket>,
-    message_buffers: Arc<DashMap<u64, Vec<(usize, Vec<u8>)>>>,
+    message_buffers: Arc<DashMap<u64, Vec<(usize, Vec<u8>)>, RandomState>>,
     _secure: bool,
     _compress: bool,
     _message_status: Arc<RwLock<MessageStatus>>,
@@ -22,7 +23,7 @@ impl Receiver {
 
         Ok(Self {
             receiver: Arc::new(socket),
-            message_buffers: Arc::new(DashMap::new()),
+            message_buffers: Arc::new(DashMap::with_hasher(RandomState::new())),
             _secure: secure,
             _compress: compress,
             _message_status: Arc::new(RwLock::new(MessageStatus::NotSecured)),
