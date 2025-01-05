@@ -1,4 +1,2 @@
 [workspace]
-members = [
-    "rasterizeddb_core", "test_db_web"
-, "test_server"]
+members = ["rasterizeddb_core", "test_db_web"]
