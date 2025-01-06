@@ -9,11 +9,15 @@ use super::{helpers::whitespace_spec_splitter, models::{ComparerOperation, MathO
 
 #[allow(unused_variables)]
 #[allow(unused_mut)]
-pub fn parse_rql(query: &str) -> Result<ParserResult, String> {
+pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
     let hash = get_hash(query);
 
     if let Some(file_positions) = POSITIONS_CACHE.get(&hash) {
-        return Ok(ParserResult::HashIndexes(file_positions));
+        let db_action = DatabaseAction {
+            table_name: "".to_string(),
+            parser_result: ParserResult::HashIndexes(file_positions)
+        };
+        return Ok(db_action);
     }
 
     let begin_result = query.find("BEGIN");
@@ -188,15 +192,23 @@ pub fn parse_rql(query: &str) -> Result<ParserResult, String> {
 
         tokens_vector.push((token_vector, None));
 
-        return Ok(ParserResult::EvaluationTokens(EvaluationResult {
-            query_hash: hash,
-            tokens: tokens_vector,
-            limit: limit_i64
-        }));
+        return Ok(DatabaseAction { 
+            table_name: "".to_string(),
+            parser_result: ParserResult::EvaluationTokens(EvaluationResult {
+                query_hash: hash,
+                tokens: tokens_vector,
+                limit: limit_i64
+            })
+        });
     } else {
         let select_clause = &query[begin + 5..end].trim();
         todo!()
     }
+}
+
+pub struct DatabaseAction {
+    table_name: String,
+    parser_result: ParserResult
 }
 
 pub enum ParserResult {

@@ -135,7 +135,7 @@ async fn main() -> std::io::Result<()> {
             END
         "#)).unwrap();
 
-        let _rows = table.execute_query(query_evaluation).await?.unwrap();
+        //let _rows = table.execute_query(query_evaluation).await?.unwrap();
         stopwatch.stop();
         println!("{}ms", stopwatch.elapsed_ms());
         stopwatch.reset();

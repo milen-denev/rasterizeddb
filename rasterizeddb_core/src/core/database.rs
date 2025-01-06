@@ -1,7 +1,15 @@
-use std::marker::PhantomData;
+use rastdp::receiver::Receiver;
 
-use super::storage_providers::traits::IOOperationsSync;
+use super::{storage_providers::traits::IOOperationsSync, table::Table};
 
 pub struct Database<S: IOOperationsSync> {
-    io_sync: PhantomData<S>
+    config_table: Table<S>,
+    tables: Vec<Table<S>>,
+    server: Receiver
+}
+
+impl<S: IOOperationsSync> Database<S> {
+    pub async fn new() {
+
+    }
 }

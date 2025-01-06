@@ -106,9 +106,9 @@ async fn query() -> Response {
 
     let table = unsafe { TABLE.force_mut().await };
 
-    let result = table.first_or_default_by_query(query_evaluation).await.unwrap();
+    //let result = table.first_or_default_by_query(query_evaluation).await.unwrap();
 
-    if result.is_some() {
+    if true {//if result.is_some() {
         Response::builder().status(200).body("".into()).unwrap()
     } else {
         Response::builder().status(404).body("".into()).unwrap()
