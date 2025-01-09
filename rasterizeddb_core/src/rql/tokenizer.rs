@@ -132,7 +132,11 @@ pub(crate) fn evaluate_column_result(
                             continue; // Missing left operand
                         }
                     }
-                    _ => continue, // Ignore other tokens
+                    Token::Value(column_value) => {
+                        // Get the value associated with the column_id
+                        current_value = Some(*column_value.clone());
+                       
+                    }
                 }
             } else {
                 break false

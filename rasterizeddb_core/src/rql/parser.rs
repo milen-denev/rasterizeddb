@@ -187,6 +187,12 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
                 } else {
                     panic!()
                 }
+            } else if token == "true" {
+                let val = Token::Value(Box::new(Column::new(true).unwrap()));
+                token_vector.push(val);
+            } else if token == "false" {
+                let val = Token::Value(Box::new(Column::new(false).unwrap()));
+                token_vector.push(val);
             }
         }
 
@@ -207,8 +213,8 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
 }
 
 pub struct DatabaseAction {
-    table_name: String,
-    parser_result: ParserResult
+    pub table_name: String,
+    pub parser_result: ParserResult
 }
 
 pub enum ParserResult {

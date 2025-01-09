@@ -288,4 +288,47 @@ impl IOOperationsSync for LocalStorageProvider {
         self.append_file = file_append;
         self.write_file = file_write;
     }
+    
+    fn get_location(&self) -> Option<String> {
+        Some(self.location.clone())
+    }
+    
+    #[allow(refining_impl_trait)]
+    async fn create_new(&self, name: String) -> Self {
+        let delimiter = if cfg!(unix) {
+            "/"
+        } else if cfg!(windows) {
+            "\\"
+        } else {
+            panic!("OS not supported");
+        };
+
+        let location_str = format!("{}", self.location);
+
+        let location_path = Path::new(&location_str);
+
+        if !location_path.exists() {
+            _ = std::fs::create_dir(location_path);
+        }
+
+        let file_str = format!("{}{}{}", self.location, delimiter, name);
+        
+        let file_path = Path::new(&file_str);
+
+        if !file_path.exists() && !file_path.is_file() {
+            _ = std::fs::File::create(&file_str).unwrap();
+        }
+
+        let file_read = tokio::fs::File::options().read(true).open(&file_str).await.unwrap();
+        let file_append = std::fs::File::options().read(true).append(true).open(&file_str).unwrap();
+        let file_write = std::fs::File::options().read(true).write(true).open(&file_str).unwrap();
+
+        LocalStorageProvider {
+            read_file: Arc::new(RwLock::new(file_read)),
+            append_file: file_append,
+            write_file: file_write,
+            location: self.location.to_string(),
+            table_name: name.to_string()
+        }
+    }
 }

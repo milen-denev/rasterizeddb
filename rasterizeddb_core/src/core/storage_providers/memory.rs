@@ -208,4 +208,15 @@ impl IOOperationsSync for MemoryStorageProvider {
         self.vec.extend(iter);
         temp_io_sync.vec.clear();
     }
+    
+    fn get_location(&self) -> Option<String> {
+        None
+    }
+    
+    #[allow(refining_impl_trait)]
+    async fn create_new(&self, _name: String) -> Self {
+        MemoryStorageProvider {
+            vec: ConcurrentVec::with_doubling_growth()
+        }
+    }
 }

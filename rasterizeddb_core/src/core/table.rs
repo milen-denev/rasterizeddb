@@ -86,6 +86,56 @@ impl<S: IOOperationsSync> Table<S> {
         }
     }
 
+/// #### STABILIZED
+    /// Initializes a new table. compressed and immutable are not implemented yet.
+    pub(crate) async fn init_inner(
+        mut io_sync: S,
+        compressed: bool,
+        immutable: bool) -> io::Result<Table<S>> {
+        let table_file_len = io_sync.get_len().await;
+
+        if table_file_len >= HEADER_SIZE as u64 {
+            
+            let buffer = io_sync.read_data(&mut 0, HEADER_SIZE as u32).await;
+            let mut table_header = TableHeader::from_buffer(buffer).unwrap();
+
+            let last_row_id: u64 = table_header.last_row_id;
+
+            table_header.total_file_length = table_file_len;
+
+            let table = Table {
+                io_sync: io_sync,
+                table_header: Arc::new(RwLock::const_new(table_header)),
+                in_memory_index: Arc::new(RwLock::const_new(None)),
+                current_file_length: Arc::new(RwLock::const_new(table_file_len)),
+                current_row_id: Arc::new(RwLock::const_new(last_row_id)),
+                immutable: immutable,
+                locked: Arc::new(RwLock::const_new(false))
+            };
+
+            Ok(table)
+        } else {
+            let table_header = TableHeader::new(HEADER_SIZE as u64, 0, compressed, 0, 0, false);
+
+            // Serialize the header and write it to the file
+            let header_bytes = table_header.to_bytes().unwrap();
+
+            io_sync.write_data(0, &header_bytes);
+
+            let table = Table {
+                io_sync: io_sync,
+                table_header: Arc::new(RwLock::const_new(table_header)),
+                in_memory_index: Arc::new(RwLock::const_new(None)),
+                current_file_length: Arc::new(RwLock::const_new(table_file_len)),
+                current_row_id: Arc::new(RwLock::const_new(0)),
+                immutable: immutable,
+                locked: Arc::new(RwLock::const_new(false))
+            };
+
+            Ok(table)
+        }
+    }
+
     /// #### STABILIZED
     fn get_current_table_length(&mut self) -> u64 {
         let file_length = loop {

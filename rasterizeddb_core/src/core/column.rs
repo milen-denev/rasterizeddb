@@ -39,7 +39,7 @@ impl Debug for Column {
 }
 
 impl Column {
-    fn get_type<T>() -> &'static str{
+    fn get_type<T>() -> &'static str {
         std::any::type_name::<T>()
     }
 

@@ -53,6 +53,10 @@ pub trait IOOperationsSync: Clone {
     async fn create_temp(&self) -> Self;
 
     async fn swap_temp(&mut self, temp_io_sync: &mut Self);
+
+    fn get_location(&self) -> Option<String>;
+
+    async fn create_new(&self, name: String) -> Self;
 }
 
 pub trait IOOperationsAsync<'a>: TryCloneAsync {
