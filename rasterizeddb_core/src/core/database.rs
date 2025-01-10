@@ -4,7 +4,7 @@ use ahash::RandomState;
 use dashmap::DashMap;
 use rastdp::receiver::Receiver;
 
-use crate::rql;
+use crate::rql::{self, parser::{DatabaseAction, ParserResult}};
 
 use super::{column::Column, storage_providers::traits::IOOperationsSync, table::Table};
 
@@ -22,7 +22,6 @@ impl<S: IOOperationsSync> Database<S> {
         let all_rows_result = rql::parser::parse_rql(r#"
             BEGIN
             SELECT FROM CONFIG_TABLE
-            WHERE true = true
             END
         "#).unwrap();
 
@@ -60,4 +59,66 @@ impl<S: IOOperationsSync> Database<S> {
             server: receiver
         })
     }
+
+    pub async fn create_table(&self, name: String, compress: bool, immutable: bool) -> io::Result<()>  {
+        let new_io_sync = self.config_table.io_sync.create_new(name.clone()).await;
+        let table = Table::<S>::init_inner(new_io_sync, compress, immutable).await?;
+        self.tables.insert(name, table);
+        Ok(())
+    }
+
+    pub async fn drop_table(&self, name: String) -> io::Result<()>  {
+        let mut table = self.tables.try_get_mut(&name);
+
+        while table.is_locked() {
+            table = self.tables.try_get_mut(&name);
+        }
+
+        let mut table = table.unwrap();
+
+        table.io_sync.drop();
+
+        drop(table);
+
+        _ = self.tables.remove(&name).unwrap();
+
+        Ok(())
+    }
+
+    pub async fn start_async(&self) -> io::Result<()> {
+        
+
+        Ok(())
+    }
+
+    pub(crate) async fn process_incoming_queries(&self, request_vec: Vec<u8>) -> Vec<u8> {
+        let database_operation = rql::parser::parse_rql(&String::from_utf8_lossy(&request_vec)).unwrap();
+        
+        match database_operation.parser_result {
+            ParserResult::CreateTable((name, compress, immutable)) => { 
+                self.create_table(name, compress, immutable).await.unwrap();
+                let mut result: [u8; 1] = [0u8; 1];
+                result[0] = 0;
+                return result.to_vec();
+            },
+            ParserResult::DropTable(name) => {
+                self.drop_table(name).await.unwrap();
+                let mut result: [u8; 1] = [0u8; 1];
+                result[0] = 0;
+                return result.to_vec();
+            },
+            ParserResult::InsertEvaluationTokens(tokens) => todo!(),
+            ParserResult::UpdateEvaluationTokens(tokens) => todo!(),
+            ParserResult::DeleteEvaluationTokens(tokens) => todo!(),
+            ParserResult::QueryEvaluationTokens(tokens) => todo!(),
+            ParserResult::CachedHashIndexes(indexes) => todo!(),
+        }
+    }
+}
+
+#[repr(u8)]
+pub enum QueryExecutionResult {
+    Ok = 0,
+    RowsAffected(u64) = 1,
+    RowsResult(Box<Vec<u8>>) = 2
 }

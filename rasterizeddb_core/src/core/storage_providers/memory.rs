@@ -219,4 +219,8 @@ impl IOOperationsSync for MemoryStorageProvider {
             vec: ConcurrentVec::with_doubling_growth()
         }
     }
+    
+    fn drop(&mut self) {
+        self.vec.clear();
+    }
 }

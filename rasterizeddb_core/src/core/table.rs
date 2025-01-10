@@ -757,6 +757,7 @@ impl<S: IOOperationsSync> Table<S> {
                 Vec::default()
             };
 
+            let select_all = evaluation_tokens.select_all;
             let hash = evaluation_tokens.query_hash;
             let evaluation_tokens = evaluation_tokens.tokens;
 
@@ -858,8 +859,13 @@ impl<S: IOOperationsSync> Table<S> {
                                 data_buffer.clear();
                             }
 
-                            let evaluation = evaluate_column_result(&required_columns, &evaluation_tokens);
-                            required_columns.clear();
+                            let evaluation = if select_all {
+                                let eval = evaluate_column_result(&required_columns, &evaluation_tokens);
+                                required_columns.clear();
+                                eval
+                            } else {
+                                true
+                            };
 
                             if evaluation {   
                                 
@@ -981,8 +987,13 @@ impl<S: IOOperationsSync> Table<S> {
                             column_index_inner += 1;
                         }
 
-                        let evaluation = evaluate_column_result(&required_columns, &evaluation_tokens);
-                        required_columns.clear();
+                        let evaluation = if select_all {
+                            let eval = evaluate_column_result(&required_columns, &evaluation_tokens);
+                            required_columns.clear();
+                            eval
+                        } else {
+                            true
+                        };
 
                         if evaluation {
                             let row = columns_cursor_to_row(

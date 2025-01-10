@@ -57,6 +57,8 @@ pub trait IOOperationsSync: Clone {
     fn get_location(&self) -> Option<String>;
 
     async fn create_new(&self, name: String) -> Self;
+
+    fn drop(&mut self);
 }
 
 pub trait IOOperationsAsync<'a>: TryCloneAsync {

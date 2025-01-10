@@ -1,7 +1,7 @@
 use crate::{
     core::{
         column::Column,
-        hashing::get_hash}, 
+        hashing::get_hash, row::{InsertOrUpdateRow, Row}}, 
         POSITIONS_CACHE
     };
 
@@ -30,15 +30,26 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
     }
 
     let select_result = query.find("SELECT");
-    //let select;
+    let mut select_table = String::new();
 
     if select_result.is_none() {
         return Err("SELECT statement is missing.".into())
-    } else {
-        //select = select_result.unwrap();
     }
 
-    //println!("{}", select);
+    if let Some(select_start) = select_result {
+        // Find the starting index of the number after "SELECT FROM"
+        let select_from_str = query[select_start + (6 + 4)..].trim(); // +6 +4 to skip "SELECT FROM"
+        
+        // Find the end of the number using a space or newline as a delimiter
+        let select_from_end = select_from_str.find(|c: char| c.is_whitespace()).unwrap_or(select_from_str.len());
+        
+        // Extract the substring and parse it as i64
+        let select_value = &select_from_str[..select_from_end];
+        
+        select_table.push_str(select_value);
+    }
+
+    println!("{}", select_table);
 
     let where_result = query.find("WHERE");
     let mut where_i: usize = 0;
@@ -52,14 +63,12 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
     }
 
     let return_result = query.find("RETURN");
-    let mut return_i: usize = 0;
     let return_all: bool;
 
     if return_result.is_none() {
         return_all = true;
     } else {
         return_all = false;
-        return_i = return_result.unwrap();
     }
 
     let end_result = query.find("END");
@@ -76,7 +85,7 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
 
     if let Some(limit_start) = limit_result {
         // Find the starting index of the number after "LIMIT"
-        let limit_str = &query[limit_start + 5..].trim(); // +5 to skip "LIMIT"
+        let limit_str = query[limit_start + 5..].trim(); // +5 to skip "LIMIT"
         
         // Find the end of the number using a space or newline as a delimiter
         let limit_end = limit_str.find(|c: char| c.is_whitespace()).unwrap_or(limit_str.len());
@@ -94,11 +103,17 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
         }
     }
 
-    // Step 1: Parse WHERE clause
-    if where_result.is_some() && return_result.is_some()  && return_all && select_all {
-        let select_clause = &query[begin + 5..where_i].trim();
-        let where_clause = &query[where_i + 5..return_i].trim();
-        todo!()
+    if return_all && select_all {
+        let select_clause = &query[begin + 6..].trim();
+        return Ok(DatabaseAction { 
+            table_name: select_table,
+            parser_result: ParserResult::QueryEvaluationTokens(EvaluationResult {
+                query_hash: hash,
+                tokens: Vec::default(),
+                limit: limit_i64,
+                select_all: true
+            })
+        });
     } else if return_result.is_none() && where_result.is_some() {
         let select_clause = &query[begin + 5..where_i].trim();
         let where_clause = &query[where_i + 5..end].trim();
@@ -187,10 +202,10 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
                 } else {
                     panic!()
                 }
-            } else if token == "true" {
+            } else if token == "TRUE" {
                 let val = Token::Value(Box::new(Column::new(true).unwrap()));
                 token_vector.push(val);
-            } else if token == "false" {
+            } else if token == "FALSE" {
                 let val = Token::Value(Box::new(Column::new(false).unwrap()));
                 token_vector.push(val);
             }
@@ -199,16 +214,16 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
         tokens_vector.push((token_vector, None));
 
         return Ok(DatabaseAction { 
-            table_name: "".to_string(),
+            table_name: select_table,
             parser_result: ParserResult::QueryEvaluationTokens(EvaluationResult {
                 query_hash: hash,
                 tokens: tokens_vector,
-                limit: limit_i64
+                limit: limit_i64,
+                select_all: false
             })
         });
     } else {
-        let select_clause = &query[begin + 5..end].trim();
-        todo!()
+        panic!("Operation not supported")
     }
 }
 
@@ -218,9 +233,9 @@ pub struct DatabaseAction {
 }
 
 pub enum ParserResult {
-    CreateTable(String),
+    CreateTable((String,bool, bool)),
     DropTable(String),
-    InsertEvaluationTokens(EvaluationResult),
+    InsertEvaluationTokens(InsertEvaluationResult),
     UpdateEvaluationTokens(EvaluationResult),
     DeleteEvaluationTokens(EvaluationResult),
     QueryEvaluationTokens(EvaluationResult),
@@ -230,5 +245,10 @@ pub enum ParserResult {
 pub struct EvaluationResult {
     pub query_hash: u64,
     pub tokens: Vec<(Vec<Token>, Option<Next>)>,
-    pub limit: i64
+    pub limit: i64,
+    pub select_all: bool
+}
+
+pub struct InsertEvaluationResult {
+    pub rows: Vec<InsertOrUpdateRow>
 }

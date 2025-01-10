@@ -1,4 +1,4 @@
-use std::{fs, io::{Cursor, Read, Seek, SeekFrom, Write}, path::Path, sync::Arc};
+use std::{fs::{self, remove_file}, io::{Cursor, Read, Seek, SeekFrom, Write}, path::Path, sync::Arc};
 
 use tokio::{io::{AsyncReadExt, AsyncSeekExt}, runtime::Handle, sync::RwLock};
 
@@ -330,5 +330,21 @@ impl IOOperationsSync for LocalStorageProvider {
             location: self.location.to_string(),
             table_name: name.to_string()
         }
+    }
+    
+    fn drop(&mut self) {
+        let delimiter = if cfg!(unix) {
+            "/"
+        } else if cfg!(windows) {
+            "\\"
+        } else {
+            panic!("OS not supported");
+        };
+
+        let file_str = format!("{}{}{}", self.location, delimiter, self.table_name);
+        
+        let path = Path::new(&file_str);
+
+        remove_file(&path).unwrap();
     }
 }
