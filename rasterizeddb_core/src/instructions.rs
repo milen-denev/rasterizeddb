@@ -22,7 +22,7 @@ pub(crate) fn compare_vecs_ne(vec1: &[u8], vec2: &[u8]) -> bool {
 
 /// Check if `haystack` contains `needle`
 #[inline]
-pub(crate) fn contains_subsequence(haystack: &Vec<u8>, needle: &Vec<u8>) -> bool {
+pub(crate) fn contains_subsequence(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() || needle.len() > haystack.len() {
         return false;
     }
