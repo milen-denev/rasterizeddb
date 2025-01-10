@@ -1,5 +1,7 @@
 use std::io;
 
+use ahash::RandomState;
+use dashmap::DashMap;
 use rastdp::receiver::Receiver;
 
 use crate::rql;
@@ -8,7 +10,7 @@ use super::{column::Column, storage_providers::traits::IOOperationsSync, table::
 
 pub struct Database<S: IOOperationsSync> {
     config_table: Table<S>,
-    tables: Vec<Table<S>>,
+    tables: DashMap<String, Table<S>, RandomState>,
     server: Receiver
 }
 
@@ -26,7 +28,7 @@ impl<S: IOOperationsSync> Database<S> {
 
         let table_rows = config_table.execute_query(all_rows_result.parser_result).await?;
 
-        let tables: Vec<Table<S>> = if table_rows.is_some() {
+        let tables: DashMap<String, Table<S>, RandomState> = if table_rows.is_some() {
             let rows = table_rows.unwrap();
 
             let mut table_specs: Vec<(String, bool, bool)> = Vec::default();
@@ -39,16 +41,17 @@ impl<S: IOOperationsSync> Database<S> {
                 table_specs.push((name, compress, immutable));
             }
 
-            let mut inited_tables: Vec<Table<S>> = Vec::default();
+            let inited_tables: DashMap<String, Table<S>, RandomState> = DashMap::default();
+
             for table_spec in table_specs {
-                let new_io_sync = io_sync.create_new(table_spec.0).await;
+                let new_io_sync = io_sync.create_new(table_spec.0.clone()).await;
                 let table = Table::<S>::init_inner(new_io_sync, table_spec.1, table_spec.2).await?;
-                inited_tables.push(table);
+                inited_tables.insert(table_spec.0, table);
             }
 
             inited_tables
         } else {
-            Vec::default()
+            DashMap::default()
         };
 
         Ok(Database {

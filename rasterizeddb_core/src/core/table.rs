@@ -483,7 +483,7 @@ impl<S: IOOperationsSync> Table<S> {
     /// #### STABILIZED
     /// Get first row by query.
     pub async fn first_or_default_by_query(&mut self, parser_result: ParserResult) -> io::Result<Option<Row>> {
-        if let ParserResult::HashIndexes(hash_indexes) = parser_result {
+        if let ParserResult::CachedHashIndexes(hash_indexes) = parser_result {
             for record in hash_indexes {
                 let mut position = record.0;
                 let length = record.1;
@@ -493,7 +493,7 @@ impl<S: IOOperationsSync> Table<S> {
                     length).await.unwrap()));
             }
             panic!("hash_indexes is empty.");
-        } else if let ParserResult::EvaluationTokens(evaluation_tokens) = parser_result {
+        } else if let ParserResult::QueryEvaluationTokens(evaluation_tokens) = parser_result {
 
             let hash = evaluation_tokens.query_hash;
             let evaluation_tokens = evaluation_tokens.tokens;
@@ -736,7 +736,7 @@ impl<S: IOOperationsSync> Table<S> {
     }
 
     pub async fn execute_query(&mut self, parser_result: ParserResult) -> io::Result<Option<Vec<Row>>> {
-        if let ParserResult::HashIndexes(hash_indexes) = parser_result {
+        if let ParserResult::CachedHashIndexes(hash_indexes) = parser_result {
             let mut rows: Vec<Row> = Vec::with_capacity(hash_indexes.len());
             for record in hash_indexes {
                 let mut position = record.0;
@@ -748,7 +748,7 @@ impl<S: IOOperationsSync> Table<S> {
             }
 
             return Ok(Some(rows));
-        } else if let ParserResult::EvaluationTokens(evaluation_tokens) = parser_result {
+        } else if let ParserResult::QueryEvaluationTokens(evaluation_tokens) = parser_result {
             let limit = evaluation_tokens.limit;
 
             let mut rows: Vec<Row> = if limit < 1024 && limit > 0 {

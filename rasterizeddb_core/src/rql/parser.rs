@@ -15,7 +15,7 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
     if let Some(file_positions) = POSITIONS_CACHE.get(&hash) {
         let db_action = DatabaseAction {
             table_name: "".to_string(),
-            parser_result: ParserResult::HashIndexes(file_positions)
+            parser_result: ParserResult::CachedHashIndexes(file_positions)
         };
         return Ok(db_action);
     }
@@ -200,7 +200,7 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
 
         return Ok(DatabaseAction { 
             table_name: "".to_string(),
-            parser_result: ParserResult::EvaluationTokens(EvaluationResult {
+            parser_result: ParserResult::QueryEvaluationTokens(EvaluationResult {
                 query_hash: hash,
                 tokens: tokens_vector,
                 limit: limit_i64
@@ -218,8 +218,13 @@ pub struct DatabaseAction {
 }
 
 pub enum ParserResult {
-    HashIndexes(Vec<(u64, u32)>),
-    EvaluationTokens(EvaluationResult)
+    CreateTable(String),
+    DropTable(String),
+    InsertEvaluationTokens(EvaluationResult),
+    UpdateEvaluationTokens(EvaluationResult),
+    DeleteEvaluationTokens(EvaluationResult),
+    QueryEvaluationTokens(EvaluationResult),
+    CachedHashIndexes(Vec<(u64, u32)>)
 }
 
 pub struct EvaluationResult {
