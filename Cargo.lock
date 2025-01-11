@@ -1070,10 +1070,11 @@ dependencies = [
 
 [[package]]
 name = "rastdp"
-version = "0.4.1"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cbdd833fd5bfe3e31b04a13d43298ca80a4f21c818aaa367440386ab01b5ea22"
 dependencies = [
  "ahash",
- "async-lazy",
  "dashmap",
  "log",
  "moka",
