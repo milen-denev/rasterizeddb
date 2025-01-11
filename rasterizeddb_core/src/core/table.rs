@@ -23,7 +23,8 @@ use super::{
 };
 
 pub struct Table<S: IOOperationsSync> {
-    pub(crate) io_sync: S,
+    
+    pub(crate) io_sync: Box<S>,
     pub(crate) table_header: Arc<RwLock<TableHeader>>,
     pub(crate) in_memory_index: Arc<RwLock<Option<Vec<FileChunk>>>>,
     pub(crate) current_file_length: Arc<RwLock<u64>>,
@@ -54,7 +55,7 @@ impl<S: IOOperationsSync> Table<S> {
             table_header.total_file_length = table_file_len;
 
             let table = Table {
-                io_sync: io_sync,
+                io_sync: Box::new(io_sync),
                 table_header: Arc::new(RwLock::const_new(table_header)),
                 in_memory_index: Arc::new(RwLock::const_new(None)),
                 current_file_length: Arc::new(RwLock::const_new(table_file_len)),
@@ -73,7 +74,7 @@ impl<S: IOOperationsSync> Table<S> {
             io_sync.write_data(0, &header_bytes);
 
             let table = Table {
-                io_sync: io_sync,
+                io_sync: Box::new(io_sync),
                 table_header: Arc::new(RwLock::const_new(table_header)),
                 in_memory_index: Arc::new(RwLock::const_new(None)),
                 current_file_length: Arc::new(RwLock::const_new(table_file_len)),
@@ -104,7 +105,7 @@ impl<S: IOOperationsSync> Table<S> {
             table_header.total_file_length = table_file_len;
 
             let table = Table {
-                io_sync: io_sync,
+                io_sync: Box::new(io_sync),
                 table_header: Arc::new(RwLock::const_new(table_header)),
                 in_memory_index: Arc::new(RwLock::const_new(None)),
                 current_file_length: Arc::new(RwLock::const_new(table_file_len)),
@@ -123,7 +124,7 @@ impl<S: IOOperationsSync> Table<S> {
             io_sync.write_data(0, &header_bytes);
 
             let table = Table {
-                io_sync: io_sync,
+                io_sync: Box::new(io_sync),
                 table_header: Arc::new(RwLock::const_new(table_header)),
                 in_memory_index: Arc::new(RwLock::const_new(None)),
                 current_file_length: Arc::new(RwLock::const_new(table_file_len)),

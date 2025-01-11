@@ -16,7 +16,7 @@ pub(crate) struct FileChunk {
 }
 
 impl FileChunk {
-    pub async fn read_chunk_sync(&self, io_sync: &mut impl IOOperationsSync) -> Cursor<Vec<u8>> {
+    pub async fn read_chunk_sync(&self, io_sync: &mut Box<impl IOOperationsSync>) -> Cursor<Vec<u8>> {
         let mut current_file_position = self.current_file_position.clone();
 
         let buffer = io_sync.read_data(&mut current_file_position, self.chunk_size as u32).await;
@@ -30,7 +30,7 @@ impl FileChunk {
         return cursor;
     }
 
-    pub async fn read_chunk_to_end_sync(&self, file_position: u64, io_sync: &mut impl IOOperationsSync) -> Cursor<Vec<u8>> {
+    pub async fn read_chunk_to_end_sync(&self, file_position: u64, io_sync: &mut Box<impl IOOperationsSync>) -> Cursor<Vec<u8>> {
         let buffer = io_sync.read_data_to_end(file_position).await;
         
         if buffer.len() == 0 {

@@ -4,7 +4,7 @@ pub type IOError = std::io::Error;
 pub type IOResult<T> = std::result::Result<T, IOError>;
 
 #[allow(async_fn_in_trait)]
-pub trait IOOperationsSync: Clone {
+pub trait IOOperationsSync: Clone + Sync + Send {
     fn write_data_unsync(&mut self,
         position: u64, 
         buffer: &[u8]);
@@ -25,9 +25,9 @@ pub trait IOOperationsSync: Clone {
         seek: SeekFrom, 
         buffer: &[u8]);
 
-    async fn read_data(&mut self,
+    fn read_data(&mut self,
         position: &mut u64,  
-        length: u32) -> Vec<u8>;
+        length: u32) -> impl Future<Output = Vec<u8>> + Send + Sync;
 
     async fn read_data_into_buffer(&mut self,
         position: &mut u64,  
@@ -46,7 +46,7 @@ pub trait IOOperationsSync: Clone {
     fn append_data_unsync(&mut self,  
         buffer: &[u8]);
 
-    async fn get_len(&mut self) -> u64;
+    fn get_len(&mut self) -> impl Future<Output = u64> + Send + Sync;
 
     fn exists(location: &str, table_name: &str) -> bool;
 
@@ -56,9 +56,9 @@ pub trait IOOperationsSync: Clone {
 
     fn get_location(&self) -> Option<String>;
 
-    async fn create_new(&self, name: String) -> Self;
+    fn create_new(&self, name: String) -> impl Future<Output = Self> + Send + Sync; 
 
-    fn drop(&mut self);
+    fn drop_io(&mut self);
 }
 
 pub trait IOOperationsAsync<'a>: TryCloneAsync {

@@ -39,11 +39,9 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
     if let Some(select_start) = select_result {
         // Find the starting index of the number after "SELECT FROM"
         let select_from_str = query[select_start + (6 + 4)..].trim(); // +6 +4 to skip "SELECT FROM"
-        
-        // Find the end of the number using a space or newline as a delimiter
+
         let select_from_end = select_from_str.find(|c: char| c.is_whitespace()).unwrap_or(select_from_str.len());
         
-        // Extract the substring and parse it as i64
         let select_value = &select_from_str[..select_from_end];
         
         select_table.push_str(select_value);
@@ -114,7 +112,7 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
                 select_all: true
             })
         });
-    } else if return_result.is_none() && where_result.is_some() {
+    } else if return_all && where_result.is_some() {
         let select_clause = &query[begin + 5..where_i].trim();
         let where_clause = &query[where_i + 5..end].trim();
 

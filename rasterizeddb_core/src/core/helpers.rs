@@ -12,7 +12,7 @@ use super::{
 };
 
 pub(crate) async fn read_row_columns(
-    io_sync: &mut impl IOOperationsSync, 
+    io_sync: &mut Box<impl IOOperationsSync>, 
     first_column_index: u64, 
     id: u64, 
     length: u32) -> io::Result<Row> {
@@ -116,7 +116,7 @@ pub(crate) fn read_row_cursor(first_column_index: u64, id: u64, length: u32, cur
 
 pub(crate) async fn delete_row_file(
     first_column_index: u64, 
-    io_sync: &mut impl IOOperationsSync) -> io::Result<()> {
+    io_sync: &mut Box<impl IOOperationsSync>) -> io::Result<()> {
     // LEN (4)
     let mut position = first_column_index.clone() - 4;
 
@@ -135,7 +135,7 @@ pub(crate) async fn delete_row_file(
 }
 
 pub(crate) async fn skip_empty_spaces_file(
-    io_sync: &mut impl IOOperationsSync, 
+    io_sync: &mut Box<impl IOOperationsSync>, 
     file_position: &mut u64,
     file_length: u64) -> u64 {
     if file_length == *file_position || file_length < *file_position {
@@ -224,7 +224,7 @@ pub(crate) fn skip_empty_spaces_cursor(cursor: &mut Cursor<Vec<u8>>, cursor_leng
 }
 
 pub(crate) async fn row_prefetching(
-    io_sync: &mut impl IOOperationsSync, 
+    io_sync: &mut Box<impl IOOperationsSync>, 
     file_position: &mut u64, 
     file_length: u64) -> io::Result<Option<RowPrefetchResult>> {
     if *file_position < file_length {
@@ -344,7 +344,7 @@ pub(crate) fn add_last_in_memory_index(
 }
 
 pub(crate) async fn indexed_row_fetching_file( 
-    io_sync: &mut impl IOOperationsSync, 
+    io_sync: &mut Box<impl IOOperationsSync>, 
     position: &mut u64, 
     length: u32) -> io::Result<Row> {
     let mut cursor = io_sync.read_data_to_cursor(position, (length + 1 + 1 + 8 + 4) as u32).await;

@@ -332,7 +332,7 @@ impl IOOperationsSync for LocalStorageProvider {
         }
     }
     
-    fn drop(&mut self) {
+    fn drop_io(&mut self) {
         let delimiter = if cfg!(unix) {
             "/"
         } else if cfg!(windows) {

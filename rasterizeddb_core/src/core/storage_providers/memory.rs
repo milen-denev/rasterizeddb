@@ -220,7 +220,7 @@ impl IOOperationsSync for MemoryStorageProvider {
         }
     }
     
-    fn drop(&mut self) {
+    fn drop_io(&mut self) {
         self.vec.clear();
     }
 }
