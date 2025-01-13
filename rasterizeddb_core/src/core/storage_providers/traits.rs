@@ -29,16 +29,16 @@ pub trait IOOperationsSync: Clone + Sync + Send {
         position: &mut u64,  
         length: u32) -> impl Future<Output = Vec<u8>> + Send + Sync;
 
-    async fn read_data_into_buffer(&mut self,
+    fn read_data_into_buffer(&mut self,
         position: &mut u64,  
-        buffer: &mut [u8]);
+        buffer: &mut [u8]) -> impl Future<Output = ()> + Send + Sync;
 
-    async fn read_data_to_cursor(&mut self,
+    fn read_data_to_cursor(&mut self,
         position: &mut u64,  
-        length: u32) -> Cursor<Vec<u8>>;
+        length: u32) -> impl Future<Output = Cursor<Vec<u8>>> + Send + Sync;
 
-    async fn read_data_to_end(&mut self,
-        position: u64) -> Vec<u8>;
+    fn read_data_to_end(&mut self,
+        position: u64) -> impl Future<Output = Vec<u8>> + Send + Sync;
 
     fn append_data(&mut self,  
         buffer: &[u8]);
@@ -50,9 +50,9 @@ pub trait IOOperationsSync: Clone + Sync + Send {
 
     fn exists(location: &str, table_name: &str) -> bool;
 
-    async fn create_temp(&self) -> Self;
+    fn create_temp(&self) -> impl Future<Output = Self> + Send + Sync;
 
-    async fn swap_temp(&mut self, temp_io_sync: &mut Self);
+    fn swap_temp(&mut self, temp_io_sync: &mut Self) -> impl Future<Output = ()> + Send + Sync;
 
     fn get_location(&self) -> Option<String>;
 

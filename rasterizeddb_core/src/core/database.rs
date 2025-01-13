@@ -3,13 +3,14 @@ use std::{io, sync::Arc};
 use ahash::RandomState;
 use dashmap::DashMap;
 use rastdp::receiver::Receiver;
+use tokio::sync::RwLock;
 
-use crate::rql::{self, parser::{DatabaseAction, ParserResult}};
+use crate::{rql::{self, parser::ParserResult}, SERVER_PORT};
 
-use super::{column::Column, storage_providers::traits::IOOperationsSync, table::Table};
+use super::{column::Column, row::InsertOrUpdateRow, storage_providers::traits::IOOperationsSync, table::Table};
 
 static RECEIVER: async_lazy::Lazy<Arc<Receiver>> = async_lazy::Lazy::const_new(|| Box::pin(async {
-    let receiver = Receiver::new("127.0.0.1:8080").await.unwrap();
+    let receiver = Receiver::new(&format!("127.0.0.1:{}", SERVER_PORT)).await.unwrap();
     Arc::new(receiver)
 }));
 
@@ -67,14 +68,38 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
         })
     }
 
-    pub async fn create_table(&self, name: String, compress: bool, immutable: bool) -> io::Result<()> {
+    pub async fn create_table(
+        &mut self, 
+        name: String, 
+        compress: bool, 
+        immutable: bool) -> io::Result<()> {
         let new_io_sync = self.config_table.io_sync.create_new(name.clone()).await;
         let table = Table::<S>::init_inner(new_io_sync, compress, immutable).await?;
-        self.tables.insert(name, table);
+
+        self.tables.insert(name.clone(), table);
+
+        let mut name_column = Column::new(name).unwrap();
+        let mut compress_column = Column::new(compress).unwrap();
+        let mut immutable_column = Column::new(immutable).unwrap();
+
+        let mut columns_buffer_update: Vec<u8> = Vec::with_capacity(
+            name_column.len() + 
+            compress_column.len() + 
+            immutable_column.len() 
+        );
+
+        columns_buffer_update.append(&mut name_column.into_vec().unwrap());
+        columns_buffer_update.append(&mut compress_column.into_vec().unwrap());
+        columns_buffer_update.append(&mut immutable_column.into_vec().unwrap());
+
+        self.config_table.insert_row(InsertOrUpdateRow { 
+            columns_data: columns_buffer_update 
+        }).await;
+
         Ok(())
     }
 
-    pub async fn drop_table(&self, name: String) -> io::Result<()>  {
+    pub async fn drop_table(&mut self, name: String) -> io::Result<()>  {
         let mut table = self.tables.try_get_mut(&name);
 
         while table.is_locked() {
@@ -89,10 +114,13 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
 
         _ = self.tables.remove(&name).unwrap();
 
+        let row = self.config_table.first_or_default_by_column(0, name).await?.unwrap();
+        self.config_table.delete_row_by_id(row.id).await?;
+
         Ok(())
     }
 
-    pub async fn start_async(database: Arc<Database<S>>) -> io::Result<()> {
+    pub async fn start_async(database: Arc<RwLock<Database<S>>>) -> io::Result<()> {
         let db = database.clone();
         let receiver = RECEIVER.force().await;
 
@@ -107,18 +135,20 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
     }
 }
 
-pub(crate) async fn process_incoming_queries<S: IOOperationsSync>(database: Arc<Database<S>>, request_vec: Vec<u8>) -> Vec<u8> {
+pub(crate) async fn process_incoming_queries<S: IOOperationsSync>(database: Arc<RwLock<Database<S>>>, request_vec: Vec<u8>) -> Vec<u8> {
     let database_operation = rql::parser::parse_rql(&String::from_utf8_lossy(&request_vec)).unwrap();
     
     match database_operation.parser_result {
         ParserResult::CreateTable((name, compress, immutable)) => { 
-            database.create_table(name, compress, immutable).await.unwrap();
+            let mut db = database.write().await;
+            db.create_table(name, compress, immutable).await.unwrap();
             let mut result: [u8; 1] = [0u8; 1];
             result[0] = 0;
             return result.to_vec();
         },
         ParserResult::DropTable(name) => {
-            database.drop_table(name).await.unwrap();
+            let mut db = database.write().await;
+            db.drop_table(name).await.unwrap();
             let mut result: [u8; 1] = [0u8; 1];
             result[0] = 0;
             return result.to_vec();
@@ -135,5 +165,6 @@ pub(crate) async fn process_incoming_queries<S: IOOperationsSync>(database: Arc<
 pub enum QueryExecutionResult {
     Ok = 0,
     RowsAffected(u64) = 1,
-    RowsResult(Box<Vec<u8>>) = 2
+    RowsResult(Box<Vec<u8>>) = 2,
+    Error(String) = 3
 }

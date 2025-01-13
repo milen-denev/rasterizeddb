@@ -2,6 +2,7 @@ use ahash::RandomState;
 use moka::sync::Cache;
 use once_cell::sync::Lazy;
 
+pub(crate) const  SERVER_PORT: u16 = 8080;
 pub(crate) const HEADER_SIZE: u16 = 30;
 pub(crate) const CHUNK_SIZE: u32 = 1_000_000;
 

@@ -1,4 +1,4 @@
-use std::io::{self, Cursor, Read, Seek, SeekFrom};
+use std::{future::Future, io::{self, Cursor, Read, Seek, SeekFrom}};
 
 use byteorder::{LittleEndian, ReadBytesExt};
 

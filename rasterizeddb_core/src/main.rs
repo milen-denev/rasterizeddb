@@ -7,6 +7,7 @@ use rasterizeddb_core::{
 };
 
 use stopwatch::Stopwatch;
+use tokio::sync::RwLock;
 use std::fs::remove_file;
 
 #[tokio::main]
@@ -22,7 +23,7 @@ async fn main() -> std::io::Result<()> {
 
     let database = Database::new(io_sync).await?;
 
-    Database::start_async(Arc::new(database)).await?;
+    Database::start_async(Arc::new(RwLock::new(database))).await?;
 
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;

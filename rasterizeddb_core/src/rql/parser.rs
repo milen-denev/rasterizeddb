@@ -1,7 +1,7 @@
 use crate::{
     core::{
         column::Column,
-        hashing::get_hash, row::{InsertOrUpdateRow, Row}}, 
+        hashing::get_hash, row::InsertOrUpdateRow}, 
         POSITIONS_CACHE
     };
 
@@ -27,6 +27,75 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
         return Err("BEGIN statement is missing.".into())
     } else {
         begin = begin_result.unwrap();
+    }
+
+    
+    let end_result = query.find("END");
+    let end;
+
+    if end_result.is_none() {
+        return Err("END statement is missing.".into())
+    } else {
+        end = end_result.unwrap();
+    }
+
+    //CREATE TABLE
+    if let Some(create_start) = query.find("CREATE TABLE") {
+        let create_str = query[create_start + 12..].trim(); // Skip "CREATE TABLE"
+
+        // Extract table name
+        let table_name_end = create_str.find(|c: char| c == '(').ok_or("Missing '(' in CREATE TABLE statement")?;
+        let table_name = create_str[..table_name_end].trim();
+
+        if table_name.is_empty() {
+            return Err("Table name is missing in CREATE TABLE statement.".into());
+        }
+
+        // Extract options between parentheses
+        let options_start = create_str.find('(').unwrap() + 1;
+        let options_end = create_str.find(')').ok_or("Missing ')' in CREATE TABLE statement")?;
+        let options = &create_str[options_start..options_end].trim();
+
+        // Split options and parse TRUE/FALSE
+        let mut option_values = options.split(',').map(|s| s.trim());
+        let compressed = match option_values.next() {
+            Some("TRUE") => true,
+            Some("FALSE") => false,
+            _ => return Err("Invalid value for compression option in CREATE TABLE.".into()),
+        };
+
+        let immutable = match option_values.next() {
+            Some("TRUE") => true,
+            Some("FALSE") => false,
+            _ => return Err("Invalid value for immutability option in CREATE TABLE.".into()),
+        };
+
+        // Ensure no extra arguments are present
+        if option_values.next().is_some() {
+            return Err("Unexpected extra arguments in CREATE TABLE statement.".into());
+        }
+
+        return Ok(DatabaseAction {
+            table_name: table_name.to_string(),
+            parser_result: ParserResult::CreateTable((table_name.to_string(), compressed, immutable)),
+        });
+    }
+
+    // Handle DROP TABLE
+    if let Some(drop_start) = query.find("DROP TABLE") {
+        let drop_str = query[drop_start + 10..].trim(); // Skip "DROP TABLE"
+
+        // Extract table name
+        let table_name = drop_str.trim();
+
+        if table_name.is_empty() {
+            return Err("Table name is missing in DROP TABLE statement.".into());
+        }
+
+        return Ok(DatabaseAction {
+            table_name: table_name.to_string(),
+            parser_result: ParserResult::DropTable(table_name.to_string()),
+        });
     }
 
     let select_result = query.find("SELECT");
@@ -69,15 +138,7 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
         return_all = false;
     }
 
-    let end_result = query.find("END");
-    let end;
-
-    if end_result.is_none() {
-        return Err("END statement is missing.".into())
-    } else {
-        end = end_result.unwrap();
-    }
-
+    // Get LIMIT
     let limit_result = query.find("LIMIT");
     let mut limit_i64 = i64::MAX;
 
@@ -101,6 +162,7 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
         }
     }
 
+    //RETURN ALL & SELECT ALL scenario
     if return_all && select_all {
         let select_clause = &query[begin + 6..].trim();
         return Ok(DatabaseAction { 
@@ -112,7 +174,10 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
                 select_all: true
             })
         });
-    } else if return_all && where_result.is_some() {
+    } 
+    
+    // RETURN ALL and WHERE clause scenario
+    if return_all && where_result.is_some() {
         let select_clause = &query[begin + 5..where_i].trim();
         let where_clause = &query[where_i + 5..end].trim();
 
@@ -220,9 +285,9 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
                 select_all: false
             })
         });
-    } else {
-        panic!("Operation not supported")
     }
+
+    panic!("Operation not supported")
 }
 
 pub struct DatabaseAction {
