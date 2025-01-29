@@ -1,4 +1,4 @@
-use std::arch::x86_64::*;
+use std::arch::{asm, x86_64::*};
 
 /// Converts a slice of 4 `u8` to a `u32` using little-endian ordering.
 /// This function requires SSE2 support.
@@ -13,4 +13,27 @@ pub unsafe fn slice_to_u32_avx2(slice: &[u8]) -> u32 {
     let result = _mm_cvtsi128_si32(input) as u32;
 
     result
+}
+
+#[inline(always)]
+pub unsafe fn read_big_endian_u64(ptr: *const u8) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        {
+            let val: u64;
+            asm!(
+                "mov {0}, qword ptr [{1}]",
+                out(reg) val,
+                in(reg) ptr,
+                options(nostack, pure, readonly)
+            );
+            return val.to_be();
+        }
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        // Portable fallback for non-x86_64 CPUs
+        core::ptr::read_unaligned(ptr as *const u64).to_be()
+    }
 }

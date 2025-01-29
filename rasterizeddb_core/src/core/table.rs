@@ -1238,7 +1238,7 @@ impl<S: IOOperationsSync> Table<S> {
             let result = self.current_file_length.try_read();
             if let Ok(current_len) = result {
                 if *current_len == 0 {
-                    break (current_len.clone() + HEADER_SIZE as u64);
+                    break current_len.clone() + HEADER_SIZE as u64;
                 } else {
                     break current_len.clone();
                 }

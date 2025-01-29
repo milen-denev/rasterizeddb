@@ -1,4 +1,4 @@
-use std::arch::x86_64::*;
+use std::arch::{asm, x86_64::*};
 
 #[inline]
 pub(crate) fn compare_vecs_eq(vec1: &[u8], vec2: &[u8]) -> bool {
@@ -21,7 +21,7 @@ pub(crate) fn compare_vecs_ne(vec1: &[u8], vec2: &[u8]) -> bool {
 }
 
 /// Check if `haystack` contains `needle`
-#[inline]
+#[inline(always)]
 pub(crate) fn contains_subsequence(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() || needle.len() > haystack.len() {
         return false;
@@ -32,8 +32,9 @@ pub(crate) fn contains_subsequence(haystack: &[u8], needle: &[u8]) -> bool {
     let haystack_len = haystack.len();
 
     unsafe {
-        // Use SIMD if available
-        if is_x86_feature_detected!("sse2") {
+        // If x86_64 is used
+        #[cfg(target_arch = "x86_64")]
+        {
             let needle_first_byte = _mm_set1_epi8(needle[0] as i8);
             let mut i = 0;
 
@@ -61,8 +62,11 @@ pub(crate) fn contains_subsequence(haystack: &[u8], needle: &[u8]) -> bool {
         }
     }
 
-    // Fallback: Naive search if SIMD is unavailable
-    haystack.windows(needle_len).any(|window| window == needle)
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        // Fallback: Naive search if SIMD is unavailable
+        haystack.windows(needle_len).any(|window| window == needle)
+    }
 }
 
 #[inline]
@@ -73,4 +77,27 @@ pub(crate) fn compare_vecs_starts_with(vec1: &[u8], vec2: &[u8]) -> bool {
 #[inline]
 pub(crate) fn compare_vecs_ends_with(vec1: &[u8], vec2: &[u8]) -> bool {
     return vec1.ends_with(vec2); 
+}
+
+#[inline(always)]
+pub unsafe fn read_big_endian_u64(ptr: *const u8) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        {
+            let val: u64;
+            asm!(
+                "mov {0}, qword ptr [{1}]",
+                out(reg) val,
+                in(reg) ptr,
+                options(nostack, pure, readonly)
+            );
+            return val.to_be();
+        }
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        // Portable fallback for non-x86_64 CPUs
+        core::ptr::read_unaligned(ptr as *const u64).to_be()
+    }
 }
