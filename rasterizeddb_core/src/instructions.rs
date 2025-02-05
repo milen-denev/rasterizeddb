@@ -78,26 +78,3 @@ pub(crate) fn compare_vecs_starts_with(vec1: &[u8], vec2: &[u8]) -> bool {
 pub(crate) fn compare_vecs_ends_with(vec1: &[u8], vec2: &[u8]) -> bool {
     return vec1.ends_with(vec2); 
 }
-
-#[inline(always)]
-pub unsafe fn read_big_endian_u64(ptr: *const u8) -> u64 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        {
-            let val: u64;
-            asm!(
-                "mov {0}, qword ptr [{1}]",
-                out(reg) val,
-                in(reg) ptr,
-                options(nostack, pure, readonly)
-            );
-            return val.to_be();
-        }
-    }
-
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        // Portable fallback for non-x86_64 CPUs
-        core::ptr::read_unaligned(ptr as *const u64).to_be()
-    }
-}

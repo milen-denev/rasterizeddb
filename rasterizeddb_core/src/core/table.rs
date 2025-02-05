@@ -522,7 +522,7 @@ impl<S: IOOperationsSync> Table<S> {
                         Token::Column(column_index) => column_index,
                         _ => panic!()
                     }).collect_vec();
-
+             
                 for chunk in chunks {
                     let mut cursor = chunk.read_chunk_sync(&mut self.io_sync).await;
                     
@@ -534,8 +534,7 @@ impl<S: IOOperationsSync> Table<S> {
                             let mut current_column_index: u32 = 0;
                             let first_column_index = cursor.stream_position().unwrap();
 
-                            loop {  
-
+                            loop {
                                 if column_indexes.iter().any(|x| *x == current_column_index) {
                                     let column_type = cursor.read_u8().unwrap();
         
@@ -869,7 +868,6 @@ impl<S: IOOperationsSync> Table<S> {
                             };
 
                             if evaluation {   
-                                
                                 let row = read_row_cursor(
                                     first_column_index, 
                                     prefetch_result.found_id,
@@ -1056,6 +1054,7 @@ impl<S: IOOperationsSync> Table<S> {
 
         if let Some(chunks) = chunks_result.as_ref() {
             let mut chunks_ended_position: u64 = 0;
+
             for chunk in chunks {
                 let mut cursor = chunk.read_chunk_sync(&mut self.io_sync).await;
 

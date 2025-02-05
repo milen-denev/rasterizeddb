@@ -177,7 +177,7 @@ impl IOOperationsSync for LocalStorageProvider {
         read_file.read(buffer).await.unwrap();
         *position += buffer.len() as u64;
     }
-    
+
     async fn read_data_to_cursor(&mut self,
         position: &mut u64,  
         length: u32) -> Cursor<Vec<u8>> {

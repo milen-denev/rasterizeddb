@@ -1,8 +1,8 @@
-use std::{future::Future, io::{self, Cursor, Read, Seek, SeekFrom}};
+use std::{arch::x86_64::{_mm_prefetch, _MM_HINT_T0}, future::Future, io::{self, Cursor, Read, Seek, SeekFrom}, mem::zeroed};
 
 use byteorder::{LittleEndian, ReadBytesExt};
 
-use crate::{CHUNK_SIZE, EMPTY_BUFFER, HEADER_SIZE};
+use crate::{simds::endianess::{read_u32, read_u64, read_u8}, CHUNK_SIZE, EMPTY_BUFFER, HEADER_SIZE};
 use super::{
     column::Column, 
     db_type::DbType, 
@@ -67,7 +67,7 @@ pub(crate) async fn read_row_columns(
     });
 }
 
-pub(crate) fn read_row_cursor(first_column_index: u64, id: u64, length: u32, cursor: &mut Cursor<Vec<u8>>) -> io::Result<Row> {
+pub(crate) fn read_row_cursor<'a>(first_column_index: u64, id: u64, length: u32, cursor: &mut Cursor<Vec<u8>>) -> io::Result<Row> {
     cursor.seek(SeekFrom::Start(first_column_index)).unwrap();
 
     let mut columns: Vec<Column> = Vec::default();
@@ -194,6 +194,7 @@ pub(crate) fn skip_empty_spaces_cursor(cursor: &mut Cursor<Vec<u8>>, cursor_leng
             cursor.read(&mut check_next_buffer).unwrap();
 
             let cursor_position = cursor.position();
+            
             if cursor_length == cursor_position as u32 || cursor_length < cursor_position as u32 {
                 return Ok(());
             }
@@ -257,7 +258,7 @@ pub(crate) async fn row_prefetching(
     }
 }
 
-pub(crate) fn row_prefetching_cursor(
+pub fn row_prefetching_cursor_ex(
     cursor: &mut Cursor<Vec<u8>>, 
     chunk: &FileChunk) -> io::Result<Option<RowPrefetchResult>> {
 
@@ -284,6 +285,79 @@ pub(crate) fn row_prefetching_cursor(
         length: length
     }));
 }
+
+pub fn row_prefetching_cursor(
+    cursor: &mut Cursor<Vec<u8>>, 
+    chunk: &FileChunk) -> io::Result<Option<RowPrefetchResult>> {
+
+    skip_empty_spaces_cursor(cursor, chunk.chunk_size).unwrap();
+    
+    let mut header_bytes: [u8; 13] = [0; 13];
+
+    _ = cursor.read_exact(&mut header_bytes); 
+
+    #[allow(static_mut_refs)]
+    unsafe {
+        let start_bytes = [header_bytes[0]];
+        
+        let found_id_bytes = [
+            header_bytes[1], 
+            header_bytes[2], 
+            header_bytes[3],
+            header_bytes[4], 
+            header_bytes[5], 
+            header_bytes[6], 
+            header_bytes[7],
+            header_bytes[8]
+        ];
+
+        let length_bytes = [
+            header_bytes[9], 
+            header_bytes[10], 
+            header_bytes[11], 
+            header_bytes[12]
+        ];
+
+        let start_now_ptr = start_bytes.as_ptr();
+        
+        #[cfg(target_arch = "x86_64")]
+        {
+            _mm_prefetch::<_MM_HINT_T0>(start_now_ptr as *const i8);
+        }
+
+        let start_signal = read_u8(start_now_ptr);
+
+        let start_signal_type = DbType::from_byte(start_signal);
+
+        if start_signal_type != DbType::START {
+            panic!("Start row signal not present.");
+        }
+
+        let found_id_ptr = found_id_bytes.as_ptr();
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            _mm_prefetch::<_MM_HINT_T0>(found_id_ptr as *const i8);
+        }
+
+        let found_id = read_u64(found_id_ptr);
+
+        let length_ptr = length_bytes.as_ptr();
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            _mm_prefetch::<_MM_HINT_T0>(length_ptr as *const i8);
+        }
+
+        let length = read_u32(length_ptr);
+
+        return Ok(Some(RowPrefetchResult {
+            found_id: found_id,
+            length: length
+        }));
+    }
+}
+
 
 pub(crate) fn add_in_memory_index(
     current_chunk_size: &mut u32,

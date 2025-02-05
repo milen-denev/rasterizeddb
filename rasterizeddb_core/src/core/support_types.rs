@@ -9,7 +9,7 @@ pub struct RowPrefetchResult {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct FileChunk {
+pub struct FileChunk {
     pub current_file_position: u64,
     pub chunk_size: u32,
     pub next_row_id: u64

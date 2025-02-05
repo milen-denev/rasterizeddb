@@ -1,8 +1,9 @@
-use std::{arch::x86_64::{_mm_prefetch, _MM_HINT_T0}, hint::black_box, io::Cursor};
+use std::{arch::x86_64::{_mm_prefetch, _MM_HINT_T0}, hint::black_box, io::{self, Cursor, Seek}};
 
 use byteorder::{LittleEndian, ReadBytesExt};
 use criterion::{criterion_group, criterion_main, Criterion};
-use rasterizeddb_core::simds::little_endian::{read_big_endian_u64, slice_to_u32_avx2};
+use rasterizeddb_core::{core::{helpers::{row_prefetching_cursor, row_prefetching_cursor_ex}, storage_providers::file_sync::LocalStorageProvider, support_types::{FileChunk, RowPrefetchResult}}, simds::endianess::read_u64};
+use tokio::runtime::Runtime;
 
 // fn get_read_u32_raw(buffer: Vec<u8>) -> u32 {
 //     let u32 = &buffer[0..4];
@@ -15,8 +16,20 @@ use rasterizeddb_core::simds::little_endian::{read_big_endian_u64, slice_to_u32_
 //     u32
 // }
 
+fn get_row_prefetch_result(
+    cursor: &mut Cursor<Vec<u8>>, 
+    chunk: &FileChunk) -> io::Result<Option<RowPrefetchResult>> {
+    row_prefetching_cursor_ex(cursor, chunk)
+}
+
+fn get_row_prefetch_result_2(
+    cursor: &mut Cursor<Vec<u8>>, 
+    chunk: &FileChunk) -> io::Result<Option<RowPrefetchResult>> {
+    row_prefetching_cursor(cursor, chunk)
+}
+
 fn get_read_u64_raw(ptr: *const u8) -> u64 {
-    let u64 = unsafe { read_big_endian_u64(ptr) };
+    let u64 = unsafe { read_u64(ptr) };
     u64
 }
 
@@ -42,15 +55,45 @@ fn criterion_benchmark_buffers(c: &mut Criterion) {
         _mm_prefetch::<_MM_HINT_T0>(be_ptr as *const i8);
     }
 
-    c.bench_function("get_read_u64_raw", 
-        |b| b.iter(|| 
-        {
-            get_read_u64_raw(black_box(be_ptr));
+    let chunk = FileChunk { current_file_position: 30, chunk_size: 1000050, next_row_id: 20001 };
+    let chunk2 = FileChunk { current_file_position: 30, chunk_size: 1000050, next_row_id: 20001 };
+
+    let rt = Runtime::new().unwrap();
+
+    let mut io_sync =  Box::new(rt.block_on(LocalStorageProvider::new(
+        "C:\\Users\\mspc6\\OneDrive\\Professional\\Desktop",
+        "database.db"
+    )));
+
+    //let mut cursor = rt.block_on(chunk.read_chunk_sync(&mut io_sync));
+
+    // c.bench_function("get_read_u64_raw", 
+    //     |b| b.iter(|| 
+    //     {
+    //         get_read_u64_raw(black_box(be_ptr));
+    //     })
+    // );
+
+    // c.bench_function("get_read_u64_crate", 
+    //     |b| b.iter(|| get_read_u64_crate(black_box(&data)))
+    // );
+
+    let mut cursor = rt.block_on(chunk.read_chunk_sync(&mut io_sync));
+
+    c.bench_function("get_row_prefetch_result", 
+        |b| b.iter(||  {
+            _ = cursor.seek(io::SeekFrom::Start(0));  
+            get_row_prefetch_result(black_box(&mut cursor), black_box(&chunk))
         })
     );
 
-    c.bench_function("get_read_u64_crate", 
-        |b| b.iter(|| get_read_u64_crate(black_box(&data)))
+    let mut cursor2 = rt.block_on(chunk2.read_chunk_sync(&mut io_sync));
+
+    c.bench_function("get_row_prefetch_result_2", 
+        |b| b.iter(|| {
+            _ = cursor2.seek(io::SeekFrom::Start(0));  
+            get_row_prefetch_result_2(black_box(&mut cursor2), black_box(&chunk2))
+        })
     );
 }
 

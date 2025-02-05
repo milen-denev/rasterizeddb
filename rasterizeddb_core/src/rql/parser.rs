@@ -116,7 +116,7 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
         select_table.push_str(select_value);
     }
 
-    println!("{}", select_table);
+    //println!("{}", select_table);
 
     let where_result = query.find("WHERE");
     let mut where_i: usize = 0;
@@ -204,6 +204,10 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
 
             index_token += token.len() as u32;
 
+            if token == " " || token.is_empty() {
+                continue;
+            }
+
             if token.starts_with("COL(") {
                 let column_end = token.find(")").unwrap();
                 let column_index = str::parse::<u32>(&token[4..column_end].trim()).unwrap();
@@ -252,11 +256,12 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
                 let val = Token::Value(Box::new(Column::new(string).unwrap()));
                 token_vector.push(val);
             } else if !token.contains(".") {
-                if let Ok(token_number) = str::parse::<i128>(&token) {
+                let result_i128 = str::parse::<i128>(&token.trim());
+                if let Ok(token_number) = result_i128 {
                     let val = Token::Value(Box::new(Column::new(token_number).unwrap()));
                     token_vector.push(val);
                 } else {
-                    panic!()
+                    panic!("Error parsing token number: {}, error: {}", token, result_i128.unwrap_err());
                 }
             } else if token.contains(".") {
                 if let Ok(token_number) = str::parse::<f64>(&token) {

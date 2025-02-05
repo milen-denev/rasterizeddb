@@ -18,36 +18,36 @@ async fn main() -> std::io::Result<()> {
 
     let io_sync = LocalStorageProvider::new(
         "C:\\Users\\mspc6\\OneDrive\\Professional\\Desktop",
-        ""
+        "database.db"
     ).await;
 
-    let database = Database::new(io_sync).await?;
+    //let database = Database::new(io_sync).await?;
 
-    Database::start_async(Arc::new(RwLock::new(database))).await?;
+    // Database::start_async(Arc::new(RwLock::new(database))).await?;
 
-    loop {
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-    }
+    // loop {
+    //     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    // }
 
     //let io_sync = MemoryStorageProvider::new();
 
-    // let mut table = Table::init(io_sync, false, false).await.unwrap();
+    let mut table = Table::init(io_sync, false, false).await.unwrap();
 
-    // for i in 0..500 {
-    //     if i == 300 {
-    //         let mut c1 = Column::new(1000).unwrap();
-    //         let mut c2 = Column::new(i * -1).unwrap();
-    //         //let mut c3 = Column::new("This is awesome 2.").unwrap();
+    // for i in 0..200_000 {
+    //     if i == 199_998 {
+    //         let mut c1 = Column::new(5_000_000).unwrap();
+    //         let mut c2 = Column::new(-5_000_000).unwrap();
+    //         let mut c3 = Column::new("This is awesome 5_000_000.").unwrap();
     
     //         let mut columns_buffer: Vec<u8> = Vec::with_capacity(
     //             c1.len() + 
-    //             c2.len() //+
-    //             //c3.len() 
+    //             c2.len() +
+    //             c3.len() 
     //         );
         
     //         columns_buffer.append(&mut c1.into_vec().unwrap());
     //         columns_buffer.append(&mut c2.into_vec().unwrap());
-    //         //columns_buffer.append(&mut c3.into_vec().unwrap());
+    //         columns_buffer.append(&mut c3.into_vec().unwrap());
         
     //         let insert_row = InsertOrUpdateRow {
     //             columns_data: columns_buffer
@@ -57,17 +57,17 @@ async fn main() -> std::io::Result<()> {
     //     } else {
     //         let mut c1 = Column::new(i).unwrap();
     //         let mut c2 = Column::new(i * -1).unwrap();
-    //         //let mut c3 = Column::new("This is also awesome.").unwrap();
+    //         let mut c3 = Column::new("This is also awesome.").unwrap();
     
     //         let mut columns_buffer: Vec<u8> = Vec::with_capacity(
     //             c1.len() + 
-    //             c2.len() //+
-    //             //c3.len() 
+    //             c2.len() +
+    //             c3.len() 
     //         );
         
     //         columns_buffer.append(&mut c1.into_vec().unwrap());
     //         columns_buffer.append(&mut c2.into_vec().unwrap());
-    //         //columns_buffer.append(&mut c3.into_vec().unwrap());
+    //         columns_buffer.append(&mut c3.into_vec().unwrap());
         
     //         let insert_row = InsertOrUpdateRow {
     //             columns_data: columns_buffer
@@ -77,13 +77,44 @@ async fn main() -> std::io::Result<()> {
     //     }
     // }
 
-    //table.rebuild_in_memory_indexes().await;
+    // println!("DONE inserting rows.");
 
-    //let row = table.first_or_default_by_id(1).await?.unwrap();
+    table.rebuild_in_memory_indexes().await;
 
-    // for column in Column::from_buffer(&row.columns_data).unwrap() {
-    //     println!("{}", column.into_value());
-    // }
+    println!("DONE building indexes.");
+
+    let row = table.first_or_default_by_id(1).await?.unwrap();
+
+    for column in Column::from_buffer(&row.columns_data).unwrap() {
+        println!("{}", column.into_value());
+    }
+
+    let row = table.first_or_default_by_id(60).await?.unwrap();
+
+    for column in Column::from_buffer(&row.columns_data).unwrap() {
+        println!("{}", column.into_value());
+    }
+
+    let mut stopwatch = Stopwatch::new();
+
+    // WHERE COL(0) >= 6000000 LIMIT 20
+
+    let query_evaluation = parse_rql(&format!(r#"
+        BEGIN
+        SELECT FROM NAME_DOESNT_MATTER_FOR_NOW
+        WHERE COL(2) = 'This is awesome 5_000_000.'
+        LIMIT 1
+        END
+    "#)).unwrap();
+
+    stopwatch.start();
+    let rows = table.execute_query(query_evaluation.parser_result).await?;
+    stopwatch.stop();
+
+    println!("elapsed {:?}", stopwatch.elapsed_ms());
+    println!("total rows {:?}", rows.unwrap().len());
+
+    //table.delete_row_by_id(3).await.unwrap();
 
     // UPDATE ROW(3)
 
@@ -154,10 +185,10 @@ async fn main() -> std::io::Result<()> {
     //     }
     // }
 
-    // println!("Press any key to continue...");
+    println!("Press any key to continue...");
 
-    // let mut buffer = String::new();
-    // stdin().read_line(&mut buffer).unwrap();
+    let mut buffer = String::new();
+    stdin().read_line(&mut buffer).unwrap();
 
-    // Ok(())
+    Ok(())
 }

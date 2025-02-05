@@ -37,8 +37,8 @@ debug-assertions = false
 overflow-checks = false
 incremental = false 
 codegen-units = 1
-lto = "fat"
+lto = "fat" 
 
 [features]
-default = ["enable_index_caching"]
+default = []
 enable_index_caching = []
