@@ -1,5 +1,5 @@
 use std::{
-    fmt::Display, io::{self, Read, Seek, SeekFrom}, sync::Arc
+    fmt::Display, io::{self, Read, Seek, SeekFrom}, mem::zeroed, sync::Arc
 };
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -19,7 +19,7 @@ use super::{
         read_row_cursor, 
         row_prefetching, 
         row_prefetching_cursor
-    }, row::{InsertOrUpdateRow, Row}, storage_providers::traits::IOOperationsSync, support_types::FileChunk, table_header::TableHeader
+    }, row::{InsertOrUpdateRow, Row}, storage_providers::traits::IOOperationsSync, support_types::{FileChunk, RowPrefetchResult}, table_header::TableHeader
 };
 
 pub struct Table<S: IOOperationsSync> {
@@ -758,11 +758,8 @@ impl<S: IOOperationsSync> Table<S> {
             };
 
             let select_all = evaluation_tokens.select_all;
-            let hash = evaluation_tokens.query_hash;
             let evaluation_tokens = evaluation_tokens.tokens;
-
-            let file_length = self.get_current_table_length();
-    
+            let file_length = self.get_current_table_length();  
             let chunks_arc_clone = self.in_memory_index.clone();
 
             let chunks_result = loop {
@@ -790,6 +787,8 @@ impl<S: IOOperationsSync> Table<S> {
                         _ => panic!()
                     }).collect_vec();
 
+                println!("has chunks");
+
                 for chunk in chunks {
                     let mut cursor = chunk.read_chunk_sync(&mut self.io_sync).await;
                     
@@ -802,7 +801,7 @@ impl<S: IOOperationsSync> Table<S> {
                             let first_column_index = cursor.stream_position().unwrap();
 
                             loop {  
-
+                                println!("stream {}", cursor.stream_position().unwrap());
                                 if column_indexes.iter().any(|x| *x == current_column_index) {
                                     let column_type = cursor.read_u8().unwrap();
         
@@ -859,7 +858,7 @@ impl<S: IOOperationsSync> Table<S> {
                                 data_buffer.clear();
                             }
 
-                            let evaluation = if select_all {
+                            let evaluation = if !select_all {
                                 let eval = evaluate_column_result(&required_columns, &evaluation_tokens);
                                 required_columns.clear();
                                 eval
@@ -917,8 +916,6 @@ impl<S: IOOperationsSync> Table<S> {
                         file_length).await.unwrap() {
     
                         let mut column_index_inner = 0;
-
-                        let first_column_index = position + 4 + 8 + 1;
 
                         let mut columns_cursor = self.io_sync.read_data_to_cursor(
                             &mut position, 
@@ -986,7 +983,7 @@ impl<S: IOOperationsSync> Table<S> {
                             column_index_inner += 1;
                         }
 
-                        let evaluation = if select_all {
+                        let evaluation = if !select_all {
                             let eval = evaluate_column_result(&required_columns, &evaluation_tokens);
                             required_columns.clear();
                             eval
@@ -1177,6 +1174,9 @@ impl<S: IOOperationsSync> Table<S> {
 
         let mut position = HEADER_SIZE as u64;
 
+        let mut added = false;
+        let mut last_prefetch_result: RowPrefetchResult = RowPrefetchResult::default();
+
         loop {
             if let Some(prefetch_result) = row_prefetching(
                 &mut self.io_sync,
@@ -1187,13 +1187,20 @@ impl<S: IOOperationsSync> Table<S> {
                 //START (1), ROWID (8), LEN (4), COLUMNS (X), END (1)
                 current_chunk_size += 1 + 8 + 4 + prefetch_result.length + 1;
 
-                add_in_memory_index(&mut current_chunk_size, prefetch_result.found_id, position, &mut current_chunk_options);
+                added = add_in_memory_index(&mut current_chunk_size, prefetch_result.found_id, position, &mut current_chunk_options);
+
+                last_prefetch_result = prefetch_result;
+
                 if (position + CHUNK_SIZE as u64) >= file_length {
                     break;
                 }
             } else {
                 break;
             } 
+        }
+
+        if !added {
+            position -= 1 + 8 + 4 + last_prefetch_result.length as u64 + 1;
         }
 
         if file_length > position {

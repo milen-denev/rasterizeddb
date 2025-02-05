@@ -1,2 +1,3 @@
 [workspace]
 members = ["rasterizeddb_core", "test_db_web"]
+resolver = "2"

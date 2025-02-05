@@ -11,6 +11,8 @@ use super::{
     support_types::{FileChunk, RowPrefetchResult}
 };
 
+const EMPTY_HEADER: [u8; 13] = [0; 13];
+
 pub(crate) async fn read_row_columns(
     io_sync: &mut Box<impl IOOperationsSync>, 
     first_column_index: u64, 
@@ -295,6 +297,10 @@ pub fn row_prefetching_cursor(
     let mut header_bytes: [u8; 13] = [0; 13];
 
     _ = cursor.read_exact(&mut header_bytes); 
+   
+    if header_bytes == EMPTY_HEADER {
+        return Ok(None);
+    }
 
     #[allow(static_mut_refs)]
     unsafe {
@@ -363,7 +369,7 @@ pub(crate) fn add_in_memory_index(
     current_chunk_size: &mut u32,
     current_id: u64,
     file_position: u64,
-    in_memory_index: &mut Option<Vec<FileChunk>>) {
+    in_memory_index: &mut Option<Vec<FileChunk>>) -> bool {
 
     if *current_chunk_size > CHUNK_SIZE {
         if let Some(file_chunks_indexes) = in_memory_index.as_mut() {
@@ -386,6 +392,10 @@ pub(crate) fn add_in_memory_index(
         }
         
         *current_chunk_size = 0;
+
+        true
+    } else {
+        false
     }
 }
 
