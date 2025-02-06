@@ -261,7 +261,7 @@ impl IOOperationsSync for LocalStorageProvider {
         }
     }
     
-    async fn swap_temp(&mut self, temp_io_sync: &mut Self) {
+    async fn swap_temp(&mut self, _temp_io_sync: &mut Self) {
         let delimiter = if cfg!(unix) {
             "/"
         } else if cfg!(windows) {

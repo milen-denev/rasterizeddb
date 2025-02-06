@@ -6,7 +6,7 @@ pub(crate) const  SERVER_PORT: u16 = 8080;
 pub(crate) const HEADER_SIZE: u16 = 30;
 pub(crate) const CHUNK_SIZE: u32 = 1_000_000;
 
-pub(crate) const EMPTY_BUFFER: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
+pub const EMPTY_BUFFER: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
 
 pub(crate) static POSITIONS_CACHE: Lazy<Cache<u64, Vec<(u64, u32)>, RandomState>> = Lazy::new(|| {
     let cache = Cache::builder()

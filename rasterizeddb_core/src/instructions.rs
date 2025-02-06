@@ -1,4 +1,4 @@
-use std::arch::{asm, x86_64::*};
+use std::arch::x86_64::*;
 
 #[inline]
 pub(crate) fn compare_vecs_eq(vec1: &[u8], vec2: &[u8]) -> bool {

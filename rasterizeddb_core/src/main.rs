@@ -1,17 +1,24 @@
-use std::{io::stdin, sync::Arc};
+use std::{arch::x86_64::{_mm_prefetch, _MM_HINT_T0}, io::stdin};
 
 use rasterizeddb_core::{
     core::{
-        column::Column, database::{self, Database}, row::InsertOrUpdateRow, storage_providers::{file_sync::LocalStorageProvider, memory::MemoryStorageProvider}, table::Table
-    }, rql::parser::parse_rql
+        column::Column, 
+        row::InsertOrUpdateRow, 
+        storage_providers::file_sync::LocalStorageProvider, 
+        table::Table
+    }, rql::parser::parse_rql, EMPTY_BUFFER
 };
 
 use stopwatch::Stopwatch;
-use tokio::sync::RwLock;
-use std::fs::remove_file;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let empty_buffer_ptr = EMPTY_BUFFER.as_ptr();
+        unsafe { _mm_prefetch::<_MM_HINT_T0>(empty_buffer_ptr as *const i8) };
+    }
+    
     std::env::set_var("RUST_BACKTRACE","0");
 
     //_ = remove_file("C:\\Users\\mspc6\\OneDrive\\Professional\\Desktop\\database.db");
@@ -33,55 +40,80 @@ async fn main() -> std::io::Result<()> {
 
     let mut table = Table::init(io_sync, false, false).await.unwrap();
 
-    for i in 0..1_000_000 {
-        if i == 999_998_999 {
-            let mut c1 = Column::new(1_597_937).unwrap();
-            let mut c2 = Column::new(-1_597_937).unwrap();
-            let mut c3 = Column::new("This is the millionth something row.").unwrap();
+    let mut c1 = Column::new(1_597_937).unwrap();
+    let mut c2 = Column::new(-1_597_937).unwrap();
+    let mut c3 = Column::new("This is the millionth something row.").unwrap();
+
+    let mut columns_buffer: Vec<u8> = Vec::with_capacity(
+        c1.len() + 
+        c2.len() +
+        c3.len() 
+    );
+
+    columns_buffer.append(&mut c1.into_vec().unwrap());
+    columns_buffer.append(&mut c2.into_vec().unwrap());
+    columns_buffer.append(&mut c3.into_vec().unwrap());
+
+    let _insert_row = InsertOrUpdateRow {
+        columns_data: columns_buffer
+    };
+
+    //table.insert_row(insert_row).await;
+
+    // for i in 0..1_000_000 {
+    //     if i == 999_998_999 {
+    //         let mut c1 = Column::new(1_597_937).unwrap();
+    //         let mut c2 = Column::new(-1_597_937).unwrap();
+    //         let mut c3 = Column::new("This is the millionth something row.").unwrap();
     
-            let mut columns_buffer: Vec<u8> = Vec::with_capacity(
-                c1.len() + 
-                c2.len() +
-                c3.len() 
-            );
+    //         let mut columns_buffer: Vec<u8> = Vec::with_capacity(
+    //             c1.len() + 
+    //             c2.len() +
+    //             c3.len() 
+    //         );
         
-            columns_buffer.append(&mut c1.into_vec().unwrap());
-            columns_buffer.append(&mut c2.into_vec().unwrap());
-            columns_buffer.append(&mut c3.into_vec().unwrap());
+    //         columns_buffer.append(&mut c1.into_vec().unwrap());
+    //         columns_buffer.append(&mut c2.into_vec().unwrap());
+    //         columns_buffer.append(&mut c3.into_vec().unwrap());
         
-            let insert_row = InsertOrUpdateRow {
-                columns_data: columns_buffer
-            };
+    //         let insert_row = InsertOrUpdateRow {
+    //             columns_data: columns_buffer
+    //         };
         
-            table.insert_row(insert_row).await;
-        } else {
-            let mut c1 = Column::new(i).unwrap();
-            let mut c2 = Column::new(i * -1).unwrap();
-            let mut c3 = Column::new("This is also awesome.").unwrap();
+    //         table.insert_row(insert_row).await;
+    //     } else {
+    //         let mut c1 = Column::new(i).unwrap();
+    //         let mut c2 = Column::new(i * -1).unwrap();
+    //         let mut c3 = Column::new("This is also awesome.").unwrap();
     
-            let mut columns_buffer: Vec<u8> = Vec::with_capacity(
-                c1.len() + 
-                c2.len() +
-                c3.len() 
-            );
+    //         let mut columns_buffer: Vec<u8> = Vec::with_capacity(
+    //             c1.len() + 
+    //             c2.len() +
+    //             c3.len() 
+    //         );
         
-            columns_buffer.append(&mut c1.into_vec().unwrap());
-            columns_buffer.append(&mut c2.into_vec().unwrap());
-            columns_buffer.append(&mut c3.into_vec().unwrap());
+    //         columns_buffer.append(&mut c1.into_vec().unwrap());
+    //         columns_buffer.append(&mut c2.into_vec().unwrap());
+    //         columns_buffer.append(&mut c3.into_vec().unwrap());
         
-            let insert_row = InsertOrUpdateRow {
-                columns_data: columns_buffer
-            };
+    //         let insert_row = InsertOrUpdateRow {
+    //             columns_data: columns_buffer
+    //         };
         
-            table.insert_row(insert_row).await;
-        }
-    }
+    //         table.insert_row(insert_row).await;
+    //     }
+    // }
 
     println!("DONE inserting rows.");
 
     table.rebuild_in_memory_indexes().await;
 
     println!("DONE building indexes.");
+
+    println!("Press any key to continue...");
+
+    let mut buffer = String::new();
+    stdin().read_line(&mut buffer).unwrap();
 
     // let row = table.first_or_default_by_id(1).await?.unwrap();
 
@@ -104,6 +136,25 @@ async fn main() -> std::io::Result<()> {
         SELECT FROM NAME_DOESNT_MATTER_FOR_NOW
         WHERE COL(2) = 'This is the millionth something row.'
         LIMIT 1
+        END
+    "#)).unwrap();
+
+    stopwatch.start();
+    let rows = table.execute_query(query_evaluation.parser_result).await?;
+    stopwatch.stop();
+
+    println!("elapsed {:?}", stopwatch.elapsed_ms());
+    println!("total rows {:?}", rows.unwrap().len());
+
+    println!("second try");
+
+    stopwatch.reset();
+
+    let query_evaluation = parse_rql(&format!(r#"
+        BEGIN
+        SELECT FROM NAME_DOESNT_MATTER_FOR_NOW
+        WHERE COL(2) = 'This is the millionth something row.'
+        LIMIT 10
         END
     "#)).unwrap();
 

@@ -135,6 +135,7 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
     }
 }
 
+#[allow(unused_variables)]
 pub(crate) async fn process_incoming_queries<S: IOOperationsSync>(database: Arc<RwLock<Database<S>>>, request_vec: Vec<u8>) -> Vec<u8> {
     let database_operation = rql::parser::parse_rql(&String::from_utf8_lossy(&request_vec)).unwrap();
     

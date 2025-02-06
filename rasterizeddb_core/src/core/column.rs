@@ -444,7 +444,7 @@ impl Column {
         compare_vecs_eq(&self.content, &column.content)
     }
 
-    pub fn ne(&self, column: &Column) -> bool {
+    pub fn not_equal(&self, column: &Column) -> bool {
         compare_vecs_ne(&self.content, &column.content)
     }
 

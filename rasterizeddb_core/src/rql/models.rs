@@ -1,3 +1,5 @@
+use std::pin::Pin;
+
 use crate::core::column::Column;
 
 #[derive(Debug, PartialEq, Clone)]
@@ -33,6 +35,6 @@ pub enum MathOperation {
 pub enum Token {
     Column(u32),
     Math(MathOperation),
-    Value(Box<Column>),
+    Value(Pin<Box<Column>>),
     Operation(ComparerOperation)
 }
