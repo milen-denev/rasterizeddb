@@ -74,5 +74,6 @@ pub fn extent_non_string_buffer(
         let mut preset_buffer = vec![0; db_size as usize];
         cursor.read(&mut preset_buffer).unwrap();
         data_buffer.append(&mut preset_buffer);
+        *position += db_size;
     }
 }

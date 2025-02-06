@@ -880,14 +880,14 @@ impl<S: IOOperationsSync> Table<S> {
                                         
                                         let str_length = unsafe { read_u32(str_len_array_pointer) };
         
-                                        data_buffer.extend_from_slice(&str_len_array);
-
                                         let cursor = &mut cursor_vector.cursor;
                                         cursor.seek(SeekFrom::Start(position)).unwrap();
 
                                         let mut preset_buffer = vec![0; str_length as usize];
                                         cursor.read(&mut preset_buffer).unwrap();
                                         data_buffer.append(&mut preset_buffer);
+
+                                        position += str_length as u64;
                                     }
                                     
                                     let column = if column_type >= 1 && column_type <= 10 {
