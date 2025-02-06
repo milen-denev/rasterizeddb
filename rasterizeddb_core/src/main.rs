@@ -14,7 +14,7 @@ use std::fs::remove_file;
 async fn main() -> std::io::Result<()> {
     std::env::set_var("RUST_BACKTRACE","0");
 
-    _ = remove_file("C:\\Users\\mspc6\\OneDrive\\Professional\\Desktop\\database.db");
+    //_ = remove_file("C:\\Users\\mspc6\\OneDrive\\Professional\\Desktop\\database.db");
 
     let io_sync = LocalStorageProvider::new(
         "C:\\Users\\mspc6\\OneDrive\\Professional\\Desktop",
@@ -33,8 +33,8 @@ async fn main() -> std::io::Result<()> {
 
     let mut table = Table::init(io_sync, false, false).await.unwrap();
 
-    for i in 0..5 {
-        if i == 29_998 {
+    for i in 0..1_000_000 {
+        if i == 999_998_999 {
             let mut c1 = Column::new(1_597_937).unwrap();
             let mut c2 = Column::new(-1_597_937).unwrap();
             let mut c3 = Column::new("This is the millionth something row.").unwrap();

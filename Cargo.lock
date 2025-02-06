@@ -891,9 +891,9 @@ dependencies = [
 
 [[package]]
 name = "orx-pinned-vec"
-version = "3.12.0"
+version = "3.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3399d3e5a3f13266c493c2f3f948e4093288cc88fe8d5bb1929d54fb3a5b5eb5"
+checksum = "32c2101c6690d781ec4476dd37a898fb1164b06a30b775dc1655e27d567ab4d9"
 dependencies = [
  "orx-iterable",
  "orx-pseudo-default",
@@ -1104,7 +1104,7 @@ dependencies = [
 
 [[package]]
 name = "rasterizeddb_core"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "ahash",
  "async-lazy",
