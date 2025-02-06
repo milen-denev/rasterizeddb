@@ -111,3 +111,5 @@ pub mod core;
 pub mod simds;
 pub mod rql;
 pub(crate) mod instructions;
+pub(crate) mod memory_pool;
+pub(crate) mod column_unsafe;

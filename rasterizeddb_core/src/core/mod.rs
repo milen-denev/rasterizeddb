@@ -8,3 +8,4 @@ pub mod support_types;
 pub mod hashing;
 pub mod database;
 pub mod storage_providers;
+pub mod table_ext;

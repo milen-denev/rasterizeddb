@@ -39,14 +39,14 @@ pub(crate) async fn read_row_columns(
             let mut preset_buffer = vec![0; db_size as usize];
             cursor.read_exact(&mut preset_buffer)?;
 
-            data_buffer.append(&mut preset_buffer.to_vec());
+            data_buffer.append(&mut preset_buffer);
         } else {
             let str_length = cursor.read_u32::<LittleEndian>().unwrap();
 
             let mut preset_buffer = vec![0; str_length as usize];
             cursor.read_exact(&mut preset_buffer)?;
           
-            data_buffer.append(&mut preset_buffer.to_vec());
+            data_buffer.append(&mut preset_buffer);
         }
         
         let column = Column::from_raw(column_type, data_buffer, None);

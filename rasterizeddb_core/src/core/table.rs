@@ -1,12 +1,12 @@
 use std::{
-    fmt::Display, io::{self, Read, Seek, SeekFrom}, pin::Pin, sync::Arc
+    arch::x86_64::{_mm_prefetch, _MM_HINT_T0}, fmt::Display, io::{self, Read, Seek, SeekFrom}, pin::Pin, sync::Arc
 };
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use itertools::Itertools;
 use tokio::sync::{RwLock, RwLockWriteGuard};
 
-use crate::{core::helpers::delete_row_file, rql::models::Next, CHUNK_SIZE, HEADER_SIZE, POSITIONS_CACHE};
+use crate::{core::helpers::delete_row_file, rql::models::Next, simds::endianess::read_u32, CHUNK_SIZE, HEADER_SIZE, POSITIONS_CACHE};
 use super::{
     super::rql::{
         models::Token, parser::ParserResult, tokenizer::evaluate_column_result
@@ -19,11 +19,7 @@ use super::{
         read_row_cursor, 
         row_prefetching, 
         row_prefetching_cursor
-    }, 
-    row::{InsertOrUpdateRow, Row}, 
-    storage_providers::traits::IOOperationsSync, 
-    support_types::{CursorVector, FileChunk, RowPrefetchResult}, 
-    table_header::TableHeader
+    }, row::{InsertOrUpdateRow, Row}, storage_providers::traits::IOOperationsSync, support_types::{CursorVector, FileChunk, RowPrefetchResult}, table_ext::extent_non_string_buffer, table_header::TableHeader
 };
 
 #[allow(dead_code)]
@@ -841,44 +837,62 @@ impl<S: IOOperationsSync> Table<S> {
                     let mut position: u64 = 0;
 
                     let mut data_buffer = Vec::default();
+
                     loop {
                         if let Some(prefetch_result) = row_prefetching_cursor(&mut position, &mut cursor_vector, chunk).unwrap() {
                         
                             let mut current_column_index: u32 = 0;
                             let first_column_index = position.clone();
 
-                            loop {  
+                            loop {
                                 if column_indexes.iter().any(|x| *x == current_column_index) {
-                                    let cursor = &mut cursor_vector.cursor;
-                                    cursor.seek(SeekFrom::Start(position)).unwrap();
-                                    
-                                    let column_type = cursor.read_u8().unwrap();
-        
-                                    let db_type = DbType::from_byte(column_type);
+                                    let column_type = cursor_vector.vector[position as usize];
+                                    position += 1;
+
+                                    let db_type = DbType::from_byte(column_type.clone());
         
                                     if db_type == DbType::END {
                                         break;
                                     }
         
                                     if db_type != DbType::STRING {
-                                        let db_size = db_type.get_size();
-        
-                                        let mut preset_buffer = vec![0; db_size as usize];
-                                        cursor.read(&mut preset_buffer).unwrap();
-                                        data_buffer.append(&mut preset_buffer);
+                                        extent_non_string_buffer(
+                                            &mut data_buffer, 
+                                            &db_type, 
+                                            &mut cursor_vector, 
+                                            &mut position);
                                     } else {
-                                        let str_length = cursor.read_u32::<LittleEndian>().unwrap();
+                                        let str_len_array: [u8; 4] = [
+                                            cursor_vector.vector[position as usize],
+                                            cursor_vector.vector[(position + 1) as usize],
+                                            cursor_vector.vector[(position + 2) as usize],
+                                            cursor_vector.vector[(position + 3) as usize]
+                                        ];
+
+                                        position += 4;
+
+                                        let str_len_array_pointer = str_len_array.as_ptr();
+
+                                        #[cfg(target_arch = "x86_64")]
+                                        {
+                                            unsafe { _mm_prefetch::<_MM_HINT_T0>(str_len_array_pointer as *const i8) };
+                                        }
+                                        
+                                        let str_length = unsafe { read_u32(str_len_array_pointer) };
         
+                                        data_buffer.extend_from_slice(&str_len_array);
+
+                                        let cursor = &mut cursor_vector.cursor;
+                                        cursor.seek(SeekFrom::Start(position)).unwrap();
+
                                         let mut preset_buffer = vec![0; str_length as usize];
                                         cursor.read(&mut preset_buffer).unwrap();
                                         data_buffer.append(&mut preset_buffer);
                                     }
                                     
-                                    let type_byte = db_type.to_byte();
-                                        
-                                    let column = if type_byte >= 1 && type_byte <= 10 {
+                                    let column = if column_type >= 1 && column_type <= 10 {
                                         Column::from_raw(column_type, data_buffer.to_vec(), Some(DowngradeType::I128))
-                                    } else if type_byte >= 11 && type_byte <= 12 {
+                                    } else if column_type >= 11 && column_type <= 12 {
                                         Column::from_raw(column_type, data_buffer.to_vec(), Some(DowngradeType::F64))
                                     } else {
                                         Column::from_raw(column_type, data_buffer.to_vec(), None)
@@ -886,10 +900,8 @@ impl<S: IOOperationsSync> Table<S> {
         
                                     required_columns.push((current_column_index, Box::pin(column)));
                                 } else {
-                                    let cursor = &mut cursor_vector.cursor;
-                                    cursor.seek(SeekFrom::Start(position)).unwrap();
-
-                                    let column_type = cursor.read_u8().unwrap();
+                                    let column_type = cursor_vector.vector[position as usize];
+                                    position += 1;
         
                                     let db_type = DbType::from_byte(column_type);
         
@@ -899,13 +911,28 @@ impl<S: IOOperationsSync> Table<S> {
         
                                     if db_type != DbType::STRING {
                                         let db_size = db_type.get_size();
-                                        cursor.seek(SeekFrom::Current(db_size as i64)).unwrap();
+                                        position += db_size as u64;
                                     } else {
-                                        let str_length = cursor.read_u32::<LittleEndian>().unwrap();
-                                        cursor.seek(SeekFrom::Current(str_length as i64)).unwrap();
-                                    }
+                                        let str_len_array: [u8; 4] = [
+                                            cursor_vector.vector[position as usize],
+                                            cursor_vector.vector[(position + 1) as usize],
+                                            cursor_vector.vector[(position + 2) as usize],
+                                            cursor_vector.vector[(position + 3) as usize]
+                                        ];
 
-                                    position = cursor.stream_position().unwrap();
+                                        position += 4;
+
+                                        let str_len_array_pointer = str_len_array.as_ptr();
+
+                                        #[cfg(target_arch = "x86_64")]
+                                        {
+                                            unsafe { _mm_prefetch::<_MM_HINT_T0>(str_len_array_pointer as *const i8) };
+                                        }
+                                        
+                                        let str_length = unsafe { read_u32(str_len_array_pointer) };
+
+                                        position += str_length as u64;
+                                    }
                                 }
 
                                 current_column_index += 1;
