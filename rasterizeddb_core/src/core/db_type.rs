@@ -52,6 +52,7 @@ impl DbType {
         }
     }
 
+    #[track_caller]
     pub fn from_byte(byte: u8) -> DbType {
         match byte {
             1 => DbType::I8,
@@ -76,7 +77,8 @@ impl DbType {
         }
     }
 
-    pub fn get_size(&self) -> u64 {
+    #[track_caller]
+    pub fn get_size(&self) -> u32 {
         match self {
             DbType::I8 => 1,
             DbType::I16 => 2,

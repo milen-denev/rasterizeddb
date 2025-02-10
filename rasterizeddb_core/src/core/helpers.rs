@@ -1,8 +1,8 @@
-use std::{arch::x86_64::{_mm_prefetch, _MM_HINT_T0}, io::{self, Cursor, Read, Seek, SeekFrom}};
+use std::{arch::x86_64::{_mm_prefetch, _MM_HINT_T0}, io::{self, Cursor, Read, Seek, SeekFrom}, ptr};
 
 use byteorder::{LittleEndian, ReadBytesExt};
 
-use crate::{simds::endianess::{read_u32, read_u64, read_u8}, CHUNK_SIZE, EMPTY_BUFFER, HEADER_SIZE};
+use crate::{instructions::ref_vec, memory_pool::{Chunk, MEMORY_POOL}, simds::endianess::{read_u32, read_u64, read_u8}, CHUNK_SIZE, EMPTY_BUFFER, HEADER_SIZE};
 use super::{
     column::Column, 
     db_type::DbType, 
@@ -10,6 +10,53 @@ use super::{
     storage_providers::traits::IOOperationsSync, 
     support_types::{CursorVector, FileChunk, RowPrefetchResult}
 };
+
+pub(crate) fn read_row_cursor<'a>(first_column_index: u64, id: u64, length: u32, cursor: &mut Cursor<&Vec<u8>>) -> io::Result<Row> {
+    cursor.seek(SeekFrom::Start(first_column_index)).unwrap();
+
+    let mut columns: Vec<Column> = Vec::default();
+    
+    loop {
+        let column_type = cursor.read_u8().unwrap();
+
+        let db_type = DbType::from_byte(column_type);
+
+        if db_type == DbType::END {
+            break;
+        }
+
+        let mut data_buffer = Vec::default();
+
+        if db_type != DbType::STRING {
+            let db_size = db_type.get_size();
+
+            let mut preset_buffer = vec![0; db_size as usize];
+            cursor.read(&mut preset_buffer).unwrap();
+            data_buffer.append(&mut preset_buffer.to_vec());
+        } else {
+            let str_length = cursor.read_u32::<LittleEndian>().unwrap();
+            let mut preset_buffer = vec![0; str_length as usize];
+            cursor.read(&mut preset_buffer).unwrap();
+            data_buffer.append(&mut preset_buffer.to_vec());
+        }
+        
+        let column = Column::from_raw_clone(column_type, &data_buffer);
+
+        columns.push(column);
+    }
+
+    let mut columns_buffer: Vec<u8> = Vec::default();
+
+    for mut column in columns {
+        columns_buffer.append(&mut column.into_vec().unwrap());
+    }
+
+    return Ok(Row {
+        id: id,
+        length: length,
+        columns_data: columns_buffer
+    });
+}
 
 pub(crate) async fn read_row_columns(
     io_sync: &mut Box<impl IOOperationsSync>, 
@@ -49,7 +96,7 @@ pub(crate) async fn read_row_columns(
             data_buffer.append(&mut preset_buffer);
         }
         
-        let column = Column::from_raw(column_type, data_buffer, None);
+        let column = Column::from_raw_clone(column_type, &data_buffer);
 
         columns.push(column);
     }
@@ -67,45 +114,140 @@ pub(crate) async fn read_row_columns(
     });
 }
 
-pub(crate) fn read_row_cursor<'a>(first_column_index: u64, id: u64, length: u32, cursor: &mut Cursor<&Vec<u8>>) -> io::Result<Row> {
-    cursor.seek(SeekFrom::Start(first_column_index)).unwrap();
-
+pub(crate) async fn read_row_buffer<'a>(
+    first_column_index: u64, 
+    id: u64, 
+    length: u32, 
+    buffer: &'a [u8],
+    chunk_references: &mut Vec<Chunk>) -> io::Result<Row> {
+    let mut position = first_column_index as usize;
+    let start = position;
+    
     let mut columns: Vec<Column> = Vec::default();
     
+    let mut internal_chunks: Vec<Chunk> = Vec::default();
+
     loop {
-        let column_type = cursor.read_u8().unwrap();
+        let column_type_slice = [buffer[position]];
+        
+        position += 1;
+
+        let column_type_ptr = column_type_slice.as_ptr();
+    
+        #[cfg(target_arch = "x86_64")]
+        {
+            unsafe { _mm_prefetch::<_MM_HINT_T0>(column_type_ptr as *const i8) };
+        }
+
+        let column_type = unsafe { read_u8(column_type_ptr) };
 
         let db_type = DbType::from_byte(column_type);
 
         if db_type == DbType::END {
             break;
         }
-
-        let mut data_buffer = Vec::default();
-
-        if db_type != DbType::STRING {
+   
+        let data_buffer = if db_type != DbType::STRING {
             let db_size = db_type.get_size();
 
-            let mut preset_buffer = vec![0; db_size as usize];
-            cursor.read(&mut preset_buffer).unwrap();
-            data_buffer.append(&mut preset_buffer.to_vec());
+            let raw_pointer_result = {
+                let mut memory_pool = MEMORY_POOL.write().unwrap();
+
+                let pointer_result = memory_pool.acquire(db_size).await;
+                
+                drop(memory_pool);
+
+                pointer_result
+            };
+
+            let mut temp_buffer = match raw_pointer_result {
+                Some(chunk) => {
+                    let ref_vec = ref_vec(chunk.ptr, chunk.size as usize);
+                    internal_chunks.push(chunk);
+                    ref_vec
+                },
+                None => vec![0; db_size as usize]
+            };
+
+            let slice = &buffer[position..position + db_size as usize];
+
+            position += db_size as usize;
+
+            unsafe { ptr::copy_nonoverlapping(slice.as_ptr(), temp_buffer.as_mut_ptr(), db_size as usize) };
+
+            temp_buffer
         } else {
-            let str_length = cursor.read_u32::<LittleEndian>().unwrap();
-            let mut preset_buffer = vec![0; str_length as usize];
-            cursor.read(&mut preset_buffer).unwrap();
-            data_buffer.append(&mut preset_buffer.to_vec());
-        }
+            // READ LEN - START
+            let str_len_slice = &buffer[position..position + 4];
+
+            let str_length = unsafe { read_u32(str_len_slice.as_ptr()) };
+
+            position += 4;
+            // READ LEN - END
+
+            let raw_pointer_result = {
+                let mut memory_pool = MEMORY_POOL.write().unwrap();
+
+                let pointer_result = memory_pool.acquire(str_length + 4).await;
+                
+                drop(memory_pool);
+
+                pointer_result
+            };
+
+            let mut temp_buffer = match raw_pointer_result {
+                Some(chunk) => {
+                    let ref_vec = ref_vec(chunk.ptr, chunk.size as usize + 4);
+                    internal_chunks.push(chunk);
+                    ref_vec
+                },
+                None => vec![0; str_length as usize + 4]
+            };
+
+            let slice = &buffer[position as usize..position as usize + str_length as usize];
+
+            temp_buffer[..4].copy_from_slice(str_len_slice);
+
+            position += str_length as usize;
+
+            unsafe { 
+                ptr::copy_nonoverlapping(slice.as_ptr(), temp_buffer[4..].as_mut_ptr(), str_length as usize);
+            };
+
+            temp_buffer
+        };
         
-        let column = Column::from_raw(column_type, data_buffer, None);
+        let column = Column::from_raw(column_type, &data_buffer);
 
         columns.push(column);
     }
 
-    let mut columns_buffer: Vec<u8> = Vec::default();
+    let total_size = position - start;
+
+    let raw_pointer_result = {
+        let mut memory_pool = MEMORY_POOL.write().unwrap();
+
+        let pointer_result = memory_pool.acquire(total_size as u32).await;
+        
+        drop(memory_pool);
+
+        pointer_result
+    };
+
+    let mut columns_buffer = match raw_pointer_result {
+        Some(chunk) => {
+            let vec =  ref_vec(chunk.ptr, chunk.size as usize);
+            chunk_references.push(chunk);
+            vec
+        },
+        None => vec![0; total_size as usize]
+    };
 
     for mut column in columns {
         columns_buffer.append(&mut column.into_vec().unwrap());
     }
+
+    drop(internal_chunks);
 
     return Ok(Row {
         id: id,
@@ -464,7 +606,7 @@ pub(crate) async fn indexed_row_fetching_file(
             data_buffer.append(&mut preset_buffer.to_vec());
         }
         
-        let column = Column::from_raw(column_type, data_buffer, None);
+        let column = Column::from_raw_clone(column_type, &data_buffer);
 
         columns.push(column);
     }
@@ -514,7 +656,7 @@ pub(crate) fn columns_cursor_to_row(
             data_buffer.append(&mut preset_buffer.to_vec());
         }
         
-        let column = Column::from_raw(column_type, data_buffer, None);
+        let column = Column::from_raw_clone(column_type, &data_buffer);
 
         columns.push(column);
     }

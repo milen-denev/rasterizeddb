@@ -4,7 +4,7 @@ use rasterizeddb_core::{
     core::{
         column::Column, 
         row::InsertOrUpdateRow, 
-        storage_providers::file_sync::LocalStorageProvider, 
+        storage_providers::{file_sync::LocalStorageProvider, memory::MemoryStorageProvider}, 
         table::Table
     }, rql::parser::parse_rql, EMPTY_BUFFER
 };
@@ -28,6 +28,8 @@ async fn main() -> std::io::Result<()> {
         "database.db"
     ).await;
 
+    //let io_sync = MemoryStorageProvider::new();
+
     //let database = Database::new(io_sync).await?;
 
     // Database::start_async(Arc::new(RwLock::new(database))).await?;
@@ -38,27 +40,27 @@ async fn main() -> std::io::Result<()> {
 
     //let io_sync = MemoryStorageProvider::new();
 
-    let mut table = Table::init(io_sync, false, false).await.unwrap();
+   let mut table = Table::init(io_sync, false, false).await.unwrap();
 
-    let mut c1 = Column::new(1_597_937).unwrap();
-    let mut c2 = Column::new(-1_597_937).unwrap();
-    let mut c3 = Column::new("This is the millionth something row.").unwrap();
+    // let mut c1 = Column::new(1_597_937).unwrap();
+    // let mut c2 = Column::new(-1_597_937).unwrap();
+    // let mut c3 = Column::new("This is the millionth something row.").unwrap();
 
-    let mut columns_buffer: Vec<u8> = Vec::with_capacity(
-        c1.len() + 
-        c2.len() +
-        c3.len() 
-    );
+    // let mut columns_buffer: Vec<u8> = Vec::with_capacity(
+    //     c1.len() + 
+    //     c2.len() +
+    //     c3.len() 
+    // );
 
-    columns_buffer.append(&mut c1.into_vec().unwrap());
-    columns_buffer.append(&mut c2.into_vec().unwrap());
-    columns_buffer.append(&mut c3.into_vec().unwrap());
+    // columns_buffer.append(&mut c1.into_vec().unwrap());
+    // columns_buffer.append(&mut c2.into_vec().unwrap());
+    // columns_buffer.append(&mut c3.into_vec().unwrap());
 
-    let _insert_row = InsertOrUpdateRow {
-        columns_data: columns_buffer
-    };
+    // let _insert_row = InsertOrUpdateRow {
+    //     columns_data: columns_buffer
+    // };
 
-    //table.insert_row(insert_row).await;
+    // table.insert_row(_insert_row).await;
 
     // for i in 0..1_000_000 {
     //     if i == 999_998_999 {
@@ -104,7 +106,7 @@ async fn main() -> std::io::Result<()> {
     //     }
     // }
 
-    println!("DONE inserting rows.");
+    // println!("DONE inserting rows.");
 
     table.rebuild_in_memory_indexes().await;
 

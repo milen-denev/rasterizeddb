@@ -1,4 +1,4 @@
-use std::arch::x86_64::*;
+use std::{arch::{asm, x86_64::*}, ptr};
 
 #[inline]
 pub(crate) fn compare_vecs_eq(vec1: &[u8], vec2: &[u8]) -> bool {
@@ -77,4 +77,50 @@ pub(crate) fn compare_vecs_starts_with(vec1: &[u8], vec2: &[u8]) -> bool {
 #[inline]
 pub(crate) fn compare_vecs_ends_with(vec1: &[u8], vec2: &[u8]) -> bool {
     return vec1.ends_with(vec2); 
+}
+
+#[inline(always)]
+pub unsafe fn compare_raw_vecs(vec_a: *mut u8, vec_b: *mut u8, vec_a_len: u32, vec_b_len: u32) -> bool {
+    let mut result: u8;
+    
+    if vec_a_len != vec_b_len {
+        return false;
+    }
+
+    asm!(
+        "repe cmpsb",
+        inout("rsi") vec_a => _,
+        inout("rdi") vec_b => _,
+        inout("rcx") vec_a_len => _,
+        out("al") result
+    );
+
+    result == 0
+}
+
+#[inline(always)]
+pub unsafe fn zero_buffer(buf: *mut u8, len: usize) {
+    ptr::write_bytes(buf, 0, len);
+}
+
+#[inline(always)]
+pub fn copy_vec_to_ptr(vec: &[u8], dst: *mut u8) {
+    unsafe {
+        ptr::copy_nonoverlapping(vec.as_ptr(), dst, vec.len());
+    }
+}
+
+#[inline(always)]
+pub fn vec_from_ptr_safe(ptr: *mut u8, len: usize) -> Vec<u8> {
+    unsafe {
+        let slice = std::slice::from_raw_parts(ptr, len);
+        slice.to_vec() // Creates a new Vec<u8>
+    }
+}
+
+#[inline(always)]
+pub fn ref_vec(ptr: *mut u8, len: usize) -> Vec<u8> {
+    unsafe {
+        Vec::from_raw_parts(ptr, len, len)
+    }
 }

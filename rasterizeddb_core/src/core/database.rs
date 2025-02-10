@@ -114,8 +114,8 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
 
         _ = self.tables.remove(&name).unwrap();
 
-        let row = self.config_table.first_or_default_by_column(0, name).await?.unwrap();
-        self.config_table.delete_row_by_id(row.id).await?;
+        //let row = self.config_table.first_or_default_by_column(0, name).await?.unwrap();
+        //self.config_table.delete_row_by_id(row.id).await?;
 
         Ok(())
     }
@@ -124,12 +124,12 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
         let db = database.clone();
         let receiver = RECEIVER.force().await;
 
-        let future = receiver.start_processing_function_result_object(
-            db, 
-            process_incoming_queries
-        );
+        // let future = receiver.start_processing_function_result_object(
+        //     db, 
+        //     process_incoming_queries
+        // );
 
-        _ = tokio::spawn(future).await;
+        // _ = tokio::spawn(future).await;
 
         Ok(())
     }

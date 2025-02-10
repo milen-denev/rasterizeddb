@@ -44,17 +44,17 @@ async fn main() {
         .unwrap()
     ));
 
-    let app = Router::new()
-        .route("/", get(index))
-        .route("/get", get(query))
-        .route("/test", get(test_reading))
-        .layer(Extension(file));
+    // let app = Router::new()
+    //     .route("/", get(index))
+    //     .route("/get", get(query))
+    //     .route("/test", get(test_reading))
+    //     .layer(Extension(file));
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:80")
-        .await
-        .unwrap();
+    // let listener = tokio::net::TcpListener::bind("127.0.0.1:80")
+    //     .await
+    //     .unwrap();
 
-    axum::serve(listener, app).await.unwrap();
+    // axum::serve(listener, app).await.unwrap();
 }
 
 #[allow(static_mut_refs)]

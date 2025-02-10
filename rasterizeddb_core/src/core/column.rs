@@ -1,9 +1,10 @@
-use std::{fmt::{Debug, Display}, io::{self, Cursor, Read, Write}, ops::{Deref, DerefMut}};
+use std::{arch::x86_64::{_mm_prefetch, _MM_HINT_T0}, fmt::{Debug, Display}, io::{self, Cursor, Read, Write}, ops::{Deref, DerefMut}, ptr};
 
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt, WriteBytesExt};
+use futures::executor::block_on;
 use once_cell::sync::Lazy;
 
-use crate::instructions::{compare_vecs_ends_with, compare_vecs_eq, compare_vecs_ne, compare_vecs_starts_with, contains_subsequence};
+use crate::{instructions::{compare_raw_vecs, compare_vecs_ends_with, compare_vecs_eq, compare_vecs_ne, compare_vecs_starts_with, contains_subsequence, copy_vec_to_ptr, ref_vec, vec_from_ptr_safe}, memory_pool::{Chunk, MEMORY_POOL}, simds::endianess::{read_u32, read_u8}};
 
 use super::db_type::DbType;
 
@@ -14,20 +15,85 @@ pub(crate) const ZERO_VALUE: Lazy<Column> = Lazy::new(|| {
 #[derive(PartialEq, Clone)]
 pub struct Column {
     pub data_type: DbType,
-    pub content: Vec<u8>
+    pub content: ColumnValue
 }
 
-impl Deref for Column {
-    type Target = Vec<u8>;
+pub enum ColumnValue {
+    StaticMemoryPointer(Chunk),
+    ManagedMemoryPointer(Vec<u8>)
+}
 
-    fn deref(&self) -> &Self::Target {
-        &self.content
+impl ColumnValue {
+    pub fn len(&self) -> u32 {
+        match self {
+            ColumnValue::StaticMemoryPointer(chunk) => chunk.size,
+            ColumnValue::ManagedMemoryPointer(vec) => vec.len() as u32
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match self {
+            ColumnValue::StaticMemoryPointer(chunk) => chunk.size == 0,
+            ColumnValue::ManagedMemoryPointer(vec) => vec.is_empty()
+        }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            ColumnValue::StaticMemoryPointer(chunk) => {
+                unsafe { std::slice::from_raw_parts(chunk.ptr, chunk.size as usize) }
+            }
+            ColumnValue::ManagedMemoryPointer(vec) => vec.as_slice(),
+        }
+    }
+
+    pub fn to_vec(&self) -> Vec<u8> {
+        match self {
+            ColumnValue::StaticMemoryPointer(chunk) => vec_from_ptr_safe(chunk.ptr, chunk.size as usize),
+            ColumnValue::ManagedMemoryPointer(vec) => vec.clone(),
+        }
+    }
+
+    pub fn replace(&mut self, new_values: &[u8]) {
+        match self {
+            ColumnValue::StaticMemoryPointer(chunk) => {
+                assert_eq!(new_values.len(), chunk.size as usize, "New values must have the same length");
+                unsafe {
+                    std::ptr::copy_nonoverlapping(new_values.as_ptr(), chunk.ptr, chunk.size as usize);
+                }
+            }
+            ColumnValue::ManagedMemoryPointer(vec) => {
+                assert_eq!(new_values.len(), vec.len(), "New values must have the same length");
+                vec.copy_from_slice(new_values);
+            }
+        }
     }
 }
 
-impl DerefMut for Column {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.content
+impl PartialEq for ColumnValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (ColumnValue::StaticMemoryPointer(pointer_a), ColumnValue::StaticMemoryPointer(pointer_b)) => {
+                unsafe { compare_raw_vecs(pointer_a.ptr, pointer_b.ptr, pointer_a.size, pointer_b.size) }
+            }
+            (ColumnValue::ManagedMemoryPointer(a), ColumnValue::ManagedMemoryPointer(b)) => {
+                compare_vecs_eq(a, b)
+            }
+            _ => false
+        }
+    }
+}
+
+impl Clone for ColumnValue {
+    fn clone(&self) -> Self {
+        match self {
+            ColumnValue::StaticMemoryPointer(chunk) => {
+                ColumnValue::StaticMemoryPointer(chunk.clone())
+            }
+            ColumnValue::ManagedMemoryPointer(vec) => {
+                ColumnValue::ManagedMemoryPointer(vec.clone())
+            }
+        }
     }
 }
 
@@ -202,28 +268,47 @@ impl Column {
             }
         };
 
+        //Create the buffer with db_type included
+        let mut buffer: Vec<u8> = if db_type != DbType::STRING {
+            Vec::with_capacity(vec.len() + 1) 
+        } else {
+            Vec::with_capacity(vec.len() + 1 + 4) 
+        };
+
+        if db_type == DbType::STRING {
+            buffer.write_u32::<LittleEndian>(vec.len() as u32).unwrap();
+        }
+
+        buffer.extend_from_slice(&vec);
+
+        let mut memory_pool = MEMORY_POOL.write().unwrap();
+
+        let pointer_result = block_on(memory_pool.acquire(vec.len() as u32));
+        
+        drop(memory_pool);
+
+        let column_value = match pointer_result {
+            Some(chunk) => {
+                copy_vec_to_ptr(&buffer, chunk.ptr);
+                ColumnValue::StaticMemoryPointer(chunk)
+            },
+            None => ColumnValue::ManagedMemoryPointer(vec)
+        };
+
         Ok(Column {
             data_type: db_type,
-            content: vec
+            content: column_value
         })
     }
 
+    // Vector must be dropped before dropping column
     pub fn into_vec(&mut self) -> io::Result<Vec<u8>> {
-        let content_len = self.content.len();
-
-        let mut buffer: Vec<u8> = if self.data_type != DbType::STRING {
-            Vec::with_capacity(content_len + 1) 
-        } else {
-            Vec::with_capacity(content_len + 1 + 4) 
+        let buffer = match &self.content {
+            ColumnValue::StaticMemoryPointer(chunk) => {
+                ref_vec(chunk.ptr, chunk.size as usize)
+            },
+            ColumnValue::ManagedMemoryPointer(vec) => vec.clone()
         };
-
-        buffer.push(self.data_type.to_byte());
-
-        if self.data_type == DbType::STRING {
-            buffer.write_u32::<LittleEndian>(content_len as u32).unwrap();
-        }
-
-        buffer.append(&mut self.content);
 
         Ok(buffer)
     }
@@ -233,104 +318,149 @@ impl Column {
             panic!("Trying to calculate length of empty vector");
         }
 
-        self.content.len() + 1
+        self.content.len() as usize + 1
     }
 
-    pub fn from_raw(data_type: u8, buffer: Vec<u8>, downgrade_type: Option<DowngradeType>) -> Column {        
-        if let Some(downgrade_type) = downgrade_type {
-            if downgrade_type == DowngradeType::I128 {
-                if data_type >= 1 && data_type <= 10 {
-                    let db_type_enum = DbType::from_byte(data_type);
-    
-                    let mut cursor = Cursor::new(buffer);
-                    let mut data_buffer: Vec<u8> = Vec::default();
-    
-                    let mut temp_buffer = vec![0; db_type_enum.get_size() as usize];
-                    cursor.read(&mut temp_buffer).unwrap();
-                    data_buffer.append(&mut temp_buffer.to_vec());
-                    
-                    let value = match db_type_enum {
-                        DbType::I8 => data_buffer.as_slice().read_i8().unwrap() as i128,
-                        DbType::I16 => LittleEndian::read_i16(&data_buffer) as i128,
-                        DbType::I32 => LittleEndian::read_i32(&data_buffer) as i128,
-                        DbType::I64 => LittleEndian::read_i64(&data_buffer) as i128,
-                        DbType::I128 => LittleEndian::read_i128(&data_buffer),
-                        DbType::U8 => data_buffer.as_slice().read_u8().unwrap() as i128,
-                        DbType::U16 => LittleEndian::read_u16(&data_buffer) as i128,
-                        DbType::U32 => LittleEndian::read_u32(&data_buffer) as i128,
-                        DbType::U64 => LittleEndian::read_u64(&data_buffer) as i128,
-                        DbType::U128 => LittleEndian::read_u128(&data_buffer) as i128,
-                        _ => panic!("Unsupported type"),
-                    };
-    
-                    let mut new_buffer: Vec<u8> = Vec::with_capacity(0);
-    
-                    new_buffer.write_i128::<LittleEndian>(value).unwrap();
-    
-                    return Column {
-                        data_type: db_type_enum,
-                        content: new_buffer
-                    };
-                }
-            } else {
-                if data_type >= 11 && data_type <= 12 {
-                    let db_type_enum = DbType::from_byte(data_type);
-    
-                    let mut cursor = Cursor::new(buffer);
-                    let mut data_buffer: Vec<u8> = Vec::default();
-    
-                    let mut temp_buffer = vec![0; db_type_enum.get_size() as usize];
-                    cursor.read(&mut temp_buffer).unwrap();
-                    data_buffer.append(&mut temp_buffer.to_vec());
-                    
-                    let value = match db_type_enum {
-                        DbType::F32 => LittleEndian::read_f32(&data_buffer) as f64,
-                        DbType::F64 => LittleEndian::read_f64(&data_buffer) as f64,
-                        _ => panic!("Unsupported type"),
-                    };
-    
-                    let mut new_buffer: Vec<u8> = Vec::with_capacity(0);
-    
-                    new_buffer.write_f64::<LittleEndian>(value).unwrap();
-    
-                    return Column {
-                        data_type: db_type_enum,
-                        content: new_buffer
-                    };
-                }
+    pub fn from_raw(data_type: u8, buffer: &[u8]) -> Column {    
+        let column_value = {
+            let mut memory_pool = MEMORY_POOL.write().unwrap();
+
+            let pointer_result = block_on(memory_pool.acquire(buffer.len() as u32));
+            
+            drop(memory_pool);
+
+            match pointer_result {
+                Some(chunk) => {
+                    copy_vec_to_ptr(buffer, chunk.ptr);
+                    ColumnValue::StaticMemoryPointer(chunk)
+                },
+                None => ColumnValue::ManagedMemoryPointer(buffer.to_vec())
             }
-        }
+        };
 
         Column {
             data_type: DbType::from_byte(data_type),
-            content: buffer
+            content: column_value
+        }
+    }
+
+    pub fn from_raw_clone(data_type: u8, buffer: &[u8]) -> Column {    
+        let column_value = {
+            let mut memory_pool = MEMORY_POOL.write().unwrap();
+
+            let pointer_result = block_on(memory_pool.acquire(buffer.len() as u32));
+            
+            drop(memory_pool);
+
+            match pointer_result {
+                _ => ColumnValue::ManagedMemoryPointer(buffer.to_vec()),
+            }
+        };
+
+        Column {
+            data_type: DbType::from_byte(data_type),
+            content: column_value
         }
     }
 
     pub fn from_buffer(buffer: &[u8]) -> io::Result<Vec<Column>> {
-        let mut cursor = Cursor::new(buffer);
-
         let mut columns: Vec<Column> = Vec::default();
 
-        while cursor.position() < buffer.len() as u64 {
-            let column_type = cursor.read_u8().unwrap();
+        let mut position: u64 = 0;
 
+        let mut chunk_references: Vec<Chunk> = Vec::new();
+
+        while position < buffer.len() as u64 {
+            let column_type_slice = [buffer[0]];
+        
+            position += 1;
+
+            let column_type_ptr = column_type_slice.as_ptr();
+        
+            #[cfg(target_arch = "x86_64")]
+            {
+                unsafe { _mm_prefetch::<_MM_HINT_T0>(column_type_ptr as *const i8) };
+            }
+    
+            let column_type = unsafe { read_u8(column_type_ptr) };
+    
             let db_type = DbType::from_byte(column_type);
 
-            let mut data_buffer: Vec<u8> = Vec::default();
-
-            if db_type != DbType::STRING {
-                let mut temp_buffer = vec![0; db_type.get_size() as usize];
-                cursor.read(&mut temp_buffer).unwrap();
-                data_buffer.append(&mut temp_buffer.to_vec());
-            } else {
-                let str_length = cursor.read_u32::<LittleEndian>().unwrap();
-                let mut temp_buffer = vec![0; str_length as usize];
-                cursor.read(&mut temp_buffer).unwrap();
-                data_buffer.append(&mut temp_buffer.to_vec());
+            if db_type == DbType::END {
+                break;
             }
 
-            let column = Column::from_raw(column_type, data_buffer, None);
+            let data_buffer = if db_type != DbType::STRING {
+                let db_size = db_type.get_size();
+
+                let raw_pointer_result = {
+                    let mut memory_pool = MEMORY_POOL.write().unwrap();
+    
+                    let pointer_result = block_on(memory_pool.acquire(db_size));
+                    
+                    drop(memory_pool);
+    
+                    pointer_result
+                };
+    
+                let mut temp_buffer = match raw_pointer_result {
+                    Some(chunk) => {
+                        let ref_vec = ref_vec(chunk.ptr, chunk.size as usize);
+                        chunk_references.push(chunk);
+                        ref_vec
+                    },
+                    None => vec![0; db_size as usize]
+                };
+
+                let slice = &buffer[position as usize..position as usize + db_size as usize];
+
+                position += db_size as u64;
+
+                unsafe { ptr::copy_nonoverlapping(slice.as_ptr(), temp_buffer.as_mut_ptr(), db_size as usize) };
+
+                temp_buffer
+            } else {
+                // READ LEN - START
+                let str_len_slice = &buffer[position as usize..position as usize + 4 as usize];
+
+                let str_length = unsafe { read_u32(str_len_slice.as_ptr()) };
+
+                position += 4 as u64;
+                // READ LEN - END
+
+                let raw_pointer_result = {
+                    let mut memory_pool = MEMORY_POOL.write().unwrap();
+    
+                    let pointer_result = block_on(memory_pool.acquire(str_length + 4));
+                    
+                    drop(memory_pool);
+    
+                    pointer_result
+                };
+
+                let mut temp_buffer = match raw_pointer_result {
+                    Some(chunk) => {
+                        let ref_vec = ref_vec(chunk.ptr, chunk.size as usize + 4);
+                        chunk_references.push(chunk);
+                        ref_vec
+                    },
+                    None => vec![0; str_length as usize + 4]
+                };
+
+                let slice = &buffer[position as usize..position as usize + str_length as usize];
+
+                temp_buffer[..4].copy_from_slice(str_len_slice);
+
+                position += str_length as u64;
+
+                unsafe { 
+                    ptr::copy_nonoverlapping(slice.as_ptr(), temp_buffer[4..].as_mut_ptr(), str_length as usize);
+                };
+
+                temp_buffer
+            };
+
+            let column = Column::from_raw_clone(column_type, &data_buffer);
 
             columns.push(column);
         }
@@ -341,16 +471,17 @@ impl Column {
     /// For debug purposes
     pub fn print(&self) {
         if self.data_type == DbType::I32 {
-            let i32_value = LittleEndian::read_i32(&self.content);
+            let i32_value = LittleEndian::read_i32(self.content.as_slice());
             println!("i32:{}", i32_value);
         } else if self.data_type == DbType::STRING {
-            let string_value = String::from_utf8(self.content.clone()).unwrap();
+            let vec = self.content.as_slice()[4..].to_vec();
+            let string_value = String::from_utf8(vec).unwrap();
             println!("string:{}", string_value);
         } else if self.data_type == DbType::CHAR {
-            let char_value = char::from_u32(LittleEndian::read_u32(&self.content)).unwrap();
+            let char_value = char::from_u32(LittleEndian::read_u32(self.content.as_slice())).unwrap();
             println!("char:{}", char_value);
         } else if self.data_type == DbType::I128 {
-            let i128_value = LittleEndian::read_i128(&self.content);
+            let i128_value = LittleEndian::read_i128(self.content.as_slice());
             println!("i128:{}", i128_value);
         }
     }
@@ -358,16 +489,17 @@ impl Column {
     /// For debug purposes
     pub fn to_str(&self) -> String {
         if self.data_type == DbType::I32 {
-            let i32_value = LittleEndian::read_i32(&self.content);
+            let i32_value = LittleEndian::read_i32(self.content.as_slice());
             format!("i32:{}", i32_value)
         } else if self.data_type == DbType::STRING {
-            let string_value = String::from_utf8(self.content.clone()).unwrap();
+            let vec = self.content.as_slice()[4..].to_vec();
+            let string_value = String::from_utf8(vec).unwrap();
             format!("string:{}", string_value)
         } else if self.data_type == DbType::CHAR {
-            let char_value = char::from_u32(LittleEndian::read_u32(&self.content)).unwrap();
+            let char_value = char::from_u32(LittleEndian::read_u32(self.content.as_slice())).unwrap();
             format!("char:{}", char_value)
         } else if self.data_type == DbType::I128 {
-            let i128_value = LittleEndian::read_i128(&self.content);
+            let i128_value = LittleEndian::read_i128(self.content.as_slice());
             format!("i128:{}", i128_value)
         } else {
             String::from("N/A")
@@ -377,59 +509,60 @@ impl Column {
     pub fn into_value(&self) -> String {
         match self.data_type {
             DbType::I8 => {
-                let value = self.content[0] as i8;
+                let value = self.content.as_slice()[1] as i8;
                 value.to_string()
             }
             DbType::I16 => {
-                let value = LittleEndian::read_i16(&self.content);
+                let value = LittleEndian::read_i16(self.content.as_slice()[1..].as_ref());
                 value.to_string()
             }
             DbType::I32 => {
-                let value = LittleEndian::read_i32(&self.content);
+                let value = LittleEndian::read_i32(self.content.as_slice()[1..].as_ref());
                 value.to_string()
             }
             DbType::I64 => {
-                let value = LittleEndian::read_i64(&self.content);
+                let value = LittleEndian::read_i64(self.content.as_slice()[1..].as_ref());
                 value.to_string()
             }
             DbType::I128 => {
-                let value = LittleEndian::read_i128(&self.content);
+                let value = LittleEndian::read_i128(self.content.as_slice()[1..].as_ref());
                 value.to_string()
             }
             DbType::U8 => {
-                let value = self.content[0] as u8;
+                let value = self.content.as_slice()[1] as i8;
                 value.to_string()
             }
             DbType::U16 => {
-                let value = LittleEndian::read_u16(&self.content);
+                let value = LittleEndian::read_u16(self.content.as_slice()[1..].as_ref());
                 value.to_string()
             }
             DbType::U32 => {
-                let value = LittleEndian::read_u32(&self.content);
+                let value = LittleEndian::read_u32(self.content.as_slice()[1..].as_ref());
                 value.to_string()
             }
             DbType::U64 => {
-                let value = LittleEndian::read_u64(&self.content);
+                let value = LittleEndian::read_u64(self.content.as_slice()[1..].as_ref());
                 value.to_string()
             }
             DbType::U128 => {
-                let value = LittleEndian::read_u128(&self.content);
+                let value = LittleEndian::read_u128(self.content.as_slice()[1..].as_ref());
                 value.to_string()
             }
             DbType::F32 => {
-                let value = LittleEndian::read_f32(&self.content);
+                let value = LittleEndian::read_f32(self.content.as_slice()[1..].as_ref());
                 value.to_string()
             }
             DbType::F64 => {
-                let value = LittleEndian::read_f64(&self.content);
+                let value = LittleEndian::read_f64(self.content.as_slice()[1..].as_ref());
                 value.to_string()
             }
             DbType::CHAR => {
-                let value = char::from_u32(LittleEndian::read_u32(&self.content)).unwrap();
+                let value = char::from_u32(LittleEndian::read_u32(self.content.as_slice()[1..].as_ref())).unwrap();
                 value.to_string()
             }
             DbType::STRING => {
-                let value = String::from_utf8(self.content.clone()).unwrap();
+                let vec = self.content.as_slice()[4..].to_vec();
+                let value = String::from_utf8(vec).unwrap();
                 value
             }
             _ => todo!(),
@@ -441,16 +574,16 @@ impl Column {
     }
 
     pub fn equals(&self, column: &Column) -> bool {
-        compare_vecs_eq(&self.content, &column.content)
+        compare_vecs_eq(self.content.as_slice(), column.content.as_slice())
     }
 
     pub fn not_equal(&self, column: &Column) -> bool {
-        compare_vecs_ne(&self.content, &column.content)
+        compare_vecs_ne(self.content.as_slice(), column.content.as_slice())
     }
 
     pub fn contains(&self, column: &Column) -> bool {
         if self.data_type == DbType::STRING {
-            contains_subsequence(&self.content, &column.content)
+            contains_subsequence(self.content.as_slice(), column.content.as_slice())
         } else {
             panic!("Contains method cannot be used on columns that are not of type string");
         }
@@ -458,7 +591,7 @@ impl Column {
 
     pub fn starts_with(&self, column: &Column) -> bool {
         if self.data_type == DbType::STRING {
-            compare_vecs_starts_with(&self.content, &column.content)
+            compare_vecs_starts_with(self.content.as_slice(), column.content.as_slice())
         } else {
             panic!("Starts With method cannot be used on columns that are not of type string");
         }
@@ -466,7 +599,7 @@ impl Column {
 
     pub fn ends_with(&self, column: &Column) -> bool {
         if self.data_type == DbType::STRING {
-            compare_vecs_ends_with(&self.content, &column.content)
+            compare_vecs_ends_with(self.content.as_slice(), column.content.as_slice())
         } else {
             panic!("Ends With method cannot be used on columns that are not of type string");
         }
@@ -478,62 +611,62 @@ impl Column {
                 let i8_1 = self.content.as_slice().read_i8().unwrap();
                 let i8_2 = column.content.as_slice().read_i8().unwrap();
                 i8_1 > i8_2
-            }
+            },
             DbType::I16 => {
-                let i16_1 = Cursor::new(&self.content).read_i16::<LittleEndian>().unwrap();
-                let i16_2 = Cursor::new(&column.content).read_i16::<LittleEndian>().unwrap();
+                let i16_1 = self.content.as_slice().read_i16::<LittleEndian>().unwrap();
+                let i16_2 = column.content.as_slice().read_i16::<LittleEndian>().unwrap();
                 i16_1 > i16_2
-            }
+            },
             DbType::I32 => {
-                let i32_1 = Cursor::new(&self.content).read_i32::<LittleEndian>().unwrap();
-                let i32_2 = Cursor::new(&column.content).read_i32::<LittleEndian>().unwrap();
+                let i32_1 = self.content.as_slice().read_i32::<LittleEndian>().unwrap();
+                let i32_2 = column.content.as_slice().read_i32::<LittleEndian>().unwrap();
                 i32_1 > i32_2
-            }
+            },
             DbType::I64 => {
-                let i64_1 = Cursor::new(&self.content).read_i64::<LittleEndian>().unwrap();
-                let i64_2 = Cursor::new(&column.content).read_i64::<LittleEndian>().unwrap();
+                let i64_1 = self.content.as_slice().read_i64::<LittleEndian>().unwrap();
+                let i64_2 = column.content.as_slice().read_i64::<LittleEndian>().unwrap();
                 i64_1 > i64_2
-            }
+            },
             DbType::I128 => {
-                let i128_1 = Cursor::new(&self.content).read_i128::<LittleEndian>().unwrap();
-                let i128_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
+                let i128_1 = self.content.as_slice().read_i128::<LittleEndian>().unwrap();
+                let i128_2 = column.content.as_slice().read_i128::<LittleEndian>().unwrap();
                 i128_1 > i128_2
-            }
+            },
             DbType::U8 => {
                 let u8_1 = self.content.as_slice().read_u8().unwrap();
                 let u8_2 = column.content.as_slice().read_u8().unwrap();
                 u8_1 > u8_2
-            }
+            },
             DbType::U16 => {
-                let u16_1 = Cursor::new(&self.content).read_u16::<LittleEndian>().unwrap();
-                let u16_2 = Cursor::new(&column.content).read_u16::<LittleEndian>().unwrap();
+                let u16_1 = self.content.as_slice().read_u16::<LittleEndian>().unwrap();
+                let u16_2 = column.content.as_slice().read_u16::<LittleEndian>().unwrap();
                 u16_1 > u16_2
-            }
+            },
             DbType::U32 => {
-                let u32_1 = Cursor::new(&self.content).read_u32::<LittleEndian>().unwrap();
-                let u32_2 = Cursor::new(&column.content).read_u32::<LittleEndian>().unwrap();
+                let u32_1 = self.content.as_slice().read_u32::<LittleEndian>().unwrap();
+                let u32_2 = column.content.as_slice().read_u32::<LittleEndian>().unwrap();
                 u32_1 > u32_2
-            }
+            },
             DbType::U64 => {
-                let u64_1 = Cursor::new(&self.content).read_u64::<LittleEndian>().unwrap();
-                let u64_2 = Cursor::new(&column.content).read_u64::<LittleEndian>().unwrap();
+                let u64_1 = self.content.as_slice().read_u64::<LittleEndian>().unwrap();
+                let u64_2 = column.content.as_slice().read_u64::<LittleEndian>().unwrap();
                 u64_1 > u64_2
-            }
+            },
             DbType::U128 => {
-                let u128_1 = Cursor::new(&self.content).read_u128::<LittleEndian>().unwrap();
-                let u128_2 = Cursor::new(&column.content).read_u128::<LittleEndian>().unwrap();
+                let u128_1 = self.content.as_slice().read_u128::<LittleEndian>().unwrap();
+                let u128_2 = column.content.as_slice().read_u128::<LittleEndian>().unwrap();
                 u128_1 > u128_2
-            }
+            },
             DbType::F32 => {
-                let f32_1 = Cursor::new(&self.content).read_f32::<LittleEndian>().unwrap();
-                let f32_2 = Cursor::new(&column.content).read_f32::<LittleEndian>().unwrap();
+                let f32_1 = self.content.as_slice().read_f32::<LittleEndian>().unwrap();
+                let f32_2 = column.content.as_slice().read_f32::<LittleEndian>().unwrap();
                 f32_1 > f32_2
-            }
+            },
             DbType::F64 => {
-                let f64_1 = Cursor::new(&self.content).read_f64::<LittleEndian>().unwrap();
-                let f64_2 = Cursor::new(&column.content).read_f64::<LittleEndian>().unwrap();
+                let f64_1 = self.content.as_slice().read_f64::<LittleEndian>().unwrap();
+                let f64_2 = column.content.as_slice().read_f64::<LittleEndian>().unwrap();
                 f64_1 > f64_2
-            }
+            },
             _ => panic!("Greater than method cannot be used on columns that are not of numeric types"),
         }
     }
@@ -546,23 +679,23 @@ impl Column {
                 i8_1 >= i8_2
             }
             DbType::I16 => {
-                let i16_1 = Cursor::new(&self.content).read_i16::<LittleEndian>().unwrap();
-                let i16_2 = Cursor::new(&column.content).read_i16::<LittleEndian>().unwrap();
+                let i16_1 = self.content.as_slice().read_i16::<LittleEndian>().unwrap();
+                let i16_2 = column.content.as_slice().read_i16::<LittleEndian>().unwrap();
                 i16_1 >= i16_2
             }
             DbType::I32 => {
-                let i32_1 = Cursor::new(&self.content).read_i32::<LittleEndian>().unwrap();
-                let i32_2 = Cursor::new(&column.content).read_i32::<LittleEndian>().unwrap();
+                let i32_1 = self.content.as_slice().read_i32::<LittleEndian>().unwrap();
+                let i32_2 = column.content.as_slice().read_i32::<LittleEndian>().unwrap();
                 i32_1 >= i32_2
             }
             DbType::I64 => {
-                let i64_1 = Cursor::new(&self.content).read_i64::<LittleEndian>().unwrap();
-                let i64_2 = Cursor::new(&column.content).read_i64::<LittleEndian>().unwrap();
+                let i64_1 = self.content.as_slice().read_i64::<LittleEndian>().unwrap();
+                let i64_2 = column.content.as_slice().read_i64::<LittleEndian>().unwrap();
                 i64_1 >= i64_2
             }
             DbType::I128 => {
-                let i128_1 = Cursor::new(&self.content).read_i128::<LittleEndian>().unwrap();
-                let i128_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
+                let i128_1 = self.content.as_slice().read_i128::<LittleEndian>().unwrap();
+                let i128_2 = column.content.as_slice().read_i128::<LittleEndian>().unwrap();
                 i128_1 >= i128_2
             }
             DbType::U8 => {
@@ -571,39 +704,39 @@ impl Column {
                 u8_1 >= u8_2
             }
             DbType::U16 => {
-                let u16_1 = Cursor::new(&self.content).read_u16::<LittleEndian>().unwrap();
-                let u16_2 = Cursor::new(&column.content).read_u16::<LittleEndian>().unwrap();
+                let u16_1 = self.content.as_slice().read_u16::<LittleEndian>().unwrap();
+                let u16_2 = column.content.as_slice().read_u16::<LittleEndian>().unwrap();
                 u16_1 >= u16_2
             }
             DbType::U32 => {
-                let u32_1 = Cursor::new(&self.content).read_u32::<LittleEndian>().unwrap();
-                let u32_2 = Cursor::new(&column.content).read_u32::<LittleEndian>().unwrap();
+                let u32_1 = self.content.as_slice().read_u32::<LittleEndian>().unwrap();
+                let u32_2 = column.content.as_slice().read_u32::<LittleEndian>().unwrap();
                 u32_1 >= u32_2
             }
             DbType::U64 => {
-                let u64_1 = Cursor::new(&self.content).read_u64::<LittleEndian>().unwrap();
-                let u64_2 = Cursor::new(&column.content).read_u64::<LittleEndian>().unwrap();
+                let u64_1 = self.content.as_slice().read_u64::<LittleEndian>().unwrap();
+                let u64_2 = column.content.as_slice().read_u64::<LittleEndian>().unwrap();
                 u64_1 >= u64_2
             }
             DbType::U128 => {
-                let u128_1 = Cursor::new(&self.content).read_u128::<LittleEndian>().unwrap();
-                let u128_2 = Cursor::new(&column.content).read_u128::<LittleEndian>().unwrap();
+                let u128_1 = self.content.as_slice().read_u128::<LittleEndian>().unwrap();
+                let u128_2 = column.content.as_slice().read_u128::<LittleEndian>().unwrap();
                 u128_1 >= u128_2
             }
             DbType::F32 => {
-                let f32_1 = Cursor::new(&self.content).read_f32::<LittleEndian>().unwrap();
-                let f32_2 = Cursor::new(&column.content).read_f32::<LittleEndian>().unwrap();
+                let f32_1 = self.content.as_slice().read_f32::<LittleEndian>().unwrap();
+                let f32_2 = column.content.as_slice().read_f32::<LittleEndian>().unwrap();
                 f32_1 >= f32_2
             }
             DbType::F64 => {
-                let f64_1 = Cursor::new(&self.content).read_f64::<LittleEndian>().unwrap();
-                let f64_2 = Cursor::new(&column.content).read_f64::<LittleEndian>().unwrap();
+                let f64_1 = self.content.as_slice().read_f64::<LittleEndian>().unwrap();
+                let f64_2 = column.content.as_slice().read_f64::<LittleEndian>().unwrap();
                 f64_1 >= f64_2
             }
             _ => panic!("Greater or equals method cannot be used on columns that are not of numeric types"),
         }
     }
-
+    
     pub fn less_than(&self, column: &Column) -> bool {
         match self.data_type {
             DbType::I8 => {
@@ -612,23 +745,23 @@ impl Column {
                 i8_1 < i8_2
             }
             DbType::I16 => {
-                let i16_1 = Cursor::new(&self.content).read_i16::<LittleEndian>().unwrap();
-                let i16_2 = Cursor::new(&column.content).read_i16::<LittleEndian>().unwrap();
+                let i16_1 = self.content.as_slice().read_i16::<LittleEndian>().unwrap();
+                let i16_2 = column.content.as_slice().read_i16::<LittleEndian>().unwrap();
                 i16_1 < i16_2
             }
             DbType::I32 => {
-                let i32_1 = Cursor::new(&self.content).read_i32::<LittleEndian>().unwrap();
-                let i32_2 = Cursor::new(&column.content).read_i32::<LittleEndian>().unwrap();
+                let i32_1 = self.content.as_slice().read_i32::<LittleEndian>().unwrap();
+                let i32_2 = column.content.as_slice().read_i32::<LittleEndian>().unwrap();
                 i32_1 < i32_2
             }
             DbType::I64 => {
-                let i64_1 = Cursor::new(&self.content).read_i64::<LittleEndian>().unwrap();
-                let i64_2 = Cursor::new(&column.content).read_i64::<LittleEndian>().unwrap();
+                let i64_1 = self.content.as_slice().read_i64::<LittleEndian>().unwrap();
+                let i64_2 = column.content.as_slice().read_i64::<LittleEndian>().unwrap();
                 i64_1 < i64_2
             }
             DbType::I128 => {
-                let i128_1 = Cursor::new(&self.content).read_i128::<LittleEndian>().unwrap();
-                let i128_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
+                let i128_1 = self.content.as_slice().read_i128::<LittleEndian>().unwrap();
+                let i128_2 = column.content.as_slice().read_i128::<LittleEndian>().unwrap();
                 i128_1 < i128_2
             }
             DbType::U8 => {
@@ -637,39 +770,39 @@ impl Column {
                 u8_1 < u8_2
             }
             DbType::U16 => {
-                let u16_1 = Cursor::new(&self.content).read_u16::<LittleEndian>().unwrap();
-                let u16_2 = Cursor::new(&column.content).read_u16::<LittleEndian>().unwrap();
+                let u16_1 = self.content.as_slice().read_u16::<LittleEndian>().unwrap();
+                let u16_2 = column.content.as_slice().read_u16::<LittleEndian>().unwrap();
                 u16_1 < u16_2
             }
             DbType::U32 => {
-                let u32_1 = Cursor::new(&self.content).read_u32::<LittleEndian>().unwrap();
-                let u32_2 = Cursor::new(&column.content).read_u32::<LittleEndian>().unwrap();
+                let u32_1 = self.content.as_slice().read_u32::<LittleEndian>().unwrap();
+                let u32_2 = column.content.as_slice().read_u32::<LittleEndian>().unwrap();
                 u32_1 < u32_2
             }
             DbType::U64 => {
-                let u64_1 = Cursor::new(&self.content).read_u64::<LittleEndian>().unwrap();
-                let u64_2 = Cursor::new(&column.content).read_u64::<LittleEndian>().unwrap();
+                let u64_1 = self.content.as_slice().read_u64::<LittleEndian>().unwrap();
+                let u64_2 = column.content.as_slice().read_u64::<LittleEndian>().unwrap();
                 u64_1 < u64_2
             }
             DbType::U128 => {
-                let u128_1 = Cursor::new(&self.content).read_u128::<LittleEndian>().unwrap();
-                let u128_2 = Cursor::new(&column.content).read_u128::<LittleEndian>().unwrap();
+                let u128_1 = self.content.as_slice().read_u128::<LittleEndian>().unwrap();
+                let u128_2 = column.content.as_slice().read_u128::<LittleEndian>().unwrap();
                 u128_1 < u128_2
             }
             DbType::F32 => {
-                let f32_1 = Cursor::new(&self.content).read_f32::<LittleEndian>().unwrap();
-                let f32_2 = Cursor::new(&column.content).read_f32::<LittleEndian>().unwrap();
+                let f32_1 = self.content.as_slice().read_f32::<LittleEndian>().unwrap();
+                let f32_2 = column.content.as_slice().read_f32::<LittleEndian>().unwrap();
                 f32_1 < f32_2
             }
             DbType::F64 => {
-                let f64_1 = Cursor::new(&self.content).read_f64::<LittleEndian>().unwrap();
-                let f64_2 = Cursor::new(&column.content).read_f64::<LittleEndian>().unwrap();
+                let f64_1 = self.content.as_slice().read_f64::<LittleEndian>().unwrap();
+                let f64_2 = column.content.as_slice().read_f64::<LittleEndian>().unwrap();
                 f64_1 < f64_2
             }
             _ => panic!("Less than method cannot be used on columns that are not of numeric types"),
         }
     }
-
+    
     pub fn less_or_equals(&self, column: &Column) -> bool {
         match self.data_type {
             DbType::I8 => {
@@ -678,23 +811,23 @@ impl Column {
                 i8_1 <= i8_2
             }
             DbType::I16 => {
-                let i16_1 = Cursor::new(&self.content).read_i16::<LittleEndian>().unwrap();
-                let i16_2 = Cursor::new(&column.content).read_i16::<LittleEndian>().unwrap();
+                let i16_1 = self.content.as_slice().read_i16::<LittleEndian>().unwrap();
+                let i16_2 = column.content.as_slice().read_i16::<LittleEndian>().unwrap();
                 i16_1 <= i16_2
             }
             DbType::I32 => {
-                let i32_1 = Cursor::new(&self.content).read_i32::<LittleEndian>().unwrap();
-                let i32_2 = Cursor::new(&column.content).read_i32::<LittleEndian>().unwrap();
+                let i32_1 = self.content.as_slice().read_i32::<LittleEndian>().unwrap();
+                let i32_2 = column.content.as_slice().read_i32::<LittleEndian>().unwrap();
                 i32_1 <= i32_2
             }
             DbType::I64 => {
-                let i64_1 = Cursor::new(&self.content).read_i64::<LittleEndian>().unwrap();
-                let i64_2 = Cursor::new(&column.content).read_i64::<LittleEndian>().unwrap();
+                let i64_1 = self.content.as_slice().read_i64::<LittleEndian>().unwrap();
+                let i64_2 = column.content.as_slice().read_i64::<LittleEndian>().unwrap();
                 i64_1 <= i64_2
             }
             DbType::I128 => {
-                let i128_1 = Cursor::new(&self.content).read_i128::<LittleEndian>().unwrap();
-                let i128_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
+                let i128_1 = self.content.as_slice().read_i128::<LittleEndian>().unwrap();
+                let i128_2 = column.content.as_slice().read_i128::<LittleEndian>().unwrap();
                 i128_1 <= i128_2
             }
             DbType::U8 => {
@@ -703,33 +836,33 @@ impl Column {
                 u8_1 <= u8_2
             }
             DbType::U16 => {
-                let u16_1 = Cursor::new(&self.content).read_u16::<LittleEndian>().unwrap();
-                let u16_2 = Cursor::new(&column.content).read_u16::<LittleEndian>().unwrap();
+                let u16_1 = self.content.as_slice().read_u16::<LittleEndian>().unwrap();
+                let u16_2 = column.content.as_slice().read_u16::<LittleEndian>().unwrap();
                 u16_1 <= u16_2
             }
             DbType::U32 => {
-                let u32_1 = Cursor::new(&self.content).read_u32::<LittleEndian>().unwrap();
-                let u32_2 = Cursor::new(&column.content).read_u32::<LittleEndian>().unwrap();
+                let u32_1 = self.content.as_slice().read_u32::<LittleEndian>().unwrap();
+                let u32_2 = column.content.as_slice().read_u32::<LittleEndian>().unwrap();
                 u32_1 <= u32_2
             }
             DbType::U64 => {
-                let u64_1 = Cursor::new(&self.content).read_u64::<LittleEndian>().unwrap();
-                let u64_2 = Cursor::new(&column.content).read_u64::<LittleEndian>().unwrap();
+                let u64_1 = self.content.as_slice().read_u64::<LittleEndian>().unwrap();
+                let u64_2 = column.content.as_slice().read_u64::<LittleEndian>().unwrap();
                 u64_1 <= u64_2
             }
             DbType::U128 => {
-                let u128_1 = Cursor::new(&self.content).read_u128::<LittleEndian>().unwrap();
-                let u128_2 = Cursor::new(&column.content).read_u128::<LittleEndian>().unwrap();
+                let u128_1 = self.content.as_slice().read_u128::<LittleEndian>().unwrap();
+                let u128_2 = column.content.as_slice().read_u128::<LittleEndian>().unwrap();
                 u128_1 <= u128_2
             }
             DbType::F32 => {
-                let f32_1 = Cursor::new(&self.content).read_f32::<LittleEndian>().unwrap();
-                let f32_2 = Cursor::new(&column.content).read_f32::<LittleEndian>().unwrap();
+                let f32_1 = self.content.as_slice().read_f32::<LittleEndian>().unwrap();
+                let f32_2 = column.content.as_slice().read_f32::<LittleEndian>().unwrap();
                 f32_1 <= f32_2
             }
             DbType::F64 => {
-                let f64_1 = Cursor::new(&self.content).read_f64::<LittleEndian>().unwrap();
-                let f64_2 = Cursor::new(&column.content).read_f64::<LittleEndian>().unwrap();
+                let f64_1 = self.content.as_slice().read_f64::<LittleEndian>().unwrap();
+                let f64_2 = column.content.as_slice().read_f64::<LittleEndian>().unwrap();
                 f64_1 <= f64_2
             }
             _ => panic!("Less or equals method cannot be used on columns that are not of numeric types"),
@@ -739,272 +872,272 @@ impl Column {
     pub fn add(&mut self, column: &Column) {
         match self.data_type {
             DbType::I8 => {
-                let i8_1 = self.content.as_slice().read_i8().unwrap() as i128;
-                let i8_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
-                self.content = (i8_1 + i8_2).to_le_bytes().to_vec();
+                let i8_1 = self.content.as_slice().read_i8().unwrap();
+                let i8_2 = column.content.as_slice().read_i8().unwrap();
+                self.content.replace(&(i8_1 + i8_2).to_le_bytes());
             }
             DbType::I16 => {
-                let i16_1 = Cursor::new(&self.content).read_i16::<LittleEndian>().unwrap() as i128;
-                let i16_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
-                self.content = (i16_1 + i16_2).to_le_bytes().to_vec();
+                let i16_1 = self.content.as_slice().read_i16::<LittleEndian>().unwrap();
+                let i16_2 = column.content.as_slice().read_i16::<LittleEndian>().unwrap();
+                self.content.replace(&(i16_1 + i16_2).to_le_bytes());
             }
             DbType::I32 => {
-                let i32_1 = Cursor::new(&self.content).read_i32::<LittleEndian>().unwrap() as i128;
-                let i32_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
-                self.content = (i32_1 + i32_2).to_le_bytes().to_vec();
+                let i32_1 = self.content.as_slice().read_i32::<LittleEndian>().unwrap();
+                let i32_2 = column.content.as_slice().read_i32::<LittleEndian>().unwrap();
+                self.content.replace(&(i32_1 + i32_2).to_le_bytes());
             }
             DbType::I64 => {
-                let i64_1 = Cursor::new(&self.content).read_i64::<LittleEndian>().unwrap() as i128;
-                let i64_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
-                self.content = (i64_1 + i64_2).to_le_bytes().to_vec();
+                let i64_1 = self.content.as_slice().read_i64::<LittleEndian>().unwrap();
+                let i64_2 = column.content.as_slice().read_i64::<LittleEndian>().unwrap();
+                self.content.replace(&(i64_1 + i64_2).to_le_bytes());
             }
             DbType::I128 => {
-                let i128_1 = Cursor::new(&self.content).read_i128::<LittleEndian>().unwrap();
-                let i128_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
-                self.content = (i128_1 + i128_2).to_le_bytes().to_vec();
+                let i128_1 = self.content.as_slice().read_i128::<LittleEndian>().unwrap();
+                let i128_2 = column.content.as_slice().read_i128::<LittleEndian>().unwrap();
+                self.content.replace(&(i128_1 + i128_2).to_le_bytes());
             }
             DbType::U8 => {
-                let u8_1 = self.content.as_slice().read_u8().unwrap() as i128;
-                let u8_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
-                self.content = (u8_1 + u8_2).to_le_bytes().to_vec();
+                let u8_1 = self.content.as_slice().read_u8().unwrap();
+                let u8_2 = column.content.as_slice().read_u8().unwrap();
+                self.content.replace(&(u8_1 + u8_2).to_le_bytes());
             }
             DbType::U16 => {
-                let u16_1 = Cursor::new(&self.content).read_u16::<LittleEndian>().unwrap() as i128;
-                let u16_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
-                self.content =  (u16_1 + u16_2).to_le_bytes().to_vec();
+                let u16_1 = self.content.as_slice().read_u16::<LittleEndian>().unwrap();
+                let u16_2 = column.content.as_slice().read_u16::<LittleEndian>().unwrap();
+                self.content.replace(&(u16_1 + u16_2).to_le_bytes());
             }
             DbType::U32 => {
-                let u32_1 = Cursor::new(&self.content).read_u32::<LittleEndian>().unwrap() as i128;
-                let u32_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
-                self.content = (u32_1 + u32_2).to_le_bytes().to_vec();
+                let u32_1 = self.content.as_slice().read_u32::<LittleEndian>().unwrap();
+                let u32_2 = column.content.as_slice().read_u32::<LittleEndian>().unwrap();
+                self.content.replace(&(u32_1 + u32_2).to_le_bytes());
             }
             DbType::U64 => {
-                let u64_1 = Cursor::new(&self.content).read_u64::<LittleEndian>().unwrap() as i128;
-                let u64_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
-                self.content = (u64_1 + u64_2).to_le_bytes().to_vec();
+                let u64_1 = self.content.as_slice().read_u64::<LittleEndian>().unwrap();
+                let u64_2 = column.content.as_slice().read_u64::<LittleEndian>().unwrap();
+                self.content.replace(&(u64_1 + u64_2).to_le_bytes());
             }
             DbType::U128 => {
-                let u128_1 = Cursor::new(&self.content).read_u128::<LittleEndian>().unwrap() as i128;
-                let u128_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
-                self.content = (u128_1 + u128_2).to_le_bytes().to_vec();
+                let u128_1 = self.content.as_slice().read_u128::<LittleEndian>().unwrap();
+                let u128_2 = column.content.as_slice().read_u128::<LittleEndian>().unwrap();
+                self.content.replace(&(u128_1 + u128_2).to_le_bytes());
             }
             DbType::F32 => {
-                let f32_1 = Cursor::new(&self.content).read_f32::<LittleEndian>().unwrap() as f64;
-                let f32_2 = Cursor::new(&column.content).read_f64::<LittleEndian>().unwrap();
-                self.content = (f32_1 + f32_2).to_le_bytes().to_vec();
+                let f32_1 = self.content.as_slice().read_f32::<LittleEndian>().unwrap();
+                let f32_2 = column.content.as_slice().read_f32::<LittleEndian>().unwrap();
+                self.content.replace(&(f32_1 + f32_2).to_le_bytes());
             }
             DbType::F64 => {
-                let f64_1 = Cursor::new(&self.content).read_f64::<LittleEndian>().unwrap() as f64;
-                let f64_2 = Cursor::new(&column.content).read_f64::<LittleEndian>().unwrap();
-                self.content = (f64_1 + f64_2).to_le_bytes().to_vec();
+                let f64_1 = self.content.as_slice().read_f64::<LittleEndian>().unwrap();
+                let f64_2 = column.content.as_slice().read_f64::<LittleEndian>().unwrap();
+                self.content.replace(&(f64_1 + f64_2).to_le_bytes());
             }
             DbType::STRING => {
-                let str_1 = String::from_utf8(self.content.clone()).unwrap();
-                let str_2 = String::from_utf8(column.content.clone()).unwrap();
+                let str_1 = String::from_utf8(self.content.as_slice()[4..].to_vec()).unwrap();
+                let str_2 = String::from_utf8(column.content.as_slice()[4..].to_vec()).unwrap();
                 let concatenated = format!("{}{}", str_1, str_2);
-                self.content = concatenated.into_bytes();
+                self.content = ColumnValue::ManagedMemoryPointer(concatenated.as_bytes().to_vec());
             }
-            _ => panic!("Add operation is not supported for this data type"),
+            _ => panic!("Addition method cannot be used on unsupported data types"),
         }
-    }   
+    }  
 
     pub fn subtract(&mut self, column: &Column) {
         match self.data_type {
             DbType::I8 => {
-                let i8_1 = self.content.as_slice().read_i8().unwrap() as i128;
-                let i8_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
-                self.content = (i8_1 - i8_2).to_le_bytes().to_vec();
+                let i8_1 = self.content.as_slice().read_i8().unwrap();
+                let i8_2 = column.content.as_slice().read_i8().unwrap();
+                self.content.replace(&(i8_1 - i8_2).to_le_bytes());
             }
             DbType::I16 => {
-                let i16_1 = Cursor::new(&self.content).read_i16::<LittleEndian>().unwrap() as i128;
-                let i16_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
-                self.content = (i16_1 - i16_2).to_le_bytes().to_vec();
+                let i16_1 = self.content.as_slice().read_i16::<LittleEndian>().unwrap();
+                let i16_2 = column.content.as_slice().read_i16::<LittleEndian>().unwrap();
+                self.content.replace(&(i16_1 - i16_2).to_le_bytes());
             }
             DbType::I32 => {
-                let i32_1 = Cursor::new(&self.content).read_i32::<LittleEndian>().unwrap() as i128;
-                let i32_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
-                self.content = (i32_1 - i32_2).to_le_bytes().to_vec();
+                let i32_1 = self.content.as_slice().read_i32::<LittleEndian>().unwrap();
+                let i32_2 = column.content.as_slice().read_i32::<LittleEndian>().unwrap();
+                self.content.replace(&(i32_1 - i32_2).to_le_bytes());
             }
             DbType::I64 => {
-                let i64_1 = Cursor::new(&self.content).read_i64::<LittleEndian>().unwrap() as i128;
-                let i64_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
-                self.content = (i64_1 - i64_2).to_le_bytes().to_vec();
+                let i64_1 = self.content.as_slice().read_i64::<LittleEndian>().unwrap();
+                let i64_2 = column.content.as_slice().read_i64::<LittleEndian>().unwrap();
+                self.content.replace(&(i64_1 - i64_2).to_le_bytes());
             }
             DbType::I128 => {
-                let i128_1 = Cursor::new(&self.content).read_i128::<LittleEndian>().unwrap();
-                let i128_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
-                self.content = (i128_1 - i128_2).to_le_bytes().to_vec();
+                let i128_1 = self.content.as_slice().read_i128::<LittleEndian>().unwrap();
+                let i128_2 = column.content.as_slice().read_i128::<LittleEndian>().unwrap();
+                self.content.replace(&(i128_1 - i128_2).to_le_bytes());
             }
             DbType::U8 => {
-                let u8_1 = self.content.as_slice().read_u8().unwrap() as i128;
-                let u8_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
-                self.content = (u8_1 - u8_2).to_le_bytes().to_vec();
+                let u8_1 = self.content.as_slice().read_u8().unwrap();
+                let u8_2 = column.content.as_slice().read_u8().unwrap();
+                self.content.replace(&(u8_1 - u8_2).to_le_bytes());
             }
             DbType::U16 => {
-                let u16_1 = Cursor::new(&self.content).read_u16::<LittleEndian>().unwrap() as i128;
-                let u16_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
-                self.content =  (u16_1 - u16_2).to_le_bytes().to_vec();
+                let u16_1 = self.content.as_slice().read_u16::<LittleEndian>().unwrap();
+                let u16_2 = column.content.as_slice().read_u16::<LittleEndian>().unwrap();
+                self.content.replace(&(u16_1 - u16_2).to_le_bytes());
             }
             DbType::U32 => {
-                let u32_1 = Cursor::new(&self.content).read_u32::<LittleEndian>().unwrap() as i128;
-                let u32_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
-                self.content = (u32_1 - u32_2).to_le_bytes().to_vec();
+                let u32_1 = self.content.as_slice().read_u32::<LittleEndian>().unwrap();
+                let u32_2 = column.content.as_slice().read_u32::<LittleEndian>().unwrap();
+                self.content.replace(&(u32_1 - u32_2).to_le_bytes());
             }
             DbType::U64 => {
-                let u64_1 = Cursor::new(&self.content).read_u64::<LittleEndian>().unwrap() as i128;
-                let u64_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
-                self.content = (u64_1 - u64_2).to_le_bytes().to_vec();
+                let u64_1 = self.content.as_slice().read_u64::<LittleEndian>().unwrap();
+                let u64_2 = column.content.as_slice().read_u64::<LittleEndian>().unwrap();
+                self.content.replace(&(u64_1 - u64_2).to_le_bytes());
             }
             DbType::U128 => {
-                let u128_1 = Cursor::new(&self.content).read_u128::<LittleEndian>().unwrap() as i128;
-                let u128_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
-                self.content = (u128_1 - u128_2).to_le_bytes().to_vec();
+                let u128_1 = self.content.as_slice().read_u128::<LittleEndian>().unwrap();
+                let u128_2 = column.content.as_slice().read_u128::<LittleEndian>().unwrap();
+                self.content.replace(&(u128_1 - u128_2).to_le_bytes());
             }
             DbType::F32 => {
-                let f32_1 = Cursor::new(&self.content).read_f32::<LittleEndian>().unwrap() as f64;
-                let f32_2 = Cursor::new(&column.content).read_f64::<LittleEndian>().unwrap();
-                self.content = (f32_1 - f32_2).to_le_bytes().to_vec();
+                let f32_1 = self.content.as_slice().read_f32::<LittleEndian>().unwrap();
+                let f32_2 = column.content.as_slice().read_f32::<LittleEndian>().unwrap();
+                self.content.replace(&(f32_1 - f32_2).to_le_bytes());
             }
             DbType::F64 => {
-                let f64_1 = Cursor::new(&self.content).read_f64::<LittleEndian>().unwrap() as f64;
-                let f64_2 = Cursor::new(&column.content).read_f64::<LittleEndian>().unwrap();
-                self.content = (f64_1 - f64_2).to_le_bytes().to_vec();
+                let f64_1 = self.content.as_slice().read_f64::<LittleEndian>().unwrap();
+                let f64_2 = column.content.as_slice().read_f64::<LittleEndian>().unwrap();
+                self.content.replace(&(f64_1 - f64_2).to_le_bytes());
             }
-            _ => panic!("Add operation is not supported for this data type"),
+            _ => panic!("Subtraction method cannot be used on unsupported data types"),
         }
     }
 
     pub fn multiply(&mut self, column: &Column) {
         match self.data_type {
             DbType::I8 => {
-                let i8_1 = self.content.as_slice().read_i8().unwrap() as i128;
-                let i8_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
-                self.content = (i8_1 * i8_2).to_le_bytes().to_vec();
+                let i8_1 = self.content.as_slice().read_i8().unwrap();
+                let i8_2 = column.content.as_slice().read_i8().unwrap();
+                self.content.replace(&(i8_1 * i8_2).to_le_bytes());
             }
             DbType::I16 => {
-                let i16_1 = Cursor::new(&self.content).read_i16::<LittleEndian>().unwrap() as i128;
-                let i16_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
-                self.content = (i16_1 * i16_2).to_le_bytes().to_vec();
+                let i16_1 = self.content.as_slice().read_i16::<LittleEndian>().unwrap();
+                let i16_2 = column.content.as_slice().read_i16::<LittleEndian>().unwrap();
+                self.content.replace(&(i16_1 * i16_2).to_le_bytes());
             }
             DbType::I32 => {
-                let i32_1 = Cursor::new(&self.content).read_i32::<LittleEndian>().unwrap() as i128;
-                let i32_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
-                self.content = (i32_1 * i32_2).to_le_bytes().to_vec();
+                let i32_1 = self.content.as_slice().read_i32::<LittleEndian>().unwrap();
+                let i32_2 = column.content.as_slice().read_i32::<LittleEndian>().unwrap();
+                self.content.replace(&(i32_1 * i32_2).to_le_bytes());
             }
             DbType::I64 => {
-                let i64_1 = Cursor::new(&self.content).read_i64::<LittleEndian>().unwrap() as i128;
-                let i64_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
-                self.content = (i64_1 * i64_2).to_le_bytes().to_vec();
+                let i64_1 = self.content.as_slice().read_i64::<LittleEndian>().unwrap();
+                let i64_2 = column.content.as_slice().read_i64::<LittleEndian>().unwrap();
+                self.content.replace(&(i64_1 * i64_2).to_le_bytes());
             }
             DbType::I128 => {
-                let i128_1 = Cursor::new(&self.content).read_i128::<LittleEndian>().unwrap();
-                let i128_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
-                self.content = (i128_1 * i128_2).to_le_bytes().to_vec();
+                let i128_1 = self.content.as_slice().read_i128::<LittleEndian>().unwrap();
+                let i128_2 = column.content.as_slice().read_i128::<LittleEndian>().unwrap();
+                self.content.replace(&(i128_1 * i128_2).to_le_bytes());
             }
             DbType::U8 => {
-                let u8_1 = self.content.as_slice().read_u8().unwrap() as i128;
-                let u8_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
-                self.content = (u8_1 * u8_2).to_le_bytes().to_vec();
+                let u8_1 = self.content.as_slice().read_u8().unwrap();
+                let u8_2 = column.content.as_slice().read_u8().unwrap();
+                self.content.replace(&(u8_1 * u8_2).to_le_bytes());
             }
             DbType::U16 => {
-                let u16_1 = Cursor::new(&self.content).read_u16::<LittleEndian>().unwrap() as i128;
-                let u16_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
-                self.content =  (u16_1 * u16_2).to_le_bytes().to_vec();
+                let u16_1 = self.content.as_slice().read_u16::<LittleEndian>().unwrap();
+                let u16_2 = column.content.as_slice().read_u16::<LittleEndian>().unwrap();
+                self.content.replace(&(u16_1 * u16_2).to_le_bytes());
             }
             DbType::U32 => {
-                let u32_1 = Cursor::new(&self.content).read_u32::<LittleEndian>().unwrap() as i128;
-                let u32_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
-                self.content = (u32_1 * u32_2).to_le_bytes().to_vec();
+                let u32_1 = self.content.as_slice().read_u32::<LittleEndian>().unwrap();
+                let u32_2 = column.content.as_slice().read_u32::<LittleEndian>().unwrap();
+                self.content.replace(&(u32_1 * u32_2).to_le_bytes());
             }
             DbType::U64 => {
-                let u64_1 = Cursor::new(&self.content).read_u64::<LittleEndian>().unwrap() as i128;
-                let u64_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
-                self.content = (u64_1 * u64_2).to_le_bytes().to_vec();
+                let u64_1 = self.content.as_slice().read_u64::<LittleEndian>().unwrap();
+                let u64_2 = column.content.as_slice().read_u64::<LittleEndian>().unwrap();
+                self.content.replace(&(u64_1 * u64_2).to_le_bytes());
             }
             DbType::U128 => {
-                let u128_1 = Cursor::new(&self.content).read_u128::<LittleEndian>().unwrap() as i128;
-                let u128_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
-                self.content = (u128_1 * u128_2).to_le_bytes().to_vec();
+                let u128_1 = self.content.as_slice().read_u128::<LittleEndian>().unwrap();
+                let u128_2 = column.content.as_slice().read_u128::<LittleEndian>().unwrap();
+                self.content.replace(&(u128_1 * u128_2).to_le_bytes());
             }
             DbType::F32 => {
-                let f32_1 = Cursor::new(&self.content).read_f32::<LittleEndian>().unwrap() as f64;
-                let f32_2 = Cursor::new(&column.content).read_f64::<LittleEndian>().unwrap();
-                self.content = (f32_1 * f32_2).to_le_bytes().to_vec();
+                let f32_1 = self.content.as_slice().read_f32::<LittleEndian>().unwrap();
+                let f32_2 = column.content.as_slice().read_f32::<LittleEndian>().unwrap();
+                self.content.replace(&(f32_1 * f32_2).to_le_bytes());
             }
             DbType::F64 => {
-                let f64_1 = Cursor::new(&self.content).read_f64::<LittleEndian>().unwrap() as f64;
-                let f64_2 = Cursor::new(&column.content).read_f64::<LittleEndian>().unwrap();
-                self.content = (f64_1 * f64_2).to_le_bytes().to_vec();
+                let f64_1 = self.content.as_slice().read_f64::<LittleEndian>().unwrap();
+                let f64_2 = column.content.as_slice().read_f64::<LittleEndian>().unwrap();
+                self.content.replace(&(f64_1 * f64_2).to_le_bytes());
             }
-            _ => panic!("Add operation is not supported for this data type"),
+            _ => panic!("Multiplication method cannot be used on unsupported data types"),
         }
     }
 
     pub fn divide(&mut self, column: &Column) {
         match self.data_type {
             DbType::I8 => {
-                let i8_1 = self.content.as_slice().read_i8().unwrap() as i128;
-                let i8_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
-                self.content = (i8_1 / i8_2).to_le_bytes().to_vec();
+                let i8_1 = self.content.as_slice().read_i8().unwrap();
+                let i8_2 = column.content.as_slice().read_i8().unwrap();
+                self.content.replace(&(i8_1 / i8_2).to_le_bytes());
             }
             DbType::I16 => {
-                let i16_1 = Cursor::new(&self.content).read_i16::<LittleEndian>().unwrap() as i128;
-                let i16_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
-                self.content = (i16_1 / i16_2).to_le_bytes().to_vec();
+                let i16_1 = self.content.as_slice().read_i16::<LittleEndian>().unwrap();
+                let i16_2 = column.content.as_slice().read_i16::<LittleEndian>().unwrap();
+                self.content.replace(&(i16_1 / i16_2).to_le_bytes());
             }
             DbType::I32 => {
-                let i32_1 = Cursor::new(&self.content).read_i32::<LittleEndian>().unwrap() as i128;
-                let i32_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
-                self.content = (i32_1 / i32_2).to_le_bytes().to_vec();
+                let i32_1 = self.content.as_slice().read_i32::<LittleEndian>().unwrap();
+                let i32_2 = column.content.as_slice().read_i32::<LittleEndian>().unwrap();
+                self.content.replace(&(i32_1 / i32_2).to_le_bytes());
             }
             DbType::I64 => {
-                let i64_1 = Cursor::new(&self.content).read_i64::<LittleEndian>().unwrap() as i128;
-                let i64_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
-                self.content = (i64_1 / i64_2).to_le_bytes().to_vec();
+                let i64_1 = self.content.as_slice().read_i64::<LittleEndian>().unwrap();
+                let i64_2 = column.content.as_slice().read_i64::<LittleEndian>().unwrap();
+                self.content.replace(&(i64_1 / i64_2).to_le_bytes());
             }
             DbType::I128 => {
-                let i128_1 = Cursor::new(&self.content).read_i128::<LittleEndian>().unwrap();
-                let i128_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
-                self.content = (i128_1 / i128_2).to_le_bytes().to_vec();
+                let i128_1 = self.content.as_slice().read_i128::<LittleEndian>().unwrap();
+                let i128_2 = column.content.as_slice().read_i128::<LittleEndian>().unwrap();
+                self.content.replace(&(i128_1 / i128_2).to_le_bytes());
             }
             DbType::U8 => {
-                let u8_1 = self.content.as_slice().read_u8().unwrap() as i128;
-                let u8_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
-                self.content = (u8_1 / u8_2).to_le_bytes().to_vec();
+                let u8_1 = self.content.as_slice().read_u8().unwrap();
+                let u8_2 = column.content.as_slice().read_u8().unwrap();
+                self.content.replace(&(u8_1 / u8_2).to_le_bytes());
             }
             DbType::U16 => {
-                let u16_1 = Cursor::new(&self.content).read_u16::<LittleEndian>().unwrap() as i128;
-                let u16_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
-                self.content =  (u16_1 / u16_2).to_le_bytes().to_vec();
+                let u16_1 = self.content.as_slice().read_u16::<LittleEndian>().unwrap();
+                let u16_2 = column.content.as_slice().read_u16::<LittleEndian>().unwrap();
+                self.content.replace(&(u16_1 / u16_2).to_le_bytes());
             }
             DbType::U32 => {
-                let u32_1 = Cursor::new(&self.content).read_u32::<LittleEndian>().unwrap() as i128;
-                let u32_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
-                self.content = (u32_1 / u32_2).to_le_bytes().to_vec();
+                let u32_1 = self.content.as_slice().read_u32::<LittleEndian>().unwrap();
+                let u32_2 = column.content.as_slice().read_u32::<LittleEndian>().unwrap();
+                self.content.replace(&(u32_1 / u32_2).to_le_bytes());
             }
             DbType::U64 => {
-                let u64_1 = Cursor::new(&self.content).read_u64::<LittleEndian>().unwrap() as i128;
-                let u64_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
-                self.content = (u64_1 / u64_2).to_le_bytes().to_vec();
+                let u64_1 = self.content.as_slice().read_u64::<LittleEndian>().unwrap();
+                let u64_2 = column.content.as_slice().read_u64::<LittleEndian>().unwrap();
+                self.content.replace(&(u64_1 / u64_2).to_le_bytes());
             }
             DbType::U128 => {
-                let u128_1 = Cursor::new(&self.content).read_u128::<LittleEndian>().unwrap() as i128;
-                let u128_2 = Cursor::new(&column.content).read_i128::<LittleEndian>().unwrap();
-                self.content = (u128_1 / u128_2).to_le_bytes().to_vec();
+                let u128_1 = self.content.as_slice().read_u128::<LittleEndian>().unwrap();
+                let u128_2 = column.content.as_slice().read_u128::<LittleEndian>().unwrap();
+                self.content.replace(&(u128_1 / u128_2).to_le_bytes());
             }
             DbType::F32 => {
-                let f32_1 = Cursor::new(&self.content).read_f32::<LittleEndian>().unwrap() as f64;
-                let f32_2 = Cursor::new(&column.content).read_f64::<LittleEndian>().unwrap();
-                self.content = (f32_1 / f32_2).to_le_bytes().to_vec();
+                let f32_1 = self.content.as_slice().read_f32::<LittleEndian>().unwrap();
+                let f32_2 = column.content.as_slice().read_f32::<LittleEndian>().unwrap();
+                self.content.replace(&(f32_1 / f32_2).to_le_bytes());
             }
             DbType::F64 => {
-                let f64_1 = Cursor::new(&self.content).read_f64::<LittleEndian>().unwrap() as f64;
-                let f64_2 = Cursor::new(&column.content).read_f64::<LittleEndian>().unwrap();
-                self.content = (f64_1 / f64_2).to_le_bytes().to_vec();
+                let f64_1 = self.content.as_slice().read_f64::<LittleEndian>().unwrap();
+                let f64_2 = column.content.as_slice().read_f64::<LittleEndian>().unwrap();
+                self.content.replace(&(f64_1 / f64_2).to_le_bytes());
             }
-            _ => panic!("Add operation is not supported for this data type"),
+            _ => panic!("Division method cannot be used on unsupported data types"),
         }
-    }   
+    }
 }
 
 #[derive(Debug, PartialEq)]

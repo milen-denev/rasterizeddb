@@ -1,47 +1,102 @@
 use once_cell::sync::Lazy;
-use tokio::sync::RwLock;
-use std::{pin::Pin, sync::Arc};
+use tokio::task::yield_now;
+use std::{
+    pin::Pin,
+    sync::{Arc, RwLock},
+    collections::BTreeMap,
+};
+use dashmap::DashMap;
+use crate::instructions::zero_buffer;
 
 pub static MEMORY_POOL: Lazy<Arc<RwLock<MemoryPool>>> = Lazy::new(|| {
     Arc::new(RwLock::new(MemoryPool::new()))
 });
 
 pub struct MemoryPool {
-    pub current_index: Arc<RwLock<u32>>,
-    pub buffer: Pin<Box<[u8; 8_388_608]>> // 8MB
+    pub buffer: Pin<Box<[u8; 8_388_608]>>, // 8MB
+    pub allocations: DashMap<usize, u32>, // Tracks active allocations
+    pub freed_chunks: BTreeMap<u32, Vec<usize>>, // Sorted free chunks by size
 }
 
 impl MemoryPool {
     pub fn new() -> Self {
         Self {
-            current_index: Arc::new(RwLock::new(0)),
-            buffer: Box::pin([0; 8_388_608])
+            buffer: Box::pin([0; 8_388_608]),
+            allocations: DashMap::new(),
+            freed_chunks: BTreeMap::new(),
         }
     }
 
-    pub async fn acquire(&mut self, size: u32) -> Option<*mut u8> {
-        let mut current_index = self.current_index.write().await;
-        let start_index = *current_index;
-        let end_index = start_index + size;
+    pub async fn acquire(&mut self, size: u32) -> Option<Chunk> {
+        yield_now().await;
 
-        if end_index > 8_388_608 {
+        // First, check if there's a freed chunk we can reuse
+        if let Some((&free_size, ptrs)) = self.freed_chunks.range_mut(size..).next() {
+            if let Some(ptr) = ptrs.pop() {
+                if ptrs.is_empty() {
+                    self.freed_chunks.remove(&free_size);
+                }
+                self.allocations.insert(ptr, size);
+
+                let ptr = ptr as *mut u8;
+
+                return Some(Chunk {
+                    ptr,
+                    size,
+                    pool: Arc::downgrade(&MEMORY_POOL),
+                });
+            }
+        }
+
+        // Otherwise, allocate from the buffer
+        let current_index = self.allocations.iter().map(|e| *e.value()).sum::<u32>();
+        if current_index + size > 8_388_608 {
             return None;
         }
 
-        *current_index += size;
+        let ptr = self.buffer[current_index as usize..(current_index + size) as usize].as_mut_ptr();
+        self.allocations.insert(ptr as usize, size);
 
-        Some(self.buffer[start_index as usize..end_index as usize].as_mut_ptr())
+        Some(Chunk {
+            ptr,
+            size,
+            pool: Arc::downgrade(&MEMORY_POOL),
+        })
     }
 
-    pub async fn release(&mut self, ptr: *mut u8, size: u32) {
-        let mut current_index = self.current_index.write().await;
-        let start_index = *current_index;
-        let end_index = start_index + size;
+    fn release(&mut self, ptr: *mut u8) {
+        if let Some((_, size)) = self.allocations.remove(&(ptr as usize)) {
+            unsafe { zero_buffer(ptr, size as usize) };
 
-        for i in start_index..end_index {
-            self.buffer[i as usize] = 0;
+            // Track freed chunk for reuse
+            self.freed_chunks.entry(size).or_default().push(ptr as usize);
         }
+    }
+}
 
-        *current_index -= size;
+#[derive(Debug, Clone)]
+pub struct Chunk {
+    pub ptr: *mut u8,
+    pub size: u32,
+    pool: std::sync::Weak<RwLock<MemoryPool>>,
+}
+
+impl Default for Chunk {
+    fn default() -> Self {
+        Self {
+            ptr: std::ptr::null_mut(),
+            size: 0,
+            pool: std::sync::Weak::default()
+        }
+    }
+}
+
+impl Drop for Chunk {
+    fn drop(&mut self) {
+        if let Some(pool) = self.pool.upgrade() {
+            if let Ok(mut pool) = pool.write() {
+                pool.release(self.ptr);
+            }
+        }
     }
 }
