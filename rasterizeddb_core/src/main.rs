@@ -158,7 +158,7 @@ async fn main() -> std::io::Result<()> {
     let query_evaluation = parse_rql(&format!(r#"
         BEGIN
         SELECT FROM NAME_DOESNT_MATTER_FOR_NOW
-         WHERE COL(2) = 'This is the millionth something row.'
+        WHERE COL(1) = -1597937
         LIMIT 1
         END
     "#)).unwrap();
@@ -177,7 +177,7 @@ async fn main() -> std::io::Result<()> {
     let query_evaluation = parse_rql(&format!(r#"
         BEGIN
         SELECT FROM NAME_DOESNT_MATTER_FOR_NOW
-        WHERE COL(2) = 'This is the millionth something row.'
+        WHERE COL(1) = -1597937
         LIMIT 10
         END
     "#)).unwrap();
