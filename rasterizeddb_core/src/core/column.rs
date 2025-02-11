@@ -18,6 +18,7 @@ pub struct Column {
     pub content: ColumnValue
 }
 
+#[derive(Debug)]
 pub enum ColumnValue {
     StaticMemoryPointer(Chunk),
     ManagedMemoryPointer(Vec<u8>)
@@ -429,9 +430,12 @@ impl Column {
                 }
             };
 
+            let mut value_data = value.to_le_bytes();
             let mut new_buffer = unsafe { new_memory_chunk.into_vec() };
 
-            new_buffer.write_i128::<LittleEndian>(value).unwrap();
+            unsafe {
+                ptr::copy_nonoverlapping(value_data.as_mut_ptr(), new_buffer.as_mut_ptr(), 16);
+            }
 
             new_memory_chunk.deallocate_vec(new_buffer);
 
@@ -464,9 +468,12 @@ impl Column {
                 }
             };
 
+            let mut value_data = value.to_le_bytes();
             let mut new_buffer = unsafe { new_memory_chunk.into_vec() };
 
-            new_buffer.write_f64::<LittleEndian>(value).unwrap();
+            unsafe {
+                ptr::copy_nonoverlapping(value_data.as_mut_ptr(), new_buffer.as_mut_ptr(), 8);
+            }
 
             new_memory_chunk.deallocate_vec(new_buffer);
 
@@ -496,9 +503,15 @@ impl Column {
 
     /// For debug purposes
     pub fn to_str(&self) -> String {
-        if self.data_type == DbType::I32 {
+        if self.data_type == DbType::I16 {
+            let i16_value = LittleEndian::read_i16(self.content.as_slice());
+            format!("i16:{}", i16_value)
+        } else if self.data_type == DbType::I32 {
             let i32_value = LittleEndian::read_i32(self.content.as_slice());
             format!("i32:{}", i32_value)
+        } else if self.data_type == DbType::U16 {
+            let u16_value = LittleEndian::read_u16(self.content.as_slice());
+            format!("u16:{}", u16_value)
         } else if self.data_type == DbType::STRING {
             let vec = self.content.as_slice()[4..].to_vec();
             let string_value = String::from_utf8(vec).unwrap();
@@ -582,7 +595,6 @@ impl Column {
     }
 
     pub fn equals(&self, column: &Column) -> bool {
-        println!("{:?} = {:?}", self.content.as_slice(), column.content.as_slice());
         compare_vecs_eq(self.content.as_slice(), column.content.as_slice())
     }
 

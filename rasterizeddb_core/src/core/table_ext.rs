@@ -13,7 +13,7 @@ pub fn extent_non_string_buffer(
         let preset_array: [u8; 1] = [cursor_vector.vector[*position as usize]];
         *position += 1;
 
-        data_buffer.extend_from_slice(&preset_array);
+        data_buffer.copy_from_slice(&preset_array);
     } else if db_size == 2 {
         let preset_array: [u8; 2] = [
             cursor_vector.vector[*position as usize],
@@ -21,7 +21,7 @@ pub fn extent_non_string_buffer(
         ];
         *position += 2;
 
-        data_buffer.extend_from_slice(&preset_array);
+        data_buffer.copy_from_slice(&preset_array);
     } else if db_size == 4 {
         let preset_array: [u8; 4] = [
             cursor_vector.vector[*position as usize],
@@ -31,7 +31,7 @@ pub fn extent_non_string_buffer(
         ];
         *position += 4;
 
-        data_buffer.extend_from_slice(&preset_array);
+        data_buffer.copy_from_slice(&preset_array);
     } else if db_size == 8 {
         let preset_array: [u8; 8] = [
             cursor_vector.vector[*position as usize],
@@ -45,7 +45,7 @@ pub fn extent_non_string_buffer(
         ];
         *position += 8;
 
-        data_buffer.extend_from_slice(&preset_array);
+        data_buffer.copy_from_slice(&preset_array);
     } else if db_size == 16 {
         let preset_array: [u8; 16] = [
             cursor_vector.vector[*position as usize],
@@ -67,7 +67,7 @@ pub fn extent_non_string_buffer(
         ];
         *position += 16;
 
-        data_buffer.extend_from_slice(&preset_array);
+        data_buffer.copy_from_slice(&preset_array);
     } else {
         let cursor = &mut cursor_vector.cursor;
         cursor.seek(SeekFrom::Start(*position)).unwrap();

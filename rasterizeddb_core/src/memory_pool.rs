@@ -103,7 +103,6 @@ impl Drop for Chunk {
     #[track_caller]
     fn drop(&mut self) {
         if self.vec.is_none() {
-            println!("drop called");
             if let Some(pool) = self.pool.upgrade() {
                 if let Ok(mut pool) = pool.write() {
                     pool.release(self.ptr);

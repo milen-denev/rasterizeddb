@@ -317,10 +317,11 @@ impl<S: IOOperationsSync> Table<S> {
                                     }
         
                                     if db_type != DbType::STRING {
+                                        let size = db_type.get_size();
                                         let mut memory_chunk = {
                                             let mut memory_pool = MEMORY_POOL.write().unwrap();
                                     
-                                            let pointer_result = memory_pool.acquire(db_type.get_size()).await;
+                                            let pointer_result = memory_pool.acquire(size).await;
                                                 
                                             drop(memory_pool);
                                     
@@ -328,7 +329,7 @@ impl<S: IOOperationsSync> Table<S> {
                                                 Some(chunk) => {
                                                     chunk
                                                 },
-                                                None => Chunk::from_vec(vec![0; prefetch_result.length as usize + 1])
+                                                None => Chunk::from_vec(vec![0; size as usize])
                                             }
                                         };
             

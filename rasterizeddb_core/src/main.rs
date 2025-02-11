@@ -21,7 +21,7 @@ async fn main() -> std::io::Result<()> {
 
     std::env::set_var("RUST_BACKTRACE","0");
 
-    _ = remove_file("C:\\Users\\mspc6\\OneDrive\\Professional\\Desktop\\database.db");
+    //_ = remove_file("C:\\Users\\mspc6\\OneDrive\\Professional\\Desktop\\database.db");
 
     let io_sync = LocalStorageProvider::new(
         "C:\\Users\\mspc6\\OneDrive\\Professional\\Desktop",
@@ -42,47 +42,47 @@ async fn main() -> std::io::Result<()> {
 
    let mut table = Table::init(io_sync, false, false).await.unwrap();
 
-    let c1 = Column::new(10_u16).unwrap();
-    let c2 = Column::new(20_u16).unwrap();
+    // let c1 = Column::new(10_u16).unwrap();
+    // let c2 = Column::new(20_u16).unwrap();
     //let mut c3 = Column::new("This is the millionth something row.").unwrap();
 
-    let mut columns_buffer: Vec<u8> = Vec::with_capacity(
-        c1.len() + 
-        c2.len()
-    );
+    // let mut columns_buffer: Vec<u8> = Vec::with_capacity(
+    //     c1.len() + 
+    //     c2.len()
+    // );
 
-    columns_buffer.append(&mut unsafe {
-        let chunk = c1.into_chunk().unwrap();
-        let mut cd = chunk.into_vec();
-        let cl = ManuallyDrop::into_inner(cd.clone());
-        ManuallyDrop::drop(&mut cd);
-        cl
-    });
-    columns_buffer.append(&mut unsafe {
-        let chunk = c2.into_chunk().unwrap();
-        let mut cd = chunk.into_vec();
-        let cl = ManuallyDrop::into_inner(cd.clone());
-        ManuallyDrop::drop(&mut cd);
-        cl
-    });
+    // columns_buffer.append(&mut unsafe {
+    //     let chunk = c1.into_chunk().unwrap();
+    //     let mut cd = chunk.into_vec();
+    //     let cl = ManuallyDrop::into_inner(cd.clone());
+    //     ManuallyDrop::drop(&mut cd);
+    //     cl
+    // });
+    // columns_buffer.append(&mut unsafe {
+    //     let chunk = c2.into_chunk().unwrap();
+    //     let mut cd = chunk.into_vec();
+    //     let cl = ManuallyDrop::into_inner(cd.clone());
+    //     ManuallyDrop::drop(&mut cd);
+    //     cl
+    // });
 
-    let _insert_row = InsertOrUpdateRow {
-        columns_data: columns_buffer.clone()
-    };
+    // let _insert_row = InsertOrUpdateRow {
+    //     columns_data: columns_buffer.clone()
+    // };
 
-    table.insert_row(_insert_row).await;
+    // table.insert_row(_insert_row).await;
 
-    let _insert_row = InsertOrUpdateRow {
-        columns_data: columns_buffer.clone()
-    };
+    // let _insert_row = InsertOrUpdateRow {
+    //     columns_data: columns_buffer.clone()
+    // };
 
-    table.insert_row(_insert_row).await;
+    // table.insert_row(_insert_row).await;
 
-    let _insert_row = InsertOrUpdateRow {
-        columns_data: columns_buffer
-    };
+    // let _insert_row = InsertOrUpdateRow {
+    //     columns_data: columns_buffer
+    // };
 
-    table.insert_row(_insert_row).await;
+    // table.insert_row(_insert_row).await;
 
     // for i in 0..1_000_000 {
     //     if i == 999_998_999 {
@@ -158,7 +158,7 @@ async fn main() -> std::io::Result<()> {
     let query_evaluation = parse_rql(&format!(r#"
         BEGIN
         SELECT FROM NAME_DOESNT_MATTER_FOR_NOW
-        WHERE COL(0) = 10
+         WHERE COL(2) = 'This is the millionth something row.'
         LIMIT 1
         END
     "#)).unwrap();

@@ -1,7 +1,6 @@
 use crate::{
     core::{
-        column::Column,
-        hashing::get_hash, row::InsertOrUpdateRow}, 
+        column::Column, db_type::DbType, hashing::get_hash, row::InsertOrUpdateRow}, 
         POSITIONS_CACHE
     };
 
@@ -258,23 +257,27 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
             } else if !token.contains(".") {
                 let result_i128 = str::parse::<i128>(&token.trim());
                 if let Ok(token_number) = result_i128 {
-                    let val = Token::Value(Column::new(token_number).unwrap());
+                    let column = Column::from_raw(10, &token_number.to_le_bytes());
+                    let val = Token::Value(column);
                     token_vector.push(val);
                 } else {
                     panic!("Error parsing token number: {}, error: {}", token, result_i128.unwrap_err());
                 }
             } else if token.contains(".") {
                 if let Ok(token_number) = str::parse::<f64>(&token) {
-                    let val = Token::Value(Column::new(token_number).unwrap());
+                    let column = Column::from_raw(12, &token_number.to_le_bytes());
+                    let val = Token::Value(column);
                     token_vector.push(val);
                 } else {
                     panic!()
                 }
             } else if token == "TRUE" {
-                let val = Token::Value(Column::new(true).unwrap());
+                let column = Column::from_raw(12, &[true as u8]);
+                let val = Token::Value(column);
                 token_vector.push(val);
             } else if token == "FALSE" {
-                let val = Token::Value(Column::new(false).unwrap());
+                let column = Column::from_raw(12, &[false as u8]);
+                let val = Token::Value(column);
                 token_vector.push(val);
             }
         }
