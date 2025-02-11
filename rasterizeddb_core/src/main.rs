@@ -1,4 +1,4 @@
-use std::{arch::x86_64::{_mm_prefetch, _MM_HINT_T0}, io::stdin};
+use std::{arch::x86_64::{_mm_prefetch, _MM_HINT_T0}, fs::remove_file, io::stdin, mem::ManuallyDrop};
 
 use rasterizeddb_core::{
     core::{
@@ -6,7 +6,7 @@ use rasterizeddb_core::{
         row::InsertOrUpdateRow, 
         storage_providers::{file_sync::LocalStorageProvider, memory::MemoryStorageProvider}, 
         table::Table
-    }, rql::parser::parse_rql, EMPTY_BUFFER
+    }, memory_pool::MEMORY_POOL, rql::parser::parse_rql, EMPTY_BUFFER
 };
 
 use stopwatch::Stopwatch;
@@ -18,10 +18,10 @@ async fn main() -> std::io::Result<()> {
         let empty_buffer_ptr = EMPTY_BUFFER.as_ptr();
         unsafe { _mm_prefetch::<_MM_HINT_T0>(empty_buffer_ptr as *const i8) };
     }
-    
+
     std::env::set_var("RUST_BACKTRACE","0");
 
-    //_ = remove_file("C:\\Users\\mspc6\\OneDrive\\Professional\\Desktop\\database.db");
+    _ = remove_file("C:\\Users\\mspc6\\OneDrive\\Professional\\Desktop\\database.db");
 
     let io_sync = LocalStorageProvider::new(
         "C:\\Users\\mspc6\\OneDrive\\Professional\\Desktop",
@@ -42,25 +42,47 @@ async fn main() -> std::io::Result<()> {
 
    let mut table = Table::init(io_sync, false, false).await.unwrap();
 
-    // let mut c1 = Column::new(1_597_937).unwrap();
-    // let mut c2 = Column::new(-1_597_937).unwrap();
-    // let mut c3 = Column::new("This is the millionth something row.").unwrap();
+    let c1 = Column::new(10_u16).unwrap();
+    let c2 = Column::new(20_u16).unwrap();
+    //let mut c3 = Column::new("This is the millionth something row.").unwrap();
 
-    // let mut columns_buffer: Vec<u8> = Vec::with_capacity(
-    //     c1.len() + 
-    //     c2.len() +
-    //     c3.len() 
-    // );
+    let mut columns_buffer: Vec<u8> = Vec::with_capacity(
+        c1.len() + 
+        c2.len()
+    );
 
-    // columns_buffer.append(&mut c1.into_vec().unwrap());
-    // columns_buffer.append(&mut c2.into_vec().unwrap());
-    // columns_buffer.append(&mut c3.into_vec().unwrap());
+    columns_buffer.append(&mut unsafe {
+        let chunk = c1.into_chunk().unwrap();
+        let mut cd = chunk.into_vec();
+        let cl = ManuallyDrop::into_inner(cd.clone());
+        ManuallyDrop::drop(&mut cd);
+        cl
+    });
+    columns_buffer.append(&mut unsafe {
+        let chunk = c2.into_chunk().unwrap();
+        let mut cd = chunk.into_vec();
+        let cl = ManuallyDrop::into_inner(cd.clone());
+        ManuallyDrop::drop(&mut cd);
+        cl
+    });
 
-    // let _insert_row = InsertOrUpdateRow {
-    //     columns_data: columns_buffer
-    // };
+    let _insert_row = InsertOrUpdateRow {
+        columns_data: columns_buffer.clone()
+    };
 
-    // table.insert_row(_insert_row).await;
+    table.insert_row(_insert_row).await;
+
+    let _insert_row = InsertOrUpdateRow {
+        columns_data: columns_buffer.clone()
+    };
+
+    table.insert_row(_insert_row).await;
+
+    let _insert_row = InsertOrUpdateRow {
+        columns_data: columns_buffer
+    };
+
+    table.insert_row(_insert_row).await;
 
     // for i in 0..1_000_000 {
     //     if i == 999_998_999 {
@@ -136,7 +158,7 @@ async fn main() -> std::io::Result<()> {
     let query_evaluation = parse_rql(&format!(r#"
         BEGIN
         SELECT FROM NAME_DOESNT_MATTER_FOR_NOW
-        WHERE COL(2) = 'This is the millionth something row.'
+        WHERE COL(0) = 10
         LIMIT 1
         END
     "#)).unwrap();

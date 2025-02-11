@@ -1,3 +1,4 @@
+use std::mem::ManuallyDrop;
 use std::sync::Arc;
 
 use once_cell::sync::Lazy;
@@ -63,8 +64,8 @@ async fn index() -> Response {
     let y = unsafe { RANDOM.gen_range(-10..10 as i32) } as i32;
     let z = unsafe { RANDOM.gen_range(-10..10 as i32) } as i32;
 
-    let mut c1_update = Column::new(x + y).unwrap();
-    let mut c2_update = Column::new((((x as f64) / (y as f64) as f64) * z as f64) as f64).unwrap();
+    let c1_update = Column::new(x + y).unwrap();
+    let c2_update = Column::new((((x as f64) / (y as f64) as f64) * z as f64) as f64).unwrap();
     //let large_string = "A".repeat(1024);
     //let mut c3_update = Column::new(&large_string).unwrap();
 
@@ -73,9 +74,20 @@ async fn index() -> Response {
         c2_update.len()
         //c3_update.len() 
     );
-
-    columns_buffer_update.append(&mut c1_update.into_vec().unwrap());
-    columns_buffer_update.append(&mut c2_update.into_vec().unwrap());
+    columns_buffer_update.append(&mut unsafe {
+        let chunk = c1_update.into_chunk().unwrap();
+        let mut cd = chunk.into_vec();
+        let cl = ManuallyDrop::into_inner(cd.clone());
+        ManuallyDrop::drop(&mut cd);
+        cl
+    });
+    columns_buffer_update.append(&mut unsafe {
+        let chunk = c2_update.into_chunk().unwrap();
+        let mut cd = chunk.into_vec();
+        let cl = ManuallyDrop::into_inner(cd.clone());
+        ManuallyDrop::drop(&mut cd);
+        cl
+    });
     //columns_buffer_update.append(&mut c3_update.into_vec().unwrap());
 
     let update_row = InsertOrUpdateRow {

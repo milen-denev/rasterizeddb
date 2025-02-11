@@ -253,28 +253,28 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
                 tokens_vector.push((new_vector, Some(Next::Or)));
             } else if token.starts_with('\'') && token.ends_with('\'') {
                 let string = &token[1..token.len() -1];
-                let val = Token::Value(Box::pin(Column::new(string).unwrap()));
+                let val = Token::Value(Column::new(string).unwrap());
                 token_vector.push(val);
             } else if !token.contains(".") {
                 let result_i128 = str::parse::<i128>(&token.trim());
                 if let Ok(token_number) = result_i128 {
-                    let val = Token::Value(Box::pin(Column::new(token_number).unwrap()));
+                    let val = Token::Value(Column::new(token_number).unwrap());
                     token_vector.push(val);
                 } else {
                     panic!("Error parsing token number: {}, error: {}", token, result_i128.unwrap_err());
                 }
             } else if token.contains(".") {
                 if let Ok(token_number) = str::parse::<f64>(&token) {
-                    let val = Token::Value(Box::pin(Column::new(token_number).unwrap()));
+                    let val = Token::Value(Column::new(token_number).unwrap());
                     token_vector.push(val);
                 } else {
                     panic!()
                 }
             } else if token == "TRUE" {
-                let val = Token::Value(Box::pin(Column::new(true).unwrap()));
+                let val = Token::Value(Column::new(true).unwrap());
                 token_vector.push(val);
             } else if token == "FALSE" {
-                let val = Token::Value(Box::pin(Column::new(false).unwrap()));
+                let val = Token::Value(Column::new(false).unwrap());
                 token_vector.push(val);
             }
         }

@@ -1,5 +1,5 @@
 use std::{
-    arch::x86_64::{_mm_prefetch, _MM_HINT_T0}, fmt::Display, io::{self, Read, Seek, SeekFrom}, pin::Pin, sync::Arc
+    arch::x86_64::{_mm_prefetch, _MM_HINT_T0}, io::{self, Read, Seek, SeekFrom, Write}, pin::Pin, sync::Arc
 };
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -10,7 +10,7 @@ use crate::{core::helpers::delete_row_file, instructions::ref_vec, memory_pool::
 use super::{
     super::rql::{
         models::Token, parser::ParserResult, tokenizer::evaluate_column_result
-    }, column::{Column, DowngradeType}, db_type::DbType, helpers::{
+    }, column::Column, db_type::DbType, helpers::{
         add_in_memory_index, 
         add_last_in_memory_index, 
         columns_cursor_to_row, 
@@ -280,7 +280,7 @@ impl<S: IOOperationsSync> Table<S> {
 
             if let Some(chunks) = chunks_result.as_ref() {
 
-                let mut required_columns: Vec<(u32, Pin<Box<Column>>)> = Vec::default();
+                let mut required_columns: Vec<(u32, Column)> = Vec::default();
 
                 let column_indexes = evaluation_tokens.iter()
                     .flat_map(|(tokens, _)| tokens.iter())
@@ -301,26 +301,7 @@ impl<S: IOOperationsSync> Table<S> {
 
                     loop {
                         if let Some(prefetch_result) = row_prefetching_cursor(&mut position, &mut cursor_vector, chunk).unwrap() {
-                            let mut buffer_chunk = Chunk::default();
-                            let mut str_chunk = Chunk::default();
-
-                            let mut data_buffer = {
-                                let mut memory_pool = MEMORY_POOL.write().unwrap();
-                    
-                                let pointer_result = memory_pool.acquire(prefetch_result.length + 1 as u32).await;
-                                
-                                drop(memory_pool);
-                    
-                                match pointer_result {
-                                    Some(chunk) => {
-                                        let ref_buffer = ref_vec(chunk.ptr, chunk.size as usize);
-                                        buffer_chunk = chunk;
-                                        ref_buffer
-                                    },
-                                    None => vec![0; prefetch_result.length as usize + 1]
-                                }
-                            };
-
+                           
                             let mut current_column_index: u32 = 0;
                             let first_column_index = position.clone();
 
@@ -330,17 +311,40 @@ impl<S: IOOperationsSync> Table<S> {
                                     position += 1;
 
                                     let db_type = DbType::from_byte(column_type.clone());
-        
+       
                                     if db_type == DbType::END {
                                         break;
                                     }
         
                                     if db_type != DbType::STRING {
+                                        let mut memory_chunk = {
+                                            let mut memory_pool = MEMORY_POOL.write().unwrap();
+                                    
+                                            let pointer_result = memory_pool.acquire(db_type.get_size()).await;
+                                                
+                                            drop(memory_pool);
+                                    
+                                            match pointer_result {
+                                                Some(chunk) => {
+                                                    chunk
+                                                },
+                                                None => Chunk::from_vec(vec![0; prefetch_result.length as usize + 1])
+                                            }
+                                        };
+            
+                                        let mut data_buffer = unsafe { memory_chunk.into_vec() };
+            
                                         extent_non_string_buffer(
                                             &mut data_buffer, 
                                             &db_type, 
                                             &mut cursor_vector, 
                                             &mut position);
+
+                                        memory_chunk.deallocate_vec(data_buffer);
+
+                                        let column = Column::from_chunk(column_type, memory_chunk);
+
+                                        required_columns.push((current_column_index, column.into_downgrade().await));
                                     } else {
                                         let str_len_array: [u8; 4] = [
                                             cursor_vector.vector[position as usize],
@@ -363,7 +367,6 @@ impl<S: IOOperationsSync> Table<S> {
                                         let cursor = &mut cursor_vector.cursor;
                                         cursor.seek(SeekFrom::Start(position)).unwrap();
 
-
                                         let raw_pointer_result = {
                                             let mut memory_pool = MEMORY_POOL.write().unwrap();
                             
@@ -374,24 +377,29 @@ impl<S: IOOperationsSync> Table<S> {
                                             pointer_result
                                         };
 
-                                        let mut preset_buffer = match raw_pointer_result {
-                                            Some(chunk) => {
-                                                let ref_vec = ref_vec(chunk.ptr, chunk.size as usize + 4);
-                                                str_chunk = chunk;
-                                                ref_vec
+                                        let mut str_memory_chunk = match raw_pointer_result {
+                                            Some(memory_chunk) => {
+                                                memory_chunk
                                             },
-                                            None => vec![0; str_length as usize + 4]
+                                            None => {
+                                                Chunk::from_vec(vec![0; str_length as usize + 4])
+                                            }
                                         };
+                                        
+                                        let mut preset_buffer = unsafe { str_memory_chunk.into_vec() };
+
+                                        _ = preset_buffer.write(&str_length.to_le_bytes());
 
                                         cursor.read(&mut preset_buffer).unwrap();
-                                        data_buffer.append(&mut preset_buffer);
+
+                                        str_memory_chunk.deallocate_vec(preset_buffer);
 
                                         position += str_length as u64;
-                                    }
-                                    
-                                    let column = Column::from_raw(column_type, &data_buffer);
 
-                                    required_columns.push((current_column_index, Box::pin(column)));
+                                        let column = Column::from_chunk(column_type, str_memory_chunk);
+
+                                        required_columns.push((current_column_index, column.into_downgrade().await));
+                                    }
                                 } else {
                                     let column_type = cursor_vector.vector[position as usize];
                                     position += 1;
@@ -427,9 +435,7 @@ impl<S: IOOperationsSync> Table<S> {
                                         position += str_length as u64;
                                     }
                                 }
-
                                 current_column_index += 1;
-                                data_buffer.clear();
                             }
 
                             let evaluation = if !select_all {
@@ -437,8 +443,9 @@ impl<S: IOOperationsSync> Table<S> {
                                     &mut required_columns, 
                                     &evaluation_tokens,
                                     &mut token_results);
-                                token_results.clear();
+                                    
                                 required_columns.clear();
+                                token_results.clear();
                                 eval
                             } else {
                                 true
@@ -473,9 +480,6 @@ impl<S: IOOperationsSync> Table<S> {
 
                                 position = cursor.stream_position().unwrap();
                             }
-
-                            drop(str_chunk);
-                            drop(buffer_chunk);
                         } else {
                             break;
                         }
@@ -494,7 +498,7 @@ impl<S: IOOperationsSync> Table<S> {
 
                     
                 let mut token_results: Vec<(bool, Option<Next>)> = Vec::with_capacity(evaluation_tokens.len());
-                let mut required_columns: Vec<(u32, Pin<Box<Column>>)> = Vec::default();
+                let mut required_columns: Vec<(u32, Column)> = Vec::default();
                 let mut position = HEADER_SIZE as u64;
 
                 loop {
@@ -503,25 +507,6 @@ impl<S: IOOperationsSync> Table<S> {
                         &mut position,
                         file_length).await.unwrap() {
     
-                        let mut buffer_chunk = Chunk::default();
-
-                        let mut data_buffer = {
-                            let mut memory_pool = MEMORY_POOL.write().unwrap();
-                
-                            let pointer_result = memory_pool.acquire(prefetch_result.length + 1 as u32).await;
-                            
-                            drop(memory_pool);
-                
-                            match pointer_result {
-                                Some(chunk) => {
-                                    let ref_buffer = ref_vec(chunk.ptr, chunk.size as usize);
-                                    buffer_chunk = chunk;
-                                    ref_buffer
-                                },
-                                None => vec![0; prefetch_result.length as usize + 1]
-                            }
-                        };
-
                         let mut column_index_inner = 0;
 
                         let mut columns_cursor = self.io_sync.read_data_to_cursor(
@@ -530,6 +515,24 @@ impl<S: IOOperationsSync> Table<S> {
     
                         loop {
                             if column_indexes.iter().any(|x| *x == column_index_inner) {
+                                
+                                let mut memory_chunk = {
+                                    let mut memory_pool = MEMORY_POOL.write().unwrap();
+                        
+                                    let pointer_result = memory_pool.acquire(prefetch_result.length + 1 as u32).await;
+                                    
+                                    drop(memory_pool);
+                        
+                                    match pointer_result {
+                                        Some(chunk) => {
+                                            chunk
+                                        },
+                                        None => Chunk::from_vec(vec![0; prefetch_result.length as usize + 1])
+                                    }
+                                };
+
+                                let mut data_buffer = unsafe { memory_chunk.into_vec() };
+
                                 let column_type = columns_cursor.read_u8().unwrap();
 
                                 let db_type = DbType::from_byte(column_type);
@@ -552,9 +555,11 @@ impl<S: IOOperationsSync> Table<S> {
                                     data_buffer.append(&mut preset_buffer);
                                 }
                                 
-                                let column = Column::from_raw(column_type, &data_buffer);
+                                memory_chunk.deallocate_vec(data_buffer);
 
-                                required_columns.push((column_index_inner, Box::pin(column)));
+                                let column = Column::from_chunk(column_type, memory_chunk);
+
+                                required_columns.push((column_index_inner, column.into_downgrade().await));
                             } else {
                                 let column_type = columns_cursor.read_u8().unwrap();
 
@@ -616,8 +621,6 @@ impl<S: IOOperationsSync> Table<S> {
                                 return Ok(Some(rows));
                             }
                         }
-
-                        drop(buffer_chunk);
                     } else {
                         break;
                     }

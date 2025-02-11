@@ -1,4 +1,4 @@
-use std::{arch::{asm, x86_64::*}, ptr};
+use std::{arch::{asm, x86_64::*}, mem::{self, ManuallyDrop}, ptr};
 
 #[inline]
 pub(crate) fn compare_vecs_eq(vec1: &[u8], vec2: &[u8]) -> bool {
@@ -99,8 +99,8 @@ pub unsafe fn compare_raw_vecs(vec_a: *mut u8, vec_b: *mut u8, vec_a_len: u32, v
 }
 
 #[inline(always)]
-pub unsafe fn zero_buffer(buf: *mut u8, len: usize) {
-    ptr::write_bytes(buf, 0, len);
+pub unsafe fn zero_buffer(dst: *mut u8, len: usize) {
+    ptr::write_bytes(dst, 0, len);
 }
 
 #[inline(always)]
@@ -119,8 +119,10 @@ pub fn vec_from_ptr_safe(ptr: *mut u8, len: usize) -> Vec<u8> {
 }
 
 #[inline(always)]
-pub fn ref_vec(ptr: *mut u8, len: usize) -> Vec<u8> {
+pub unsafe fn ref_vec(ptr: *mut u8, len: usize) -> ManuallyDrop<Vec<u8>> {
     unsafe {
-        Vec::from_raw_parts(ptr, len, len)
+        let vec = Vec::from_raw_parts(ptr, len, len);
+        let manual = ManuallyDrop::new(vec);
+        manual
     }
 }

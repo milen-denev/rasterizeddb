@@ -1,4 +1,4 @@
-use std::{io, sync::Arc};
+use std::{io, mem::ManuallyDrop, sync::Arc};
 
 use ahash::RandomState;
 use dashmap::DashMap;
@@ -78,9 +78,9 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
 
         self.tables.insert(name.clone(), table);
 
-        let mut name_column = Column::new(name).unwrap();
-        let mut compress_column = Column::new(compress).unwrap();
-        let mut immutable_column = Column::new(immutable).unwrap();
+        let name_column = Column::new(name).unwrap();
+        let compress_column = Column::new(compress).unwrap();
+        let immutable_column = Column::new(immutable).unwrap();
 
         let mut columns_buffer_update: Vec<u8> = Vec::with_capacity(
             name_column.len() + 
@@ -88,9 +88,27 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
             immutable_column.len() 
         );
 
-        columns_buffer_update.append(&mut name_column.into_vec().unwrap());
-        columns_buffer_update.append(&mut compress_column.into_vec().unwrap());
-        columns_buffer_update.append(&mut immutable_column.into_vec().unwrap());
+        columns_buffer_update.append(&mut unsafe {
+            let chunk = name_column.into_chunk().unwrap();
+            let mut cd = chunk.into_vec();
+            let cl = ManuallyDrop::into_inner(cd.clone());
+            ManuallyDrop::drop(&mut cd);
+            cl
+        });
+        columns_buffer_update.append(&mut unsafe {
+            let chunk = compress_column.into_chunk().unwrap();
+            let mut cd = chunk.into_vec();
+            let cl = ManuallyDrop::into_inner(cd.clone());
+            ManuallyDrop::drop(&mut cd);
+            cl
+        });
+        columns_buffer_update.append(&mut unsafe {
+            let chunk = immutable_column.into_chunk().unwrap();
+            let mut cd = chunk.into_vec();
+            let cl = ManuallyDrop::into_inner(cd.clone());
+            ManuallyDrop::drop(&mut cd);
+            cl
+        });
 
         self.config_table.insert_row(InsertOrUpdateRow { 
             columns_data: columns_buffer_update 

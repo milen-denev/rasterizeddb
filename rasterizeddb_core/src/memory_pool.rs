@@ -1,19 +1,19 @@
 use once_cell::sync::Lazy;
 use tokio::task::yield_now;
 use std::{
-    pin::Pin,
-    sync::{Arc, RwLock},
-    collections::BTreeMap,
+    collections::BTreeMap, mem::{self, ManuallyDrop}, pin::Pin, ptr, sync::{Arc, RwLock}
 };
 use dashmap::DashMap;
-use crate::instructions::zero_buffer;
+use crate::instructions::{ref_vec, zero_buffer};
+
+const MEMORY_POOL_SIZE: usize = 8_388_608;
 
 pub static MEMORY_POOL: Lazy<Arc<RwLock<MemoryPool>>> = Lazy::new(|| {
     Arc::new(RwLock::new(MemoryPool::new()))
 });
 
 pub struct MemoryPool {
-    pub buffer: Pin<Box<[u8; 8_388_608]>>, // 8MB
+    pub buffer: Pin<Box<[u8]>>, // 8MB
     pub allocations: DashMap<usize, u32>, // Tracks active allocations
     pub freed_chunks: BTreeMap<u32, Vec<usize>>, // Sorted free chunks by size
 }
@@ -21,7 +21,10 @@ pub struct MemoryPool {
 impl MemoryPool {
     pub fn new() -> Self {
         Self {
-            buffer: Box::pin([0; 8_388_608]),
+            buffer: {
+                let buffer = vec![0_u8; MEMORY_POOL_SIZE].into_boxed_slice();
+                Pin::new(buffer)
+            },
             allocations: DashMap::new(),
             freed_chunks: BTreeMap::new(),
         }
@@ -44,13 +47,14 @@ impl MemoryPool {
                     ptr,
                     size,
                     pool: Arc::downgrade(&MEMORY_POOL),
+                    vec: None
                 });
             }
         }
 
         // Otherwise, allocate from the buffer
         let current_index = self.allocations.iter().map(|e| *e.value()).sum::<u32>();
-        if current_index + size > 8_388_608 {
+        if current_index + size > MEMORY_POOL_SIZE as u32 {
             return None;
         }
 
@@ -61,6 +65,7 @@ impl MemoryPool {
             ptr,
             size,
             pool: Arc::downgrade(&MEMORY_POOL),
+            vec: None
         })
     }
 
@@ -79,6 +84,8 @@ pub struct Chunk {
     pub ptr: *mut u8,
     pub size: u32,
     pool: std::sync::Weak<RwLock<MemoryPool>>,
+    // Used to store a vector instead of a raw pointer. Either one or the other will be set.
+    pub vec: Option<Vec<u8>>
 }
 
 impl Default for Chunk {
@@ -86,17 +93,55 @@ impl Default for Chunk {
         Self {
             ptr: std::ptr::null_mut(),
             size: 0,
-            pool: std::sync::Weak::default()
+            pool: std::sync::Weak::default(),
+            vec: None
         }
     }
 }
 
 impl Drop for Chunk {
+    #[track_caller]
     fn drop(&mut self) {
-        if let Some(pool) = self.pool.upgrade() {
-            if let Ok(mut pool) = pool.write() {
-                pool.release(self.ptr);
+        if self.vec.is_none() {
+            println!("drop called");
+            if let Some(pool) = self.pool.upgrade() {
+                if let Ok(mut pool) = pool.write() {
+                    pool.release(self.ptr);
+                }
             }
+        }
+    }
+}
+
+impl Chunk {
+    // Create a new chunk from a vector with no memory chunk allocated from pool
+    #[track_caller]
+    pub fn from_vec(vec: Vec<u8>) -> Self {
+
+        Chunk {
+            ptr: ptr::null_mut(),
+            size: 0,
+            pool: std::sync::Weak::default(),
+            vec: Some(vec)
+        }
+    }
+
+    #[track_caller]
+    pub unsafe fn into_vec(&self) -> ManuallyDrop<Vec<u8>> {
+        if let Some(vec) = self.vec.as_ref() {
+            let new_vec = vec.clone();
+            let manual = ManuallyDrop::new(new_vec);
+            manual
+        } else {
+            ref_vec(self.ptr, self.size as usize)
+        }
+    }
+
+    pub fn deallocate_vec(&mut self, vec: ManuallyDrop<Vec<u8>>) {
+        if self.vec.is_some() {
+            self.vec = Some(ManuallyDrop::into_inner(vec));
+        } else {
+            mem::forget(vec);
         }
     }
 }

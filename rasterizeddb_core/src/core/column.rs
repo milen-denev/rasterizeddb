@@ -1,4 +1,4 @@
-use std::{arch::x86_64::{_mm_prefetch, _MM_HINT_T0}, fmt::{Debug, Display}, io::{self, Cursor, Read, Write}, ops::{Deref, DerefMut}, ptr};
+use std::{arch::x86_64::{_mm_prefetch, _MM_HINT_T0}, fmt::{Debug, Display}, io::{self, Cursor, Read, Write}, mem::ManuallyDrop, ops::{Deref, DerefMut}, ptr};
 
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt, WriteBytesExt};
 use futures::executor::block_on;
@@ -275,42 +275,30 @@ impl Column {
             Vec::with_capacity(vec.len() + 1 + 4) 
         };
 
+        buffer.write_u8(db_type.to_byte()).unwrap();
+
         if db_type == DbType::STRING {
             buffer.write_u32::<LittleEndian>(vec.len() as u32).unwrap();
         }
 
         buffer.extend_from_slice(&vec);
 
-        let mut memory_pool = MEMORY_POOL.write().unwrap();
-
-        let pointer_result = block_on(memory_pool.acquire(vec.len() as u32));
-        
-        drop(memory_pool);
-
-        let column_value = match pointer_result {
-            Some(chunk) => {
-                copy_vec_to_ptr(&buffer, chunk.ptr);
-                ColumnValue::StaticMemoryPointer(chunk)
-            },
-            None => ColumnValue::ManagedMemoryPointer(vec)
-        };
-
         Ok(Column {
             data_type: db_type,
-            content: column_value
+            content: ColumnValue::ManagedMemoryPointer(buffer)
         })
     }
 
     // Vector must be dropped before dropping column
-    pub fn into_vec(&mut self) -> io::Result<Vec<u8>> {
-        let buffer = match &self.content {
+    pub unsafe fn into_chunk(self) -> io::Result<Chunk> {
+        let chunk = match self.content {
             ColumnValue::StaticMemoryPointer(chunk) => {
-                ref_vec(chunk.ptr, chunk.size as usize)
+                chunk
             },
-            ColumnValue::ManagedMemoryPointer(vec) => vec.clone()
+            ColumnValue::ManagedMemoryPointer(vec) => Chunk::from_vec(vec)
         };
 
-        Ok(buffer)
+        Ok(chunk)
     }
 
     pub fn len(&self) -> usize {
@@ -344,17 +332,25 @@ impl Column {
         }
     }
 
+    pub fn from_chunk(data_type: u8, mut chunk: Chunk) -> Column {    
+        if chunk.vec.is_none() {
+            Column {
+                data_type: DbType::from_byte(data_type),
+                content: ColumnValue::StaticMemoryPointer(chunk)
+            }
+        } else {
+            let vec = chunk.vec.clone().unwrap();
+            chunk.vec = None;
+            Column {
+                data_type: DbType::from_byte(data_type),
+                content: ColumnValue::ManagedMemoryPointer(vec)
+            }
+        }
+    }
+
     pub fn from_raw_clone(data_type: u8, buffer: &[u8]) -> Column {    
         let column_value = {
-            let mut memory_pool = MEMORY_POOL.write().unwrap();
-
-            let pointer_result = block_on(memory_pool.acquire(buffer.len() as u32));
-            
-            drop(memory_pool);
-
-            match pointer_result {
-                _ => ColumnValue::ManagedMemoryPointer(buffer.to_vec()),
-            }
+            ColumnValue::ManagedMemoryPointer(buffer.to_vec())  
         };
 
         Column {
@@ -364,108 +360,120 @@ impl Column {
     }
 
     pub fn from_buffer(buffer: &[u8]) -> io::Result<Vec<Column>> {
+        let mut cursor = Cursor::new(buffer);
+
         let mut columns: Vec<Column> = Vec::default();
 
-        let mut position: u64 = 0;
+        while cursor.position() < buffer.len() as u64 {
+            let column_type = cursor.read_u8().unwrap();
 
-        let mut chunk_references: Vec<Chunk> = Vec::new();
-
-        while position < buffer.len() as u64 {
-            let column_type_slice = [buffer[0]];
-        
-            position += 1;
-
-            let column_type_ptr = column_type_slice.as_ptr();
-        
-            #[cfg(target_arch = "x86_64")]
-            {
-                unsafe { _mm_prefetch::<_MM_HINT_T0>(column_type_ptr as *const i8) };
-            }
-    
-            let column_type = unsafe { read_u8(column_type_ptr) };
-    
             let db_type = DbType::from_byte(column_type);
 
-            if db_type == DbType::END {
-                break;
+            let mut data_buffer: Vec<u8> = Vec::default();
+
+            if db_type != DbType::STRING {
+                let mut temp_buffer = vec![0; db_type.get_size() as usize];
+                cursor.read(&mut temp_buffer).unwrap();
+                data_buffer.append(&mut temp_buffer.to_vec());
+            } else {
+                let str_length = cursor.read_u32::<LittleEndian>().unwrap();
+                let mut temp_buffer = vec![0; str_length as usize];
+                cursor.read(&mut temp_buffer).unwrap();
+                data_buffer.append(&mut temp_buffer.to_vec());
             }
 
-            let data_buffer = if db_type != DbType::STRING {
-                let db_size = db_type.get_size();
-
-                let raw_pointer_result = {
-                    let mut memory_pool = MEMORY_POOL.write().unwrap();
-    
-                    let pointer_result = block_on(memory_pool.acquire(db_size));
-                    
-                    drop(memory_pool);
-    
-                    pointer_result
-                };
-    
-                let mut temp_buffer = match raw_pointer_result {
-                    Some(chunk) => {
-                        let ref_vec = ref_vec(chunk.ptr, chunk.size as usize);
-                        chunk_references.push(chunk);
-                        ref_vec
-                    },
-                    None => vec![0; db_size as usize]
-                };
-
-                let slice = &buffer[position as usize..position as usize + db_size as usize];
-
-                position += db_size as u64;
-
-                unsafe { ptr::copy_nonoverlapping(slice.as_ptr(), temp_buffer.as_mut_ptr(), db_size as usize) };
-
-                temp_buffer
-            } else {
-                // READ LEN - START
-                let str_len_slice = &buffer[position as usize..position as usize + 4 as usize];
-
-                let str_length = unsafe { read_u32(str_len_slice.as_ptr()) };
-
-                position += 4 as u64;
-                // READ LEN - END
-
-                let raw_pointer_result = {
-                    let mut memory_pool = MEMORY_POOL.write().unwrap();
-    
-                    let pointer_result = block_on(memory_pool.acquire(str_length + 4));
-                    
-                    drop(memory_pool);
-    
-                    pointer_result
-                };
-
-                let mut temp_buffer = match raw_pointer_result {
-                    Some(chunk) => {
-                        let ref_vec = ref_vec(chunk.ptr, chunk.size as usize + 4);
-                        chunk_references.push(chunk);
-                        ref_vec
-                    },
-                    None => vec![0; str_length as usize + 4]
-                };
-
-                let slice = &buffer[position as usize..position as usize + str_length as usize];
-
-                temp_buffer[..4].copy_from_slice(str_len_slice);
-
-                position += str_length as u64;
-
-                unsafe { 
-                    ptr::copy_nonoverlapping(slice.as_ptr(), temp_buffer[4..].as_mut_ptr(), str_length as usize);
-                };
-
-                temp_buffer
-            };
-
-            let column = Column::from_raw_clone(column_type, &data_buffer);
+            let column = Column::from_raw(column_type, &data_buffer);
 
             columns.push(column);
         }
 
         return Ok(columns);
+    }
+
+    pub async fn into_downgrade(self) -> Column {  
+        let data_type = self.data_type.to_byte();
+    
+        if data_type >= 1 && data_type <= 10 {
+            let db_type_enum = DbType::from_byte(data_type);
+
+            let memory_chunk = unsafe { self.into_chunk().unwrap() };
+            let data_buffer = unsafe { memory_chunk.into_vec() };
+
+            let value = match db_type_enum {
+                DbType::I8 => data_buffer.as_slice().read_i8().unwrap() as i128,
+                DbType::I16 => LittleEndian::read_i16(&data_buffer) as i128,
+                DbType::I32 => LittleEndian::read_i32(&data_buffer) as i128,
+                DbType::I64 => LittleEndian::read_i64(&data_buffer) as i128,
+                DbType::I128 => LittleEndian::read_i128(&data_buffer),
+                DbType::U8 => data_buffer.as_slice().read_u8().unwrap() as i128,
+                DbType::U16 => LittleEndian::read_u16(&data_buffer) as i128,
+                DbType::U32 => LittleEndian::read_u32(&data_buffer) as i128,
+                DbType::U64 => LittleEndian::read_u64(&data_buffer) as i128,
+                DbType::U128 => LittleEndian::read_u128(&data_buffer) as i128,
+                _ => panic!("Unsupported type"),
+            };
+
+            let mut new_memory_chunk = {
+                let mut memory_pool = MEMORY_POOL.write().unwrap();
+    
+                //i128 size
+                let pointer_result = memory_pool.acquire(16).await;
+                
+                drop(memory_pool);
+    
+                match pointer_result {
+                    Some(chunk) => {
+                        chunk
+                    },
+                    None => Chunk::from_vec(vec![0; 16])
+                }
+            };
+
+            let mut new_buffer = unsafe { new_memory_chunk.into_vec() };
+
+            new_buffer.write_i128::<LittleEndian>(value).unwrap();
+
+            new_memory_chunk.deallocate_vec(new_buffer);
+
+            return Column::from_chunk(data_type, new_memory_chunk);
+        } else if data_type >= 11 && data_type <= 12 {
+            let db_type_enum = DbType::from_byte(data_type);
+
+            let memory_chunk = unsafe { self.into_chunk().unwrap() };
+            let data_buffer = unsafe { memory_chunk.into_vec() };
+
+            let value = match db_type_enum {
+                DbType::F32 => LittleEndian::read_f32(&data_buffer) as f64,
+                DbType::F64 => LittleEndian::read_f64(&data_buffer) as f64,
+                _ => panic!("Unsupported type"),
+            };
+
+            let mut new_memory_chunk = {
+                let mut memory_pool = MEMORY_POOL.write().unwrap();
+    
+                //f64 size
+                let pointer_result = memory_pool.acquire(8).await;
+                
+                drop(memory_pool);
+    
+                match pointer_result {
+                    Some(chunk) => {
+                        chunk
+                    },
+                    None => Chunk::from_vec(vec![0; 8])
+                }
+            };
+
+            let mut new_buffer = unsafe { new_memory_chunk.into_vec() };
+
+            new_buffer.write_f64::<LittleEndian>(value).unwrap();
+
+            new_memory_chunk.deallocate_vec(new_buffer);
+
+            return Column::from_chunk(data_type, new_memory_chunk);
+        } else {
+            self
+        }
     }
 
     /// For debug purposes
@@ -574,6 +582,7 @@ impl Column {
     }
 
     pub fn equals(&self, column: &Column) -> bool {
+        println!("{:?} = {:?}", self.content.as_slice(), column.content.as_slice());
         compare_vecs_eq(self.content.as_slice(), column.content.as_slice())
     }
 

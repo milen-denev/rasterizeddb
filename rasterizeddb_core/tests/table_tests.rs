@@ -1,4 +1,4 @@
-use std::fs::remove_file;
+use std::{fs::remove_file, mem::ManuallyDrop};
 use tokio::runtime;
 
 use rasterizeddb_core::core::{
@@ -23,9 +23,9 @@ pub fn rebuild_indexes_file() {
 
         for i in 0..500 {
             if i == 450 {
-                let mut c1 = Column::new(1000).unwrap();
-                let mut c2 = Column::new(i * -1).unwrap();
-                let mut c3 = Column::new("This is awesome.").unwrap();
+                let c1 = Column::new(1000).unwrap();
+                let c2 = Column::new(i * -1).unwrap();
+                let c3 = Column::new("This is awesome.").unwrap();
         
                 let mut columns_buffer: Vec<u8> = Vec::with_capacity(
                     c1.len() + 
@@ -33,9 +33,27 @@ pub fn rebuild_indexes_file() {
                     c3.len() 
                 );
             
-                columns_buffer.append(&mut c1.into_vec().unwrap());
-                columns_buffer.append(&mut c2.into_vec().unwrap());
-                columns_buffer.append(&mut c3.into_vec().unwrap());
+                columns_buffer.append(&mut unsafe {
+                    let chunk = c1.into_chunk().unwrap();
+                    let mut cd = chunk.into_vec();
+                    let cl = ManuallyDrop::into_inner(cd.clone());
+                    ManuallyDrop::drop(&mut cd);
+                    cl
+                });
+                columns_buffer.append(&mut unsafe {
+                    let chunk = c2.into_chunk().unwrap();
+                    let mut cd = chunk.into_vec();
+                    let cl = ManuallyDrop::into_inner(cd.clone());
+                    ManuallyDrop::drop(&mut cd);
+                    cl
+                });
+                columns_buffer.append(&mut unsafe {
+                    let chunk = c3.into_chunk().unwrap();
+                    let mut cd = chunk.into_vec();
+                    let cl = ManuallyDrop::into_inner(cd.clone());
+                    ManuallyDrop::drop(&mut cd);
+                    cl
+                });
             
                 let insert_row = InsertOrUpdateRow {
                     columns_data: columns_buffer
@@ -43,9 +61,9 @@ pub fn rebuild_indexes_file() {
             
                 table.insert_row(insert_row).await;
             } else {
-                let mut c1 = Column::new(i).unwrap();
-                let mut c2 = Column::new(i * -1).unwrap();
-                let mut c3 = Column::new("This is also awesome.").unwrap();
+                let c1 = Column::new(i).unwrap();
+                let c2 = Column::new(i * -1).unwrap();
+                let c3 = Column::new("This is also awesome.").unwrap();
         
                 let mut columns_buffer: Vec<u8> = Vec::with_capacity(
                     c1.len() + 
@@ -53,9 +71,27 @@ pub fn rebuild_indexes_file() {
                     c3.len() 
                 );
             
-                columns_buffer.append(&mut c1.into_vec().unwrap());
-                columns_buffer.append(&mut c2.into_vec().unwrap());
-                columns_buffer.append(&mut c3.into_vec().unwrap());
+                columns_buffer.append(&mut unsafe {
+                    let chunk = c1.into_chunk().unwrap();
+                    let mut cd = chunk.into_vec();
+                    let cl = ManuallyDrop::into_inner(cd.clone());
+                    ManuallyDrop::drop(&mut cd);
+                    cl
+                });
+                columns_buffer.append(&mut unsafe {
+                    let chunk = c2.into_chunk().unwrap();
+                    let mut cd = chunk.into_vec();
+                    let cl = ManuallyDrop::into_inner(cd.clone());
+                    ManuallyDrop::drop(&mut cd);
+                    cl
+                });
+                columns_buffer.append(&mut unsafe {
+                    let chunk = c3.into_chunk().unwrap();
+                    let mut cd = chunk.into_vec();
+                    let cl = ManuallyDrop::into_inner(cd.clone());
+                    ManuallyDrop::drop(&mut cd);
+                    cl
+                });
             
                 let insert_row = InsertOrUpdateRow {
                     columns_data: columns_buffer
@@ -79,19 +115,36 @@ pub fn rebuild_indexes_memory() {
 
         for i in 0..500 {
             if i == 450 {
-                let mut c1 = Column::new(1000).unwrap();
-                let mut c2 = Column::new(i * -1).unwrap();
-                let mut c3 = Column::new("This is awesome.").unwrap();
+                let c1 = Column::new(1000).unwrap();
+                let c2 = Column::new(i * -1).unwrap();
+                let c3 = Column::new("This is awesome.").unwrap();
         
                 let mut columns_buffer: Vec<u8> = Vec::with_capacity(
                     c1.len() + 
                     c2.len() + 
                     c3.len() 
                 );
-            
-                columns_buffer.append(&mut c1.into_vec().unwrap());
-                columns_buffer.append(&mut c2.into_vec().unwrap());
-                columns_buffer.append(&mut c3.into_vec().unwrap());
+                columns_buffer.append(&mut unsafe {
+                    let chunk = c1.into_chunk().unwrap();
+                    let mut cd = chunk.into_vec();
+                    let cl = ManuallyDrop::into_inner(cd.clone());
+                    ManuallyDrop::drop(&mut cd);
+                    cl
+                });
+                columns_buffer.append(&mut unsafe {
+                    let chunk = c2.into_chunk().unwrap();
+                    let mut cd = chunk.into_vec();
+                    let cl = ManuallyDrop::into_inner(cd.clone());
+                    ManuallyDrop::drop(&mut cd);
+                    cl
+                });
+                columns_buffer.append(&mut unsafe {
+                    let chunk = c3.into_chunk().unwrap();
+                    let mut cd = chunk.into_vec();
+                    let cl = ManuallyDrop::into_inner(cd.clone());
+                    ManuallyDrop::drop(&mut cd);
+                    cl
+                });
             
                 let insert_row = InsertOrUpdateRow {
                     columns_data: columns_buffer
@@ -99,9 +152,9 @@ pub fn rebuild_indexes_memory() {
             
                 table.insert_row(insert_row).await;
             } else {
-                let mut c1 = Column::new(i).unwrap();
-                let mut c2 = Column::new(i * -1).unwrap();
-                let mut c3 = Column::new("This is also awesome.").unwrap();
+                let c1 = Column::new(i).unwrap();
+                let c2 = Column::new(i * -1).unwrap();
+                let c3 = Column::new("This is also awesome.").unwrap();
         
                 let mut columns_buffer: Vec<u8> = Vec::with_capacity(
                     c1.len() + 
@@ -109,9 +162,27 @@ pub fn rebuild_indexes_memory() {
                     c3.len() 
                 );
             
-                columns_buffer.append(&mut c1.into_vec().unwrap());
-                columns_buffer.append(&mut c2.into_vec().unwrap());
-                columns_buffer.append(&mut c3.into_vec().unwrap());
+                columns_buffer.append(&mut unsafe {
+                    let chunk = c1.into_chunk().unwrap();
+                    let mut cd = chunk.into_vec();
+                    let cl = ManuallyDrop::into_inner(cd.clone());
+                    ManuallyDrop::drop(&mut cd);
+                    cl
+                });
+                columns_buffer.append(&mut unsafe {
+                    let chunk = c2.into_chunk().unwrap();
+                    let mut cd = chunk.into_vec();
+                    let cl = ManuallyDrop::into_inner(cd.clone());
+                    ManuallyDrop::drop(&mut cd);
+                    cl
+                });
+                columns_buffer.append(&mut unsafe {
+                    let chunk = c3.into_chunk().unwrap();
+                    let mut cd = chunk.into_vec();
+                    let cl = ManuallyDrop::into_inner(cd.clone());
+                    ManuallyDrop::drop(&mut cd);
+                    cl
+                });
             
                 let insert_row = InsertOrUpdateRow {
                     columns_data: columns_buffer

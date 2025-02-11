@@ -35,6 +35,6 @@ pub enum MathOperation {
 pub enum Token {
     Column(u32),
     Math(MathOperation),
-    Value(Pin<Box<Column>>),
+    Value(Column),
     Operation(ComparerOperation)
 }

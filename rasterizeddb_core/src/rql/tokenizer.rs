@@ -9,34 +9,35 @@ const ZERO_VALUE: LazyCell<Column> = LazyCell::new(|| {
 });
 
 pub(crate) fn evaluate_column_result(
-    required_columns: &mut Vec<(u32, Pin<Box<Column>>)>, 
+    required_columns: &Vec<(u32, Column)>, 
     evaluation_tokens: &Vec<(Vec<Token>, Option<Next>)>,
     token_results: &mut Vec<(bool, Option<Next>)>) -> bool {
     
     let mut iter = evaluation_tokens.iter();
 
     while let Some(tokens) = iter.next() {
-        let mut current_value: Option<*mut Column> = None;
+        let mut current_value: Option<Column> = None;
         let mut token_iter = tokens.0.iter();
 
         let evalaution_result = loop {  
-            if let Some(token) = token_iter.next(){
+            if let Some(token) = token_iter.next() {
                 match token {
                     Token::Column(column_id) => {
                         // Get the value associated with the column_id
-                        if let Some((_, column)) = required_columns.iter_mut().find(|(id, _)| *id == *column_id) {
-                            current_value = Some(unsafe { Pin::as_mut(column).get_unchecked_mut() });
+                        if let Some((_, column)) = required_columns.iter().find(|(id, _)| *id == *column_id) {
+                            current_value = Some(column.clone());
                         } else {
                             continue; // Column ID not found
                         }
                     }
                     Token::Math(operation) => {
-                        if let Some(left_value) = current_value {
+                        if let Some(left_value) = current_value.as_mut() {
                             // Get the next token for the right operand
                             let iter_result = token_iter.next();
                             if let Some(Token::Value(column)) = iter_result {
                                 let right_value = column;
-                                let left_value: &mut Column = unsafe { &mut *left_value };
+                                let left_value = left_value;
+                                
                                 // Perform the math operation
                                 match operation {
                                     MathOperation::Add => left_value.add(&right_value),
@@ -54,7 +55,6 @@ pub(crate) fn evaluate_column_result(
                                 let right_value = column;
     
                                 if let Some((_, column)) = required_columns.iter().find(|(id, _)| *id == *right_value) {
-                                    let left_value: &mut Column = unsafe { &mut *left_value };
                                     let right_value = column;
             
                                     // Perform the math operation
@@ -82,18 +82,17 @@ pub(crate) fn evaluate_column_result(
                     }
                     Token::Operation(op) => {
                     
-                        if let Some(left_value) = current_value {
+                        if let Some(left_value) = current_value.as_ref() {
                             
                             let next_token = token_iter.next();
                             // Get the next token for the right operand
                             if let Some(Token::Value(column)) = next_token {
-                                let left_value: &mut Column = unsafe { &mut *left_value };
                                 let right_value = column;
 
                                 // Perform the comparison
                                 let result = match op {
                                     ComparerOperation::Equals => left_value.equals(&right_value),
-                                    ComparerOperation::NotEquals =>  left_value.not_equal(&right_value),
+                                    ComparerOperation::NotEquals =>  left_value.ne(&right_value),
                                     ComparerOperation::Greater => left_value.greater_than(&right_value),
                                     ComparerOperation::Less => left_value.less_than(&right_value),
                                     ComparerOperation::GreaterOrEquals => left_value.greater_or_equals(&right_value),
@@ -108,13 +107,12 @@ pub(crate) fn evaluate_column_result(
                                 let right_value = column;
 
                                 if let Some((_, column)) = required_columns.iter().find(|(id, _)| *id == *right_value) {
-                                    let left_value: &mut Column = unsafe { &mut *left_value };
                                     let right_value = column;
     
                                     // Perform the comparison
                                     let result = match op {
                                         ComparerOperation::Equals => left_value.equals(&right_value),
-                                        ComparerOperation::NotEquals =>  left_value.not_equal(&right_value),
+                                        ComparerOperation::NotEquals =>  left_value.ne(&right_value),
                                         ComparerOperation::Greater => left_value.greater_than(&right_value),
                                         ComparerOperation::Less => left_value.less_than(&right_value),
                                         ComparerOperation::GreaterOrEquals => left_value.greater_or_equals(&right_value),
@@ -136,10 +134,9 @@ pub(crate) fn evaluate_column_result(
                         }
                     }
                     Token::Value(column_value) => {
-                        let column_ptr: *mut Column = Pin::as_ref(&column_value).get_ref() as *const Column as *mut Column;
-
                         // Get the value associated with the column_id
-                        current_value = Some(column_ptr);
+                        current_value = Some(column_value.clone());
+                       
                     }
                 }
             } else {
@@ -187,6 +184,6 @@ pub(crate) fn evaluate_column_result(
             final_result = token_result.0;
         }
     }
-
+    
     final_result // Default to false if no comparison was made
 }
