@@ -252,7 +252,7 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
                 tokens_vector.push((new_vector, Some(Next::Or)));
             } else if token.starts_with('\'') && token.ends_with('\'') {
                 let string = &token[1..token.len() -1];
-                let val = Token::Value(Column::new(string).unwrap());
+                let val = Token::Value(Column::from_raw(14, string.as_bytes()));
                 token_vector.push(val);
             } else if !token.contains(".") {
                 let result_i128 = str::parse::<i128>(&token.trim());
