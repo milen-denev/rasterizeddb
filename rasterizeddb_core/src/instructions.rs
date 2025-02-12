@@ -105,8 +105,6 @@ pub fn copy_vec_to_ptr(vec: &[u8], dst: *mut u8) {
 }
 
 pub fn copy_ptr_to_vec(src: *const u8, vec: &mut Vec<u8>, len: usize) {
-    assert!(vec.len() >= len, "Destination Vec is too small!");
-
     unsafe {
         vec[..len].copy_from_slice(std::slice::from_raw_parts(src, len));
     }

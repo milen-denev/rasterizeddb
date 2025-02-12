@@ -1,5 +1,5 @@
 use std::{
-    mem::{self, ManuallyDrop}, pin::Pin, ptr, sync::{atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering}, Arc, LazyLock}
+    arch::x86_64::{_mm_prefetch, _MM_HINT_T0}, mem::{self, ManuallyDrop}, pin::Pin, ptr, sync::{atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering}, Arc, LazyLock}
 };
 
 use crate::instructions::ref_vec;
@@ -171,6 +171,7 @@ impl MemoryPool {
         }
     }
 
+    #[inline(always)]
     pub fn acquire(&self, size: u32) -> Option<Chunk> {
         let mut current_start = 0;
         let mut slot_index: Option<usize> = None;
@@ -219,6 +220,7 @@ impl MemoryPool {
         })
     }
 
+    #[inline(always)]
     fn release(&self, index: i32) {
         if index != -1 {
             ATOMIC_IN_USE_ARRAY[index as usize].store(false, Ordering::Release);
@@ -262,6 +264,12 @@ impl Drop for Chunk {
 }
 
 impl Chunk {
+    pub fn prefetch_to_lcache(&self) {
+        if self.vec.is_none() {
+            unsafe { _mm_prefetch::<_MM_HINT_T0>(self.ptr as *const i8) };
+        }
+    }
+
     // Create a new chunk from a vector with no memory chunk allocated from pool
     pub fn from_vec(vec: Vec<u8>) -> Self {
         Chunk {

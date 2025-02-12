@@ -2,7 +2,7 @@ use std::io::{Read, Seek, SeekFrom};
 
 use super::{db_type::DbType, support_types::CursorVector};
 
-//#[inline(always)]
+#[inline(always)]
 pub fn extent_non_string_buffer(
     data_buffer: &mut Vec<u8>, 
     db_type: &DbType, 

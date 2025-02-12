@@ -257,7 +257,7 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
             } else if !token.contains(".") {
                 let result_i128 = str::parse::<i128>(&token.trim());
                 if let Ok(token_number) = result_i128 {
-                    let column = Column::from_chunk(5, Chunk::from_vec(token_number.to_le_bytes().to_vec()));
+                    let column = Column::create_temp(true, token_number.to_le_bytes().to_vec());
                     let val = Token::Value(column);
                     token_vector.push(val);
                 } else {
@@ -265,18 +265,18 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
                 }
             } else if token.contains(".") {
                 if let Ok(token_number) = str::parse::<f64>(&token) {
-                    let column = Column::from_chunk(12, Chunk::from_vec(token_number.to_le_bytes().to_vec()));
+                    let column = Column::create_temp(false, token_number.to_le_bytes().to_vec());
                     let val = Token::Value(column);
                     token_vector.push(val);
                 } else {
                     panic!()
                 }
             } else if token == "TRUE" {
-                let column = Column::from_chunk(6, Chunk::from_vec([true as u8].to_vec()));
+                let column = Column::create_temp(true, [1].to_vec());
                 let val = Token::Value(column);
                 token_vector.push(val);
             } else if token == "FALSE" {
-                let column = Column::from_chunk(6, Chunk::from_vec([false as u8].to_vec()));
+                let column = Column::create_temp(true, [0].to_vec());
                 let val = Token::Value(column);
                 token_vector.push(val);
             }

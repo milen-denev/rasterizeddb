@@ -262,7 +262,7 @@ impl<S: IOOperationsSync> Table<S> {
             };
 
             let select_all = evaluation_tokens.select_all;
-            let evaluation_tokens = evaluation_tokens.tokens;
+            let mut evaluation_tokens = evaluation_tokens.tokens;
             let file_length = self.get_current_table_length();  
             let chunks_arc_clone = self.in_memory_index.clone();
 
@@ -318,16 +318,9 @@ impl<S: IOOperationsSync> Table<S> {
         
                                     if db_type != DbType::STRING {
                                         let size = db_type.get_size();
-                                        let memory_chunk = {
-                                            let pointer_result = MEMORY_POOL.acquire(size);
-                                                
-                                            match pointer_result {
-                                                Some(chunk) => {
-                                                    chunk
-                                                },
-                                                None => Chunk::from_vec(vec![0; size as usize])
-                                            }
-                                        };
+                                        let memory_chunk = MEMORY_POOL
+                                            .acquire(size)
+                                            .unwrap_or_else(|| Chunk::from_vec(vec![0; size as usize]));
             
                                         let mut data_buffer = unsafe { memory_chunk.into_vec() };
             
@@ -339,7 +332,7 @@ impl<S: IOOperationsSync> Table<S> {
 
                                         let column = Column::from_chunk(column_type, memory_chunk);
 
-                                        required_columns.push((current_column_index, column.into_downgrade()));
+                                        required_columns.push((current_column_index, column));
                                     } else {
                                         let str_len_array: [u8; 4] = [
                                             cursor_vector.vector[position as usize],
@@ -362,20 +355,9 @@ impl<S: IOOperationsSync> Table<S> {
                                         let cursor = &mut cursor_vector.cursor;
                                         cursor.seek(SeekFrom::Start(position)).unwrap();
 
-                                        let raw_pointer_result = {
-                                            let pointer_result = MEMORY_POOL.acquire(str_length + 4);
-                                            
-                                            pointer_result
-                                        };
-
-                                        let str_memory_chunk = match raw_pointer_result {
-                                            Some(memory_chunk) => {
-                                                memory_chunk
-                                            },
-                                            None => {
-                                                Chunk::from_vec(vec![0; str_length as usize + 4])
-                                            }
-                                        };
+                                        let str_memory_chunk = MEMORY_POOL
+                                            .acquire(str_length + 4)
+                                            .unwrap_or_else(|| Chunk::from_vec(vec![0; str_length as usize + 4]));
                                         
                                         let mut preset_buffer = unsafe { str_memory_chunk.into_vec() };
 
@@ -430,7 +412,7 @@ impl<S: IOOperationsSync> Table<S> {
                             let evaluation = if !select_all {
                                 let eval = evaluate_column_result(
                                     &mut required_columns, 
-                                    &evaluation_tokens,
+                                    &mut evaluation_tokens,
                                     &mut token_results);
                                     
                                 required_columns.clear();
@@ -505,16 +487,9 @@ impl<S: IOOperationsSync> Table<S> {
                         loop {
                             if column_indexes.iter().any(|x| *x == column_index_inner) {
                                 
-                                let memory_chunk = {
-                                    let pointer_result = MEMORY_POOL.acquire(prefetch_result.length + 1 as u32);
-                                    
-                                    match pointer_result {
-                                        Some(chunk) => {
-                                            chunk
-                                        },
-                                        None => Chunk::from_vec(vec![0; prefetch_result.length as usize + 1])
-                                    }
-                                };
+                                let memory_chunk = MEMORY_POOL
+                                    .acquire(prefetch_result.length + 1)
+                                    .unwrap_or_else(|| Chunk::from_vec(vec![0; prefetch_result.length as usize + 1]));
 
                                 let mut data_buffer = unsafe { memory_chunk.into_vec() };
 
@@ -542,7 +517,7 @@ impl<S: IOOperationsSync> Table<S> {
                                 
                                 let column = Column::from_chunk(column_type, memory_chunk);
 
-                                required_columns.push((column_index_inner, column.into_downgrade()));
+                                required_columns.push((column_index_inner, column));
                             } else {
                                 let column_type = columns_cursor.read_u8().unwrap();
 
@@ -571,7 +546,7 @@ impl<S: IOOperationsSync> Table<S> {
                         let evaluation = if !select_all {
                             let eval = evaluate_column_result(
                                 &mut required_columns, 
-                                &evaluation_tokens,
+                                &mut evaluation_tokens,
                                 &mut token_results);
 
                             token_results.clear();

@@ -276,6 +276,7 @@ pub(crate) async fn row_prefetching(
     }
 }
 
+#[inline(always)]
 pub fn row_prefetching_cursor(
     position: &mut u64,
     cursor_vector: &mut CursorVector, 

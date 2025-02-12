@@ -1,6 +1,6 @@
 use std::{cell::LazyCell, pin::Pin};
 
-use crate::core::column::Column;
+use crate::core::{column::Column, db_type::DbType};
 
 use super::models::{ComparerOperation, MathOperation, Next, Token};
 
@@ -9,15 +9,15 @@ const ZERO_VALUE: LazyCell<Column> = LazyCell::new(|| {
 });
 
 pub(crate) fn evaluate_column_result(
-    required_columns: &Vec<(u32, Column)>, 
-    evaluation_tokens: &Vec<(Vec<Token>, Option<Next>)>,
+    required_columns: &mut Vec<(u32, Column)>, 
+    evaluation_tokens: &mut Vec<(Vec<Token>, Option<Next>)>,
     token_results: &mut Vec<(bool, Option<Next>)>) -> bool {
     
-    let mut iter = evaluation_tokens.iter();
+    let mut iter = evaluation_tokens.iter_mut();
 
     while let Some(tokens) = iter.next() {
         let mut current_value: Option<Column> = None;
-        let mut token_iter = tokens.0.iter();
+        let mut token_iter = tokens.0.iter_mut();
 
         let evalaution_result = loop {  
             if let Some(token) = token_iter.next() {
@@ -31,12 +31,15 @@ pub(crate) fn evaluate_column_result(
                         }
                     }
                     Token::Math(operation) => {
-                        if let Some(left_value) = current_value.as_mut() {
+                        if let Some(ref mut left_value) = current_value.as_mut() {
                             // Get the next token for the right operand
                             let iter_result = token_iter.next();
                             if let Some(Token::Value(column)) = iter_result {
+                                if column.data_type == DbType::TBD {
+                                    column.into_regular(left_value.data_type.clone());
+                                }
+
                                 let right_value = column;
-                                let left_value = left_value;
                                 
                                 // Perform the math operation
                                 match operation {
@@ -54,7 +57,11 @@ pub(crate) fn evaluate_column_result(
                             }  else if let Some(Token::Column(column)) = iter_result {
                                 let right_value = column;
     
-                                if let Some((_, column)) = required_columns.iter().find(|(id, _)| *id == *right_value) {
+                                if let Some((_, column)) = required_columns.iter_mut().find(|(id, _)| *id == *right_value) {
+                                    if column.data_type == DbType::TBD {
+                                        column.into_regular(left_value.data_type.clone());
+                                    }
+
                                     let right_value = column;
             
                                     // Perform the math operation
@@ -82,17 +89,22 @@ pub(crate) fn evaluate_column_result(
                     }
                     Token::Operation(op) => {
                     
-                        if let Some(left_value) = current_value.as_ref() {
-                            
+                        if let Some(ref mut left_value) = current_value.as_mut() {
+
+
                             let next_token = token_iter.next();
                             // Get the next token for the right operand
-                            if let Some(Token::Value(column)) = next_token {
+                            if let Some(Token::Value(ref mut column)) = next_token {
+                                if column.data_type == DbType::TBD {
+                                    column.into_regular(left_value.data_type.clone());
+                                }
+
                                 let right_value = column;
 
                                 // Perform the comparison
                                 let result = match op {
                                     ComparerOperation::Equals => left_value.equals(&right_value),
-                                    ComparerOperation::NotEquals =>  left_value.ne(&right_value),
+                                    ComparerOperation::NotEquals =>  left_value.not_equal(&right_value),
                                     ComparerOperation::Greater => left_value.greater_than(&right_value),
                                     ComparerOperation::Less => left_value.less_than(&right_value),
                                     ComparerOperation::GreaterOrEquals => left_value.greater_or_equals(&right_value),
@@ -103,16 +115,20 @@ pub(crate) fn evaluate_column_result(
                                 };
 
                                 break result // Return the result of the comparison
-                            } else if let Some(Token::Column(column)) = next_token {
+                            } else if let Some(Token::Column(ref mut column)) = next_token {
                                 let right_value = column;
 
-                                if let Some((_, column)) = required_columns.iter().find(|(id, _)| *id == *right_value) {
+                                if let Some((_, ref mut column)) = required_columns.iter_mut().find(|(id, _)| *id == *right_value) {
+                                    if column.data_type == DbType::TBD {
+                                        column.into_regular(left_value.data_type.clone());
+                                    }
+
                                     let right_value = column;
     
                                     // Perform the comparison
                                     let result = match op {
                                         ComparerOperation::Equals => left_value.equals(&right_value),
-                                        ComparerOperation::NotEquals =>  left_value.ne(&right_value),
+                                        ComparerOperation::NotEquals =>  left_value.not_equal(&right_value),
                                         ComparerOperation::Greater => left_value.greater_than(&right_value),
                                         ComparerOperation::Less => left_value.less_than(&right_value),
                                         ComparerOperation::GreaterOrEquals => left_value.greater_or_equals(&right_value),
@@ -133,10 +149,8 @@ pub(crate) fn evaluate_column_result(
                             continue; // Missing left operand
                         }
                     }
-                    Token::Value(column_value) => {
-                        // Get the value associated with the column_id
+                    Token::Value(ref mut column_value) => {
                         current_value = Some(column_value.clone());
-                       
                     }
                 }
             } else {

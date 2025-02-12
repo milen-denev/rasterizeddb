@@ -17,6 +17,7 @@ pub enum DbType {
     CHAR,
     STRING,
     DATETIME,
+    TBD,
     NULL,
     START,
     END
@@ -46,6 +47,7 @@ impl DbType {
             DbType::CHAR => 13,
             DbType::STRING => 14,
             DbType::DATETIME => 15,
+            DbType::TBD => 252,
             DbType::NULL => 253,
             DbType::START => 254,
             DbType::END => 255
@@ -94,6 +96,7 @@ impl DbType {
             DbType::F64 => 8,
             DbType::CHAR => 4,
             DbType::STRING => panic!("STRING type doesn't have a set size of bytes."),
+            DbType::TBD => panic!("TBD (To Be Determined) is a temporary type."),
             DbType::NULL => 1,
             DbType::START => 1,
             DbType::END => 1,

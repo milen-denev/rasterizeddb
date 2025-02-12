@@ -9,10 +9,9 @@ use crate::{instructions::{
     compare_vecs_eq, 
     compare_vecs_ne, 
     compare_vecs_starts_with, 
-    contains_subsequence, 
-    copy_vec_to_ptr, 
+    contains_subsequence,
     vec_from_ptr_safe
-}, memory_pool::{Chunk, ChunkIntoVecResult, MEMORY_POOL}};
+}, memory_pool::{Chunk, MEMORY_POOL}};
 
 use super::db_type::DbType;
 
@@ -28,6 +27,7 @@ pub struct Column {
 
 #[derive(Debug)]
 pub enum ColumnValue {
+    TempHolder((DbType, Vec<u8>)),
     StaticMemoryPointer(Chunk),
     ManagedMemoryPointer(Vec<u8>)
 }
@@ -36,14 +36,16 @@ impl ColumnValue {
     pub fn len(&self) -> u32 {
         match self {
             ColumnValue::StaticMemoryPointer(chunk) => chunk.size,
-            ColumnValue::ManagedMemoryPointer(vec) => vec.len() as u32
+            ColumnValue::ManagedMemoryPointer(vec) => vec.len() as u32,
+            _ => panic!("Operation is not supported, column is in temporary state.")
         }
     }
 
     pub fn is_empty(&self) -> bool {
         match self {
             ColumnValue::StaticMemoryPointer(chunk) => chunk.size == 0,
-            ColumnValue::ManagedMemoryPointer(vec) => vec.is_empty()
+            ColumnValue::ManagedMemoryPointer(vec) => vec.is_empty(),
+            _ => panic!("Operation is not supported, column is in temporary state.")
         }
     }
 
@@ -53,6 +55,7 @@ impl ColumnValue {
                 unsafe { std::slice::from_raw_parts::<u8>(chunk.ptr, chunk.size as usize) }
             }
             ColumnValue::ManagedMemoryPointer(vec) => vec.as_slice(),
+            _ => panic!("Operation is not supported, column is in temporary state.")
         }
     }
 
@@ -60,6 +63,7 @@ impl ColumnValue {
         match self {
             ColumnValue::StaticMemoryPointer(chunk) => vec_from_ptr_safe(chunk.ptr, chunk.size as usize),
             ColumnValue::ManagedMemoryPointer(vec) => vec.clone(),
+            _ => panic!("Operation is not supported, column is in temporary state.")
         }
     }
 
@@ -74,7 +78,8 @@ impl ColumnValue {
             ColumnValue::ManagedMemoryPointer(vec) => {
                 assert_eq!(new_values.len(), vec.len(), "New values must have the same length");
                 vec.copy_from_slice(new_values);
-            }
+            },
+            _ => panic!("Operation is not supported, column is in temporary state.")
         }
     }
 }
@@ -101,7 +106,8 @@ impl Clone for ColumnValue {
             }
             ColumnValue::ManagedMemoryPointer(vec) => {
                 ColumnValue::ManagedMemoryPointer(vec.clone())
-            }
+            },
+            _ => panic!("Operation is not supported, column is in temporary state.")
         }
     }
 }
@@ -258,6 +264,8 @@ impl Column {
                 DbType::U32
             } else if value_type == "u64" {
                 DbType::U64
+            } else if value_type == "u128" {
+                DbType::U128
             } else if value_type == "f32" {
                 DbType::F32
             } else if value_type == "f64" {
@@ -272,6 +280,8 @@ impl Column {
                 DbType::STRING
             } else if value_type == "datetime" {
                 DbType::DATETIME
+            } else if value_type == "bool" {
+                DbType::U8
             } else {
                 panic!("Wrong datatype provided: {}.", value_type);
             }
@@ -304,7 +314,8 @@ impl Column {
             ColumnValue::StaticMemoryPointer(chunk) => {
                 chunk
             },
-            ColumnValue::ManagedMemoryPointer(vec) => Chunk::from_vec(vec)
+            ColumnValue::ManagedMemoryPointer(vec) => Chunk::from_vec(vec),
+            _ => panic!("Operation is not supported, column is in temporary state.")
         };
 
         Ok(chunk)
@@ -316,6 +327,52 @@ impl Column {
         }
 
         self.content.len() as usize + 1
+    }
+
+    pub fn create_temp(is_i128: bool, vec: Vec<u8>) -> Self { 
+        if is_i128 {
+            Column {
+                data_type: DbType::TBD,
+                content: ColumnValue::TempHolder((DbType::I128, vec))
+            }
+        } else {
+            Column {
+                data_type: DbType::TBD,
+                content: ColumnValue::TempHolder((DbType::F64, vec))
+            }
+        }
+    }
+
+    pub fn into_regular(&mut self, db_type: DbType) {
+        let new_content = match &self.content {
+            ColumnValue::TempHolder((is_i128_or_f64, vec)) => {
+                if db_type == DbType::NULL {
+                    panic!()
+                }
+
+                let new_vec = if vec.len() as u32 != db_type.get_size() {
+                    if DbType::I128 == *is_i128_or_f64 {
+                        Self::convert_i128_vec(vec, db_type.clone())
+                    } else if DbType::I128 == *is_i128_or_f64  {
+                        Self::convert_f64_vec(vec, db_type.clone())
+                    } else {
+                        vec.clone()
+                    }
+                } else {
+                    vec.clone()
+                };
+
+                if new_vec.len() as u32 != db_type.get_size() {
+                    panic!()
+                }
+
+                ColumnValue::ManagedMemoryPointer(new_vec)
+            } 
+            _ => panic!()
+        };
+        
+        self.content =  new_content;
+        self.data_type = db_type;
     }
 
     pub fn from_chunk(data_type: u8, chunk: Chunk) -> Column {    
@@ -376,87 +433,80 @@ impl Column {
         return Ok(columns);
     }
 
-    //#[inline(always)]
-    pub fn into_downgrade(self) -> Column {  
+    #[inline(always)]
+    pub fn into_downgrade(self) -> Column {
         let data_type = self.data_type.to_byte();
     
-        if data_type >= 1 && data_type <= 10 {
-            let db_type_enum = DbType::from_byte(data_type);
-
+        if (1..=10).contains(&data_type) {
+            let db_type = DbType::from_byte(data_type);
+            // SAFETY: we assume self.into_chunk() always returns Some(chunk)
             let memory_chunk = unsafe { self.into_chunk().unwrap() };
             let data_buffer = unsafe { memory_chunk.into_vec() };
-
-            let value = match db_type_enum {
-                DbType::I8 => data_buffer.as_slice().read_i8().unwrap() as i128,
-                DbType::I16 => LittleEndian::read_i16(data_buffer.as_slice()) as i128,
-                DbType::I32 => LittleEndian::read_i32(data_buffer.as_slice()) as i128,
-                DbType::I64 => LittleEndian::read_i64(data_buffer.as_slice()) as i128,
-                DbType::I128 => LittleEndian::read_i128(data_buffer.as_slice()),
-                DbType::U8 => data_buffer.as_slice().read_u8().unwrap() as i128,
-                DbType::U16 => LittleEndian::read_u16(data_buffer.as_slice()) as i128,
-                DbType::U32 => LittleEndian::read_u32(data_buffer.as_slice()) as i128,
-                DbType::U64 => LittleEndian::read_u64(data_buffer.as_slice()) as i128,
-                DbType::U128 => LittleEndian::read_u128(data_buffer.as_slice()) as i128,
-                _ => panic!("Unsupported type"),
+    
+            memory_chunk.prefetch_to_lcache();
+            
+            // Read the value and cast to i128 as needed.
+            let value: i128 = match db_type {
+                DbType::I8    => data_buffer.as_slice().read_i8().unwrap() as i128,
+                DbType::I16   => LittleEndian::read_i16(data_buffer.as_slice()) as i128,
+                DbType::I32   => LittleEndian::read_i32(data_buffer.as_slice()) as i128,
+                DbType::I64   => LittleEndian::read_i64(data_buffer.as_slice()) as i128,
+                DbType::I128  => LittleEndian::read_i128(data_buffer.as_slice()),
+                DbType::U8    => data_buffer.as_slice().read_u8().unwrap() as i128,
+                DbType::U16   => LittleEndian::read_u16(data_buffer.as_slice()) as i128,
+                DbType::U32   => LittleEndian::read_u32(data_buffer.as_slice()) as i128,
+                DbType::U64   => LittleEndian::read_u64(data_buffer.as_slice()) as i128,
+                DbType::U128  => LittleEndian::read_u128(data_buffer.as_slice()) as i128,
+                _             => panic!("Unsupported type"),
             };
+    
+            // Convert to little-endian bytes (16 bytes for i128).
+            let mut bytes = value.to_le_bytes();
+            // Acquire a new memory chunk sized for 16 bytes.
+            let new_memory_chunk = MEMORY_POOL
+                .acquire(16)
+                .unwrap_or_else(|| Chunk::from_vec(vec![0; 16]));
 
-            let new_memory_chunk = {
-                //i128 size
-                let pointer_result = MEMORY_POOL.acquire(16);
-                
-                match pointer_result {
-                    Some(chunk) => {
-                        chunk
-                    },
-                    None => Chunk::from_vec(vec![0; 16])
-                }
-            };
-
-            let mut value_data = value.to_le_bytes();
             let new_buffer = unsafe { new_memory_chunk.into_vec() };
 
+            // Copy the bytes safely.
             unsafe {
-                ptr::copy_nonoverlapping(value_data.as_mut_ptr(), new_buffer.as_vec().as_ptr() as *mut u8, 16);
+                ptr::copy_nonoverlapping(bytes.as_mut_ptr(), new_buffer.as_vec().as_ptr() as *mut u8, 8);
             }
-
-            // I128 = 5
+    
+            // Column type for i128 is indicated by 5.
             return Column::from_chunk(5, new_memory_chunk);
-        } else if data_type >= 11 && data_type <= 12 {
-            let db_type_enum = DbType::from_byte(data_type);
-
+        } else if (11..=12).contains(&data_type) {
+            let db_type = DbType::from_byte(data_type);
             let memory_chunk = unsafe { self.into_chunk().unwrap() };
             let data_buffer = unsafe { memory_chunk.into_vec() };
 
-            let value = match db_type_enum {
+            memory_chunk.prefetch_to_lcache();
+
+            // For floating-point, convert to f64.
+            let value: f64 = match db_type {
                 DbType::F32 => LittleEndian::read_f32(data_buffer.as_slice()) as f64,
                 DbType::F64 => LittleEndian::read_f64(data_buffer.as_slice()) as f64,
-                _ => panic!("Unsupported type"),
+                _         => panic!("Unsupported type"),
             };
+    
+            // f64 converts to 8 little-endian bytes.
+            let mut bytes = value.to_le_bytes();
+            let new_memory_chunk = MEMORY_POOL
+                .acquire(8)
+                .unwrap_or_else(|| Chunk::from_vec(vec![0; 8]));
 
-            let new_memory_chunk = {
-                //f64 size
-                let pointer_result = MEMORY_POOL.acquire(8);
-                
-                match pointer_result {
-                    Some(chunk) => {
-                        chunk
-                    },
-                    None => Chunk::from_vec(vec![0; 8])
-                }
-            };
-
-            let mut value_data = value.to_le_bytes();
             let new_buffer = unsafe { new_memory_chunk.into_vec() };
 
             unsafe {
-                ptr::copy_nonoverlapping(value_data.as_mut_ptr(), new_buffer.as_vec().as_ptr() as *mut u8, 8);
+                ptr::copy_nonoverlapping(bytes.as_mut_ptr(), new_buffer.as_vec().as_ptr() as *mut u8, 8);
             }
-
-             // F64 = 11
+    
+            // Column type for f64 is indicated by 12.
             return Column::from_chunk(12, new_memory_chunk);
-        } else {
-            self
         }
+        // For any other type, return self unchanged.
+        self
     }
 
     /// For debug purposes
@@ -1135,6 +1185,73 @@ impl Column {
                 self.content.replace(&(f64_1 / f64_2).to_le_bytes());
             }
             _ => panic!("Division method cannot be used on unsupported data types"),
+        }
+    }
+
+    fn convert_f64_vec(vec: &Vec<u8>, db_type: DbType) -> Vec<u8> {
+        let mut buf = [0u8; 8];
+        let len = vec.len().min(8);
+        buf[..len].copy_from_slice(&vec[..len]);
+        let value = f64::from_le_bytes(buf);
+        match db_type {
+            DbType::F64 => value.to_le_bytes().to_vec(),
+            DbType::F32 => {
+                let value_f32 = value as f32;
+                value_f32.to_le_bytes().to_vec()
+            }
+            _ => panic!("Unsupported expected size {} for float conversion", db_type.get_size()),
+        }
+    }
+
+    fn convert_i128_vec(vec: &Vec<u8>, db_type: DbType) -> Vec<u8> {
+        // Prepare a 16-byte buffer (i128 is 16 bytes)
+        let mut buf = [0u8; 16];
+        // Copy the available bytes (if vec is shorter, assume it was zero–padded)
+        let len = vec.len().min(16);
+        buf[..len].copy_from_slice(&vec[..len]);
+        let value = i128::from_le_bytes(buf);
+        match db_type {
+            DbType::U128 => {
+                // Convert to u128 (lossy if value < 0)
+                let value_u128 = value as u128;
+                value_u128.to_le_bytes().to_vec() // 16 bytes
+            }
+            DbType::I128 => {
+                value.to_le_bytes().to_vec() // 16 bytes
+            }
+            DbType::U64 => {
+                let value_u64 = value as u64;
+                value_u64.to_le_bytes().to_vec() // 8 bytes
+            }
+            DbType::I64 => {
+                let value_i64 = value as i64;
+                value_i64.to_le_bytes().to_vec() // 8 bytes
+            }
+            DbType::U32 => {
+                let value_u32 = value as u32;
+                value_u32.to_le_bytes().to_vec() // 4 bytes
+            }
+            DbType::I32 => {
+                let value_i32 = value as i32;
+                value_i32.to_le_bytes().to_vec() // 4 bytes
+            }
+            DbType::U16 => {
+                let value_u16 = value as u16;
+                value_u16.to_le_bytes().to_vec() // 2 bytes
+            }
+            DbType::I16 => {
+                let value_i16 = value as i16;
+                value_i16.to_le_bytes().to_vec() // 2 bytes
+            }
+            DbType::U8 => {
+                let value_u8 = value as u8;
+                value_u8.to_le_bytes().to_vec() // 1 byte
+            }
+            DbType::I8 => {
+                let value_i8 = value as i8;
+                value_i8.to_le_bytes().to_vec() // 1 byte
+            }
+            _ => panic!("Unsupported expected size {} for integer conversion", db_type.get_size()),
         }
     }
 }
