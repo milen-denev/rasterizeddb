@@ -50,20 +50,8 @@ async fn main() -> std::io::Result<()> {
     //         c2.len()
     //     );
     
-    //     columns_buffer.append(&mut unsafe {
-    //         let chunk = c1.into_chunk().unwrap();
-    //         let mut cd = chunk.into_vec();
-    //         let cl = ManuallyDrop::into_inner(cd.clone());
-    //         ManuallyDrop::drop(&mut cd);
-    //         cl
-    //     });
-    //     columns_buffer.append(&mut unsafe {
-    //         let chunk = c2.into_chunk().unwrap();
-    //         let mut cd = chunk.into_vec();
-    //         let cl = ManuallyDrop::into_inner(cd.clone());
-    //         ManuallyDrop::drop(&mut cd);
-    //         cl
-    //     });
+    //     columns_buffer.append(&mut c1.content.to_vec());
+    //     columns_buffer.append(&mut c2.content.to_vec());
     
     //     let _insert_row = InsertOrUpdateRow {
     //         columns_data: columns_buffer.clone()
@@ -88,7 +76,7 @@ async fn main() -> std::io::Result<()> {
     let query_evaluation = parse_rql(&format!(r#"
         BEGIN
         SELECT FROM NAME_DOESNT_MATTER_FOR_NOW
-        WHERE COL(0) = 83300
+        WHERE COL(0) > 99872
         LIMIT 1
         END
     "#)).unwrap();
@@ -107,7 +95,7 @@ async fn main() -> std::io::Result<()> {
     let query_evaluation = parse_rql(&format!(r#"
         BEGIN
         SELECT FROM NAME_DOESNT_MATTER_FOR_NOW
-        WHERE COL(0) > 82999
+        WHERE COL(0) > 82999 OR COL(1) < -1000 AND COL(0) > 5000
         LIMIT 10
         END
     "#)).unwrap();

@@ -12,7 +12,7 @@ use crate::{instructions::{
     contains_subsequence, 
     copy_vec_to_ptr, 
     vec_from_ptr_safe
-}, memory_pool::{Chunk, MEMORY_POOL}};
+}, memory_pool::{Chunk, ChunkIntoVecResult, MEMORY_POOL}};
 
 use super::db_type::DbType;
 
@@ -50,7 +50,7 @@ impl ColumnValue {
     pub fn as_slice(&self) -> &[u8] {
         match self {
             ColumnValue::StaticMemoryPointer(chunk) => {
-                unsafe { std::slice::from_raw_parts(chunk.ptr, chunk.size as usize) }
+                unsafe { std::slice::from_raw_parts::<u8>(chunk.ptr, chunk.size as usize) }
             }
             ColumnValue::ManagedMemoryPointer(vec) => vec.as_slice(),
         }
@@ -337,18 +337,17 @@ impl Column {
         }
     }
 
-    pub fn from_chunk(data_type: u8, mut chunk: Chunk) -> Column {    
+    pub fn from_chunk(data_type: u8, chunk: Chunk) -> Column {    
         if chunk.vec.is_none() {
             Column {
                 data_type: DbType::from_byte(data_type),
                 content: ColumnValue::StaticMemoryPointer(chunk)
             }
         } else {
-            let vec = chunk.vec.clone().unwrap();
-            chunk.vec = None;
+            let vec = chunk.vec.as_ref().unwrap();
             Column {
                 data_type: DbType::from_byte(data_type),
-                content: ColumnValue::ManagedMemoryPointer(vec)
+                content: ColumnValue::ManagedMemoryPointer(vec.clone())
             }
         }
     }
@@ -395,8 +394,8 @@ impl Column {
         return Ok(columns);
     }
 
-    #[inline(always)]
-    pub async fn into_downgrade(self) -> Column {  
+    //#[inline(always)]
+    pub fn into_downgrade(self) -> Column {  
         let data_type = self.data_type.to_byte();
     
         if data_type >= 1 && data_type <= 10 {
@@ -407,19 +406,19 @@ impl Column {
 
             let value = match db_type_enum {
                 DbType::I8 => data_buffer.as_slice().read_i8().unwrap() as i128,
-                DbType::I16 => LittleEndian::read_i16(&data_buffer) as i128,
-                DbType::I32 => LittleEndian::read_i32(&data_buffer) as i128,
-                DbType::I64 => LittleEndian::read_i64(&data_buffer) as i128,
-                DbType::I128 => LittleEndian::read_i128(&data_buffer),
+                DbType::I16 => LittleEndian::read_i16(data_buffer.as_slice()) as i128,
+                DbType::I32 => LittleEndian::read_i32(data_buffer.as_slice()) as i128,
+                DbType::I64 => LittleEndian::read_i64(data_buffer.as_slice()) as i128,
+                DbType::I128 => LittleEndian::read_i128(data_buffer.as_slice()),
                 DbType::U8 => data_buffer.as_slice().read_u8().unwrap() as i128,
-                DbType::U16 => LittleEndian::read_u16(&data_buffer) as i128,
-                DbType::U32 => LittleEndian::read_u32(&data_buffer) as i128,
-                DbType::U64 => LittleEndian::read_u64(&data_buffer) as i128,
-                DbType::U128 => LittleEndian::read_u128(&data_buffer) as i128,
+                DbType::U16 => LittleEndian::read_u16(data_buffer.as_slice()) as i128,
+                DbType::U32 => LittleEndian::read_u32(data_buffer.as_slice()) as i128,
+                DbType::U64 => LittleEndian::read_u64(data_buffer.as_slice()) as i128,
+                DbType::U128 => LittleEndian::read_u128(data_buffer.as_slice()) as i128,
                 _ => panic!("Unsupported type"),
             };
 
-            let mut new_memory_chunk = {
+            let new_memory_chunk = {
                 //i128 size
                 let pointer_result = MEMORY_POOL.acquire(16);
                 
@@ -432,15 +431,14 @@ impl Column {
             };
 
             let mut value_data = value.to_le_bytes();
-            let mut new_buffer = unsafe { new_memory_chunk.into_vec() };
+            let new_buffer = unsafe { new_memory_chunk.into_vec() };
 
             unsafe {
-                ptr::copy_nonoverlapping(value_data.as_mut_ptr(), new_buffer.as_mut_ptr(), 16);
+                ptr::copy_nonoverlapping(value_data.as_mut_ptr(), new_buffer.as_vec().as_ptr() as *mut u8, 16);
             }
 
-            new_memory_chunk.deallocate_vec(new_buffer);
-
-            return Column::from_chunk(data_type, new_memory_chunk);
+            // I128 = 5
+            return Column::from_chunk(5, new_memory_chunk);
         } else if data_type >= 11 && data_type <= 12 {
             let db_type_enum = DbType::from_byte(data_type);
 
@@ -448,12 +446,12 @@ impl Column {
             let data_buffer = unsafe { memory_chunk.into_vec() };
 
             let value = match db_type_enum {
-                DbType::F32 => LittleEndian::read_f32(&data_buffer) as f64,
-                DbType::F64 => LittleEndian::read_f64(&data_buffer) as f64,
+                DbType::F32 => LittleEndian::read_f32(data_buffer.as_slice()) as f64,
+                DbType::F64 => LittleEndian::read_f64(data_buffer.as_slice()) as f64,
                 _ => panic!("Unsupported type"),
             };
 
-            let mut new_memory_chunk = {
+            let new_memory_chunk = {
                 //f64 size
                 let pointer_result = MEMORY_POOL.acquire(8);
                 
@@ -466,15 +464,14 @@ impl Column {
             };
 
             let mut value_data = value.to_le_bytes();
-            let mut new_buffer = unsafe { new_memory_chunk.into_vec() };
+            let new_buffer = unsafe { new_memory_chunk.into_vec() };
 
             unsafe {
-                ptr::copy_nonoverlapping(value_data.as_mut_ptr(), new_buffer.as_mut_ptr(), 8);
+                ptr::copy_nonoverlapping(value_data.as_mut_ptr(), new_buffer.as_vec().as_ptr() as *mut u8, 8);
             }
 
-            new_memory_chunk.deallocate_vec(new_buffer);
-
-            return Column::from_chunk(data_type, new_memory_chunk);
+             // F64 = 11
+            return Column::from_chunk(12, new_memory_chunk);
         } else {
             self
         }
@@ -524,6 +521,7 @@ impl Column {
         }
     }
   
+    #[inline(always)]
     pub fn into_value(&self) -> String {
         match self.data_type {
             DbType::I8 => {
@@ -755,7 +753,7 @@ impl Column {
             _ => panic!("Greater or equals method cannot be used on columns that are not of numeric types"),
         }
     }
-    
+
     pub fn less_than(&self, column: &Column) -> bool {
         match self.data_type {
             DbType::I8 => {
@@ -821,7 +819,7 @@ impl Column {
             _ => panic!("Less than method cannot be used on columns that are not of numeric types"),
         }
     }
-    
+
     pub fn less_or_equals(&self, column: &Column) -> bool {
         match self.data_type {
             DbType::I8 => {

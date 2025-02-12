@@ -1,21 +1,24 @@
-use once_cell::sync::Lazy;
 use std::{
-    mem::{self, ManuallyDrop}, pin::Pin, ptr, sync::{atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering}, Arc, LazyLock, RwLock}
+    mem::{self, ManuallyDrop}, pin::Pin, ptr, sync::{atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering}, Arc, LazyLock}
 };
+
 use crate::instructions::ref_vec;
 
-const MEMORY_POOL_SIZE: usize = 16777216; // 16MB
+const MEMORY_POOL_SIZE: usize = 33554432; // 32MB
 
 pub static MEMORY_POOL: LazyLock<Arc<MemoryPool>> = LazyLock::new(|| Arc::new(MemoryPool::new()));
 
 pub struct MemoryPool {
-    pub buffer: Pin<Box<[u8]>>,
+    pub buffer: Arc<Pin<Box<[u8]>>>,
     pub start: usize,
     pub end: usize
 }
 
-static ATOMIC_PTR_ARRAY: LazyLock<Box<[(AtomicUsize, AtomicU32)]>> = LazyLock::new(|| {
-    Box::new([
+unsafe impl Send for MemoryPool {}
+unsafe impl Sync for MemoryPool {}
+
+static ATOMIC_PTR_ARRAY: LazyLock<Arc<Box<[(AtomicUsize, AtomicU32)]>>> = LazyLock::new(|| {
+    Arc::new(Box::new([
         (AtomicUsize::new(0), AtomicU32::new(0)),
         (AtomicUsize::new(0), AtomicU32::new(0)),
         (AtomicUsize::new(0), AtomicU32::new(0)),
@@ -48,43 +51,11 @@ static ATOMIC_PTR_ARRAY: LazyLock<Box<[(AtomicUsize, AtomicU32)]>> = LazyLock::n
         (AtomicUsize::new(0), AtomicU32::new(0)),
         (AtomicUsize::new(0), AtomicU32::new(0)),
         (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-    ])
+    ]))
 });
 
-static ATOMIC_IN_USE_ARRAY: LazyLock<Box<[AtomicBool]>> = LazyLock::new(|| {
-    Box::new([
+static ATOMIC_IN_USE_ARRAY: LazyLock<Arc<Box<[AtomicBool]>>> = LazyLock::new(|| {
+    Arc::new(Box::new([
         AtomicBool::new(false),
         AtomicBool::new(false),
         AtomicBool::new(false),
@@ -117,39 +88,7 @@ static ATOMIC_IN_USE_ARRAY: LazyLock<Box<[AtomicBool]>> = LazyLock::new(|| {
         AtomicBool::new(false),
         AtomicBool::new(false),
         AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-    ])
+    ]))
 });
 
 impl MemoryPool {
@@ -161,21 +100,20 @@ impl MemoryPool {
 
         Self {
             buffer: {
-                pinned_box
+                Arc::new(pinned_box)
             },
             start: ptr_start,
             end: ptr_end
         }
     }
 
-    #[inline(always)]
     pub fn acquire(&self, size: u32) -> Option<Chunk> {
         //let caller = std::panic::Location::caller();
         //println!("acquire called: {}, {}", caller.file(), caller.line());
 
         let mut current_start = 0;
     
-        let mut slot: i32 = -1;
+        let mut index: i32 = -1;
 
         // Find the last allocated slot and compute the next starting address
         for (i, in_use) in ATOMIC_IN_USE_ARRAY.iter().enumerate() {
@@ -191,7 +129,7 @@ impl MemoryPool {
                             current_start += previous_size as usize;
                         }
 
-                        slot = i as i32;
+                        index = i as i32;
                         break;
                     }
                 } else {
@@ -203,18 +141,18 @@ impl MemoryPool {
                         current_start += previous_size as usize;
                     }
 
-                    slot = i as i32;
+                    index = i as i32;
                     break;
                 }
             }
         }
 
-        if slot == -1 {
+        if index == -1 || current_start as u32 + size > 16777216 {
             return None;
         }
 
         for (i, in_use) in ATOMIC_IN_USE_ARRAY.iter().enumerate() {
-            if slot == i as i32 {
+            if index == i as i32 {
                 let ptr = self.buffer[current_start as usize..(current_start + size as usize)].as_ptr() as *mut u8;
 
                 in_use.store(true, Ordering::Release);
@@ -225,7 +163,8 @@ impl MemoryPool {
                     ptr,
                     size,
                     pool: Arc::downgrade(&MEMORY_POOL),
-                    vec: None
+                    vec: None,
+                    index: index
                 });
             } 
         }
@@ -233,23 +172,12 @@ impl MemoryPool {
         return None;
     }
 
-    #[inline(always)]
-    fn release(&self, ptr: *mut u8) {
-        let index = find_index_by_usize(ptr as usize);
-        if let Some(index) = index {
-            ATOMIC_IN_USE_ARRAY[index].store(false, Ordering::Release);
+    fn release(&self, index: i32) {
+        if index != -1 {
+            
+            ATOMIC_IN_USE_ARRAY[index as usize].store(false, Ordering::Release);
         }
     }
-}
-
-#[inline(always)]
-fn find_index_by_usize(target: usize) -> Option<usize> {
-    for (i, (stored_usize, _)) in ATOMIC_PTR_ARRAY.iter().enumerate() {
-        if stored_usize.load(Ordering::Acquire) == target {
-            return Some(i);
-        }
-    }
-    None
 }
 
 #[derive(Debug, Clone)]
@@ -258,8 +186,12 @@ pub struct Chunk {
     pub size: u32,
     pool: std::sync::Weak<MemoryPool>,
     // Used to store a vector instead of a raw pointer. Either one or the other will be set.
-    pub vec: Option<Vec<u8>>
+    pub vec: Option<Vec<u8>>,
+    pub index: i32
 }
+
+unsafe impl Send for Chunk {}
+unsafe impl Sync for Chunk {}
 
 impl Default for Chunk {
     fn default() -> Self {
@@ -267,17 +199,17 @@ impl Default for Chunk {
             ptr: std::ptr::null_mut(),
             size: 0,
             pool: std::sync::Weak::default(),
-            vec: None
+            vec: None,
+            index: -1
         }
     }
 }
 
 impl Drop for Chunk {
-    
     fn drop(&mut self) {
         if self.vec.is_none() {
             if let Some(pool) = self.pool.upgrade() {
-                pool.release(self.ptr);
+                pool.release(self.index);
             }
         }
     }
@@ -291,27 +223,56 @@ impl Chunk {
             ptr: ptr::null_mut(),
             size: 0,
             pool: std::sync::Weak::default(),
-            vec: Some(vec)
+            vec: Some(vec),
+            index: -1
         }
     }
 
-    #[inline(always)]
-    pub unsafe fn into_vec(&self) -> ManuallyDrop<Vec<u8>> {
+    pub unsafe fn into_vec(&self) -> ChunkIntoVecResult {
         if let Some(vec) = self.vec.as_ref() {
-            let new_vec = vec.clone();
-            let manual = ManuallyDrop::new(new_vec);
-            manual
+            let new_vec = Vec::from_raw_parts(vec.as_ptr() as *mut u8, vec.len(), vec.len());
+            ChunkIntoVecResult::Vec(new_vec)
         } else {
-            ref_vec(self.ptr, self.size as usize)
+            ChunkIntoVecResult::ManualVec(ref_vec(self.ptr, self.size as usize))
         }
     }
 
-    #[inline(always)]
-    pub fn deallocate_vec(&mut self, vec: ManuallyDrop<Vec<u8>>) {
-        if self.vec.is_some() {
-            self.vec = Some(ManuallyDrop::into_inner(vec));
-        } else {
-            mem::forget(vec);
+    pub fn deallocate_vec(&mut self, chunk_vec_result: ChunkIntoVecResult) {
+        match chunk_vec_result {
+            ChunkIntoVecResult::Vec(_) => {
+            },
+            ChunkIntoVecResult::ManualVec(manual) => {
+                mem::forget(manual);
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum ChunkIntoVecResult {
+    Vec(Vec<u8>),
+    ManualVec(ManuallyDrop<Vec<u8>>)
+}
+
+impl ChunkIntoVecResult {
+    pub fn as_vec(&self) -> &Vec<u8> {
+        match self {
+            ChunkIntoVecResult::Vec(v) => v,
+            ChunkIntoVecResult::ManualVec(v) => v,
+        }
+    }
+
+    pub fn as_vec_mut(&mut self) -> &mut Vec<u8> {
+        match self {
+            ChunkIntoVecResult::Vec(v) => v,
+            ChunkIntoVecResult::ManualVec(v) => v,
+        }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            ChunkIntoVecResult::Vec(v) => v.as_slice(),
+            ChunkIntoVecResult::ManualVec(v) => v.as_slice(),
         }
     }
 }

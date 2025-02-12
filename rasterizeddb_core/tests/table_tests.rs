@@ -33,27 +33,9 @@ pub fn rebuild_indexes_file() {
                     c3.len() 
                 );
             
-                columns_buffer.append(&mut unsafe {
-                    let chunk = c1.into_chunk().unwrap();
-                    let mut cd = chunk.into_vec();
-                    let cl = ManuallyDrop::into_inner(cd.clone());
-                    ManuallyDrop::drop(&mut cd);
-                    cl
-                });
-                columns_buffer.append(&mut unsafe {
-                    let chunk = c2.into_chunk().unwrap();
-                    let mut cd = chunk.into_vec();
-                    let cl = ManuallyDrop::into_inner(cd.clone());
-                    ManuallyDrop::drop(&mut cd);
-                    cl
-                });
-                columns_buffer.append(&mut unsafe {
-                    let chunk = c3.into_chunk().unwrap();
-                    let mut cd = chunk.into_vec();
-                    let cl = ManuallyDrop::into_inner(cd.clone());
-                    ManuallyDrop::drop(&mut cd);
-                    cl
-                });
+                columns_buffer.append(&mut c1.content.to_vec());
+                columns_buffer.append(&mut c2.content.to_vec());
+                columns_buffer.append(&mut c3.content.to_vec());
             
                 let insert_row = InsertOrUpdateRow {
                     columns_data: columns_buffer
@@ -71,27 +53,9 @@ pub fn rebuild_indexes_file() {
                     c3.len() 
                 );
             
-                columns_buffer.append(&mut unsafe {
-                    let chunk = c1.into_chunk().unwrap();
-                    let mut cd = chunk.into_vec();
-                    let cl = ManuallyDrop::into_inner(cd.clone());
-                    ManuallyDrop::drop(&mut cd);
-                    cl
-                });
-                columns_buffer.append(&mut unsafe {
-                    let chunk = c2.into_chunk().unwrap();
-                    let mut cd = chunk.into_vec();
-                    let cl = ManuallyDrop::into_inner(cd.clone());
-                    ManuallyDrop::drop(&mut cd);
-                    cl
-                });
-                columns_buffer.append(&mut unsafe {
-                    let chunk = c3.into_chunk().unwrap();
-                    let mut cd = chunk.into_vec();
-                    let cl = ManuallyDrop::into_inner(cd.clone());
-                    ManuallyDrop::drop(&mut cd);
-                    cl
-                });
+                columns_buffer.append(&mut c1.content.to_vec());
+                columns_buffer.append(&mut c2.content.to_vec());
+                columns_buffer.append(&mut c3.content.to_vec());
             
                 let insert_row = InsertOrUpdateRow {
                     columns_data: columns_buffer
@@ -124,27 +88,10 @@ pub fn rebuild_indexes_memory() {
                     c2.len() + 
                     c3.len() 
                 );
-                columns_buffer.append(&mut unsafe {
-                    let chunk = c1.into_chunk().unwrap();
-                    let mut cd = chunk.into_vec();
-                    let cl = ManuallyDrop::into_inner(cd.clone());
-                    ManuallyDrop::drop(&mut cd);
-                    cl
-                });
-                columns_buffer.append(&mut unsafe {
-                    let chunk = c2.into_chunk().unwrap();
-                    let mut cd = chunk.into_vec();
-                    let cl = ManuallyDrop::into_inner(cd.clone());
-                    ManuallyDrop::drop(&mut cd);
-                    cl
-                });
-                columns_buffer.append(&mut unsafe {
-                    let chunk = c3.into_chunk().unwrap();
-                    let mut cd = chunk.into_vec();
-                    let cl = ManuallyDrop::into_inner(cd.clone());
-                    ManuallyDrop::drop(&mut cd);
-                    cl
-                });
+
+                columns_buffer.append(&mut c1.content.to_vec());
+                columns_buffer.append(&mut c2.content.to_vec());
+                columns_buffer.append(&mut c3.content.to_vec());
             
                 let insert_row = InsertOrUpdateRow {
                     columns_data: columns_buffer
@@ -162,27 +109,9 @@ pub fn rebuild_indexes_memory() {
                     c3.len() 
                 );
             
-                columns_buffer.append(&mut unsafe {
-                    let chunk = c1.into_chunk().unwrap();
-                    let mut cd = chunk.into_vec();
-                    let cl = ManuallyDrop::into_inner(cd.clone());
-                    ManuallyDrop::drop(&mut cd);
-                    cl
-                });
-                columns_buffer.append(&mut unsafe {
-                    let chunk = c2.into_chunk().unwrap();
-                    let mut cd = chunk.into_vec();
-                    let cl = ManuallyDrop::into_inner(cd.clone());
-                    ManuallyDrop::drop(&mut cd);
-                    cl
-                });
-                columns_buffer.append(&mut unsafe {
-                    let chunk = c3.into_chunk().unwrap();
-                    let mut cd = chunk.into_vec();
-                    let cl = ManuallyDrop::into_inner(cd.clone());
-                    ManuallyDrop::drop(&mut cd);
-                    cl
-                });
+                columns_buffer.append(&mut c1.content.to_vec());
+                columns_buffer.append(&mut c2.content.to_vec());
+                columns_buffer.append(&mut c3.content.to_vec());
             
                 let insert_row = InsertOrUpdateRow {
                     columns_data: columns_buffer

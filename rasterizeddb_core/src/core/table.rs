@@ -318,7 +318,7 @@ impl<S: IOOperationsSync> Table<S> {
         
                                     if db_type != DbType::STRING {
                                         let size = db_type.get_size();
-                                        let mut memory_chunk = {
+                                        let memory_chunk = {
                                             let pointer_result = MEMORY_POOL.acquire(size);
                                                 
                                             match pointer_result {
@@ -332,16 +332,14 @@ impl<S: IOOperationsSync> Table<S> {
                                         let mut data_buffer = unsafe { memory_chunk.into_vec() };
             
                                         extent_non_string_buffer(
-                                            &mut data_buffer, 
+                                            data_buffer.as_vec_mut(), 
                                             &db_type, 
                                             &mut cursor_vector, 
                                             &mut position);
 
-                                        memory_chunk.deallocate_vec(data_buffer);
-
                                         let column = Column::from_chunk(column_type, memory_chunk);
 
-                                        required_columns.push((current_column_index, column.into_downgrade().await));
+                                        required_columns.push((current_column_index, column.into_downgrade()));
                                     } else {
                                         let str_len_array: [u8; 4] = [
                                             cursor_vector.vector[position as usize],
@@ -370,7 +368,7 @@ impl<S: IOOperationsSync> Table<S> {
                                             pointer_result
                                         };
 
-                                        let mut str_memory_chunk = match raw_pointer_result {
+                                        let str_memory_chunk = match raw_pointer_result {
                                             Some(memory_chunk) => {
                                                 memory_chunk
                                             },
@@ -381,17 +379,15 @@ impl<S: IOOperationsSync> Table<S> {
                                         
                                         let mut preset_buffer = unsafe { str_memory_chunk.into_vec() };
 
-                                        _ = preset_buffer.write(&str_length.to_le_bytes());
+                                        _ = preset_buffer.as_vec_mut().write(&str_length.to_le_bytes());
 
-                                        cursor.read(&mut preset_buffer).unwrap();
-
-                                        str_memory_chunk.deallocate_vec(preset_buffer);
+                                        cursor.read(preset_buffer.as_vec_mut()).unwrap();
 
                                         position += str_length as u64;
 
                                         let column = Column::from_chunk(column_type, str_memory_chunk);
 
-                                        required_columns.push((current_column_index, column.into_downgrade().await));
+                                        required_columns.push((current_column_index, column.into_downgrade()));
                                     }
                                 } else {
                                     let column_type = cursor_vector.vector[position as usize];
@@ -509,7 +505,7 @@ impl<S: IOOperationsSync> Table<S> {
                         loop {
                             if column_indexes.iter().any(|x| *x == column_index_inner) {
                                 
-                                let mut memory_chunk = {
+                                let memory_chunk = {
                                     let pointer_result = MEMORY_POOL.acquire(prefetch_result.length + 1 as u32);
                                     
                                     match pointer_result {
@@ -535,20 +531,18 @@ impl<S: IOOperationsSync> Table<S> {
 
                                     let mut preset_buffer = vec![0; db_size as usize];
                                     columns_cursor.read(&mut preset_buffer).unwrap();
-                                    data_buffer.append(&mut preset_buffer);
+                                    data_buffer.as_vec_mut().write(&mut preset_buffer).unwrap();
                                 } else {
                                     let str_length = columns_cursor.read_u32::<LittleEndian>().unwrap();
 
                                     let mut preset_buffer = vec![0; str_length as usize];
                                     columns_cursor.read(&mut preset_buffer).unwrap();
-                                    data_buffer.append(&mut preset_buffer);
+                                    data_buffer.as_vec_mut().write(&mut preset_buffer).unwrap();
                                 }
                                 
-                                memory_chunk.deallocate_vec(data_buffer);
-
                                 let column = Column::from_chunk(column_type, memory_chunk);
 
-                                required_columns.push((column_index_inner, column.into_downgrade().await));
+                                required_columns.push((column_index_inner, column.into_downgrade()));
                             } else {
                                 let column_type = columns_cursor.read_u8().unwrap();
 

@@ -48,13 +48,7 @@ pub(crate) fn read_row_cursor<'a>(first_column_index: u64, id: u64, length: u32,
     let mut columns_buffer: Vec<u8> = Vec::default();
 
     for column in columns {
-        columns_buffer.append(&mut unsafe {
-            let chunk = column.into_chunk().unwrap();
-            let mut cd = chunk.into_vec();
-            let cl = ManuallyDrop::into_inner(cd.clone());
-            ManuallyDrop::drop(&mut cd);
-            cl
-        });
+        columns_buffer.append(&mut &mut column.content.to_vec());
     }
 
     return Ok(Row {
@@ -110,13 +104,7 @@ pub(crate) async fn read_row_columns(
     let mut columns_buffer: Vec<u8> = Vec::default();
 
     for column in columns {
-        columns_buffer.append(&mut unsafe {
-            let chunk = column.into_chunk().unwrap();
-            let mut cd = chunk.into_vec();
-            let cl = ManuallyDrop::into_inner(cd.clone());
-            ManuallyDrop::drop(&mut cd);
-            cl
-        });
+        columns_buffer.append(&mut &mut column.content.to_vec());
     }
 
     return Ok(Row {
@@ -484,13 +472,7 @@ pub(crate) async fn indexed_row_fetching_file(
     let mut columns_buffer: Vec<u8> = Vec::default();
 
     for column in columns {
-        columns_buffer.append(&mut unsafe {
-            let chunk = column.into_chunk().unwrap();
-            let mut cd = chunk.into_vec();
-            let cl = ManuallyDrop::into_inner(cd.clone());
-            ManuallyDrop::drop(&mut cd);
-            cl
-        });
+        columns_buffer.append(&mut &mut column.content.to_vec());
     }
 
     return Ok(Row {
@@ -540,13 +522,7 @@ pub(crate) fn columns_cursor_to_row(
     let mut columns_buffer: Vec<u8> = Vec::default();
 
     for column in columns {
-        columns_buffer.append(&mut unsafe {
-            let chunk = column.into_chunk().unwrap();
-            let mut cd = chunk.into_vec();
-            let cl = ManuallyDrop::into_inner(cd.clone());
-            ManuallyDrop::drop(&mut cd);
-            cl
-        });
+        columns_buffer.append(&mut column.content.to_vec());
     }
 
     return Ok(Row {

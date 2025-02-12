@@ -88,27 +88,9 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
             immutable_column.len() 
         );
 
-        columns_buffer_update.append(&mut unsafe {
-            let chunk = name_column.into_chunk().unwrap();
-            let mut cd = chunk.into_vec();
-            let cl = ManuallyDrop::into_inner(cd.clone());
-            ManuallyDrop::drop(&mut cd);
-            cl
-        });
-        columns_buffer_update.append(&mut unsafe {
-            let chunk = compress_column.into_chunk().unwrap();
-            let mut cd = chunk.into_vec();
-            let cl = ManuallyDrop::into_inner(cd.clone());
-            ManuallyDrop::drop(&mut cd);
-            cl
-        });
-        columns_buffer_update.append(&mut unsafe {
-            let chunk = immutable_column.into_chunk().unwrap();
-            let mut cd = chunk.into_vec();
-            let cl = ManuallyDrop::into_inner(cd.clone());
-            ManuallyDrop::drop(&mut cd);
-            cl
-        });
+        columns_buffer_update.append(&mut name_column.content.to_vec());
+        columns_buffer_update.append(&mut compress_column.content.to_vec());
+        columns_buffer_update.append(&mut immutable_column.content.to_vec());
 
         self.config_table.insert_row(InsertOrUpdateRow { 
             columns_data: columns_buffer_update 
