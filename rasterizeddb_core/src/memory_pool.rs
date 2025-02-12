@@ -4,7 +4,7 @@ use std::{
 
 use crate::instructions::ref_vec;
 
-const MEMORY_POOL_SIZE: usize = 33554432; // 32MB
+const MEMORY_POOL_SIZE: usize = 268435456; // 128MB
 
 pub static MEMORY_POOL: LazyLock<Arc<MemoryPool>> = LazyLock::new(|| Arc::new(MemoryPool::new()));
 
@@ -51,11 +51,75 @@ static ATOMIC_PTR_ARRAY: LazyLock<Arc<Box<[(AtomicUsize, AtomicU32)]>>> = LazyLo
         (AtomicUsize::new(0), AtomicU32::new(0)),
         (AtomicUsize::new(0), AtomicU32::new(0)),
         (AtomicUsize::new(0), AtomicU32::new(0)),
+        (AtomicUsize::new(0), AtomicU32::new(0)),
+        (AtomicUsize::new(0), AtomicU32::new(0)),
+        (AtomicUsize::new(0), AtomicU32::new(0)),
+        (AtomicUsize::new(0), AtomicU32::new(0)),
+        (AtomicUsize::new(0), AtomicU32::new(0)),
+        (AtomicUsize::new(0), AtomicU32::new(0)),
+        (AtomicUsize::new(0), AtomicU32::new(0)),
+        (AtomicUsize::new(0), AtomicU32::new(0)),
+        (AtomicUsize::new(0), AtomicU32::new(0)),
+        (AtomicUsize::new(0), AtomicU32::new(0)),
+        (AtomicUsize::new(0), AtomicU32::new(0)),
+        (AtomicUsize::new(0), AtomicU32::new(0)),
+        (AtomicUsize::new(0), AtomicU32::new(0)),
+        (AtomicUsize::new(0), AtomicU32::new(0)),
+        (AtomicUsize::new(0), AtomicU32::new(0)),
+        (AtomicUsize::new(0), AtomicU32::new(0)),
+        (AtomicUsize::new(0), AtomicU32::new(0)),
+        (AtomicUsize::new(0), AtomicU32::new(0)),
+        (AtomicUsize::new(0), AtomicU32::new(0)),
+        (AtomicUsize::new(0), AtomicU32::new(0)),
+        (AtomicUsize::new(0), AtomicU32::new(0)),
+        (AtomicUsize::new(0), AtomicU32::new(0)),
+        (AtomicUsize::new(0), AtomicU32::new(0)),
+        (AtomicUsize::new(0), AtomicU32::new(0)),
+        (AtomicUsize::new(0), AtomicU32::new(0)),
+        (AtomicUsize::new(0), AtomicU32::new(0)),
+        (AtomicUsize::new(0), AtomicU32::new(0)),
+        (AtomicUsize::new(0), AtomicU32::new(0)),
+        (AtomicUsize::new(0), AtomicU32::new(0)),
+        (AtomicUsize::new(0), AtomicU32::new(0)),
+        (AtomicUsize::new(0), AtomicU32::new(0)),
+        (AtomicUsize::new(0), AtomicU32::new(0)),
     ]))
 });
 
 static ATOMIC_IN_USE_ARRAY: LazyLock<Arc<Box<[AtomicBool]>>> = LazyLock::new(|| {
     Arc::new(Box::new([
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
         AtomicBool::new(false),
         AtomicBool::new(false),
         AtomicBool::new(false),
@@ -131,7 +195,7 @@ impl MemoryPool {
     
         let i = match slot_index {
             Some(idx) => idx,
-            None => return None,
+            None => return None
         };
     
         // Check that we do not exceed the limit.
@@ -200,7 +264,6 @@ impl Drop for Chunk {
 impl Chunk {
     // Create a new chunk from a vector with no memory chunk allocated from pool
     pub fn from_vec(vec: Vec<u8>) -> Self {
-
         Chunk {
             ptr: ptr::null_mut(),
             size: 0,
@@ -212,7 +275,7 @@ impl Chunk {
 
     pub unsafe fn into_vec(&self) -> ChunkIntoVecResult {
         if let Some(vec) = self.vec.as_ref() {
-            let new_vec = Vec::from_raw_parts(vec.as_ptr() as *mut u8, vec.len(), vec.len());
+            let new_vec = vec.clone();
             ChunkIntoVecResult::Vec(new_vec)
         } else {
             ChunkIntoVecResult::ManualVec(ref_vec(self.ptr, self.size as usize))

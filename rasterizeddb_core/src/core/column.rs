@@ -318,25 +318,6 @@ impl Column {
         self.content.len() as usize + 1
     }
 
-    pub fn from_raw(data_type: u8, buffer: &[u8]) -> Column {    
-        let column_value = {
-            let pointer_result = MEMORY_POOL.acquire(buffer.len() as u32);
-            
-            match pointer_result {
-                Some(chunk) => {
-                    copy_vec_to_ptr(buffer, chunk.ptr);
-                    ColumnValue::StaticMemoryPointer(chunk)
-                },
-                None => ColumnValue::ManagedMemoryPointer(buffer.to_vec())
-            }
-        };
-
-        Column {
-            data_type: DbType::from_byte(data_type),
-            content: column_value
-        }
-    }
-
     pub fn from_chunk(data_type: u8, chunk: Chunk) -> Column {    
         if chunk.vec.is_none() {
             Column {
@@ -386,7 +367,8 @@ impl Column {
                 data_buffer.append(&mut temp_buffer.to_vec());
             }
 
-            let column = Column::from_raw(column_type, &data_buffer);
+            let memory_chunk = Chunk::from_vec(buffer.to_vec());
+            let column = Column::from_chunk(column_type, memory_chunk);
 
             columns.push(column);
         }

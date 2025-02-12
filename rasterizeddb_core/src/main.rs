@@ -1,12 +1,10 @@
-use std::{arch::x86_64::{_mm_prefetch, _MM_HINT_T0}, fs::remove_file, io::stdin, mem::ManuallyDrop};
+use std::{arch::x86_64::{_mm_prefetch, _MM_HINT_T0}, io::stdin};
 
 use rasterizeddb_core::{
     core::{
-        column::Column, 
-        row::InsertOrUpdateRow, 
-        storage_providers::{file_sync::LocalStorageProvider, memory::MemoryStorageProvider}, 
+        storage_providers::file_sync::LocalStorageProvider, 
         table::Table
-    }, memory_pool::MEMORY_POOL, rql::parser::parse_rql, EMPTY_BUFFER
+    }, rql::parser::parse_rql, EMPTY_BUFFER
 };
 
 use stopwatch::Stopwatch;
