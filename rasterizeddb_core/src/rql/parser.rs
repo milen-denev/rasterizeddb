@@ -272,11 +272,11 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
                     panic!()
                 }
             } else if token == "TRUE" {
-                let column = Column::from_chunk(12, Chunk::from_vec([true as u8].to_vec()));
+                let column = Column::from_chunk(6, Chunk::from_vec([true as u8].to_vec()));
                 let val = Token::Value(column);
                 token_vector.push(val);
             } else if token == "FALSE" {
-                let column = Column::from_chunk(12, Chunk::from_vec([false as u8].to_vec()));
+                let column = Column::from_chunk(6, Chunk::from_vec([false as u8].to_vec()));
                 let val = Token::Value(column);
                 token_vector.push(val);
             }

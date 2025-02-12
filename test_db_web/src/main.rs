@@ -74,12 +74,12 @@ async fn query() -> Response {
     //OR COL(1) = {x} / {y} * {z}
     
     let query_evaluation = parse_rql(&format!(r#"
-            BEGIN
-            SELECT FROM NAME_DOESNT_MATTER_FOR_NOW
-            WHERE COL(0) > {x} OR COL(1) > {y} OR COL(0) > -1000
-            LIMIT 1000
-            END
-        "#)).unwrap();
+        BEGIN
+        SELECT FROM NAME_DOESNT_MATTER_FOR_NOW
+        WHERE COL(0) > {x} OR COL(1) > {y} OR COL(0) > -1000
+        LIMIT 1000
+        END
+    "#)).unwrap();
 
     let table = unsafe { TABLE.force_mut().await };
 
