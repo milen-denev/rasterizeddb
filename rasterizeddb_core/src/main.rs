@@ -89,7 +89,7 @@ async fn main() -> std::io::Result<()> {
         BEGIN
         SELECT FROM NAME_DOESNT_MATTER_FOR_NOW
         WHERE COL(0) = 83300
-        LIMIT 100000
+        LIMIT 1
         END
     "#)).unwrap();
 
