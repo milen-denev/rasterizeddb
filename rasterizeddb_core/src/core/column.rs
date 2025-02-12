@@ -1,10 +1,18 @@
-use std::{arch::x86_64::{_mm_prefetch, _MM_HINT_T0}, fmt::{Debug, Display}, io::{self, Cursor, Read, Write}, mem::ManuallyDrop, ops::{Deref, DerefMut}, ptr};
+use std::{fmt::{Debug, Display}, io::{self, Cursor, Read, Write}, ptr};
 
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt, WriteBytesExt};
-use futures::executor::block_on;
 use once_cell::sync::Lazy;
 
-use crate::{instructions::{compare_raw_vecs, compare_vecs_ends_with, compare_vecs_eq, compare_vecs_ne, compare_vecs_starts_with, contains_subsequence, copy_vec_to_ptr, ref_vec, vec_from_ptr_safe}, memory_pool::{Chunk, MEMORY_POOL}, simds::endianess::{read_u32, read_u8}};
+use crate::{instructions::{
+    compare_raw_vecs, 
+    compare_vecs_ends_with, 
+    compare_vecs_eq, 
+    compare_vecs_ne, 
+    compare_vecs_starts_with, 
+    contains_subsequence, 
+    copy_vec_to_ptr, 
+    vec_from_ptr_safe
+}, memory_pool::{Chunk, MEMORY_POOL}};
 
 use super::db_type::DbType;
 
@@ -312,12 +320,8 @@ impl Column {
 
     pub fn from_raw(data_type: u8, buffer: &[u8]) -> Column {    
         let column_value = {
-            let mut memory_pool = MEMORY_POOL.write().unwrap();
-
-            let pointer_result = block_on(memory_pool.acquire(buffer.len() as u32));
+            let pointer_result = MEMORY_POOL.acquire(buffer.len() as u32);
             
-            drop(memory_pool);
-
             match pointer_result {
                 Some(chunk) => {
                     copy_vec_to_ptr(buffer, chunk.ptr);
@@ -391,6 +395,7 @@ impl Column {
         return Ok(columns);
     }
 
+    #[inline(always)]
     pub async fn into_downgrade(self) -> Column {  
         let data_type = self.data_type.to_byte();
     
@@ -415,13 +420,9 @@ impl Column {
             };
 
             let mut new_memory_chunk = {
-                let mut memory_pool = MEMORY_POOL.write().unwrap();
-    
                 //i128 size
-                let pointer_result = memory_pool.acquire(16).await;
+                let pointer_result = MEMORY_POOL.acquire(16);
                 
-                drop(memory_pool);
-    
                 match pointer_result {
                     Some(chunk) => {
                         chunk
@@ -453,13 +454,9 @@ impl Column {
             };
 
             let mut new_memory_chunk = {
-                let mut memory_pool = MEMORY_POOL.write().unwrap();
-    
                 //f64 size
-                let pointer_result = memory_pool.acquire(8).await;
+                let pointer_result = MEMORY_POOL.acquire(8);
                 
-                drop(memory_pool);
-    
                 match pointer_result {
                     Some(chunk) => {
                         chunk
@@ -595,6 +592,7 @@ impl Column {
     }
 
     pub fn equals(&self, column: &Column) -> bool {
+        //println!("vec 1: {:?} | vec 2: {:?}", self.content.as_slice(), column.content.as_slice());
         compare_vecs_eq(self.content.as_slice(), column.content.as_slice())
     }
 

@@ -40,92 +40,36 @@ async fn main() -> std::io::Result<()> {
 
     //let io_sync = MemoryStorageProvider::new();
 
-   let mut table = Table::init(io_sync, false, false).await.unwrap();
+    let mut table = Table::init(io_sync, false, false).await.unwrap();
 
-    // let c1 = Column::new(10_u16).unwrap();
-    // let c2 = Column::new(20_u16).unwrap();
-    //let mut c3 = Column::new("This is the millionth something row.").unwrap();
-
-    // let mut columns_buffer: Vec<u8> = Vec::with_capacity(
-    //     c1.len() + 
-    //     c2.len()
-    // );
-
-    // columns_buffer.append(&mut unsafe {
-    //     let chunk = c1.into_chunk().unwrap();
-    //     let mut cd = chunk.into_vec();
-    //     let cl = ManuallyDrop::into_inner(cd.clone());
-    //     ManuallyDrop::drop(&mut cd);
-    //     cl
-    // });
-    // columns_buffer.append(&mut unsafe {
-    //     let chunk = c2.into_chunk().unwrap();
-    //     let mut cd = chunk.into_vec();
-    //     let cl = ManuallyDrop::into_inner(cd.clone());
-    //     ManuallyDrop::drop(&mut cd);
-    //     cl
-    // });
-
-    // let _insert_row = InsertOrUpdateRow {
-    //     columns_data: columns_buffer.clone()
-    // };
-
-    // table.insert_row(_insert_row).await;
-
-    // let _insert_row = InsertOrUpdateRow {
-    //     columns_data: columns_buffer.clone()
-    // };
-
-    // table.insert_row(_insert_row).await;
-
-    // let _insert_row = InsertOrUpdateRow {
-    //     columns_data: columns_buffer
-    // };
-
-    // table.insert_row(_insert_row).await;
-
-    // for i in 0..1_000_000 {
-    //     if i == 999_998_999 {
-    //         let mut c1 = Column::new(1_597_937).unwrap();
-    //         let mut c2 = Column::new(-1_597_937).unwrap();
-    //         let mut c3 = Column::new("This is the millionth something row.").unwrap();
+    // for i in 1..100_001 {
+    //     let c1 = Column::new(i).unwrap();
+    //     let c2 = Column::new(i * -1).unwrap();
+    //     let mut columns_buffer: Vec<u8> = Vec::with_capacity(
+    //         c1.len() + 
+    //         c2.len()
+    //     );
     
-    //         let mut columns_buffer: Vec<u8> = Vec::with_capacity(
-    //             c1.len() + 
-    //             c2.len() +
-    //             c3.len() 
-    //         );
-        
-    //         columns_buffer.append(&mut c1.into_vec().unwrap());
-    //         columns_buffer.append(&mut c2.into_vec().unwrap());
-    //         columns_buffer.append(&mut c3.into_vec().unwrap());
-        
-    //         let insert_row = InsertOrUpdateRow {
-    //             columns_data: columns_buffer
-    //         };
-        
-    //         table.insert_row(insert_row).await;
-    //     } else {
-    //         let mut c1 = Column::new(i).unwrap();
-    //         let mut c2 = Column::new(i * -1).unwrap();
-    //         let mut c3 = Column::new("This is also awesome.").unwrap();
+    //     columns_buffer.append(&mut unsafe {
+    //         let chunk = c1.into_chunk().unwrap();
+    //         let mut cd = chunk.into_vec();
+    //         let cl = ManuallyDrop::into_inner(cd.clone());
+    //         ManuallyDrop::drop(&mut cd);
+    //         cl
+    //     });
+    //     columns_buffer.append(&mut unsafe {
+    //         let chunk = c2.into_chunk().unwrap();
+    //         let mut cd = chunk.into_vec();
+    //         let cl = ManuallyDrop::into_inner(cd.clone());
+    //         ManuallyDrop::drop(&mut cd);
+    //         cl
+    //     });
     
-    //         let mut columns_buffer: Vec<u8> = Vec::with_capacity(
-    //             c1.len() + 
-    //             c2.len() +
-    //             c3.len() 
-    //         );
-        
-    //         columns_buffer.append(&mut c1.into_vec().unwrap());
-    //         columns_buffer.append(&mut c2.into_vec().unwrap());
-    //         columns_buffer.append(&mut c3.into_vec().unwrap());
-        
-    //         let insert_row = InsertOrUpdateRow {
-    //             columns_data: columns_buffer
-    //         };
-        
-    //         table.insert_row(insert_row).await;
-    //     }
+    //     let _insert_row = InsertOrUpdateRow {
+    //         columns_data: columns_buffer.clone()
+    //     };
+    
+    //     table.insert_row(_insert_row).await;
     // }
 
     // println!("DONE inserting rows.");
@@ -139,27 +83,13 @@ async fn main() -> std::io::Result<()> {
     let mut buffer = String::new();
     stdin().read_line(&mut buffer).unwrap();
 
-    // let row = table.first_or_default_by_id(1).await?.unwrap();
-
-    // for column in Column::from_buffer(&row.columns_data).unwrap() {
-    //     println!("{}", column.into_value());
-    // }
-
-    // let row = table.first_or_default_by_id(60).await?.unwrap();
-
-    // for column in Column::from_buffer(&row.columns_data).unwrap() {
-    //     println!("{}", column.into_value());
-    // }
-
     let mut stopwatch = Stopwatch::new();
-
-    // WHERE COL(0) >= 6000000 LIMIT 20
 
     let query_evaluation = parse_rql(&format!(r#"
         BEGIN
         SELECT FROM NAME_DOESNT_MATTER_FOR_NOW
-        WHERE COL(1) = -1597937
-        LIMIT 1
+        WHERE COL(0) = 83300
+        LIMIT 100000
         END
     "#)).unwrap();
 
@@ -167,7 +97,7 @@ async fn main() -> std::io::Result<()> {
     let rows = table.execute_query(query_evaluation.parser_result).await?;
     stopwatch.stop();
 
-    println!("elapsed {:?}", stopwatch.elapsed_ms());
+    println!("elapsed {:?}", stopwatch.elapsed());
     println!("total rows {:?}", rows.unwrap().len());
 
     println!("second try");
@@ -177,7 +107,7 @@ async fn main() -> std::io::Result<()> {
     let query_evaluation = parse_rql(&format!(r#"
         BEGIN
         SELECT FROM NAME_DOESNT_MATTER_FOR_NOW
-        WHERE COL(1) = -1597937
+        WHERE COL(0) > 82999
         LIMIT 10
         END
     "#)).unwrap();
@@ -186,7 +116,7 @@ async fn main() -> std::io::Result<()> {
     let rows = table.execute_query(query_evaluation.parser_result).await?;
     stopwatch.stop();
 
-    println!("elapsed {:?}", stopwatch.elapsed_ms());
+    println!("elapsed {:?}", stopwatch.elapsed());
     println!("total rows {:?}", rows.unwrap().len());
 
     //table.delete_row_by_id(3).await.unwrap();

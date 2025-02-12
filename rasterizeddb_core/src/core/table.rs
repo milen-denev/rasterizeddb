@@ -319,12 +319,8 @@ impl<S: IOOperationsSync> Table<S> {
                                     if db_type != DbType::STRING {
                                         let size = db_type.get_size();
                                         let mut memory_chunk = {
-                                            let mut memory_pool = MEMORY_POOL.write().unwrap();
-                                    
-                                            let pointer_result = memory_pool.acquire(size).await;
+                                            let pointer_result = MEMORY_POOL.acquire(size);
                                                 
-                                            drop(memory_pool);
-                                    
                                             match pointer_result {
                                                 Some(chunk) => {
                                                     chunk
@@ -369,12 +365,8 @@ impl<S: IOOperationsSync> Table<S> {
                                         cursor.seek(SeekFrom::Start(position)).unwrap();
 
                                         let raw_pointer_result = {
-                                            let mut memory_pool = MEMORY_POOL.write().unwrap();
-                            
-                                            let pointer_result = memory_pool.acquire(str_length + 4).await;
+                                            let pointer_result = MEMORY_POOL.acquire(str_length + 4);
                                             
-                                            drop(memory_pool);
-                            
                                             pointer_result
                                         };
 
@@ -518,12 +510,8 @@ impl<S: IOOperationsSync> Table<S> {
                             if column_indexes.iter().any(|x| *x == column_index_inner) {
                                 
                                 let mut memory_chunk = {
-                                    let mut memory_pool = MEMORY_POOL.write().unwrap();
-                        
-                                    let pointer_result = memory_pool.acquire(prefetch_result.length + 1 as u32).await;
+                                    let pointer_result = MEMORY_POOL.acquire(prefetch_result.length + 1 as u32);
                                     
-                                    drop(memory_pool);
-                        
                                     match pointer_result {
                                         Some(chunk) => {
                                             chunk
