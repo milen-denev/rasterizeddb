@@ -108,73 +108,55 @@ impl MemoryPool {
     }
 
     pub fn acquire(&self, size: u32) -> Option<Chunk> {
-        //let caller = std::panic::Location::caller();
-        //println!("acquire called: {}, {}", caller.file(), caller.line());
-
         let mut current_start = 0;
+        let mut slot_index: Option<usize> = None;
     
-        let mut index: i32 = -1;
-
-        // Find the last allocated slot and compute the next starting address
-        for (i, in_use) in ATOMIC_IN_USE_ARRAY.iter().enumerate() {
-            if !in_use.load(Ordering::Acquire) {
-                let previous_size = ATOMIC_PTR_ARRAY[i].1.load(Ordering::Acquire);
-                if previous_size != 0 {
-                    if size <= previous_size {
-                        let previous_start = ATOMIC_PTR_ARRAY[i].0.load(Ordering::Acquire);
-
-                        if previous_start != 0 {
-                            current_start = previous_start - self.start + previous_size as usize;
-                        } else {
-                            current_start += previous_size as usize;
-                        }
-
-                        index = i as i32;
-                        break;
-                    }
+        // Try to atomically claim one of the available slots.
+        for (i, flag) in ATOMIC_IN_USE_ARRAY.iter().enumerate() {
+            if flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
+                slot_index = Some(i);
+    
+                // Read the previous size and pointer in an atomic way.
+                let previous_size = ATOMIC_PTR_ARRAY[i].1.load(Ordering::SeqCst);
+                let previous_start = ATOMIC_PTR_ARRAY[i].0.load(Ordering::SeqCst);
+    
+                if previous_size != 0 && previous_start != 0 {
+                    current_start = previous_start - self.start + previous_size as usize;
                 } else {
-                    let previous_start = ATOMIC_PTR_ARRAY[i].0.load(Ordering::Acquire);
-                    
-                    if previous_start != 0 {
-                        current_start = previous_start - self.start + previous_size as usize;
-                    } else {
-                        current_start += previous_size as usize;
-                    }
-
-                    index = i as i32;
-                    break;
+                    current_start += previous_size as usize; // usually zero on first allocation
                 }
+                break;
             }
         }
-
-        if index == -1 || current_start as u32 + size > 16777216 {
+    
+        let i = match slot_index {
+            Some(idx) => idx,
+            None => return None,
+        };
+    
+        // Check that we do not exceed the limit.
+        if current_start + size as usize > MEMORY_POOL_SIZE {
+            // Release our claim if allocation cannot proceed.
+            ATOMIC_IN_USE_ARRAY[i].store(false, Ordering::SeqCst);
             return None;
         }
-
-        for (i, in_use) in ATOMIC_IN_USE_ARRAY.iter().enumerate() {
-            if index == i as i32 {
-                let ptr = self.buffer[current_start as usize..(current_start + size as usize)].as_ptr() as *mut u8;
-
-                in_use.store(true, Ordering::Release);
-                ATOMIC_PTR_ARRAY[i].0.store(ptr as usize, Ordering::Release);
-                ATOMIC_PTR_ARRAY[i].1.store(size, Ordering::Release);
-                
-                return Some(Chunk {
-                    ptr,
-                    size,
-                    pool: Arc::downgrade(&MEMORY_POOL),
-                    vec: None,
-                    index: index
-                });
-            } 
-        }
-
-        return None;
+    
+        // Set the pointer and size for the slot.
+        let ptr = self.buffer[current_start..current_start + size as usize].as_ptr() as *mut u8;
+        ATOMIC_PTR_ARRAY[i].0.store(ptr as usize, Ordering::SeqCst);
+        ATOMIC_PTR_ARRAY[i].1.store(size, Ordering::SeqCst);
+    
+        Some(Chunk {
+            ptr,
+            size,
+            pool: Arc::downgrade(&MEMORY_POOL),
+            vec: None,
+            index: i as i32,
+        })
     }
 
     fn release(&self, index: i32) {
         if index != -1 {
-            
             ATOMIC_IN_USE_ARRAY[index as usize].store(false, Ordering::Release);
         }
     }
