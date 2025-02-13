@@ -87,23 +87,28 @@ let mut table = Table::init(io_sync, false, false).unwrap();
 #### Create columns, rows and insert them
 
 ```rust
-let mut c1 = Column::new(10 as i32).unwrap();
-let mut c2 = Column::new(50.0 as f64).unwrap();
-let mut c3 = Column::new("This is awesome").unwrap();
+let c1 = Column::new(10).unwrap();
+let c2 = Column::new(-10).unwrap();
+let str = 'A'.to_string().repeat(100);
+let c3 = Column::new(str).unwrap();
+
 let mut columns_buffer: Vec<u8> = Vec::with_capacity(
-    c1.len() + 
+    c1.len() +
     c2.len() +
-    c3.len() +
+    c3.len()
 );
-columns_buffer.append(&mut c1.into_vec().unwrap());
-columns_buffer.append(&mut c2.into_vec().unwrap());
-columns_buffer.append(&mut c3.into_vec().unwrap());
+
+columns_buffer.append(&mut c1.content.to_vec());
+columns_buffer.append(&mut c2.content.to_vec());
+columns_buffer.append(&mut c3.content.to_vec());
 
 let insert_row = InsertOrUpdateRow {
-    columns_data: columns_buffer
+    columns_data: columns_buffer.clone()
 };
 
 table.insert_row(insert_row).await;
+//OR unsafe
+table.insert_row_unsync(insert_row).await;
 ```
 
 #### Build in-memory file indexes
@@ -113,26 +118,19 @@ table.rebuild_in_memory_indexes();
 
 #### Retrieve a row
 ```rust
-let row_by_id = table.first_or_default_by_id(10).unwrap().unwrap();
-
-// Read columns
-for column in Column::from_buffer(&row2.columns_data).unwrap().iter() {
-    println!("{}", column.into_value());
-}
-
-// Column index, value that must be equal
-let row_by_column_value = table.first_or_default_by_column(2, "This is awesome").unwrap().unwrap();
-
 //Rasterized Query Language (Alpha)
-let query_evaluation = parse_rql(&format!(r#"
-    BEGIN
-    SELECT FROM NAME_DOESNT_MATTER_FOR_NOW
-    WHERE COL(2) = 'This is awesome'
-    END
-"#)).unwrap();
+let query_evaluation = parse_rql(&format!(
+r#"
+        BEGIN
+        SELECT FROM NAME_DOESNT_MATTER_FOR_NOW
+        WHERE COL(1) = -10
+        LIMIT 2
+        END
+"#
+))
+.unwrap();
 
-// Uses cache: If the same query is repeated, the time to retrieve a row should be in the single-digit range.
-let row_by_query = table.first_or_default_by_query(query_evaluation).await.unwrap().unwrap();
+let rows = table.execute_query(query_evaluation.parser_result).await?;
 ```
 
 #### Update a row
