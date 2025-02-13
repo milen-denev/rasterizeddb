@@ -1,9 +1,13 @@
 use crate::{
-    core::{
-        column::Column, db_type::DbType, hashing::get_hash, row::InsertOrUpdateRow}, memory_pool::Chunk, POSITIONS_CACHE
-    };
+    core::{column::Column, db_type::DbType, hashing::get_hash, row::InsertOrUpdateRow},
+    memory_pool::Chunk,
+    POSITIONS_CACHE,
+};
 
-use super::{helpers::whitespace_spec_splitter, models::{ComparerOperation, MathOperation, Next, Token}};
+use super::{
+    helpers::whitespace_spec_splitter,
+    models::{ComparerOperation, MathOperation, Next, Token},
+};
 
 #[allow(unused_variables)]
 #[allow(unused_mut)]
@@ -13,7 +17,7 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
     if let Some(file_positions) = POSITIONS_CACHE.get(&hash) {
         let db_action = DatabaseAction {
             table_name: "".to_string(),
-            parser_result: ParserResult::CachedHashIndexes(file_positions)
+            parser_result: ParserResult::CachedHashIndexes(file_positions),
         };
         return Ok(db_action);
     }
@@ -22,17 +26,16 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
     let begin;
 
     if begin_result.is_none() {
-        return Err("BEGIN statement is missing.".into())
+        return Err("BEGIN statement is missing.".into());
     } else {
         begin = begin_result.unwrap();
     }
 
-    
     let end_result = query.find("END");
     let end;
 
     if end_result.is_none() {
-        return Err("END statement is missing.".into())
+        return Err("END statement is missing.".into());
     } else {
         end = end_result.unwrap();
     }
@@ -42,7 +45,9 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
         let create_str = query[create_start + 12..].trim(); // Skip "CREATE TABLE"
 
         // Extract table name
-        let table_name_end = create_str.find(|c: char| c == '(').ok_or("Missing '(' in CREATE TABLE statement")?;
+        let table_name_end = create_str
+            .find(|c: char| c == '(')
+            .ok_or("Missing '(' in CREATE TABLE statement")?;
         let table_name = create_str[..table_name_end].trim();
 
         if table_name.is_empty() {
@@ -51,7 +56,9 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
 
         // Extract options between parentheses
         let options_start = create_str.find('(').unwrap() + 1;
-        let options_end = create_str.find(')').ok_or("Missing ')' in CREATE TABLE statement")?;
+        let options_end = create_str
+            .find(')')
+            .ok_or("Missing ')' in CREATE TABLE statement")?;
         let options = &create_str[options_start..options_end].trim();
 
         // Split options and parse TRUE/FALSE
@@ -75,7 +82,11 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
 
         return Ok(DatabaseAction {
             table_name: table_name.to_string(),
-            parser_result: ParserResult::CreateTable((table_name.to_string(), compressed, immutable)),
+            parser_result: ParserResult::CreateTable((
+                table_name.to_string(),
+                compressed,
+                immutable,
+            )),
         });
     }
 
@@ -100,17 +111,19 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
     let mut select_table = String::new();
 
     if select_result.is_none() {
-        return Err("SELECT statement is missing.".into())
+        return Err("SELECT statement is missing.".into());
     }
 
     if let Some(select_start) = select_result {
         // Find the starting index of the number after "SELECT FROM"
         let select_from_str = query[select_start + (6 + 4)..].trim(); // +6 +4 to skip "SELECT FROM"
 
-        let select_from_end = select_from_str.find(|c: char| c.is_whitespace()).unwrap_or(select_from_str.len());
-        
+        let select_from_end = select_from_str
+            .find(|c: char| c.is_whitespace())
+            .unwrap_or(select_from_str.len());
+
         let select_value = &select_from_str[..select_from_end];
-        
+
         select_table.push_str(select_value);
     }
 
@@ -143,10 +156,12 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
     if let Some(limit_start) = limit_result {
         // Find the starting index of the number after "LIMIT"
         let limit_str = query[limit_start + 5..].trim(); // +5 to skip "LIMIT"
-        
+
         // Find the end of the number using a space or newline as a delimiter
-        let limit_end = limit_str.find(|c: char| c.is_whitespace()).unwrap_or(limit_str.len());
-        
+        let limit_end = limit_str
+            .find(|c: char| c.is_whitespace())
+            .unwrap_or(limit_str.len());
+
         // Extract the substring and parse it as i64
         let limit_value = &limit_str[..limit_end];
         if let Ok(limit_number) = str::parse::<i64>(limit_value) {
@@ -163,17 +178,17 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
     //RETURN ALL & SELECT ALL scenario
     if return_all && select_all {
         let select_clause = &query[begin + 6..].trim();
-        return Ok(DatabaseAction { 
+        return Ok(DatabaseAction {
             table_name: select_table,
             parser_result: ParserResult::QueryEvaluationTokens(EvaluationResult {
                 query_hash: hash,
                 tokens: Vec::default(),
                 limit: limit_i64,
-                select_all: true
-            })
+                select_all: true,
+            }),
         });
-    } 
-    
+    }
+
     // RETURN ALL and WHERE clause scenario
     if return_all && where_result.is_some() {
         let select_clause = &query[begin + 5..where_i].trim();
@@ -181,14 +196,14 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
 
         let mut where_tokens = whitespace_spec_splitter(where_clause);
 
-        let mut index_token: u32 = 0; 
+        let mut index_token: u32 = 0;
         let mut tokens_vector: Vec<(Vec<Token>, Option<Next>)> = Vec::default();
         let mut token_vector: Vec<Token> = Vec::default();
 
         let mut where_tokens_iter = where_tokens.into_iter();
 
-        let  mut double_continue = false;
-        
+        let mut double_continue = false;
+
         while let Some(token) = where_tokens_iter.next() {
             if double_continue {
                 double_continue = false;
@@ -214,7 +229,7 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
             } else if token.eq("*") {
                 let val = Token::Math(MathOperation::Multiply);
                 token_vector.push(val);
-            }  else if token.eq("-") {
+            } else if token.eq("-") {
                 let val = Token::Math(MathOperation::Subtract);
                 token_vector.push(val);
             } else if token.eq("/") {
@@ -250,7 +265,7 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
                 new_vector.append(&mut token_vector);
                 tokens_vector.push((new_vector, Some(Next::Or)));
             } else if token.starts_with('\'') && token.ends_with('\'') {
-                let string = &token[1..token.len() -1];
+                let string = &token[1..token.len() - 1];
                 let column = Column::from_chunk(14, Chunk::from_vec(string.as_bytes().to_vec()));
                 let val = Token::Value(column);
                 token_vector.push(val);
@@ -261,7 +276,11 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
                     let val = Token::Value(column);
                     token_vector.push(val);
                 } else {
-                    panic!("Error parsing token number: {}, error: {}", token, result_i128.unwrap_err());
+                    panic!(
+                        "Error parsing token number: {}, error: {}",
+                        token,
+                        result_i128.unwrap_err()
+                    );
                 }
             } else if token.contains(".") {
                 if let Ok(token_number) = str::parse::<f64>(&token) {
@@ -284,14 +303,14 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
 
         tokens_vector.push((token_vector, None));
 
-        return Ok(DatabaseAction { 
+        return Ok(DatabaseAction {
             table_name: select_table,
             parser_result: ParserResult::QueryEvaluationTokens(EvaluationResult {
                 query_hash: hash,
                 tokens: tokens_vector,
                 limit: limit_i64,
-                select_all: false
-            })
+                select_all: false,
+            }),
         });
     }
 
@@ -300,26 +319,26 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
 
 pub struct DatabaseAction {
     pub table_name: String,
-    pub parser_result: ParserResult
+    pub parser_result: ParserResult,
 }
 
 pub enum ParserResult {
-    CreateTable((String,bool, bool)),
+    CreateTable((String, bool, bool)),
     DropTable(String),
     InsertEvaluationTokens(InsertEvaluationResult),
     UpdateEvaluationTokens(EvaluationResult),
     DeleteEvaluationTokens(EvaluationResult),
     QueryEvaluationTokens(EvaluationResult),
-    CachedHashIndexes(Vec<(u64, u32)>)
+    CachedHashIndexes(Vec<(u64, u32)>),
 }
 
 pub struct EvaluationResult {
     pub query_hash: u64,
     pub tokens: Vec<(Vec<Token>, Option<Next>)>,
     pub limit: i64,
-    pub select_all: bool
+    pub select_all: bool,
 }
 
 pub struct InsertEvaluationResult {
-    pub rows: Vec<InsertOrUpdateRow>
+    pub rows: Vec<InsertOrUpdateRow>,
 }

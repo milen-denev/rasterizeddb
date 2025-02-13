@@ -1,10 +1,16 @@
-use std::{arch::x86_64::{_mm_prefetch, _MM_HINT_T0}, io::stdin};
+use std::{
+    arch::x86_64::{_mm_prefetch, _MM_HINT_T0},
+    fs::remove_file,
+    io::stdin,
+};
 
 use rasterizeddb_core::{
     core::{
-        storage_providers::file_sync::LocalStorageProvider, 
-        table::Table
-    }, rql::parser::parse_rql, EMPTY_BUFFER
+        column::Column, row::InsertOrUpdateRow, storage_providers::file_sync::LocalStorageProvider,
+        table::Table,
+    },
+    rql::parser::parse_rql,
+    EMPTY_BUFFER,
 };
 
 use stopwatch::Stopwatch;
@@ -17,14 +23,15 @@ async fn main() -> std::io::Result<()> {
         unsafe { _mm_prefetch::<_MM_HINT_T0>(empty_buffer_ptr as *const i8) };
     }
 
-    std::env::set_var("RUST_BACKTRACE","0");
+    std::env::set_var("RUST_BACKTRACE", "0");
 
     //_ = remove_file("C:\\Users\\mspc6\\OneDrive\\Professional\\Desktop\\database.db");
 
     let io_sync = LocalStorageProvider::new(
         "C:\\Users\\mspc6\\OneDrive\\Professional\\Desktop",
-        "database.db"
-    ).await;
+        "database.db",
+    )
+    .await;
 
     //let io_sync = MemoryStorageProvider::new();
 
@@ -40,22 +47,27 @@ async fn main() -> std::io::Result<()> {
 
     let mut table = Table::init(io_sync, false, false).await.unwrap();
 
-    // for i in 1..100_001 {
+    // for i in 200_000..=1_000_000 {
     //     let c1 = Column::new(i).unwrap();
     //     let c2 = Column::new(i * -1).unwrap();
+    //     let str = 'A'.to_string().repeat(100);
+    //     let c3 = Column::new(str).unwrap();
+
     //     let mut columns_buffer: Vec<u8> = Vec::with_capacity(
-    //         c1.len() + 
-    //         c2.len()
+    //         c1.len() +
+    //         c2.len() +
+    //         c3.len()
     //     );
-    
+
     //     columns_buffer.append(&mut c1.content.to_vec());
     //     columns_buffer.append(&mut c2.content.to_vec());
-    
+    //     columns_buffer.append(&mut c3.content.to_vec());
+
     //     let _insert_row = InsertOrUpdateRow {
     //         columns_data: columns_buffer.clone()
     //     };
-    
-    //     table.insert_row(_insert_row).await;
+
+    //     table.insert_row_unsync(_insert_row).await;
     // }
 
     // println!("DONE inserting rows.");
@@ -71,13 +83,16 @@ async fn main() -> std::io::Result<()> {
 
     let mut stopwatch = Stopwatch::new();
 
-    let query_evaluation = parse_rql(&format!(r#"
+    let query_evaluation = parse_rql(&format!(
+        r#"
         BEGIN
         SELECT FROM NAME_DOESNT_MATTER_FOR_NOW
-        WHERE COL(0) > 99872
-        LIMIT 1
+        WHERE COL(0) > 999872
+        LIMIT 2
         END
-    "#)).unwrap();
+    "#
+    ))
+    .unwrap();
 
     stopwatch.start();
     let rows = table.execute_query(query_evaluation.parser_result).await?;
@@ -90,13 +105,16 @@ async fn main() -> std::io::Result<()> {
 
     stopwatch.reset();
 
-    let query_evaluation = parse_rql(&format!(r#"
+    let query_evaluation = parse_rql(&format!(
+        r#"
         BEGIN
         SELECT FROM NAME_DOESNT_MATTER_FOR_NOW
-        WHERE COL(0) > 82999 OR COL(1) < -1000 AND COL(0) > 5000
-        LIMIT 10
+        WHERE COL(0) > 999872
+        LIMIT 2
         END
-    "#)).unwrap();
+    "#
+    ))
+    .unwrap();
 
     stopwatch.start();
     let rows = table.execute_query(query_evaluation.parser_result).await?;
@@ -117,9 +135,9 @@ async fn main() -> std::io::Result<()> {
     //let mut c3_update = Column::new(&large_string).unwrap();
 
     // let mut columns_buffer_update: Vec<u8> = Vec::with_capacity(
-    //     c1_update.len() + 
+    //     c1_update.len() +
     //     c2_update.len()
-        //c3_update.len() 
+    //c3_update.len()
     //);
 
     // columns_buffer_update.append(&mut c1_update.into_vec().unwrap());

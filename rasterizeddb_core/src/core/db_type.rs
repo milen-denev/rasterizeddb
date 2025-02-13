@@ -20,7 +20,7 @@ pub enum DbType {
     TBD,
     NULL,
     START,
-    END
+    END,
 }
 
 impl Display for DbType {
@@ -30,7 +30,7 @@ impl Display for DbType {
 }
 
 impl DbType {
-    pub fn to_byte(&self) -> u8{
+    pub fn to_byte(&self) -> u8 {
         match self {
             DbType::I8 => 1,
             DbType::I16 => 2,
@@ -50,7 +50,7 @@ impl DbType {
             DbType::TBD => 252,
             DbType::NULL => 253,
             DbType::START => 254,
-            DbType::END => 255
+            DbType::END => 255,
         }
     }
 
@@ -75,7 +75,7 @@ impl DbType {
             253 => DbType::NULL,
             254 => DbType::START,
             255 => DbType::END,
-            _ => panic!("Invalid byte type: {}", byte)
+            _ => panic!("Invalid byte type: {}", byte),
         }
     }
 
@@ -100,7 +100,7 @@ impl DbType {
             DbType::NULL => 1,
             DbType::START => 1,
             DbType::END => 1,
-            DbType::DATETIME => todo!()
+            DbType::DATETIME => todo!(),
         }
     }
 }

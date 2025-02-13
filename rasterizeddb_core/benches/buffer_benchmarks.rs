@@ -1,8 +1,19 @@
-use std::{arch::x86_64::{_mm_prefetch, _MM_HINT_T0}, hint::black_box, io::{self, Cursor, Seek}};
+use std::{
+    arch::x86_64::{_mm_prefetch, _MM_HINT_T0},
+    hint::black_box,
+    io::{self, Cursor, Seek},
+};
 
 use byteorder::{LittleEndian, ReadBytesExt};
 use criterion::{criterion_group, criterion_main, Criterion};
-use rasterizeddb_core::{core::{helpers::row_prefetching_cursor, storage_providers::file_sync::LocalStorageProvider, support_types::{FileChunk, RowPrefetchResult}}, simds::endianess::read_u64};
+use rasterizeddb_core::{
+    core::{
+        helpers::row_prefetching_cursor,
+        storage_providers::file_sync::LocalStorageProvider,
+        support_types::{FileChunk, RowPrefetchResult},
+    },
+    simds::endianess::read_u64,
+};
 use tokio::runtime::Runtime;
 
 // fn get_read_u32_raw(buffer: Vec<u8>) -> u32 {
@@ -17,8 +28,9 @@ use tokio::runtime::Runtime;
 // }
 
 fn get_row_prefetch_result_2(
-    cursor: &mut Cursor<Vec<u8>>, 
-    chunk: &FileChunk) -> io::Result<Option<RowPrefetchResult>> {
+    cursor: &mut Cursor<Vec<u8>>,
+    chunk: &FileChunk,
+) -> io::Result<Option<RowPrefetchResult>> {
     //row_prefetching_cursor(cursor, chunk)
     Ok(None)
 }
@@ -33,12 +45,12 @@ fn get_read_u64_crate(slice: &[u8; 8]) -> u64 {
     u64
 }
 
-fn criterion_benchmark_buffers(c: &mut Criterion) { 
-    // c.bench_function("get_read_u32_raw", 
+fn criterion_benchmark_buffers(c: &mut Criterion) {
+    // c.bench_function("get_read_u32_raw",
     //     |b| b.iter(|| get_read_u32_raw(black_box(vec![200, 50, 30, 0])))
     // );
 
-    // c.bench_function("get_read_u32_cursor", 
+    // c.bench_function("get_read_u32_cursor",
     //     |b| b.iter(|| get_read_u32_cursor(black_box(Cursor::new(vec![200, 50, 30, 0]))))
     // );
 
@@ -46,47 +58,55 @@ fn criterion_benchmark_buffers(c: &mut Criterion) {
 
     let be_ptr = data.as_ptr();
 
-    unsafe { 
+    unsafe {
         _mm_prefetch::<_MM_HINT_T0>(be_ptr as *const i8);
     }
 
-    let _chunk = FileChunk { current_file_position: 30, chunk_size: 1000050, next_row_id: 20001 };
-    let _chunk2 = FileChunk { current_file_position: 30, chunk_size: 1000050, next_row_id: 20001 };
+    let _chunk = FileChunk {
+        current_file_position: 30,
+        chunk_size: 1000050,
+        next_row_id: 20001,
+    };
+    let _chunk2 = FileChunk {
+        current_file_position: 30,
+        chunk_size: 1000050,
+        next_row_id: 20001,
+    };
 
     let rt = Runtime::new().unwrap();
 
-    let mut _io_sync =  Box::new(rt.block_on(LocalStorageProvider::new(
+    let mut _io_sync = Box::new(rt.block_on(LocalStorageProvider::new(
         "C:\\Users\\mspc6\\OneDrive\\Professional\\Desktop",
-        "database.db"
+        "database.db",
     )));
 
     //let mut cursor = rt.block_on(chunk.read_chunk_sync(&mut io_sync));
 
-    // c.bench_function("get_read_u64_raw", 
-    //     |b| b.iter(|| 
+    // c.bench_function("get_read_u64_raw",
+    //     |b| b.iter(||
     //     {
     //         get_read_u64_raw(black_box(be_ptr));
     //     })
     // );
 
-    // c.bench_function("get_read_u64_crate", 
+    // c.bench_function("get_read_u64_crate",
     //     |b| b.iter(|| get_read_u64_crate(black_box(&data)))
     // );
 
     // let mut cursor = rt.block_on(chunk.read_chunk_sync(&mut io_sync));
 
-    // c.bench_function("get_row_prefetch_result", 
+    // c.bench_function("get_row_prefetch_result",
     //     |b| b.iter(||  {
-    //         _ = cursor.seek(io::SeekFrom::Start(0));  
+    //         _ = cursor.seek(io::SeekFrom::Start(0));
     //         get_row_prefetch_result(black_box(&mut cursor), black_box(&chunk))
     //     })
     // );
 
     // let mut cursor2 = rt.block_on(chunk2.read_chunk_sync(&mut io_sync));
 
-    // c.bench_function("get_row_prefetch_result_2", 
+    // c.bench_function("get_row_prefetch_result_2",
     //     |b| b.iter(|| {
-    //         _ = cursor2.seek(io::SeekFrom::Start(0));  
+    //         _ = cursor2.seek(io::SeekFrom::Start(0));
     //         get_row_prefetch_result_2(black_box(&mut cursor2), black_box(&chunk2))
     //     })
     // );

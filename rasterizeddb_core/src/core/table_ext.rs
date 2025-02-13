@@ -4,12 +4,13 @@ use super::{db_type::DbType, support_types::CursorVector};
 
 #[inline(always)]
 pub fn extent_non_string_buffer(
-    data_buffer: &mut Vec<u8>, 
-    db_type: &DbType, 
+    data_buffer: &mut Vec<u8>,
+    db_type: &DbType,
     cursor_vector: &mut CursorVector,
-    position: &mut u64) {
+    position: &mut u64,
+) {
     let db_size = db_type.get_size();
-        
+
     if db_size == 1 {
         let preset_array: [u8; 1] = [cursor_vector.vector[*position as usize]];
         *position += 1;
@@ -18,7 +19,7 @@ pub fn extent_non_string_buffer(
     } else if db_size == 2 {
         let preset_array: [u8; 2] = [
             cursor_vector.vector[*position as usize],
-            cursor_vector.vector[(*position + 1) as usize]
+            cursor_vector.vector[(*position + 1) as usize],
         ];
         *position += 2;
 
@@ -28,7 +29,7 @@ pub fn extent_non_string_buffer(
             cursor_vector.vector[*position as usize],
             cursor_vector.vector[(*position + 1) as usize],
             cursor_vector.vector[(*position + 2) as usize],
-            cursor_vector.vector[(*position + 3) as usize]
+            cursor_vector.vector[(*position + 3) as usize],
         ];
         *position += 4;
 
@@ -42,7 +43,7 @@ pub fn extent_non_string_buffer(
             cursor_vector.vector[(*position + 4) as usize],
             cursor_vector.vector[(*position + 5) as usize],
             cursor_vector.vector[(*position + 6) as usize],
-            cursor_vector.vector[(*position + 7) as usize]
+            cursor_vector.vector[(*position + 7) as usize],
         ];
         *position += 8;
 
@@ -64,7 +65,7 @@ pub fn extent_non_string_buffer(
             cursor_vector.vector[(*position + 12) as usize],
             cursor_vector.vector[(*position + 13) as usize],
             cursor_vector.vector[(*position + 14) as usize],
-            cursor_vector.vector[(*position + 15) as usize]
+            cursor_vector.vector[(*position + 15) as usize],
         ];
         *position += 16;
 

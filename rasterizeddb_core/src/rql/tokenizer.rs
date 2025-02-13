@@ -4,27 +4,27 @@ use crate::core::{column::Column, db_type::DbType};
 
 use super::models::{ComparerOperation, MathOperation, Next, Token};
 
-const ZERO_VALUE: LazyCell<Column> = LazyCell::new(|| {
-    Column::new(0).unwrap()
-});
+const ZERO_VALUE: LazyCell<Column> = LazyCell::new(|| Column::new(0).unwrap());
 
 pub(crate) fn evaluate_column_result(
-    required_columns: &mut Vec<(u32, Column)>, 
+    required_columns: &mut Vec<(u32, Column)>,
     evaluation_tokens: &mut Vec<(Vec<Token>, Option<Next>)>,
-    token_results: &mut Vec<(bool, Option<Next>)>) -> bool {
-    
+    token_results: &mut Vec<(bool, Option<Next>)>,
+) -> bool {
     let mut iter = evaluation_tokens.iter_mut();
 
     while let Some(tokens) = iter.next() {
         let mut current_value: Option<Column> = None;
         let mut token_iter = tokens.0.iter_mut();
 
-        let evalaution_result = loop {  
+        let evalaution_result = loop {
             if let Some(token) = token_iter.next() {
                 match token {
                     Token::Column(column_id) => {
                         // Get the value associated with the column_id
-                        if let Some((_, column)) = required_columns.iter().find(|(id, _)| *id == *column_id) {
+                        if let Some((_, column)) =
+                            required_columns.iter().find(|(id, _)| *id == *column_id)
+                        {
                             current_value = Some(column.clone());
                         } else {
                             continue; // Column ID not found
@@ -40,42 +40,49 @@ pub(crate) fn evaluate_column_result(
                                 }
 
                                 let right_value = column;
-                                
+
                                 // Perform the math operation
                                 match operation {
                                     MathOperation::Add => left_value.add(&right_value),
                                     MathOperation::Subtract => left_value.subtract(&right_value),
                                     MathOperation::Multiply => left_value.multiply(&right_value),
                                     MathOperation::Divide => {
-                                        if right_value.equals(&ZERO_VALUE)  {
+                                        if right_value.equals(&ZERO_VALUE) {
                                             panic!("Division with zero is not allowed.")
                                         }
                                         left_value.divide(&right_value)
                                     }
-                                    _ => todo!()
+                                    _ => todo!(),
                                 };
-                            }  else if let Some(Token::Column(column)) = iter_result {
+                            } else if let Some(Token::Column(column)) = iter_result {
                                 let right_value = column;
-    
-                                if let Some((_, column)) = required_columns.iter_mut().find(|(id, _)| *id == *right_value) {
+
+                                if let Some((_, column)) = required_columns
+                                    .iter_mut()
+                                    .find(|(id, _)| *id == *right_value)
+                                {
                                     if column.data_type == DbType::TBD {
                                         column.into_regular(left_value.data_type.clone());
                                     }
 
                                     let right_value = column;
-            
+
                                     // Perform the math operation
                                     match operation {
                                         MathOperation::Add => left_value.add(&right_value),
-                                        MathOperation::Subtract => left_value.subtract(&right_value),
-                                        MathOperation::Multiply => left_value.multiply(&right_value),
+                                        MathOperation::Subtract => {
+                                            left_value.subtract(&right_value)
+                                        }
+                                        MathOperation::Multiply => {
+                                            left_value.multiply(&right_value)
+                                        }
                                         MathOperation::Divide => {
-                                            if right_value.equals(&ZERO_VALUE)  {
+                                            if right_value.equals(&ZERO_VALUE) {
                                                 panic!("Division with zero is not allowed.")
                                             }
                                             left_value.divide(&right_value)
                                         }
-                                        _ => todo!()
+                                        _ => todo!(),
                                     };
                                 } else {
                                     continue; // Column ID not found
@@ -88,10 +95,7 @@ pub(crate) fn evaluate_column_result(
                         }
                     }
                     Token::Operation(op) => {
-                    
                         if let Some(ref mut left_value) = current_value.as_mut() {
-
-
                             let next_token = token_iter.next();
                             // Get the next token for the right operand
                             if let Some(Token::Value(ref mut column)) = next_token {
@@ -104,41 +108,76 @@ pub(crate) fn evaluate_column_result(
                                 // Perform the comparison
                                 let result = match op {
                                     ComparerOperation::Equals => left_value.equals(&right_value),
-                                    ComparerOperation::NotEquals =>  left_value.not_equal(&right_value),
-                                    ComparerOperation::Greater => left_value.greater_than(&right_value),
+                                    ComparerOperation::NotEquals => {
+                                        left_value.not_equal(&right_value)
+                                    }
+                                    ComparerOperation::Greater => {
+                                        left_value.greater_than(&right_value)
+                                    }
                                     ComparerOperation::Less => left_value.less_than(&right_value),
-                                    ComparerOperation::GreaterOrEquals => left_value.greater_or_equals(&right_value),
-                                    ComparerOperation::LessOrEquals => left_value.less_or_equals(&right_value),
-                                    ComparerOperation::Contains => left_value.contains(&right_value),
-                                    ComparerOperation::StartsWith => left_value.starts_with(&right_value),
-                                    ComparerOperation::EndsWith => left_value.ends_with(&right_value),
+                                    ComparerOperation::GreaterOrEquals => {
+                                        left_value.greater_or_equals(&right_value)
+                                    }
+                                    ComparerOperation::LessOrEquals => {
+                                        left_value.less_or_equals(&right_value)
+                                    }
+                                    ComparerOperation::Contains => {
+                                        left_value.contains(&right_value)
+                                    }
+                                    ComparerOperation::StartsWith => {
+                                        left_value.starts_with(&right_value)
+                                    }
+                                    ComparerOperation::EndsWith => {
+                                        left_value.ends_with(&right_value)
+                                    }
                                 };
 
-                                break result // Return the result of the comparison
+                                break result; // Return the result of the comparison
                             } else if let Some(Token::Column(ref mut column)) = next_token {
                                 let right_value = column;
 
-                                if let Some((_, ref mut column)) = required_columns.iter_mut().find(|(id, _)| *id == *right_value) {
+                                if let Some((_, ref mut column)) = required_columns
+                                    .iter_mut()
+                                    .find(|(id, _)| *id == *right_value)
+                                {
                                     if column.data_type == DbType::TBD {
                                         column.into_regular(left_value.data_type.clone());
                                     }
 
                                     let right_value = column;
-    
+
                                     // Perform the comparison
                                     let result = match op {
-                                        ComparerOperation::Equals => left_value.equals(&right_value),
-                                        ComparerOperation::NotEquals =>  left_value.not_equal(&right_value),
-                                        ComparerOperation::Greater => left_value.greater_than(&right_value),
-                                        ComparerOperation::Less => left_value.less_than(&right_value),
-                                        ComparerOperation::GreaterOrEquals => left_value.greater_or_equals(&right_value),
-                                        ComparerOperation::LessOrEquals => left_value.less_or_equals(&right_value),
-                                        ComparerOperation::Contains => left_value.contains(&right_value),
-                                        ComparerOperation::StartsWith => left_value.starts_with(&right_value),
-                                        ComparerOperation::EndsWith => left_value.ends_with(&right_value),
+                                        ComparerOperation::Equals => {
+                                            left_value.equals(&right_value)
+                                        }
+                                        ComparerOperation::NotEquals => {
+                                            left_value.not_equal(&right_value)
+                                        }
+                                        ComparerOperation::Greater => {
+                                            left_value.greater_than(&right_value)
+                                        }
+                                        ComparerOperation::Less => {
+                                            left_value.less_than(&right_value)
+                                        }
+                                        ComparerOperation::GreaterOrEquals => {
+                                            left_value.greater_or_equals(&right_value)
+                                        }
+                                        ComparerOperation::LessOrEquals => {
+                                            left_value.less_or_equals(&right_value)
+                                        }
+                                        ComparerOperation::Contains => {
+                                            left_value.contains(&right_value)
+                                        }
+                                        ComparerOperation::StartsWith => {
+                                            left_value.starts_with(&right_value)
+                                        }
+                                        ComparerOperation::EndsWith => {
+                                            left_value.ends_with(&right_value)
+                                        }
                                     };
-    
-                                    break result
+
+                                    break result;
                                 } else {
                                     continue; // Column ID not found
                                 }
@@ -154,7 +193,7 @@ pub(crate) fn evaluate_column_result(
                     }
                 }
             } else {
-                break false
+                break false;
             }
         };
 
@@ -173,7 +212,7 @@ pub(crate) fn evaluate_column_result(
             final_result = first.0;
             previous = first.1.clone().unwrap();
         }
-        
+
         for token_result in token_results.iter().skip(1).take(total_results_len - 2) {
             if let Some(next) = token_result.1.clone() {
                 if previous == Next::And {
@@ -198,6 +237,6 @@ pub(crate) fn evaluate_column_result(
             final_result = token_result.0;
         }
     }
-    
+
     final_result // Default to false if no comparison was made
 }

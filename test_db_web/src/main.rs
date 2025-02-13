@@ -1,26 +1,28 @@
-use std::mem::ManuallyDrop;
-use rasterizeddb_core::core::{
-    column::Column, 
-    row::InsertOrUpdateRow, 
-    storage_providers::file_sync::LocalStorageProvider, 
-    table::Table
-};
-use axum::{response::Response, routing::get};
 use axum::Router;
+use axum::{response::Response, routing::get};
+use rasterizeddb_core::core::{
+    column::Column, row::InsertOrUpdateRow, storage_providers::file_sync::LocalStorageProvider,
+    table::Table,
+};
 use rasterizeddb_core::rql::parser::parse_rql;
+use std::mem::ManuallyDrop;
 
-static mut TABLE: async_lazy::Lazy<Table<LocalStorageProvider>> = async_lazy::Lazy::const_new(|| Box::pin(async {
-    let io_sync = LocalStorageProvider::new(
-        "C:\\Users\\mspc6\\OneDrive\\Professional\\Desktop",
-        "database.db"
-    ).await;
+static mut TABLE: async_lazy::Lazy<Table<LocalStorageProvider>> =
+    async_lazy::Lazy::const_new(|| {
+        Box::pin(async {
+            let io_sync = LocalStorageProvider::new(
+                "C:\\Users\\mspc6\\OneDrive\\Professional\\Desktop",
+                "database.db",
+            )
+            .await;
 
-    let mut table = Table::init(io_sync, false, false).await.unwrap();
+            let mut table = Table::init(io_sync, false, false).await.unwrap();
 
-    table.rebuild_in_memory_indexes().await;
+            table.rebuild_in_memory_indexes().await;
 
-    table
-}));
+            table
+        })
+    });
 
 #[tokio::main]
 async fn main() {
@@ -28,9 +30,7 @@ async fn main() {
         .route("/", get(index))
         .route("/get", get(query));
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:80")
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:80").await.unwrap();
 
     axum::serve(listener, app).await.unwrap();
 }
@@ -47,16 +47,14 @@ async fn index() -> Response {
     let c3_update = Column::new(&large_string).unwrap();
 
     let mut columns_buffer_update: Vec<u8> = Vec::with_capacity(
-        c1_update.len() + 
-        c2_update.len()
-        //c3_update.len() 
+        c1_update.len() + c2_update.len(), //c3_update.len()
     );
     columns_buffer_update.append(&mut c1_update.content.to_vec());
     columns_buffer_update.append(&mut c2_update.content.to_vec());
     columns_buffer_update.append(&mut c3_update.content.to_vec());
 
     let update_row = InsertOrUpdateRow {
-        columns_data: columns_buffer_update
+        columns_data: columns_buffer_update,
     };
 
     let table = unsafe { TABLE.force_mut().await };
@@ -72,18 +70,24 @@ async fn query() -> Response {
     let y = rand::random_range(-10..10 as i32);
 
     //OR COL(1) = {x} / {y} * {z}
-    
-    let query_evaluation = parse_rql(&format!(r#"
+
+    let query_evaluation = parse_rql(&format!(
+        r#"
         BEGIN
         SELECT FROM NAME_DOESNT_MATTER_FOR_NOW
         WHERE COL(0) > {x} OR COL(1) > {y} OR COL(0) > -1000
         LIMIT 1000
         END
-    "#)).unwrap();
+    "#
+    ))
+    .unwrap();
 
     let table = unsafe { TABLE.force_mut().await };
 
-    let result = table.execute_query(query_evaluation.parser_result).await.unwrap();
+    let result = table
+        .execute_query(query_evaluation.parser_result)
+        .await
+        .unwrap();
 
     if result.is_some() {
         Response::builder().status(200).body("".into()).unwrap()

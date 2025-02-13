@@ -1,4 +1,8 @@
-use std::{arch::{asm, x86_64::*}, mem::{self, ManuallyDrop}, ptr};
+use std::{
+    arch::{asm, x86_64::*},
+    mem::{self, ManuallyDrop},
+    ptr,
+};
 
 #[inline]
 pub(crate) fn compare_vecs_eq(vec1: &[u8], vec2: &[u8]) -> bool {
@@ -7,7 +11,7 @@ pub(crate) fn compare_vecs_eq(vec1: &[u8], vec2: &[u8]) -> bool {
         return false;
     }
 
-    return vec1.eq(vec2); 
+    return vec1.eq(vec2);
 }
 
 #[inline]
@@ -17,7 +21,7 @@ pub(crate) fn compare_vecs_ne(vec1: &[u8], vec2: &[u8]) -> bool {
         return true;
     }
 
-    return vec1.ne(vec2); 
+    return vec1.ne(vec2);
 }
 
 /// Check if `haystack` contains `needle`
@@ -41,7 +45,7 @@ pub(crate) fn contains_subsequence(haystack: &[u8], needle: &[u8]) -> bool {
             while i <= haystack_len - needle_len {
                 // Load 16 bytes from haystack using SSE2
                 let chunk = _mm_loadu_si128(haystack[i..].as_ptr() as *const __m128i);
-                
+
                 // Compare with first byte of needle
                 let cmp_mask = _mm_movemask_epi8(_mm_cmpeq_epi8(chunk, needle_first_byte));
 
@@ -71,18 +75,23 @@ pub(crate) fn contains_subsequence(haystack: &[u8], needle: &[u8]) -> bool {
 
 #[inline]
 pub(crate) fn compare_vecs_starts_with(vec1: &[u8], vec2: &[u8]) -> bool {
-    return vec1.starts_with(vec2); 
+    return vec1.starts_with(vec2);
 }
 
 #[inline]
 pub(crate) fn compare_vecs_ends_with(vec1: &[u8], vec2: &[u8]) -> bool {
-    return vec1.ends_with(vec2); 
+    return vec1.ends_with(vec2);
 }
 
 #[inline(always)]
-pub unsafe fn compare_raw_vecs(vec_a: *mut u8, vec_b: *mut u8, vec_a_len: u32, vec_b_len: u32) -> bool {
+pub unsafe fn compare_raw_vecs(
+    vec_a: *mut u8,
+    vec_b: *mut u8,
+    vec_a_len: u32,
+    vec_b_len: u32,
+) -> bool {
     let mut result: u8;
-    
+
     if vec_a_len != vec_b_len {
         return false;
     }
