@@ -1,9 +1,11 @@
+#[allow(unused_imports)]
 use std::{
     arch::x86_64::{_mm_prefetch, _MM_HINT_T0},
     fs::remove_file,
     io::stdin,
 };
 
+#[allow(unused_imports)]
 use rasterizeddb_core::{
     core::{
         column::Column, row::InsertOrUpdateRow, storage_providers::file_sync::LocalStorageProvider,

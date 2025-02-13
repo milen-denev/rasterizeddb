@@ -1,5 +1,5 @@
 use crate::{
-    core::{column::Column, db_type::DbType, hashing::get_hash, row::InsertOrUpdateRow},
+    core::{column::Column, hashing::get_hash, row::InsertOrUpdateRow},
     memory_pool::Chunk,
     POSITIONS_CACHE,
 };

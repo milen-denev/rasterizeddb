@@ -1,8 +1,7 @@
 use std::{
     arch::x86_64::{_mm_prefetch, _MM_HINT_T0},
     fmt::{Debug, Display},
-    io::{self, Cursor, Read, Write},
-    ptr,
+    io::{self, Cursor, Read, Write}
 };
 
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -13,7 +12,7 @@ use crate::{
         compare_raw_vecs, compare_vecs_ends_with, compare_vecs_eq, compare_vecs_ne,
         compare_vecs_starts_with, contains_subsequence, vec_from_ptr_safe,
     },
-    memory_pool::{Chunk, MEMORY_POOL},
+    memory_pool::Chunk,
     simds::endianess::{
         read_f32, read_f64, read_i128, read_i16, read_i32, read_i64, read_i8, read_u128, read_u16,
         read_u32, read_u64, read_u8,
@@ -466,90 +465,6 @@ impl Column {
         }
 
         return Ok(columns);
-    }
-
-    #[inline(always)]
-    pub fn into_downgrade(self) -> Column {
-        let data_type = self.data_type.to_byte();
-
-        if (1..=10).contains(&data_type) {
-            let db_type = DbType::from_byte(data_type);
-            // SAFETY: we assume self.into_chunk() always returns Some(chunk)
-            let memory_chunk = unsafe { self.into_chunk().unwrap() };
-            let data_buffer = unsafe { memory_chunk.into_vec() };
-
-            memory_chunk.prefetch_to_lcache();
-
-            // Read the value and cast to i128 as needed.
-            let value: i128 = match db_type {
-                DbType::I8 => data_buffer.as_slice().read_i8().unwrap() as i128,
-                DbType::I16 => LittleEndian::read_i16(data_buffer.as_slice()) as i128,
-                DbType::I32 => LittleEndian::read_i32(data_buffer.as_slice()) as i128,
-                DbType::I64 => LittleEndian::read_i64(data_buffer.as_slice()) as i128,
-                DbType::I128 => LittleEndian::read_i128(data_buffer.as_slice()),
-                DbType::U8 => data_buffer.as_slice().read_u8().unwrap() as i128,
-                DbType::U16 => LittleEndian::read_u16(data_buffer.as_slice()) as i128,
-                DbType::U32 => LittleEndian::read_u32(data_buffer.as_slice()) as i128,
-                DbType::U64 => LittleEndian::read_u64(data_buffer.as_slice()) as i128,
-                DbType::U128 => LittleEndian::read_u128(data_buffer.as_slice()) as i128,
-                _ => panic!("Unsupported type"),
-            };
-
-            // Convert to little-endian bytes (16 bytes for i128).
-            let mut bytes = value.to_le_bytes();
-            // Acquire a new memory chunk sized for 16 bytes.
-            let new_memory_chunk = MEMORY_POOL
-                .acquire(16)
-                .unwrap_or_else(|| Chunk::from_vec(vec![0; 16]));
-
-            let new_buffer = unsafe { new_memory_chunk.into_vec() };
-
-            // Copy the bytes safely.
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    bytes.as_mut_ptr(),
-                    new_buffer.as_vec().as_ptr() as *mut u8,
-                    8,
-                );
-            }
-
-            // Column type for i128 is indicated by 5.
-            return Column::from_chunk(5, new_memory_chunk);
-        } else if (11..=12).contains(&data_type) {
-            let db_type = DbType::from_byte(data_type);
-            let memory_chunk = unsafe { self.into_chunk().unwrap() };
-            let data_buffer = unsafe { memory_chunk.into_vec() };
-
-            memory_chunk.prefetch_to_lcache();
-
-            // For floating-point, convert to f64.
-            let value: f64 = match db_type {
-                DbType::F32 => LittleEndian::read_f32(data_buffer.as_slice()) as f64,
-                DbType::F64 => LittleEndian::read_f64(data_buffer.as_slice()) as f64,
-                _ => panic!("Unsupported type"),
-            };
-
-            // f64 converts to 8 little-endian bytes.
-            let mut bytes = value.to_le_bytes();
-            let new_memory_chunk = MEMORY_POOL
-                .acquire(8)
-                .unwrap_or_else(|| Chunk::from_vec(vec![0; 8]));
-
-            let new_buffer = unsafe { new_memory_chunk.into_vec() };
-
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    bytes.as_mut_ptr(),
-                    new_buffer.as_vec().as_ptr() as *mut u8,
-                    8,
-                );
-            }
-
-            // Column type for f64 is indicated by 12.
-            return Column::from_chunk(12, new_memory_chunk);
-        }
-        // For any other type, return self unchanged.
-        self
     }
 
     /// For debug purposes

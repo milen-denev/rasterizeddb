@@ -4,8 +4,8 @@ use rasterizeddb_core::core::{
     column::Column, row::InsertOrUpdateRow, storage_providers::file_sync::LocalStorageProvider,
     table::Table,
 };
+
 use rasterizeddb_core::rql::parser::parse_rql;
-use std::mem::ManuallyDrop;
 
 static mut TABLE: async_lazy::Lazy<Table<LocalStorageProvider>> =
     async_lazy::Lazy::const_new(|| {

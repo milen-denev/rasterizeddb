@@ -1,5 +1,3 @@
-use std::pin::Pin;
-
 use crate::core::column::Column;
 
 #[derive(Debug, PartialEq, Clone)]

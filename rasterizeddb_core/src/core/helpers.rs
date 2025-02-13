@@ -1,8 +1,6 @@
 use std::{
     arch::x86_64::{_mm_prefetch, _MM_HINT_T0},
-    io::{self, Cursor, Read, Seek, SeekFrom},
-    mem::ManuallyDrop,
-    ptr,
+    io::{self, Cursor, Read, Seek, SeekFrom}
 };
 
 use byteorder::{LittleEndian, ReadBytesExt};
@@ -15,8 +13,6 @@ use super::{
     support_types::{CursorVector, FileChunk, RowPrefetchResult},
 };
 use crate::{
-    instructions::ref_vec,
-    memory_pool::{Chunk, MEMORY_POOL},
     simds::endianess::{read_u32, read_u64, read_u8},
     CHUNK_SIZE, EMPTY_BUFFER, HEADER_SIZE,
 };

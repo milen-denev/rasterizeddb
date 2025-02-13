@@ -1,7 +1,6 @@
 use std::{
     arch::x86_64::{_mm_prefetch, _MM_HINT_T0},
     io::{self, Read, Seek, SeekFrom, Write},
-    pin::Pin,
     sync::Arc,
 };
 
@@ -26,7 +25,6 @@ use super::{
 };
 use crate::{
     core::helpers::delete_row_file,
-    instructions::ref_vec,
     memory_pool::{Chunk, MEMORY_POOL},
     rql::models::Next,
     simds::endianess::read_u32,
@@ -456,7 +454,7 @@ impl<S: IOOperationsSync> Table<S> {
                                             Column::from_chunk(column_type, str_memory_chunk);
 
                                         required_columns
-                                            .push((current_column_index, column.into_downgrade()));
+                                            .push((current_column_index, column));
                                     }
                                 } else {
                                     let column_type = cursor_vector.vector[position as usize];

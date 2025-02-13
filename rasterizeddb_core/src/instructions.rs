@@ -1,6 +1,6 @@
 use std::{
     arch::{asm, x86_64::*},
-    mem::{self, ManuallyDrop},
+    mem::ManuallyDrop,
     ptr,
 };
 
@@ -107,6 +107,7 @@ pub unsafe fn compare_raw_vecs(
     result == 0
 }
 
+#[allow(unused)]
 pub fn copy_vec_to_ptr(vec: &[u8], dst: *mut u8) {
     unsafe {
         ptr::copy_nonoverlapping(vec.as_ptr(), dst, vec.len());

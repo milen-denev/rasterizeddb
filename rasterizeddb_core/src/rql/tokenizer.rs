@@ -1,4 +1,4 @@
-use std::{cell::LazyCell, pin::Pin};
+use std::cell::LazyCell;
 
 use crate::core::{column::Column, db_type::DbType};
 
