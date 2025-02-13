@@ -1,10 +1,11 @@
-pub mod table;
 pub mod column;
+pub mod database;
 pub mod db_type;
+pub mod hashing;
 pub mod helpers;
 pub mod row;
-pub mod table_header;
-pub mod support_types;
-pub mod hashing;
-pub mod database;
 pub mod storage_providers;
+pub mod support_types;
+pub mod table;
+pub mod table_ext;
+pub mod table_header;

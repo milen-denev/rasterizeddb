@@ -7,7 +7,7 @@ pub(crate) fn whitespace_spec_splitter(input: &str) -> Vec<String> {
         match c {
             '\'' => {
                 in_quotes = !in_quotes; // Toggle the in_quotes flag
-                current.push(c);       // Include the quote in the current part
+                current.push(c); // Include the quote in the current part
             }
             ' ' if !in_quotes => {
                 if !current.is_empty() {

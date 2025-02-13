@@ -17,9 +17,10 @@ pub enum DbType {
     CHAR,
     STRING,
     DATETIME,
+    TBD,
     NULL,
     START,
-    END
+    END,
 }
 
 impl Display for DbType {
@@ -29,7 +30,7 @@ impl Display for DbType {
 }
 
 impl DbType {
-    pub fn to_byte(&self) -> u8{
+    pub fn to_byte(&self) -> u8 {
         match self {
             DbType::I8 => 1,
             DbType::I16 => 2,
@@ -46,12 +47,14 @@ impl DbType {
             DbType::CHAR => 13,
             DbType::STRING => 14,
             DbType::DATETIME => 15,
+            DbType::TBD => 252,
             DbType::NULL => 253,
             DbType::START => 254,
-            DbType::END => 255
+            DbType::END => 255,
         }
     }
 
+    #[track_caller]
     pub fn from_byte(byte: u8) -> DbType {
         match byte {
             1 => DbType::I8,
@@ -72,11 +75,12 @@ impl DbType {
             253 => DbType::NULL,
             254 => DbType::START,
             255 => DbType::END,
-            _ => panic!("Invalid byte type: {}", byte)
+            _ => panic!("Invalid byte type: {}", byte),
         }
     }
 
-    pub fn get_size(&self) -> u64 {
+    #[track_caller]
+    pub fn get_size(&self) -> u32 {
         match self {
             DbType::I8 => 1,
             DbType::I16 => 2,
@@ -92,10 +96,11 @@ impl DbType {
             DbType::F64 => 8,
             DbType::CHAR => 4,
             DbType::STRING => panic!("STRING type doesn't have a set size of bytes."),
+            DbType::TBD => panic!("TBD (To Be Determined) is a temporary type."),
             DbType::NULL => 1,
             DbType::START => 1,
             DbType::END => 1,
-            DbType::DATETIME => todo!()
+            DbType::DATETIME => todo!(),
         }
     }
 }

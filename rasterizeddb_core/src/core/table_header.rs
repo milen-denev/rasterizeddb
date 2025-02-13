@@ -1,24 +1,27 @@
-use std::{fs::File, io::{self, Cursor, Seek, SeekFrom, Write}};
+use std::{
+    fs::File,
+    io::{self, Cursor, Seek, SeekFrom, Write},
+};
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
 pub struct TableHeader {
-    pub(crate) total_file_length: u64,  // Total length of the file in bytes
-    pub(crate) shard_number: u32,       // Identifier for the shard
-    pub(crate) compressed: bool,        // Compression status: true if compressed, false otherwise
-    pub(crate) first_row_id: u64,       // ID of the first row
-    pub(crate) last_row_id: u64,        // ID of the last row
-    pub(crate) immutable: bool          // Append only table
+    pub(crate) total_file_length: u64, // Total length of the file in bytes
+    pub(crate) shard_number: u32,      // Identifier for the shard
+    pub(crate) compressed: bool,       // Compression status: true if compressed, false otherwise
+    pub(crate) first_row_id: u64,      // ID of the first row
+    pub(crate) last_row_id: u64,       // ID of the last row
+    pub(crate) immutable: bool,        // Append only table
 }
 
 impl TableHeader {
     pub(crate) fn new(
         total_file_length: u64, //8
-        shard_number: u32, //4
-        compressed: bool, //1
-        first_row_id: u64, //8
-        last_row_id: u64, //8
-        immutable: bool //1
+        shard_number: u32,      //4
+        compressed: bool,       //1
+        first_row_id: u64,      //8
+        last_row_id: u64,       //8
+        immutable: bool,        //1
     ) -> Self {
         Self {
             total_file_length,
@@ -26,7 +29,7 @@ impl TableHeader {
             compressed,
             first_row_id,
             last_row_id,
-            immutable: immutable
+            immutable: immutable,
         }
     }
 
@@ -35,13 +38,17 @@ impl TableHeader {
         let mut buffer = Vec::new();
 
         // Write total_file_length as u64
-        buffer.write_u64::<LittleEndian>(self.total_file_length).unwrap();
+        buffer
+            .write_u64::<LittleEndian>(self.total_file_length)
+            .unwrap();
 
         // Write shard_number as u32
         buffer.write_u32::<LittleEndian>(self.shard_number).unwrap();
 
         // Write compressed as a single byte (0 for false, 1 for true)
-        buffer.write_u8(if self.compressed { 1 } else { 0 }).unwrap();
+        buffer
+            .write_u8(if self.compressed { 1 } else { 0 })
+            .unwrap();
 
         // Write first_row_id as u64
         buffer.write_u64::<LittleEndian>(self.first_row_id).unwrap();
