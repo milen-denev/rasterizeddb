@@ -5,9 +5,9 @@ use std::{
     sync::Arc,
 };
 
+use futures::executor::block_on;
 use tokio::{
     io::{AsyncReadExt, AsyncSeekExt},
-    runtime::Handle,
     sync::RwLock,
 };
 
@@ -23,15 +23,37 @@ pub struct LocalStorageProvider {
 
 impl Clone for LocalStorageProvider {
     fn clone(&self) -> Self {
-        let handle = Handle::current();
-        _ = handle.enter();
-        let read_guard_file = futures::executor::block_on(self.read_file.read());
-        let read_file = futures::executor::block_on(read_guard_file.try_clone()).unwrap();
+        let delimiter = if cfg!(unix) {
+            "/"
+        } else if cfg!(windows) {
+            "\\"
+        } else {
+            panic!("OS not supported");
+        };
+
+        let file_str = format!("{}{}{}", self.location, delimiter, self.table_name);
+
+        let file_read = block_on(tokio::fs::File::options()
+            .read(true)
+            .open(&file_str))
+            .unwrap();
+
+        let file_append = std::fs::File::options()
+            .read(true)
+            .append(true)
+            .open(&file_str)
+            .unwrap();
+
+        let file_write = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(&file_str)
+            .unwrap();
 
         Self {
-            read_file: Arc::new(RwLock::new(read_file)),
-            append_file: self.append_file.try_clone().unwrap(),
-            write_file: self.write_file.try_clone().unwrap(),
+            read_file: Arc::new(RwLock::new(file_read)),
+            append_file: file_append,
+            write_file: file_write,
             location: self.location.clone(),
             table_name: self.table_name.clone(),
         }

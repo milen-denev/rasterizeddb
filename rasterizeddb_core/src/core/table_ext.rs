@@ -1,14 +1,18 @@
-use std::io::{Read, Seek, SeekFrom};
+use std::{arch::x86_64::{_mm_prefetch, _MM_HINT_T0}, io::{self, Read, Seek, SeekFrom, Write}, sync::Arc};
 
-use super::{db_type::DbType, support_types::CursorVector};
+use futures::{stream, StreamExt};
+use tokio::sync::RwLock;
+
+use crate::{memory_pool::{Chunk, MEMORY_POOL}, rql::{models::{Next, Token}, tokenizer::evaluate_column_result}, simds::endianess::read_u32};
+
+use super::{column::Column, db_type::DbType, helpers::{read_row_cursor, row_prefetching_cursor}, row::Row, storage_providers::traits::IOOperationsSync, support_types::{CursorVector, FileChunk}};
 
 #[inline(always)]
 pub fn extent_non_string_buffer(
     data_buffer: &mut Vec<u8>,
     db_type: &DbType,
     cursor_vector: &mut CursorVector,
-    position: &mut u64,
-) {
+    position: &mut u64) {
     let db_size = db_type.get_size();
 
     if db_size == 1 {
@@ -78,4 +82,277 @@ pub fn extent_non_string_buffer(
         data_buffer.append(&mut preset_buffer);
         *position += db_size as u64;
     }
+}
+
+pub(crate) async fn _process_all_chunks(
+    column_indexes: Vec<u32>,
+    evaluation_tokens: Arc<RwLock<Vec<(Vec<Token>, Option<Next>)>>>,
+    limit: u64,
+    select_all: bool,
+    mutated: bool,
+    io_sync: &mut Box<impl IOOperationsSync>,
+    chunks: Vec<FileChunk>,
+    parallelism_limit: usize
+) -> io::Result<Option<Vec<Row>>> {
+    let rows: Arc<RwLock<Vec<Row>>> = if limit < 1024 && limit > 0 {
+        Arc::new(RwLock::new(Vec::with_capacity(limit as usize)))
+    } else {
+        Arc::new(RwLock::new(Vec::default()))
+    };
+
+    let rows_clone = rows.clone(); // Clone the Arc *outside* the stream
+
+    // Create a stream of futures, each processing one chunk.
+    let stream = stream::iter(chunks.iter().map(|chunk| {
+        let rows_clone_inner = rows_clone.clone(); // Clone again *inside* the map for each chunk
+        let mut io_sync_inner = io_sync.clone();
+        let column_indexes_inner = column_indexes.clone();
+        let evaluation_tokens_inner = evaluation_tokens.clone();
+
+        // You can also clone necessary shared resources here if needed.
+        async move { _process_chunk_async(
+            chunk.read_chunk_sync(&mut io_sync_inner).await, 
+            column_indexes_inner,
+            evaluation_tokens_inner, 
+            limit,
+            select_all,
+            mutated,
+            chunk,
+            rows_clone_inner).await }
+    }));
+
+    // `buffered` limits the number of concurrently running tasks.
+    let mut results = stream.buffered(parallelism_limit);
+
+    // Handle any errors from the stream
+    while let Some(result) = results.next().await {
+        if let Err(e) = result {
+            // Log or handle the error appropriately.  You might want to return an error here.
+            panic!("Error processing chunk: {:?}", e);
+            // Example: return Err(io::Error::new(io::ErrorKind::Other, "Error processing chunks"));
+        }
+    }
+
+    let mut all_rows: Vec<Row> = Vec::new();
+
+    let rows_write = rows.write_owned().await;
+
+    while let Some(row) = rows_write.iter().next() {
+        all_rows.push(row.clone());
+        if all_rows.len() >= limit as usize {
+            all_rows.truncate(limit as usize);
+            break;
+        }
+    }
+
+    Ok(Some(all_rows))
+}
+
+pub(crate) async fn _process_chunk_async(
+    chunk_buffer: Vec<u8>,
+    column_indexes: Vec<u32>,
+    evaluation_tokens: Arc<RwLock<Vec<(Vec<Token>, Option<Next>)>>>,
+    limit: u64,
+    select_all: bool, 
+    mutated: bool,
+    file_chunk: &FileChunk,
+    rows: Arc<RwLock<Vec<Row>>>
+) -> io::Result<()> {
+    let mut position: u64 = 0;
+    let mut cursor_vector = CursorVector::new(&chunk_buffer);
+    let mut required_columns: Vec<(u32, Column)> = Vec::default();
+    let mut token_results: Vec<(bool, Option<Next>)> = Vec::default();
+
+    loop {
+        if let Some(prefetch_result) =
+            row_prefetching_cursor(&mut position, &mut cursor_vector, file_chunk, mutated)
+                .unwrap()
+        {
+            let mut current_column_index: u32 = 0;
+            let first_column_index = position.clone();
+
+            loop {
+                if column_indexes.iter().any(|x| *x == current_column_index) {
+                    let column_type = cursor_vector.vector[position as usize];
+                    position += 1;
+
+                    let db_type = DbType::from_byte(column_type.clone());
+
+                    if db_type == DbType::END {
+                        break;
+                    }
+
+                    if db_type != DbType::STRING {
+                        let size = db_type.get_size();
+                        let memory_chunk =
+                            MEMORY_POOL.acquire(size).unwrap_or_else(|| {
+                                Chunk::from_vec(vec![0; size as usize])
+                            });
+
+                        let mut data_buffer = unsafe { memory_chunk.into_vec() };
+
+                        extent_non_string_buffer(
+                            data_buffer.as_vec_mut(),
+                            &db_type,
+                            &mut cursor_vector,
+                            &mut position,
+                        );
+
+                        let column = Column::from_chunk(column_type, memory_chunk);
+
+                        required_columns.push((current_column_index, column));
+                    } else {
+                        let str_len_array: [u8; 4] = [
+                            cursor_vector.vector[position as usize],
+                            cursor_vector.vector[(position + 1) as usize],
+                            cursor_vector.vector[(position + 2) as usize],
+                            cursor_vector.vector[(position + 3) as usize],
+                        ];
+
+                        position += 4;
+
+                        let str_len_array_pointer = str_len_array.as_ptr();
+
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            unsafe {
+                                _mm_prefetch::<_MM_HINT_T0>(
+                                    str_len_array_pointer as *const i8,
+                                )
+                            };
+                        }
+
+                        let str_length = unsafe { read_u32(str_len_array_pointer) };
+
+                        let cursor = &mut cursor_vector.cursor;
+                        cursor.seek(SeekFrom::Start(position)).unwrap();
+
+                        let str_memory_chunk = MEMORY_POOL
+                            .acquire(str_length + 4)
+                            .unwrap_or_else(|| {
+                                Chunk::from_vec(vec![0; str_length as usize + 4])
+                            });
+
+                        let mut preset_buffer =
+                            unsafe { str_memory_chunk.into_vec() };
+
+                        _ = preset_buffer
+                            .as_vec_mut()
+                            .write(&str_length.to_le_bytes());
+
+                        cursor.read(preset_buffer.as_vec_mut()).unwrap();
+
+                        position += str_length as u64;
+
+                        let column =
+                            Column::from_chunk(column_type, str_memory_chunk);
+
+                        required_columns
+                            .push((current_column_index, column));
+                    }
+                } else {
+                    let column_type = cursor_vector.vector[position as usize];
+                    position += 1;
+
+                    let db_type = DbType::from_byte(column_type);
+
+                    if db_type == DbType::END {
+                        break;
+                    }
+
+                    if db_type != DbType::STRING {
+                        let db_size = db_type.get_size();
+                        position += db_size as u64;
+                    } else {
+                        let str_len_array: [u8; 4] = [
+                            cursor_vector.vector[position as usize],
+                            cursor_vector.vector[(position + 1) as usize],
+                            cursor_vector.vector[(position + 2) as usize],
+                            cursor_vector.vector[(position + 3) as usize],
+                        ];
+
+                        position += 4;
+
+                        let str_len_array_pointer = str_len_array.as_ptr();
+
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            unsafe {
+                                _mm_prefetch::<_MM_HINT_T0>(
+                                    str_len_array_pointer as *const i8,
+                                )
+                            };
+                        }
+
+                        let str_length = unsafe { read_u32(str_len_array_pointer) };
+
+                        position += str_length as u64;
+                    }
+                }
+                current_column_index += 1;
+            }
+
+            let evaluation = if !select_all {
+                let mut evaluation_tokens_write = evaluation_tokens.write().await;
+
+                let eval = evaluate_column_result(
+                    &mut required_columns,
+                    &mut evaluation_tokens_write,
+                    &mut token_results,
+                );
+
+                required_columns.clear();
+                token_results.clear();
+                eval
+            } else {
+                true
+            };
+
+            if evaluation {
+                let mut cursor = &mut cursor_vector.cursor;
+                cursor.seek(SeekFrom::Start(position)).unwrap();
+
+                let row = read_row_cursor(
+                    first_column_index,
+                    prefetch_result.found_id,
+                    prefetch_result.length,
+                    &mut cursor,
+                )
+                .unwrap();
+
+                let mut rows_write = rows.write().await;
+                let current_limit = rows_write.len();
+
+                if current_limit < limit as usize {
+                    rows_write.push(row);
+                }
+
+                #[cfg(feature = "enable_index_caching")]
+                {
+                    result_row_vec.push((
+                        chunk.current_file_position + first_column_index
+                            - 1
+                            - 8
+                            - 4,
+                        prefetch_result.length,
+                    ));
+                }
+
+                if current_limit == limit as usize {
+                    #[cfg(feature = "enable_index_caching")]
+                    {
+                        POSITIONS_CACHE.insert(hash, result_row_vec);
+                    }
+
+                    break;
+                }
+
+                position = cursor.stream_position().unwrap();
+            }
+        } else {
+            break;
+        }
+    };
+
+    Ok(())
 }

@@ -320,6 +320,7 @@ impl<S: IOOperationsSync> Table<S> {
 
             return Ok(Some(rows));
         } else if let ParserResult::QueryEvaluationTokens(evaluation_tokens) = parser_result {
+
             let limit = evaluation_tokens.limit;
 
             let mut rows: Vec<Row> = if limit < 1024 && limit > 0 {
@@ -349,8 +350,6 @@ impl<S: IOOperationsSync> Table<S> {
             let mutated = table_header.mutated;
 
             if let Some(chunks) = chunks_result.as_ref() {
-                let mut required_columns: Vec<(u32, Column)> = Vec::default();
-                let mut token_results: Vec<(bool, Option<Next>)> = Vec::with_capacity(evaluation_tokens.len());
 
                 let column_indexes = evaluation_tokens
                     .iter()
@@ -365,6 +364,23 @@ impl<S: IOOperationsSync> Table<S> {
                     })
                     .collect_vec();
 
+                // #[cfg(feature  = "enable_parallelism")]
+                // {
+                //     return process_all_chunks(
+                //         column_indexes,
+                //         Arc::new(RwLock::new(evaluation_tokens)),
+                //         limit as u64,
+                //         select_all,
+                //         mutated,
+                //         &mut self.io_sync,
+                //         chunks.clone(),
+                //         50
+                //     ).await;
+                // }
+
+                let mut required_columns: Vec<(u32, Column)> = Vec::default();
+                let mut token_results: Vec<(bool, Option<Next>)> = Vec::with_capacity(evaluation_tokens.len());
+
                 for chunk in chunks {
                     let buffer = chunk.read_chunk_sync(&mut self.io_sync).await;
 
@@ -372,9 +388,7 @@ impl<S: IOOperationsSync> Table<S> {
                     let mut position: u64 = 0;
 
                     loop {
-                        if let Some(prefetch_result) =
-                            row_prefetching_cursor(&mut position, &mut cursor_vector, chunk, mutated)
-                                .unwrap()
+                        if let Some(prefetch_result) = row_prefetching_cursor(&mut position, &mut cursor_vector, chunk, mutated).unwrap()
                         {
                             let mut current_column_index: u32 = 0;
                             let first_column_index = position.clone();
