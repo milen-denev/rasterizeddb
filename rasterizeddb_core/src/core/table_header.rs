@@ -1,7 +1,4 @@
-use std::{
-    fs::File,
-    io::{self, Cursor, Seek, SeekFrom, Write},
-};
+use std::io::{self, Cursor};
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
@@ -12,6 +9,7 @@ pub struct TableHeader {
     pub(crate) first_row_id: u64,      // ID of the first row
     pub(crate) last_row_id: u64,       // ID of the last row
     pub(crate) immutable: bool,        // Append only table
+    pub(crate) mutated: bool
 }
 
 impl TableHeader {
@@ -30,6 +28,7 @@ impl TableHeader {
             first_row_id,
             last_row_id,
             immutable: immutable,
+            mutated: false
         }
     }
 
@@ -59,21 +58,10 @@ impl TableHeader {
         // Write immutable as u8
         buffer.write_u8(if self.immutable { 1 } else { 0 }).unwrap();
 
+        // Write mutated as u8
+        buffer.write_u8(if self.mutated { 1 } else { 0 }).unwrap();
+
         Ok(buffer)
-    }
-
-    /// Save the header fields and rewrite to file
-    pub(crate) fn _save_header(&self, file_name: &str) -> io::Result<()> {
-        let mut file = File::options().write(true).open(file_name).unwrap();
-
-        // Serialize the new header
-        let header_bytes = self.to_bytes().unwrap();
-
-        // Seek to the beginning of the file and overwrite the header
-        file.seek(SeekFrom::Start(0)).unwrap();
-        file.write_all(&header_bytes).unwrap();
-
-        Ok(())
     }
 
     pub(crate) fn from_buffer(buffer: Vec<u8>) -> io::Result<TableHeader> {
@@ -97,6 +85,9 @@ impl TableHeader {
         // Read immutable as u8
         let immutable = cursor.read_u8().unwrap();
 
+        // Read mutated as u8
+        let mutated = cursor.read_u8().unwrap();
+
         Ok(TableHeader {
             total_file_length: total_file_length,
             shard_number: shard_number,
@@ -104,6 +95,7 @@ impl TableHeader {
             first_row_id: first_row_id,
             last_row_id: last_row_id,
             immutable: if immutable == 1 { true } else { false },
+            mutated: if mutated == 1 { true } else { false },
         })
     }
 }

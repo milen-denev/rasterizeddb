@@ -3,7 +3,7 @@ use moka::sync::Cache;
 use once_cell::sync::Lazy;
 
 pub(crate) const SERVER_PORT: u16 = 8080;
-pub(crate) const HEADER_SIZE: u16 = 30;
+pub(crate) const HEADER_SIZE: u16 = 31;
 pub(crate) const CHUNK_SIZE: u32 = 4194304; //4MB
 
 pub const EMPTY_BUFFER: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 0];

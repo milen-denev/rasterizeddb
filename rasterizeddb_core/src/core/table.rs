@@ -345,8 +345,12 @@ impl<S: IOOperationsSync> Table<S> {
             #[cfg(feature = "enable_index_caching")]
             let mut result_row_vec: Vec<(u64, u32)> = Vec::default();
 
+            let table_header = self.table_header.read().await;
+            let mutated = table_header.mutated;
+
             if let Some(chunks) = chunks_result.as_ref() {
                 let mut required_columns: Vec<(u32, Column)> = Vec::default();
+                let mut token_results: Vec<(bool, Option<Next>)> = Vec::with_capacity(evaluation_tokens.len());
 
                 let column_indexes = evaluation_tokens
                     .iter()
@@ -364,14 +368,12 @@ impl<S: IOOperationsSync> Table<S> {
                 for chunk in chunks {
                     let buffer = chunk.read_chunk_sync(&mut self.io_sync).await;
 
-                    let mut token_results: Vec<(bool, Option<Next>)> =
-                        Vec::with_capacity(evaluation_tokens.len());
                     let mut cursor_vector = CursorVector::new(&buffer);
                     let mut position: u64 = 0;
 
                     loop {
                         if let Some(prefetch_result) =
-                            row_prefetching_cursor(&mut position, &mut cursor_vector, chunk)
+                            row_prefetching_cursor(&mut position, &mut cursor_vector, chunk, mutated)
                                 .unwrap()
                         {
                             let mut current_column_index: u32 = 0;
@@ -575,7 +577,7 @@ impl<S: IOOperationsSync> Table<S> {
 
                 loop {
                     if let Some(prefetch_result) =
-                        row_prefetching(&mut self.io_sync, &mut position, file_length)
+                        row_prefetching(&mut self.io_sync, &mut position, file_length, mutated)
                             .await
                             .unwrap()
                     {
@@ -732,6 +734,9 @@ impl<S: IOOperationsSync> Table<S> {
             }
         };
 
+        let table_header = self.table_header.read().await;
+        let mutated = table_header.mutated;
+
         if let Some(chunks) = chunks_result.as_ref() {
             for chunk in chunks {
                 let buffer = chunk.read_chunk_sync(&mut self.io_sync).await;
@@ -741,7 +746,7 @@ impl<S: IOOperationsSync> Table<S> {
 
                 loop {
                     if let Some(prefetch_result) =
-                        row_prefetching_cursor(&mut position, &mut cursor_vector, chunk).unwrap()
+                        row_prefetching_cursor(&mut position, &mut cursor_vector, chunk, mutated).unwrap()
                     {
                         if id == prefetch_result.found_id {
                             let starting_column_position =
@@ -759,6 +764,10 @@ impl<S: IOOperationsSync> Table<S> {
                                 .await
                                 .unwrap();
 
+                            let mut table_header = self.table_header.write().await;
+                            table_header.mutated = true;
+                            self.io_sync.write_data(0, &table_header.to_bytes().unwrap());
+
                             return Ok(());
                         } else {
                             //+1 because of the END db type.
@@ -773,7 +782,7 @@ impl<S: IOOperationsSync> Table<S> {
             let mut position = HEADER_SIZE as u64;
             loop {
                 if let Some(prefetch_result) =
-                    row_prefetching(&mut self.io_sync, &mut position, file_length)
+                    row_prefetching(&mut self.io_sync, &mut position, file_length, mutated)
                         .await
                         .unwrap()
                 {
@@ -783,6 +792,10 @@ impl<S: IOOperationsSync> Table<S> {
                         delete_row_file(starting_column_position, &mut self.io_sync)
                             .await
                             .unwrap();
+
+                        let mut table_header = self.table_header.write().await;
+                        table_header.mutated = true;
+                        self.io_sync.write_data(0, &table_header.to_bytes().unwrap());
 
                         return Ok(());
                     } else {
@@ -836,9 +849,12 @@ impl<S: IOOperationsSync> Table<S> {
         let mut added = false;
         let mut last_prefetch_result: RowPrefetchResult = RowPrefetchResult::default();
 
+        let table_header = self.table_header.read().await;
+        let mutated = table_header.mutated;
+
         loop {
             if let Some(prefetch_result) =
-                row_prefetching(&mut self.io_sync, &mut position, file_length)
+                row_prefetching(&mut self.io_sync, &mut position, file_length, mutated)
                     .await
                     .unwrap()
             {
@@ -919,8 +935,12 @@ impl<S: IOOperationsSync> Table<S> {
         let mut position = HEADER_SIZE as u64;
 
         loop {
+            
+            let table_header = self.table_header.read().await;
+            let mutated = table_header.mutated;
+
             if let Some(prefetch_result) =
-                row_prefetching(&mut self.io_sync, &mut position, file_length)
+                row_prefetching(&mut self.io_sync, &mut position, file_length, mutated)
                     .await
                     .unwrap()
             {
@@ -1010,6 +1030,7 @@ impl<S: IOOperationsSync> Table<S> {
 
                         break;
                     } else {
+                        drop(table_header);
                         let row_id = self.update_eof_and_id(update_row_size as u64).await;
 
                         //DbType START
@@ -1079,6 +1100,10 @@ impl<S: IOOperationsSync> Table<S> {
 
                         drop(chunks_write_result);
 
+                        let mut table_header = self.table_header.write().await;
+                        table_header.mutated = true;
+                        self.io_sync.write_data(0, &table_header.to_bytes().unwrap());
+
                         break;
                     }
                 } else {
@@ -1111,7 +1136,7 @@ impl<S: IOOperationsSync> Table<S> {
 
         loop {
             if let Some(prefetch_result) =
-                row_prefetching(&mut self.io_sync, &mut position, file_length)
+                row_prefetching(&mut self.io_sync, &mut position, file_length, self.table_header.read().await.mutated)
                     .await
                     .unwrap()
             {
@@ -1127,7 +1152,7 @@ impl<S: IOOperationsSync> Table<S> {
                 // END (1)
                 position += prefetch_result.length as u64 + 1;
                 temp_table
-                    .insert_row(InsertOrUpdateRow {
+                    .insert_row_unsync(InsertOrUpdateRow {
                         columns_data: row.columns_data,
                     })
                     .await;
@@ -1144,5 +1169,9 @@ impl<S: IOOperationsSync> Table<S> {
 
         let mut table_locked = self.locked.write().await;
         *table_locked = false;
+
+        let mut table_header = self.table_header.write().await;
+        table_header.mutated = false;
+        self.io_sync.write_data(0, &table_header.to_bytes().unwrap());
     }
 }

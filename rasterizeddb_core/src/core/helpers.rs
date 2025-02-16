@@ -286,10 +286,13 @@ pub(crate) async fn row_prefetching(
     io_sync: &mut Box<impl IOOperationsSync>,
     file_position: &mut u64,
     file_length: u64,
+    is_mutated: bool
 ) -> io::Result<Option<RowPrefetchResult>> {
     if *file_position < file_length {
-        *file_position = skip_empty_spaces_file(io_sync, file_position, file_length).await;
-
+        if is_mutated {
+            *file_position = skip_empty_spaces_file(io_sync, file_position, file_length).await;
+        }
+        
         let mut cursor = io_sync.read_data_to_cursor(file_position, 1 + 8 + 4).await;
 
         let start_now_byte = cursor.read_u8();
@@ -322,10 +325,11 @@ pub fn row_prefetching_cursor(
     position: &mut u64,
     cursor_vector: &mut CursorVector,
     chunk: &FileChunk,
+    is_mutated: bool
 ) -> io::Result<Option<RowPrefetchResult>> {
-    skip_empty_spaces_cursor(position, cursor_vector, chunk.chunk_size).unwrap();
-
-    //let mut header_bytes: [u8; 13] = [0; 13];
+    if is_mutated {
+        skip_empty_spaces_cursor(position, cursor_vector, chunk.chunk_size).unwrap();
+    }
 
     let slice = cursor_vector.vector.as_slice();
 
