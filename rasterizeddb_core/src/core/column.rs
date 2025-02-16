@@ -521,19 +521,19 @@ impl Column {
                 value.to_string()
             }
             DbType::I16 => {
-                let value = LittleEndian::read_i16(self.content.as_slice()[1..].as_ref());
+                let value = LittleEndian::read_i16(self.content.as_slice().as_ref());
                 value.to_string()
             }
             DbType::I32 => {
-                let value = LittleEndian::read_i32(self.content.as_slice()[1..].as_ref());
+                let value = LittleEndian::read_i32(self.content.as_slice().as_ref());
                 value.to_string()
             }
             DbType::I64 => {
-                let value = LittleEndian::read_i64(self.content.as_slice()[1..].as_ref());
+                let value = LittleEndian::read_i64(self.content.as_slice().as_ref());
                 value.to_string()
             }
             DbType::I128 => {
-                let value = LittleEndian::read_i128(self.content.as_slice()[1..].as_ref());
+                let value = LittleEndian::read_i128(self.content.as_slice().as_ref());
                 value.to_string()
             }
             DbType::U8 => {
@@ -541,27 +541,27 @@ impl Column {
                 value.to_string()
             }
             DbType::U16 => {
-                let value = LittleEndian::read_u16(self.content.as_slice()[1..].as_ref());
+                let value = LittleEndian::read_u16(self.content.as_slice().as_ref());
                 value.to_string()
             }
             DbType::U32 => {
-                let value = LittleEndian::read_u32(self.content.as_slice()[1..].as_ref());
+                let value = LittleEndian::read_u32(self.content.as_slice().as_ref());
                 value.to_string()
             }
             DbType::U64 => {
-                let value = LittleEndian::read_u64(self.content.as_slice()[1..].as_ref());
+                let value = LittleEndian::read_u64(self.content.as_slice().as_ref());
                 value.to_string()
             }
             DbType::U128 => {
-                let value = LittleEndian::read_u128(self.content.as_slice()[1..].as_ref());
+                let value = LittleEndian::read_u128(self.content.as_slice().as_ref());
                 value.to_string()
             }
             DbType::F32 => {
-                let value = LittleEndian::read_f32(self.content.as_slice()[1..].as_ref());
+                let value = LittleEndian::read_f32(self.content.as_slice().as_ref());
                 value.to_string()
             }
             DbType::F64 => {
-                let value = LittleEndian::read_f64(self.content.as_slice()[1..].as_ref());
+                let value = LittleEndian::read_f64(self.content.as_slice().as_ref());
                 value.to_string()
             }
             DbType::CHAR => {
@@ -572,7 +572,7 @@ impl Column {
                 value.to_string()
             }
             DbType::STRING => {
-                let vec = self.content.as_slice()[4..].to_vec();
+                let vec = self.content.as_slice().to_vec();
                 let value = String::from_utf8(vec).unwrap();
                 value
             }
