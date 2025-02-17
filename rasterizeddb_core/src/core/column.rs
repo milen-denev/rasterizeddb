@@ -136,6 +136,7 @@ impl PartialEq for ColumnValue {
 }
 
 impl Clone for ColumnValue {
+    #[track_caller]
     fn clone(&self) -> Self {
         match self {
             ColumnValue::StaticMemoryPointer(chunk) => {
@@ -144,7 +145,9 @@ impl Clone for ColumnValue {
             ColumnValue::ManagedMemoryPointer(vec) => {
                 ColumnValue::ManagedMemoryPointer(vec.clone())
             }
-            _ => panic!("Operation is not supported, column is in temporary state."),
+            ColumnValue::TempHolder((db_type, vec)) => {
+                ColumnValue::TempHolder((db_type.clone(), vec.clone()))
+            }
         }
     }
 }
