@@ -146,8 +146,8 @@ pub(crate) async fn delete_row_file(
     io_sync.write_data_seek(
         SeekFrom::Start(first_column_index - 4 - 8 - 1),
         &empty_buffer,
-    );
-    io_sync.verify_data_and_sync(first_column_index - 4 - 8 - 1, &empty_buffer);
+    ).await;
+    io_sync.verify_data_and_sync(first_column_index - 4 - 8 - 1, &empty_buffer).await;
 
     return Ok(());
 }
