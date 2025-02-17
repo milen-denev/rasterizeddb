@@ -1,8 +1,10 @@
 use crate::{
     core::{column::Column, hashing::get_hash, row::InsertOrUpdateRow},
-    memory_pool::Chunk,
-    POSITIONS_CACHE,
+    memory_pool::Chunk
 };
+
+#[cfg(feature = "enable_index_caching")]
+use crate::POSITIONS_CACHE;
 
 use super::{
     helpers::whitespace_spec_splitter,
@@ -14,6 +16,7 @@ use super::{
 pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
     let hash = get_hash(query);
 
+    #[cfg(feature = "enable_index_caching")]
     if let Some(file_positions) = POSITIONS_CACHE.get(&hash) {
         let db_action = DatabaseAction {
             table_name: "".to_string(),
