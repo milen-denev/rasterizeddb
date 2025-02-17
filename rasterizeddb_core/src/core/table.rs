@@ -24,12 +24,15 @@ use super::{
     table_header::TableHeader,
 };
 use crate::{
-    core::helpers::delete_row_file,
+    core::{helpers::delete_row_file, table_ext::_process_all_chunks},
     memory_pool::{Chunk, MEMORY_POOL},
     rql::models::Next,
     simds::endianess::read_u32,
-    CHUNK_SIZE, HEADER_SIZE, POSITIONS_CACHE,
+    CHUNK_SIZE, HEADER_SIZE, THREADS
 };
+
+#[cfg(feature = "enable_index_caching")]
+use crate::POSITIONS_CACHE;
 
 #[allow(dead_code)]
 pub struct Table<S: IOOperationsSync> {
@@ -76,7 +79,7 @@ impl<S: IOOperationsSync> Table<S> {
             // Serialize the header and write it to the file
             let header_bytes = table_header.to_bytes().unwrap();
 
-            io_sync.write_data(0, &header_bytes);
+            io_sync.write_data(0, &header_bytes).await;
 
             let table = Table {
                 io_sync: Box::new(io_sync),
@@ -126,7 +129,7 @@ impl<S: IOOperationsSync> Table<S> {
             // Serialize the header and write it to the file
             let header_bytes = table_header.to_bytes().unwrap();
 
-            io_sync.write_data(0, &header_bytes);
+            io_sync.write_data(0, &header_bytes).await;
 
             let table = Table {
                 io_sync: Box::new(io_sync),
@@ -218,7 +221,7 @@ impl<S: IOOperationsSync> Table<S> {
         //DbType END
         buffer.push(255);
 
-        self.io_sync.append_data(&buffer);
+        self.io_sync.append_data(&buffer).await;
         // let verify_result = self.io_sync.verify_data_and_sync(current_file_len, &buffer);
 
         // #[allow(unreachable_code)]
@@ -240,7 +243,7 @@ impl<S: IOOperationsSync> Table<S> {
 
         let new_header = table_header_w.to_bytes().unwrap();
 
-        self.io_sync.write_data(0, &new_header);
+        self.io_sync.write_data(0, &new_header).await;
     }
 
     /// #### STABILIZED
@@ -277,7 +280,7 @@ impl<S: IOOperationsSync> Table<S> {
         //DbType END
         buffer.push(255);
 
-        self.io_sync.append_data_unsync(&buffer);
+        self.io_sync.append_data_unsync(&buffer).await;
         // let verify_result = self.io_sync.verify_data_and_sync(current_file_len, &buffer);
 
         // #[allow(unreachable_code)]
@@ -299,7 +302,7 @@ impl<S: IOOperationsSync> Table<S> {
 
         let new_header = table_header_w.to_bytes().unwrap();
 
-        self.io_sync.write_data_unsync(0, &new_header);
+        self.io_sync.write_data_unsync(0, &new_header).await;
     }
 
     pub async fn execute_query(
@@ -320,6 +323,8 @@ impl<S: IOOperationsSync> Table<S> {
 
             return Ok(Some(rows));
         } else if let ParserResult::QueryEvaluationTokens(evaluation_tokens) = parser_result {
+            #[cfg(feature = "enable_index_caching")]
+            let hash = evaluation_tokens.query_hash;
 
             let limit = evaluation_tokens.limit;
 
@@ -364,20 +369,25 @@ impl<S: IOOperationsSync> Table<S> {
                     })
                     .collect_vec();
 
-                // #[cfg(feature  = "enable_parallelism")]
-                // {
-                //     return process_all_chunks(
-                //         column_indexes,
-                //         Arc::new(RwLock::new(evaluation_tokens)),
-                //         limit as u64,
-                //         select_all,
-                //         mutated,
-                //         &mut self.io_sync,
-                //         chunks.clone(),
-                //         50
-                //     ).await;
-                // }
+                #[cfg(feature  = "enable_parallelism")]
+                {
+                    return _process_all_chunks(
+                        Arc::new(column_indexes),
+                        evaluation_tokens,
+                        limit as u64,
+                        select_all,
+                        mutated,
+                        &mut self.io_sync,
+                        Arc::new(chunks.clone()),
+                        THREADS,
+                        
+                        #[cfg(feature = "enable_index_caching")]
+                        hash
 
+                    ).await;
+                }
+
+                #[allow(unreachable_code)]
                 let mut required_columns: Vec<(u32, Column)> = Vec::default();
                 let mut token_results: Vec<(bool, Option<Next>)> = Vec::with_capacity(evaluation_tokens.len());
 
@@ -597,6 +607,9 @@ impl<S: IOOperationsSync> Table<S> {
                     {
                         let mut column_index_inner = 0;
 
+                        #[cfg(feature = "enable_index_caching")]
+                        let first_column_index = position;
+
                         let mut columns_cursor = self
                             .io_sync
                             .read_data_to_cursor(&mut position, prefetch_result.length + 1)
@@ -766,6 +779,7 @@ impl<S: IOOperationsSync> Table<S> {
                             let starting_column_position =
                                 position.clone() + chunk.current_file_position as u64;
 
+                            #[cfg(feature = "enable_index_caching")]
                             if let Some(record) = POSITIONS_CACHE.iter().find(|x| {
                                 x.1.iter().any(|&(key, _)| {
                                     key == (starting_column_position - 1 - 4 - 8) as u64
@@ -780,7 +794,7 @@ impl<S: IOOperationsSync> Table<S> {
 
                             let mut table_header = self.table_header.write().await;
                             table_header.mutated = true;
-                            self.io_sync.write_data(0, &table_header.to_bytes().unwrap());
+                            self.io_sync.write_data(0, &table_header.to_bytes().unwrap()).await;
 
                             return Ok(());
                         } else {
@@ -809,7 +823,7 @@ impl<S: IOOperationsSync> Table<S> {
 
                         let mut table_header = self.table_header.write().await;
                         table_header.mutated = true;
-                        self.io_sync.write_data(0, &table_header.to_bytes().unwrap());
+                        self.io_sync.write_data(0, &table_header.to_bytes().unwrap()).await;
 
                         return Ok(());
                     } else {
@@ -982,9 +996,8 @@ impl<S: IOOperationsSync> Table<S> {
 
                         let new_position = position - 8 - 4 - 1;
 
-                        self.io_sync.write_data_unsync(new_position, &buffer);
-                        let verify_result =
-                            self.io_sync.verify_data_and_sync(new_position, &buffer);
+                        self.io_sync.write_data_unsync(new_position, &buffer).await;
+                        let verify_result = self.io_sync.verify_data_and_sync(new_position, &buffer).await;
 
                         #[allow(unreachable_code)]
                         if !verify_result {
@@ -1014,9 +1027,8 @@ impl<S: IOOperationsSync> Table<S> {
 
                         let new_position = position - 8 - 4 - 1;
 
-                        self.io_sync.write_data_unsync(new_position, &buffer);
-                        let verify_result =
-                            self.io_sync.verify_data_and_sync(new_position, &buffer);
+                        self.io_sync.write_data_unsync(new_position, &buffer).await;
+                        let verify_result = self.io_sync.verify_data_and_sync(new_position, &buffer).await;
 
                         #[allow(unreachable_code)]
                         if !verify_result {
@@ -1030,11 +1042,11 @@ impl<S: IOOperationsSync> Table<S> {
                         self.io_sync.write_data_unsync(
                             new_position + update_row_size as u64,
                             &empty_buffer,
-                        );
+                        ).await;
                         let clean_up_verify_result = self.io_sync.verify_data_and_sync(
                             new_position + update_row_size as u64,
                             &empty_buffer,
-                        );
+                        ).await;
 
                         #[allow(unreachable_code)]
                         if !clean_up_verify_result {
@@ -1061,9 +1073,8 @@ impl<S: IOOperationsSync> Table<S> {
                         //DbType END
                         buffer.push(255);
 
-                        self.io_sync.append_data_unsync(&buffer);
-                        let verify_result =
-                            self.io_sync.verify_data_and_sync(current_file_len, &buffer);
+                        self.io_sync.append_data_unsync(&buffer).await;
+                        let verify_result = self.io_sync.verify_data_and_sync(current_file_len, &buffer).await;
 
                         #[allow(unreachable_code)]
                         if !verify_result {
@@ -1075,10 +1086,10 @@ impl<S: IOOperationsSync> Table<S> {
 
                         let new_position = position - 8 - 4 - 1;
 
-                        self.io_sync.write_data_unsync(new_position, &empty_buffer);
+                        self.io_sync.write_data_unsync(new_position, &empty_buffer).await;
                         let clean_up_verify_result = self
                             .io_sync
-                            .verify_data_and_sync(new_position, &empty_buffer);
+                            .verify_data_and_sync(new_position, &empty_buffer).await;
 
                         #[allow(unreachable_code)]
                         if !clean_up_verify_result {
@@ -1116,7 +1127,7 @@ impl<S: IOOperationsSync> Table<S> {
 
                         let mut table_header = self.table_header.write().await;
                         table_header.mutated = true;
-                        self.io_sync.write_data(0, &table_header.to_bytes().unwrap());
+                        self.io_sync.write_data(0, &table_header.to_bytes().unwrap()).await;
 
                         break;
                     }
@@ -1186,6 +1197,6 @@ impl<S: IOOperationsSync> Table<S> {
 
         let mut table_header = self.table_header.write().await;
         table_header.mutated = false;
-        self.io_sync.write_data(0, &table_header.to_bytes().unwrap());
+        self.io_sync.write_data(0, &table_header.to_bytes().unwrap()).await;
     }
 }
