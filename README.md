@@ -58,6 +58,7 @@ Short answer, no. It will get through many refinements and even changes to the t
 
 #### Features:
 `enable_index_caching` to enable query caching
+`enable_parallelism` to enable in parallel table chunk scanning
 
 ```rust
 // Imports
