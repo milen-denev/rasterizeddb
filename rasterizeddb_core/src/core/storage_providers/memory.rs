@@ -25,7 +25,7 @@ impl MemoryStorageProvider {
 }
 
 impl IOOperationsSync for MemoryStorageProvider {
-    fn write_data(&mut self, position: u64, buffer: &[u8]) {
+    async fn write_data(&mut self, position: u64, buffer: &[u8]) {
         let end = position + buffer.len() as u64;
 
         let mut x = 0;
@@ -44,7 +44,7 @@ impl IOOperationsSync for MemoryStorageProvider {
         }
     }
 
-    fn write_data_seek(&mut self, seek: std::io::SeekFrom, buffer: &[u8]) {
+    async fn write_data_seek(&mut self, seek: std::io::SeekFrom, buffer: &[u8]) {
         let needed_len = buffer.len();
         let current_len = self.vec.len();
 
@@ -125,7 +125,7 @@ impl IOOperationsSync for MemoryStorageProvider {
         return buffer;
     }
 
-    fn append_data(&mut self, buffer: &[u8]) {
+    async fn append_data(&mut self, buffer: &[u8]) {
         for u8_value in buffer {
             self.vec.extend(vec![*u8_value; 1]);
         }
@@ -141,7 +141,7 @@ impl IOOperationsSync for MemoryStorageProvider {
         true
     }
 
-    fn write_data_unsync(&mut self, position: u64, buffer: &[u8]) {
+    async fn write_data_unsync(&mut self, position: u64, buffer: &[u8]) {
         let end = position + buffer.len() as u64;
 
         let mut x = 0;
@@ -160,19 +160,19 @@ impl IOOperationsSync for MemoryStorageProvider {
         }
     }
 
-    fn verify_data(&mut self, position: u64, buffer: &[u8]) -> bool {
+    async fn verify_data(&mut self, position: u64, buffer: &[u8]) -> bool {
         let _position = position;
         let _buffer = buffer;
         true
     }
 
-    fn verify_data_and_sync(&mut self, position: u64, buffer: &[u8]) -> bool {
+    async fn verify_data_and_sync(&mut self, position: u64, buffer: &[u8]) -> bool {
         let _position = position;
         let _buffer = buffer;
         true
     }
 
-    fn append_data_unsync(&mut self, buffer: &[u8]) {
+    async fn append_data_unsync(&mut self, buffer: &[u8]) {
         for u8_value in buffer {
             self.vec.extend(vec![*u8_value; 1]);
         }
