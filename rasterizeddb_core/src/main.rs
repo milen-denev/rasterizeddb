@@ -27,10 +27,12 @@ async fn main() -> std::io::Result<()> {
 
     std::env::set_var("RUST_BACKTRACE", "0");
 
-    _ = remove_file("C:\\Users\\mspc6\\OneDrive\\Professional\\Desktop\\database.db");
+    let db_file = "G:\\db\\";
+
+    //_ = remove_file(format!("{}\\{}", db_file, "database.db"));
 
     let io_sync = LocalStorageProvider::new(
-        "C:\\Users\\mspc6\\OneDrive\\Professional\\Desktop",
+        db_file,
         "database.db",
     )
     .await;
@@ -49,30 +51,30 @@ async fn main() -> std::io::Result<()> {
 
     let mut table = Table::init(io_sync, false, false).await.unwrap();
 
-    for i in 1..=1_000_000 {
-        let c1 = Column::new(i).unwrap();
-        let c2 = Column::new(i * -1).unwrap();
-        let str = 'A'.to_string().repeat(100);
-        let c3 = Column::new(str).unwrap();
+    // for i in 1..=10_000_000 {
+    //     let c1 = Column::new(i).unwrap();
+    //     let c2 = Column::new(i * -1).unwrap();
+    //     let str = 'A'.to_string().repeat(100);
+    //     let c3 = Column::new(str).unwrap();
 
-        let mut columns_buffer: Vec<u8> = Vec::with_capacity(
-            c1.len() +
-            c2.len() +
-            c3.len()
-        );
+    //     let mut columns_buffer: Vec<u8> = Vec::with_capacity(
+    //         c1.len() +
+    //         c2.len() +
+    //         c3.len()
+    //     );
 
-        columns_buffer.append(&mut c1.content.to_vec());
-        columns_buffer.append(&mut c2.content.to_vec());
-        columns_buffer.append(&mut c3.content.to_vec());
+    //     columns_buffer.append(&mut c1.content.to_vec());
+    //     columns_buffer.append(&mut c2.content.to_vec());
+    //     columns_buffer.append(&mut c3.content.to_vec());
 
-        let _insert_row = InsertOrUpdateRow {
-            columns_data: columns_buffer.clone()
-        };
+    //     let _insert_row = InsertOrUpdateRow {
+    //         columns_data: columns_buffer.clone()
+    //     };
 
-        table.insert_row_unsync(_insert_row).await;
-    }
+    //     table.insert_row_unsync(_insert_row).await;
+    // }
 
-    println!("DONE inserting rows.");
+    // println!("DONE inserting rows.");
 
     table.rebuild_in_memory_indexes().await;
 
@@ -89,7 +91,7 @@ async fn main() -> std::io::Result<()> {
         r#"
         BEGIN
         SELECT FROM NAME_DOESNT_MATTER_FOR_NOW
-        WHERE COL(0) > 999872
+        WHERE COL(0) > 9999999
         LIMIT 2
         END
     "#
@@ -111,7 +113,7 @@ async fn main() -> std::io::Result<()> {
         r#"
         BEGIN
         SELECT FROM NAME_DOESNT_MATTER_FOR_NOW
-        WHERE COL(0) > 999872
+        WHERE COL(0) = 9999999
         LIMIT 2
         END
     "#
