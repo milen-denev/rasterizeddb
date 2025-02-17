@@ -8,15 +8,15 @@ pub type IOResult<T> = std::result::Result<T, IOError>;
 
 #[allow(async_fn_in_trait)]
 pub trait IOOperationsSync: Clone + Sync + Send {
-    fn write_data_unsync(&mut self, position: u64, buffer: &[u8]);
+    fn write_data_unsync(&mut self, position: u64, buffer: &[u8]) -> impl Future<Output = ()> + Send + Sync;
 
-    fn verify_data(&mut self, position: u64, buffer: &[u8]) -> bool;
+    fn verify_data(&mut self, position: u64, buffer: &[u8]) -> impl Future<Output = bool> + Send + Sync;
 
-    fn verify_data_and_sync(&mut self, position: u64, buffer: &[u8]) -> bool;
+    fn verify_data_and_sync(&mut self, position: u64, buffer: &[u8]) -> impl Future<Output = bool> + Send + Sync;
 
-    fn write_data(&mut self, position: u64, buffer: &[u8]);
+    fn write_data(&mut self, position: u64, buffer: &[u8]) -> impl Future<Output = ()> + Send + Sync;
 
-    fn write_data_seek(&mut self, seek: SeekFrom, buffer: &[u8]);
+    fn write_data_seek(&mut self, seek: SeekFrom, buffer: &[u8]) -> impl Future<Output = ()> + Send + Sync;
 
     fn read_data(
         &mut self,
@@ -38,9 +38,9 @@ pub trait IOOperationsSync: Clone + Sync + Send {
 
     fn read_data_to_end(&mut self, position: u64) -> impl Future<Output = Vec<u8>> + Send + Sync;
 
-    fn append_data(&mut self, buffer: &[u8]);
+    fn append_data(&mut self, buffer: &[u8]) -> impl Future<Output = ()> + Send + Sync;
 
-    fn append_data_unsync(&mut self, buffer: &[u8]);
+    fn append_data_unsync(&mut self, buffer: &[u8]) -> impl Future<Output = ()> + Send + Sync;
 
     fn get_len(&mut self) -> impl Future<Output = u64> + Send + Sync;
 
