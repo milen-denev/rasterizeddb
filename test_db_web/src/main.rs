@@ -27,8 +27,8 @@ static mut TABLE: async_lazy::Lazy<Table<LocalStorageProvider>> =
 #[tokio::main]
 async fn main() {
     let app = Router::new()
-        .route("/", get(index));
-        //.route("/get", get(query));
+        .route("/", get(index))
+        .route("/get", get(query));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:80").await.unwrap();
 
