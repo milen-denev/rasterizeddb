@@ -108,6 +108,7 @@ pub(crate) async fn process_all_chunks(
     hash: u64
 
 ) -> io::Result<Option<Vec<Row>>> {
+    use futures::future::join_all;
     use tokio::{sync::Semaphore, task};
 
     let atomic_limit = Arc::new(AtomicU64::new(0));
@@ -154,9 +155,7 @@ pub(crate) async fn process_all_chunks(
         handles.push(handle);
     }
 
-    for handle in handles {
-        handle.await.unwrap();
-    }
+    join_all(handles).await;
 
     let aggregator_handle = tokio::spawn(async move {
         let mut collected_rows = Vec::with_capacity(limit as usize);
