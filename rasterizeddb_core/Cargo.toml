@@ -40,6 +40,6 @@ codegen-units = 1
 lto = "fat"
 
 [features]
-default = ["enable_parallelism"]
-enable_index_caching = []
+default = ["enable_parallelism"] # "enable_parallelism"
+enable_index_caching =  []
 enable_parallelism = []

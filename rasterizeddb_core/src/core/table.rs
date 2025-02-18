@@ -24,12 +24,18 @@ use super::{
     table_header::TableHeader,
 };
 use crate::{
-    core::{helpers::delete_row_file, table_ext::_process_all_chunks},
+    core::helpers::delete_row_file,
     memory_pool::{Chunk, MEMORY_POOL},
     rql::models::Next,
     simds::endianess::read_u32,
-    CHUNK_SIZE, HEADER_SIZE, THREADS
+    CHUNK_SIZE, HEADER_SIZE, 
 };
+
+#[cfg(feature = "enable_parallelism")]
+use crate::THREADS;
+
+#[cfg(feature = "enable_parallelism")]
+use crate::core::table_ext::process_all_chunks;
 
 #[cfg(feature = "enable_index_caching")]
 use crate::POSITIONS_CACHE;
@@ -371,7 +377,7 @@ impl<S: IOOperationsSync> Table<S> {
 
                 #[cfg(feature  = "enable_parallelism")]
                 {
-                    return _process_all_chunks(
+                    return process_all_chunks(
                         Arc::new(column_indexes),
                         evaluation_tokens,
                         limit as u64,

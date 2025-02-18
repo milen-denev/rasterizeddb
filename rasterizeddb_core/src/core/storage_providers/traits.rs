@@ -7,7 +7,7 @@ pub type IOError = std::io::Error;
 pub type IOResult<T> = std::result::Result<T, IOError>;
 
 #[allow(async_fn_in_trait)]
-pub trait IOOperationsSync: Clone + Sync + Send {
+pub trait IOOperationsSync: Clone + Sync + Send + 'static {
     fn write_data_unsync(&mut self, position: u64, buffer: &[u8]) -> impl Future<Output = ()> + Send + Sync;
 
     fn verify_data(&mut self, position: u64, buffer: &[u8]) -> impl Future<Output = bool> + Send + Sync;

@@ -10,6 +10,9 @@ use once_cell::sync::Lazy;
 pub(crate) const SERVER_PORT: u16 = 8080;
 pub(crate) const HEADER_SIZE: u16 = 31;
 pub(crate) const CHUNK_SIZE: u32 = 16 * 1_000_000;
+//pub(crate) const CHUNK_SIZE: u32 = 1_000_000;
+
+#[cfg(feature = "enable_parallelism")]
 pub(crate) const THREADS: usize = 32;
 
 pub const EMPTY_BUFFER: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 0];

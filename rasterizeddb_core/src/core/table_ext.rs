@@ -1,14 +1,20 @@
-use std::{arch::x86_64::{_mm_prefetch, _MM_HINT_T0}, io::{self, Read, Seek, SeekFrom, Write}, sync::Arc};
+use std::io::{Read, Seek, SeekFrom};
+use super::{db_type::DbType, support_types::CursorVector};
 
-use futures::{stream, StreamExt};
-use tokio::sync::RwLock;
+#[cfg(feature = "enable_parallelism")]
+use std::{arch::x86_64::{_mm_prefetch, _MM_HINT_T0}, io::{self, Write}, sync::{atomic::{AtomicU64, Ordering}, Arc}};
 
-use crate::{memory_pool::{Chunk, MEMORY_POOL}, rql::{models::{Next, Token}, tokenizer::evaluate_column_result}, simds::endianess::read_u32};
+#[cfg(feature = "enable_parallelism")]
+use tokio::sync::mpsc;
 
 #[cfg(feature = "enable_index_caching")]
 use crate::POSITIONS_CACHE;
 
-use super::{column::Column, db_type::DbType, helpers::{read_row_cursor, row_prefetching_cursor}, row::Row, storage_providers::traits::IOOperationsSync, support_types::{CursorVector, FileChunk}};
+#[cfg(feature = "enable_parallelism")]
+use super::{column::Column, helpers::{read_row_cursor, row_prefetching_cursor}, row::Row, storage_providers::traits::IOOperationsSync, support_types::FileChunk};
+
+#[cfg(feature = "enable_parallelism")]
+use crate::{memory_pool::{Chunk, MEMORY_POOL}, rql::{models::{Next, Token}, tokenizer::evaluate_column_result}, simds::endianess::read_u32};
 
 #[inline(always)]
 pub fn extent_non_string_buffer(
@@ -87,7 +93,8 @@ pub fn extent_non_string_buffer(
     }
 }
 
-pub(crate) async fn _process_all_chunks(
+#[cfg(feature = "enable_parallelism")]
+pub(crate) async fn process_all_chunks(
     column_indexes: Arc<Vec<u32>>,
     evaluation_tokens: Vec<(Vec<Token>, Option<Next>)>,
     limit: u64,
@@ -101,69 +108,71 @@ pub(crate) async fn _process_all_chunks(
     hash: u64
 
 ) -> io::Result<Option<Vec<Row>>> {
-    let rows: Arc<RwLock<Vec<Row>>> = if limit < 1024 && limit > 0 {
-        Arc::new(RwLock::new(Vec::with_capacity(limit as usize)))
-    } else {
-        Arc::new(RwLock::new(Vec::default()))
-    };
+    use tokio::{sync::Semaphore, task};
 
-    let mut i: u32 = 0;
+    let atomic_limit = Arc::new(AtomicU64::new(0));
 
-    let rows2 = rows.clone();
+    let (tx, mut rx) = mpsc::unbounded_channel::<Row>();
 
-    // Create a stream of futures, each processing one chunk.
-    let stream = stream::iter(chunks.iter().map(|chunk| {
-        let rows_clone_inner = rows2.clone(); // Clone again *inside* the map for each chunk
+    let semaphore = Arc::new(Semaphore::new(parallelism_limit));
+    let total_chunks = chunks.len();
+    let mut handles = Vec::with_capacity(total_chunks);
+
+    for (i, chunk) in chunks.iter().cloned().enumerate() {
+  
+        let semaphore_clone = semaphore.clone();
+
+        let atomic_u64_clone = atomic_limit.clone();
+        let tx_clone = tx.clone();
         let mut io_sync_inner = io_sync.clone();
         let column_indexes_inner = column_indexes.clone();
         let evaluation_tokens_inner = evaluation_tokens.clone();
 
-        i += 1;
+        let handle = task::spawn(async move {
+            let permit = semaphore_clone.acquire().await.unwrap();
 
-        // You can also clone necessary shared resources here if needed.
-        async move { tokio::spawn( _process_chunk_async(
-            chunk.read_chunk_sync(&mut io_sync_inner).await, 
-            column_indexes_inner,
-            evaluation_tokens_inner, 
-            limit,
-            select_all,
-            mutated,
-            chunk.clone(),
-            rows_clone_inner,
-            i,
+            _ = process_chunk_async(
+                chunk.read_chunk_sync(&mut io_sync_inner).await, 
+                column_indexes_inner,
+                evaluation_tokens_inner, 
+                limit,
+                select_all,
+                mutated,
+                chunk.clone(),
+                atomic_u64_clone,
+                tx_clone,
+                i as u32,
 
-            #[cfg(feature = "enable_index_caching")]
-            hash
+                #[cfg(feature = "enable_index_caching")]
+                hash
 
-        )).await }
-    }));
+            ).await;
 
-    // `buffered` limits the number of concurrently running tasks.
-    let mut results = stream.buffer_unordered(parallelism_limit);
+            drop(permit); // Release the permit when task finishes
+        });
 
-    // Handle any errors from the stream
-    while let Some(result) = results.next().await {
-        if let Err(e) = result {
-            // Log or handle the error appropriately.  You might want to return an error here.
-            panic!("Error processing chunk: {:?}", e);
-            // Example: return Err(io::Error::new(io::ErrorKind::Other, "Error processing chunks"));
-        }
+        handles.push(handle);
     }
 
-    let mut all_rows: Vec<Row> = Vec::new();
-    let rows_write = rows.write().await;
-
-    for row in rows_write.iter() {
-        all_rows.push(row.clone());
-        if all_rows.len() == limit as usize {
-            break;
-        }
+    for handle in handles {
+        handle.await.unwrap();
     }
+
+    let aggregator_handle = tokio::spawn(async move {
+        let mut collected_rows = Vec::with_capacity(limit as usize);
+        rx.recv_many(&mut collected_rows, usize::MAX).await;
+        drop(rx);
+        collected_rows
+    });
+
+    // Await the aggregator to finish collecting rows.
+    let all_rows = aggregator_handle.await.unwrap();
 
     Ok(Some(all_rows))
 }
 
-pub(crate) async fn _process_chunk_async(
+#[cfg(feature = "enable_parallelism")]
+pub(crate) async fn process_chunk_async(
     chunk_buffer: Vec<u8>,
     column_indexes: Arc<Vec<u32>>,
     mut evaluation_tokens: Vec<(Vec<Token>, Option<Next>)>,
@@ -171,14 +180,16 @@ pub(crate) async fn _process_chunk_async(
     select_all: bool, 
     mutated: bool,
     file_chunk: FileChunk,
-    rows: Arc<RwLock<Vec<Row>>>,
+    atomic_limit: Arc<AtomicU64>,
+    tx: mpsc::UnboundedSender<Row>,
+
     _thread_id: u32,
 
     #[cfg(feature = "enable_index_caching")]
     hash: u64
 
 ) -> io::Result<()> {
-    //println!("from: {:?}", thread_id);
+    //println!("thread: {}", _thread_id);
 
     #[cfg(feature = "enable_index_caching")]
     let mut result_row_vec: Vec<(u64, u32)> = Vec::default();
@@ -343,15 +354,14 @@ pub(crate) async fn _process_chunk_async(
                 )
                 .unwrap();
 
-                let mut rows_write = rows.write().await;
-                let mut current_limit = rows_write.len();
+                let current_limit = atomic_limit.fetch_add(1, Ordering::Relaxed);
 
-                if current_limit < limit as usize {
-                    rows_write.push(row);
+                if current_limit <= limit {
+                    if tx.send(row).is_err() {
+                        break;
+                    }    
                 }
-
-                current_limit += 1;
-
+                
                 #[cfg(feature = "enable_index_caching")]
                 {
                     result_row_vec.push((
@@ -363,7 +373,7 @@ pub(crate) async fn _process_chunk_async(
                     ));
                 }
 
-                if current_limit == limit as usize {
+                if current_limit == limit {
                     #[cfg(feature = "enable_index_caching")]
                     {
                         POSITIONS_CACHE.insert(hash, result_row_vec);
