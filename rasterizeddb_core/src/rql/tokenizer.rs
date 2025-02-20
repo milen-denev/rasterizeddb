@@ -21,17 +21,19 @@ pub(crate) fn evaluate_column_result(
             if let Some(token) = token_iter.next() {
                 match token {
                     Token::Column(column_id) => {
-                        // Get the value associated with the column_id
-                        if let Some((_, column)) =
-                            required_columns.iter().find(|(id, _)| *id == *column_id)
-                        {
-                            current_value = Some(column.clone());
-                        } else {
-                            continue; // Column ID not found
+                        if current_value == None {
+                            // Get the value associated with the column_id
+                            if let Some((_, column)) =
+                                required_columns.iter().find(|(id, _)| *id == *column_id)
+                            {
+                                current_value = Some(column.clone());
+                            } else {
+                                continue; // Column ID not found
+                            }
                         }
                     }
                     Token::Math(operation) => {
-                        if let Some(ref mut left_value) = current_value.as_mut() {
+                        if let Some(ref mut left_value) = current_value {
                             // Get the next token for the right operand
                             let iter_result = token_iter.next();
                             if let Some(Token::Value(column)) = iter_result {
@@ -189,7 +191,9 @@ pub(crate) fn evaluate_column_result(
                         }
                     }
                     Token::Value(ref mut column_value) => {
-                        current_value = Some(column_value.clone());
+                        if token_iter.next_back().is_some() {
+                            current_value = Some(column_value.clone());
+                        }
                     }
                 }
             } else {
