@@ -100,7 +100,7 @@ pub(crate) fn evaluate_column_result(
                         if let Some(ref mut left_value) = current_value.as_mut() {
                             let next_token = token_iter.next();
                             // Get the next token for the right operand
-                            if let Some(Token::Value(ref mut column)) = next_token {
+                            if let Some(Token::Value(column)) = next_token {
                                 if column.data_type == DbType::TBD {
                                     column.into_regular(left_value.data_type.clone());
                                 }
@@ -135,10 +135,10 @@ pub(crate) fn evaluate_column_result(
                                 };
 
                                 break result; // Return the result of the comparison
-                            } else if let Some(Token::Column(ref mut column)) = next_token {
+                            } else if let Some(Token::Column(column)) = next_token {
                                 let right_value = column;
 
-                                if let Some((_, ref mut column)) = required_columns
+                                if let Some((_, column)) = required_columns
                                     .iter_mut()
                                     .find(|(id, _)| *id == *right_value)
                                 {
@@ -190,7 +190,7 @@ pub(crate) fn evaluate_column_result(
                             continue; // Missing left operand
                         }
                     }
-                    Token::Value(ref mut column_value) => {
+                    Token::Value(column_value) => {
                         if token_iter.next_back().is_some() {
                             current_value = Some(column_value.clone());
                         }

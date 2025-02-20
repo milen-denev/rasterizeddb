@@ -25,7 +25,7 @@ async fn main() -> std::io::Result<()> {
         unsafe { _mm_prefetch::<_MM_HINT_T0>(empty_buffer_ptr as *const i8) };
     }
 
-    std::env::set_var("RUST_BACKTRACE", "0");
+    unsafe { std::env::set_var("RUST_BACKTRACE", "0") };
 
     let db_file = "C:\\db\\";
 

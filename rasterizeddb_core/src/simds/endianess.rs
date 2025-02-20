@@ -5,12 +5,14 @@ pub unsafe fn read_i8(ptr: *const u8) -> i8 {
     #[cfg(target_arch = "x86_64")]
     {
         let val: i8;
-        asm!(
-            "mov {0}, byte ptr [{1}]",
-            out(reg_byte) val,
-            in(reg) ptr,
-            options(nostack, pure, readonly)
-        );
+        unsafe {
+            asm!(
+                "mov {0}, byte ptr [{1}]",
+                out(reg_byte) val,
+                in(reg) ptr,
+                options(nostack, pure, readonly)
+            );
+        }
         return val;
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -25,12 +27,14 @@ pub unsafe fn read_u8(ptr: *const u8) -> u8 {
     #[cfg(target_arch = "x86_64")]
     {
         let val: u8;
-        asm!(
-            "mov {0}, byte ptr [{1}]",
-            out(reg_byte) val,
-            in(reg) ptr,
-            options(nostack, pure, readonly)
-        );
+        unsafe {
+            asm!(
+                "mov {0}, byte ptr [{1}]",
+                out(reg_byte) val,
+                in(reg) ptr,
+                options(nostack, pure, readonly)
+            );
+        }
         return val;
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -45,12 +49,14 @@ pub unsafe fn read_i16(ptr: *const u8) -> i16 {
     #[cfg(target_arch = "x86_64")]
     {
         let val: i16;
-        asm!(
-            "mov {0:x}, word ptr [{1}]",
-            out(reg) val,
-            in(reg) ptr,
-            options(nostack, pure, readonly)
-        );
+        unsafe {
+            asm!(
+                "mov {0:x}, word ptr [{1}]",
+                out(reg) val,
+                in(reg) ptr,
+                options(nostack, pure, readonly)
+            );
+        }
         return val;
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -65,12 +71,14 @@ pub unsafe fn read_u16(ptr: *const u8) -> u16 {
     #[cfg(target_arch = "x86_64")]
     {
         let val: u16;
-        asm!(
-            "mov {0:x}, word ptr [{1}]",
-            out(reg) val,
-            in(reg) ptr,
-            options(nostack, pure, readonly)
-        );
+        unsafe {
+            asm!(
+                "mov {0:x}, word ptr [{1}]",
+                out(reg) val,
+                in(reg) ptr,
+                options(nostack, pure, readonly)
+            );
+        }
         return val;
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -85,12 +93,14 @@ pub unsafe fn read_i32(ptr: *const u8) -> i32 {
     #[cfg(target_arch = "x86_64")]
     {
         let val: i32;
-        asm!(
-            "mov {0:e}, dword ptr [{1}]",
-            out(reg) val,
-            in(reg) ptr,
-            options(nostack, pure, readonly)
-        );
+        unsafe {
+            asm!(
+                "mov {0:e}, dword ptr [{1}]",
+                out(reg) val,
+                in(reg) ptr,
+                options(nostack, pure, readonly)
+            );
+        }
         return val;
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -105,12 +115,14 @@ pub unsafe fn read_u32(ptr: *const u8) -> u32 {
     #[cfg(target_arch = "x86_64")]
     {
         let val: u32;
-        asm!(
-            "mov {0:e}, dword ptr [{1}]",
-            out(reg) val,
-            in(reg) ptr,
-            options(nostack, pure, readonly)
-        );
+        unsafe {
+            asm!(
+                "mov {0:e}, dword ptr [{1}]",
+                out(reg) val,
+                in(reg) ptr,
+                options(nostack, pure, readonly)
+            );
+        }
         return val;
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -125,12 +137,14 @@ pub unsafe fn read_i64(ptr: *const u8) -> i64 {
     #[cfg(target_arch = "x86_64")]
     {
         let val: i64;
-        asm!(
-            "mov {0}, qword ptr [{1}]",
-            out(reg) val,
-            in(reg) ptr,
-            options(nostack, pure, readonly)
-        );
+        unsafe {
+            asm!(
+                "mov {0}, qword ptr [{1}]",
+                out(reg) val,
+                in(reg) ptr,
+                options(nostack, pure, readonly)
+            );
+        }
         return val;
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -145,12 +159,14 @@ pub unsafe fn read_u64(ptr: *const u8) -> u64 {
     #[cfg(target_arch = "x86_64")]
     {
         let val: u64;
-        asm!(
-            "mov {0}, qword ptr [{1}]",
-            out(reg) val,
-            in(reg) ptr,
-            options(nostack, pure, readonly)
-        );
+        unsafe {
+            asm!(
+                "mov {0}, qword ptr [{1}]",
+                out(reg) val,
+                in(reg) ptr,
+                options(nostack, pure, readonly)
+            );
+        }
         return val;
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -166,13 +182,15 @@ pub unsafe fn read_i128(ptr: *const u8) -> i128 {
     #[cfg(target_arch = "x86_64")]
     {
         let val: __m128i;
-        asm!(
-            "movdqu {0}, xmmword ptr [{1}]",
-            out(xmm_reg) val,
-            in(reg) ptr,
-            options(nostack, pure, readonly)
-        );
-        core::mem::transmute(val)
+        unsafe {
+            asm!(
+                "movdqu {0}, xmmword ptr [{1}]",
+                out(xmm_reg) val,
+                in(reg) ptr,
+                options(nostack, pure, readonly)
+            );
+        }
+        unsafe { core::mem::transmute(val) }
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -187,13 +205,15 @@ pub unsafe fn read_u128(ptr: *const u8) -> u128 {
     #[cfg(target_arch = "x86_64")]
     {
         let val: __m128i;
-        asm!(
-            "movdqu {0}, xmmword ptr [{1}]",
-            out(xmm_reg) val,
-            in(reg) ptr,
-            options(nostack, pure, readonly)
-        );
-        core::mem::transmute(val)
+        unsafe {
+            asm!(
+                "movdqu {0}, xmmword ptr [{1}]",
+                out(xmm_reg) val,
+                in(reg) ptr,
+                options(nostack, pure, readonly)
+            );
+        }
+        unsafe { core::mem::transmute(val) }
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -207,12 +227,14 @@ pub unsafe fn read_f32(ptr: *const u8) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
         let val: f32;
-        asm!(
-            "movss {0}, dword ptr [{1}]",
-            out(xmm_reg) val,
-            in(reg) ptr,
-            options(nostack, pure, readonly)
-        );
+        unsafe {
+            asm!(
+                "movss {0}, dword ptr [{1}]",
+                out(xmm_reg) val,
+                in(reg) ptr,
+                options(nostack, pure, readonly)
+            );
+        }
         return val;
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -227,12 +249,14 @@ pub unsafe fn read_f64(ptr: *const u8) -> f64 {
     #[cfg(target_arch = "x86_64")]
     {
         let val: f64;
-        asm!(
-            "movsd {0}, qword ptr [{1}]",
-            out(xmm_reg) val,
-            in(reg) ptr,
-            options(nostack, pure, readonly)
-        );
+        unsafe {
+            asm!(
+                "movsd {0}, qword ptr [{1}]",
+                out(xmm_reg) val,
+                in(reg) ptr,
+                options(nostack, pure, readonly)
+            );
+        }
         return val;
     }
     #[cfg(not(target_arch = "x86_64"))]

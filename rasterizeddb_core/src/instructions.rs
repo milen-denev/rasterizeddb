@@ -95,14 +95,16 @@ pub unsafe fn compare_raw_vecs(
     if vec_a_len != vec_b_len {
         return false;
     }
-
-    asm!(
-        "repe cmpsb",
-        inout("rsi") vec_a => _,
-        inout("rdi") vec_b => _,
-        inout("rcx") vec_a_len => _,
-        out("al") result
-    );
+    
+    unsafe {
+        asm!(
+            "repe cmpsb",
+            inout("rsi") vec_a => _,
+            inout("rdi") vec_b => _,
+            inout("rcx") vec_a_len => _,
+            out("al") result
+        );
+    }
 
     result == 0
 }

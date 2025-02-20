@@ -309,7 +309,7 @@ impl MemoryChunk {
             let new_vec = vec.clone();
             ChunkIntoVecResult::Vec(new_vec)
         } else {
-            ChunkIntoVecResult::ManualVec(ref_vec(self.ptr, self.size as usize))
+            ChunkIntoVecResult::ManualVec(unsafe { ref_vec(self.ptr, self.size as usize) })
         }
     }
 
