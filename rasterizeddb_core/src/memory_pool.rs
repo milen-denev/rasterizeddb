@@ -191,7 +191,7 @@ impl MemoryPool {
     }
 
     #[inline(always)]
-    pub fn acquire(&self, size: u32) -> Option<Chunk> {
+    pub fn acquire(&self, size: u32) -> Option<MemoryChunk> {
         let mut current_start = 0;
         let mut slot_index: Option<usize> = None;
 
@@ -233,7 +233,7 @@ impl MemoryPool {
         ATOMIC_PTR_ARRAY[i].0.store(ptr as usize, Ordering::SeqCst);
         ATOMIC_PTR_ARRAY[i].1.store(size, Ordering::SeqCst);
 
-        Some(Chunk {
+        Some(MemoryChunk {
             ptr,
             size,
             //pool: Arc::downgrade(&MEMORY_POOL),
@@ -251,7 +251,7 @@ impl MemoryPool {
 }
 
 #[derive(Debug, Clone)]
-pub struct Chunk {
+pub struct MemoryChunk {
     pub ptr: *mut u8,
     pub size: u32,
     //pool: std::sync::Weak<MemoryPool>,
@@ -260,10 +260,10 @@ pub struct Chunk {
     pub index: i32,
 }
 
-unsafe impl Send for Chunk {}
-unsafe impl Sync for Chunk {}
+unsafe impl Send for MemoryChunk {}
+unsafe impl Sync for MemoryChunk {}
 
-impl Default for Chunk {
+impl Default for MemoryChunk {
     fn default() -> Self {
         Self {
             ptr: std::ptr::null_mut(),
@@ -275,7 +275,7 @@ impl Default for Chunk {
     }
 }
 
-impl Drop for Chunk {
+impl Drop for MemoryChunk {
     fn drop(&mut self) {
         if self.vec.is_none() {
             // if let Some(pool) = self.pool.upgrade() {
@@ -286,7 +286,7 @@ impl Drop for Chunk {
     }
 }
 
-impl Chunk {
+impl MemoryChunk {
     pub fn prefetch_to_lcache(&self) {
         if self.vec.is_none() {
             unsafe { _mm_prefetch::<_MM_HINT_T0>(self.ptr as *const i8) };
@@ -295,7 +295,7 @@ impl Chunk {
 
     // Create a new chunk from a vector with no memory chunk allocated from pool
     pub fn from_vec(vec: Vec<u8>) -> Self {
-        Chunk {
+        MemoryChunk {
             ptr: ptr::null_mut(),
             size: 0,
             //pool: std::sync::Weak::default(),

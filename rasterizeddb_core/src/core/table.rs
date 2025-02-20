@@ -13,8 +13,13 @@ use super::{
     column::Column,
     db_type::DbType,
     helpers::{
-        add_in_memory_index, add_last_in_memory_index, columns_cursor_to_row,
-        indexed_row_fetching_file, read_row_columns, read_row_cursor, row_prefetching,
+        add_in_memory_index, 
+        add_last_in_memory_index, 
+        columns_cursor_to_row,
+        indexed_row_fetching_file, 
+        read_row_columns, 
+        read_row_cursor, 
+        row_prefetching,
         row_prefetching_cursor,
     },
     row::{InsertOrUpdateRow, Row},
@@ -25,7 +30,7 @@ use super::{
 };
 use crate::{
     core::helpers::delete_row_file,
-    memory_pool::{Chunk, MEMORY_POOL},
+    memory_pool::{MemoryChunk, MEMORY_POOL},
     rql::models::Next,
     simds::endianess::read_u32,
     CHUNK_SIZE, HEADER_SIZE, 
@@ -404,8 +409,7 @@ impl<S: IOOperationsSync> Table<S> {
                     let mut position: u64 = 0;
 
                     loop {
-                        if let Some(prefetch_result) = row_prefetching_cursor(&mut position, &mut cursor_vector, chunk, mutated).unwrap()
-                        {
+                        if let Some(prefetch_result) = row_prefetching_cursor(&mut position, &mut cursor_vector, chunk, mutated).unwrap() {
                             let mut current_column_index: u32 = 0;
                             let first_column_index = position.clone();
 
@@ -424,7 +428,7 @@ impl<S: IOOperationsSync> Table<S> {
                                         let size = db_type.get_size();
                                         let memory_chunk =
                                             MEMORY_POOL.acquire(size).unwrap_or_else(|| {
-                                                Chunk::from_vec(vec![0; size as usize])
+                                                MemoryChunk::from_vec(vec![0; size as usize])
                                             });
 
                                         let mut data_buffer = unsafe { memory_chunk.into_vec() };
@@ -468,7 +472,7 @@ impl<S: IOOperationsSync> Table<S> {
                                         let str_memory_chunk = MEMORY_POOL
                                             .acquire(str_length + 4)
                                             .unwrap_or_else(|| {
-                                                Chunk::from_vec(vec![0; str_length as usize + 4])
+                                                MemoryChunk::from_vec(vec![0; str_length as usize + 4])
                                             });
 
                                         let mut preset_buffer =
@@ -626,7 +630,7 @@ impl<S: IOOperationsSync> Table<S> {
                                 let memory_chunk = MEMORY_POOL
                                     .acquire(prefetch_result.length + 1)
                                     .unwrap_or_else(|| {
-                                        Chunk::from_vec(vec![
+                                        MemoryChunk::from_vec(vec![
                                             0;
                                             prefetch_result.length as usize + 1
                                         ])

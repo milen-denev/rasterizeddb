@@ -1,7 +1,7 @@
 use std::{
     arch::x86_64::{_mm_prefetch, _MM_HINT_T0},
     fmt::{Debug, Display},
-    io::{self, Cursor, Read, Write}
+    io::{self, Cursor, Read, Write}, ops::{Deref, DerefMut}
 };
 
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -12,7 +12,7 @@ use crate::{
         compare_raw_vecs, compare_vecs_ends_with, compare_vecs_eq, compare_vecs_ne,
         compare_vecs_starts_with, contains_subsequence, vec_from_ptr_safe,
     },
-    memory_pool::Chunk,
+    memory_pool::MemoryChunk,
     simds::endianess::{
         read_f32, read_f64, read_i128, read_i16, read_i32, read_i64, read_i8, read_u128, read_u16,
         read_u32, read_u64, read_u8,
@@ -29,11 +29,71 @@ pub struct Column {
     pub content: ColumnValue,
 }
 
+impl Deref for Column {
+    type Target = ColumnValue;
+
+    fn deref(&self) -> &Self::Target {
+        &self.content
+    }
+}
+
+impl DerefMut for Column {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.content
+    }
+}
+
+impl Default for Column {
+    fn default() -> Self {
+        Self { data_type: DbType::TBD, content: Default::default() }
+    }
+}
+
 #[derive(Debug)]
 pub enum ColumnValue {
     TempHolder((DbType, Vec<u8>)),
-    StaticMemoryPointer(Chunk),
+    StaticMemoryPointer(MemoryChunk),
     ManagedMemoryPointer(Vec<u8>),
+}
+
+impl Default for ColumnValue {
+    fn default() -> Self {
+        ColumnValue::ManagedMemoryPointer(Vec::default())
+    }
+}
+
+impl PartialEq for ColumnValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                ColumnValue::StaticMemoryPointer(pointer_a),
+                ColumnValue::StaticMemoryPointer(pointer_b),
+            ) => unsafe {
+                compare_raw_vecs(pointer_a.ptr, pointer_b.ptr, pointer_a.size, pointer_b.size)
+            },
+            (ColumnValue::ManagedMemoryPointer(a), ColumnValue::ManagedMemoryPointer(b)) => {
+                compare_vecs_eq(a, b)
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Clone for ColumnValue {
+    #[track_caller]
+    fn clone(&self) -> Self {
+        match self {
+            ColumnValue::StaticMemoryPointer(chunk) => {
+                ColumnValue::StaticMemoryPointer(chunk.clone())
+            }
+            ColumnValue::ManagedMemoryPointer(vec) => {
+                ColumnValue::ManagedMemoryPointer(vec.clone())
+            }
+            ColumnValue::TempHolder((db_type, vec)) => {
+                ColumnValue::TempHolder((db_type.clone(), vec.clone()))
+            }
+        }
+    }
 }
 
 impl ColumnValue {
@@ -114,40 +174,6 @@ impl ColumnValue {
         {
             let ptr = self.get_ptr();
             unsafe { _mm_prefetch::<_MM_HINT_T0>(ptr as *const i8) };
-        }
-    }
-}
-
-impl PartialEq for ColumnValue {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (
-                ColumnValue::StaticMemoryPointer(pointer_a),
-                ColumnValue::StaticMemoryPointer(pointer_b),
-            ) => unsafe {
-                compare_raw_vecs(pointer_a.ptr, pointer_b.ptr, pointer_a.size, pointer_b.size)
-            },
-            (ColumnValue::ManagedMemoryPointer(a), ColumnValue::ManagedMemoryPointer(b)) => {
-                compare_vecs_eq(a, b)
-            }
-            _ => false,
-        }
-    }
-}
-
-impl Clone for ColumnValue {
-    #[track_caller]
-    fn clone(&self) -> Self {
-        match self {
-            ColumnValue::StaticMemoryPointer(chunk) => {
-                ColumnValue::StaticMemoryPointer(chunk.clone())
-            }
-            ColumnValue::ManagedMemoryPointer(vec) => {
-                ColumnValue::ManagedMemoryPointer(vec.clone())
-            }
-            ColumnValue::TempHolder((db_type, vec)) => {
-                ColumnValue::TempHolder((db_type.clone(), vec.clone()))
-            }
         }
     }
 }
@@ -350,10 +376,10 @@ impl Column {
     }
 
     // Vector must be dropped before dropping column
-    pub unsafe fn into_chunk(self) -> io::Result<Chunk> {
+    pub unsafe fn into_chunk(self) -> io::Result<MemoryChunk> {
         let chunk = match self.content {
             ColumnValue::StaticMemoryPointer(chunk) => chunk,
-            ColumnValue::ManagedMemoryPointer(vec) => Chunk::from_vec(vec),
+            ColumnValue::ManagedMemoryPointer(vec) => MemoryChunk::from_vec(vec),
             _ => panic!("Operation is not supported, column is in temporary state."),
         };
 
@@ -414,7 +440,7 @@ impl Column {
         self.data_type = db_type;
     }
 
-    pub fn from_chunk(data_type: u8, chunk: Chunk) -> Column {
+    pub fn from_chunk(data_type: u8, chunk: MemoryChunk) -> Column {
         if chunk.vec.is_none() {
             Column {
                 data_type: DbType::from_byte(data_type),
@@ -461,7 +487,7 @@ impl Column {
                 data_buffer.append(&mut temp_buffer.to_vec());
             }
 
-            let memory_chunk = Chunk::from_vec(buffer.to_vec());
+            let memory_chunk = MemoryChunk::from_vec(buffer.to_vec());
             let column = Column::from_chunk(column_type, memory_chunk);
 
             columns.push(column);
@@ -680,6 +706,7 @@ impl Column {
 
                 let i32_1 = unsafe { read_i32(ptr_1) };
                 let i32_2 = unsafe { read_i32(ptr_2) };
+                
                 i32_1 > i32_2
             }
             DbType::I64 => {

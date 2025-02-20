@@ -14,7 +14,7 @@ use crate::POSITIONS_CACHE;
 use super::{column::Column, helpers::{read_row_cursor, row_prefetching_cursor}, row::Row, storage_providers::traits::IOOperationsSync, support_types::FileChunk};
 
 #[cfg(feature = "enable_parallelism")]
-use crate::{memory_pool::{Chunk, MEMORY_POOL}, rql::{models::{Next, Token}, tokenizer::evaluate_column_result}, simds::endianess::read_u32};
+use crate::{memory_pool::{MemoryChunk, MEMORY_POOL}, rql::{models::{Next, Token}, tokenizer::evaluate_column_result}, simds::endianess::read_u32};
 
 #[inline(always)]
 pub fn extent_non_string_buffer(
@@ -159,7 +159,13 @@ pub(crate) async fn process_all_chunks(
 
     let aggregator_handle = tokio::spawn(async move {
         let mut collected_rows = Vec::with_capacity(limit as usize);
-        rx.recv_many(&mut collected_rows, usize::MAX).await;
+
+        if rx.is_empty() {
+
+        } else {
+            rx.recv_many(&mut collected_rows, usize::MAX).await;
+        }
+
         drop(rx);
         collected_rows
     });
@@ -167,7 +173,11 @@ pub(crate) async fn process_all_chunks(
     // Await the aggregator to finish collecting rows.
     let all_rows = aggregator_handle.await.unwrap();
 
-    Ok(Some(all_rows))
+    if all_rows.len() == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(all_rows))
+    }
 }
 
 #[cfg(feature = "enable_parallelism")]
@@ -221,7 +231,7 @@ pub(crate) async fn process_chunk_async(
                         let size = db_type.get_size();
                         let memory_chunk =
                             MEMORY_POOL.acquire(size).unwrap_or_else(|| {
-                                Chunk::from_vec(vec![0; size as usize])
+                                MemoryChunk::from_vec(vec![0; size as usize])
                             });
 
                         let mut data_buffer = unsafe { memory_chunk.into_vec() };
@@ -265,7 +275,7 @@ pub(crate) async fn process_chunk_async(
                         let str_memory_chunk = MEMORY_POOL
                             .acquire(str_length + 4)
                             .unwrap_or_else(|| {
-                                Chunk::from_vec(vec![0; str_length as usize + 4])
+                                MemoryChunk::from_vec(vec![0; str_length as usize + 4])
                             });
 
                         let mut preset_buffer =

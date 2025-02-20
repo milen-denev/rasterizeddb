@@ -1,6 +1,6 @@
 use crate::{
     core::{column::Column, hashing::get_hash, row::InsertOrUpdateRow},
-    memory_pool::Chunk
+    memory_pool::MemoryChunk
 };
 
 #[cfg(feature = "enable_index_caching")]
@@ -269,7 +269,7 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
                 tokens_vector.push((new_vector, Some(Next::Or)));
             } else if token.starts_with('\'') && token.ends_with('\'') {
                 let string = &token[1..token.len() - 1];
-                let column = Column::from_chunk(14, Chunk::from_vec(string.as_bytes().to_vec()));
+                let column = Column::from_chunk(14, MemoryChunk::from_vec(string.as_bytes().to_vec()));
                 let val = Token::Value(column);
                 token_vector.push(val);
             } else if !token.contains(".") {

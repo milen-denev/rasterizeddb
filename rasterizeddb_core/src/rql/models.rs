@@ -32,7 +32,7 @@ pub enum MathOperation {
 #[derive(Debug, PartialEq, Clone)]
 pub enum Token {
     Column(u32),
-    Math(MathOperation),
     Value(Column),
     Operation(ComparerOperation),
+    Math(MathOperation),
 }
