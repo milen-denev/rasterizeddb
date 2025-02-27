@@ -1,7 +1,7 @@
 use std::{
     arch::x86_64::{_mm_prefetch, _MM_HINT_T0},
     io::{self, Read, Seek, SeekFrom, Write},
-    sync::Arc,
+    sync::{atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}, Arc},
 };
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -49,11 +49,27 @@ use crate::POSITIONS_CACHE;
 pub struct Table<S: IOOperationsSync> {
     pub(crate) io_sync: Box<S>,
     pub(crate) table_header: Arc<RwLock<TableHeader>>,
-    pub(crate) in_memory_index: Arc<RwLock<Option<Vec<FileChunk>>>>,
-    pub(crate) current_file_length: Arc<RwLock<u64>>,
-    pub(crate) current_row_id: Arc<RwLock<u64>>,
+    pub(crate) in_memory_index: Arc<Option<Vec<FileChunk>>>,
+    pub(crate) current_file_length: AtomicU64,
+    pub(crate) current_row_id: AtomicU64,
     pub(crate) immutable: bool,
-    pub(crate) locked: Arc<RwLock<bool>>,
+    pub(crate) locked: AtomicBool,
+}
+
+impl<S: IOOperationsSync> Clone for Table<S> {
+    fn clone(&self) -> Self {
+        let is_locked = self.locked.load(Ordering::Relaxed);   
+
+        Self { 
+            io_sync: self.io_sync.clone(), 
+            table_header: self.table_header.clone(), 
+            in_memory_index: self.in_memory_index.clone(), 
+            current_file_length: self.current_file_length.clone(), 
+            current_row_id: self.current_row_id.clone(), 
+            immutable: self.immutable.clone(), 
+            locked: AtomicBool::new(is_locked) 
+        }
+    }
 }
 
 unsafe impl<S: IOOperationsSync> Send for Table<S> {}
@@ -76,11 +92,11 @@ impl<S: IOOperationsSync> Table<S> {
             let table = Table {
                 io_sync: Box::new(io_sync),
                 table_header: Arc::new(RwLock::const_new(table_header)),
-                in_memory_index: Arc::new(RwLock::const_new(None)),
-                current_file_length: Arc::new(RwLock::const_new(table_file_len)),
-                current_row_id: Arc::new(RwLock::const_new(last_row_id)),
+                in_memory_index: Arc::new(None),
+                current_file_length: AtomicU64::new(table_file_len),
+                current_row_id: AtomicU64::new(last_row_id),
                 immutable: immutable,
-                locked: Arc::new(RwLock::const_new(false)),
+                locked: AtomicBool::new(false),
             };
 
             Ok(table)
@@ -95,11 +111,11 @@ impl<S: IOOperationsSync> Table<S> {
             let table = Table {
                 io_sync: Box::new(io_sync),
                 table_header: Arc::new(RwLock::const_new(table_header)),
-                in_memory_index: Arc::new(RwLock::const_new(None)),
-                current_file_length: Arc::new(RwLock::const_new(table_file_len)),
-                current_row_id: Arc::new(RwLock::const_new(0)),
+                in_memory_index: Arc::new(None),
+                current_file_length: AtomicU64::new(table_file_len),
+                current_row_id: AtomicU64::new(0),
                 immutable: immutable,
-                locked: Arc::new(RwLock::const_new(false)),
+                locked: AtomicBool::new(false),
             };
 
             Ok(table)
@@ -126,11 +142,11 @@ impl<S: IOOperationsSync> Table<S> {
             let table = Table {
                 io_sync: Box::new(io_sync),
                 table_header: Arc::new(RwLock::const_new(table_header)),
-                in_memory_index: Arc::new(RwLock::const_new(None)),
-                current_file_length: Arc::new(RwLock::const_new(table_file_len)),
-                current_row_id: Arc::new(RwLock::const_new(last_row_id)),
+                in_memory_index: Arc::new(None),
+                current_file_length: AtomicU64::new(table_file_len),
+                current_row_id: AtomicU64::new(last_row_id),
                 immutable: immutable,
-                locked: Arc::new(RwLock::const_new(false)),
+                locked: AtomicBool::new(false),
             };
 
             Ok(table)
@@ -145,11 +161,11 @@ impl<S: IOOperationsSync> Table<S> {
             let table = Table {
                 io_sync: Box::new(io_sync),
                 table_header: Arc::new(RwLock::const_new(table_header)),
-                in_memory_index: Arc::new(RwLock::const_new(None)),
-                current_file_length: Arc::new(RwLock::const_new(table_file_len)),
-                current_row_id: Arc::new(RwLock::const_new(0)),
+                in_memory_index: Arc::new(None),
+                current_file_length: AtomicU64::new(table_file_len),
+                current_row_id: AtomicU64::new(0),
                 immutable: immutable,
-                locked: Arc::new(RwLock::const_new(false)),
+                locked: AtomicBool::new(false),
             };
 
             Ok(table)
@@ -158,19 +174,13 @@ impl<S: IOOperationsSync> Table<S> {
 
     /// #### STABILIZED
     fn get_current_table_length(&mut self) -> u64 {
-        let file_length = loop {
-            if let Ok(len) = self.current_file_length.try_read() {
-                break *len;
-            }
-        };
-
-        return file_length;
+        return self.current_file_length.load(Ordering::Relaxed);
     }
 
     /// #### STABILIZED
     async fn update_eof_and_id(&mut self, buffer_size: u64) -> u64 {
-        let end_of_file_c = self.current_file_length.clone();
-        let last_row_id_c = self.current_row_id.clone();
+        let end_of_file_c = self.current_file_length.load(Ordering::Relaxed);
+        let last_row_id_c = self.current_row_id.load(Ordering::Relaxed);
 
         let mut end_of_file: RwLockWriteGuard<u64> = loop {
             let result = end_of_file_c.try_write();
@@ -202,8 +212,8 @@ impl<S: IOOperationsSync> Table<S> {
     /// Inserts a new row.
     pub async fn insert_row(&mut self, row: InsertOrUpdateRow) {
         loop {
-            let table_locked = self.locked.read().await;
-            if *table_locked {
+            let table_locked = self.locked.load(Ordering::Relaxed);
+            if table_locked {
                 continue;
             } else {
                 break;
@@ -261,8 +271,8 @@ impl<S: IOOperationsSync> Table<S> {
     /// Inserts a new row.
     pub async fn insert_row_unsync(&mut self, row: InsertOrUpdateRow) {
         loop {
-            let table_locked = self.locked.read().await;
-            if *table_locked {
+            let table_locked = self.locked.load(Ordering::Relaxed);
+            if table_locked {
                 continue;
             } else {
                 break;
@@ -752,8 +762,8 @@ impl<S: IOOperationsSync> Table<S> {
     /// Deletes the row by the given id.
     pub async fn delete_row_by_id(&mut self, id: u64) -> io::Result<()> {
         loop {
-            let table_locked = self.locked.read().await;
-            if *table_locked {
+            let table_locked = self.locked.load(Ordering::Relaxed);
+            if table_locked {
                 continue;
             } else {
                 break;
@@ -853,8 +863,8 @@ impl<S: IOOperationsSync> Table<S> {
     /// Rebuilds the in-memory indexes.
     pub async fn rebuild_in_memory_indexes(&mut self) {
         loop {
-            let table_locked = self.locked.read().await;
-            if *table_locked {
+            let table_locked = self.locked.load(Ordering::Relaxed);
+            if table_locked {
                 continue;
             } else {
                 break;
@@ -943,8 +953,8 @@ impl<S: IOOperationsSync> Table<S> {
     /// Updates the row by the given id.
     pub async fn update_row_by_id(&mut self, id: u64, row: InsertOrUpdateRow) {
         loop {
-            let table_locked = self.locked.read().await;
-            if *table_locked {
+            let table_locked = self.locked.load(Ordering::Relaxed);
+            if table_locked {
                 continue;
             } else {
                 break;
@@ -1154,11 +1164,10 @@ impl<S: IOOperationsSync> Table<S> {
     /// Vacuuming currently locks the table and inserts, updates, rebuild cache indexes, and deletes will be waiting until the vacuum is done.
     pub async fn vacuum_table(&mut self) {
         loop {
-            let mut table_locked = self.locked.write().await;
-            if *table_locked {
+            let table_locked = self.locked.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok();
+            if !table_locked {
                 continue;
             } else {
-                *table_locked = true;
                 break;
             }
         }
@@ -1202,8 +1211,14 @@ impl<S: IOOperationsSync> Table<S> {
 
         self.in_memory_index = Arc::new(RwLock::const_new(None));
 
-        let mut table_locked = self.locked.write().await;
-        *table_locked = false;
+        loop {
+            let table_locked = self.locked.compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed).is_ok();
+            if !table_locked {
+                continue;
+            } else {
+                break;
+            }
+        }
 
         let mut table_header = self.table_header.write().await;
         table_header.mutated = false;
