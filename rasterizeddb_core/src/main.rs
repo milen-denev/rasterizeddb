@@ -51,7 +51,7 @@ async fn main() -> std::io::Result<()> {
 
     let mut table = Table::init(io_sync, false, false).await.unwrap();
 
-    // for i in 1..=2_000 {
+    // for i in 1..=2_000_000 {
     //     let c1 = Column::new(i).unwrap();
     //     let c2 = Column::new(i * -1).unwrap();
     //     let str = 'A'.to_string().repeat(100);
@@ -71,7 +71,12 @@ async fn main() -> std::io::Result<()> {
     //         columns_data: columns_buffer.clone()
     //     };
 
-    //     table.insert_row_unsync(_insert_row).await;
+    //     let clone_1 = table.clone();
+
+    //     _ = tokio::spawn(async move {
+    //         let mut clone =  clone_1.clone();
+    //         clone.insert_row_unsync(_insert_row).await; 
+    //     }).await;
     // }
 
     // println!("DONE inserting rows.");
@@ -91,8 +96,8 @@ async fn main() -> std::io::Result<()> {
         r#"
         BEGIN
         SELECT FROM NAME_DOESNT_MATTER_FOR_NOW
-        WHERE COL(0) >= 499999
-        LIMIT 10
+        WHERE COL(0) >= 1999999
+        LIMIT 50
         END
     "#
     ))
@@ -113,8 +118,8 @@ async fn main() -> std::io::Result<()> {
         r#"
         BEGIN
         SELECT FROM NAME_DOESNT_MATTER_FOR_NOW
-        WHERE COL(0) = 499999
-        LIMIT 2
+        WHERE COL(0) = 1999999
+        LIMIT 50
         END
     "#
     ))
