@@ -4,8 +4,9 @@ use std::{
     sync::{atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}, Arc},
 };
 
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::{ByteOrder, LittleEndian, ReadBytesExt, WriteBytesExt};
 use itertools::Itertools;
+use log::debug;
 use tokio::sync::{RwLock, RwLockWriteGuard};
 
 use super::{
@@ -29,11 +30,7 @@ use super::{
     table_header::TableHeader,
 };
 use crate::{
-    core::helpers::delete_row_file,
-    memory_pool::{MemoryChunk, MEMORY_POOL},
-    rql::models::Next,
-    simds::endianess::read_u32,
-    CHUNK_SIZE, HEADER_SIZE, 
+    core::helpers::delete_row_file, memory_pool::{MemoryChunk, MEMORY_POOL}, rql::models::Next, simds::endianess::read_u32, CHUNK_SIZE, EMPTY_BUFFER, HEADER_SIZE 
 };
 
 #[cfg(feature = "enable_parallelism")]
@@ -58,15 +55,17 @@ pub struct Table<S: IOOperationsSync> {
 
 impl<S: IOOperationsSync> Clone for Table<S> {
     fn clone(&self) -> Self {
-        let is_locked = self.locked.load(Ordering::Relaxed);   
+        let is_locked = self.locked.load(Ordering::Relaxed);
+        let current_file_length = self.current_file_length.load(Ordering::Relaxed);
+        let current_row_id = self.current_row_id.load(Ordering::Relaxed);
 
         Self { 
             io_sync: self.io_sync.clone(), 
             table_header: self.table_header.clone(), 
             in_memory_index: self.in_memory_index.clone(), 
-            current_file_length: self.current_file_length.clone(), 
-            current_row_id: self.current_row_id.clone(), 
-            immutable: self.immutable.clone(), 
+            current_file_length: AtomicU64::new(current_file_length), 
+            current_row_id: AtomicU64::new(current_row_id), 
+            immutable: self.immutable, 
             locked: AtomicBool::new(is_locked) 
         }
     }
@@ -179,33 +178,23 @@ impl<S: IOOperationsSync> Table<S> {
 
     /// #### STABILIZED
     async fn update_eof_and_id(&mut self, buffer_size: u64) -> u64 {
-        let end_of_file_c = self.current_file_length.load(Ordering::Relaxed);
-        let last_row_id_c = self.current_row_id.load(Ordering::Relaxed);
-
-        let mut end_of_file: RwLockWriteGuard<u64> = loop {
-            let result = end_of_file_c.try_write();
-            if let Ok(mut end_of_file) = result {
-                if *end_of_file == 0 {
-                    *end_of_file = HEADER_SIZE as u64;
-                    break end_of_file;
-                }
-                break end_of_file;
-            }
+        // Get current values from atomics
+        let end_of_file = self.current_file_length.load(Ordering::Relaxed);
+        
+        // If end_of_file is 0, set it to HEADER_SIZE
+        let new_end_of_file = if end_of_file == 0 {
+            HEADER_SIZE as u64 + buffer_size
+        } else {
+            end_of_file + buffer_size
         };
-
-        let mut last_row_id: RwLockWriteGuard<u64> = loop {
-            let result = last_row_id_c.try_write();
-            if let Ok(last_row_id) = result {
-                break last_row_id;
-            }
-        };
-
-        *end_of_file = *end_of_file + buffer_size;
-        *last_row_id = *last_row_id + 1;
-
-        let last_row_id = *last_row_id;
-
-        return last_row_id;
+        
+        // Store new end_of_file value
+        self.current_file_length.store(new_end_of_file, Ordering::Relaxed);
+        
+        // Increment and return row ID atomically
+        let new_row_id = self.current_row_id.fetch_add(1, Ordering::Relaxed) + 1;
+        
+        return new_row_id;
     }
 
     /// #### STABILIZED
@@ -358,14 +347,9 @@ impl<S: IOOperationsSync> Table<S> {
             let select_all = evaluation_tokens.select_all;
             let mut evaluation_tokens = evaluation_tokens.tokens;
             let file_length = self.get_current_table_length();
-            let chunks_arc_clone = self.in_memory_index.clone();
 
-            let chunks_result = loop {
-                let result = chunks_arc_clone.try_read();
-                if let Ok(in_memory_index) = result {
-                    break in_memory_index;
-                }
-            };
+            let chunks_arc_clone = self.in_memory_index.clone();
+            let chunks_result = chunks_arc_clone.as_ref();
 
             let mut current_limit: i64 = 0;
 
@@ -376,7 +360,6 @@ impl<S: IOOperationsSync> Table<S> {
             let mutated = table_header.mutated;
 
             if let Some(chunks) = chunks_result.as_ref() {
-
                 let column_indexes = evaluation_tokens
                     .iter()
                     .flat_map(|(tokens, _)| tokens.iter())
@@ -774,12 +757,7 @@ impl<S: IOOperationsSync> Table<S> {
 
         let chunks_arc_clone = self.in_memory_index.clone();
 
-        let chunks_result = loop {
-            let result = chunks_arc_clone.try_read();
-            if let Ok(in_memory_index) = result {
-                break in_memory_index;
-            }
-        };
+        let chunks_result = chunks_arc_clone.as_ref();
 
         let table_header = self.table_header.read().await;
         let mutated = table_header.mutated;
@@ -862,6 +840,7 @@ impl<S: IOOperationsSync> Table<S> {
     /// #### STABILIZED
     /// Rebuilds the in-memory indexes.
     pub async fn rebuild_in_memory_indexes(&mut self) {
+        // Wait until the table is not locked
         loop {
             let table_locked = self.locked.load(Ordering::Relaxed);
             if table_locked {
@@ -872,83 +851,221 @@ impl<S: IOOperationsSync> Table<S> {
         }
 
         let file_length = self.get_current_table_length();
+        if file_length <= HEADER_SIZE as u64 {
+            // Empty database, nothing to index
+            return;
+        }
 
-        let chunks_arc_clone = self.in_memory_index.clone();
-
-        let chunks_result = loop {
-            let result = chunks_arc_clone.try_read();
-            if let Ok(in_memory_index) = result {
-                break in_memory_index;
-            }
-        };
-
-        let mut current_chunk_options = if let Some(chunks) = chunks_result.clone() {
-            Some(chunks)
-        } else {
-            None
-        };
-
-        drop(chunks_result);
-
-        let mut current_chunk_size: u32 = 0;
-
-        let mut position = HEADER_SIZE as u64;
-
-        let mut added = false;
-        let mut last_prefetch_result: RowPrefetchResult = RowPrefetchResult::default();
-
+        // Get table header info for mutation status
         let table_header = self.table_header.read().await;
         let mutated = table_header.mutated;
+        drop(table_header);
 
-        loop {
-            if let Some(prefetch_result) =
-                row_prefetching(&mut self.io_sync, &mut position, file_length, mutated)
-                    .await
-                    .unwrap()
-            {
-                position += prefetch_result.length as u64 + 1;
-                //START (1), ROWID (8), LEN (4), COLUMNS (X), END (1)
-                current_chunk_size += 1 + 8 + 4 + prefetch_result.length + 1;
+        // Initialize a temporary storage for the chunks we find
+        let mut chunks_vec: Vec<FileChunk> = Vec::with_capacity(32);
+        let mut position = HEADER_SIZE as u64;
+        let mut current_chunk_start = position;
+        let mut current_chunk_size: u32 = 0;
+        let mut last_row_id: u64 = 0;
 
-                added = add_in_memory_index(
-                    &mut current_chunk_size,
-                    prefetch_result.found_id,
-                    position,
-                    &mut current_chunk_options,
-                );
+        // Use a larger read buffer (4MB) for efficient scanning
+        const SCAN_BUFFER_SIZE: u32 = 4_194_304; // 4MB
 
-                last_prefetch_result = prefetch_result;
+        debug!("Starting indexing - file_length: {}", file_length);
 
-                if (position + CHUNK_SIZE as u64) >= file_length {
-                    break;
-                }
-            } else {
+        let mut scan_count = 0;
+        let start_time = std::time::Instant::now();
+
+        while position < file_length {
+            scan_count += 1;
+            if scan_count % 10 == 0 {
+                debug!("Scan progress: {:.2}% ({}/{})", 
+                    (position as f64 / file_length as f64) * 100.0, 
+                    position, file_length);
+            }
+        
+            // Calculate how much to read (either our buffer size or remaining file)
+            let read_size = std::cmp::min(
+                SCAN_BUFFER_SIZE, 
+                (file_length - position) as u32
+            );
+            
+            if read_size == 0 {
                 break;
             }
-        }
 
-        if !added {
-            position -= 1 + 8 + 4 + last_prefetch_result.length as u64 + 1;
-        }
-
-        if file_length > position {
-            add_last_in_memory_index(position, file_length, &mut current_chunk_options);
-        }
-
-        let chunks_arc_clone = self.in_memory_index.clone();
-
-        let mut chunks_write_result = loop {
-            let result = chunks_arc_clone.try_write();
-            if let Ok(in_memory_index) = result {
-                break in_memory_index;
+            // Read a large chunk in one operation
+            let mut data_position = position;
+            let buffer = self.io_sync.read_data(&mut data_position, read_size).await;
+            
+            // Safety check - ensure we got some data
+            if buffer.is_empty() {
+                debug!("Warning: Empty buffer read at position {}", position);
+                position += 1024; // Skip ahead to make progress
+                continue;
             }
-        };
+            
+            // Process the buffer to find START markers and row information
+            let mut buffer_position: usize = 0;
+            let buffer_length = buffer.len();
+            let mut rows_found_in_buffer = 0;
+            
+            while buffer_position + 13 <= buffer_length { // Need at least START + ID + LENGTH
+                // Skip empty spaces if table was mutated
+                if mutated && buffer_position < buffer_length && buffer[buffer_position] == 0 {
+                    // Fast-forward through empty spaces
+                    let mut empty_pos = buffer_position;
+                    while empty_pos + 8 <= buffer_length && 
+                          &buffer[empty_pos..empty_pos+8] == EMPTY_BUFFER.as_slice() {
+                        empty_pos += 8;
+                    }
+                    
+                    // If we reached the end of the buffer without finding data
+                    if empty_pos + 8 > buffer_length {
+                        buffer_position = buffer_length;
+                        position += buffer_position as u64;
+                        break;
+                    }
+                    
+                    // Find START marker
+                    while empty_pos < buffer_length && buffer[empty_pos] != DbType::START.to_byte() {
+                        empty_pos += 1;
+                    }
+                    
+                    if empty_pos >= buffer_length {
+                        buffer_position = buffer_length;
+                        position += buffer_position as u64;
+                        break;
+                    }
+                    
+                    buffer_position = empty_pos;
+                }
 
-        *chunks_write_result = current_chunk_options;
+                // Check for START marker
+                if buffer_position >= buffer_length || buffer[buffer_position] != DbType::START.to_byte() {
+                    // If no START marker is found, move to next byte and try again
+                    buffer_position += 1;
+                    continue;
+                }
 
-        drop(chunks_write_result);
+                // We found a START marker, extract ID and LENGTH
+                if buffer_position + 13 > buffer_length {
+                    // Not enough data in buffer, move position to the marker and read again
+                    position += buffer_position as u64;
+                    break;
+                }
+
+                // Extract row ID and length
+                let row_id_bytes = &buffer[buffer_position+1..buffer_position+9];
+                let length_bytes = &buffer[buffer_position+9..buffer_position+13];
+                let row_id = LittleEndian::read_u64(row_id_bytes);
+                let row_length = LittleEndian::read_u32(length_bytes);
+                
+                // Validate the row length is reasonable
+                if row_length > CHUNK_SIZE || row_length == 0 {
+                    // This doesn't look like a valid row, skip this byte
+                    buffer_position += 1;
+                    continue;
+                }
+                
+                // Calculate full row size including header and footer
+                let full_row_size = (1 + 8 + 4 + row_length + 1) as u32; // START + ID + LEN + CONTENT + END
+                rows_found_in_buffer += 1;
+                
+                // Update the last row ID if this one is larger
+                if row_id > last_row_id {
+                    last_row_id = row_id;
+                }
+                
+                // Check if current row would make chunk exceed CHUNK_SIZE
+                if current_chunk_size + full_row_size > CHUNK_SIZE {
+                    // Add the current chunk without this row
+                    if current_chunk_size > 0 {
+                        chunks_vec.push(FileChunk {
+                            current_file_position: current_chunk_start,
+                            chunk_size: current_chunk_size,
+                            next_row_id: row_id,
+                        });
+                    }
+                    
+                    // Start a new chunk with this row
+                    current_chunk_start = position + buffer_position as u64;
+                    current_chunk_size = full_row_size;
+                } else {
+                    // Add to current chunk
+                    current_chunk_size += full_row_size;
+                }
+                
+                // Move to next row - ensure we don't exceed the buffer
+                if buffer_position + full_row_size as usize <= buffer_length {
+                    buffer_position += full_row_size as usize;
+                } else {
+                    // Row extends beyond buffer, skip to next read
+                    position += buffer_position as u64;
+                    break;
+                }
+            }
+            
+            // Update position for next read
+            if buffer_position > 0 {
+                position += buffer_position as u64;
+            } else {
+                // If we made no progress, skip ahead to avoid an infinite loop
+                position += 1024; // Skip ahead by 1KB 
+                debug!("Warning: No progress made in buffer scan, skipping ahead");
+            }
+
+            if rows_found_in_buffer == 0 && buffer_length > 13 {
+                // No rows found in this buffer, which is unexpected
+                debug!("Warning: No rows found in buffer of size {}", buffer_length);
+            }
+        }
+        
+        // Always add the final chunk if it has data
+        if current_chunk_size > 0 {
+            chunks_vec.push(FileChunk {
+                current_file_position: current_chunk_start,
+                chunk_size: file_length as u32 - current_chunk_start as u32,
+                next_row_id: last_row_id,
+            });
+        }
+
+        // Display indexing results
+        let elapsed = start_time.elapsed();
+        debug!("Indexing complete in {:.2?}", elapsed);
+        debug!("Indexed from {} to {} bytes ({:.2}% of file)", 
+            HEADER_SIZE, position, (position as f64 / file_length as f64) * 100.0);
+        debug!("Found {} chunks with last row_id {}", chunks_vec.len(), last_row_id);
+        
+        // Debug: Print first and last chunk info
+        if !chunks_vec.is_empty() {
+            let first = &chunks_vec[0];
+            let last = &chunks_vec[chunks_vec.len() - 1];
+            debug!("First chunk: start={}, size={}, next_row_id={}", 
+                first.current_file_position, first.chunk_size, first.next_row_id);
+            debug!("Last chunk: start={}, size={}, next_row_id={}", 
+                last.current_file_position, last.chunk_size, last.next_row_id);
+        }
+
+        // Update the in_memory_index
+        if chunks_vec.is_empty() {
+            self.in_memory_index = Arc::new(None);
+        } else {
+            self.in_memory_index = Arc::new(Some(chunks_vec));
+        }
+        
+        // Update last_row_id in current_row_id atomic if needed
+        let current_last_row_id = self.current_row_id.load(Ordering::Relaxed);
+        if last_row_id > current_last_row_id {
+            self.current_row_id.store(last_row_id, Ordering::Relaxed);
+            
+            // Update the table header
+            let mut table_header = self.table_header.write().await;
+            table_header.last_row_id = last_row_id;
+            self.io_sync.write_data(0, &table_header.to_bytes().unwrap()).await;
+        }
     }
-
+    
     /// #### STABILIZED
     /// Updates the row by the given id.
     pub async fn update_row_by_id(&mut self, id: u64, row: InsertOrUpdateRow) {
@@ -968,15 +1085,12 @@ impl<S: IOOperationsSync> Table<S> {
 
         let update_row_size = buffer.capacity() as u32;
 
-        let current_file_len: u64 = loop {
-            let result = self.current_file_length.try_read();
-            if let Ok(current_len) = result {
-                if *current_len == 0 {
-                    break current_len.clone() + HEADER_SIZE as u64;
-                } else {
-                    break current_len.clone();
-                }
-            }
+        // Get current file length using atomic
+        let current_file_len = self.current_file_length.load(Ordering::Relaxed);
+        let current_file_len = if current_file_len == 0 {
+            HEADER_SIZE as u64
+        } else {
+            current_file_len
         };
 
         let file_length = self.get_current_table_length();
@@ -1119,31 +1233,34 @@ impl<S: IOOperationsSync> Table<S> {
 
                         let chunks_arc_clone = self.in_memory_index.clone();
 
-                        let mut chunks_write_result = loop {
-                            let result = chunks_arc_clone.try_write();
-                            if let Ok(in_memory_index) = result {
-                                break in_memory_index;
-                            }
+                        let mut new_chunks = if let Some(existing_chunks) = chunks_arc_clone.as_ref() {
+                            existing_chunks.clone()
+                        } else {
+                            Vec::with_capacity(1)
                         };
-
-                        if let Some(ref mut chunks) = *chunks_write_result {
-                            let last_chunk = chunks.last_mut().unwrap();
-
+                        
+                        if !new_chunks.is_empty() {
+                            let last_chunk = new_chunks.last_mut().unwrap();
+                            
                             if last_chunk.chunk_size + update_row_size <= CHUNK_SIZE as u32 {
-                                last_chunk.chunk_size = last_chunk.chunk_size + update_row_size;
-                                last_chunk.next_row_id = last_chunk.next_row_id + 1;
+                                last_chunk.chunk_size += update_row_size;
+                                last_chunk.next_row_id += 1;
                             } else {
-                                let new_chunk = FileChunk {
-                                    current_file_position: current_file_len, //+ last_chunk.chunk_size as u64,
+                                new_chunks.push(FileChunk {
+                                    current_file_position: current_file_len,
                                     chunk_size: update_row_size,
                                     next_row_id: row_id,
-                                };
-
-                                chunks.push(new_chunk);
+                                });
                             }
+                        } else {
+                            new_chunks.push(FileChunk {
+                                current_file_position: current_file_len,
+                                chunk_size: update_row_size,
+                                next_row_id: row_id,
+                            });
                         }
-
-                        drop(chunks_write_result);
+                        
+                        self.in_memory_index = Arc::new(Some(new_chunks));
 
                         let mut table_header = self.table_header.write().await;
                         table_header.mutated = true;
@@ -1209,7 +1326,7 @@ impl<S: IOOperationsSync> Table<S> {
 
         drop(temp_table);
 
-        self.in_memory_index = Arc::new(RwLock::const_new(None));
+        self.in_memory_index = Arc::new(None);
 
         loop {
             let table_locked = self.locked.compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed).is_ok();

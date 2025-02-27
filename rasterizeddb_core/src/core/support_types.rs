@@ -48,6 +48,11 @@ impl FileChunk {
 
         return buffer;
     }
+
+    #[inline(always)]
+    pub fn is_valid(&self) -> bool {
+        self.current_file_position > 0 && self.chunk_size > 0
+    }
 }
 
 impl<'a> CursorVector<'a> {
