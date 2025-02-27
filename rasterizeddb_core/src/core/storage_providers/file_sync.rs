@@ -1,17 +1,19 @@
 use std::{
     fs::{self, remove_file},
-    io::{Cursor, Read, Seek, SeekFrom, Write},
-    path::Path
+    io::{Cursor, Read, Seek, SeekFrom},
+    path::Path, sync::Arc
 };
 
-use tokio::task::yield_now;
+use tokio::{io::{AsyncSeekExt, AsyncWriteExt}, sync::RwLock, task::yield_now};
 
 use super::traits::IOOperationsSync;
 
 pub struct LocalStorageProvider {
+    pub(super) append_file: Arc<RwLock<tokio::fs::File>>,
+    pub(super) write_file: Arc<RwLock<tokio::fs::File>>,
     pub(crate) location: String,
     pub(crate) table_name: String,
-    pub(crate) file_str: String,
+    pub(crate) file_str: String
 }
 
 unsafe impl Sync for LocalStorageProvider { }
@@ -20,6 +22,8 @@ unsafe impl Send for LocalStorageProvider { }
 impl Clone for LocalStorageProvider {
     fn clone(&self) -> Self {
         Self {
+            append_file: self.append_file.clone(),
+            write_file: self.write_file.clone(),
             location: self.location.clone(),
             table_name: self.table_name.clone(),
             file_str: self.file_str.clone(),
@@ -53,7 +57,24 @@ impl LocalStorageProvider {
             _ = std::fs::File::create(&file_str).unwrap();
         }
 
+
+        let file_append = tokio::fs::File::options()
+            .read(true)
+            .append(true)
+            .open(&file_str)
+            .await
+            .unwrap();
+
+        let file_write = tokio::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(&file_str)
+            .await
+            .unwrap();
+
         LocalStorageProvider {
+            append_file: Arc::new(RwLock::new(file_append)),
+            write_file: Arc::new(RwLock::new(file_write)),
             location: location.to_string(),
             table_name: table_name.to_string(),
             file_str: file_str,
@@ -86,16 +107,9 @@ impl LocalStorageProvider {
 
 impl IOOperationsSync for LocalStorageProvider {
     async fn write_data_unsync(&mut self, position: u64, buffer: &[u8]) {
-        yield_now().await;
-
-        let mut file_write = std::fs::File::options()
-            .read(true)
-            .write(true)
-            .open(&self.file_str)
-            .unwrap();
-
-        file_write.seek(SeekFrom::Start(position)).unwrap();
-        file_write.write_all(buffer).unwrap();
+        let mut file = self.write_file.write().await;
+        file.seek(SeekFrom::Start(position)).await.unwrap();
+        file.write_all(buffer).await.unwrap();
     }
 
     async fn verify_data(&mut self, position: u64, buffer: &[u8]) -> bool {
@@ -113,32 +127,18 @@ impl IOOperationsSync for LocalStorageProvider {
     }
 
     async fn write_data(&mut self, position: u64, buffer: &[u8]) {
-        yield_now().await;
-
-        let mut file = std::fs::File::options()
-            .read(true)
-            .write(true)
-            .open(&self.file_str)
-            .unwrap();
-
-        file.seek(SeekFrom::Start(position)).unwrap();
-        file.write_all(buffer).unwrap();
-        file.flush().unwrap();
-        file.sync_all().unwrap();
+        let mut file = self.write_file.write().await;
+        file.seek(SeekFrom::Start(position)).await.unwrap();
+        file.write_all(buffer).await.unwrap();
+        file.flush().await.unwrap();
+        file.sync_all().await.unwrap();
     }
 
     async fn append_data(&mut self, buffer: &[u8]) {
-        yield_now().await;
-
-        let mut file = std::fs::File::options()
-            .read(true)
-            .append(true)
-            .open(&self.file_str)
-            .unwrap();
-
-        file.write_all(&buffer).unwrap();
-        file.flush().unwrap();
-        file.sync_all().unwrap();
+        let mut file = self.append_file.write().await;
+        file.write_all(&buffer).await.unwrap();
+        file.flush().await.unwrap();
+        file.sync_all().await.unwrap();
     }
 
     async fn read_data(&mut self, position: &mut u64, length: u32) -> Vec<u8> {
@@ -241,18 +241,11 @@ impl IOOperationsSync for LocalStorageProvider {
     }
 
     async fn write_data_seek(&mut self, seek: SeekFrom, buffer: &[u8]) {
-        yield_now().await;
-
-        let mut file = std::fs::File::options()
-            .read(true)
-            .write(true)
-            .open(&self.file_str)
-            .unwrap();
-
-        file.seek(seek).unwrap();
-        file.write_all(buffer).unwrap();
-        file.flush().unwrap();
-        file.sync_all().unwrap();
+        let mut file = self.write_file.write().await;
+        file.seek(seek).await.unwrap();
+        file.write_all(buffer).await.unwrap();
+        file.flush().await.unwrap();
+        file.sync_all().await.unwrap();
     }
 
     async fn verify_data_and_sync(&mut self, position: u64, buffer: &[u8]) -> bool {
@@ -276,15 +269,8 @@ impl IOOperationsSync for LocalStorageProvider {
     }
 
     async fn append_data_unsync(&mut self, buffer: &[u8]) {
-        yield_now().await;
-        
-        let mut file = std::fs::File::options()
-            .read(true)
-            .append(true)
-            .open(&self.file_str)
-            .unwrap();
-
-        file.write_all(&buffer).unwrap();
+        let mut file = self.append_file.write().await;
+        file.write_all(&buffer).await.unwrap();
     }
 
     async fn create_temp(&self) -> Self {
@@ -308,7 +294,23 @@ impl IOOperationsSync for LocalStorageProvider {
 
         _ = std::fs::File::create(&file_str).unwrap();
 
+        let file_append = tokio::fs::File::options()
+            .read(true)
+            .append(true)
+            .open(&file_str)
+            .await
+            .unwrap();
+
+        let file_write = tokio::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(&file_str)
+            .await
+            .unwrap();
+
         Self {
+            append_file: Arc::new(RwLock::new(file_append)),
+            write_file: Arc::new(RwLock::new(file_write)),
             location: self.location.to_string(),
             table_name: "temp.db".to_string(),
             file_str: file_str,
@@ -353,8 +355,23 @@ impl IOOperationsSync for LocalStorageProvider {
         if !file_path.exists() && !file_path.is_file() {
             _ = std::fs::File::create(&self.file_str).unwrap();
         }
+        let file_append = tokio::fs::File::options()
+            .read(true)
+            .append(true)
+            .open(&self.file_str)
+            .await
+            .unwrap();
+
+        let file_write = tokio::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(&self.file_str)
+            .await
+            .unwrap();
 
         LocalStorageProvider {
+            append_file: Arc::new(RwLock::new(file_append)),
+            write_file: Arc::new(RwLock::new(file_write)),
             location: self.location.to_string(),
             table_name: name.to_string(),
             file_str: self.file_str.clone()
