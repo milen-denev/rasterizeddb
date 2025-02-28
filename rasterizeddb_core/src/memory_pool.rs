@@ -198,14 +198,14 @@ impl MemoryPool {
         // Try to atomically claim one of the available slots.
         for (i, flag) in ATOMIC_IN_USE_ARRAY.iter().enumerate() {
             if flag
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
+                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
             {
                 slot_index = Some(i);
 
                 // Read the previous size and pointer in an atomic way.
-                let previous_size = ATOMIC_PTR_ARRAY[i].1.load(Ordering::SeqCst);
-                let previous_start = ATOMIC_PTR_ARRAY[i].0.load(Ordering::SeqCst);
+                let previous_size = ATOMIC_PTR_ARRAY[i].1.load(Ordering::Relaxed);
+                let previous_start = ATOMIC_PTR_ARRAY[i].0.load(Ordering::Relaxed);
 
                 if previous_size != 0 && previous_start != 0 {
                     current_start = previous_start - self.start + previous_size as usize;
@@ -224,14 +224,14 @@ impl MemoryPool {
         // Check that we do not exceed the limit.
         if current_start + size as usize > MEMORY_POOL_SIZE {
             // Release our claim if allocation cannot proceed.
-            ATOMIC_IN_USE_ARRAY[i].store(false, Ordering::SeqCst);
+            ATOMIC_IN_USE_ARRAY[i].store(false, Ordering::Relaxed);
             return None;
         }
 
         // Set the pointer and size for the slot.
         let ptr = self.buffer[current_start..current_start + size as usize].as_ptr() as *mut u8;
-        ATOMIC_PTR_ARRAY[i].0.store(ptr as usize, Ordering::SeqCst);
-        ATOMIC_PTR_ARRAY[i].1.store(size, Ordering::SeqCst);
+        ATOMIC_PTR_ARRAY[i].0.store(ptr as usize, Ordering::Relaxed);
+        ATOMIC_PTR_ARRAY[i].1.store(size, Ordering::Relaxed);
 
         Some(MemoryChunk {
             ptr,
@@ -245,7 +245,7 @@ impl MemoryPool {
     #[inline(always)]
     fn release(&self, index: i32) {
         if index != -1 {
-            ATOMIC_IN_USE_ARRAY[index as usize].store(false, Ordering::Release);
+            ATOMIC_IN_USE_ARRAY[index as usize].store(false, Ordering::Relaxed);
         }
     }
 }
