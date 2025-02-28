@@ -365,7 +365,7 @@ pub(crate) async fn process_chunk_async(
 
                 let current_limit = atomic_limit.fetch_add(1, Ordering::Relaxed);
 
-                if current_limit <= limit {
+                if current_limit < limit {
                     if tx.send(row).is_err() {
                         break;
                     }    
