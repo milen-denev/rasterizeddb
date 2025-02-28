@@ -51,7 +51,7 @@ async fn main() -> std::io::Result<()> {
 
     let mut table = Table::init(io_sync, false, false).await.unwrap();
 
-    // for i in 1..=2_000_000 {
+    // for i in 1_000_001..=5_000_000 {
     //     let c1 = Column::new(i).unwrap();
     //     let c2 = Column::new(i * -1).unwrap();
     //     let str = 'A'.to_string().repeat(100);
@@ -96,7 +96,7 @@ async fn main() -> std::io::Result<()> {
         r#"
         BEGIN
         SELECT FROM NAME_DOESNT_MATTER_FOR_NOW
-        WHERE COL(0) >= 1999999
+        WHERE COL(0) >= 4999999
         LIMIT 50
         END
     "#
@@ -118,7 +118,7 @@ async fn main() -> std::io::Result<()> {
         r#"
         BEGIN
         SELECT FROM NAME_DOESNT_MATTER_FOR_NOW
-        WHERE COL(0) = 1999999
+        WHERE COL(0) = 4999999
         LIMIT 50
         END
     "#
