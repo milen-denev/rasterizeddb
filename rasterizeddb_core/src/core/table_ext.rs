@@ -181,6 +181,7 @@ pub(crate) async fn process_all_chunks(
 }
 
 #[cfg(feature = "enable_parallelism")]
+#[inline(always)]
 pub(crate) async fn process_chunk_async(
     chunk_buffer: Vec<u8>,
     column_indexes: Arc<Vec<u32>>,
