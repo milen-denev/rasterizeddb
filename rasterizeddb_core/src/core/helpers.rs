@@ -13,8 +13,8 @@ use super::{
     support_types::{CursorVector, FileChunk, RowPrefetchResult},
 };
 use crate::{
-    simds::endianess::{read_u32, read_u64, read_u8},
-    CHUNK_SIZE, EMPTY_BUFFER, HEADER_SIZE,
+    simds::endianess::{read_u32, read_u64},
+    EMPTY_BUFFER,
 };
 
 #[inline(always)]
@@ -371,73 +371,6 @@ pub fn row_prefetching_cursor(
         found_id,
         length,
     }))
-}
-
-#[inline(always)]
-pub(crate) fn add_in_memory_index(
-    current_chunk_size: &mut u32,
-    current_id: u64,
-    file_position: u64,
-    in_memory_index: &mut Option<Vec<FileChunk>>,
-) -> bool {
-    if *current_chunk_size > CHUNK_SIZE {
-        // Only allocate a new Vec if needed
-        match in_memory_index {
-            Some(file_chunks_indexes) => {
-                file_chunks_indexes.push(FileChunk {
-                    current_file_position: file_position - *current_chunk_size as u64,
-                    chunk_size: *current_chunk_size,
-                    next_row_id: current_id,
-                });
-            },
-            None => {
-                let mut chunks_vec = Vec::with_capacity(16); // Preallocate with a reasonable capacity
-                chunks_vec.push(FileChunk {
-                    current_file_position: HEADER_SIZE as u64,
-                    chunk_size: *current_chunk_size,
-                    next_row_id: current_id,
-                });
-                *in_memory_index = Some(chunks_vec);
-            }
-        }
-
-        *current_chunk_size = 0;
-        true
-    } else {
-        false
-    }
-}
-
-#[inline(always)]
-pub(crate) fn add_last_in_memory_index(
-    file_position: u64,
-    file_length: u64,
-    in_memory_index: &mut Option<Vec<FileChunk>>,
-) {
-    if file_position >= file_length {
-        return;
-    }
-
-    let chunk_size = file_length as u32 - file_position as u32;
-    
-    match in_memory_index {
-        Some(file_chunks_indexes) => {
-            file_chunks_indexes.push(FileChunk {
-                current_file_position: file_position,
-                chunk_size,
-                next_row_id: 0,
-            });
-        },
-        None => {
-            let mut chunks_vec = Vec::with_capacity(1);
-            chunks_vec.push(FileChunk {
-                current_file_position: HEADER_SIZE as u64,
-                chunk_size,
-                next_row_id: 0,
-            });
-            *in_memory_index = Some(chunks_vec);
-        }
-    }
 }
 
 #[inline(always)]
