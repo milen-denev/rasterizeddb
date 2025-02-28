@@ -1,7 +1,7 @@
 use std::{
     arch::x86_64::{_mm_prefetch, _MM_HINT_T0},
     io::{self, Read, Seek, SeekFrom, Write},
-    sync::{atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}, Arc},
+    sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc},
 };
 
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -13,9 +13,7 @@ use super::{
     super::rql::{models::Token, parser::ParserResult, tokenizer::evaluate_column_result},
     column::Column,
     db_type::DbType,
-    helpers::{
-        add_in_memory_index, 
-        add_last_in_memory_index, 
+    helpers::{ 
         columns_cursor_to_row,
         indexed_row_fetching_file, 
         read_row_columns, 
@@ -25,7 +23,7 @@ use super::{
     },
     row::{InsertOrUpdateRow, Row},
     storage_providers::traits::IOOperationsSync,
-    support_types::{CursorVector, FileChunk, RowPrefetchResult},
+    support_types::{CursorVector, FileChunk},
     table_ext::extent_non_string_buffer,
     table_header::TableHeader,
 };
@@ -51,6 +49,7 @@ pub struct Table<S: IOOperationsSync> {
     pub(crate) current_row_id: AtomicU64,
     pub(crate) immutable: bool,
     pub(crate) locked: AtomicBool,
+    pub(crate) mutated: AtomicBool,
 }
 
 impl<S: IOOperationsSync> Clone for Table<S> {
@@ -58,6 +57,7 @@ impl<S: IOOperationsSync> Clone for Table<S> {
         let is_locked = self.locked.load(Ordering::Relaxed);
         let current_file_length = self.current_file_length.load(Ordering::Relaxed);
         let current_row_id = self.current_row_id.load(Ordering::Relaxed);
+        let mutated = self.mutated.load(Ordering::Relaxed);
 
         Self { 
             io_sync: self.io_sync.clone(), 
@@ -66,7 +66,8 @@ impl<S: IOOperationsSync> Clone for Table<S> {
             current_file_length: AtomicU64::new(current_file_length), 
             current_row_id: AtomicU64::new(current_row_id), 
             immutable: self.immutable, 
-            locked: AtomicBool::new(is_locked) 
+            locked: AtomicBool::new(is_locked),
+            mutated: AtomicBool::new(mutated) 
         }
     }
 }
@@ -84,6 +85,8 @@ impl<S: IOOperationsSync> Table<S> {
             let buffer = io_sync.read_data(&mut 0, HEADER_SIZE as u32).await;
             let mut table_header = TableHeader::from_buffer(buffer).unwrap();
 
+            let mutated = table_header.mutated;
+            
             let last_row_id: u64 = table_header.last_row_id;
 
             table_header.total_file_length = table_file_len;
@@ -96,12 +99,15 @@ impl<S: IOOperationsSync> Table<S> {
                 current_row_id: AtomicU64::new(last_row_id),
                 immutable: immutable,
                 locked: AtomicBool::new(false),
+                mutated: AtomicBool::new(mutated),
             };
 
             Ok(table)
         } else {
             let table_header = TableHeader::new(HEADER_SIZE as u64, 0, compressed, 0, 0, false);
 
+            let mutated = table_header.mutated;
+            
             // Serialize the header and write it to the file
             let header_bytes = table_header.to_bytes().unwrap();
 
@@ -115,6 +121,7 @@ impl<S: IOOperationsSync> Table<S> {
                 current_row_id: AtomicU64::new(0),
                 immutable: immutable,
                 locked: AtomicBool::new(false),
+                mutated: AtomicBool::new(mutated),
             };
 
             Ok(table)
@@ -134,6 +141,8 @@ impl<S: IOOperationsSync> Table<S> {
             let buffer = io_sync.read_data(&mut 0, HEADER_SIZE as u32).await;
             let mut table_header = TableHeader::from_buffer(buffer).unwrap();
 
+            let mutated = table_header.mutated;
+            
             let last_row_id: u64 = table_header.last_row_id;
 
             table_header.total_file_length = table_file_len;
@@ -146,11 +155,14 @@ impl<S: IOOperationsSync> Table<S> {
                 current_row_id: AtomicU64::new(last_row_id),
                 immutable: immutable,
                 locked: AtomicBool::new(false),
+                mutated: AtomicBool::new(mutated),
             };
 
             Ok(table)
         } else {
             let table_header = TableHeader::new(HEADER_SIZE as u64, 0, compressed, 0, 0, false);
+
+            let mutated = table_header.mutated;
 
             // Serialize the header and write it to the file
             let header_bytes = table_header.to_bytes().unwrap();
@@ -165,6 +177,7 @@ impl<S: IOOperationsSync> Table<S> {
                 current_row_id: AtomicU64::new(0),
                 immutable: immutable,
                 locked: AtomicBool::new(false),
+                mutated: AtomicBool::new(mutated),
             };
 
             Ok(table)
@@ -356,8 +369,7 @@ impl<S: IOOperationsSync> Table<S> {
             #[cfg(feature = "enable_index_caching")]
             let mut result_row_vec: Vec<(u64, u32)> = Vec::default();
 
-            let table_header = self.table_header.read().await;
-            let mutated = table_header.mutated;
+            let mutated = self.mutated.load(Ordering::Relaxed);
 
             if let Some(chunks) = chunks_result.as_ref() {
                 let column_indexes = evaluation_tokens
@@ -791,6 +803,9 @@ impl<S: IOOperationsSync> Table<S> {
                                 .unwrap();
 
                             let mut table_header = self.table_header.write().await;
+
+                            self.mutated.store(true, Ordering::Relaxed);
+
                             table_header.mutated = true;
                             self.io_sync.write_data(0, &table_header.to_bytes().unwrap()).await;
 
@@ -820,6 +835,9 @@ impl<S: IOOperationsSync> Table<S> {
                             .unwrap();
 
                         let mut table_header = self.table_header.write().await;
+
+                        self.mutated.store(true, Ordering::Relaxed);
+
                         table_header.mutated = true;
                         self.io_sync.write_data(0, &table_header.to_bytes().unwrap()).await;
 
@@ -1262,6 +1280,8 @@ impl<S: IOOperationsSync> Table<S> {
                         
                         self.in_memory_index = Arc::new(Some(new_chunks));
 
+                        self.mutated.store(true, Ordering::Relaxed);
+
                         let mut table_header = self.table_header.write().await;
                         table_header.mutated = true;
                         self.io_sync.write_data(0, &table_header.to_bytes().unwrap()).await;
@@ -1333,6 +1353,7 @@ impl<S: IOOperationsSync> Table<S> {
             if !table_locked {
                 continue;
             } else {
+                self.mutated.store(false, Ordering::Relaxed);
                 break;
             }
         }
@@ -1340,5 +1361,6 @@ impl<S: IOOperationsSync> Table<S> {
         let mut table_header = self.table_header.write().await;
         table_header.mutated = false;
         self.io_sync.write_data(0, &table_header.to_bytes().unwrap()).await;
+       
     }
 }
