@@ -2,250 +2,49 @@ use std::{
     arch::x86_64::{_mm_prefetch, _MM_HINT_T0},
     mem::{self, ManuallyDrop},
     pin::Pin,
-    ptr,
-    sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
-        Arc, LazyLock,
-    },
+    ptr
 };
 
-use crate::instructions::ref_vec;
+use crate::instructions::{ref_vec, ref_vec_no_manual};
 
-const MEMORY_POOL_SIZE: usize = 268435456; // 256MiB
+pub static MEMORY_POOL: MemoryPool = MemoryPool::new();
 
-pub static MEMORY_POOL: LazyLock<Arc<MemoryPool>> = LazyLock::new(|| Arc::new(MemoryPool::new()));
-
-pub struct MemoryPool {
-    pub buffer: Arc<Pin<Box<[u8]>>>,
-    pub start: usize,
-    pub end: usize,
-}
+pub struct MemoryPool;
 
 unsafe impl Send for MemoryPool {}
 unsafe impl Sync for MemoryPool {}
 
-static ATOMIC_PTR_ARRAY: LazyLock<Arc<Box<[(AtomicUsize, AtomicU32)]>>> = LazyLock::new(|| {
-    Arc::new(Box::new([
-        //16
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        //16
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        //16
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        //16
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-        (AtomicUsize::new(0), AtomicU32::new(0)),
-    ]))
-});
-
-static ATOMIC_IN_USE_ARRAY: LazyLock<Arc<Box<[AtomicBool]>>> = LazyLock::new(|| {
-    Arc::new(Box::new([
-        //16
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        //16
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        //16
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        //16
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-    ]))
-});
+use libmimalloc_sys::{mi_malloc, mi_free};
 
 impl MemoryPool {
-    pub fn new() -> Self {
-        let buffer = vec![0_u8; MEMORY_POOL_SIZE].into_boxed_slice();
-        let pinned_box = Pin::new(buffer);
-        let ptr_start = pinned_box.as_ptr() as usize;
-        let ptr_end = ptr_start + MEMORY_POOL_SIZE;
-
-        Self {
-            buffer: { Arc::new(pinned_box) },
-            start: ptr_start,
-            end: ptr_end,
-        }
+    pub const  fn new() -> Self {
+        Self
     }
 
     #[inline(always)]
     pub fn acquire(&self, size: u32) -> Option<MemoryChunk> {
-        let mut current_start = 0;
-        let mut slot_index: Option<usize> = None;
+        let ptr = unsafe { mi_malloc(size as usize) as *mut u8 };
 
-        // Try to atomically claim one of the available slots.
-        for (i, flag) in ATOMIC_IN_USE_ARRAY.iter().enumerate() {
-            if flag
-                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                slot_index = Some(i);
-
-                // Read the previous size and pointer in an atomic way.
-                let previous_size = ATOMIC_PTR_ARRAY[i].1.load(Ordering::Relaxed);
-                let previous_start = ATOMIC_PTR_ARRAY[i].0.load(Ordering::Relaxed);
-
-                if previous_size != 0 && previous_start != 0 {
-                    current_start = previous_start - self.start + previous_size as usize;
-                } else {
-                    current_start += previous_size as usize; // usually zero on first allocation
-                }
-                break;
-            }
+        if ptr.is_null() {
+            return None;  // Allocation failed (likely OOM) – return None instead of panicking.
         }
-
-        let i = match slot_index {
-            Some(idx) => idx,
-            None => return None,
-        };
-
-        // Check that we do not exceed the limit.
-        if current_start + size as usize > MEMORY_POOL_SIZE {
-            // Release our claim if allocation cannot proceed.
-            ATOMIC_IN_USE_ARRAY[i].store(false, Ordering::Relaxed);
-            return None;
-        }
-
-        // Set the pointer and size for the slot.
-        let ptr = self.buffer[current_start..current_start + size as usize].as_ptr() as *mut u8;
-        ATOMIC_PTR_ARRAY[i].0.store(ptr as usize, Ordering::Relaxed);
-        ATOMIC_PTR_ARRAY[i].1.store(size, Ordering::Relaxed);
 
         Some(MemoryChunk {
             ptr,
             size,
             //pool: Arc::downgrade(&MEMORY_POOL),
-            vec: None,
-            index: i as i32,
+            vec: None
         })
     }
 
     #[inline(always)]
-    fn release(&self, index: i32) {
-        if index != -1 {
-            ATOMIC_IN_USE_ARRAY[index as usize].store(false, Ordering::Relaxed);
+    fn release(&self, ptr: *mut u8) {
+        if ptr.is_null() {
+            return;  // No action needed for null pointers (matches C free behavior).
+        }
+
+        unsafe {
+            mi_free(ptr as *mut _);
         }
     }
 }
@@ -257,7 +56,6 @@ pub struct MemoryChunk {
     //pool: std::sync::Weak<MemoryPool>,
     // Used to store a vector instead of a raw pointer. Either one or the other will be set.
     pub vec: Option<Pin<Box<Vec<u8>>>>,
-    pub index: i32,
 }
 
 unsafe impl Send for MemoryChunk {}
@@ -270,7 +68,6 @@ impl Default for MemoryChunk {
             size: 0,
             //pool: std::sync::Weak::default(),
             vec: None,
-            index: -1,
         }
     }
 }
@@ -281,7 +78,7 @@ impl Drop for MemoryChunk {
             // if let Some(pool) = self.pool.upgrade() {
             //     pool.release(self.index);
             // }
-            MEMORY_POOL.release(self.index);
+            MEMORY_POOL.release(self.ptr);
         }
     }
 }
@@ -299,15 +96,14 @@ impl MemoryChunk {
             ptr: ptr::null_mut(),
             size: 0,
             //pool: std::sync::Weak::default(),
-            vec: Some(Box::pin(vec)),
-            index: -1,
+            vec: Some(Box::pin(vec))
         }
     }
 
     pub unsafe fn into_vec(&self) -> ChunkIntoVecResult {
         if let Some(vec) = self.vec.as_ref() {
-            let new_vec = vec.clone();
-            ChunkIntoVecResult::Vec(new_vec)
+            let new_vec = unsafe { ref_vec_no_manual(vec.as_ptr() as *mut u8, vec.len()) };
+            ChunkIntoVecResult::Vec(Box::pin(new_vec))
         } else {
             ChunkIntoVecResult::ManualVec(unsafe { ref_vec(self.ptr, self.size as usize) })
         }

@@ -135,3 +135,10 @@ pub unsafe fn ref_vec(ptr: *mut u8, len: usize) -> ManuallyDrop<Vec<u8>> {
         manual
     }
 }
+
+pub unsafe fn ref_vec_no_manual(ptr: *mut u8, len: usize) -> Vec<u8> {
+    unsafe {
+        let vec = Vec::from_raw_parts(ptr, len, len);
+        vec
+    }
+}
