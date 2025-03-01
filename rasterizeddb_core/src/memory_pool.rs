@@ -256,7 +256,7 @@ pub struct MemoryChunk {
     pub size: u32,
     //pool: std::sync::Weak<MemoryPool>,
     // Used to store a vector instead of a raw pointer. Either one or the other will be set.
-    pub vec: Option<Vec<u8>>,
+    pub vec: Option<Pin<Box<Vec<u8>>>>,
     pub index: i32,
 }
 
@@ -299,7 +299,7 @@ impl MemoryChunk {
             ptr: ptr::null_mut(),
             size: 0,
             //pool: std::sync::Weak::default(),
-            vec: Some(vec),
+            vec: Some(Box::pin(vec)),
             index: -1,
         }
     }
@@ -325,7 +325,7 @@ impl MemoryChunk {
 
 #[derive(Debug)]
 pub enum ChunkIntoVecResult {
-    Vec(Vec<u8>),
+    Vec(Pin<Box<Vec<u8>>>),
     ManualVec(ManuallyDrop<Vec<u8>>),
 }
 

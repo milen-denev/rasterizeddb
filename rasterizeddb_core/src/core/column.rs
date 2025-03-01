@@ -1,7 +1,7 @@
 use std::{
     arch::x86_64::{_mm_prefetch, _MM_HINT_T0},
     fmt::{Debug, Display},
-    io::{self, Cursor, Read, Write}, ops::{Deref, DerefMut}
+    io::{self, Cursor, Read, Write}, ops::{Deref, DerefMut}, pin::Pin
 };
 
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -53,12 +53,12 @@ impl Default for Column {
 pub enum ColumnValue {
     TempHolder((DbType, Vec<u8>)),
     StaticMemoryPointer(MemoryChunk),
-    ManagedMemoryPointer(Vec<u8>),
+    ManagedMemoryPointer(Pin<Box<Vec<u8>>>),
 }
 
 impl Default for ColumnValue {
     fn default() -> Self {
-        ColumnValue::ManagedMemoryPointer(Vec::default())
+        ColumnValue::ManagedMemoryPointer(Box::pin(Vec::default()))
     }
 }
 
@@ -128,7 +128,7 @@ impl ColumnValue {
             ColumnValue::StaticMemoryPointer(chunk) => {
                 vec_from_ptr_safe(chunk.ptr, chunk.size as usize)
             }
-            ColumnValue::ManagedMemoryPointer(vec) => vec.clone(),
+            ColumnValue::ManagedMemoryPointer(vec) => vec_from_ptr_safe(vec.as_ptr() as *mut u8, vec.len()),
             _ => panic!("Operation is not supported, column is in temporary state."),
         }
     }
@@ -371,7 +371,7 @@ impl Column {
 
         Ok(Column {
             data_type: db_type,
-            content: ColumnValue::ManagedMemoryPointer(buffer),
+            content: ColumnValue::ManagedMemoryPointer(Box::pin(buffer)),
         })
     }
 
@@ -379,7 +379,7 @@ impl Column {
     pub unsafe fn into_chunk(self) -> io::Result<MemoryChunk> {
         let chunk = match self.content {
             ColumnValue::StaticMemoryPointer(chunk) => chunk,
-            ColumnValue::ManagedMemoryPointer(vec) => MemoryChunk::from_vec(vec),
+            ColumnValue::ManagedMemoryPointer(vec) => MemoryChunk::from_vec(vec_from_ptr_safe(vec.as_ptr() as *mut u8, vec.len())),
             _ => panic!("Operation is not supported, column is in temporary state."),
         };
 
@@ -431,7 +431,7 @@ impl Column {
                     panic!()
                 }
 
-                ColumnValue::ManagedMemoryPointer(new_vec)
+                ColumnValue::ManagedMemoryPointer(Box::pin(new_vec))
             }
             _ => panic!(),
         };
@@ -456,7 +456,7 @@ impl Column {
     }
 
     pub fn from_raw_clone(data_type: u8, buffer: &[u8]) -> Column {
-        let column_value = { ColumnValue::ManagedMemoryPointer(buffer.to_vec()) };
+        let column_value = { ColumnValue::ManagedMemoryPointer(Box::pin(vec_from_ptr_safe(buffer.as_ptr() as *mut u8, buffer.len()))) };
 
         Column {
             data_type: DbType::from_byte(data_type),
