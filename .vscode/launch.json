@@ -5,7 +5,7 @@
             "type": "lldb",
             "request": "launch",
             "name": "Debug",
-            "program": "${workspaceRoot}/target/debug/rasterizeddb_core",
+            "program": "${workspaceRoot}/target/debug/rastcp",
             "args": [],
             "cwd": "${workspaceRoot}/target/debug",
             "sourceLanguages": ["rust"],
@@ -18,3 +18,4 @@
 //rasterizeddb_core
 //test_db_web
 //test_server
+//rastcp
