@@ -15,7 +15,7 @@ use super::{
     table::Table,
 };
 
-static RECEIVER: async_lazy::Lazy<Arc<Receiver>> = async_lazy::Lazy::const_new(|| {
+static RECEIVER: async_lazy::Lazy<Arc<Receiver>> = async_lazy::Lazy::new(|| {
     Box::pin(async {
         let receiver = Receiver::new(&format!("127.0.0.1:{}", SERVER_PORT))
             .await

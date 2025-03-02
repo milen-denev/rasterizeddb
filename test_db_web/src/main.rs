@@ -8,7 +8,7 @@ use rasterizeddb_core::core::{
 use rasterizeddb_core::rql::parser::parse_rql;
 
 static mut TABLE: async_lazy::Lazy<Table<LocalStorageProvider>> =
-    async_lazy::Lazy::const_new(|| {
+    async_lazy::Lazy::new(|| {
         Box::pin(async {
             let io_sync = LocalStorageProvider::new(
                 "C:\\Users\\mspc6\\OneDrive\\Professional\\Desktop",
