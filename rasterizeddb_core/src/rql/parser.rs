@@ -16,15 +16,6 @@ use super::{
 pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
     let hash = get_hash(query);
 
-    #[cfg(feature = "enable_index_caching")]
-    if let Some(file_positions) = POSITIONS_CACHE.get(&hash) {
-        let db_action = DatabaseAction {
-            table_name: "".to_string(),
-            parser_result: ParserResult::CachedHashIndexes(file_positions),
-        };
-        return Ok(db_action);
-    }
-
     let begin_result = query.find("BEGIN");
     let begin;
 
@@ -41,6 +32,35 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
         return Err("END statement is missing.".into());
     } else {
         end = end_result.unwrap();
+    }
+
+    let select_result = query.find("SELECT");
+    let mut select_table = String::new();
+
+    if select_result.is_none() {
+        return Err("SELECT statement is missing.".into());
+    }
+
+    if let Some(select_start) = select_result {
+        // Find the starting index of the number after "SELECT FROM"
+        let select_from_str = query[select_start + (6 + 4)..].trim(); // +6 +4 to skip "SELECT FROM"
+
+        let select_from_end = select_from_str
+            .find(|c: char| c.is_whitespace())
+            .unwrap_or(select_from_str.len());
+
+        let select_value = &select_from_str[..select_from_end];
+
+        select_table.push_str(select_value);
+    }
+
+    #[cfg(feature = "enable_index_caching")]
+    if let Some(file_positions) = POSITIONS_CACHE.get(&hash) {
+        let db_action = DatabaseAction {
+            table_name: select_table.to_string(),
+            parser_result: ParserResult::CachedHashIndexes(file_positions),
+        };
+        return Ok(db_action);
     }
 
     //CREATE TABLE
@@ -108,26 +128,6 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
             table_name: table_name.to_string(),
             parser_result: ParserResult::DropTable(table_name.to_string()),
         });
-    }
-
-    let select_result = query.find("SELECT");
-    let mut select_table = String::new();
-
-    if select_result.is_none() {
-        return Err("SELECT statement is missing.".into());
-    }
-
-    if let Some(select_start) = select_result {
-        // Find the starting index of the number after "SELECT FROM"
-        let select_from_str = query[select_start + (6 + 4)..].trim(); // +6 +4 to skip "SELECT FROM"
-
-        let select_from_end = select_from_str
-            .find(|c: char| c.is_whitespace())
-            .unwrap_or(select_from_str.len());
-
-        let select_value = &select_from_str[..select_from_end];
-
-        select_table.push_str(select_value);
     }
 
     //println!("{}", select_table);
