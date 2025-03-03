@@ -43,3 +43,32 @@ where
     
     Ok(())
 }
+
+// Read a message with a timeout
+pub async fn read_message_timeout<S>(
+    stream: &mut S, 
+    timeout: std::time::Duration
+) -> Result<Vec<u8>, RastcpError> 
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    match tokio::time::timeout(timeout, read_message(stream)).await {
+        Ok(result) => result,
+        Err(_) => Err(RastcpError::ConnectionTimeout),
+    }
+}
+
+// Write a message with a timeout
+pub async fn write_message_timeout<S>(
+    stream: &mut S, 
+    data: &[u8],
+    timeout: std::time::Duration
+) -> Result<(), RastcpError> 
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    match tokio::time::timeout(timeout, write_message(stream, data)).await {
+        Ok(result) => result,
+        Err(_) => Err(RastcpError::ConnectionTimeout),
+    }
+}
