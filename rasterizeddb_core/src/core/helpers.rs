@@ -12,13 +12,14 @@ use super::{
     storage_providers::traits::IOOperationsSync,
     support_types::{CursorVector, FileChunk, RowPrefetchResult},
 };
+
 use crate::{
     simds::endianess::{read_u32, read_u64},
     EMPTY_BUFFER,
 };
 
 #[inline(always)]
-pub(crate) fn read_row_cursor<'a>(
+pub(crate) fn read_row_cursor_whole<'a>(
     first_column_index: u64,
     id: u64,
     length: u32,
@@ -300,6 +301,7 @@ pub(crate) async fn row_prefetching(
 }
 
 #[inline(always)]
+#[track_caller]
 pub fn row_prefetching_cursor(
     position: &mut u64,
     cursor_vector: &mut CursorVector,
@@ -403,7 +405,7 @@ pub(crate) async fn indexed_row_fetching_file(
 }
 
 #[inline(always)]
-pub(crate) fn columns_cursor_to_row(
+pub(crate) fn columns_cursor_to_row_whole(
     mut columns_cursor: Cursor<Vec<u8>>,
     id: u64,
     length: u32,
