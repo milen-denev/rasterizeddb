@@ -67,7 +67,7 @@ impl IOOperationsSync for MemoryStorageProvider {
         }
     }
 
-    async fn read_data(&mut self, position: &mut u64, length: u32) -> Vec<u8> {
+    async fn read_data(&self, position: &mut u64, length: u32) -> Vec<u8> {
         let mut buffer: Vec<u8> = Vec::with_capacity(length as usize);
         let start = *position;
         let end = *position + length as u64;
@@ -81,7 +81,7 @@ impl IOOperationsSync for MemoryStorageProvider {
         return buffer;
     }
 
-    async fn read_data_into_buffer(&mut self, position: &mut u64, buffer: &mut [u8]) {
+    async fn read_data_into_buffer(&self, position: &mut u64, buffer: &mut [u8]) {
         let start = *position;
         let end = *position + buffer.len() as u64 + 1;
 
@@ -96,7 +96,7 @@ impl IOOperationsSync for MemoryStorageProvider {
     }
 
     async fn read_data_to_cursor(
-        &mut self,
+        &self,
         position: &mut u64,
         length: u32,
     ) -> std::io::Cursor<Vec<u8>> {
@@ -113,7 +113,7 @@ impl IOOperationsSync for MemoryStorageProvider {
         return Cursor::new(buffer);
     }
 
-    async fn read_data_to_end(&mut self, position: u64) -> Vec<u8> {
+    async fn read_data_to_end(&self, position: u64) -> Vec<u8> {
         let total_len = self.vec.len() as u64;
         let mut buffer: Vec<u8> = Vec::with_capacity((total_len - position) as usize);
 

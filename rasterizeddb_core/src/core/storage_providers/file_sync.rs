@@ -141,7 +141,7 @@ impl IOOperationsSync for LocalStorageProvider {
         file.sync_all().await.unwrap();
     }
 
-    async fn read_data(&mut self, position: &mut u64, length: u32) -> Vec<u8> {
+    async fn read_data(&self, position: &mut u64, length: u32) -> Vec<u8> {
         yield_now().await;
 
         let mut read_file = std::fs::File::options()
@@ -160,7 +160,7 @@ impl IOOperationsSync for LocalStorageProvider {
         }
     }
 
-    async fn read_data_to_end(&mut self, position: u64) -> Vec<u8> {
+    async fn read_data_to_end(&self, position: u64) -> Vec<u8> {
         yield_now().await;
         
         let mut read_file = std::fs::File::options()
@@ -206,7 +206,7 @@ impl IOOperationsSync for LocalStorageProvider {
         }
     }
 
-    async fn read_data_into_buffer(&mut self, position: &mut u64, buffer: &mut [u8]) {
+    async fn read_data_into_buffer(&self, position: &mut u64, buffer: &mut [u8]) {
         yield_now().await;
         
         let mut read_file = std::fs::File::options()
@@ -219,7 +219,7 @@ impl IOOperationsSync for LocalStorageProvider {
         *position += buffer.len() as u64;
     }
 
-    async fn read_data_to_cursor(&mut self, position: &mut u64, length: u32) -> Cursor<Vec<u8>> {
+    async fn read_data_to_cursor(&self, position: &mut u64, length: u32) -> Cursor<Vec<u8>> {
         yield_now().await;
         
         let mut read_file = std::fs::File::options()

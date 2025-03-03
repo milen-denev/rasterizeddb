@@ -100,7 +100,7 @@ pub(crate) async fn process_all_chunks(
     limit: u64,
     select_all: bool,
     mutated: bool,
-    io_sync: &mut Box<impl IOOperationsSync>,
+    io_sync: &Box<impl IOOperationsSync>,
     chunks: Arc<Vec<FileChunk>>,
     parallelism_limit: usize,
 

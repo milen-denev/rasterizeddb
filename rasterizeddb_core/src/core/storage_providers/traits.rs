@@ -19,24 +19,24 @@ pub trait IOOperationsSync: Clone + Sync + Send + 'static {
     fn write_data_seek(&mut self, seek: SeekFrom, buffer: &[u8]) -> impl Future<Output = ()> + Send + Sync;
 
     fn read_data(
-        &mut self,
+        &self,
         position: &mut u64,
         length: u32,
     ) -> impl Future<Output = Vec<u8>> + Send + Sync;
 
     fn read_data_into_buffer(
-        &mut self,
+        &self,
         position: &mut u64,
         buffer: &mut [u8],
     ) -> impl Future<Output = ()> + Send + Sync;
 
     fn read_data_to_cursor(
-        &mut self,
+        &self,
         position: &mut u64,
         length: u32,
     ) -> impl Future<Output = Cursor<Vec<u8>>> + Send + Sync;
 
-    fn read_data_to_end(&mut self, position: u64) -> impl Future<Output = Vec<u8>> + Send + Sync;
+    fn read_data_to_end(&self, position: u64) -> impl Future<Output = Vec<u8>> + Send + Sync;
 
     fn append_data(&mut self, buffer: &[u8]) -> impl Future<Output = ()> + Send + Sync;
 

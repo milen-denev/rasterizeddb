@@ -64,7 +64,7 @@ pub(crate) fn read_row_cursor<'a>(
 
 #[inline(always)]
 pub(crate) async fn read_row_columns(
-    io_sync: &mut Box<impl IOOperationsSync>,
+    io_sync: &Box<impl IOOperationsSync>,
     first_column_index: u64,
     id: u64,
     length: u32,
@@ -136,7 +136,7 @@ pub(crate) async fn delete_row_file(
 
 #[inline(always)]
 pub(crate) async fn skip_empty_spaces_file(
-    io_sync: &mut Box<impl IOOperationsSync>,
+    io_sync: &Box<impl IOOperationsSync>,
     file_position: &mut u64,
     file_length: u64,
 ) -> u64 {
@@ -290,7 +290,7 @@ pub(crate) fn skip_empty_spaces_cursor(
 
 #[inline(always)]
 pub(crate) async fn row_prefetching(
-    io_sync: &mut Box<impl IOOperationsSync>,
+    io_sync: &Box<impl IOOperationsSync>,
     file_position: &mut u64,
     file_length: u64,
     is_mutated: bool
@@ -375,7 +375,7 @@ pub fn row_prefetching_cursor(
 
 #[inline(always)]
 pub(crate) async fn indexed_row_fetching_file(
-    io_sync: &mut Box<impl IOOperationsSync>,
+    io_sync: &Box<impl IOOperationsSync>,
     position: &mut u64,
     length: u32,
 ) -> io::Result<Row> {

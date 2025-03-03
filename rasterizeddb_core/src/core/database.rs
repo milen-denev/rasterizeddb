@@ -33,7 +33,7 @@ unsafe impl<S: IOOperationsSync> Sync for Database<S> {}
 impl<S: IOOperationsSync + Send + Sync> Database<S> {
     pub async fn new(io_sync: S) -> io::Result<Database<S>> {
         let io_sync = io_sync.create_new("CONFIG_TABLE.db".to_string()).await;
-        let mut config_table = Table::init(io_sync.clone(), false, false).await?;
+        let config_table = Table::init(io_sync.clone(), false, false).await?;
 
         let all_rows_result = rql::parser::parse_rql(
             r#"
@@ -147,27 +147,27 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
         Ok(())
     }
 
-    pub async fn execute_cached_query(&mut self, name: String, parser_cached_result: ParserResult) -> io::Result<Vec<u8>> {
-        let mut table = self.tables.try_get_mut(&name);
+    pub async fn execute_cached_query(&self, name: String, parser_cached_result: ParserResult) -> io::Result<Vec<u8>> {
+        let mut table = self.tables.try_get(&name);
 
         while table.is_locked() {
-            table = self.tables.try_get_mut(&name);
+            table = self.tables.try_get(&name);
         }
 
-        let mut table = table.unwrap();
+        let table = table.unwrap();
         let rows: Option<Vec<Row>> = table.execute_query(parser_cached_result).await.unwrap();
 
         Ok(row::Row::serialize_rows(rows))
     }
 
-    pub async fn execute_query(&mut self, name: String, parser_cached_result: ParserResult) -> io::Result<Vec<u8>> {
-        let mut table = self.tables.try_get_mut(&name);
+    pub async fn execute_query(&self, name: String, parser_cached_result: ParserResult) -> io::Result<Vec<u8>> {
+        let mut table = self.tables.try_get(&name);
 
         while table.is_locked() {
-            table = self.tables.try_get_mut(&name);
+            table = self.tables.try_get(&name);
         }
 
-        let mut table = table.unwrap();
+        let table = table.unwrap();
         let rows: Option<Vec<Row>> = table.execute_query(parser_cached_result).await.unwrap();
 
         Ok(row::Row::serialize_rows(rows))
@@ -214,7 +214,7 @@ pub(crate) async fn process_incoming_queries<S: IOOperationsSync>(
         ParserResult::UpdateEvaluationTokens(tokens) => todo!(),
         ParserResult::DeleteEvaluationTokens(tokens) => todo!(),
         ParserResult::QueryEvaluationTokens(tokens) => {
-            let mut db = database.write().await;
+            let db = database.read().await;
             let mut rows_result = db.execute_query(database_operation.table_name, ParserResult::QueryEvaluationTokens(tokens)).await.unwrap();
             let mut result: [u8; 1] = [2u8; 1];
             let mut final_vec = Vec::with_capacity(1 + rows_result.len());
@@ -225,7 +225,7 @@ pub(crate) async fn process_incoming_queries<S: IOOperationsSync>(
             return final_vec;
         },
         ParserResult::CachedHashIndexes(indexes) => {
-            let mut db = database.write().await;
+            let db = database.read().await;
             let mut rows_result = db.execute_cached_query(database_operation.table_name, ParserResult::CachedHashIndexes(indexes)).await.unwrap();
             let mut result: [u8; 1] = [2u8; 1];
             let mut final_vec = Vec::with_capacity(1 + rows_result.len());

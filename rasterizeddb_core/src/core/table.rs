@@ -185,7 +185,7 @@ impl<S: IOOperationsSync> Table<S> {
     }
 
     /// #### STABILIZED
-    fn get_current_table_length(&mut self) -> u64 {
+    fn get_current_table_length(&self) -> u64 {
         return self.current_file_length.load(Ordering::Relaxed);
     }
 
@@ -329,7 +329,7 @@ impl<S: IOOperationsSync> Table<S> {
     }
 
     pub async fn execute_query(
-        &mut self,
+        &self,
         parser_result: ParserResult,
     ) -> io::Result<Option<Vec<Row>>> {
         if let ParserResult::CachedHashIndexes(hash_indexes) = parser_result {
@@ -338,7 +338,7 @@ impl<S: IOOperationsSync> Table<S> {
                 let mut position = record.0;
                 let length = record.1;
                 rows.push(
-                    indexed_row_fetching_file(&mut self.io_sync, &mut position, length)
+                    indexed_row_fetching_file(&self.io_sync, &mut position, length)
                         .await
                         .unwrap(),
                 );
@@ -393,7 +393,7 @@ impl<S: IOOperationsSync> Table<S> {
                         limit as u64,
                         select_all,
                         mutated,
-                        &mut self.io_sync,
+                        &self.io_sync,
                         Arc::new(chunks.clone()),
                         THREADS,
                         
@@ -616,7 +616,7 @@ impl<S: IOOperationsSync> Table<S> {
 
                 loop {
                     if let Some(prefetch_result) =
-                        row_prefetching(&mut self.io_sync, &mut position, file_length, mutated)
+                        row_prefetching(&self.io_sync, &mut position, file_length, mutated)
                             .await
                             .unwrap()
                     {
