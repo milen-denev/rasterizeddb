@@ -34,35 +34,6 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
         end = end_result.unwrap();
     }
 
-    let select_result = query.find("SELECT");
-    let mut select_table = String::new();
-
-    if select_result.is_none() {
-        return Err("SELECT statement is missing.".into());
-    }
-
-    if let Some(select_start) = select_result {
-        // Find the starting index of the number after "SELECT FROM"
-        let select_from_str = query[select_start + (6 + 4)..].trim(); // +6 +4 to skip "SELECT FROM"
-
-        let select_from_end = select_from_str
-            .find(|c: char| c.is_whitespace())
-            .unwrap_or(select_from_str.len());
-
-        let select_value = &select_from_str[..select_from_end];
-
-        select_table.push_str(select_value);
-    }
-
-    #[cfg(feature = "enable_index_caching")]
-    if let Some(file_positions) = POSITIONS_CACHE.get(&hash) {
-        let db_action = DatabaseAction {
-            table_name: select_table.to_string(),
-            parser_result: ParserResult::CachedHashIndexes(file_positions),
-        };
-        return Ok(db_action);
-    }
-
     //CREATE TABLE
     if let Some(create_start) = query.find("CREATE TABLE") {
         let create_str = query[create_start + 12..].trim(); // Skip "CREATE TABLE"
@@ -130,7 +101,43 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
         });
     }
 
-    //println!("{}", select_table);
+    let select_result = query.find("SELECT");
+    let mut select_table = String::new();
+
+    if select_result.is_none() {
+        return Err("SELECT statement is missing.".into());
+    }
+
+    if let Some(select_start) = select_result {
+        // Find the starting index of the number after "SELECT FROM"
+        let select_from_str = query[select_start + (6 + 1 + 4)..].trim(); // +6 +4 to skip "SELECT FROM"
+
+        let select_from_end = select_from_str
+            .find(|c: char| c.is_whitespace())
+            .unwrap_or(select_from_str.len());
+
+        let select_value = &select_from_str[..select_from_end];
+
+        select_table.push_str(select_value);
+    }
+
+    #[cfg(feature = "enable_index_caching")]
+    if let Some(file_positions) = POSITIONS_CACHE.get(&hash) {
+        let db_action = DatabaseAction {
+            table_name: select_table.to_string(),
+            parser_result: ParserResult::CachedHashIndexes(file_positions),
+        };
+        return Ok(db_action);
+    }
+
+    let rebuild_indexes_result = query.find("REBUILD_INDEXES");
+   
+    if rebuild_indexes_result.is_some() {
+        return Ok(DatabaseAction {
+            table_name: select_table.clone(),
+            parser_result: ParserResult::RebuildIndexes(select_table),
+        });
+    }
 
     let where_result = query.find("WHERE");
     let mut where_i: usize = 0;
@@ -333,6 +340,7 @@ pub enum ParserResult {
     DeleteEvaluationTokens(EvaluationResult),
     QueryEvaluationTokens(EvaluationResult),
     CachedHashIndexes(Vec<(u64, u32)>),
+    RebuildIndexes(String),
 }
 
 pub struct EvaluationResult {
