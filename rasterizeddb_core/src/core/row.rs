@@ -1,3 +1,5 @@
+use super::column::Column;
+
 #[derive(Debug, Clone)]
 pub struct Row {
     pub id: u64,
@@ -146,6 +148,11 @@ impl Row {
             },
             _ => Err(Error::new(ErrorKind::InvalidData, "Invalid marker byte"))
         }
+    }
+
+    /// Extract column data into a Vec<Column>
+    pub fn columns(&self) -> Result<Vec<Column>, std::io::Error> {
+        Column::from_buffer(&self.columns_data)
     }
 }
 
