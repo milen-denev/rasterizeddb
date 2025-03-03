@@ -10,16 +10,20 @@ use log::debug;
 use tokio::sync::{RwLock, RwLockWriteGuard};
 
 use super::{
-    super::rql::{models::Token, parser::ParserResult, tokenizer::evaluate_column_result},
+    super::rql::{
+        models::Token, 
+        parser::ParserResult, 
+        tokenizer::evaluate_column_result
+    },
     column::Column,
     db_type::DbType,
     helpers::{ 
-        columns_cursor_to_row,
+        columns_cursor_to_row_whole, 
         indexed_row_fetching_file, 
         read_row_columns, 
-        read_row_cursor, 
-        row_prefetching,
-        row_prefetching_cursor,
+        read_row_cursor_whole, 
+        row_prefetching, 
+        row_prefetching_cursor
     },
     row::{InsertOrUpdateRow, Row},
     storage_providers::traits::IOOperationsSync,
@@ -27,6 +31,7 @@ use super::{
     table_ext::extent_non_string_buffer,
     table_header::TableHeader,
 };
+
 use crate::{
     core::helpers::delete_row_file, memory_pool::{MemoryChunk, MEMORY_POOL}, rql::models::Next, simds::endianess::read_u32, CHUNK_SIZE, EMPTY_BUFFER, HEADER_SIZE 
 };
@@ -556,9 +561,9 @@ impl<S: IOOperationsSync> Table<S> {
 
                             if evaluation {
                                 let mut cursor = &mut cursor_vector.cursor;
-                                cursor.seek(SeekFrom::Start(position)).unwrap();
+                                let new_position = first_column_index + prefetch_result.length as u64 + 1;
 
-                                let row = read_row_cursor(
+                                let row = read_row_cursor_whole(
                                     first_column_index,
                                     prefetch_result.found_id,
                                     prefetch_result.length,
@@ -589,7 +594,9 @@ impl<S: IOOperationsSync> Table<S> {
                                     return Ok(Some(rows));
                                 }
 
-                                position = cursor.stream_position().unwrap();
+                                position = new_position;
+                            } else {
+                                position = first_column_index + prefetch_result.length as u64 + 1;
                             }
                         } else {
                             break;
@@ -712,7 +719,7 @@ impl<S: IOOperationsSync> Table<S> {
                         };
 
                         if evaluation {
-                            let row = columns_cursor_to_row(
+                            let row = columns_cursor_to_row_whole(
                                 columns_cursor,
                                 prefetch_result.found_id,
                                 prefetch_result.length,
