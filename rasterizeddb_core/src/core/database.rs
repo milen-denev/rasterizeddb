@@ -66,10 +66,11 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
             let inited_tables: DashMap<String, Table<S>, RandomState> = DashMap::default();
 
             for table_spec in table_specs {
-                let file_name = format!("{}.db", table_spec.0.trim());
+                let table_name = table_spec.0.trim().replace("\0", "").to_string();
+                let file_name = format!("{}.db", table_name);
                 let new_io_sync = io_sync.create_new(file_name).await;
                 let table = Table::<S>::init_inner(new_io_sync, table_spec.1, table_spec.2).await?;
-                inited_tables.insert(table_spec.0, table);
+                inited_tables.insert(table_name, table);
             }
 
             inited_tables
@@ -89,6 +90,10 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
         compress: bool,
         immutable: bool,
     ) -> io::Result<()> {
+        if self.tables.contains_key(&name) {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "Table already exists"));
+        }
+
         let new_io_sync = self.config_table.io_sync.create_new(format!("{}.db", name)).await;
         let table = Table::<S>::init_inner(new_io_sync, compress, immutable).await?;
 
@@ -117,7 +122,7 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
     pub async fn drop_table(&mut self, name: String) -> io::Result<()> {
         let mut table = self.tables.try_get_mut(&name);
 
-        while table.is_locked() {
+        while table.is_locked() || table.is_absent() {
             table = self.tables.try_get_mut(&name);
         }
 
@@ -153,7 +158,7 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
     pub async fn execute_cached_query(&self, name: String, parser_cached_result: ParserResult) -> io::Result<Vec<u8>> {
         let mut table = self.tables.try_get(&name);
 
-        while table.is_locked() {
+        while table.is_locked() || table.is_absent() {
             table = self.tables.try_get(&name);
         }
 
@@ -166,7 +171,7 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
     pub async fn execute_query(&self, name: String, parser_cached_result: ParserResult) -> io::Result<Vec<u8>> {
         let mut table = self.tables.try_get(&name);
 
-        while table.is_locked() {
+        while table.is_locked() || table.is_absent() {
             table = self.tables.try_get(&name);
         }
 
@@ -244,10 +249,13 @@ pub(crate) async fn process_incoming_queries<S: IOOperationsSync>(
         },
         ParserResult::RebuildIndexes(name) => {
             let db = database.read().await;
+          
             let mut table = db.tables.try_get_mut(&name);
-            if table.is_locked() {
+
+            while table.is_locked() || table.is_absent() {
                 table = db.tables.try_get_mut(&name);
             }
+
             let mut table = table.unwrap();
             table.rebuild_in_memory_indexes().await;
             let mut result: [u8; 1] = [0u8; 1];
