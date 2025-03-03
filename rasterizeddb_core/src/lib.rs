@@ -119,3 +119,4 @@ pub(crate) mod instructions;
 pub mod memory_pool;
 pub mod rql;
 pub mod simds;
+pub mod client;
