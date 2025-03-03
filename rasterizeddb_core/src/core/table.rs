@@ -1361,6 +1361,5 @@ impl<S: IOOperationsSync> Table<S> {
         let mut table_header = self.table_header.write().await;
         table_header.mutated = false;
         self.io_sync.write_data(0, &table_header.to_bytes().unwrap()).await;
-       
     }
 }
