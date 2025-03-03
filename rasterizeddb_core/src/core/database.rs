@@ -2,7 +2,7 @@ use std::{io, sync::Arc};
 
 use ahash::RandomState;
 use dashmap::DashMap;
-use rastdp::receiver::Receiver;
+use rastcp::server::TcpServer;
 use tokio::sync::RwLock;
 
 use crate::{
@@ -11,16 +11,14 @@ use crate::{
 };
 
 use super::{
-    column::Column, row::InsertOrUpdateRow, storage_providers::traits::IOOperationsSync,
+    column::Column, row::{self, InsertOrUpdateRow, Row}, storage_providers::traits::IOOperationsSync,
     table::Table,
 };
 
-static RECEIVER: async_lazy::Lazy<Arc<Receiver>> = async_lazy::Lazy::new(|| {
+static TCP_SERVER: async_lazy::Lazy<Arc<TcpServer>> = async_lazy::Lazy::new(|| {
     Box::pin(async {
-        let receiver = Receiver::new(&format!("127.0.0.1:{}", SERVER_PORT))
-            .await
-            .unwrap();
-        Arc::new(receiver)
+        let server = TcpServer::new(&format!("127.0.0.1:{}", SERVER_PORT)).await.unwrap();
+        Arc::new(server)
     })
 });
 
@@ -33,54 +31,54 @@ unsafe impl<S: IOOperationsSync> Send for Database<S> {}
 unsafe impl<S: IOOperationsSync> Sync for Database<S> {}
 
 impl<S: IOOperationsSync + Send + Sync> Database<S> {
-    // pub async fn new(io_sync: S) -> io::Result<Database<S>> {
-    //     let io_sync = io_sync.create_new("CONFIG_TABLE.db".to_string()).await;
-    //     let mut config_table = Table::init(io_sync.clone(), false, false).await?;
+    pub async fn new(io_sync: S) -> io::Result<Database<S>> {
+        let io_sync = io_sync.create_new("CONFIG_TABLE.db".to_string()).await;
+        let mut config_table = Table::init(io_sync.clone(), false, false).await?;
 
-    //     let all_rows_result = rql::parser::parse_rql(
-    //         r#"
-    //         BEGIN
-    //         SELECT FROM CONFIG_TABLE
-    //         END
-    //     "#,
-    //     )
-    //     .unwrap();
+        let all_rows_result = rql::parser::parse_rql(
+            r#"
+            BEGIN
+            SELECT FROM CONFIG_TABLE
+            END
+        "#,
+        )
+        .unwrap();
 
-    //     // let table_rows = config_table
-    //     //     .execute_query(all_rows_result.parser_result)
-    //     //     .await?;
+        let table_rows = config_table
+            .execute_query(all_rows_result.parser_result)
+            .await?;
 
-    //     // let tables: DashMap<String, Table<S>, RandomState> = if table_rows.is_some() {
-    //     //     let rows = table_rows.unwrap();
+        let tables: DashMap<String, Table<S>, RandomState> = if table_rows.is_some() {
+            let rows = table_rows.unwrap();
 
-    //     //     let mut table_specs: Vec<(String, bool, bool)> = Vec::default();
+            let mut table_specs: Vec<(String, bool, bool)> = Vec::default();
 
-    //     //     for row in rows {
-    //     //         let columns = Column::from_buffer(&row.columns_data)?;
-    //     //         let name = columns[0].into_value();
-    //     //         let compress: bool = columns[1].into_value().parse().unwrap();
-    //     //         let immutable: bool = columns[2].into_value().parse().unwrap();
-    //     //         table_specs.push((name, compress, immutable));
-    //     //     }
+            for row in rows {
+                let columns = Column::from_buffer(&row.columns_data)?;
+                let name = columns[0].into_value();
+                let compress: bool = columns[1].into_value().parse().unwrap();
+                let immutable: bool = columns[2].into_value().parse().unwrap();
+                table_specs.push((name, compress, immutable));
+            }
 
-    //     //     let inited_tables: DashMap<String, Table<S>, RandomState> = DashMap::default();
+            let inited_tables: DashMap<String, Table<S>, RandomState> = DashMap::default();
 
-    //     //     for table_spec in table_specs {
-    //     //         let new_io_sync = io_sync.create_new(table_spec.0.clone()).await;
-    //     //         let table = Table::<S>::init_inner(new_io_sync, table_spec.1, table_spec.2).await?;
-    //     //         inited_tables.insert(table_spec.0, table);
-    //     //     }
+            for table_spec in table_specs {
+                let new_io_sync = io_sync.create_new(table_spec.0.clone()).await;
+                let table = Table::<S>::init_inner(new_io_sync, table_spec.1, table_spec.2).await?;
+                inited_tables.insert(table_spec.0, table);
+            }
 
-    //     //     inited_tables
-    //     // } else {
-    //     //     DashMap::default()
-    //     // };
+            inited_tables
+        } else {
+            DashMap::default()
+        };
 
-    //     // Ok(Database {
-    //     //     config_table: config_table,
-    //     //     tables: Arc::new(tables), //server: receiver
-    //     // })
-    // }
+        Ok(Database {
+            config_table: config_table,
+            tables: Arc::new(tables), //server: receiver
+        })
+    }
 
     pub async fn create_table(
         &mut self,
@@ -128,17 +126,58 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
 
         _ = self.tables.remove(&name).unwrap();
 
-        //let row = self.config_table.first_or_default_by_column(0, name).await?.unwrap();
-        //self.config_table.delete_row_by_id(row.id).await?;
+        let select_table_to_drop = rql::parser::parse_rql(&format!(
+        r#"
+            BEGIN
+            SELECT FROM CONFIG_TABLE
+            WHERE name = {name}
+            END
+        "#,
+        ))
+        .unwrap();
+
+        let table_row = self.config_table
+            .execute_query(select_table_to_drop.parser_result)
+            .await?;
+
+        let row_id = table_row.unwrap().pop().unwrap().id;
+        self.config_table.delete_row_by_id(row_id).await?;
+        self.config_table.vacuum_table().await;
 
         Ok(())
     }
 
+    pub async fn execute_cached_query(&mut self, name: String, parser_cached_result: ParserResult) -> io::Result<Vec<u8>> {
+        let mut table = self.tables.try_get_mut(&name);
+
+        while table.is_locked() {
+            table = self.tables.try_get_mut(&name);
+        }
+
+        let mut table = table.unwrap();
+        let rows: Option<Vec<Row>> = table.execute_query(parser_cached_result).await.unwrap();
+
+        Ok(row::Row::serialize_rows(rows))
+    }
+
+    pub async fn execute_query(&mut self, name: String, parser_cached_result: ParserResult) -> io::Result<Vec<u8>> {
+        let mut table = self.tables.try_get_mut(&name);
+
+        while table.is_locked() {
+            table = self.tables.try_get_mut(&name);
+        }
+
+        let mut table = table.unwrap();
+        let rows: Option<Vec<Row>> = table.execute_query(parser_cached_result).await.unwrap();
+
+        Ok(row::Row::serialize_rows(rows))
+    }
+
     pub async fn start_async(database: Arc<RwLock<Database<S>>>) -> io::Result<()> {
         let db = database.clone();
-        let receiver = RECEIVER.force().await;
+        let receiver = TCP_SERVER.force().await;
 
-        let future = receiver.start_processing_function_result_object(
+        let future = receiver.run_with_context(
             db,
             process_incoming_queries
         );
@@ -154,8 +193,7 @@ pub(crate) async fn process_incoming_queries<S: IOOperationsSync>(
     database: Arc<RwLock<Database<S>>>,
     request_vec: Vec<u8>,
 ) -> Vec<u8> {
-    let database_operation =
-        rql::parser::parse_rql(&String::from_utf8_lossy(&request_vec)).unwrap();
+    let database_operation = rql::parser::parse_rql(&String::from_utf8_lossy(&request_vec)).unwrap();
 
     match database_operation.parser_result {
         ParserResult::CreateTable((name, compress, immutable)) => {
@@ -175,8 +213,28 @@ pub(crate) async fn process_incoming_queries<S: IOOperationsSync>(
         ParserResult::InsertEvaluationTokens(tokens) => todo!(),
         ParserResult::UpdateEvaluationTokens(tokens) => todo!(),
         ParserResult::DeleteEvaluationTokens(tokens) => todo!(),
-        ParserResult::QueryEvaluationTokens(tokens) => todo!(),
-        ParserResult::CachedHashIndexes(indexes) => todo!(),
+        ParserResult::QueryEvaluationTokens(tokens) => {
+            let mut db = database.write().await;
+            let mut rows_result = db.execute_query(database_operation.table_name, ParserResult::QueryEvaluationTokens(tokens)).await.unwrap();
+            let mut result: [u8; 1] = [2u8; 1];
+            let mut final_vec = Vec::with_capacity(1 + rows_result.len());
+
+            final_vec.extend_from_slice(&mut result);
+            final_vec.append(&mut rows_result);
+
+            return final_vec;
+        },
+        ParserResult::CachedHashIndexes(indexes) => {
+            let mut db = database.write().await;
+            let mut rows_result = db.execute_cached_query(database_operation.table_name, ParserResult::CachedHashIndexes(indexes)).await.unwrap();
+            let mut result: [u8; 1] = [2u8; 1];
+            let mut final_vec = Vec::with_capacity(1 + rows_result.len());
+
+            final_vec.extend_from_slice(&mut result);
+            final_vec.append(&mut rows_result);
+
+            return final_vec;
+        },
     }
 }
 
