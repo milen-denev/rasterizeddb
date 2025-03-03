@@ -350,22 +350,24 @@ impl IOOperationsSync for LocalStorageProvider {
             _ = std::fs::create_dir(location_path);
         }
 
-        let file_path = Path::new(&self.file_str);
+        let new_table = format!("{}{}", self.location, name.replace("\0", ""));
+        let file_path = Path::new(&new_table);
 
         if !file_path.exists() && !file_path.is_file() {
-            _ = std::fs::File::create(&self.file_str).unwrap();
+            _ = std::fs::File::create(&file_path).unwrap();
         }
+        
         let file_append = tokio::fs::File::options()
             .read(true)
             .append(true)
-            .open(&self.file_str)
+            .open(&file_path)
             .await
             .unwrap();
 
         let file_write = tokio::fs::File::options()
             .read(true)
             .write(true)
-            .open(&self.file_str)
+            .open(&file_path)
             .await
             .unwrap();
 
@@ -374,7 +376,7 @@ impl IOOperationsSync for LocalStorageProvider {
             write_file: Arc::new(RwLock::new(file_write)),
             location: self.location.to_string(),
             table_name: name.to_string(),
-            file_str: self.file_str.clone()
+            file_str: new_table.clone()
         }
     }
 
