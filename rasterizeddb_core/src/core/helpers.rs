@@ -25,35 +25,9 @@ pub(crate) fn read_row_cursor<'a>(
     cursor: &mut Cursor<&Vec<u8>>,
 ) -> io::Result<Row> {
     cursor.seek(SeekFrom::Start(first_column_index)).unwrap();
+    let mut columns_buffer: Vec<u8> = vec![0; length as usize];
 
-    // Pre-allocate with estimated capacity to avoid reallocations
-    let mut columns: Vec<Column> = Vec::with_capacity(8); // Typical row has several columns
-    let mut columns_buffer: Vec<u8> = Vec::with_capacity(length as usize);
-
-    loop {
-        let column_type = cursor.read_u8().unwrap();
-        let db_type = DbType::from_byte(column_type);
-
-        if db_type == DbType::END {
-            break;
-        }
-
-        let mut data_buffer = if db_type != DbType::STRING {
-            let db_size = db_type.get_size();
-            let mut buffer = vec![0; db_size as usize];
-            cursor.read_exact(&mut buffer)?;
-            buffer
-        } else {
-            let str_length = cursor.read_u32::<LittleEndian>().unwrap();
-            let mut buffer = vec![0; str_length as usize];
-            cursor.read_exact(&mut buffer)?;
-            buffer
-        };
-
-        let column = Column::from_raw_clone(column_type, &data_buffer);
-        columns.push(column);
-        columns_buffer.append(&mut data_buffer);
-    }
+    cursor.read_exact(&mut columns_buffer).unwrap();
 
     Ok(Row {
         id,
@@ -435,43 +409,10 @@ pub(crate) fn columns_cursor_to_row(
     length: u32,
 ) -> io::Result<Row> {
     columns_cursor.set_position(0);
-    
-    // Pre-allocate vectors to avoid reallocations
-    let mut columns: Vec<Column> = Vec::with_capacity(8);
     let mut columns_buffer: Vec<u8> = Vec::with_capacity(length as usize);
     let cursor_data = columns_cursor.get_ref();
     
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        if !cursor_data.is_empty() {
-            _mm_prefetch::<_MM_HINT_T0>(cursor_data.as_ptr() as *const i8);
-        }
-    }
-
-    loop {
-        let column_type = columns_cursor.read_u8().unwrap();
-        let db_type = DbType::from_byte(column_type);
-
-        if db_type == DbType::END {
-            break;
-        }
-
-        let data_buffer = if db_type != DbType::STRING {
-            let db_size = db_type.get_size();
-            let mut buffer = vec![0; db_size as usize];
-            columns_cursor.read_exact(&mut buffer).unwrap();
-            buffer
-        } else {
-            let str_length = columns_cursor.read_u32::<LittleEndian>().unwrap();
-            let mut buffer = vec![0; str_length as usize];
-            columns_cursor.read_exact(&mut buffer).unwrap();
-            buffer
-        };
-
-        let column = Column::from_raw_clone(column_type, &data_buffer);
-        columns.push(column);
-        columns_buffer.extend_from_slice(&data_buffer);
-    }
+    columns_buffer.extend_from_slice(&cursor_data[..length as usize]);
 
     Ok(Row {
         id,

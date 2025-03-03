@@ -2,6 +2,7 @@ use std::{io, sync::Arc};
 
 use ahash::RandomState;
 use dashmap::DashMap;
+use log::info;
 use rastcp::server::TcpServer;
 use tokio::sync::RwLock;
 
@@ -32,8 +33,8 @@ unsafe impl<S: IOOperationsSync> Sync for Database<S> {}
 
 impl<S: IOOperationsSync + Send + Sync> Database<S> {
     pub async fn new(io_sync: S) -> io::Result<Database<S>> {
-        let io_sync = io_sync.create_new("CONFIG_TABLE.db".to_string()).await;
-        let config_table = Table::init(io_sync.clone(), false, false).await?;
+        let config_io_sync = io_sync.create_new("CONFIG_TABLE.db".to_string()).await;
+        let config_table = Table::init(config_io_sync.clone(), false, false).await?;
 
         let all_rows_result = rql::parser::parse_rql(
             r#"
@@ -56,15 +57,17 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
             for row in rows {
                 let columns = Column::from_buffer(&row.columns_data)?;
                 let name = columns[0].into_value();
-                let compress: bool = columns[1].into_value().parse().unwrap();
-                let immutable: bool = columns[2].into_value().parse().unwrap();
+                info!("Table name found: {}", name);
+                let compress: bool = columns[1].content.as_slice()[0] == 1;
+                let immutable: bool = columns[2].content.as_slice()[0] == 1;
                 table_specs.push((name, compress, immutable));
             }
 
             let inited_tables: DashMap<String, Table<S>, RandomState> = DashMap::default();
 
             for table_spec in table_specs {
-                let new_io_sync = io_sync.create_new(table_spec.0.clone()).await;
+                let file_name = format!("{}.db", table_spec.0.trim());
+                let new_io_sync = io_sync.create_new(file_name).await;
                 let table = Table::<S>::init_inner(new_io_sync, table_spec.1, table_spec.2).await?;
                 inited_tables.insert(table_spec.0, table);
             }
@@ -76,7 +79,7 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
 
         Ok(Database {
             config_table: config_table,
-            tables: Arc::new(tables), //server: receiver
+            tables: Arc::new(tables),
         })
     }
 
@@ -86,12 +89,10 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
         compress: bool,
         immutable: bool,
     ) -> io::Result<()> {
-        let new_io_sync = self.config_table.io_sync.create_new(name.clone()).await;
+        let new_io_sync = self.config_table.io_sync.create_new(format!("{}.db", name)).await;
         let table = Table::<S>::init_inner(new_io_sync, compress, immutable).await?;
 
-        self.tables.insert(name.clone(), table);
-
-        let name_column = Column::new(name).unwrap();
+        let name_column = Column::new(name.clone()).unwrap();
         let compress_column = Column::new(compress).unwrap();
         let immutable_column = Column::new(immutable).unwrap();
 
@@ -101,6 +102,8 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
         columns_buffer_update.append(&mut name_column.content.to_vec());
         columns_buffer_update.append(&mut compress_column.content.to_vec());
         columns_buffer_update.append(&mut immutable_column.content.to_vec());
+
+        self.tables.insert(name, table);
 
         self.config_table
             .insert_row(InsertOrUpdateRow {
@@ -193,7 +196,11 @@ pub(crate) async fn process_incoming_queries<S: IOOperationsSync>(
     database: Arc<RwLock<Database<S>>>,
     request_vec: Vec<u8>,
 ) -> Vec<u8> {
-    let database_operation = rql::parser::parse_rql(&String::from_utf8_lossy(&request_vec)).unwrap();
+    let query = String::from_utf8_lossy(&request_vec);
+    
+    info!("Received query: {}", query);
+
+    let database_operation = rql::parser::parse_rql(&query).unwrap();
 
     match database_operation.parser_result {
         ParserResult::CreateTable((name, compress, immutable)) => {
@@ -235,6 +242,18 @@ pub(crate) async fn process_incoming_queries<S: IOOperationsSync>(
 
             return final_vec;
         },
+        ParserResult::RebuildIndexes(name) => {
+            let db = database.read().await;
+            let mut table = db.tables.try_get_mut(&name);
+            if table.is_locked() {
+                table = db.tables.try_get_mut(&name);
+            }
+            let mut table = table.unwrap();
+            table.rebuild_in_memory_indexes().await;
+            let mut result: [u8; 1] = [0u8; 1];
+            result[0] = 0;
+            return result.to_vec();
+        }
     }
 }
 

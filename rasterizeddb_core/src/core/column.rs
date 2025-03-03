@@ -290,6 +290,11 @@ impl Column {
                 let string_value = str::parse::<String>(value.as_ref()).unwrap();
                 buffer.write_all(string_value.as_bytes()).unwrap();
                 Ok(buffer)
+            },
+            "bool" => {
+                let mut buffer: Vec<u8> = Vec::with_capacity(1);
+                buffer.write(&[if str::parse::<bool>(value.as_ref()).unwrap() { 1 } else { 0 }]).unwrap();
+                Ok(buffer)
             }
             // "datetime" => {
             //     let mut buffer: Vec<u8> = Vec::new();
@@ -464,6 +469,7 @@ impl Column {
         }
     }
 
+    #[track_caller]
     pub fn from_buffer(buffer: &[u8]) -> io::Result<Vec<Column>> {
         let mut cursor = Cursor::new(buffer);
 
@@ -484,10 +490,11 @@ impl Column {
                 let str_length = cursor.read_u32::<LittleEndian>().unwrap();
                 let mut temp_buffer = vec![0; str_length as usize];
                 cursor.read(&mut temp_buffer).unwrap();
+                data_buffer.append(&mut str_length.to_le_bytes().to_vec());
                 data_buffer.append(&mut temp_buffer.to_vec());
             }
 
-            let memory_chunk = MemoryChunk::from_vec(buffer.to_vec());
+            let memory_chunk = MemoryChunk::from_vec(data_buffer.to_vec());
             let column = Column::from_chunk(column_type, memory_chunk);
 
             columns.push(column);
@@ -542,11 +549,11 @@ impl Column {
         }
     }
 
-    #[inline(always)]
+    //#[inline(always)]
     pub fn into_value(&self) -> String {
         match self.data_type {
             DbType::I8 => {
-                let value = self.content.as_slice()[1] as i8;
+                let value = self.content.as_slice()[0] as i8;
                 value.to_string()
             }
             DbType::I16 => {
@@ -566,7 +573,7 @@ impl Column {
                 value.to_string()
             }
             DbType::U8 => {
-                let value = self.content.as_slice()[1] as u8;
+                let value = self.content.as_slice()[0] as u8;
                 value.to_string()
             }
             DbType::U16 => {
@@ -595,13 +602,13 @@ impl Column {
             }
             DbType::CHAR => {
                 let value = char::from_u32(LittleEndian::read_u32(
-                    self.content.as_slice()[1..].as_ref(),
+                    self.content.as_slice().as_ref(),
                 ))
                 .unwrap();
                 value.to_string()
             }
             DbType::STRING => {
-                let vec = self.content.as_slice().to_vec();
+                let vec = self.content.as_slice()[3..].to_vec();
                 let value = String::from_utf8(vec).unwrap();
                 value
             }

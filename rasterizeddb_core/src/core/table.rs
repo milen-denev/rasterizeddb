@@ -82,6 +82,7 @@ impl<S: IOOperationsSync> Table<S> {
         let table_file_len = io_sync.get_len().await;
 
         if table_file_len >= HEADER_SIZE as u64 {
+            
             let buffer = io_sync.read_data(&mut 0, HEADER_SIZE as u32).await;
             let mut table_header = TableHeader::from_buffer(buffer).unwrap();
 
@@ -609,8 +610,7 @@ impl<S: IOOperationsSync> Table<S> {
                     })
                     .collect_vec();
 
-                let mut token_results: Vec<(bool, Option<Next>)> =
-                    Vec::with_capacity(evaluation_tokens.len());
+                let mut token_results: Vec<(bool, Option<Next>)> = Vec::with_capacity(evaluation_tokens.len());
                 let mut required_columns: Vec<(u32, Column)> = Vec::default();
                 let mut position = HEADER_SIZE as u64;
 
