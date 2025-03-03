@@ -566,7 +566,7 @@ impl Column {
                 value.to_string()
             }
             DbType::U8 => {
-                let value = self.content.as_slice()[1] as i8;
+                let value = self.content.as_slice()[1] as u8;
                 value.to_string()
             }
             DbType::U16 => {
