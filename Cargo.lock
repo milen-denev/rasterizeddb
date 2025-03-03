@@ -1456,6 +1456,7 @@ dependencies = [
  "byteorder",
  "criterion",
  "dashmap",
+ "env_logger",
  "futures",
  "itertools 0.14.0",
  "libmimalloc-sys",
