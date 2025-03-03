@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use crate::POSITIONS_CACHE;
 
 #[cfg(feature = "enable_parallelism")]
-use super::{column::Column, helpers::{read_row_cursor, row_prefetching_cursor}, row::Row, storage_providers::traits::IOOperationsSync, support_types::FileChunk};
+use super::{column::Column, helpers::row_prefetching_cursor, row::Row, storage_providers::traits::IOOperationsSync, support_types::FileChunk};
 
 #[cfg(feature = "enable_parallelism")]
 use crate::{memory_pool::{MemoryChunk, MEMORY_POOL}, rql::{models::{Next, Token}, tokenizer::evaluate_column_result}, simds::endianess::read_u32};
@@ -160,9 +160,7 @@ pub(crate) async fn process_all_chunks(
     let aggregator_handle = tokio::spawn(async move {
         let mut collected_rows = Vec::with_capacity(limit as usize);
 
-        if rx.is_empty() {
-
-        } else {
+        if !rx.is_empty() {
             rx.recv_many(&mut collected_rows, usize::MAX).await;
         }
 
@@ -200,6 +198,8 @@ pub(crate) async fn process_chunk_async(
 
 ) -> io::Result<()> {
     //println!("thread: {}", _thread_id);
+
+    use super::helpers::read_row_cursor_whole;
 
     #[cfg(feature = "enable_index_caching")]
     let mut result_row_vec: Vec<(u64, u32)> = Vec::default();
@@ -354,9 +354,9 @@ pub(crate) async fn process_chunk_async(
 
             if evaluation {
                 let mut cursor = &mut cursor_vector.cursor;
-                cursor.seek(SeekFrom::Start(position)).unwrap();
+                let new_position = first_column_index + prefetch_result.length as u64 + 1;
 
-                let row = read_row_cursor(
+                let row = read_row_cursor_whole(
                     first_column_index,
                     prefetch_result.found_id,
                     prefetch_result.length,
@@ -392,7 +392,9 @@ pub(crate) async fn process_chunk_async(
                     break;
                 }
 
-                position = cursor.stream_position().unwrap();
+                position = new_position;
+            } else {
+                position = first_column_index + prefetch_result.length as u64 + 1;
             }
         } else {
             break;
