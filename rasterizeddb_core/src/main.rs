@@ -6,7 +6,7 @@ use std::{
     io::stdin,
 };
 
-use rasterizeddb_core::{client::DbClient, core::database::Database};
+use rasterizeddb_core::core::database::Database;
 #[allow(unused_imports)]
 use rasterizeddb_core::{
     core::{
@@ -21,6 +21,7 @@ use stopwatch::Stopwatch;
 use tokio::sync::RwLock;
 
 #[tokio::main(flavor = "multi_thread")]
+#[allow(unreachable_code)]
 async fn main() -> std::io::Result<()> {
     #[cfg(target_arch = "x86_64")]
     {
@@ -29,41 +30,25 @@ async fn main() -> std::io::Result<()> {
     }
 
     unsafe { std::env::set_var("RUST_BACKTRACE", "0") };
-    unsafe { std::env::set_var("RUST_LOG", "info") };
+    unsafe { std::env::set_var("RUST_LOG", "error") };
 
     env_logger::init();
 
     let db_file = "C:\\db\\";
 
     //_ = remove_file(format!("{}\\{}", db_file, "database.db"));
+    
+    //let io_sync = MemoryStorageProvider::new();
 
     let io_sync = LocalStorageProvider::new(
         db_file,
         "database.db",
     )
     .await;
-
-    //let io_sync = MemoryStorageProvider::new();
-
     let database = Database::new(io_sync).await?;
+    _ = tokio::spawn(Database::start_async(Arc::new(RwLock::new(database)))).await?;
 
-    tokio::spawn(Database::start_async(Arc::new(RwLock::new(database))));
-
-    let mut client = DbClient::new(Some("127.0.0.1")).await.unwrap();
-
-    //client.execute_query("BEGIN CREATE TABLE database (FALSE, FALSE) END").await.unwrap();
-    client.execute_query("BEGIN SELECT FROM database REBUILD_INDEXES END").await.unwrap();
-
-    let result = DbClient::extract_rows(client.execute_query(&format!(
-        r#"
-        BEGIN
-        SELECT FROM database
-        WHERE COL(0) >= 4999999
-        LIMIT 50
-        END
-    "#)).await.unwrap());
-
-    println!("{:?}", result);
+    return Ok(());
 
     let io_sync = LocalStorageProvider::new(
         db_file,
