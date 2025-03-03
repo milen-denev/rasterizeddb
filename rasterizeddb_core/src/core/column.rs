@@ -549,7 +549,7 @@ impl Column {
         }
     }
 
-    //#[inline(always)]
+    #[inline(always)]
     pub fn into_value(&self) -> String {
         match self.data_type {
             DbType::I8 => {
