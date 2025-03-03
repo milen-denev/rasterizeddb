@@ -236,6 +236,8 @@ impl TcpServer {
                     // Process the data with the handler
                     let response = handler(data).await;
                     
+                    debug!("Replying with {} bytes to {}", response.len(), peer_addr);
+
                     // Send response back
                     write_message(&mut tls_stream, &response).await?;
                 }
@@ -278,6 +280,8 @@ impl TcpServer {
                     let context_clone = context.clone();
                     let response = handler(context_clone, data).await;
                     
+                    debug!("Replying with {} bytes to {}", response.len(), peer_addr);
+
                     // Send response back
                     write_message(&mut tls_stream, &response).await?;
                 }
@@ -319,6 +323,8 @@ impl TcpServer {
                     // Process the data with the handler, passing the shared context
                     let response = handler(context.clone(), data).await;
                     
+                    debug!("Replying with {} bytes to {}", response.len(), peer_addr);
+
                     // Send response back
                     write_message(&mut tls_stream, &response).await?;
                 }
