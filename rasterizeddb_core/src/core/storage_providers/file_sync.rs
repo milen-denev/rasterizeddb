@@ -57,7 +57,6 @@ impl LocalStorageProvider {
             _ = std::fs::File::create(&file_str).unwrap();
         }
 
-
         let file_append = tokio::fs::File::options()
             .read(true)
             .append(true)
@@ -350,7 +349,7 @@ impl IOOperationsSync for LocalStorageProvider {
             _ = std::fs::create_dir(location_path);
         }
 
-        let new_table = format!("{}{}", self.location, name.replace("\0", ""));
+        let new_table = format!("{}{}", self.location, name);
         let file_path = Path::new(&new_table);
 
         if !file_path.exists() && !file_path.is_file() {
