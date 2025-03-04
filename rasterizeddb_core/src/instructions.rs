@@ -110,24 +110,28 @@ pub unsafe fn compare_raw_vecs(
 }
 
 #[allow(unused)]
+#[inline(always)]
 pub fn copy_vec_to_ptr(vec: &[u8], dst: *mut u8) {
     unsafe {
         ptr::copy_nonoverlapping(vec.as_ptr(), dst, vec.len());
     }
 }
 
+#[inline(always)]
 pub fn copy_ptr_to_vec(src: *const u8, vec: &mut Vec<u8>, len: usize) {
     unsafe {
         vec[..len].copy_from_slice(std::slice::from_raw_parts(src, len));
     }
 }
 
+#[inline(always)]
 pub fn vec_from_ptr_safe(ptr: *mut u8, len: usize) -> Vec<u8> {
     let mut vec = vec![0_u8; len];
     copy_ptr_to_vec(ptr, &mut vec, len);
     vec
 }
 
+#[inline(always)]
 pub unsafe fn ref_vec(ptr: *mut u8, len: usize) -> ManuallyDrop<Vec<u8>> {
     unsafe {
         let vec = Vec::from_raw_parts(ptr, len, len);
@@ -136,6 +140,7 @@ pub unsafe fn ref_vec(ptr: *mut u8, len: usize) -> ManuallyDrop<Vec<u8>> {
     }
 }
 
+#[inline(always)]
 pub unsafe fn ref_vec_no_manual(ptr: *mut u8, len: usize) -> Vec<u8> {
     unsafe {
         let vec = Vec::from_raw_parts(ptr, len, len);

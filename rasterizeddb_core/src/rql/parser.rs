@@ -13,6 +13,7 @@ use super::{
 
 #[allow(unused_variables)]
 #[allow(unused_mut)]
+#[inline(always)]
 pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
     let hash = get_hash(query);
 
