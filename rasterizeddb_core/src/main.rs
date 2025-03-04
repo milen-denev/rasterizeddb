@@ -18,7 +18,7 @@ async fn main() -> std::io::Result<()> {
     }
 
     unsafe { std::env::set_var("RUST_BACKTRACE", "0") };
-    unsafe { std::env::set_var("RUST_LOG", "error") };
+    unsafe { std::env::set_var("RUST_LOG", "info") };
 
     env_logger::init();
 

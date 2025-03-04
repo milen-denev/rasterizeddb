@@ -3,13 +3,12 @@ use std::io::stdin;
 use rasterizeddb_core::client::DbClient;
 use stopwatch::Stopwatch;
 
-
 #[tokio::main(flavor = "multi_thread")]
 #[allow(unreachable_code)]
 async fn main() -> std::io::Result<()> {
     let mut client = DbClient::new(Some("127.0.0.1")).await.unwrap();
 
-    //client.execute_query("BEGIN CREATE TABLE database (FALSE, FALSE) END").await.unwrap();
+    client.execute_query("BEGIN CREATE TABLE database (FALSE, FALSE) END").await.unwrap();
     client.execute_query("BEGIN SELECT FROM database REBUILD_INDEXES END").await.unwrap();
 
     let mut stopwatch = Stopwatch::new();

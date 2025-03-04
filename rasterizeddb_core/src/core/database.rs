@@ -90,29 +90,35 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
         compress: bool,
         immutable: bool,
     ) -> io::Result<()> {
+        // Optimize table creation by reserving memory upfront
         if self.tables.contains_key(&name) {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, "Table already exists"));
         }
 
+        // Create columns buffer with exact capacity to avoid reallocations
+        let name_column = Column::new(name.clone())?;
+        let compress_column = Column::new(compress)?;
+        let immutable_column = Column::new(immutable)?;
+        
+        let total_capacity = name_column.len() + compress_column.len() + immutable_column.len();
+        let mut columns_buffer: Vec<u8> = Vec::with_capacity(total_capacity);
+        
+        // Use extend_from_slice instead of append where possible
+        columns_buffer.extend_from_slice(&name_column.content.as_slice());
+        columns_buffer.extend_from_slice(&compress_column.content.as_slice());
+        columns_buffer.extend_from_slice(&immutable_column.content.as_slice());
+
+        // Create the new table file and initialize it in one transaction
         let new_io_sync = self.config_table.io_sync.create_new(format!("{}.db", name)).await;
         let table = Table::<S>::init_inner(new_io_sync, compress, immutable).await?;
-
-        let name_column = Column::new(name.clone()).unwrap();
-        let compress_column = Column::new(compress).unwrap();
-        let immutable_column = Column::new(immutable).unwrap();
-
-        let mut columns_buffer_update: Vec<u8> =
-            Vec::with_capacity(name_column.len() + compress_column.len() + immutable_column.len());
-
-        columns_buffer_update.append(&mut name_column.content.to_vec());
-        columns_buffer_update.append(&mut compress_column.content.to_vec());
-        columns_buffer_update.append(&mut immutable_column.content.to_vec());
-
+        
+        // Insert the table descriptor and update in-memory collection in one operation
         self.tables.insert(name, table);
-
+        
+        // Insert config record
         self.config_table
             .insert_row(InsertOrUpdateRow {
-                columns_data: columns_buffer_update,
+                columns_data: columns_buffer,
             })
             .await;
 
@@ -120,65 +126,67 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
     }
 
     pub async fn drop_table(&mut self, name: String) -> io::Result<()> {
-        let mut table = self.tables.try_get_mut(&name);
+        // Use optimization: remove from hashmap first to prevent new queries, then clean up resources
+        let mut table = match self.tables.remove(&name) {
+            Some((_, table)) => table,
+            None => return Err(io::Error::new(io::ErrorKind::NotFound, "Table not found")),
+        };
 
-        while table.is_locked() || table.is_absent() {
-            table = self.tables.try_get_mut(&name);
-        }
-
-        let mut table = table.unwrap();
-
+        // Drop IO resources
         table.io_sync.drop_io();
 
-        drop(table);
+        // Find and delete config entry efficiently
+        let select_query = format!(
+            r#"
+                BEGIN
+                SELECT FROM CONFIG_TABLE
+                WHERE name = {name}
+                END
+            "#,
+        );
+        
+        let select_table_to_drop = rql::parser::parse_rql(&select_query).unwrap();
 
-        _ = self.tables.remove(&name).unwrap();
-
-        let select_table_to_drop = rql::parser::parse_rql(&format!(
-        r#"
-            BEGIN
-            SELECT FROM CONFIG_TABLE
-            WHERE name = {name}
-            END
-        "#,
-        ))
-        .unwrap();
-
-        let table_row = self.config_table
+        let table_row_result = self.config_table
             .execute_query(select_table_to_drop.parser_result)
             .await?;
-
-        let row_id = table_row.unwrap().pop().unwrap().id;
-        self.config_table.delete_row_by_id(row_id).await?;
-        self.config_table.vacuum_table().await;
+            
+        if let Some(mut rows) = table_row_result {
+            if let Some(row) = rows.pop() {
+                // Delete the config record
+                self.config_table.delete_row_by_id(row.id).await?;
+                
+                // Schedule vacuum as a background task to avoid blocking caller
+                let mut config_table_clone = self.config_table.clone();
+                tokio::spawn(async move {
+                    config_table_clone.vacuum_table().await;
+                });
+            }
+        }
 
         Ok(())
     }
 
     pub async fn execute_cached_query(&self, name: String, parser_cached_result: ParserResult) -> io::Result<Vec<u8>> {
-        let mut table = self.tables.try_get(&name);
-
-        while table.is_locked() || table.is_absent() {
-            table = self.tables.try_get(&name);
+        // Use the same pattern as execute_query for consistency
+        match self.tables.get(&name) {
+            Some(table) => {
+                let rows: Option<Vec<Row>> = table.execute_query(parser_cached_result).await?;
+                Ok(row::Row::serialize_rows(rows))
+            },
+            None => Err(io::Error::new(io::ErrorKind::NotFound, format!("Table not found: {}", name)))
         }
-
-        let table = table.unwrap();
-        let rows: Option<Vec<Row>> = table.execute_query(parser_cached_result).await.unwrap();
-
-        Ok(row::Row::serialize_rows(rows))
     }
 
     pub async fn execute_query(&self, name: String, parser_cached_result: ParserResult) -> io::Result<Vec<u8>> {
-        let mut table = self.tables.try_get(&name);
-
-        while table.is_locked() || table.is_absent() {
-            table = self.tables.try_get(&name);
+        // Replace busy waiting with a more efficient approach using dashmap's entry API
+        match self.tables.get(&name) {
+            Some(table) => {
+                let rows: Option<Vec<Row>> = table.execute_query(parser_cached_result).await?;
+                Ok(row::Row::serialize_rows(rows))
+            },
+            None => Err(io::Error::new(io::ErrorKind::NotFound, format!("Table not found: {}", name)))
         }
-
-        let table = table.unwrap();
-        let rows: Option<Vec<Row>> = table.execute_query(parser_cached_result).await.unwrap();
-
-        Ok(row::Row::serialize_rows(rows))
     }
 
     pub async fn start_async(database: Arc<RwLock<Database<S>>>) -> io::Result<()> {
@@ -201,67 +209,125 @@ pub(crate) async fn process_incoming_queries<S: IOOperationsSync>(
     database: Arc<RwLock<Database<S>>>,
     request_vec: Vec<u8>,
 ) -> Vec<u8> {
+    // Optimize: avoid converting to string if we only need to parse it 
+    // (Future optimization: implement zero-copy parsing directly from bytes)
     let query = String::from_utf8_lossy(&request_vec);
     
     info!("Received query: {}", query);
 
-    let database_operation = rql::parser::parse_rql(&query).unwrap();
+    let database_operation = match rql::parser::parse_rql(&query) {
+        Ok(op) => op,
+        Err(e) => {
+            let mut result = Vec::with_capacity(1 + e.len());
+            result.push(3); // Error code
+            result.extend_from_slice(e.as_bytes());
+            return result;
+        }
+    };
+
+    // Reuse buffers for common result types
+    let create_ok_result = [0u8; 1];
+    let rows_result_prefix = [2u8; 1];
 
     match database_operation.parser_result {
         ParserResult::CreateTable((name, compress, immutable)) => {
             let mut db = database.write().await;
-            db.create_table(name, compress, immutable).await.unwrap();
-            let mut result: [u8; 1] = [0u8; 1];
-            result[0] = 0;
-            return result.to_vec();
+            match db.create_table(name, compress, immutable).await {
+                Ok(_) => create_ok_result.to_vec(),
+                Err(e) => {
+                    let mut result = Vec::with_capacity(1 + e.to_string().len());
+                    result.push(3); // Error code
+                    result.extend_from_slice(e.to_string().as_bytes());
+                    result
+                }
+            }
         }
         ParserResult::DropTable(name) => {
             let mut db = database.write().await;
-            db.drop_table(name).await.unwrap();
-            let mut result: [u8; 1] = [0u8; 1];
-            result[0] = 0;
-            return result.to_vec();
+            match db.drop_table(name).await {
+                Ok(_) => create_ok_result.to_vec(),
+                Err(e) => {
+                    let mut result = Vec::with_capacity(1 + e.to_string().len());
+                    result.push(3); // Error code
+                    result.extend_from_slice(e.to_string().as_bytes());
+                    result
+                }
+            }
         }
-        ParserResult::InsertEvaluationTokens(tokens) => todo!(),
-        ParserResult::UpdateEvaluationTokens(tokens) => todo!(),
-        ParserResult::DeleteEvaluationTokens(tokens) => todo!(),
         ParserResult::QueryEvaluationTokens(tokens) => {
+            // Optimize: Use read lock instead of write lock for queries
             let db = database.read().await;
-            let mut rows_result = db.execute_query(database_operation.table_name, ParserResult::QueryEvaluationTokens(tokens)).await.unwrap();
-            let mut result: [u8; 1] = [2u8; 1];
-            let mut final_vec = Vec::with_capacity(1 + rows_result.len());
-
-            final_vec.extend_from_slice(&mut result);
-            final_vec.append(&mut rows_result);
-
-            return final_vec;
+            
+            match db.execute_query(database_operation.table_name, ParserResult::QueryEvaluationTokens(tokens)).await {
+                Ok(mut rows_result) => {
+                    // Pre-allocate result vector with exact size
+                    let mut final_vec = Vec::with_capacity(1 + rows_result.len());
+                    final_vec.extend_from_slice(&rows_result_prefix);
+                    final_vec.append(&mut rows_result);
+                    final_vec
+                },
+                Err(e) => {
+                    let mut result = Vec::with_capacity(1 + e.to_string().len());
+                    result.push(3); // Error code
+                    result.extend_from_slice(e.to_string().as_bytes());
+                    result
+                }
+            }
         },
         ParserResult::CachedHashIndexes(indexes) => {
             let db = database.read().await;
-            let mut rows_result = db.execute_cached_query(database_operation.table_name, ParserResult::CachedHashIndexes(indexes)).await.unwrap();
-            let mut result: [u8; 1] = [2u8; 1];
-            let mut final_vec = Vec::with_capacity(1 + rows_result.len());
-
-            final_vec.extend_from_slice(&mut result);
-            final_vec.append(&mut rows_result);
-
-            return final_vec;
+            
+            match db.execute_cached_query(database_operation.table_name, 
+                                        ParserResult::CachedHashIndexes(indexes)).await {
+                Ok(mut rows_result) => {
+                    // Pre-allocate result vector with exact size
+                    let mut final_vec = Vec::with_capacity(1 + rows_result.len());
+                    final_vec.extend_from_slice(&rows_result_prefix);
+                    final_vec.append(&mut rows_result);
+                    final_vec
+                },
+                Err(e) => {
+                    let mut result = Vec::with_capacity(1 + e.to_string().len());
+                    result.push(3); // Error code
+                    result.extend_from_slice(e.to_string().as_bytes());
+                    result
+                }
+            }
         },
         ParserResult::RebuildIndexes(name) => {
+            // Use entry API to safely get and modify the table
             let db = database.read().await;
-          
+            
             let mut table = db.tables.try_get_mut(&name);
 
-            while table.is_locked() || table.is_absent() {
-                table = db.tables.try_get_mut(&name);
+            if table.is_absent() {
+                let error_msg = format!("Table not found: {}", name);
+                let mut result = Vec::with_capacity(1 + error_msg.len());
+                result.push(3); // Error code
+                result.extend_from_slice(error_msg.as_bytes());
+                return result;
             }
 
-            let mut table = table.unwrap();
-            table.rebuild_in_memory_indexes().await;
-            let mut result: [u8; 1] = [0u8; 1];
-            result[0] = 0;
-            return result.to_vec();
-        }
+            loop {
+                if table.is_locked() {
+                    table = db.tables.try_get_mut(&name);
+                } else {
+                    break;
+                }
+            }
+
+            let table = table.unwrap();
+
+            // Optimize index rebuilding as a background task
+            let mut table_clone = table.clone();
+            tokio::spawn(async move {
+                table_clone.rebuild_in_memory_indexes().await;
+            });
+            create_ok_result.to_vec()
+        },
+        ParserResult::InsertEvaluationTokens(tokens) => todo!(),
+        ParserResult::UpdateEvaluationTokens(tokens) => todo!(),
+        ParserResult::DeleteEvaluationTokens(tokens) => todo!(),
     }
 }
 

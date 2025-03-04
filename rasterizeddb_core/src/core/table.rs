@@ -219,60 +219,110 @@ impl<S: IOOperationsSync> Table<S> {
     /// #### STABILIZED
     /// Inserts a new row.
     pub async fn insert_row(&mut self, row: InsertOrUpdateRow) {
-        loop {
-            let table_locked = self.locked.load(Ordering::Relaxed);
-            if table_locked {
-                continue;
-            } else {
-                break;
+        // Wait for table lock using atomic spin lock with backoff
+        let mut spin_count = 0;
+        while self.locked.load(Ordering::Relaxed) {
+            if spin_count > 10 {
+                // After a few spins, yield to avoid CPU thrashing
+                tokio::task::yield_now().await;
             }
+            spin_count += 1;
         }
 
-        let columns_len = row.columns_data.len();
+        // Calculate required buffer size once
+        let columns_data_len = row.columns_data.len();
+        let header_size = 1 + 8 + 4; // START (1) + ID (8) + LENGTH (4)
+        let footer_size = 1;         // END (1)
+        let total_buffer_size = header_size + columns_data_len + footer_size;
 
-        //START (1) + END (1) + u64 ID (8) + u32 LENGTH (4) + VEC SIZE
-        let mut buffer: Vec<u8> = Vec::with_capacity(1 + 1 + 8 + 4 + columns_len);
+        // Get the row ID and update file length atomically
+        let row_id = self.update_eof_and_id(total_buffer_size as u64).await;
 
-        let total_row_size = buffer.capacity() as u64;
+        // Preallocate exact buffer size to avoid reallocation
+        let mut buffer = Vec::with_capacity(total_buffer_size);
 
-        let row_id = self.update_eof_and_id(total_row_size).await;
+        // Write header directly into buffer 
+        buffer.push(254); // DbType START
+        
+        // Write row ID efficiently
+        let row_id_bytes = row_id.to_le_bytes();
+        buffer.extend_from_slice(&row_id_bytes);
+        
+        // Write length efficiently
+        let columns_len_bytes = (columns_data_len as u32).to_le_bytes();
+        buffer.extend_from_slice(&columns_len_bytes);
 
-        //DbType START
-        buffer.push(254);
+        // Add column data without unnecessary cloning
+        buffer.extend_from_slice(&row.columns_data);
+        
+        // Add footer
+        buffer.push(255); // DbType END
 
-        WriteBytesExt::write_u64::<LittleEndian>(&mut buffer, row_id).unwrap();
-        WriteBytesExt::write_u32::<LittleEndian>(&mut buffer, columns_len as u32).unwrap();
+        // Buffer should now be exactly at capacity
+        debug_assert_eq!(buffer.len(), buffer.capacity());
 
-        let mut columns_data = row.columns_data;
-
-        buffer.append(&mut columns_data);
-
-        //DbType END
-        buffer.push(255);
-
+        // Using a single I/O operation instead of multiple append operations
         self.io_sync.append_data(&buffer).await;
-        // let verify_result = self.io_sync.verify_data_and_sync(current_file_len, &buffer);
 
-        // #[allow(unreachable_code)]
-        // if !verify_result {
-        //     panic!("DB file contains error.");
-        //     todo!("Add rollback.");
-        // }
-
-        let table_header = self.table_header.clone();
-
-        let mut table_header_w: RwLockWriteGuard<TableHeader> = loop {
-            let result = table_header.try_write();
-            if let Ok(table_header) = result {
-                break table_header;
+        // Update table header with minimal locking
+        // Try acquiring lock with timeout to avoid deadlocks
+        if let Ok(mut table_header_w) = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            self.table_header.write()
+        ).await {
+            // Only update the changed field rather than serializing entire header
+            if table_header_w.last_row_id < row_id {
+                table_header_w.last_row_id = row_id;
+                
+                // Write only the row_id portion of header to minimize I/O
+                let offset = TableHeader::ROW_ID_OFFSET;
+                let row_id_bytes = row_id.to_le_bytes();
+                self.io_sync.write_data(offset, &row_id_bytes).await;
             }
-        };
-
-        table_header_w.last_row_id = row_id;
-
-        let new_header = table_header_w.to_bytes().unwrap();
-
-        self.io_sync.write_data(0, &new_header).await;
+        } else {
+            // If we couldn't get lock, update the header asynchronously
+            let mut io_sync_clone = self.io_sync.clone();
+            let row_id_copy = row_id;
+            let table_header_clone = self.table_header.clone();
+            
+            tokio::spawn(async move {
+                let mut header = table_header_clone.write().await;
+                if header.last_row_id < row_id_copy {
+                    header.last_row_id = row_id_copy;
+                    let offset = TableHeader::ROW_ID_OFFSET;
+                    let row_id_bytes = row_id_copy.to_le_bytes();
+                    io_sync_clone.write_data(offset, &row_id_bytes).await;
+                }
+            });
+        }
+        
+        // Update in-memory indexes if they exist
+        if let Some(chunks) = self.in_memory_index.as_ref() {
+            if !chunks.is_empty() {
+                // Add row to in-memory index to avoid full rebuilds
+                let current_file_len = self.current_file_length.load(Ordering::Relaxed);
+                let position = current_file_len - total_buffer_size as u64;
+                
+                // Clone and modify the chunks vector
+                let mut new_chunks = chunks.clone();
+                let last_chunk = new_chunks.last_mut().unwrap();
+                
+                if last_chunk.chunk_size + total_buffer_size as u32 <= CHUNK_SIZE as u32 {
+                    last_chunk.chunk_size += total_buffer_size as u32;
+                    last_chunk.next_row_id = row_id;
+                } else {
+                    // Create a new chunk if current one is full
+                    new_chunks.push(FileChunk {
+                        current_file_position: position,
+                        chunk_size: total_buffer_size as u32,
+                        next_row_id: row_id,
+                    });
+                }
+                
+                // Replace the in-memory index atomically
+                self.in_memory_index = Arc::new(Some(new_chunks));
+            }
+        }
     }
 
     /// #### STABILIZED
@@ -1307,6 +1357,7 @@ impl<S: IOOperationsSync> Table<S> {
     /// So deleted row ID(3) and following rows ID(4), ID(5), ID(X) will become row ID(3), ID(4), ID(X - 1)
     /// Vacuuming currently locks the table and inserts, updates, rebuild cache indexes, and deletes will be waiting until the vacuum is done.
     pub async fn vacuum_table(&mut self) {
+        // Acquire lock on the table
         loop {
             let table_locked = self.locked.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok();
             if !table_locked {
@@ -1317,44 +1368,153 @@ impl<S: IOOperationsSync> Table<S> {
         }
 
         let file_length = self.get_current_table_length();
-        let mut position: u64 = HEADER_SIZE as u64;
-
+        
+        // Early return for empty tables
+        if file_length <= HEADER_SIZE as u64 {
+            self.locked.store(false, Ordering::Relaxed);
+            return;
+        }
+        
+        const BUFFER_THRESHOLD: usize = 8 * 1024 * 1024; // 8 MB buffer threshold
+        
+        // Create temporary table
         let temp_io_sync = self.io_sync.create_temp().await;
         let mut temp_table = Table::init(temp_io_sync, false, false).await.unwrap();
-
-        loop {
-            if let Some(prefetch_result) =
-                row_prefetching(&mut self.io_sync, &mut position, file_length, self.table_header.read().await.mutated)
+        
+        // Batch collection for buffering rows before writing to disk
+        let mut row_batch: Vec<InsertOrUpdateRow> = Vec::new();
+        let mut current_batch_size: usize = 0;
+        let mut total_rows_processed: usize = 0;
+        
+        // Get table mutation status
+        let mutated = self.table_header.read().await.mutated;
+        
+        // Check if in-memory indexes are available
+        let chunks_arc_clone = self.in_memory_index.clone();
+        
+        if let Some(chunks) = chunks_arc_clone.as_ref() {
+            debug!("Vacuum: processing with in-memory chunks ({} chunks found)", chunks.len());
+            
+            for (chunk_idx, chunk) in chunks.iter().enumerate() {
+                // Read an entire chunk into memory at once
+                let buffer = chunk.read_chunk_sync(&mut self.io_sync).await;
+                let mut cursor_vector = CursorVector::new(&buffer);
+                let mut position: u64 = 0;
+                
+                loop {
+                    if let Some(prefetch_result) = row_prefetching_cursor(&mut position, &mut cursor_vector, chunk, mutated).unwrap() {
+                        // Use the in-memory cursor data directly rather than re-reading from disk
+                        let first_column_index = position;
+                        let mut cursor = &mut cursor_vector.cursor;
+                        
+                        let row = read_row_cursor_whole(
+                            first_column_index,
+                            prefetch_result.found_id,
+                            prefetch_result.length,
+                            &mut cursor,
+                        ).unwrap();
+                        
+                        // Add row to memory buffer
+                        let row_size = row.columns_data.len();
+                        row_batch.push(InsertOrUpdateRow {
+                            columns_data: row.columns_data,
+                        });
+                        current_batch_size += row_size;
+                        total_rows_processed += 1;
+                        
+                        // Flush buffer when threshold is reached
+                        if current_batch_size >= BUFFER_THRESHOLD {
+                            debug!("Vacuum: flushing buffer - chunk {}/{} - {} rows processed", 
+                                   chunk_idx + 1, chunks.len(), total_rows_processed);
+                            
+                            // Write batch to temp table
+                            for row_to_insert in row_batch.drain(..) {
+                                temp_table.insert_row_unsync(row_to_insert).await;
+                            }
+                            current_batch_size = 0;
+                        }
+                        
+                        // Move to next row
+                        position += prefetch_result.length as u64 + 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        } else {
+            debug!("Vacuum: processing without in-memory indexes");
+            
+            // Process the file sequentially when no in-memory indexes exist
+            let mut position: u64 = HEADER_SIZE as u64;
+            let mut last_log_pos: u64 = position;
+            
+            loop {
+                if let Some(prefetch_result) = row_prefetching(&mut self.io_sync, &mut position, file_length, mutated)
                     .await
                     .unwrap()
-            {
-                let row = read_row_columns(
-                    &mut self.io_sync,
-                    position,
-                    prefetch_result.found_id,
-                    prefetch_result.length + 1,
-                )
-                .await
-                .unwrap();
-
-                // END (1)
-                position += prefetch_result.length as u64 + 1;
-                temp_table
-                    .insert_row_unsync(InsertOrUpdateRow {
+                {
+                    // Read the entire row at once
+                    let row = read_row_columns(
+                        &mut self.io_sync,
+                        position,
+                        prefetch_result.found_id,
+                        prefetch_result.length + 1,
+                    )
+                    .await
+                    .unwrap();
+                    
+                    // Add to memory buffer
+                    let row_size = row.columns_data.len();
+                    row_batch.push(InsertOrUpdateRow {
                         columns_data: row.columns_data,
-                    })
-                    .await;
-            } else {
-                break;
+                    });
+                    current_batch_size += row_size;
+                    total_rows_processed += 1;
+                    
+                    // Flush buffer when threshold is reached
+                    if current_batch_size >= BUFFER_THRESHOLD {
+                        let progress = ((position - HEADER_SIZE as u64) as f64 / 
+                                      (file_length - HEADER_SIZE as u64) as f64) * 100.0;
+                        
+                        debug!("Vacuum: flushing buffer - {:.2}% complete ({} rows, {:.2}MB processed)",
+                               progress, total_rows_processed,
+                               (position - last_log_pos) as f64 / 1_048_576.0);
+                        
+                        // Write batch to temp table
+                        for row_to_insert in row_batch.drain(..) {
+                            temp_table.insert_row_unsync(row_to_insert).await;
+                        }
+                        current_batch_size = 0;
+                        last_log_pos = position;
+                    }
+                    
+                    // Move to next row
+                    position += prefetch_result.length as u64 + 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        
+        // Flush any remaining rows in the buffer
+        if !row_batch.is_empty() {
+            debug!("Vacuum: flushing final buffer - {} rows total", total_rows_processed);
+            for row_to_insert in row_batch.drain(..) {
+                temp_table.insert_row_unsync(row_to_insert).await;
             }
         }
 
+        debug!("Vacuum: swapping temporary table with main table");
+        
+        // Swap the temporary table with the main one
         self.io_sync.swap_temp(&mut temp_table.io_sync).await;
-
+        
         drop(temp_table);
 
+        // Reset the in-memory index
         self.in_memory_index = Arc::new(None);
 
+        // Release the table lock and update state
         loop {
             let table_locked = self.locked.compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed).is_ok();
             if !table_locked {
@@ -1368,5 +1528,7 @@ impl<S: IOOperationsSync> Table<S> {
         let mut table_header = self.table_header.write().await;
         table_header.mutated = false;
         self.io_sync.write_data(0, &table_header.to_bytes().unwrap()).await;
+        
+        debug!("Vacuum completed: processed {} rows", total_rows_processed);
     }
 }

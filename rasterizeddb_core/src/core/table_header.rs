@@ -13,6 +13,9 @@ pub struct TableHeader {
 }
 
 impl TableHeader {
+    // Offset to the last_row_id field in the header
+    pub const ROW_ID_OFFSET: u64 = 8; // Update this if your header layout changes
+
     pub(crate) fn new(
         total_file_length: u64, //8
         shard_number: u32,      //4
