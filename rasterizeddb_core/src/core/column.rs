@@ -380,6 +380,75 @@ impl Column {
         })
     }
 
+    pub fn new_without_type<T>(value: T) -> io::Result<Column>
+    where
+        T: Display,
+    {
+        let value_type = Self::get_type::<T>();
+
+        let vec = Self::to_vec(value.to_string(), value_type).unwrap();
+
+        let db_type = {
+            if value_type == "i32" {
+                DbType::I32
+            } else if value_type == "i8" {
+                DbType::I8
+            } else if value_type == "i16" {
+                DbType::I16
+            } else if value_type == "i64" {
+                DbType::I64
+            } else if value_type == "i128" {
+                DbType::I128
+            } else if value_type == "u8" {
+                DbType::U8
+            } else if value_type == "u16" {
+                DbType::U16
+            } else if value_type == "u32" {
+                DbType::U32
+            } else if value_type == "u64" {
+                DbType::U64
+            } else if value_type == "u128" {
+                DbType::U128
+            } else if value_type == "f32" {
+                DbType::F32
+            } else if value_type == "f64" {
+                DbType::F64
+            } else if value_type == "char" {
+                DbType::CHAR
+            } else if value_type == "alloc::string::String" {
+                DbType::STRING
+            } else if value_type == "&alloc::string::String" {
+                DbType::STRING
+            } else if value_type == "&str" {
+                DbType::STRING
+            } else if value_type == "datetime" {
+                DbType::DATETIME
+            } else if value_type == "bool" {
+                DbType::U8
+            } else {
+                panic!("Wrong datatype provided: {}.", value_type);
+            }
+        };
+
+        //Create the buffer with db_type included
+        let mut buffer: Vec<u8> = if db_type != DbType::STRING {
+            Vec::with_capacity(vec.len())
+        } else {
+            Vec::with_capacity(vec.len() + 4)
+        };
+
+        if db_type == DbType::STRING {
+            buffer.write_u32::<LittleEndian>(vec.len() as u32).unwrap();
+        }
+
+        buffer.extend_from_slice(&vec);
+
+        Ok(Column {
+            data_type: db_type,
+            content: ColumnValue::ManagedMemoryPointer(Box::pin(buffer)),
+        })
+    }
+
     // Vector must be dropped before dropping column
     pub unsafe fn into_chunk(self) -> io::Result<MemoryChunk> {
         let chunk = match self.content {
