@@ -5,7 +5,7 @@ use std::{
     ptr
 };
 
-use crate::instructions::{ref_vec, ref_vec_no_manual};
+use crate::instructions::{copy_vec_to_ptr, ref_vec, ref_vec_no_manual};
 
 pub static MEMORY_POOL: MemoryPool = MemoryPool::new();
 
@@ -22,19 +22,17 @@ impl MemoryPool {
     }
 
     #[inline(always)]
-    pub fn acquire(&self, size: u32) -> Option<MemoryChunk> {
+    pub fn acquire(&self, size: u32) -> MemoryChunk {
         let ptr = unsafe { mi_malloc(size as usize) as *mut u8 };
 
         if ptr.is_null() {
-            return None;  // Allocation failed (likely OOM) – return None instead of panicking.
+            panic!("Allocation failed (likely OOM)");
         }
 
-        Some(MemoryChunk {
+        MemoryChunk {
             ptr,
-            size,
-            //pool: Arc::downgrade(&MEMORY_POOL),
-            vec: None
-        })
+            size
+        }
     }
 
     #[inline(always)]
@@ -52,97 +50,57 @@ impl MemoryPool {
 #[derive(Debug, Clone)]
 pub struct MemoryChunk {
     pub ptr: *mut u8,
-    pub size: u32,
-    //pool: std::sync::Weak<MemoryPool>,
-    // Used to store a vector instead of a raw pointer. Either one or the other will be set.
-    pub vec: Option<Pin<Box<Vec<u8>>>>,
+    pub size: u32
 }
 
 unsafe impl Send for MemoryChunk {}
 unsafe impl Sync for MemoryChunk {}
 
-impl Default for MemoryChunk {
-    fn default() -> Self {
-        Self {
-            ptr: std::ptr::null_mut(),
-            size: 0,
-            //pool: std::sync::Weak::default(),
-            vec: None,
-        }
-    }
-}
-
 impl Drop for MemoryChunk {
     fn drop(&mut self) {
-        if self.vec.is_none() {
-            // if let Some(pool) = self.pool.upgrade() {
-            //     pool.release(self.index);
-            // }
-            MEMORY_POOL.release(self.ptr);
-        }
+        MEMORY_POOL.release(self.ptr);
     }
 }
 
 impl MemoryChunk {
     pub fn prefetch_to_lcache(&self) {
-        if self.vec.is_none() {
-            unsafe { _mm_prefetch::<_MM_HINT_T0>(self.ptr as *const i8) };
-        }
+        unsafe { _mm_prefetch::<_MM_HINT_T0>(self.ptr as *const i8) };
     }
 
     // Create a new chunk from a vector with no memory chunk allocated from pool
     pub fn from_vec(vec: Vec<u8>) -> Self {
-        MemoryChunk {
-            ptr: ptr::null_mut(),
-            size: 0,
-            //pool: std::sync::Weak::default(),
-            vec: Some(Box::pin(vec))
-        }
+        let len = vec.len() as u32;
+        let memory_chunk = MEMORY_POOL.acquire(len);
+        copy_vec_to_ptr(vec.as_slice(), memory_chunk.ptr);
+        drop(vec);
+        memory_chunk
     }
 
     pub unsafe fn into_vec(&self) -> ChunkIntoVecResult {
-        if let Some(vec) = self.vec.as_ref() {
-            let new_vec = unsafe { ref_vec_no_manual(vec.as_ptr() as *mut u8, vec.len()) };
-            ChunkIntoVecResult::Vec(Box::pin(new_vec))
-        } else {
-            ChunkIntoVecResult::ManualVec(unsafe { ref_vec(self.ptr, self.size as usize) })
-        }
-    }
-
-    pub fn deallocate_vec(&mut self, chunk_vec_result: ChunkIntoVecResult) {
-        match chunk_vec_result {
-            ChunkIntoVecResult::Vec(_) => {}
-            ChunkIntoVecResult::ManualVec(manual) => {
-                mem::forget(manual);
-            }
-        }
+        ChunkIntoVecResult::ManualVec(unsafe { ref_vec(self.ptr, self.size as usize) })
     }
 }
 
 #[derive(Debug)]
 pub enum ChunkIntoVecResult {
-    Vec(Pin<Box<Vec<u8>>>),
     ManualVec(ManuallyDrop<Vec<u8>>),
 }
 
 impl ChunkIntoVecResult {
     pub fn as_vec(&self) -> &Vec<u8> {
         match self {
-            ChunkIntoVecResult::Vec(v) => v,
             ChunkIntoVecResult::ManualVec(v) => v,
         }
     }
 
     pub fn as_vec_mut(&mut self) -> &mut Vec<u8> {
         match self {
-            ChunkIntoVecResult::Vec(v) => v,
             ChunkIntoVecResult::ManualVec(v) => v,
         }
     }
 
     pub fn as_slice(&self) -> &[u8] {
         match self {
-            ChunkIntoVecResult::Vec(v) => v.as_slice(),
             ChunkIntoVecResult::ManualVec(v) => v.as_slice(),
         }
     }

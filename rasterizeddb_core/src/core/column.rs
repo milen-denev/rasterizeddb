@@ -446,17 +446,11 @@ impl Column {
     }
 
     pub fn from_chunk(data_type: u8, chunk: MemoryChunk) -> Column {
-        if chunk.vec.is_none() {
-            Column {
-                data_type: DbType::from_byte(data_type),
-                content: ColumnValue::StaticMemoryPointer(chunk),
-            }
-        } else {
-            let vec = chunk.vec.as_ref().unwrap();
-            Column {
-                data_type: DbType::from_byte(data_type),
-                content: ColumnValue::ManagedMemoryPointer(vec.clone()),
-            }
+        let vec = unsafe { chunk.into_vec() };
+        
+        Column {
+            data_type: DbType::from_byte(data_type),
+            content: ColumnValue::ManagedMemoryPointer(Box::pin(vec.as_vec().clone())),
         }
     }
 

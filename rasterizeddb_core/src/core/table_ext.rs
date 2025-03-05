@@ -230,10 +230,7 @@ pub(crate) async fn process_chunk_async(
 
                     if db_type != DbType::STRING {
                         let size = db_type.get_size();
-                        let memory_chunk =
-                            MEMORY_POOL.acquire(size).unwrap_or_else(|| {
-                                MemoryChunk::from_vec(vec![0; size as usize])
-                            });
+                        let memory_chunk = MEMORY_POOL.acquire(size);
 
                         let mut data_buffer = unsafe { memory_chunk.into_vec() };
 
@@ -273,11 +270,7 @@ pub(crate) async fn process_chunk_async(
                         let cursor = &mut cursor_vector.cursor;
                         cursor.seek(SeekFrom::Start(position)).unwrap();
 
-                        let str_memory_chunk = MEMORY_POOL
-                            .acquire(str_length + 4)
-                            .unwrap_or_else(|| {
-                                MemoryChunk::from_vec(vec![0; str_length as usize + 4])
-                            });
+                        let str_memory_chunk = MEMORY_POOL.acquire(str_length + 4);
 
                         let mut preset_buffer =
                             unsafe { str_memory_chunk.into_vec() };
