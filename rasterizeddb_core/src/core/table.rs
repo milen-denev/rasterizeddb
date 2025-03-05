@@ -458,11 +458,11 @@ impl<S: IOOperationsSync> Table<S> {
                                             cursor_vector.vector[(position + 2) as usize],
                                             cursor_vector.vector[(position + 3) as usize],
                                         ];
-
+                
                                         position += 4;
-
+                
                                         let str_len_array_pointer = str_len_array.as_ptr();
-
+                
                                         #[cfg(target_arch = "x86_64")]
                                         {
                                             unsafe {
@@ -471,24 +471,25 @@ impl<S: IOOperationsSync> Table<S> {
                                                 )
                                             };
                                         }
-
+                
                                         let str_length = unsafe { read_u32(str_len_array_pointer) };
-
-                                        let cursor = &mut cursor_vector.cursor;
-                                        cursor.seek(SeekFrom::Start(position)).unwrap();
-
-                                        let str_memory_chunk = MEMORY_POOL.acquire(str_length + 4);
-
+                
+                                        let chunk_slice = cursor_vector.vector.as_slice();
+                
+                                        let str_memory_chunk = MEMORY_POOL.acquire(str_length);
+                
                                         let mut preset_buffer =
                                             unsafe { str_memory_chunk.into_vec() };
-
-                                        _ = preset_buffer
-                                            .as_vec_mut()
-                                            .write(&str_length.to_le_bytes());
-
-                                        cursor.read(preset_buffer.as_vec_mut()).unwrap();
-
+                
+                                        let preset_buffer_slice = preset_buffer.as_vec_mut();
+ 
+                                        for (i, byte) in chunk_slice[position as usize..position as usize + str_length as usize].iter().enumerate() {
+                                            preset_buffer_slice[i] = *byte;
+                                        }
+                
                                         position += str_length as u64;
+                
+                                        drop(preset_buffer);                
 
                                         let column =
                                             Column::from_chunk(column_type, str_memory_chunk);
