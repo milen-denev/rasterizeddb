@@ -33,7 +33,7 @@ use super::{
 };
 
 use crate::{
-    core::helpers::delete_row_file, memory_pool::{MemoryChunk, MEMORY_POOL}, rql::models::Next, simds::endianess::read_u32, CHUNK_SIZE, EMPTY_BUFFER, HEADER_SIZE 
+    core::helpers::delete_row_file, memory_pool::MEMORY_POOL, rql::models::Next, simds::endianess::read_u32, CHUNK_SIZE, EMPTY_BUFFER, HEADER_SIZE 
 };
 
 #[cfg(feature = "enable_parallelism")]
@@ -540,8 +540,12 @@ impl<S: IOOperationsSync> Table<S> {
                             }
 
                             let evaluation = if !select_all {
+                                debug!("Evaluating column result.");
+                                debug!("Required columns: {:?}", required_columns);
+                                debug!("Evaluation tokens: {:?}", evaluation_tokens);
+
                                 let eval = evaluate_column_result(
-                                    &mut required_columns,
+                                    &required_columns,
                                     &mut evaluation_tokens,
                                     &mut token_results,
                                 );
@@ -692,8 +696,12 @@ impl<S: IOOperationsSync> Table<S> {
                         }
 
                         let evaluation = if !select_all {
+                            debug!("Evaluating column result.");
+                            debug!("Required columns: {:?}", required_columns);
+                            debug!("Evaluation tokens: {:?}", evaluation_tokens);
+
                             let eval = evaluate_column_result(
-                                &mut required_columns,
+                                &required_columns,
                                 &mut evaluation_tokens,
                                 &mut token_results,
                             );
