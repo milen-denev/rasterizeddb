@@ -1,11 +1,9 @@
 use std::{
     arch::x86_64::{_mm_prefetch, _MM_HINT_T0},
-    mem::{self, ManuallyDrop},
-    pin::Pin,
-    ptr
+    mem::ManuallyDrop
 };
 
-use crate::instructions::{copy_vec_to_ptr, ref_vec, ref_vec_no_manual};
+use crate::instructions::{copy_vec_to_ptr, ref_vec};
 
 pub static MEMORY_POOL: MemoryPool = MemoryPool::new();
 
@@ -26,7 +24,7 @@ impl MemoryPool {
         let ptr = unsafe { mi_malloc(size as usize) as *mut u8 };
 
         if ptr.is_null() {
-            panic!("Allocation failed (likely OOM)");
+            panic!("Allocation failed (likely OOM).");
         }
 
         MemoryChunk {
@@ -38,7 +36,7 @@ impl MemoryPool {
     #[inline(always)]
     fn release(&self, ptr: *mut u8) {
         if ptr.is_null() {
-            return;  // No action needed for null pointers (matches C free behavior).
+            panic!("Invalid operation, releasing null pointer.");
         }
 
         unsafe {
