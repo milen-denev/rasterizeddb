@@ -336,7 +336,7 @@ pub(crate) async fn process_chunk_async(
 
             let evaluation = if !select_all {
                 let eval = evaluate_column_result(
-                    &mut required_columns,
+                    &required_columns,
                     &mut evaluation_tokens,
                     &mut token_results,
                 );
