@@ -3,7 +3,6 @@ use std::io::stdin;
 use rasterizeddb_core::client::DbClient;
 use stopwatch::Stopwatch;
 
-
 #[tokio::main(flavor = "multi_thread")]
 #[allow(unreachable_code)]
 async fn main() -> std::io::Result<()> {
@@ -19,26 +18,26 @@ async fn main() -> std::io::Result<()> {
         r#"
         BEGIN
         SELECT FROM database
-        WHERE COL(0) = 4999999
+        WHERE COL(0) = 1000000
         LIMIT 50
         END
     "#);
 
     let db_response = client.execute_query(&query).await.unwrap();
-    let result = DbClient::extract_rows(db_response).unwrap();
+    let result = DbClient::extract_rows(db_response).unwrap().unwrap();
 
     stopwatch.stop();
 
-    // for row in result.unwrap().unwrap().iter() {
-    //     let columns = row.columns().unwrap();
-    //     for (i, column) in columns.iter().enumerate() {
-    //         println!("Column ({}): {}", i, column.into_value());
-    //     }
-    // }
+    for row in result.iter() {
+        let columns = row.columns().unwrap();
+        for (i, column) in columns.iter().enumerate() {
+            println!("Column ({}): {}", i, column.into_value());
+        }
+    }
 
     println!("Elapsed {:?}", stopwatch.elapsed());
 
-    println!("Total rows: {}", result.unwrap().len());
+    println!("Total rows: {}", result.len());
 
     println!("Press any key to continue...");
 
