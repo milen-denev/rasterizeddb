@@ -25,12 +25,12 @@ async fn main() -> std::io::Result<()> {
     let db_file = "C:\\db\\";
     let io_sync = LocalStorageProvider::new(
         db_file,
-        "database.db",
+        None
     )
     .await;
 
     let database = Database::new(io_sync).await?;
     _ = tokio::spawn(Database::start_async(Arc::new(RwLock::new(database)))).await?;
 
-    return Ok(());
+    Ok(())
 }

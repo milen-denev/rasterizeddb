@@ -32,52 +32,97 @@ impl Clone for LocalStorageProvider {
 }
 
 impl LocalStorageProvider {
-    pub async fn new(location: &str, table_name: &str) -> LocalStorageProvider {
-        let delimiter = if cfg!(unix) {
-            "/"
-        } else if cfg!(windows) {
-            "\\"
+    pub async fn new(location: &str, table_name: Option<&str>) -> LocalStorageProvider {
+        if let Some(table_name) = table_name {
+            let delimiter = if cfg!(unix) {
+                "/"
+            } else if cfg!(windows) {
+                "\\"
+            } else {
+                panic!("OS not supported");
+            };
+    
+            let location_str = format!("{}", location);
+    
+            let location_path = Path::new(&location_str);
+    
+            if !location_path.exists() {
+                _ = std::fs::create_dir(location_path);
+            }
+    
+            let file_str = format!("{}{}{}", location, delimiter, table_name);
+    
+            let file_path = Path::new(&file_str);
+    
+            if !file_path.exists() && !file_path.is_file() {
+                _ = std::fs::File::create(&file_str).unwrap();
+            }
+
+            let file_append = tokio::fs::File::options()
+                .read(true)
+                .append(true)
+                .open(&file_str)
+                .await
+                .unwrap();
+
+            let file_write = tokio::fs::File::options()
+                .read(true)
+                .write(true)
+                .open(&file_str)
+                .await
+                .unwrap();
+
+            LocalStorageProvider {
+                append_file: Arc::new(RwLock::new(file_append)),
+                write_file: Arc::new(RwLock::new(file_write)),
+                location: location.to_string(),
+                table_name: table_name.to_string(),
+                file_str: file_str,
+            }
         } else {
-            panic!("OS not supported");
-        };
-
-        let location_str = format!("{}", location);
-
-        let location_path = Path::new(&location_str);
-
-        if !location_path.exists() {
-            _ = std::fs::create_dir(location_path);
-        }
-
-        let file_str = format!("{}{}{}", location, delimiter, table_name);
-
-        let file_path = Path::new(&file_str);
-
-        if !file_path.exists() && !file_path.is_file() {
+            let delimiter = if cfg!(unix) {
+                "/"
+            } else if cfg!(windows) {
+                "\\"
+            } else {
+                panic!("OS not supported");
+            };
+    
+            let location_str = format!("{}", location);
+    
+            let location_path = Path::new(&location_str);
+    
+            if !location_path.exists() {
+                _ = std::fs::create_dir(location_path);
+            }
+    
+            let file_str = format!("{}{}{}", location, delimiter, "CONFIG_TABLE.db");
+    
             _ = std::fs::File::create(&file_str).unwrap();
+    
+            let file_append = tokio::fs::File::options()
+                .read(true)
+                .append(true)
+                .open(&file_str)
+                .await
+                .unwrap();
+    
+            let file_write = tokio::fs::File::options()
+                .read(true)
+                .write(true)
+                .open(&file_str)
+                .await
+                .unwrap();
+    
+            LocalStorageProvider {
+                append_file: Arc::new(RwLock::new(file_append)),
+                write_file: Arc::new(RwLock::new(file_write)),
+                location: location.to_string(),
+                table_name: "temp.db".to_string(),
+                file_str: file_str,
+            }
         }
-
-        let file_append = tokio::fs::File::options()
-            .read(true)
-            .append(true)
-            .open(&file_str)
-            .await
-            .unwrap();
-
-        let file_write = tokio::fs::File::options()
-            .read(true)
-            .write(true)
-            .open(&file_str)
-            .await
-            .unwrap();
-
-        LocalStorageProvider {
-            append_file: Arc::new(RwLock::new(file_append)),
-            write_file: Arc::new(RwLock::new(file_write)),
-            location: location.to_string(),
-            table_name: table_name.to_string(),
-            file_str: file_str,
-        }
+ 
     }
 
     pub async fn close_files(&mut self) {

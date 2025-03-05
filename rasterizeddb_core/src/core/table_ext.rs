@@ -1,8 +1,11 @@
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom};
+use log::debug;
+
 use super::{db_type::DbType, support_types::CursorVector};
+use super::helpers::read_row_cursor_whole;
 
 #[cfg(feature = "enable_parallelism")]
-use std::{arch::x86_64::{_mm_prefetch, _MM_HINT_T0}, io::{self, Write}, sync::{atomic::{AtomicU64, Ordering}, Arc}};
+use std::{arch::x86_64::{_mm_prefetch, _MM_HINT_T0}, sync::{atomic::{AtomicU64, Ordering}, Arc}};
 
 #[cfg(feature = "enable_parallelism")]
 use tokio::sync::mpsc;
@@ -14,7 +17,7 @@ use crate::POSITIONS_CACHE;
 use super::{column::Column, helpers::row_prefetching_cursor, row::Row, storage_providers::traits::IOOperationsSync, support_types::FileChunk};
 
 #[cfg(feature = "enable_parallelism")]
-use crate::{memory_pool::{MemoryChunk, MEMORY_POOL}, rql::{models::{Next, Token}, tokenizer::evaluate_column_result}, simds::endianess::read_u32};
+use crate::{memory_pool::MEMORY_POOL, rql::{models::{Next, Token}, tokenizer::evaluate_column_result}, simds::endianess::read_u32};
 
 #[inline(always)]
 pub fn extent_non_string_buffer(
@@ -108,6 +111,7 @@ pub(crate) async fn process_all_chunks(
     hash: u64
 
 ) -> io::Result<Option<Vec<Row>>> {
+
     use futures::future::join_all;
     use tokio::{sync::Semaphore, task};
 
@@ -158,7 +162,7 @@ pub(crate) async fn process_all_chunks(
     join_all(handles).await;
 
     let aggregator_handle = tokio::spawn(async move {
-        let mut collected_rows = Vec::with_capacity(limit as usize);
+        let mut collected_rows = Vec::with_capacity(if limit > 50 { 50 } else { limit as usize });
 
         if !rx.is_empty() {
             rx.recv_many(&mut collected_rows, usize::MAX).await;
@@ -197,9 +201,7 @@ pub(crate) async fn process_chunk_async(
     hash: u64
 
 ) -> io::Result<()> {
-    //println!("thread: {}", _thread_id);
-
-    use super::helpers::read_row_cursor_whole;
+    debug!("thread: {}", _thread_id);
 
     #[cfg(feature = "enable_index_caching")]
     let mut result_row_vec: Vec<(u64, u32)> = Vec::default();
@@ -230,10 +232,7 @@ pub(crate) async fn process_chunk_async(
 
                     if db_type != DbType::STRING {
                         let size = db_type.get_size();
-                        let memory_chunk =
-                            MEMORY_POOL.acquire(size).unwrap_or_else(|| {
-                                MemoryChunk::from_vec(vec![0; size as usize])
-                            });
+                        let memory_chunk = MEMORY_POOL.acquire(size);
 
                         let mut data_buffer = unsafe { memory_chunk.into_vec() };
 
@@ -270,25 +269,22 @@ pub(crate) async fn process_chunk_async(
 
                         let str_length = unsafe { read_u32(str_len_array_pointer) };
 
-                        let cursor = &mut cursor_vector.cursor;
-                        cursor.seek(SeekFrom::Start(position)).unwrap();
+                        let chunk_slice = cursor_vector.vector.as_slice();
 
-                        let str_memory_chunk = MEMORY_POOL
-                            .acquire(str_length + 4)
-                            .unwrap_or_else(|| {
-                                MemoryChunk::from_vec(vec![0; str_length as usize + 4])
-                            });
+                        let str_memory_chunk = MEMORY_POOL.acquire(str_length);
 
                         let mut preset_buffer =
                             unsafe { str_memory_chunk.into_vec() };
 
-                        _ = preset_buffer
-                            .as_vec_mut()
-                            .write(&str_length.to_le_bytes());
+                        let preset_buffer_slice = preset_buffer.as_vec_mut();
 
-                        cursor.read(preset_buffer.as_vec_mut()).unwrap();
+                        for (i, byte) in chunk_slice[position as usize..position as usize + str_length as usize].iter().enumerate() {
+                            preset_buffer_slice[i] = *byte;
+                        }
 
                         position += str_length as u64;
+
+                        drop(preset_buffer);
 
                         let column =
                             Column::from_chunk(column_type, str_memory_chunk);
@@ -340,7 +336,7 @@ pub(crate) async fn process_chunk_async(
 
             let evaluation = if !select_all {
                 let eval = evaluate_column_result(
-                    &mut required_columns,
+                    &required_columns,
                     &mut evaluation_tokens,
                     &mut token_results,
                 );
