@@ -1,13 +1,13 @@
 use std::{io, sync::Arc};
 
 use ahash::RandomState;
-use dashmap::DashMap;
+use dashmap::{DashMap, Map};
 use log::info;
 use rastcp::server::TcpServer;
 use tokio::sync::RwLock;
 
 use crate::{
-    rql::{self, parser::ParserResult},
+    rql::{self, parser::{InsertEvaluationResult, ParserResult}},
     SERVER_PORT,
 };
 
@@ -181,6 +181,23 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
         Ok(row::Row::serialize_rows(rows))
     }
 
+
+    pub async fn execute_insert_query(&self, name: String, insert_evaluation_result: InsertEvaluationResult) -> io::Result<()> {
+        let mut table = self.tables._try_get_mut(&name);
+
+        while table.is_locked() || table.is_absent() {
+            table = self.tables.try_get_mut(&name);
+        }
+
+        let mut table = table.unwrap();
+
+        for row in insert_evaluation_result.rows {
+            table.insert_row(row).await;
+        }
+
+        Ok(())
+    }
+
     pub async fn start_async(database: Arc<RwLock<Database<S>>>) -> io::Result<()> {
         let db = database.clone();
         let receiver = TCP_SERVER.force().await;
@@ -210,10 +227,20 @@ pub(crate) async fn process_incoming_queries<S: IOOperationsSync>(
     match database_operation.parser_result {
         ParserResult::CreateTable((name, compress, immutable)) => {
             let mut db = database.write().await;
-            db.create_table(name, compress, immutable).await.unwrap();
-            let mut result: [u8; 1] = [0u8; 1];
-            result[0] = 0;
-            return result.to_vec();
+            if let Ok(_) = db.create_table(name, compress, immutable).await {
+                let mut result: [u8; 1] = [0u8; 1];
+                result[0] = 0;
+                return result.to_vec();
+            } else {
+                let mut result: [u8; 1] = [1u8; 1];
+                result[0] = 3;
+                let mut result = result.to_vec();
+                let error_message = "Table already exists";
+                let mut error_message_bytes = Vec::with_capacity(error_message.len());
+                error_message_bytes.extend_from_slice(error_message.as_bytes());
+                result.extend_from_slice(&mut error_message_bytes);
+                return result.to_vec();
+            }
         }
         ParserResult::DropTable(name) => {
             let mut db = database.write().await;
@@ -222,7 +249,13 @@ pub(crate) async fn process_incoming_queries<S: IOOperationsSync>(
             result[0] = 0;
             return result.to_vec();
         }
-        ParserResult::InsertEvaluationTokens(tokens) => todo!(),
+        ParserResult::InsertEvaluationTokens(insert_evaluation_result) => {
+            let db = database.read().await;
+            db.execute_insert_query(database_operation.table_name, insert_evaluation_result).await.unwrap();
+            let mut result: [u8; 1] = [0u8; 1];
+            result[0] = 0;
+            return result.to_vec();
+        },
         ParserResult::UpdateEvaluationTokens(tokens) => todo!(),
         ParserResult::DeleteEvaluationTokens(tokens) => todo!(),
         ParserResult::QueryEvaluationTokens(tokens) => {
@@ -265,6 +298,7 @@ pub(crate) async fn process_incoming_queries<S: IOOperationsSync>(
     }
 }
 
+#[derive(Debug)]
 #[repr(u8)]
 pub enum QueryExecutionResult {
     Ok = 0,
