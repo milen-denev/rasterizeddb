@@ -109,7 +109,9 @@ pub(crate) fn evaluate_column_result(
 
                                 // Perform the comparison
                                 let result = match op {
-                                    ComparerOperation::Equals => left_value.equals(&right_value),
+                                    ComparerOperation::Equals => {
+                                        left_value.equals(&right_value)
+                                    }
                                     ComparerOperation::NotEquals => {
                                         left_value.not_equal(&right_value)
                                     }

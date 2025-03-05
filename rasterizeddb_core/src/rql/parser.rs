@@ -394,7 +394,7 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
             parser_result: ParserResult::RebuildIndexes(select_table),
         });
     }
-
+    
     let where_result = query.find("WHERE");
     let mut where_i: usize = 0;
     let select_all: bool;
