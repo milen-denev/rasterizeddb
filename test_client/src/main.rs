@@ -8,23 +8,38 @@ use stopwatch::Stopwatch;
 async fn main() -> std::io::Result<()> {
     let mut client = DbClient::new(Some("127.0.0.1")).await.unwrap();
 
-    //client.execute_query("BEGIN CREATE TABLE database (FALSE, FALSE) END").await.unwrap();
-    client.execute_query("BEGIN SELECT FROM database REBUILD_INDEXES END").await.unwrap();
+    let create_result = client.execute_query("BEGIN CREATE TABLE test_db (FALSE, FALSE) END").await;
+
+    println!("Create result: {:?}", create_result);
+
+    client.execute_query("BEGIN SELECT FROM test_db REBUILD_INDEXES END").await.unwrap();
 
     let mut stopwatch = Stopwatch::new();
     stopwatch.start();
 
-    let query = format!(
+    let query1 = format!(
         r#"
         BEGIN
-        SELECT FROM database
-        WHERE COL(0) = 1000000
+        INSERT INTO test_db (COL(I32), COL(STRING))
+        VALUES (5882, 'This is a test2')
+        END
+    "#);
+
+    let query2 = format!(
+        r#"
+        BEGIN
+        SELECT FROM test_db
+        WHERE COL(0) = 5882
         LIMIT 50
         END
     "#);
 
-    let db_response = client.execute_query(&query).await.unwrap();
-    let result = DbClient::extract_rows(db_response).unwrap().unwrap();
+    let db_response1 = client.execute_query(&query1).await.unwrap();
+
+    println!("Insert result: {:?}", db_response1);
+
+    let db_response2 = client.execute_query(&query2).await.unwrap();
+    let result = DbClient::extract_rows(db_response2).unwrap().unwrap();
 
     stopwatch.stop();
 
