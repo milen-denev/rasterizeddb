@@ -1,6 +1,9 @@
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use byteorder::{ByteOrder, LittleEndian};
 use rastcp::client::{TcpClient, TcpClientBuilder};
+use tokio::sync::RwLock;
 
 use crate::core::database::QueryExecutionResult;
 use crate::core::row::Row;
@@ -8,8 +11,8 @@ use crate::SERVER_PORT;
 
 /// Client for connecting to RasterizedDB
 pub struct DbClient {
-    client: TcpClient,
-    connected: bool,
+    client: Arc<RwLock<TcpClient>>,
+    connected: AtomicBool,
 }
 
 impl DbClient {
@@ -30,40 +33,40 @@ impl DbClient {
             .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e.to_string()))?;
             
         Ok(DbClient {
-            client,
-            connected: true,
+            client: Arc::new(RwLock::new(client)),
+            connected: AtomicBool::new(true),
         })
     }
 
     /// Connect to the database server
-    pub async fn connect(&mut self) -> io::Result<()> {
-        if !self.connected {
-            self.client.connect()
+    pub async fn connect(&self) -> io::Result<()> {
+        if !self.connected.load(Ordering::Relaxed) {
+            self.client.write().await.connect()
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e.to_string()))?;
-            self.connected = true;
+            self.connected.store(true, Ordering::Relaxed);
         }
         Ok(())
     }
 
     /// Close the connection to the database server
-    pub async fn close(&mut self) -> io::Result<()> {
-        if self.connected {
-            self.client.close()
+    pub async fn close(&self) -> io::Result<()> {
+        if self.connected.load(Ordering::Relaxed) {
+            self.client.write().await.close()
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::ConnectionAborted, e.to_string()))?;
-            self.connected = false;
+            self.connected.store(false, Ordering::Relaxed);
         }
         Ok(())
     }
 
     /// Execute an RQL query and return the result
-    pub async fn execute_query(&mut self, query: &str) -> io::Result<QueryExecutionResult> {
+    pub async fn execute_query(&self, query: &str) -> io::Result<QueryExecutionResult> {
         // Make sure we're connected
         self.connect().await?;
         
         // Send the query
-        let response = self.client.send(query.as_bytes().to_vec())
+        let response = self.client.write().await.send(query.as_bytes().to_vec())
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::ConnectionAborted, e.to_string()))?;
         
@@ -113,11 +116,11 @@ impl DbClient {
 
     /// Check if the client is connected
     pub fn is_connected(&self) -> bool {
-        self.connected
+        self.connected.load(Ordering::Relaxed)
     }
 
     /// Force reconnection to the server
-    pub async fn reconnect(&mut self) -> io::Result<()> {
+    pub async fn reconnect(&self) -> io::Result<()> {
         self.close().await?;
         self.connect().await
     }
