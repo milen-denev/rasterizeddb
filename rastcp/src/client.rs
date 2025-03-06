@@ -52,9 +52,9 @@ impl ServerCertVerifier for AcceptAnyCertificate {
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         // Support all common signature schemes
         vec![
-            // SignatureScheme::ECDSA_NISTP256_SHA256,
-            // SignatureScheme::RSA_PSS_SHA256,
-            // SignatureScheme::ED25519,
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::ED25519,
             SignatureScheme::RSA_PKCS1_SHA256,
             SignatureScheme::RSA_PKCS1_SHA384,
             SignatureScheme::RSA_PKCS1_SHA512
