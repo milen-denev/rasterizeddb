@@ -14,29 +14,32 @@ async fn main() -> std::io::Result<()> {
 
     client.execute_query("BEGIN SELECT FROM test_db REBUILD_INDEXES END").await.unwrap();
 
+    // for i in 0..1_500_000 {
+    //     let query = format!(
+    //         r#"
+    //         BEGIN
+    //         INSERT INTO test_db (COL(F64), COL(F32), COL(I32), COL(STRING), COL(CHAR), COL(U128))
+    //         VALUES ({}, {}, {}, {}, 'D', {})
+    //         END
+    //     "#, i, i as f64 * -1 as f64, i as i32, "Milen Denev", u128::MAX - i);
+                
+    //     let db_response = client.execute_query(&query).await.unwrap();
+
+    //     // println!("Insert result: {:?}", db_response);
+    // }
+
+    println!("Done inserting rows.");
+
     let mut stopwatch = Stopwatch::new();
     stopwatch.start();
-
-    let query1 = format!(
-        r#"
-        BEGIN
-        INSERT INTO test_db (COL(I32), COL(STRING))
-        VALUES (5882, 'This is a test2')
-        END
-    "#);
 
     let query2 = format!(
         r#"
         BEGIN
         SELECT FROM test_db
-        WHERE COL(0) = 5882
-        LIMIT 50
+        WHERE COL(0,F64) = 1003522
         END
     "#);
-
-    let db_response1 = client.execute_query(&query1).await.unwrap();
-
-    println!("Insert result: {:?}", db_response1);
 
     let db_response2 = client.execute_query(&query2).await.unwrap();
     let result = DbClient::extract_rows(db_response2).unwrap().unwrap();
