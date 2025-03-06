@@ -7,7 +7,7 @@ use rasterizeddb_core::client::DbClient;
 static CLIENT: async_lazy::Lazy<DbClient> =
     async_lazy::Lazy::new(|| {
         Box::pin(async {
-            let client = DbClient::new(Some("127.0.0.1")).await.unwrap();
+            let client = DbClient::with_pool_settings(Some("127.0.0.1"), 10, 1000).await.unwrap();
             client.execute_query("BEGIN CREATE TABLE test_db (FALSE, FALSE) END").await.unwrap();
             client.execute_query("BEGIN SELECT FROM test_db REBUILD_INDEXES END").await.unwrap();
             client

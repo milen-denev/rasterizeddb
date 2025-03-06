@@ -12,7 +12,6 @@ use rasterizeddb_core::{
 };
 
 use tokio::fs::remove_file;
-use tokio::sync::RwLock;
 
 #[tokio::main(flavor = "multi_thread")]
 #[allow(unreachable_code)]
@@ -35,7 +34,7 @@ async fn main() -> std::io::Result<()> {
     .await;
 
     let _database = Database::new(io_sync).await?;
-    _ = tokio::spawn(Database::start_async(Arc::new(RwLock::new(_database)))).await?;
+    _ = tokio::spawn(Database::start_async(Arc::new(_database))).await?;
 
     return Ok(());
 

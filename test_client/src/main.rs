@@ -12,7 +12,9 @@ async fn main() -> std::io::Result<()> {
 
     println!("Create result: {:?}", create_result);
 
-    client.execute_query("BEGIN SELECT FROM test_db REBUILD_INDEXES END").await.unwrap();
+    let rebuild_result = client.execute_query("BEGIN SELECT FROM test_db REBUILD_INDEXES END").await.unwrap();
+
+    println!("Rebuild indexes result: {:?}", rebuild_result);
 
     // for i in 0..1_500_000 {
     //     let query = format!(
@@ -37,7 +39,8 @@ async fn main() -> std::io::Result<()> {
         r#"
         BEGIN
         SELECT FROM test_db
-        WHERE COL(0,F64) = 1003522
+        WHERE COL(0,I32) = 12440 
+        LIMIT 1000000
         END
     "#);
 
@@ -46,12 +49,12 @@ async fn main() -> std::io::Result<()> {
 
     stopwatch.stop();
 
-    for row in result.iter() {
-        let columns = row.columns().unwrap();
-        for (i, column) in columns.iter().enumerate() {
-            println!("Column ({}): {}", i, column.into_value());
-        }
-    }
+    // for row in result.iter() {
+    //     let columns = row.columns().unwrap();
+    //     for (i, column) in columns.iter().enumerate() {
+    //         println!("Column ({}): {}", i, column.into_value());
+    //     }
+    // }
 
     println!("Elapsed {:?}", stopwatch.elapsed());
 
