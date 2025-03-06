@@ -192,7 +192,7 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
                 let mut columns: Vec<Column> = Vec::with_capacity(raw_values.len());
                 
                 for (i, val) in raw_values.iter().enumerate() {
-                    let column = parse_typed_value(val, data_types[i])?;
+                    let column = parse_typed_value_with_type(val, data_types[i])?;
                     columns.push(column);
                 }
                 
@@ -661,6 +661,108 @@ fn parse_typed_value(value_str: &str, data_type: &str) -> std::result::Result<Co
             if value_str.starts_with('\'') && value_str.ends_with('\'') && value_str.chars().count() == 3 {
                 let ch = value_str.chars().nth(1).unwrap();
                 Ok(Column::new_without_type(ch).unwrap())
+            } else {
+                Err(format!("Invalid CHAR value: {}", value_str))
+            }
+        },
+        _ => Err(format!("Unsupported data type: {}", data_type))
+    }.map_err(|e| e.to_string())
+}
+
+fn parse_typed_value_with_type(value_str: &str, data_type: &str) -> std::result::Result<Column, String> {
+    match data_type {
+        "I8" => {
+            match value_str.parse::<i8>() {
+                Ok(num) => Ok(Column::new(num).unwrap()),
+                Err(e) => Err(format!("Failed to parse I8 value '{}': {}", value_str, e))
+            }
+        },
+        "I16" => {
+            match value_str.parse::<i16>() {
+                Ok(num) => Ok(Column::new(num).unwrap()),
+                Err(e) => Err(format!("Failed to parse I16 value '{}': {}", value_str, e))
+            }
+        },
+        "I32" => {
+            match value_str.parse::<i32>() {
+                Ok(num) => { Ok(Column::new(num).unwrap()) },
+                Err(e) => Err(format!("Failed to parse I32 value '{}': {}", value_str, e))
+            }
+        },
+        "I64" => {
+            match value_str.parse::<i64>() {
+                Ok(num) => Ok(Column::new(num).unwrap()),
+                Err(e) => Err(format!("Failed to parse I64 value '{}': {}", value_str, e))
+            }
+        },
+        "I128" => {
+            match value_str.parse::<i128>() {
+                Ok(num) => Ok(Column::new(num).unwrap()),
+                Err(e) => Err(format!("Failed to parse I128 value '{}': {}", value_str, e))
+            }
+        },
+        "U8" => {
+            match value_str.parse::<u8>() {
+                Ok(num) => Ok(Column::new(num).unwrap()),
+                Err(e) => Err(format!("Failed to parse U8 value '{}': {}", value_str, e))
+            }
+        },
+        "U16" => {
+            match value_str.parse::<u16>() {
+                Ok(num) => Ok(Column::new(num).unwrap()),
+                Err(e) => Err(format!("Failed to parse U16 value '{}': {}", value_str, e))
+            }
+        },
+        "U32" => {
+            match value_str.parse::<u32>() {
+                Ok(num) => Ok(Column::new(num).unwrap()),
+                Err(e) => Err(format!("Failed to parse U32 value '{}': {}", value_str, e))
+            }
+        },
+        "U64" => {
+            match value_str.parse::<u64>() {
+                Ok(num) => Ok(Column::new(num).unwrap()),
+                Err(e) => Err(format!("Failed to parse U64 value '{}': {}", value_str, e))
+            }
+        },
+        "U128" => {
+            match value_str.parse::<u128>() {
+                Ok(num) => Ok(Column::new(num).unwrap()),
+                Err(e) => Err(format!("Failed to parse U128 value '{}': {}", value_str, e))
+            }
+        },
+        "F32" => {
+            match value_str.parse::<f32>() {
+                Ok(num) => Ok(Column::new(num).unwrap()),
+                Err(e) => Err(format!("Failed to parse F32 value '{}': {}", value_str, e))
+            }
+        },
+        "F64" => {
+            match value_str.parse::<f64>() {
+                Ok(num) => Ok(Column::new(num).unwrap()),
+                Err(e) => Err(format!("Failed to parse F64 value '{}': {}", value_str, e))
+            }
+        },
+        "STRING" => {
+            // Handle string values (strip quotes if present)
+            let string_value = if value_str.starts_with('\'') && value_str.ends_with('\'') {
+                &value_str[1..value_str.len()-1]
+            } else {
+                value_str
+            };
+            Ok(Column::new(string_value.to_string()).unwrap())
+        },
+        "BOOL" => {
+            match value_str.to_lowercase().as_str() {
+                "true" | "1" => Ok(Column::new(true).unwrap()),
+                "false" | "0" => Ok(Column::new(false).unwrap()),
+                _ => Err(format!("Failed to parse BOOL value: {}", value_str))
+            }
+        },
+        "CHAR" => {
+            if value_str.starts_with('\'') && value_str.ends_with('\'') && value_str.chars().count() == 3 {
+                let ch = value_str.chars().nth(1).unwrap();
+                Ok(Column::new(ch).unwrap())
             } else {
                 Err(format!("Invalid CHAR value: {}", value_str))
             }

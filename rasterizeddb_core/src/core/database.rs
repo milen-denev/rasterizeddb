@@ -1,9 +1,9 @@
-use std::{io, sync::Arc};
+use std::{io, sync::Arc, usize, vec};
 
 use ahash::RandomState;
 use dashmap::{DashMap, Map};
 use log::info;
-use rastcp::server::TcpServer;
+use rastcp::server::{TcpServer, TcpServerBuilder};
 use tokio::sync::RwLock;
 
 use crate::{
@@ -18,7 +18,12 @@ use super::{
 
 static TCP_SERVER: async_lazy::Lazy<Arc<TcpServer>> = async_lazy::Lazy::new(|| {
     Box::pin(async {
-        let server = TcpServer::new(&format!("127.0.0.1:{}", SERVER_PORT)).await.unwrap();
+        let server = TcpServerBuilder::new("127.0.0.1", SERVER_PORT)
+            .max_connections(usize::MAX)
+            .build()
+            .await
+            .unwrap();
+
         Arc::new(server)
     })
 });
@@ -168,7 +173,7 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
         Ok(row::Row::serialize_rows(rows))
     }
 
-    pub async fn execute_query(&self, name: String, parser_cached_result: ParserResult) -> io::Result<Vec<u8>> {
+    pub async fn execute_query(&self, name: String, parser_result: ParserResult) -> io::Result<Vec<u8>> {
         let mut table = self.tables.try_get(&name);
 
         while table.is_locked() || table.is_absent() {
@@ -176,13 +181,12 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
         }
 
         let table = table.unwrap();
-        let rows: Option<Vec<Row>> = table.execute_query(parser_cached_result).await.unwrap();
+        let rows: Option<Vec<Row>> = table.execute_query(parser_result).await.unwrap();
 
         Ok(row::Row::serialize_rows(rows))
     }
 
-
-    pub async fn execute_insert_query(&self, name: String, insert_evaluation_result: InsertEvaluationResult) -> io::Result<()> {
+    pub async fn execute_insert_query(&self, name: String, insert_evaluation_result: InsertEvaluationResult) -> std::result::Result<u64, String> {
         let mut table = self.tables._try_get_mut(&name);
 
         while table.is_locked() || table.is_absent() {
@@ -191,10 +195,35 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
 
         let mut table = table.unwrap();
 
+        let mut rows_affected = 0;
+
         for row in insert_evaluation_result.rows {
             table.insert_row(row).await;
+            rows_affected += 1;
         }
 
+        Ok(rows_affected)
+    }
+
+    pub async fn execute_delete_query(&self, name: String, delete_evaluation_tokens: ParserResult) -> io::Result<()> {
+        let mut table = self.tables.try_get_mut(&name);
+
+        while table.is_locked() || table.is_absent() {
+            table = self.tables.try_get_mut(&name);
+        }
+
+        let mut table = table.unwrap();
+        
+        // Find rows matching the delete criteria
+        let rows = table.execute_query(delete_evaluation_tokens).await?;
+        
+        if let Some(rows) = rows {
+            // Delete each matching row by its ID
+            for row in rows {
+                table.delete_row_by_id(row.id).await?;
+            }
+        }
+        
         Ok(())
     }
 
@@ -251,13 +280,20 @@ pub(crate) async fn process_incoming_queries<S: IOOperationsSync>(
         }
         ParserResult::InsertEvaluationTokens(insert_evaluation_result) => {
             let db = database.read().await;
-            db.execute_insert_query(database_operation.table_name, insert_evaluation_result).await.unwrap();
+            let rows_affected = db.execute_insert_query(database_operation.table_name, insert_evaluation_result).await.unwrap();
+            let mut result = vec![0u8; 1];
+            result[0] = 1;
+            result.extend_from_slice(&mut rows_affected.to_le_bytes());
+            return result.to_vec();
+        },
+        ParserResult::UpdateEvaluationTokens(tokens) => todo!(),
+        ParserResult::DeleteEvaluationTokens(tokens) => {
+            let db = database.write().await;
+            db.execute_delete_query(database_operation.table_name, ParserResult::QueryEvaluationTokens(tokens)).await.unwrap();
             let mut result: [u8; 1] = [0u8; 1];
             result[0] = 0;
             return result.to_vec();
         },
-        ParserResult::UpdateEvaluationTokens(tokens) => todo!(),
-        ParserResult::DeleteEvaluationTokens(tokens) => todo!(),
         ParserResult::QueryEvaluationTokens(tokens) => {
             let db = database.read().await;
             let mut rows_result = db.execute_query(database_operation.table_name, ParserResult::QueryEvaluationTokens(tokens)).await.unwrap();

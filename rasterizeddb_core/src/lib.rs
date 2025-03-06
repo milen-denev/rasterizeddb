@@ -12,7 +12,7 @@ pub(crate) const HEADER_SIZE: u16 = 31;
 pub(crate) const CHUNK_SIZE: u32 = 8 * 1_000_000;
 
 #[cfg(feature = "enable_parallelism")]
-pub(crate) const THREADS: usize = 16;
+pub(crate) const THREADS: usize = 32;
 
 pub const EMPTY_BUFFER: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
 
