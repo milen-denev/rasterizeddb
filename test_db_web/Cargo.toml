@@ -13,11 +13,11 @@ async-lazy = { version = "0.1.2", features = ["parking_lot"] }
 rand = "0.9.0"
 
 [profile.release]
-strip = "none"
+strip = "all"
 opt-level = 3
-debug = true
+debug = false
 debug-assertions = false
 overflow-checks = false
-incremental = false 
+incremental = false
 codegen-units = 1
 lto = "fat"
