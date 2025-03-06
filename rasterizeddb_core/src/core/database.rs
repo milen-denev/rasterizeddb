@@ -29,7 +29,7 @@ static TCP_SERVER: async_lazy::Lazy<Arc<TcpServer>> = async_lazy::Lazy::new(|| {
 });
 
 pub struct Database<S: IOOperationsSync + Send + Sync + 'static> {
-    config_table: Table<S>,
+    config_table: RwLock<Table<S>>,
     tables: Arc<DashMap<String, Table<S>, RandomState>>,
 }
 
@@ -84,13 +84,13 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
         };
 
         Ok(Database {
-            config_table: config_table,
+            config_table: RwLock::new(config_table),
             tables: Arc::new(tables),
         })
     }
 
     pub async fn create_table(
-        &mut self,
+        &self,
         name: String,
         compress: bool,
         immutable: bool,
@@ -99,7 +99,9 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, "Table already exists"));
         }
 
-        let new_io_sync = self.config_table.io_sync.create_new(format!("{}.db", name)).await;
+        let mut config_table = self.config_table.write().await;
+
+        let new_io_sync = config_table.io_sync.create_new(format!("{}.db", name)).await;
         let table = Table::<S>::init_inner(new_io_sync, compress, immutable).await?;
 
         let name_column = Column::new(name.clone()).unwrap();
@@ -115,7 +117,7 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
 
         self.tables.insert(name, table);
 
-        self.config_table
+        config_table
             .insert_row(InsertOrUpdateRow {
                 columns_data: columns_buffer_update,
             })
@@ -124,7 +126,9 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
         Ok(())
     }
 
-    pub async fn drop_table(&mut self, name: String) -> io::Result<()> {
+    pub async fn drop_table(&self, name: String) -> io::Result<()> {        
+        let mut config_table = self.config_table.write().await;
+
         let mut table = self.tables.try_get_mut(&name);
 
         while table.is_locked() || table.is_absent() {
@@ -149,13 +153,13 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
         ))
         .unwrap();
 
-        let table_row = self.config_table
+        let table_row = config_table
             .execute_query(select_table_to_drop.parser_result)
             .await?;
 
         let row_id = table_row.unwrap().pop().unwrap().id;
-        self.config_table.delete_row_by_id(row_id).await?;
-        self.config_table.vacuum_table().await;
+        config_table.delete_row_by_id(row_id).await?;
+        config_table.vacuum_table().await;
 
         Ok(())
     }
@@ -181,6 +185,7 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
         }
 
         let table = table.unwrap();
+
         let rows: Option<Vec<Row>> = table.execute_query(parser_result).await.unwrap();
 
         Ok(row::Row::serialize_rows(rows))
@@ -227,7 +232,7 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
         Ok(())
     }
 
-    pub async fn start_async(database: Arc<RwLock<Database<S>>>) -> io::Result<()> {
+    pub async fn start_async(database: Arc<Database<S>>) -> io::Result<()> {
         let db = database.clone();
         let receiver = TCP_SERVER.force().await;
 
@@ -247,7 +252,7 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
 
 #[allow(unused_variables)]
 pub(crate) async fn process_incoming_queries<S: IOOperationsSync>(
-    database: Arc<RwLock<Database<S>>>,
+    database: Arc<Database<S>>,
     request_vec: Vec<u8>,
 ) -> Vec<u8> {
     let query = String::from_utf8_lossy(&request_vec);
@@ -258,8 +263,7 @@ pub(crate) async fn process_incoming_queries<S: IOOperationsSync>(
 
     match database_operation.parser_result {
         ParserResult::CreateTable((name, compress, immutable)) => {
-            let mut db = database.write().await;
-            if let Ok(_) = db.create_table(name, compress, immutable).await {
+            if let Ok(_) = database.create_table(name, compress, immutable).await {
                 let mut result: [u8; 1] = [0u8; 1];
                 result[0] = 0;
                 return result.to_vec();
@@ -275,15 +279,13 @@ pub(crate) async fn process_incoming_queries<S: IOOperationsSync>(
             }
         }
         ParserResult::DropTable(name) => {
-            let mut db = database.write().await;
-            db.drop_table(name).await.unwrap();
+            database.drop_table(name).await.unwrap();
             let mut result: [u8; 1] = [0u8; 1];
             result[0] = 0;
             return result.to_vec();
         }
         ParserResult::InsertEvaluationTokens(insert_evaluation_result) => {
-            let db = database.read().await;
-            let rows_affected = db.execute_insert_query(database_operation.table_name, insert_evaluation_result).await.unwrap();
+            let rows_affected = database.execute_insert_query(database_operation.table_name, insert_evaluation_result).await.unwrap();
             let mut result = vec![0u8; 1];
             result[0] = 1;
             result.extend_from_slice(&mut rows_affected.to_le_bytes());
@@ -291,15 +293,13 @@ pub(crate) async fn process_incoming_queries<S: IOOperationsSync>(
         },
         ParserResult::UpdateEvaluationTokens(tokens) => todo!(),
         ParserResult::DeleteEvaluationTokens(tokens) => {
-            let db = database.write().await;
-            db.execute_delete_query(database_operation.table_name, ParserResult::QueryEvaluationTokens(tokens)).await.unwrap();
+            database.execute_delete_query(database_operation.table_name, ParserResult::QueryEvaluationTokens(tokens)).await.unwrap();
             let mut result: [u8; 1] = [0u8; 1];
             result[0] = 0;
             return result.to_vec();
         },
         ParserResult::QueryEvaluationTokens(tokens) => {
-            let db = database.read().await;
-            let mut rows_result = db.execute_query(database_operation.table_name, ParserResult::QueryEvaluationTokens(tokens)).await.unwrap();
+            let mut rows_result = database.execute_query(database_operation.table_name, ParserResult::QueryEvaluationTokens(tokens)).await.unwrap();
             let mut result: [u8; 1] = [2u8; 1];
             let mut final_vec = Vec::with_capacity(1 + rows_result.len());
 
@@ -309,8 +309,7 @@ pub(crate) async fn process_incoming_queries<S: IOOperationsSync>(
             return final_vec;
         },
         ParserResult::CachedHashIndexes(indexes) => {
-            let db = database.read().await;
-            let mut rows_result = db.execute_cached_query(database_operation.table_name, ParserResult::CachedHashIndexes(indexes)).await.unwrap();
+            let mut rows_result = database.execute_cached_query(database_operation.table_name, ParserResult::CachedHashIndexes(indexes)).await.unwrap();
             let mut result: [u8; 1] = [2u8; 1];
             let mut final_vec = Vec::with_capacity(1 + rows_result.len());
 
@@ -320,12 +319,10 @@ pub(crate) async fn process_incoming_queries<S: IOOperationsSync>(
             return final_vec;
         },
         ParserResult::RebuildIndexes(name) => {
-            let db = database.read().await;
-          
-            let mut table = db.tables.try_get_mut(&name);
+            let mut table = database.tables.try_get_mut(&name);
 
             while table.is_locked() || table.is_absent() {
-                table = db.tables.try_get_mut(&name);
+                table = database.tables.try_get_mut(&name);
             }
 
             let mut table = table.unwrap();
