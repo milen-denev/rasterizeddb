@@ -6,7 +6,7 @@ use stopwatch::Stopwatch;
 #[tokio::main(flavor = "multi_thread")]
 #[allow(unreachable_code)]
 async fn main() -> std::io::Result<()> {
-    let mut client = DbClient::new(Some("127.0.0.1")).await.unwrap();
+    let client = DbClient::new(Some("127.0.0.1")).await.unwrap();
 
     let create_result = client.execute_query("BEGIN CREATE TABLE test_db (FALSE, FALSE) END").await;
 

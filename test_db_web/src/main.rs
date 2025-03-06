@@ -4,10 +4,10 @@ use axum::Router;
 use axum::{response::Response, routing::get};
 use rasterizeddb_core::client::DbClient;
 
-static mut CLIENT: async_lazy::Lazy<DbClient> =
+static CLIENT: async_lazy::Lazy<DbClient> =
     async_lazy::Lazy::new(|| {
         Box::pin(async {
-            let mut client = DbClient::new(Some("127.0.0.1")).await.unwrap();
+            let client = DbClient::new(Some("127.0.0.1")).await.unwrap();
             client.execute_query("BEGIN CREATE TABLE test_db (FALSE, FALSE) END").await.unwrap();
             client.execute_query("BEGIN SELECT FROM test_db REBUILD_INDEXES END").await.unwrap();
             client
@@ -27,16 +27,16 @@ async fn main() {
 
 #[allow(static_mut_refs)]
 async fn index() -> Response {
-    let x = rand::random_range(-30000.0..50000.0 as f64);
+    let x = rand::random_range(-30000..50000 as i32);
     let y = rand::random_range(-20000..20000 as i32);
     let z = rand::random_range(-100_000.0..100_000.0 as f64);
 
-    let client = unsafe { CLIENT.force_mut().await };
+    let client = CLIENT.force().await;
 
     let query = format!(
         r#"
         BEGIN
-        INSERT INTO test_db (COL(F64), COL(I32), COL(STRING), COL(F64))
+        INSERT INTO test_db (COL(I32), COL(I32), COL(STRING), COL(F64))
         VALUES ({}, {}, '{}', {})
         END
     "#, x as f64, y, "Hello, World!", z);
@@ -52,7 +52,7 @@ async fn index() -> Response {
 
 #[allow(static_mut_refs)]
 async fn query() -> Response {
-    let x = rand::random_range(30000.0..50000.0 as f64);
+    let x = rand::random_range(-30000..50000 as i32);
     //let y = rand::random_range(-10..10 as i32);
 
     //OR COL(1) = {x} / {y} * {z}
@@ -61,16 +61,16 @@ async fn query() -> Response {
         r#"
         BEGIN
         SELECT FROM test_db
-        WHERE COL(0,F64) < {x}
+        WHERE COL(0,I32) < {x}
         LIMIT 1000
         END
     "#
     );
 
-    let client = unsafe { CLIENT.force_mut().await };
+    let client = CLIENT.force().await;
 
     let db_response2 = client.execute_query(&query_evaluation).await.unwrap();
-    let result = DbClient::extract_rows(db_response2).unwrap().unwrap();
+    let result = DbClient::extract_rows(db_response2).unwrap().unwrap_or_default();
 
     let mut output = String::new();
 
