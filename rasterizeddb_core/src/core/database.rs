@@ -231,12 +231,15 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
         let db = database.clone();
         let receiver = TCP_SERVER.force().await;
 
-        let future = receiver.run_with_context(
-            db,
-            process_incoming_queries
-        );
-
-        _ = tokio::spawn(future).await;
+        let fut = async move {
+            let receiver_clone = receiver.clone();
+            _ = receiver_clone.run_with_context(
+                db,
+                process_incoming_queries
+            ).await;
+        };
+        
+        _ = tokio::spawn(fut).await;
 
         Ok(())
     }
