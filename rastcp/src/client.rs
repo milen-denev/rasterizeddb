@@ -175,7 +175,9 @@ impl TcpClient {
     // Modified send method to use the existing connection
     pub async fn send(&mut self, data: Vec<u8>) -> Result<Vec<u8>, RastcpError> {
         // Connect if not connected
-        self.connect().await?;
+        if !self.is_connected() {
+            return Err(RastcpError::NotConnected);
+        }
         
         let stream = self.connection.as_mut().unwrap();
         

@@ -46,4 +46,7 @@ pub enum RastcpError {
     
     #[error("Connection backpressure")]
     ConnectionBackpressure,
+
+    #[error("Not connected")]
+    NotConnected
 }
