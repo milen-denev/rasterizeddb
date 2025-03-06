@@ -13,10 +13,10 @@ use tokio::time::sleep;
 #[tokio::test]
 async fn test_custom_protocol_handler() {
     let _ = env_logger::builder().is_test(true).try_init();
-    let server_addr = "127.0.0.1:8097";
+    let server_addr = "127.0.0.1";
     
     // Create a server that expects JSON protocol
-    let server = TcpServerBuilder::new(server_addr)
+    let server = TcpServerBuilder::new(server_addr, 8097)
         .build()
         .await
         .unwrap();
@@ -60,7 +60,7 @@ async fn test_custom_protocol_handler() {
     sleep(Duration::from_millis(100)).await;
     
     // Create a client
-    let mut client = TcpClientBuilder::new(server_addr)
+    let mut client = TcpClientBuilder::new(&format!("{}:8097", server_addr))
         .build()
         .await
         .unwrap();
@@ -103,14 +103,14 @@ async fn test_custom_protocol_handler() {
 #[tokio::test]
 async fn test_client_disconnect_handling() {
     let _ = env_logger::builder().is_test(true).try_init();
-    let server_addr = "127.0.0.1:8098";
+    let server_addr = "127.0.0.1";
     
     // Message tracking
     let message_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let message_count_clone = message_count.clone();
     
     // Create server
-    let server = TcpServerBuilder::new(server_addr)
+    let server = TcpServerBuilder::new(server_addr, 8098)
         .build()
         .await
         .unwrap();
@@ -132,7 +132,7 @@ async fn test_client_disconnect_handling() {
     
     // Create multiple clients and test abrupt disconnection
     for i in 0..5 {
-        let mut client = TcpClientBuilder::new(server_addr)
+        let mut client = TcpClientBuilder::new(&format!("{}:8098", server_addr))
             .build()
             .await
             .unwrap();

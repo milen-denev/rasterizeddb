@@ -6,7 +6,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     tokio::spawn(async move { 
         println!("Starting server...");
-        let server = TcpServer::new("127.0.0.1:8080").await.unwrap();
+        let server = TcpServer::new("127.0.0.1", 8080).await.unwrap();
         server.run(|data| {
             println!("Received data: {} bytes", data.len());
             async move {

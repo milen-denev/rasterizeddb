@@ -205,7 +205,7 @@ async fn run_server(directory: &str) -> Result<(), RastcpError> {
     
     let file_server = FileServer::new(directory);
     
-    let server = TcpServerBuilder::new("127.0.0.1:8877")
+    let server = TcpServerBuilder::new("127.0.0.1", 8877)
         .build()
         .await?;
     

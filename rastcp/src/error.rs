@@ -28,4 +28,13 @@ pub enum RastcpError {
     
     #[error("Authentication error: {0}")]
     AuthenticationError(String),
+
+    #[error("Socket binding error: {0}")]
+    SocketBindingError(String),
+
+    #[error("Socket listening error: {0}")]
+    SocketListeningError(String),
+
+    #[error("Socket keep alive error: {0}")]
+    SocketKeepAliveError(String),
 }

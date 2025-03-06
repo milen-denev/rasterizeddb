@@ -8,7 +8,7 @@ async fn test_client_server_communication() {
     let _ = env_logger::builder().is_test(true).try_init();
     
     // Start a server
-    let server = TcpServerBuilder::new("127.0.0.1:8081")
+    let server = TcpServerBuilder::new("127.0.0.1", 8081)
         .max_connections(10)
         .build()
         .await
@@ -56,7 +56,7 @@ async fn test_multiple_clients() {
     let _ = env_logger::builder().is_test(true).try_init();
     
     // Start a server
-    let server = TcpServerBuilder::new("127.0.0.1:8082")
+    let server = TcpServerBuilder::new("127.0.0.1", 8082)
         .max_connections(10)
         .build()
         .await

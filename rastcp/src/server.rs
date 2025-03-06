@@ -1,8 +1,15 @@
 use std::future::Future;
+use std::net::{IpAddr, SocketAddr};
+use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 use log::{debug, error, info};
+use rustls::compress::CompressionCache;
+use rustls::crypto::aws_lc_rs::Ticketer;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::server::ServerSessionMemoryCache;
 use rustls::ServerConfig;
+use socket2::{Domain, Protocol, SockAddr, Socket, TcpKeepalive, Type};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
@@ -12,6 +19,7 @@ use crate::error::RastcpError;
 
 pub struct TcpServerBuilder {
     addr: String,
+    port: u16,
     custom_certs: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
     max_connections: Option<usize>,
 }
@@ -24,9 +32,10 @@ pub struct TcpServer {
 }
 
 impl TcpServerBuilder {
-    pub fn new(addr: &str) -> Self {
+    pub fn new(addr: &str, port: u16) -> Self {
         Self {
             addr: addr.to_string(),
+            port,
             custom_certs: None,
             max_connections: None,
         }
@@ -50,19 +59,49 @@ impl TcpServerBuilder {
         };
         
         // Create TLS config
-        let config = ServerConfig::builder()
+        let mut server_config = ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(certs, private_key)
             .map_err(|e| RastcpError::CertificateLoading(e.to_string()))?;
         
+        server_config.max_early_data_size = 1024;
+        server_config.ticketer = Ticketer::new().unwrap();
+        server_config.session_storage = ServerSessionMemoryCache::new(128);
+        server_config.alpn_protocols = vec!["h2".into(), "http/1.1".into()];
+        server_config.cert_compression_cache = Arc::new(CompressionCache::new(64));
+        server_config.send_half_rtt_data = true;
+        server_config.send_tls13_tickets = 2;
+
         // Create server
-        let listener = TcpListener::bind(&self.addr).await?;
-        let acceptor = TlsAcceptor::from(Arc::new(config));
+        let ip_addr = IpAddr::from_str(&self.addr).unwrap();
+
+        let addr = if cfg!(debug_assertions) {
+            SocketAddr::from((ip_addr, self.port))
+        } else {
+            SocketAddr::from((ip_addr, self.port))
+        };
+
+        let socket = Socket::new_raw(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+
+        _ = socket.set_nodelay(true);
+        _ = socket.set_nonblocking(true);
+        _ = socket.set_reuse_address(false);
+        _ = socket.set_recv_buffer_size(1024 * 5);
+        _ = socket.set_send_buffer_size(1024 * 20);
+        _ = socket.bind(&SockAddr::from(addr)).map_err(|e| RastcpError::SocketBindingError(e.to_string()))?;
+        _ = socket.listen(i32::MAX).map_err(|e| RastcpError::SocketListeningError(e.to_string()))?;
+        let tcp_keep_alive = &TcpKeepalive::new().with_time(Duration::from_secs(7200));
+        _ = socket.set_tcp_keepalive(tcp_keep_alive).map_err(|e| RastcpError::SocketKeepAliveError(e.to_string()))?;
+
+        let listener: std::net::TcpListener = socket.into();
+        let tokio_listener = TcpListener::from_std(listener).unwrap();
+
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
         
         info!("Server built to listen on {}", self.addr);
         
         Ok(TcpServer {
-            listener,
+            listener: tokio_listener,
             acceptor,
             max_connections: self.max_connections,
             current_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -71,8 +110,8 @@ impl TcpServerBuilder {
 }
 
 impl TcpServer {
-    pub async fn new(addr: &str) -> Result<Self, RastcpError> {
-        TcpServerBuilder::new(addr).build().await
+    pub async fn new(addr: &str, port: u16) -> Result<Self, RastcpError> {
+        TcpServerBuilder::new(addr, port).build().await
     }
 
     // Original run method remains unchanged for backward compatibility
@@ -86,7 +125,7 @@ impl TcpServer {
         loop {
             // Check if we're at max connections
             if let Some(max) = self.max_connections {
-                let current = self.current_connections.load(std::sync::atomic::Ordering::SeqCst);
+                let current = self.current_connections.load(std::sync::atomic::Ordering::Relaxed);
                 if current >= max {
                     // Wait a bit before checking again
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -103,14 +142,14 @@ impl TcpServer {
                     let conn_counter = self.current_connections.clone();
                     
                     // Increment connection counter
-                    conn_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    conn_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     
                     tokio::spawn(async move {
                         if let Err(e) = Self::handle_connection(stream, acceptor, handler).await {
                             error!("Connection error: {}", e);
                         }
                         // Decrement connection counter when done
-                        conn_counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        conn_counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                     });
                 }
                 Err(e) => {
@@ -132,7 +171,7 @@ impl TcpServer {
         loop {
             // Check if we're at max connections
             if let Some(max) = self.max_connections {
-                let current = self.current_connections.load(std::sync::atomic::Ordering::SeqCst);
+                let current = self.current_connections.load(std::sync::atomic::Ordering::Relaxed);
                 if current >= max {
                     // Wait a bit before checking again
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -150,14 +189,14 @@ impl TcpServer {
                     let conn_counter = self.current_connections.clone();
                     
                     // Increment connection counter
-                    conn_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    conn_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     
                     tokio::spawn(async move {
                         if let Err(e) = Self::handle_connection_with_context(stream, acceptor, context, handler).await {
                             error!("Connection error: {}", e);
                         }
                         // Decrement connection counter when done
-                        conn_counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        conn_counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                     });
                 }
                 Err(e) => {
@@ -179,7 +218,7 @@ impl TcpServer {
         loop {
             // Check if we're at max connections
             if let Some(max) = self.max_connections {
-                let current = self.current_connections.load(std::sync::atomic::Ordering::SeqCst);
+                let current = self.current_connections.load(std::sync::atomic::Ordering::Relaxed);
                 if current >= max {
                     // Wait a bit before checking again
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -197,14 +236,14 @@ impl TcpServer {
                     let conn_counter = self.current_connections.clone();
                     
                     // Increment connection counter
-                    conn_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    conn_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     
                     tokio::spawn(async move {
                         if let Err(e) = Self::handle_connection_with_shared_context(stream, acceptor, context, handler).await {
                             error!("Connection error: {}", e);
                         }
                         // Decrement connection counter when done
-                        conn_counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        conn_counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                     });
                 }
                 Err(e) => {

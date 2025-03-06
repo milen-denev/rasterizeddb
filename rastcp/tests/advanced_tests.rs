@@ -4,11 +4,11 @@ use std::time::Duration;
 use tokio::time::{sleep, timeout};
 
 // Helper function to create a test server
-async fn create_test_server(addr: &str) -> (tokio::task::JoinHandle<()>, Arc<AtomicUsize>) {
+async fn create_test_server(addr: &str, port: u16) -> (tokio::task::JoinHandle<()>, Arc<AtomicUsize>) {
     let message_count = Arc::new(AtomicUsize::new(0));
     let message_count_clone = message_count.clone();
     
-    let server = TcpServerBuilder::new(addr)
+    let server = TcpServerBuilder::new(addr, port)
         .max_connections(20)
         .build()
         .await
@@ -30,12 +30,12 @@ async fn create_test_server(addr: &str) -> (tokio::task::JoinHandle<()>, Arc<Ato
 #[tokio::test]
 async fn test_client_reconnection() {
     let _ = env_logger::builder().is_test(true).try_init();
-    let server_addr = "127.0.0.1:8090";
+    let server_addr = "127.0.0.1";
     
-    let (server_handle, message_count) = create_test_server(server_addr).await;
+    let (server_handle, message_count) = create_test_server(server_addr, 8090).await;
     
     // Create a client
-    let mut client = TcpClientBuilder::new(server_addr)
+    let mut client = TcpClientBuilder::new(&format!("{}:8090", server_addr))
         .timeout(Duration::from_secs(5))
         .build()
         .await
@@ -78,12 +78,12 @@ async fn test_client_reconnection() {
 #[tokio::test]
 async fn test_large_messages() {
     let _ = env_logger::builder().is_test(true).try_init();
-    let server_addr = "127.0.0.1:8091";
+    let server_addr = "127.0.0.1";
     
-    let (server_handle, _) = create_test_server(server_addr).await;
+    let (server_handle, _) = create_test_server(server_addr, 8091).await;
     
     // Create a client
-    let mut client = TcpClientBuilder::new(server_addr)
+    let mut client = TcpClientBuilder::new(&format!("{}:8091", server_addr))
         .timeout(Duration::from_secs(5))
         .build()
         .await
@@ -110,9 +110,9 @@ async fn test_large_messages() {
 #[tokio::test]
 async fn test_concurrent_connections() {
     let _ = env_logger::builder().is_test(true).try_init();
-    let server_addr = "127.0.0.1:8092";
+    let server_addr = "127.0.0.1";
     
-    let (server_handle, message_count) = create_test_server(server_addr).await;
+    let (server_handle, message_count) = create_test_server(server_addr, 8092).await;
     
     // Number of concurrent clients
     let client_count = 50;
@@ -125,7 +125,7 @@ async fn test_concurrent_connections() {
     for client_id in 0..client_count {
         let handle = tokio::spawn(async move {
             // Create a client
-            let mut client = TcpClientBuilder::new(server_addr)
+            let mut client = TcpClientBuilder::new(&format!("{}:8092", server_addr))
                 .timeout(Duration::from_secs(10))
                 .build()
                 .await
@@ -193,10 +193,10 @@ async fn test_connection_timeout() {
 #[tokio::test]
 async fn test_client_handler_errors() {
     let _ = env_logger::builder().is_test(true).try_init();
-    let server_addr = "127.0.0.1:8094";
+    let server_addr = "127.0.0.1";
     
     // Create a server with an "echo uppercase" handler
-    let server = TcpServerBuilder::new(server_addr)
+    let server = TcpServerBuilder::new(server_addr, 8094)
         .build()
         .await
         .unwrap();
@@ -215,7 +215,7 @@ async fn test_client_handler_errors() {
     sleep(Duration::from_millis(100)).await;
     
     // Create a client
-    let mut client = TcpClientBuilder::new(server_addr)
+    let mut client = TcpClientBuilder::new(&format!("{}:8094", server_addr))
         .build()
         .await
         .unwrap();
@@ -237,12 +237,12 @@ async fn test_client_handler_errors() {
 #[tokio::test]
 async fn test_throughput_benchmark() {
     let _ = env_logger::builder().is_test(true).try_init();
-    let server_addr = "127.0.0.1:8095";
+    let server_addr = "127.0.0.1";
     
-    let (server_handle, _) = create_test_server(server_addr).await;
+    let (server_handle, _) = create_test_server(server_addr, 8095).await;
     
     // Create a client
-    let mut client = TcpClientBuilder::new(server_addr)
+    let mut client = TcpClientBuilder::new(&format!("{}:8095", server_addr))
         .build()
         .await
         .unwrap();
