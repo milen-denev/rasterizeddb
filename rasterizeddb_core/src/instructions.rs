@@ -109,7 +109,6 @@ pub unsafe fn compare_raw_vecs(
     result == 0
 }
 
-#[allow(unused)]
 #[inline(always)]
 pub fn copy_vec_to_ptr(vec: &[u8], dst: *mut u8) {
     unsafe {
@@ -137,13 +136,5 @@ pub unsafe fn ref_vec(ptr: *mut u8, len: usize) -> ManuallyDrop<Vec<u8>> {
         let vec = Vec::from_raw_parts(ptr, len, len);
         let manual = ManuallyDrop::new(vec);
         manual
-    }
-}
-
-#[inline(always)]
-pub unsafe fn ref_vec_no_manual(ptr: *mut u8, len: usize) -> Vec<u8> {
-    unsafe {
-        let vec = Vec::from_raw_parts(ptr, len, len);
-        vec
     }
 }

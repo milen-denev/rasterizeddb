@@ -12,7 +12,7 @@ static mut TABLE: async_lazy::Lazy<Table<LocalStorageProvider>> =
         Box::pin(async {
             let io_sync = LocalStorageProvider::new(
                 "C:\\Users\\mspc6\\OneDrive\\Professional\\Desktop",
-                "database.db",
+                Some("database.db"),
             )
             .await;
 

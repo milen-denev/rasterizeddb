@@ -14,7 +14,7 @@ pub fn rebuild_indexes_file() {
     let rt = runtime::Builder::new_current_thread().build().unwrap();
 
     rt.block_on(async {
-        let io_sync = LocalStorageProvider::new("C:\\Tests", "database.db").await;
+        let io_sync = LocalStorageProvider::new("C:\\Tests", Some("database.db")).await;
 
         let mut table = Table::init(io_sync, false, false).await.unwrap();
 

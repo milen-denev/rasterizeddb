@@ -77,7 +77,7 @@ fn criterion_benchmark_buffers(c: &mut Criterion) {
 
     let mut _io_sync = Box::new(rt.block_on(LocalStorageProvider::new(
         "C:\\Users\\mspc6\\OneDrive\\Professional\\Desktop",
-        "database.db",
+        Some("database.db"),
     )));
 
     //let mut cursor = rt.block_on(chunk.read_chunk_sync(&mut io_sync));
