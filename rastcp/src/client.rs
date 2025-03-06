@@ -1,16 +1,19 @@
 use std::sync::Arc;
 use log::{debug, info};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::client::Resumption;
 use rustls::pki_types::{ServerName, CertificateDer, UnixTime};
 use rustls::{ClientConfig, Error, SignatureScheme};
 use tokio::net::TcpStream;
 use tokio_rustls::{TlsConnector, client::TlsStream};
 
 use crate::common::{read_message, write_message};
+use crate::config::ConfigBuilderExt;
 use crate::error::RastcpError;
 
 // A certificate verifier that accepts any certificate
 #[derive(Debug)]
+#[allow(dead_code)]
 struct AcceptAnyCertificate;
 
 impl ServerCertVerifier for AcceptAnyCertificate {
@@ -49,10 +52,12 @@ impl ServerCertVerifier for AcceptAnyCertificate {
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         // Support all common signature schemes
         vec![
+            // SignatureScheme::ECDSA_NISTP256_SHA256,
+            // SignatureScheme::RSA_PSS_SHA256,
+            // SignatureScheme::ED25519,
             SignatureScheme::RSA_PKCS1_SHA256,
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::ED25519,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512
         ]
     }
 }
@@ -98,15 +103,29 @@ impl TcpClientBuilder {
     pub async fn build(self) -> Result<TcpClient, RastcpError> {
         let config = if self.verify_certificate {
             // Use default certificate verification
-            ClientConfig::builder()
-                .with_root_certificates(rustls::RootCertStore::empty())
-                .with_no_client_auth()
+            let mut client_config = ClientConfig::builder()
+                .with_webpki_roots()
+                .with_no_client_auth();
+            
+            client_config.enable_early_data = true;
+            client_config.resumption = Resumption::in_memory_sessions(128);
+            client_config.enable_sni = true;
+            client_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+            client_config.key_log = Arc::new(rustls::KeyLogFile::new());
+            client_config
         } else {
             // Accept any certificate
-            ClientConfig::builder()
+            let mut client_config = ClientConfig::builder()
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(AcceptAnyCertificate))
-                .with_no_client_auth()
+                .with_no_client_auth();
+            
+            client_config.enable_early_data = true;
+            client_config.resumption = Resumption::in_memory_sessions(128);
+            client_config.enable_sni = true;
+            client_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+            client_config.key_log = Arc::new(rustls::KeyLogFile::new());
+            client_config
         };
 
         // Get server name from address

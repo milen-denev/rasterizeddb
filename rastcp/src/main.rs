@@ -1,4 +1,4 @@
-use rastcp::{client::TcpClient, server::TcpServer};
+use rastcp::{client::TcpClient, server::TcpServerBuilder};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -6,7 +6,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     tokio::spawn(async move { 
         println!("Starting server...");
-        let server = TcpServer::new("127.0.0.1", 8080).await.unwrap();
+        
+        // Use the builder with improved settings
+        let server = TcpServerBuilder::new("127.0.0.1", 8080)
+            .max_connections(100) // Set an appropriate limit
+            .session_cache_size(2048) // Increase session cache size
+            .connection_backoff_ms(50) // Reduce backoff time for testing
+            .handshake_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .await
+            .unwrap();
+            
         server.run(|data| {
             println!("Received data: {} bytes", data.len());
             async move {

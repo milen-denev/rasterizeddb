@@ -37,4 +37,13 @@ pub enum RastcpError {
 
     #[error("Socket keep alive error: {0}")]
     SocketKeepAliveError(String),
+    
+    #[error("TLS handshake timeout")]
+    TlsHandshakeTimeout,
+    
+    #[error("Handler timeout")]
+    HandlerTimeout,
+    
+    #[error("Connection backpressure")]
+    ConnectionBackpressure,
 }
