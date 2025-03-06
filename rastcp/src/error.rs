@@ -28,4 +28,7 @@ pub enum RastcpError {
     
     #[error("Authentication error: {0}")]
     AuthenticationError(String),
+
+    #[error("Not connected")]
+    NotConnected
 }
