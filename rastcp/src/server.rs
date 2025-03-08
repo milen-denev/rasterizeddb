@@ -365,7 +365,7 @@ impl TcpServer {
 
         // Apply timeout to TLS handshake to prevent hanging connections
         match tokio::time::timeout(
-            Duration::from_secs(10), 
+            Duration::from_secs(30), 
             acceptor.accept(stream)
         ).await {
             Ok(Ok(mut tls_stream)) => {
@@ -449,7 +449,7 @@ impl TcpServer {
 
         // Apply timeout to TLS handshake to prevent hanging connections
         match tokio::time::timeout(
-            Duration::from_secs(10), 
+            Duration::from_secs(30), 
             acceptor.accept(stream)
         ).await {
             Ok(Ok(mut tls_stream)) => {
@@ -534,7 +534,7 @@ impl TcpServer {
        
         // Apply timeout to TLS handshake to prevent hanging connections
         match tokio::time::timeout(
-            Duration::from_secs(10), 
+            Duration::from_secs(30), 
             acceptor.accept(stream)
         ).await {
             Ok(Ok(mut tls_stream)) => {
