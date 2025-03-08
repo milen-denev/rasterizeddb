@@ -749,7 +749,7 @@ impl<S: IOOperationsSync> Table<S> {
 
         let chunks_result = chunks_arc_clone.as_ref();
 
-        let mutated = self.table_header.mutated.load(Ordering::Relaxed);
+        let mutated = self.table_header.mutated.load(Ordering::SeqCst);
 
         if let Some(chunks) = chunks_result.as_ref() {
             for chunk in chunks {
@@ -779,8 +779,8 @@ impl<S: IOOperationsSync> Table<S> {
                                 .await
                                 .unwrap();
 
-                            self.mutated.store(true, Ordering::Relaxed);
-                            self.table_header.mutated.store(true, Ordering::Relaxed);
+                            self.mutated.store(true, Ordering::SeqCst);
+                            self.table_header.mutated.store(true, Ordering::SeqCst);
                             self.io_sync.write_data(0, &self.table_header.to_bytes().unwrap()).await;
 
                             return Ok(());
@@ -808,8 +808,8 @@ impl<S: IOOperationsSync> Table<S> {
                             .await
                             .unwrap();
 
-                            self.mutated.store(true, Ordering::Relaxed);
-                            self.table_header.mutated.store(true, Ordering::Relaxed);
+                            self.mutated.store(true, Ordering::SeqCst);
+                            self.table_header.mutated.store(true, Ordering::SeqCst);
                             self.io_sync.write_data(0, &self.table_header.to_bytes().unwrap()).await;
 
                         return Ok(());
@@ -846,7 +846,7 @@ impl<S: IOOperationsSync> Table<S> {
         }
 
         // Get table header info for mutation status
-        let mutated = self.table_header.mutated.load(Ordering::Relaxed);
+        let mutated = self.table_header.mutated.load(Ordering::SeqCst);
         
         // Initialize a temporary storage for the chunks we find
         let mut chunks_vec: Vec<FileChunk> = Vec::with_capacity(32);
@@ -1083,7 +1083,7 @@ impl<S: IOOperationsSync> Table<S> {
         let mut position = HEADER_SIZE as u64;
 
         loop {           
-            let mutated = self.table_header.mutated.load(Ordering::Relaxed);
+            let mutated = self.table_header.mutated.load(Ordering::SeqCst);
 
             if let Some(prefetch_result) =
                 row_prefetching(&mut self.io_sync, &mut position, file_length, mutated)
@@ -1161,6 +1161,7 @@ impl<S: IOOperationsSync> Table<S> {
                             new_position + update_row_size as u64,
                             &empty_buffer,
                         ).await;
+                        
                         let clean_up_verify_result = self.io_sync.verify_data_and_sync(
                             new_position + update_row_size as u64,
                             &empty_buffer,
@@ -1171,6 +1172,10 @@ impl<S: IOOperationsSync> Table<S> {
                             panic!("DB file contains error.");
                             todo!("Add rollback.");
                         }
+
+                        self.mutated.store(true, Ordering::SeqCst);
+                        self.table_header.mutated.store(true, Ordering::SeqCst);
+                        self.io_sync.write_data(0, &self.table_header.to_bytes().unwrap()).await;
 
                         break;
                     } else {
@@ -1245,8 +1250,8 @@ impl<S: IOOperationsSync> Table<S> {
                         
                         self.in_memory_index = Arc::new(Some(new_chunks));
 
-    
-                        self.table_header.mutated.store(true, Ordering::Relaxed);
+                        self.mutated.store(true, Ordering::SeqCst);
+                        self.table_header.mutated.store(true, Ordering::SeqCst);
                         self.io_sync.write_data(0, &self.table_header.to_bytes().unwrap()).await;
 
                         break;
@@ -1293,7 +1298,7 @@ impl<S: IOOperationsSync> Table<S> {
         let mut total_rows_processed: usize = 0;
         
         // Get table mutation status
-        let mutated = self.table_header.mutated.load(Ordering::Relaxed);
+        let mutated = self.table_header.mutated.load(Ordering::SeqCst);
         
         // Check if in-memory indexes are available
         let chunks_arc_clone = self.in_memory_index.clone();
@@ -1426,12 +1431,12 @@ impl<S: IOOperationsSync> Table<S> {
             if !table_locked {
                 continue;
             } else {
-                self.mutated.store(false, Ordering::Relaxed);
                 break;
             }
         }
 
-        self.table_header.mutated.store(false, Ordering::Relaxed);
+        self.mutated.store(false, Ordering::SeqCst);
+        self.table_header.mutated.store(false, Ordering::SeqCst);
         self.io_sync.write_data(0, &self.table_header.to_bytes().unwrap()).await;
         
         debug!("Vacuum completed: processed {} rows", total_rows_processed);
