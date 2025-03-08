@@ -1,4 +1,4 @@
-use std::{fs::remove_file, mem::ManuallyDrop};
+use std::fs::remove_file;
 use tokio::runtime;
 
 use rasterizeddb_core::core::{
@@ -16,7 +16,7 @@ pub fn rebuild_indexes_file() {
     rt.block_on(async {
         let io_sync = LocalStorageProvider::new("C:\\Tests", Some("database.db")).await;
 
-        let mut table = Table::init(io_sync, false, false).await.unwrap();
+        let mut table = Table::init("database".into(), io_sync, false, false).await.unwrap();
 
         for i in 0..500 {
             if i == 450 {
@@ -66,7 +66,7 @@ pub fn rebuild_indexes_memory() {
     rt.block_on(async {
         let io_sync = MemoryStorageProvider::new();
 
-        let mut table = Table::init(io_sync, false, false).await.unwrap();
+        let mut table = Table::init("database".into(), io_sync, false, false).await.unwrap();
 
         for i in 0..500 {
             if i == 450 {

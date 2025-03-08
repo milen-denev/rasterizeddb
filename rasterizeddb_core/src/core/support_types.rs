@@ -1,6 +1,6 @@
 use std::io::Cursor;
 
-use super::storage_providers::traits::IOOperationsSync;
+use super::{row::Row, storage_providers::traits::IOOperationsSync};
 
 #[derive(Debug, Default)]
 pub struct RowPrefetchResult {
@@ -62,4 +62,9 @@ impl<'a> CursorVector<'a> {
             vector: vector,
         }
     }
+}
+
+pub enum ReturnResult {
+    Rows(Vec<Row>),
+    HtmlView(String)
 }
