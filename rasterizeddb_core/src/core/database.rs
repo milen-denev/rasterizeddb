@@ -12,8 +12,7 @@ use crate::{
 };
 
 use super::{
-    column::Column, row::{self, InsertOrUpdateRow, Row}, storage_providers::traits::IOOperationsSync,
-    table::Table,
+    column::Column, row::{self, InsertOrUpdateRow}, storage_providers::traits::IOOperationsSync, support_types::ReturnResult, table::Table
 };
 
 static TCP_SERVER: async_lazy::Lazy<Arc<TcpServer>> = async_lazy::Lazy::new(|| {
@@ -39,7 +38,7 @@ unsafe impl<S: IOOperationsSync> Sync for Database<S> {}
 impl<S: IOOperationsSync + Send + Sync> Database<S> {
     pub async fn new(io_sync: S) -> io::Result<Database<S>> {
         let config_io_sync = io_sync.create_new("CONFIG_TABLE.db".to_string()).await;
-        let config_table = Table::init(config_io_sync.clone(), false, false).await?;
+        let config_table = Table::init("CONFIG_TABLE".into(), config_io_sync.clone(), false, false).await?;
 
         let all_rows_result = rql::parser::parse_rql(
             r#"
@@ -56,8 +55,14 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
 
         let tables: DashMap<String, Table<S>, RandomState> = if table_rows.is_some() {
             let rows = table_rows.unwrap();
-
             let mut table_specs: Vec<(String, bool, bool)> = Vec::default();
+
+            let rows = match rows {
+                ReturnResult::Rows(rows) => rows,
+                ReturnResult::HtmlView(_) => {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid data type returned from query."));
+                }
+            };
 
             for row in rows {
                 let columns = Column::from_buffer(&row.columns_data)?;
@@ -74,7 +79,7 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
                 let table_name = table_spec.0.trim().replace("\0", "").to_string();
                 let file_name = format!("{}.db", table_name);
                 let new_io_sync = io_sync.create_new(file_name).await;
-                let table = Table::<S>::init_inner(new_io_sync, table_spec.1, table_spec.2).await?;
+                let table = Table::<S>::init_inner(table_name.clone(), new_io_sync, table_spec.1, table_spec.2).await?;
                 inited_tables.insert(table_name, table);
             }
 
@@ -102,7 +107,7 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
         let mut config_table = self.config_table.write().await;
 
         let new_io_sync = config_table.io_sync.create_new(format!("{}.db", name)).await;
-        let table = Table::<S>::init_inner(new_io_sync, compress, immutable).await?;
+        let table = Table::<S>::init_inner(name.clone(), new_io_sync, compress, immutable).await?;
 
         let name_column = Column::new(name.clone()).unwrap();
         let compress_column = Column::new(compress).unwrap();
@@ -157,9 +162,26 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
             .execute_query(select_table_to_drop.parser_result)
             .await?;
 
-        let row_id = table_row.unwrap().pop().unwrap().id;
-        config_table.delete_row_by_id(row_id).await?;
-        config_table.vacuum_table().await;
+        match table_row {
+            Some(ReturnResult::Rows(rows)) => {
+                for row in rows {
+                    let columns = Column::from_buffer(&row.columns_data)?;
+                    let table_name = columns[0].into_value();
+                    if table_name == name {
+                        let row_id = row.id;
+                        config_table.delete_row_by_id(row_id).await?;
+                        config_table.vacuum_table().await;
+                        break;
+                    }
+                }
+            },
+            Some(ReturnResult::HtmlView(_)) => {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid data type returned from query."));
+            },
+            None => {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid data type returned from query."));
+            }
+        }
 
         Ok(())
     }
@@ -172,7 +194,7 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
         }
 
         let table = table.unwrap();
-        let rows: Option<Vec<Row>> = table.execute_query(parser_cached_result).await.unwrap();
+        let rows: Option<ReturnResult> = table.execute_query(parser_cached_result).await.unwrap();
 
         Ok(row::Row::serialize_rows(rows))
     }
@@ -186,7 +208,7 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
 
         let table = table.unwrap();
 
-        let rows: Option<Vec<Row>> = table.execute_query(parser_result).await.unwrap();
+        let rows: Option<ReturnResult> = table.execute_query(parser_result).await.unwrap();
 
         Ok(row::Row::serialize_rows(rows))
     }
@@ -223,9 +245,15 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
         let rows = table.execute_query(delete_evaluation_tokens).await?;
         
         if let Some(rows) = rows {
-            // Delete each matching row by its ID
-            for row in rows {
-                table.delete_row_by_id(row.id).await?;
+            match rows {
+                ReturnResult::Rows(rows) => {
+                    for row in rows {
+                        table.delete_row_by_id(row.id).await?;
+                    }
+                },
+                ReturnResult::HtmlView(_) => {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid data type returned from query."));
+                }
             }
         }
         
