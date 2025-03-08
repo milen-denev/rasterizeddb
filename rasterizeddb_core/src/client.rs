@@ -8,6 +8,7 @@ use tokio::sync::Mutex;
 
 use crate::core::database::QueryExecutionResult;
 use crate::core::row::Row;
+use crate::core::support_types::ReturnResult;
 use crate::SERVER_PORT;
 
 /// A pooled client connection
@@ -366,7 +367,7 @@ impl DbClient {
     }
 
     /// Helper method to extract rows from a QueryExecutionResult
-    pub fn extract_rows(result: QueryExecutionResult) -> io::Result<Option<Vec<Row>>> {
+    pub fn extract_rows(result: QueryExecutionResult) -> io::Result<Option<ReturnResult>> {
         match result {
             QueryExecutionResult::RowsResult(data) => {
                 Row::deserialize_rows(&data)
