@@ -26,13 +26,13 @@ use super::{
     },
     row::{InsertOrUpdateRow, Row},
     storage_providers::traits::IOOperationsSync,
-    support_types::{CursorVector, FileChunk},
+    support_types::{CursorVector, FileChunk, ReturnResult},
     table_ext::extent_non_string_buffer,
     table_header::TableHeader,
 };
 
 use crate::{
-    core::helpers::delete_row_file, memory_pool::MEMORY_POOL, rql::models::Next, simds::endianess::read_u32, CHUNK_SIZE, EMPTY_BUFFER, HEADER_SIZE 
+    core::helpers::delete_row_file, memory_pool::MEMORY_POOL, renderers::html::render_rows_to_html, rql::{models::Next, parser::ReturnView}, simds::endianess::read_u32, CHUNK_SIZE, EMPTY_BUFFER, HEADER_SIZE 
 };
 
 #[cfg(feature = "enable_parallelism")]
@@ -46,6 +46,7 @@ use crate::POSITIONS_CACHE;
 
 #[allow(dead_code)]
 pub struct Table<S: IOOperationsSync> {
+    pub(crate) table_name: String,
     pub(crate) io_sync: Box<S>,
     pub(crate) table_header: Arc<TableHeader>,
     pub(crate) in_memory_index: Arc<Option<Vec<FileChunk>>>,
@@ -64,6 +65,7 @@ impl<S: IOOperationsSync> Clone for Table<S> {
         let mutated = self.mutated.load(Ordering::Relaxed);
 
         Self { 
+            table_name: self.table_name.clone(),
             io_sync: self.io_sync.clone(), 
             table_header: self.table_header.clone(), 
             in_memory_index: self.in_memory_index.clone(), 
@@ -82,7 +84,7 @@ unsafe impl<S: IOOperationsSync> Sync for Table<S> {}
 impl<S: IOOperationsSync> Table<S> {
     /// #### STABILIZED
     /// Initializes a new table. compressed and immutable are not implemented yet.
-    pub async fn init(mut io_sync: S, compressed: bool, immutable: bool) -> io::Result<Table<S>> {
+    pub async fn init(table_name: String, mut io_sync: S, compressed: bool, immutable: bool) -> io::Result<Table<S>> {
         let table_file_len = io_sync.get_len().await;
 
         if table_file_len >= HEADER_SIZE as u64 {
@@ -97,6 +99,7 @@ impl<S: IOOperationsSync> Table<S> {
             table_header.total_file_length.store(io_sync.get_len().await, Ordering::Relaxed);
 
             let table = Table {
+                table_name,
                 io_sync: Box::new(io_sync),
                 table_header: Arc::new(table_header),
                 in_memory_index: Arc::new(None),
@@ -119,6 +122,7 @@ impl<S: IOOperationsSync> Table<S> {
             io_sync.write_data(0, &header_bytes).await;
 
             let table = Table {
+                table_name,
                 io_sync: Box::new(io_sync),
                 table_header: Arc::new(table_header),
                 in_memory_index: Arc::new(None),
@@ -136,6 +140,7 @@ impl<S: IOOperationsSync> Table<S> {
     /// #### STABILIZED
     /// Initializes a new table. compressed and immutable are not implemented yet.
     pub(crate) async fn init_inner(
+        table_name: String, 
         mut io_sync: S,
         compressed: bool,
         immutable: bool,
@@ -152,6 +157,7 @@ impl<S: IOOperationsSync> Table<S> {
             table_header.total_file_length.store(io_sync.get_len().await, Ordering::Relaxed);
 
             let table = Table {
+                table_name,
                 io_sync: Box::new(io_sync),
                 table_header: Arc::new(table_header),
                 in_memory_index: Arc::new(None),
@@ -174,6 +180,7 @@ impl<S: IOOperationsSync> Table<S> {
             io_sync.write_data(0, &header_bytes).await;
 
             let table = Table {
+                table_name,
                 io_sync: Box::new(io_sync),
                 table_header: Arc::new(table_header),
                 in_memory_index: Arc::new(None),
@@ -397,8 +404,8 @@ impl<S: IOOperationsSync> Table<S> {
     pub async fn execute_query(
         &self,
         parser_result: ParserResult,
-    ) -> io::Result<Option<Vec<Row>>> {
-        if let ParserResult::CachedHashIndexes(hash_indexes) = parser_result {
+    ) -> io::Result<Option<ReturnResult>> {
+        if let ParserResult::CachedHashIndexes((hash_indexes, return_view)) = parser_result {
             let mut rows: Vec<Row> = Vec::with_capacity(hash_indexes.len());
             for record in hash_indexes {
                 let mut position = record.0;
@@ -410,11 +417,21 @@ impl<S: IOOperationsSync> Table<S> {
                 );
             }
 
-            return Ok(Some(rows));
+            if let Some(return_view) = return_view {
+                if return_view == ReturnView::Html {
+                    return  Ok(Some(ReturnResult::HtmlView(render_rows_to_html(Ok(Some(rows)), &self.table_name).unwrap())));
+                } else {
+                    return Ok(Some(ReturnResult::Rows(rows)));
+                }
+            }
+            else {
+                return Ok(Some(ReturnResult::Rows(rows)));
+            }
         } else if let ParserResult::QueryEvaluationTokens(evaluation_tokens) = parser_result {
             #[cfg(feature = "enable_index_caching")]
             let hash = evaluation_tokens.query_hash;
 
+            let return_view = evaluation_tokens.return_view;
             let limit = evaluation_tokens.limit;
 
             let mut rows: Vec<Row> = if limit < 1024 && limit > 0 {
@@ -454,6 +471,8 @@ impl<S: IOOperationsSync> Table<S> {
                 #[cfg(feature  = "enable_parallelism")]
                 {
                     return process_all_chunks(
+                        &self.table_name,
+                        return_view,
                         Arc::new(column_indexes),
                         evaluation_tokens,
                         limit as u64,
@@ -649,7 +668,17 @@ impl<S: IOOperationsSync> Table<S> {
                                     {
                                         POSITIONS_CACHE.insert(hash, result_row_vec);
                                     }
-                                    return Ok(Some(rows));
+
+                                    if let Some(return_view) = return_view {
+                                        if return_view == ReturnView::Html {
+                                            return  Ok(Some(ReturnResult::HtmlView(render_rows_to_html(Ok(Some(rows)), &self.table_name).unwrap())));
+                                        } else {
+                                            return Ok(Some(ReturnResult::Rows(rows)));
+                                        }
+                                    }
+                                    else {
+                                        return Ok(Some(ReturnResult::Rows(rows)));
+                                    }
                                 }
 
                                 position = new_position;
@@ -796,7 +825,17 @@ impl<S: IOOperationsSync> Table<S> {
                                 {
                                     POSITIONS_CACHE.insert(hash, result_row_vec);
                                 }
-                                return Ok(Some(rows));
+
+                                if let Some(return_view) = return_view {
+                                    if return_view == ReturnView::Html {
+                                        return  Ok(Some(ReturnResult::HtmlView(render_rows_to_html(Ok(Some(rows)), &self.table_name).unwrap())));
+                                    } else {
+                                        return Ok(Some(ReturnResult::Rows(rows)));
+                                    }
+                                }
+                                else {
+                                    return Ok(Some(ReturnResult::Rows(rows)));
+                                }
                             }
                         }
                     } else {
@@ -806,7 +845,16 @@ impl<S: IOOperationsSync> Table<S> {
             }
 
             if rows.len() > 0 {
-                return Ok(Some(rows));
+                if let Some(return_view) = return_view {
+                    if return_view == ReturnView::Html {
+                        return  Ok(Some(ReturnResult::HtmlView(render_rows_to_html(Ok(Some(rows)), &self.table_name).unwrap())));
+                    } else {
+                        return Ok(Some(ReturnResult::Rows(rows)));
+                    }
+                }
+                else {
+                    return Ok(Some(ReturnResult::Rows(rows)));
+                }
             } else {
                 return Ok(None);
             }
@@ -1374,7 +1422,7 @@ impl<S: IOOperationsSync> Table<S> {
         
         // Create temporary table
         let temp_io_sync = self.io_sync.create_temp().await;
-        let mut temp_table = Table::init(temp_io_sync, false, false).await.unwrap();
+        let mut temp_table = Table::init("temp".into(), temp_io_sync, false, false).await.unwrap();
         
         // Batch collection for buffering rows before writing to disk
         let mut row_batch: Vec<InsertOrUpdateRow> = Vec::new();
