@@ -248,15 +248,57 @@ impl<S: IOOperationsSync> Table<S> {
         //DbType END
         buffer.push(255);
 
+        // Get the current file position where this row was inserted
+        let current_file_pos = self.current_file_length.load(Ordering::Relaxed) - total_row_size;
+        
         self.io_sync.append_data(&buffer).await;
-        // let verify_result = self.io_sync.verify_data_and_sync(current_file_len, &buffer);
 
-        // #[allow(unreachable_code)]
-        // if !verify_result {
-        //     panic!("DB file contains error.");
-        //     todo!("Add rollback.");
-        // }
+        // Update in-memory index
+        let chunks_arc_clone = self.in_memory_index.clone();
+        let row_size = buffer.len() as u32;
 
+        let new_chunks = if let Some(existing_chunks) = chunks_arc_clone.as_ref() {
+            let mut chunks = existing_chunks.clone();
+            
+            if !chunks.is_empty() {
+                let last_chunk = chunks.last_mut().unwrap();
+                
+                if last_chunk.chunk_size + row_size <= CHUNK_SIZE {
+                    // Row fits in the current chunk, update it
+                    last_chunk.chunk_size += row_size;
+                    last_chunk.next_row_id = row_id + 1;
+                } else {
+                    // Row doesn't fit, create new chunk
+                    chunks.push(FileChunk {
+                        current_file_position: current_file_pos,
+                        chunk_size: row_size,
+                        next_row_id: row_id + 1,
+                    });
+                }
+            } else {
+                // No chunks exist yet, create the first one
+                chunks.push(FileChunk {
+                    current_file_position: current_file_pos,
+                    chunk_size: row_size,
+                    next_row_id: row_id + 1,
+                });
+            }
+            
+            chunks
+        } else {
+            // Create new index with first chunk
+            let mut chunks = Vec::with_capacity(1);
+            chunks.push(FileChunk {
+                current_file_position: current_file_pos,
+                chunk_size: row_size,
+                next_row_id: row_id + 1,
+            });
+            chunks
+        };
+        
+        self.in_memory_index = Arc::new(Some(new_chunks));
+
+        // Update table header
         self.table_header.last_row_id.store(row_id, Ordering::SeqCst);
         let table_bytes = self.table_header.to_bytes().unwrap();
         self.io_sync.write_data_seek(SeekFrom::Start(0), &table_bytes).await;
@@ -296,15 +338,57 @@ impl<S: IOOperationsSync> Table<S> {
         //DbType END
         buffer.push(255);
 
+        // Get the current file position where this row was inserted
+        let current_file_pos = self.current_file_length.load(Ordering::Relaxed) - total_row_size;
+        
         self.io_sync.append_data_unsync(&buffer).await;
-        // let verify_result = self.io_sync.verify_data_and_sync(current_file_len, &buffer);
 
-        // #[allow(unreachable_code)]
-        // if !verify_result {
-        //     panic!("DB file contains error.");
-        //     todo!("Add rollback.");
-        // }
+        // Update in-memory index
+        let chunks_arc_clone = self.in_memory_index.clone();
+        let row_size = buffer.len() as u32;
 
+        let new_chunks = if let Some(existing_chunks) = chunks_arc_clone.as_ref() {
+            let mut chunks = existing_chunks.clone();
+            
+            if !chunks.is_empty() {
+                let last_chunk = chunks.last_mut().unwrap();
+                
+                if last_chunk.chunk_size + row_size <= CHUNK_SIZE {
+                    // Row fits in the current chunk, update it
+                    last_chunk.chunk_size += row_size;
+                    last_chunk.next_row_id = row_id + 1;
+                } else {
+                    // Row doesn't fit, create new chunk
+                    chunks.push(FileChunk {
+                        current_file_position: current_file_pos,
+                        chunk_size: row_size,
+                        next_row_id: row_id + 1,
+                    });
+                }
+            } else {
+                // No chunks exist yet, create the first one
+                chunks.push(FileChunk {
+                    current_file_position: current_file_pos,
+                    chunk_size: row_size,
+                    next_row_id: row_id + 1,
+                });
+            }
+            
+            chunks
+        } else {
+            // Create new index with first chunk
+            let mut chunks = Vec::with_capacity(1);
+            chunks.push(FileChunk {
+                current_file_position: current_file_pos,
+                chunk_size: row_size,
+                next_row_id: row_id + 1,
+            });
+            chunks
+        };
+        
+        self.in_memory_index = Arc::new(Some(new_chunks));
+
+        // Update table header
         self.table_header.last_row_id.store(row_id, Ordering::SeqCst);
         let table_bytes = self.table_header.to_bytes().unwrap();
         self.io_sync.write_data_seek(SeekFrom::Start(0), &table_bytes).await;
