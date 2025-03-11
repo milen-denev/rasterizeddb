@@ -34,7 +34,6 @@ name = "buffer_benchmarks"
 harness = false
 
 [profile.release]
-strip = "all"
 opt-level = 3
 debug = false
 debug-assertions = false

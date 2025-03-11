@@ -13,7 +13,6 @@ async-lazy = { version = "0.1.2", features = ["parking_lot"] }
 rand = "0.9.0"
 
 [profile.release]
-strip = "all"
 opt-level = 3
 debug = false
 debug-assertions = false

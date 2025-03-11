@@ -25,7 +25,6 @@ serde = { version = "1.0.218", features = ["derive"] }
 uuid = "1.15.1"
 
 [profile.release]
-strip = "all"
 opt-level = 3
 debug = false
 debug-assertions = false

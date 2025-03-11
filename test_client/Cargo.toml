@@ -9,7 +9,6 @@ tokio = { version = "1", features = ["full"] }
 stopwatch = "0.0.7"
 
 [profile.release]
-strip = "all"
 opt-level = 3
 debug = false
 debug-assertions = false
