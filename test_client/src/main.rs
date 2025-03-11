@@ -1,6 +1,6 @@
 use std::io::stdin;
 
-use rasterizeddb_core::client::DbClient;
+use rasterizeddb_core::{client::DbClient, core::support_types::ReturnResult};
 use stopwatch::Stopwatch;
 
 #[tokio::main(flavor = "multi_thread")]
@@ -58,7 +58,14 @@ async fn main() -> std::io::Result<()> {
 
     println!("Elapsed {:?}", stopwatch.elapsed());
 
-    println!("Total rows: {}", result.len());
+    match result {
+        ReturnResult::Rows(rows) => {
+            println!("Total rows: {}", rows.len());
+        },
+        ReturnResult::HtmlView(html_string) => {
+            println!("Html string: {}", html_string);
+        }
+    }
 
     println!("Press any key to continue...");
 

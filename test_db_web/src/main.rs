@@ -3,6 +3,7 @@ use axum::http::header;
 use axum::Router;
 use axum::{response::Response, routing::get};
 use rasterizeddb_core::client::DbClient;
+use rasterizeddb_core::core::support_types::ReturnResult;
 
 static CLIENT: async_lazy::Lazy<DbClient> =
     async_lazy::Lazy::new(|| {
@@ -63,6 +64,7 @@ async fn query() -> Response {
         SELECT FROM test_db
         WHERE COL(0,I32) < {x}
         LIMIT 1000
+        RETURN HTML_VIEW
         END
     "#
     );
@@ -70,16 +72,23 @@ async fn query() -> Response {
     let client = CLIENT.force().await;
 
     let db_response2 = client.execute_query(&query_evaluation).await.unwrap();
-    let result = DbClient::extract_rows(db_response2).unwrap().unwrap_or_default();
+    let result = DbClient::extract_rows(db_response2).unwrap().unwrap();
 
     let mut output = String::new();
 
-    for row in result.iter() {
-        let columns = row.columns().unwrap();
-        for (i, column) in columns.iter().enumerate() {
-            output.push_str(&format!("Column ({}): {} | ", i, column.into_value()));
+    match result {
+        ReturnResult::Rows(rows) => {
+            for row in rows.iter() {
+                let columns = row.columns().unwrap();
+                for (i, column) in columns.iter().enumerate() {
+                    output.push_str(&format!("Column ({}): {} | ", i, column.into_value()));
+                }
+                output.push_str("\n");
+            }
+        },
+        ReturnResult::HtmlView(html_string) => {
+            output.push_str(&html_string);
         }
-        output.push_str("\n");
     }
 
     Response::builder().header(header::CONTENT_TYPE, "text/html; charset=UTF-8").body(Body::new(output)).unwrap()

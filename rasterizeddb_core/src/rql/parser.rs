@@ -229,7 +229,7 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
             return Err("Table name is missing in DELETE FROM statement.".into());
         }
         
-        // Parse WHERE clause (reuse existing where clause parsing)
+        // Parse WHERE clause
         let where_result = query.find("WHERE");
         if where_result.is_none() {
             return Err("WHERE statement is missing in DELETE.".into());
@@ -238,113 +238,8 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
         let where_i = where_result.unwrap();
         let where_clause = &query[where_i + 5..end].trim();
         
-        let mut where_tokens = whitespace_spec_splitter(where_clause);
-        let mut index_token: u32 = 0;
-        let mut tokens_vector: Vec<(Vec<Token>, Option<Next>)> = Vec::default();
-        let mut token_vector: Vec<Token> = Vec::default();
-        
-        let mut where_tokens_iter = where_tokens.into_iter();
-        
-        let mut double_continue = false;
-        
-        while let Some(token) = where_tokens_iter.next() {
-            if double_continue {
-                double_continue = false;
-                continue;
-            }
-            
-            if token.eq("LIMIT") {
-                double_continue = true;
-                continue;
-            }
-            
-            index_token += token.len() as u32;
-            
-            if token == " " || token.is_empty() {
-                continue;
-            }
-            
-            if token.starts_with("COL(") {
-                let column_end = token.find(")").unwrap();
-                let column_index = str::parse::<u32>(&token[4..column_end].trim()).unwrap();
-                let val = Token::Column(column_index);
-                token_vector.push(val);
-            } else if token.eq("*") {
-                let val = Token::Math(MathOperation::Multiply);
-                token_vector.push(val);
-            } else if token.eq("-") {
-                let val = Token::Math(MathOperation::Subtract);
-                token_vector.push(val);
-            } else if token.eq("/") {
-                let val = Token::Math(MathOperation::Divide);
-                token_vector.push(val);
-            } else if token.eq("+") {
-                let val = Token::Math(MathOperation::Add);
-                token_vector.push(val);
-            } else if token.eq("=") {
-                let val = Token::Operation(ComparerOperation::Equals);
-                token_vector.push(val);
-            } else if token.eq(">") {
-                let val = Token::Operation(ComparerOperation::Greater);
-                token_vector.push(val);
-            } else if token.eq(">=") {
-                let val = Token::Operation(ComparerOperation::GreaterOrEquals);
-                token_vector.push(val);
-            } else if token.eq("!=") {
-                let val = Token::Operation(ComparerOperation::NotEquals);
-                token_vector.push(val);
-            } else if token.eq("<") {
-                let val = Token::Operation(ComparerOperation::Less);
-                token_vector.push(val);
-            } else if token.eq("<=") {
-                let val = Token::Operation(ComparerOperation::LessOrEquals);
-                token_vector.push(val);
-            } else if token.eq("AND") {
-                let mut new_vector: Vec<Token> = Vec::with_capacity(token_vector.len());
-                new_vector.append(&mut token_vector);
-                tokens_vector.push((new_vector, Some(Next::And)));
-            } else if token.eq("OR") {
-                let mut new_vector: Vec<Token> = Vec::with_capacity(token_vector.len());
-                new_vector.append(&mut token_vector);
-                tokens_vector.push((new_vector, Some(Next::Or)));
-            } else if token.starts_with('\'') && token.ends_with('\'') {
-                let string = &token[1..token.len() - 1];
-                let column = Column::from_chunk(14, MemoryChunk::from_vec(string.as_bytes().to_vec()));
-                let val = Token::Value(column);
-                token_vector.push(val);
-            } else if !token.contains(".") {
-                let result_i128 = str::parse::<i128>(&token.trim());
-                if let Ok(token_number) = result_i128 {
-                    let column = Column::create_temp(true, token_number.to_le_bytes().to_vec());
-                    let val = Token::Value(column);
-                    token_vector.push(val);
-                } else {
-                    panic!(
-                        "Error parsing token number: {}, error: {}",
-                        token,
-                        result_i128.unwrap_err()
-                    );
-                }
-            } else if token.contains(".") {
-                if let Ok(token_number) = str::parse::<f64>(&token) {
-                    let column = Column::create_temp(false, token_number.to_le_bytes().to_vec());
-                    let val = Token::Value(column);
-                    token_vector.push(val);
-                } else {
-                    panic!()
-                }
-            } else if token == "TRUE" {
-                let column = Column::create_temp(true, [1].to_vec());
-                let val = Token::Value(column);
-                token_vector.push(val);
-            } else if token == "FALSE" {
-                let column = Column::create_temp(true, [0].to_vec());
-                let val = Token::Value(column);
-                token_vector.push(val);
-            }
-        }
-        
-        tokens_vector.push((token_vector, None));
+        // Use the refactored function to parse the WHERE clause
+        let tokens_vector = parse_where_clause(where_clause);
         
         return Ok(DatabaseAction {
             table_name: table_name.to_string(),
@@ -353,6 +248,7 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
                 tokens: tokens_vector,
                 limit: i64::MAX, // No limit for DELETE
                 select_all: false,
+                return_view: None
             }),
         });
     }
@@ -377,11 +273,30 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
         select_table.push_str(select_value);
     }
 
+
+    let return_result = query.find("RETURN");
+    let return_all: bool;
+    let mut return_view: Option<ReturnView> = None;
+
+    if return_result.is_none() {
+        return_all = true;
+    } else {
+        return_all = false;
+        
+        // Parse what comes after RETURN
+        let return_start = return_result.unwrap();
+        let return_clause = &query[return_start + 6..].trim(); // +6 to skip "RETURN"
+        
+        if return_clause.starts_with("HTML_VIEW") {
+            return_view = Some(ReturnView::Html);
+        }
+    }
+
     #[cfg(feature = "enable_index_caching")]
     if let Some(file_positions) = POSITIONS_CACHE.get(&hash) {
         let db_action = DatabaseAction {
             table_name: select_table.to_string(),
-            parser_result: ParserResult::CachedHashIndexes(file_positions),
+            parser_result: ParserResult::CachedHashIndexes((file_positions, return_view)),
         };
         return Ok(db_action);
     }
@@ -404,15 +319,6 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
     } else {
         select_all = false;
         where_i = where_result.unwrap();
-    }
-
-    let return_result = query.find("RETURN");
-    let return_all: bool;
-
-    if return_result.is_none() {
-        return_all = true;
-    } else {
-        return_all = false;
     }
 
     // Get LIMIT
@@ -451,6 +357,7 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
                 tokens: Vec::default(),
                 limit: limit_i64,
                 select_all: true,
+                return_view: return_view
             }),
         });
     }
@@ -460,97 +367,8 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
         let select_clause = &query[begin + 5..where_i].trim();
         let where_clause = &query[where_i + 5..end].trim();
 
-        let mut where_tokens = whitespace_spec_splitter(where_clause);
-
-        let mut index_token: u32 = 0;
-        let mut tokens_vector: Vec<(Vec<Token>, Option<Next>)> = Vec::default();
-        let mut token_vector: Vec<Token> = Vec::default();
-
-        let mut where_tokens_iter = where_tokens.into_iter();
-
-        let mut double_continue = false;
-
-        let mut column_type = String::default();
-
-        while let Some(token) = where_tokens_iter.next() {
-            if double_continue {
-                double_continue = false;
-                continue;
-            }
-
-            if token.eq("LIMIT") {
-                double_continue = true;
-                continue;
-            }
-
-            index_token += token.len() as u32;
-
-            if token == " " || token.is_empty() {
-                continue;
-            }
-
-            if token.starts_with("COL(") {
-                let column_end = token.find(")").unwrap();
-                let column_type_and_index = token[4..column_end].trim();
-                let column_type_and_index_split: Vec<&str> = column_type_and_index.split(',').collect();
-                let column_index = str::parse::<u32>(column_type_and_index_split[0]).unwrap();
-                column_type = column_type_and_index_split[1].to_string();
-                let val = Token::Column(column_index);
-                token_vector.push(val);
-            } else if token.eq("*") {
-                let val = Token::Math(MathOperation::Multiply);
-                token_vector.push(val);
-            } else if token.eq("-") {
-                let val = Token::Math(MathOperation::Subtract);
-                token_vector.push(val);
-            } else if token.eq("/") {
-                let val = Token::Math(MathOperation::Divide);
-                token_vector.push(val);
-            } else if token.eq("+") {
-                let val = Token::Math(MathOperation::Add);
-                token_vector.push(val);
-            } else if token.eq("=") {
-                let val = Token::Operation(ComparerOperation::Equals);
-                token_vector.push(val);
-            } else if token.eq(">") {
-                let val = Token::Operation(ComparerOperation::Greater);
-                token_vector.push(val);
-            } else if token.eq(">=") {
-                let val = Token::Operation(ComparerOperation::GreaterOrEquals);
-                token_vector.push(val);
-            } else if token.eq("!=") {
-                let val = Token::Operation(ComparerOperation::NotEquals);
-                token_vector.push(val);
-            } else if token.eq("<") {
-                let val = Token::Operation(ComparerOperation::Less);
-                token_vector.push(val);
-            } else if token.eq("<=") {
-                let val = Token::Operation(ComparerOperation::LessOrEquals);
-                token_vector.push(val);
-            } else if token.eq("AND") {
-                let mut new_vector: Vec<Token> = Vec::with_capacity(token_vector.len());
-                new_vector.append(&mut token_vector);
-                tokens_vector.push((new_vector, Some(Next::And)));
-            } else if token.eq("OR") {
-                let mut new_vector: Vec<Token> = Vec::with_capacity(token_vector.len());
-                new_vector.append(&mut token_vector);
-                tokens_vector.push((new_vector, Some(Next::Or)));
-            } else if token.starts_with('\'') && token.ends_with('\'') {
-                let string = &token[1..token.len() - 1];
-                let column = Column::from_chunk(14, MemoryChunk::from_vec(string.as_bytes().to_vec()));
-                let val = Token::Value(column);
-                token_vector.push(val);
-            } else {
-                if let Ok(column) = parse_typed_value(&token, &column_type) {
-                    let val = Token::Value(column);
-                    token_vector.push(val);
-                } else {
-                    panic!()
-                }
-            }
-        }
-
-        tokens_vector.push((token_vector, None));
+        // Use the refactored function to parse the WHERE clause
+        let tokens_vector = parse_where_clause(where_clause);
 
         return Ok(DatabaseAction {
             table_name: select_table,
@@ -559,11 +377,121 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
                 tokens: tokens_vector,
                 limit: limit_i64,
                 select_all: false,
+                return_view: return_view
+            }),
+        });
+    }
+
+    // Handle the case where RETURN is specified with HTML_VIEW
+    if !return_all && where_result.is_some() {
+        let where_clause = &query[where_i + 5..end].trim();
+        
+        // Use the refactored function to parse the WHERE clause
+        let tokens_vector = parse_where_clause(where_clause);
+        
+        return Ok(DatabaseAction {
+            table_name: select_table,
+            parser_result: ParserResult::QueryEvaluationTokens(EvaluationResult {
+                query_hash: hash,
+                tokens: tokens_vector,
+                limit: limit_i64,
+                select_all: false,
+                return_view: return_view
             }),
         });
     }
 
     panic!("Operation not supported")
+}
+
+// Helper function to parse a WHERE clause into tokens
+fn parse_where_clause(where_clause: &str) -> Vec<(Vec<Token>, Option<Next>)> {
+    let where_tokens = whitespace_spec_splitter(where_clause);
+    let mut tokens_vector: Vec<(Vec<Token>, Option<Next>)> = Vec::default();
+    let mut token_vector: Vec<Token> = Vec::default();
+    
+    let mut where_tokens_iter = where_tokens.into_iter();
+    let mut double_continue = false;
+    let mut column_type = String::default();
+    
+    while let Some(token) = where_tokens_iter.next() {
+        if double_continue {
+            double_continue = false;
+            continue;
+        }
+        
+        if token.eq("LIMIT") || token.eq("RETURN") {
+            double_continue = true;
+            continue;
+        }
+        
+        if token == " " || token.is_empty() {
+            continue;
+        }
+        
+        if token.starts_with("COL(") {
+            let column_end = token.find(")").unwrap();
+            let column_type_and_index = token[4..column_end].trim();
+            let column_type_and_index_split: Vec<&str> = column_type_and_index.split(',').collect();
+            let column_index = str::parse::<u32>(column_type_and_index_split[0]).unwrap();
+            column_type = column_type_and_index_split[1].to_string();
+            let val = Token::Column(column_index);
+            token_vector.push(val);
+        } else if token.eq("*") {
+            let val = Token::Math(MathOperation::Multiply);
+            token_vector.push(val);
+        } else if token.eq("-") {
+            let val = Token::Math(MathOperation::Subtract);
+            token_vector.push(val);
+        } else if token.eq("/") {
+            let val = Token::Math(MathOperation::Divide);
+            token_vector.push(val);
+        } else if token.eq("+") {
+            let val = Token::Math(MathOperation::Add);
+            token_vector.push(val);
+        } else if token.eq("=") {
+            let val = Token::Operation(ComparerOperation::Equals);
+            token_vector.push(val);
+        } else if token.eq(">") {
+            let val = Token::Operation(ComparerOperation::Greater);
+            token_vector.push(val);
+        } else if token.eq(">=") {
+            let val = Token::Operation(ComparerOperation::GreaterOrEquals);
+            token_vector.push(val);
+        } else if token.eq("!=") {
+            let val = Token::Operation(ComparerOperation::NotEquals);
+            token_vector.push(val);
+        } else if token.eq("<") {
+            let val = Token::Operation(ComparerOperation::Less);
+            token_vector.push(val);
+        } else if token.eq("<=") {
+            let val = Token::Operation(ComparerOperation::LessOrEquals);
+            token_vector.push(val);
+        } else if token.eq("AND") {
+            let mut new_vector: Vec<Token> = Vec::with_capacity(token_vector.len());
+            new_vector.append(&mut token_vector);
+            tokens_vector.push((new_vector, Some(Next::And)));
+        } else if token.eq("OR") {
+            let mut new_vector: Vec<Token> = Vec::with_capacity(token_vector.len());
+            new_vector.append(&mut token_vector);
+            tokens_vector.push((new_vector, Some(Next::Or)));
+        } else if token.starts_with('\'') && token.ends_with('\'') {
+            let string = &token[1..token.len() - 1];
+            let column = Column::from_chunk(14, MemoryChunk::from_vec(string.as_bytes().to_vec()));
+            let val = Token::Value(column);
+            token_vector.push(val);
+        } else {
+            if let Ok(column) = parse_typed_value(&token, &column_type) {
+                let val = Token::Value(column);
+                token_vector.push(val);
+            } else {
+                panic!()
+            }
+        }
+    }
+    
+    tokens_vector.push((token_vector, None));
+    tokens_vector
 }
 
 // Helper function to parse a value string into a Column with specific type
@@ -783,7 +711,7 @@ pub enum ParserResult {
     UpdateEvaluationTokens(EvaluationResult),
     DeleteEvaluationTokens(EvaluationResult),
     QueryEvaluationTokens(EvaluationResult),
-    CachedHashIndexes(Vec<(u64, u32)>),
+    CachedHashIndexes((Vec<(u64, u32)>, Option<ReturnView>)),
     RebuildIndexes(String),
 }
 
@@ -792,8 +720,14 @@ pub struct EvaluationResult {
     pub tokens: Vec<(Vec<Token>, Option<Next>)>,
     pub limit: i64,
     pub select_all: bool,
+    pub return_view: Option<ReturnView>
 }
 
 pub struct InsertEvaluationResult {
     pub rows: Vec<InsertOrUpdateRow>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReturnView {
+    Html
 }

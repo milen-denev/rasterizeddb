@@ -26,13 +26,13 @@ use super::{
     },
     row::{InsertOrUpdateRow, Row},
     storage_providers::traits::IOOperationsSync,
-    support_types::{CursorVector, FileChunk},
+    support_types::{CursorVector, FileChunk, ReturnResult},
     table_ext::extent_non_string_buffer,
     table_header::TableHeader,
 };
 
 use crate::{
-    core::helpers::delete_row_file, memory_pool::MEMORY_POOL, rql::models::Next, simds::endianess::read_u32, CHUNK_SIZE, EMPTY_BUFFER, HEADER_SIZE 
+    core::helpers::delete_row_file, memory_pool::MEMORY_POOL, renderers::html::render_rows_to_html, rql::{models::Next, parser::ReturnView}, simds::endianess::read_u32, CHUNK_SIZE, EMPTY_BUFFER, HEADER_SIZE 
 };
 
 #[cfg(feature = "enable_parallelism")]
@@ -46,6 +46,7 @@ use crate::POSITIONS_CACHE;
 
 #[allow(dead_code)]
 pub struct Table<S: IOOperationsSync> {
+    pub(crate) table_name: String,
     pub(crate) io_sync: Box<S>,
     pub(crate) table_header: Arc<TableHeader>,
     pub(crate) in_memory_index: Arc<Option<Vec<FileChunk>>>,
@@ -64,6 +65,7 @@ impl<S: IOOperationsSync> Clone for Table<S> {
         let mutated = self.mutated.load(Ordering::Relaxed);
 
         Self { 
+            table_name: self.table_name.clone(),
             io_sync: self.io_sync.clone(), 
             table_header: self.table_header.clone(), 
             in_memory_index: self.in_memory_index.clone(), 
@@ -82,7 +84,7 @@ unsafe impl<S: IOOperationsSync> Sync for Table<S> {}
 impl<S: IOOperationsSync> Table<S> {
     /// #### STABILIZED
     /// Initializes a new table. compressed and immutable are not implemented yet.
-    pub async fn init(mut io_sync: S, compressed: bool, immutable: bool) -> io::Result<Table<S>> {
+    pub async fn init(table_name: String, mut io_sync: S, compressed: bool, immutable: bool) -> io::Result<Table<S>> {
         let table_file_len = io_sync.get_len().await;
 
         if table_file_len >= HEADER_SIZE as u64 {
@@ -97,6 +99,7 @@ impl<S: IOOperationsSync> Table<S> {
             table_header.total_file_length.store(io_sync.get_len().await, Ordering::Relaxed);
 
             let table = Table {
+                table_name,
                 io_sync: Box::new(io_sync),
                 table_header: Arc::new(table_header),
                 in_memory_index: Arc::new(None),
@@ -119,6 +122,7 @@ impl<S: IOOperationsSync> Table<S> {
             io_sync.write_data(0, &header_bytes).await;
 
             let table = Table {
+                table_name,
                 io_sync: Box::new(io_sync),
                 table_header: Arc::new(table_header),
                 in_memory_index: Arc::new(None),
@@ -136,6 +140,7 @@ impl<S: IOOperationsSync> Table<S> {
     /// #### STABILIZED
     /// Initializes a new table. compressed and immutable are not implemented yet.
     pub(crate) async fn init_inner(
+        table_name: String, 
         mut io_sync: S,
         compressed: bool,
         immutable: bool,
@@ -152,6 +157,7 @@ impl<S: IOOperationsSync> Table<S> {
             table_header.total_file_length.store(io_sync.get_len().await, Ordering::Relaxed);
 
             let table = Table {
+                table_name,
                 io_sync: Box::new(io_sync),
                 table_header: Arc::new(table_header),
                 in_memory_index: Arc::new(None),
@@ -174,6 +180,7 @@ impl<S: IOOperationsSync> Table<S> {
             io_sync.write_data(0, &header_bytes).await;
 
             let table = Table {
+                table_name,
                 io_sync: Box::new(io_sync),
                 table_header: Arc::new(table_header),
                 in_memory_index: Arc::new(None),
@@ -248,15 +255,57 @@ impl<S: IOOperationsSync> Table<S> {
         //DbType END
         buffer.push(255);
 
+        // Get the current file position where this row was inserted
+        let current_file_pos = self.current_file_length.load(Ordering::Relaxed) - total_row_size;
+        
         self.io_sync.append_data(&buffer).await;
-        // let verify_result = self.io_sync.verify_data_and_sync(current_file_len, &buffer);
 
-        // #[allow(unreachable_code)]
-        // if !verify_result {
-        //     panic!("DB file contains error.");
-        //     todo!("Add rollback.");
-        // }
+        // Update in-memory index
+        let chunks_arc_clone = self.in_memory_index.clone();
+        let row_size = buffer.len() as u32;
 
+        let new_chunks = if let Some(existing_chunks) = chunks_arc_clone.as_ref() {
+            let mut chunks = existing_chunks.clone();
+            
+            if !chunks.is_empty() {
+                let last_chunk = chunks.last_mut().unwrap();
+                
+                if last_chunk.chunk_size + row_size <= CHUNK_SIZE {
+                    // Row fits in the current chunk, update it
+                    last_chunk.chunk_size += row_size;
+                    last_chunk.next_row_id = row_id + 1;
+                } else {
+                    // Row doesn't fit, create new chunk
+                    chunks.push(FileChunk {
+                        current_file_position: current_file_pos,
+                        chunk_size: row_size,
+                        next_row_id: row_id + 1,
+                    });
+                }
+            } else {
+                // No chunks exist yet, create the first one
+                chunks.push(FileChunk {
+                    current_file_position: current_file_pos,
+                    chunk_size: row_size,
+                    next_row_id: row_id + 1,
+                });
+            }
+            
+            chunks
+        } else {
+            // Create new index with first chunk
+            let mut chunks = Vec::with_capacity(1);
+            chunks.push(FileChunk {
+                current_file_position: current_file_pos,
+                chunk_size: row_size,
+                next_row_id: row_id + 1,
+            });
+            chunks
+        };
+        
+        self.in_memory_index = Arc::new(Some(new_chunks));
+
+        // Update table header
         self.table_header.last_row_id.store(row_id, Ordering::SeqCst);
         let table_bytes = self.table_header.to_bytes().unwrap();
         self.io_sync.write_data_seek(SeekFrom::Start(0), &table_bytes).await;
@@ -296,15 +345,57 @@ impl<S: IOOperationsSync> Table<S> {
         //DbType END
         buffer.push(255);
 
+        // Get the current file position where this row was inserted
+        let current_file_pos = self.current_file_length.load(Ordering::Relaxed) - total_row_size;
+        
         self.io_sync.append_data_unsync(&buffer).await;
-        // let verify_result = self.io_sync.verify_data_and_sync(current_file_len, &buffer);
 
-        // #[allow(unreachable_code)]
-        // if !verify_result {
-        //     panic!("DB file contains error.");
-        //     todo!("Add rollback.");
-        // }
+        // Update in-memory index
+        let chunks_arc_clone = self.in_memory_index.clone();
+        let row_size = buffer.len() as u32;
 
+        let new_chunks = if let Some(existing_chunks) = chunks_arc_clone.as_ref() {
+            let mut chunks = existing_chunks.clone();
+            
+            if !chunks.is_empty() {
+                let last_chunk = chunks.last_mut().unwrap();
+                
+                if last_chunk.chunk_size + row_size <= CHUNK_SIZE {
+                    // Row fits in the current chunk, update it
+                    last_chunk.chunk_size += row_size;
+                    last_chunk.next_row_id = row_id + 1;
+                } else {
+                    // Row doesn't fit, create new chunk
+                    chunks.push(FileChunk {
+                        current_file_position: current_file_pos,
+                        chunk_size: row_size,
+                        next_row_id: row_id + 1,
+                    });
+                }
+            } else {
+                // No chunks exist yet, create the first one
+                chunks.push(FileChunk {
+                    current_file_position: current_file_pos,
+                    chunk_size: row_size,
+                    next_row_id: row_id + 1,
+                });
+            }
+            
+            chunks
+        } else {
+            // Create new index with first chunk
+            let mut chunks = Vec::with_capacity(1);
+            chunks.push(FileChunk {
+                current_file_position: current_file_pos,
+                chunk_size: row_size,
+                next_row_id: row_id + 1,
+            });
+            chunks
+        };
+        
+        self.in_memory_index = Arc::new(Some(new_chunks));
+
+        // Update table header
         self.table_header.last_row_id.store(row_id, Ordering::SeqCst);
         let table_bytes = self.table_header.to_bytes().unwrap();
         self.io_sync.write_data_seek(SeekFrom::Start(0), &table_bytes).await;
@@ -313,8 +404,8 @@ impl<S: IOOperationsSync> Table<S> {
     pub async fn execute_query(
         &self,
         parser_result: ParserResult,
-    ) -> io::Result<Option<Vec<Row>>> {
-        if let ParserResult::CachedHashIndexes(hash_indexes) = parser_result {
+    ) -> io::Result<Option<ReturnResult>> {
+        if let ParserResult::CachedHashIndexes((hash_indexes, return_view)) = parser_result {
             let mut rows: Vec<Row> = Vec::with_capacity(hash_indexes.len());
             for record in hash_indexes {
                 let mut position = record.0;
@@ -326,11 +417,21 @@ impl<S: IOOperationsSync> Table<S> {
                 );
             }
 
-            return Ok(Some(rows));
+            if let Some(return_view) = return_view {
+                if return_view == ReturnView::Html {
+                    return  Ok(Some(ReturnResult::HtmlView(render_rows_to_html(Ok(Some(rows)), &self.table_name).unwrap())));
+                } else {
+                    return Ok(Some(ReturnResult::Rows(rows)));
+                }
+            }
+            else {
+                return Ok(Some(ReturnResult::Rows(rows)));
+            }
         } else if let ParserResult::QueryEvaluationTokens(evaluation_tokens) = parser_result {
             #[cfg(feature = "enable_index_caching")]
             let hash = evaluation_tokens.query_hash;
 
+            let return_view = evaluation_tokens.return_view;
             let limit = evaluation_tokens.limit;
 
             let mut rows: Vec<Row> = if limit < 1024 && limit > 0 {
@@ -370,6 +471,8 @@ impl<S: IOOperationsSync> Table<S> {
                 #[cfg(feature  = "enable_parallelism")]
                 {
                     return process_all_chunks(
+                        &self.table_name,
+                        return_view,
                         Arc::new(column_indexes),
                         evaluation_tokens,
                         limit as u64,
@@ -565,7 +668,17 @@ impl<S: IOOperationsSync> Table<S> {
                                     {
                                         POSITIONS_CACHE.insert(hash, result_row_vec);
                                     }
-                                    return Ok(Some(rows));
+
+                                    if let Some(return_view) = return_view {
+                                        if return_view == ReturnView::Html {
+                                            return  Ok(Some(ReturnResult::HtmlView(render_rows_to_html(Ok(Some(rows)), &self.table_name).unwrap())));
+                                        } else {
+                                            return Ok(Some(ReturnResult::Rows(rows)));
+                                        }
+                                    }
+                                    else {
+                                        return Ok(Some(ReturnResult::Rows(rows)));
+                                    }
                                 }
 
                                 position = new_position;
@@ -712,7 +825,17 @@ impl<S: IOOperationsSync> Table<S> {
                                 {
                                     POSITIONS_CACHE.insert(hash, result_row_vec);
                                 }
-                                return Ok(Some(rows));
+
+                                if let Some(return_view) = return_view {
+                                    if return_view == ReturnView::Html {
+                                        return  Ok(Some(ReturnResult::HtmlView(render_rows_to_html(Ok(Some(rows)), &self.table_name).unwrap())));
+                                    } else {
+                                        return Ok(Some(ReturnResult::Rows(rows)));
+                                    }
+                                }
+                                else {
+                                    return Ok(Some(ReturnResult::Rows(rows)));
+                                }
                             }
                         }
                     } else {
@@ -722,7 +845,16 @@ impl<S: IOOperationsSync> Table<S> {
             }
 
             if rows.len() > 0 {
-                return Ok(Some(rows));
+                if let Some(return_view) = return_view {
+                    if return_view == ReturnView::Html {
+                        return  Ok(Some(ReturnResult::HtmlView(render_rows_to_html(Ok(Some(rows)), &self.table_name).unwrap())));
+                    } else {
+                        return Ok(Some(ReturnResult::Rows(rows)));
+                    }
+                }
+                else {
+                    return Ok(Some(ReturnResult::Rows(rows)));
+                }
             } else {
                 return Ok(None);
             }
@@ -749,7 +881,7 @@ impl<S: IOOperationsSync> Table<S> {
 
         let chunks_result = chunks_arc_clone.as_ref();
 
-        let mutated = self.table_header.mutated.load(Ordering::Relaxed);
+        let mutated = self.table_header.mutated.load(Ordering::SeqCst);
 
         if let Some(chunks) = chunks_result.as_ref() {
             for chunk in chunks {
@@ -779,8 +911,8 @@ impl<S: IOOperationsSync> Table<S> {
                                 .await
                                 .unwrap();
 
-                            self.mutated.store(true, Ordering::Relaxed);
-                            self.table_header.mutated.store(true, Ordering::Relaxed);
+                            self.mutated.store(true, Ordering::SeqCst);
+                            self.table_header.mutated.store(true, Ordering::SeqCst);
                             self.io_sync.write_data(0, &self.table_header.to_bytes().unwrap()).await;
 
                             return Ok(());
@@ -808,8 +940,8 @@ impl<S: IOOperationsSync> Table<S> {
                             .await
                             .unwrap();
 
-                            self.mutated.store(true, Ordering::Relaxed);
-                            self.table_header.mutated.store(true, Ordering::Relaxed);
+                            self.mutated.store(true, Ordering::SeqCst);
+                            self.table_header.mutated.store(true, Ordering::SeqCst);
                             self.io_sync.write_data(0, &self.table_header.to_bytes().unwrap()).await;
 
                         return Ok(());
@@ -846,7 +978,7 @@ impl<S: IOOperationsSync> Table<S> {
         }
 
         // Get table header info for mutation status
-        let mutated = self.table_header.mutated.load(Ordering::Relaxed);
+        let mutated = self.table_header.mutated.load(Ordering::SeqCst);
         
         // Initialize a temporary storage for the chunks we find
         let mut chunks_vec: Vec<FileChunk> = Vec::with_capacity(32);
@@ -1083,7 +1215,7 @@ impl<S: IOOperationsSync> Table<S> {
         let mut position = HEADER_SIZE as u64;
 
         loop {           
-            let mutated = self.table_header.mutated.load(Ordering::Relaxed);
+            let mutated = self.table_header.mutated.load(Ordering::SeqCst);
 
             if let Some(prefetch_result) =
                 row_prefetching(&mut self.io_sync, &mut position, file_length, mutated)
@@ -1161,6 +1293,7 @@ impl<S: IOOperationsSync> Table<S> {
                             new_position + update_row_size as u64,
                             &empty_buffer,
                         ).await;
+                        
                         let clean_up_verify_result = self.io_sync.verify_data_and_sync(
                             new_position + update_row_size as u64,
                             &empty_buffer,
@@ -1171,6 +1304,10 @@ impl<S: IOOperationsSync> Table<S> {
                             panic!("DB file contains error.");
                             todo!("Add rollback.");
                         }
+
+                        self.mutated.store(true, Ordering::SeqCst);
+                        self.table_header.mutated.store(true, Ordering::SeqCst);
+                        self.io_sync.write_data(0, &self.table_header.to_bytes().unwrap()).await;
 
                         break;
                     } else {
@@ -1245,8 +1382,8 @@ impl<S: IOOperationsSync> Table<S> {
                         
                         self.in_memory_index = Arc::new(Some(new_chunks));
 
-    
-                        self.table_header.mutated.store(true, Ordering::Relaxed);
+                        self.mutated.store(true, Ordering::SeqCst);
+                        self.table_header.mutated.store(true, Ordering::SeqCst);
                         self.io_sync.write_data(0, &self.table_header.to_bytes().unwrap()).await;
 
                         break;
@@ -1285,7 +1422,7 @@ impl<S: IOOperationsSync> Table<S> {
         
         // Create temporary table
         let temp_io_sync = self.io_sync.create_temp().await;
-        let mut temp_table = Table::init(temp_io_sync, false, false).await.unwrap();
+        let mut temp_table = Table::init("temp".into(), temp_io_sync, false, false).await.unwrap();
         
         // Batch collection for buffering rows before writing to disk
         let mut row_batch: Vec<InsertOrUpdateRow> = Vec::new();
@@ -1293,7 +1430,7 @@ impl<S: IOOperationsSync> Table<S> {
         let mut total_rows_processed: usize = 0;
         
         // Get table mutation status
-        let mutated = self.table_header.mutated.load(Ordering::Relaxed);
+        let mutated = self.table_header.mutated.load(Ordering::SeqCst);
         
         // Check if in-memory indexes are available
         let chunks_arc_clone = self.in_memory_index.clone();
@@ -1426,12 +1563,12 @@ impl<S: IOOperationsSync> Table<S> {
             if !table_locked {
                 continue;
             } else {
-                self.mutated.store(false, Ordering::Relaxed);
                 break;
             }
         }
 
-        self.table_header.mutated.store(false, Ordering::Relaxed);
+        self.mutated.store(false, Ordering::SeqCst);
+        self.table_header.mutated.store(false, Ordering::SeqCst);
         self.io_sync.write_data(0, &self.table_header.to_bytes().unwrap()).await;
         
         debug!("Vacuum completed: processed {} rows", total_rows_processed);

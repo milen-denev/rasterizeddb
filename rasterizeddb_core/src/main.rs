@@ -46,7 +46,7 @@ async fn main() -> std::io::Result<()> {
     )
     .await;
 
-    let mut table = Table::init(io_sync, false, false).await.unwrap();
+    let mut table = Table::init("test_db".into(), io_sync, false, false).await.unwrap();
 
     let insert_query_evaluation = format!(
         r#"
@@ -88,9 +88,9 @@ async fn main() -> std::io::Result<()> {
     "#
     )).unwrap();
 
-    let rows = table.execute_query(query_evaluation.parser_result).await.unwrap();
+    let _result = table.execute_query(query_evaluation.parser_result).await.unwrap();
 
-    println!("total rows from query {:?}", rows.unwrap().len());
+    //println!("total rows from query {:?}", rows.unwrap().len());
 
     return Ok(());
 }
