@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tokio = { version = "1.43.0", features = ["full"] }
+tokio = { version = "1.44.2", features = ["full"] }
 rustls = { version = "0.23.23" }
 tokio-rustls = "0.26.2"
 rustls-pemfile = "2.2.0"
