@@ -25,7 +25,7 @@ use super::{
         row_prefetching_cursor
     },
     row::{InsertOrUpdateRow, Row},
-    storage_providers::traits::IOOperationsSync,
+    storage_providers::traits::StorageIO,
     support_types::{CursorVector, FileChunk, ReturnResult},
     table_ext::extent_non_string_buffer,
     table_header::TableHeader,
@@ -45,7 +45,7 @@ use crate::core::table_ext::process_all_chunks;
 use crate::POSITIONS_CACHE;
 
 #[allow(dead_code)]
-pub struct Table<S: IOOperationsSync> {
+pub struct Table<S: StorageIO> {
     pub(crate) table_name: String,
     pub(crate) io_sync: Box<S>,
     pub(crate) table_header: Arc<TableHeader>,
@@ -57,7 +57,7 @@ pub struct Table<S: IOOperationsSync> {
     pub(crate) mutated: AtomicBool,
 }
 
-impl<S: IOOperationsSync> Clone for Table<S> {
+impl<S: StorageIO> Clone for Table<S> {
     fn clone(&self) -> Self {
         let is_locked = self.locked.load(Ordering::Relaxed);
         let current_file_length = self.current_file_length.load(Ordering::Relaxed);
@@ -78,10 +78,10 @@ impl<S: IOOperationsSync> Clone for Table<S> {
     }
 }
 
-unsafe impl<S: IOOperationsSync> Send for Table<S> {}
-unsafe impl<S: IOOperationsSync> Sync for Table<S> {}
+unsafe impl<S: StorageIO> Send for Table<S> {}
+unsafe impl<S: StorageIO> Sync for Table<S> {}
 
-impl<S: IOOperationsSync> Table<S> {
+impl<S: StorageIO> Table<S> {
     /// #### STABILIZED
     /// Initializes a new table. compressed and immutable are not implemented yet.
     pub async fn init(table_name: String, mut io_sync: S, compressed: bool, immutable: bool) -> io::Result<Table<S>> {

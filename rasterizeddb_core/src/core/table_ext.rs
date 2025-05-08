@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use crate::POSITIONS_CACHE;
 
 #[cfg(feature = "enable_parallelism")]
-use super::{column::Column, helpers::row_prefetching_cursor, row::Row, storage_providers::traits::IOOperationsSync, support_types::FileChunk};
+use super::{column::Column, helpers::row_prefetching_cursor, row::Row, storage_providers::traits::StorageIO, support_types::FileChunk};
 
 #[cfg(feature = "enable_parallelism")]
 use crate::{memory_pool::MEMORY_POOL, rql::{models::{Next, Token}, tokenizer::evaluate_column_result}, simds::endianess::read_u32};
@@ -108,7 +108,7 @@ pub(crate) async fn process_all_chunks(
     limit: u64,
     select_all: bool,
     mutated: bool,
-    io_sync: &Box<impl IOOperationsSync>,
+    io_sync: &Box<impl StorageIO>,
     chunks: Arc<Vec<FileChunk>>,
     parallelism_limit: usize,
 

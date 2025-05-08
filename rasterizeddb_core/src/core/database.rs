@@ -12,7 +12,7 @@ use crate::{
 };
 
 use super::{
-    column::Column, row::{self, InsertOrUpdateRow}, storage_providers::traits::IOOperationsSync, support_types::ReturnResult, table::Table
+    column::Column, row::{self, InsertOrUpdateRow}, storage_providers::traits::StorageIO, support_types::ReturnResult, table::Table
 };
 
 static TCP_SERVER: async_lazy::Lazy<Arc<TcpServer>> = async_lazy::Lazy::new(|| {
@@ -27,15 +27,15 @@ static TCP_SERVER: async_lazy::Lazy<Arc<TcpServer>> = async_lazy::Lazy::new(|| {
     })
 });
 
-pub struct Database<S: IOOperationsSync + Send + Sync + 'static> {
+pub struct Database<S: StorageIO + Send + Sync + 'static> {
     config_table: RwLock<Table<S>>,
     tables: Arc<DashMap<String, Table<S>, RandomState>>,
 }
 
-unsafe impl<S: IOOperationsSync> Send for Database<S> {}
-unsafe impl<S: IOOperationsSync> Sync for Database<S> {}
+unsafe impl<S: StorageIO> Send for Database<S> {}
+unsafe impl<S: StorageIO> Sync for Database<S> {}
 
-impl<S: IOOperationsSync + Send + Sync> Database<S> {
+impl<S: StorageIO + Send + Sync> Database<S> {
     pub async fn new(io_sync: S) -> io::Result<Database<S>> {
         let config_io_sync = io_sync.create_new("CONFIG_TABLE.db".to_string()).await;
         let config_table = Table::init("CONFIG_TABLE".into(), config_io_sync.clone(), false, false).await?;
@@ -279,7 +279,7 @@ impl<S: IOOperationsSync + Send + Sync> Database<S> {
 }
 
 #[allow(unused_variables)]
-pub(crate) async fn process_incoming_queries<S: IOOperationsSync>(
+pub(crate) async fn process_incoming_queries<S: StorageIO>(
     database: Arc<Database<S>>,
     request_vec: Vec<u8>,
 ) -> Vec<u8> {

@@ -9,7 +9,7 @@ use super::{
     column::Column,
     db_type::DbType,
     row::Row,
-    storage_providers::traits::IOOperationsSync,
+    storage_providers::traits::StorageIO,
     support_types::{CursorVector, FileChunk, RowPrefetchResult},
 };
 
@@ -39,7 +39,7 @@ pub(crate) fn read_row_cursor_whole<'a>(
 
 #[inline(always)]
 pub(crate) async fn read_row_columns(
-    io_sync: &Box<impl IOOperationsSync>,
+    io_sync: &Box<impl StorageIO>,
     first_column_index: u64,
     id: u64,
     length: u32,
@@ -84,7 +84,7 @@ pub(crate) async fn read_row_columns(
 #[inline(always)]
 pub(crate) async fn delete_row_file(
     first_column_index: u64,
-    io_sync: &mut Box<impl IOOperationsSync>,
+    io_sync: &mut Box<impl StorageIO>,
 ) -> io::Result<()> {
     // LEN (4)
     let mut position = first_column_index - 4;
@@ -111,7 +111,7 @@ pub(crate) async fn delete_row_file(
 
 #[inline(always)]
 pub(crate) async fn skip_empty_spaces_file(
-    io_sync: &Box<impl IOOperationsSync>,
+    io_sync: &Box<impl StorageIO>,
     file_position: &mut u64,
     file_length: u64,
 ) -> u64 {
@@ -265,7 +265,7 @@ pub(crate) fn skip_empty_spaces_cursor(
 
 #[inline(always)]
 pub(crate) async fn row_prefetching(
-    io_sync: &Box<impl IOOperationsSync>,
+    io_sync: &Box<impl StorageIO>,
     file_position: &mut u64,
     file_length: u64,
     is_mutated: bool
@@ -351,7 +351,7 @@ pub fn row_prefetching_cursor(
 
 #[inline(always)]
 pub(crate) async fn indexed_row_fetching_file(
-    io_sync: &Box<impl IOOperationsSync>,
+    io_sync: &Box<impl StorageIO>,
     position: &mut u64,
     length: u32,
 ) -> io::Result<Row> {

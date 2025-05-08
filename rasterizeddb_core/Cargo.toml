@@ -47,3 +47,4 @@ lto = "fat"
 default = ["enable_parallelism"] # "enable_parallelism"
 enable_index_caching =  []
 enable_parallelism = []
+enable_long_row = []

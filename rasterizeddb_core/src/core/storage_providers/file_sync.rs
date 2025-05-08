@@ -6,7 +6,7 @@ use std::{
 
 use tokio::{io::{AsyncSeekExt, AsyncWriteExt}, sync::RwLock, task::yield_now};
 
-use super::traits::IOOperationsSync;
+use super::traits::StorageIO;
 
 pub struct LocalStorageProvider {
     pub(super) append_file: Arc<RwLock<tokio::fs::File>>,
@@ -149,7 +149,7 @@ impl LocalStorageProvider {
     }
 }
 
-impl IOOperationsSync for LocalStorageProvider {
+impl StorageIO for LocalStorageProvider {
     async fn write_data_unsync(&mut self, position: u64, buffer: &[u8]) {
         let mut file = self.write_file.write().await;
         file.seek(SeekFrom::Start(position)).await.unwrap();

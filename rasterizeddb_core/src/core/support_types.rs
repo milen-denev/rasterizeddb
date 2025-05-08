@@ -1,6 +1,6 @@
 use std::io::Cursor;
 
-use super::{row::Row, storage_providers::traits::IOOperationsSync};
+use super::{row::Row, storage_providers::traits::StorageIO};
 
 #[derive(Debug, Default)]
 pub struct RowPrefetchResult {
@@ -21,7 +21,7 @@ pub struct CursorVector<'a> {
 }
 
 impl FileChunk {
-    pub async fn read_chunk_sync(&self, io_sync: &mut Box<impl IOOperationsSync>) -> Vec<u8> {
+    pub async fn read_chunk_sync(&self, io_sync: &mut Box<impl StorageIO>) -> Vec<u8> {
         let mut current_file_position = self.current_file_position.clone();
 
         let buffer = io_sync
@@ -38,7 +38,7 @@ impl FileChunk {
     pub async fn read_chunk_to_end_sync(
         &self,
         file_position: u64,
-        io_sync: &mut Box<impl IOOperationsSync>,
+        io_sync: &mut Box<impl StorageIO>,
     ) -> Vec<u8> {
         let buffer = io_sync.read_data_to_end(file_position).await;
 

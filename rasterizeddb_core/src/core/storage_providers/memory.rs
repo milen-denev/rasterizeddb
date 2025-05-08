@@ -2,7 +2,7 @@ use std::io::{Cursor, SeekFrom};
 
 use orx_concurrent_vec::ConcurrentVec;
 
-use super::traits::IOOperationsSync;
+use super::traits::StorageIO;
 
 pub struct MemoryStorageProvider {
     vec: ConcurrentVec<u8>,
@@ -24,7 +24,7 @@ impl MemoryStorageProvider {
     }
 }
 
-impl IOOperationsSync for MemoryStorageProvider {
+impl StorageIO for MemoryStorageProvider {
     async fn write_data(&mut self, position: u64, buffer: &[u8]) {
         let end = position + buffer.len() as u64;
 
