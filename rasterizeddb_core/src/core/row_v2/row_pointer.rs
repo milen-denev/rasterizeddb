@@ -178,6 +178,9 @@ impl<'a, S: StorageIO> Iterator for RowPointerIterator<'a, S> {
         use tokio::runtime::Handle;
         if let Ok(handle) = Handle::try_current() {
             return handle.block_on(future).transpose();
+        } else {
+            // If not in an async context, we can't block on the future
+            return None;
         }
     }
 }
@@ -342,6 +345,10 @@ impl RowPointer {
 
         let position = cursor.read_u64::<LittleEndian>()?;
         let deleted = cursor.read_u8()? != 0;
+
+
+        #[cfg(feature = "enable_long_row")]
+        let checksum = cursor.read_u32::<LittleEndian>()?;
 
         #[cfg(feature = "enable_long_row")]
         let cluster = cursor.read_u32::<LittleEndian>()?;
