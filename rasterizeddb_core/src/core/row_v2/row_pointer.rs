@@ -1,6 +1,8 @@
 use crate::core::storage_providers::traits::StorageIO;
-use std::io::Result;
-use byteorder::{LittleEndian, WriteBytesExt};
+use std::io::{Result, Error, ErrorKind};
+use std::marker::PhantomData;
+use byteorder::{LittleEndian, WriteBytesExt, ReadBytesExt};
+use std::io::Cursor;
 
 #[cfg(feature = "enable_long_row")]
 const TOTAL_LENGTH : usize = 
@@ -24,6 +26,161 @@ const TOTAL_LENGTH : usize =
     8 + // position (u64)
     1 // deleted (bool)
     ; 
+
+/// Iterates over RowPointers from a StorageIO in 64KB chunks
+pub struct RowPointerIterator<'a, S: StorageIO> {
+    /// Reference to the storage provider
+    io: &'a mut S,
+    /// Current position in the storage
+    position: u64,
+    /// Buffer to store 64KB chunks
+    buffer: Vec<u8>,
+    /// Current index in the buffer
+    buffer_index: usize,
+    /// Valid data length in the buffer
+    buffer_valid_length: usize,
+    /// Total length of the storage
+    total_length: u64,
+    /// End of data flag
+    end_of_data: bool,
+}
+
+/// Implementation for RowPointerIterator providing methods to create and iterate over RowPointers
+impl<'a, S: StorageIO> RowPointerIterator<'a, S> {
+    /// Create a new RowPointerIterator for the given StorageIO
+    pub async fn new(io: &'a mut S) -> Result<Self> {
+        const CHUNK_SIZE: usize = 64 * 1024; // 64KB chunks
+        
+        let total_length = io.get_len().await;
+        let buffer = Vec::with_capacity(CHUNK_SIZE);
+        
+        let mut iterator = RowPointerIterator {
+            io,
+            position: 0,
+            buffer,
+            buffer_index: 0,
+            buffer_valid_length: 0,
+            total_length,
+            end_of_data: false,
+        };
+        
+        // Load the first chunk of data
+        iterator.load_next_chunk().await?;
+        
+        Ok(iterator)
+    }
+    
+    /// Load the next chunk of data into the buffer
+    async fn load_next_chunk(&mut self) -> Result<()> {
+        const CHUNK_SIZE: usize = 64 * 1024; // 64KB chunks
+        
+        // Reset buffer index
+        self.buffer_index = 0;
+        
+        // Check if we've reached the end of the storage
+        if self.position >= self.total_length {
+            self.end_of_data = true;
+            return Ok(());
+        }
+        
+        // Calculate how many bytes to read (may be less than CHUNK_SIZE at the end)
+        let bytes_remaining = self.total_length - self.position;
+        let bytes_to_read = std::cmp::min(bytes_remaining, CHUNK_SIZE as u64);
+        
+        // Clear the buffer and ensure capacity
+        self.buffer.clear();
+        self.buffer.reserve(bytes_to_read as usize);
+        
+        // Read data into the buffer
+        self.io.read_data_into_buffer(&mut self.position, &mut self.buffer).await;
+        self.buffer_valid_length = self.buffer.len();
+        
+        // Update position for next read
+        self.position += bytes_to_read;
+        
+        Ok(())
+    }
+    
+    /// Get the next RowPointer from the buffer, loading a new chunk if necessary
+    pub async fn next_row_pointer(&mut self) -> Result<Option<RowPointer>> {
+        // If we've reached the end of the data, return None
+        if self.end_of_data {
+            return Ok(None);
+        }
+        
+        // If we've reached the end of the current buffer, load the next chunk
+        if self.buffer_index >= self.buffer_valid_length {
+            self.load_next_chunk().await?;
+            
+            // If loading the next chunk reached the end of data, return None
+            if self.end_of_data {
+                return Ok(None);
+            }
+        }
+        
+        // Check if we have enough data left in the buffer for a complete RowPointer
+        if self.buffer_index + TOTAL_LENGTH > self.buffer_valid_length {
+            // We need to handle the case where a RowPointer spans two chunks
+            // For simplicity, we'll move the remaining data to the beginning of the buffer,
+            // load more data, and then parse the RowPointer
+            let remaining_data = self.buffer[self.buffer_index..].to_vec();
+            self.buffer.clear();
+            self.buffer.extend_from_slice(&remaining_data);
+            
+            // Update buffer index and valid length
+            let remaining_length = remaining_data.len();
+            self.buffer_index = 0;
+            self.buffer_valid_length = remaining_length;
+            
+            // Calculate how many bytes to read
+            let bytes_remaining = self.total_length - (self.position - remaining_length as u64);
+            let bytes_to_read = std::cmp::min(bytes_remaining, (64 * 1024 - remaining_length) as u64);
+            
+            // Read more data into the buffer
+            let mut temp_position = self.position - remaining_length as u64 + bytes_to_read;
+            self.io.read_data_into_buffer(&mut temp_position, &mut self.buffer).await;
+            self.buffer_valid_length = self.buffer.len();
+            
+            // Update position for next read
+            self.position += bytes_to_read;
+            
+            // If we still don't have enough data for a complete RowPointer, return None
+            if self.buffer_valid_length < TOTAL_LENGTH {
+                self.end_of_data = true;
+                return Ok(None);
+            }
+        }
+        
+        // Parse the RowPointer from the buffer
+        let slice = &self.buffer[self.buffer_index..self.buffer_index + TOTAL_LENGTH];
+        let row_pointer = RowPointer::from_vec(slice)?;
+        
+        // Advance the buffer index
+        self.buffer_index += TOTAL_LENGTH;
+        
+        Ok(Some(row_pointer))
+    }
+}
+
+// Implement the Iterator trait for RowPointerIterator for synchronous usage
+impl<'a, S: StorageIO> Iterator for RowPointerIterator<'a, S> {
+    type Item = Result<RowPointer>;
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        // Since the actual implementation is async, this provides a blocking wrapper
+        // This is not ideal for production use but shows how the iterator would work
+        // In a real implementation, we'd use a proper async iterator pattern
+        
+        // Create a future and block on it
+        let future = self.next_row_pointer();
+        
+       
+        use tokio::runtime::Handle;
+        if let Ok(handle) = Handle::try_current() {
+            return handle.block_on(future).transpose();
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct RowPointer{
