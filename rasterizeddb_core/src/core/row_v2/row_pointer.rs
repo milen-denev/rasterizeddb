@@ -1,8 +1,7 @@
-use crate::core::storage_providers::traits::StorageIO;
-use std::io::{Result, Error, ErrorKind};
-use std::marker::PhantomData;
-use byteorder::{LittleEndian, WriteBytesExt, ReadBytesExt};
-use std::io::Cursor;
+use crate::{core::storage_providers::traits::StorageIO, memory_pool::MemoryBlockWrapper};
+use crate::memory_pool::MEMORY_POOL;
+use std::io::Result;
+use byteorder::{LittleEndian, WriteBytesExt};
 
 #[cfg(feature = "enable_long_row")]
 const TOTAL_LENGTH : usize = 
@@ -153,7 +152,7 @@ impl<'a, S: StorageIO> RowPointerIterator<'a, S> {
         
         // Parse the RowPointer from the buffer
         let slice = &self.buffer[self.buffer_index..self.buffer_index + TOTAL_LENGTH];
-        let row_pointer = RowPointer::from_vec(slice)?;
+        let row_pointer = RowPointer::from_slice(slice)?;
         
         // Advance the buffer index
         self.buffer_index += TOTAL_LENGTH;
@@ -280,8 +279,10 @@ impl RowPointer {
     }
 
     /// Serializes the RowPointer into a Vec<u8>
-    pub fn into_vec(&self) -> Vec<u8> {
-        let mut buffer = Vec::with_capacity(TOTAL_LENGTH);
+    pub fn into_wrapper(&self) -> MemoryBlockWrapper {
+        let block = MEMORY_POOL.acquire(TOTAL_LENGTH as u32);
+        let mut wrapper = unsafe { block.into_wrapper() };
+        let buffer = wrapper.as_vec_mut();
         
         // Write all fields in order
         #[cfg(feature = "enable_long_row")]
@@ -308,26 +309,26 @@ impl RowPointer {
             buffer.write_u8(self.is_active as u8).unwrap();
        }
   
-        buffer
+        wrapper
     }
     
     /// Writes the RowPointer to the given StorageIO at the specified position
     pub async fn write_to_io<S: StorageIO>(&self, io: &mut S) -> Result<()> {
-        let buffer = self.into_vec();
+        let wrapper = self.into_wrapper();
 
         let position = io.get_len().await;
 
         // Write data to storage
-        io.append_data(buffer.as_slice()).await;
+        io.append_data(wrapper.as_slice()).await;
         
         // Verify written data
-        io.verify_data_and_sync(position, &buffer).await;
+        io.verify_data_and_sync(position, wrapper.as_slice()).await;
         
         Ok(())
     }
     
-    /// Deserializes a Vec<u8> into a RowPointer
-    pub fn from_vec(buffer: &[u8]) -> Result<Self> {
+    /// Deserializes a slice of u8 into a RowPointer
+    pub fn from_slice(buffer: &[u8]) -> Result<Self> {
         use byteorder::{LittleEndian, ReadBytesExt};
         use std::io::Cursor;
         
@@ -393,11 +394,17 @@ impl RowPointer {
     
     /// Reads a RowPointer from the given StorageIO at the specified position
     pub async fn read_from_io<S: StorageIO>(io: &mut S, position: &mut u64) -> Result<Self> {
-        let mut buffer = Vec::with_capacity(TOTAL_LENGTH as usize);
 
+        let block = MEMORY_POOL.acquire(TOTAL_LENGTH as u32);
+        let mut wrapper = unsafe { block.into_wrapper() };
+        let mut vec = wrapper.as_vec_mut();
+        
         // Read all data in one operation
-        io.read_data_into_buffer(position, &mut buffer).await;
+        io.read_data_into_buffer(position, &mut vec).await;
 
-        Self::from_vec(&buffer)
+        let row_pointer = Self::from_slice(&vec)?;
+        drop(block);
+
+        Ok(row_pointer)
     }
 }
