@@ -20,14 +20,14 @@ impl MemoryPool {
     }
 
     #[inline(always)]
-    pub fn acquire(&self, size: u32) -> MemoryChunk {
+    pub fn acquire(&self, size: u32) -> MemoryBlock {
         let ptr = unsafe { mi_malloc(size as usize) as *mut u8 };
 
         if ptr.is_null() {
             panic!("Allocation failed (likely OOM).");
         }
 
-        MemoryChunk {
+        MemoryBlock {
             ptr,
             size
         }
@@ -46,21 +46,21 @@ impl MemoryPool {
 }
 
 #[derive(Debug, Clone)]
-pub struct MemoryChunk {
+pub struct MemoryBlock {
     pub ptr: *mut u8,
     pub size: u32
 }
 
-unsafe impl Send for MemoryChunk {}
-unsafe impl Sync for MemoryChunk {}
+unsafe impl Send for MemoryBlock {}
+unsafe impl Sync for MemoryBlock {}
 
-impl Drop for MemoryChunk {
+impl Drop for MemoryBlock {
     fn drop(&mut self) {
         MEMORY_POOL.release(self.ptr);
     }
 }
 
-impl MemoryChunk {
+impl MemoryBlock {
     pub fn prefetch_to_lcache(&self) {
         unsafe { _mm_prefetch::<_MM_HINT_T0>(self.ptr as *const i8) };
     }
@@ -74,32 +74,39 @@ impl MemoryChunk {
         memory_chunk
     }
 
-    pub unsafe fn into_vec(&self) -> ChunkIntoVecResult {
-        ChunkIntoVecResult::ManualVec(unsafe { ref_vec(self.ptr, self.size as usize) })
+    pub unsafe fn into_wrapper(&self) -> MemoryBlockWrapper {
+        MemoryBlockWrapper {
+            data: unsafe { ref_vec(self.ptr, self.size as usize) },
+            ptr: self.ptr,
+            size: self.size,
+        }
     }
 }
 
 #[derive(Debug)]
-pub enum ChunkIntoVecResult {
-    ManualVec(ManuallyDrop<Vec<u8>>),
+pub struct  MemoryBlockWrapper {
+    pub data: ManuallyDrop<Vec<u8>>,
+    pub ptr: *mut u8,
+    pub size: u32
 }
 
-impl ChunkIntoVecResult {
+impl MemoryBlockWrapper {
     pub fn as_vec(&self) -> &Vec<u8> {
-        match self {
-            ChunkIntoVecResult::ManualVec(v) => v,
-        }
+        &self.data
     }
 
     pub fn as_vec_mut(&mut self) -> &mut Vec<u8> {
-        match self {
-            ChunkIntoVecResult::ManualVec(v) => v,
-        }
+        &mut self.data
     }
 
     pub fn as_slice(&self) -> &[u8] {
-        match self {
-            ChunkIntoVecResult::ManualVec(v) => v.as_slice(),
+        &self.data
+    }
+
+    pub fn into_block(self) -> MemoryBlock {
+        MemoryBlock {
+            ptr: self.ptr,
+            size: self.size
         }
     }
 }
