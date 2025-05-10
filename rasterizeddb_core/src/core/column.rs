@@ -12,7 +12,7 @@ use crate::{
         compare_raw_vecs, compare_vecs_ends_with, compare_vecs_eq, compare_vecs_ne,
         compare_vecs_starts_with, contains_subsequence, vec_from_ptr_safe,
     },
-    memory_pool::MemoryChunk,
+    memory_pool::MemoryBlock,
     simds::endianess::{
         read_f32, read_f64, read_i128, read_i16, read_i32, read_i64, read_i8, read_u128, read_u16,
         read_u32, read_u64, read_u8,
@@ -52,7 +52,7 @@ impl Default for Column {
 #[derive(Debug)]
 pub enum ColumnValue {
     TempHolder((DbType, Vec<u8>)),
-    StaticMemoryPointer(MemoryChunk),
+    StaticMemoryPointer(MemoryBlock),
     ManagedMemoryPointer(Pin<Box<Vec<u8>>>),
 }
 
@@ -450,10 +450,10 @@ impl Column {
     }
 
     // Vector must be dropped before dropping column
-    pub unsafe fn into_chunk(self) -> io::Result<MemoryChunk> {
+    pub unsafe fn into_chunk(self) -> io::Result<MemoryBlock> {
         let chunk = match self.content {
             ColumnValue::StaticMemoryPointer(chunk) => chunk,
-            ColumnValue::ManagedMemoryPointer(vec) => MemoryChunk::from_vec(vec_from_ptr_safe(vec.as_ptr() as *mut u8, vec.len())),
+            ColumnValue::ManagedMemoryPointer(vec) => MemoryBlock::from_vec(vec_from_ptr_safe(vec.as_ptr() as *mut u8, vec.len())),
             _ => panic!("Operation is not supported, column is in temporary state."),
         };
 
@@ -514,8 +514,8 @@ impl Column {
         self.data_type = db_type;
     }
 
-    pub fn from_chunk(data_type: u8, chunk: MemoryChunk) -> Column {
-        let vec = unsafe { chunk.into_vec() };
+    pub fn from_chunk(data_type: u8, chunk: MemoryBlock) -> Column {
+        let vec = unsafe { chunk.into_wrapper() };
         
         Column {
             data_type: DbType::from_byte(data_type),
@@ -557,7 +557,7 @@ impl Column {
                 data_buffer.append(&mut temp_buffer.to_vec());
             }
 
-            let memory_chunk = MemoryChunk::from_vec(data_buffer.to_vec());
+            let memory_chunk = MemoryBlock::from_vec(data_buffer.to_vec());
             let column = Column::from_chunk(column_type, memory_chunk);
 
             columns.push(column);

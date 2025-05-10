@@ -518,7 +518,7 @@ impl<S: StorageIO> Table<S> {
                                         let size = db_type.get_size();
                                         let memory_chunk = MEMORY_POOL.acquire(size);
 
-                                        let mut data_buffer = unsafe { memory_chunk.into_vec() };
+                                        let mut data_buffer = unsafe { memory_chunk.into_wrapper() };
 
                                         extent_non_string_buffer(
                                             data_buffer.as_vec_mut(),
@@ -558,7 +558,7 @@ impl<S: StorageIO> Table<S> {
                                         let str_memory_chunk = MEMORY_POOL.acquire(str_length);
                 
                                         let mut preset_buffer =
-                                            unsafe { str_memory_chunk.into_vec() };
+                                            unsafe { str_memory_chunk.into_wrapper() };
                 
                                         let preset_buffer_slice = preset_buffer.as_vec_mut();
  
@@ -728,7 +728,7 @@ impl<S: StorageIO> Table<S> {
                             if column_indexes.iter().any(|x| *x == column_index_inner) {
                                 let memory_chunk = MEMORY_POOL.acquire(prefetch_result.length + 1);
 
-                                let mut data_buffer = unsafe { memory_chunk.into_vec() };
+                                let mut data_buffer = unsafe { memory_chunk.into_wrapper() };
 
                                 let column_type = columns_cursor.read_u8().unwrap();
 

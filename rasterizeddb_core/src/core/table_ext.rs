@@ -246,7 +246,7 @@ pub(crate) async fn process_chunk_async(
                         let size = db_type.get_size();
                         let memory_chunk = MEMORY_POOL.acquire(size);
 
-                        let mut data_buffer = unsafe { memory_chunk.into_vec() };
+                        let mut data_buffer = unsafe { memory_chunk.into_wrapper() };
 
                         extent_non_string_buffer(
                             data_buffer.as_vec_mut(),
@@ -286,7 +286,7 @@ pub(crate) async fn process_chunk_async(
                         let str_memory_chunk = MEMORY_POOL.acquire(str_length);
 
                         let mut preset_buffer =
-                            unsafe { str_memory_chunk.into_vec() };
+                            unsafe { str_memory_chunk.into_wrapper() };
 
                         let preset_buffer_slice = preset_buffer.as_vec_mut();
 

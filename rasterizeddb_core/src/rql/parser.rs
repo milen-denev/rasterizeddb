@@ -1,6 +1,6 @@
 use crate::{
     core::{column::Column, hashing::get_hash, row::InsertOrUpdateRow},
-    memory_pool::MemoryChunk
+    memory_pool::MemoryBlock
 };
 
 #[cfg(feature = "enable_index_caching")]
@@ -477,7 +477,7 @@ fn parse_where_clause(where_clause: &str) -> Vec<(Vec<Token>, Option<Next>)> {
             tokens_vector.push((new_vector, Some(Next::Or)));
         } else if token.starts_with('\'') && token.ends_with('\'') {
             let string = &token[1..token.len() - 1];
-            let column = Column::from_chunk(14, MemoryChunk::from_vec(string.as_bytes().to_vec()));
+            let column = Column::from_chunk(14, MemoryBlock::from_vec(string.as_bytes().to_vec()));
             let val = Token::Value(column);
             token_vector.push(val);
         } else {
