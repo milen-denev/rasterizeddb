@@ -1,7 +1,13 @@
-use crate::{core::storage_providers::traits::StorageIO, memory_pool::MemoryBlockWrapper};
-use crate::memory_pool::MEMORY_POOL;
-use std::io::Result;
+use super::error::Result;
 use byteorder::{LittleEndian, WriteBytesExt};
+
+use crate::{
+    core::{
+        storage_providers::traits::StorageIO, 
+        row_v2::row::{Row, Column, RowFetch},
+    }, 
+    memory_pool::{MemoryBlockWrapper, MEMORY_POOL}
+};
 
 #[cfg(feature = "enable_long_row")]
 const TOTAL_LENGTH : usize = 
@@ -75,8 +81,7 @@ impl<'a, S: StorageIO> RowPointerIterator<'a, S> {
         
         // Reset buffer index
         self.buffer_index = 0;
-        
-        // Check if we've reached the end of the storage
+          // Check if we've reached the end of the storage
         if self.position >= self.total_length {
             self.end_of_data = true;
             return Ok(());
@@ -406,5 +411,70 @@ impl RowPointer {
         drop(block);
 
         Ok(row_pointer)
+    }
+
+    /// Fetches specific columns of a row based on the RowFetch specification
+    /// 
+    /// This method reads only the columns specified in the RowFetch rather than the entire row,
+    /// which can be more efficient for queries that only need specific columns.
+    /// 
+    /// # Arguments
+    /// 
+    /// * `io` - The storage I/O provider to read from
+    /// * `row_fetch` - Specification of which columns to fetch and their positions/sizes
+    /// 
+    /// # Returns
+    /// 
+    /// A Result containing the constructed Row with only the requested columns
+    pub async fn fetch_row<S: StorageIO>(&self, io: &mut S, row_fetch: &RowFetch) -> Result<Row> {
+        // Skip fetching if the row is marked as deleted
+        if self.deleted {
+            return Err(super::error::RowError::NotFound("Row is marked as deleted".into()));
+        }
+
+        // Calculate the total size of all columns we need to fetch
+        // let total_columns_size: u32 = row_fetch.columns_fetching_data.iter()
+        //     .map(|cfd| cfd.size)
+        //     .sum();
+
+        // Create a vector to hold all the columns
+        let mut columns = Vec::with_capacity(row_fetch.columns_fetching_data.len());
+        
+        // For each column specified in the fetch data
+        for column_data in &row_fetch.columns_fetching_data {
+            // Calculate the absolute position of this column in storage
+            let column_absolute_position = self.position + column_data.column_position as u64;
+            
+            // Seek to the column position
+            let mut read_position = column_absolute_position;
+            
+            // Allocate memory for the column data
+            let block = MEMORY_POOL.acquire(column_data.size);
+            let mut wrapper = unsafe { block.into_wrapper() };
+            let mut buffer = wrapper.as_vec_mut();
+            
+            // Read the column data directly into our buffer
+            io.read_data_into_buffer(&mut read_position, &mut buffer).await;
+              // Create a Column object with the read data
+            let column = Column {
+                schema_id: 0, // Schema ID would be set based on metadata or query context
+                data: wrapper,
+                column_type: column_data.column_type.clone(), // Clone the DbType
+            };
+            
+            columns.push(column);
+        }
+        
+        // Create and return the Row with just the fetched columns
+        Ok(Row {
+            position: self.position,
+            columns,
+            
+            #[cfg(feature = "enable_long_row")]
+            length: self.length,
+            
+            #[cfg(not(feature = "enable_long_row"))]
+            length: self.length,
+        })
     }
 }

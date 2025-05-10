@@ -1,7 +1,6 @@
 use crate::{core::db_type::DbType, memory_pool::MemoryBlockWrapper};
 
 pub struct RowFetch {
-    pub position: u64,
     pub columns_fetching_data: Vec<ColumnFetchingData>
 }
 
@@ -12,7 +11,6 @@ pub struct ColumnFetchingData {
 }
 
 pub struct RowWrite {
-    pub position: u64,
     pub columns_writing_data: Vec<ColumnWritingData>
 }
 
