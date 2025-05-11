@@ -20,7 +20,7 @@ impl MemoryPool {
     }
 
     #[inline(always)]
-    pub fn acquire(&self, size: u32) -> MemoryBlock {
+    pub fn acquire(&self, size: usize) -> MemoryBlock {
         let ptr = unsafe { mi_malloc(size as usize) as *mut u8 };
 
         if ptr.is_null() {
@@ -48,7 +48,7 @@ impl MemoryPool {
 #[derive(Debug, Clone)]
 pub struct MemoryBlock {
     pub ptr: *mut u8,
-    pub size: u32
+    pub size: usize
 }
 
 unsafe impl Send for MemoryBlock {}
@@ -67,7 +67,7 @@ impl MemoryBlock {
 
     // Create a new chunk from a vector with no memory chunk allocated from pool
     pub fn from_vec(vec: Vec<u8>) -> Self {
-        let len = vec.len() as u32;
+        let len = vec.len();
         let memory_chunk = MEMORY_POOL.acquire(len);
         copy_vec_to_ptr(vec.as_slice(), memory_chunk.ptr);
         drop(vec);
@@ -87,7 +87,7 @@ impl MemoryBlock {
 pub struct  MemoryBlockWrapper {
     pub data: ManuallyDrop<Vec<u8>>,
     pub ptr: *mut u8,
-    pub size: u32
+    pub size: usize
 }
 
 impl MemoryBlockWrapper {
