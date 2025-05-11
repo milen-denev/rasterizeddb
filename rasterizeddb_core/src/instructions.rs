@@ -87,8 +87,8 @@ pub(crate) fn compare_vecs_ends_with(vec1: &[u8], vec2: &[u8]) -> bool {
 pub unsafe fn compare_raw_vecs(
     vec_a: *mut u8,
     vec_b: *mut u8,
-    vec_a_len: u32,
-    vec_b_len: u32,
+    vec_a_len: usize,
+    vec_b_len: usize,
 ) -> bool {
     let mut result: u8;
 
