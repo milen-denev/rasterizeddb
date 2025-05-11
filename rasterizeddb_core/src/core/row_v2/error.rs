@@ -33,6 +33,8 @@ pub enum RowError {
     InvalidColumn(String),
     /// Deleted row errors
     DeletedRow(String),
+    /// Saving failed errors
+    SavingFailed(String),
     /// General errors with custom message
     Other(String)
 }
@@ -54,6 +56,7 @@ impl fmt::Display for RowError {
             RowError::InvalidLength(msg) => write!(f, "Invalid length: {}", msg),
             RowError::InvalidColumn(msg) => write!(f, "Invalid column: {}", msg),
             RowError::DeletedRow(msg) => write!(f, "Deleted row: {}", msg),
+            RowError::SavingFailed(msg) => write!(f, "Saving failed: {}", msg),
             RowError::Other(msg) => write!(f, "Error: {}", msg),
         }
     }
