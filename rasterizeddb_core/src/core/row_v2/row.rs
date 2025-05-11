@@ -1,21 +1,21 @@
-use crate::{core::db_type::DbType, memory_pool::MemoryBlockWrapper};
+use crate::{core::db_type::DbType, memory_pool::MemoryBlock};
 
 pub struct RowFetch {
     pub columns_fetching_data: Vec<ColumnFetchingData>
 }
 
 pub struct ColumnFetchingData {
-    pub column_position: u32,
+    pub column_offset: u32,
     pub column_type: DbType,
     pub size: u32
 }
 
 pub struct RowWrite {
-    pub columns_writing_data: Vec<ColumnWritingData>
+    pub columns_writing_data: Vec<ColumnWritePayload>
 }
 
-pub struct ColumnWritingData {
-    pub data: MemoryBlockWrapper,
+pub struct ColumnWritePayload {
+    pub data: MemoryBlock,
     pub write_order: u32,
     pub column_type: DbType,
     pub size: u32
@@ -34,7 +34,7 @@ pub struct Row {
 
 pub struct Column {
     pub schema_id: u64,
-    pub data: MemoryBlockWrapper,
+    pub data: MemoryBlock,
     pub column_type: DbType,
 }
 
