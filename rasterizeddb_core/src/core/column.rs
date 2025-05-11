@@ -99,7 +99,7 @@ impl Clone for ColumnValue {
 impl ColumnValue {
     pub fn len(&self) -> u32 {
         match self {
-            ColumnValue::StaticMemoryPointer(chunk) => chunk.size,
+            ColumnValue::StaticMemoryPointer(chunk) => chunk.size as u32,
             ColumnValue::ManagedMemoryPointer(vec) => vec.len() as u32,
             _ => panic!("Operation is not supported, column is in temporary state."),
         }
