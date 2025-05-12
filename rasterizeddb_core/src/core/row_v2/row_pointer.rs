@@ -1,4 +1,4 @@
-use std::sync::atomic::AtomicU64;
+use std::{io::Cursor, sync::atomic::AtomicU64};
 
 use super::{error::Result, row::RowWrite};
 use byteorder::{LittleEndian, WriteBytesExt};
@@ -35,6 +35,17 @@ const TOTAL_LENGTH : usize =
     1 // deleted (bool)
     ; 
 
+#[cfg(feature = "enable_long_row")]
+#[cfg(not(debug_assertions))]
+const CHUNK_SIZE: usize = 5 * 695 * 92; // ~320KB chunks
+
+#[cfg(feature = "enable_long_row")]
+#[cfg(debug_assertions)]
+const CHUNK_SIZE: usize = 92 * 2; // 92 * 2 bytes chunks for debugging
+
+#[cfg(not(feature = "enable_long_row"))]
+const CHUNK_SIZE: usize = 3047 * 21; // ~64KB chunks
+
 // TODO replace with fastcrc32
 const CRC: Crc::<u32>  = Crc::<u32>::new(&CRC_32_ISO_HDLC);
 
@@ -51,7 +62,7 @@ pub struct RowPointerIterator<'a, S: StorageIO> {
     /// Valid data length in the buffer
     buffer_valid_length: usize,
     /// Total length of the storage
-    total_length: u64,
+    total_length: usize,
     /// End of data flag
     end_of_data: bool,
 }
@@ -60,11 +71,16 @@ pub struct RowPointerIterator<'a, S: StorageIO> {
 impl<'a, S: StorageIO> RowPointerIterator<'a, S> {
     /// Create a new RowPointerIterator for the given StorageIO
     pub async fn new(io: &'a mut S) -> Result<Self> {
-        const CHUNK_SIZE: usize = 64 * 1024; // 64KB chunks
-        
-        let total_length = io.get_len().await;
-        let buffer = Vec::with_capacity(CHUNK_SIZE);
-        
+        let total_length = io.get_len().await as usize;
+
+        let buffer_size = if total_length > CHUNK_SIZE {
+            CHUNK_SIZE
+        } else {
+            total_length
+        };
+
+        let buffer = vec![0u8; buffer_size];
+
         let mut iterator = RowPointerIterator {
             io,
             position: 0,
@@ -83,26 +99,26 @@ impl<'a, S: StorageIO> RowPointerIterator<'a, S> {
     
     /// Load the next chunk of data into the buffer
     async fn load_next_chunk(&mut self) -> Result<()> {
-        const CHUNK_SIZE: usize = 64 * 1024; // 64KB chunks
-        
         // Reset buffer index
         self.buffer_index = 0;
-          // Check if we've reached the end of the storage
-        if self.position >= self.total_length {
+
+        // Check if we've reached the end of the storage
+        if self.position >= self.total_length as u64 {
             self.end_of_data = true;
             return Ok(());
         }
         
         // Calculate how many bytes to read (may be less than CHUNK_SIZE at the end)
-        let bytes_remaining = self.total_length - self.position;
+        let bytes_remaining = self.total_length as u64 - self.position;
         let bytes_to_read = std::cmp::min(bytes_remaining, CHUNK_SIZE as u64);
         
         // Clear the buffer and ensure capacity
         self.buffer.clear();
-        self.buffer.reserve(bytes_to_read as usize);
+        self.buffer.resize(bytes_to_read as usize, 0);
         
         // Read data into the buffer
-        self.io.read_data_into_buffer(&mut self.position, &mut self.buffer).await;
+        let mut read_position = self.position;
+        self.io.read_data_into_buffer(&mut read_position, &mut self.buffer).await;
         self.buffer_valid_length = self.buffer.len();
         
         // Update position for next read
@@ -131,28 +147,39 @@ impl<'a, S: StorageIO> RowPointerIterator<'a, S> {
         // Check if we have enough data left in the buffer for a complete RowPointer
         if self.buffer_index + TOTAL_LENGTH > self.buffer_valid_length {
             // We need to handle the case where a RowPointer spans two chunks
-            // For simplicity, we'll move the remaining data to the beginning of the buffer,
-            // load more data, and then parse the RowPointer
             let remaining_data = self.buffer[self.buffer_index..].to_vec();
+            let remaining_length = remaining_data.len();
+            
+            // Reset buffer with the remaining data
             self.buffer.clear();
             self.buffer.extend_from_slice(&remaining_data);
             
             // Update buffer index and valid length
-            let remaining_length = remaining_data.len();
             self.buffer_index = 0;
             self.buffer_valid_length = remaining_length;
             
-            // Calculate how many bytes to read
-            let bytes_remaining = self.total_length - (self.position - remaining_length as u64);
-            let bytes_to_read = std::cmp::min(bytes_remaining, (64 * 1024 - remaining_length) as u64);
+            // Calculate how many additional bytes to read
+            let additional_bytes_needed = TOTAL_LENGTH - remaining_length;
             
-            // Read more data into the buffer
-            let mut temp_position = self.position - remaining_length as u64 + bytes_to_read;
-            self.io.read_data_into_buffer(&mut temp_position, &mut self.buffer).await;
+            // Check if there's enough data left in the storage
+            let bytes_remaining_in_storage = self.total_length as u64 - (self.position - remaining_length as u64);
+            
+            if bytes_remaining_in_storage < additional_bytes_needed as u64 {
+                self.end_of_data = true;
+                return Ok(None);
+            }
+            
+            // Read the additional bytes
+            let mut additional_data = vec![0u8; additional_bytes_needed];
+            let mut read_position = self.position - remaining_length as u64;
+            self.io.read_data_into_buffer(&mut read_position, &mut additional_data).await;
+            
+            // Append the additional data to the buffer
+            self.buffer.extend_from_slice(&additional_data);
             self.buffer_valid_length = self.buffer.len();
             
             // Update position for next read
-            self.position += bytes_to_read;
+            self.position = read_position + additional_bytes_needed as u64;
             
             // If we still don't have enough data for a complete RowPointer, return None
             if self.buffer_valid_length < TOTAL_LENGTH {
@@ -345,30 +372,35 @@ impl RowPointer {
         let block = MEMORY_POOL.acquire(TOTAL_LENGTH as usize);
         let mut wrapper = unsafe { block.into_wrapper() };
         let buffer = wrapper.as_vec_mut();
-        
+ 
+        debug_assert!(buffer.len() == TOTAL_LENGTH, "Buffer size mismatch");
+
+        let mut cursor = Cursor::new(buffer);
+        cursor.set_position(0);
+
         // Write all fields in order
         #[cfg(feature = "enable_long_row")]
-        buffer.write_u128::<LittleEndian>(self.id).unwrap();
+        cursor.write_u128::<LittleEndian>(self.id).unwrap();
         #[cfg(feature = "enable_long_row")]
-        buffer.write_u64::<LittleEndian>(self.length).unwrap();
+        cursor.write_u64::<LittleEndian>(self.length).unwrap();
 
         #[cfg(not(feature = "enable_long_row"))]
-        buffer.write_u64::<LittleEndian>(self.id).unwrap();
+        cursor.write_u64::<LittleEndian>(self.id).unwrap();
         #[cfg(not(feature = "enable_long_row"))]
-        buffer.write_u32::<LittleEndian>(self.length).unwrap();
+        cursor.write_u32::<LittleEndian>(self.length).unwrap();
 
-        buffer.write_u64::<LittleEndian>(self.position).unwrap();
-        buffer.write_u8(self.deleted as u8).unwrap();
+        cursor.write_u64::<LittleEndian>(self.position).unwrap();
+        cursor.write_u8(self.deleted as u8).unwrap();
 
        #[cfg(feature = "enable_long_row")]
        {
-            buffer.write_u32::<LittleEndian>(self.checksum).unwrap();
-            buffer.write_u32::<LittleEndian>(self.cluster).unwrap();
-            buffer.write_u128::<LittleEndian>(self.deleted_at).unwrap();
-            buffer.write_u128::<LittleEndian>(self.created_at).unwrap();
-            buffer.write_u128::<LittleEndian>(self.updated_at).unwrap();
-            buffer.write_u16::<LittleEndian>(self.version).unwrap();
-            buffer.write_u8(self.is_active as u8).unwrap();
+            cursor.write_u32::<LittleEndian>(self.checksum).unwrap();
+            cursor.write_u32::<LittleEndian>(self.cluster).unwrap();
+            cursor.write_u128::<LittleEndian>(self.deleted_at).unwrap();
+            cursor.write_u128::<LittleEndian>(self.created_at).unwrap();
+            cursor.write_u128::<LittleEndian>(self.updated_at).unwrap();
+            cursor.write_u16::<LittleEndian>(self.version).unwrap();
+            cursor.write_u8(self.is_active as u8).unwrap();
        }
   
         block
@@ -578,13 +610,14 @@ impl RowPointer {
 
         let total_bytes = row_write.columns_writing_data.iter().map(|col| col.size as u64).sum::<u64>();
 
+        // Allocate memory to store the row data
         let block = MEMORY_POOL.acquire(total_bytes as usize);
         let mut wrapper = unsafe { block.into_wrapper() };
         let buffer = wrapper.as_vec_mut();
 
         let mut row_position = 0;
 
-        // Write the row data to the rows_io
+        // Write each column data into the buffer
         for column in row_write.columns_writing_data.iter().sorted_by(|a, b| a.write_order.cmp(&b.write_order)) {
             let end_of_column = row_position + column.size as u64;
             let column_data_wrapper = unsafe { column.data.into_wrapper() };
@@ -595,6 +628,7 @@ impl RowPointer {
             row_position = end_of_column;
         }
 
+        // Write the row data to the rows_io
         rows_io.append_data(buffer.as_slice()).await;
         let write_result = rows_io.verify_data_and_sync(io_position, buffer.as_slice()).await;
 
@@ -610,5 +644,128 @@ impl RowPointer {
 
 #[cfg(test)]
 mod tests {
+    use crate::core::storage_providers::mock_file_sync::MockStorageProvider;
+    use super::*;
+
+    // Helper function to create a row pointer and return its serialized form
+    fn create_test_row_pointer(id: u64, position: u64, length: u32, deleted: bool) -> RowPointer {
+        #[cfg(feature = "enable_long_row")]
+        {
+            RowPointer {
+                id: id as u128,
+                length: length as u64,
+                position,
+                deleted,
+                checksum: 0,
+                cluster: 0,
+                deleted_at: 0,
+                created_at: 0,
+                updated_at: 0,
+                version: 0,
+                is_active: true,
+            }
+        }
+        
+        #[cfg(not(feature = "enable_long_row"))]
+        {
+            RowPointer {
+                id,
+                length,
+                position,
+                deleted,
+            }
+        }
+    }
     
+    #[tokio::test]
+    async fn test_row_pointer_iterator_empty() {
+        let mut mock_io = MockStorageProvider::new().await;
+        
+        let mut iterator = RowPointerIterator::new(&mut mock_io).await.unwrap();
+        
+        // Should return None for an empty storage
+        assert!(iterator.next_row_pointer().await.unwrap().is_none());
+    }
+    
+    #[tokio::test]
+    async fn test_row_pointer_iterator_single_pointer() {
+        // Create a single row pointer
+        let row_pointer = create_test_row_pointer(1, 100, 50, false);
+
+        let mut mock_io = MockStorageProvider::new().await;
+        
+        row_pointer.save(&mut mock_io).await.unwrap();
+
+        let mut row_pointer_iterator = RowPointerIterator::new(&mut mock_io).await.unwrap();
+        
+        // Should return our row pointer
+        let read_pointer = row_pointer_iterator.next_row_pointer().await.unwrap().unwrap();
+        
+        assert_eq!(read_pointer.id, 1);
+        assert_eq!(read_pointer.position, 100);
+        assert_eq!(read_pointer.length, 50);
+        assert_eq!(read_pointer.deleted, false);
+        
+
+        assert!(row_pointer_iterator.next_row_pointer().await.unwrap().is_none());
+    }
+    
+    #[tokio::test]
+    async fn test_row_pointer_iterator_2_pointers() {
+        // Create a single row pointer
+        let row_pointer = create_test_row_pointer(1, 100, 50, false);
+
+        let mut mock_io = MockStorageProvider::new().await;
+        
+        row_pointer.save(&mut mock_io).await.unwrap();
+        row_pointer.save(&mut mock_io).await.unwrap();
+
+        let mut row_pointer_iterator = RowPointerIterator::new(&mut mock_io).await.unwrap();
+        
+        // Should return our row pointer
+        let read_pointer = row_pointer_iterator.next_row_pointer().await.unwrap().unwrap();
+        
+        assert_eq!(read_pointer.id, 1);
+        assert_eq!(read_pointer.position, 100);
+        assert_eq!(read_pointer.length, 50);
+        assert_eq!(read_pointer.deleted, false);
+        
+        // Next call should return None
+        assert!(row_pointer_iterator.next_row_pointer().await.unwrap().is_some());
+        assert!(row_pointer_iterator.next_row_pointer().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_row_pointer_iterator_3_pointers() {
+        // Create a single row pointer
+        let row_pointer = create_test_row_pointer(1, 100, 50, false);
+        let row_pointer2 = create_test_row_pointer(2, 150, 100, false);
+
+        let mut mock_io = MockStorageProvider::new().await;
+        
+        row_pointer.save(&mut mock_io).await.unwrap();
+        row_pointer2.save(&mut mock_io).await.unwrap();
+        row_pointer.save(&mut mock_io).await.unwrap();
+
+        let mut row_pointer_iterator = RowPointerIterator::new(&mut mock_io).await.unwrap();
+        
+        // Should return our row pointer
+        let read_pointer = row_pointer_iterator.next_row_pointer().await.unwrap().unwrap();
+        
+        assert_eq!(read_pointer.id, 1);
+        assert_eq!(read_pointer.position, 100);
+        assert_eq!(read_pointer.length, 50);
+        assert_eq!(read_pointer.deleted, false);
+        
+        let read_pointer = row_pointer_iterator.next_row_pointer().await.unwrap().unwrap();
+        
+        assert_eq!(read_pointer.id, 2);
+        assert_eq!(read_pointer.position, 150);
+        assert_eq!(read_pointer.length, 100);
+        assert_eq!(read_pointer.deleted, false);
+
+        // Next call should return None
+        assert!(row_pointer_iterator.next_row_pointer().await.unwrap().is_some());
+        assert!(row_pointer_iterator.next_row_pointer().await.unwrap().is_none());
+    }
 }
