@@ -35,6 +35,7 @@ const TOTAL_LENGTH : usize =
     1 // deleted (bool)
     ; 
 
+// TODO replace with fastcrc32
 const CRC: Crc::<u32>  = Crc::<u32>::new(&CRC_32_ISO_HDLC);
 
 /// Iterates over RowPointers from a StorageIO in 64KB chunks
@@ -605,4 +606,9 @@ impl RowPointer {
 
         Ok(row_pointer)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    
 }
