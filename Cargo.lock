@@ -1829,6 +1829,7 @@ dependencies = [
  "orx-concurrent-vec",
  "rastcp",
  "stopwatch",
+ "temp_testdir",
  "tera",
  "tokio",
 ]
@@ -2233,6 +2234,12 @@ name = "tagptr"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7b2093cf4c8eb1e67749a6762251bc9cd836b6fc171623bd0a9d324d37af2417"
+
+[[package]]
+name = "temp_testdir"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "921f1e9c427802414907a48b21a6504ff6b3a15a1a3cf37e699590949ad9befc"
 
 [[package]]
 name = "tera"
