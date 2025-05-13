@@ -37,4 +37,3 @@ pub struct Column {
     pub data: MemoryBlock,
     pub column_type: DbType,
 }
-
