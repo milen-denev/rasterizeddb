@@ -2,7 +2,10 @@ use std::{io::Cursor, sync::atomic::AtomicU64};
 
 use super::{error::Result, row::RowWrite};
 use byteorder::{LittleEndian, WriteBytesExt};
+
+#[cfg(feature = "enable_long_row")]
 use crc::{Crc, CRC_32_ISO_HDLC};
+
 use itertools::Itertools;
 
 use crate::{
@@ -47,6 +50,7 @@ const CHUNK_SIZE: usize = 92 * 2; // 92 * 2 bytes chunks for debugging
 const CHUNK_SIZE: usize = 3047 * 21; // ~64KB chunks
 
 // TODO replace with fastcrc32
+#[cfg(feature = "enable_long_row")]
 const CRC: Crc::<u32>  = Crc::<u32>::new(&CRC_32_ISO_HDLC);
 
 /// Iterates over RowPointers from a StorageIO in 64KB chunks
@@ -362,11 +366,15 @@ impl RowPointer {
         let block = self.into_memory_block();
         let wrapper = unsafe { block.into_wrapper() };
 
+        #[cfg(feature = "enable_data_verification")]
         let position = io.get_len().await;
 
         io.append_data(wrapper.as_slice()).await;
+
+        #[cfg(feature = "enable_data_verification")]
         let verify_result = io.verify_data_and_sync(position, wrapper.as_slice()).await;
 
+        #[cfg(feature = "enable_data_verification")]
         if !verify_result {
             // Rollback the transaction if verification fails
             // TODO
@@ -421,12 +429,14 @@ impl RowPointer {
         let block = self.into_memory_block();
         let wrapper = unsafe { block.into_wrapper() };
 
+        #[cfg(feature = "enable_data_verification")]
         let position = io.get_len().await;
 
         // Write data to storage
         io.append_data(wrapper.as_slice()).await;
         
         // Verify written data
+        #[cfg(feature = "enable_data_verification")]
         io.verify_data_and_sync(position, wrapper.as_slice()).await;
         
         Ok(())
@@ -644,6 +654,7 @@ impl RowPointer {
         // Write the row data to the pointers_io
         row_pointer.save(pointers_io).await?;
 
+        #[cfg(feature = "enable_data_verification")]
         let io_position = row_pointer.position;
 
         let mut total_bytes = row_write.columns_writing_data.iter().map(|col| col.size as u64).sum::<u64>();
@@ -722,8 +733,11 @@ impl RowPointer {
 
         // Write the row data to the rows_io
         rows_io.append_data(buffer.as_slice()).await;
+
+        #[cfg(feature = "enable_data_verification")]
         let write_result = rows_io.verify_data_and_sync(io_position, buffer.as_slice()).await;
 
+        #[cfg(feature = "enable_data_verification")]
         if !write_result {
             // Rollback the transaction if verification fails
             // TODO
@@ -863,24 +877,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_save_row_pointers() {
-        let mut mock_io_pointers = MockStorageProvider::new().await;
+     let mut mock_io_pointers = MockStorageProvider::new().await;
         let mut mock_io_rows = MockStorageProvider::new().await;
+
+        #[cfg(feature = "enable_long_row")]
         let cluster = 0;
 
         let last_id = AtomicU64::new(0);
         let table_length = AtomicU64::new(0);
 
         let string_bytes = b"Hello, world!";
-        let string_data = MEMORY_POOL.acquire(string_bytes.len() + 4);
+
+        let string_data = MEMORY_POOL.acquire(string_bytes.len());
         let mut string_data_wrapper = unsafe { string_data.into_wrapper() };
         let string_vec = string_data_wrapper.as_vec_mut();
-        let string_size = string_bytes.len() as u32;
-        let string_size_bytes = string_size.to_le_bytes();
-        string_vec[0] = string_size_bytes[0];
-        string_vec[1] = string_size_bytes[1];
-        string_vec[2] = string_size_bytes[2];
-        string_vec[3] = string_size_bytes[3];
-        string_vec[4..].copy_from_slice(string_bytes);
+
+        string_vec[0..].copy_from_slice(string_bytes);
 
         let i32_bytes = 42_i32.to_le_bytes();
         let i32_data = MEMORY_POOL.acquire(i32_bytes.len());
@@ -894,7 +906,7 @@ mod tests {
                     data: string_data,
                     write_order: 0,
                     column_type: DbType::STRING,
-                    size: string_bytes.len() as u32 + 4
+                    size: 4 + 8 // String Size + String Pointer
                 },
                 ColumnWritePayload {
                     data: i32_data,
@@ -922,6 +934,8 @@ mod tests {
     async fn test_save_and_read_row_pointers() {
         let mut mock_io_pointers = MockStorageProvider::new().await;
         let mut mock_io_rows = MockStorageProvider::new().await;
+
+        #[cfg(feature = "enable_long_row")]
         let cluster = 0;
 
         let last_id = AtomicU64::new(0);
