@@ -18,6 +18,7 @@ use rasterizeddb_core::{
     EMPTY_BUFFER,
 };
 
+use stopwatch::Stopwatch;
 use tokio::fs::remove_file;
 
 #[tokio::main(flavor = "multi_thread")]
@@ -29,11 +30,13 @@ async fn main() -> std::io::Result<()> {
     println!("{}", mock_io_pointers.get_location().unwrap());
     println!("{}", mock_io_rows.get_location().unwrap());
 
+    #[cfg(feature = "enable_long_row")]
     let cluster = 0;
 
     let last_id = AtomicU64::new(0);
     let table_length = AtomicU64::new(0);
 
+    // Column 0
     let string_bytes = b"Hello, world!";
 
     let string_data = MEMORY_POOL.acquire(string_bytes.len());
@@ -41,6 +44,19 @@ async fn main() -> std::io::Result<()> {
     let string_vec = string_data_wrapper.as_vec_mut();
 
     string_vec[0..].copy_from_slice(string_bytes);
+
+    // Column 1
+    
+    let large_string = "Hello, world!".repeat(50);
+    let large_string_bytes = large_string.as_bytes();
+
+    let large_string_data = MEMORY_POOL.acquire(large_string_bytes.len());
+    let mut large_string_data_wrapper = unsafe { large_string_data.into_wrapper() };
+    let large_string_vec = large_string_data_wrapper.as_vec_mut();
+
+    large_string_vec[0..].copy_from_slice(large_string_bytes);
+
+    // Column 2
 
     let i32_bytes = 42_i32.to_le_bytes();
     let i32_data = MEMORY_POOL.acquire(i32_bytes.len());
@@ -62,8 +78,54 @@ async fn main() -> std::io::Result<()> {
                 column_type: DbType::I32,
                 size: i32_bytes.len() as u32
             },
+            ColumnWritePayload {
+                data: large_string_data,
+                write_order: 2,
+                column_type: DbType::STRING,
+                size: 4 + 8 // String Size + String Pointer
+            },
         ],
     };
+
+    _ = RowPointer::write_row(
+        &mut mock_io_pointers, 
+        &mut mock_io_rows, 
+        &last_id, 
+        &table_length, 
+        #[cfg(feature = "enable_long_row")]
+        cluster, 
+        &row_write
+    ).await;
+
+    _ = RowPointer::write_row(
+        &mut mock_io_pointers, 
+        &mut mock_io_rows, 
+        &last_id, 
+        &table_length, 
+        #[cfg(feature = "enable_long_row")]
+        cluster, 
+        &row_write
+    ).await;
+
+    _ = RowPointer::write_row(
+        &mut mock_io_pointers, 
+        &mut mock_io_rows, 
+        &last_id, 
+        &table_length, 
+        #[cfg(feature = "enable_long_row")]
+        cluster, 
+        &row_write
+    ).await;
+
+    _ = RowPointer::write_row(
+        &mut mock_io_pointers, 
+        &mut mock_io_rows, 
+        &last_id, 
+        &table_length, 
+        #[cfg(feature = "enable_long_row")]
+        cluster, 
+        &row_write
+    ).await;
 
     let result = RowPointer::write_row(
         &mut mock_io_pointers, 
@@ -75,9 +137,13 @@ async fn main() -> std::io::Result<()> {
         &row_write
     ).await;
 
+    println!("Row write result: {:?}", result);
+
     assert!(result.is_ok());
 
     let mut iterator = RowPointerIterator::new(&mut mock_io_pointers).await.unwrap();
+
+    let mut stopwatch = Stopwatch::start_new();
 
     let next_pointer = iterator.next_row_pointer().await.unwrap().unwrap();
 
@@ -86,13 +152,18 @@ async fn main() -> std::io::Result<()> {
             ColumnFetchingData {
                 column_offset: 0,
                 column_type: DbType::STRING,
-                size: string_bytes.len() as u32 + 4
+                size: 0 // String size is not known yet
             },
             ColumnFetchingData {
                 column_offset: 8 + 4,
                 column_type: DbType::I32,
                 size: i32_bytes.len() as u32
             },
+            // ColumnFetchingData {
+            //     column_offset: 8 + 4 + 4,
+            //     column_type: DbType::STRING,
+            //     size: 0 // String size is not known yet
+            // },
         ],
     };
 
@@ -101,13 +172,21 @@ async fn main() -> std::io::Result<()> {
         &row_fetch
     ).await.unwrap();
 
+    stopwatch.stop();
+
+    println!("Row fetch took: {:?}", stopwatch.elapsed());
+    
     row.columns.iter().for_each(|column| {
         match column.column_type {
             DbType::STRING => {
-                println!("String column: {:?}", column.data);
+                println!("STRING column: {:?}", column.data);
                 let wrapper = unsafe { column.data.into_wrapper() };
                 let string_data = wrapper.as_vec();
-                assert_eq!(string_data, string_bytes);
+                if string_data.len() < 100 {
+                    assert_eq!(string_data, string_bytes);
+                } else {
+                    assert_eq!(string_data, large_string_bytes);
+                } 
             },
             DbType::I32 => {
                 println!("I32 column: {:?}", column.data);
