@@ -46,7 +46,8 @@ lto = "fat"
 # rustflags = [ "-C", "target-cpu=native" ]
 
 [features]
-default = ["enable_parallelism", "enable_long_row"] # "enable_parallelism"
+default = ["enable_parallelism"] # "enable_parallelism" "enable_long_row"
 enable_index_caching =  []
 enable_parallelism = []
 enable_long_row = []
+enable_data_verification = []
