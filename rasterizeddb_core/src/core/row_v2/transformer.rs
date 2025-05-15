@@ -2,6 +2,8 @@ use itertools::Either;
 
 use crate::{core::db_type::DbType, memory_pool::MemoryBlock};
 
+use super::{logical::perform_comparison_operation, math::perform_math_operation};
+
 pub struct ColumnTransformer {
     pub column_type: DbType,
     pub column_1: MemoryBlock,
@@ -15,6 +17,7 @@ pub enum ColumnTransformerType {
     ComparerOperation(ComparerOperation),
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub enum ComparerOperation {
     Equals,
     NotEquals,
@@ -60,67 +63,31 @@ impl ColumnTransformer {
         }
     }
 
-    pub fn transform(&self) -> Either<MemoryBlock, bool> {
+    pub fn transform(&self) -> Either<MemoryBlock, bool> {  
+        let wrapper_1 = unsafe { self.column_1.into_wrapper() };
+        let wrapper_2 = unsafe { self.column_2.into_wrapper() };
+
+        let input1 =  wrapper_1.as_slice();
+        let input2 = wrapper_2.as_slice();
+
         match self.transformer_type {
             ColumnTransformerType::MathOperation(ref operation) => {
                 if self.next.is_some() {
                     panic!("Next operation is not supported for MathOperation");
                 }
 
-                match operation {
-                    MathOperation::Add => {
-                        // Perform addition
-                    }
-                    MathOperation::Subtract => {
-                        // Perform subtraction
-                    }
-                    MathOperation::Multiply => {
-                        // Perform multiplication
-                    }
-                    MathOperation::Divide => {
-                        // Perform division
-                    }
-                    MathOperation::Exponent => {
-                        // Perform exponentiation
-                    }
-                    MathOperation::Root => {
-                        // Perform root operation
-                    }
-                }
+                Either::Left(perform_math_operation(input1, input2, &self.column_type, operation))
             },
             ColumnTransformerType::ComparerOperation(ref operation) => {
-                match operation {
-                    ComparerOperation::Equals => {
-                        // Perform equals operation
-                    }
-                    ComparerOperation::NotEquals => {
-                        // Perform not equals operation
-                    }
-                    ComparerOperation::Contains => {
-                        // Perform contains operation
-                    }
-                    ComparerOperation::StartsWith => {
-                        // Perform starts with operation
-                    }
-                    ComparerOperation::EndsWith => {
-                        // Perform ends with operation
-                    }
-                    ComparerOperation::Greater => {
-                        // Perform greater operation
-                    }
-                    ComparerOperation::GreaterOrEquals => {
-                        // Perform greater or equals operation
-                    }
-                    ComparerOperation::Less => {
-                        // Perform less operation
-                    }
-                    ComparerOperation::LessOrEquals => {
-                        // Perform less or equals operation
-                    }
-                }
+                Either::Right(
+                    perform_comparison_operation(
+                        input1,
+                        input2,
+                        &self.column_type,
+                        operation
+                    )
+                )
             }
-        };
-
-        Either::Left(MemoryBlock::from_vec(vec![]))
+        }
     }
 }
