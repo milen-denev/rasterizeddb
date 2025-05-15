@@ -29,23 +29,18 @@ async fn main() -> std::io::Result<()> {
     println!("{}", mock_io_pointers.get_location().unwrap());
     println!("{}", mock_io_rows.get_location().unwrap());
 
-    #[cfg(feature = "enable_long_row")]
     let cluster = 0;
 
     let last_id = AtomicU64::new(0);
     let table_length = AtomicU64::new(0);
 
     let string_bytes = b"Hello, world!";
-    let string_data = MEMORY_POOL.acquire(string_bytes.len() + 4);
+
+    let string_data = MEMORY_POOL.acquire(string_bytes.len());
     let mut string_data_wrapper = unsafe { string_data.into_wrapper() };
     let string_vec = string_data_wrapper.as_vec_mut();
-    let string_size = string_bytes.len() as u32;
-    let string_size_bytes = string_size.to_le_bytes();
-    string_vec[0] = string_size_bytes[0];
-    string_vec[1] = string_size_bytes[1];
-    string_vec[2] = string_size_bytes[2];
-    string_vec[3] = string_size_bytes[3];
-    string_vec[4..].copy_from_slice(string_bytes);
+
+    string_vec[0..].copy_from_slice(string_bytes);
 
     let i32_bytes = 42_i32.to_le_bytes();
     let i32_data = MEMORY_POOL.acquire(i32_bytes.len());
@@ -56,16 +51,16 @@ async fn main() -> std::io::Result<()> {
     let row_write = RowWrite {
         columns_writing_data: vec![
             ColumnWritePayload {
-                data: i32_data,
+                data: string_data,
                 write_order: 0,
+                column_type: DbType::STRING,
+                size: 4 + 8 // String Size + String Pointer
+            },
+            ColumnWritePayload {
+                data: i32_data,
+                write_order: 1,
                 column_type: DbType::I32,
                 size: i32_bytes.len() as u32
-            },            
-            ColumnWritePayload {
-                data: string_data,
-                write_order: 1,
-                column_type: DbType::STRING,
-                size: string_bytes.len() as u32 + 4
             },
         ],
     };
@@ -86,20 +81,18 @@ async fn main() -> std::io::Result<()> {
 
     let next_pointer = iterator.next_row_pointer().await.unwrap().unwrap();
 
-    println!("Row pointer: {:?}", next_pointer);
-
     let row_fetch = RowFetch {
         columns_fetching_data: vec![
             ColumnFetchingData {
                 column_offset: 0,
+                column_type: DbType::STRING,
+                size: string_bytes.len() as u32 + 4
+            },
+            ColumnFetchingData {
+                column_offset: 8 + 4,
                 column_type: DbType::I32,
                 size: i32_bytes.len() as u32
             },
-            ColumnFetchingData {
-                column_offset: 4,
-                column_type: DbType::STRING,
-                size: string_bytes.len() as u32 + 4
-            }
         ],
     };
 
@@ -111,12 +104,13 @@ async fn main() -> std::io::Result<()> {
     row.columns.iter().for_each(|column| {
         match column.column_type {
             DbType::STRING => {
+                println!("String column: {:?}", column.data);
                 let wrapper = unsafe { column.data.into_wrapper() };
-                let string_data = wrapper.as_slice();
-                assert_eq!(string_data[0..4], string_size_bytes);
-                assert_eq!(&string_data[4..], string_bytes);
+                let string_data = wrapper.as_vec();
+                assert_eq!(string_data, string_bytes);
             },
             DbType::I32 => {
+                println!("I32 column: {:?}", column.data);
                 let wrapper = unsafe { column.data.into_wrapper() };
                 let i32_data = wrapper.as_slice();
                 assert_eq!(i32_data, i32_bytes);

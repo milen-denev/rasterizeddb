@@ -1,4 +1,4 @@
-use std::{io::{Cursor, Write}, sync::atomic::AtomicU64};
+use std::{io::Cursor, sync::atomic::AtomicU64};
 
 use super::{error::Result, row::RowWrite};
 use byteorder::{LittleEndian, WriteBytesExt};
@@ -305,8 +305,16 @@ impl RowPointer {
         let timestamp = Self::get_timestamp();
 
         #[cfg(feature = "enable_long_row")]
-        let checksum: u32 = { 
-            let block = MEMORY_POOL.acquire(total_len as usize);
+        let checksum: u32 = {
+            let all_data_size = row_write.columns_writing_data
+                .iter()
+                .map(|col| 
+                    unsafe { 
+                        col.data.into_wrapper().as_slice().len() 
+                    } as u64)
+                .sum::<u64>();
+
+            let block = MEMORY_POOL.acquire(all_data_size as usize);
             let mut wrapper = unsafe { block.into_wrapper() };
             let vec = wrapper.as_vec_mut();
 
@@ -320,6 +328,7 @@ impl RowPointer {
                 vec[position..position + size].copy_from_slice(column_vec);
                 position += size;
             }
+
             CRC.checksum(&vec)
         };
 
@@ -523,8 +532,6 @@ impl RowPointer {
             return Err(super::error::RowError::NotFound("Row is marked as deleted".into()));
         }
         
-        println!("{:?}", self);
-
         // Create a vector to hold all the columns
         let mut columns = Vec::with_capacity(row_fetch.columns_fetching_data.len());
         
@@ -539,7 +546,7 @@ impl RowPointer {
                 io.read_data_into_buffer(&mut position, &mut string_position_buffer).await;
 
                 // Turn [u8] into u64
-                let string_row_position = unsafe { simds::endianess::read_u64(string_position_buffer.as_ptr()) };
+                let mut string_row_position = unsafe { simds::endianess::read_u64(string_position_buffer.as_ptr()) };
 
                 let mut string_size_buffer = [0u8; 4];
 
@@ -550,8 +557,10 @@ impl RowPointer {
                 let string_block = MEMORY_POOL.acquire(string_size as usize);
                 let mut string_wrapper = unsafe { string_block.into_wrapper() };
                 let mut string_buffer = string_wrapper.as_vec_mut();
-                let mut string_position = position + string_row_position;
-                io.read_data_into_buffer(&mut string_position, &mut string_buffer).await;
+
+                io.read_data_into_buffer(&mut string_row_position, &mut string_buffer).await;
+
+                println!("Block data: {:?}", string_block);
 
                 // Create a column with the string data
                 let column = Column {
@@ -571,6 +580,9 @@ impl RowPointer {
                 
                 // Read the column data directly into our buffer
                 io.read_data_into_buffer(&mut position, &mut buffer).await;
+
+                println!("Block data: {:?}", block);
+
                 // Create a Column object with the read data
                 let column = Column {
                     schema_id: 0, // Schema ID would be set based on metadata or query context
@@ -644,8 +656,8 @@ impl RowPointer {
         total_bytes = total_bytes + total_string_size;
 
         // Count number of string columns
-        let string_columns_count = row_write.columns_writing_data.iter().filter(|col| col.column_type == DbType::STRING).count();
-        total_bytes = total_bytes + string_columns_count as u64 * 4;
+        // let string_columns_count = row_write.columns_writing_data.iter().filter(|col| col.column_type == DbType::STRING).count();
+        // total_bytes = total_bytes + string_columns_count as u64 * (4 + 8); // 4 bytes for size and 8 bytes for pointer
 
         // Allocate memory to store the row data
         let block = MEMORY_POOL.acquire(total_bytes as usize);
@@ -654,17 +666,23 @@ impl RowPointer {
 
         let mut row_position = 0;
 
-        let mut string_data: Vec<u8> = Vec::with_capacity(string_columns_count * 1024);
+        let string_block = MEMORY_POOL.acquire(total_string_size as usize);
+        let mut string_wrapper = unsafe { string_block.into_wrapper() };
+        let string_data = string_wrapper.as_vec_mut();
 
         let mut end_of_row: u64 = row_write.columns_writing_data.iter().map(|col| col.size as u64).sum();
 
         // Write each column data into the buffer
+        
+        let mut string_data_position: u64 = 0;
+
         for column in row_write.columns_writing_data.iter().sorted_by(|a, b| a.write_order.cmp(&b.write_order)) {
             let end_of_column = row_position + column.size as u64;
 
             // If it's string a pointer of u64 must be created which will point to
             // the ending of the row, were the strings are saved.
             // If it's a known size, integers, floats, etc. it's placed into the buffer.
+            // Example:
             //              U64 POINTER | U32 SIZE             U64 POINTER | U32 SIZE     BINARY DATA | BINARY DATA
             //    4 bytes | 8 bytes | 4 bytes | 4 bytes | 16 bytes |  8 bytes  |  4 bytes  |   X bytes   |   X bytes  
             // ROW: [I32|STRING_POINTER_1|STRING_SIZE|I32|U128|STRING_POINTER_2|STRING_SIZE|STRING_DATA_1|STRING_DATA_2]
@@ -673,26 +691,34 @@ impl RowPointer {
                 let string_column_data_wrapper = unsafe { column.data.into_wrapper() };
                 let string_column_vec = string_column_data_wrapper.as_slice();
 
-                string_data.write(string_column_vec).unwrap();
+                let string_size = string_column_vec.len() as u32;
+
+                string_data[string_data_position as usize..string_data_position as usize + string_size as usize].copy_from_slice(string_column_vec);
+
+                string_data_position = string_data_position + string_size as u64;
 
                 let end_of_row_bytes = end_of_row.to_le_bytes();
 
-                buffer[row_position as usize..end_of_column as usize].copy_from_slice(&end_of_row_bytes);
-                let string_size = string_column_vec.len() as u32;
-                buffer[end_of_column as usize..end_of_column as usize + 4].copy_from_slice(&string_size.to_le_bytes());
+                // Write STRING_POINTER
+                buffer[row_position as usize..row_position as usize + 8].copy_from_slice(&end_of_row_bytes);
+             
+                // Write STRING_SIZE
+                buffer[row_position as usize + 8..row_position as usize + 4 + 8].copy_from_slice(&string_size.to_le_bytes());
 
                 end_of_row = end_of_row + string_column_vec.len() as u64;
+
+                row_position = end_of_column;
             } else {
                 let column_data_wrapper = unsafe { column.data.into_wrapper() };
                 let column_vec = column_data_wrapper.as_slice();
 
                 buffer[row_position as usize..end_of_column as usize].copy_from_slice(column_vec);
-            }
 
-            row_position = end_of_column;
+                row_position = end_of_column;
+            }
         }
 
-        buffer[row_position as usize..end_of_row as usize].copy_from_slice(&string_data);
+        buffer[row_position as usize..].copy_from_slice(&string_data);
 
         // Write the row data to the rows_io
         rows_io.append_data(buffer.as_slice()).await;
@@ -902,16 +928,12 @@ mod tests {
         let table_length = AtomicU64::new(0);
 
         let string_bytes = b"Hello, world!";
-        let string_data = MEMORY_POOL.acquire(string_bytes.len() + 4);
+
+        let string_data = MEMORY_POOL.acquire(string_bytes.len());
         let mut string_data_wrapper = unsafe { string_data.into_wrapper() };
         let string_vec = string_data_wrapper.as_vec_mut();
-        let string_size = string_bytes.len() as u32;
-        let string_size_bytes = string_size.to_le_bytes();
-        string_vec[0] = string_size_bytes[0];
-        string_vec[1] = string_size_bytes[1];
-        string_vec[2] = string_size_bytes[2];
-        string_vec[3] = string_size_bytes[3];
-        string_vec[4..].copy_from_slice(string_bytes);
+
+        string_vec[0..].copy_from_slice(string_bytes);
 
         let i32_bytes = 42_i32.to_le_bytes();
         let i32_data = MEMORY_POOL.acquire(i32_bytes.len());
@@ -925,7 +947,7 @@ mod tests {
                     data: string_data,
                     write_order: 0,
                     column_type: DbType::STRING,
-                    size: string_bytes.len() as u32 + 4
+                    size: 4 + 8 // String Size + String Pointer
                 },
                 ColumnWritePayload {
                     data: i32_data,
@@ -960,7 +982,7 @@ mod tests {
                     size: string_bytes.len() as u32 + 4
                 },
                 ColumnFetchingData {
-                    column_offset: 4,
+                    column_offset: 8 + 4,
                     column_type: DbType::I32,
                     size: i32_bytes.len() as u32
                 },
@@ -977,8 +999,7 @@ mod tests {
                 DbType::STRING => {
                     let wrapper = unsafe { column.data.into_wrapper() };
                     let string_data = wrapper.as_slice();
-                    assert_eq!(string_data[0..4], string_size_bytes);
-                    assert_eq!(&string_data[4..], string_bytes);
+                    assert_eq!(&string_data[0..], string_bytes);
                 },
                 DbType::I32 => {
                     let wrapper = unsafe { column.data.into_wrapper() };
