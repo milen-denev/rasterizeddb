@@ -304,6 +304,7 @@ impl StorageIO for LocalStorageProvider {
         file.seek(SeekFrom::Start(position)).unwrap();
         let mut file_buffer = vec![0; buffer.len() as usize];
         file.read_exact(&mut file_buffer).unwrap();
+        
         if buffer.eq(&file_buffer) {
             file.sync_data().unwrap();
             true
