@@ -28,6 +28,9 @@ tera = "1.20.0"
 crc = "3.3.0"
 temp_testdir = "0.2.3"
 memmap2 = "0.9.5"
+# papaya = "0.2.1"
+rand = "0.9.1"
+crossbeam-queue = "0.3.12"
 
 [dev-dependencies]
 criterion = { version = "0.6.0" }
