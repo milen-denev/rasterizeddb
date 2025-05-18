@@ -7,11 +7,12 @@ use super::{logical::perform_comparison_operation, math::perform_math_operation}
 pub struct ColumnTransformer {
     pub column_type: DbType,
     pub column_1: MemoryBlock,
-    pub column_2: MemoryBlock,
+    pub column_2: Option<MemoryBlock>,
     pub transformer_type: ColumnTransformerType,
     pub next: Option<Next>
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub enum ColumnTransformerType {
     MathOperation(MathOperation),
     ComparerOperation(ComparerOperation),
@@ -50,14 +51,13 @@ impl ColumnTransformer {
     pub fn new(
         column_type: DbType,
         column_1: MemoryBlock,
-        column_2: MemoryBlock,
         transformer_type: ColumnTransformerType,
         next: Option<Next>
     ) -> Self {
         Self {
             column_type,
             column_1,
-            column_2,
+            column_2: None,
             transformer_type,
             next
         }
@@ -65,7 +65,7 @@ impl ColumnTransformer {
 
     pub fn transform_single(&self) -> Either<MemoryBlock, bool> {  
         let input1 = self.column_1.into_slice();
-        let input2 = self.column_2.into_slice();
+        let input2 = self.column_2.as_ref().unwrap().into_slice();
 
         match self.transformer_type {
             ColumnTransformerType::MathOperation(ref operation) => {
@@ -86,6 +86,10 @@ impl ColumnTransformer {
                 )
             }
         }
+    }
+
+    pub fn setup_column_2(&mut self, column_2: MemoryBlock) {
+        self.column_2 = Some(column_2);
     }
 }
 
@@ -115,13 +119,14 @@ mod tests {
         let i32_data_1 = create_memory_block_from_i32(10);
         let i32_data_2 = create_memory_block_from_i32(20);
 
-        let transformer = ColumnTransformer::new(
+        let mut transformer = ColumnTransformer::new(
             DbType::I32,
             i32_data_1,
-            i32_data_2,
             ColumnTransformerType::MathOperation(MathOperation::Add),
             None,
         );
+        
+        transformer.setup_column_2(i32_data_2);
 
         if let Either::Left(result) = transformer.transform_single() {
             let result_slice = result.into_slice();
@@ -137,13 +142,14 @@ mod tests {
         let i32_data_1 = create_memory_block_from_i32(42);
         let i32_data_2 = create_memory_block_from_i32(42);
 
-        let transformer = ColumnTransformer::new(
+        let mut transformer = ColumnTransformer::new(
             DbType::I32,
             i32_data_1,
-            i32_data_2,
             ColumnTransformerType::ComparerOperation(ComparerOperation::Equals),
             None,
         );
+
+        transformer.setup_column_2(i32_data_2);
 
         if let Either::Right(result) = transformer.transform_single() {
             assert!(result);
@@ -157,13 +163,14 @@ mod tests {
         let i32_data_1 = create_memory_block_from_i32(42);
         let i32_data_2 = create_memory_block_from_i32(43);
 
-        let transformer = ColumnTransformer::new(
+        let mut transformer = ColumnTransformer::new(
             DbType::I32,
             i32_data_1,
-            i32_data_2,
             ColumnTransformerType::ComparerOperation(ComparerOperation::NotEquals),
             None,
         );
+
+        transformer.setup_column_2(i32_data_2);
 
         if let Either::Right(result) = transformer.transform_single() {
             assert!(result);
@@ -178,13 +185,14 @@ mod tests {
         let i32_data_1 = create_memory_block_from_i32(10);
         let i32_data_2 = create_memory_block_from_i32(20);
 
-        let transformer = ColumnTransformer::new(
+        let mut transformer = ColumnTransformer::new(
             DbType::I32,
             i32_data_1,
-            i32_data_2,
             ColumnTransformerType::MathOperation(MathOperation::Add),
             Some(Next::And),
         );
+
+        transformer.setup_column_2(i32_data_2);
 
         transformer.transform_single();
     }
@@ -194,13 +202,14 @@ mod tests {
         let string_data_1 = create_memory_block_from_string("Hello, world!");
         let string_data_2 = create_memory_block_from_string("world");
 
-        let transformer = ColumnTransformer::new(
+        let mut transformer = ColumnTransformer::new(
             DbType::STRING,
             string_data_1,
-            string_data_2,
             ColumnTransformerType::ComparerOperation(ComparerOperation::Contains),
             None,
         );
+
+        transformer.setup_column_2(string_data_2);
 
         if let Either::Right(result) = transformer.transform_single() {
             assert!(result);
@@ -214,13 +223,14 @@ mod tests {
         let string_data_1 = create_memory_block_from_string("Hello, world!");
         let string_data_2 = create_memory_block_from_string("Hello");
 
-        let transformer = ColumnTransformer::new(
+        let mut transformer = ColumnTransformer::new(
             DbType::STRING,
             string_data_1,
-            string_data_2,
             ColumnTransformerType::ComparerOperation(ComparerOperation::StartsWith),
             None,
         );
+
+        transformer.setup_column_2(string_data_2);
 
         if let Either::Right(result) = transformer.transform_single() {
             assert!(result);
@@ -234,13 +244,14 @@ mod tests {
         let string_data_1 = create_memory_block_from_string("Hello, world!");
         let string_data_2 = create_memory_block_from_string("world!");
 
-        let transformer = ColumnTransformer::new(
+        let mut transformer = ColumnTransformer::new(
             DbType::STRING,
             string_data_1,
-            string_data_2,
             ColumnTransformerType::ComparerOperation(ComparerOperation::EndsWith),
             None,
         );
+
+        transformer.setup_column_2(string_data_2);
 
         if let Either::Right(result) = transformer.transform_single() {
             assert!(result);
@@ -254,13 +265,14 @@ mod tests {
         let string_data_1 = create_memory_block_from_string("Hello, world!");
         let string_data_2 = create_memory_block_from_string("planet");
 
-        let transformer = ColumnTransformer::new(
+        let mut transformer = ColumnTransformer::new(
             DbType::STRING,
             string_data_1,
-            string_data_2,
             ColumnTransformerType::ComparerOperation(ComparerOperation::Contains),
             None,
         );
+
+        transformer.setup_column_2(string_data_2);
 
         if let Either::Right(result) = transformer.transform_single() {
             assert!(!result);

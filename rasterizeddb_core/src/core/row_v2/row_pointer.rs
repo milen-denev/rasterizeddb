@@ -16,7 +16,7 @@ use crate::{
 };
 
 // Number of row pointers to fetch at once in next_row_pointers
-const BATCH_SIZE: usize = 2000;
+const BATCH_SIZE: usize = 5000;
 
 #[cfg(feature = "enable_long_row")]
 const TOTAL_LENGTH : usize = 
@@ -31,7 +31,7 @@ const TOTAL_LENGTH : usize =
     16 + // updated_at (u128)
     2 + // version (u16)
     1   // is_active (bool)
-    ; 
+    ;
 
 #[cfg(not(feature = "enable_long_row"))]
 const TOTAL_LENGTH : usize = 
@@ -104,6 +104,13 @@ impl<'a, S: StorageIO> RowPointerIterator<'a, S> {
         Ok(iterator)
     }
     
+    pub fn reset(&mut self) {
+        self.position = 0;
+        self.buffer_index = 0;
+        self.buffer_valid_length = 0;
+        self.end_of_data = false;
+    }
+
     /// Load the next chunk of data into the buffer
     async fn load_next_chunk(&mut self) -> Result<()> {
         // Reset buffer index
@@ -755,7 +762,7 @@ impl RowPointer {
 
     pub async fn fetch_row_reuse_async<S: StorageIO>(
         &self, 
-        io: &S, 
+        io: &&S, 
         row_fetch: &RowFetch,
         row_reuse: &mut Row) {
         // Skip fetching if the row is marked as deleted
@@ -863,9 +870,6 @@ impl RowPointer {
             row_write
         );
 
-        // Write the row data to the pointers_io
-        row_pointer.save(pointers_io).await?;
-
         #[cfg(feature = "enable_data_verification")]
         let io_position = row_pointer.position;
 
@@ -935,6 +939,10 @@ impl RowPointer {
 
         // Write the row data to the rows_io
         rows_io.append_data(slice).await;
+
+        // Write the pointer last
+        // Write the row data to the pointers_io
+        row_pointer.save(pointers_io).await?;
 
         #[cfg(feature = "enable_data_verification")]
         let write_result = rows_io.verify_data_and_sync(io_position, slice).await;

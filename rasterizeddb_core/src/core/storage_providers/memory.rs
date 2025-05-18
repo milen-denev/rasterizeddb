@@ -1,17 +1,20 @@
 use std::io::{Cursor, SeekFrom};
 
 use orx_concurrent_vec::ConcurrentVec;
+use rand::RngCore;
 
 use super::traits::StorageIO;
 
 pub struct MemoryStorageProvider {
     vec: ConcurrentVec<u8>,
+    random_u32: u32
 }
 
 impl Clone for MemoryStorageProvider {
     fn clone(&self) -> Self {
         Self {
             vec: self.vec.clone(),
+            random_u32: self.random_u32
         }
     }
 }
@@ -20,6 +23,7 @@ impl MemoryStorageProvider {
     pub fn new() -> MemoryStorageProvider {
         MemoryStorageProvider {
             vec: ConcurrentVec::with_doubling_growth(),
+            random_u32: rand::rng().next_u32()
         }
     }
 }
@@ -181,6 +185,7 @@ impl StorageIO for MemoryStorageProvider {
     async fn create_temp(&self) -> Self {
         Self {
             vec: ConcurrentVec::with_doubling_growth(),
+            random_u32: rand::rng().next_u32()
         }
     }
 
@@ -200,10 +205,19 @@ impl StorageIO for MemoryStorageProvider {
     async fn create_new(&self, _name: String) -> Self {
         MemoryStorageProvider {
             vec: ConcurrentVec::with_doubling_growth(),
+            random_u32: rand::rng().next_u32()
         }
     }
 
     fn drop_io(&mut self) {
         self.vec.clear();
+    }
+    
+    fn get_hash(&self) -> u32 {
+        self.random_u32
+    }
+    
+    fn start_service(&mut self) -> impl Future<Output = ()> + Send + Sync {
+        async {}
     }
 }

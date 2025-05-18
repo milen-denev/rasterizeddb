@@ -1,14 +1,20 @@
 use std::{
-    fs::{self, remove_file},
-    io::{Cursor, SeekFrom},
-    path::Path, sync::{atomic::AtomicU64, Arc}
+    fs::{self, remove_file}, io::{Cursor, Read, Seek, SeekFrom}, path::Path, sync::{atomic::{AtomicBool, AtomicU64}, Arc}
 };
 
+use crossbeam_queue::SegQueue;
+use futures::future::join_all;
 use tokio::{io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt}, sync::RwLock, task::yield_now};
 
 use memmap2::{Mmap, MmapOptions};
 
-use super::traits::StorageIO;
+use crate::memory_pool::{MemoryBlock, MEMORY_POOL};
+
+use super::{traits::StorageIO, CRC};
+
+// pub static CACHE_MAP: std::sync::LazyLock<papaya::HashMap<(u64, u32), MemoryBlock>> = std::sync::LazyLock::new(|| {
+//     papaya::HashMap::new()
+// });
 
 pub struct LocalStorageProvider {
     pub(super) append_file: Arc<RwLock<tokio::fs::File>>,
@@ -17,7 +23,10 @@ pub struct LocalStorageProvider {
     pub(crate) table_name: String,
     pub(crate) file_str: String,
     pub(crate) file_len: AtomicU64,
-    pub(crate) memory_map: Mmap
+    pub(crate) _memory_map: Mmap,
+    pub(crate) hash: u32,
+    locked: AtomicBool,
+    appender: SegQueue<MemoryBlock>
 }
 
 unsafe impl Sync for LocalStorageProvider { }
@@ -32,9 +41,12 @@ impl Clone for LocalStorageProvider {
             table_name: self.table_name.clone(),
             file_str: self.file_str.clone(),
             file_len: AtomicU64::new(self.file_len.load(std::sync::atomic::Ordering::SeqCst)),
-            memory_map: unsafe { MmapOptions::new()
+            _memory_map: unsafe { MmapOptions::new()
                 .map(&std::fs::File::open(&self.file_str).unwrap())
-                .unwrap() }
+                .unwrap() },
+            hash: CRC.checksum(format!("{}+++{}", self.location, self.table_name).as_bytes()),
+            appender: SegQueue::new(),
+            locked: AtomicBool::new(false)
         }
     }
 }
@@ -80,12 +92,13 @@ impl LocalStorageProvider {
                 .await
                 .unwrap();
 
-            let file_read = std::fs::File::options()
+            let file_read_mmap = std::fs::File::options()
                 .read(true)
+                .write(true)
                 .open(&file_str)
                 .unwrap();
 
-            let file_len = file_read.metadata().unwrap().len();
+            let file_len = file_read_mmap.metadata().unwrap().len();
 
             LocalStorageProvider {
                 append_file: Arc::new(RwLock::new(file_append)),
@@ -94,9 +107,13 @@ impl LocalStorageProvider {
                 table_name: table_name.to_string(),
                 file_str: file_str,
                 file_len: AtomicU64::new(file_len),
-                memory_map: unsafe { MmapOptions::new()
-                    .map(&file_read)
-                    .unwrap() }
+                _memory_map: unsafe { MmapOptions::new()
+                    .populate()
+                    .map(&file_read_mmap)
+                    .unwrap() },
+                hash: CRC.checksum(format!("{}+++{}", location, table_name).as_bytes()),
+                appender: SegQueue::new(),
+                locked: AtomicBool::new(false)
             }
         } else {
             let delimiter = if cfg!(unix) {
@@ -133,12 +150,13 @@ impl LocalStorageProvider {
                 .await
                 .unwrap();
     
-            let file_read = std::fs::File::options()
+            let file_read_mmap = std::fs::File::options()
                 .read(true)
+                .write(true)
                 .open(&file_str)
                 .unwrap();
 
-            let file_len = file_read.metadata().unwrap().len();
+            let file_len = file_read_mmap.metadata().unwrap().len();
 
             LocalStorageProvider {
                 append_file: Arc::new(RwLock::new(file_append)),
@@ -147,9 +165,12 @@ impl LocalStorageProvider {
                 table_name: "temp.db".to_string(),
                 file_str: file_str,
                 file_len: AtomicU64::new(file_len),
-                memory_map: unsafe { MmapOptions::new()
-                    .map(&file_read)
-                    .unwrap() }
+                _memory_map: unsafe { MmapOptions::new()
+                    .map(&file_read_mmap)
+                    .unwrap() },
+                hash: CRC.checksum(format!("{}+++{}", location, "CONFIG_TABLE.db").as_bytes()),
+                appender: SegQueue::new(),
+                locked: AtomicBool::new(false)
             }
         }
  
@@ -176,6 +197,61 @@ impl LocalStorageProvider {
         _ = file_read.sync_all();
         _ = file_append.sync_all();
         _ = file_write.sync_all();
+    }
+
+    pub async fn start_append_data_service(&mut self) {
+        loop {
+            if self.appender.len() > 0 {
+                //println!("Starting appending data, locking activating.");
+                self.locked.store(true, std::sync::atomic::Ordering::Relaxed);
+
+                let mut buffer: Vec<u8> = Vec::default();
+
+                let mut size: usize = 0;
+
+                while let Some(block) = self.appender.pop() {
+                    let slice = block.into_slice();
+                    buffer.extend_from_slice(slice);
+                    size = size + slice.len();
+                    if size > 1024 * 1024 * 64 {
+                        break;
+                    }
+                }
+
+                // let mut file = self.append_file.write().await;
+                // file.write_all(&buffer).await.unwrap();
+
+                // file.flush().await.unwrap();
+                // file.sync_all().await.unwrap();
+
+                // let file_read = std::fs::File::options()
+                //     .read(true)
+                //     .open(&self.file_str)
+                //     .unwrap();
+
+                //let len = self.file_len.load(std::sync::atomic::Ordering::Relaxed);
+                //let write_file = self.write_file.read().await;
+
+                let mut file = self.append_file.write().await;
+
+                file.write_all(&buffer).await.unwrap();
+                file.flush().await.unwrap();
+                file.sync_all().await.unwrap();
+
+                //self._memory_map[len as usize..len as usize + size].copy_from_slice(&buffer);
+                self._memory_map = unsafe { MmapOptions::new()
+                    .map(&*file)
+                    .unwrap() };
+
+                self.file_len.fetch_add(size as u64, std::sync::atomic::Ordering::Relaxed);
+
+                self.locked.store(false, std::sync::atomic::Ordering::Relaxed);
+
+                //println!("Finished appending data, unlocking.");
+            } else {
+                tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+            }
+        }
     }
 }
 
@@ -208,12 +284,15 @@ impl StorageIO for LocalStorageProvider {
     }
 
     async fn append_data(&mut self, buffer: &[u8]) {
-        let mut file = self.append_file.write().await;
-        file.write_all(&buffer).await.unwrap();
-        file.flush().await.unwrap();
-        file.sync_all().await.unwrap();
+        let block = MEMORY_POOL.acquire(buffer.len());
+        let slice = block.into_slice_mut();
+        slice.copy_from_slice(buffer);
+        self.appender.push(block);
 
-        self.file_len.fetch_add(buffer.len() as u64, std::sync::atomic::Ordering::SeqCst);
+        // let mut file = self.append_file.write().await;
+        // file.write_all(&buffer).await.unwrap();
+        // file.flush().await.unwrap();
+        // file.sync_all().await.unwrap();
     }
 
     async fn read_data(&self, position: &mut u64, length: u32) -> Vec<u8> {
@@ -278,33 +357,61 @@ impl StorageIO for LocalStorageProvider {
         }
     }
 
+    #[allow(unreachable_code)]
     async fn read_data_into_buffer(&self, position: &mut u64, buffer: &mut [u8]) {
-        // let (start, end) = get_range(position, self.file_len.load(std::sync::atomic::Ordering::Relaxed));
-        // let range = (start, end, RowPointer::get_timestamp_seconds());
+        // use crate::{core::row_v2::row_pointer::RowPointer, memory_pool::{MemoryBlock, MEMORY_POOL}};
+        // fn get_range(position: &u64, max: u64) -> (u64,u64) {
+        //     const BLOCK_SIZE: u64 = 1024 * 1024 * 16; // 16MB
+        //     let chunk = position / BLOCK_SIZE;
+        //     let start = chunk * BLOCK_SIZE;
+        //     let mut end = (chunk + 1) * BLOCK_SIZE;
 
-        // println!("Range: {:?}", range);
-        // println!("Position: {:?}", position);
+        //     if end > max {
+        //         end = max;
+        //     }
 
-        // if let Some(block) = CACHE_MAP.get(&range) {
+        //     (start, end)
+        // }
+
+        // let range = get_range(position, self.file_len.load(std::sync::atomic::Ordering::Relaxed));
+
+        // if let Some(block) = CACHE_MAP.pin().get(&(range.1, self.hash)) {
         //     let slice = block.into_slice();
         //     let new_position = *position - range.0;
-        //     buffer.copy_from_slice(&slice[new_position as usize..]);
-        //     *position += buffer.len() as u64;
-        //     return;
-        // } else {
-        //     let mut file = std::fs::File::options()
-        //         .read(true)
-        //         .open(&self.file_str)
-        //         .unwrap();
+        //     let buffer_len = buffer.len();
 
+        //     if slice.len() > new_position as usize + buffer_len {
+        //         // Copy the available data from the cached block
+        //         buffer.copy_from_slice(&slice[new_position as usize..new_position as usize + buffer_len]);
+        //         *position += buffer_len as u64;
+        //         return;
+        //     } else {
+        //         // This is the case where we need to handle partial read from cache and rest from memory map
+        //         let available_len = slice.len() - new_position as usize; // How much we can read from cache
+                
+        //         // Copy the available part from cache
+        //         buffer[..available_len].copy_from_slice(&slice[new_position as usize..]);
+                
+        //         // Calculate the remaining part position and size
+        //         let remaining_size = buffer_len - available_len;
+        //         let remaining_position = range.0 + new_position as u64 + available_len as u64;
+                
+        //         // Copy the remaining part from memory map
+        //         buffer[available_len..].copy_from_slice(
+        //             &self.memory_map[remaining_position as usize..remaining_position as usize + remaining_size]
+        //         );
+                
+        //         *position += buffer_len as u64;
+        //         return;
+        //     }
+        // } else {
+        //     let range = (range.0, range.1, RowPointer::get_timestamp_seconds());
         //     let block = MEMORY_POOL.acquire((range.1 - range.0) as usize);
         //     let slice = block.into_slice_mut();
 
-        //     file.seek(SeekFrom::Start(range.0)).unwrap();
-          
-        //     file.read_exact(slice).unwrap();
+        //     slice.copy_from_slice(&self.memory_map[range.0 as usize..range.1 as usize]);
 
-        //     CACHE_MAP.insert(range, block);
+        //     CACHE_MAP.pin_owned().insert((range.1, self.hash), block);
 
         //     let buffer_len = buffer.len() as u64;
 
@@ -312,11 +419,23 @@ impl StorageIO for LocalStorageProvider {
 
         //     buffer.copy_from_slice(&slice[(*position - range.0) as usize..*position as usize - range.0 as usize + buffer_len as usize]);
         // }
-    
-        let mmap = &self.memory_map;
-        let buffer_len = buffer.len();
 
-        buffer.copy_from_slice(&mmap[*position as usize..*position as usize + buffer_len]);
+        // return;
+
+        let buffer_len = buffer.len();
+        //let table_len = self.file_len.load(std::sync::atomic::Ordering::Relaxed);
+
+        if self.locked.load(std::sync::atomic::Ordering::Relaxed) { //|| self._memory_map.len() < table_len as usize 
+            let mut read_file = std::fs::File::options()
+                .read(true)
+                .open(&self.file_str)
+                .unwrap();
+
+            read_file.seek(SeekFrom::Start(*position)).unwrap();
+            read_file.read_exact(buffer).unwrap();
+        } else {
+            buffer.copy_from_slice(&self._memory_map[*position as usize..*position as usize + buffer_len]);
+        }
 
         *position += buffer_len as u64;
     }
@@ -410,12 +529,13 @@ impl StorageIO for LocalStorageProvider {
             .await
             .unwrap();
 
-        let file_read = std::fs::File::options()
+        let file_read_mmap = std::fs::File::options()
                 .read(true)
+                .write(true)
                 .open(&file_str)
                 .unwrap();
 
-        let file_len = file_read.metadata().unwrap().len();
+        let file_len = file_read_mmap.metadata().unwrap().len();
 
         Self {
             append_file: Arc::new(RwLock::new(file_append)),
@@ -424,9 +544,12 @@ impl StorageIO for LocalStorageProvider {
             table_name: "temp.db".to_string(),
             file_str: file_str,
             file_len: AtomicU64::new(file_len),
-            memory_map: unsafe { MmapOptions::new()
-                .map(&file_read)
-                .unwrap() }
+            _memory_map: unsafe { MmapOptions::new()
+                    .map(&file_read_mmap)
+                    .unwrap() },
+            hash: CRC.checksum(format!("{}+++{}", self.location, "temp.db").as_bytes()),
+            appender: SegQueue::new(),
+            locked: AtomicBool::new(false)
         }
     }
 
@@ -484,12 +607,13 @@ impl StorageIO for LocalStorageProvider {
             .await
             .unwrap();
 
-        let file_read = std::fs::File::options()
+        let file_read_mmap = std::fs::File::options()
                 .read(true)
+                .write(true)
                 .open(&file_path)
                 .unwrap();
 
-        let file_len = file_read.metadata().unwrap().len();
+        let file_len = file_read_mmap.metadata().unwrap().len();
 
         LocalStorageProvider {
             append_file: Arc::new(RwLock::new(file_append)),
@@ -498,9 +622,12 @@ impl StorageIO for LocalStorageProvider {
             table_name: name.to_string(),
             file_str: new_table.clone(),
             file_len: AtomicU64::new(file_len),
-            memory_map: unsafe { MmapOptions::new()
-                .map(&file_read)
-                .unwrap() }
+            _memory_map: unsafe { MmapOptions::new()
+                .map(&file_read_mmap)
+                .unwrap() },
+            hash: CRC.checksum(format!("{}+++{}", self.location, name).as_bytes()),
+            appender: SegQueue::new(),
+            locked: AtomicBool::new(false)
         }
     }
 
@@ -519,17 +646,16 @@ impl StorageIO for LocalStorageProvider {
 
         remove_file(&path).unwrap();
     }
+
+    fn get_hash(&self) -> u32 {
+        self.hash
+    }
+    
+    async fn start_service(&mut self) {
+        let services = vec![
+            self.start_append_data_service()
+        ];
+
+        join_all(services).await;
+    } 
 }
-
-// fn get_range(position: &u64, max: u64) -> (u64,u64) {
-//     const BLOCK_SIZE: u64 = 1024 * 1024 * 16; // 16MB
-//     let chunk = position / BLOCK_SIZE;
-//     let start = chunk * BLOCK_SIZE;
-//     let mut end = (chunk + 1) * BLOCK_SIZE;
-
-//     if end > max {
-//         end = max;
-//     }
-
-//     (start, end)
-// }
