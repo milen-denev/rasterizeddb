@@ -55,4 +55,8 @@ pub trait StorageIO: Clone + Sync + Send + 'static {
     fn create_new(&self, name: String) -> impl Future<Output = Self> + Send + Sync;
 
     fn drop_io(&mut self);
+
+    fn get_hash(&self) -> u32;
+
+    fn start_service(&mut self) -> impl Future<Output = ()> + Send + Sync;
 }
