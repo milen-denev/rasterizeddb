@@ -12,7 +12,7 @@ use crate::{
     core::{
         db_type::DbType, row_v2::row::{Column, Row, RowFetch}, storage_providers::traits::StorageIO
     }, 
-    memory_pool::{MemoryBlock, MEMORY_POOL}, simds
+    memory_pool::{MemoryBlock, MEMORY_POOL}, simds::{self, endianess::*}
 };
 
 // Number of row pointers to fetch at once in next_row_pointers
@@ -199,7 +199,7 @@ impl<'a, S: StorageIO> RowPointerIterator<'a, S> {
 
         // Parse the RowPointer from the buffer
         slice.copy_from_slice(&self.buffer.into_slice()[self.buffer_index..self.buffer_index + TOTAL_LENGTH]);
-        let row_pointer = RowPointer::from_slice(&slice)?;
+        let row_pointer = RowPointer::from_slice(&slice);
         
         // Advance the buffer index
         self.buffer_index += TOTAL_LENGTH;
@@ -344,10 +344,10 @@ impl RowPointer {
 
             let total_string_size = row_write.columns_writing_data.iter()
                 .filter(|col| col.column_type == DbType::STRING)
-                .map(|col| unsafe { col.data.into_wrapper().as_slice().len() as u64 })
-                .sum::<u64>();
+                .map(|col| col.data.into_slice().len() as u32)
+                .sum::<u32>();
 
-            total_bytes = total_bytes + total_string_size;
+            total_bytes = total_bytes + total_string_size as u64;
 
             let position = table_length.fetch_add(total_bytes, std::sync::atomic::Ordering::SeqCst);
 
@@ -378,27 +378,23 @@ impl RowPointer {
             let all_data_size = row_write.columns_writing_data
                 .iter()
                 .map(|col| 
-                    unsafe { 
-                        col.data.into_wrapper().as_slice().len() 
-                    } as u64)
+                    col.data.into_slice().len() as u64)
                 .sum::<u64>();
 
             let block = MEMORY_POOL.acquire(all_data_size as usize);
-            let mut wrapper = unsafe { block.into_wrapper() };
-            let vec = wrapper.as_vec_mut();
+            let slice = block.into_slice_mut();
 
             let mut position: usize = 0;
 
             for row_write in &row_write.columns_writing_data {
-                let column_data_wrapper = unsafe { row_write.data.into_wrapper() };
-                let column_vec = column_data_wrapper.as_slice();
-                let size = column_vec.len();
+                let column_slice = row_write.data.into_slice();
+                let size = column_slice.len();
 
-                vec[position..position + size].copy_from_slice(column_vec);
+                slice[position..position + size].copy_from_slice(column_slice);
                 position += size;
             }
 
-            CRC.checksum(&vec)
+            CRC.checksum(slice)
         };
 
         RowPointer {
@@ -512,53 +508,63 @@ impl RowPointer {
     }
     
     /// Deserializes a slice of u8 into a RowPointer
-    pub fn from_slice(buffer: &[u8; TOTAL_LENGTH]) -> Result<Self> {
-        use byteorder::{LittleEndian, ReadBytesExt};
-        use std::io::Cursor;
-        
-        let mut cursor = Cursor::new(buffer);
-
+    pub fn from_slice(buffer: &[u8; TOTAL_LENGTH]) -> Self {
+        // ID field
         #[cfg(feature = "enable_long_row")]
-        let id = cursor.read_u128::<LittleEndian>()?;
-        #[cfg(feature = "enable_long_row")]
-        let length = cursor.read_u64::<LittleEndian>()?;
+        let id = unsafe { read_u128(buffer.as_ptr()) };
 
         #[cfg(not(feature = "enable_long_row"))]
-        let id = cursor.read_u64::<LittleEndian>()?;
+        let id = unsafe { read_u64(buffer.as_ptr()) };
+
+        // Length field
+        #[cfg(feature = "enable_long_row")]
+        let length = unsafe { read_u64(buffer.as_ptr().add(16)) };
+
         #[cfg(not(feature = "enable_long_row"))]
-        let length = cursor.read_u32::<LittleEndian>().unwrap();
+        let length = unsafe { read_u32(buffer.as_ptr().add(8)) };
 
-        let position = cursor.read_u64::<LittleEndian>()?;
-        let deleted = cursor.read_u8()? != 0;
+        // Position field (u64 in both cases)
+        #[cfg(feature = "enable_long_row")]
+        let position = unsafe { read_u64(buffer.as_ptr().add(24))};
 
+        #[cfg(not(feature = "enable_long_row"))]
+        let position = unsafe { read_u64(buffer.as_ptr().add(12)) };
+
+        // Deleted field (bool - 1 byte)
+        #[cfg(feature = "enable_long_row")]
+        let deleted = unsafe { read_u8(buffer.as_ptr().add(32)) } != 0;
+
+        #[cfg(not(feature = "enable_long_row"))]
+        let deleted = unsafe { read_u8(buffer.as_ptr().add(20)) } != 0;
+
+        // The following fields only exist in the long row format
+        #[cfg(feature = "enable_long_row")]
+        let checksum = unsafe { read_u32(buffer.as_ptr().add(33)) };
 
         #[cfg(feature = "enable_long_row")]
-        let checksum = cursor.read_u32::<LittleEndian>()?;
+        let cluster = unsafe { read_u32(buffer.as_ptr().add(37)) };
 
         #[cfg(feature = "enable_long_row")]
-        let cluster = cursor.read_u32::<LittleEndian>()?;
+        let deleted_at = unsafe { read_u128(buffer.as_ptr().add(41)) };
 
         #[cfg(feature = "enable_long_row")]
-        let deleted_at = cursor.read_u128::<LittleEndian>()?;
+        let created_at = unsafe { read_u128(buffer.as_ptr().add(57)) };
 
         #[cfg(feature = "enable_long_row")]
-        let created_at = cursor.read_u128::<LittleEndian>()?;
+        let updated_at = unsafe { read_u128(buffer.as_ptr().add(73)) };
 
         #[cfg(feature = "enable_long_row")]
-        let updated_at = cursor.read_u128::<LittleEndian>()?;
+        let version = unsafe { read_u16(buffer.as_ptr().add(89)) };
 
         #[cfg(feature = "enable_long_row")]
-        let version = cursor.read_u16::<LittleEndian>()?;
+        let is_active = unsafe { read_u8(buffer.as_ptr().add(91)) } != 0 ;
 
-        #[cfg(feature = "enable_long_row")]
-        let is_active = cursor.read_u8()? != 0;
-
-        Ok(RowPointer {
+        // Create the RowPointer struct from the read values
+        let row_pointer = RowPointer {
             id,
             length,
             position,
             deleted,
-
             #[cfg(feature = "enable_long_row")]
             checksum,
             #[cfg(feature = "enable_long_row")]
@@ -573,12 +579,13 @@ impl RowPointer {
             version,
             #[cfg(feature = "enable_long_row")]
             is_active,
-
             writing_data: WritingData {
                 total_columns_size: 0, // Placeholder, will be set later
                 total_strings_size: 0, // Placeholder, will be set later
             }
-        })
+        };
+
+        row_pointer
     }
     
     /// Reads a RowPointer from the given StorageIO at the specified position
@@ -588,7 +595,7 @@ impl RowPointer {
         // Read all data in one operation
         io.read_data_into_buffer(position, &mut slice).await;
 
-        let row_pointer = Self::from_slice(&slice)?;
+        let row_pointer = Self::from_slice(&slice);
 
         Ok(row_pointer)
     }
