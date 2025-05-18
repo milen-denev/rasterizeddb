@@ -515,11 +515,11 @@ impl Column {
     }
 
     pub fn from_chunk(data_type: u8, chunk: MemoryBlock) -> Column {
-        let vec = unsafe { chunk.into_wrapper() };
+        let vec = chunk.into_slice();
         
         Column {
             data_type: DbType::from_byte(data_type),
-            content: ColumnValue::ManagedMemoryPointer(Box::pin(vec.as_vec().clone())),
+            content: ColumnValue::ManagedMemoryPointer(Box::pin(vec.to_vec().clone())),
         }
     }
 
