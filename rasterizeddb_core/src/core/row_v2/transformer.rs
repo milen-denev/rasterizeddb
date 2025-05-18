@@ -64,11 +64,8 @@ impl ColumnTransformer {
     }
 
     pub fn transform_single(&self) -> Either<MemoryBlock, bool> {  
-        let wrapper_1 = unsafe { self.column_1.into_wrapper() };
-        let wrapper_2 = unsafe { self.column_2.into_wrapper() };
-
-        let input1 =  wrapper_1.as_slice();
-        let input2 = wrapper_2.as_slice();
+        let input1 = self.column_1.into_slice();
+        let input2 = self.column_2.into_slice();
 
         match self.transformer_type {
             ColumnTransformerType::MathOperation(ref operation) => {
@@ -100,18 +97,16 @@ mod tests {
     fn create_memory_block_from_i32(value: i32) -> MemoryBlock {
         let bytes = value.to_le_bytes();
         let data = MEMORY_POOL.acquire(bytes.len());
-        let mut wrapper = unsafe { data.into_wrapper() };
-        let vec = wrapper.as_vec_mut();
-        vec.copy_from_slice(&bytes);
+        let slice = data.into_slice_mut();
+        slice.copy_from_slice(&bytes);
         data
     }
 
     fn create_memory_block_from_string(value: &str) -> MemoryBlock {
         let bytes = value.as_bytes();
         let data = MEMORY_POOL.acquire(bytes.len());
-        let mut wrapper = unsafe { data.into_wrapper() };
-        let vec = wrapper.as_vec_mut();
-        vec.copy_from_slice(bytes);
+        let slice = data.into_slice_mut();
+        slice.copy_from_slice(bytes);
         data
     }
 
@@ -129,8 +124,7 @@ mod tests {
         );
 
         if let Either::Left(result) = transformer.transform_single() {
-            let wrapper = unsafe { result.into_wrapper() };
-            let result_slice = wrapper.as_slice();
+            let result_slice = result.into_slice();
             let result_value = i32::from_le_bytes(result_slice.try_into().unwrap());
             assert_eq!(result_value, 30);
         } else {
