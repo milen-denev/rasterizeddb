@@ -1,3 +1,5 @@
+use std::fmt::Debug;
+
 use crate::core::db_type::DbType;
 
 use super::{common::{simd_compare_strings, FromLeBytes}, transformer::ComparerOperation};
@@ -25,7 +27,7 @@ pub fn perform_comparison_operation(input1: &[u8], input2: &[u8], db_type: &DbTy
 #[inline(always)]
 fn generic_comparison<T>(input1: &[u8], input2: &[u8], operation: &ComparerOperation) -> bool
 where
-    T: Copy + Default + PartialEq + PartialOrd + FromLeBytes,
+    T: Copy + Default + PartialEq + PartialOrd + FromLeBytes + Debug,
 {
     let num1 = T::from_le_bytes(input1);
     let num2 = T::from_le_bytes(input2);
