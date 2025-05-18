@@ -1,7 +1,5 @@
 use std::{
-    arch::{asm, x86_64::*},
-    mem::ManuallyDrop,
-    ptr,
+    arch::{asm, x86_64::*}, ptr
 };
 
 #[inline]
@@ -131,10 +129,13 @@ pub fn vec_from_ptr_safe(ptr: *mut u8, len: usize) -> Vec<u8> {
 }
 
 #[inline(always)]
-pub unsafe fn ref_vec(ptr: *mut u8, len: usize) -> ManuallyDrop<Vec<u8>> {
-    unsafe {
-        let vec = Vec::from_raw_parts(ptr, len, len);
-        let manual = ManuallyDrop::new(vec);
-        manual
-    }
+#[allow(unsafe_op_in_unsafe_fn)]
+pub unsafe fn ref_slice_mut(ptr: *mut u8, len: usize) -> &'static mut [u8] {
+    std::slice::from_raw_parts_mut(ptr, len)
+}
+
+#[inline(always)]
+#[allow(unsafe_op_in_unsafe_fn)]
+pub unsafe fn ref_slice(ptr: *mut u8, len: usize) -> &'static [u8] {
+    std::slice::from_raw_parts(ptr, len)
 }
