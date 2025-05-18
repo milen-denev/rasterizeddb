@@ -24,7 +24,7 @@ use crate::{memory_pool::MEMORY_POOL, rql::{models::{Next, Token}, tokenizer::ev
 
 #[inline(always)]
 pub fn extent_non_string_buffer(
-    data_buffer: &mut Vec<u8>,
+    data_buffer: &'static mut [u8],
     db_type: &DbType,
     cursor_vector: &mut CursorVector,
     position: &mut u64) {
@@ -94,7 +94,7 @@ pub fn extent_non_string_buffer(
         cursor.seek(SeekFrom::Start(*position)).unwrap();
         let mut preset_buffer = vec![0; db_size as usize];
         cursor.read(&mut preset_buffer).unwrap();
-        data_buffer.append(&mut preset_buffer);
+        data_buffer.copy_from_slice(&mut preset_buffer);
         *position += db_size as u64;
     }
 }
@@ -246,10 +246,10 @@ pub(crate) async fn process_chunk_async(
                         let size = db_type.get_size();
                         let memory_chunk = MEMORY_POOL.acquire(size as usize);
 
-                        let mut data_buffer = unsafe { memory_chunk.into_wrapper() };
+                        let data_buffer = memory_chunk.into_slice_mut();
 
                         extent_non_string_buffer(
-                            data_buffer.as_vec_mut(),
+                            data_buffer,
                             &db_type,
                             &mut cursor_vector,
                             &mut position,
@@ -285,18 +285,13 @@ pub(crate) async fn process_chunk_async(
 
                         let str_memory_chunk = MEMORY_POOL.acquire(str_length as usize);
 
-                        let mut preset_buffer =
-                            unsafe { str_memory_chunk.into_wrapper() };
-
-                        let preset_buffer_slice = preset_buffer.as_vec_mut();
+                        let preset_buffer = str_memory_chunk.into_slice_mut();
 
                         for (i, byte) in chunk_slice[position as usize..position as usize + str_length as usize].iter().enumerate() {
-                            preset_buffer_slice[i] = *byte;
+                            preset_buffer[i] = *byte;
                         }
 
                         position += str_length as u64;
-
-                        drop(preset_buffer);
 
                         let column =
                             Column::from_chunk(column_type, str_memory_chunk);

@@ -518,10 +518,10 @@ impl<S: StorageIO> Table<S> {
                                         let size = db_type.get_size();
                                         let memory_chunk = MEMORY_POOL.acquire(size as usize);
 
-                                        let mut data_buffer = unsafe { memory_chunk.into_wrapper() };
+                                        let data_buffer = memory_chunk.into_slice_mut();
 
                                         extent_non_string_buffer(
-                                            data_buffer.as_vec_mut(),
+                                            data_buffer,
                                             &db_type,
                                             &mut cursor_vector,
                                             &mut position,
@@ -557,19 +557,14 @@ impl<S: StorageIO> Table<S> {
                 
                                         let str_memory_chunk = MEMORY_POOL.acquire(str_length as usize);
                 
-                                        let mut preset_buffer =
-                                            unsafe { str_memory_chunk.into_wrapper() };
-                
-                                        let preset_buffer_slice = preset_buffer.as_vec_mut();
- 
+                                        let preset_buffer = str_memory_chunk.into_slice_mut();
+
                                         for (i, byte) in chunk_slice[position as usize..position as usize + str_length as usize].iter().enumerate() {
-                                            preset_buffer_slice[i] = *byte;
+                                            preset_buffer[i] = *byte;
                                         }
                 
                                         position += str_length as u64;
                 
-                                        drop(preset_buffer);                
-
                                         let column =
                                             Column::from_chunk(column_type, str_memory_chunk);
 
@@ -728,7 +723,7 @@ impl<S: StorageIO> Table<S> {
                             if column_indexes.iter().any(|x| *x == column_index_inner) {
                                 let memory_chunk = MEMORY_POOL.acquire(prefetch_result.length as usize + 1);
 
-                                let mut data_buffer = unsafe { memory_chunk.into_wrapper() };
+                                let mut data_buffer = memory_chunk.into_slice_mut();
 
                                 let column_type = columns_cursor.read_u8().unwrap();
 
@@ -743,14 +738,14 @@ impl<S: StorageIO> Table<S> {
 
                                     let mut preset_buffer = vec![0; db_size as usize];
                                     columns_cursor.read(&mut preset_buffer).unwrap();
-                                    data_buffer.as_vec_mut().write(&mut preset_buffer).unwrap();
+                                    data_buffer.write(&mut preset_buffer).unwrap();
                                 } else {
                                     let str_length =
                                         columns_cursor.read_u32::<LittleEndian>().unwrap();
 
                                     let mut preset_buffer = vec![0; str_length as usize];
                                     columns_cursor.read(&mut preset_buffer).unwrap();
-                                    data_buffer.as_vec_mut().write(&mut preset_buffer).unwrap();
+                                    data_buffer.write(&mut preset_buffer).unwrap();
                                 }
 
                                 let column = Column::from_chunk(column_type, memory_chunk);
