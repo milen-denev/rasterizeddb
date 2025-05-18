@@ -21,6 +21,7 @@ pub struct ColumnWritePayload {
     pub size: u32
 }
 
+#[derive(Debug, Default)]
 pub struct Row {
     pub position: u64,
     pub columns: Vec<Column>,
@@ -32,8 +33,33 @@ pub struct Row {
     pub length: u32,
 }
 
+impl Row {
+    pub fn clone_from_mut_row(row: &Row) -> Row {
+        Row {
+            position: row.position,
+            columns: row.columns.clone(),
+            length: row.length
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Column {
     pub schema_id: u64,
     pub data: MemoryBlock,
     pub column_type: DbType,
+}
+
+impl Default for Column {
+    fn default() -> Self {
+        Self {
+            schema_id: 0,
+            data: MemoryBlock {
+                ptr: 0 as *mut u8,
+                size: 0,
+                should_drop: false
+            },
+            column_type: DbType::NULL
+        }
+    }
 }
