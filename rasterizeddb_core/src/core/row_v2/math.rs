@@ -49,8 +49,7 @@ where
     );
 
     let block = MEMORY_POOL.acquire(input1.len());
-    let mut block_wrapper = unsafe { block.into_wrapper() };
-    let result = block_wrapper.as_vec_mut();
+    let result = block.into_slice_mut();
 
     let num1 = T::from_le_bytes(input1);
     let num2 = T::from_le_bytes(input2);
@@ -99,8 +98,7 @@ mod tests {
     where
         T: Copy + Default + FromLeBytes,
     {
-        let block_wrapper = unsafe { block.into_wrapper() };
-        let bytes = block_wrapper.as_vec();
+        let bytes = block.into_slice();
         T::from_le_bytes(bytes)
     }
 
