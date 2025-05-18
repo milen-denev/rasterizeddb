@@ -1,9 +1,8 @@
 use std::{
-    arch::x86_64::{_mm_prefetch, _MM_HINT_T0},
-    mem::ManuallyDrop
+    arch::x86_64::{_mm_prefetch, _MM_HINT_T0}
 };
 
-use crate::instructions::{copy_vec_to_ptr, ref_vec};
+use crate::instructions::{copy_vec_to_ptr, ref_slice, ref_slice_mut};
 
 pub static MEMORY_POOL: MemoryPool = MemoryPool::new();
 
@@ -29,7 +28,8 @@ impl MemoryPool {
 
         MemoryBlock {
             ptr,
-            size
+            size,
+            should_drop: true
         }
     }
 
@@ -45,10 +45,11 @@ impl MemoryPool {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Hash)]
 pub struct MemoryBlock {
     pub ptr: *mut u8,
-    pub size: usize
+    pub size: usize,
+    pub(crate) should_drop: bool
 }
 
 unsafe impl Send for MemoryBlock {}
@@ -56,7 +57,19 @@ unsafe impl Sync for MemoryBlock {}
 
 impl Drop for MemoryBlock {
     fn drop(&mut self) {
-        MEMORY_POOL.release(self.ptr);
+        if self.should_drop {
+            MEMORY_POOL.release(self.ptr);
+        }
+    }
+}
+
+impl Clone for MemoryBlock {
+    fn clone(&self) -> Self {
+        MemoryBlock {
+            ptr: self.ptr,
+            size: self.size,
+            should_drop: false
+        }
     }
 }
 
@@ -74,39 +87,11 @@ impl MemoryBlock {
         memory_chunk
     }
 
-    pub unsafe fn into_wrapper(&self) -> MemoryBlockWrapper {
-        MemoryBlockWrapper {
-            data: unsafe { ref_vec(self.ptr, self.size as usize) },
-            ptr: self.ptr,
-            size: self.size,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct  MemoryBlockWrapper {
-    pub data: ManuallyDrop<Vec<u8>>,
-    pub ptr: *mut u8,
-    pub size: usize
-}
-
-impl MemoryBlockWrapper {
-    pub fn as_vec(&self) -> &Vec<u8> {
-        &self.data
+    pub fn into_slice(&self) -> &'static [u8] {
+        unsafe { ref_slice(self.ptr, self.size) }
     }
 
-    pub fn as_vec_mut(&mut self) -> &mut Vec<u8> {
-        &mut self.data
-    }
-
-    pub fn as_slice(&self) -> &[u8] {
-        &self.data
-    }
-
-    pub fn into_block(self) -> MemoryBlock {
-        MemoryBlock {
-            ptr: self.ptr,
-            size: self.size
-        }
+    pub fn into_slice_mut(&self) -> &'static mut [u8] {
+        unsafe { ref_slice_mut(self.ptr, self.size) }
     }
 }
