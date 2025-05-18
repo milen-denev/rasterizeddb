@@ -1,4 +1,4 @@
-use std::{io::Cursor, sync::atomic::AtomicU64};
+use std::{io::Cursor, sync::{atomic::AtomicU64, Arc}};
 
 use super::{error::Result, row::RowWrite};
 use byteorder::{LittleEndian, WriteBytesExt};
@@ -14,6 +14,9 @@ use crate::{
     }, 
     memory_pool::{MemoryBlock, MEMORY_POOL}, simds
 };
+
+// Number of row pointers to fetch at once in next_row_pointers
+const BATCH_SIZE: usize = 2000;
 
 #[cfg(feature = "enable_long_row")]
 const TOTAL_LENGTH : usize = 
@@ -60,7 +63,7 @@ pub struct RowPointerIterator<'a, S: StorageIO> {
     /// Current position in the storage
     position: u64,
     /// Buffer to store 64KB chunks
-    buffer: Vec<u8>,
+    buffer: MemoryBlock,
     /// Current index in the buffer
     buffer_index: usize,
     /// Valid data length in the buffer
@@ -83,12 +86,12 @@ impl<'a, S: StorageIO> RowPointerIterator<'a, S> {
             total_length
         };
 
-        let buffer = vec![0u8; buffer_size];
+        let memory_block = MEMORY_POOL.acquire(buffer_size);
 
         let mut iterator = RowPointerIterator {
             io,
             position: 0,
-            buffer,
+            buffer: memory_block,
             buffer_index: 0,
             buffer_valid_length: 0,
             total_length,
@@ -117,13 +120,13 @@ impl<'a, S: StorageIO> RowPointerIterator<'a, S> {
         let bytes_to_read = std::cmp::min(bytes_remaining, CHUNK_SIZE as u64);
         
         // Clear the buffer and ensure capacity
-        self.buffer.clear();
-        self.buffer.resize(bytes_to_read as usize, 0);
+
+        self.buffer = MEMORY_POOL.acquire(bytes_to_read as usize);
         
         // Read data into the buffer
         let mut read_position = self.position;
-        self.io.read_data_into_buffer(&mut read_position, &mut self.buffer).await;
-        self.buffer_valid_length = self.buffer.len();
+        self.io.read_data_into_buffer(&mut read_position, &mut self.buffer.into_slice_mut()).await;
+        self.buffer_valid_length = self.buffer.into_slice().len();
         
         // Update position for next read
         self.position += bytes_to_read;
@@ -149,57 +152,73 @@ impl<'a, S: StorageIO> RowPointerIterator<'a, S> {
         }
         
         // Check if we have enough data left in the buffer for a complete RowPointer
-        if self.buffer_index + TOTAL_LENGTH > self.buffer_valid_length {
-            // We need to handle the case where a RowPointer spans two chunks
-            let remaining_data = self.buffer[self.buffer_index..].to_vec();
-            let remaining_length = remaining_data.len();
+        // if self.buffer_index + TOTAL_LENGTH > self.buffer_valid_length {
+        //     // We need to handle the case where a RowPointer spans two chunks
+        //     let remaining_data = self.buffer[self.buffer_index..].to_vec();
+        //     let remaining_length = remaining_data.len();
             
-            // Reset buffer with the remaining data
-            self.buffer.clear();
-            self.buffer.extend_from_slice(&remaining_data);
+        //     // Reset buffer with the remaining data
+        //     self.buffer.clear();
+        //     self.buffer.extend_from_slice(&remaining_data);
             
-            // Update buffer index and valid length
-            self.buffer_index = 0;
-            self.buffer_valid_length = remaining_length;
+        //     // Update buffer index and valid length
+        //     self.buffer_index = 0;
+        //     self.buffer_valid_length = remaining_length;
             
-            // Calculate how many additional bytes to read
-            let additional_bytes_needed = TOTAL_LENGTH - remaining_length;
+        //     // Calculate how many additional bytes to read
+        //     let additional_bytes_needed = TOTAL_LENGTH - remaining_length;
             
-            // Check if there's enough data left in the storage
-            let bytes_remaining_in_storage = self.total_length as u64 - (self.position - remaining_length as u64);
+        //     // Check if there's enough data left in the storage
+        //     let bytes_remaining_in_storage = self.total_length as u64 - (self.position - remaining_length as u64);
             
-            if bytes_remaining_in_storage < additional_bytes_needed as u64 {
-                self.end_of_data = true;
-                return Ok(None);
-            }
+        //     if bytes_remaining_in_storage < additional_bytes_needed as u64 {
+        //         self.end_of_data = true;
+        //         return Ok(None);
+        //     }
             
-            // Read the additional bytes
-            let mut additional_data = vec![0u8; additional_bytes_needed];
-            let mut read_position = self.position - remaining_length as u64;
-            self.io.read_data_into_buffer(&mut read_position, &mut additional_data).await;
+        //     // Read the additional bytes
+        //     let mut additional_data = vec![0u8; additional_bytes_needed];
+        //     let mut read_position = self.position - remaining_length as u64;
+        //     self.io.read_data_into_buffer(&mut read_position, &mut additional_data).await;
             
-            // Append the additional data to the buffer
-            self.buffer.extend_from_slice(&additional_data);
-            self.buffer_valid_length = self.buffer.len();
+        //     // Append the additional data to the buffer
+        //     self.buffer.extend_from_slice(&additional_data);
+        //     self.buffer_valid_length = self.buffer.len();
             
-            // Update position for next read
-            self.position = read_position + additional_bytes_needed as u64;
+        //     // Update position for next read
+        //     self.position = read_position + additional_bytes_needed as u64;
             
-            // If we still don't have enough data for a complete RowPointer, return None
-            if self.buffer_valid_length < TOTAL_LENGTH {
-                self.end_of_data = true;
-                return Ok(None);
-            }
-        }
+        //     // If we still don't have enough data for a complete RowPointer, return None
+        //     if self.buffer_valid_length < TOTAL_LENGTH {
+        //         self.end_of_data = true;
+        //         return Ok(None);
+        //     }
+        // }
         
+        let mut slice: [u8; TOTAL_LENGTH] = [0; TOTAL_LENGTH];
+
         // Parse the RowPointer from the buffer
-        let slice = &self.buffer[self.buffer_index..self.buffer_index + TOTAL_LENGTH];
-        let row_pointer = RowPointer::from_slice(slice)?;
+        slice.copy_from_slice(&self.buffer.into_slice()[self.buffer_index..self.buffer_index + TOTAL_LENGTH]);
+        let row_pointer = RowPointer::from_slice(&slice)?;
         
         // Advance the buffer index
         self.buffer_index += TOTAL_LENGTH;
         
         Ok(Some(row_pointer))
+    }
+    
+    /// Get multiple RowPointers at once, up to BATCH_SIZE
+    pub async fn next_row_pointers(&mut self) -> Result<Vec<RowPointer>> {
+        let mut pointers = Vec::with_capacity(BATCH_SIZE);
+        
+        for _ in 0..BATCH_SIZE {
+            match self.next_row_pointer().await? {
+                Some(pointer) => pointers.push(pointer),
+                None => break,
+            }
+        }
+        
+        Ok(pointers)
     }
 }
 
@@ -254,7 +273,20 @@ pub struct RowPointer{
     #[cfg(feature = "enable_long_row")]
     pub version: u16,
     #[cfg(feature = "enable_long_row")]
-    pub is_active: bool
+    pub is_active: bool,
+
+    pub writing_data: WritingData
+}
+
+#[derive(Debug, Clone)]
+pub struct WritingData {
+    #[cfg(feature = "enable_long_row")]
+    pub total_columns_size: u64,
+
+    #[cfg(not(feature = "enable_long_row"))]
+    pub total_columns_size: u32,
+
+    pub total_strings_size: u32
 }
 
 impl RowPointer {
@@ -264,6 +296,15 @@ impl RowPointer {
         let now = std::time::SystemTime::now();
         let duration = now.duration_since(std::time::UNIX_EPOCH).unwrap();
         let timestamp = duration.as_millis();
+        timestamp
+    }
+
+    /// Gets the current timestamp in milliseconds since UNIX epoch
+    pub fn get_timestamp_seconds() -> u64 {
+        // Get the current timestamp in milliseconds
+        let now = std::time::SystemTime::now();
+        let duration = now.duration_since(std::time::UNIX_EPOCH).unwrap();
+        let timestamp = duration.as_secs();
         timestamp
     }
 
@@ -298,12 +339,36 @@ impl RowPointer {
         let id = last_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         #[cfg(feature = "enable_long_row")]
-        let total_len = row_write.columns_writing_data.iter().map(|col| col.size as u64).sum::<u64>();
+        let (position, total_bytes, total_string_size) = {
+            let mut total_bytes = row_write.columns_writing_data.iter().map(|col| col.size as u64).sum::<u64>();
+
+            let total_string_size = row_write.columns_writing_data.iter()
+                .filter(|col| col.column_type == DbType::STRING)
+                .map(|col| unsafe { col.data.into_wrapper().as_slice().len() as u64 })
+                .sum::<u64>();
+
+            total_bytes = total_bytes + total_string_size;
+
+            let position = table_length.fetch_add(total_bytes, std::sync::atomic::Ordering::SeqCst);
+
+            (position, total_bytes, total_string_size)
+        };
 
         #[cfg(not(feature = "enable_long_row"))]
-        let total_len = row_write.columns_writing_data.iter().map(|col| col.size).sum::<u32>() as u32;
+        let (position, total_bytes, total_string_size) = {
+            let mut total_bytes = row_write.columns_writing_data.iter().map(|col| col.size).sum::<u32>();
 
-        let position = table_length.fetch_add(total_len as u64, std::sync::atomic::Ordering::SeqCst);
+            let total_string_size = row_write.columns_writing_data.iter()
+                .filter(|col| col.column_type == DbType::STRING)
+                .map(|col| col.data.into_slice().len() as u32)
+                .sum::<u32>();
+
+            total_bytes = total_bytes + total_string_size;
+
+            let position = table_length.fetch_add(total_bytes as u64, std::sync::atomic::Ordering::SeqCst);
+
+            (position, total_bytes, total_string_size)
+        };
 
         #[cfg(feature = "enable_long_row")]
         let timestamp = Self::get_timestamp();
@@ -338,7 +403,7 @@ impl RowPointer {
 
         RowPointer {
             id: id + 1,
-            length: total_len,
+            length: total_bytes,
             position,
             deleted: false,
 
@@ -355,7 +420,12 @@ impl RowPointer {
             #[cfg(feature = "enable_long_row")]
             version: 0,
             #[cfg(feature = "enable_long_row")]
-            is_active: true
+            is_active: true,
+
+            writing_data: WritingData {
+                total_columns_size: total_bytes,
+                total_strings_size: total_string_size,
+            }
         }
     }
 
@@ -364,15 +434,15 @@ impl RowPointer {
         io: &mut S,) -> Result<()> {
         
         let block = self.into_memory_block();
-        let wrapper = unsafe { block.into_wrapper() };
+        let slice = block.into_slice();
 
         #[cfg(feature = "enable_data_verification")]
         let position = io.get_len().await;
 
-        io.append_data(wrapper.as_slice()).await;
+        io.append_data(slice).await;
 
         #[cfg(feature = "enable_data_verification")]
-        let verify_result = io.verify_data_and_sync(position, wrapper.as_slice()).await;
+        let verify_result = io.verify_data_and_sync(position, slice).await;
 
         #[cfg(feature = "enable_data_verification")]
         if !verify_result {
@@ -387,12 +457,11 @@ impl RowPointer {
     /// Serializes the RowPointer into a Vec<u8>
     pub fn into_memory_block(&self) -> MemoryBlock {
         let block = MEMORY_POOL.acquire(TOTAL_LENGTH as usize);
-        let mut wrapper = unsafe { block.into_wrapper() };
-        let buffer = wrapper.as_vec_mut();
+        let slice = block.into_slice_mut();
  
-        debug_assert!(buffer.len() == TOTAL_LENGTH, "Buffer size mismatch");
+        debug_assert!(slice.len() == TOTAL_LENGTH, "Buffer size mismatch");
 
-        let mut cursor = Cursor::new(buffer);
+        let mut cursor = Cursor::new(slice);
         cursor.set_position(0);
 
         // Write all fields in order
@@ -427,23 +496,23 @@ impl RowPointer {
     /// Writes the RowPointer to the given StorageIO at the specified position
     pub async fn write_to_io<S: StorageIO>(&self, io: &mut S) -> Result<()> {
         let block = self.into_memory_block();
-        let wrapper = unsafe { block.into_wrapper() };
+        let slice = block.into_slice();
 
         #[cfg(feature = "enable_data_verification")]
         let position = io.get_len().await;
 
         // Write data to storage
-        io.append_data(wrapper.as_slice()).await;
+        io.append_data(slice).await;
         
         // Verify written data
         #[cfg(feature = "enable_data_verification")]
-        io.verify_data_and_sync(position, wrapper.as_slice()).await;
+        io.verify_data_and_sync(position, slice).await;
         
         Ok(())
     }
     
     /// Deserializes a slice of u8 into a RowPointer
-    pub fn from_slice(buffer: &[u8]) -> Result<Self> {
+    pub fn from_slice(buffer: &[u8; TOTAL_LENGTH]) -> Result<Self> {
         use byteorder::{LittleEndian, ReadBytesExt};
         use std::io::Cursor;
         
@@ -503,22 +572,23 @@ impl RowPointer {
             #[cfg(feature = "enable_long_row")]
             version,
             #[cfg(feature = "enable_long_row")]
-            is_active
+            is_active,
+
+            writing_data: WritingData {
+                total_columns_size: 0, // Placeholder, will be set later
+                total_strings_size: 0, // Placeholder, will be set later
+            }
         })
     }
     
     /// Reads a RowPointer from the given StorageIO at the specified position
     pub async fn read_from_io<S: StorageIO>(io: &mut S, position: &mut u64) -> Result<Self> {
+        let mut slice: [u8; TOTAL_LENGTH] = [0; TOTAL_LENGTH];
 
-        let block = MEMORY_POOL.acquire(TOTAL_LENGTH as usize);
-        let mut wrapper = unsafe { block.into_wrapper() };
-        let mut vec = wrapper.as_vec_mut();
-        
         // Read all data in one operation
-        io.read_data_into_buffer(position, &mut vec).await;
+        io.read_data_into_buffer(position, &mut slice).await;
 
-        let row_pointer = Self::from_slice(&vec)?;
-        drop(block);
+        let row_pointer = Self::from_slice(&slice)?;
 
         Ok(row_pointer)
     }
@@ -536,7 +606,7 @@ impl RowPointer {
     /// # Returns
     /// 
     /// A Result containing the constructed Row with only the requested columns
-    pub async fn fetch_row<S: StorageIO>(&self, io: &mut S, row_fetch: &RowFetch) -> Result<Row> {
+    pub async fn fetch_row<S: StorageIO>(&self, io: &S, row_fetch: &RowFetch) -> Result<Row> {
         // Skip fetching if the row is marked as deleted
         if self.deleted {
             return Err(super::error::RowError::NotFound("Row is marked as deleted".into()));
@@ -565,12 +635,9 @@ impl RowPointer {
 
                 // Read the string data
                 let string_block = MEMORY_POOL.acquire(string_size as usize);
-                let mut string_wrapper = unsafe { string_block.into_wrapper() };
-                let mut string_buffer = string_wrapper.as_vec_mut();
+                let string_slice = string_block.into_slice_mut();
 
-                io.read_data_into_buffer(&mut string_row_position, &mut string_buffer).await;
-
-                println!("Block data: {:?}", string_block);
+                io.read_data_into_buffer(&mut string_row_position, string_slice).await;
 
                 // Create a column with the string data
                 let column = Column {
@@ -585,13 +652,10 @@ impl RowPointer {
 
                 // Allocate memory for the column data
                 let block = MEMORY_POOL.acquire(c_size as usize);
-                let mut wrapper = unsafe { block.into_wrapper() };
-                let mut buffer = wrapper.as_vec_mut();
+                let slice = block.into_slice_mut();
                 
                 // Read the column data directly into our buffer
-                io.read_data_into_buffer(&mut position, &mut buffer).await;
-
-                println!("Block data: {:?}", block);
+                io.read_data_into_buffer(&mut position, slice).await;
 
                 // Create a Column object with the read data
                 let column = Column {
@@ -610,6 +674,147 @@ impl RowPointer {
             columns,
             length: self.length
         })
+    }
+
+    pub async fn fetch_row_async<S: StorageIO>(&self, io: Arc<S>, row_fetch: Arc<RowFetch>) -> Result<Row> {
+        // Skip fetching if the row is marked as deleted
+        if self.deleted {
+            return Err(super::error::RowError::NotFound("Row is marked as deleted".into()));
+        }
+        
+        // Create a vector to hold all the columns
+        let mut columns = Vec::with_capacity(row_fetch.columns_fetching_data.len());
+        
+        // For each column specified in the fetch data
+        for column_data in &row_fetch.columns_fetching_data {
+            let mut position = self.position + column_data.column_offset as u64;
+
+            if column_data.column_type == DbType::STRING {
+                // For strings, we need to read the size first
+                let mut string_position_buffer = [0u8; 8];
+
+                io.read_data_into_buffer(&mut position, &mut string_position_buffer).await;
+
+                // Turn [u8] into u64
+                let mut string_row_position = unsafe { simds::endianess::read_u64(string_position_buffer.as_ptr()) };
+
+                let mut string_size_buffer = [0u8; 4];
+
+                io.read_data_into_buffer(&mut position, &mut string_size_buffer).await;
+                let string_size = unsafe { simds::endianess::read_u32(string_size_buffer.as_ptr()) };
+
+                // Read the string data
+                let string_block = MEMORY_POOL.acquire(string_size as usize);
+                let string_slice = string_block.into_slice_mut();
+
+                io.read_data_into_buffer(&mut string_row_position, string_slice).await;
+
+                // Create a column with the string data
+                let column = Column {
+                    schema_id: 0,
+                    data: string_block,
+                    column_type: DbType::STRING,
+                };
+
+                columns.push(column);
+            } else {
+                let c_size = column_data.size;
+
+                // Allocate memory for the column data
+                let block = MEMORY_POOL.acquire(c_size as usize);
+                let slice = block.into_slice_mut();
+                
+                // Read the column data directly into our buffer
+                io.read_data_into_buffer(&mut position, slice).await;
+
+                // Create a Column object with the read data
+                let column = Column {
+                    schema_id: 0, // Schema ID would be set based on metadata or query context
+                    data: block,
+                    column_type: column_data.column_type.clone(), // Clone the DbType
+                };
+                
+                columns.push(column);
+            }
+        }
+        
+        // Create and return the Row with just the fetched columns
+        Ok(Row {
+            position: self.position,
+            columns,
+            length: self.length
+        })
+    }
+
+    pub async fn fetch_row_reuse_async<S: StorageIO>(
+        &self, 
+        io: &S, 
+        row_fetch: &RowFetch,
+        row_reuse: &mut Row) {
+        // Skip fetching if the row is marked as deleted
+        if self.deleted {
+            panic!();
+        }
+        
+        // Create a vector to hold all the columns
+        let columns = &mut row_reuse.columns;
+        columns.clear();
+
+        // For each column specified in the fetch data
+        for column_data in &row_fetch.columns_fetching_data {
+            let mut position = self.position + column_data.column_offset as u64;
+
+            if column_data.column_type == DbType::STRING {
+                // For strings, we need to read the size first
+                let mut string_position_buffer = [0u8; 8];
+
+                io.read_data_into_buffer(&mut position, &mut string_position_buffer).await;
+
+                // Turn [u8] into u64
+                let mut string_row_position = unsafe { simds::endianess::read_u64(string_position_buffer.as_ptr()) };
+
+                let mut string_size_buffer = [0u8; 4];
+
+                io.read_data_into_buffer(&mut position, &mut string_size_buffer).await;
+                let string_size = unsafe { simds::endianess::read_u32(string_size_buffer.as_ptr()) };
+
+                // Read the string data
+                let string_block = MEMORY_POOL.acquire(string_size as usize);
+                let string_slice = string_block.into_slice_mut();
+
+                io.read_data_into_buffer(&mut string_row_position, string_slice).await;
+
+                // Create a column with the string data
+                let column = Column {
+                    schema_id: 0,
+                    data: string_block,
+                    column_type: DbType::STRING,
+                };
+
+                columns.push(column);
+            } else {
+                let c_size = column_data.size;
+
+                // Allocate memory for the column data
+                let block = MEMORY_POOL.acquire(c_size as usize);
+                let slice = block.into_slice_mut();
+                
+                // Read the column data directly into our buffer
+                io.read_data_into_buffer(&mut position, slice).await;
+
+                // Create a Column object with the read data
+                let column = Column {
+                    schema_id: 0, // Schema ID would be set based on metadata or query context
+                    data: block,
+                    column_type: column_data.column_type.clone(), // Clone the DbType
+                };
+                
+                columns.push(column);
+            }
+        }
+        
+        row_reuse.position = self.position;
+        row_reuse.length = self.length;
     }
 
     /// Writes a row to storage using the given RowWrite payload
@@ -657,14 +862,8 @@ impl RowPointer {
         #[cfg(feature = "enable_data_verification")]
         let io_position = row_pointer.position;
 
-        let mut total_bytes = row_write.columns_writing_data.iter().map(|col| col.size as u64).sum::<u64>();
-
-        let total_string_size = row_write.columns_writing_data.iter()
-            .filter(|col| col.column_type == DbType::STRING)
-            .map(|col| unsafe { col.data.into_wrapper().as_slice().len() as u64 })
-            .sum::<u64>();
-
-        total_bytes = total_bytes + total_string_size;
+        let total_bytes = row_pointer.writing_data.total_columns_size;
+        let total_string_size = row_pointer.writing_data.total_strings_size;
 
         // Count number of string columns
         // let string_columns_count = row_write.columns_writing_data.iter().filter(|col| col.column_type == DbType::STRING).count();
@@ -672,14 +871,12 @@ impl RowPointer {
 
         // Allocate memory to store the row data
         let block = MEMORY_POOL.acquire(total_bytes as usize);
-        let mut wrapper = unsafe { block.into_wrapper() };
-        let buffer = wrapper.as_vec_mut();
+        let slice = block.into_slice_mut();
 
         let mut row_position = 0;
 
         let string_block = MEMORY_POOL.acquire(total_string_size as usize);
-        let mut string_wrapper = unsafe { string_block.into_wrapper() };
-        let string_data = string_wrapper.as_vec_mut();
+        let string_slice = string_block.into_slice_mut();
 
         let mut end_of_row: u64 = row_write.columns_writing_data.iter().map(|col| col.size as u64).sum();
 
@@ -699,43 +896,41 @@ impl RowPointer {
             // ROW: [I32|STRING_POINTER_1|STRING_SIZE|I32|U128|STRING_POINTER_2|STRING_SIZE|STRING_DATA_1|STRING_DATA_2]
             // 
             if column.column_type == DbType::STRING {
-                let string_column_data_wrapper = unsafe { column.data.into_wrapper() };
-                let string_column_vec = string_column_data_wrapper.as_slice();
+                let string_column_slice = column.data.into_slice();
 
-                let string_size = string_column_vec.len() as u32;
+                let string_size = string_column_slice.len() as u32;
 
-                string_data[string_data_position as usize..string_data_position as usize + string_size as usize].copy_from_slice(string_column_vec);
+                string_slice[string_data_position as usize..string_data_position as usize + string_size as usize].copy_from_slice(string_column_slice);
 
                 string_data_position = string_data_position + string_size as u64;
 
                 let end_of_row_bytes = end_of_row.to_le_bytes();
 
                 // Write STRING_POINTER
-                buffer[row_position as usize..row_position as usize + 8].copy_from_slice(&end_of_row_bytes);
+                slice[row_position as usize..row_position as usize + 8].copy_from_slice(&end_of_row_bytes);
              
                 // Write STRING_SIZE
-                buffer[row_position as usize + 8..row_position as usize + 4 + 8].copy_from_slice(&string_size.to_le_bytes());
+                slice[row_position as usize + 8..row_position as usize + 4 + 8].copy_from_slice(&string_size.to_le_bytes());
 
-                end_of_row = end_of_row + string_column_vec.len() as u64;
+                end_of_row = end_of_row + string_column_slice.len() as u64;
 
                 row_position = end_of_column;
             } else {
-                let column_data_wrapper = unsafe { column.data.into_wrapper() };
-                let column_vec = column_data_wrapper.as_slice();
+                let column_slice = column.data.into_slice();
 
-                buffer[row_position as usize..end_of_column as usize].copy_from_slice(column_vec);
+                slice[row_position as usize..end_of_column as usize].copy_from_slice(column_slice);
 
                 row_position = end_of_column;
             }
         }
 
-        buffer[row_position as usize..].copy_from_slice(&string_data);
+        slice[row_position as usize..].copy_from_slice(&string_slice);
 
         // Write the row data to the rows_io
-        rows_io.append_data(buffer.as_slice()).await;
+        rows_io.append_data(slice).await;
 
         #[cfg(feature = "enable_data_verification")]
-        let write_result = rows_io.verify_data_and_sync(io_position, buffer.as_slice()).await;
+        let write_result = rows_io.verify_data_and_sync(io_position, slice).await;
 
         #[cfg(feature = "enable_data_verification")]
         if !write_result {
@@ -769,6 +964,10 @@ mod tests {
                 updated_at: 0,
                 version: 0,
                 is_active: true,
+                writing_data: WritingData {
+                    total_columns_size: 0,
+                    total_strings_size: 0,
+                },
             }
         }
         
@@ -779,6 +978,10 @@ mod tests {
                 length,
                 position,
                 deleted,
+                writing_data: WritingData {
+                    total_columns_size: 0,
+                    total_strings_size: 0,
+                },
             }
         }
     }
@@ -889,16 +1092,14 @@ mod tests {
         let string_bytes = b"Hello, world!";
 
         let string_data = MEMORY_POOL.acquire(string_bytes.len());
-        let mut string_data_wrapper = unsafe { string_data.into_wrapper() };
-        let string_vec = string_data_wrapper.as_vec_mut();
+        let string_slice = string_data.into_slice_mut();
 
-        string_vec[0..].copy_from_slice(string_bytes);
+        string_slice[0..].copy_from_slice(string_bytes);
 
         let i32_bytes = 42_i32.to_le_bytes();
         let i32_data = MEMORY_POOL.acquire(i32_bytes.len());
-        let mut i32_data_wrapper = unsafe { i32_data.into_wrapper() };
-        let i32_vec = i32_data_wrapper.as_vec_mut();
-        i32_vec.copy_from_slice(&i32_bytes);
+        let i32_slice = i32_data.into_slice_mut();
+        i32_slice.copy_from_slice(&i32_bytes);
 
         let row_write = RowWrite {
             columns_writing_data: vec![
@@ -944,16 +1145,13 @@ mod tests {
         let string_bytes = b"Hello, world!";
 
         let string_data = MEMORY_POOL.acquire(string_bytes.len());
-        let mut string_data_wrapper = unsafe { string_data.into_wrapper() };
-        let string_vec = string_data_wrapper.as_vec_mut();
-
-        string_vec[0..].copy_from_slice(string_bytes);
+        let string_slice = string_data.into_slice_mut();
+        string_slice[0..].copy_from_slice(string_bytes);
 
         let i32_bytes = 42_i32.to_le_bytes();
         let i32_data = MEMORY_POOL.acquire(i32_bytes.len());
-        let mut i32_data_wrapper = unsafe { i32_data.into_wrapper() };
-        let i32_vec = i32_data_wrapper.as_vec_mut();
-        i32_vec.copy_from_slice(&i32_bytes);
+        let i32_slice = i32_data.into_slice_mut();
+        i32_slice.copy_from_slice(&i32_bytes);
 
         let row_write = RowWrite {
             columns_writing_data: vec![
@@ -971,6 +1169,16 @@ mod tests {
                 },
             ],
         };
+
+        let _result = RowPointer::write_row(
+            &mut mock_io_pointers, 
+            &mut mock_io_rows, 
+            &last_id, 
+            &table_length, 
+            #[cfg(feature = "enable_long_row")]
+            cluster, 
+            &row_write
+        ).await;
 
         let result = RowPointer::write_row(
             &mut mock_io_pointers, 
@@ -1004,21 +1212,19 @@ mod tests {
         };
 
         let row = next_pointer.fetch_row(
-            &mut mock_io_rows, 
+            &mock_io_rows, 
             &row_fetch
         ).await.unwrap();
 
         row.columns.iter().for_each(|column| {
             match column.column_type {
                 DbType::STRING => {
-                    let wrapper = unsafe { column.data.into_wrapper() };
-                    let string_data = wrapper.as_slice();
-                    assert_eq!(&string_data[0..], string_bytes);
+                    let string_slice = column.data.into_slice();
+                    assert_eq!(&string_slice[0..], string_bytes);
                 },
                 DbType::I32 => {
-                    let wrapper = unsafe { column.data.into_wrapper() };
-                    let i32_data = wrapper.as_slice();
-                    assert_eq!(i32_data, i32_bytes);
+                    let i32_slice = column.data.into_slice();
+                    assert_eq!(i32_slice, i32_bytes);
                 },
                 _ => {}
             }
