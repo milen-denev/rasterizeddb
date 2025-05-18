@@ -1,9 +1,10 @@
-// ...existing code...
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
+use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};
+
 use rasterizeddb_core::core::row_v2::{
     common::simd_compare_strings, transformer::ComparerOperation,
 };
-use std::str;
+
+use std::{hint::black_box, str};
 
 // Helper functions for standard library comparisons
 #[inline(always)]
