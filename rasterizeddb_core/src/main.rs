@@ -22,7 +22,9 @@ use stopwatch::Stopwatch;
 static mut IO_ROWS: async_lazy::Lazy<LocalStorageProvider> =
     async_lazy::Lazy::new(|| {
         Box::pin(async {
-            let io = LocalStorageProvider::new("G:\\Databases\\Test_Database", Some("rows3.db")).await;
+            //let io = LocalStorageProvider::new("G:\\Databases\\Test_Database", Some("rows3.db")).await;
+            let loc = "/home/milen-denev/Database/";
+            let io = LocalStorageProvider::new(loc, Some("rows3.db")).await;
             io
         })
     });
@@ -30,7 +32,9 @@ static mut IO_ROWS: async_lazy::Lazy<LocalStorageProvider> =
 static mut IO_POINTERS: async_lazy::Lazy<LocalStorageProvider> =
     async_lazy::Lazy::new(|| {
         Box::pin(async {
-            let io = LocalStorageProvider::new("G:\\Databases\\Test_Database", Some("pointers3.db")).await;
+            //let io = LocalStorageProvider::new("G:\\Databases\\Test_Database", Some("pointers3.db")).await;
+            let loc = "/home/milen-denev/Database/";
+            let io = LocalStorageProvider::new(loc, Some("pointers3.db")).await;
             io
         })
     });
@@ -64,7 +68,7 @@ async fn main() -> std::io::Result<()> {
     // let row_write = create_row_write(true);
     // let custom_row = create_row_write_custom_i32(SEARCH_VALUE, true);
 
-    // for _i in 0..30_000_000 {
+    // for _i in 0..1000 {
     //     _ = RowPointer::write_row(
     //         io_pointers,
     //         io_rows, 
@@ -90,7 +94,7 @@ async fn main() -> std::io::Result<()> {
     //     println!("Error writing row: {}", e);
     // }
 
-    //tokio::time::sleep(tokio::time::Duration::from_millis(10000)).await;
+    //tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
 
     let mut stopwatch = Stopwatch::start_new();
 

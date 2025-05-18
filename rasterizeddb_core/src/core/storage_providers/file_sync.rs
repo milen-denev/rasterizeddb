@@ -1,6 +1,8 @@
 use std::{
-    fs::{self, remove_file}, io::{Cursor, Read, Seek, SeekFrom}, path::Path, sync::{atomic::{AtomicBool, AtomicU64}, Arc}
+    fs::{self, remove_file}, path::Path, sync::{atomic::{AtomicBool, AtomicU64}, Arc}
 };
+
+use std::io::*;
 
 use crossbeam_queue::SegQueue;
 use futures::future::join_all;
@@ -11,6 +13,9 @@ use memmap2::{Mmap, MmapOptions};
 use crate::memory_pool::{MemoryBlock, MEMORY_POOL};
 
 use super::{traits::StorageIO, CRC};
+
+#[cfg(unix)]
+use super::io_uring_reader::AsyncUringReader;
 
 // pub static CACHE_MAP: std::sync::LazyLock<papaya::HashMap<(u64, u32), MemoryBlock>> = std::sync::LazyLock::new(|| {
 //     papaya::HashMap::new()
@@ -26,7 +31,9 @@ pub struct LocalStorageProvider {
     pub(crate) _memory_map: Mmap,
     pub(crate) hash: u32,
     locked: AtomicBool,
-    appender: SegQueue<MemoryBlock>
+    appender: SegQueue<MemoryBlock>,
+    #[cfg(unix)]
+    io_uring_reader: AsyncUringReader
 }
 
 unsafe impl Sync for LocalStorageProvider { }
@@ -46,7 +53,9 @@ impl Clone for LocalStorageProvider {
                 .unwrap() },
             hash: CRC.checksum(format!("{}+++{}", self.location, self.table_name).as_bytes()),
             appender: SegQueue::new(),
-            locked: AtomicBool::new(false)
+            locked: AtomicBool::new(false),
+            #[cfg(unix)]
+            io_uring_reader: self.io_uring_reader.clone()
         }
     }
 }
@@ -105,7 +114,7 @@ impl LocalStorageProvider {
                 write_file: Arc::new(RwLock::new(file_write)),
                 location: location.to_string(),
                 table_name: table_name.to_string(),
-                file_str: file_str,
+                file_str: file_str.clone(),
                 file_len: AtomicU64::new(file_len),
                 _memory_map: unsafe { MmapOptions::new()
                     .populate()
@@ -113,7 +122,9 @@ impl LocalStorageProvider {
                     .unwrap() },
                 hash: CRC.checksum(format!("{}+++{}", location, table_name).as_bytes()),
                 appender: SegQueue::new(),
-                locked: AtomicBool::new(false)
+                locked: AtomicBool::new(false),
+                #[cfg(unix)]
+                io_uring_reader: AsyncUringReader::new(&file_str, 1024).unwrap()
             }
         } else {
             let delimiter = if cfg!(unix) {
@@ -163,14 +174,16 @@ impl LocalStorageProvider {
                 write_file: Arc::new(RwLock::new(file_write)),
                 location: location.to_string(),
                 table_name: "temp.db".to_string(),
-                file_str: file_str,
+                file_str: file_str.clone(),
                 file_len: AtomicU64::new(file_len),
                 _memory_map: unsafe { MmapOptions::new()
                     .map(&file_read_mmap)
                     .unwrap() },
                 hash: CRC.checksum(format!("{}+++{}", location, "CONFIG_TABLE.db").as_bytes()),
                 appender: SegQueue::new(),
-                locked: AtomicBool::new(false)
+                locked: AtomicBool::new(false),
+                #[cfg(unix)]
+                io_uring_reader: AsyncUringReader::new(&file_str, 1024).unwrap()
             }
         }
  
@@ -422,6 +435,8 @@ impl StorageIO for LocalStorageProvider {
 
         // return;
 
+        // #[cfg(windows)]
+        // {
         let buffer_len = buffer.len();
         //let table_len = self.file_len.load(std::sync::atomic::Ordering::Relaxed);
 
@@ -438,6 +453,18 @@ impl StorageIO for LocalStorageProvider {
         }
 
         *position += buffer_len as u64;
+        // }
+        
+        // #[cfg(unix)]
+        // {
+        //     let buffer_len = buffer.len();
+        //     let offset = *position;
+        //     let result = self.io_uring_reader.read_at(offset, buffer_len).await.unwrap();
+
+        //     buffer.copy_from_slice(&result);
+        //     *position += buffer_len as u64;
+        // }
+
     }
 
     async fn read_data_to_cursor(&self, position: &mut u64, length: u32) -> Cursor<Vec<u8>> {
@@ -542,14 +569,16 @@ impl StorageIO for LocalStorageProvider {
             write_file: Arc::new(RwLock::new(file_write)),
             location: self.location.to_string(),
             table_name: "temp.db".to_string(),
-            file_str: file_str,
+            file_str: file_str.clone(),
             file_len: AtomicU64::new(file_len),
             _memory_map: unsafe { MmapOptions::new()
                     .map(&file_read_mmap)
                     .unwrap() },
             hash: CRC.checksum(format!("{}+++{}", self.location, "temp.db").as_bytes()),
             appender: SegQueue::new(),
-            locked: AtomicBool::new(false)
+            locked: AtomicBool::new(false),
+            #[cfg(unix)]
+            io_uring_reader: AsyncUringReader::new(&file_str, 1024).unwrap()
         }
     }
 
@@ -627,7 +656,9 @@ impl StorageIO for LocalStorageProvider {
                 .unwrap() },
             hash: CRC.checksum(format!("{}+++{}", self.location, name).as_bytes()),
             appender: SegQueue::new(),
-            locked: AtomicBool::new(false)
+            locked: AtomicBool::new(false),
+            #[cfg(unix)]
+            io_uring_reader: AsyncUringReader::new(&new_table, 1024).unwrap()
         }
     }
 

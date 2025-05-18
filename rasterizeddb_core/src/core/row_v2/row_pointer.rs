@@ -227,28 +227,10 @@ impl<'a, S: StorageIO> RowPointerIterator<'a, S> {
         
         Ok(pointers)
     }
-}
 
-// Implement the Iterator trait for RowPointerIterator for synchronous usage
-impl<'a, S: StorageIO> Iterator for RowPointerIterator<'a, S> {
-    type Item = Result<RowPointer>;
-    
-    fn next(&mut self) -> Option<Self::Item> {
-        // Since the actual implementation is async, this provides a blocking wrapper
-        // This is not ideal for production use but shows how the iterator would work
-        // In a real implementation, we'd use a proper async iterator pattern
-        
-        // Create a future and block on it
-        let future = self.next_row_pointer();
-        
-       
-        use tokio::runtime::Handle;
-        if let Ok(handle) = Handle::try_current() {
-            return handle.block_on(future).transpose();
-        } else {
-            // If not in an async context, we can't block on the future
-            return None;
-        }
+    pub async fn next(&mut self) -> Result<Option<RowPointer>> {
+        let result = self.next_row_pointer().await;
+        result
     }
 }
 

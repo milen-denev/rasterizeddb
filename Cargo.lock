@@ -1003,6 +1003,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "io-uring"
+version = "0.7.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5ebb93303c65a11753dd0e45cd6bfa5c65ee1f0b9f8e2178b6998ddc8b284f04"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1838,10 +1849,12 @@ dependencies = [
  "byteorder",
  "crc",
  "criterion",
+ "crossbeam-channel",
  "crossbeam-queue",
  "dashmap",
  "env_logger",
  "futures",
+ "io-uring",
  "itertools 0.14.0",
  "libmimalloc-sys",
  "log",

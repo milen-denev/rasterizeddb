@@ -32,6 +32,11 @@ memmap2 = "0.9.5"
 rand = "0.9.1"
 crossbeam-queue = "0.3.12"
 
+# unix dependencies
+[target.'cfg(unix)'.dependencies]
+io-uring = "0.7.7"
+crossbeam-channel = "0.5.15"
+
 [dev-dependencies]
 criterion = { version = "0.6.0" }
 

@@ -11,9 +11,9 @@
             },
             "problemMatcher": [],
 			"options": {
-				"shell": {
-					"executable": "powershell.exe"
-				}
+				// "shell": {
+				// 	"executable": "nu"
+				// }
 			}
         },
         {
