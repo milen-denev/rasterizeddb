@@ -50,7 +50,7 @@ impl Clone for MockStorageProvider {
 impl MockStorageProvider {
     pub async fn new() -> MockStorageProvider {
         let temp = TempDir::default();
-        let file_path = PathBuf::from(temp.as_ref());
+        let file_path = PathBuf::from(temp.as_ref().to_str().unwrap());
        
         let delimiter = if cfg!(unix) {
             "/"
@@ -64,15 +64,12 @@ impl MockStorageProvider {
 
         let location_path = Path::new(&location_str);
 
-        if !location_path.exists() {
-            _ = std::fs::create_dir(location_path);
-        }
-
-        let file_str = format!("{}{}{}", file_path.to_str().unwrap(), delimiter, "CONFIG_TABLE.db");
-
-        _ = std::fs::File::create(&file_str).unwrap();
+        _ = std::fs::create_dir(location_path);
+        
+        let file_str = format!("{}{}{}", location_str, delimiter, "TEMP.db");
 
         let file_append = tokio::fs::File::options()
+            .create(true)
             .read(true)
             .append(true)
             .open(&file_str)
@@ -86,7 +83,6 @@ impl MockStorageProvider {
             .await
             .unwrap();
 
-            
         let file_read = std::fs::File::options()
             .read(true)
             .open(&file_str)
@@ -95,11 +91,11 @@ impl MockStorageProvider {
         MockStorageProvider {
             append_file: Arc::new(RwLock::new(file_append)),
             write_file: Arc::new(RwLock::new(file_write)),
-            location: file_path.to_str().unwrap().to_string(),
-            table_name: "temp.db".to_string(),
+            location: location_str.to_string(),
+            table_name: "TEMP.db".to_string(),
             file_str: file_str,
             _temp_dir_hold: temp,
-            hash: CRC.checksum(format!("{}+++{}", file_path.to_str().unwrap(), "temp.db").as_bytes()),
+            hash: CRC.checksum(format!("{}+++{}", file_path.to_str().unwrap(), "TEMP.db").as_bytes()),
             appender: SegQueue::new(),
             _memory_map: unsafe { MmapOptions::new()
                     .map(&file_read)
@@ -145,7 +141,7 @@ impl MockStorageProvider {
                 file.flush().await.unwrap();
                 file.sync_all().await.unwrap();
             } else {
-                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
             }
         }
     }
@@ -180,7 +176,7 @@ impl StorageIO for MockStorageProvider {
         file.sync_all().await.unwrap();
     }
 
-    async fn append_data(&mut self, buffer: &[u8]) {
+    async fn append_data(&mut self, buffer: &[u8], _immediate: bool) {
         let mut file = self.append_file.write().await;
         file.write_all(&buffer).await.unwrap();
         file.flush().await.unwrap();
@@ -318,6 +314,8 @@ impl StorageIO for MockStorageProvider {
         let buffer_len = buffer.len();
         //let table_len = self.file_len.load(std::sync::atomic::Ordering::Relaxed);
 
+        println!("file_str: {}", self.file_str);
+
         let mut read_file = std::fs::File::options()
             .read(true)
             .open(&self.file_str)
@@ -384,8 +382,6 @@ impl StorageIO for MockStorageProvider {
     }
 
     async fn create_temp(&self) -> Self {
-        yield_now().await;
-        
         let delimiter = if cfg!(unix) {
             "/"
         } else if cfg!(windows) {
@@ -400,7 +396,7 @@ impl StorageIO for MockStorageProvider {
             _ = std::fs::create_dir(location_path);
         }
 
-        let file_str = format!("{}{}{}", self.location, delimiter, "temp.db");
+        let file_str = format!("{}{}{}", self.location, delimiter, "TEMP_2");
 
         _ = std::fs::File::create(&file_str).unwrap();
 
@@ -427,10 +423,10 @@ impl StorageIO for MockStorageProvider {
             append_file: Arc::new(RwLock::new(file_append)),
             write_file: Arc::new(RwLock::new(file_write)),
             location: self.location.to_string(),
-            table_name: "temp.db".to_string(),
+            table_name: "TEMP_2.db".to_string(),
             file_str: file_str,
             _temp_dir_hold: TempDir::default(),
-            hash: CRC.checksum(format!("{}+++{}", self.location, "temp.db").as_bytes()),
+            hash: CRC.checksum(format!("{}+++{}", self.location, "TEMP_2.db").as_bytes()),
             appender: SegQueue::new(),
             _memory_map: unsafe { MmapOptions::new()
                 .map(&file_read)
@@ -465,21 +461,27 @@ impl StorageIO for MockStorageProvider {
 
     #[allow(refining_impl_trait)]
     async fn create_new(&self, name: String) -> Self {
+        let delimiter = if cfg!(unix) {
+            "/"
+        } else if cfg!(windows) {
+            "\\"
+        } else {
+            panic!("OS not supported");
+        };
+
         let location_path = Path::new(& self.location);
 
         if !location_path.exists() {
             _ = std::fs::create_dir(location_path);
         }
 
-        let new_table = format!("{}{}", self.location, name);
+        let new_table = format!("{}{}{}", self.location, delimiter, name);
         let file_path = Path::new(&new_table);
 
         if !file_path.exists() {
             _ = std::fs::File::create(&file_path).unwrap();
         }
         
-        //_ = std::fs::File::create(&file_path).unwrap();
-
         let file_append = tokio::fs::File::options()
             .read(true)
             .append(true)
@@ -506,7 +508,7 @@ impl StorageIO for MockStorageProvider {
             table_name: name.to_string(),
             file_str: new_table.clone(),
             _temp_dir_hold: TempDir::default(),
-            hash: CRC.checksum(format!("{}+++{}", file_path.to_str().unwrap(), "temp.db").as_bytes()),
+            hash: CRC.checksum(format!("{}+++{}", file_path.to_str().unwrap(), name).as_bytes()),
             appender: SegQueue::new(),
             _memory_map: unsafe { MmapOptions::new()
                 .map(&file_read)
@@ -541,6 +543,10 @@ impl StorageIO for MockStorageProvider {
 
         join_all(services).await;
     } 
+
+    fn get_name(&self) -> String {
+        self.table_name.clone()
+    }
 }
 
 impl Drop for MockStorageProvider {

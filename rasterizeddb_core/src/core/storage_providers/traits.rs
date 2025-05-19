@@ -38,7 +38,7 @@ pub trait StorageIO: Clone + Sync + Send + 'static {
 
     fn read_data_to_end(&self, position: u64) -> impl Future<Output = Vec<u8>> + Send + Sync;
 
-    fn append_data(&mut self, buffer: &[u8]) -> impl Future<Output = ()> + Send + Sync;
+    fn append_data(&mut self, buffer: &[u8], immediate: bool) -> impl Future<Output = ()> + Send + Sync;
 
     fn append_data_unsync(&mut self, buffer: &[u8]) -> impl Future<Output = ()> + Send + Sync;
 
@@ -59,4 +59,6 @@ pub trait StorageIO: Clone + Sync + Send + 'static {
     fn get_hash(&self) -> u32;
 
     fn start_service(&mut self) -> impl Future<Output = ()> + Send + Sync;
+
+    fn get_name(&self) -> String;
 }
