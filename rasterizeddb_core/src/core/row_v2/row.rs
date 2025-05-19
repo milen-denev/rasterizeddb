@@ -49,17 +49,3 @@ pub struct Column {
     pub data: MemoryBlock,
     pub column_type: DbType,
 }
-
-impl Default for Column {
-    fn default() -> Self {
-        Self {
-            schema_id: 0,
-            data: MemoryBlock {
-                ptr: 0 as *mut u8,
-                size: 0,
-                should_drop: false
-            },
-            column_type: DbType::NULL
-        }
-    }
-}
