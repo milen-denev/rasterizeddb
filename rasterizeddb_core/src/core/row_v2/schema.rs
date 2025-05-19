@@ -18,6 +18,7 @@ const BATCH_SIZE: usize = 100;
 
 const TABLE_SIZE: usize = 129 * 2; // 128 chars for name  + null terminator and primary key + null terminator
 
+#[derive(Debug, Clone)]
 pub struct SchemaField {
     pub name: String,
     pub db_type: DbType,
@@ -28,14 +29,14 @@ pub struct SchemaField {
 }
 
 impl SchemaField {
-    pub fn new(name: String, db_type: DbType, size: u32, offset: u64, write_order: u64) -> Self {
+    pub fn new(name: String, db_type: DbType, size: u32, offset: u64, write_order: u64, is_unique: bool) -> Self {
         SchemaField {
             name,
             db_type,
             size,
             offset,
             write_order,
-            is_unique: false
+            is_unique
         }
     }
 
@@ -128,7 +129,7 @@ impl SchemaField {
 
     pub async fn save_field(&self, io: &mut impl StorageIO) -> io::Result<()> {
         let data = self.into_vec();
-        io.append_data(&data).await;
+        io.append_data(&data, true).await;
         Ok(())
     }
 }
@@ -384,12 +385,59 @@ impl TableSchema {
     
     pub async fn save(&self, schema_io: &mut impl StorageIO) -> io::Result<()> {
         let data = self.into_vec();
-        schema_io.append_data(&data).await;
+        schema_io.append_data(&data, true).await;
         Ok(())
     }
 
-    pub async fn add_field<S: StorageIO>(&mut self, schema_io: &S, field: SchemaField) {
-        let mut field_io = schema_io.create_new("FIELDS.db".into()).await;
+    pub async fn add_field<S: StorageIO>(
+        &mut self, 
+        schema_io: &S, 
+        field_name: String, 
+        db_type: DbType, 
+        is_unique: bool) {
+
+        let mut field_io = schema_io.create_new(format!("{}_{}", schema_io.get_name().replace(".db", ""), "FIELDS.db")).await;
+        let mut field_iterator = SchemaFieldIterator::new(&mut field_io).await.unwrap();
+
+        let mut all_fields: Vec<SchemaField> = Vec::new();
+
+        while let Ok(mut fields) = field_iterator.next_schema_fields().await {
+            if fields.is_empty() {
+                break;
+            }
+            all_fields.append(&mut fields);
+        }
+
+        // Check if field from the table schema already exists
+        for field in all_fields.iter() {
+            if field_name == field.name {
+                return;
+            }
+        }
+
+        // Add fields to the all_fields if they are not already present
+        // for field in  self.fields.iter() {
+        //     if all_fields.iter().any(|f| f.name != field.name) {
+        //         all_fields.push(field.clone());
+        //     }
+        // }
+
+        let offset: u64 = all_fields.iter().map(|f| f.db_type.get_size() as u64).sum();
+        let write_order: u64 = if all_fields.len() > 0 {
+            all_fields.iter().map(|f| f.write_order).max().unwrap_or(0) + 1
+        }  else {
+            0
+        };
+
+        let field = SchemaField::new(
+            field_name,
+            db_type.clone(),
+            db_type.get_size(),
+            offset,
+            write_order,
+            is_unique,
+        );
+
         _ = field.save_field(&mut field_io).await;
         self.fields.push(field);
     }
@@ -512,11 +560,25 @@ impl<'a, S: StorageIO> TableSchemaIterator<'a, S> {
         let schema_data = &self.buffer.into_slice()[self.buffer_index..self.buffer_index + TABLE_SIZE];
         
         // Parse the TableSchema from the buffer
-        let table_schema = match TableSchema::from_vec(schema_data) {
+        let mut table_schema = match TableSchema::from_vec(schema_data) {
             Ok(schema) => schema,
             Err(_e) => return Err(io::Error::new(io::ErrorKind::InvalidData, "Failed to parse TableSchema.")),
         };
+
+        table_schema.fields.clear();
+
+        let mut field_io = self.io.create_new(format!("{}_{}", self.io.get_name().replace(".db", ""), "FIELDS.db")).await;
         
+        let mut field_iterator = SchemaFieldIterator::new(&mut field_io).await.unwrap();
+
+        // Load all fields associated with this table schema
+        while let Ok(mut fields) = field_iterator.next_schema_fields().await {
+            if fields.is_empty() {
+                break;
+            }
+            table_schema.fields.append(&mut fields);
+        }
+
         // Advance the buffer index
         self.buffer_index += TABLE_SIZE;
         
@@ -541,18 +603,15 @@ mod tests {
     // Helper function to create a schema field and return it
     fn create_test_schema_field(name: &str, db_type: DbType, offset: u64, write_order: u64, is_unique: bool) -> SchemaField {
         let db_size = db_type.get_size();
-        let mut schema_field = SchemaField::new(
+        let schema_field = SchemaField::new(
             name.to_string(),
             db_type,
             db_size,
             offset,
             write_order,
+            is_unique
         );
-        
-        if is_unique {
-            schema_field.set_unique();
-        }
-        
+  
         schema_field
     }
     
@@ -732,7 +791,7 @@ mod tests {
         assert!(iterator.next_schema_field().await.unwrap().is_none());
     }
 
-        // Helper function to create a test TableSchema
+    // Helper function to create a test TableSchema
     fn create_test_table_schema(name: &str, primary_key: Option<&str>) -> TableSchema {
         let mut table = TableSchema::new(name.to_string());
         if let Some(pk) = primary_key {
@@ -742,7 +801,7 @@ mod tests {
     }
 
     // Helper function to save a table schema to storage
-    async fn save_table_schema(schema: &TableSchema, storage: &mut MockStorageProvider) -> io::Result<()> {
+    async fn save_table_schema<S: StorageIO>(schema: &TableSchema, storage: &mut S) -> io::Result<()> {
         schema.save(storage).await
     }
 
@@ -837,24 +896,19 @@ mod tests {
         schema.save(&mut mock_io).await.unwrap();
 
         // Add fields
-        let id_field = SchemaField::new(
+
+        schema.add_field(
+            &mut mock_io, 
             "order_id".to_string(),
             DbType::I64,
-            8,
-            0,
-            1
-        );
-        schema.add_field(&mut mock_io, id_field).await;
+            false).await;
         
-        let date_field = SchemaField::new(
+        schema.add_field(
+            &mut mock_io,
             "created_at".to_string(),
             DbType::U64,
-            8,
-            8,
-            2
-        );
-        schema.add_field(&mut mock_io, date_field).await;
-        
+            false).await;
+
         // Serialize
         let vec = schema.into_vec();
         
@@ -953,11 +1007,15 @@ mod tests {
     
     #[tokio::test]
     async fn test_table_schema_iterator_reset() {
+         _ = tokio::fs::remove_file("G:\\Databases\\Test_Database\\schema1.db").await;
+        let field_name = format!("{}{}", "G:\\Databases\\Test_Database\\schema1", "_FIELDS.db");
+        _ = tokio::fs::remove_file(field_name).await;
+
+        let mut mock_io = crate::core::storage_providers::file_sync::LocalStorageProvider::new("G:\\Databases\\Test_Database", Some("schema1.db")).await;
+
         // Create schemas
         let schema1 = create_test_table_schema("users", Some("id"));
         let schema2 = create_test_table_schema("products", None);
-        
-        let mut mock_io = MockStorageProvider::new().await;
         
         // Save schemas to storage
         save_table_schema(&schema1, &mut mock_io).await.unwrap();
@@ -982,6 +1040,10 @@ mod tests {
         
         // No more schemas
         assert!(iterator.next_table_schema().await.unwrap().is_none());
+
+         _ = tokio::fs::remove_file("G:\\Databases\\Test_Database\\schema1.db").await;
+        let field_name = format!("{}{}", "G:\\Databases\\Test_Database\\schema1", "_FIELDS.db");
+        _ = tokio::fs::remove_file(field_name).await;
     }
     
     #[tokio::test]
@@ -1044,5 +1106,109 @@ mod tests {
         
         assert_eq!(read_schema.name, "a".repeat(128));
         assert_eq!(read_schema.primary_key.as_ref().unwrap().to_string(), "b".repeat(128));
+    }
+
+    #[tokio::test]
+   
+    async fn test_table_schema_complete_set() {
+        _ = tokio::fs::remove_file("G:\\Databases\\Test_Database\\schema2.db").await;
+        let field_name = format!("{}{}", "G:\\Databases\\Test_Database\\schema2", "_FIELDS.db");
+        _ = tokio::fs::remove_file(field_name).await;
+
+        // Create schemas
+        let mut schema1 = create_test_table_schema("users", Some("id"));
+
+        let mut mock_io = crate::core::storage_providers::file_sync::LocalStorageProvider::new("G:\\Databases\\Test_Database", Some("schema2.db")).await;
+        //let mut mock_io_fields = mock_io.create_new(format!("{}_{}", mock_io.get_name().replace(".db", ""), "FIELDS.db")).await;
+
+        schema1.save(&mut mock_io).await.unwrap();
+
+        schema1.add_field(&mut mock_io, 
+            "email".into(),
+            DbType::STRING,
+            true).await;
+
+        schema1.add_field(
+            &mut mock_io,
+            "created_at".into(),
+            DbType::U64,
+            false).await;
+
+        schema1.add_field(
+            &mut mock_io,
+            "updated_at".into(),
+            DbType::U64,
+            false).await;
+        
+        schema1.add_field(
+            &mut mock_io,
+            "first_name".into(),
+            DbType::STRING,
+            false).await;
+        
+        schema1.add_field(
+            &mut mock_io,
+            "last_name".into(),
+            DbType::STRING,
+            false).await;
+
+        schema1.add_field(
+            &mut mock_io,
+            "user_id".into(),
+            DbType::U128,
+            false).await;
+
+        let mut iterator = TableSchemaIterator::new(&mut mock_io).await.unwrap();
+        let read_schema1 = iterator.next_table_schema().await.unwrap().unwrap();
+        assert_eq!(read_schema1.name, "users");
+
+        assert_eq!(read_schema1.primary_key, Some("id".to_string()));
+        assert_eq!(read_schema1.fields.len(), 6);
+
+        assert_eq!(read_schema1.fields[0].name, "email");
+        assert_eq!(read_schema1.fields[0].db_type, DbType::STRING);
+        assert_eq!(read_schema1.fields[0].is_unique, true);
+        assert_eq!(read_schema1.fields[0].offset, 0);
+        assert_eq!(read_schema1.fields[0].write_order, 0);
+        assert_eq!(read_schema1.fields[0].size, 8 + 4);
+
+        assert_eq!(read_schema1.fields[1].name, "created_at");
+        assert_eq!(read_schema1.fields[1].db_type, DbType::U64);
+        assert_eq!(read_schema1.fields[1].is_unique, false);
+        assert_eq!(read_schema1.fields[1].offset, 8 + 4);
+        assert_eq!(read_schema1.fields[1].write_order, 1);
+        assert_eq!(read_schema1.fields[1].size, 8);
+
+        assert_eq!(read_schema1.fields[2].name, "updated_at");
+        assert_eq!(read_schema1.fields[2].db_type, DbType::U64);
+        assert_eq!(read_schema1.fields[2].is_unique, false);
+        assert_eq!(read_schema1.fields[2].offset, 4 + 8 + 8);
+        assert_eq!(read_schema1.fields[2].write_order, 2);
+        assert_eq!(read_schema1.fields[2].size, 8);
+
+        assert_eq!(read_schema1.fields[3].name, "first_name");
+        assert_eq!(read_schema1.fields[3].db_type, DbType::STRING);
+        assert_eq!(read_schema1.fields[3].is_unique, false);
+        assert_eq!(read_schema1.fields[3].offset, 4 + 8 + 8 + 8);
+        assert_eq!(read_schema1.fields[3].write_order, 3);
+        assert_eq!(read_schema1.fields[3].size, 8 + 4);
+
+        assert_eq!(read_schema1.fields[4].name, "last_name");
+        assert_eq!(read_schema1.fields[4].db_type, DbType::STRING);
+        assert_eq!(read_schema1.fields[4].is_unique, false);
+        assert_eq!(read_schema1.fields[4].offset, 4 + 8 + 8 + 8 + 4 + 8);
+        assert_eq!(read_schema1.fields[4].write_order, 4);
+        assert_eq!(read_schema1.fields[4].size, 8 + 4);
+
+        assert_eq!(read_schema1.fields[5].name, "user_id");
+        assert_eq!(read_schema1.fields[5].db_type, DbType::U128);
+        assert_eq!(read_schema1.fields[5].is_unique, false);
+        assert_eq!(read_schema1.fields[5].offset, 4 + 8 + 8 + 8 + 4 + 8 + 4 + 8);
+        assert_eq!(read_schema1.fields[5].write_order, 5);
+        assert_eq!(read_schema1.fields[5].size, 16);
+
+        _ = tokio::fs::remove_file("G:\\Databases\\Test_Database\\schema2.db").await;
+        let field_name = format!("{}{}", "G:\\Databases\\Test_Database\\schema2", "_FIELDS.db");
+        _ = tokio::fs::remove_file(field_name).await;
     }
 }
