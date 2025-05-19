@@ -69,7 +69,11 @@ impl PartialEq for ColumnValue {
                 ColumnValue::StaticMemoryPointer(pointer_a),
                 ColumnValue::StaticMemoryPointer(pointer_b),
             ) => unsafe {
-                compare_raw_vecs(pointer_a.ptr, pointer_b.ptr, pointer_a.size, pointer_b.size)
+                compare_raw_vecs(
+                    pointer_a.into_slice().as_ptr() as *mut u8, 
+                    pointer_b.into_slice().as_ptr() as *mut u8, 
+                    pointer_a.into_slice().len(),  
+                    pointer_b.into_slice().len())
             },
             (ColumnValue::ManagedMemoryPointer(a), ColumnValue::ManagedMemoryPointer(b)) => {
                 compare_vecs_eq(a, b)
@@ -99,7 +103,7 @@ impl Clone for ColumnValue {
 impl ColumnValue {
     pub fn len(&self) -> u32 {
         match self {
-            ColumnValue::StaticMemoryPointer(chunk) => chunk.size as u32,
+            ColumnValue::StaticMemoryPointer(chunk) => chunk.into_slice().len() as u32,
             ColumnValue::ManagedMemoryPointer(vec) => vec.len() as u32,
             _ => panic!("Operation is not supported, column is in temporary state."),
         }
@@ -107,7 +111,7 @@ impl ColumnValue {
 
     pub fn is_empty(&self) -> bool {
         match self {
-            ColumnValue::StaticMemoryPointer(chunk) => chunk.size == 0,
+            ColumnValue::StaticMemoryPointer(chunk) => chunk.into_slice().len() == 0,
             ColumnValue::ManagedMemoryPointer(vec) => vec.is_empty(),
             _ => panic!("Operation is not supported, column is in temporary state."),
         }
@@ -116,7 +120,7 @@ impl ColumnValue {
     pub fn as_slice(&self) -> &[u8] {
         match self {
             ColumnValue::StaticMemoryPointer(chunk) => unsafe {
-                std::slice::from_raw_parts::<u8>(chunk.ptr, chunk.size as usize)
+                std::slice::from_raw_parts::<u8>(chunk.into_slice().as_ptr(), chunk.into_slice().len() as usize)
             },
             ColumnValue::ManagedMemoryPointer(vec) => vec.as_slice(),
             _ => panic!("Operation is not supported, column is in temporary state."),
@@ -126,7 +130,7 @@ impl ColumnValue {
     pub fn to_vec(&self) -> Vec<u8> {
         match self {
             ColumnValue::StaticMemoryPointer(chunk) => {
-                vec_from_ptr_safe(chunk.ptr, chunk.size as usize)
+                vec_from_ptr_safe(chunk.into_slice().as_ptr() as *mut u8, chunk.into_slice().len() as usize)
             }
             ColumnValue::ManagedMemoryPointer(vec) => vec_from_ptr_safe(vec.as_ptr() as *mut u8, vec.len()),
             _ => panic!("Operation is not supported, column is in temporary state."),
@@ -138,14 +142,14 @@ impl ColumnValue {
             ColumnValue::StaticMemoryPointer(chunk) => {
                 assert_eq!(
                     new_values.len(),
-                    chunk.size as usize,
+                    chunk.into_slice().len(),
                     "New values must have the same length"
                 );
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         new_values.as_ptr(),
-                        chunk.ptr,
-                        chunk.size as usize,
+                        chunk.into_slice().as_ptr() as *mut u8,
+                        chunk.into_slice().len(),
                     );
                 }
             }
@@ -163,7 +167,7 @@ impl ColumnValue {
 
     pub fn get_ptr(&self) -> *mut u8 {
         match self {
-            ColumnValue::StaticMemoryPointer(chunk) => chunk.ptr.clone(),
+            ColumnValue::StaticMemoryPointer(chunk) => chunk.into_slice().as_ptr().clone() as *mut u8,
             ColumnValue::ManagedMemoryPointer(vec) => vec.as_ptr() as *mut u8,
             _ => panic!("Operation is not supported, column is in temporary state."),
         }
