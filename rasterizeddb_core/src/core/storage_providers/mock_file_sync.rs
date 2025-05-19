@@ -474,10 +474,12 @@ impl StorageIO for MockStorageProvider {
         let new_table = format!("{}{}", self.location, name);
         let file_path = Path::new(&new_table);
 
-        if !file_path.exists() && !file_path.is_file() {
+        if !file_path.exists() {
             _ = std::fs::File::create(&file_path).unwrap();
         }
         
+        //_ = std::fs::File::create(&file_path).unwrap();
+
         let file_append = tokio::fs::File::options()
             .read(true)
             .append(true)
@@ -493,9 +495,9 @@ impl StorageIO for MockStorageProvider {
             .unwrap();
 
         let file_read = std::fs::File::options()
-                .read(true)
-                .open(&file_path)
-                .unwrap();
+            .read(true)
+            .open(&file_path)
+            .unwrap();
 
         MockStorageProvider {
             append_file: Arc::new(RwLock::new(file_append)),
