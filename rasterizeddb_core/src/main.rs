@@ -9,8 +9,10 @@ use rasterizeddb_core::core::db_type::DbType;
 use rasterizeddb_core::core::mock_helpers::{create_row_write, create_row_write_custom_i32, get_row_fetch_i32, i32_column};
 use rasterizeddb_core::core::row_v2::concurrent_processor::ConcurrentProcessor;
 use rasterizeddb_core::core::row_v2::row_pointer::{RowPointer, RowPointerIterator};
+use rasterizeddb_core::core::row_v2::schema::{TableSchema, TableSchemaIterator};
 use rasterizeddb_core::core::row_v2::transformer::{ColumnTransformer, ColumnTransformerType, ComparerOperation};
 
+use rasterizeddb_core::core::storage_providers::mock_file_sync::MockStorageProvider;
 use rasterizeddb_core::core::storage_providers::traits::StorageIO;
 use rasterizeddb_core::{
     core::storage_providers::file_sync::LocalStorageProvider,
@@ -24,7 +26,7 @@ static mut IO_ROWS: async_lazy::Lazy<LocalStorageProvider> =
     async_lazy::Lazy::new(|| {
         Box::pin(async {
             //_ = remove_file("G:\\Databases\\Test_Database\\rows3.db").await;
-            let io = LocalStorageProvider::new("G:\\Databases\\Test_Database", Some("rows3.db")).await;
+            let io = LocalStorageProvider::new("G:\\Databases\\Test_Database", Some("rows2.db")).await;
             //let loc = "/home/milen-denev/Database/";
             //let io = LocalStorageProvider::new(loc, Some("rows3.db")).await;
             io
@@ -35,7 +37,7 @@ static mut IO_POINTERS: async_lazy::Lazy<LocalStorageProvider> =
     async_lazy::Lazy::new(|| {
         Box::pin(async {
             //_ = remove_file("G:\\Databases\\Test_Database\\pointers3.db").await;
-            let io = LocalStorageProvider::new("G:\\Databases\\Test_Database", Some("pointers3.db")).await;
+            let io = LocalStorageProvider::new("G:\\Databases\\Test_Database", Some("pointers2.db")).await;
             //let loc = "/home/milen-denev/Database/";
             //let io = LocalStorageProvider::new(loc, Some("pointers3.db")).await;
             io
@@ -56,7 +58,7 @@ async fn main() -> std::io::Result<()> {
 
     let io_rows = unsafe { IO_ROWS.force_mut().await };
     let io_pointers = unsafe { IO_POINTERS.force_mut().await };
-    let io_pointers_2 = unsafe { IO_POINTERS.force_mut().await };
+    //let io_pointers_2 = unsafe { IO_POINTERS.force_mut().await };
 
     let mut iterator = RowPointerIterator::new(io_pointers).await.unwrap();
 
@@ -161,11 +163,10 @@ async fn main() -> std::io::Result<()> {
         } 
     }
 
-
-    let stdin = std::io::stdin();
-    let mut buffer = String::new();
-    println!("Press Enter to continue...");
-    stdin.read_line(&mut buffer).unwrap();
+    // let stdin = std::io::stdin();
+    // let mut buffer = String::new();
+    // println!("Press Enter to continue...");
+    // stdin.read_line(&mut buffer).unwrap();
 
     return Ok(());
 
