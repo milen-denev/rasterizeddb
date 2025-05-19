@@ -24,6 +24,7 @@ union MemoryBlockData {
 }
 
 impl Clone for MemoryBlockData {
+    #[inline(always)]
     fn clone(&self) -> Self {
         unsafe {
             if self.heap_data.0.is_null() {
@@ -50,6 +51,7 @@ pub struct MemoryBlock {
 }
 
 impl Default for MemoryBlock {
+     #[inline(always)]
     fn default() -> Self {
         // A default MemoryBlock will be an empty, inline block
         MemoryBlock {
@@ -73,7 +75,12 @@ impl fmt::Debug for MemoryBlock {
             debug_struct.field("ptr", &ptr);
             debug_struct.field("allocated_size", &allocated_size);
             // Optionally, show a preview of the data (be careful with large sizes)
-            // debug_struct.field("data_preview", &self.as_slice());
+            let inline_data = &self.into_slice();
+            let mut str_buffer = String::new();
+            for byte in inline_data.iter() {
+                str_buffer.push(*byte as char);
+            }
+            debug_struct.field("data", &str_buffer);
         } else {
             // For inline, show the inline capacity and the actual data bytes
             debug_struct.field("inline_capacity", &INLINE_CAPACITY);
@@ -91,6 +98,7 @@ impl fmt::Debug for MemoryBlock {
 }
 
 impl MemoryPool {
+    #[inline(always)]
     pub const  fn new() -> Self {
         Self
     }
@@ -143,6 +151,7 @@ unsafe impl Send for MemoryBlock {}
 unsafe impl Sync for MemoryBlock {}
 
 impl Drop for MemoryBlock {
+    #[inline(always)]
     fn drop(&mut self) {
         if self.should_drop && self.is_heap {
             MEMORY_POOL.release(unsafe { self.data.heap_data.0 });
@@ -154,6 +163,7 @@ impl Drop for MemoryBlock {
 }
 
 impl Clone for MemoryBlock {
+    #[inline(always)]
     fn clone(&self) -> Self {
         if self.is_heap {
             MemoryBlock {
@@ -174,6 +184,7 @@ impl Clone for MemoryBlock {
 }
 
 impl MemoryBlock {
+    #[inline(always)]
     pub fn prefetch_to_lcache(&self) {
         if self.is_heap {
             // Prefetch the heap data to the L1 cache
@@ -185,12 +196,13 @@ impl MemoryBlock {
     }
 
     // Create a new chunk from a vector with no memory chunk allocated from pool
+    #[inline(always)]
     pub fn from_vec(vec: Vec<u8>) -> Self {
         let len = vec.len();
         let memory_chunk = MEMORY_POOL.acquire(len);
 
         if memory_chunk.is_heap {
-              copy_vec_to_ptr(vec.as_slice(), unsafe { memory_chunk.data.heap_data.0 });
+            copy_vec_to_ptr(vec.as_slice(), unsafe { memory_chunk.data.heap_data.0 });
         } else {
             copy_vec_to_ptr(vec.as_slice(), unsafe { memory_chunk.data.inline_data.as_ptr() as *mut u8 });
         }
@@ -199,6 +211,7 @@ impl MemoryBlock {
         memory_chunk
     }
 
+    #[inline(always)]
     pub fn into_slice(&self) -> &'static [u8] {
         if self.is_heap {
             // If it's a heap allocation, return the slice from the pointer
@@ -209,6 +222,7 @@ impl MemoryBlock {
         }
     }
 
+    #[inline(always)]
     pub fn into_slice_mut(&self) -> &'static mut [u8] {
         if self.is_heap {
             // If it's a heap allocation, return the mutable slice from the pointer
@@ -515,5 +529,7 @@ mod tests {
             // All blocks should still be alive
         }
         // Now blocks should be dropped and memory freed
+
+        assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 1);
     }
 }
