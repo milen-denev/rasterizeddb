@@ -6,3 +6,4 @@ pub mod math;
 pub mod logical;
 pub mod common;
 pub mod concurrent_processor;
+pub mod schema;
