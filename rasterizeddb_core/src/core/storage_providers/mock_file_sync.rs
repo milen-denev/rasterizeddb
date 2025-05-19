@@ -23,7 +23,7 @@ pub struct MockStorageProvider {
     _temp_dir_hold: TempDir,
     pub(crate) hash: u32,
     appender: SegQueue<MemoryBlock>,
-    pub(crate) memory_map: Mmap,
+    pub(crate) _memory_map: Mmap,
 }
 
 unsafe impl Sync for MockStorageProvider { }
@@ -40,7 +40,7 @@ impl Clone for MockStorageProvider {
             _temp_dir_hold: TempDir::default(),
             hash: CRC.checksum(format!("{}+++{}", self.location, "temp.db").as_bytes()),
             appender: SegQueue::new(),
-            memory_map: unsafe { MmapOptions::new()
+            _memory_map: unsafe { MmapOptions::new()
                 .map(&std::fs::File::open(&self.file_str).unwrap())
                 .unwrap() },
         }
@@ -101,7 +101,7 @@ impl MockStorageProvider {
             _temp_dir_hold: temp,
             hash: CRC.checksum(format!("{}+++{}", file_path.to_str().unwrap(), "temp.db").as_bytes()),
             appender: SegQueue::new(),
-            memory_map: unsafe { MmapOptions::new()
+            _memory_map: unsafe { MmapOptions::new()
                     .map(&file_read)
                     .unwrap() },
         }
@@ -315,10 +315,16 @@ impl StorageIO for MockStorageProvider {
 
         // return;
     
-        let mmap = &self.memory_map;
         let buffer_len = buffer.len();
+        //let table_len = self.file_len.load(std::sync::atomic::Ordering::Relaxed);
 
-        buffer.copy_from_slice(&mmap[*position as usize..*position as usize + buffer_len]);
+        let mut read_file = std::fs::File::options()
+            .read(true)
+            .open(&self.file_str)
+            .unwrap();
+
+        read_file.seek(SeekFrom::Start(*position)).unwrap();
+        read_file.read_exact(buffer).unwrap();
 
         *position += buffer_len as u64;
     }
@@ -426,7 +432,7 @@ impl StorageIO for MockStorageProvider {
             _temp_dir_hold: TempDir::default(),
             hash: CRC.checksum(format!("{}+++{}", self.location, "temp.db").as_bytes()),
             appender: SegQueue::new(),
-            memory_map: unsafe { MmapOptions::new()
+            _memory_map: unsafe { MmapOptions::new()
                 .map(&file_read)
                 .unwrap() },
         }
@@ -500,7 +506,7 @@ impl StorageIO for MockStorageProvider {
             _temp_dir_hold: TempDir::default(),
             hash: CRC.checksum(format!("{}+++{}", file_path.to_str().unwrap(), "temp.db").as_bytes()),
             appender: SegQueue::new(),
-            memory_map: unsafe { MmapOptions::new()
+            _memory_map: unsafe { MmapOptions::new()
                 .map(&file_read)
                 .unwrap() },
         }
