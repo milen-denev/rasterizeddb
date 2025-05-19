@@ -18,10 +18,12 @@ use rasterizeddb_core::{
 };
 
 use stopwatch::Stopwatch;
+use tokio::fs::remove_file;
 
 static mut IO_ROWS: async_lazy::Lazy<LocalStorageProvider> =
     async_lazy::Lazy::new(|| {
         Box::pin(async {
+            _ = remove_file("G:\\Databases\\Test_Database\\rows3.db").await;
             let io = LocalStorageProvider::new("G:\\Databases\\Test_Database", Some("rows3.db")).await;
             //let loc = "/home/milen-denev/Database/";
             //let io = LocalStorageProvider::new(loc, Some("rows3.db")).await;
@@ -32,6 +34,7 @@ static mut IO_ROWS: async_lazy::Lazy<LocalStorageProvider> =
 static mut IO_POINTERS: async_lazy::Lazy<LocalStorageProvider> =
     async_lazy::Lazy::new(|| {
         Box::pin(async {
+            _ = remove_file("G:\\Databases\\Test_Database\\pointers3.db").await;
             let io = LocalStorageProvider::new("G:\\Databases\\Test_Database", Some("pointers3.db")).await;
             //let loc = "/home/milen-denev/Database/";
             //let io = LocalStorageProvider::new(loc, Some("pointers3.db")).await;
@@ -53,6 +56,9 @@ async fn main() -> std::io::Result<()> {
 
     let io_rows = unsafe { IO_ROWS.force_mut().await };
     let io_pointers = unsafe { IO_POINTERS.force_mut().await };
+    let io_pointers_2 = unsafe { IO_POINTERS.force_mut().await };
+
+    let mut iterator = RowPointerIterator::new(io_pointers).await.unwrap();
 
     let stdin = std::io::stdin();
     let mut buffer = String::new();
@@ -62,15 +68,22 @@ async fn main() -> std::io::Result<()> {
     #[cfg(feature = "enable_long_row")]
     let cluster = 0;
 
-    // let last_id = AtomicU64::new(0);
-    // let table_length = AtomicU64::new(io_rows.get_len().await);
+    let last_row = iterator.read_last().await;
 
-    // let row_write = create_row_write(true);
-    // let custom_row = create_row_write_custom_i32(SEARCH_VALUE, true);
+    let last_id = if let Some(row) = last_row {
+        AtomicU64::new(row.id)
+    } else {
+        AtomicU64::new(0)
+    };
+
+    let table_length = AtomicU64::new(io_rows.get_len().await);
+
+    let row_write = create_row_write(true);
+    let custom_row = create_row_write_custom_i32(SEARCH_VALUE, true);
 
     // for _i in 0..1000 {
     //     _ = RowPointer::write_row(
-    //         io_pointers,
+    //         io_pointers_2,
     //         io_rows, 
     //         &last_id, 
     //         &table_length, 
@@ -80,27 +93,26 @@ async fn main() -> std::io::Result<()> {
     //     ).await;
     // }
 
-    // let _result = RowPointer::write_row(
-    //     io_pointers,
-    //     io_rows, 
-    //     &last_id, 
-    //     &table_length, 
-    //     #[cfg(feature = "enable_long_row")]
-    //     cluster, 
-    //     &custom_row
-    // ).await;
+    let _result = RowPointer::write_row(
+        io_pointers_2,
+        io_rows, 
+        &last_id, 
+        &table_length, 
+        #[cfg(feature = "enable_long_row")]
+        cluster, 
+        &custom_row
+    ).await;
 
     // if let Err(e) = result {
     //     println!("Error writing row: {}", e);
     // }
 
-    //tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
 
     let mut stopwatch = Stopwatch::start_new();
 
     let concurrent_processor = ConcurrentProcessor::new();
 
-    let mut iterator = RowPointerIterator::new(io_pointers).await.unwrap();
     let row_fetch = get_row_fetch_i32();
     let search_value = SEARCH_VALUE;
     let search_value_block = i32_column(search_value);
@@ -120,27 +132,29 @@ async fn main() -> std::io::Result<()> {
     println!("Total rows collected: {}", all_rows.len());
     println!("Row fetch took: {:?}", stopwatch.elapsed());
     
-    loop {
-                stopwatch.reset();
-        stopwatch.start();
-        
-        let row_fetch = get_row_fetch_i32();
-        let search_value = SEARCH_VALUE;
-        let search_value_block = i32_column(search_value);
+    if false {
+        loop {
+            stopwatch.reset();
+            stopwatch.start();
+            
+            let row_fetch = get_row_fetch_i32();
+            let search_value = SEARCH_VALUE;
+            let search_value_block = i32_column(search_value);
 
-        let transformer = ColumnTransformer::new(
-            DbType::I32,
-            search_value_block,
-            ColumnTransformerType::ComparerOperation(ComparerOperation::Equals),
-            None
-        );
+            let transformer = ColumnTransformer::new(
+                DbType::I32,
+                search_value_block,
+                ColumnTransformerType::ComparerOperation(ComparerOperation::Equals),
+                None
+            );
 
-        let all_rows = concurrent_processor.process(row_fetch, io_rows, &mut iterator, transformer).await;
-        stopwatch.stop();
+            let all_rows = concurrent_processor.process(row_fetch, io_rows, &mut iterator, transformer).await;
+            stopwatch.stop();
 
-        println!("Total rows collected: {}", all_rows.len());
-        println!("Second row fetch took: {:?}", stopwatch.elapsed());
-    } 
+            println!("Total rows collected: {}", all_rows.len());
+            println!("Second row fetch took: {:?}", stopwatch.elapsed());
+        } 
+    }
 
     let stdin = std::io::stdin();
     let mut buffer = String::new();
