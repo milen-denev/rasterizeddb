@@ -99,7 +99,7 @@ impl DbType {
             DbType::F32 => 4,
             DbType::F64 => 8,
             DbType::CHAR => 4,
-            DbType::STRING => panic!("STRING type doesn't have a set size of bytes."),
+            DbType::STRING => 4 + 8,
             DbType::TBD => panic!("TBD (To Be Determined) is a temporary type."),
             DbType::NULL => 1,
             DbType::START => 1,
