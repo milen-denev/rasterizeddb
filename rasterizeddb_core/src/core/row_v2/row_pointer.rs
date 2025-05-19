@@ -397,7 +397,7 @@ impl RowPointer {
         #[cfg(feature = "enable_data_verification")]
         let position = io.get_len().await;
 
-        io.append_data(slice).await;
+        io.append_data(slice, false).await;
 
         #[cfg(feature = "enable_data_verification")]
         let verify_result = io.verify_data_and_sync(position, slice).await;
@@ -460,7 +460,7 @@ impl RowPointer {
         let position = io.get_len().await;
 
         // Write data to storage
-        io.append_data(slice).await;
+        io.append_data(slice, false).await;
         
         // Verify written data
         #[cfg(feature = "enable_data_verification")]
@@ -893,7 +893,7 @@ impl RowPointer {
         slice[row_position as usize..].copy_from_slice(&string_slice);
 
         // Write the row data to the rows_io
-        rows_io.append_data(slice).await;
+        rows_io.append_data(slice, false).await;
 
         // Write the pointer last
         // Write the row data to the pointers_io

@@ -258,7 +258,7 @@ impl<S: StorageIO> Table<S> {
         // Get the current file position where this row was inserted
         let current_file_pos = self.current_file_length.load(Ordering::Relaxed) - total_row_size;
         
-        self.io_sync.append_data(&buffer).await;
+        self.io_sync.append_data(&buffer, true).await;
 
         // Update in-memory index
         let chunks_arc_clone = self.in_memory_index.clone();
