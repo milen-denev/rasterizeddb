@@ -188,6 +188,23 @@ impl<'a, S: StorageIO> RowPointerIterator<'a, S> {
         let result = self.next_row_pointer().await;
         result
     }
+
+    pub async fn read_last(&mut self) -> Option<RowPointer> {
+        let mut position = self.io.get_len().await;
+        let mut slice: [u8; TOTAL_LENGTH] = [0; TOTAL_LENGTH];
+
+        if position < TOTAL_LENGTH as u64 {
+            return None;
+        }
+
+        position = position - TOTAL_LENGTH as u64;
+
+        self.io.read_data_into_buffer(&mut position, &mut slice).await;
+
+        let row_pointer = RowPointer::from_slice(&slice);
+
+        Some(row_pointer)
+    }
 }
 
 #[derive(Debug, Clone)]
