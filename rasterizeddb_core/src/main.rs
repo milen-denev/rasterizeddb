@@ -22,9 +22,9 @@ use stopwatch::Stopwatch;
 static mut IO_ROWS: async_lazy::Lazy<LocalStorageProvider> =
     async_lazy::Lazy::new(|| {
         Box::pin(async {
-            //let io = LocalStorageProvider::new("G:\\Databases\\Test_Database", Some("rows3.db")).await;
-            let loc = "/home/milen-denev/Database/";
-            let io = LocalStorageProvider::new(loc, Some("rows3.db")).await;
+            let io = LocalStorageProvider::new("G:\\Databases\\Test_Database", Some("rows3.db")).await;
+            //let loc = "/home/milen-denev/Database/";
+            //let io = LocalStorageProvider::new(loc, Some("rows3.db")).await;
             io
         })
     });
@@ -32,9 +32,9 @@ static mut IO_ROWS: async_lazy::Lazy<LocalStorageProvider> =
 static mut IO_POINTERS: async_lazy::Lazy<LocalStorageProvider> =
     async_lazy::Lazy::new(|| {
         Box::pin(async {
-            //let io = LocalStorageProvider::new("G:\\Databases\\Test_Database", Some("pointers3.db")).await;
-            let loc = "/home/milen-denev/Database/";
-            let io = LocalStorageProvider::new(loc, Some("pointers3.db")).await;
+            let io = LocalStorageProvider::new("G:\\Databases\\Test_Database", Some("pointers3.db")).await;
+            //let loc = "/home/milen-denev/Database/";
+            //let io = LocalStorageProvider::new(loc, Some("pointers3.db")).await;
             io
         })
     });
@@ -120,25 +120,27 @@ async fn main() -> std::io::Result<()> {
     println!("Total rows collected: {}", all_rows.len());
     println!("Row fetch took: {:?}", stopwatch.elapsed());
     
-    stopwatch.reset();
-    stopwatch.start();
-    
-    let row_fetch = get_row_fetch_i32();
-    let search_value = SEARCH_VALUE;
-    let search_value_block = i32_column(search_value);
+    loop {
+                stopwatch.reset();
+        stopwatch.start();
+        
+        let row_fetch = get_row_fetch_i32();
+        let search_value = SEARCH_VALUE;
+        let search_value_block = i32_column(search_value);
 
-    let transformer = ColumnTransformer::new(
-        DbType::I32,
-        search_value_block,
-        ColumnTransformerType::ComparerOperation(ComparerOperation::Equals),
-        None
-    );
+        let transformer = ColumnTransformer::new(
+            DbType::I32,
+            search_value_block,
+            ColumnTransformerType::ComparerOperation(ComparerOperation::Equals),
+            None
+        );
 
-    let all_rows = concurrent_processor.process(row_fetch, io_rows, &mut iterator, transformer).await;
-    stopwatch.stop();
+        let all_rows = concurrent_processor.process(row_fetch, io_rows, &mut iterator, transformer).await;
+        stopwatch.stop();
 
-    println!("Total rows collected: {}", all_rows.len());
-    println!("Second row fetch took: {:?}", stopwatch.elapsed());
+        println!("Total rows collected: {}", all_rows.len());
+        println!("Second row fetch took: {:?}", stopwatch.elapsed());
+    } 
 
     let stdin = std::io::stdin();
     let mut buffer = String::new();

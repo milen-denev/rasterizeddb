@@ -43,14 +43,14 @@ const TOTAL_LENGTH : usize =
 
 #[cfg(feature = "enable_long_row")]
 #[cfg(not(debug_assertions))]
-const CHUNK_SIZE: usize = 5 * 695 * 92; // ~320KB chunks
+const CHUNK_SIZE: usize = TOTAL_LENGTH * 3047; // ~320KB chunks
 
 #[cfg(feature = "enable_long_row")]
 #[cfg(debug_assertions)]
-const CHUNK_SIZE: usize = 92 * 2; // 92 * 2 bytes chunks for debugging
+const CHUNK_SIZE: usize = TOTAL_LENGTH * 2; // 92 * 2 bytes chunks for debugging
 
 #[cfg(not(feature = "enable_long_row"))]
-const CHUNK_SIZE: usize = 3047 * 21; // ~64KB chunks
+const CHUNK_SIZE: usize = TOTAL_LENGTH * 3047; // ~64KB chunks
 
 // TODO replace with fastcrc32
 #[cfg(feature = "enable_long_row")]
@@ -157,50 +157,6 @@ impl<'a, S: StorageIO> RowPointerIterator<'a, S> {
                 return Ok(None);
             }
         }
-        
-        // Check if we have enough data left in the buffer for a complete RowPointer
-        // if self.buffer_index + TOTAL_LENGTH > self.buffer_valid_length {
-        //     // We need to handle the case where a RowPointer spans two chunks
-        //     let remaining_data = self.buffer[self.buffer_index..].to_vec();
-        //     let remaining_length = remaining_data.len();
-            
-        //     // Reset buffer with the remaining data
-        //     self.buffer.clear();
-        //     self.buffer.extend_from_slice(&remaining_data);
-            
-        //     // Update buffer index and valid length
-        //     self.buffer_index = 0;
-        //     self.buffer_valid_length = remaining_length;
-            
-        //     // Calculate how many additional bytes to read
-        //     let additional_bytes_needed = TOTAL_LENGTH - remaining_length;
-            
-        //     // Check if there's enough data left in the storage
-        //     let bytes_remaining_in_storage = self.total_length as u64 - (self.position - remaining_length as u64);
-            
-        //     if bytes_remaining_in_storage < additional_bytes_needed as u64 {
-        //         self.end_of_data = true;
-        //         return Ok(None);
-        //     }
-            
-        //     // Read the additional bytes
-        //     let mut additional_data = vec![0u8; additional_bytes_needed];
-        //     let mut read_position = self.position - remaining_length as u64;
-        //     self.io.read_data_into_buffer(&mut read_position, &mut additional_data).await;
-            
-        //     // Append the additional data to the buffer
-        //     self.buffer.extend_from_slice(&additional_data);
-        //     self.buffer_valid_length = self.buffer.len();
-            
-        //     // Update position for next read
-        //     self.position = read_position + additional_bytes_needed as u64;
-            
-        //     // If we still don't have enough data for a complete RowPointer, return None
-        //     if self.buffer_valid_length < TOTAL_LENGTH {
-        //         self.end_of_data = true;
-        //         return Ok(None);
-        //     }
-        // }
         
         let mut slice: [u8; TOTAL_LENGTH] = [0; TOTAL_LENGTH];
 
