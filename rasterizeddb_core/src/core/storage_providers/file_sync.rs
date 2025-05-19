@@ -1,5 +1,5 @@
 use std::{
-    fs::{self, remove_file}, path::Path, sync::{atomic::{AtomicBool, AtomicU64}, Arc}
+    fs::{self, remove_file, OpenOptions}, path::Path, sync::{atomic::{AtomicBool, AtomicU64}, Arc}
 };
 
 use std::io::*;
@@ -251,9 +251,16 @@ impl LocalStorageProvider {
                 file.flush().await.unwrap();
                 file.sync_all().await.unwrap();
 
+                drop(file);
+
+                let file = OpenOptions::new()
+                    .read(true)
+                    .open(&self.file_str)
+                    .unwrap();
+
                 //self._memory_map[len as usize..len as usize + size].copy_from_slice(&buffer);
                 self._memory_map = unsafe { MmapOptions::new()
-                    .map(&*file)
+                    .map(&file)
                     .unwrap() };
 
                 self.file_len.fetch_add(size as u64, std::sync::atomic::Ordering::Relaxed);
