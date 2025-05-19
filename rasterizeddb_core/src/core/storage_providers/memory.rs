@@ -7,23 +7,26 @@ use super::traits::StorageIO;
 
 pub struct MemoryStorageProvider {
     vec: ConcurrentVec<u8>,
-    random_u32: u32
+    random_u32: u32,
+    name: String,
 }
 
 impl Clone for MemoryStorageProvider {
     fn clone(&self) -> Self {
         Self {
             vec: self.vec.clone(),
-            random_u32: self.random_u32
+            random_u32: self.random_u32,
+            name: self.name.clone(),
         }
     }
 }
 
 impl MemoryStorageProvider {
-    pub fn new() -> MemoryStorageProvider {
+    pub fn new(name: &str) -> MemoryStorageProvider {
         MemoryStorageProvider {
             vec: ConcurrentVec::with_doubling_growth(),
-            random_u32: rand::rng().next_u32()
+            random_u32: rand::rng().next_u32(),
+            name: name.to_string(),
         }
     }
 }
@@ -129,7 +132,7 @@ impl StorageIO for MemoryStorageProvider {
         return buffer;
     }
 
-    async fn append_data(&mut self, buffer: &[u8]) {
+    async fn append_data(&mut self, buffer: &[u8], _immediate: bool) {
         for u8_value in buffer {
             self.vec.extend(vec![*u8_value; 1]);
         }
@@ -185,7 +188,8 @@ impl StorageIO for MemoryStorageProvider {
     async fn create_temp(&self) -> Self {
         Self {
             vec: ConcurrentVec::with_doubling_growth(),
-            random_u32: rand::rng().next_u32()
+            random_u32: rand::rng().next_u32(),
+            name: "temp".to_string(),
         }
     }
 
@@ -202,10 +206,11 @@ impl StorageIO for MemoryStorageProvider {
     }
 
     #[allow(refining_impl_trait)]
-    async fn create_new(&self, _name: String) -> Self {
+    async fn create_new(&self, name: String) -> Self {
         MemoryStorageProvider {
             vec: ConcurrentVec::with_doubling_growth(),
-            random_u32: rand::rng().next_u32()
+            random_u32: rand::rng().next_u32(),
+            name: name,
         }
     }
 
@@ -219,5 +224,9 @@ impl StorageIO for MemoryStorageProvider {
     
     fn start_service(&mut self) -> impl Future<Output = ()> + Send + Sync {
         async {}
+    }
+
+    fn get_name(&self) -> String {
+        self.name.clone()
     }
 }
