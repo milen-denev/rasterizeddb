@@ -23,7 +23,7 @@ use tokio::fs::remove_file;
 static mut IO_ROWS: async_lazy::Lazy<LocalStorageProvider> =
     async_lazy::Lazy::new(|| {
         Box::pin(async {
-            _ = remove_file("G:\\Databases\\Test_Database\\rows3.db").await;
+            //_ = remove_file("G:\\Databases\\Test_Database\\rows3.db").await;
             let io = LocalStorageProvider::new("G:\\Databases\\Test_Database", Some("rows3.db")).await;
             //let loc = "/home/milen-denev/Database/";
             //let io = LocalStorageProvider::new(loc, Some("rows3.db")).await;
@@ -34,7 +34,7 @@ static mut IO_ROWS: async_lazy::Lazy<LocalStorageProvider> =
 static mut IO_POINTERS: async_lazy::Lazy<LocalStorageProvider> =
     async_lazy::Lazy::new(|| {
         Box::pin(async {
-            _ = remove_file("G:\\Databases\\Test_Database\\pointers3.db").await;
+            //_ = remove_file("G:\\Databases\\Test_Database\\pointers3.db").await;
             let io = LocalStorageProvider::new("G:\\Databases\\Test_Database", Some("pointers3.db")).await;
             //let loc = "/home/milen-denev/Database/";
             //let io = LocalStorageProvider::new(loc, Some("pointers3.db")).await;
@@ -68,20 +68,20 @@ async fn main() -> std::io::Result<()> {
     #[cfg(feature = "enable_long_row")]
     let cluster = 0;
 
-    let last_row = iterator.read_last().await;
+    //let last_row = iterator.read_last().await;
 
-    let last_id = if let Some(row) = last_row {
-        AtomicU64::new(row.id)
-    } else {
-        AtomicU64::new(0)
-    };
+    // let last_id = if let Some(row) = last_row {
+    //     AtomicU64::new(row.id)
+    // } else {
+    //     AtomicU64::new(0)
+    // };
 
-    let table_length = AtomicU64::new(io_rows.get_len().await);
+    // let table_length = AtomicU64::new(io_rows.get_len().await);
 
-    let row_write = create_row_write(true);
-    let custom_row = create_row_write_custom_i32(SEARCH_VALUE, true);
+    // let row_write = create_row_write(true);
+    // let custom_row = create_row_write_custom_i32(SEARCH_VALUE, true);
 
-    // for _i in 0..1000 {
+    // for _i in 0..1_000_000 {
     //     _ = RowPointer::write_row(
     //         io_pointers_2,
     //         io_rows, 
@@ -92,22 +92,24 @@ async fn main() -> std::io::Result<()> {
     //         &row_write
     //     ).await;
     // }
+    
+    // tokio::time::sleep(tokio::time::Duration::from_millis(5_000)).await;
 
-    let _result = RowPointer::write_row(
-        io_pointers_2,
-        io_rows, 
-        &last_id, 
-        &table_length, 
-        #[cfg(feature = "enable_long_row")]
-        cluster, 
-        &custom_row
-    ).await;
+    // let _result = RowPointer::write_row(
+    //     io_pointers_2,
+    //     io_rows, 
+    //     &last_id, 
+    //     &table_length, 
+    //     #[cfg(feature = "enable_long_row")]
+    //     cluster, 
+    //     &custom_row
+    // ).await;
 
     // if let Err(e) = result {
     //     println!("Error writing row: {}", e);
     // }
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+    //tokio::time::sleep(tokio::time::Duration::from_millis(5_000)).await;
 
     let mut stopwatch = Stopwatch::start_new();
 
@@ -132,7 +134,7 @@ async fn main() -> std::io::Result<()> {
     println!("Total rows collected: {}", all_rows.len());
     println!("Row fetch took: {:?}", stopwatch.elapsed());
     
-    if false {
+    if true {
         loop {
             stopwatch.reset();
             stopwatch.start();
@@ -153,8 +155,12 @@ async fn main() -> std::io::Result<()> {
 
             println!("Total rows collected: {}", all_rows.len());
             println!("Second row fetch took: {:?}", stopwatch.elapsed());
+            
+            print_process_memory_stats("After row fetch");
+            tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
         } 
     }
+
 
     let stdin = std::io::stdin();
     let mut buffer = String::new();
@@ -184,4 +190,17 @@ async fn main() -> std::io::Result<()> {
     _ = tokio::spawn(Database::start_async(Arc::new(_database))).await?;
 
     return Ok(());
+}
+
+fn print_process_memory_stats(label: &str) {
+    if let Some(usage) = memory_stats::memory_stats() {
+        println!("--- Memory Stats ({}) ---", label);
+        println!("  Physical Memory: {} bytes ({} MB)", usage.physical_mem, usage.physical_mem / (1024 * 1024));
+        println!("  Virtual Memory:  {} bytes ({} MB)", usage.virtual_mem, usage.virtual_mem / (1024 * 1024));
+        println!("----------------------------");
+    } else {
+        println!("--- Memory Stats ({}) ---", label);
+        println!("  Could not get memory statistics.");
+        println!("----------------------------");
+    }
 }
