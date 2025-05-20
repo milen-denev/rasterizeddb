@@ -3,41 +3,59 @@ use crate::memory_pool::{MemoryBlock, MEMORY_POOL};
 
 use crate::core::db_type::DbType;
 
+use super::schema::SchemaField;
 use super::transformer::{ComparerOperation, ComparisonOperand, MathOperation, Next, TransformerProcessor};
 
 #[derive(Debug, Clone)]
 pub enum Token {
     Ident(String),
-    Number(i32),
+    Number(NumericValue),
     StringLit(String),
     Op(String),
     LPar,
     RPar,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum NumericValue {
+    I8(i8),
+    I16(i16),
+    I32(i32),
+    I64(i64),
+    I128(i128),
+    U8(u8),
+    U16(u16),
+    U32(u32),
+    U64(u64),
+    U128(u128),
+    F32(f32),
+    F64(f64),
+}
+
 // For testing only
 #[cfg(test)]
-pub fn tokenize_for_test(s: &str) -> Vec<Token> {
-    tokenize(s)
+pub fn tokenize_for_test(s: &str, schema: &Vec<SchemaField>) -> Vec<Token> {
+    tokenize(s, schema)
 }
 
 pub fn parse_query(
     query: &str,
-    columns: &HashMap<String, MemoryBlock>
+    columns: &HashMap<String, MemoryBlock>,
+    schema: &Vec<SchemaField>,
 ) -> TransformerProcessor {
-    let parser = QueryParser::new(query, columns);
+    let parser = QueryParser::new(query, columns, schema);
     parser.parse_where()
 }
 
 struct QueryParser<'a> {
     toks: Vec<Token>,
     pos: usize,
-    cols: &'a HashMap<String, MemoryBlock>,
+    cols: &'a HashMap<String, MemoryBlock>
 }
 
 impl<'a> QueryParser<'a> {
-    fn new(s: &str, cols: &'a HashMap<String, MemoryBlock>) -> Self {
-        let toks = tokenize(s);
+    fn new(s: &str, cols: &'a HashMap<String, MemoryBlock>, schema: &'a Vec<SchemaField>) -> Self {
+        let toks = tokenize(s, schema);
         Self { toks, pos: 0, cols }
     }
 
@@ -197,7 +215,7 @@ impl<'a> QueryParser<'a> {
     ) -> ComparisonOperand {
         match self.next().unwrap() {
             Token::Number(n) => {
-                let mb = int_to_mb(n);
+                let mb = numeric_to_mb(n);
                 ComparisonOperand::Direct(mb)
             }
             Token::StringLit(s) => {
@@ -243,13 +261,54 @@ impl<'a> QueryParser<'a> {
 
 }
 
-fn tokenize(s: &str) -> Vec<Token> {
+fn tokenize(s: &str, schema: &Vec<SchemaField>) -> Vec<Token> {
     let mut out = Vec::new();
-    let mut i=0;
+    let mut i = 0;
     let cs: Vec<char> = s.chars().collect();
-    while i<cs.len() {
+    
+    // Helper function to determine numeric type based on field name and value
+    fn parse_numeric_value(value_str: &str, field_name: Option<&str>, schema: &Vec<SchemaField>) -> NumericValue {
+        // Try to find the field in schema
+        if let Some(field_name) = field_name {
+            if let Some(field) = schema.iter().find(|f| f.name == field_name) {
+                // Parse according to the field's database type
+                return match field.db_type {
+                    DbType::I8 => NumericValue::I8(value_str.parse().unwrap_or_default()),
+                    DbType::I16 => NumericValue::I16(value_str.parse().unwrap_or_default()),
+                    DbType::I32 => NumericValue::I32(value_str.parse().unwrap_or_default()),
+                    DbType::I64 => NumericValue::I64(value_str.parse().unwrap_or_default()),
+                    DbType::I128 => NumericValue::I128(value_str.parse().unwrap_or_default()),
+                    DbType::U8 => NumericValue::U8(value_str.parse().unwrap_or_default()),
+                    DbType::U16 => NumericValue::U16(value_str.parse().unwrap_or_default()),
+                    DbType::U32 => NumericValue::U32(value_str.parse().unwrap_or_default()),
+                    DbType::U64 => NumericValue::U64(value_str.parse().unwrap_or_default()),
+                    DbType::U128 => NumericValue::U128(value_str.parse().unwrap_or_default()),
+                    DbType::F32 => NumericValue::F32(value_str.parse().unwrap_or_default()),
+                    DbType::F64 => NumericValue::F64(value_str.parse().unwrap_or_default()),
+                    _ => NumericValue::I32(value_str.parse().unwrap_or_default()), // Default fallback
+                };
+            }
+        }
+        
+        // Default behavior: determine type based on the format of the number
+        if value_str.contains('.') {
+            NumericValue::F64(value_str.parse().unwrap_or_default())
+        } else {
+            let parsed_num: i64 = value_str.parse().unwrap_or_default();
+            if parsed_num >= i32::MIN as i64 && parsed_num <= i32::MAX as i64 {
+                NumericValue::I32(parsed_num as i32)
+            } else {
+                NumericValue::I64(parsed_num)
+            }
+        }
+    }
+    
+    // Track context for field association
+    let mut current_field: Option<String> = None;
+    
+    while i < cs.len() {
         match cs[i] {
-            c if c.is_whitespace() => i+=1,
+            c if c.is_whitespace() => i += 1,
             '\'' => {
                 // find closing quote safely
                 let mut j = i + 1;
@@ -261,46 +320,94 @@ fn tokenize(s: &str) -> Vec<Token> {
                 i = j + 1;
             }
             c if c.is_ascii_digit() => {
-                let start=i;
-                while i<cs.len() && cs[i].is_ascii_digit() { i+=1 }
-                let num: i32 = cs[start..i].iter().collect::<String>().parse().unwrap();
-                out.push(Token::Number(num));
+                let start = i;
+                // Handle floating point numbers
+                let mut has_decimal = false;
+                while i < cs.len() && (cs[i].is_ascii_digit() || (!has_decimal && cs[i] == '.')) {
+                    if cs[i] == '.' {
+                        has_decimal = true;
+                    }
+                    i += 1;
+                }
+                
+                let num_str = cs[start..i].iter().collect::<String>();
+                let numeric_value = parse_numeric_value(&num_str, current_field.as_deref(), schema);
+                out.push(Token::Number(numeric_value));
             }
             c if is_id_start(c) => {
-                let start=i;
-                while i<cs.len() && is_id_part(cs[i]) { i+=1 }
+                let start = i;
+                while i < cs.len() && is_id_part(cs[i]) { i += 1 }
                 let id = cs[start..i].iter().collect::<String>();
-                // treat all keywords and identifiers uniformly, including CONTAINS, STARTSWITH, ENDSWITH
+                
+                // Store identifier as potential field name for next numeric value
+                if schema.iter().any(|field| field.name == id) {
+                    current_field = Some(id.clone());
+                }
+                
                 out.push(Token::Ident(id));
             }
-            '(' => { out.push(Token::LPar); i+=1 }
-            ')' => { out.push(Token::RPar); i+=1 }
+            '(' => { out.push(Token::LPar); i += 1 }
+            ')' => { out.push(Token::RPar); i += 1 }
             '<'|'>'|'!'|'=' => {
                 let mut op = cs[i].to_string();
-                if i+1<cs.len() && cs[i+1]=='=' {
+                if i+1 < cs.len() && cs[i+1] == '=' {
                     op.push('=');
-                    i+=2;
-                } else { i+=1; }
+                    i += 2;
+                } else { i += 1; }
                 out.push(Token::Op(op));
             }
             '+'|'-'|'*'|'/' => {
                 out.push(Token::Op(cs[i].to_string()));
-                i+=1;
+                i += 1;
+            }
+            ',' => { i += 1; current_field = None; } // Reset current field on comma
+            'A'..='Z'|'a'..='z' => {
+                // Handle keywords like AND, OR
+                let start = i;
+                while i < cs.len() && is_id_part(cs[i]) { i += 1 }
+                let keyword = cs[start..i].iter().collect::<String>();
+                
+                // If it's a logical operator, reset the current field context
+                if keyword.to_uppercase() == "AND" || keyword.to_uppercase() == "OR" {
+                    current_field = None;
+                }
+                
+                out.push(Token::Ident(keyword));
             }
             _ => panic!("unexpected char {}", cs[i]),
         }
     }
+    
     out
 }
 
 fn is_id_start(c: char) -> bool { c.is_alphabetic() || c=='_' }
 fn is_id_part(c: char)  -> bool { c.is_alphanumeric() || c=='_' }
 
-fn int_to_mb(v: i32) -> MemoryBlock {
-    let b = v.to_le_bytes();
-    let mb = MEMORY_POOL.acquire(b.len());
-    mb.into_slice_mut().copy_from_slice(&b);
-    mb
+fn numeric_to_mb(v: NumericValue) -> MemoryBlock {
+    macro_rules! direct {
+        ($val:expr) => {{
+            let bytes = $val.to_le_bytes();
+            let mb = MEMORY_POOL.acquire(bytes.len());
+            mb.into_slice_mut().copy_from_slice(&bytes);
+            mb
+        }};
+    }
+    let b = match v {
+        NumericValue::I8(n)   => direct!(n),
+        NumericValue::I16(n)  => direct!(n),
+        NumericValue::I32(n)  => direct!(n),
+        NumericValue::I64(n)  => direct!(n),
+        NumericValue::I128(n) => direct!(n),
+        NumericValue::U8(n)   => direct!(n),
+        NumericValue::U16(n)  => direct!(n),
+        NumericValue::U32(n)  => direct!(n),
+        NumericValue::U64(n)  => direct!(n),
+        NumericValue::U128(n) => direct!(n),
+        NumericValue::F32(f)  => direct!(f),
+        NumericValue::F64(f)  => direct!(f),
+    };
+    b
 }
 
 fn str_to_mb(s: &str) -> MemoryBlock {
@@ -313,8 +420,21 @@ fn str_to_mb(s: &str) -> MemoryBlock {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use crate::core::row_v2::query_parser::{parse_query, tokenize_for_test};
+    use crate::core::db_type::DbType;
+    use crate::core::row_v2::query_parser::{parse_query, tokenize_for_test, NumericValue};
+    use crate::core::row_v2::schema::SchemaField;
     use crate::memory_pool::{MemoryBlock, MEMORY_POOL};
+
+    fn create_schema() -> Vec<SchemaField> {
+        vec![
+            SchemaField::new("id".to_string(), DbType::I32, 4 , 0, 0, false),
+            SchemaField::new("age".to_string(), DbType::I32, 4 , 0, 0, false),
+            SchemaField::new("salary".to_string(), DbType::I32, 4 , 0, 0, false),
+            SchemaField::new("name".to_string(), DbType::STRING, 4 + 8 , 0, 0, false),
+            SchemaField::new("department".to_string(), DbType::STRING, 4 + 8 , 0, 0, false),
+            SchemaField::new("bank_balance".to_string(), DbType::F64, 8 , 0, 0, false),
+        ]
+    }
 
     fn create_memory_block_from_i32(value: i32) -> MemoryBlock {
         let bytes = value.to_le_bytes();
@@ -332,6 +452,14 @@ mod tests {
         data
     }
 
+    fn create_memory_block_from_f64(value: f64) -> MemoryBlock {
+        let bytes = value.to_le_bytes();
+        let data = MEMORY_POOL.acquire(bytes.len());
+        let slice = data.into_slice_mut();
+        slice.copy_from_slice(&bytes);
+        data
+    }
+
     fn setup_test_columns() -> HashMap<String, MemoryBlock> {
         let mut columns = HashMap::new();
         columns.insert("id".to_string(), create_memory_block_from_i32(42));
@@ -339,6 +467,7 @@ mod tests {
         columns.insert("salary".to_string(), create_memory_block_from_i32(50000));
         columns.insert("name".to_string(), create_memory_block_from_string("John Doe"));
         columns.insert("department".to_string(), create_memory_block_from_string("Engineering"));
+        columns.insert("bank_balance".to_string(), create_memory_block_from_f64(1000.43));
         columns
     }
 
@@ -347,7 +476,7 @@ mod tests {
         let columns = setup_test_columns();
         let query = "id = 42";
         
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(processor.execute());
     }
 
@@ -356,7 +485,7 @@ mod tests {
         let columns = setup_test_columns();
         let query = "id != 50";
         
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(processor.execute());
     }
 
@@ -364,8 +493,8 @@ mod tests {
     fn test_parse_simple_greater_than() {
         let columns = setup_test_columns();
         let query = "age > 25";
-        
-        let mut processor = parse_query(query, &columns);
+
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(processor.execute());
     }
 
@@ -373,8 +502,8 @@ mod tests {
     fn test_parse_simple_less_than() {
         let columns = setup_test_columns();
         let query = "age < 40";
-        
-        let mut processor = parse_query(query, &columns);
+
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(processor.execute());
     }
 
@@ -382,8 +511,8 @@ mod tests {
     fn test_parse_greater_or_equal() {
         let columns = setup_test_columns();
         let query = "age >= 30";
-        
-        let mut processor = parse_query(query, &columns);
+
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(processor.execute());
     }
 
@@ -391,8 +520,8 @@ mod tests {
     fn test_parse_less_or_equal() {
         let columns = setup_test_columns();
         let query = "age <= 30";
-        
-        let mut processor = parse_query(query, &columns);
+
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(processor.execute());
     }
 
@@ -400,8 +529,8 @@ mod tests {
     fn test_parse_math_operation() {
         let columns = setup_test_columns();
         let query = "age + 10 = 40";
-        
-        let mut processor = parse_query(query, &columns);
+
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(processor.execute());
     }
 
@@ -409,8 +538,8 @@ mod tests {
     fn test_parse_multiple_math_operations() {
         let columns = setup_test_columns();
         let query = "age * 2 + 10 = 70";
-        
-        let mut processor = parse_query(query, &columns);
+
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(processor.execute());
     }
 
@@ -418,8 +547,8 @@ mod tests {
     fn test_parse_parentheses() {
         let columns = setup_test_columns();
         let query = "(age + 10) * 2 = 80";
-        
-        let mut processor = parse_query(query, &columns);
+
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(processor.execute());
     }
 
@@ -427,8 +556,8 @@ mod tests {
     fn test_parse_string_contains() {
         let columns = setup_test_columns();
         let query = "name CONTAINS 'John'";
-        
-        let mut processor = parse_query(query, &columns);
+
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(processor.execute());
     }
 
@@ -436,8 +565,8 @@ mod tests {
     fn test_parse_string_starts_with() {
         let columns = setup_test_columns();
         let query = "name STARTSWITH 'John'";
-        
-        let mut processor = parse_query(query, &columns);
+
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(processor.execute());
     }
 
@@ -445,8 +574,8 @@ mod tests {
     fn test_parse_string_ends_with() {
         let columns = setup_test_columns();
         let query = "name ENDSWITH 'Doe'";
-        
-        let mut processor = parse_query(query, &columns);
+
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(processor.execute());
     }
 
@@ -454,8 +583,8 @@ mod tests {
     fn test_parse_logical_and() {
         let columns = setup_test_columns();
         let query = "age > 25 AND salary = 50000";
-        
-        let mut processor = parse_query(query, &columns);
+
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(processor.execute());
     }
 
@@ -463,8 +592,8 @@ mod tests {
     fn test_parse_logical_or() {
         let columns = setup_test_columns();
         let query = "age < 25 OR salary = 50000";
-        
-        let mut processor = parse_query(query, &columns);
+
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(processor.execute());
     }
 
@@ -472,8 +601,8 @@ mod tests {
     fn test_parse_complex_query() {
         let columns = setup_test_columns();
         let query = "age > 25 AND (salary = 50000 OR name CONTAINS 'Jane')";
-        
-        let mut processor = parse_query(query, &columns);
+
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(processor.execute());
     }
 
@@ -481,7 +610,7 @@ mod tests {
     fn test_tokenize() {
         use crate::core::row_v2::query_parser::Token;
         
-        let tokens = tokenize_for_test("age >= 30 AND name CONTAINS 'John'");
+        let tokens = tokenize_for_test("age >= 30 AND name CONTAINS 'John'", &create_schema());
         
         assert_eq!(tokens.len(), 7);
         
@@ -497,7 +626,7 @@ mod tests {
         }
         
         match &tokens[2] {
-            Token::Number(n) => assert_eq!(*n, 30),
+            Token::Number(n) => assert_eq!(*n, NumericValue::I32(30)),
             _ => panic!("Expected number token"),
         }
         
@@ -527,7 +656,7 @@ mod tests {
     fn test_string_equality_type_inference() {
         let columns = setup_test_columns();
         let query = "name = 'John Doe'";
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(processor.execute());
     }
 
@@ -535,7 +664,7 @@ mod tests {
     fn test_string_op_type_inference() {
         let columns = setup_test_columns();
         let query = "department STARTSWITH 'Eng'";
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(processor.execute());
     }
 
@@ -543,7 +672,7 @@ mod tests {
     fn test_mixed_types_in_different_comparisons_false() {
         let columns = setup_test_columns();
         let query = "id > 10 AND name = 'Test'"; // id > 10 (T), name = 'Test' (F) -> F
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(!processor.execute());
     }
 
@@ -551,7 +680,7 @@ mod tests {
     fn test_arithmetic_precedence_div_add() {
         let columns = setup_test_columns();
         let query = "salary / 2 + 100 = 25100"; // 50000/2 + 100 = 25000 + 100 = 25100
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(processor.execute());
     }
 
@@ -559,7 +688,7 @@ mod tests {
     fn test_arithmetic_precedence_literal_first_div_add() {
         let columns = setup_test_columns();
         let query = "10 + salary / 2 = 25010"; // 10 + 50000/2 = 10 + 25000 = 25010
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(processor.execute());
     }
 
@@ -568,7 +697,7 @@ mod tests {
         let columns = setup_test_columns();
         // (id=42 (T) AND age > 20 (T)) OR salary < 60000 (T) -> (T AND T) OR T -> T OR T -> T
         let query = "id = 42 AND age > 20 OR salary < 60000";
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(processor.execute());
     }
 
@@ -577,7 +706,7 @@ mod tests {
         let columns = setup_test_columns();
         // id = 10 (F) OR (age > 20 (T) AND salary = 50000 (T)) -> F OR (T AND T) -> F OR T -> T
         let query = "id = 10 OR age > 20 AND salary = 50000";
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(processor.execute());
     }
     
@@ -585,7 +714,7 @@ mod tests {
     fn test_explicit_logical_grouping_and_first() {
         let columns = setup_test_columns();
         let query = "(id = 42 AND age > 20) OR salary < 60000"; // Same as test_logical_precedence_and_then_or
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(processor.execute());
     }
 
@@ -593,7 +722,7 @@ mod tests {
     fn test_explicit_logical_grouping_or_first_with_and() {
         let columns = setup_test_columns();
         let query = "id = 10 OR (age > 20 AND salary = 50000)"; // Same as test_logical_precedence_or_then_and_parsed
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(processor.execute());
     }
 
@@ -603,7 +732,7 @@ mod tests {
         // (name STARTSWITH 'J' (T) OR department = 'Sales' (F)) AND age < 35 (T)
         // (T OR F) AND T -> T AND T -> T
         let query = "(name STARTSWITH 'J' OR department = 'Sales') AND age < 35";
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(processor.execute());
     }
 
@@ -612,7 +741,7 @@ mod tests {
         let columns = setup_test_columns();
         // ((30+5)*2 - 10)/3 = (35*2 - 10)/3 = (70-10)/3 = 60/3 = 20
         let query = "( (age + 5) * 2 - 10 ) / 3 = 20";
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(processor.execute());
     }
 
@@ -622,7 +751,7 @@ mod tests {
         // (id=42 (T) AND (age>25 (T) OR age<20 (F))) OR department='Engineering' (T)
         // (T AND (T OR F)) OR T -> (T AND T) OR T -> T OR T -> T
         let query = "(id = 42 AND (age > 25 OR age < 20)) OR department = 'Engineering'";
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(processor.execute());
     }
 
@@ -630,7 +759,7 @@ mod tests {
     fn test_column_compared_to_itself() {
         let columns = setup_test_columns();
         let query = "id = id"; // 42 = 42
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(processor.execute());
     }
     
@@ -638,7 +767,7 @@ mod tests {
     fn test_literal_on_left_arithmetic_on_right() {
         let columns = setup_test_columns();
         let query = "10 = id - 32"; // 10 = 42 - 32 -> 10 = 10
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(processor.execute());
     }
 
@@ -647,7 +776,7 @@ mod tests {
         let columns = setup_test_columns();
         // name = 'John Doe' (T) AND name != 'Jane Doe' (T) -> T
         let query = "name = 'John Doe' AND name != 'Jane Doe'";
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(processor.execute());
     }
 
@@ -656,7 +785,7 @@ mod tests {
         let columns = setup_test_columns();
         // (age + 10) > 30 (T, 40 > 30) AND id = 42 (T) -> T
         let query = "(age + 10) > 30 AND id = 42";
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(processor.execute());
     }
 
@@ -665,7 +794,7 @@ mod tests {
         let columns = setup_test_columns();
         // department ENDSWITH 'ing' (T) AND name CONTAINS 'oh' (T) -> T
         let query = "department ENDSWITH 'ing' AND name CONTAINS 'oh'";
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(processor.execute());
     }
 
@@ -677,7 +806,7 @@ mod tests {
         // (name STARTSWITH 'J' (T) OR department = 'HR' (F)) -> (T OR F) -> T
         // T AND T -> T
         let query = "(age + salary / 1000 > 70) AND (name STARTSWITH 'J' OR department = 'HR')";
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(processor.execute());
     }
 
@@ -689,7 +818,7 @@ mod tests {
         // (salary > 40000 (T) AND salary < 60000 (T)) -> (T AND T) -> T
         // T AND T -> T
         let query = "(age * 2 = 60 OR age / 2 = 15) AND (salary > 40000 AND salary < 60000)";
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(processor.execute());
     }
 
@@ -700,21 +829,21 @@ mod tests {
         // age * 1000 + 10000 = 30 * 1000 + 10000 = 30000 + 10000 = 40000
         // 40000 = 40000 -> T
         let query = "salary - 10000 = age * 1000 + 10000";
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(processor.execute());
     }
 
     #[test]
     fn test_tokenize_keywords_as_idents_and_ops() { // Existing test_tokenize is good, this adds a bit more
         use crate::core::row_v2::query_parser::Token;
-        
-        let tokens = tokenize_for_test("age >= 30 AND name CONTAINS 'John' OR id STARTSWITH 'prefix'");
-        
+
+        let tokens = tokenize_for_test("age >= 30 AND name CONTAINS 'John' OR id STARTSWITH 'prefix'", &create_schema());
+
         assert_eq!(tokens.len(), 11);
         
         match &tokens[0] { Token::Ident(s) => assert_eq!(s, "age"), _ => panic!("Expected ident") }
         match &tokens[1] { Token::Op(s) => assert_eq!(s, ">="), _ => panic!("Expected op") }
-        match &tokens[2] { Token::Number(n) => assert_eq!(*n, 30), _ => panic!("Expected num") }
+        match &tokens[2] { Token::Number(n) => assert_eq!(*n, NumericValue::I32(30)), _ => panic!("Expected num") }
         match &tokens[3] { Token::Ident(s) => assert_eq!(s.to_uppercase(), "AND"), _ => panic!("Expected AND") }
         match &tokens[4] { Token::Ident(s) => assert_eq!(s, "name"), _ => panic!("Expected ident") }
         match &tokens[5] { Token::Ident(s) => assert_eq!(s.to_uppercase(), "CONTAINS"), _ => panic!("Expected CONTAINS") }
@@ -731,7 +860,7 @@ mod tests {
     fn test_parse_simple_equals_false() {
         let columns = setup_test_columns();
         let query = "id = 100"; // 42 = 100 -> False
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(!processor.execute());
     }
 
@@ -739,7 +868,7 @@ mod tests {
     fn test_parse_simple_string_equals_false() {
         let columns = setup_test_columns();
         let query = "name = 'NonExistent'"; // 'John Doe' = 'NonExistent' -> False
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(!processor.execute());
     }
 
@@ -747,7 +876,7 @@ mod tests {
     fn test_parse_simple_greater_than_false() {
         let columns = setup_test_columns();
         let query = "age > 30"; // 30 > 30 -> False
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(!processor.execute());
     }
 
@@ -755,7 +884,7 @@ mod tests {
     fn test_parse_simple_less_than_false() {
         let columns = setup_test_columns();
         let query = "salary < 50000"; // 50000 < 50000 -> False
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(!processor.execute());
     }
 
@@ -763,7 +892,7 @@ mod tests {
     fn test_parse_simple_not_equals_false() {
         let columns = setup_test_columns();
         let query = "id != 42"; // 42 != 42 -> False
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(!processor.execute());
     }
 
@@ -771,7 +900,7 @@ mod tests {
     fn test_parse_string_contains_false() {
         let columns = setup_test_columns();
         let query = "name CONTAINS 'XYZ'"; // 'John Doe' CONTAINS 'XYZ' -> False
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(!processor.execute());
     }
 
@@ -779,7 +908,7 @@ mod tests {
     fn test_parse_string_starts_with_false() {
         let columns = setup_test_columns();
         let query = "department STARTSWITH 'Sci'"; // 'Engineering' STARTSWITH 'Sci' -> False
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(!processor.execute());
     }
 
@@ -787,7 +916,7 @@ mod tests {
     fn test_parse_string_ends_with_false() {
         let columns = setup_test_columns();
         let query = "name ENDSWITH 'Smith'"; // 'John Doe' ENDSWITH 'Smith' -> False
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(!processor.execute());
     }
 
@@ -795,7 +924,7 @@ mod tests {
     fn test_parse_math_operation_false() {
         let columns = setup_test_columns();
         let query = "age + 10 = 50"; // 30 + 10 = 40; 40 = 50 -> False
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(!processor.execute());
     }
 
@@ -803,7 +932,7 @@ mod tests {
     fn test_parse_multiple_math_operations_false() {
         let columns = setup_test_columns();
         let query = "age * 2 + 10 = 60"; // 30 * 2 + 10 = 70; 70 = 60 -> False
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(!processor.execute());
     }
 
@@ -811,7 +940,7 @@ mod tests {
     fn test_parse_parentheses_false() {
         let columns = setup_test_columns();
         let query = "(age + 10) * 2 = 70"; // (30 + 10) * 2 = 80; 80 = 70 -> False
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(!processor.execute());
     }
 
@@ -819,7 +948,7 @@ mod tests {
     fn test_parse_logical_and_false_first_cond() {
         let columns = setup_test_columns();
         let query = "age > 35 AND salary = 50000"; // (30 > 35 -> F) AND (50000 = 50000 -> T) -> F
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(!processor.execute());
     }
 
@@ -827,7 +956,7 @@ mod tests {
     fn test_parse_logical_and_false_second_cond() {
         let columns = setup_test_columns();
         let query = "age > 25 AND salary = 10000"; // (30 > 25 -> T) AND (50000 = 10000 -> F) -> F
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(!processor.execute());
     }
 
@@ -835,7 +964,7 @@ mod tests {
     fn test_parse_logical_and_false_both_conds() {
         let columns = setup_test_columns();
         let query = "age > 35 AND salary = 10000"; // (F) AND (F) -> F
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(!processor.execute());
     }
 
@@ -843,7 +972,7 @@ mod tests {
     fn test_parse_logical_or_false_both_conds() {
         let columns = setup_test_columns();
         let query = "age < 20 OR salary = 10000"; // (30 < 20 -> F) OR (50000 = 10000 -> F) -> F
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(!processor.execute());
     }
 
@@ -851,7 +980,7 @@ mod tests {
     fn test_column_vs_column_false() {
         let columns = setup_test_columns();
         let query = "id = age"; // 42 = 30 -> False
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(!processor.execute());
     }
 
@@ -859,7 +988,7 @@ mod tests {
     fn test_literal_on_left_arithmetic_on_right_false() {
         let columns = setup_test_columns();
         let query = "10 = id - 30"; // 10 = (42 - 30) -> 10 = 12 -> False
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(!processor.execute());
     }
 
@@ -868,7 +997,7 @@ mod tests {
         let columns = setup_test_columns();
         // age > 25 (T) AND (salary = 10000 (F) OR name CONTAINS 'Jane' (F)) -> T AND (F OR F) -> T AND F -> F
         let query = "age > 25 AND (salary = 10000 OR name CONTAINS 'Jane')";
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(!processor.execute());
     }
 
@@ -878,7 +1007,7 @@ mod tests {
         let columns = setup_test_columns();
         // AgE > 35 (F) aNd SaLaRy = 50000 (T) -> F
         let query = "AgE > 35 aNd SaLaRy = 50000";
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(!processor.execute());
     }
 
@@ -887,7 +1016,7 @@ mod tests {
         let columns = setup_test_columns();
         // id = 100 (F) AND name CONTAINS 'John' (T) -> F
         let query = "id   =  100   AND  name   CONTAINS   'John'";
-        let mut processor = parse_query(query, &columns);
+        let mut processor = parse_query(query, &columns, &create_schema());
         assert!(!processor.execute());
     }
 }
