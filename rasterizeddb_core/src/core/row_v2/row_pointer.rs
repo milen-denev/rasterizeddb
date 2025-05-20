@@ -451,24 +451,6 @@ impl RowPointer {
         block
     }
     
-    /// Writes the RowPointer to the given StorageIO at the specified position
-    pub async fn write_to_io<S: StorageIO>(&self, io: &mut S) -> Result<()> {
-        let block = self.into_memory_block();
-        let slice = block.into_slice();
-
-        #[cfg(feature = "enable_data_verification")]
-        let position = io.get_len().await;
-
-        // Write data to storage
-        io.append_data(slice, false).await;
-        
-        // Verify written data
-        #[cfg(feature = "enable_data_verification")]
-        io.verify_data_and_sync(position, slice).await;
-        
-        Ok(())
-    }
-    
     /// Deserializes a slice of u8 into a RowPointer
     pub fn from_slice(buffer: &[u8; TOTAL_LENGTH]) -> Self {
         // ID field
