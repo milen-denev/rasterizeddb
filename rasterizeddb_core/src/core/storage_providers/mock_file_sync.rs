@@ -314,8 +314,6 @@ impl StorageIO for MockStorageProvider {
         let buffer_len = buffer.len();
         //let table_len = self.file_len.load(std::sync::atomic::Ordering::Relaxed);
 
-        println!("file_str: {}", self.file_str);
-
         let mut read_file = std::fs::File::options()
             .read(true)
             .open(&self.file_str)
