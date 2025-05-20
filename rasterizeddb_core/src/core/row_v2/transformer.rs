@@ -133,33 +133,61 @@ impl TransformerProcessor {
         }
     }    
     
-    /// Add a math operation transformer
+   /// Add a math operation transformer
+    /// Accepts either direct MemoryBlocks or intermediate result indices (usize) as operands.
     pub fn add_math_operation(
         &mut self,
         column_type: DbType,
-        column_1: MemoryBlock, 
-        column_2: MemoryBlock,
+        left_operand_in: impl Into<ComparisonOperand>,
+        right_operand_in: impl Into<ComparisonOperand>,
         operation: MathOperation,
     ) -> usize {
-        let result_index = self.intermediate_results.len();
-        
+        let result_store_idx = self.intermediate_results.len(); // Index for storing the output of THIS math operation
+
+        let left_op = left_operand_in.into();
+        let right_op = right_operand_in.into();
+
+        let placeholder = MemoryBlock::default();
+        // Initialize ColumnTransformer with placeholders for column_1 and column_2
         let mut transformer = ColumnTransformer::new(
             column_type,
-            column_1,
+            placeholder.clone(), 
             ColumnTransformerType::MathOperation(operation),
-            None,
+            None, // Math operations don't have a 'Next' logical connector
         );
+        // setup_column_2 also needs to be called, even with a placeholder initially for column_2
+        transformer.setup_column_2(placeholder); 
+
+        // Configure column_1 or result_index_1 based on the left operand type
+        match left_op {
+            ComparisonOperand::Direct(mem) => {
+                transformer.column_1 = mem;
+            }
+            ComparisonOperand::Intermediate(idx) => {
+                transformer.result_index_1 = Some(idx);
+                // transformer.column_1 remains the placeholder; it will be filled by execute()
+            }
+        }
+
+        // Configure column_2 or result_index_2 based on the right operand type
+        match right_op {
+            ComparisonOperand::Direct(mem) => {
+                transformer.setup_column_2(mem);
+            }
+            ComparisonOperand::Intermediate(idx) => {
+                transformer.result_index_2 = Some(idx);
+                // transformer.column_2 remains the placeholder (set via setup_column_2 above); it will be filled by execute()
+            }
+        }
         
-        // Store the result index in the transformer
-        transformer.result_store_index = Some(result_index);
+        // Set the index where the result of this math operation will be stored
+        transformer.result_store_index = Some(result_store_idx); 
         
-        transformer.setup_column_2(column_2);
         self.transformers.push_back(transformer);
+        // Reserve space in intermediate_results for the output of this operation
+        self.intermediate_results.push(MemoryBlock::default()); 
         
-        // Reserve space for the result
-        self.intermediate_results.push(MemoryBlock::default());
-        
-        result_index
+        result_store_idx // Return the index where the output will be stored
     }
     
     /// Add a comparison operation with a logical connector
@@ -254,25 +282,28 @@ impl TransformerProcessor {
     /// Evaluate the logical combination of comparison results
     fn evaluate_comparison_results(&self, results: Vec<(bool, Option<Next>)>) -> bool {
         if results.is_empty() {
-            return false;
+            return false; // Or true, depending on desired behavior for an empty set.
         }
         
         let mut final_result = results[0].0;
         
         for i in 0..results.len()-1 {
-            let (current_result, next_op) = &results[i];
-            let (next_result, _) = results[i+1];
+            // connector_from_current is the operator that links the accumulated 'final_result'
+            // (which represents the evaluation up to results[i].0) with results[i+1].0
+            let (_, connector_from_current) = &results[i]; 
+            let (next_standalone_bool_val, _) = results[i+1];
             
-            match next_op {
+            match connector_from_current {
                 Some(Next::And) => {
-                    final_result = *current_result && next_result;
+                    final_result = final_result && next_standalone_bool_val;
                 },
                 Some(Next::Or) => {
-                    final_result = *current_result || next_result;
+                    final_result = final_result || next_standalone_bool_val;
                 },
                 None => {
-                    // If no connector, this is the last result
-                    final_result = *current_result;
+                    // If results[i].next is None, it means the logical chain effectively ends
+                    // after results[i].0 has been incorporated into final_result.
+                    // The loop should not process results[i+1] with this connector.
                     break;
                 }
             }
@@ -637,5 +668,1283 @@ mod tests {
 
         // The first condition is true but the second is false
         assert!(multi_transformer.execute());
+    }
+
+    
+    #[test]
+    fn test_numerical_simple_and_true() {
+        // Test: (10 > 5) AND (20 = 20) -> true
+        let mut processor = TransformerProcessor::new();
+        let val_10 = create_memory_block_from_i32(10);
+        let val_5 = create_memory_block_from_i32(5);
+        let val_20 = create_memory_block_from_i32(20);
+
+        processor.add_comparison(DbType::I32, val_10, val_5, ComparerOperation::Greater, Some(Next::And));
+        processor.add_comparison(DbType::I32, val_20.clone(), val_20, ComparerOperation::Equals, None);
+        assert!(processor.execute());
+    }
+
+    #[test]
+    fn test_numerical_simple_and_false() {
+        // Test: (10 > 5) AND (20 = 10) -> false
+        let mut processor = TransformerProcessor::new();
+        let val_10 = create_memory_block_from_i32(10);
+        let val_5 = create_memory_block_from_i32(5);
+        let val_20 = create_memory_block_from_i32(20);
+        let val_10_b = create_memory_block_from_i32(10);
+
+        processor.add_comparison(DbType::I32, val_10, val_5, ComparerOperation::Greater, Some(Next::And));
+        processor.add_comparison(DbType::I32, val_20, val_10_b, ComparerOperation::Equals, None);
+        assert!(!processor.execute());
+    }
+
+    #[test]
+    fn test_numerical_simple_or_true() {
+        // Test: (10 < 5) OR (20 = 20) -> true
+        let mut processor = TransformerProcessor::new();
+        let val_10 = create_memory_block_from_i32(10);
+        let val_5 = create_memory_block_from_i32(5);
+        let val_20 = create_memory_block_from_i32(20);
+
+        processor.add_comparison(DbType::I32, val_10, val_5, ComparerOperation::Less, Some(Next::Or));
+        processor.add_comparison(DbType::I32, val_20.clone(), val_20, ComparerOperation::Equals, None);
+        assert!(processor.execute());
+    }
+
+    #[test]
+    fn test_numerical_simple_or_false() {
+        // Test: (10 < 5) OR (20 = 10) -> false
+        let mut processor = TransformerProcessor::new();
+        let val_10 = create_memory_block_from_i32(10);
+        let val_5 = create_memory_block_from_i32(5);
+        let val_20 = create_memory_block_from_i32(20);
+        let val_10_b = create_memory_block_from_i32(10);
+
+        processor.add_comparison(DbType::I32, val_10, val_5, ComparerOperation::Less, Some(Next::Or));
+        processor.add_comparison(DbType::I32, val_20, val_10_b, ComparerOperation::Equals, None);
+        assert!(!processor.execute());
+    }
+
+    #[test]
+    fn test_numerical_math_then_compare_true() {
+        // Test: (5 + 5) = 10 -> true
+        let mut processor = TransformerProcessor::new();
+        let val_5 = create_memory_block_from_i32(5);
+        let val_10 = create_memory_block_from_i32(10);
+
+        let sum_idx = processor.add_math_operation(DbType::I32, val_5.clone(), val_5, MathOperation::Add);
+        processor.add_comparison(DbType::I32, sum_idx, val_10, ComparerOperation::Equals, None);
+        assert!(processor.execute());
+    }
+
+    #[test]
+    fn test_numerical_math_then_compare_false() {
+        // Test: (5 + 10) != 10 -> true
+        let mut processor = TransformerProcessor::new();
+        let val_5 = create_memory_block_from_i32(5);
+        let val_10 = create_memory_block_from_i32(10);
+
+        let sum_idx = processor.add_math_operation(DbType::I32, val_5, val_10.clone(), MathOperation::Add);
+        processor.add_comparison(DbType::I32, sum_idx, val_10, ComparerOperation::NotEquals, None);
+        assert!(processor.execute());
+    }
+
+    #[test]
+    fn test_numerical_two_math_ops_and_true() {
+        // Test: (10 - 3) > (2 * 3) -> 7 > 6 -> true
+        let mut processor = TransformerProcessor::new();
+        let val_10 = create_memory_block_from_i32(10);
+        let val_3 = create_memory_block_from_i32(3);
+        let val_2 = create_memory_block_from_i32(2);
+
+        let diff_idx = processor.add_math_operation(DbType::I32, val_10, val_3.clone(), MathOperation::Subtract);
+        let prod_idx = processor.add_math_operation(DbType::I32, val_2, val_3, MathOperation::Multiply);
+        processor.add_comparison(DbType::I32, diff_idx, prod_idx, ComparerOperation::Greater, None);
+        assert!(processor.execute());
+    }
+    
+    #[test]
+    fn test_numerical_greater_or_equals_true_equal() {
+        // Test: 10 >= 10 -> true
+        let mut processor = TransformerProcessor::new();
+        let val_10a = create_memory_block_from_i32(10);
+        let val_10b = create_memory_block_from_i32(10);
+        processor.add_comparison(DbType::I32, val_10a, val_10b, ComparerOperation::GreaterOrEquals, None);
+        assert!(processor.execute());
+    }
+
+    #[test]
+    fn test_numerical_greater_or_equals_true_greater() {
+        // Test: 15 >= 10 -> true
+        let mut processor = TransformerProcessor::new();
+        let val_15 = create_memory_block_from_i32(15);
+        let val_10 = create_memory_block_from_i32(10);
+        processor.add_comparison(DbType::I32, val_15, val_10, ComparerOperation::GreaterOrEquals, None);
+        assert!(processor.execute());
+    }
+
+    #[test]
+    fn test_numerical_greater_or_equals_false() {
+        // Test: 5 >= 10 -> false
+        let mut processor = TransformerProcessor::new();
+        let val_5 = create_memory_block_from_i32(5);
+        let val_10 = create_memory_block_from_i32(10);
+        processor.add_comparison(DbType::I32, val_5, val_10, ComparerOperation::GreaterOrEquals, None);
+        assert!(!processor.execute());
+    }
+
+    #[test]
+    fn test_numerical_less_or_equals_true_equal() {
+        // Test: 10 <= 10 -> true
+        let mut processor = TransformerProcessor::new();
+        let val_10a = create_memory_block_from_i32(10);
+        let val_10b = create_memory_block_from_i32(10);
+        processor.add_comparison(DbType::I32, val_10a, val_10b, ComparerOperation::LessOrEquals, None);
+        assert!(processor.execute());
+    }
+
+    #[test]
+    fn test_numerical_less_or_equals_true_less() {
+        // Test: 5 <= 10 -> true
+        let mut processor = TransformerProcessor::new();
+        let val_5 = create_memory_block_from_i32(5);
+        let val_10 = create_memory_block_from_i32(10);
+        processor.add_comparison(DbType::I32, val_5, val_10, ComparerOperation::LessOrEquals, None);
+        assert!(processor.execute());
+    }
+
+    #[test]
+    fn test_numerical_less_or_equals_false() {
+        // Test: 15 <= 10 -> false
+        let mut processor = TransformerProcessor::new();
+        let val_15 = create_memory_block_from_i32(15);
+        let val_10 = create_memory_block_from_i32(10);
+        processor.add_comparison(DbType::I32, val_15, val_10, ComparerOperation::LessOrEquals, None);
+        assert!(!processor.execute());
+    }
+
+    #[test]
+    fn test_numerical_complex_and_or_true() {
+        // Test: ((5 + 5) = 10 AND 7 > 3) OR 2 < 1 -> (true AND true) OR false -> true OR false -> true
+        let mut processor = TransformerProcessor::new();
+        let val_5 = create_memory_block_from_i32(5);
+        let val_10 = create_memory_block_from_i32(10);
+        let val_7 = create_memory_block_from_i32(7);
+        let val_3 = create_memory_block_from_i32(3);
+        let val_2 = create_memory_block_from_i32(2);
+        let val_1 = create_memory_block_from_i32(1);
+
+        let sum_idx = processor.add_math_operation(DbType::I32, val_5.clone(), val_5, MathOperation::Add);
+        processor.add_comparison(DbType::I32, sum_idx, val_10, ComparerOperation::Equals, Some(Next::And));
+        processor.add_comparison(DbType::I32, val_7, val_3, ComparerOperation::Greater, Some(Next::Or));
+        processor.add_comparison(DbType::I32, val_2, val_1, ComparerOperation::Less, None);
+        assert!(processor.execute());
+    }
+
+    #[test]
+    fn test_numerical_complex_and_or_false() {
+        // Test: ((5 + 5) = 7 AND 7 > 3) OR 2 < 1 -> (false AND true) OR false -> false OR false -> false
+        let mut processor = TransformerProcessor::new();
+        let val_5 = create_memory_block_from_i32(5);
+        let val_7 = create_memory_block_from_i32(7);
+        let val_3 = create_memory_block_from_i32(3);
+        let val_2 = create_memory_block_from_i32(2);
+        let val_1 = create_memory_block_from_i32(1);
+
+        let sum_idx = processor.add_math_operation(DbType::I32, val_5.clone(), val_5, MathOperation::Add); // result is 10
+        processor.add_comparison(DbType::I32, sum_idx, val_7.clone(), ComparerOperation::Equals, Some(Next::And)); // 10 = 7 is false
+        processor.add_comparison(DbType::I32, val_7, val_3, ComparerOperation::Greater, Some(Next::Or));
+        processor.add_comparison(DbType::I32, val_2, val_1, ComparerOperation::Less, None);
+        assert!(!processor.execute());
+    }
+
+    #[test]
+    fn test_string_simple_and_true() {
+        // Test: ("hello" = "hello") AND ("world" CONTAINS "orl") -> true
+        let mut processor = TransformerProcessor::new();
+        let str_hello_a = create_memory_block_from_string("hello");
+        let str_hello_b = create_memory_block_from_string("hello");
+        let str_world = create_memory_block_from_string("world");
+        let str_orl = create_memory_block_from_string("orl");
+
+        processor.add_comparison(DbType::STRING, str_hello_a, str_hello_b, ComparerOperation::Equals, Some(Next::And));
+        processor.add_comparison(DbType::STRING, str_world, str_orl, ComparerOperation::Contains, None);
+        assert!(processor.execute());
+    }
+
+    #[test]
+    fn test_string_simple_and_false() {
+        // Test: ("hello" = "hello") AND ("world" CONTAINS "xyz") -> false
+        let mut processor = TransformerProcessor::new();
+        let str_hello_a = create_memory_block_from_string("hello");
+        let str_hello_b = create_memory_block_from_string("hello");
+        let str_world = create_memory_block_from_string("world");
+        let str_xyz = create_memory_block_from_string("xyz");
+
+        processor.add_comparison(DbType::STRING, str_hello_a, str_hello_b, ComparerOperation::Equals, Some(Next::And));
+        processor.add_comparison(DbType::STRING, str_world, str_xyz, ComparerOperation::Contains, None);
+        assert!(!processor.execute());
+    }
+    
+    #[test]
+    fn test_string_simple_or_true() {
+        // Test: ("apple" STARTSWITH "b") OR ("banana" ENDSWITH "ana") -> true
+        let mut processor = TransformerProcessor::new();
+        let str_apple = create_memory_block_from_string("apple");
+        let str_b = create_memory_block_from_string("b");
+        let str_banana = create_memory_block_from_string("banana");
+        let str_ana = create_memory_block_from_string("ana");
+
+        processor.add_comparison(DbType::STRING, str_apple, str_b, ComparerOperation::StartsWith, Some(Next::Or));
+        processor.add_comparison(DbType::STRING, str_banana, str_ana, ComparerOperation::EndsWith, None);
+        assert!(processor.execute());
+    }
+
+    #[test]
+    fn test_string_simple_or_false() {
+        // Test: ("apple" STARTSWITH "b") OR ("banana" ENDSWITH "xyz") -> false
+        let mut processor = TransformerProcessor::new();
+        let str_apple = create_memory_block_from_string("apple");
+        let str_b = create_memory_block_from_string("b");
+        let str_banana = create_memory_block_from_string("banana");
+        let str_xyz = create_memory_block_from_string("xyz");
+
+        processor.add_comparison(DbType::STRING, str_apple, str_b, ComparerOperation::StartsWith, Some(Next::Or));
+        processor.add_comparison(DbType::STRING, str_banana, str_xyz, ComparerOperation::EndsWith, None);
+        assert!(!processor.execute());
+    }
+
+    #[test]
+    fn test_string_not_equals_true() {
+        // Test: "cat" != "dog" -> true
+        let mut processor = TransformerProcessor::new();
+        let str_cat = create_memory_block_from_string("cat");
+        let str_dog = create_memory_block_from_string("dog");
+        processor.add_comparison(DbType::STRING, str_cat, str_dog, ComparerOperation::NotEquals, None);
+        assert!(processor.execute());
+    }
+
+    #[test]
+    fn test_string_not_equals_false() {
+        // Test: "cat" != "cat" -> false
+        let mut processor = TransformerProcessor::new();
+        let str_cat_a = create_memory_block_from_string("cat");
+        let str_cat_b = create_memory_block_from_string("cat");
+        processor.add_comparison(DbType::STRING, str_cat_a, str_cat_b, ComparerOperation::NotEquals, None);
+        assert!(!processor.execute());
+    }
+
+    #[test]
+    fn test_string_complex_starts_ends_contains_true() {
+        // Test: ("longstring" STARTSWITH "long") AND ("anotherstring" ENDSWITH "string") OR ("middle" CONTAINS "dd")
+        // -> (true AND true) OR true -> true OR true -> true
+        let mut processor = TransformerProcessor::new();
+        let longstring = create_memory_block_from_string("longstring");
+        let long_ = create_memory_block_from_string("long");
+        let anotherstring = create_memory_block_from_string("anotherstring");
+        let string_ = create_memory_block_from_string("string");
+        let middle = create_memory_block_from_string("middle");
+        let dd = create_memory_block_from_string("dd");
+
+        processor.add_comparison(DbType::STRING, longstring, long_, ComparerOperation::StartsWith, Some(Next::And));
+        processor.add_comparison(DbType::STRING, anotherstring, string_, ComparerOperation::EndsWith, Some(Next::Or));
+        processor.add_comparison(DbType::STRING, middle, dd, ComparerOperation::Contains, None);
+        assert!(processor.execute());
+    }
+
+    #[test]
+    fn test_string_complex_all_false_with_or() {
+        // Test: ("abc" STARTSWITH "d") OR ("def" ENDSWITH "g") OR ("ghi" CONTAINS "j")
+        // -> false OR false OR false -> false
+        let mut processor = TransformerProcessor::new();
+        let abc = create_memory_block_from_string("abc");
+        let d = create_memory_block_from_string("d");
+        let def = create_memory_block_from_string("def");
+        let g = create_memory_block_from_string("g");
+        let ghi = create_memory_block_from_string("ghi");
+        let j = create_memory_block_from_string("j");
+
+        processor.add_comparison(DbType::STRING, abc, d, ComparerOperation::StartsWith, Some(Next::Or));
+        processor.add_comparison(DbType::STRING, def, g, ComparerOperation::EndsWith, Some(Next::Or));
+        processor.add_comparison(DbType::STRING, ghi, j, ComparerOperation::Contains, None);
+        assert!(!processor.execute());
+    }
+    
+    #[test]
+    fn test_string_mixed_operators_true() {
+        // Test: ("test" = "test" AND "example" CONTAINS "amp") OR "false" = "true"
+        // -> (true AND true) OR false -> true OR false -> true
+        let mut processor = TransformerProcessor::new();
+        let test_a = create_memory_block_from_string("test");
+        let test_b = create_memory_block_from_string("test");
+        let example = create_memory_block_from_string("example");
+        let amp = create_memory_block_from_string("amp");
+        let str_false = create_memory_block_from_string("false");
+        let str_true = create_memory_block_from_string("true");
+
+        processor.add_comparison(DbType::STRING, test_a, test_b, ComparerOperation::Equals, Some(Next::And));
+        processor.add_comparison(DbType::STRING, example, amp, ComparerOperation::Contains, Some(Next::Or));
+        processor.add_comparison(DbType::STRING, str_false, str_true, ComparerOperation::Equals, None);
+        assert!(processor.execute());
+    }
+
+    #[test]
+    fn test_string_empty_string_comparisons() {
+        // Test: ("" = "") AND ("" CONTAINS "") OR ("a" STARTSWITH "")
+        // -> (true AND true) OR true -> true
+        let mut processor = TransformerProcessor::new();
+        let empty_a = create_memory_block_from_string("");
+        let empty_b = create_memory_block_from_string("");
+        let str_a = create_memory_block_from_string("a");
+
+        processor.add_comparison(DbType::STRING, empty_a.clone(), empty_b.clone(), ComparerOperation::Equals, Some(Next::And));
+        processor.add_comparison(DbType::STRING, empty_a.clone(), empty_b.clone(), ComparerOperation::Contains, Some(Next::Or));
+        processor.add_comparison(DbType::STRING, str_a, empty_a, ComparerOperation::StartsWith, None);
+        assert!(processor.execute());
+    }
+
+    // --- Additional Complex Mixed Scenario Tests ---
+
+    #[test]
+    fn test_complex_mixed_scenario_1() {
+        // Logic: ((10 + 5) = 15 AND "apple" STARTSWITH "app") OR ((20 - 5) > 10 AND "banana" CONTAINS "nan")
+        // B1: (10 + 5) = 15  => 15 = 15 => true
+        // B2: "apple" STARTSWITH "app" => true
+        // B3: (20 - 5) > 10  => 15 > 10 => true
+        // B4: "banana" CONTAINS "nan" => true
+        // Evaluation: (((B1 AND B2) OR B3) AND B4)
+        // => (((true AND true) OR true) AND true) => ((true OR true) AND true) => (true AND true) => true
+        let mut processor = TransformerProcessor::new();
+
+        let num_10 = create_memory_block_from_i32(10);
+        let num_5 = create_memory_block_from_i32(5);
+        let num_15 = create_memory_block_from_i32(15);
+        let num_20 = create_memory_block_from_i32(20);
+
+        let str_apple = create_memory_block_from_string("apple");
+        let str_app = create_memory_block_from_string("app");
+        let str_banana = create_memory_block_from_string("banana");
+        let str_nan = create_memory_block_from_string("nan");
+
+        let sum_idx = processor.add_math_operation(DbType::I32, num_10.clone(), num_5.clone(), MathOperation::Add);
+        processor.add_comparison(DbType::I32, sum_idx, num_15.clone(), ComparerOperation::Equals, Some(Next::And)); // B1
+
+        processor.add_comparison(DbType::STRING, str_apple, str_app, ComparerOperation::StartsWith, Some(Next::Or)); // B2
+
+        let diff_idx = processor.add_math_operation(DbType::I32, num_20, num_5.clone(), MathOperation::Subtract);
+        processor.add_comparison(DbType::I32, diff_idx, num_10, ComparerOperation::Greater, Some(Next::And)); // B3
+
+        processor.add_comparison(DbType::STRING, str_banana, str_nan, ComparerOperation::Contains, None); // B4
+        
+        assert_eq!(processor.execute(), true);
+    }
+
+    #[test]
+    fn test_complex_mixed_scenario_2() {
+        // Logic: ((10 * 2) < 15 OR "test" ENDSWITH "est") AND ((100 / 4) = 25 OR "string" != "string")
+        // B1: (10 * 2) < 15 => 20 < 15 => false
+        // B2: "test" ENDSWITH "est" => true
+        // B3: (100 / 4) = 25 => 25 = 25 => true
+        // B4: "string" != "string" => false
+        // Evaluation: (((B1 OR B2) AND B3) OR B4)
+        // => (((false OR true) AND true) OR false) => ((true AND true) OR false) => (true OR false) => true
+        let mut processor = TransformerProcessor::new();
+
+        let num_10 = create_memory_block_from_i32(10);
+        let num_2 = create_memory_block_from_i32(2);
+        let num_15 = create_memory_block_from_i32(15);
+        let num_100 = create_memory_block_from_i32(100);
+        let num_4 = create_memory_block_from_i32(4);
+        let num_25 = create_memory_block_from_i32(25);
+
+        let str_test = create_memory_block_from_string("test");
+        let str_est = create_memory_block_from_string("est");
+        let str_string = create_memory_block_from_string("string");
+
+        let mul_idx = processor.add_math_operation(DbType::I32, num_10, num_2, MathOperation::Multiply);
+        processor.add_comparison(DbType::I32, mul_idx, num_15, ComparerOperation::Less, Some(Next::Or)); // B1
+
+        processor.add_comparison(DbType::STRING, str_test, str_est, ComparerOperation::EndsWith, Some(Next::And)); // B2
+        
+        let div_idx = processor.add_math_operation(DbType::I32, num_100, num_4, MathOperation::Divide);
+        processor.add_comparison(DbType::I32, div_idx, num_25, ComparerOperation::Equals, Some(Next::Or)); // B3
+
+        processor.add_comparison(DbType::STRING, str_string.clone(), str_string, ComparerOperation::NotEquals, None); // B4
+
+        assert_eq!(processor.execute(), true);
+    }
+
+    #[test]
+    fn test_complex_mixed_scenario_3() {
+        // Logic: ( (5 ** 2) = 25 AND "alpha" CONTAINS "pha" ) OR ( (27 ROOT 3) != 3 AND "beta" STARTSWITH "bet" ) AND ("gamma" = "delta")
+        // B1: (5 ** 2) = 25 => 25 = 25 => true
+        // B2: "alpha" CONTAINS "pha" => true
+        // B3: (27 ROOT 3) != 3 => 3 != 3 => false (assuming integer cube root)
+        // B4: "beta" STARTSWITH "bet" => true
+        // B5: "gamma" = "delta" => false
+        // Evaluation: ((((B1 AND B2) OR B3) AND B4) AND B5)
+        // => ((((true AND true) OR false) AND true) AND false) => (((true OR false) AND true) AND false)
+        // => ((true AND true) AND false) => (true AND false) => false
+        let mut processor = TransformerProcessor::new();
+
+        let num_5 = create_memory_block_from_i32(5);
+        let num_2 = create_memory_block_from_i32(2); // Exponent
+        let num_25 = create_memory_block_from_i32(25);
+        let num_27 = create_memory_block_from_i32(27);
+        let num_3 = create_memory_block_from_i32(3); // Root index and comparison value
+
+        let str_alpha = create_memory_block_from_string("alpha");
+        let str_pha = create_memory_block_from_string("pha");
+        let str_beta = create_memory_block_from_string("beta");
+        let str_bet = create_memory_block_from_string("bet");
+        let str_gamma = create_memory_block_from_string("gamma");
+        let str_delta = create_memory_block_from_string("delta");
+
+        let exp_idx = processor.add_math_operation(DbType::I32, num_5, num_2, MathOperation::Exponent);
+        processor.add_comparison(DbType::I32, exp_idx, num_25, ComparerOperation::Equals, Some(Next::And)); // B1
+
+        processor.add_comparison(DbType::STRING, str_alpha, str_pha, ComparerOperation::Contains, Some(Next::Or)); // B2
+
+        let root_idx = processor.add_math_operation(DbType::I32, num_27, num_3.clone(), MathOperation::Root);
+        processor.add_comparison(DbType::I32, root_idx, num_3, ComparerOperation::NotEquals, Some(Next::And)); // B3
+
+        processor.add_comparison(DbType::STRING, str_beta, str_bet, ComparerOperation::StartsWith, Some(Next::And)); // B4
+        
+        processor.add_comparison(DbType::STRING, str_gamma, str_delta, ComparerOperation::Equals, None); // B5
+
+        assert_eq!(processor.execute(), false);
+    }
+
+    #[test]
+    fn test_complex_mixed_scenario_4() {
+        // Logic: (7 >= (1 + 5) AND "rustlang" ENDSWITH "lang") OR ( (10 - 20) < 0 AND "code" = "code") AND (5 > 10)
+        // B1: 7 >= (1 + 5) => 7 >= 6 => true
+        // B2: "rustlang" ENDSWITH "lang" => true
+        // B3: (10 - 20) < 0 => -10 < 0 => true
+        // B4: "code" = "code" => true
+        // B5: 5 > 10 => false
+        // Evaluation: ((((B1 AND B2) OR B3) AND B4) AND B5)
+        // => ((((true AND true) OR true) AND true) AND false) => (((true OR true) AND true) AND false)
+        // => ((true AND true) AND false) => (true AND false) => false
+        let mut processor = TransformerProcessor::new();
+
+        let num_7 = create_memory_block_from_i32(7);
+        let num_1 = create_memory_block_from_i32(1);
+        let num_5 = create_memory_block_from_i32(5);
+        let num_10 = create_memory_block_from_i32(10);
+        let num_20 = create_memory_block_from_i32(20);
+        let num_0 = create_memory_block_from_i32(0);
+        
+        let str_rustlang = create_memory_block_from_string("rustlang");
+        let str_lang = create_memory_block_from_string("lang");
+        let str_code = create_memory_block_from_string("code");
+
+        let sum_idx = processor.add_math_operation(DbType::I32, num_1, num_5.clone(), MathOperation::Add);
+        processor.add_comparison(DbType::I32, num_7, sum_idx, ComparerOperation::GreaterOrEquals, Some(Next::And)); // B1
+
+        processor.add_comparison(DbType::STRING, str_rustlang, str_lang, ComparerOperation::EndsWith, Some(Next::Or)); // B2
+
+        let diff_idx = processor.add_math_operation(DbType::I32, num_10.clone(), num_20, MathOperation::Subtract);
+        processor.add_comparison(DbType::I32, diff_idx, num_0, ComparerOperation::Less, Some(Next::And)); // B3
+
+        processor.add_comparison(DbType::STRING, str_code.clone(), str_code, ComparerOperation::Equals, Some(Next::And)); // B4
+
+        processor.add_comparison(DbType::I32, num_5, num_10, ComparerOperation::Greater, None); // B5
+
+        assert_eq!(processor.execute(), false);
+    }
+
+    #[test]
+    fn test_complex_mixed_scenario_5() {
+        // Logic: ( (3 * 7) <= 20 OR "openai" != "google" ) AND ( (50 / 2) > 24 OR "gpt" STARTSWITH "ai" )
+        // B1: (3 * 7) <= 20 => 21 <= 20 => false
+        // B2: "openai" != "google" => true
+        // B3: (50 / 2) > 24 => 25 > 24 => true
+        // B4: "gpt" STARTSWITH "ai" => false
+        // Evaluation: (((B1 OR B2) AND B3) OR B4)
+        // => (((false OR true) AND true) OR false) => ((true AND true) OR false) => (true OR false) => true
+        let mut processor = TransformerProcessor::new();
+
+        let num_3 = create_memory_block_from_i32(3);
+        let num_7 = create_memory_block_from_i32(7);
+        let num_20 = create_memory_block_from_i32(20);
+        let num_50 = create_memory_block_from_i32(50);
+        let num_2 = create_memory_block_from_i32(2);
+        let num_24 = create_memory_block_from_i32(24);
+
+        let str_openai = create_memory_block_from_string("openai");
+        let str_google = create_memory_block_from_string("google");
+        let str_gpt = create_memory_block_from_string("gpt");
+        let str_ai = create_memory_block_from_string("ai");
+
+        let mul_idx = processor.add_math_operation(DbType::I32, num_3, num_7, MathOperation::Multiply);
+        processor.add_comparison(DbType::I32, mul_idx, num_20, ComparerOperation::LessOrEquals, Some(Next::Or)); // B1
+
+        processor.add_comparison(DbType::STRING, str_openai, str_google, ComparerOperation::NotEquals, Some(Next::And)); // B2
+
+        let div_idx = processor.add_math_operation(DbType::I32, num_50, num_2, MathOperation::Divide);
+        processor.add_comparison(DbType::I32, div_idx, num_24, ComparerOperation::Greater, Some(Next::Or)); // B3
+
+        processor.add_comparison(DbType::STRING, str_gpt, str_ai, ComparerOperation::StartsWith, None); // B4
+
+        assert_eq!(processor.execute(), true);
+    }
+    
+    #[test]
+    fn test_complex_mixed_scenario_6() {
+        // Logic: ( (100 - 90) = 10 AND "transformer" CONTAINS "form" ) OR ( (2 ** 4) != 16 AND "processor" ENDSWITH "saur" )
+        // B1: (100 - 90) = 10 => 10 = 10 => true
+        // B2: "transformer" CONTAINS "form" => true
+        // B3: (2 ** 4) != 16 => 16 != 16 => false
+        // B4: "processor" ENDSWITH "saur" => false
+        // Evaluation: (((B1 AND B2) OR B3) AND B4)
+        // => (((true AND true) OR false) AND false) => ((true OR false) AND false) => (true AND false) => false
+        let mut processor = TransformerProcessor::new();
+
+        let num_100 = create_memory_block_from_i32(100);
+        let num_90 = create_memory_block_from_i32(90);
+        let num_10 = create_memory_block_from_i32(10);
+        let num_2 = create_memory_block_from_i32(2);
+        let num_4 = create_memory_block_from_i32(4); // Exponent
+        let num_16 = create_memory_block_from_i32(16);
+
+        let str_transformer = create_memory_block_from_string("transformer");
+        let str_form = create_memory_block_from_string("form");
+        let str_processor = create_memory_block_from_string("processor");
+        let str_saur = create_memory_block_from_string("saur");
+
+        let diff_idx = processor.add_math_operation(DbType::I32, num_100, num_90, MathOperation::Subtract);
+        processor.add_comparison(DbType::I32, diff_idx, num_10, ComparerOperation::Equals, Some(Next::And)); // B1
+
+        processor.add_comparison(DbType::STRING, str_transformer, str_form, ComparerOperation::Contains, Some(Next::Or)); // B2
+
+        let exp_idx = processor.add_math_operation(DbType::I32, num_2, num_4, MathOperation::Exponent);
+        processor.add_comparison(DbType::I32, exp_idx, num_16, ComparerOperation::NotEquals, Some(Next::And)); // B3
+
+        processor.add_comparison(DbType::STRING, str_processor, str_saur, ComparerOperation::EndsWith, None); // B4
+
+        assert_eq!(processor.execute(), false);
+    }
+
+    #[test]
+    fn test_complex_mixed_scenario_7() {
+        // Logic: ( (64 ROOT 2) = 8 AND "database" STARTSWITH "data" ) AND ( (7 * 3) > 20 OR "query" = "Query" )
+        // B1: (64 ROOT 2) = 8 => 8 = 8 => true (integer square root)
+        // B2: "database" STARTSWITH "data" => true
+        // B3: (7 * 3) > 20 => 21 > 20 => true
+        // B4: "query" = "Query" => false (case-sensitive)
+        // Evaluation: (((B1 AND B2) AND B3) OR B4)
+        // => (((true AND true) AND true) OR false) => ((true AND true) OR false) => (true OR false) => true
+        let mut processor = TransformerProcessor::new();
+
+        let num_64 = create_memory_block_from_i32(64);
+        let num_2 = create_memory_block_from_i32(2); // Root index
+        let num_8 = create_memory_block_from_i32(8);
+        let num_7 = create_memory_block_from_i32(7);
+        let num_3 = create_memory_block_from_i32(3);
+        let num_20 = create_memory_block_from_i32(20);
+
+        let str_database = create_memory_block_from_string("database");
+        let str_data = create_memory_block_from_string("data");
+        let str_query_lc = create_memory_block_from_string("query");
+        let str_query_uc = create_memory_block_from_string("Query");
+
+        let root_idx = processor.add_math_operation(DbType::I32, num_64, num_2, MathOperation::Root);
+        processor.add_comparison(DbType::I32, root_idx, num_8, ComparerOperation::Equals, Some(Next::And)); // B1
+
+        processor.add_comparison(DbType::STRING, str_database, str_data, ComparerOperation::StartsWith, Some(Next::And)); // B2
+
+        let mul_idx = processor.add_math_operation(DbType::I32, num_7, num_3, MathOperation::Multiply);
+        processor.add_comparison(DbType::I32, mul_idx, num_20, ComparerOperation::Greater, Some(Next::Or)); // B3
+
+        processor.add_comparison(DbType::STRING, str_query_lc, str_query_uc, ComparerOperation::Equals, None); // B4
+
+        assert_eq!(processor.execute(), true);
+    }
+
+    #[test]
+    fn test_complex_mixed_scenario_8() {
+        // Logic: ( (10 / 3) = 3 AND "Rust" != "rust" ) OR ( (5 + 0) <= 4 AND "Go" CONTAINS "lang" )
+        // B1: (10 / 3) = 3 => 3 = 3 => true (integer division)
+        // B2: "Rust" != "rust" => true
+        // B3: (5 + 0) <= 4 => 5 <= 4 => false
+        // B4: "Go" CONTAINS "lang" => false
+        // Evaluation: (((B1 AND B2) OR B3) AND B4)
+        // => (((true AND true) OR false) AND false) => ((true OR false) AND false) => (true AND false) => false
+        let mut processor = TransformerProcessor::new();
+
+        let num_10 = create_memory_block_from_i32(10);
+        let num_3 = create_memory_block_from_i32(3);
+        let num_5 = create_memory_block_from_i32(5);
+        let num_0 = create_memory_block_from_i32(0);
+        let num_4 = create_memory_block_from_i32(4);
+
+        let str_rust_uc = create_memory_block_from_string("Rust");
+        let str_rust_lc = create_memory_block_from_string("rust");
+        let str_go = create_memory_block_from_string("Go");
+        let str_lang = create_memory_block_from_string("lang");
+
+        let div_idx = processor.add_math_operation(DbType::I32, num_10, num_3.clone(), MathOperation::Divide);
+        processor.add_comparison(DbType::I32, div_idx, num_3, ComparerOperation::Equals, Some(Next::And)); // B1
+
+        processor.add_comparison(DbType::STRING, str_rust_uc, str_rust_lc, ComparerOperation::NotEquals, Some(Next::Or)); // B2
+
+        let sum_idx = processor.add_math_operation(DbType::I32, num_5, num_0, MathOperation::Add);
+        processor.add_comparison(DbType::I32, sum_idx, num_4, ComparerOperation::LessOrEquals, Some(Next::And)); // B3
+
+        processor.add_comparison(DbType::STRING, str_go, str_lang, ComparerOperation::Contains, None); // B4
+
+        assert_eq!(processor.execute(), false);
+    }
+
+
+    #[test]
+    fn test_complex_mixed_scenario_10() {
+        // Logic: ( (4 ** 3) = 60 OR "string one" STARTSWITH "str" ) AND ( (50 / 5) != 10 OR "string two" CONTAINS "three" )
+        // B1: (4 ** 3) = 60 => 64 = 60 => false
+        // B2: "string one" STARTSWITH "str" => true
+        // B3: (50 / 5) != 10 => 10 != 10 => false
+        // B4: "string two" CONTAINS "three" => false
+        // Evaluation: (((B1 OR B2) AND B3) OR B4)
+        // => (((false OR true) AND false) OR false) => ((true AND false) OR false) => (false OR false) => false
+        let mut processor = TransformerProcessor::new();
+
+        let num_4 = create_memory_block_from_i32(4);
+        let num_3_exp = create_memory_block_from_i32(3); // Exponent
+        let num_60 = create_memory_block_from_i32(60);
+        let num_50 = create_memory_block_from_i32(50);
+        let num_5_div = create_memory_block_from_i32(5);
+        let num_10 = create_memory_block_from_i32(10);
+
+        let str_one = create_memory_block_from_string("string one");
+        let str_str = create_memory_block_from_string("str");
+        let str_two = create_memory_block_from_string("string two");
+        let str_three = create_memory_block_from_string("three");
+
+        let exp_idx = processor.add_math_operation(DbType::I32, num_4, num_3_exp, MathOperation::Exponent);
+        processor.add_comparison(DbType::I32, exp_idx, num_60, ComparerOperation::Equals, Some(Next::Or)); // B1
+
+        processor.add_comparison(DbType::STRING, str_one, str_str, ComparerOperation::StartsWith, Some(Next::And)); // B2
+
+        let div_idx = processor.add_math_operation(DbType::I32, num_50, num_5_div, MathOperation::Divide);
+        processor.add_comparison(DbType::I32, div_idx, num_10, ComparerOperation::NotEquals, Some(Next::Or)); // B3
+
+        processor.add_comparison(DbType::STRING, str_two, str_three, ComparerOperation::Contains, None); // B4
+
+        assert_eq!(processor.execute(), false);
+    }
+
+    #[test]
+    fn test_complex_mixed_scenario_12() {
+        // Logic: ( (7 * 0) = 0 OR "a" != "a" ) AND ( (100 / 10) >= 10 OR "b" STARTSWITH "c" ) AND ( (2+2) = 4 )
+        // B1: (7 * 0) = 0 => 0 = 0 => true
+        // B2: "a" != "a" => false
+        // B3: (100 / 10) >= 10 => 10 >= 10 => true
+        // B4: "b" STARTSWITH "c" => false
+        // B5: (2+2) = 4 => 4 = 4 => true
+        // Evaluation: ((((B1 OR B2) AND B3) OR B4) AND B5)
+        // => ((((true OR false) AND true) OR false) AND true) => (((true AND true) OR false) AND true)
+        // => ((true OR false) AND true) => (true AND true) => true
+        let mut processor = TransformerProcessor::new();
+
+        let num_7 = create_memory_block_from_i32(7);
+        let num_0 = create_memory_block_from_i32(0);
+        let num_100 = create_memory_block_from_i32(100);
+        let num_10 = create_memory_block_from_i32(10);
+        let num_2 = create_memory_block_from_i32(2);
+        let num_4 = create_memory_block_from_i32(4);
+
+        let str_a = create_memory_block_from_string("a");
+        let str_b = create_memory_block_from_string("b");
+        let str_c = create_memory_block_from_string("c");
+
+        let mul_idx = processor.add_math_operation(DbType::I32, num_7, num_0.clone(), MathOperation::Multiply);
+        processor.add_comparison(DbType::I32, mul_idx, num_0, ComparerOperation::Equals, Some(Next::Or)); // B1
+
+        processor.add_comparison(DbType::STRING, str_a.clone(), str_a, ComparerOperation::NotEquals, Some(Next::And)); // B2
+
+        let div_idx = processor.add_math_operation(DbType::I32, num_100, num_10.clone(), MathOperation::Divide);
+        processor.add_comparison(DbType::I32, div_idx, num_10, ComparerOperation::GreaterOrEquals, Some(Next::Or)); // B3
+
+        processor.add_comparison(DbType::STRING, str_b, str_c, ComparerOperation::StartsWith, Some(Next::And)); // B4
+        
+        let sum_idx = processor.add_math_operation(DbType::I32, num_2.clone(), num_2, MathOperation::Add);
+        processor.add_comparison(DbType::I32, sum_idx, num_4, ComparerOperation::Equals, None); // B5
+
+        assert_eq!(processor.execute(), true);
+    }
+
+    #[test]
+    fn test_complex_mixed_scenario_13() {
+        // Logic: ( "xyz" ENDSWITH "yz" AND (5-5) = 1 ) OR ( "abc" CONTAINS "d" AND (10*1) > 5 )
+        // B1: "xyz" ENDSWITH "yz" => true
+        // M1: 5-5 = 0
+        // B2: M1 = 1 => 0 = 1 => false
+        // B3: "abc" CONTAINS "d" => false
+        // M2: 10*1 = 10
+        // B4: M2 > 5 => 10 > 5 => true
+        // Evaluation: (((B1 AND B2) OR B3) AND B4)
+        // => (((true AND false) OR false) AND true) => ((false OR false) AND true) => (false AND true) => false
+        let mut processor = TransformerProcessor::new();
+
+        let num_5 = create_memory_block_from_i32(5);
+        let num_1 = create_memory_block_from_i32(1);
+        let num_10 = create_memory_block_from_i32(10);
+
+        let str_xyz = create_memory_block_from_string("xyz");
+        let str_yz = create_memory_block_from_string("yz");
+        let str_abc = create_memory_block_from_string("abc");
+        let str_d = create_memory_block_from_string("d");
+
+        processor.add_comparison(DbType::STRING, str_xyz, str_yz, ComparerOperation::EndsWith, Some(Next::And)); // B1
+
+        let diff_idx = processor.add_math_operation(DbType::I32, num_5.clone(), num_5.clone(), MathOperation::Subtract); // M1
+        processor.add_comparison(DbType::I32, diff_idx, num_1.clone(), ComparerOperation::Equals, Some(Next::Or)); // B2
+
+        processor.add_comparison(DbType::STRING, str_abc, str_d, ComparerOperation::Contains, Some(Next::And)); // B3
+
+        let mul_idx = processor.add_math_operation(DbType::I32, num_10, num_1, MathOperation::Multiply); // M2
+        processor.add_comparison(DbType::I32, mul_idx, num_5, ComparerOperation::Greater, None); // B4
+
+        assert_eq!(processor.execute(), false);
+    }
+
+    #[test]
+    fn test_complex_mixed_scenario_15() {
+        // Logic: ( (2**5) != 32 AND "A" = "B" ) OR ( (10/2) > 5 AND "C" != "D" ) OR ( (1-1) = 0 )
+        // B1: (2**5) != 32 => 32 != 32 => false
+        // B2: "A" = "B" => false
+        // B3: (10/2) > 5 => 5 > 5 => false
+        // B4: "C" != "D" => true
+        // B5: (1-1) = 0 => 0 = 0 => true
+        // Evaluation: ((( (B1 AND B2) OR B3) AND B4) OR B5)
+        // => ((( (false AND false) OR false) AND true) OR true) => (((false OR false) AND true) OR true)
+        // => ((false AND true) OR true) => (false OR true) => true
+        let mut processor = TransformerProcessor::new();
+
+        let num_2 = create_memory_block_from_i32(2);
+        let num_5_exp = create_memory_block_from_i32(5);
+        let num_32 = create_memory_block_from_i32(32);
+        let num_10 = create_memory_block_from_i32(10);
+        let num_2_div = create_memory_block_from_i32(2);
+        let num_5_comp = create_memory_block_from_i32(5);
+        let num_1 = create_memory_block_from_i32(1);
+        let num_0 = create_memory_block_from_i32(0);
+
+        let str_a = create_memory_block_from_string("A");
+        let str_b = create_memory_block_from_string("B");
+        let str_c = create_memory_block_from_string("C");
+        let str_d = create_memory_block_from_string("D");
+
+        let exp_idx = processor.add_math_operation(DbType::I32, num_2.clone(), num_5_exp, MathOperation::Exponent);
+        processor.add_comparison(DbType::I32, exp_idx, num_32, ComparerOperation::NotEquals, Some(Next::And)); // B1
+
+        processor.add_comparison(DbType::STRING, str_a, str_b, ComparerOperation::Equals, Some(Next::Or)); // B2
+
+        let div_idx = processor.add_math_operation(DbType::I32, num_10, num_2_div, MathOperation::Divide);
+        processor.add_comparison(DbType::I32, div_idx, num_5_comp, ComparerOperation::Greater, Some(Next::And)); // B3
+
+        processor.add_comparison(DbType::STRING, str_c, str_d, ComparerOperation::NotEquals, Some(Next::Or)); // B4
+
+        let diff_idx = processor.add_math_operation(DbType::I32, num_1.clone(), num_1, MathOperation::Subtract);
+        processor.add_comparison(DbType::I32, diff_idx, num_0, ComparerOperation::Equals, None); // B5
+
+        assert_eq!(processor.execute(), true);
+    }
+
+    #[test]
+    fn test_complex_mixed_scenario_16_all_false_chain() {
+        // Logic: ( (10 + 10) = 21 AND "true" = "false" ) OR ( (5 * 5) < 20 AND "pass" = "fail" ) OR ( (100-1) > 100 )
+        // B1: (10+10)=21 => 20=21 => false
+        // B2: "true"="false" => false
+        // B3: (5*5)<20 => 25<20 => false
+        // B4: "pass"="fail" => false
+        // B5: (100-1)>100 => 99>100 => false
+        // Evaluation: ((( (B1 AND B2) OR B3) AND B4) OR B5)
+        // => ((( (false AND false) OR false) AND false) OR false) => (((false OR false) AND false) OR false)
+        // => ((false AND false) OR false) => (false OR false) => false
+        let mut processor = TransformerProcessor::new();
+
+        let num_10 = create_memory_block_from_i32(10);
+        let num_21 = create_memory_block_from_i32(21);
+        let num_5 = create_memory_block_from_i32(5);
+        let num_20 = create_memory_block_from_i32(20);
+        let num_100 = create_memory_block_from_i32(100);
+        let num_1 = create_memory_block_from_i32(1);
+
+        let str_true = create_memory_block_from_string("true");
+        let str_false = create_memory_block_from_string("false");
+        let str_pass = create_memory_block_from_string("pass");
+        let str_fail = create_memory_block_from_string("fail");
+
+        let sum_idx = processor.add_math_operation(DbType::I32, num_10.clone(), num_10.clone(), MathOperation::Add);
+        processor.add_comparison(DbType::I32, sum_idx, num_21, ComparerOperation::Equals, Some(Next::And)); // B1
+
+        processor.add_comparison(DbType::STRING, str_true, str_false, ComparerOperation::Equals, Some(Next::Or)); // B2
+
+        let mul_idx = processor.add_math_operation(DbType::I32, num_5.clone(), num_5.clone(), MathOperation::Multiply);
+        processor.add_comparison(DbType::I32, mul_idx, num_20, ComparerOperation::Less, Some(Next::And)); // B3
+
+        processor.add_comparison(DbType::STRING, str_pass, str_fail, ComparerOperation::Equals, Some(Next::Or)); // B4
+
+        let diff_idx = processor.add_math_operation(DbType::I32, num_100.clone(), num_1, MathOperation::Subtract);
+        processor.add_comparison(DbType::I32, diff_idx, num_100.clone(), ComparerOperation::Greater, None); // B5
+
+        assert_eq!(processor.execute(), false);
+    }
+
+    #[test]
+    fn test_complex_mixed_scenario_18_alternating_true_false() {
+        // Logic: ( (10 > 5) AND "str1" = "str2" ) OR ( (20-10) = 10 AND "str3" != "str3" ) OR ( (3*3) < 10 )
+        // B1: 10 > 5 => true
+        // B2: "str1" = "str2" => false
+        // B3: (20-10) = 10 => 10 = 10 => true
+        // B4: "str3" != "str3" => false
+        // B5: (3*3) < 10 => 9 < 10 => true
+        // Evaluation: ((( (B1 AND B2) OR B3) AND B4) OR B5)
+        // => ((( (true AND false) OR true) AND false) OR true) => (((false OR true) AND false) OR true)
+        // => ((true AND false) OR true) => (false OR true) => true
+        let mut processor = TransformerProcessor::new();
+
+        let num_10 = create_memory_block_from_i32(10);
+        let num_5 = create_memory_block_from_i32(5);
+        let num_20 = create_memory_block_from_i32(20);
+        let num_3 = create_memory_block_from_i32(3);
+
+        let str1 = create_memory_block_from_string("str1");
+        let str2 = create_memory_block_from_string("str2");
+        let str3 = create_memory_block_from_string("str3");
+
+        processor.add_comparison(DbType::I32, num_10.clone(), num_5.clone(), ComparerOperation::Greater, Some(Next::And)); // B1
+        processor.add_comparison(DbType::STRING, str1, str2, ComparerOperation::Equals, Some(Next::Or)); // B2
+
+        let diff_idx = processor.add_math_operation(DbType::I32, num_20, num_10.clone(), MathOperation::Subtract);
+        processor.add_comparison(DbType::I32, diff_idx, num_10.clone(), ComparerOperation::Equals, Some(Next::And)); // B3
+        processor.add_comparison(DbType::STRING, str3.clone(), str3, ComparerOperation::NotEquals, Some(Next::Or)); // B4
+
+        let mul_idx = processor.add_math_operation(DbType::I32, num_3.clone(), num_3, MathOperation::Multiply);
+        processor.add_comparison(DbType::I32, mul_idx, num_10, ComparerOperation::Less, None); // B5
+
+        assert_eq!(processor.execute(), true);
+    }
+
+    #[test]
+    fn test_complex_mixed_scenario_19_mostly_string_ops() {
+        // Logic: ( "start" STARTSWITH "st" AND (1+1)=2 ) OR ( "middle" CONTAINS "ddl" AND (5>10) ) OR ( "end" ENDSWITH "D" )
+        // B1: "start" STARTSWITH "st" => true
+        // B2: (1+1)=2 => true
+        // B3: "middle" CONTAINS "ddl" => true
+        // B4: (5>10) => false
+        // B5: "end" ENDSWITH "D" => false
+        // Evaluation: ((( (B1 AND B2) OR B3) AND B4) OR B5)
+        // => ((( (true AND true) OR true) AND false) OR false) => (((true OR true) AND false) OR false)
+        // => ((true AND false) OR false) => (false OR false) => false
+        let mut processor = TransformerProcessor::new();
+
+        let num_1 = create_memory_block_from_i32(1);
+        let num_2 = create_memory_block_from_i32(2);
+        let num_5 = create_memory_block_from_i32(5);
+        let num_10 = create_memory_block_from_i32(10);
+
+        let str_start = create_memory_block_from_string("start");
+        let str_st = create_memory_block_from_string("st");
+        let str_middle = create_memory_block_from_string("middle");
+        let str_ddl = create_memory_block_from_string("ddl");
+        let str_end = create_memory_block_from_string("end");
+        let str_cap_d = create_memory_block_from_string("D");
+
+        processor.add_comparison(DbType::STRING, str_start, str_st, ComparerOperation::StartsWith, Some(Next::And)); // B1
+        let sum_idx = processor.add_math_operation(DbType::I32, num_1.clone(), num_1, MathOperation::Add);
+        processor.add_comparison(DbType::I32, sum_idx, num_2, ComparerOperation::Equals, Some(Next::Or)); // B2
+
+        processor.add_comparison(DbType::STRING, str_middle, str_ddl, ComparerOperation::Contains, Some(Next::And)); // B3
+        processor.add_comparison(DbType::I32, num_5, num_10, ComparerOperation::Greater, Some(Next::Or)); // B4
+
+        processor.add_comparison(DbType::STRING, str_end, str_cap_d, ComparerOperation::EndsWith, None); // B5
+
+        assert_eq!(processor.execute(), false);
+    }
+
+    #[test]
+    fn test_complex_mixed_scenario_20_final_true_from_last_or() {
+        // Logic: ( (100/0) ... this would panic, so use valid math ... (100/25)=3 AND "no" = "yes" ) OR ( (10-20) < 0 AND "false" != "true" ) OR ( (1*1)=1 )
+        // B1: (100/25)=3 => 4=3 => false
+        // B2: "no" = "yes" => false
+        // B3: (10-20) < 0 => -10 < 0 => true
+        // B4: "false" != "true" => true
+        // B5: (1*1)=1 => 1=1 => true
+        // Evaluation: ((( (B1 AND B2) OR B3) AND B4) OR B5)
+        // => ((( (false AND false) OR true) AND true) OR true) => (((false OR true) AND true) OR true)
+        // => ((true AND true) OR true) => (true OR true) => true
+        let mut processor = TransformerProcessor::new();
+
+        let num_100 = create_memory_block_from_i32(100);
+        let num_25 = create_memory_block_from_i32(25);
+        let num_3 = create_memory_block_from_i32(3);
+        let num_10 = create_memory_block_from_i32(10);
+        let num_20 = create_memory_block_from_i32(20);
+        let num_0 = create_memory_block_from_i32(0);
+        let num_1 = create_memory_block_from_i32(1);
+
+        let str_no = create_memory_block_from_string("no");
+        let str_yes = create_memory_block_from_string("yes");
+        let str_false = create_memory_block_from_string("false");
+        let str_true = create_memory_block_from_string("true");
+
+        let div_idx = processor.add_math_operation(DbType::I32, num_100, num_25, MathOperation::Divide);
+        processor.add_comparison(DbType::I32, div_idx, num_3, ComparerOperation::Equals, Some(Next::And)); // B1
+        processor.add_comparison(DbType::STRING, str_no, str_yes, ComparerOperation::Equals, Some(Next::Or)); // B2
+
+        let diff_idx = processor.add_math_operation(DbType::I32, num_10, num_20, MathOperation::Subtract);
+        processor.add_comparison(DbType::I32, diff_idx, num_0, ComparerOperation::Less, Some(Next::And)); // B3
+        processor.add_comparison(DbType::STRING, str_false, str_true, ComparerOperation::NotEquals, Some(Next::Or)); // B4
+
+        let mul_idx = processor.add_math_operation(DbType::I32, num_1.clone(), num_1.clone(), MathOperation::Multiply);
+        processor.add_comparison(DbType::I32, mul_idx, num_1.clone(), ComparerOperation::Equals, None); // B5
+
+        assert_eq!(processor.execute(), true);
+    }
+
+    #[test]
+    fn test_complex_mixed_scenario_17_heavy_nesting_math() {
+        // Logic: ( ((100 / (2*5)) - 5) = 5 AND "complex_string_test_case" CONTAINS "test" ) OR ( ( (2**3)**2 ) < 60 AND "end" ENDSWITH "nd" )
+        // M1: 2*5 = 10
+        // M2: 100/M1 = 100/10 = 10
+        // M3: M2-5 = 10-5 = 5
+        // B1: M3 = 5 => 5 = 5 => true
+        // B2: "complex_string_test_case" CONTAINS "test" => true
+        // M4: 2**3 = 8
+        // M5: M4**2 = 8**2 = 64
+        // B3: M5 < 60 => 64 < 60 => false
+        // B4: "end" ENDSWITH "nd" => true
+        // Evaluation:
+        // 1. B1 (true) AND B2 (true) => true
+        // 2. (result of 1) (true) OR B3 (false) => true
+        // 3. (result of 2) (true) AND B4 (true) => true
+        let mut processor = TransformerProcessor::new();
+
+        let num_100 = create_memory_block_from_i32(100);
+        let num_2 = create_memory_block_from_i32(2);
+        let num_5 = create_memory_block_from_i32(5);
+        let num_3_exp = create_memory_block_from_i32(3);
+        let num_2_exp = create_memory_block_from_i32(2);
+        let num_60 = create_memory_block_from_i32(60);
+
+        let str_complex = create_memory_block_from_string("complex_string_test_case");
+        let str_test = create_memory_block_from_string("test");
+        let str_end = create_memory_block_from_string("end");
+        let str_nd = create_memory_block_from_string("nd");
+
+        let m1_idx = processor.add_math_operation(DbType::I32, num_2.clone(), num_5.clone(), MathOperation::Multiply);
+        let m2_idx = processor.add_math_operation(DbType::I32, num_100.clone(), m1_idx, MathOperation::Divide);
+        let m3_idx = processor.add_math_operation(DbType::I32, m2_idx, num_5.clone(), MathOperation::Subtract);
+        processor.add_comparison(DbType::I32, m3_idx, num_5, ComparerOperation::Equals, Some(Next::And)); // B1
+
+        processor.add_comparison(DbType::STRING, str_complex, str_test, ComparerOperation::Contains, Some(Next::Or)); // B2
+
+        let m4_idx = processor.add_math_operation(DbType::I32, num_2.clone(), num_3_exp, MathOperation::Exponent);
+        let m5_idx = processor.add_math_operation(DbType::I32, m4_idx, num_2_exp, MathOperation::Exponent);
+        processor.add_comparison(DbType::I32, m5_idx, num_60, ComparerOperation::Less, Some(Next::And)); // B3
+
+        processor.add_comparison(DbType::STRING, str_end, str_nd, ComparerOperation::EndsWith, None); // B4
+
+        assert_eq!(processor.execute(), true); // Corrected based on left-to-right
+    }
+
+    #[test]
+    fn test_complex_mixed_scenario_14() {
+        // Logic: ( (9 ROOT 2) < 3 OR "hello world" STARTSWITH "hello" ) AND ( (4+4+4) = 12 OR "false" = "true" )
+        // M1: 9 ROOT 2 = 3 (integer square root)
+        // B1: M1 < 3 => 3 < 3 => false
+        // B2: "hello world" STARTSWITH "hello" => true
+        // M2: 4+4 = 8
+        // M3: M2+4 = 8+4 = 12
+        // B3: M3 = 12 => 12 = 12 => true
+        // B4: "false" = "true" => false
+        // Evaluation:
+        // 1. B1 (false) OR B2 (true) => true
+        // 2. (result of 1) (true) AND B3 (true) => true
+        // 3. (result of 2) (true) OR B4 (false) => true
+        let mut processor = TransformerProcessor::new();
+
+        let num_9_val = create_memory_block_from_i32(9); // Renamed to avoid conflict
+        let num_2_root = create_memory_block_from_i32(2);
+        let num_3 = create_memory_block_from_i32(3);
+        let num_4 = create_memory_block_from_i32(4);
+        let num_12 = create_memory_block_from_i32(12);
+
+        let str_helloworld = create_memory_block_from_string("hello world");
+        let str_hello = create_memory_block_from_string("hello");
+        let str_false = create_memory_block_from_string("false");
+        let str_true = create_memory_block_from_string("true");
+
+        let root_idx = processor.add_math_operation(DbType::I32, num_9_val, num_2_root, MathOperation::Root); // M1
+        processor.add_comparison(DbType::I32, root_idx, num_3, ComparerOperation::Less, Some(Next::Or)); // B1
+
+        processor.add_comparison(DbType::STRING, str_helloworld, str_hello, ComparerOperation::StartsWith, Some(Next::And)); // B2
+
+        let sum1_idx = processor.add_math_operation(DbType::I32, num_4.clone(), num_4.clone(), MathOperation::Add); // M2
+        let sum2_idx = processor.add_math_operation(DbType::I32, sum1_idx, num_4, MathOperation::Add); // M3
+        processor.add_comparison(DbType::I32, sum2_idx, num_12, ComparerOperation::Equals, Some(Next::Or)); // B3
+
+        processor.add_comparison(DbType::STRING, str_false, str_true, ComparerOperation::Equals, None); // B4
+
+        assert_eq!(processor.execute(), true); // Corrected based on left-to-right
+    }
+
+    #[test]
+    fn test_complex_mixed_scenario_11() {
+        // Logic: ( (1 + 2 + 3) = 6 AND "complex" CONTAINS "plex" ) OR ( (10 - 1) < 8 AND "test" = "testing" )
+        // M1: 1 + 2 = 3
+        // M2: M1 + 3 = 3 + 3 = 6
+        // B1: M2 = 6 => 6 = 6 => true
+        // B2: "complex" CONTAINS "plex" => true
+        // M3: 10 - 1 = 9
+        // B3: M3 < 8 => 9 < 8 => false
+        // B4: "test" = "testing" => false
+        // Evaluation:
+        // 1. B1 (true) AND B2 (true) => true
+        // 2. (result of 1) (true) OR B3 (false) => true
+        // 3. (result of 2) (true) AND B4 (false) => false
+        let mut processor = TransformerProcessor::new();
+
+        let num_1 = create_memory_block_from_i32(1);
+        let num_2 = create_memory_block_from_i32(2);
+        let num_3 = create_memory_block_from_i32(3);
+        let num_6 = create_memory_block_from_i32(6);
+        let num_10 = create_memory_block_from_i32(10);
+        let num_8 = create_memory_block_from_i32(8);
+
+        let str_complex = create_memory_block_from_string("complex");
+        let str_plex = create_memory_block_from_string("plex");
+        let str_test = create_memory_block_from_string("test");
+        let str_testing = create_memory_block_from_string("testing");
+
+        let sum1_idx = processor.add_math_operation(DbType::I32, num_1.clone(), num_2.clone(), MathOperation::Add); // M1
+        let sum2_idx = processor.add_math_operation(DbType::I32, sum1_idx, num_3.clone(), MathOperation::Add); // M2
+        processor.add_comparison(DbType::I32, sum2_idx, num_6, ComparerOperation::Equals, Some(Next::And)); // B1
+
+        processor.add_comparison(DbType::STRING, str_complex, str_plex, ComparerOperation::Contains, Some(Next::Or)); // B2
+
+        let diff_idx = processor.add_math_operation(DbType::I32, num_10, num_1, MathOperation::Subtract); // M3
+        processor.add_comparison(DbType::I32, diff_idx, num_8, ComparerOperation::Less, Some(Next::And)); // B3
+
+        processor.add_comparison(DbType::STRING, str_test, str_testing, ComparerOperation::Equals, None); // B4
+
+        assert_eq!(processor.execute(), false); // Corrected based on left-to-right
+    }
+
+    #[test]
+    fn test_complex_mixed_scenario_9() {
+        // Logic: ( (20 - (3*5)) > 0 AND "example" ENDSWITH "ple" ) OR ( (100 ROOT 2) < 9 AND "another" = "another" )
+        // M1: 3 * 5 = 15
+        // M1_res: 20 - M1 = 20 - 15 = 5
+        // B1: M1_res > 0 => 5 > 0 => true
+        // B2: "example" ENDSWITH "ple" => true
+        // M2: 100 ROOT 2 = 10
+        // B3: M2 < 9 => 10 < 9 => false
+        // B4: "another" = "another" => true
+        // Evaluation:
+        // 1. B1 (true) AND B2 (true) => true
+        // 2. (result of 1) (true) OR B3 (false) => true
+        // 3. (result of 2) (true) AND B4 (true) => true
+        let mut processor = TransformerProcessor::new();
+
+        let num_20_val = create_memory_block_from_i32(20); // Renamed
+        let num_3_val = create_memory_block_from_i32(3);   // Renamed
+        let num_5_val = create_memory_block_from_i32(5);   // Renamed
+        let num_0_val = create_memory_block_from_i32(0);   // Renamed
+        let num_100_val = create_memory_block_from_i32(100); // Renamed
+        let num_2_root_val = create_memory_block_from_i32(2); // Renamed
+        let num_9_val = create_memory_block_from_i32(9);     // Renamed
+
+        let str_example = create_memory_block_from_string("example");
+        let str_ple = create_memory_block_from_string("ple");
+        let str_another = create_memory_block_from_string("another");
+
+        let mul_res_idx = processor.add_math_operation(DbType::I32, num_3_val, num_5_val, MathOperation::Multiply); // M1
+        let sub_res_idx = processor.add_math_operation(DbType::I32, num_20_val, mul_res_idx, MathOperation::Subtract); // M1_res
+        processor.add_comparison(DbType::I32, sub_res_idx, num_0_val, ComparerOperation::Greater, Some(Next::And)); // B1
+
+        processor.add_comparison(DbType::STRING, str_example, str_ple, ComparerOperation::EndsWith, Some(Next::Or)); // B2
+
+        let root_res_idx = processor.add_math_operation(DbType::I32, num_100_val, num_2_root_val, MathOperation::Root); // M2
+        processor.add_comparison(DbType::I32, root_res_idx, num_9_val, ComparerOperation::Less, Some(Next::And)); // B3
+
+        processor.add_comparison(DbType::STRING, str_another.clone(), str_another, ComparerOperation::Equals, None); // B4
+
+        assert_eq!(processor.execute(), true); // Corrected based on left-to-right
+    }
+
+    // --- Ultra Complex Scenarios (15 contributing operations) ---
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn test_ultra_complex_scenario_1_expected_true() {
+        // Operations: 5 math, 10 comparisons = 15 total contributing operations
+        // Logic:
+        // Op1: Math: (10 + 20) -> res_m1 (30)
+        // Op2: Comp: res_m1 = 30 (B1: true) AND
+        // Op3: Comp: "rust" STARTSWITH "ru" (B2: true) OR
+        // Op4: Math: (5 * 5) -> res_m2 (25)
+        // Op5: Comp: res_m2 > 20 (B3: true) AND
+        // Op6: Comp: "processor" CONTAINS "cess" (B4: true) AND
+        // Op7: Math: (100 / 4) -> res_m3 (25)
+        // Op8: Comp: res_m3 = 25 (B5: true) OR
+        // Op9: Comp: "test" != "testing" (B6: true) AND
+        // Op10: Math: (2 ** 4) -> res_m4 (16)
+        // Op11: Comp: res_m4 >= 16 (B7: true) AND
+        // Op12: Comp: "example" ENDSWITH "ple" (B8: true) OR
+        // Op13: Math: (81 ROOT 2) -> res_m5 (9)
+        // Op14: Comp: res_m5 < 10 (B9: true) AND
+        // Op15: Comp: "final" = "final" (B10: true)
+        //
+        // Evaluation (left-to-right):
+        // 1. B1 (true) AND B2 (true) => true
+        // 2. (prev: true) OR B3 (true) => true
+        // 3. (prev: true) AND B4 (true) => true
+        // 4. (prev: true) AND B5 (true) => true
+        // 5. (prev: true) OR B6 (true) => true
+        // 6. (prev: true) AND B7 (true) => true
+        // 7. (prev: true) AND B8 (true) => true
+        // 8. (prev: true) OR B9 (true) => true
+        // 9. (prev: true) AND B10 (true) => true
+        // Expected: true
+        let mut processor = TransformerProcessor::new();
+
+        let uc1_num_10 = create_memory_block_from_i32(10);
+        let uc1_num_20 = create_memory_block_from_i32(20);
+        let uc1_num_30 = create_memory_block_from_i32(30);
+        let uc1_str_rust = create_memory_block_from_string("rust");
+        let uc1_str_ru = create_memory_block_from_string("ru");
+        let uc1_num_5 = create_memory_block_from_i32(5);
+        let uc1_str_processor = create_memory_block_from_string("processor");
+        let uc1_str_cess = create_memory_block_from_string("cess");
+        let uc1_num_100 = create_memory_block_from_i32(100);
+        let uc1_num_4 = create_memory_block_from_i32(4);
+        let uc1_num_25 = create_memory_block_from_i32(25);
+        let uc1_str_test = create_memory_block_from_string("test");
+        let uc1_str_testing = create_memory_block_from_string("testing");
+        let uc1_num_2 = create_memory_block_from_i32(2);
+        let uc1_num_16 = create_memory_block_from_i32(16);
+        let uc1_str_example = create_memory_block_from_string("example");
+        let uc1_str_ple = create_memory_block_from_string("ple");
+        let uc1_num_81 = create_memory_block_from_i32(81);
+        let uc1_num_sq_root = create_memory_block_from_i32(2); // for ROOT 2
+        let uc1_str_final = create_memory_block_from_string("final");
+
+        // Op1 & Op2
+        let res_m1 = processor.add_math_operation(DbType::I32, uc1_num_10.clone(), uc1_num_20.clone(), MathOperation::Add);
+        processor.add_comparison(DbType::I32, res_m1, uc1_num_30.clone(), ComparerOperation::Equals, Some(Next::And)); // B1
+        // Op3
+        processor.add_comparison(DbType::STRING, uc1_str_rust.clone(), uc1_str_ru.clone(), ComparerOperation::StartsWith, Some(Next::Or)); // B2
+        // Op4 & Op5
+        let res_m2 = processor.add_math_operation(DbType::I32, uc1_num_5.clone(), uc1_num_5.clone(), MathOperation::Multiply);
+        processor.add_comparison(DbType::I32, res_m2, uc1_num_20.clone(), ComparerOperation::Greater, Some(Next::And)); // B3
+        // Op6
+        processor.add_comparison(DbType::STRING, uc1_str_processor.clone(), uc1_str_cess.clone(), ComparerOperation::Contains, Some(Next::And)); // B4
+        // Op7 & Op8
+        let res_m3 = processor.add_math_operation(DbType::I32, uc1_num_100.clone(), uc1_num_4.clone(), MathOperation::Divide);
+        processor.add_comparison(DbType::I32, res_m3, uc1_num_25.clone(), ComparerOperation::Equals, Some(Next::Or)); // B5
+        // Op9
+        processor.add_comparison(DbType::STRING, uc1_str_test.clone(), uc1_str_testing.clone(), ComparerOperation::NotEquals, Some(Next::And)); // B6
+        // Op10 & Op11
+        let res_m4 = processor.add_math_operation(DbType::I32, uc1_num_2.clone(), uc1_num_4.clone(), MathOperation::Exponent);
+        processor.add_comparison(DbType::I32, res_m4, uc1_num_16.clone(), ComparerOperation::GreaterOrEquals, Some(Next::And)); // B7
+        // Op12
+        processor.add_comparison(DbType::STRING, uc1_str_example.clone(), uc1_str_ple.clone(), ComparerOperation::EndsWith, Some(Next::Or)); // B8
+        // Op13 & Op14
+        let res_m5 = processor.add_math_operation(DbType::I32, uc1_num_81.clone(), uc1_num_sq_root.clone(), MathOperation::Root);
+        processor.add_comparison(DbType::I32, res_m5, uc1_num_10.clone(), ComparerOperation::Less, Some(Next::And)); // B9
+        // Op15
+        processor.add_comparison(DbType::STRING, uc1_str_final.clone(), uc1_str_final.clone(), ComparerOperation::Equals, None); // B10
+        
+        assert_eq!(processor.execute(), true);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn test_ultra_complex_scenario_2_expected_false() {
+        // Operations: 5 math, 10 comparisons = 15 total contributing operations
+        // Logic:
+        // Op1: Math: (7 - 3) -> res_mA (4)
+        // Op2: Comp: res_mA = 5 (C1: false) OR
+        // Op3: Comp: "alpha" CONTAINS "Z" (C2: false) AND
+        // Op4: Math: (3 * 8) -> res_mB (24)
+        // Op5: Comp: res_mB <= 20 (C3: false) OR
+        // Op6: Comp: "omega" ENDSWITH "gaX" (C4: false) AND
+        // Op7: Math: (50 / 2) -> res_mC (25)
+        // Op8: Comp: res_mC != 25 (C5: false) OR
+        // Op9: Comp: "chain" = "link" (C6: false) AND
+        // Op10: Math: (3 ** 3) -> res_mD (27)
+        // Op11: Comp: res_mD < 27 (C7: false) OR
+        // Op12: Comp: "database" STARTSWITH "Data" (C8: false) AND
+        // Op13: Math: (16 ROOT 4) -> res_mE (2)
+        // Op14: Comp: res_mE > 2 (C9: false) OR
+        // Op15: Comp: "true_str" = "false_str" (C10: false) // Renamed variables to avoid conflict
+        //
+        // Evaluation (left-to-right):
+        // 1. C1 (false) OR C2 (false) => false
+        // 2. (prev: false) AND C3 (false) => false
+        // 3. (prev: false) OR C4 (false) => false
+        // 4. (prev: false) AND C5 (false) => false
+        // 5. (prev: false) OR C6 (false) => false
+        // 6. (prev: false) AND C7 (false) => false
+        // 7. (prev: false) OR C8 (false) => false
+        // 8. (prev: false) AND C9 (false) => false
+        // 9. (prev: false) OR C10 (false) => false
+        // Expected: false
+        let mut processor = TransformerProcessor::new();
+
+        let uc2_num_7 = create_memory_block_from_i32(7);
+        let uc2_num_3 = create_memory_block_from_i32(3);
+        let uc2_num_5_comp = create_memory_block_from_i32(5); // For C1 comparison
+        let uc2_str_alpha = create_memory_block_from_string("alpha");
+        let uc2_str_z = create_memory_block_from_string("Z");
+        let uc2_num_8 = create_memory_block_from_i32(8);
+        let uc2_num_20_comp = create_memory_block_from_i32(20); // For C3 comparison
+        let uc2_str_omega = create_memory_block_from_string("omega");
+        let uc2_str_gax = create_memory_block_from_string("gaX");
+        let uc2_num_50 = create_memory_block_from_i32(50);
+        let uc2_num_2_div = create_memory_block_from_i32(2); // For division and C9 comparison
+        let uc2_num_25_comp = create_memory_block_from_i32(25); // For C5 comparison
+        let uc2_str_chain = create_memory_block_from_string("chain");
+        let uc2_str_link = create_memory_block_from_string("link");
+        let uc2_num_3_exp = create_memory_block_from_i32(3); // For exponent
+        let uc2_num_27_comp = create_memory_block_from_i32(27); // For C7 comparison
+        let uc2_str_database = create_memory_block_from_string("database");
+        let uc2_str_cap_data = create_memory_block_from_string("Data");
+        let uc2_num_16_root = create_memory_block_from_i32(16);
+        let uc2_num_4_root_idx = create_memory_block_from_i32(4);
+        let uc2_str_true = create_memory_block_from_string("true_str"); // Renamed
+        let uc2_str_false = create_memory_block_from_string("false_str"); // Renamed
+
+        // Op1 & Op2
+        let res_mA = processor.add_math_operation(DbType::I32, uc2_num_7.clone(), uc2_num_3.clone(), MathOperation::Subtract);
+        processor.add_comparison(DbType::I32, res_mA, uc2_num_5_comp.clone(), ComparerOperation::Equals, Some(Next::Or)); // C1
+        // Op3
+        processor.add_comparison(DbType::STRING, uc2_str_alpha.clone(), uc2_str_z.clone(), ComparerOperation::Contains, Some(Next::And)); // C2
+        // Op4 & Op5
+        let res_mB = processor.add_math_operation(DbType::I32, uc2_num_3.clone(), uc2_num_8.clone(), MathOperation::Multiply);
+        processor.add_comparison(DbType::I32, res_mB, uc2_num_20_comp.clone(), ComparerOperation::LessOrEquals, Some(Next::Or)); // C3
+        // Op6
+        processor.add_comparison(DbType::STRING, uc2_str_omega.clone(), uc2_str_gax.clone(), ComparerOperation::EndsWith, Some(Next::And)); // C4
+        // Op7 & Op8
+        let res_mC = processor.add_math_operation(DbType::I32, uc2_num_50.clone(), uc2_num_2_div.clone(), MathOperation::Divide);
+        processor.add_comparison(DbType::I32, res_mC, uc2_num_25_comp.clone(), ComparerOperation::NotEquals, Some(Next::Or)); // C5
+        // Op9
+        processor.add_comparison(DbType::STRING, uc2_str_chain.clone(), uc2_str_link.clone(), ComparerOperation::Equals, Some(Next::And)); // C6
+        // Op10 & Op11
+        let res_mD = processor.add_math_operation(DbType::I32, uc2_num_3.clone(), uc2_num_3_exp.clone(), MathOperation::Exponent);
+        processor.add_comparison(DbType::I32, res_mD, uc2_num_27_comp.clone(), ComparerOperation::Less, Some(Next::Or)); // C7
+        // Op12
+        processor.add_comparison(DbType::STRING, uc2_str_database.clone(), uc2_str_cap_data.clone(), ComparerOperation::StartsWith, Some(Next::And)); // C8
+        // Op13 & Op14
+        let res_mE = processor.add_math_operation(DbType::I32, uc2_num_16_root.clone(), uc2_num_4_root_idx.clone(), MathOperation::Root);
+        processor.add_comparison(DbType::I32, res_mE, uc2_num_2_div.clone(), ComparerOperation::Greater, Some(Next::Or)); // C9
+        // Op15
+        processor.add_comparison(DbType::STRING, uc2_str_true.clone(), uc2_str_false.clone(), ComparerOperation::Equals, None); // C10
+
+        assert_eq!(processor.execute(), false);
     }
 }
