@@ -67,7 +67,7 @@ impl ConcurrentProcessor {
                     let result = transformer.transform_single();
                     
                     if let Either::Right(found) = result {
-                        if found {
+                        if found.0 {
                             //println!("Found row with ID: {}", pointer.id);
                             tx_clone.send(Row::clone_from_mut_row(&row)).unwrap();
                         }
