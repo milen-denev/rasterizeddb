@@ -8,3 +8,4 @@ pub mod common;
 pub mod concurrent_processor;
 pub mod schema;
 pub mod table;
+pub mod query_parser;
