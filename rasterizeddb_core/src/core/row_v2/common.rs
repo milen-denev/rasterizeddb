@@ -1,26 +1,31 @@
 use std::arch::x86_64::*;
 
+use crate::memory_pool::MEMORY_POOL;
 use super::transformer::ComparerOperation;
+use crate::memory_pool::MemoryBlock;
 
 // Helper trait to convert number types to/from little-endian byte slices
 pub trait FromLeBytes: Sized {
     fn from_le_bytes(bytes: &[u8]) -> Self;
-    fn to_le_bytes(&self) -> Vec<u8>;
+    fn to_le_bytes(&self) -> MemoryBlock;
 }
 
 macro_rules! impl_from_le_bytes {
     ($($type:ty),*) => {
         $(
             impl FromLeBytes for $type {
-
                 #[inline(always)]
                 fn from_le_bytes(bytes: &[u8]) -> Self {
                     <$type>::from_le_bytes(bytes.try_into().expect("Invalid byte slice"))
                 }
 
                 #[inline(always)]
-                fn to_le_bytes(&self) -> Vec<u8> {
-                    (*self).to_le_bytes().to_vec() // Explicitly call the standard method
+                fn to_le_bytes(&self) -> MemoryBlock {
+                    let len = std::mem::size_of::<$type>();
+                    let memory = MEMORY_POOL.acquire(len);
+                    let slice = memory.into_slice_mut();
+                    slice.copy_from_slice(&(*self).to_le_bytes());
+                    memory
                 }
             }
         )*
@@ -29,7 +34,6 @@ macro_rules! impl_from_le_bytes {
 
 // Implement the trait for all required types
 impl_from_le_bytes!(i8, u8, i16, u16, i32, u32, i64, u64, i128, u128, f32, f64);
-
 
 // Custom trait for converting from f64
 pub trait FromF64: Sized {
