@@ -6,96 +6,15 @@ use crate::instructions::{copy_vec_to_ptr, ref_slice, ref_slice_mut};
 
 pub static MEMORY_POOL: MemoryPool = MemoryPool::new();
 
-pub struct MemoryPool;
-
-unsafe impl Send for MemoryPool {}
-unsafe impl Sync for MemoryPool {}
-
 use libmimalloc_sys::{mi_malloc, mi_free};
 
 // Define the maximum size for inline allocation
 const INLINE_CAPACITY: usize = 21;
 
-// The union to hold either the inline buffer or the heap pointer/size
-#[repr(C)] // Ensure a consistent memory layout, critical for unions
-union MemoryBlockData {
-    inline_data: [u8; INLINE_CAPACITY],
-    heap_data: (*mut u8, usize), // Tuple for pointer and size
-}
+pub struct MemoryPool;
 
-impl Clone for MemoryBlockData {
-    #[inline(always)]
-    fn clone(&self) -> Self {
-        unsafe {
-            if self.heap_data.0.is_null() {
-                // If the heap pointer is null, we are dealing with inline data
-                MemoryBlockData {
-                    inline_data: self.inline_data,
-                }
-            } else {
-                // Create a new MemoryBlockData with the copied data
-                MemoryBlockData {
-                    heap_data: self.heap_data,
-                }
-            }
-        }
-    }
-}
-
-// The main MemoryBlock struct that manages the union
-pub struct MemoryBlock {
-    data: MemoryBlockData,
-    len: usize, // Actual length of the data
-    is_heap: bool, // Discriminant for the union: true if heap, false if inline
-    should_drop: bool
-}
-
-impl Default for MemoryBlock {
-     #[inline(always)]
-    fn default() -> Self {
-        // A default MemoryBlock will be an empty, inline block
-        MemoryBlock {
-            data: MemoryBlockData { inline_data: [0; INLINE_CAPACITY] }, // Initialize with zeros
-            len: 0,
-            is_heap: false, // It's an inline block
-            should_drop: false // Not needed as it's implied by is_heap
-        }
-    }
-}
-
-impl fmt::Debug for MemoryBlock {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut debug_struct = f.debug_struct("MemoryBlock");
-        debug_struct.field("len", &self.len);
-        debug_struct.field("is_heap", &self.is_heap);
-
-        if self.is_heap {
-            // For heap-allocated, show the pointer and the full allocated size
-            let (ptr, allocated_size) = unsafe { self.data.heap_data };
-            debug_struct.field("ptr", &ptr);
-            debug_struct.field("allocated_size", &allocated_size);
-            // Optionally, show a preview of the data (be careful with large sizes)
-            let inline_data = &self.into_slice();
-            let mut str_buffer = String::new();
-            for byte in inline_data.iter() {
-                str_buffer.push(*byte as char);
-            }
-            debug_struct.field("data", &str_buffer);
-        } else {
-            // For inline, show the inline capacity and the actual data bytes
-            debug_struct.field("inline_capacity", &INLINE_CAPACITY);
-            let inline_data = unsafe { &self.data.inline_data };
-            let mut str_buffer = String::new();
-            for byte in inline_data.iter() {
-                str_buffer.push(*byte as char);
-            }
-            // Use self.as_slice() to only show the *used* portion of the inline data
-            debug_struct.field("data", &str_buffer);
-        }
-
-        debug_struct.finish()
-    }
-}
+unsafe impl Send for MemoryPool {}
+unsafe impl Sync for MemoryPool {}
 
 impl MemoryPool {
     #[inline(always)]
@@ -147,8 +66,89 @@ impl MemoryPool {
     }
 }
 
+// The union to hold either the inline buffer or the heap pointer/size
+#[repr(C)] // Ensure a consistent memory layout, critical for unions
+union MemoryBlockData {
+    inline_data: [u8; INLINE_CAPACITY],
+    heap_data: (*mut u8, usize), // Tuple for pointer and size
+}
+
+impl Clone for MemoryBlockData {
+    #[inline(always)]
+    fn clone(&self) -> Self {
+        unsafe {
+            if self.heap_data.0.is_null() {
+                // If the heap pointer is null, we are dealing with inline data
+                MemoryBlockData {
+                    inline_data: self.inline_data,
+                }
+            } else {
+                // Create a new MemoryBlockData with the copied data
+                MemoryBlockData {
+                    heap_data: self.heap_data,
+                }
+            }
+        }
+    }
+}
+
+// The main MemoryBlock struct that manages the union
+pub struct MemoryBlock {
+    data: MemoryBlockData,
+    len: usize, // Actual length of the data
+    is_heap: bool, // Discriminant for the union: true if heap, false if inline
+    should_drop: bool
+}
+
 unsafe impl Send for MemoryBlock {}
 unsafe impl Sync for MemoryBlock {}
+
+impl Default for MemoryBlock {
+     #[inline(always)]
+    fn default() -> Self {
+        // A default MemoryBlock will be an empty, inline block
+        MemoryBlock {
+            data: MemoryBlockData { inline_data: [0; INLINE_CAPACITY] }, // Initialize with zeros
+            len: 0,
+            is_heap: false, // It's an inline block
+            should_drop: false // Not needed as it's implied by is_heap
+        }
+    }
+}
+
+impl fmt::Debug for MemoryBlock {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug_struct = f.debug_struct("MemoryBlock");
+        debug_struct.field("len", &self.len);
+        debug_struct.field("is_heap", &self.is_heap);
+
+        if self.is_heap {
+            // For heap-allocated, show the pointer and the full allocated size
+            let (ptr, allocated_size) = unsafe { self.data.heap_data };
+            debug_struct.field("ptr", &ptr);
+            debug_struct.field("allocated_size", &allocated_size);
+            // Optionally, show a preview of the data (be careful with large sizes)
+            let inline_data = &self.into_slice();
+            let mut str_buffer = String::new();
+            for byte in inline_data.iter() {
+                str_buffer.push(*byte as char);
+            }
+            debug_struct.field("data", &str_buffer);
+        } else {
+            // For inline, show the inline capacity and the actual data bytes
+            debug_struct.field("inline_capacity", &INLINE_CAPACITY);
+            let inline_data = unsafe { &self.data.inline_data };
+            let mut str_buffer = String::new();
+            for byte in inline_data.iter() {
+                str_buffer.push(*byte as char);
+            }
+            // Use self.as_slice() to only show the *used* portion of the inline data
+            debug_struct.field("data", &str_buffer);
+        }
+
+        debug_struct.finish()
+    }
+}
 
 impl Drop for MemoryBlock {
     #[inline(always)]
