@@ -17,7 +17,7 @@ const SCHEMA_FIELD_CHUNK_SIZE: usize = SCHEMA_FIELD_SIZE as usize * 100;
 /// Number of schema fields to retrieve in a batch
 const BATCH_SIZE: usize = 100;
 
-const TABLE_SIZE: usize = 129 * 2; // 128 chars for name  + null terminator and primary key + null terminator
+const TABLE_SIZE: usize = 129 * 2 + 1; // 128 chars for name  + null terminator and primary key + null terminator
 
 #[derive(Debug, Clone)]
 pub struct SchemaField {
@@ -282,7 +282,8 @@ pub struct TableSchema {
     pub name: String,
     pub fields: Vec<SchemaField>,
     pub primary_key: Option<String>,
-    pub indexes: Vec<TableIndex>
+    pub indexes: Vec<TableIndex>,
+    pub is_immutable: bool
 }
 
 pub struct TableIndex {
@@ -292,12 +293,13 @@ pub struct TableIndex {
 }
 
 impl TableSchema {
-    pub fn new(name: String) -> Self {
+    pub fn new(name: String, is_immutable: bool) -> Self {
         TableSchema {
             name,
             fields: Vec::new(),
             primary_key: None,
             indexes: Vec::new(),
+            is_immutable
         }
     }
 
@@ -354,6 +356,8 @@ impl TableSchema {
         }
         // If no primary key, this section remains all zeros
         
+        vec[129 + 129] = self.is_immutable as u8; // Null terminator for primary key
+
         vec
     }
 
@@ -383,11 +387,19 @@ impl TableSchema {
             }
         };
         
+        let immutable = if 0 == vec[129 + 129] { 
+            false
+        } else {
+            true
+        };
+
         Ok(TableSchema {
             name,
             fields: Vec::new(), // Fields are stored separately
             primary_key,
-            indexes: Vec::new(), // Indexes are stored separately
+            indexes: Vec::new(), // Indexes are stored separately,
+            is_immutable: immutable,
+
         })
     }
     
@@ -829,7 +841,16 @@ mod tests {
 
     // Helper function to create a test TableSchema
     fn create_test_table_schema(name: &str, primary_key: Option<&str>) -> TableSchema {
-        let mut table = TableSchema::new(name.to_string());
+        let mut table = TableSchema::new(name.to_string(), false);
+        if let Some(pk) = primary_key {
+            table.set_primary_key(pk.to_string());
+        }
+        table
+    }
+
+    // Helper function to create a test TableSchema
+    fn create_test_table_schema_immutable(name: &str, primary_key: Option<&str>) -> TableSchema {
+        let mut table = TableSchema::new(name.to_string(), true);
         if let Some(pk) = primary_key {
             table.set_primary_key(pk.to_string());
         }
@@ -956,11 +977,45 @@ mod tests {
         assert_eq!(deserialized.primary_key, Some("order_id".to_string()));
         assert!(deserialized.fields.is_empty());
     }
-    
+
+    #[tokio::test]
+    async fn test_table_schema_mutability() {
+        let mut mock_io = MockStorageProvider::new().await;
+
+        // Create schema with fields and indexes
+        let schema = create_test_table_schema_immutable("orders", Some("order_id"));
+        
+        schema.save(&mut mock_io).await.unwrap();
+
+        let mut schema_iter = TableSchemaIterator::new(&mut mock_io).await.unwrap();
+
+        let schema = schema_iter.next_table_schema().await.unwrap().unwrap();
+
+        // Verify core properties (fields are not part of serialization)
+        assert_eq!(schema.is_immutable, true);
+    }
+
+    #[tokio::test]
+    async fn test_table_schema_mutability_2() {
+        let mut mock_io = MockStorageProvider::new().await;
+
+        // Create schema with fields and indexes
+        let schema = create_test_table_schema("orders", Some("order_id"));
+        
+        schema.save(&mut mock_io).await.unwrap();
+
+        let mut schema_iter = TableSchemaIterator::new(&mut mock_io).await.unwrap();
+
+        let schema = schema_iter.next_table_schema().await.unwrap().unwrap();
+
+        // Verify core properties (fields are not part of serialization)
+        assert_eq!(schema.is_immutable, false);
+    }
+
     #[test]
     fn test_table_schema_special_chars() {
         // Create schema with special characters in name and primary key
-        let mut schema = TableSchema::new("users!@#123".to_string());
+        let mut schema = TableSchema::new("users!@#123".to_string(), true);
         schema.set_primary_key("id!@#123".to_string());
         
         // Serialize
