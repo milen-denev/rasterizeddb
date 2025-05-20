@@ -103,6 +103,7 @@ impl ColumnTransformer {
 }
 
 /// An enum to represent either a direct memory block or an index to an intermediate result
+#[derive(Debug, Clone)]
 pub enum ComparisonOperand {
     Direct(MemoryBlock),
     Intermediate(usize),
