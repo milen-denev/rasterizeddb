@@ -75,7 +75,7 @@ where
         }
     };
 
-    result.copy_from_slice(&res.to_le_bytes());
+    result.copy_from_slice(res.to_le_bytes().into_slice());
 
     block
 }
@@ -86,7 +86,7 @@ mod tests {
     use crate::core::row_v2::transformer::MathOperation;
     
     // Helper function to convert a value to little-endian bytes
-    fn to_le_bytes<T>(value: T) -> Vec<u8>
+    fn to_le_bytes<T>(value: T) -> MemoryBlock
     where
         T: Copy + Default + FromLeBytes,
     {
@@ -105,148 +105,148 @@ mod tests {
     #[test]
     fn test_add_operation() {
         // Integer addition
-        let result = perform_math_operation(&to_le_bytes(5i32), &to_le_bytes(3i32), &DbType::I32, &MathOperation::Add);
+        let result = perform_math_operation(to_le_bytes(5i32).into_slice(), to_le_bytes(3i32).into_slice(), &DbType::I32, &MathOperation::Add);
         assert_eq!(from_memory_block::<i32>(result), 8);
 
         // Unsigned integer addition
-        let result = perform_math_operation(&to_le_bytes(5u64), &to_le_bytes(3u64), &DbType::U64, &MathOperation::Add);
+        let result = perform_math_operation(to_le_bytes(5u64).into_slice(), to_le_bytes(3u64).into_slice(), &DbType::U64, &MathOperation::Add);
         assert_eq!(from_memory_block::<u64>(result), 8);
 
         // Floating point addition
-        let result = perform_math_operation(&to_le_bytes(5.5f32), &to_le_bytes(3.2f32), &DbType::F32, &MathOperation::Add);
+        let result = perform_math_operation(to_le_bytes(5.5f32).into_slice(), to_le_bytes(3.2f32).into_slice(), &DbType::F32, &MathOperation::Add);
         assert!((from_memory_block::<f32>(result) - 8.7).abs() < 0.001);
 
-        let result = perform_math_operation(&to_le_bytes(5.5f64), &to_le_bytes(3.2f64), &DbType::F64, &MathOperation::Add);
+        let result = perform_math_operation(to_le_bytes(5.5f64).into_slice(), to_le_bytes(3.2f64).into_slice(), &DbType::F64, &MathOperation::Add);
         assert!((from_memory_block::<f64>(result) - 8.7).abs() < 0.001);
     }
 
     #[test]
     fn test_subtract_operation() {
         // Integer subtraction
-        let result = perform_math_operation(&to_le_bytes(5i32), &to_le_bytes(3i32), &DbType::I32, &MathOperation::Subtract);
+        let result = perform_math_operation(to_le_bytes(5i32).into_slice(), to_le_bytes(3i32).into_slice(), &DbType::I32, &MathOperation::Subtract);
         assert_eq!(from_memory_block::<i32>(result), 2);
 
         // Unsigned integer subtraction
-        let result = perform_math_operation(&to_le_bytes(5u64), &to_le_bytes(3u64), &DbType::U64, &MathOperation::Subtract);
+        let result = perform_math_operation(to_le_bytes(5u64).into_slice(), to_le_bytes(3u64).into_slice(), &DbType::U64, &MathOperation::Subtract);
         assert_eq!(from_memory_block::<u64>(result), 2);
 
         // Floating point subtraction
-        let result = perform_math_operation(&to_le_bytes(5.5f32), &to_le_bytes(3.2f32), &DbType::F32, &MathOperation::Subtract);
+        let result = perform_math_operation(to_le_bytes(5.5f32).into_slice(), to_le_bytes(3.2f32).into_slice(), &DbType::F32, &MathOperation::Subtract);
         assert!((from_memory_block::<f32>(result) - 2.3).abs() < 0.001);
 
-        let result = perform_math_operation(&to_le_bytes(5.5f64), &to_le_bytes(3.2f64), &DbType::F64, &MathOperation::Subtract);
+        let result = perform_math_operation(to_le_bytes(5.5f64).into_slice(), to_le_bytes(3.2f64).into_slice(), &DbType::F64, &MathOperation::Subtract);
         assert!((from_memory_block::<f64>(result) - 2.3).abs() < 0.001);
     }
 
     #[test]
     fn test_multiply_operation() {
         // Integer multiplication
-        let result = perform_math_operation(&to_le_bytes(5i32), &to_le_bytes(3i32), &DbType::I32, &MathOperation::Multiply);
+        let result = perform_math_operation(to_le_bytes(5i32).into_slice(), to_le_bytes(3i32).into_slice(), &DbType::I32, &MathOperation::Multiply);
         assert_eq!(from_memory_block::<i32>(result), 15);
 
         // Unsigned integer multiplication
-        let result = perform_math_operation(&to_le_bytes(5u64), &to_le_bytes(3u64), &DbType::U64, &MathOperation::Multiply);
+        let result = perform_math_operation(to_le_bytes(5u64).into_slice(), to_le_bytes(3u64).into_slice(), &DbType::U64, &MathOperation::Multiply);
         assert_eq!(from_memory_block::<u64>(result), 15);
 
         // Floating point multiplication
-        let result = perform_math_operation(&to_le_bytes(5.5f32), &to_le_bytes(3.0f32), &DbType::F32, &MathOperation::Multiply);
+        let result = perform_math_operation(to_le_bytes(5.5f32).into_slice(), to_le_bytes(3.0f32).into_slice(), &DbType::F32, &MathOperation::Multiply);
         assert!((from_memory_block::<f32>(result) - 16.5).abs() < 0.001);
 
-        let result = perform_math_operation(&to_le_bytes(5.5f64), &to_le_bytes(3.0f64), &DbType::F64, &MathOperation::Multiply);
+        let result = perform_math_operation(to_le_bytes(5.5f64).into_slice(), to_le_bytes(3.0f64).into_slice(), &DbType::F64, &MathOperation::Multiply);
         assert!((from_memory_block::<f64>(result) - 16.5).abs() < 0.001);
     }
 
     #[test]
     fn test_divide_operation() {
         // Integer division
-        let result = perform_math_operation(&to_le_bytes(15i32), &to_le_bytes(3i32), &DbType::I32, &MathOperation::Divide);
+        let result = perform_math_operation(to_le_bytes(15i32).into_slice(), to_le_bytes(3i32).into_slice(), &DbType::I32, &MathOperation::Divide);
         assert_eq!(from_memory_block::<i32>(result), 5);
 
         // Unsigned integer division
-        let result = perform_math_operation(&to_le_bytes(15u64), &to_le_bytes(3u64), &DbType::U64, &MathOperation::Divide);
+        let result = perform_math_operation(to_le_bytes(15u64).into_slice(), to_le_bytes(3u64).into_slice(), &DbType::U64, &MathOperation::Divide);
         assert_eq!(from_memory_block::<u64>(result), 5);
 
         // Floating point division
-        let result = perform_math_operation(&to_le_bytes(16.5f32), &to_le_bytes(3.0f32), &DbType::F32, &MathOperation::Divide);
+        let result = perform_math_operation(to_le_bytes(16.5f32).into_slice(), to_le_bytes(3.0f32).into_slice(), &DbType::F32, &MathOperation::Divide);
         assert!((from_memory_block::<f32>(result) - 5.5).abs() < 0.001);
 
-        let result = perform_math_operation(&to_le_bytes(16.5f64), &to_le_bytes(3.0f64), &DbType::F64, &MathOperation::Divide);
+        let result = perform_math_operation(to_le_bytes(16.5f64).into_slice(), to_le_bytes(3.0f64).into_slice(), &DbType::F64, &MathOperation::Divide);
         assert!((from_memory_block::<f64>(result) - 5.5).abs() < 0.001);
     }
 
     #[test]
     fn test_exponent_operation() {
         // Integer exponentiation
-        let result = perform_math_operation(&to_le_bytes(2i32), &to_le_bytes(3i32), &DbType::I32, &MathOperation::Exponent);
+        let result = perform_math_operation(to_le_bytes(2i32).into_slice(), to_le_bytes(3i32).into_slice(), &DbType::I32, &MathOperation::Exponent);
         assert_eq!(from_memory_block::<i32>(result), 8);
 
         // Unsigned integer exponentiation
-        let result = perform_math_operation(&to_le_bytes(2u64), &to_le_bytes(3u64), &DbType::U64, &MathOperation::Exponent);
+        let result = perform_math_operation(to_le_bytes(2u64).into_slice(), to_le_bytes(3u64).into_slice(), &DbType::U64, &MathOperation::Exponent);
         assert_eq!(from_memory_block::<u64>(result), 8);
 
         // Floating point exponentiation
-        let result = perform_math_operation(&to_le_bytes(2.0f32), &to_le_bytes(1.5f32), &DbType::F32, &MathOperation::Exponent);
+        let result = perform_math_operation(to_le_bytes(2.0f32).into_slice(), to_le_bytes(1.5f32).into_slice(), &DbType::F32, &MathOperation::Exponent);
         assert!((from_memory_block::<f32>(result) - 2.83).abs() < 0.01);
 
-        let result = perform_math_operation(&to_le_bytes(2.0f64), &to_le_bytes(1.5f64), &DbType::F64, &MathOperation::Exponent);
+        let result = perform_math_operation(to_le_bytes(2.0f64).into_slice(), to_le_bytes(1.5f64).into_slice(), &DbType::F64, &MathOperation::Exponent);
         assert!((from_memory_block::<f64>(result) - 2.83).abs() < 0.01);
     }
 
     #[test]
     fn test_root_operation() {
         // Integer root
-        let result = perform_math_operation(&to_le_bytes(8i32), &to_le_bytes(3i32), &DbType::I32, &MathOperation::Root);
+        let result = perform_math_operation(to_le_bytes(8i32).into_slice(), to_le_bytes(3i32).into_slice(), &DbType::I32, &MathOperation::Root);
         assert_eq!(from_memory_block::<i32>(result), 2);
 
         // Unsigned integer root
-        let result = perform_math_operation(&to_le_bytes(8u64), &to_le_bytes(3u64), &DbType::U64, &MathOperation::Root);
+        let result = perform_math_operation(to_le_bytes(8u64).into_slice(), to_le_bytes(3u64).into_slice(), &DbType::U64, &MathOperation::Root);
         assert_eq!(from_memory_block::<u64>(result), 2);
 
         // Floating point root
-        let result = perform_math_operation(&to_le_bytes(9.0f32), &to_le_bytes(2.0f32), &DbType::F32, &MathOperation::Root);
+        let result = perform_math_operation(to_le_bytes(9.0f32).into_slice(), to_le_bytes(2.0f32).into_slice(), &DbType::F32, &MathOperation::Root);
         assert!((from_memory_block::<f32>(result) - 3.0).abs() < 0.001);
 
-        let result = perform_math_operation(&to_le_bytes(9.0f64), &to_le_bytes(2.0f64), &DbType::F64, &MathOperation::Root);
+        let result = perform_math_operation(to_le_bytes(9.0f64).into_slice(), to_le_bytes(2.0f64).into_slice(), &DbType::F64, &MathOperation::Root);
         assert!((from_memory_block::<f64>(result) - 3.0).abs() < 0.001);
     }
 
     #[test]
     fn test_all_numeric_types() {
         // Test i8
-        let result = perform_math_operation(&to_le_bytes(5i8), &to_le_bytes(3i8), &DbType::I8, &MathOperation::Add);
+        let result = perform_math_operation(to_le_bytes(5i8).into_slice(), to_le_bytes(3i8).into_slice(), &DbType::I8, &MathOperation::Add);
         assert_eq!(from_memory_block::<i8>(result), 8);
 
         // Test u8
-        let result = perform_math_operation(&to_le_bytes(5u8), &to_le_bytes(3u8), &DbType::U8, &MathOperation::Add);
+        let result = perform_math_operation(to_le_bytes(5u8).into_slice(), to_le_bytes(3u8).into_slice(), &DbType::U8, &MathOperation::Add);
         assert_eq!(from_memory_block::<u8>(result), 8);
 
         // Test i16
-        let result = perform_math_operation(&to_le_bytes(5i16), &to_le_bytes(3i16), &DbType::I16, &MathOperation::Add);
+        let result = perform_math_operation(to_le_bytes(5i16).into_slice(), to_le_bytes(3i16).into_slice(), &DbType::I16, &MathOperation::Add);
         assert_eq!(from_memory_block::<i16>(result), 8);
 
         // Test u16
-        let result = perform_math_operation(&to_le_bytes(5u16), &to_le_bytes(3u16), &DbType::U16, &MathOperation::Add);
+        let result = perform_math_operation(to_le_bytes(5u16).into_slice(), to_le_bytes(3u16).into_slice(), &DbType::U16, &MathOperation::Add);
         assert_eq!(from_memory_block::<u16>(result), 8);
 
         // Test i128
-        let result = perform_math_operation(&to_le_bytes(5i128), &to_le_bytes(3i128), &DbType::I128, &MathOperation::Add);
+        let result = perform_math_operation(to_le_bytes(5i128).into_slice(), to_le_bytes(3i128).into_slice(), &DbType::I128, &MathOperation::Add);
         assert_eq!(from_memory_block::<i128>(result), 8);
 
         // Test u128
-        let result = perform_math_operation(&to_le_bytes(5u128), &to_le_bytes(3u128), &DbType::U128, &MathOperation::Add);
+        let result = perform_math_operation(to_le_bytes(5u128).into_slice(), to_le_bytes(3u128).into_slice(), &DbType::U128, &MathOperation::Add);
         assert_eq!(from_memory_block::<u128>(result), 8);
     }
 
     #[test]
     #[should_panic(expected = "Division by zero is not allowed")]
     fn test_divide_by_zero() {
-        perform_math_operation(&to_le_bytes(5i32), &to_le_bytes(0i32), &DbType::I32, &MathOperation::Divide);
+        perform_math_operation(to_le_bytes(5i32).into_slice(), to_le_bytes(0i32).into_slice(), &DbType::I32, &MathOperation::Divide);
     }
 
     #[test]
     #[should_panic(expected = "Root by zero is not allowed")]
     fn test_root_by_zero() {
-        perform_math_operation(&to_le_bytes(5i32), &to_le_bytes(0i32), &DbType::I32, &MathOperation::Root);
+        perform_math_operation(to_le_bytes(5i32).into_slice(), to_le_bytes(0i32).into_slice(), &DbType::I32, &MathOperation::Root);
     }
 
     #[test]
@@ -254,7 +254,7 @@ mod tests {
     fn test_edge_cases() {
         // Test with minimum and maximum values
         let _result = perform_math_operation(
-            &to_le_bytes(i32::MAX), &to_le_bytes(1i32), 
+            to_le_bytes(i32::MAX).into_slice(), to_le_bytes(1i32).into_slice(),
             &DbType::I32, &MathOperation::Add
         );
     }
@@ -262,14 +262,14 @@ mod tests {
     #[test]
     #[should_panic(expected = "Input slices must have the same length")]
     fn test_unequal_length_inputs() {
-        let input1 = to_le_bytes(5i32);
-        let input2 = to_le_bytes(3i16);
-        perform_math_operation(&input1, &input2, &DbType::I32, &MathOperation::Add);
+        let input1 = to_le_bytes(5i32).into_slice();
+        let input2 = to_le_bytes(3i16).into_slice();
+        perform_math_operation(input1, input2, &DbType::I32, &MathOperation::Add);
     }
 
     #[test]
     #[should_panic(expected = "Unsupported data type for math operation")]
     fn test_unsupported_type() {
-        perform_math_operation(&to_le_bytes(5i32), &to_le_bytes(3i32), &DbType::STRING, &MathOperation::Add);
+        perform_math_operation(to_le_bytes(5i32).into_slice(), to_le_bytes(3i32).into_slice(), &DbType::STRING, &MathOperation::Add);
     }
 }
