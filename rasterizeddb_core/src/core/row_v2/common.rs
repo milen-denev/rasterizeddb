@@ -15,10 +15,12 @@ macro_rules! impl_from_le_bytes {
         $(
             impl FromLeBytes for $type {
                 #[inline(always)]
+                #[track_caller]
                 fn from_le_bytes(bytes: &[u8]) -> Self {
                     <$type>::from_le_bytes(bytes.try_into().expect("Invalid byte slice"))
                 }
 
+                #[track_caller]
                 #[inline(always)]
                 fn to_le_bytes(&self) -> MemoryBlock {
                     let len = std::mem::size_of::<$type>();
@@ -144,8 +146,95 @@ pub fn simd_compare_strings(input1: &[u8], input2: &[u8], operation: &ComparerOp
         ComparerOperation::Contains => unsafe { simd_contains(input1, input2) },
         ComparerOperation::StartsWith => unsafe { simd_starts_with(input1, input2) },
         ComparerOperation::EndsWith => unsafe { simd_ends_with(input1, input2) },
+        ComparerOperation::GreaterOrEquals => unsafe { simd_creater_or_equal(input1, input2) },
         _ => panic!("Unsupported operation for string types: {:?}", operation),
     }
+}
+
+#[inline(always)]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn simd_creater_or_equal(input1: &[u8], input2: &[u8]) -> bool {
+    let len1 = input1.len();
+    let len2 = input2.len();
+    let min_len = len1.min(len2);
+
+    let ptr1 = input1.as_ptr();
+    let ptr2 = input2.as_ptr();
+
+    let mut i = 0;
+
+    // AVX2 path (process 32 bytes at a time)
+    // Assumes AVX2 support is enabled at compile time for these intrinsics to be valid.
+    if min_len.saturating_sub(i) >= 32 {
+        let v_sign_bit_256 = _mm256_set1_epi8(0x80u8 as i8);
+        while i + 32 <= min_len {
+            let v1_256 = _mm256_loadu_si256(ptr1.add(i) as *const __m256i);
+            let v2_256 = _mm256_loadu_si256(ptr2.add(i) as *const __m256i);
+
+            // Check for equality first
+            let eq_cmp_256 = _mm256_cmpeq_epi8(v1_256, v2_256);
+            let eq_mask_256 = _mm256_movemask_epi8(eq_cmp_256) as u32;
+
+            if eq_mask_256 != 0xFFFFFFFFu32 { // If not all bytes in the vector are equal
+                // Transform to signed for correct unsigned comparison using signed greater-than
+                // (unsigned a > unsigned b) is equivalent to (signed (a^0x80) > signed (b^0x80))
+                let s1_256 = _mm256_xor_si256(v1_256, v_sign_bit_256);
+                let s2_256 = _mm256_xor_si256(v2_256, v_sign_bit_256);
+                
+                let gt_cmp_256 = _mm256_cmpgt_epi8(s1_256, s2_256); // v1 > v2 (lexicographically)
+                let gt_mask_256 = _mm256_movemask_epi8(gt_cmp_256) as u32;
+
+                // Find the first differing byte
+                // (eq_mask_256 ^ 0xFFFFFFFFu32) gives a mask of differing bytes
+                let diff_mask = eq_mask_256 ^ 0xFFFFFFFFu32;
+                let first_diff_bit_idx = diff_mask.trailing_zeros(); // Index (0-31) of the first differing byte
+
+                // Check if at this first differing position, v1 was greater than v2
+                return (gt_mask_256 >> first_diff_bit_idx) & 1 != 0;
+            }
+            i += 32;
+        }
+    }
+
+    // SSE2 path (process 16 bytes at a time for remaining)
+    // Assumes SSE2 support is enabled at compile time.
+    if min_len.saturating_sub(i) >= 16 {
+        let v_sign_bit_128 = _mm_set1_epi8(0x80u8 as i8);
+        while i + 16 <= min_len {
+            let v1_128 = _mm_loadu_si128(ptr1.add(i) as *const __m128i);
+            let v2_128 = _mm_loadu_si128(ptr2.add(i) as *const __m128i);
+
+            let eq_cmp_128 = _mm_cmpeq_epi8(v1_128, v2_128);
+            let eq_mask_128 = _mm_movemask_epi8(eq_cmp_128) as u16;
+
+            if eq_mask_128 != 0xFFFFu16 { // If not all bytes in the vector are equal
+                let s1_128 = _mm_xor_si128(v1_128, v_sign_bit_128);
+                let s2_128 = _mm_xor_si128(v2_128, v_sign_bit_128);
+
+                let gt_cmp_128 = _mm_cmpgt_epi8(s1_128, s2_128); // v1 > v2 (lexicographically)
+                let gt_mask_128 = _mm_movemask_epi8(gt_cmp_128) as u16;
+                
+                let diff_mask = eq_mask_128 ^ 0xFFFFu16;
+                let first_diff_bit_idx = diff_mask.trailing_zeros(); // Index (0-15) of the first differing byte
+
+                return (gt_mask_128 >> first_diff_bit_idx) & 1 != 0;
+            }
+            i += 16;
+        }
+    }
+    
+    // Scalar path for remaining bytes (if any, or if SIMD paths didn't cover all of min_len)
+    while i < min_len {
+        let b1 = *ptr1.add(i);
+        let b2 = *ptr2.add(i);
+        if b1 > b2 { return true; }
+        if b1 < b2 { return false; }
+        i += 1;
+    }
+
+    // If all common bytes are equal, the comparison depends on the lengths.
+    // e.g., "abc" >= "ab" is true. "ab" >= "abc" is false.
+    return len1 >= len2;
 }
 
 /// SIMD-based implementation of string equality (`==`) for `&[u8]`.
@@ -822,5 +911,90 @@ mod tests {
         let s64: String = (0..64).map(|_| 'x').collect();
         assert!(simd_compare_strings(s64.as_bytes(), s64.as_bytes(), &ComparerOperation::EndsWith));
         assert!(simd_compare_strings(("y".to_string() + &s64).as_bytes(), s64.as_bytes(), &ComparerOperation::EndsWith));
+    }
+
+    #[test]
+    fn test_simd_compare_strings_greater_or_equals() {
+        // Basic cases
+        assert!(simd_compare_strings("hello".as_bytes(), "hello".as_bytes(), &ComparerOperation::GreaterOrEquals));
+        assert!(simd_compare_strings("world".as_bytes(), "hello".as_bytes(), &ComparerOperation::GreaterOrEquals));
+        assert!(!simd_compare_strings("hello".as_bytes(), "world".as_bytes(), &ComparerOperation::GreaterOrEquals));
+
+        // Length differences
+        assert!(simd_compare_strings("abc".as_bytes(), "ab".as_bytes(), &ComparerOperation::GreaterOrEquals));
+        assert!(!simd_compare_strings("ab".as_bytes(), "abc".as_bytes(), &ComparerOperation::GreaterOrEquals));
+        assert!(simd_compare_strings("abc".as_bytes(), "abc".as_bytes(), &ComparerOperation::GreaterOrEquals));
+
+        // Empty strings
+        assert!(simd_compare_strings("".as_bytes(), "".as_bytes(), &ComparerOperation::GreaterOrEquals));
+        assert!(simd_compare_strings("a".as_bytes(), "".as_bytes(), &ComparerOperation::GreaterOrEquals));
+        assert!(!simd_compare_strings("".as_bytes(), "a".as_bytes(), &ComparerOperation::GreaterOrEquals));
+
+        // Different casing (lexicographical comparison)
+        assert!(simd_compare_strings("zebra".as_bytes(), "apple".as_bytes(), &ComparerOperation::GreaterOrEquals));
+        assert!(simd_compare_strings("apple".as_bytes(), "Apple".as_bytes(), &ComparerOperation::GreaterOrEquals)); // 'a' > 'A'
+        assert!(!simd_compare_strings("Apple".as_bytes(), "apple".as_bytes(), &ComparerOperation::GreaterOrEquals));
+
+        // Test AVX2 path (strings > 32 bytes)
+        let s33_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".as_bytes(); // 33 'a's
+        let s33_b = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab".as_bytes(); // 32 'a's and 1 'b'
+        let s33_c = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".as_bytes(); // 33 'a's
+        assert!(!simd_compare_strings(s33_a, s33_b, &ComparerOperation::GreaterOrEquals));
+        assert!(simd_compare_strings(s33_b, s33_a, &ComparerOperation::GreaterOrEquals));
+        assert!(simd_compare_strings(s33_a, s33_c, &ComparerOperation::GreaterOrEquals));
+
+        let s65_a: String = (0..65).map(|_| 'a').collect();
+        let mut s65_b_vec: Vec<u8> = (0..65).map(|_| b'a').collect();
+        s65_b_vec[64] = b'b'; // last char different
+        let s65_b = s65_b_vec.as_slice();
+        assert!(!simd_compare_strings(s65_a.as_bytes(), s65_b, &ComparerOperation::GreaterOrEquals));
+        assert!(simd_compare_strings(s65_b, s65_a.as_bytes(), &ComparerOperation::GreaterOrEquals));
+        assert!(simd_compare_strings(s65_a.as_bytes(), s65_a.as_bytes(), &ComparerOperation::GreaterOrEquals));
+
+        let mut s65_c_vec: Vec<u8> = (0..65).map(|_| b'a').collect();
+        s65_c_vec[30] = b'b'; // char in first AVX block different
+        let s65_c = s65_c_vec.as_slice();
+        assert!(!simd_compare_strings(s65_a.as_bytes(), s65_c, &ComparerOperation::GreaterOrEquals));
+        assert!(simd_compare_strings(s65_c, s65_a.as_bytes(), &ComparerOperation::GreaterOrEquals));
+
+
+        // Test SSE2 path (strings > 16 and <=32 bytes, or remainder after AVX2)
+        let s17_a = "aaaaaaaaaaaaaaaaa".as_bytes(); // 17 'a's
+        let s17_b = "aaaaaaaaaaaaaaaab".as_bytes(); // 16 'a's and 1 'b'
+        let s17_c = "aaaaaaaaaaaaaaaaa".as_bytes(); // 17 'a's
+        assert!(!simd_compare_strings(s17_a, s17_b, &ComparerOperation::GreaterOrEquals));
+        assert!(simd_compare_strings(s17_b, s17_a, &ComparerOperation::GreaterOrEquals));
+        assert!(simd_compare_strings(s17_a, s17_c, &ComparerOperation::GreaterOrEquals));
+
+        let s32_a: String = (0..32).map(|_| 'x').collect();
+        let mut s32_b_vec: Vec<u8> = (0..32).map(|_| b'x').collect();
+        s32_b_vec[31] = b'y';
+        let s32_b = s32_b_vec.as_slice();
+        assert!(!simd_compare_strings(s32_a.as_bytes(), s32_b, &ComparerOperation::GreaterOrEquals));
+        assert!(simd_compare_strings(s32_b, s32_a.as_bytes(), &ComparerOperation::GreaterOrEquals));
+        assert!(simd_compare_strings(s32_a.as_bytes(), s32_a.as_bytes(), &ComparerOperation::GreaterOrEquals));
+
+        let mut s32_c_vec: Vec<u8> = (0..32).map(|_| b'x').collect();
+        s32_c_vec[10] = b'y'; // char in first SSE block different
+        let s32_c = s32_c_vec.as_slice();
+        assert!(!simd_compare_strings(s32_a.as_bytes(), s32_c, &ComparerOperation::GreaterOrEquals));
+        assert!(simd_compare_strings(s32_c, s32_a.as_bytes(), &ComparerOperation::GreaterOrEquals));
+
+        // Test scalar path (strings <= 16 bytes, or remainder after SIMD)
+        assert!(simd_compare_strings("apple".as_bytes(), "apply".as_bytes(), &ComparerOperation::GreaterOrEquals) == ("apple" >= "apply"));
+        assert!(simd_compare_strings("apply".as_bytes(), "apple".as_bytes(), &ComparerOperation::GreaterOrEquals) == ("apply" >= "apple"));
+        assert!(simd_compare_strings("test".as_bytes(), "testing".as_bytes(), &ComparerOperation::GreaterOrEquals) == ("test" >= "testing"));
+        assert!(simd_compare_strings("testing".as_bytes(), "test".as_bytes(), &ComparerOperation::GreaterOrEquals) == ("testing" >= "test"));
+
+        // Test strings that are prefixes of each other
+        let prefix_long = "abcdefghijklmnopq"; // 17 chars
+        let prefix_short = "abcdefghijklmnop";  // 16 chars
+        assert!(simd_compare_strings(prefix_long.as_bytes(), prefix_short.as_bytes(), &ComparerOperation::GreaterOrEquals));
+        assert!(!simd_compare_strings(prefix_short.as_bytes(), prefix_long.as_bytes(), &ComparerOperation::GreaterOrEquals));
+
+        let prefix_long_avx = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_"; // 33 chars
+        let prefix_short_avx = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";  // 32 chars
+        assert!(simd_compare_strings(prefix_long_avx.as_bytes(), prefix_short_avx.as_bytes(), &ComparerOperation::GreaterOrEquals));
+        assert!(!simd_compare_strings(prefix_short_avx.as_bytes(), prefix_long_avx.as_bytes(), &ComparerOperation::GreaterOrEquals));
     }
 }
