@@ -12,3 +12,4 @@ pub mod table_header;
 pub mod row_v2;
 pub mod columns_v2;
 pub mod mock_helpers;
+pub mod mock_table;
