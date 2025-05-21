@@ -1,5 +1,7 @@
 use std::io;
 
+use itertools::Itertools;
+
 use crate::{core::{db_type::DbType, storage_providers::traits::StorageIO}, memory_pool::{MemoryBlock, MEMORY_POOL}};
 
 const SCHEMA_FIELD_SIZE: u64 = 
@@ -139,6 +141,23 @@ impl SchemaField {
         let data = self.into_vec();
         io.append_data(&data, true).await;
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SchemaCalculator;
+
+impl SchemaCalculator {
+    pub fn calculate_schema_offset(&self, field_name: &str, fields: &[SchemaField]) -> u32 {
+        let mut offset = 0;
+        for field in fields.iter().sorted_by(|x, y| Ord::cmp(&x.write_order, &y.write_order)) {
+            if field.name == field_name {
+                return offset;
+            }
+            //println!("Field: {} - Offset: {}", field.name, offset);
+            offset += field.size as u32;
+        }
+        offset
     }
 }
 
