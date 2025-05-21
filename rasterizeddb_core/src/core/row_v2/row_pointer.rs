@@ -397,7 +397,7 @@ impl RowPointer {
         #[cfg(feature = "enable_data_verification")]
         let position = io.get_len().await;
 
-        io.append_data(slice, false).await;
+        io.append_data(slice, true).await;
 
         #[cfg(feature = "enable_data_verification")]
         let verify_result = io.verify_data_and_sync(position, slice).await;
@@ -711,6 +711,8 @@ impl RowPointer {
         let columns = &mut row_reuse.columns;
         columns.clear();
 
+        let mut schema_id = 0;
+
         // For each column specified in the fetch data
         for column_data in &row_fetch.columns_fetching_data {
             let mut position = self.position + column_data.column_offset as u64;
@@ -737,10 +739,12 @@ impl RowPointer {
 
                 // Create a column with the string data
                 let column = Column {
-                    schema_id: 0,
+                    schema_id: schema_id,
                     data: string_block,
                     column_type: DbType::STRING,
                 };
+
+                schema_id += 1;
 
                 columns.push(column);
             } else {
@@ -755,11 +759,13 @@ impl RowPointer {
 
                 // Create a Column object with the read data
                 let column = Column {
-                    schema_id: 0, // Schema ID would be set based on metadata or query context
+                    schema_id: schema_id, // Schema ID would be set based on metadata or query context
                     data: block,
                     column_type: column_data.column_type.clone(), // Clone the DbType
                 };
-                
+
+                schema_id += 1;
+
                 columns.push(column);
             }
         }
@@ -875,7 +881,7 @@ impl RowPointer {
         slice[row_position as usize..].copy_from_slice(&string_slice);
 
         // Write the row data to the rows_io
-        rows_io.append_data(slice, false).await;
+        rows_io.append_data(slice, true).await;
 
         // Write the pointer last
         // Write the row data to the pointers_io
@@ -899,6 +905,103 @@ impl RowPointer {
 mod tests {
     use crate::core::{row_v2::row::{ColumnFetchingData, ColumnWritePayload}, storage_providers::mock_file_sync::MockStorageProvider};
     use super::*;
+
+    fn create_string_column(data: &str, write_order: u32) -> ColumnWritePayload {
+        let string_bytes = data.as_bytes();
+
+        let string_data = MEMORY_POOL.acquire(string_bytes.len());
+        let string_slice = string_data.into_slice_mut();
+
+        string_slice[0..].copy_from_slice(string_bytes);
+
+        ColumnWritePayload {
+            data: string_data,
+            write_order,
+            column_type: DbType::STRING,
+            size: 4 + 8
+        }
+    }
+
+    fn create_u8_column(data: u8, write_order: u32) -> ColumnWritePayload {
+        let u8_data = MEMORY_POOL.acquire(1);
+        let u8_slice = u8_data.into_slice_mut();
+        u8_slice.copy_from_slice(&data.to_le_bytes());
+
+        ColumnWritePayload {
+            data: u8_data,
+            write_order,
+            column_type: DbType::U8,
+            size: 1
+        }
+    }
+
+    fn create_u64_column(data: u64, write_order: u32) -> ColumnWritePayload {
+        let u64_data = MEMORY_POOL.acquire(8);
+        let u64_slice = u64_data.into_slice_mut();
+        u64_slice.copy_from_slice(&data.to_le_bytes());
+
+        ColumnWritePayload {
+            data: u64_data,
+            write_order,
+            column_type: DbType::U64,
+            size: 8
+        }
+    }
+
+    fn create_f32_column(data: f32, write_order: u32) -> ColumnWritePayload {
+        let f32_data = MEMORY_POOL.acquire(4);
+        let f32_slice = f32_data.into_slice_mut();
+        f32_slice.copy_from_slice(&data.to_le_bytes());
+
+        ColumnWritePayload {
+            data: f32_data,
+            write_order,
+            column_type: DbType::F32,
+            size: 4
+        }
+    }
+
+    fn create_f64_column(data: f64, write_order: u32) -> ColumnWritePayload {
+        let f64_data = MEMORY_POOL.acquire(8);
+        let f64_slice = f64_data.into_slice_mut();
+        f64_slice.copy_from_slice(&data.to_le_bytes());
+
+        ColumnWritePayload {
+            data: f64_data,
+            write_order,
+            column_type: DbType::F64,
+            size: 8
+        }
+    }
+
+    fn create_row_write(id: u64) -> RowWrite {
+        RowWrite {
+            columns_writing_data: vec![
+                create_u64_column(id, 0),
+                create_string_column("John Doe", 1),
+                create_u8_column(30, 2),
+                create_string_column("john.doe@example.com", 3),
+                create_string_column("123 Main St", 4),
+                create_string_column("555-1234", 5),
+                create_u8_column(1, 6),
+                create_f64_column(1000.50, 7),
+                create_u8_column(0, 8),
+                create_string_column("1990-01-01", 9),
+                create_string_column("2023-10-01", 10),
+                create_string_column("Sunsung Phone Andomega 10", 11),
+                create_f32_column(100.0, 12),
+                create_string_column("2023-10-01", 13),
+                create_string_column("New York", 14),
+                create_string_column("Credit Card", 15),
+                create_string_column("Electronics", 16),
+                create_string_column("Smartphones", 17),
+                create_string_column("Latest model", 18),
+                create_string_column("No notes", 19),
+            ],
+        }
+    }
+
+
 
     // Helper function to create a row pointer and return its serialized form
     fn create_test_row_pointer(id: u64, position: u64, length: u32, deleted: bool) -> RowPointer {
@@ -1181,5 +1284,87 @@ mod tests {
                 _ => {}
             }
         });
+    }
+
+    #[tokio::test]
+    async fn test_save_and_read_row_pointers_async() {
+        let mut mock_io_pointers = MockStorageProvider::new().await;
+        let mut mock_io_rows = MockStorageProvider::new().await;
+
+        #[cfg(feature = "enable_long_row")]
+        let cluster = 0;
+
+        let last_id = AtomicU64::new(0);
+        let table_length = AtomicU64::new(0);
+
+        let _result = RowPointer::write_row(
+            &mut mock_io_pointers, 
+            &mut mock_io_rows, 
+            &last_id, 
+            &table_length, 
+            #[cfg(feature = "enable_long_row")]
+            cluster, 
+            &create_row_write(0)
+        ).await;
+
+        let result = RowPointer::write_row(
+            &mut mock_io_pointers, 
+            &mut mock_io_rows, 
+            &last_id, 
+            &table_length, 
+            #[cfg(feature = "enable_long_row")]
+            cluster, 
+            &create_row_write(1)
+        ).await;
+        assert!(result.is_ok());
+
+        let mut iterator = RowPointerIterator::new(&mut mock_io_pointers).await.unwrap();
+
+        let next_pointer = iterator.next_row_pointer().await.unwrap().unwrap();
+
+        let row_fetch = RowFetch {
+            columns_fetching_data: vec![
+                ColumnFetchingData {
+                    column_offset: 0,
+                    column_type: DbType::U64,
+                    size: 8
+                },
+                ColumnFetchingData {
+                    column_offset: 8,
+                    column_type: DbType::STRING,
+                    size: 4 + 8
+                },
+                ColumnFetchingData {
+                    column_offset: 8 + 4 + 8,
+                    column_type: DbType::U8,
+                    size: 1
+                }
+            ],
+        };
+
+        let row = next_pointer.fetch_row(
+            &mock_io_rows, 
+            &row_fetch
+        ).await.unwrap();
+
+        row.columns.iter().for_each(|column| {
+            match column.column_type {
+                DbType::U8 => {
+                    let u8_slice = column.data.into_slice();
+                    assert_eq!(u8_slice, &[30]);
+                },
+                DbType::STRING => {
+                    let string_slice = column.data.into_slice();
+                    assert_eq!(&string_slice[0..], b"John Doe");
+                },
+                DbType::U64 => {
+                    let u64_bytes = 0_u64.to_le_bytes();
+                    let u64_slice = column.data.into_slice();
+                    assert_eq!(u64_slice, u64_bytes);
+                },
+                _ => {}
+            }
+        });
+
     }
 }
