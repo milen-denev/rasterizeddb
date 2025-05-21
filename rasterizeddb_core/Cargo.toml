@@ -49,6 +49,14 @@ harness = false
 name = "string_instructions_benchmarks"
 harness = false
 
+[[bench]]
+name = "query_benchmarks"
+harness = false
+
+[[bench]]
+name = "query_executor_benchmarks"
+harness = false
+
 [profile.release]
 opt-level = 3
 debug = false
