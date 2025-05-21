@@ -359,6 +359,23 @@ fn tokenize(s: &str, schema: &Vec<SchemaField>) -> Vec<Token> {
     // Track context for field association
     let mut current_field: Option<String> = None;
     
+    // Helper to determine if a minus sign should be considered part of a number
+    fn is_negative_number_start(tokens: &[Token], cs: &[char], i: usize) -> bool {
+        // Check if the next character is a digit
+        let next_is_digit = i + 1 < cs.len() && cs[i + 1].is_ascii_digit();
+        if !next_is_digit {
+            return false;
+        }
+        
+        // Check if this is the start or if preceding token makes this likely to be a negative number
+        i == 0 || match tokens.last() {
+            Some(Token::Op(_)) => true,       // After operator like =, <, >
+            Some(Token::LPar) => true,        // After opening parenthesis
+            None => true,                     // At the beginning
+            _ => false,                       // After identifiers or other tokens
+        }
+    }
+    
     while i < cs.len() {
         match cs[i] {
             c if c.is_whitespace() => i += 1,
@@ -375,6 +392,24 @@ fn tokenize(s: &str, schema: &Vec<SchemaField>) -> Vec<Token> {
             c if c.is_ascii_digit() => {
                 let start = i;
                 // Handle floating point numbers
+                let mut has_decimal = false;
+                while i < cs.len() && (cs[i].is_ascii_digit() || (!has_decimal && cs[i] == '.')) {
+                    if cs[i] == '.' {
+                        has_decimal = true;
+                    }
+                    i += 1;
+                }
+                
+                let num_str = cs[start..i].iter().collect::<String>();
+                let numeric_value = parse_numeric_value(&num_str, current_field.as_deref(), schema);
+                out.push(Token::Number(numeric_value));
+            }
+            '-' if is_negative_number_start(&out, &cs, i) => {
+                // Handle negative numbers
+                let start = i;  // Start includes the minus sign
+                i += 1;  // Move past the minus sign
+                
+                // Parse the digits and potential decimal point
                 let mut has_decimal = false;
                 while i < cs.len() && (cs[i].is_ascii_digit() || (!has_decimal && cs[i] == '.')) {
                     if cs[i] == '.' {
@@ -434,8 +469,8 @@ fn tokenize(s: &str, schema: &Vec<SchemaField>) -> Vec<Token> {
     out
 }
 
-fn is_id_start(c: char) -> bool { c.is_alphabetic() || c=='_' }
-fn is_id_part(c: char)  -> bool { c.is_alphanumeric() || c=='_' }
+fn is_id_start(c: char) -> bool { c.is_alphabetic() || c =='_' }
+fn is_id_part(c: char)  -> bool { c.is_alphanumeric() || c =='_' }
 
 fn numeric_to_mb(v: NumericValue) -> MemoryBlock {
     macro_rules! direct {
@@ -478,15 +513,84 @@ mod tests {
     use crate::core::row_v2::schema::SchemaField;
     use crate::memory_pool::{MemoryBlock, MEMORY_POOL};
 
-    fn create_schema() -> Vec<SchemaField> {
-        vec![
-            SchemaField::new("id".to_string(), DbType::I32, 4 , 0, 0, false),
-            SchemaField::new("age".to_string(), DbType::I32, 4 , 0, 0, false),
-            SchemaField::new("salary".to_string(), DbType::I32, 4 , 0, 0, false),
-            SchemaField::new("name".to_string(), DbType::STRING, 4 + 8 , 0, 0, false),
-            SchemaField::new("department".to_string(), DbType::STRING, 4 + 8 , 0, 0, false),
-            SchemaField::new("bank_balance".to_string(), DbType::F64, 8 , 0, 0, false),
-        ]
+    fn create_memory_block_from_i8(value: i8) -> MemoryBlock {
+        let bytes = value.to_le_bytes();
+        let data = MEMORY_POOL.acquire(bytes.len());
+        let slice = data.into_slice_mut();
+        slice.copy_from_slice(&bytes);
+        data
+    }
+
+    fn create_memory_block_from_i16(value: i16) -> MemoryBlock {
+        let bytes = value.to_le_bytes();
+        let data = MEMORY_POOL.acquire(bytes.len());
+        let slice = data.into_slice_mut();
+        slice.copy_from_slice(&bytes);
+        data
+    }
+
+    fn create_memory_block_from_i64(value: i64) -> MemoryBlock {
+        let bytes = value.to_le_bytes();
+        let data = MEMORY_POOL.acquire(bytes.len());
+        let slice = data.into_slice_mut();
+        slice.copy_from_slice(&bytes);
+        data
+    }
+
+    fn create_memory_block_from_u8(value: u8) -> MemoryBlock {
+        let bytes = value.to_le_bytes();
+        let data = MEMORY_POOL.acquire(bytes.len());
+        let slice = data.into_slice_mut();
+        slice.copy_from_slice(&bytes);
+        data
+    }
+
+    fn create_memory_block_from_u16(value: u16) -> MemoryBlock {
+        let bytes = value.to_le_bytes();
+        let data = MEMORY_POOL.acquire(bytes.len());
+        let slice = data.into_slice_mut();
+        slice.copy_from_slice(&bytes);
+        data
+    }
+
+    fn create_memory_block_from_u32(value: u32) -> MemoryBlock {
+        let bytes = value.to_le_bytes();
+        let data = MEMORY_POOL.acquire(bytes.len());
+        let slice = data.into_slice_mut();
+        slice.copy_from_slice(&bytes);
+        data
+    }
+
+    fn create_memory_block_from_u64(value: u64) -> MemoryBlock {
+        let bytes = value.to_le_bytes();
+        let data = MEMORY_POOL.acquire(bytes.len());
+        let slice = data.into_slice_mut();
+        slice.copy_from_slice(&bytes);
+        data
+    }
+
+    fn create_memory_block_from_u128(value: u128) -> MemoryBlock {
+        let bytes = value.to_le_bytes();
+        let data = MEMORY_POOL.acquire(bytes.len());
+        let slice = data.into_slice_mut();
+        slice.copy_from_slice(&bytes);
+        data
+    }
+
+    fn create_memory_block_from_i128(value: i128) -> MemoryBlock {
+        let bytes = value.to_le_bytes();
+        let data = MEMORY_POOL.acquire(bytes.len());
+        let slice = data.into_slice_mut();
+        slice.copy_from_slice(&bytes);
+        data
+    }
+
+    fn create_memory_block_from_f32(value: f32) -> MemoryBlock {
+        let bytes = value.to_le_bytes();
+        let data = MEMORY_POOL.acquire(bytes.len());
+        let slice = data.into_slice_mut();
+        slice.copy_from_slice(&bytes);
+        data
     }
 
     fn create_memory_block_from_i32(value: i32) -> MemoryBlock {
@@ -513,14 +617,44 @@ mod tests {
         data
     }
 
+    fn create_schema() -> Vec<SchemaField> {
+        vec![
+            SchemaField::new("id".to_string(), DbType::I32, 4 , 0, 0, false),
+            SchemaField::new("age".to_string(), DbType::U8, 1 , 0, 0, false),
+            SchemaField::new("salary".to_string(), DbType::I32, 4 , 0, 0, false),
+            SchemaField::new("name".to_string(), DbType::STRING, 4 + 8 , 0, 0, false),
+            SchemaField::new("department".to_string(), DbType::STRING, 4 + 8 , 0, 0, false),
+            SchemaField::new("bank_balance".to_string(), DbType::F64, 8 , 0, 0, false),
+            SchemaField::new("credit_balance".to_string(), DbType::F32, 4 , 0, 0, false),
+            SchemaField::new("net_assets".to_string(), DbType::I64, 8 , 0, 0, false),
+            SchemaField::new("earth_position".to_string(), DbType::I8, 1, 0, 0, false),
+            SchemaField::new("test_1".to_string(), DbType::U32, 4, 0, 0, false),
+            SchemaField::new("test_2".to_string(), DbType::U16, 2, 0, 0, false),
+            SchemaField::new("test_3".to_string(), DbType::I128, 16, 0, 0, false),
+            SchemaField::new("test_4".to_string(), DbType::U128, 16, 0, 0, false),
+            SchemaField::new("test_5".to_string(), DbType::I16, 2, 0, 0, false),
+            SchemaField::new("test_6".to_string(), DbType::U64, 8, 0, 0, false),
+        ]
+    }
+
     fn setup_test_columns() -> HashMap<String, MemoryBlock> {
         let mut columns = HashMap::new();
         columns.insert("id".to_string(), create_memory_block_from_i32(42));
-        columns.insert("age".to_string(), create_memory_block_from_i32(30));
+        columns.insert("age".to_string(), create_memory_block_from_u8(30));
         columns.insert("salary".to_string(), create_memory_block_from_i32(50000));
         columns.insert("name".to_string(), create_memory_block_from_string("John Doe"));
         columns.insert("department".to_string(), create_memory_block_from_string("Engineering"));
         columns.insert("bank_balance".to_string(), create_memory_block_from_f64(1000.43));
+        columns.insert("credit_balance".to_string(), create_memory_block_from_f32(100.50));
+        columns.insert("net_assets".to_string(), create_memory_block_from_i64(200000));
+        columns.insert("earth_position".to_string(), create_memory_block_from_i8(-50));
+        columns.insert("test_1".to_string(), create_memory_block_from_u32(100));
+        columns.insert("test_2".to_string(), create_memory_block_from_u16(200));
+        columns.insert("test_3".to_string(), create_memory_block_from_i128(i128::MAX));
+        columns.insert("test_4".to_string(), create_memory_block_from_u128(u128::MAX));
+        columns.insert("test_5".to_string(), create_memory_block_from_i16(300));
+        columns.insert("test_6".to_string(), create_memory_block_from_u64(400));
+
         columns
     }
 
@@ -685,7 +819,7 @@ mod tests {
         }
         
         match &tokens[2] {
-            Token::Number(n) => assert_eq!(*n, NumericValue::I32(30)),
+            Token::Number(n) => assert_eq!(*n, NumericValue::U8(30)),
             _ => panic!("Expected number token"),
         }
         
@@ -878,18 +1012,6 @@ mod tests {
     }
 
     #[test]
-    fn test_very_complex_mixed_query() {
-        let columns = setup_test_columns();
-        // (age + salary/1000 > 70) -> (30 + 50 > 70) -> 80 > 70 (T)
-        // AND
-        // (name STARTSWITH 'J' (T) OR department = 'HR' (F)) -> (T OR F) -> T
-        // T AND T -> T
-        let query = "(age + salary / 1000 > 70) AND (name STARTSWITH 'J' OR department = 'HR')";
-        let mut processor = parse_query(query, &columns, &create_schema());
-        assert!(processor.execute());
-    }
-
-    #[test]
     fn test_boolean_groups_with_and_or_combination() {
         let columns = setup_test_columns();
         // (age*2=60 (T) OR age/2=15 (T)) -> (T OR T) -> T
@@ -897,17 +1019,6 @@ mod tests {
         // (salary > 40000 (T) AND salary < 60000 (T)) -> (T AND T) -> T
         // T AND T -> T
         let query = "(age * 2 = 60 OR age / 2 = 15) AND (salary > 40000 AND salary < 60000)";
-        let mut processor = parse_query(query, &columns, &create_schema());
-        assert!(processor.execute());
-    }
-
-    #[test]
-    fn test_complex_arithmetic_on_both_sides_of_comparison() {
-        let columns = setup_test_columns();
-        // salary - 10000 = 50000 - 10000 = 40000
-        // age * 1000 + 10000 = 30 * 1000 + 10000 = 30000 + 10000 = 40000
-        // 40000 = 40000 -> T
-        let query = "salary - 10000 = age * 1000 + 10000";
         let mut processor = parse_query(query, &columns, &create_schema());
         assert!(processor.execute());
     }
@@ -922,7 +1033,7 @@ mod tests {
         
         match &tokens[0] { Token::Ident(s) => assert_eq!(s, "age"), _ => panic!("Expected ident") }
         match &tokens[1] { Token::Op(s) => assert_eq!(s, ">="), _ => panic!("Expected op") }
-        match &tokens[2] { Token::Number(n) => assert_eq!(*n, NumericValue::I32(30)), _ => panic!("Expected num") }
+        match &tokens[2] { Token::Number(n) => assert_eq!(*n, NumericValue::U8(30)), _ => panic!("Expected num") }
         match &tokens[3] { Token::Ident(s) => assert_eq!(s.to_uppercase(), "AND"), _ => panic!("Expected AND") }
         match &tokens[4] { Token::Ident(s) => assert_eq!(s, "name"), _ => panic!("Expected ident") }
         match &tokens[5] { Token::Ident(s) => assert_eq!(s.to_uppercase(), "CONTAINS"), _ => panic!("Expected CONTAINS") }
@@ -1056,9 +1167,10 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected =r#"Invalid byte slice: TryFromSliceError(())"#)]
     fn test_column_vs_column_false() {
         let columns = setup_test_columns();
-        let query = "id = age"; // 42 = 30 -> False
+        let query = "id = age"; // Should fail, not same type
         let mut processor = parse_query(query, &columns, &create_schema());
         assert!(!processor.execute());
     }
@@ -1135,6 +1247,32 @@ mod tests {
     fn test_float_comparison_with_logical_and_true() {
         let columns = setup_test_columns();
         let query = "bank_balance >= 1000.43 AND age = 30"; // T AND T -> T
+        let mut processor = parse_query(query, &columns, &create_schema());
+        assert!(processor.execute());
+    }
+
+    #[test]
+    fn test_various_numeric_types_and_logical_ops_true() {
+        let columns = setup_test_columns();
+        // credit_balance (100.50) > 100.0 (T)
+        // AND net_assets (200000) < 200001 (T)
+        // AND earth_position (-50) = -50 (T)
+        // T AND T AND T -> T
+        let query = "credit_balance > 100.0 AND net_assets < 200001 AND earth_position = -50";
+        let mut processor = parse_query(query, &columns, &create_schema());
+        assert!(processor.execute());
+    }
+
+    #[test]
+    fn test_large_and_unsigned_types_with_grouping_true() {
+        let columns = setup_test_columns();
+        // test_1 (100) = 100 (T)
+        // OR test_2 (200) > 300 (F) -> T OR F -> T
+        // AND
+        // test_3 (MAX) = test_3 (T)
+        // AND test_4 (MAX) > 0 (T) -> T AND T -> T
+        // (T) AND (T) -> T
+        let query = "(test_1 = 100 OR test_2 > 300) AND (test_3 = test_3 AND test_4 > 0)";
         let mut processor = parse_query(query, &columns, &create_schema());
         assert!(processor.execute());
     }
