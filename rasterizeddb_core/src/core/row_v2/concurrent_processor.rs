@@ -1,11 +1,10 @@
 use std::sync::Arc;
 
 use futures::future::join_all;
-use itertools::Either;
 use tokio::{sync::{mpsc, Semaphore}, task};
 
-use crate::core::storage_providers::traits::StorageIO;
-use super::{row::{Row, RowFetch}, row_pointer::RowPointerIterator, transformer::ColumnTransformer};
+use crate::{core::storage_providers::traits::StorageIO, memory_pool::MemoryBlock};
+use super::{query_parser::{parse_query, tokenize}, row::{column_vec_into_dashmap, update_values_of_dashmap, Column, Row, RowFetch}, row_pointer::RowPointerIterator, schema::SchemaField};
 
 pub struct ConcurrentProcessor;
 
@@ -15,10 +14,11 @@ impl ConcurrentProcessor {
     }
 
     pub async fn process<'a, S: StorageIO>(&self, 
+        where_query: &str,
         row_fetch: RowFetch,
+        table_schema: Vec<SchemaField>,
         io_rows: &'static S,
-        iterator: &mut RowPointerIterator<'a, S>,
-        column_transformer: ColumnTransformer) -> Vec<Row> {
+        iterator: &mut RowPointerIterator<'a, S>) -> Vec<Row> {
 
         let (tx, mut rx) = mpsc::unbounded_channel::<Row>();
         let arc_tuple = Arc::new((Semaphore::new(16), io_rows, row_fetch));
@@ -27,6 +27,26 @@ impl ConcurrentProcessor {
         let mut batch_handles = Vec::new();
 
         iterator.reset();
+
+        let reference_columns = {
+            let mut temp_columns = Vec::new();
+            for schema in &table_schema {
+                let column = Column {
+                    schema_id: schema.write_order,
+                    data: MemoryBlock::default(),
+                    column_type: schema.db_type.clone(),
+                };
+                temp_columns.push(column);
+            }
+            temp_columns
+        };
+
+        let reference_columns_arc = Arc::new(reference_columns);
+        let schema_arc = Arc::new(table_schema);
+        let query_arc = Arc::new(where_query.to_string());
+
+        let tokens = tokenize(&query_arc, &schema_arc);
+        let token_arc = Arc::new(tokens);
 
         // Process batches
         while let Ok(pointers) = iterator.next_row_pointers().await {
@@ -37,13 +57,17 @@ impl ConcurrentProcessor {
             let tuple_clone = arc_tuple.clone();
             let tx_clone = tx.clone();
 
-            let column_type = column_transformer.column_type.clone();
-            let column_1 = column_transformer.column_1.clone();
-            let transformer_type = column_transformer.transformer_type.clone();
-            let next = column_transformer.next.clone();
+            let schema_ref = schema_arc.clone();
+            let reference_columns_ref = reference_columns_arc.clone();
+            let token_ref = token_arc.clone();
 
             // Spawn a task for this entire batch of pointers
             let batch_handle = task::spawn(async move {
+                let dashmap = column_vec_into_dashmap(
+                    &reference_columns_ref,
+                    &schema_ref
+                );
+                
                 // Acquire a permit for this batch
                 let batch_permit = tuple_clone.0.acquire().await.unwrap();
 
@@ -55,24 +79,23 @@ impl ConcurrentProcessor {
                     let (_, io_clone, row_fetch) = &*tuple_clone_2;
                     pointer.fetch_row_reuse_async(io_clone, &row_fetch, &mut row).await;
                     
-                    let mut transformer = ColumnTransformer::new(
-                        column_type.clone(),
-                        column_1.clone(),
-                        transformer_type.clone(),
-                        next.clone()
+                    update_values_of_dashmap(
+                        &dashmap,
+                        &row.columns,
+                        &schema_ref
                     );
 
-                    transformer.setup_column_2(row.columns[0].data.clone());
-                    
-                    let result = transformer.transform_single();
-                    
-                    if let Either::Right(found) = result {
-                        if found.0 {
-                            //println!("Found row with ID: {}", pointer.id);
-                            tx_clone.send(Row::clone_from_mut_row(&row)).unwrap();
-                        }
-                    }
+                    let mut transformer = parse_query(
+                        &token_ref,
+                        &dashmap,
+                        &schema_ref
+                    );
 
+                    let result = transformer.execute();
+
+                    if result {
+                        tx_clone.send(Row::clone_from_mut_row(&row)).unwrap();
+                    }
                 }
 
                 // Release the batch semaphore permit
