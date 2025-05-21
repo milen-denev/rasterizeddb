@@ -50,13 +50,14 @@ pub fn parse_query(
 struct QueryParser<'a> {
     toks: Vec<Token>,
     pos: usize,
-    cols: &'a HashMap<String, MemoryBlock>
+    cols: &'a HashMap<String, MemoryBlock>,
+    schema: &'a Vec<SchemaField>,
 }
 
 impl<'a> QueryParser<'a> {
     fn new(s: &str, cols: &'a HashMap<String, MemoryBlock>, schema: &'a Vec<SchemaField>) -> Self {
         let toks = tokenize(s, schema);
-        Self { toks, pos: 0, cols }
+        Self { toks, pos: 0, cols, schema }
     }
 
     fn parse_where(mut self) -> TransformerProcessor {
@@ -96,7 +97,7 @@ impl<'a> QueryParser<'a> {
             }
         }
         // default to comparison (handles arithmetic grouping)
-        self.parse_comparison(proc);
+        self.parse_comparison(proc); // parse_comparison now returns ()
     }
 
     /// Heuristic to check if parentheses at pos wrap a boolean expression
@@ -122,13 +123,14 @@ impl<'a> QueryParser<'a> {
     fn parse_comparison(
         &mut self,
         proc: &mut TransformerProcessor
-    ) -> ComparisonOperand {
-        let left = self.parse_expr(proc);
-        let op = match self.next().unwrap() {
+    ) { // Changed return type to ()
+        let (left_op, left_type) = self.parse_expr(proc); // Now returns (ComparisonOperand, DbType)
+        let op_token = self.next().unwrap();
+        let op = match op_token {
             Token::Op(o) | Token::Ident(o) => o.to_uppercase(),
             _ => panic!("expected comparison op"),
         };
-        let right = self.parse_expr(proc);
+        let (right_op, right_type) = self.parse_expr(proc); // Now returns (ComparisonOperand, DbType)
         let cmp = match op.as_str() {
             "="  => ComparerOperation::Equals,
             "!=" => ComparerOperation::NotEquals,
@@ -141,99 +143,91 @@ impl<'a> QueryParser<'a> {
             "ENDSWITH"    => ComparerOperation::EndsWith,
             _ => panic!("unknown cmp {}", op),
         };
-        let next = self.peek_logic();
+        let next_logic_op = self.peek_logic();
         
-        // Try to infer column type from the operands
-        let col_type = match (&left, &right) {
-            (ComparisonOperand::Direct(mb_left), _) => {
-                // Check if left operand is a string by checking operation type
-                match cmp {
-                    ComparerOperation::Contains | 
-                    ComparerOperation::StartsWith | 
-                    ComparerOperation::EndsWith => DbType::STRING,
-                    _ => {
-                        // For other operations, we need to infer from the operand
-                        // Assume I32 is always 4 bytes
-                        if mb_left.into_slice().len() != 4 {
-                            DbType::STRING
-                        } else {
-                            DbType::I32
-                        }
-                    }
-                }
-            },
-            (_, ComparisonOperand::Direct(mb_right)) => {
-                // If left isn't a direct operand, check the right one
-                if mb_right.into_slice().len() != 4 {
-                    DbType::STRING
-                } else {
-                    DbType::I32
-                }
-            },
-            _ => DbType::I32 // Default to I32 if we can't determine
+        let determined_comparison_type = match cmp {
+            ComparerOperation::Contains | 
+            ComparerOperation::StartsWith | 
+            ComparerOperation::EndsWith => DbType::STRING,
+            _ => promote_types(left_type, right_type), // Use types from expressions
         };
         
         proc.add_comparison(
-            col_type,
-            left.clone(),
-            right.clone(),
+            determined_comparison_type,
+            left_op.clone(),
+            right_op.clone(),
             cmp,
-            next.clone()
+            next_logic_op.clone()
         );
-        left
-    }    fn parse_expr(
+    }        
+    
+    fn parse_expr(
         &mut self,
         proc: &mut TransformerProcessor
-    ) -> ComparisonOperand {
-        let mut lhs = self.parse_term(proc);
-        while let Some(op) = self.peek_op(&["+","-"]) {
-            let math = if op=="+" { MathOperation::Add } else { MathOperation::Subtract };
+    ) -> (ComparisonOperand, DbType) { // Changed return type
+        let (mut lhs_op, mut lhs_type) = self.parse_term(proc);
+        while let Some(op_str) = self.peek_op(&["+","-"]) {
+            let math = if op_str=="+" { MathOperation::Add } else { MathOperation::Subtract };
             self.next(); // consume op
-            let rhs = self.parse_term(proc);
-            let idx = proc.add_math_operation(DbType::I32, lhs.clone(), rhs.clone(), math);
-            lhs = ComparisonOperand::Intermediate(idx);
+            let (rhs_op, rhs_type) = self.parse_term(proc);
+            
+            let result_type = promote_types(lhs_type, rhs_type);
+            let idx = proc.add_math_operation(result_type.clone(), lhs_op.clone(), rhs_op.clone(), math);
+            lhs_op = ComparisonOperand::Intermediate(idx);
+            lhs_type = result_type; // Update type to the result type of the operation
         }
-        lhs
-    }    fn parse_term(
+        (lhs_op, lhs_type)
+    }    
+    
+    fn parse_term(
         &mut self,
         proc: &mut TransformerProcessor
-    ) -> ComparisonOperand {
-        let mut lhs = self.parse_factor(proc);
-        while let Some(op) = self.peek_op(&["*","/"]) {
-            let math = if op=="*" { MathOperation::Multiply } else { MathOperation::Divide };
+    ) -> (ComparisonOperand, DbType) { // Changed return type
+        let (mut lhs_op, mut lhs_type) = self.parse_factor(proc);
+        while let Some(op_str) = self.peek_op(&["*","/"]) {
+            let math = if op_str=="*" { MathOperation::Multiply } else { MathOperation::Divide };
             self.next();
-            let rhs = self.parse_factor(proc);
-            let idx = proc.add_math_operation(DbType::I32, lhs.clone(), rhs.clone(), math);
-            lhs = ComparisonOperand::Intermediate(idx);
+            let (rhs_op, rhs_type) = self.parse_factor(proc);
+
+            let result_type = promote_types(lhs_type, rhs_type);
+            let idx = proc.add_math_operation(result_type.clone(), lhs_op.clone(), rhs_op.clone(), math);
+            lhs_op = ComparisonOperand::Intermediate(idx);
+            lhs_type = result_type; // Update type to the result type of the operation
         }
-        lhs
+        (lhs_op, lhs_type)
     }
 
-    fn parse_factor(
+   fn parse_factor(
         &mut self,
         proc: &mut TransformerProcessor
-    ) -> ComparisonOperand {
+    ) -> (ComparisonOperand, DbType) { // Changed return type
         match self.next().unwrap() {
             Token::Number(n) => {
+                let db_type = numeric_value_to_db_type(&n);
                 let mb = numeric_to_mb(n);
-                ComparisonOperand::Direct(mb)
+                (ComparisonOperand::Direct(mb), db_type)
             }
             Token::StringLit(s) => {
                 let mb = str_to_mb(&s);
-                ComparisonOperand::Direct(mb)
+                (ComparisonOperand::Direct(mb), DbType::STRING)
             }
             Token::Ident(name) => {
+                // It's important that self.schema is available and populated
+                let field_schema = self.schema.iter().find(|f| f.name == name)
+                    .unwrap_or_else(|| panic!("unknown column schema for {}", name));
                 let mb = self.cols.get(&name)
-                    .unwrap_or_else(|| panic!("unknown column {}", name))
+                    .unwrap_or_else(|| panic!("unknown column data for {}", name))
                     .clone();
-                ComparisonOperand::Direct(mb)
+                (ComparisonOperand::Direct(mb), field_schema.db_type.clone())
             }
             Token::LPar => {
-                let inner = self.parse_expr(proc);
-                assert!(matches!(self.next().unwrap(), Token::RPar));
-                inner
+                let (inner_op, inner_type) = self.parse_expr(proc); // parse_expr now returns tuple
+                if !matches!(self.next().unwrap(), Token::RPar) {
+                    panic!("expected closing parenthesis after grouped expression");
+                }
+                (inner_op, inner_type)
             }
-            _ => panic!("unexpected factor"),
+            t => panic!("unexpected factor: {:?}", t),
         }
     }
 
@@ -259,6 +253,65 @@ impl<'a> QueryParser<'a> {
         t
     }
 
+}
+
+fn numeric_value_to_db_type(nv: &NumericValue) -> DbType {
+    match nv {
+        NumericValue::I8(_) => DbType::I8,
+        NumericValue::I16(_) => DbType::I16,
+        NumericValue::I32(_) => DbType::I32,
+        NumericValue::I64(_) => DbType::I64,
+        NumericValue::I128(_) => DbType::I128,
+        NumericValue::U8(_) => DbType::U8,
+        NumericValue::U16(_) => DbType::U16,
+        NumericValue::U32(_) => DbType::U32,
+        NumericValue::U64(_) => DbType::U64,
+        NumericValue::U128(_) => DbType::U128,
+        NumericValue::F32(_) => DbType::F32,
+        NumericValue::F64(_) => DbType::F64,
+    }
+}
+
+// Helper to get a rank for type promotion (higher is "larger" or more general)
+fn get_type_rank(db_type: &DbType) -> u8 {
+    match db_type {
+        DbType::F64 => 10,
+        DbType::F32 => 9,
+        DbType::I128 => 8,
+        // Note: U128 vs I128 promotion needs careful thought for actual ops if mixing signed/unsigned
+        DbType::U128 => 7, 
+        DbType::I64 => 6,
+        DbType::U64 => 5,
+        DbType::I32 => 4,
+        DbType::U32 => 3,
+        DbType::I16 => 2,
+        DbType::U16 => 1,
+        DbType::I8 | DbType::U8 => 0, 
+        // Non-numeric types, or types not typically involved in arithmetic promotion
+        DbType::STRING | DbType::DATETIME | DbType::CHAR | DbType::NULL => 0, // Or a distinct low rank / handle separately
+        _ => panic!("unknown type for promotion"),
+    }
+}
+
+// Simple type promotion logic for arithmetic and comparison operations
+fn promote_types(type1: DbType, type2: DbType) -> DbType {
+    if type1 == DbType::STRING || type2 == DbType::STRING {
+        // For arithmetic, this would be an error. For comparisons, it might be allowed if one is string.
+        // The parse_comparison handles string-specific ops separately.
+        // If this is reached for '=', '>', etc. and one is string, it implies string comparison.
+        // However, numeric promotion shouldn't yield STRING.
+        if type1 == DbType::STRING && type2 == DbType::STRING {
+            return DbType::STRING;
+        }
+        // This case (e.g. number vs string in arithmetic) should ideally be an error earlier
+        // or handled by specific casting rules if allowed.
+        panic!("Cannot promote types: {:?} and {:?} for generic arithmetic/comparison. String involved.", type1, type2);
+    }
+
+    let rank1 = get_type_rank(&type1);
+    let rank2 = get_type_rank(&type2);
+
+    if rank1 >= rank2 { type1 } else { type2 }
 }
 
 fn tokenize(s: &str, schema: &Vec<SchemaField>) -> Vec<Token> {
@@ -610,9 +663,15 @@ mod tests {
     fn test_tokenize() {
         use crate::core::row_v2::query_parser::Token;
         
-        let tokens = tokenize_for_test("age >= 30 AND name CONTAINS 'John'", &create_schema());
+        let tokens = tokenize_for_test("
+            age >= 30 
+            AND 
+            name CONTAINS 'John'
+            AND
+            bank_balance > 1000.00
+            ", &create_schema());
         
-        assert_eq!(tokens.len(), 7);
+        assert_eq!(tokens.len(), 11);
         
         // Validate token types and values
         match &tokens[0] {
@@ -648,6 +707,26 @@ mod tests {
         match &tokens[6] {
             Token::StringLit(s) => assert_eq!(s, "John"),
             _ => panic!("Expected string literal token"),
+        }
+
+        match &tokens[7] {
+            Token::Ident(s) => assert_eq!(s.to_uppercase(), "AND"),
+            _ => panic!("Expected AND token"),
+        }
+
+        match &tokens[8] {
+            Token::Ident(s) => assert_eq!(s, "bank_balance"),
+            _ => panic!("Expected identifier token"),
+        }
+
+        match &tokens[9] {
+            Token::Op(s) => assert_eq!(s, ">"),
+            _ => panic!("Expected operator token"),
+        }
+
+        match &tokens[10] {
+            Token::Number(s) => assert_eq!(s, &NumericValue::F64(1000.00)),
+            _ => panic!("Expected number token"),
         }
     }
 
@@ -1002,7 +1081,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected ="unknown column AgE")]
+    #[should_panic(expected ="unknown column schema for AgE")]
     fn test_case_insensitive_keywords_with_false_outcome() {
         let columns = setup_test_columns();
         // AgE > 35 (F) aNd SaLaRy = 50000 (T) -> F
@@ -1018,5 +1097,45 @@ mod tests {
         let query = "id   =  100   AND  name   CONTAINS   'John'";
         let mut processor = parse_query(query, &columns, &create_schema());
         assert!(!processor.execute());
+    }
+
+    #[test]
+    fn test_float_equality_true() {
+        let columns = setup_test_columns();
+        let query = "bank_balance = 1000.43";
+        let mut processor = parse_query(query, &columns, &create_schema());
+        assert!(processor.execute());
+    }
+
+    #[test]
+    fn test_float_equality_false() {
+        let columns = setup_test_columns();
+        let query = "bank_balance = 1000.44";
+        let mut processor = parse_query(query, &columns, &create_schema());
+        assert!(!processor.execute());
+    }
+
+    #[test]
+    fn test_float_greater_than_true() {
+        let columns = setup_test_columns();
+        let query = "bank_balance > 1000.0";
+        let mut processor = parse_query(query, &columns, &create_schema());
+        assert!(processor.execute());
+    }
+
+    #[test]
+    fn test_float_less_than_with_arithmetic_false() {
+        let columns = setup_test_columns();
+        let query = "bank_balance - 0.43 < 1000.0"; // 1000.43 - 0.43 = 1000.0; 1000.0 < 1000.0 is false
+        let mut processor = parse_query(query, &columns, &create_schema());
+        assert!(!processor.execute());
+    }
+
+    #[test]
+    fn test_float_comparison_with_logical_and_true() {
+        let columns = setup_test_columns();
+        let query = "bank_balance >= 1000.43 AND age = 30"; // T AND T -> T
+        let mut processor = parse_query(query, &columns, &create_schema());
+        assert!(processor.execute());
     }
 }
