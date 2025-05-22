@@ -2,7 +2,7 @@ use std::sync::atomic::AtomicU64;
 
 use stopwatch::Stopwatch;
 
-use crate::{core::{row, row_v2::{concurrent_processor::ConcurrentProcessor, schema::TableSchemaIterator}}, memory_pool::MEMORY_POOL};
+use crate::{core::{row_v2::{concurrent_processor::ConcurrentProcessor, schema::TableSchemaIterator}}, memory_pool::MEMORY_POOL};
 
 use super::{db_type::DbType, row_v2::{row::{ColumnFetchingData, ColumnWritePayload, RowFetch, RowWrite}, row_pointer::{RowPointer, RowPointerIterator}, schema::{SchemaCalculator, SchemaField, TableSchema}}, storage_providers::{file_sync::LocalStorageProvider, traits::StorageIO}};
 
@@ -82,7 +82,7 @@ pub async fn consolidated_read_data_function(schema: TableSchema, id: u64) {
             &format!(
             r##"
                 id = {}
-                age < 40 AND 
+                 age < 40 AND 
                 bank_balance > 500.25 AND 
                 name != 'Jane Doe' AND 
                 last_purchase_category CONTAINS 'Elec' AND 
@@ -112,7 +112,6 @@ pub async fn consolidated_read_data_function(schema: TableSchema, id: u64) {
 
         println!("Total rows collected: {}", all_rows.len());
         println!("Row fetch took: {:?}", stopwatch.elapsed());
-
     }
 
     // for row in all_rows {
