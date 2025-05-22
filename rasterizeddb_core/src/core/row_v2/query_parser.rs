@@ -1,36 +1,11 @@
 use std::borrow::Cow;
 use smallvec::SmallVec;
 
-use crate::memory_pool::{MemoryBlock, MEMORY_POOL};
+use crate::memory_pool::MemoryBlock;
 use crate::core::db_type::DbType;
 use super::schema::SchemaField;
+use super::tokenizer::{numeric_to_mb, numeric_value_to_db_type, promote_numeric_types, promote_types, str_to_mb, tokenize, Token};
 use super::transformer::{ComparerOperation, ComparisonOperand, MathOperation, Next, TransformerProcessor};
-
-#[derive(Debug, Clone)]
-pub enum Token {
-    Ident(String),
-    Number(NumericValue),
-    StringLit(String),
-    Op(String),
-    LPar,
-    RPar,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum NumericValue {
-    I8(i8),
-    I16(i16),
-    I32(i32),
-    I64(i64),
-    I128(i128),
-    U8(u8),
-    U16(u16),
-    U32(u32),
-    U64(u64),
-    U128(u128),
-    F32(f32),
-    F64(f64),
-}
 
 pub fn parse_query<'a, 'b, 'c>(
     toks: &'a SmallVec<[Token; 36]>,
@@ -38,8 +13,9 @@ pub fn parse_query<'a, 'b, 'c>(
     schema: &'a SmallVec<[SchemaField; 20]>,
     transformers: &'b mut TransformerProcessor<'b>,
 ) {
-    let parser = QueryParser::new(toks, &columns, schema, transformers);
-    parser.parse_where()
+    println!("Parsing query: {:?}", toks);
+    let mut parser = QueryParser::new(toks, columns, schema, transformers);
+    parser.parse_where();
 }
 
 struct QueryParser<'a, 'b, 'c> {
@@ -60,7 +36,7 @@ impl<'a, 'b, 'c> QueryParser<'a, 'b, 'c> {
         Self { toks: tokens, pos: 0, cols, schema, query_transformer }
     }
 
-    fn parse_where(mut self) {
+    fn parse_where(&mut self) {
         self.parse_or();
     }
 
@@ -85,32 +61,49 @@ impl<'a, 'b, 'c> QueryParser<'a, 'b, 'c> {
     /// Parse either a grouped boolean expression or a comparison
     fn parse_comp_or_group(&mut self) {
         if let Some(Token::LPar) = self.toks.get(self.pos) {
+            // Fix: Enhanced boolean group detection
             if self.is_boolean_group(self.pos) {
                 self.pos += 1; // consume '('
                 self.parse_or();
-                if !matches!(self.next().unwrap(), Token::RPar) {
+                if !matches!(self.next().unwrap_or_else(|| panic!("Unexpected end of token stream")), 
+                           Token::RPar) {
                     panic!("expected closing parenthesis");
                 }
                 return;
             }
         }
         // default to comparison (handles arithmetic grouping)
-        self.parse_comparison(); // parse_comparison now returns ()
+        self.parse_comparison();
     }
 
-    /// Heuristic to check if parentheses at pos wrap a boolean expression
+    /// Improved heuristic to check if parentheses at pos wrap a boolean expression
     fn is_boolean_group(&self, start: usize) -> bool {
         let mut depth = 0;
         let mut i = start;
+        let mut has_boolean_op = false;
+        
         while i < self.toks.len() {
             match &self.toks[i] {
                 Token::LPar => depth += 1,
                 Token::RPar => {
                     depth -= 1;
-                    if depth == 0 { break; }
-                }
-                Token::Op(o) if ["=","!=",">",">=","<","<=","CONTAINS","STARTSWITH","ENDSWITH"].contains(&o.as_str()) => return true,
-                Token::Ident(t) if ["AND","OR"].contains(&t.to_uppercase().as_str()) => return true,
+                    if depth == 0 { 
+                        // If we reached the closing parenthesis and found a boolean op, this is a boolean group
+                        return has_boolean_op; 
+                    }
+                },
+                Token::Op(o) if ["=","!=",">",">=","<","<="].contains(&o.as_str()) => has_boolean_op = true,
+                Token::Ident(t) => {
+                    let upper = t.to_uppercase();
+                    if ["AND", "OR"].contains(&upper.as_str()) {
+                        has_boolean_op = true;
+                    } else if ["CONTAINS", "STARTSWITH", "ENDSWITH"].contains(&upper.as_str()) {
+                        // These keywords are inherently comparison operators,
+                        // thus they make the expression boolean.
+                        has_boolean_op = true;
+                    }
+                    // Other identifiers (column names, etc.) do not by themselves make a group boolean.
+                },
                 _ => {}
             }
             i += 1;
@@ -118,16 +111,19 @@ impl<'a, 'b, 'c> QueryParser<'a, 'b, 'c> {
         false
     }
 
-    fn parse_comparison(
-        &mut self,
-    ) { // Changed return type to ()
-        let (left_op, left_type) = self.parse_expr(); // Now returns (ComparisonOperand, DbType)
-        let op_token = self.next().unwrap();
+    fn parse_comparison(&mut self) {
+        let (left_op, left_type) = self.parse_expr();
+        
+        // Fix: Handle both Token::Op and Token::Ident for operators
+        let op_token = self.next().unwrap_or_else(|| panic!("Unexpected end of token stream"));
         let op = match op_token {
-            Token::Op(o) | Token::Ident(o) => o.to_uppercase(),
-            _ => panic!("expected comparison op"),
+            Token::Op(o) => o.to_uppercase(),
+            Token::Ident(o) => o.to_uppercase(),
+            _ => panic!("expected comparison operator, got {:?}", op_token),
         };
-        let (right_op, right_type) = self.parse_expr(); // Now returns (ComparisonOperand, DbType)
+        
+        let (right_op, right_type) = self.parse_expr();
+        
         let cmp = match op.as_str() {
             "="  => ComparerOperation::Equals,
             "!=" => ComparerOperation::NotEquals,
@@ -138,67 +134,82 @@ impl<'a, 'b, 'c> QueryParser<'a, 'b, 'c> {
             "CONTAINS"    => ComparerOperation::Contains,
             "STARTSWITH"  => ComparerOperation::StartsWith,
             "ENDSWITH"    => ComparerOperation::EndsWith,
-            _ => panic!("unknown cmp {}", op),
+            _ => panic!("unknown comparison operator: {}", op),
         };
+        
         let next_logic_op = self.peek_logic();
         
+        // Fix: Better type handling for string operations
         let determined_comparison_type = match cmp {
             ComparerOperation::Contains | 
             ComparerOperation::StartsWith | 
-            ComparerOperation::EndsWith => DbType::STRING,
-            _ => promote_types(left_type, right_type), // Use types from expressions
+            ComparerOperation::EndsWith => {
+                // For string operations, ensure at least one operand is a string
+                if left_type == DbType::STRING || right_type == DbType::STRING {
+                    DbType::STRING
+                } else {
+                    panic!("String operations require at least one string operand")
+                }
+            },
+            _ => promote_types(left_type, right_type), 
         };
         
         self.query_transformer.add_comparison(
             determined_comparison_type,
-            left_op.clone(),
-            right_op.clone(),
+            left_op,
+            right_op,
             cmp,
-            next_logic_op.clone()
+            next_logic_op
         );
-    }        
+    }
     
-    fn parse_expr(
-        &mut self,
-    ) -> (ComparisonOperand, DbType) { // Changed return type
+    fn parse_expr(&mut self) -> (ComparisonOperand, DbType) {
         let (mut lhs_op, mut lhs_type) = self.parse_term();
+        
         while let Some(op_str) = self.peek_op(&["+","-"]) {
-            let math = if op_str=="+" { MathOperation::Add } else { MathOperation::Subtract };
+            let math = if op_str == "+" { MathOperation::Add } else { MathOperation::Subtract };
             self.next(); // consume op
             let (rhs_op, rhs_type) = self.parse_term();
             
-            let result_type = promote_types(lhs_type, rhs_type);
-            let idx = self.query_transformer.add_math_operation(result_type.clone(), lhs_op.clone(), rhs_op.clone(), math);
+            // Fix: Improved type promotion for arithmetic operations
+            let result_type = promote_numeric_types(lhs_type.clone(), rhs_type.clone())
+                .unwrap_or_else(|| panic!("Cannot perform arithmetic on incompatible types: {:?} and {:?}", lhs_type, rhs_type));
+                
+            let idx = self.query_transformer.add_math_operation(result_type.clone(), lhs_op, rhs_op, math);
             lhs_op = ComparisonOperand::Intermediate(idx);
-            lhs_type = result_type; // Update type to the result type of the operation
+            lhs_type = result_type;
         }
+        
         (lhs_op, lhs_type)
-    }    
+    }
     
-    fn parse_term(
-        &mut self
-    ) -> (ComparisonOperand, DbType) { // Changed return type
+    fn parse_term(&mut self) -> (ComparisonOperand, DbType) {
         let (mut lhs_op, mut lhs_type) = self.parse_factor();
+        
         while let Some(op_str) = self.peek_op(&["*","/"]) {
-            let math = if op_str=="*" { MathOperation::Multiply } else { MathOperation::Divide };
+            let math = if op_str == "*" { MathOperation::Multiply } else { MathOperation::Divide };
             self.next();
             let (rhs_op, rhs_type) = self.parse_factor();
 
-            let result_type = promote_types(lhs_type, rhs_type);
-            let idx = self.query_transformer.add_math_operation(result_type.clone(), lhs_op.clone(), rhs_op.clone(), math);
+            // Fix: Improved type promotion for arithmetic operations
+            let result_type = promote_numeric_types(lhs_type.clone(), rhs_type.clone())
+                .unwrap_or_else(|| panic!("Cannot perform arithmetic on incompatible types: {:?} and {:?}", lhs_type, rhs_type));
+                
+            let idx = self.query_transformer.add_math_operation(result_type.clone(), lhs_op, rhs_op, math);
             lhs_op = ComparisonOperand::Intermediate(idx);
-            lhs_type = result_type; // Update type to the result type of the operation
+            lhs_type = result_type;
         }
+        
         (lhs_op, lhs_type)
     }
 
-   fn parse_factor(
-        &mut self
-    ) -> (ComparisonOperand, DbType) { // Changed return type
-        match self.next().unwrap() {
+    fn parse_factor(&mut self) -> (ComparisonOperand, DbType) {
+        let token = self.next().unwrap_or_else(|| panic!("Unexpected end of token stream"));
+        
+        match token {
             Token::Number(n) => {
                 let db_type = numeric_value_to_db_type(&n);
-                let mb = numeric_to_mb(n);
+                let mb = numeric_to_mb(&n);
                 (ComparisonOperand::Direct(mb), db_type)
             }
             Token::StringLit(s) => {
@@ -206,17 +217,23 @@ impl<'a, 'b, 'c> QueryParser<'a, 'b, 'c> {
                 (ComparisonOperand::Direct(mb), DbType::STRING)
             }
             Token::Ident(name) => {
-                // It's important that self.schema is available and populated
-                let field_schema = self.schema.iter().find(|f| f.name == name)
-                    .unwrap_or_else(|| panic!("unknown column schema for {}", name));
-                let mb = self.cols.iter().find(|(n, _)| n == &name)
+                // Fix: Enhanced schema field lookup with better error handling
+                let field_schema = self.schema.iter()
+                    .find(|f| f.name == name)  // Case-insensitive match
+                    .unwrap_or_else(|| panic!("unknown column schema for '{}'", name));
+                
+                // Find column data
+                let mb = self.cols.iter()
+                    .find(|(n, _)| n == &name)  // Case-insensitive match
                     .map(|(_, mb)| mb.clone())
-                    .unwrap_or_else(|| panic!("unknown column data for {}", name));
+                    .unwrap_or_else(|| panic!("unknown column data for '{}'", name));
+                
                 (ComparisonOperand::Direct(mb), field_schema.db_type.clone())
             }
             Token::LPar => {
-                let (inner_op, inner_type) = self.parse_expr(); // parse_expr now returns tuple
-                if !matches!(self.next().unwrap(), Token::RPar) {
+                let (inner_op, inner_type) = self.parse_expr();
+                if !matches!(self.next().unwrap_or_else(|| panic!("Unexpected end of token stream")), 
+                           Token::RPar) {
                     panic!("expected closing parenthesis after grouped expression");
                 }
                 (inner_op, inner_type)
@@ -232,14 +249,20 @@ impl<'a, 'b, 'c> QueryParser<'a, 'b, 'c> {
                 "OR"  => Some(Next::Or),
                 _ => None
             }
-        } else { None }
+        } else { 
+            None 
+        }
     }
 
-    fn next_logic(&mut self) { self.pos+=1; }
+    fn next_logic(&mut self) { 
+        self.pos += 1; 
+    }
 
     fn peek_op(&self, a: &[&str]) -> Option<String> {
         if let Some(Token::Op(o)) = self.toks.get(self.pos) {
-            if a.contains(&o.as_str()) { return Some(o.clone()) }
+            if a.contains(&o.as_str()) { 
+                return Some(o.clone()) 
+            }
         }
         None
     }
@@ -249,265 +272,6 @@ impl<'a, 'b, 'c> QueryParser<'a, 'b, 'c> {
         self.pos += 1;
         t
     }
-
-}
-
-fn numeric_value_to_db_type(nv: &NumericValue) -> DbType {
-    match nv {
-        NumericValue::I8(_) => DbType::I8,
-        NumericValue::I16(_) => DbType::I16,
-        NumericValue::I32(_) => DbType::I32,
-        NumericValue::I64(_) => DbType::I64,
-        NumericValue::I128(_) => DbType::I128,
-        NumericValue::U8(_) => DbType::U8,
-        NumericValue::U16(_) => DbType::U16,
-        NumericValue::U32(_) => DbType::U32,
-        NumericValue::U64(_) => DbType::U64,
-        NumericValue::U128(_) => DbType::U128,
-        NumericValue::F32(_) => DbType::F32,
-        NumericValue::F64(_) => DbType::F64,
-    }
-}
-
-// Helper to get a rank for type promotion (higher is "larger" or more general)
-fn get_type_rank(db_type: &DbType) -> u8 {
-    match db_type {
-        DbType::F64 => 10,
-        DbType::F32 => 9,
-        DbType::I128 => 8,
-        // Note: U128 vs I128 promotion needs careful thought for actual ops if mixing signed/unsigned
-        DbType::U128 => 7, 
-        DbType::I64 => 6,
-        DbType::U64 => 5,
-        DbType::I32 => 4,
-        DbType::U32 => 3,
-        DbType::I16 => 2,
-        DbType::U16 => 1,
-        DbType::I8 | DbType::U8 => 0, 
-        // Non-numeric types, or types not typically involved in arithmetic promotion
-        DbType::STRING | DbType::DATETIME | DbType::CHAR | DbType::NULL => 0, // Or a distinct low rank / handle separately
-        _ => panic!("unknown type for promotion"),
-    }
-}
-
-// Simple type promotion logic for arithmetic and comparison operations
-fn promote_types(type1: DbType, type2: DbType) -> DbType {
-    if type1 == DbType::STRING || type2 == DbType::STRING {
-        // For arithmetic, this would be an error. For comparisons, it might be allowed if one is string.
-        // The parse_comparison handles string-specific ops separately.
-        // If this is reached for '=', '>', etc. and one is string, it implies string comparison.
-        // However, numeric promotion shouldn't yield STRING.
-        if type1 == DbType::STRING && type2 == DbType::STRING {
-            return DbType::STRING;
-        }
-        // This case (e.g. number vs string in arithmetic) should ideally be an error earlier
-        // or handled by specific casting rules if allowed.
-        panic!("Cannot promote types: {:?} and {:?} for generic arithmetic/comparison. String involved.", type1, type2);
-    }
-
-    let rank1 = get_type_rank(&type1);
-    let rank2 = get_type_rank(&type2);
-
-    if rank1 >= rank2 { type1 } else { type2 }
-}
-
-#[inline(always)]
-pub fn tokenize(s: &str, schema: &SmallVec<[SchemaField; 20]>) -> SmallVec<[Token; 36]> {
-    let mut out = SmallVec::new();
-    let mut i = 0;
-    let cs: Vec<char> = s.chars().collect();
-    
-    // Helper function to determine numeric type based on field name and value
-    #[inline(always)]
-    fn parse_numeric_value(value_str: &str, field_name: Option<&str>, schema: &SmallVec<[SchemaField; 20]>) -> NumericValue {
-        // Try to find the field in schema
-        if let Some(field_name) = field_name {
-            if let Some(field) = schema.iter().find(|f| f.name == field_name) {
-                // Parse according to the field's database type
-                return match field.db_type {
-                    DbType::I8 => NumericValue::I8(value_str.parse().unwrap_or_default()),
-                    DbType::I16 => NumericValue::I16(value_str.parse().unwrap_or_default()),
-                    DbType::I32 => NumericValue::I32(value_str.parse().unwrap_or_default()),
-                    DbType::I64 => NumericValue::I64(value_str.parse().unwrap_or_default()),
-                    DbType::I128 => NumericValue::I128(value_str.parse().unwrap_or_default()),
-                    DbType::U8 => NumericValue::U8(value_str.parse().unwrap_or_default()),
-                    DbType::U16 => NumericValue::U16(value_str.parse().unwrap_or_default()),
-                    DbType::U32 => NumericValue::U32(value_str.parse().unwrap_or_default()),
-                    DbType::U64 => NumericValue::U64(value_str.parse().unwrap_or_default()),
-                    DbType::U128 => NumericValue::U128(value_str.parse().unwrap_or_default()),
-                    DbType::F32 => NumericValue::F32(value_str.parse().unwrap_or_default()),
-                    DbType::F64 => NumericValue::F64(value_str.parse().unwrap_or_default()),
-                    _ => NumericValue::I32(value_str.parse().unwrap_or_default()), // Default fallback
-                };
-            }
-        }
-        
-        // Default behavior: determine type based on the format of the number
-        if value_str.contains('.') {
-            NumericValue::F64(value_str.parse().unwrap_or_default())
-        } else {
-            let parsed_num: i64 = value_str.parse().unwrap_or_default();
-            if parsed_num >= i32::MIN as i64 && parsed_num <= i32::MAX as i64 {
-                NumericValue::I32(parsed_num as i32)
-            } else {
-                NumericValue::I64(parsed_num)
-            }
-        }
-    }
-    
-    // Track context for field association
-    let mut current_field: Option<String> = None;
-    
-    // Helper to determine if a minus sign should be considered part of a number
-    #[inline(always)]
-    fn is_negative_number_start(tokens: &[Token], cs: &[char], i: usize) -> bool {
-        // Check if the next character is a digit
-        let next_is_digit = i + 1 < cs.len() && cs[i + 1].is_ascii_digit();
-        if !next_is_digit {
-            return false;
-        }
-        
-        // Check if this is the start or if preceding token makes this likely to be a negative number
-        i == 0 || match tokens.last() {
-            Some(Token::Op(_)) => true,       // After operator like =, <, >
-            Some(Token::LPar) => true,        // After opening parenthesis
-            None => true,                     // At the beginning
-            _ => false,                       // After identifiers or other tokens
-        }
-    }
-    
-    while i < cs.len() {
-        match cs[i] {
-            c if c.is_whitespace() => i += 1,
-            '\'' => {
-                // find closing quote safely
-                let mut j = i + 1;
-                while j < cs.len() && cs[j] != '\'' {
-                    j += 1;
-                }
-                let lit: String = cs[i+1..j].iter().collect();
-                out.push(Token::StringLit(lit));
-                i = j + 1;
-            }
-            c if c.is_ascii_digit() => {
-                let start = i;
-                // Handle floating point numbers
-                let mut has_decimal = false;
-                while i < cs.len() && (cs[i].is_ascii_digit() || (!has_decimal && cs[i] == '.')) {
-                    if cs[i] == '.' {
-                        has_decimal = true;
-                    }
-                    i += 1;
-                }
-                
-                let num_str = cs[start..i].iter().collect::<String>();
-                let numeric_value = parse_numeric_value(&num_str, current_field.as_deref(), schema);
-                out.push(Token::Number(numeric_value));
-            }
-            '-' if is_negative_number_start(&out, &cs, i) => {
-                // Handle negative numbers
-                let start = i;  // Start includes the minus sign
-                i += 1;  // Move past the minus sign
-                
-                // Parse the digits and potential decimal point
-                let mut has_decimal = false;
-                while i < cs.len() && (cs[i].is_ascii_digit() || (!has_decimal && cs[i] == '.')) {
-                    if cs[i] == '.' {
-                        has_decimal = true;
-                    }
-                    i += 1;
-                }
-                
-                let num_str = cs[start..i].iter().collect::<String>();
-                let numeric_value = parse_numeric_value(&num_str, current_field.as_deref(), schema);
-                out.push(Token::Number(numeric_value));
-            }
-            c if is_id_start(c) => {
-                let start = i;
-                while i < cs.len() && is_id_part(cs[i]) { i += 1 }
-                let id = cs[start..i].iter().collect::<String>();
-                
-                // Store identifier as potential field name for next numeric value
-                if schema.iter().any(|field| field.name == id) {
-                    current_field = Some(id.clone());
-                }
-                
-                out.push(Token::Ident(id));
-            }
-            '(' => { out.push(Token::LPar); i += 1 }
-            ')' => { out.push(Token::RPar); i += 1 }
-            '<'|'>'|'!'|'=' => {
-                let mut op = cs[i].to_string();
-                if i+1 < cs.len() && cs[i+1] == '=' {
-                    op.push('=');
-                    i += 2;
-                } else { i += 1; }
-                out.push(Token::Op(op));
-            }
-            '+'|'-'|'*'|'/' => {
-                out.push(Token::Op(cs[i].to_string()));
-                i += 1;
-            }
-            ',' => { i += 1; current_field = None; } // Reset current field on comma
-            'A'..='Z'|'a'..='z' => {
-                // Handle keywords like AND, OR
-                let start = i;
-                while i < cs.len() && is_id_part(cs[i]) { i += 1 }
-                let keyword = cs[start..i].iter().collect::<String>();
-                
-                // If it's a logical operator, reset the current field context
-                if keyword.to_uppercase() == "AND" || keyword.to_uppercase() == "OR" {
-                    current_field = None;
-                }
-                
-                out.push(Token::Ident(keyword));
-            }
-            _ => panic!("unexpected char {}", cs[i]),
-        }
-    }
-    
-    out
-}
-
-#[inline(always)]
-fn is_id_start(c: char) -> bool { c.is_alphabetic() || c == '_' }
-
-#[inline(always)]
-fn is_id_part(c: char)  -> bool { c.is_alphanumeric() || c == '_' }
-
-#[inline(always)]
-fn numeric_to_mb(v: NumericValue) -> MemoryBlock {
-    macro_rules! direct {
-        ($val:expr) => {{
-            let bytes = $val.to_le_bytes();
-            let mb = MEMORY_POOL.acquire(bytes.len());
-            mb.into_slice_mut().copy_from_slice(&bytes);
-            mb
-        }};
-    }
-    let b = match v {
-        NumericValue::I8(n)   => direct!(n),
-        NumericValue::I16(n)  => direct!(n),
-        NumericValue::I32(n)  => direct!(n),
-        NumericValue::I64(n)  => direct!(n),
-        NumericValue::I128(n) => direct!(n),
-        NumericValue::U8(n)   => direct!(n),
-        NumericValue::U16(n)  => direct!(n),
-        NumericValue::U32(n)  => direct!(n),
-        NumericValue::U64(n)  => direct!(n),
-        NumericValue::U128(n) => direct!(n),
-        NumericValue::F32(f)  => direct!(f),
-        NumericValue::F64(f)  => direct!(f),
-    };
-    b
-}
-
-#[inline(always)]
-fn str_to_mb(s: &str) -> MemoryBlock {
-    let b = s.as_bytes();
-    let mb = MEMORY_POOL.acquire(b.len());
-    mb.into_slice_mut().copy_from_slice(b);
-    mb
 }
 
 pub fn tokenize_for_test(s: &str, schema: &SmallVec<[SchemaField; 20]>) -> SmallVec<[Token; 36]> {
@@ -523,9 +287,11 @@ mod tests {
 
     use crate::core::db_type::DbType;
     use crate::core::row_v2::concurrent_processor::Buffer;
-    use crate::core::row_v2::query_parser::{parse_query, tokenize_for_test, NumericValue};
+    use crate::core::row_v2::query_parser::{parse_query, tokenize_for_test};
     use crate::core::row_v2::row::Row;
     use crate::core::row_v2::schema::SchemaField;
+    use crate::core::row_v2::token_processor::TokenProcessor;
+    use crate::core::row_v2::tokenizer::NumericValue;
     use crate::core::row_v2::transformer::TransformerProcessor;
     use crate::memory_pool::{MemoryBlock, MEMORY_POOL};
 
@@ -2185,7 +1951,7 @@ bool_buffer: SmallVec::new(),
     }
 
     #[test]
-    #[should_panic(expected ="unknown column schema for AgE")]
+    #[should_panic(expected ="Unknown column: 'AgE' is not defined in the schema")]
     fn test_case_insensitive_keywords_with_false_outcome() {
         let schema = create_schema(); 
         static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
@@ -2493,6 +2259,7 @@ bool_buffer: SmallVec::new(),
             (bank_balance >= 1000.43 AND net_assets > 800000) OR
             (department STARTSWITH 'Eng' AND email ENDSWITH 'example.com')
         "##;
+        
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
@@ -2505,8 +2272,13 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &schema, unsafe { &mut *transformer.get() });
+        let mut processor = TokenProcessor::new(tokens);
+        
+        processor.process(unsafe { &mut *transformer.get() }).unwrap();
+
+        //parse_query(&tokens, &columns, &schema, unsafe { &mut *transformer.get() });
+
+
         assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
-
 }
