@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
 use log::LevelFilter;
 use rasterizeddb_core::core::database::Database;
-use rasterizeddb_core::core::mock_table::{consolidated_read_data_function, consolidated_write_data_function, get_schema, IO_POINTERS, IO_ROWS};
+use rasterizeddb_core::core::mock_table::{consolidated_read_data_function, get_schema, IO_POINTERS, IO_ROWS};
 use rasterizeddb_core::core::storage_providers::traits::StorageIO;
 use rasterizeddb_core::{
     core::storage_providers::file_sync::LocalStorageProvider,
@@ -19,8 +19,15 @@ async fn main() -> std::io::Result<()> {
     tokio::spawn(io_rows.start_service());
     tokio::spawn(io_pointers.start_service());
 
-    //consolidated_write_data_function(50000).await;
+    // rasterizeddb_core::core::mock_table::
+    //     consolidated_write_data_function(50000).await;
     let schema = get_schema().await;
+
+    let stdin = std::io::stdin();
+    let mut buffer = String::new();
+    println!("Press Enter to start...");
+    stdin.read_line(&mut buffer).unwrap();
+
     consolidated_read_data_function(schema, 49999).await;
 
     let stdin = std::io::stdin();
