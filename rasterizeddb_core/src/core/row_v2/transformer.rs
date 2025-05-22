@@ -5,6 +5,7 @@ use crate::{core::{db_type::DbType, helpers2::smallvec_extensions::SmallVecExten
 
 use super::{logical::perform_comparison_operation, math::perform_math_operation};
 
+#[derive(Debug)]
 pub struct ColumnTransformer {
     pub column_type: DbType,
     pub column_1: MemoryBlock,
@@ -120,6 +121,7 @@ impl From<usize> for ComparisonOperand {
     }
 }
 
+#[derive(Debug)]
 pub struct TransformerProcessor<'a> {
     transformers: &'a mut SmallVec<[ColumnTransformer; 36]>,
     intermediate_results: &'a mut  SmallVec<[MemoryBlock; 20]>,
@@ -249,6 +251,12 @@ impl<'a> TransformerProcessor<'a> {
 
     /// Execute all transformations and return final result
     pub fn execute(&mut self, comparison_results: &mut SmallVec<[(bool, Option<Next>); 20]>) -> bool {
+
+        #[cfg(debug_assertions)]
+        for transformer in self.transformers.iter() {
+            println!("Transformer: {:?}", transformer);
+        }
+
         // Process all transformers
         while let Some(mut transformer) = self.transformers.pop_front() {
             // If this transformer uses intermediate results, update its memory blocks
@@ -282,34 +290,25 @@ impl<'a> TransformerProcessor<'a> {
     /// Evaluate the logical combination of comparison results
     fn evaluate_comparison_results(&self, results: &mut SmallVec<[(bool, Option<Next>); 20]>) -> bool {
         if results.is_empty() {
-            return false; // Or true, depending on desired behavior for an empty set.
+            return false;
         }
         
-        let mut final_result = results[0].0;
+        // Start with first result
+        let mut result = results[0].0;
         
-        for i in 0..results.len()-1 {
-            // connector_from_current is the operator that links the accumulated 'final_result'
-            // (which represents the evaluation up to results[i].0) with results[i+1].0
-            let (_, connector_from_current) = &results[i]; 
-            let (next_standalone_bool_val, _) = results[i+1];
+        // Process each comparison sequentially
+        for i in 0..results.len() - 1 {
+            let connector = &results[i].1;
+            let next_value = results[i + 1].0;
             
-            match connector_from_current {
-                Some(Next::And) => {
-                    final_result = final_result && next_standalone_bool_val;
-                },
-                Some(Next::Or) => {
-                    final_result = final_result || next_standalone_bool_val;
-                },
-                None => {
-                    // If results[i].next is None, it means the logical chain effectively ends
-                    // after results[i].0 has been incorporated into final_result.
-                    // The loop should not process results[i+1] with this connector.
-                    break;
-                }
+            match connector {
+                Some(Next::And) => result = result && next_value,
+                Some(Next::Or) => result = result || next_value,
+                None => result = result && next_value, // Treat None as AND
             }
         }
         
-        final_result
+        result
     }
 }
 
@@ -317,6 +316,30 @@ impl<'a> TransformerProcessor<'a> {
 mod tests {
     use super::*;
     use crate::memory_pool::MEMORY_POOL;
+    
+    fn create_memory_block_from_f64(value: f64) -> MemoryBlock {
+        let bytes = value.to_le_bytes();
+        let data = MEMORY_POOL.acquire(bytes.len());
+        let slice = data.into_slice_mut();
+        slice.copy_from_slice(&bytes);
+        data
+    }
+
+    fn create_memory_block_from_u8(value: u8) -> MemoryBlock {
+        let bytes = value.to_le_bytes();
+        let data = MEMORY_POOL.acquire(bytes.len());
+        let slice = data.into_slice_mut();
+        slice.copy_from_slice(&bytes);
+        data
+    }
+
+    fn create_memory_block_from_u128(value: u128) -> MemoryBlock {
+        let bytes = value.to_le_bytes();
+        let data = MEMORY_POOL.acquire(bytes.len());
+        let slice = data.into_slice_mut();
+        slice.copy_from_slice(&bytes);
+        data
+    }
 
     fn create_memory_block_from_i32(value: i32) -> MemoryBlock {
         let bytes = value.to_le_bytes();
@@ -2098,5 +2121,204 @@ assert_eq!(processor.execute(&mut bool_buffer), true);
 
         let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert_eq!(processor.execute(&mut bool_buffer), false);
+    }
+
+    #[test]
+    fn test_complex_business_query_with_or_groups() {
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
+        let mut processor = TransformerProcessor::new(&mut transformers, &mut intermediate_results);
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
+
+        // Create test values
+        // Group 1: id = 42 AND name CONTAINS 'John'
+        let id_val = create_memory_block_from_u128(42);
+        let id_42 = create_memory_block_from_u128(42);
+        let name_val = create_memory_block_from_string("John Smith");
+        let name_pattern = create_memory_block_from_string("John");
+        
+        // Group 2: age > 25 AND salary < 50000.0
+        let age_val = create_memory_block_from_u8(30);
+        let age_comp = create_memory_block_from_u8(25);
+        let salary_val = create_memory_block_from_f64(40000.0);
+        let salary_comp = create_memory_block_from_f64(50000.0);
+        
+        // Group 3: bank_balance >= 1000.43 AND net_assets > 800000
+        let bank_balance_val = create_memory_block_from_f64(1500.75);
+        let bank_balance_comp = create_memory_block_from_f64(1000.43);
+        let net_assets_val = create_memory_block_from_f64(900000.0);
+        let net_assets_comp = create_memory_block_from_f64(800000.0);
+
+        // Group 4: department STARTSWITH 'Eng' AND email ENDSWITH 'example.com'
+        let dept_val = create_memory_block_from_string("Engineering");
+        let dept_prefix = create_memory_block_from_string("Eng");
+        let email_val = create_memory_block_from_string("john.smith@example.com");
+        let email_suffix = create_memory_block_from_string("example.com");
+
+        // Build the query:
+        // (id = 42 AND name CONTAINS 'John') OR
+        // (age > 25 AND salary < 50000.0) OR
+        // (bank_balance >= 1000.43 AND net_assets > 800000) OR
+        // (department STARTSWITH 'Eng' AND email ENDSWITH 'example.com')
+
+        // First group: id = 42 AND name CONTAINS 'John'
+        processor.add_comparison(
+            DbType::U128,
+            id_val.clone(), 
+            id_42.clone(),
+            ComparerOperation::Equals,
+            Some(Next::And)
+        );
+        
+        processor.add_comparison(
+            DbType::STRING,
+            name_val.clone(),
+            name_pattern.clone(),
+            ComparerOperation::Contains,
+            Some(Next::Or) // OR connecting to the next group
+        );
+        
+        // Second group: age > 25 AND salary < 50000.0
+        processor.add_comparison(
+            DbType::U8,
+            age_val.clone(),
+            age_comp.clone(),
+            ComparerOperation::Greater,
+            Some(Next::And)
+        );
+        
+        processor.add_comparison(
+            DbType::F64,
+            salary_val.clone(),
+            salary_comp.clone(),
+            ComparerOperation::Less,
+            Some(Next::Or) // OR connecting to the next group
+        );
+        
+        // Third group: bank_balance >= 1000.43 AND net_assets > 800000
+        processor.add_comparison(
+            DbType::F64,
+            bank_balance_val.clone(),
+            bank_balance_comp.clone(),
+            ComparerOperation::GreaterOrEquals,
+            Some(Next::And)
+        );
+        
+        processor.add_comparison(
+            DbType::F64,
+            net_assets_val.clone(),
+            net_assets_comp.clone(),
+            ComparerOperation::Greater,
+            Some(Next::Or) // OR connecting to the next group
+        );
+        
+        // Fourth group: department STARTSWITH 'Eng' AND email ENDSWITH 'example.com'
+        processor.add_comparison(
+            DbType::STRING,
+            dept_val.clone(),
+            dept_prefix.clone(),
+            ComparerOperation::StartsWith,
+            Some(Next::And)
+        );
+        
+        processor.add_comparison(
+            DbType::STRING,
+            email_val.clone(),
+            email_suffix.clone(),
+            ComparerOperation::EndsWith,
+            None // End of the query
+        );
+        
+        // Execute the query - expecting true since all conditions should evaluate to true
+        assert!(processor.execute(&mut bool_buffer));
+        
+        // Test a failing case (when none of the conditions match)
+        // Clear previous state
+        transformers.clear();
+        intermediate_results.clear();
+        bool_buffer.clear();
+        
+        let mut failing_processor = TransformerProcessor::new(&mut transformers, &mut intermediate_results);
+        
+        // Create failing test values
+        let id_val_fail = create_memory_block_from_u128(43); // Not 42
+        let name_val_fail = create_memory_block_from_string("Smith"); // Doesn't contain "John"
+        let age_val_fail = create_memory_block_from_u8(20); // Not > 25
+        let salary_val_fail = create_memory_block_from_f64(60000.0); // Not < 50000
+        let bank_balance_val_fail = create_memory_block_from_f64(900.0); // Not >= 1000.43
+        let net_assets_val_fail = create_memory_block_from_f64(700000.0); // Not > 800000
+        let dept_val_fail = create_memory_block_from_string("Finance"); // Doesn't start with "Eng"
+        let email_val_fail = create_memory_block_from_string("john@othercompany.com"); // Doesn't end with "example.com"
+        
+        // First failing group
+        failing_processor.add_comparison(
+            DbType::U128,
+            id_val_fail.clone(), 
+            id_42.clone(),
+            ComparerOperation::Equals,
+            Some(Next::And)
+        );
+        
+        failing_processor.add_comparison(
+            DbType::STRING,
+            name_val_fail.clone(),
+            name_pattern.clone(),
+            ComparerOperation::Contains,
+            Some(Next::Or)
+        );
+        
+        // Second failing group
+        failing_processor.add_comparison(
+            DbType::U8,
+            age_val_fail.clone(),
+            age_comp.clone(),
+            ComparerOperation::Greater,
+            Some(Next::And)
+        );
+        
+        failing_processor.add_comparison(
+            DbType::F64,
+            salary_val_fail.clone(),
+            salary_comp.clone(),
+            ComparerOperation::Less,
+            Some(Next::Or)
+        );
+        
+        // Third failing group
+        failing_processor.add_comparison(
+            DbType::F64,
+            bank_balance_val_fail.clone(),
+            bank_balance_comp.clone(),
+            ComparerOperation::GreaterOrEquals,
+            Some(Next::And)
+        );
+        
+        failing_processor.add_comparison(
+            DbType::F64,
+            net_assets_val_fail.clone(),
+            net_assets_comp.clone(),
+            ComparerOperation::Greater,
+            Some(Next::Or)
+        );
+        
+        // Fourth failing group
+        failing_processor.add_comparison(
+            DbType::STRING,
+            dept_val_fail.clone(),
+            dept_prefix.clone(),
+            ComparerOperation::StartsWith,
+            Some(Next::And)
+        );
+        
+        failing_processor.add_comparison(
+            DbType::STRING,
+            email_val_fail.clone(),
+            email_suffix.clone(),
+            ComparerOperation::EndsWith,
+            None
+        );
+        
+        // This should fail because none of the condition groups are satisfied
+        assert!(!failing_processor.execute(&mut bool_buffer));
     }
 }
