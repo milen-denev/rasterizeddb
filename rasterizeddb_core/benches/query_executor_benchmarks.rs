@@ -1,9 +1,14 @@
 use criterion::{criterion_group, criterion_main, Criterion};
-use dashmap::DashMap;
-use rasterizeddb_core::core::row_v2::query_parser::{parse_query, tokenize_for_test};
+use rasterizeddb_core::core::row_v2::concurrent_processor::Buffer;
+use rasterizeddb_core::core::row_v2::query_parser::{parse_query, tokenize, tokenize_for_test};
+use rasterizeddb_core::core::row_v2::row::Row;
 use rasterizeddb_core::core::row_v2::schema::SchemaField;
 use rasterizeddb_core::core::db_type::DbType;
+use rasterizeddb_core::core::row_v2::transformer::TransformerProcessor;
 use rasterizeddb_core::memory_pool::{MemoryBlock, MEMORY_POOL};
+use std::borrow::Cow;
+use std::cell::UnsafeCell;
+use std::collections::VecDeque;
 use std::hint::black_box;
 
 fn create_benchmark_schema() -> Vec<SchemaField> {
@@ -118,30 +123,33 @@ fn create_memory_block_from_u64(value: u64) -> MemoryBlock {
     data
 }
 
-fn setup_benchmark_columns() -> DashMap<String, MemoryBlock> {
-    let columns = DashMap::new();
-    columns.insert("id".to_string(), create_memory_block_from_i32(42));
-    columns.insert("age".to_string(), create_memory_block_from_u8(30));
-    columns.insert("salary".to_string(), create_memory_block_from_i32(50000));
-    columns.insert("name".to_string(), create_memory_block_from_string("John Doe"));
-    columns.insert("department".to_string(), create_memory_block_from_string("Engineering"));
-    columns.insert("bank_balance".to_string(), create_memory_block_from_f64(1000.43));
-    columns.insert("is_active".to_string(), create_memory_block_from_u8(1)); // true
-    columns.insert("score".to_string(), create_memory_block_from_f32(85.5));
-    columns.insert("notes".to_string(), create_memory_block_from_string("This is an important note for review."));
-    columns.insert("created_at".to_string(), create_memory_block_from_i64(1672531200)); // Example timestamp
+pub fn setup_test_columns<'a>() -> Vec<(Cow<'a, str>, MemoryBlock)>  {
+    let mut columns = Vec::with_capacity(20);
 
-    columns.insert("credit_balance".to_string(), create_memory_block_from_f32(100.50));
-    columns.insert("net_assets".to_string(), create_memory_block_from_i64(200000));
-    columns.insert("earth_position".to_string(), create_memory_block_from_i8(-50));
-    columns.insert("test_1".to_string(), create_memory_block_from_u32(100));
-    columns.insert("test_2".to_string(), create_memory_block_from_u16(200));
-    columns.insert("test_3".to_string(), create_memory_block_from_i128(i128::MAX -100));
-    columns.insert("test_4".to_string(), create_memory_block_from_u128(u128::MAX -100));
-    columns.insert("test_5".to_string(), create_memory_block_from_i16(300));
-    columns.insert("test_6".to_string(), create_memory_block_from_u64(400));
+    columns.push((Cow::Borrowed("id"), create_memory_block_from_i32(42)));
+    columns.push((Cow::Borrowed("age"), create_memory_block_from_u8(30)));
+    columns.push((Cow::Borrowed("salary"), create_memory_block_from_i32(50000)));
+    columns.push((Cow::Borrowed("name"), create_memory_block_from_string("John Doe")));
+    columns.push((Cow::Borrowed("department"), create_memory_block_from_string("Engineering")));
+    columns.push((Cow::Borrowed("bank_balance"), create_memory_block_from_f64(1000.43)));
+    columns.push((Cow::Borrowed("is_active"), create_memory_block_from_u8(1))); // true
+    columns.push((Cow::Borrowed("score"), create_memory_block_from_f32(85.5)));
+    columns.push((Cow::Borrowed("notes"), create_memory_block_from_string("This is an important note for review.")));
+    columns.push((Cow::Borrowed("created_at"), create_memory_block_from_i64(1672531200))); // Example timestamp
+
+    columns.push((Cow::Borrowed("credit_balance"), create_memory_block_from_f32(100.50)));
+    columns.push((Cow::Borrowed("net_assets"), create_memory_block_from_i64(200000)));
+    columns.push((Cow::Borrowed("earth_position"), create_memory_block_from_i8(-50)));
+    columns.push((Cow::Borrowed("test_1"), create_memory_block_from_u32(100)));
+    columns.push((Cow::Borrowed("test_2"), create_memory_block_from_u16(200)));
+    columns.push((Cow::Borrowed("test_3"), create_memory_block_from_i128(i128::MAX -100)));
+    columns.push((Cow::Borrowed("test_4"), create_memory_block_from_u128(u128::MAX -100)));
+    columns.push((Cow::Borrowed("test_5"), create_memory_block_from_i16(300)));
+    columns.push((Cow::Borrowed("test_6"), create_memory_block_from_u64(400)));
+
     columns
 }
+
 
 // fn benchmark_tokenize(c: &mut Criterion) {
 //     let schema = create_benchmark_schema();
@@ -183,42 +191,90 @@ fn setup_benchmark_columns() -> DashMap<String, MemoryBlock> {
 // }
 
 fn benchmark_execute_query(c: &mut Criterion) {
-    let schema = create_benchmark_schema();
-    let columns = setup_benchmark_columns();
+    // let schema = create_benchmark_schema();
+    // let columns = setup_test_columns();
 
     let simple_query = "id = 42";
+    let mut buffer = Buffer {
+        hashtable_buffer: vec![],
+        row: Row::default(),
+        transformers: VecDeque::new(),
+        intermediate_results: vec![],
+        bool_buffer: Vec::new(),
+    };
     c.bench_function("execute_simple_query_true", |b| {
         b.iter(|| {
-            let token = tokenize_for_test(black_box(simple_query), black_box(&schema));
-            let mut processor = parse_query(black_box(&token), black_box(&columns), black_box(&schema));
-            black_box(processor.execute())
+            let schema = create_benchmark_schema();
+            let columns = setup_test_columns();
+            let tokens = tokenize_for_test(black_box(simple_query), black_box(&schema));
+
+            let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+            parse_query(&tokens, &columns, &schema, unsafe { &mut *transformer.get() });
+            black_box(transformer.get_mut().execute(&mut buffer.bool_buffer));
         });
     });
 
     let simple_query_false = "id = 50";
-     c.bench_function("execute_simple_query_false", |b| {
+    let mut buffer = Buffer {
+        hashtable_buffer: vec![],
+        row: Row::default(),
+        transformers: VecDeque::new(),
+        intermediate_results: vec![],
+        bool_buffer: Vec::new(),
+    };
+    c.bench_function("execute_simple_query_false", |b| {
         b.iter(|| {
-            let token = tokenize_for_test(black_box(simple_query_false), black_box(&schema));
-            let mut processor = parse_query(black_box(&token), black_box(&columns), black_box(&schema));
-            black_box(processor.execute())
+            let schema = create_benchmark_schema();
+            let columns = setup_test_columns();
+            let tokens = tokenize_for_test(black_box(simple_query_false), black_box(&schema));
+
+            let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+            parse_query(&tokens, &columns, &schema, unsafe { &mut *transformer.get() });
+            black_box(transformer.get_mut().execute(&mut buffer.bool_buffer));
         });
     });
 
     let complex_query_true = "age >= 30 AND name CONTAINS 'John' OR (salary / 2 + 1000 > 25000 AND department STARTSWITH 'Eng') AND bank_balance < 2000.50 OR score = 85.5";
+    let mut buffer = Buffer {
+        hashtable_buffer: vec![],
+        row: Row::default(),
+        transformers: VecDeque::new(),
+        intermediate_results: vec![],
+        bool_buffer: Vec::new(),
+    };
     c.bench_function("execute_complex_query_true", |b| {
         b.iter(|| {
-            let token = tokenize_for_test(black_box(complex_query_true), black_box(&schema));
-            let mut processor = parse_query(black_box(&token), black_box(&columns), black_box(&schema));
-            black_box(processor.execute())
+            let schema = create_benchmark_schema();
+            let columns = setup_test_columns();
+            let tokens = tokenize_for_test(black_box(complex_query_true), black_box(&schema));
+
+            let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+            parse_query(&tokens, &columns, &schema, unsafe { &mut *transformer.get() });
+            black_box(transformer.get_mut().execute(&mut buffer.bool_buffer));
         });
     });
     
     let complex_query_false = "age < 10 AND name CONTAINS 'NonExistent' OR (salary / 2 + 1000 > 90000 AND department STARTSWITH 'Xyz') AND bank_balance > 20000.50 OR score = 10.0";
+    let mut buffer = Buffer {
+        hashtable_buffer: vec![],
+        row: Row::default(),
+        transformers: VecDeque::new(),
+        intermediate_results: vec![],
+        bool_buffer: Vec::new(),
+    };
     c.bench_function("execute_complex_query_false", |b| {
          b.iter(|| {
-            let token = tokenize_for_test(black_box(complex_query_false), black_box(&schema));
-            let mut processor = parse_query(black_box(&token), black_box(&columns), black_box(&schema));
-            black_box(processor.execute())
+            let schema = create_benchmark_schema();
+            let columns = setup_test_columns();
+            let tokens = tokenize_for_test(black_box(complex_query_false), black_box(&schema));
+
+            let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+            parse_query(&tokens, &columns, &schema, unsafe { &mut *transformer.get() });
+            black_box(transformer.get_mut().execute(&mut buffer.bool_buffer));
         });
     });
 
@@ -245,16 +301,26 @@ fn benchmark_execute_query(c: &mut Criterion) {
         notes CONTAINS 'important' AND 
         created_at < 1735689700
     "##;
-
+    let mut buffer = Buffer {
+        hashtable_buffer: vec![],
+        row: Row::default(),
+        transformers: VecDeque::new(),
+        intermediate_results: vec![],
+        bool_buffer: Vec::new(),
+    };
     c.bench_function("execute_long_query_true", |b| {
         b.iter(|| {
-            let token = tokenize_for_test(black_box(long_query_true), black_box(&schema));
-            let mut processor = parse_query(black_box(&token), black_box(&columns), black_box(&schema));
-            black_box(processor.execute())
+            let schema = create_benchmark_schema();
+            let columns = setup_test_columns();
+            let tokens = tokenize(black_box(long_query_true), black_box(&schema));
+
+            let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+            parse_query(&tokens, &columns, &schema, unsafe { &mut *transformer.get() });
+            black_box(transformer.get_mut().execute(&mut buffer.bool_buffer));
         });
     });
 }
-
 
 criterion_group!(
     benches,
