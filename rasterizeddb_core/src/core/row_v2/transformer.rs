@@ -135,7 +135,7 @@ impl<'a> TransformerProcessor<'a> {
         }
     }    
     
-   /// Add a math operation transformer
+    /// Add a math operation transformer
     /// Accepts either direct MemoryBlocks or intermediate result indices (usize) as operands.
     pub fn add_math_operation(
         &mut self,
