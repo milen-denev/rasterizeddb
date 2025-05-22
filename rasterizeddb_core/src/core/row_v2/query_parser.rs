@@ -1,9 +1,6 @@
-use dashmap::DashMap;
-
+use std::borrow::Cow;
 use crate::memory_pool::{MemoryBlock, MEMORY_POOL};
-
 use crate::core::db_type::DbType;
-
 use super::schema::SchemaField;
 use super::transformer::{ComparerOperation, ComparisonOperand, MathOperation, Next, TransformerProcessor};
 
@@ -33,57 +30,62 @@ pub enum NumericValue {
     F64(f64),
 }
 
-pub fn parse_query<'a>(
+pub fn parse_query<'a, 'b>(
     toks: &'a Vec<Token>,
-    columns: &'a DashMap<String, MemoryBlock>,
+    columns: &'a Vec<(Cow<'a, str>, MemoryBlock)>,
     schema: &'a Vec<SchemaField>,
-) -> TransformerProcessor {
-    let parser = QueryParser::new(toks, columns, schema);
+    transformers: &'b mut TransformerProcessor<'b>,
+) {
+    let parser = QueryParser::new(toks, &columns, schema, transformers);
     parser.parse_where()
 }
 
-struct QueryParser<'a> {
+struct QueryParser<'a, 'b> {
     toks: &'a Vec<Token>,
     pos: usize,
-    cols: &'a DashMap<String, MemoryBlock>,
+    cols: &'a Vec<(Cow<'a, str>, MemoryBlock)>,
     schema: &'a Vec<SchemaField>,
+    query_transformer: &'b mut TransformerProcessor<'b>,
 }
 
-impl<'a> QueryParser<'a> {
-    fn new(tokens: &'a Vec<Token>, cols: &'a DashMap<String, MemoryBlock>, schema: &'a Vec<SchemaField>) -> Self {
-        Self { toks: tokens, pos: 0, cols, schema }
+impl<'a, 'b> QueryParser<'a, 'b> {
+    fn new(
+        tokens: &'a Vec<Token>, 
+        cols: &'a Vec<(Cow<'a, str>, MemoryBlock)>, 
+        schema: &'a Vec<SchemaField>,
+        query_transformer: &'b mut TransformerProcessor<'b>,
+    ) -> Self {
+        Self { toks: tokens, pos: 0, cols, schema, query_transformer }
     }
 
-    fn parse_where(mut self) -> TransformerProcessor {
-        let mut proc = TransformerProcessor::new();
-        self.parse_or(&mut proc);
-        proc
+    fn parse_where(mut self) {
+        self.parse_or();
     }
 
     /// Parse OR expressions
-    fn parse_or(&mut self, proc: &mut TransformerProcessor) {
-        self.parse_and(proc);
+    fn parse_or(&mut self) {
+        self.parse_and();
         while let Some(Next::Or) = self.peek_logic() {
             self.next_logic();
-            self.parse_and(proc);
+            self.parse_and();
         }
     }
 
     /// Parse AND expressions
-    fn parse_and(&mut self, proc: &mut TransformerProcessor) {
-        self.parse_comp_or_group(proc);
+    fn parse_and(&mut self) {
+        self.parse_comp_or_group();
         while let Some(Next::And) = self.peek_logic() {
             self.next_logic();
-            self.parse_comp_or_group(proc);
+            self.parse_comp_or_group();
         }
     }
 
     /// Parse either a grouped boolean expression or a comparison
-    fn parse_comp_or_group(&mut self, proc: &mut TransformerProcessor) {
+    fn parse_comp_or_group(&mut self) {
         if let Some(Token::LPar) = self.toks.get(self.pos) {
             if self.is_boolean_group(self.pos) {
                 self.pos += 1; // consume '('
-                self.parse_or(proc);
+                self.parse_or();
                 if !matches!(self.next().unwrap(), Token::RPar) {
                     panic!("expected closing parenthesis");
                 }
@@ -91,7 +93,7 @@ impl<'a> QueryParser<'a> {
             }
         }
         // default to comparison (handles arithmetic grouping)
-        self.parse_comparison(proc); // parse_comparison now returns ()
+        self.parse_comparison(); // parse_comparison now returns ()
     }
 
     /// Heuristic to check if parentheses at pos wrap a boolean expression
@@ -116,15 +118,14 @@ impl<'a> QueryParser<'a> {
 
     fn parse_comparison(
         &mut self,
-        proc: &mut TransformerProcessor
     ) { // Changed return type to ()
-        let (left_op, left_type) = self.parse_expr(proc); // Now returns (ComparisonOperand, DbType)
+        let (left_op, left_type) = self.parse_expr(); // Now returns (ComparisonOperand, DbType)
         let op_token = self.next().unwrap();
         let op = match op_token {
             Token::Op(o) | Token::Ident(o) => o.to_uppercase(),
             _ => panic!("expected comparison op"),
         };
-        let (right_op, right_type) = self.parse_expr(proc); // Now returns (ComparisonOperand, DbType)
+        let (right_op, right_type) = self.parse_expr(); // Now returns (ComparisonOperand, DbType)
         let cmp = match op.as_str() {
             "="  => ComparerOperation::Equals,
             "!=" => ComparerOperation::NotEquals,
@@ -146,7 +147,7 @@ impl<'a> QueryParser<'a> {
             _ => promote_types(left_type, right_type), // Use types from expressions
         };
         
-        proc.add_comparison(
+        self.query_transformer.add_comparison(
             determined_comparison_type,
             left_op.clone(),
             right_op.clone(),
@@ -157,16 +158,15 @@ impl<'a> QueryParser<'a> {
     
     fn parse_expr(
         &mut self,
-        proc: &mut TransformerProcessor
     ) -> (ComparisonOperand, DbType) { // Changed return type
-        let (mut lhs_op, mut lhs_type) = self.parse_term(proc);
+        let (mut lhs_op, mut lhs_type) = self.parse_term();
         while let Some(op_str) = self.peek_op(&["+","-"]) {
             let math = if op_str=="+" { MathOperation::Add } else { MathOperation::Subtract };
             self.next(); // consume op
-            let (rhs_op, rhs_type) = self.parse_term(proc);
+            let (rhs_op, rhs_type) = self.parse_term();
             
             let result_type = promote_types(lhs_type, rhs_type);
-            let idx = proc.add_math_operation(result_type.clone(), lhs_op.clone(), rhs_op.clone(), math);
+            let idx = self.query_transformer.add_math_operation(result_type.clone(), lhs_op.clone(), rhs_op.clone(), math);
             lhs_op = ComparisonOperand::Intermediate(idx);
             lhs_type = result_type; // Update type to the result type of the operation
         }
@@ -174,17 +174,16 @@ impl<'a> QueryParser<'a> {
     }    
     
     fn parse_term(
-        &mut self,
-        proc: &mut TransformerProcessor
+        &mut self
     ) -> (ComparisonOperand, DbType) { // Changed return type
-        let (mut lhs_op, mut lhs_type) = self.parse_factor(proc);
+        let (mut lhs_op, mut lhs_type) = self.parse_factor();
         while let Some(op_str) = self.peek_op(&["*","/"]) {
             let math = if op_str=="*" { MathOperation::Multiply } else { MathOperation::Divide };
             self.next();
-            let (rhs_op, rhs_type) = self.parse_factor(proc);
+            let (rhs_op, rhs_type) = self.parse_factor();
 
             let result_type = promote_types(lhs_type, rhs_type);
-            let idx = proc.add_math_operation(result_type.clone(), lhs_op.clone(), rhs_op.clone(), math);
+            let idx = self.query_transformer.add_math_operation(result_type.clone(), lhs_op.clone(), rhs_op.clone(), math);
             lhs_op = ComparisonOperand::Intermediate(idx);
             lhs_type = result_type; // Update type to the result type of the operation
         }
@@ -192,8 +191,7 @@ impl<'a> QueryParser<'a> {
     }
 
    fn parse_factor(
-        &mut self,
-        proc: &mut TransformerProcessor
+        &mut self
     ) -> (ComparisonOperand, DbType) { // Changed return type
         match self.next().unwrap() {
             Token::Number(n) => {
@@ -209,13 +207,13 @@ impl<'a> QueryParser<'a> {
                 // It's important that self.schema is available and populated
                 let field_schema = self.schema.iter().find(|f| f.name == name)
                     .unwrap_or_else(|| panic!("unknown column schema for {}", name));
-                let mb = self.cols.get(name.as_str())
-                    .unwrap_or_else(|| panic!("unknown column data for {}", name))
-                    .clone();
+                let mb = self.cols.iter().find(|(n, _)| n == &name)
+                    .map(|(_, mb)| mb.clone())
+                    .unwrap_or_else(|| panic!("unknown column data for {}", name));
                 (ComparisonOperand::Direct(mb), field_schema.db_type.clone())
             }
             Token::LPar => {
-                let (inner_op, inner_type) = self.parse_expr(proc); // parse_expr now returns tuple
+                let (inner_op, inner_type) = self.parse_expr(); // parse_expr now returns tuple
                 if !matches!(self.next().unwrap(), Token::RPar) {
                     panic!("expected closing parenthesis after grouped expression");
                 }
@@ -234,13 +232,16 @@ impl<'a> QueryParser<'a> {
             }
         } else { None }
     }
+
     fn next_logic(&mut self) { self.pos+=1; }
+
     fn peek_op(&self, a: &[&str]) -> Option<String> {
         if let Some(Token::Op(o)) = self.toks.get(self.pos) {
             if a.contains(&o.as_str()) { return Some(o.clone()) }
         }
         None
     }
+
     fn next(&mut self) -> Option<Token> {
         let t = self.toks.get(self.pos).cloned();
         self.pos += 1;
@@ -513,10 +514,15 @@ pub fn tokenize_for_test(s: &str, schema: &Vec<SchemaField>) -> Vec<Token> {
 
 #[cfg(test)]
 mod tests {
-    use dashmap::DashMap;
+    use std::borrow::Cow;
+    use std::cell::UnsafeCell;
+    use std::collections::VecDeque;
     use crate::core::db_type::DbType;
+    use crate::core::row_v2::concurrent_processor::Buffer;
     use crate::core::row_v2::query_parser::{parse_query, tokenize_for_test, NumericValue};
+    use crate::core::row_v2::row::Row;
     use crate::core::row_v2::schema::SchemaField;
+    use crate::core::row_v2::transformer::TransformerProcessor;
     use crate::memory_pool::{MemoryBlock, MEMORY_POOL};
 
     fn create_memory_block_from_i8(value: i8) -> MemoryBlock {
@@ -643,8 +649,8 @@ mod tests {
         ]
     }
 
-    fn setup_test_columns<'a>() -> DashMap<String, MemoryBlock> {
-        let columns = DashMap::new();
+    fn setup_test_columns<'a>() -> Vec<(Cow<'a, str>, MemoryBlock)>  {
+        let mut columns = Vec::new();
 
         static ID: &str = "id";
         static AGE: &str = "age";
@@ -662,187 +668,337 @@ mod tests {
         static TEST_5: &str = "test_5";
         static TEST_6: &str = "test_6";
 
-        columns.insert(ID.to_string(), create_memory_block_from_i32(42));
-        columns.insert(AGE.to_string(), create_memory_block_from_u8(30));
-        columns.insert(SALARY.to_string(), create_memory_block_from_i32(50000));
-        columns.insert(NAME.to_string(), create_memory_block_from_string("John Doe"));
-        columns.insert(DEPARTMENT.to_string(), create_memory_block_from_string("Engineering"));
-        columns.insert(BANK_BALANCE.to_string(), create_memory_block_from_f64(1000.43));
-        columns.insert(CREDIT_BALANCE.to_string(), create_memory_block_from_f32(100.50));
-        columns.insert(NET_ASSETS.to_string(), create_memory_block_from_i64(200000));
-        columns.insert(EARTH_POSITION.to_string(), create_memory_block_from_i8(-50));
-        columns.insert(TEST_1.to_string(), create_memory_block_from_u32(100));
-        columns.insert(TEST_2.to_string(), create_memory_block_from_u16(200));
-        columns.insert(TEST_3.to_string(), create_memory_block_from_i128(i128::MAX));
-        columns.insert(TEST_4.to_string(), create_memory_block_from_u128(u128::MAX));
-        columns.insert(TEST_5.to_string(), create_memory_block_from_i16(300));
-        columns.insert(TEST_6.to_string(), create_memory_block_from_u64(400));
+        columns.push((Cow::Owned(ID.to_string()), create_memory_block_from_i32(42)));
+        columns.push((Cow::Owned(AGE.to_string()), create_memory_block_from_u8(30)));
+        columns.push((Cow::Owned(SALARY.to_string()), create_memory_block_from_i32(50000)));
+        columns.push((Cow::Owned(NAME.to_string()), create_memory_block_from_string("John Doe")));
+        columns.push((Cow::Owned(DEPARTMENT.to_string()), create_memory_block_from_string("Engineering")));
+        columns.push((Cow::Owned(BANK_BALANCE.to_string()), create_memory_block_from_f64(1000.43)));
+        columns.push((Cow::Owned(CREDIT_BALANCE.to_string()), create_memory_block_from_f32(100.50)));
+        columns.push((Cow::Owned(NET_ASSETS.to_string()), create_memory_block_from_i64(200000)));
+        columns.push((Cow::Owned(EARTH_POSITION.to_string()), create_memory_block_from_i8(-50)));
+        columns.push((Cow::Owned(TEST_1.to_string()), create_memory_block_from_u32(100)));
+        columns.push((Cow::Owned(TEST_2.to_string()), create_memory_block_from_u16(200)));
+        columns.push((Cow::Owned(TEST_3.to_string()), create_memory_block_from_i128(i128::MAX)));
+        columns.push((Cow::Owned(TEST_4.to_string()), create_memory_block_from_u128(u128::MAX)));
+        columns.push((Cow::Owned(TEST_5.to_string()), create_memory_block_from_i16(300)));
+        columns.push((Cow::Owned(TEST_6.to_string()), create_memory_block_from_u64(400)));
 
         columns
     }
 
     #[test]
     fn test_parse_simple_equals() {
-        let schema = create_schema();
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "id = 42";
 
         let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &schema);
-        assert!(processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+            bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_parse_simple_not_equals() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "id != 50";
 
-        let tokens = tokenize_for_test(query, &create_schema());
+        let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+            bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_parse_simple_greater_than() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "age > 25";
 
-        let tokens = tokenize_for_test(query, &create_schema());
+        let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+            bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_parse_simple_less_than() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "age < 40";
 
-       let tokens = tokenize_for_test(query, &create_schema());
+       let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_parse_greater_or_equal() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "age >= 30";
 
-      let tokens = tokenize_for_test(query, &create_schema());
+      let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_parse_less_or_equal() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "age <= 30";
 
-        let tokens = tokenize_for_test(query, &create_schema());
+        let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_parse_math_operation() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "age + 10 = 40";
 
-       let tokens = tokenize_for_test(query, &create_schema());
+       let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_parse_multiple_math_operations() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "age * 2 + 10 = 70";
 
-        let tokens = tokenize_for_test(query, &create_schema());
+        let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_parse_parentheses() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "(age + 10) * 2 = 80";
 
-        let tokens = tokenize_for_test(query, &create_schema());
+        let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_parse_string_contains() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "name CONTAINS 'John'";
 
-        let tokens = tokenize_for_test(query, &create_schema());
+        let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_parse_string_starts_with() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "name STARTSWITH 'John'";
 
-        let tokens = tokenize_for_test(query, &create_schema());
+        let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_parse_string_ends_with() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "name ENDSWITH 'Doe'";
-        let tokens = tokenize_for_test(query, &create_schema());
+        let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_parse_logical_and() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "age > 25 AND salary = 50000";
 
-        let tokens = tokenize_for_test(query, &create_schema());
+        let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_parse_logical_or() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "age < 25 OR salary = 50000";
 
-        let tokens = tokenize_for_test(query, &create_schema());
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(processor.execute());
+        let tokens = tokenize_for_test(query, &schema);
+
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_parse_complex_query() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "age > 25 AND (salary = 50000 OR name CONTAINS 'Jane')";
 
-        let tokens = tokenize_for_test(query, &create_schema());
+        let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
@@ -919,189 +1075,377 @@ mod tests {
     
     #[test]
     fn test_string_equality_type_inference() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "name = 'John Doe'";
-        let tokens = tokenize_for_test(query, &create_schema());
+        let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_string_op_type_inference() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "department STARTSWITH 'Eng'";
-        let tokens = tokenize_for_test(query, &create_schema());
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(processor.execute());
+        let tokens = tokenize_for_test(query, &schema);
+
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_mixed_types_in_different_comparisons_false() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "id > 10 AND name = 'Test'"; // id > 10 (T), name = 'Test' (F) -> F
-        let tokens = tokenize_for_test(query, &create_schema());
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(!processor.execute());
+        let tokens = tokenize_for_test(query, &schema);
+
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_arithmetic_precedence_div_add() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "salary / 2 + 100 = 25100"; // 50000/2 + 100 = 25000 + 100 = 25100
-        let tokens = tokenize_for_test(query, &create_schema());
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(processor.execute());
+        let tokens = tokenize_for_test(query, &schema);
+
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_arithmetic_precedence_literal_first_div_add() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "10 + salary / 2 = 25010"; // 10 + 50000/2 = 10 + 25000 = 25010
-        let tokens = tokenize_for_test(query, &create_schema());
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(processor.execute());
+        let tokens = tokenize_for_test(query, &schema);
+
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_logical_precedence_and_then_or() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         // (id=42 (T) AND age > 20 (T)) OR salary < 60000 (T) -> (T AND T) OR T -> T OR T -> T
         let query = "id = 42 AND age > 20 OR salary < 60000";
-        let tokens = tokenize_for_test(query, &create_schema());
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(processor.execute());
+        let tokens = tokenize_for_test(query, &schema);
+
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_logical_precedence_or_then_and_parsed() { // Parser structure implies AND has higher precedence
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         // id = 10 (F) OR (age > 20 (T) AND salary = 50000 (T)) -> F OR (T AND T) -> F OR T -> T
         let query = "id = 10 OR age > 20 AND salary = 50000";
-        let tokens = tokenize_for_test(query, &create_schema());
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(processor.execute());
+        let tokens = tokenize_for_test(query, &schema);
+
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
     
     #[test]
     fn test_explicit_logical_grouping_and_first() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "(id = 42 AND age > 20) OR salary < 60000"; // Same as test_logical_precedence_and_then_or
-        let tokens = tokenize_for_test(query, &create_schema());
+        let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_explicit_logical_grouping_or_first_with_and() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "id = 10 OR (age > 20 AND salary = 50000)"; // Same as test_logical_precedence_or_then_and_parsed
-        let tokens = tokenize_for_test(query, &create_schema());
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(processor.execute());
+        let tokens = tokenize_for_test(query, &schema);
+
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_complex_boolean_with_grouping() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         // (name STARTSWITH 'J' (T) OR department = 'Sales' (F)) AND age < 35 (T)
         // (T OR F) AND T -> T AND T -> T
         let query = "(name STARTSWITH 'J' OR department = 'Sales') AND age < 35";
-        let tokens = tokenize_for_test(query, &create_schema());
+        let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_complex_arithmetic_nested_parentheses() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         // ((30+5)*2 - 10)/3 = (35*2 - 10)/3 = (70-10)/3 = 60/3 = 20
         let query = "( (age + 5) * 2 - 10 ) / 3 = 20";
-        let tokens = tokenize_for_test(query, &create_schema());
+        let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_nested_boolean_groups() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         // (id=42 (T) AND (age>25 (T) OR age<20 (F))) OR department='Engineering' (T)
         // (T AND (T OR F)) OR T -> (T AND T) OR T -> T OR T -> T
         let query = "(id = 42 AND (age > 25 OR age < 20)) OR department = 'Engineering'";
-        let tokens = tokenize_for_test(query, &create_schema());
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(processor.execute());
+        let tokens = tokenize_for_test(query, &schema);
+
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_column_compared_to_itself() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "id = id"; // 42 = 42
 
-        let tokens = tokenize_for_test(query, &create_schema());
+        let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
     
     #[test]
     fn test_literal_on_left_arithmetic_on_right() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "10 = id - 32"; // 10 = 42 - 32 -> 10 = 10
-        let tokens = tokenize_for_test(query, &create_schema());
+        let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_multiple_conditions_on_same_string_column() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         // name = 'John Doe' (T) AND name != 'Jane Doe' (T) -> T
         let query = "name = 'John Doe' AND name != 'Jane Doe'";
-        let tokens = tokenize_for_test(query, &create_schema());
+        let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_arithmetic_group_followed_by_and() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         // (age + 10) > 30 (T, 40 > 30) AND id = 42 (T) -> T
         let query = "(age + 10) > 30 AND id = 42";
-        let tokens = tokenize_for_test(query, &create_schema());
+        let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_multiple_string_operations_with_and() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         // department ENDSWITH 'ing' (T) AND name CONTAINS 'oh' (T) -> T
         let query = "department ENDSWITH 'ing' AND name CONTAINS 'oh'";
-        let tokens = tokenize_for_test(query, &create_schema());
+        let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_boolean_groups_with_and_or_combination() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         // (age*2=60 (T) OR age/2=15 (T)) -> (T OR T) -> T
         // AND
         // (salary > 40000 (T) AND salary < 60000 (T)) -> (T AND T) -> T
         // T AND T -> T
         let query = "(age * 2 = 60 OR age / 2 = 15) AND (salary > 40000 AND salary < 60000)";
-        let tokens = tokenize_for_test(query, &create_schema());
+        let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
@@ -1129,163 +1473,323 @@ mod tests {
 
     #[test]
     fn test_parse_simple_equals_false() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "id = 100"; // 42 = 100 -> False
-        let tokens = tokenize_for_test(query, &create_schema());
+        let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(!processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_parse_simple_string_equals_false() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "name = 'NonExistent'"; // 'John Doe' = 'NonExistent' -> False
-        let tokens = tokenize_for_test(query, &create_schema());
+        let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(!processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_parse_simple_greater_than_false() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "age > 30"; // 30 > 30 -> False
-        let tokens = tokenize_for_test(query, &create_schema());
+        let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(!processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_parse_simple_less_than_false() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "salary < 50000"; // 50000 < 50000 -> False
-        let tokens = tokenize_for_test(query, &create_schema());
+        let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(!processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_parse_simple_not_equals_false() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "id != 42"; // 42 != 42 -> False
-        let tokens = tokenize_for_test(query, &create_schema());
+        let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(!processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_parse_string_contains_false() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "name CONTAINS 'XYZ'"; // 'John Doe' CONTAINS 'XYZ' -> False
-        let tokens = tokenize_for_test(query, &create_schema());
+        let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(!processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_parse_string_starts_with_false() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "department STARTSWITH 'Sci'"; // 'Engineering' STARTSWITH 'Sci' -> False
-        let tokens = tokenize_for_test(query, &create_schema());
+        let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(!processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_parse_string_ends_with_false() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "name ENDSWITH 'Smith'"; // 'John Doe' ENDSWITH 'Smith' -> False
-        let tokens = tokenize_for_test(query, &create_schema());
+        let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(!processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_parse_math_operation_false() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "age + 10 = 50"; // 30 + 10 = 40; 40 = 50 -> False
-        let tokens = tokenize_for_test(query, &create_schema());
+        let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(!processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_parse_multiple_math_operations_false() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "age * 2 + 10 = 60"; // 30 * 2 + 10 = 70; 70 = 60 -> False
-        let tokens = tokenize_for_test(query, &create_schema());
+        let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(!processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_parse_parentheses_false() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "(age + 10) * 2 = 70"; // (30 + 10) * 2 = 80; 80 = 70 -> False
-        let tokens = tokenize_for_test(query, &create_schema());
+        let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(!processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_parse_logical_and_false_first_cond() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "age > 35 AND salary = 50000"; // (30 > 35 -> F) AND (50000 = 50000 -> T) -> F
-        let tokens = tokenize_for_test(query, &create_schema());
+        let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(!processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_parse_logical_and_false_second_cond() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "age > 25 AND salary = 10000"; // (30 > 25 -> T) AND (50000 = 10000 -> F) -> F
-        let tokens = tokenize_for_test(query, &create_schema());
+        let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(!processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_parse_logical_and_false_both_conds() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "age > 35 AND salary = 10000"; // (F) AND (F) -> F
-        let tokens = tokenize_for_test(query, &create_schema());
+        let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(!processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_parse_logical_or_false_both_conds() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "age < 20 OR salary = 10000"; // (30 < 20 -> F) OR (50000 = 10000 -> F) -> F
-        let tokens = tokenize_for_test(query, &create_schema());
+        let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(!processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     #[should_panic(expected =r#"Invalid byte slice: TryFromSliceError(())"#)]
     fn test_column_vs_column_false() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "id = age"; // Should fail, not same type
-        let tokens = tokenize_for_test(query, &create_schema());
+        let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
@@ -1297,8 +1801,18 @@ mod tests {
 
         let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &schema);
-        assert!(!processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
@@ -1310,95 +1824,190 @@ mod tests {
 
         let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &schema);
-        assert!(!processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+            bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     #[should_panic(expected ="unknown column schema for AgE")]
     fn test_case_insensitive_keywords_with_false_outcome() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         // AgE > 35 (F) aNd SaLaRy = 50000 (T) -> F
         let query = "AgE > 35 aNd SaLaRy = 50000";
-        let tokens = tokenize_for_test(query, &create_schema());
+        let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_query_with_extra_whitespace_false() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         // id = 100 (F) AND name CONTAINS 'John' (T) -> F
         let query = "id   =  100   AND  name   CONTAINS   'John'";
-        let tokens = tokenize_for_test(query, &create_schema());
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(!processor.execute());
+        let tokens = tokenize_for_test(query, &schema);
+
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_float_equality_true() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "bank_balance = 1000.43";
-        let tokens = tokenize_for_test(query, &create_schema());
+        let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_float_equality_false() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "bank_balance = 1000.44";
-        let tokens = tokenize_for_test(query, &create_schema());
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(!processor.execute());
+        let tokens = tokenize_for_test(query, &schema);
+
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_float_greater_than_true() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "bank_balance > 1000.0";
-        let tokens = tokenize_for_test(query, &create_schema());
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(processor.execute());
+        let tokens = tokenize_for_test(query, &schema);
+
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_float_less_than_with_arithmetic_false() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "bank_balance - 0.43 < 1000.0"; // 1000.43 - 0.43 = 1000.0; 1000.0 < 1000.0 is false
-        let tokens = tokenize_for_test(query, &create_schema());
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(!processor.execute());
+        let tokens = tokenize_for_test(query, &schema);
+
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_float_comparison_with_logical_and_true() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         let query = "bank_balance >= 1000.43 AND age = 30"; // T AND T -> T
-        let tokens = tokenize_for_test(query, &create_schema());
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(processor.execute());
+        let tokens = tokenize_for_test(query, &schema);
+
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_various_numeric_types_and_logical_ops_true() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         // credit_balance (100.50) > 100.0 (T)
         // AND net_assets (200000) < 200001 (T)
         // AND earth_position (-50) = -50 (T)
         // T AND T AND T -> T
         let query = "credit_balance > 100.0 AND net_assets < 200001 AND earth_position = -50";
-        let tokens = tokenize_for_test(query, &create_schema());
+        let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
     #[test]
     fn test_large_and_unsigned_types_with_grouping_true() {
-        let columns = setup_test_columns();
+        let schema = create_schema(); let columns = setup_test_columns();
         // test_1 (100) = 100 (T)
         // OR test_2 (200) > 300 (F) -> T OR F -> T
         // AND
@@ -1406,9 +2015,19 @@ mod tests {
         // AND test_4 (MAX) > 0 (T) -> T AND T -> T
         // (T) AND (T) -> T
         let query = "(test_1 = 100 OR test_2 > 300) AND (test_3 = test_3 AND test_4 > 0)";
-        let tokens = tokenize_for_test(query, &create_schema());
+        let tokens = tokenize_for_test(query, &schema);
 
-        let mut processor = parse_query(&tokens, &columns, &create_schema());
-        assert!(processor.execute());
+        let mut buffer = Buffer {
+            hashtable_buffer: vec![],
+            row: Row::default(),
+            transformers: VecDeque::new(),
+            intermediate_results: vec![],
+bool_buffer: vec![],
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 }
