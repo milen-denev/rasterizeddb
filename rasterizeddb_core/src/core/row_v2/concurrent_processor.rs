@@ -1,10 +1,10 @@
-use std::sync::Arc;
+use std::{borrow::Cow, cell::UnsafeCell, collections::VecDeque, sync::Arc};
 
 use futures::future::join_all;
 use tokio::{sync::{mpsc, Semaphore}, task};
 
 use crate::{core::storage_providers::traits::StorageIO, memory_pool::MemoryBlock};
-use super::{query_parser::{parse_query, tokenize}, row::{column_vec_into_dashmap, update_values_of_dashmap, Column, Row, RowFetch}, row_pointer::RowPointerIterator, schema::SchemaField};
+use super::{query_parser::{parse_query, tokenize}, row::{column_vec_into_vec, Row, RowFetch}, row_pointer::RowPointerIterator, schema::SchemaField, transformer::{ColumnTransformer, Next, TransformerProcessor}};
 
 pub struct ConcurrentProcessor;
 
@@ -28,20 +28,6 @@ impl ConcurrentProcessor {
 
         iterator.reset();
 
-        let reference_columns = {
-            let mut temp_columns = Vec::new();
-            for schema in &table_schema {
-                let column = Column {
-                    schema_id: schema.write_order,
-                    data: MemoryBlock::default(),
-                    column_type: schema.db_type.clone(),
-                };
-                temp_columns.push(column);
-            }
-            temp_columns
-        };
-
-        let reference_columns_arc = Arc::new(reference_columns);
         let schema_arc = Arc::new(table_schema);
         let query_arc = Arc::new(where_query.to_string());
 
@@ -58,44 +44,65 @@ impl ConcurrentProcessor {
             let tx_clone = tx.clone();
 
             let schema_ref = schema_arc.clone();
-            let reference_columns_ref = reference_columns_arc.clone();
             let token_ref = token_arc.clone();
 
             // Spawn a task for this entire batch of pointers
             let batch_handle = task::spawn(async move {
-                let dashmap = column_vec_into_dashmap(
-                    &reference_columns_ref,
-                    &schema_ref
-                );
-                
+
                 // Acquire a permit for this batch
                 let batch_permit = tuple_clone.0.acquire().await.unwrap();
 
-                let mut row = Row::default();
+                let row = Row::default();
+
+                let mut buffer = Buffer {
+                    // Cleared in this function
+                    hashtable_buffer: vec![],
+                    // Cleared in read row functions
+                    row,
+                    // Cleared in new function
+                    transformers: VecDeque::new(),
+                    // Cleared in new function
+                    intermediate_results: vec![],
+                    // Cleared in this function
+                    bool_buffer: vec![]
+                };
+
+                let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
                 // Process each pointer in this batch (same as your original code)
                 for pointer in pointers {
+                    buffer.hashtable_buffer.clear();
+                    buffer.bool_buffer.clear();
+
                     let tuple_clone_2 = tuple_clone.clone();
                     let (_, io_clone, row_fetch) = &*tuple_clone_2;
-                    pointer.fetch_row_reuse_async(io_clone, &row_fetch, &mut row).await;
-                    
-                    update_values_of_dashmap(
-                        &dashmap,
-                        &row.columns,
+
+                    pointer.fetch_row_reuse_async(io_clone, &row_fetch, &mut buffer.row).await;
+
+                    column_vec_into_vec(
+                        &mut buffer.hashtable_buffer,
+                        &buffer.row.columns,
                         &schema_ref
                     );
+                
+                    unsafe 
+                    {
+                        let mut_transformer = &mut *transformer.get();
 
-                    let mut transformer = parse_query(
-                        &token_ref,
-                        &dashmap,
-                        &schema_ref
-                    );
-
-                    let result = transformer.execute();
+                        parse_query(
+                            &token_ref,
+                            &buffer.hashtable_buffer,
+                            &schema_ref,
+                            mut_transformer
+                        );
+                    }
+                
+                    let result = transformer.get_mut().execute(&mut buffer.bool_buffer);
 
                     if result {
-                        tx_clone.send(Row::clone_from_mut_row(&row)).unwrap();
+                        tx_clone.send(Row::clone_from_mut_row(&buffer.row)).unwrap();
                     }
+                
                 }
 
                 // Release the batch semaphore permit
@@ -128,4 +135,12 @@ impl ConcurrentProcessor {
 
         all_rows
     }
+}
+
+pub struct Buffer<'a> {
+    pub hashtable_buffer: Vec<(Cow<'a, str>, MemoryBlock)>,
+    pub row: Row,
+    pub transformers: VecDeque<ColumnTransformer>,
+    pub intermediate_results: Vec<MemoryBlock>,
+    pub bool_buffer: Vec<(bool, Option<Next>)>
 }
