@@ -653,6 +653,35 @@ mod tests {
         ]
     }
 
+    fn create_schema_2() -> SmallVec<[SchemaField; 20]> {
+        smallvec::smallvec![
+            SchemaField::new("id".to_string(), DbType::U128, 16, 0, 0, false),
+            SchemaField::new("name".to_string(), DbType::STRING, 12, 0, 0, false),
+            SchemaField::new("age".to_string(), DbType::U8, 1, 0, 0, false),
+            SchemaField::new("email".to_string(), DbType::STRING, 12, 0, 0, false),
+            SchemaField::new("phone".to_string(), DbType::STRING, 12, 0, 0, false),
+            SchemaField::new("is_active".to_string(), DbType::U8, 1, 0, 0, false),
+            SchemaField::new("bank_balance".to_string(), DbType::F64, 8, 0, 0, false),
+            SchemaField::new("married".to_string(), DbType::U8, 1, 0, 0, false),
+            SchemaField::new("birth_date".to_string(), DbType::STRING, 12, 0, 0, false), // Assuming STRING, could be DATETIME
+            SchemaField::new("last_login".to_string(), DbType::STRING, 12, 0, 0, false), // Assuming STRING, could be DATETIME
+            SchemaField::new("last_purchase".to_string(), DbType::STRING, 12, 0, 0, false), // Assuming STRING, could be DATETIME
+            SchemaField::new("last_purchase_amount".to_string(), DbType::F32, 4, 0, 0, false),
+            SchemaField::new("last_purchase_date".to_string(), DbType::STRING, 12, 0, 0, false), // Assuming STRING, could be DATETIME
+            SchemaField::new("last_purchase_location".to_string(), DbType::STRING, 12, 0, 0, false),
+            SchemaField::new("last_purchase_method".to_string(), DbType::STRING, 12, 0, 0, false),
+            SchemaField::new("last_purchase_category".to_string(), DbType::STRING, 12, 0, 0, false),
+            SchemaField::new("last_purchase_subcategory".to_string(), DbType::STRING, 12, 0, 0, false),
+            SchemaField::new("last_purchase_description".to_string(), DbType::STRING, 12, 0, 0, false),
+            SchemaField::new("last_purchase_status".to_string(), DbType::STRING, 12, 0, 0, false),
+            SchemaField::new("last_purchase_id".to_string(), DbType::U64, 8, 0, 0, false),
+            SchemaField::new("last_purchase_notes".to_string(), DbType::STRING, 12, 0, 0, false),
+            SchemaField::new("net_assets".to_string(), DbType::F64, 8, 0, 0, false),
+            SchemaField::new("department".to_string(), DbType::STRING, 12, 0, 0, false),
+            SchemaField::new("salary".to_string(), DbType::F32, 4, 0, 0, false),
+        ]
+    }
+
     fn setup_test_columns<'a>() -> SmallVec<[(Cow<'a, str>, MemoryBlock); 20]>  {
         let mut columns = SmallVec::new();
 
@@ -687,6 +716,62 @@ mod tests {
         columns.push((Cow::Borrowed(TEST_4), create_memory_block_from_u128(u128::MAX)));
         columns.push((Cow::Borrowed(TEST_5), create_memory_block_from_i16(300)));
         columns.push((Cow::Borrowed(TEST_6), create_memory_block_from_u64(400)));
+
+        columns
+    }
+
+    fn setup_test_columns_2<'a>() -> SmallVec<[(Cow<'a, str>, MemoryBlock); 20]>  {
+        let mut columns = SmallVec::new();
+
+        static ID: &str = "id";
+        static NAME: &str = "name";
+        static AGE: &str = "age";
+        static EMAIL: &str = "email";
+        static PHONE: &str = "phone";
+        static IS_ACTIVE: &str = "is_active";
+        static BANK_BALANCE: &str = "bank_balance";
+        static MARRIED: &str = "married";
+        static BIRTH_DATE: &str = "birth_date";
+        static LAST_LOGIN: &str = "last_login";
+        static LAST_PURCHASE: &str = "last_purchase";
+        static LAST_PURCHASE_AMOUNT: &str = "last_purchase_amount";
+        static LAST_PURCHASE_DATE: &str = "last_purchase_date";
+        static LAST_PURCHASE_LOCATION: &str = "last_purchase_location";
+        static LAST_PURCHASE_METHOD: &str = "last_purchase_method";
+        static LAST_PURCHASE_CATEGORY: &str = "last_purchase_category";
+        static LAST_PURCHASE_SUBCATEGORY: &str = "last_purchase_subcategory";
+        static LAST_PURCHASE_DESCRIPTION: &str = "last_purchase_description";
+        static LAST_PURCHASE_STATUS: &str = "last_purchase_status";
+        static LAST_PURCHASE_ID: &str = "last_purchase_id";
+        static LAST_PURCHASE_NOTES: &str = "last_purchase_notes";
+        static NET_ASSETS: &str = "net_assets";
+        static DEPARTMENT: &str = "department";
+        static SALARY: &str = "salary";
+
+        columns.push((Cow::Borrowed(ID), create_memory_block_from_u128(42_433_943_354)));
+        columns.push((Cow::Borrowed(NAME), create_memory_block_from_string("John Doe")));
+        columns.push((Cow::Borrowed(AGE), create_memory_block_from_u8(30)));
+        columns.push((Cow::Borrowed(EMAIL), create_memory_block_from_string("john.doe@example.com")));
+        columns.push((Cow::Borrowed(PHONE), create_memory_block_from_string("123-456-7890")));
+        columns.push((Cow::Borrowed(IS_ACTIVE), create_memory_block_from_u8(1)));
+        columns.push((Cow::Borrowed(BANK_BALANCE), create_memory_block_from_f64(1000.43)));
+        columns.push((Cow::Borrowed(MARRIED), create_memory_block_from_u8(0)));
+        columns.push((Cow::Borrowed(BIRTH_DATE), create_memory_block_from_string("1990-01-01")));
+        columns.push((Cow::Borrowed(LAST_LOGIN), create_memory_block_from_string("2023-10-01")));
+        columns.push((Cow::Borrowed(LAST_PURCHASE), create_memory_block_from_string("2023-09-30")));
+        columns.push((Cow::Borrowed(LAST_PURCHASE_AMOUNT), create_memory_block_from_f32(15_540.75)));
+        columns.push((Cow::Borrowed(LAST_PURCHASE_DATE), create_memory_block_from_string("2023-09-30")));
+        columns.push((Cow::Borrowed(LAST_PURCHASE_LOCATION), create_memory_block_from_string("Online")));
+        columns.push((Cow::Borrowed(LAST_PURCHASE_METHOD), create_memory_block_from_string("Credit Card")));
+        columns.push((Cow::Borrowed(LAST_PURCHASE_CATEGORY), create_memory_block_from_string("Electronics")));
+        columns.push((Cow::Borrowed(LAST_PURCHASE_SUBCATEGORY), create_memory_block_from_string("Computers")));
+        columns.push((Cow::Borrowed(LAST_PURCHASE_DESCRIPTION), create_memory_block_from_string("Gaming Laptop")));
+        columns.push((Cow::Borrowed(LAST_PURCHASE_STATUS), create_memory_block_from_string("Completed")));
+        columns.push((Cow::Borrowed(LAST_PURCHASE_ID), create_memory_block_from_u64(1001)));
+        columns.push((Cow::Borrowed(LAST_PURCHASE_NOTES), create_memory_block_from_string("No issues")));
+        columns.push((Cow::Borrowed(NET_ASSETS), create_memory_block_from_f64(8_449_903_733.92)));
+        columns.push((Cow::Borrowed(DEPARTMENT), create_memory_block_from_string("Engineering")));
+        columns.push((Cow::Borrowed(SALARY), create_memory_block_from_f32(4955.58)));
 
         columns
     }
@@ -2336,4 +2421,92 @@ bool_buffer: SmallVec::new(),
         parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
         assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
+
+     fn _setup_test_columns43242<'a>() -> SmallVec<[(Cow<'a, str>, MemoryBlock); 20]>  {
+        let mut columns = SmallVec::new();
+
+        static ID: &str = "id";
+        static NAME: &str = "name";
+        static AGE: &str = "age";
+        static EMAIL: &str = "email";
+        static PHONE: &str = "phone";
+        static IS_ACTIVE: &str = "is_active";
+        static BANK_BALANCE: &str = "bank_balance";
+        static MARRIED: &str = "married";
+        static BIRTH_DATE: &str = "birth_date";
+        static LAST_LOGIN: &str = "last_login";
+        static LAST_PURCHASE: &str = "last_purchase";
+        static LAST_PURCHASE_AMOUNT: &str = "last_purchase_amount";
+        static LAST_PURCHASE_DATE: &str = "last_purchase_date";
+        static LAST_PURCHASE_LOCATION: &str = "last_purchase_location";
+        static LAST_PURCHASE_METHOD: &str = "last_purchase_method";
+        static LAST_PURCHASE_CATEGORY: &str = "last_purchase_category";
+        static LAST_PURCHASE_SUBCATEGORY: &str = "last_purchase_subcategory";
+        static LAST_PURCHASE_DESCRIPTION: &str = "last_purchase_description";
+        static LAST_PURCHASE_STATUS: &str = "last_purchase_status";
+        static LAST_PURCHASE_ID: &str = "last_purchase_id";
+        static LAST_PURCHASE_NOTES: &str = "last_purchase_notes";
+        static NET_ASSETS: &str = "net_assets";
+        static DEPARTMENT: &str = "department";
+        static SALARY: &str = "salary";
+
+        columns.push((Cow::Borrowed(ID), create_memory_block_from_u128(42_433_943_354)));
+        columns.push((Cow::Borrowed(NAME), create_memory_block_from_string("John Doe")));
+        columns.push((Cow::Borrowed(AGE), create_memory_block_from_u8(30)));
+        columns.push((Cow::Borrowed(EMAIL), create_memory_block_from_string("john.doe@example.com")));
+        columns.push((Cow::Borrowed(PHONE), create_memory_block_from_string("123-456-7890")));
+        columns.push((Cow::Borrowed(IS_ACTIVE), create_memory_block_from_u8(1)));
+        columns.push((Cow::Borrowed(BANK_BALANCE), create_memory_block_from_f64(1000.43)));
+        columns.push((Cow::Borrowed(MARRIED), create_memory_block_from_u8(0)));
+        columns.push((Cow::Borrowed(BIRTH_DATE), create_memory_block_from_string("1990-01-01")));
+        columns.push((Cow::Borrowed(LAST_LOGIN), create_memory_block_from_string("2023-10-01")));
+        columns.push((Cow::Borrowed(LAST_PURCHASE), create_memory_block_from_string("2023-09-30")));
+        columns.push((Cow::Borrowed(LAST_PURCHASE_AMOUNT), create_memory_block_from_f32(15_540.75)));
+        columns.push((Cow::Borrowed(LAST_PURCHASE_DATE), create_memory_block_from_string("2023-09-30")));
+        columns.push((Cow::Borrowed(LAST_PURCHASE_LOCATION), create_memory_block_from_string("Online")));
+        columns.push((Cow::Borrowed(LAST_PURCHASE_METHOD), create_memory_block_from_string("Credit Card")));
+        columns.push((Cow::Borrowed(LAST_PURCHASE_CATEGORY), create_memory_block_from_string("Electronics")));
+        columns.push((Cow::Borrowed(LAST_PURCHASE_SUBCATEGORY), create_memory_block_from_string("Computers")));
+        columns.push((Cow::Borrowed(LAST_PURCHASE_DESCRIPTION), create_memory_block_from_string("Gaming Laptop")));
+        columns.push((Cow::Borrowed(LAST_PURCHASE_STATUS), create_memory_block_from_string("Completed")));
+        columns.push((Cow::Borrowed(LAST_PURCHASE_ID), create_memory_block_from_u64(1001)));
+        columns.push((Cow::Borrowed(LAST_PURCHASE_NOTES), create_memory_block_from_string("No issues")));
+        columns.push((Cow::Borrowed(NET_ASSETS), create_memory_block_from_f64(8_449_903_733.92)));
+        columns.push((Cow::Borrowed(DEPARTMENT), create_memory_block_from_string("Engineering")));
+        columns.push((Cow::Borrowed(SALARY), create_memory_block_from_f32(4955.58)));
+
+        columns
+    }
+
+    #[test]
+    fn test_very_complex_query_1_true() {
+        let schema = create_schema_2(); 
+        static COLUMNS_2: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
+            let columns_box = Box::new(setup_test_columns_2());
+            columns_box
+        });
+        let columns = &*COLUMNS_2;
+
+        let query = r##"
+            (id = 42 AND name CONTAINS 'John') OR
+            (age > 25 AND salary < 50000.0) OR
+            (bank_balance >= 1000.43 AND net_assets > 800000) OR
+            (department STARTSWITH 'Eng' AND email ENDSWITH 'example.com')
+        "##;
+        let tokens = tokenize_for_test(query, &schema);
+
+        let mut buffer = Buffer {
+            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            row: Row::default(),
+            transformers: SmallVec::new(),
+            intermediate_results: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, &schema, unsafe { &mut *transformer.get() });
+        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
+    }
+
 }
