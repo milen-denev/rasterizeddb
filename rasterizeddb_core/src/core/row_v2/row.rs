@@ -1,4 +1,4 @@
-use dashmap::DashMap;
+use std::borrow::Cow;
 
 use crate::{core::db_type::DbType, memory_pool::MemoryBlock};
 
@@ -40,9 +40,9 @@ pub struct Row {
 impl Row {
     pub fn clone_from_mut_row(row: &Row) -> Row {
         Row {
-            position: row.position,
+            position: row.position.clone(),
             columns: row.columns.clone(),
-            length: row.length
+            length: row.length.clone()
         }
     }
 }
@@ -54,27 +54,12 @@ pub struct Column {
     pub column_type: DbType,
 }
 
-pub fn column_vec_into_dashmap(
+pub fn column_vec_into_vec<'a>(
+    row_mut: &mut Vec<(Cow<'a, str>, MemoryBlock)>,
     columns: &Vec<Column>,
-    schema: &Vec<SchemaField>
-) -> DashMap<String, MemoryBlock> {
-    let column_map = DashMap::new();
-
-    for column in columns {
-        column_map.insert(schema[column.schema_id as usize].name.clone(), column.data.clone());
-    }
-
-    column_map
-}
-
-pub fn update_values_of_dashmap(
-    column_map: &DashMap<String, MemoryBlock>,
-    columns: &Vec<Column>,
-    schema: &Vec<SchemaField>
+    schema: &'a Vec<SchemaField>
 ) {
     for column in columns {
-        column_map.alter(&schema[column.schema_id as usize].name, |_, _| {
-            column.data.clone()
-        });
+        row_mut.push((Cow::Borrowed(schema[column.schema_id as usize].name.as_str()), column.data.clone()));
     }
 }
