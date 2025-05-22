@@ -8,7 +8,7 @@ use crossbeam_queue::SegQueue;
 use futures::future::join_all;
 use tokio::{io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt}, sync::RwLock, task::yield_now};
 
-use memmap2::{Mmap, MmapOptions};
+use memmap2::{MmapMut, MmapOptions};
 
 use crate::memory_pool::{MemoryBlock, MEMORY_POOL};
 
@@ -28,9 +28,9 @@ pub struct LocalStorageProvider {
     pub(crate) table_name: String,
     pub(crate) file_str: String,
     pub(crate) file_len: AtomicU64,
-    pub(crate) _memory_map: Mmap,
+    pub(crate) _memory_map: MmapMut,
     pub(crate) hash: u32,
-    locked: AtomicBool,
+    _locked: AtomicBool,
     appender: SegQueue<MemoryBlock>,
     #[cfg(unix)]
     io_uring_reader: AsyncUringReader
@@ -49,11 +49,11 @@ impl Clone for LocalStorageProvider {
             file_str: self.file_str.clone(),
             file_len: AtomicU64::new(self.file_len.load(std::sync::atomic::Ordering::SeqCst)),
             _memory_map: unsafe { MmapOptions::new()
-                .map(&std::fs::File::open(&self.file_str).unwrap())
+                .map_mut(&std::fs::File::open(&self.file_str).unwrap())
                 .unwrap() },
             hash: CRC.checksum(format!("{}+++{}", self.location, self.table_name).as_bytes()),
             appender: SegQueue::new(),
-            locked: AtomicBool::new(false),
+            _locked: AtomicBool::new(false),
             #[cfg(unix)]
             io_uring_reader: self.io_uring_reader.clone()
         }
@@ -124,11 +124,11 @@ impl LocalStorageProvider {
                 file_len: AtomicU64::new(file_len),
                 _memory_map: unsafe { MmapOptions::new()
                     .populate()
-                    .map(&file_read_mmap)
+                    .map_mut(&file_read_mmap)
                     .unwrap() },
                 hash: CRC.checksum(format!("{}+++{}", final_location, table_name).as_bytes()),
                 appender: SegQueue::new(),
-                locked: AtomicBool::new(false),
+                _locked: AtomicBool::new(false),
                 #[cfg(unix)]
                 io_uring_reader: AsyncUringReader::new(&file_str, 1024).unwrap()
             }
@@ -187,11 +187,11 @@ impl LocalStorageProvider {
                 file_str: file_str.clone(),
                 file_len: AtomicU64::new(file_len),
                 _memory_map: unsafe { MmapOptions::new()
-                    .map(&file_read_mmap)
+                    .map_mut(&file_read_mmap)
                     .unwrap() },
                 hash: CRC.checksum(format!("{}+++{}", location_str, "CONFIG_TABLE.db").as_bytes()),
                 appender: SegQueue::new(),
-                locked: AtomicBool::new(false),
+                _locked: AtomicBool::new(false),
                 #[cfg(unix)]
                 io_uring_reader: AsyncUringReader::new(&file_str, 1024).unwrap()
             }
@@ -226,7 +226,7 @@ impl LocalStorageProvider {
         loop {
             if self.appender.len() > 0 {
                 //println!("Starting appending data, locking activating.");
-                self.locked.store(true, std::sync::atomic::Ordering::Relaxed);
+                //self.locked.store(true, std::sync::atomic::Ordering::Relaxed);
 
                 let mut buffer: Vec<u8> = Vec::default();
 
@@ -263,19 +263,24 @@ impl LocalStorageProvider {
 
                 drop(file);
 
-                let file = OpenOptions::new()
+               let file_ = OpenOptions::new()
                     .read(true)
+                    .write(true)
                     .open(&self.file_str)
                     .unwrap();
 
-                //self._memory_map[len as usize..len as usize + size].copy_from_slice(&buffer);
+                let buffer_len = buffer.len();
+
+                let file_len = self.file_len.load(std::sync::atomic::Ordering::Relaxed);
+                file_.set_len(file_len + buffer_len as u64).unwrap();
+
                 self._memory_map = unsafe { MmapOptions::new()
-                    .map(&file)
+                    .map_mut(&file_)
                     .unwrap() };
 
-                self.file_len.fetch_add(size as u64, std::sync::atomic::Ordering::Relaxed);
+                self.file_len.fetch_add(buffer.len() as u64, std::sync::atomic::Ordering::Release);
 
-                self.locked.store(false, std::sync::atomic::Ordering::Relaxed);
+                //self.locked.store(false, std::sync::atomic::Ordering::Relaxed);
 
                 //println!("Finished appending data, unlocking.");
             } else {
@@ -315,24 +320,31 @@ impl StorageIO for LocalStorageProvider {
 
     async fn append_data(&mut self, buffer: &[u8], immediate: bool) {
         if immediate {
-            self.locked.store(true, std::sync::atomic::Ordering::Relaxed);
+            //self.locked.store(true, std::sync::atomic::Ordering::Relaxed);
 
             let mut file = self.append_file.write().await;
             file.write_all(&buffer).await.unwrap();
             file.flush().await.unwrap();
             file.sync_all().await.unwrap();
 
-            let file_read = OpenOptions::new()
+            let file_ = OpenOptions::new()
                 .read(true)
+                .write(true)
                 .open(&self.file_str)
                 .unwrap();
 
+            let buffer_len = buffer.len();
+
+            let file_len = self.file_len.load(std::sync::atomic::Ordering::Relaxed);
+            file_.set_len(file_len + buffer_len as u64).unwrap();
+
             self._memory_map = unsafe { MmapOptions::new()
-                .map(&file_read)
+                .map_mut(&file_)
                 .unwrap() };
 
-            self.file_len.fetch_add(buffer.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            self.locked.store(false, std::sync::atomic::Ordering::Relaxed);
+            self.file_len.fetch_add(buffer.len() as u64, std::sync::atomic::Ordering::Release);
+            
+            //self.locked.store(false, std::sync::atomic::Ordering::Relaxed);
         } else {
             let block = MEMORY_POOL.acquire(buffer.len());
             let slice = block.into_slice_mut();
@@ -473,17 +485,17 @@ impl StorageIO for LocalStorageProvider {
         let buffer_len = buffer.len();
         //let table_len = self.file_len.load(std::sync::atomic::Ordering::Relaxed);
 
-        if self.locked.load(std::sync::atomic::Ordering::Relaxed) { //|| self._memory_map.len() < table_len as usize 
-            let mut read_file = std::fs::File::options()
-                .read(true)
-                .open(&self.file_str)
-                .unwrap();
+        // if self.locked.load(std::sync::atomic::Ordering::Relaxed) { //|| self._memory_map.len() < table_len as usize 
+            // let mut read_file = std::fs::File::options()
+            //     .read(true)
+            //     .open(&self.file_str)
+            //     .unwrap();
 
-            read_file.seek(SeekFrom::Start(*position)).unwrap();
-            read_file.read_exact(buffer).unwrap();
-        } else {
-            buffer.copy_from_slice(&self._memory_map[*position as usize..*position as usize + buffer_len]);
-        }
+            // read_file.seek(SeekFrom::Start(*position)).unwrap();
+            // read_file.read_exact(buffer).unwrap();
+        // } else {
+        buffer.copy_from_slice(&self._memory_map[*position as usize..*position as usize + buffer_len]);
+        //}
 
         *position += buffer_len as u64;
         // }
@@ -611,11 +623,11 @@ impl StorageIO for LocalStorageProvider {
             file_str: file_str.clone(),
             file_len: AtomicU64::new(file_len),
             _memory_map: unsafe { MmapOptions::new()
-                    .map(&file_read_mmap)
+                    .map_mut(&file_read_mmap)
                     .unwrap() },
             hash: CRC.checksum(format!("{}+++{}", final_location, "temp.db").as_bytes()),
             appender: SegQueue::new(),
-            locked: AtomicBool::new(false),
+            _locked: AtomicBool::new(false),
             #[cfg(unix)]
             io_uring_reader: AsyncUringReader::new(&file_str, 1024).unwrap()
         }
@@ -705,11 +717,11 @@ impl StorageIO for LocalStorageProvider {
             file_str: new_table.clone(),
             file_len: AtomicU64::new(file_len),
             _memory_map: unsafe { MmapOptions::new()
-                .map(&file_read_mmap)
+                .map_mut(&file_read_mmap)
                 .unwrap() },
             hash: CRC.checksum(format!("{}+++{}", final_location, name).as_bytes()),
             appender: SegQueue::new(),
-            locked: AtomicBool::new(false),
+            _locked: AtomicBool::new(false),
             #[cfg(unix)]
             io_uring_reader: AsyncUringReader::new(&new_table, 1024).unwrap()
         }

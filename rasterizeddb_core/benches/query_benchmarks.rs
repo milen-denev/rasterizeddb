@@ -2,10 +2,11 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use rasterizeddb_core::core::row_v2::query_parser::tokenize_for_test;
 use rasterizeddb_core::core::row_v2::schema::SchemaField;
 use rasterizeddb_core::core::db_type::DbType;
+use smallvec::SmallVec;
 use std::hint::black_box;
 
-fn create_benchmark_schema() -> Vec<SchemaField> {
-    vec![
+fn create_benchmark_schema() -> SmallVec<[SchemaField; 20]> {
+    smallvec::smallvec![
         SchemaField::new("id".to_string(), DbType::I32, 4, 0, 0, false),
         SchemaField::new("age".to_string(), DbType::U8, 1, 0, 0, false),
         SchemaField::new("salary".to_string(), DbType::I32, 4, 0, 0, false),

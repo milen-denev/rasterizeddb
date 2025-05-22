@@ -9,7 +9,7 @@ use super::{db_type::DbType, row_v2::{row::{ColumnFetchingData, ColumnWritePaylo
 pub static mut IO_SCHEMA: async_lazy::Lazy<LocalStorageProvider> =
     async_lazy::Lazy::new(|| {
         Box::pin(async {
-            let io = LocalStorageProvider::new("G:\\Databases\\Test_Database", Some("test_table.db")).await;
+            let io = LocalStorageProvider::new("G:\\Databases\\Test_Database", Some("test_table2.db")).await;
             io
         })
     });
@@ -69,50 +69,50 @@ pub async fn consolidated_read_data_function(schema: TableSchema, id: u64) {
     let io_pointers = unsafe { IO_POINTERS.force_mut().await };
     let io_rows = unsafe { IO_ROWS.force_mut().await };
 
-    loop {
-        let mut stopwatch = Stopwatch::start_new();
+    //loop {
+    let mut stopwatch = Stopwatch::start_new();
 
-        let schema_fields = schema.fields.clone();
-        let row_fetch = create_row_fetch(&schema_fields);
-        let mut iterator = RowPointerIterator::new(io_pointers).await.unwrap();
+    let schema_fields = schema.fields.clone();
+    let row_fetch = create_row_fetch(&schema_fields);
+    let mut iterator = RowPointerIterator::new(io_pointers).await.unwrap();
 
-        let concurrent_processor = ConcurrentProcessor::new();
+    let concurrent_processor = ConcurrentProcessor::new();
 
-        let all_rows = concurrent_processor.process(
-            &format!(
-            r##"
-                id = {}
-                 age < 40 AND 
-                bank_balance > 500.25 AND 
-                name != 'Jane Doe' AND 
-                last_purchase_category CONTAINS 'Elec' AND 
-                last_purchase_amount >= 50.0 AND 
-                is_active = 1 AND 
-                last_purchase_amount < 200.0 AND 
-                last_purchase_notes ENDSWITH 'notes' AND 
-                last_purchase_date = '2023-10-01' OR 
-                id < 100000 AND 
-                age > 25 AND 
-                bank_balance < 5000.00 AND 
-                name STARTSWITH 'J' AND 
-                last_purchase_category = 'Electronics' AND 
-                last_purchase_amount <= 150.0 AND 
-                is_active = 1 AND 
-                last_purchase_amount >= 75.5 AND 
-                last_purchase_notes CONTAINS 'No' AND 
-                last_purchase_date = '2023-10-01'
-            "##, id),
-            row_fetch,
-            schema_fields,
-            io_rows,
-            &mut iterator
-        ).await;
+    let all_rows = concurrent_processor.process(
+        &format!(
+        r##"
+            id = {}
+            age < 40 AND 
+            bank_balance > 500.25 AND 
+            name != 'Jane Doe' AND 
+            last_purchase_category CONTAINS 'Elec' AND 
+            last_purchase_amount >= 50.0 AND 
+            is_active = 1 AND 
+            last_purchase_amount < 200.0 AND 
+            last_purchase_notes ENDSWITH 'notes' AND 
+            last_purchase_date = '2023-10-01' OR 
+            id < 100000 AND 
+            age > 25 AND 
+            bank_balance < 5000.00 AND 
+            name STARTSWITH 'J' AND 
+            last_purchase_category = 'Electronics' AND 
+            last_purchase_amount <= 150.0 AND 
+            is_active = 1 AND 
+            last_purchase_amount >= 75.5 AND 
+            last_purchase_notes CONTAINS 'No' AND 
+            last_purchase_date = '2023-10-01'
+        "##, id),
+        row_fetch,
+        schema_fields,
+        io_rows,
+        &mut iterator
+    ).await;
+    
+    stopwatch.stop();
 
-        stopwatch.stop();
-
-        println!("Total rows collected: {}", all_rows.len());
-        println!("Row fetch took: {:?}", stopwatch.elapsed());
-    }
+    println!("Total rows collected: {}", all_rows.len());
+    println!("Row fetch took: {:?}", stopwatch.elapsed());
+    //}
 
     // for row in all_rows {
     //     for column in row.columns {

@@ -7,6 +7,7 @@ use byteorder::{LittleEndian, WriteBytesExt};
 use crc::{Crc, CRC_32_ISO_HDLC};
 
 use itertools::Itertools;
+use smallvec::SmallVec;
 
 use crate::{
     core::{
@@ -564,8 +565,10 @@ impl RowPointer {
         }
         
         // Create a vector to hold all the columns
-        let mut columns = Vec::with_capacity(row_fetch.columns_fetching_data.len());
+        let mut columns: SmallVec<[Column; 20]> = SmallVec::new();
         
+        let mut schema_id = 0;
+
         // For each column specified in the fetch data
         for column_data in &row_fetch.columns_fetching_data {
             let mut position = self.position + column_data.column_offset as u64;
@@ -592,10 +595,12 @@ impl RowPointer {
 
                 // Create a column with the string data
                 let column = Column {
-                    schema_id: 0,
+                    schema_id: schema_id,
                     data: string_block,
                     column_type: DbType::STRING,
                 };
+
+                schema_id += 1;
 
                 columns.push(column);
             } else {
@@ -610,10 +615,12 @@ impl RowPointer {
 
                 // Create a Column object with the read data
                 let column = Column {
-                    schema_id: 0, // Schema ID would be set based on metadata or query context
+                    schema_id: schema_id, // Schema ID would be set based on metadata or query context
                     data: block,
                     column_type: column_data.column_type.clone(), // Clone the DbType
                 };
+
+                schema_id += 1;
                 
                 columns.push(column);
             }
@@ -634,8 +641,10 @@ impl RowPointer {
         }
         
         // Create a vector to hold all the columns
-        let mut columns = Vec::with_capacity(row_fetch.columns_fetching_data.len());
+        let mut columns: SmallVec<[Column; 20]> = SmallVec::new();
         
+        let mut schema_id = 0;
+
         // For each column specified in the fetch data
         for column_data in &row_fetch.columns_fetching_data {
             let mut position = self.position + column_data.column_offset as u64;
@@ -662,10 +671,12 @@ impl RowPointer {
 
                 // Create a column with the string data
                 let column = Column {
-                    schema_id: 0,
+                    schema_id: schema_id,
                     data: string_block,
                     column_type: DbType::STRING,
                 };
+
+                schema_id += 1;
 
                 columns.push(column);
             } else {
@@ -680,11 +691,13 @@ impl RowPointer {
 
                 // Create a Column object with the read data
                 let column = Column {
-                    schema_id: 0, // Schema ID would be set based on metadata or query context
+                    schema_id: schema_id, // Schema ID would be set based on metadata or query context
                     data: block,
                     column_type: column_data.column_type.clone(), // Clone the DbType
                 };
                 
+                schema_id += 1;
+
                 columns.push(column);
             }
         }

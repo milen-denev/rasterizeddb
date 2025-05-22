@@ -1,8 +1,7 @@
-use std::collections::VecDeque;
-
 use itertools::Either;
+use smallvec::SmallVec;
 
-use crate::{core::db_type::DbType, memory_pool::MemoryBlock};
+use crate::{core::{db_type::DbType, helpers2::smallvec_extensions::SmallVecExtensions}, memory_pool::MemoryBlock};
 
 use super::{logical::perform_comparison_operation, math::perform_math_operation};
 
@@ -122,12 +121,12 @@ impl From<usize> for ComparisonOperand {
 }
 
 pub struct TransformerProcessor<'a> {
-    transformers: &'a mut VecDeque<ColumnTransformer>,
-    intermediate_results: &'a mut Vec<MemoryBlock>,
+    transformers: &'a mut SmallVec<[ColumnTransformer; 36]>,
+    intermediate_results: &'a mut  SmallVec<[MemoryBlock; 20]>,
 }
 
 impl<'a> TransformerProcessor<'a> {
-    pub fn new(transformers: &'a mut VecDeque<ColumnTransformer>, intermediate_results: &'a mut Vec<MemoryBlock>) -> Self {
+    pub fn new(transformers: &'a mut SmallVec<[ColumnTransformer; 36]>, intermediate_results: &'a mut SmallVec<[MemoryBlock; 20]>) -> Self {
         transformers.clear();
         intermediate_results.clear();
         Self {
@@ -249,7 +248,7 @@ impl<'a> TransformerProcessor<'a> {
     }
 
     /// Execute all transformations and return final result
-    pub fn execute(&mut self, comparison_results: &mut Vec<(bool, Option<Next>)>) -> bool {
+    pub fn execute(&mut self, comparison_results: &mut SmallVec<[(bool, Option<Next>); 20]>) -> bool {
         // Process all transformers
         while let Some(mut transformer) = self.transformers.pop_front() {
             // If this transformer uses intermediate results, update its memory blocks
@@ -281,7 +280,7 @@ impl<'a> TransformerProcessor<'a> {
     }
 
     /// Evaluate the logical combination of comparison results
-    fn evaluate_comparison_results(&self, results: &mut Vec<(bool, Option<Next>)>) -> bool {
+    fn evaluate_comparison_results(&self, results: &mut SmallVec<[(bool, Option<Next>); 20]>) -> bool {
         if results.is_empty() {
             return false; // Or true, depending on desired behavior for an empty set.
         }
@@ -504,8 +503,8 @@ mod tests {
     
     #[test]
     fn test_complex_query_where_clause() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // WHERE Column_1 + 5 = 0 + Column_2 AND Column_3 = 1
         let mut multi_transformer = TransformerProcessor::new(&mut transformers, &mut intermediate_results);
 
@@ -553,14 +552,14 @@ mod tests {
         );
         
         // Execute and verify the result
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert!(multi_transformer.execute(&mut bool_buffer));
     }
 
     #[test]
     fn test_complex_query_where_clause_2() { 
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Let's try another case where the condition should fail
         let mut multi_transformer = TransformerProcessor::new(&mut transformers, &mut intermediate_results);
         
@@ -602,15 +601,15 @@ assert!(multi_transformer.execute(&mut bool_buffer));
             ComparerOperation::Equals,
             None
         );
-           let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+           let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
         // This should be false since 10 + 5 != 0 + 20
         assert!(!multi_transformer.execute(&mut bool_buffer));
     }
 
     #[test]
     fn test_complex_query_where_clause_3() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new(); 
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new(); 
 
         let mut multi_transformer = TransformerProcessor::new(&mut transformers, &mut intermediate_results);
         // Use different values that will make the condition false
@@ -636,14 +635,14 @@ assert!(multi_transformer.execute(&mut bool_buffer));
         );
 
         // The first condition is true but the second is false
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
         assert!(multi_transformer.execute(&mut bool_buffer));
     }
 
     #[test]
     fn test_complex_query_where_clause_4() { 
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         let mut multi_transformer = TransformerProcessor::new(&mut transformers, &mut intermediate_results);
 
         // Use different values that will make the condition false
@@ -678,15 +677,15 @@ assert!(multi_transformer.execute(&mut bool_buffer));
         );
 
         // The first condition is true but the second is false
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert!(multi_transformer.execute(&mut bool_buffer));
     }
 
     
     #[test]
     fn test_numerical_simple_and_true() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Test: (10 > 5) AND (20 = 20) -> true
         let mut processor = TransformerProcessor::new(&mut transformers, &mut intermediate_results);
         let val_10 = create_memory_block_from_i32(10);
@@ -695,14 +694,14 @@ assert!(multi_transformer.execute(&mut bool_buffer));
 
         processor.add_comparison(DbType::I32, val_10, val_5, ComparerOperation::Greater, Some(Next::And));
         processor.add_comparison(DbType::I32, val_20.clone(), val_20, ComparerOperation::Equals, None);
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert!(processor.execute(&mut bool_buffer));
     }
 
     #[test]
     fn test_numerical_simple_and_false() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Test: (10 > 5) AND (20 = 10) -> false
         let mut processor = TransformerProcessor::new(&mut transformers, &mut intermediate_results);
         let val_10 = create_memory_block_from_i32(10);
@@ -712,14 +711,14 @@ assert!(processor.execute(&mut bool_buffer));
 
         processor.add_comparison(DbType::I32, val_10, val_5, ComparerOperation::Greater, Some(Next::And));
         processor.add_comparison(DbType::I32, val_20, val_10_b, ComparerOperation::Equals, None);
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert!(!processor.execute(&mut bool_buffer));
     }
 
     #[test]
     fn test_numerical_simple_or_true() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Test: (10 < 5) OR (20 = 20) -> true
         let mut processor = TransformerProcessor::new(&mut transformers, &mut intermediate_results);
         let val_10 = create_memory_block_from_i32(10);
@@ -728,14 +727,14 @@ assert!(!processor.execute(&mut bool_buffer));
 
         processor.add_comparison(DbType::I32, val_10, val_5, ComparerOperation::Less, Some(Next::Or));
         processor.add_comparison(DbType::I32, val_20.clone(), val_20, ComparerOperation::Equals, None);
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert!(processor.execute(&mut bool_buffer));
     }
 
     #[test]
     fn test_numerical_simple_or_false() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Test: (10 < 5) OR (20 = 10) -> false
         let mut processor = TransformerProcessor::new(&mut transformers, &mut intermediate_results);
         let val_10 = create_memory_block_from_i32(10);
@@ -745,14 +744,14 @@ assert!(processor.execute(&mut bool_buffer));
 
         processor.add_comparison(DbType::I32, val_10, val_5, ComparerOperation::Less, Some(Next::Or));
         processor.add_comparison(DbType::I32, val_20, val_10_b, ComparerOperation::Equals, None);
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert!(!processor.execute(&mut bool_buffer));
     }
 
     #[test]
     fn test_numerical_math_then_compare_true() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Test: (5 + 5) = 10 -> true
         let mut processor = TransformerProcessor::new(&mut transformers, &mut intermediate_results);
         let val_5 = create_memory_block_from_i32(5);
@@ -760,14 +759,14 @@ assert!(!processor.execute(&mut bool_buffer));
 
         let sum_idx = processor.add_math_operation(DbType::I32, val_5.clone(), val_5, MathOperation::Add);
         processor.add_comparison(DbType::I32, sum_idx, val_10, ComparerOperation::Equals, None);
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert!(processor.execute(&mut bool_buffer));
     }
 
     #[test]
     fn test_numerical_math_then_compare_false() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Test: (5 + 10) != 10 -> true
         let mut processor = TransformerProcessor::new(&mut transformers, &mut intermediate_results);
         let val_5 = create_memory_block_from_i32(5);
@@ -775,14 +774,14 @@ assert!(processor.execute(&mut bool_buffer));
 
         let sum_idx = processor.add_math_operation(DbType::I32, val_5, val_10.clone(), MathOperation::Add);
         processor.add_comparison(DbType::I32, sum_idx, val_10, ComparerOperation::NotEquals, None);
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert!(processor.execute(&mut bool_buffer));
     }
 
     #[test]
     fn test_numerical_two_math_ops_and_true() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Test: (10 - 3) > (2 * 3) -> 7 > 6 -> true
         let mut processor = TransformerProcessor::new(&mut transformers, &mut intermediate_results);
         let val_10 = create_memory_block_from_i32(10);
@@ -792,92 +791,92 @@ assert!(processor.execute(&mut bool_buffer));
         let diff_idx = processor.add_math_operation(DbType::I32, val_10, val_3.clone(), MathOperation::Subtract);
         let prod_idx = processor.add_math_operation(DbType::I32, val_2, val_3, MathOperation::Multiply);
         processor.add_comparison(DbType::I32, diff_idx, prod_idx, ComparerOperation::Greater, None);
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert!(processor.execute(&mut bool_buffer));
     }
     
     #[test]
     fn test_numerical_greater_or_equals_true_equal() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Test: 10 >= 10 -> true
         let mut processor = TransformerProcessor::new(&mut transformers, &mut intermediate_results);
         let val_10a = create_memory_block_from_i32(10);
         let val_10b = create_memory_block_from_i32(10);
         processor.add_comparison(DbType::I32, val_10a, val_10b, ComparerOperation::GreaterOrEquals, None);
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert!(processor.execute(&mut bool_buffer));
     }
 
     #[test]
     fn test_numerical_greater_or_equals_true_greater() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Test: 15 >= 10 -> true
         let mut processor = TransformerProcessor::new(&mut transformers, &mut intermediate_results);
         let val_15 = create_memory_block_from_i32(15);
         let val_10 = create_memory_block_from_i32(10);
         processor.add_comparison(DbType::I32, val_15, val_10, ComparerOperation::GreaterOrEquals, None);
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert!(processor.execute(&mut bool_buffer));
     }
 
     #[test]
     fn test_numerical_greater_or_equals_false() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Test: 5 >= 10 -> false
         let mut processor = TransformerProcessor::new(&mut transformers, &mut intermediate_results);
         let val_5 = create_memory_block_from_i32(5);
         let val_10 = create_memory_block_from_i32(10);
         processor.add_comparison(DbType::I32, val_5, val_10, ComparerOperation::GreaterOrEquals, None);
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert!(!processor.execute(&mut bool_buffer));
     }
 
     #[test]
     fn test_numerical_less_or_equals_true_equal() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Test: 10 <= 10 -> true
         let mut processor = TransformerProcessor::new(&mut transformers, &mut intermediate_results);
         let val_10a = create_memory_block_from_i32(10);
         let val_10b = create_memory_block_from_i32(10);
         processor.add_comparison(DbType::I32, val_10a, val_10b, ComparerOperation::LessOrEquals, None);
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert!(processor.execute(&mut bool_buffer));
     }
 
     #[test]
     fn test_numerical_less_or_equals_true_less() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Test: 5 <= 10 -> true
         let mut processor = TransformerProcessor::new(&mut transformers, &mut intermediate_results);
         let val_5 = create_memory_block_from_i32(5);
         let val_10 = create_memory_block_from_i32(10);
         processor.add_comparison(DbType::I32, val_5, val_10, ComparerOperation::LessOrEquals, None);
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert!(processor.execute(&mut bool_buffer));
     }
 
     #[test]
     fn test_numerical_less_or_equals_false() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Test: 15 <= 10 -> false
         let mut processor = TransformerProcessor::new(&mut transformers, &mut intermediate_results);
         let val_15 = create_memory_block_from_i32(15);
         let val_10 = create_memory_block_from_i32(10);
         processor.add_comparison(DbType::I32, val_15, val_10, ComparerOperation::LessOrEquals, None);
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert!(!processor.execute(&mut bool_buffer));
     }
 
     #[test]
     fn test_numerical_complex_and_or_true() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Test: ((5 + 5) = 10 AND 7 > 3) OR 2 < 1 -> (true AND true) OR false -> true OR false -> true
         let mut processor = TransformerProcessor::new(&mut transformers, &mut intermediate_results);
         let val_5 = create_memory_block_from_i32(5);
@@ -891,14 +890,14 @@ assert!(!processor.execute(&mut bool_buffer));
         processor.add_comparison(DbType::I32, sum_idx, val_10, ComparerOperation::Equals, Some(Next::And));
         processor.add_comparison(DbType::I32, val_7, val_3, ComparerOperation::Greater, Some(Next::Or));
         processor.add_comparison(DbType::I32, val_2, val_1, ComparerOperation::Less, None);
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert!(processor.execute(&mut bool_buffer));
     }
 
     #[test]
     fn test_numerical_complex_and_or_false() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Test: ((5 + 5) = 7 AND 7 > 3) OR 2 < 1 -> (false AND true) OR false -> false OR false -> false
         let mut processor = TransformerProcessor::new(&mut transformers, &mut intermediate_results);
         let val_5 = create_memory_block_from_i32(5);
@@ -911,14 +910,14 @@ assert!(processor.execute(&mut bool_buffer));
         processor.add_comparison(DbType::I32, sum_idx, val_7.clone(), ComparerOperation::Equals, Some(Next::And)); // 10 = 7 is false
         processor.add_comparison(DbType::I32, val_7, val_3, ComparerOperation::Greater, Some(Next::Or));
         processor.add_comparison(DbType::I32, val_2, val_1, ComparerOperation::Less, None);
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert!(!processor.execute(&mut bool_buffer));
     }
 
     #[test]
     fn test_string_simple_and_true() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Test: ("hello" = "hello") AND ("world" CONTAINS "orl") -> true
         let mut processor = TransformerProcessor::new(&mut transformers, &mut intermediate_results);
         let str_hello_a = create_memory_block_from_string("hello");
@@ -928,14 +927,14 @@ assert!(!processor.execute(&mut bool_buffer));
 
         processor.add_comparison(DbType::STRING, str_hello_a, str_hello_b, ComparerOperation::Equals, Some(Next::And));
         processor.add_comparison(DbType::STRING, str_world, str_orl, ComparerOperation::Contains, None);
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert!(processor.execute(&mut bool_buffer));
     }
 
     #[test]
     fn test_string_simple_and_false() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Test: ("hello" = "hello") AND ("world" CONTAINS "xyz") -> false
         let mut processor = TransformerProcessor::new(&mut transformers, &mut intermediate_results);
         let str_hello_a = create_memory_block_from_string("hello");
@@ -945,14 +944,14 @@ assert!(processor.execute(&mut bool_buffer));
 
         processor.add_comparison(DbType::STRING, str_hello_a, str_hello_b, ComparerOperation::Equals, Some(Next::And));
         processor.add_comparison(DbType::STRING, str_world, str_xyz, ComparerOperation::Contains, None);
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert!(!processor.execute(&mut bool_buffer));
     }
     
     #[test]
     fn test_string_simple_or_true() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Test: ("apple" STARTSWITH "b") OR ("banana" ENDSWITH "ana") -> true
         let mut processor = TransformerProcessor::new(&mut transformers, &mut intermediate_results);
         let str_apple = create_memory_block_from_string("apple");
@@ -962,14 +961,14 @@ assert!(!processor.execute(&mut bool_buffer));
 
         processor.add_comparison(DbType::STRING, str_apple, str_b, ComparerOperation::StartsWith, Some(Next::Or));
         processor.add_comparison(DbType::STRING, str_banana, str_ana, ComparerOperation::EndsWith, None);
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert!(processor.execute(&mut bool_buffer));
     }
 
     #[test]
     fn test_string_simple_or_false() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Test: ("apple" STARTSWITH "b") OR ("banana" ENDSWITH "xyz") -> false
         let mut processor = TransformerProcessor::new(&mut transformers, &mut intermediate_results);
         let str_apple = create_memory_block_from_string("apple");
@@ -979,40 +978,40 @@ assert!(processor.execute(&mut bool_buffer));
 
         processor.add_comparison(DbType::STRING, str_apple, str_b, ComparerOperation::StartsWith, Some(Next::Or));
         processor.add_comparison(DbType::STRING, str_banana, str_xyz, ComparerOperation::EndsWith, None);
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert!(!processor.execute(&mut bool_buffer));
     }
 
     #[test]
     fn test_string_not_equals_true() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Test: "cat" != "dog" -> true
         let mut processor = TransformerProcessor::new(&mut transformers, &mut intermediate_results);
         let str_cat = create_memory_block_from_string("cat");
         let str_dog = create_memory_block_from_string("dog");
         processor.add_comparison(DbType::STRING, str_cat, str_dog, ComparerOperation::NotEquals, None);
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert!(processor.execute(&mut bool_buffer));
     }
 
     #[test]
     fn test_string_not_equals_false() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Test: "cat" != "cat" -> false
         let mut processor = TransformerProcessor::new(&mut transformers, &mut intermediate_results);
         let str_cat_a = create_memory_block_from_string("cat");
         let str_cat_b = create_memory_block_from_string("cat");
         processor.add_comparison(DbType::STRING, str_cat_a, str_cat_b, ComparerOperation::NotEquals, None);
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert!(!processor.execute(&mut bool_buffer));
     }
 
     #[test]
     fn test_string_complex_starts_ends_contains_true() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Test: ("longstring" STARTSWITH "long") AND ("anotherstring" ENDSWITH "string") OR ("middle" CONTAINS "dd")
         // -> (true AND true) OR true -> true OR true -> true
         let mut processor = TransformerProcessor::new(&mut transformers, &mut intermediate_results);
@@ -1026,14 +1025,14 @@ assert!(!processor.execute(&mut bool_buffer));
         processor.add_comparison(DbType::STRING, longstring, long_, ComparerOperation::StartsWith, Some(Next::And));
         processor.add_comparison(DbType::STRING, anotherstring, string_, ComparerOperation::EndsWith, Some(Next::Or));
         processor.add_comparison(DbType::STRING, middle, dd, ComparerOperation::Contains, None);
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert!(processor.execute(&mut bool_buffer));
     }
 
     #[test]
     fn test_string_complex_all_false_with_or() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Test: ("abc" STARTSWITH "d") OR ("def" ENDSWITH "g") OR ("ghi" CONTAINS "j")
         // -> false OR false OR false -> false
         let mut processor = TransformerProcessor::new(&mut transformers, &mut intermediate_results);
@@ -1047,14 +1046,14 @@ assert!(processor.execute(&mut bool_buffer));
         processor.add_comparison(DbType::STRING, abc, d, ComparerOperation::StartsWith, Some(Next::Or));
         processor.add_comparison(DbType::STRING, def, g, ComparerOperation::EndsWith, Some(Next::Or));
         processor.add_comparison(DbType::STRING, ghi, j, ComparerOperation::Contains, None);
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert!(!processor.execute(&mut bool_buffer));
     }
     
     #[test]
     fn test_string_mixed_operators_true() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Test: ("test" = "test" AND "example" CONTAINS "amp") OR "false" = "true"
         // -> (true AND true) OR false -> true OR false -> true
         let mut processor = TransformerProcessor::new(&mut transformers, &mut intermediate_results);
@@ -1068,14 +1067,14 @@ assert!(!processor.execute(&mut bool_buffer));
         processor.add_comparison(DbType::STRING, test_a, test_b, ComparerOperation::Equals, Some(Next::And));
         processor.add_comparison(DbType::STRING, example, amp, ComparerOperation::Contains, Some(Next::Or));
         processor.add_comparison(DbType::STRING, str_false, str_true, ComparerOperation::Equals, None);
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert!(processor.execute(&mut bool_buffer));
     }
 
     #[test]
     fn test_string_empty_string_comparisons() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Test: ("" = "") AND ("" CONTAINS "") OR ("a" STARTSWITH "")
         // -> (true AND true) OR true -> true
         let mut processor = TransformerProcessor::new(&mut transformers, &mut intermediate_results);
@@ -1086,7 +1085,7 @@ assert!(processor.execute(&mut bool_buffer));
         processor.add_comparison(DbType::STRING, empty_a.clone(), empty_b.clone(), ComparerOperation::Equals, Some(Next::And));
         processor.add_comparison(DbType::STRING, empty_a.clone(), empty_b.clone(), ComparerOperation::Contains, Some(Next::Or));
         processor.add_comparison(DbType::STRING, str_a, empty_a, ComparerOperation::StartsWith, None);
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert!(processor.execute(&mut bool_buffer));
     }
 
@@ -1094,8 +1093,8 @@ assert!(processor.execute(&mut bool_buffer));
 
     #[test]
     fn test_complex_mixed_scenario_1() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Logic: ((10 + 5) = 15 AND "apple" STARTSWITH "app") OR ((20 - 5) > 10 AND "banana" CONTAINS "nan")
         // B1: (10 + 5) = 15  => 15 = 15 => true
         // B2: "apple" STARTSWITH "app" => true
@@ -1125,14 +1124,14 @@ assert!(processor.execute(&mut bool_buffer));
 
         processor.add_comparison(DbType::STRING, str_banana, str_nan, ComparerOperation::Contains, None); // B4
         
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert_eq!(processor.execute(&mut bool_buffer), true);
     }
 
     #[test]
     fn test_complex_mixed_scenario_2() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Logic: ((10 * 2) < 15 OR "test" ENDSWITH "est") AND ((100 / 4) = 25 OR "string" != "string")
         // B1: (10 * 2) < 15 => 20 < 15 => false
         // B2: "test" ENDSWITH "est" => true
@@ -1163,14 +1162,14 @@ assert_eq!(processor.execute(&mut bool_buffer), true);
 
         processor.add_comparison(DbType::STRING, str_string.clone(), str_string, ComparerOperation::NotEquals, None); // B4
 
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert_eq!(processor.execute(&mut bool_buffer), true);
     }
 
     #[test]
     fn test_complex_mixed_scenario_3() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Logic: ( (5 ** 2) = 25 AND "alpha" CONTAINS "pha" ) OR ( (27 ROOT 3) != 3 AND "beta" STARTSWITH "bet" ) AND ("gamma" = "delta")
         // B1: (5 ** 2) = 25 => 25 = 25 => true
         // B2: "alpha" CONTAINS "pha" => true
@@ -1207,14 +1206,14 @@ assert_eq!(processor.execute(&mut bool_buffer), true);
         
         processor.add_comparison(DbType::STRING, str_gamma, str_delta, ComparerOperation::Equals, None); // B5
 
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert_eq!(processor.execute(&mut bool_buffer), false);
     }
 
     #[test]
     fn test_complex_mixed_scenario_4() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Logic: (7 >= (1 + 5) AND "rustlang" ENDSWITH "lang") OR ( (10 - 20) < 0 AND "code" = "code") AND (5 > 10)
         // B1: 7 >= (1 + 5) => 7 >= 6 => true
         // B2: "rustlang" ENDSWITH "lang" => true
@@ -1249,14 +1248,14 @@ assert_eq!(processor.execute(&mut bool_buffer), false);
 
         processor.add_comparison(DbType::I32, num_5, num_10, ComparerOperation::Greater, None); // B5
 
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert_eq!(processor.execute(&mut bool_buffer), false);
     }
 
     #[test]
     fn test_complex_mixed_scenario_5() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Logic: ( (3 * 7) <= 20 OR "openai" != "google" ) AND ( (50 / 2) > 24 OR "gpt" STARTSWITH "ai" )
         // B1: (3 * 7) <= 20 => 21 <= 20 => false
         // B2: "openai" != "google" => true
@@ -1288,14 +1287,14 @@ assert_eq!(processor.execute(&mut bool_buffer), false);
 
         processor.add_comparison(DbType::STRING, str_gpt, str_ai, ComparerOperation::StartsWith, None); // B4
 
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert_eq!(processor.execute(&mut bool_buffer), true);
     }
     
     #[test]
     fn test_complex_mixed_scenario_6() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Logic: ( (100 - 90) = 10 AND "transformer" CONTAINS "form" ) OR ( (2 ** 4) != 16 AND "processor" ENDSWITH "saur" )
         // B1: (100 - 90) = 10 => 10 = 10 => true
         // B2: "transformer" CONTAINS "form" => true
@@ -1327,14 +1326,14 @@ assert_eq!(processor.execute(&mut bool_buffer), true);
 
         processor.add_comparison(DbType::STRING, str_processor, str_saur, ComparerOperation::EndsWith, None); // B4
 
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert_eq!(processor.execute(&mut bool_buffer), false);
     }
 
     #[test]
     fn test_complex_mixed_scenario_7() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Logic: ( (64 ROOT 2) = 8 AND "database" STARTSWITH "data" ) AND ( (7 * 3) > 20 OR "query" = "Query" )
         // B1: (64 ROOT 2) = 8 => 8 = 8 => true (integer square root)
         // B2: "database" STARTSWITH "data" => true
@@ -1366,14 +1365,14 @@ assert_eq!(processor.execute(&mut bool_buffer), false);
 
         processor.add_comparison(DbType::STRING, str_query_lc, str_query_uc, ComparerOperation::Equals, None); // B4
 
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert_eq!(processor.execute(&mut bool_buffer), true);
     }
 
     #[test]
     fn test_complex_mixed_scenario_8() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Logic: ( (10 / 3) = 3 AND "Rust" != "rust" ) OR ( (5 + 0) <= 4 AND "Go" CONTAINS "lang" )
         // B1: (10 / 3) = 3 => 3 = 3 => true (integer division)
         // B2: "Rust" != "rust" => true
@@ -1404,15 +1403,15 @@ assert_eq!(processor.execute(&mut bool_buffer), true);
 
         processor.add_comparison(DbType::STRING, str_go, str_lang, ComparerOperation::Contains, None); // B4
 
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert_eq!(processor.execute(&mut bool_buffer), false);
     }
 
 
     #[test]
     fn test_complex_mixed_scenario_10() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Logic: ( (4 ** 3) = 60 OR "string one" STARTSWITH "str" ) AND ( (50 / 5) != 10 OR "string two" CONTAINS "three" )
         // B1: (4 ** 3) = 60 => 64 = 60 => false
         // B2: "string one" STARTSWITH "str" => true
@@ -1444,14 +1443,14 @@ assert_eq!(processor.execute(&mut bool_buffer), false);
 
         processor.add_comparison(DbType::STRING, str_two, str_three, ComparerOperation::Contains, None); // B4
 
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert_eq!(processor.execute(&mut bool_buffer), false);
     }
 
     #[test]
     fn test_complex_mixed_scenario_12() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Logic: ( (7 * 0) = 0 OR "a" != "a" ) AND ( (100 / 10) >= 10 OR "b" STARTSWITH "c" ) AND ( (2+2) = 4 )
         // B1: (7 * 0) = 0 => 0 = 0 => true
         // B2: "a" != "a" => false
@@ -1487,14 +1486,14 @@ assert_eq!(processor.execute(&mut bool_buffer), false);
         let sum_idx = processor.add_math_operation(DbType::I32, num_2.clone(), num_2, MathOperation::Add);
         processor.add_comparison(DbType::I32, sum_idx, num_4, ComparerOperation::Equals, None); // B5
 
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert_eq!(processor.execute(&mut bool_buffer), true);
     }
 
     #[test]
     fn test_complex_mixed_scenario_13() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Logic: ( "xyz" ENDSWITH "yz" AND (5-5) = 1 ) OR ( "abc" CONTAINS "d" AND (10*1) > 5 )
         // B1: "xyz" ENDSWITH "yz" => true
         // M1: 5-5 = 0
@@ -1525,14 +1524,14 @@ assert_eq!(processor.execute(&mut bool_buffer), true);
         let mul_idx = processor.add_math_operation(DbType::I32, num_10, num_1, MathOperation::Multiply); // M2
         processor.add_comparison(DbType::I32, mul_idx, num_5, ComparerOperation::Greater, None); // B4
 
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert_eq!(processor.execute(&mut bool_buffer), false);
     }
 
     #[test]
     fn test_complex_mixed_scenario_15() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Logic: ( (2**5) != 32 AND "A" = "B" ) OR ( (10/2) > 5 AND "C" != "D" ) OR ( (1-1) = 0 )
         // B1: (2**5) != 32 => 32 != 32 => false
         // B2: "A" = "B" => false
@@ -1571,14 +1570,14 @@ assert_eq!(processor.execute(&mut bool_buffer), false);
         let diff_idx = processor.add_math_operation(DbType::I32, num_1.clone(), num_1, MathOperation::Subtract);
         processor.add_comparison(DbType::I32, diff_idx, num_0, ComparerOperation::Equals, None); // B5
 
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert_eq!(processor.execute(&mut bool_buffer), true);
     }
 
     #[test]
     fn test_complex_mixed_scenario_16_all_false_chain() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Logic: ( (10 + 10) = 21 AND "true" = "false" ) OR ( (5 * 5) < 20 AND "pass" = "fail" ) OR ( (100-1) > 100 )
         // B1: (10+10)=21 => 20=21 => false
         // B2: "true"="false" => false
@@ -1615,14 +1614,14 @@ assert_eq!(processor.execute(&mut bool_buffer), true);
         let diff_idx = processor.add_math_operation(DbType::I32, num_100.clone(), num_1, MathOperation::Subtract);
         processor.add_comparison(DbType::I32, diff_idx, num_100.clone(), ComparerOperation::Greater, None); // B5
 
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert_eq!(processor.execute(&mut bool_buffer), false);
     }
 
     #[test]
     fn test_complex_mixed_scenario_18_alternating_true_false() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Logic: ( (10 > 5) AND "str1" = "str2" ) OR ( (20-10) = 10 AND "str3" != "str3" ) OR ( (3*3) < 10 )
         // B1: 10 > 5 => true
         // B2: "str1" = "str2" => false
@@ -1653,14 +1652,14 @@ assert_eq!(processor.execute(&mut bool_buffer), false);
         let mul_idx = processor.add_math_operation(DbType::I32, num_3.clone(), num_3, MathOperation::Multiply);
         processor.add_comparison(DbType::I32, mul_idx, num_10, ComparerOperation::Less, None); // B5
 
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert_eq!(processor.execute(&mut bool_buffer), true);
     }
 
     #[test]
     fn test_complex_mixed_scenario_19_mostly_string_ops() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Logic: ( "start" STARTSWITH "st" AND (1+1)=2 ) OR ( "middle" CONTAINS "ddl" AND (5>10) ) OR ( "end" ENDSWITH "D" )
         // B1: "start" STARTSWITH "st" => true
         // B2: (1+1)=2 => true
@@ -1693,14 +1692,14 @@ assert_eq!(processor.execute(&mut bool_buffer), true);
 
         processor.add_comparison(DbType::STRING, str_end, str_cap_d, ComparerOperation::EndsWith, None); // B5
 
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert_eq!(processor.execute(&mut bool_buffer), false);
     }
 
     #[test]
     fn test_complex_mixed_scenario_20_final_true_from_last_or() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Logic: ( (100/0) ... this would panic, so use valid math ... (100/25)=3 AND "no" = "yes" ) OR ( (10-20) < 0 AND "false" != "true" ) OR ( (1*1)=1 )
         // B1: (100/25)=3 => 4=3 => false
         // B2: "no" = "yes" => false
@@ -1736,14 +1735,14 @@ assert_eq!(processor.execute(&mut bool_buffer), false);
         let mul_idx = processor.add_math_operation(DbType::I32, num_1.clone(), num_1.clone(), MathOperation::Multiply);
         processor.add_comparison(DbType::I32, mul_idx, num_1.clone(), ComparerOperation::Equals, None); // B5
 
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert_eq!(processor.execute(&mut bool_buffer), true);
     }
 
     #[test]
     fn test_complex_mixed_scenario_17_heavy_nesting_math() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Logic: ( ((100 / (2*5)) - 5) = 5 AND "complex_string_test_case" CONTAINS "test" ) OR ( ( (2**3)**2 ) < 60 AND "end" ENDSWITH "nd" )
         // M1: 2*5 = 10
         // M2: 100/M1 = 100/10 = 10
@@ -1785,14 +1784,14 @@ assert_eq!(processor.execute(&mut bool_buffer), true);
 
         processor.add_comparison(DbType::STRING, str_end, str_nd, ComparerOperation::EndsWith, None); // B4
 
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert_eq!(processor.execute(&mut bool_buffer), true); // Corrected based on left-to-right
     }
 
     #[test]
     fn test_complex_mixed_scenario_14() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Logic: ( (9 ROOT 2) < 3 OR "hello world" STARTSWITH "hello" ) AND ( (4+4+4) = 12 OR "false" = "true" )
         // M1: 9 ROOT 2 = 3 (integer square root)
         // B1: M1 < 3 => 3 < 3 => false
@@ -1829,14 +1828,14 @@ assert_eq!(processor.execute(&mut bool_buffer), true); // Corrected based on lef
 
         processor.add_comparison(DbType::STRING, str_false, str_true, ComparerOperation::Equals, None); // B4
 
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert_eq!(processor.execute(&mut bool_buffer), true); // Corrected based on left-to-right
     }
 
     #[test]
     fn test_complex_mixed_scenario_11() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Logic: ( (1 + 2 + 3) = 6 AND "complex" CONTAINS "plex" ) OR ( (10 - 1) < 8 AND "test" = "testing" )
         // M1: 1 + 2 = 3
         // M2: M1 + 3 = 3 + 3 = 6
@@ -1874,14 +1873,14 @@ assert_eq!(processor.execute(&mut bool_buffer), true); // Corrected based on lef
 
         processor.add_comparison(DbType::STRING, str_test, str_testing, ComparerOperation::Equals, None); // B4
 
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert_eq!(processor.execute(&mut bool_buffer), false); // Corrected based on left-to-right
     }
 
     #[test]
     fn test_complex_mixed_scenario_9() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Logic: ( (20 - (3*5)) > 0 AND "example" ENDSWITH "ple" ) OR ( (100 ROOT 2) < 9 AND "another" = "another" )
         // M1: 3 * 5 = 15
         // M1_res: 20 - M1 = 20 - 15 = 5
@@ -1919,7 +1918,7 @@ assert_eq!(processor.execute(&mut bool_buffer), false); // Corrected based on le
 
         processor.add_comparison(DbType::STRING, str_another.clone(), str_another, ComparerOperation::Equals, None); // B4
 
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert_eq!(processor.execute(&mut bool_buffer), true); // Corrected based on left-to-right
     }
 
@@ -1928,8 +1927,8 @@ assert_eq!(processor.execute(&mut bool_buffer), true); // Corrected based on lef
     #[test]
     #[allow(non_snake_case)]
     fn test_ultra_complex_scenario_1_expected_true() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Operations: 5 math, 10 comparisons = 15 total contributing operations
         // Logic:
         // Op1: Math: (10 + 20) -> res_m1 (30)
@@ -2008,15 +2007,15 @@ assert_eq!(processor.execute(&mut bool_buffer), true); // Corrected based on lef
         // Op15
         processor.add_comparison(DbType::STRING, uc1_str_final.clone(), uc1_str_final.clone(), ComparerOperation::Equals, None); // B10
         
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert_eq!(processor.execute(&mut bool_buffer), true);
     }
 
     #[test]
     #[allow(non_snake_case)]
     fn test_ultra_complex_scenario_2_expected_false() {
-        let mut transformers = VecDeque::new();
-        let mut intermediate_results = Vec::new();
+        let mut transformers = SmallVec::new();
+        let mut intermediate_results = SmallVec::new();
         // Operations: 5 math, 10 comparisons = 15 total contributing operations
         // Logic:
         // Op1: Math: (7 - 3) -> res_mA (4)
@@ -2097,7 +2096,7 @@ assert_eq!(processor.execute(&mut bool_buffer), true);
         // Op15
         processor.add_comparison(DbType::STRING, uc2_str_true.clone(), uc2_str_false.clone(), ComparerOperation::Equals, None); // C10
 
-        let mut bool_buffer: Vec<(bool, Option<Next>)> = Vec::new();
+        let mut bool_buffer: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
 assert_eq!(processor.execute(&mut bool_buffer), false);
     }
 }

@@ -1,10 +1,11 @@
-use std::{borrow::Cow, cell::UnsafeCell, collections::VecDeque, sync::Arc};
+use std::{borrow::Cow, cell::UnsafeCell, sync::Arc};
 
 use futures::future::join_all;
+use smallvec::SmallVec;
 use tokio::{sync::{mpsc, Semaphore}, task};
 
-use crate::{core::storage_providers::traits::StorageIO, memory_pool::MemoryBlock};
-use super::{query_parser::{parse_query, tokenize}, row::{column_vec_into_vec, Row, RowFetch}, row_pointer::RowPointerIterator, schema::SchemaField, transformer::{ColumnTransformer, Next, TransformerProcessor}};
+use crate::{core::storage_providers::traits::StorageIO, memory_pool::{MemoryBlock, MEMORY_POOL}};
+use super::{query_parser::{parse_query, tokenize, NumericValue, Token}, row::{column_vec_into_vec, Row, RowFetch}, row_pointer::RowPointerIterator, schema::SchemaField, transformer::{ColumnTransformer, ColumnTransformerType, ComparerOperation, Next, TransformerProcessor}};
 
 pub struct ConcurrentProcessor;
 
@@ -28,11 +29,16 @@ impl ConcurrentProcessor {
 
         iterator.reset();
 
+        let table_schema = table_schema
+            .into_iter()
+            .collect::<SmallVec<[SchemaField; 20]>>();
+
         let schema_arc = Arc::new(table_schema);
         let query_arc = Arc::new(where_query.to_string());
 
         let tokens = tokenize(&query_arc, &schema_arc);
-        let token_arc = Arc::new(tokens);
+        
+        let token_arc_1 = Arc::new(tokens);
 
         // Process batches
         while let Ok(pointers) = iterator.next_row_pointers().await {
@@ -44,7 +50,7 @@ impl ConcurrentProcessor {
             let tx_clone = tx.clone();
 
             let schema_ref = schema_arc.clone();
-            let token_ref = token_arc.clone();
+            let token_ref_1 = token_arc_1.clone();
 
             // Spawn a task for this entire batch of pointers
             let batch_handle = task::spawn(async move {
@@ -56,48 +62,131 @@ impl ConcurrentProcessor {
 
                 let mut buffer = Buffer {
                     // Cleared in this function
-                    hashtable_buffer: vec![],
+                    hashtable_buffer: UnsafeCell::new(SmallVec::new()),
                     // Cleared in read row functions
                     row,
                     // Cleared in new function
-                    transformers: VecDeque::new(),
+                    transformers: SmallVec::new(),
                     // Cleared in new function
-                    intermediate_results: vec![],
+                    intermediate_results: SmallVec::new(),
                     // Cleared in this function
-                    bool_buffer: vec![]
+                    bool_buffer: SmallVec::new()
                 };
 
                 let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
+                // Disabled until fixed
+                let single_transformer_data = if token_ref_1.len() == 0 {
+                    let ident = token_ref_1.iter().filter(|x| {
+                        match x {
+                            Token::Ident(_) => true,
+                            _ => false
+                        }
+                    }).next().unwrap();
+
+                    let column_1 = match ident {
+                        Token::Ident(column) => column,
+                        _ => unreachable!()
+                    };
+
+                    let schema_field = schema_ref.iter().filter(|x| { *x.name == *column_1 }).next().unwrap();
+
+                    let transform = token_ref_1.iter().filter(|x| {
+                        match x {
+                            Token::Op(_) => true,
+                            _ => false
+                        }
+                    }).next().unwrap();
+  
+                    let operations_type = match transform {
+                        Token::Op(op) => op,
+                        _ => unreachable!()
+                    };
+
+                    let operation = match operations_type.as_str() {
+                        ">" => ComparerOperation::Greater,
+                        "<" => ComparerOperation::Less,
+                        "=" => ComparerOperation::Equals,
+                        "!=" => ComparerOperation::NotEquals,
+                        ">=" => ComparerOperation::GreaterOrEquals,
+                        "<=" => ComparerOperation::LessOrEquals,
+                        "CONTAINS" => ComparerOperation::Contains,
+                        "STARTSWITH" => ComparerOperation::StartsWith,
+                        "ENDSWITH" => ComparerOperation::EndsWith,
+                        _ => unreachable!()
+                    };
+
+                    let value = token_ref_1.iter().filter(|x| {
+                        match x {
+                            Token::Number(_) => true,
+                            Token::StringLit(_) => true,
+                            _ => false
+                        }
+                    }).map(|x| 
+                        match x {
+                            Token::Number(val) => {
+                                numeric_value_into_memory_block(val)
+                            },
+                            Token::StringLit(val) => {
+                                string_value_into_memory_block(val)
+                            },
+                            _ => unreachable!()
+                        }
+                    ).next().unwrap();
+
+                    Some((schema_field.db_type.clone(), value, ColumnTransformerType::ComparerOperation(operation), schema_field.write_order))
+                } else {
+                    None
+                };
+
                 // Process each pointer in this batch (same as your original code)
                 for pointer in pointers {
-                    buffer.hashtable_buffer.clear();
-                    buffer.bool_buffer.clear();
 
                     let tuple_clone_2 = tuple_clone.clone();
                     let (_, io_clone, row_fetch) = &*tuple_clone_2;
 
                     pointer.fetch_row_reuse_async(io_clone, &row_fetch, &mut buffer.row).await;
 
-                    column_vec_into_vec(
-                        &mut buffer.hashtable_buffer,
-                        &buffer.row.columns,
-                        &schema_ref
-                    );
-                
-                    unsafe 
-                    {
-                        let mut_transformer = &mut *transformer.get();
+                    let result = if let Some(ref single_transformer_d) = single_transformer_data {
+                        let mut single_transformer = 
+                            ColumnTransformer::new(
+                                single_transformer_d.0.clone(), single_transformer_d.1.clone(), single_transformer_d.2.clone(), None);
+                    
+                        let column = buffer.row.columns.iter().filter(|x| {
+                            match x.schema_id {
+                                _ if x.schema_id == single_transformer_d.3 => true,
+                                _ => false
+                            }
+                        }).next().unwrap();
 
-                        parse_query(
-                            &token_ref,
-                            &buffer.hashtable_buffer,
-                            &schema_ref,
-                            mut_transformer
+                        single_transformer.setup_column_2(column.data.clone());
+                        single_transformer.transform_single().unwrap_right().0
+                    } else {
+                        let mut_hashtable_buffer = unsafe { &mut *buffer.hashtable_buffer.get() };
+
+                        mut_hashtable_buffer.clear();
+                        buffer.bool_buffer.clear();
+
+                        column_vec_into_vec(
+                            mut_hashtable_buffer,
+                            &buffer.row.columns,
+                            &*schema_ref
                         );
-                    }
-                
-                    let result = transformer.get_mut().execute(&mut buffer.bool_buffer);
+
+                        unsafe 
+                        {
+                            let mut_transformer = &mut *transformer.get();
+
+                            parse_query(
+                                &token_ref_1,
+                                mut_hashtable_buffer,
+                                &schema_ref,
+                                mut_transformer
+                            );
+                        }
+                    
+                        transformer.get_mut().execute(&mut buffer.bool_buffer)
+                    };
 
                     if result {
                         tx_clone.send(Row::clone_from_mut_row(&buffer.row)).unwrap();
@@ -138,9 +227,106 @@ impl ConcurrentProcessor {
 }
 
 pub struct Buffer<'a> {
-    pub hashtable_buffer: Vec<(Cow<'a, str>, MemoryBlock)>,
+    pub hashtable_buffer: UnsafeCell<SmallVec<[(Cow<'a, str>, MemoryBlock); 20]>>,
     pub row: Row,
-    pub transformers: VecDeque<ColumnTransformer>,
-    pub intermediate_results: Vec<MemoryBlock>,
-    pub bool_buffer: Vec<(bool, Option<Next>)>
+    pub transformers: SmallVec<[ColumnTransformer; 36]>,
+    pub intermediate_results: SmallVec<[MemoryBlock; 20]>,
+    pub bool_buffer: SmallVec<[(bool, Option<Next>); 20]>
+}
+
+fn numeric_value_into_memory_block(value: &NumericValue) -> MemoryBlock {
+    match value {
+        NumericValue::I8(val) => {
+            let bytes = val.to_be_bytes();
+            let block = MEMORY_POOL.acquire(bytes.len());
+            let slice = block.into_slice_mut();
+            slice.copy_from_slice(&bytes);
+            block
+        },
+        NumericValue::I16(val) => {
+            let bytes = val.to_be_bytes();
+            let block = MEMORY_POOL.acquire(bytes.len());
+            let slice = block.into_slice_mut();
+            slice.copy_from_slice(&bytes);
+            block
+        },
+        NumericValue::I32(val) => {
+            let bytes = val.to_be_bytes();
+            let block = MEMORY_POOL.acquire(bytes.len());
+            let slice = block.into_slice_mut();
+            slice.copy_from_slice(&bytes);
+            block
+        },
+        NumericValue::I64(val) => {
+            let bytes = val.to_be_bytes();
+            let block = MEMORY_POOL.acquire(bytes.len());
+            let slice = block.into_slice_mut();
+            slice.copy_from_slice(&bytes);
+            block
+        },
+        NumericValue::I128(val) => {
+            let bytes = val.to_be_bytes();
+            let block = MEMORY_POOL.acquire(bytes.len());
+            let slice = block.into_slice_mut();
+            slice.copy_from_slice(&bytes);
+            block
+        },
+        NumericValue::U8(val) => {
+            let bytes = val.to_be_bytes();
+            let block = MEMORY_POOL.acquire(bytes.len());
+            let slice = block.into_slice_mut();
+            slice.copy_from_slice(&bytes);
+            block
+        },
+        NumericValue::U16(val) => {
+            let bytes = val.to_be_bytes();
+            let block = MEMORY_POOL.acquire(bytes.len());
+            let slice = block.into_slice_mut();
+            slice.copy_from_slice(&bytes);
+            block
+        },
+        NumericValue::U32(val) => {
+            let bytes = val.to_be_bytes();
+            let block = MEMORY_POOL.acquire(bytes.len());
+            let slice = block.into_slice_mut();
+            slice.copy_from_slice(&bytes);
+            block
+        },
+        NumericValue::U64(val) => {
+            let bytes = val.to_be_bytes();
+            let block = MEMORY_POOL.acquire(bytes.len());
+            let slice = block.into_slice_mut();
+            slice.copy_from_slice(&bytes);
+            block
+        },
+        NumericValue::U128(val) => {
+            let bytes = val.to_be_bytes();
+            let block = MEMORY_POOL.acquire(bytes.len());
+            let slice = block.into_slice_mut();
+            slice.copy_from_slice(&bytes);
+            block
+        },
+        NumericValue::F32(val) => {
+            let bytes = val.to_be_bytes();
+            let block = MEMORY_POOL.acquire(bytes.len());
+            let slice = block.into_slice_mut();
+            slice.copy_from_slice(&bytes);
+            block
+        },
+        NumericValue::F64(val) => {
+            let bytes = val.to_be_bytes();
+            let block = MEMORY_POOL.acquire(bytes.len());
+            let slice = block.into_slice_mut();
+            slice.copy_from_slice(&bytes);
+            block
+        }
+    }
+}
+
+fn string_value_into_memory_block(value: &str) -> MemoryBlock {
+    let bytes = value.as_bytes();
+    let block = MEMORY_POOL.acquire(bytes.len());
+    let slice = block.into_slice_mut();
+    slice.copy_from_slice(bytes);
+    block
 }

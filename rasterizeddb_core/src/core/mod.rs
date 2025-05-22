@@ -3,6 +3,7 @@ pub mod database;
 pub mod db_type;
 pub mod hashing;
 pub mod helpers;
+pub mod helpers2;
 pub mod row;
 pub mod storage_providers;
 pub mod support_types;

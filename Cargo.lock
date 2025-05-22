@@ -1875,6 +1875,7 @@ dependencies = [
  "orx-concurrent-vec",
  "rand 0.9.1",
  "rastcp",
+ "smallvec",
  "stopwatch",
  "temp_testdir",
  "tera",

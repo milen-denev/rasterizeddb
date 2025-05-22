@@ -1,5 +1,7 @@
 use std::borrow::Cow;
 
+use smallvec::SmallVec;
+
 use crate::{core::db_type::DbType, memory_pool::MemoryBlock};
 
 use super::schema::SchemaField;
@@ -28,7 +30,7 @@ pub struct ColumnWritePayload {
 #[derive(Debug, Default)]
 pub struct Row {
     pub position: u64,
-    pub columns: Vec<Column>,
+    pub columns: SmallVec<[Column; 20]>,
     
     #[cfg(feature = "enable_long_row")]
     pub length: u64,
@@ -55,9 +57,9 @@ pub struct Column {
 }
 
 pub fn column_vec_into_vec<'a>(
-    row_mut: &mut Vec<(Cow<'a, str>, MemoryBlock)>,
-    columns: &Vec<Column>,
-    schema: &'a Vec<SchemaField>
+    row_mut: &mut SmallVec<[(Cow<'a, str>, MemoryBlock); 20]>,
+    columns: &SmallVec<[Column; 20]>,
+    schema: &'a SmallVec<[SchemaField; 20]>
 ) {
     for column in columns {
         row_mut.push((Cow::Borrowed(schema[column.schema_id as usize].name.as_str()), column.data.clone()));
