@@ -19,8 +19,8 @@ async fn main() -> std::io::Result<()> {
     tokio::spawn(io_rows.start_service());
     tokio::spawn(io_pointers.start_service());
 
-    rasterizeddb_core::core::mock_table::
-        consolidated_write_data_function(1_000_000).await;
+    // rasterizeddb_core::core::mock_table::
+    //     consolidated_write_data_function(1_000_000).await;
 
     let schema = get_schema().await;
 
