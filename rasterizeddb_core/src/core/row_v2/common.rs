@@ -16,7 +16,7 @@ macro_rules! impl_from_le_bytes {
             impl FromLeBytes for $type {
                 #[inline(always)]
                 #[track_caller]
-                fn from_le_bytes(bytes: &[u8]) -> Self {
+                fn from_le_bytes(bytes: &[u8]) -> Self {   
                     <$type>::from_le_bytes(bytes.try_into().expect("Invalid byte slice"))
                 }
 
