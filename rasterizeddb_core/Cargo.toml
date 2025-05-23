@@ -73,3 +73,6 @@ enable_index_caching =  []
 enable_parallelism = []
 enable_long_row = []
 enable_data_verification = []
+
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-cpu=native", "-C", "target-feature=+avx2"]
