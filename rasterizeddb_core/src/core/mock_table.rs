@@ -89,25 +89,25 @@ pub async fn consolidated_read_data_function(schema: TableSchema, id: u64) {
         &mut iterator
     ).await;
     
-            // age < 40 AND 
-            // bank_balance > 500.25 AND 
-            // name != 'Jane Doe' AND 
-            // last_purchase_category CONTAINS 'Elec' AND 
-            // last_purchase_amount >= 50.0 AND 
-            // is_active = 1 AND 
-            // last_purchase_amount < 200.0 AND 
-            // last_purchase_notes ENDSWITH 'notes' AND 
-            // last_purchase_date = '2023-10-01' OR 
-            // id < 100000 AND 
-            // age > 25 AND 
-            // bank_balance < 5000.00 AND 
-            // name STARTSWITH 'J' AND 
-            // last_purchase_category = 'Electronics' AND 
-            // last_purchase_amount <= 150.0 AND 
-            // is_active = 1 AND 
-            // last_purchase_amount >= 75.5 AND 
-            // last_purchase_notes CONTAINS 'No' AND 
-            // last_purchase_date = '2023-10-01'
+    // age < 40 AND 
+    // bank_balance > 500.25 AND 
+    // name != 'Jane Doe' AND 
+    // last_purchase_category CONTAINS 'Elec' AND 
+    // last_purchase_amount >= 50.0 AND 
+    // is_active = 1 AND 
+    // last_purchase_amount < 200.0 AND 
+    // last_purchase_notes ENDSWITH 'notes' AND 
+    // last_purchase_date = '2023-10-01' OR 
+    // id < 100000 AND 
+    // age > 25 AND 
+    // bank_balance < 5000.00 AND 
+    // name STARTSWITH 'J' AND 
+    // last_purchase_category = 'Electronics' AND 
+    // last_purchase_amount <= 150.0 AND 
+    // is_active = 1 AND 
+    // last_purchase_amount >= 75.5 AND 
+    // last_purchase_notes CONTAINS 'No' AND 
+    // last_purchase_date = '2023-10-01'
 
     stopwatch.stop();
 
@@ -148,101 +148,101 @@ fn create_row_fetch(schema_fields: &Vec<SchemaField>) -> RowFetch {
                 column_type: DbType::U64,
                 size: 8
             },
-            ColumnFetchingData {
-                column_offset: schema_calculator.calculate_schema_offset("name", schema_fields),
-                column_type: DbType::STRING,
-                size: 4 + 8
-            },
-            ColumnFetchingData {
-                column_offset: schema_calculator.calculate_schema_offset("age", schema_fields),
-                column_type: DbType::U8,
-                size: 1
-            },
-            ColumnFetchingData {
-                column_offset: schema_calculator.calculate_schema_offset("email", schema_fields),
-                column_type: DbType::STRING,
-                size: 4 + 8
-            },
-            ColumnFetchingData {
-                column_offset: schema_calculator.calculate_schema_offset("address", schema_fields),
-                column_type: DbType::STRING,
-                size: 4 + 8
-            },
-            ColumnFetchingData {
-                column_offset: schema_calculator.calculate_schema_offset("phone", schema_fields),
-                column_type: DbType::STRING,
-                size: 4 + 8
-            },
-            ColumnFetchingData {
-                column_offset: schema_calculator.calculate_schema_offset("is_active", schema_fields),
-                column_type: DbType::U8,
-                size: 1
-            },
-            ColumnFetchingData {
-                column_offset: schema_calculator.calculate_schema_offset("bank_balance", schema_fields),
-                column_type: DbType::F64,
-                size: 8
-            },
-            ColumnFetchingData {
-                column_offset: schema_calculator.calculate_schema_offset("married", schema_fields),
-                column_type: DbType::U8,
-                size: 1
-            },
-            ColumnFetchingData {
-                column_offset: schema_calculator.calculate_schema_offset("birth_date", schema_fields),
-                column_type: DbType::STRING,
-                size: 4 + 8
-            },
-            ColumnFetchingData {
-                column_offset: schema_calculator.calculate_schema_offset("last_login", schema_fields),
-                column_type: DbType::STRING,
-                size: 4 + 8
-            },
-            ColumnFetchingData {
-                column_offset: schema_calculator.calculate_schema_offset("last_purchase", schema_fields),
-                column_type: DbType::STRING,
-                size: 4 + 8
-            },
-            ColumnFetchingData {
-                column_offset: schema_calculator.calculate_schema_offset("last_purchase_amount", schema_fields),
-                column_type: DbType::F32,
-                size: 4
-            },
-            ColumnFetchingData {
-                column_offset: schema_calculator.calculate_schema_offset("last_purchase_date", schema_fields),
-                column_type: DbType::STRING,
-                size: 4 + 8
-            },
-            ColumnFetchingData {
-                column_offset: schema_calculator.calculate_schema_offset("last_purchase_location", schema_fields),
-                column_type: DbType::STRING,
-                size: 4 + 8
-            },
-            ColumnFetchingData {
-                column_offset: schema_calculator.calculate_schema_offset("last_purchase_method", schema_fields),
-                column_type: DbType::STRING,
-                size: 4 + 8
-            },
-            ColumnFetchingData {
-                column_offset: schema_calculator.calculate_schema_offset("last_purchase_category", schema_fields),
-                column_type: DbType::STRING,
-                size: 4 + 8
-            },
-            ColumnFetchingData {
-                column_offset: schema_calculator.calculate_schema_offset("last_purchase_subcategory", schema_fields),
-                column_type: DbType::STRING,
-                size: 4 + 8
-            },
-            ColumnFetchingData {
-                column_offset: schema_calculator.calculate_schema_offset("last_purchase_description", schema_fields),
-                column_type: DbType::STRING,
-                size: 4 + 8
-            },
-            ColumnFetchingData {
-                column_offset: schema_calculator.calculate_schema_offset("last_purchase_notes", schema_fields),
-                column_type: DbType::STRING,
-                size: 4 + 8
-            },
+            // ColumnFetchingData {
+            //     column_offset: schema_calculator.calculate_schema_offset("name", schema_fields),
+            //     column_type: DbType::STRING,
+            //     size: 4 + 8
+            // },
+            // ColumnFetchingData {
+            //     column_offset: schema_calculator.calculate_schema_offset("age", schema_fields),
+            //     column_type: DbType::U8,
+            //     size: 1
+            // },
+            // ColumnFetchingData {
+            //     column_offset: schema_calculator.calculate_schema_offset("email", schema_fields),
+            //     column_type: DbType::STRING,
+            //     size: 4 + 8
+            // },
+            // ColumnFetchingData {
+            //     column_offset: schema_calculator.calculate_schema_offset("address", schema_fields),
+            //     column_type: DbType::STRING,
+            //     size: 4 + 8
+            // },
+            // ColumnFetchingData {
+            //     column_offset: schema_calculator.calculate_schema_offset("phone", schema_fields),
+            //     column_type: DbType::STRING,
+            //     size: 4 + 8
+            // },
+            // ColumnFetchingData {
+            //     column_offset: schema_calculator.calculate_schema_offset("is_active", schema_fields),
+            //     column_type: DbType::U8,
+            //     size: 1
+            // },
+            // ColumnFetchingData {
+            //     column_offset: schema_calculator.calculate_schema_offset("bank_balance", schema_fields),
+            //     column_type: DbType::F64,
+            //     size: 8
+            // },
+            // ColumnFetchingData {
+            //     column_offset: schema_calculator.calculate_schema_offset("married", schema_fields),
+            //     column_type: DbType::U8,
+            //     size: 1
+            // },
+            // ColumnFetchingData {
+            //     column_offset: schema_calculator.calculate_schema_offset("birth_date", schema_fields),
+            //     column_type: DbType::STRING,
+            //     size: 4 + 8
+            // },
+            // ColumnFetchingData {
+            //     column_offset: schema_calculator.calculate_schema_offset("last_login", schema_fields),
+            //     column_type: DbType::STRING,
+            //     size: 4 + 8
+            // },
+            // ColumnFetchingData {
+            //     column_offset: schema_calculator.calculate_schema_offset("last_purchase", schema_fields),
+            //     column_type: DbType::STRING,
+            //     size: 4 + 8
+            // },
+            // ColumnFetchingData {
+            //     column_offset: schema_calculator.calculate_schema_offset("last_purchase_amount", schema_fields),
+            //     column_type: DbType::F32,
+            //     size: 4
+            // },
+            // ColumnFetchingData {
+            //     column_offset: schema_calculator.calculate_schema_offset("last_purchase_date", schema_fields),
+            //     column_type: DbType::STRING,
+            //     size: 4 + 8
+            // },
+            // ColumnFetchingData {
+            //     column_offset: schema_calculator.calculate_schema_offset("last_purchase_location", schema_fields),
+            //     column_type: DbType::STRING,
+            //     size: 4 + 8
+            // },
+            // ColumnFetchingData {
+            //     column_offset: schema_calculator.calculate_schema_offset("last_purchase_method", schema_fields),
+            //     column_type: DbType::STRING,
+            //     size: 4 + 8
+            // },
+            // ColumnFetchingData {
+            //     column_offset: schema_calculator.calculate_schema_offset("last_purchase_category", schema_fields),
+            //     column_type: DbType::STRING,
+            //     size: 4 + 8
+            // },
+            // ColumnFetchingData {
+            //     column_offset: schema_calculator.calculate_schema_offset("last_purchase_subcategory", schema_fields),
+            //     column_type: DbType::STRING,
+            //     size: 4 + 8
+            // },
+            // ColumnFetchingData {
+            //     column_offset: schema_calculator.calculate_schema_offset("last_purchase_description", schema_fields),
+            //     column_type: DbType::STRING,
+            //     size: 4 + 8
+            // },
+            // ColumnFetchingData {
+            //     column_offset: schema_calculator.calculate_schema_offset("last_purchase_notes", schema_fields),
+            //     column_type: DbType::STRING,
+            //     size: 4 + 8
+            // },
         ],
     }
 }

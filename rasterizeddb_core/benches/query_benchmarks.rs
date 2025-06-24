@@ -16,6 +16,7 @@ fn create_benchmark_schema() -> SmallVec<[SchemaField; 20]> {
         SchemaField::new("is_active".to_string(), DbType::U8, 1, 0, 0, false),
         SchemaField::new("score".to_string(), DbType::F32, 4, 0, 0, false),
         SchemaField::new("notes".to_string(), DbType::STRING, 4 + 8, 0, 0, false),
+        SchemaField::new("created_at".to_string(), DbType::U64, 8, 0, 0, false),
     ]
 }
 
@@ -32,7 +33,7 @@ fn benchmark_tokenize(c: &mut Criterion) {
         b.iter(|| tokenize_for_test(black_box(simple_query_string), black_box(&schema)))
     });
 
-    let long_query_string = "id > 10 AND age < 60 AND salary > 20000 AND name != 'Test' AND department CONTAINS 'Dev' AND bank_balance >= 100.0 AND is_active = TRUE AND score < 90.0 AND notes ENDSWITH 'important' AND created_at > '2023-01-01T00:00:00Z' OR id < 5 AND age > 20 AND salary < 100000 AND name STARTSWITH 'A' AND department = 'Sales' AND bank_balance <= 5000.75 AND is_active = FALSE AND score >= 50.5 AND notes CONTAINS 'review' OR bank_balance > 40000";
+    let long_query_string = "id > 10 AND age < 60 AND salary > 20000 AND name != 'Test' AND department CONTAINS 'Dev' AND bank_balance >= 100.0 AND is_active = TRUE AND score < 90.0 AND notes ENDSWITH 'important' AND created_at > 5151515 OR id < 5 AND age > 20 AND salary < 100000 AND name STARTSWITH 'A' AND department = 'Sales' AND bank_balance <= 5000.75 AND is_active = FALSE AND score >= 50.5 AND notes CONTAINS 'review' OR bank_balance > 40000";
     c.bench_function("tokenize_long_query", |b| {
         b.iter(|| tokenize_for_test(black_box(long_query_string), black_box(&schema)))
     });

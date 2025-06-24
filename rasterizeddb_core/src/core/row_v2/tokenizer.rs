@@ -12,6 +12,7 @@ pub enum Token {
     Number(NumericValue),
     StringLit(String),
     Op(String),
+    Next(String),
     LPar,
     RPar,
 }
@@ -259,10 +260,10 @@ impl FieldLookup {
         logical_ops.insert("or".to_string(), "OR".to_string());
         
         let mut string_ops = HashMap::new();
-        string_ops.insert("contains".to_string(), "contains".to_string());
-        string_ops.insert("startswith".to_string(), "startswith".to_string());
-        string_ops.insert("endswith".to_string(), "endswith".to_string());
-        
+        string_ops.insert("contains".to_string(), "CONTAINS".to_string());
+        string_ops.insert("startswith".to_string(), "STARTSWITH".to_string());
+        string_ops.insert("endswith".to_string(), "ENDSWITH".to_string());
+
         Self { map, logical_ops, string_ops }
     }
 }
@@ -399,16 +400,16 @@ pub fn tokenize(s: &str, schema: &SmallVec<[SchemaField; 20]>) -> SmallVec<[Toke
                     std::str::from_utf8_unchecked(&bytes[start..i])
                 };
 
-                let id_lower: String = id.to_string();
+                let id_lower: String = id.to_lowercase();
                 
                 // Check for special operators using pre-computed maps
                 if let Some(normalized) = field_lookup.string_ops.get(&id_lower) {
                     out.push(Token::Ident(normalized.clone()));
                     continue;
                 }
-                
+
                 if let Some(normalized) = field_lookup.logical_ops.get(&id_lower) {
-                    out.push(Token::Ident(normalized.clone()));
+                    out.push(Token::Next(normalized.clone()));  // Changed from Token::Ident to Token::Next
                     expression_type_context = None;
                     current_field_context = None;
                     continue;
@@ -748,5 +749,129 @@ pub fn numeric_type_to_db_type(nv: &NumericValue) -> DbType {
         NumericValue::U128(_) => DbType::U128,
         NumericValue::F32(_) => DbType::F32,
         NumericValue::F64(_) => DbType::F64,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_schema_2() -> SmallVec<[SchemaField; 20]> {
+        smallvec::smallvec![
+            SchemaField::new("id".to_string(), DbType::U128, 16, 0, 0, false),
+            SchemaField::new("name".to_string(), DbType::STRING, 12, 0, 1, false),
+            SchemaField::new("age".to_string(), DbType::U8, 1, 0, 2, false),
+            SchemaField::new("email".to_string(), DbType::STRING, 12, 0, 3, false),
+            SchemaField::new("phone".to_string(), DbType::STRING, 12, 0, 4, false),
+            SchemaField::new("is_active".to_string(), DbType::U8, 1, 0, 5, false),
+            SchemaField::new("bank_balance".to_string(), DbType::F64, 8, 0, 6, false),
+            SchemaField::new("married".to_string(), DbType::U8, 1, 0, 0, false),
+            SchemaField::new("birth_date".to_string(), DbType::STRING, 12, 0, 7, false), // Assuming STRING, could be DATETIME
+            SchemaField::new("last_login".to_string(), DbType::STRING, 12, 0, 8, false), // Assuming STRING, could be DATETIME
+            SchemaField::new("last_purchase".to_string(), DbType::STRING, 12, 0, 9, false), // Assuming STRING, could be DATETIME
+            SchemaField::new("last_purchase_amount".to_string(), DbType::F32, 4, 0, 10, false),
+            SchemaField::new("last_purchase_date".to_string(), DbType::STRING, 12, 0, 11, false), // Assuming STRING, could be DATETIME
+            SchemaField::new("last_purchase_location".to_string(), DbType::STRING, 12, 0, 12, false),
+            SchemaField::new("last_purchase_method".to_string(), DbType::STRING, 12, 0, 13, false),
+            SchemaField::new("last_purchase_category".to_string(), DbType::STRING, 12, 0, 14, false),
+            SchemaField::new("last_purchase_subcategory".to_string(), DbType::STRING, 12, 0, 15, false),
+            SchemaField::new("last_purchase_description".to_string(), DbType::STRING, 12, 0, 16, false),
+            SchemaField::new("last_purchase_status".to_string(), DbType::STRING, 12, 0, 17, false),
+            SchemaField::new("last_purchase_id".to_string(), DbType::U64, 8, 0, 18, false),
+            SchemaField::new("last_purchase_notes".to_string(), DbType::STRING, 12, 0, 19, false),
+            SchemaField::new("net_assets".to_string(), DbType::F64, 8, 0, 20, false),
+            SchemaField::new("department".to_string(), DbType::STRING, 12, 0, 21, false),
+            SchemaField::new("salary".to_string(), DbType::F32, 4, 0, 22, false),
+        ]
+    }
+
+    #[test]
+    fn test_tokenize_identifiers() {
+        let mut schema = SmallVec::new();
+        schema.push(SchemaField {
+            name: "field2".to_string(),
+            db_type: DbType::F64,
+            is_deleted: false,
+            size: 0,
+            offset: 0,
+            write_order: 0,
+            is_unique: false,
+        });
+        schema.push(SchemaField {
+            name: "field2".to_string(),
+            db_type: DbType::F64,
+            is_deleted: false,
+            size: 0,
+            offset: 0,
+            write_order: 0,
+            is_unique: false,
+        });
+        let tokens = tokenize("field1 + field2", &schema);
+        assert_eq!(tokens.len(), 3);
+        assert_eq!(tokens[0], Token::Ident("field1".to_string()));
+        assert_eq!(tokens[1], Token::Op("+".to_string()));
+        assert_eq!(tokens[2], Token::Ident("field2".to_string()));
+    }
+
+    #[test]
+    fn test_tokenize_numbers() {
+        let schema = SmallVec::new();
+        let tokens = tokenize("123 + 456", &schema);
+        assert_eq!(tokens.len(), 3);
+        assert_eq!(tokens[0], Token::Number(NumericValue::I32(123)));
+        assert_eq!(tokens[1], Token::Op("+".to_string()));
+        assert_eq!(tokens[2], Token::Number(NumericValue::I32(456)));
+    }
+
+    #[test]
+    fn test_large_query() {
+        let schema = create_schema_2();
+        let query = r##"
+            (id = 42 AND name CONTAINS 'John') OR
+            (age > 25 AND salary < 50000.0) OR
+            (bank_balance >= 1000.43 AND net_assets > 800000) OR
+            (department STARTSWITH 'Eng' AND email ENDSWITH 'example.com')
+        "##;
+        let tokens = tokenize(query, &schema);
+        assert_eq!(tokens.len(), 39);
+        assert_eq!(tokens[0], Token::LPar);
+        assert_eq!(tokens[1], Token::Ident("id".to_string()));
+        assert_eq!(tokens[2], Token::Op("=".to_string()));
+        assert_eq!(tokens[3], Token::Number(NumericValue::U128(42)));
+        assert_eq!(tokens[4], Token::Next("AND".to_string()));
+        assert_eq!(tokens[5], Token::Ident("name".to_string()));
+        assert_eq!(tokens[6], Token::Ident("CONTAINS".to_string()));
+        assert_eq!(tokens[7], Token::StringLit("John".to_string()));
+        assert_eq!(tokens[8], Token::RPar);
+        assert_eq!(tokens[9], Token::Next("OR".to_string()));
+        assert_eq!(tokens[10], Token::LPar);
+        assert_eq!(tokens[11], Token::Ident("age".to_string()));
+        assert_eq!(tokens[12], Token::Op(">".to_string()));
+        assert_eq!(tokens[13], Token::Number(NumericValue::U8(25)));
+        assert_eq!(tokens[14], Token::Next("AND".to_string()));
+        assert_eq!(tokens[15], Token::Ident("salary".to_string()));
+        assert_eq!(tokens[16], Token::Op("<".to_string()));
+        assert_eq!(tokens[17], Token::Number(NumericValue::F32(50000.0)));
+        assert_eq!(tokens[18], Token::RPar);
+        assert_eq!(tokens[19], Token::Next("OR".to_string()));
+        assert_eq!(tokens[20], Token::LPar);
+        assert_eq!(tokens[21], Token::Ident("bank_balance".to_string()));
+        assert_eq!(tokens[22], Token::Op(">=".to_string()));
+        assert_eq!(tokens[23], Token::Number(NumericValue::F64(1000.43)));
+        assert_eq!(tokens[24], Token::Next("AND".to_string()));
+        assert_eq!(tokens[25], Token::Ident("net_assets".to_string()));
+        assert_eq!(tokens[26], Token::Op(">".to_string()));
+        assert_eq!(tokens[27], Token::Number(NumericValue::F64(800000.0)));
+        assert_eq!(tokens[28], Token::RPar);
+        assert_eq!(tokens[29], Token::Next("OR".to_string()));
+        assert_eq!(tokens[30], Token::LPar);
+        assert_eq!(tokens[31], Token::Ident("department".to_string()));
+        assert_eq!(tokens[32], Token::Ident("STARTSWITH".to_string()));
+        assert_eq!(tokens[33], Token::StringLit("Eng".to_string()));
+        assert_eq!(tokens[34], Token::Next("AND".to_string()));
+        assert_eq!(tokens[35], Token::Ident("email".to_string()));
+        assert_eq!(tokens[36], Token::Ident("ENDSWITH".to_string()));
+        assert_eq!(tokens[37], Token::StringLit("example.com".to_string()));
+        assert_eq!(tokens[38], Token::RPar);
     }
 }

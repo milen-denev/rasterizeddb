@@ -29,8 +29,8 @@ fn generic_comparison<T>(input1: &[u8], input2: &[u8], operation: &ComparerOpera
 where
     T: Copy + Default + PartialEq + PartialOrd + FromLeBytes + Debug,
 {
-    #[cfg(debug_assertions)]
-    println!("Comparing {:?} and {:?}", input1, input2);
+    //#[cfg(debug_assertions)]
+    //println!("Comparing {:?} and {:?}", input1, input2);
     
     let num1 = T::from_le_bytes(input1);
     let num2 = T::from_le_bytes(input2);

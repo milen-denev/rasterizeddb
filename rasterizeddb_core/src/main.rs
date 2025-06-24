@@ -8,6 +8,7 @@ use rasterizeddb_core::{
     core::storage_providers::file_sync::LocalStorageProvider,
     EMPTY_BUFFER,
 };
+use smallvec::SmallVec;
 
 #[tokio::main(flavor = "multi_thread")]
 #[allow(unreachable_code)]

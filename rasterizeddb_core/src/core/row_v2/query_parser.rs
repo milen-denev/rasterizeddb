@@ -13,9 +13,9 @@ pub fn parse_query<'a, 'b, 'c>(
     schema: &'a SmallVec<[SchemaField; 20]>,
     transformers: &'b mut TransformerProcessor<'b>,
 ) {
-    println!("Parsing query: {:?}", toks);
+    //println!("Parsing query: {:?}", toks);
     let mut parser = QueryParser::new(toks, columns, schema, transformers);
-    parser.parse_where();
+    parser.execute();
 }
 
 struct QueryParser<'a, 'b, 'c> {
@@ -36,39 +36,73 @@ impl<'a, 'b, 'c> QueryParser<'a, 'b, 'c> {
         Self { toks: tokens, pos: 0, cols, schema, query_transformer }
     }
 
-    fn parse_where(&mut self) {
+    // Add more debug output to the main execute function
+    fn execute(&mut self) {
+        #[cfg(debug_assertions)]
+        println!("Starting to parse query with {} tokens", self.toks.len());
+        
+        #[cfg(debug_assertions)]
+        for (i, token) in self.toks.iter().enumerate() {
+            println!("Token {}: {:?}", i, token);
+        }
+        
         self.parse_or();
+        
+        #[cfg(debug_assertions)]
+        println!("Finished parsing. Final position: {}/{}", self.pos, self.toks.len());
     }
 
     /// Parse OR expressions
     fn parse_or(&mut self) {
         self.parse_and();
+        
+        // After parsing each AND group, check if there's an OR
         while let Some(Next::Or) = self.peek_logic() {
-            self.next_logic();
+            // Before consuming the OR, we need to set the last comparison's next operation
+            self.set_last_comparison_next_op(Some(Next::Or));
+            
+            self.next_logic(); // consume OR token
             self.parse_and();
         }
     }
 
-    /// Parse AND expressions
+    /// Parse AND expressions  
     fn parse_and(&mut self) {
         self.parse_comp_or_group();
+        
         while let Some(Next::And) = self.peek_logic() {
-            self.next_logic();
+            // Set the previous comparison's next operation to AND
+            self.set_last_comparison_next_op(Some(Next::And));
+            
+            self.next_logic(); // consume AND token
             self.parse_comp_or_group();
+        }
+    }
+        
+    // Add this helper method to set the next operation on the last added comparison
+    fn set_last_comparison_next_op(&mut self, next_op: Option<Next>) {
+        if let Some(last_transformer) = self.query_transformer.transformers.last_mut() {
+            last_transformer.next = next_op;
         }
     }
 
     /// Parse either a grouped boolean expression or a comparison
     fn parse_comp_or_group(&mut self) {
         if let Some(Token::LPar) = self.toks.get(self.pos) {
-            // Fix: Enhanced boolean group detection
+            // Check if this is a boolean group
             if self.is_boolean_group(self.pos) {
+                #[cfg(debug_assertions)]
+                println!("Parsing boolean group starting at position {}", self.pos);
+                
                 self.pos += 1; // consume '('
-                self.parse_or();
+                self.parse_or(); // Parse the boolean expression inside parentheses
                 if !matches!(self.next().unwrap_or_else(|| panic!("Unexpected end of token stream")), 
-                           Token::RPar) {
+                        Token::RPar) {
                     panic!("expected closing parenthesis");
                 }
+                
+                #[cfg(debug_assertions)]
+                println!("Finished parsing boolean group, now at position {}", self.pos);
                 return;
             }
         }
@@ -80,45 +114,72 @@ impl<'a, 'b, 'c> QueryParser<'a, 'b, 'c> {
     fn is_boolean_group(&self, start: usize) -> bool {
         let mut depth = 0;
         let mut i = start;
-        let mut has_boolean_op = false;
+        let mut has_comparison = false;
+        let mut has_boolean_keyword = false;
+        
+        #[cfg(debug_assertions)]
+        println!("Checking if position {} is start of boolean group", start);
         
         while i < self.toks.len() {
+            #[cfg(debug_assertions)]
+            if i < start + 10 { // Limit debug output
+                println!("  Checking token {}: {:?} (depth: {})", i, self.toks[i], depth);
+            }
+            
             match &self.toks[i] {
                 Token::LPar => depth += 1,
                 Token::RPar => {
                     depth -= 1;
                     if depth == 0 { 
-                        // If we reached the closing parenthesis and found a boolean op, this is a boolean group
-                        return has_boolean_op; 
+                        let result = has_comparison || has_boolean_keyword;
+                        #[cfg(debug_assertions)]
+                        println!("  Boolean group detection result: {} (has_comparison: {}, has_boolean_keyword: {})", 
+                            result, has_comparison, has_boolean_keyword);
+                        return result; 
                     }
                 },
-                Token::Op(o) if ["=","!=",">",">=","<","<="].contains(&o.as_str()) => has_boolean_op = true,
-                Token::Ident(t) => {
-                    let upper = t.to_uppercase();
-                    if ["AND", "OR"].contains(&upper.as_str()) {
-                        has_boolean_op = true;
-                    } else if ["CONTAINS", "STARTSWITH", "ENDSWITH"].contains(&upper.as_str()) {
-                        // These keywords are inherently comparison operators,
-                        // thus they make the expression boolean.
-                        has_boolean_op = true;
+                Token::Op(o) if depth >= 1 && ["=","!=",">",">=","<","<="].contains(&o.as_str()) => {
+                    has_comparison = true;
+                    #[cfg(debug_assertions)]
+                    println!("  Found comparison operator: {}", o);
+                },
+                Token::Next(n) if depth >= 1 => {
+                    if ["AND", "OR"].contains(&n.as_str()) {
+                        has_boolean_keyword = true;
+                        #[cfg(debug_assertions)]
+                        println!("  Found boolean keyword (Next): {}", n);
                     }
-                    // Other identifiers (column names, etc.) do not by themselves make a group boolean.
+                },
+                Token::Ident(t) if depth >= 1 => {
+                    let upper = t;
+                    if ["AND", "OR"].contains(&upper.as_str()) {
+                        has_boolean_keyword = true;
+                        #[cfg(debug_assertions)]
+                        println!("  Found boolean keyword (Ident): {}", upper);
+                    } else if ["CONTAINS", "STARTSWITH", "ENDSWITH"].contains(&upper.as_str()) {
+                        has_comparison = true;
+                        #[cfg(debug_assertions)]
+                        println!("  Found string comparison operator: {}", upper);
+                    }
                 },
                 _ => {}
             }
             i += 1;
         }
+        
+        #[cfg(debug_assertions)]
+        println!("  Boolean group detection result: false (reached end without closing paren)");
         false
     }
 
     fn parse_comparison(&mut self) {
         let (left_op, left_type) = self.parse_expr();
         
-        // Fix: Handle both Token::Op and Token::Ident for operators
+        // Handle both Token::Op and Token::Ident for operators
         let op_token = self.next().unwrap_or_else(|| panic!("Unexpected end of token stream"));
         let op = match op_token {
-            Token::Op(o) => o.to_uppercase(),
-            Token::Ident(o) => o.to_uppercase(),
+            Token::Op(o) => o,
+            Token::Ident(o) => o,
             _ => panic!("expected comparison operator, got {:?}", op_token),
         };
         
@@ -137,32 +198,33 @@ impl<'a, 'b, 'c> QueryParser<'a, 'b, 'c> {
             _ => panic!("unknown comparison operator: {}", op),
         };
         
-        let next_logic_op = self.peek_logic();
-        
-        // Fix: Better type handling for string operations
+        // Better type handling for string operations
         let determined_comparison_type = match cmp {
             ComparerOperation::Contains | 
             ComparerOperation::StartsWith | 
             ComparerOperation::EndsWith => {
-                // For string operations, ensure at least one operand is a string
                 if left_type == DbType::STRING || right_type == DbType::STRING {
                     DbType::STRING
                 } else {
-                    panic!("String operations require at least one string operand")
+                    DbType::STRING
                 }
             },
             _ => promote_types(left_type, right_type), 
         };
         
+        #[cfg(debug_assertions)]
+        println!("Adding comparison: {:?} {:?} {:?}", left_op, cmp, right_op);
+        
+        // Add the comparison with None initially - the logic operations will be set later
         self.query_transformer.add_comparison(
             determined_comparison_type,
             left_op,
             right_op,
             cmp,
-            next_logic_op
+            None // Will be set by parse_or/parse_and when they know what comes next
         );
     }
-    
+
     fn parse_expr(&mut self) -> (ComparisonOperand, DbType) {
         let (mut lhs_op, mut lhs_type) = self.parse_term();
         
@@ -217,14 +279,14 @@ impl<'a, 'b, 'c> QueryParser<'a, 'b, 'c> {
                 (ComparisonOperand::Direct(mb), DbType::STRING)
             }
             Token::Ident(name) => {
-                // Fix: Enhanced schema field lookup with better error handling
+                // Enhanced schema field lookup with case-insensitive matching
                 let field_schema = self.schema.iter()
-                    .find(|f| f.name == name)  // Case-insensitive match
+                    .find(|f| f.name == name)
                     .unwrap_or_else(|| panic!("unknown column schema for '{}'", name));
                 
-                // Find column data
+                // Find column data with case-insensitive matching
                 let mb = self.cols.iter()
-                    .find(|(n, _)| n == &name)  // Case-insensitive match
+                    .find(|(n, _)| *n == name)
                     .map(|(_, mb)| mb.clone())
                     .unwrap_or_else(|| panic!("unknown column data for '{}'", name));
                 
@@ -233,7 +295,7 @@ impl<'a, 'b, 'c> QueryParser<'a, 'b, 'c> {
             Token::LPar => {
                 let (inner_op, inner_type) = self.parse_expr();
                 if !matches!(self.next().unwrap_or_else(|| panic!("Unexpected end of token stream")), 
-                           Token::RPar) {
+                        Token::RPar) {
                     panic!("expected closing parenthesis after grouped expression");
                 }
                 (inner_op, inner_type)
@@ -243,10 +305,22 @@ impl<'a, 'b, 'c> QueryParser<'a, 'b, 'c> {
     }
 
     fn peek_logic(&self) -> Option<Next> {
-        if let Some(Token::Ident(t)) = self.toks.get(self.pos) {
-            match t.to_uppercase().as_str() {
-                "AND" => Some(Next::And),
-                "OR"  => Some(Next::Or),
+        if let Some(token) = self.toks.get(self.pos) {
+            match token {
+                Token::Next(next_val) => {
+                    match next_val.as_str() {
+                        "AND" => Some(Next::And),
+                        "OR" => Some(Next::Or),
+                        _ => None
+                    }
+                },
+                Token::Ident(t) => {
+                    match t.to_uppercase().as_str() {
+                        "AND" => Some(Next::And),
+                        "OR" => Some(Next::Or),
+                        _ => None
+                    }
+                },
                 _ => None
             }
         } else { 
@@ -290,7 +364,7 @@ mod tests {
     use crate::core::row_v2::query_parser::{parse_query, tokenize_for_test};
     use crate::core::row_v2::row::Row;
     use crate::core::row_v2::schema::SchemaField;
-    use crate::core::row_v2::token_processor::TokenProcessor;
+    //use crate::core::row_v2::token_processor::TokenProcessor;
     use crate::core::row_v2::tokenizer::NumericValue;
     use crate::core::row_v2::transformer::TransformerProcessor;
     use crate::memory_pool::{MemoryBlock, MEMORY_POOL};
@@ -402,49 +476,49 @@ mod tests {
     fn create_schema() -> SmallVec<[SchemaField; 20]> {
         smallvec::smallvec![
             SchemaField::new("id".to_string(), DbType::I32, 4 , 0, 0, false),
-            SchemaField::new("age".to_string(), DbType::U8, 1 , 0, 0, false),
-            SchemaField::new("salary".to_string(), DbType::I32, 4 , 0, 0, false),
-            SchemaField::new("name".to_string(), DbType::STRING, 4 + 8 , 0, 0, false),
-            SchemaField::new("department".to_string(), DbType::STRING, 4 + 8 , 0, 0, false),
-            SchemaField::new("bank_balance".to_string(), DbType::F64, 8 , 0, 0, false),
-            SchemaField::new("credit_balance".to_string(), DbType::F32, 4 , 0, 0, false),
-            SchemaField::new("net_assets".to_string(), DbType::I64, 8 , 0, 0, false),
-            SchemaField::new("earth_position".to_string(), DbType::I8, 1, 0, 0, false),
-            SchemaField::new("test_1".to_string(), DbType::U32, 4, 0, 0, false),
-            SchemaField::new("test_2".to_string(), DbType::U16, 2, 0, 0, false),
-            SchemaField::new("test_3".to_string(), DbType::I128, 16, 0, 0, false),
-            SchemaField::new("test_4".to_string(), DbType::U128, 16, 0, 0, false),
-            SchemaField::new("test_5".to_string(), DbType::I16, 2, 0, 0, false),
-            SchemaField::new("test_6".to_string(), DbType::U64, 8, 0, 0, false),
+            SchemaField::new("age".to_string(), DbType::U8, 1 , 0, 1, false),
+            SchemaField::new("salary".to_string(), DbType::I32, 4 , 0, 2, false),
+            SchemaField::new("name".to_string(), DbType::STRING, 4 + 8 , 0, 3, false),
+            SchemaField::new("department".to_string(), DbType::STRING, 4 + 8 , 0, 4, false),
+            SchemaField::new("bank_balance".to_string(), DbType::F64, 8 , 0, 5, false),
+            SchemaField::new("credit_balance".to_string(), DbType::F32, 4 , 0, 6, false),
+            SchemaField::new("net_assets".to_string(), DbType::I64, 8 , 0, 7, false),
+            SchemaField::new("earth_position".to_string(), DbType::I8, 1, 0, 8, false),
+            SchemaField::new("test_1".to_string(), DbType::U32, 4, 0, 9, false),
+            SchemaField::new("test_2".to_string(), DbType::U16, 2, 0, 10, false),
+            SchemaField::new("test_3".to_string(), DbType::I128, 16, 0, 11, false),
+            SchemaField::new("test_4".to_string(), DbType::U128, 16, 0, 12, false),
+            SchemaField::new("test_5".to_string(), DbType::I16, 2, 0, 13, false),
+            SchemaField::new("test_6".to_string(), DbType::U64, 8, 0, 14, false),
         ]
     }
 
     fn create_schema_2() -> SmallVec<[SchemaField; 20]> {
         smallvec::smallvec![
             SchemaField::new("id".to_string(), DbType::U128, 16, 0, 0, false),
-            SchemaField::new("name".to_string(), DbType::STRING, 12, 0, 0, false),
-            SchemaField::new("age".to_string(), DbType::U8, 1, 0, 0, false),
-            SchemaField::new("email".to_string(), DbType::STRING, 12, 0, 0, false),
-            SchemaField::new("phone".to_string(), DbType::STRING, 12, 0, 0, false),
-            SchemaField::new("is_active".to_string(), DbType::U8, 1, 0, 0, false),
-            SchemaField::new("bank_balance".to_string(), DbType::F64, 8, 0, 0, false),
+            SchemaField::new("name".to_string(), DbType::STRING, 12, 0, 1, false),
+            SchemaField::new("age".to_string(), DbType::U8, 1, 0, 2, false),
+            SchemaField::new("email".to_string(), DbType::STRING, 12, 0, 3, false),
+            SchemaField::new("phone".to_string(), DbType::STRING, 12, 0, 4, false),
+            SchemaField::new("is_active".to_string(), DbType::U8, 1, 0, 5, false),
+            SchemaField::new("bank_balance".to_string(), DbType::F64, 8, 0, 6, false),
             SchemaField::new("married".to_string(), DbType::U8, 1, 0, 0, false),
-            SchemaField::new("birth_date".to_string(), DbType::STRING, 12, 0, 0, false), // Assuming STRING, could be DATETIME
-            SchemaField::new("last_login".to_string(), DbType::STRING, 12, 0, 0, false), // Assuming STRING, could be DATETIME
-            SchemaField::new("last_purchase".to_string(), DbType::STRING, 12, 0, 0, false), // Assuming STRING, could be DATETIME
-            SchemaField::new("last_purchase_amount".to_string(), DbType::F32, 4, 0, 0, false),
-            SchemaField::new("last_purchase_date".to_string(), DbType::STRING, 12, 0, 0, false), // Assuming STRING, could be DATETIME
-            SchemaField::new("last_purchase_location".to_string(), DbType::STRING, 12, 0, 0, false),
-            SchemaField::new("last_purchase_method".to_string(), DbType::STRING, 12, 0, 0, false),
-            SchemaField::new("last_purchase_category".to_string(), DbType::STRING, 12, 0, 0, false),
-            SchemaField::new("last_purchase_subcategory".to_string(), DbType::STRING, 12, 0, 0, false),
-            SchemaField::new("last_purchase_description".to_string(), DbType::STRING, 12, 0, 0, false),
-            SchemaField::new("last_purchase_status".to_string(), DbType::STRING, 12, 0, 0, false),
-            SchemaField::new("last_purchase_id".to_string(), DbType::U64, 8, 0, 0, false),
-            SchemaField::new("last_purchase_notes".to_string(), DbType::STRING, 12, 0, 0, false),
-            SchemaField::new("net_assets".to_string(), DbType::F64, 8, 0, 0, false),
-            SchemaField::new("department".to_string(), DbType::STRING, 12, 0, 0, false),
-            SchemaField::new("salary".to_string(), DbType::F32, 4, 0, 0, false),
+            SchemaField::new("birth_date".to_string(), DbType::STRING, 12, 0, 7, false), // Assuming STRING, could be DATETIME
+            SchemaField::new("last_login".to_string(), DbType::STRING, 12, 0, 8, false), // Assuming STRING, could be DATETIME
+            SchemaField::new("last_purchase".to_string(), DbType::STRING, 12, 0, 9, false), // Assuming STRING, could be DATETIME
+            SchemaField::new("last_purchase_amount".to_string(), DbType::F32, 4, 0, 10, false),
+            SchemaField::new("last_purchase_date".to_string(), DbType::STRING, 12, 0, 11, false), // Assuming STRING, could be DATETIME
+            SchemaField::new("last_purchase_location".to_string(), DbType::STRING, 12, 0, 12, false),
+            SchemaField::new("last_purchase_method".to_string(), DbType::STRING, 12, 0, 13, false),
+            SchemaField::new("last_purchase_category".to_string(), DbType::STRING, 12, 0, 14, false),
+            SchemaField::new("last_purchase_subcategory".to_string(), DbType::STRING, 12, 0, 15, false),
+            SchemaField::new("last_purchase_description".to_string(), DbType::STRING, 12, 0, 16, false),
+            SchemaField::new("last_purchase_status".to_string(), DbType::STRING, 12, 0, 17, false),
+            SchemaField::new("last_purchase_id".to_string(), DbType::U64, 8, 0, 18, false),
+            SchemaField::new("last_purchase_notes".to_string(), DbType::STRING, 12, 0, 19, false),
+            SchemaField::new("net_assets".to_string(), DbType::F64, 8, 0, 20, false),
+            SchemaField::new("department".to_string(), DbType::STRING, 12, 0, 21, false),
+            SchemaField::new("salary".to_string(), DbType::F32, 4, 0, 22, false),
         ]
     }
 
@@ -2179,7 +2253,7 @@ bool_buffer: SmallVec::new(),
             row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
         };
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
@@ -2272,12 +2346,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        let mut processor = TokenProcessor::new(tokens);
-        
-        processor.process(unsafe { &mut *transformer.get() }).unwrap();
-
-        //parse_query(&tokens, &columns, &schema, unsafe { &mut *transformer.get() });
-
+        parse_query(&tokens, &columns, &schema, unsafe { &mut *transformer.get() });
 
         assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }

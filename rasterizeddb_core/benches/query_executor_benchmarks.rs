@@ -1,9 +1,10 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use rasterizeddb_core::core::row_v2::concurrent_processor::Buffer;
-use rasterizeddb_core::core::row_v2::query_parser::{parse_query, tokenize, tokenize_for_test};
+use rasterizeddb_core::core::row_v2::query_parser::{parse_query, tokenize_for_test};
 use rasterizeddb_core::core::row_v2::row::Row;
 use rasterizeddb_core::core::row_v2::schema::SchemaField;
 use rasterizeddb_core::core::db_type::DbType;
+use rasterizeddb_core::core::row_v2::tokenizer::tokenize;
 use rasterizeddb_core::core::row_v2::transformer::TransformerProcessor;
 use rasterizeddb_core::memory_pool::{MemoryBlock, MEMORY_POOL};
 use smallvec::SmallVec;
@@ -171,11 +172,12 @@ fn benchmark_execute_query(c: &mut Criterion) {
         // Cleared in this function
         bool_buffer: SmallVec::new()
     };
+
+    let schema = create_benchmark_schema();
+    let tokens = tokenize_for_test(black_box(simple_query), black_box(&schema));
+
     c.bench_function("execute_simple_query_true", |b| {
         b.iter(|| {
-            let schema = create_benchmark_schema();
-            let tokens = tokenize_for_test(black_box(simple_query), black_box(&schema));
-
             let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
             parse_query(&tokens, &columns, &schema, unsafe { &mut *transformer.get() });
@@ -196,11 +198,12 @@ fn benchmark_execute_query(c: &mut Criterion) {
         // Cleared in this function
         bool_buffer: SmallVec::new()
     };
+
+    let schema = create_benchmark_schema();
+    let tokens = tokenize_for_test(black_box(simple_query_false), black_box(&schema));
+
     c.bench_function("execute_simple_query_false", |b| {
         b.iter(|| {
-            let schema = create_benchmark_schema();
-            let tokens = tokenize_for_test(black_box(simple_query_false), black_box(&schema));
-
             let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
             parse_query(&tokens, &columns, &schema, unsafe { &mut *transformer.get() });
@@ -221,11 +224,12 @@ fn benchmark_execute_query(c: &mut Criterion) {
         // Cleared in this function
         bool_buffer: SmallVec::new()
     };
+
+    let schema = create_benchmark_schema();
+    let tokens = tokenize_for_test(black_box(complex_query_true), black_box(&schema));
+
     c.bench_function("execute_complex_query_true", |b| {
         b.iter(|| {
-            let schema = create_benchmark_schema();
-            let tokens = tokenize_for_test(black_box(complex_query_true), black_box(&schema));
-
             let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
             parse_query(&tokens, &columns, &schema, unsafe { &mut *transformer.get() });
@@ -246,11 +250,12 @@ fn benchmark_execute_query(c: &mut Criterion) {
         // Cleared in this function
         bool_buffer: SmallVec::new()
     };
+
+    let schema = create_benchmark_schema();
+    let tokens = tokenize_for_test(black_box(complex_query_false), black_box(&schema));
+
     c.bench_function("execute_complex_query_false", |b| {
          b.iter(|| {
-            let schema = create_benchmark_schema();
-            let tokens = tokenize_for_test(black_box(complex_query_false), black_box(&schema));
-
             let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
             parse_query(&tokens, &columns, &schema, unsafe { &mut *transformer.get() });
@@ -293,11 +298,12 @@ fn benchmark_execute_query(c: &mut Criterion) {
         // Cleared in this function
         bool_buffer: SmallVec::new()
     };
+
+    let schema = create_benchmark_schema();
+    let tokens = tokenize(black_box(long_query_true), black_box(&schema));
+
     c.bench_function("execute_long_query_true", |b| {
         b.iter(|| {
-            let schema = create_benchmark_schema();
-            let tokens = tokenize(black_box(long_query_true), black_box(&schema));
-
             let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
             parse_query(&tokens, &columns, &schema, unsafe { &mut *transformer.get() });
