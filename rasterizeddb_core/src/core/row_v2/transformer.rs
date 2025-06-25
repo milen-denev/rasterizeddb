@@ -304,8 +304,8 @@ impl<'a> TransformerProcessor<'a> {
         }
         
         // Split into OR groups (each group is connected by AND operations)
-        let mut or_groups = Vec::new();
-        let mut current_and_group = Vec::new();
+        let mut or_groups = SmallVec::<[bool; 20]>::new();
+        let mut current_and_group = SmallVec::<[bool; 20]>::new();
         
         for (result, next_op) in results.iter() {
             current_and_group.push(*result);

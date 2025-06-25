@@ -9,7 +9,7 @@ use super::{db_type::DbType, row_v2::{row::{ColumnFetchingData, ColumnWritePaylo
 pub static mut IO_SCHEMA: async_lazy::Lazy<LocalStorageProvider> =
     async_lazy::Lazy::new(|| {
         Box::pin(async {
-            let io = LocalStorageProvider::new("G:\\Databases\\Test_Database", Some("test_table2.db")).await;
+            let io = LocalStorageProvider::new("G:\\Databases\\Test_Database", Some("table_5M.db")).await;
             io
         })
     });
@@ -82,37 +82,37 @@ pub async fn consolidated_read_data_function(schema: TableSchema, id: u64) {
         &format!(
         r##"
             id = {}
+            age < 40 AND 
+            bank_balance > 500.25 AND 
+            name != 'Jane Doe' AND 
+            last_purchase_category CONTAINS 'Elec' AND 
+            last_purchase_amount >= 50.0 AND 
+            is_active = 1 AND 
+            last_purchase_amount < 200.0 AND 
+            last_purchase_notes ENDSWITH 'notes' AND 
+            last_purchase_date = '2023-10-01' OR 
+            id < 100000 AND 
+            age > 25 AND 
+            bank_balance < 5000.00 AND 
+            name STARTSWITH 'J' AND 
+            last_purchase_category = 'Electronics' AND 
+            last_purchase_amount <= 150.0 AND 
+            is_active = 1 AND 
+            last_purchase_amount >= 75.5 AND 
+            last_purchase_notes CONTAINS 'No' AND 
+            last_purchase_date = '2023-10-01'
         "##, id),
         row_fetch,
         schema_fields,
         io_rows,
         &mut iterator
-    ).await;
-    
-    // age < 40 AND 
-    // bank_balance > 500.25 AND 
-    // name != 'Jane Doe' AND 
-    // last_purchase_category CONTAINS 'Elec' AND 
-    // last_purchase_amount >= 50.0 AND 
-    // is_active = 1 AND 
-    // last_purchase_amount < 200.0 AND 
-    // last_purchase_notes ENDSWITH 'notes' AND 
-    // last_purchase_date = '2023-10-01' OR 
-    // id < 100000 AND 
-    // age > 25 AND 
-    // bank_balance < 5000.00 AND 
-    // name STARTSWITH 'J' AND 
-    // last_purchase_category = 'Electronics' AND 
-    // last_purchase_amount <= 150.0 AND 
-    // is_active = 1 AND 
-    // last_purchase_amount >= 75.5 AND 
-    // last_purchase_notes CONTAINS 'No' AND 
-    // last_purchase_date = '2023-10-01'
+    ).await;  
 
     stopwatch.stop();
 
     println!("Total rows collected: {}", all_rows.len());
     println!("Row fetch took: {:?}", stopwatch.elapsed());
+    
     //}
 
     // for row in all_rows {
@@ -148,101 +148,101 @@ fn create_row_fetch(schema_fields: &Vec<SchemaField>) -> RowFetch {
                 column_type: DbType::U64,
                 size: 8
             },
-            // ColumnFetchingData {
-            //     column_offset: schema_calculator.calculate_schema_offset("name", schema_fields),
-            //     column_type: DbType::STRING,
-            //     size: 4 + 8
-            // },
-            // ColumnFetchingData {
-            //     column_offset: schema_calculator.calculate_schema_offset("age", schema_fields),
-            //     column_type: DbType::U8,
-            //     size: 1
-            // },
-            // ColumnFetchingData {
-            //     column_offset: schema_calculator.calculate_schema_offset("email", schema_fields),
-            //     column_type: DbType::STRING,
-            //     size: 4 + 8
-            // },
-            // ColumnFetchingData {
-            //     column_offset: schema_calculator.calculate_schema_offset("address", schema_fields),
-            //     column_type: DbType::STRING,
-            //     size: 4 + 8
-            // },
-            // ColumnFetchingData {
-            //     column_offset: schema_calculator.calculate_schema_offset("phone", schema_fields),
-            //     column_type: DbType::STRING,
-            //     size: 4 + 8
-            // },
-            // ColumnFetchingData {
-            //     column_offset: schema_calculator.calculate_schema_offset("is_active", schema_fields),
-            //     column_type: DbType::U8,
-            //     size: 1
-            // },
-            // ColumnFetchingData {
-            //     column_offset: schema_calculator.calculate_schema_offset("bank_balance", schema_fields),
-            //     column_type: DbType::F64,
-            //     size: 8
-            // },
-            // ColumnFetchingData {
-            //     column_offset: schema_calculator.calculate_schema_offset("married", schema_fields),
-            //     column_type: DbType::U8,
-            //     size: 1
-            // },
-            // ColumnFetchingData {
-            //     column_offset: schema_calculator.calculate_schema_offset("birth_date", schema_fields),
-            //     column_type: DbType::STRING,
-            //     size: 4 + 8
-            // },
-            // ColumnFetchingData {
-            //     column_offset: schema_calculator.calculate_schema_offset("last_login", schema_fields),
-            //     column_type: DbType::STRING,
-            //     size: 4 + 8
-            // },
-            // ColumnFetchingData {
-            //     column_offset: schema_calculator.calculate_schema_offset("last_purchase", schema_fields),
-            //     column_type: DbType::STRING,
-            //     size: 4 + 8
-            // },
-            // ColumnFetchingData {
-            //     column_offset: schema_calculator.calculate_schema_offset("last_purchase_amount", schema_fields),
-            //     column_type: DbType::F32,
-            //     size: 4
-            // },
-            // ColumnFetchingData {
-            //     column_offset: schema_calculator.calculate_schema_offset("last_purchase_date", schema_fields),
-            //     column_type: DbType::STRING,
-            //     size: 4 + 8
-            // },
-            // ColumnFetchingData {
-            //     column_offset: schema_calculator.calculate_schema_offset("last_purchase_location", schema_fields),
-            //     column_type: DbType::STRING,
-            //     size: 4 + 8
-            // },
-            // ColumnFetchingData {
-            //     column_offset: schema_calculator.calculate_schema_offset("last_purchase_method", schema_fields),
-            //     column_type: DbType::STRING,
-            //     size: 4 + 8
-            // },
-            // ColumnFetchingData {
-            //     column_offset: schema_calculator.calculate_schema_offset("last_purchase_category", schema_fields),
-            //     column_type: DbType::STRING,
-            //     size: 4 + 8
-            // },
-            // ColumnFetchingData {
-            //     column_offset: schema_calculator.calculate_schema_offset("last_purchase_subcategory", schema_fields),
-            //     column_type: DbType::STRING,
-            //     size: 4 + 8
-            // },
-            // ColumnFetchingData {
-            //     column_offset: schema_calculator.calculate_schema_offset("last_purchase_description", schema_fields),
-            //     column_type: DbType::STRING,
-            //     size: 4 + 8
-            // },
-            // ColumnFetchingData {
-            //     column_offset: schema_calculator.calculate_schema_offset("last_purchase_notes", schema_fields),
-            //     column_type: DbType::STRING,
-            //     size: 4 + 8
-            // },
+            ColumnFetchingData {
+                column_offset: schema_calculator.calculate_schema_offset("name", schema_fields),
+                column_type: DbType::STRING,
+                size: 4 + 8
+            },
+            ColumnFetchingData {
+                column_offset: schema_calculator.calculate_schema_offset("age", schema_fields),
+                column_type: DbType::U8,
+                size: 1
+            },
+            ColumnFetchingData {
+                column_offset: schema_calculator.calculate_schema_offset("email", schema_fields),
+                column_type: DbType::STRING,
+                size: 4 + 8
+            },
+            ColumnFetchingData {
+                column_offset: schema_calculator.calculate_schema_offset("address", schema_fields),
+                column_type: DbType::STRING,
+                size: 4 + 8
+            },
+            ColumnFetchingData {
+                column_offset: schema_calculator.calculate_schema_offset("phone", schema_fields),
+                column_type: DbType::STRING,
+                size: 4 + 8
+            },
+            ColumnFetchingData {
+                column_offset: schema_calculator.calculate_schema_offset("is_active", schema_fields),
+                column_type: DbType::U8,
+                size: 1
+            },
+            ColumnFetchingData {
+                column_offset: schema_calculator.calculate_schema_offset("bank_balance", schema_fields),
+                column_type: DbType::F64,
+                size: 8
+            },
+            ColumnFetchingData {
+                column_offset: schema_calculator.calculate_schema_offset("married", schema_fields),
+                column_type: DbType::U8,
+                size: 1
+            },
+            ColumnFetchingData {
+                column_offset: schema_calculator.calculate_schema_offset("birth_date", schema_fields),
+                column_type: DbType::STRING,
+                size: 4 + 8
+            },
+            ColumnFetchingData {
+                column_offset: schema_calculator.calculate_schema_offset("last_login", schema_fields),
+                column_type: DbType::STRING,
+                size: 4 + 8
+            },
+            ColumnFetchingData {
+                column_offset: schema_calculator.calculate_schema_offset("last_purchase", schema_fields),
+                column_type: DbType::STRING,
+                size: 4 + 8
+            },
+            ColumnFetchingData {
+                column_offset: schema_calculator.calculate_schema_offset("last_purchase_amount", schema_fields),
+                column_type: DbType::F32,
+                size: 4
+            },
+            ColumnFetchingData {
+                column_offset: schema_calculator.calculate_schema_offset("last_purchase_date", schema_fields),
+                column_type: DbType::STRING,
+                size: 4 + 8
+            },
+            ColumnFetchingData {
+                column_offset: schema_calculator.calculate_schema_offset("last_purchase_location", schema_fields),
+                column_type: DbType::STRING,
+                size: 4 + 8
+            },
+            ColumnFetchingData {
+                column_offset: schema_calculator.calculate_schema_offset("last_purchase_method", schema_fields),
+                column_type: DbType::STRING,
+                size: 4 + 8
+            },
+            ColumnFetchingData {
+                column_offset: schema_calculator.calculate_schema_offset("last_purchase_category", schema_fields),
+                column_type: DbType::STRING,
+                size: 4 + 8
+            },
+            ColumnFetchingData {
+                column_offset: schema_calculator.calculate_schema_offset("last_purchase_subcategory", schema_fields),
+                column_type: DbType::STRING,
+                size: 4 + 8
+            },
+            ColumnFetchingData {
+                column_offset: schema_calculator.calculate_schema_offset("last_purchase_description", schema_fields),
+                column_type: DbType::STRING,
+                size: 4 + 8
+            },
+            ColumnFetchingData {
+                column_offset: schema_calculator.calculate_schema_offset("last_purchase_notes", schema_fields),
+                column_type: DbType::STRING,
+                size: 4 + 8
+            },
         ],
     }
 }
@@ -293,7 +293,11 @@ async fn fill_data<S: StorageIO>(
     #[cfg(feature = "enable_long_row")]
     let cluster = 0;
     
-    let row_write = create_row_write(id);
+    let row_write = if id == 4_999_999 {
+        create_row_write(id, Some("Test row with notes".to_string()))
+    } else {
+        create_row_write(id, None)
+    };
 
     let mut iterator = RowPointerIterator::new(io_pointers).await.unwrap();
     let last_row = iterator.read_last().await;
@@ -390,7 +394,7 @@ fn create_f64_column(data: f64, write_order: u32) -> ColumnWritePayload {
     }
 }
 
-fn create_row_write(id: u64) -> RowWrite {
+fn create_row_write(id: u64, notes: Option<String>) -> RowWrite {
     RowWrite {
         columns_writing_data: vec![
             create_u64_column(id, 0),
@@ -412,7 +416,10 @@ fn create_row_write(id: u64) -> RowWrite {
             create_string_column("Electronics", 16),
             create_string_column("Smartphones", 17),
             create_string_column("Latest model", 18),
-            create_string_column("No notes", 19),
+            notes.map_or_else(
+                || create_string_column("No notes", 19),
+                |n| create_string_column(&n, 19)
+            )
         ],
     }
 }

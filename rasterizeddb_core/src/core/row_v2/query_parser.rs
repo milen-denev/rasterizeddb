@@ -4,17 +4,16 @@ use smallvec::SmallVec;
 use crate::memory_pool::MemoryBlock;
 use crate::core::db_type::DbType;
 use super::schema::SchemaField;
-use super::tokenizer::{numeric_to_mb, numeric_value_to_db_type, promote_numeric_types, promote_types, str_to_mb, tokenize, Token};
+use super::tokenizer::{numeric_to_mb, numeric_value_to_db_type, str_to_mb, tokenize, Token};
 use super::transformer::{ComparerOperation, ComparisonOperand, MathOperation, Next, TransformerProcessor};
 
 pub fn parse_query<'a, 'b, 'c>(
     toks: &'a SmallVec<[Token; 36]>,
     columns: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
-    schema: &'a SmallVec<[SchemaField; 20]>,
     transformers: &'b mut TransformerProcessor<'b>,
 ) {
     //println!("Parsing query: {:?}", toks);
-    let mut parser = QueryParser::new(toks, columns, schema, transformers);
+    let mut parser = QueryParser::new(toks, columns, transformers);
     parser.execute();
 }
 
@@ -22,7 +21,6 @@ struct QueryParser<'a, 'b, 'c> {
     toks: &'a SmallVec<[Token; 36]>,
     pos: usize,
     cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
-    schema: &'a SmallVec<[SchemaField; 20]>,
     query_transformer: &'b mut TransformerProcessor<'b>,
 }
 
@@ -30,10 +28,9 @@ impl<'a, 'b, 'c> QueryParser<'a, 'b, 'c> {
     fn new(
         tokens: &'a SmallVec<[Token; 36]>,
         cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
-        schema: &'a SmallVec<[SchemaField; 20]>,
         query_transformer: &'b mut TransformerProcessor<'b>,
     ) -> Self {
-        Self { toks: tokens, pos: 0, cols, schema, query_transformer }
+        Self { toks: tokens, pos: 0, cols, query_transformer }
     }
 
     // Add more debug output to the main execute function
@@ -151,7 +148,7 @@ impl<'a, 'b, 'c> QueryParser<'a, 'b, 'c> {
                     }
                 },
                 Token::Ident(t) if depth >= 1 => {
-                    let upper = t;
+                    let upper = &t.0;
                     if ["AND", "OR"].contains(&upper.as_str()) {
                         has_boolean_keyword = true;
                         #[cfg(debug_assertions)]
@@ -179,7 +176,7 @@ impl<'a, 'b, 'c> QueryParser<'a, 'b, 'c> {
         let op_token = self.next().unwrap_or_else(|| panic!("Unexpected end of token stream"));
         let op = match op_token {
             Token::Op(o) => o,
-            Token::Ident(o) => o,
+            Token::Ident((o, _)) => o,
             _ => panic!("expected comparison operator, got {:?}", op_token),
         };
         
@@ -209,7 +206,7 @@ impl<'a, 'b, 'c> QueryParser<'a, 'b, 'c> {
                     DbType::STRING
                 }
             },
-            _ => promote_types(left_type, right_type), 
+            _ => left_type, 
         };
         
         #[cfg(debug_assertions)]
@@ -231,15 +228,15 @@ impl<'a, 'b, 'c> QueryParser<'a, 'b, 'c> {
         while let Some(op_str) = self.peek_op(&["+","-"]) {
             let math = if op_str == "+" { MathOperation::Add } else { MathOperation::Subtract };
             self.next(); // consume op
-            let (rhs_op, rhs_type) = self.parse_term();
+            let (rhs_op, _) = self.parse_term();
             
-            // Fix: Improved type promotion for arithmetic operations
-            let result_type = promote_numeric_types(lhs_type.clone(), rhs_type.clone())
-                .unwrap_or_else(|| panic!("Cannot perform arithmetic on incompatible types: {:?} and {:?}", lhs_type, rhs_type));
+            // // Fix: Improved type promotion for arithmetic operations
+            // let result_type = promote_numeric_types(lhs_type.clone(), rhs_type.clone())
+            //     .unwrap_or_else(|| panic!("Cannot perform arithmetic on incompatible types: {:?} and {:?}", lhs_type, rhs_type));
                 
-            let idx = self.query_transformer.add_math_operation(result_type.clone(), lhs_op, rhs_op, math);
+            let idx = self.query_transformer.add_math_operation(lhs_type.clone(), lhs_op, rhs_op, math);
             lhs_op = ComparisonOperand::Intermediate(idx);
-            lhs_type = result_type;
+            lhs_type = lhs_type;
         }
         
         (lhs_op, lhs_type)
@@ -251,15 +248,15 @@ impl<'a, 'b, 'c> QueryParser<'a, 'b, 'c> {
         while let Some(op_str) = self.peek_op(&["*","/"]) {
             let math = if op_str == "*" { MathOperation::Multiply } else { MathOperation::Divide };
             self.next();
-            let (rhs_op, rhs_type) = self.parse_factor();
+            let (rhs_op, _) = self.parse_factor();
 
             // Fix: Improved type promotion for arithmetic operations
-            let result_type = promote_numeric_types(lhs_type.clone(), rhs_type.clone())
-                .unwrap_or_else(|| panic!("Cannot perform arithmetic on incompatible types: {:?} and {:?}", lhs_type, rhs_type));
+            // let result_type = promote_numeric_types(lhs_type.clone(), rhs_type.clone())
+            //     .unwrap_or_else(|| panic!("Cannot perform arithmetic on incompatible types: {:?} and {:?}", lhs_type, rhs_type));
                 
-            let idx = self.query_transformer.add_math_operation(result_type.clone(), lhs_op, rhs_op, math);
+            let idx = self.query_transformer.add_math_operation(lhs_type.clone(), lhs_op, rhs_op, math);
             lhs_op = ComparisonOperand::Intermediate(idx);
-            lhs_type = result_type;
+            lhs_type = lhs_type;
         }
         
         (lhs_op, lhs_type)
@@ -278,19 +275,14 @@ impl<'a, 'b, 'c> QueryParser<'a, 'b, 'c> {
                 let mb = str_to_mb(&s);
                 (ComparisonOperand::Direct(mb), DbType::STRING)
             }
-            Token::Ident(name) => {
-                // Enhanced schema field lookup with case-insensitive matching
-                let field_schema = self.schema.iter()
-                    .find(|f| f.name == name)
-                    .unwrap_or_else(|| panic!("unknown column schema for '{}'", name));
-                
-                // Find column data with case-insensitive matching
+            Token::Ident((name, db_type)) => {
+                // Simply look up the column data by name - no schema validation needed
                 let mb = self.cols.iter()
-                    .find(|(n, _)| *n == name)
+                    .find(|(n, _)| n == &name)
                     .map(|(_, mb)| mb.clone())
-                    .unwrap_or_else(|| panic!("unknown column data for '{}'", name));
+                    .unwrap_or_else(|| panic!("Column data not found: '{}'", name));
                 
-                (ComparisonOperand::Direct(mb), field_schema.db_type.clone())
+                (ComparisonOperand::Direct(mb), db_type)
             }
             Token::LPar => {
                 let (inner_op, inner_type) = self.parse_expr();
@@ -314,8 +306,8 @@ impl<'a, 'b, 'c> QueryParser<'a, 'b, 'c> {
                         _ => None
                     }
                 },
-                Token::Ident(t) => {
-                    match t.to_uppercase().as_str() {
+                Token::Ident((t, _)) => {
+                    match t.as_str() {
                         "AND" => Some(Next::And),
                         "OR" => Some(Next::Or),
                         _ => None
@@ -641,7 +633,7 @@ mod tests {
             &mut buffer.intermediate_results
         ));
 
-        parse_query(&tokens, columns, &schema, unsafe { &mut *transformer.get() });
+        parse_query(&tokens, columns, unsafe { &mut *transformer.get() });
 
         assert!(transformer.get_mut().execute(&mut buffer.bool_buffer).clone());
     }
@@ -669,7 +661,7 @@ mod tests {
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -695,7 +687,7 @@ mod tests {
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -721,7 +713,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -747,7 +739,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -773,7 +765,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -799,7 +791,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -825,7 +817,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -851,7 +843,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -877,7 +869,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -903,7 +895,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -928,7 +920,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -954,7 +946,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -980,7 +972,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -1006,7 +998,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -1026,7 +1018,7 @@ bool_buffer: SmallVec::new(),
         
         // Validate token types and values
         match &tokens[0] {
-            Token::Ident(s) => assert_eq!(s, "age"),
+            Token::Ident(s) => assert_eq!(s.0, "age"),
             _ => panic!("Expected identifier token"),
         }
         
@@ -1039,19 +1031,19 @@ bool_buffer: SmallVec::new(),
             Token::Number(n) => assert_eq!(*n, NumericValue::U8(30)),
             _ => panic!("Expected number token"),
         }
-        
+
         match &tokens[3] {
-            Token::Ident(s) => assert_eq!(s.to_uppercase(), "AND"),
+            Token::Next(s) => assert_eq!(s, "AND"),
             _ => panic!("Expected AND token"),
         }
         
         match &tokens[4] {
-            Token::Ident(s) => assert_eq!(s, "name"),
+            Token::Ident(s) => assert_eq!(s.0, "name"),
             _ => panic!("Expected identifier token"),
         }
         
         match &tokens[5] {
-            Token::Ident(s) => assert_eq!(s.to_uppercase(), "CONTAINS"),
+            Token::Ident(s) => assert_eq!(s.0.to_uppercase(), "CONTAINS"),
             _ => panic!("Expected CONTAINS token"),
         }
         
@@ -1061,12 +1053,12 @@ bool_buffer: SmallVec::new(),
         }
 
         match &tokens[7] {
-            Token::Ident(s) => assert_eq!(s.to_uppercase(), "AND"),
+            Token::Next(s) => assert_eq!(s, "AND"),
             _ => panic!("Expected AND token"),
         }
 
         match &tokens[8] {
-            Token::Ident(s) => assert_eq!(s, "bank_balance"),
+            Token::Ident(s) => assert_eq!(s.0, "bank_balance"),
             _ => panic!("Expected identifier token"),
         }
 
@@ -1103,7 +1095,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -1128,7 +1120,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -1153,7 +1145,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -1178,7 +1170,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -1203,7 +1195,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -1229,7 +1221,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -1255,7 +1247,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
     
@@ -1280,7 +1272,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -1305,7 +1297,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -1332,7 +1324,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -1358,7 +1350,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -1385,7 +1377,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -1411,7 +1403,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
     
@@ -1436,7 +1428,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -1462,7 +1454,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -1488,7 +1480,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -1514,7 +1506,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -1543,7 +1535,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -1555,16 +1547,16 @@ bool_buffer: SmallVec::new(),
 
         assert_eq!(tokens.len(), 11);
         
-        match &tokens[0] { Token::Ident(s) => assert_eq!(s, "age"), _ => panic!("Expected ident") }
+        match &tokens[0] { Token::Ident(s) => assert_eq!(s.0, "age"), _ => panic!("Expected ident") }
         match &tokens[1] { Token::Op(s) => assert_eq!(s, ">="), _ => panic!("Expected op") }
         match &tokens[2] { Token::Number(n) => assert_eq!(*n, NumericValue::U8(30)), _ => panic!("Expected num") }
-        match &tokens[3] { Token::Ident(s) => assert_eq!(s.to_uppercase(), "AND"), _ => panic!("Expected AND") }
-        match &tokens[4] { Token::Ident(s) => assert_eq!(s, "name"), _ => panic!("Expected ident") }
-        match &tokens[5] { Token::Ident(s) => assert_eq!(s.to_uppercase(), "CONTAINS"), _ => panic!("Expected CONTAINS") }
+        match &tokens[3] { Token::Next(s) => assert_eq!(s, "AND"), _ => panic!("Expected AND") }
+        match &tokens[4] { Token::Ident(s) => assert_eq!(s.0, "name"), _ => panic!("Expected ident") }
+        match &tokens[5] { Token::Ident(s) => assert_eq!(s.0.to_uppercase(), "CONTAINS"), _ => panic!("Expected CONTAINS") }
         match &tokens[6] { Token::StringLit(s) => assert_eq!(s, "John"), _ => panic!("Expected str lit") }
-        match &tokens[7] { Token::Ident(s) => assert_eq!(s.to_uppercase(), "OR"), _ => panic!("Expected OR") }
-        match &tokens[8] { Token::Ident(s) => assert_eq!(s, "id"), _ => panic!("Expected ident") }
-        match &tokens[9] { Token::Ident(s) => assert_eq!(s.to_uppercase(), "STARTSWITH"), _ => panic!("Expected STARTSWITH") }
+        match &tokens[7] { Token::Next(s) => assert_eq!(s, "OR"), _ => panic!("Expected OR") }
+        match &tokens[8] { Token::Ident(s) => assert_eq!(s.0, "id"), _ => panic!("Expected ident") }
+        match &tokens[9] { Token::Ident(s) => assert_eq!(s.0.to_uppercase(), "STARTSWITH"), _ => panic!("Expected STARTSWITH") }
         match &tokens[10] { Token::StringLit(s) => assert_eq!(s, "prefix"), _ => panic!("Expected str lit") }
     }
 
@@ -1591,7 +1583,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -1616,7 +1608,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -1641,7 +1633,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -1666,7 +1658,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -1691,7 +1683,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -1716,7 +1708,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -1741,7 +1733,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -1766,7 +1758,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -1791,7 +1783,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -1816,7 +1808,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -1841,7 +1833,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -1866,7 +1858,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -1891,7 +1883,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -1916,7 +1908,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -1941,7 +1933,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -1967,7 +1959,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -1993,7 +1985,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -2020,7 +2012,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -2047,7 +2039,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -2073,7 +2065,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -2098,7 +2090,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -2123,7 +2115,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -2148,7 +2140,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -2173,7 +2165,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -2198,7 +2190,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -2227,7 +2219,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -2258,7 +2250,7 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &create_schema(), unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
         assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }
 
@@ -2346,7 +2338,72 @@ bool_buffer: SmallVec::new(),
 
         let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, &schema, unsafe { &mut *transformer.get() });
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
+
+        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
+    }
+
+    #[test]
+    fn test_ultra_complex_query_1_true() {
+        let schema = create_schema_2(); 
+        static COLUMNS_2: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
+            let columns_box = Box::new(setup_test_columns_2());
+            columns_box
+        });
+        let columns = &*COLUMNS_2;
+
+        let query = r##"
+            (id - 1 = 41 AND name CONTAINS 'John') OR
+            (age + 10 > 15 AND salary - 1000 < 49000.0) OR
+            (bank_balance >= 1000.43 AND net_assets + 40000 > 400000) OR
+            (department STARTSWITH 'Eng' AND email ENDSWITH 'example.com')
+        "##;
+        
+        let tokens = tokenize_for_test(query, &schema);
+
+        let mut buffer = Buffer {
+            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            row: Row::default(),
+            transformers: SmallVec::new(),
+            intermediate_results: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
+
+        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
+    }
+
+    
+    #[test]
+    fn test_ultra_complex_query_no_parentheses_true() {
+        let schema = create_schema_2(); 
+        static COLUMNS_2: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
+            let columns_box = Box::new(setup_test_columns_2());
+            columns_box
+        });
+        let columns = &*COLUMNS_2;
+
+        let query = r##"
+            id - 1 = 41 AND name CONTAINS 'John' OR
+            age + 10 > 15 AND salary - 1000 < 49000.0
+        "##;
+        
+        let tokens = tokenize_for_test(query, &schema);
+
+        let mut buffer = Buffer {
+            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            row: Row::default(),
+            transformers: SmallVec::new(),
+            intermediate_results: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
+        };
+
+        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+
+        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
 
         assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
     }

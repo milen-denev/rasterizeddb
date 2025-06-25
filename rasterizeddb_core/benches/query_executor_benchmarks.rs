@@ -180,7 +180,7 @@ fn benchmark_execute_query(c: &mut Criterion) {
         b.iter(|| {
             let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-            parse_query(&tokens, &columns, &schema, unsafe { &mut *transformer.get() });
+            parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
             black_box(transformer.get_mut().execute(&mut buffer.bool_buffer));
         });
     });
@@ -206,7 +206,7 @@ fn benchmark_execute_query(c: &mut Criterion) {
         b.iter(|| {
             let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-            parse_query(&tokens, &columns, &schema, unsafe { &mut *transformer.get() });
+            parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
             black_box(transformer.get_mut().execute(&mut buffer.bool_buffer));
         });
     });
@@ -232,7 +232,7 @@ fn benchmark_execute_query(c: &mut Criterion) {
         b.iter(|| {
             let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-            parse_query(&tokens, &columns, &schema, unsafe { &mut *transformer.get() });
+            parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
             black_box(transformer.get_mut().execute(&mut buffer.bool_buffer));
         });
     });
@@ -258,7 +258,7 @@ fn benchmark_execute_query(c: &mut Criterion) {
          b.iter(|| {
             let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-            parse_query(&tokens, &columns, &schema, unsafe { &mut *transformer.get() });
+            parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
             black_box(transformer.get_mut().execute(&mut buffer.bool_buffer));
         });
     });
@@ -286,6 +286,7 @@ fn benchmark_execute_query(c: &mut Criterion) {
         notes CONTAINS 'important' AND 
         created_at < 1735689700
     "##;
+    
     let mut buffer = Buffer {
         // Cleared in this function
         hashtable_buffer: UnsafeCell::new(SmallVec::new()),
@@ -306,7 +307,7 @@ fn benchmark_execute_query(c: &mut Criterion) {
         b.iter(|| {
             let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-            parse_query(&tokens, &columns, &schema, unsafe { &mut *transformer.get() });
+            parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
             black_box(transformer.get_mut().execute(&mut buffer.bool_buffer));
         });
     });

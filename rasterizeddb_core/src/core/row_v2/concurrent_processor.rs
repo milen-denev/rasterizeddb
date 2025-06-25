@@ -91,7 +91,7 @@ impl ConcurrentProcessor {
                         _ => unreachable!()
                     };
 
-                    let schema_field = schema_ref.iter().filter(|x| { *x.name == *column_1 }).next().unwrap();
+                    let schema_field = schema_ref.iter().filter(|x| { *x.name == *column_1.0 }).next().unwrap();
 
                     let transform = token_ref_1.iter().filter(|x| {
                         match x {
@@ -192,7 +192,6 @@ impl ConcurrentProcessor {
                             parse_query(
                                 &token_ref_1,
                                 mut_hashtable_buffer,
-                                &schema_ref,
                                 mut_transformer
                             );
                         }

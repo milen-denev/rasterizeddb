@@ -8,7 +8,7 @@ use super::schema::SchemaField;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
-    Ident(String),
+    Ident((String, DbType)),
     Number(NumericValue),
     StringLit(String),
     Op(String),
@@ -404,19 +404,22 @@ pub fn tokenize(s: &str, schema: &SmallVec<[SchemaField; 20]>) -> SmallVec<[Toke
                 
                 // Check for special operators using pre-computed maps
                 if let Some(normalized) = field_lookup.string_ops.get(&id_lower) {
-                    out.push(Token::Ident(normalized.clone()));
+                    // For string operations, we need to determine the type from context or schema
+                    // Since these are operators, we might want to use the current expression type
+                    let op_type = expression_type_context.clone().unwrap();
+                    out.push(Token::Ident((normalized.clone(), op_type)));
                     continue;
                 }
 
                 if let Some(normalized) = field_lookup.logical_ops.get(&id_lower) {
-                    out.push(Token::Next(normalized.clone()));  // Changed from Token::Ident to Token::Next
+                    out.push(Token::Next(normalized.clone()));
                     expression_type_context = None;
                     current_field_context = None;
                     continue;
                 }
                 
-                // Check if this is a field name
-                if let Some((canonical_name, field_type)) = field_lookup.map.get(&id_lower) {
+                // Check if this is a field name in the schema
+                if let Some((canonical_name, field_type)) = field_lookup.map.get(id) {
                     current_field_context = Some((canonical_name.clone(), field_type.clone()));
                     expression_type_context = Some(field_type.clone());
                     
@@ -428,7 +431,7 @@ pub fn tokenize(s: &str, schema: &SmallVec<[SchemaField; 20]>) -> SmallVec<[Toke
                         }
                     }
                     
-                    out.push(Token::Ident(canonical_name.clone()));
+                    out.push(Token::Ident((canonical_name.clone(), field_type.clone())));
                 } else {
                     // Validate field reference
                     if i < bytes.len() {
@@ -446,7 +449,10 @@ pub fn tokenize(s: &str, schema: &SmallVec<[SchemaField; 20]>) -> SmallVec<[Toke
                         }
                     }
                     
-                    out.push(Token::Ident(id.to_string()));
+                    // For identifiers not found in schema, this should probably be an error
+                    // since all valid fields should be in the schema
+                    // But if you want to allow unknown identifiers, you could use a default type
+                    panic!("Unknown identifier: '{}' is not defined in the schema", id);
                 }
             },
             
@@ -567,120 +573,6 @@ fn parse_default(value_str: &str) -> NumericValue {
     }
 }
 
-// Keep all the rest of the functions exactly the same
-#[inline(always)]
-fn is_numeric_type(db_type: &DbType) -> bool {
-    matches!(db_type, 
-        DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::I128 |
-        DbType::U8 | DbType::U16 | DbType::U32 | DbType::U64 | DbType::U128 |
-        DbType::F32 | DbType::F64
-    )
-}
-
-#[inline(always)]
-pub fn promote_numeric_types(type1: DbType, type2: DbType) -> Option<DbType> {
-    if !is_numeric_type(&type1) || !is_numeric_type(&type2) {
-        return None;
-    }
-    
-    if type1 == type2 {
-        return Some(type1);
-    }
-
-    match (&type1, &type2) {
-        (DbType::U8, DbType::I32) => return Some(DbType::U8),
-        (DbType::I32, DbType::U8) => return Some(DbType::U8),
-        
-        (DbType::U16, DbType::I32) => return Some(DbType::U16),
-        (DbType::I32, DbType::U16) => return Some(DbType::U16),
-        
-        (DbType::U32, DbType::I32) => return Some(DbType::U32),
-        (DbType::I32, DbType::U32) => return Some(DbType::U32),
-        
-        (DbType::U64, DbType::I32) => return Some(DbType::U64),
-        (DbType::I32, DbType::U64) => return Some(DbType::U64),
-        
-        (DbType::U128, DbType::I32) => return Some(DbType::U128),
-        (DbType::I32, DbType::U128) => return Some(DbType::U128),
-        
-        (DbType::I32, _) if is_numeric_type(&type2) => return Some(type2),
-        (_, DbType::I32) if is_numeric_type(&type1) => return Some(type1),
-        
-        _ => {}
-    }
-
-    let rank1 = get_type_rank(&type1);
-    let rank2 = get_type_rank(&type2);
-
-    let is_float1 = matches!(type1, DbType::F32 | DbType::F64);
-    let is_float2 = matches!(type2, DbType::F32 | DbType::F64);
-    
-    if is_float1 || is_float2 {
-        if rank1 >= rank2 { Some(type1) } else { Some(type2) }
-    } else {
-        let is_signed1 = matches!(type1, DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::I128);
-        let is_signed2 = matches!(type2, DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::I128);
-        
-        if is_signed1 && is_signed2 {
-            if rank1 >= rank2 { Some(type1) } else { Some(type2) }
-        } else if !is_signed1 && !is_signed2 {
-            if rank1 >= rank2 { Some(type1) } else { Some(type2) }
-        } else {
-            if (rank1 as i32 - rank2 as i32).abs() > 1 {
-                if rank1 > rank2 { Some(type1) } else { Some(type2) }
-            } else {
-                if is_signed1 { Some(type1) } else { Some(type2) }
-            }
-        }
-    }
-}
-
-#[inline(always)]
-fn get_type_rank(db_type: &DbType) -> u8 {
-    match db_type {
-        DbType::F64 => 14,
-        DbType::F32 => 13,
-        DbType::I128 => 12,
-        DbType::U128 => 11, 
-        DbType::I64 => 10,
-        DbType::U64 => 9,
-        DbType::I32 => 8,
-        DbType::U32 => 7,
-        DbType::I16 => 6,
-        DbType::U16 => 5,
-        DbType::I8 => 4,
-        DbType::U8 => 3,
-        DbType::STRING => 2,
-        DbType::DATETIME => 1, 
-        DbType::CHAR | DbType::NULL => 0,
-        _ => unreachable!("unknown type for promotion"),
-    }
-}
-
-#[inline(always)]
-pub fn promote_types(type1: DbType, type2: DbType) -> DbType {
-    if type1 == DbType::STRING || type2 == DbType::STRING {
-        return DbType::STRING;
-    }
-    
-    if type1 == type2 {
-        return type1;
-    }
-    
-    if type1 == DbType::I32 && is_numeric_type(&type2) {
-        return type2;
-    }
-    if type2 == DbType::I32 && is_numeric_type(&type1) {
-        return type1;
-    }
-    
-    if let Some(result_type) = promote_numeric_types(type1.clone(), type2.clone()) {
-        return result_type;
-    }
-    
-    panic!("Cannot promote types: {:?} and {:?} for comparison operation", type1, type2);
-}
-
 #[inline(always)]
 pub fn numeric_value_to_db_type(nv: &NumericValue) -> DbType {
     match nv {
@@ -789,7 +681,7 @@ mod tests {
     fn test_tokenize_identifiers() {
         let mut schema = SmallVec::new();
         schema.push(SchemaField {
-            name: "field2".to_string(),
+            name: "field1".to_string(),
             db_type: DbType::F64,
             is_deleted: false,
             size: 0,
@@ -808,9 +700,9 @@ mod tests {
         });
         let tokens = tokenize("field1 + field2", &schema);
         assert_eq!(tokens.len(), 3);
-        assert_eq!(tokens[0], Token::Ident("field1".to_string()));
+        assert_eq!(tokens[0], Token::Ident(("field1".to_string(), DbType::F64)));
         assert_eq!(tokens[1], Token::Op("+".to_string()));
-        assert_eq!(tokens[2], Token::Ident("field2".to_string()));
+        assert_eq!(tokens[2], Token::Ident(("field2".to_string(), DbType::F64)));
     }
 
     #[test]
@@ -835,42 +727,42 @@ mod tests {
         let tokens = tokenize(query, &schema);
         assert_eq!(tokens.len(), 39);
         assert_eq!(tokens[0], Token::LPar);
-        assert_eq!(tokens[1], Token::Ident("id".to_string()));
+        assert_eq!(tokens[1], Token::Ident(("id".to_string(), DbType::U128)));
         assert_eq!(tokens[2], Token::Op("=".to_string()));
         assert_eq!(tokens[3], Token::Number(NumericValue::U128(42)));
         assert_eq!(tokens[4], Token::Next("AND".to_string()));
-        assert_eq!(tokens[5], Token::Ident("name".to_string()));
-        assert_eq!(tokens[6], Token::Ident("CONTAINS".to_string()));
+        assert_eq!(tokens[5], Token::Ident(("name".to_string(), DbType::STRING)));
+        assert_eq!(tokens[6], Token::Ident(("CONTAINS".to_string(), DbType::STRING)));
         assert_eq!(tokens[7], Token::StringLit("John".to_string()));
         assert_eq!(tokens[8], Token::RPar);
         assert_eq!(tokens[9], Token::Next("OR".to_string()));
         assert_eq!(tokens[10], Token::LPar);
-        assert_eq!(tokens[11], Token::Ident("age".to_string()));
+        assert_eq!(tokens[11], Token::Ident(("age".to_string(), DbType::U8)));
         assert_eq!(tokens[12], Token::Op(">".to_string()));
         assert_eq!(tokens[13], Token::Number(NumericValue::U8(25)));
         assert_eq!(tokens[14], Token::Next("AND".to_string()));
-        assert_eq!(tokens[15], Token::Ident("salary".to_string()));
+        assert_eq!(tokens[15], Token::Ident(("salary".to_string(), DbType::F32)));
         assert_eq!(tokens[16], Token::Op("<".to_string()));
         assert_eq!(tokens[17], Token::Number(NumericValue::F32(50000.0)));
         assert_eq!(tokens[18], Token::RPar);
         assert_eq!(tokens[19], Token::Next("OR".to_string()));
         assert_eq!(tokens[20], Token::LPar);
-        assert_eq!(tokens[21], Token::Ident("bank_balance".to_string()));
+        assert_eq!(tokens[21], Token::Ident(("bank_balance".to_string(), DbType::F64)));
         assert_eq!(tokens[22], Token::Op(">=".to_string()));
         assert_eq!(tokens[23], Token::Number(NumericValue::F64(1000.43)));
         assert_eq!(tokens[24], Token::Next("AND".to_string()));
-        assert_eq!(tokens[25], Token::Ident("net_assets".to_string()));
+        assert_eq!(tokens[25], Token::Ident(("net_assets".to_string(), DbType::F64)));
         assert_eq!(tokens[26], Token::Op(">".to_string()));
         assert_eq!(tokens[27], Token::Number(NumericValue::F64(800000.0)));
         assert_eq!(tokens[28], Token::RPar);
         assert_eq!(tokens[29], Token::Next("OR".to_string()));
         assert_eq!(tokens[30], Token::LPar);
-        assert_eq!(tokens[31], Token::Ident("department".to_string()));
-        assert_eq!(tokens[32], Token::Ident("STARTSWITH".to_string()));
+        assert_eq!(tokens[31], Token::Ident(("department".to_string(), DbType::STRING)));
+        assert_eq!(tokens[32], Token::Ident(("STARTSWITH".to_string(), DbType::STRING)));
         assert_eq!(tokens[33], Token::StringLit("Eng".to_string()));
         assert_eq!(tokens[34], Token::Next("AND".to_string()));
-        assert_eq!(tokens[35], Token::Ident("email".to_string()));
-        assert_eq!(tokens[36], Token::Ident("ENDSWITH".to_string()));
+        assert_eq!(tokens[35], Token::Ident(("email".to_string(), DbType::STRING)));
+        assert_eq!(tokens[36], Token::Ident(("ENDSWITH".to_string(), DbType::STRING)));
         assert_eq!(tokens[37], Token::StringLit("example.com".to_string()));
         assert_eq!(tokens[38], Token::RPar);
     }

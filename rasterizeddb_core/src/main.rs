@@ -8,7 +8,6 @@ use rasterizeddb_core::{
     core::storage_providers::file_sync::LocalStorageProvider,
     EMPTY_BUFFER,
 };
-use smallvec::SmallVec;
 
 #[tokio::main(flavor = "multi_thread")]
 #[allow(unreachable_code)]
@@ -20,8 +19,8 @@ async fn main() -> std::io::Result<()> {
     tokio::spawn(io_rows.start_service());
     tokio::spawn(io_pointers.start_service());
 
-    // rasterizeddb_core::core::mock_table::
-    //     consolidated_write_data_function(1_000_000).await;
+    rasterizeddb_core::core::mock_table::
+        consolidated_write_data_function(5_000_000).await;
 
     let schema = get_schema().await;
 
@@ -30,11 +29,11 @@ async fn main() -> std::io::Result<()> {
     println!("Press Enter to start...");
     stdin.read_line(&mut buffer).unwrap();
 
-    consolidated_read_data_function(schema, 999_999).await;
+    consolidated_read_data_function(schema, 4_999_999).await;
 
     let stdin = std::io::stdin();
     let mut buffer = String::new();
-    println!("Press Enter to start...");
+    println!("Press Enter to terminate...");
     stdin.read_line(&mut buffer).unwrap();
 
     return Ok(());
