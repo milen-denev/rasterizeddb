@@ -141,7 +141,7 @@ impl MockStorageProvider {
                 file.flush().await.unwrap();
                 file.sync_all().await.unwrap();
             } else {
-                tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
             }
         }
     }

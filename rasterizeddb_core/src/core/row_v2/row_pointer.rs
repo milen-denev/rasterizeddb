@@ -390,15 +390,16 @@ impl RowPointer {
 
     pub async fn save<S: StorageIO>(
         &self,
-        io: &mut S,) -> Result<()> {
-        
+        io: &mut S,
+        immediate: bool) -> Result<()> {
+
         let block = self.into_memory_block();
         let slice = block.into_slice();
 
         #[cfg(feature = "enable_data_verification")]
         let position = io.get_len().await;
 
-        io.append_data(slice, true).await;
+        io.append_data(slice, immediate).await;
 
         #[cfg(feature = "enable_data_verification")]
         let verify_result = io.verify_data_and_sync(position, slice).await;
@@ -894,11 +895,11 @@ impl RowPointer {
         slice[row_position as usize..].copy_from_slice(&string_slice);
 
         // Write the row data to the rows_io
-        rows_io.append_data(slice, true).await;
+        rows_io.append_data(slice, false).await;
 
         // Write the pointer last
         // Write the row data to the pointers_io
-        row_pointer.save(pointers_io).await?;
+        row_pointer.save(pointers_io, false).await?;
 
         #[cfg(feature = "enable_data_verification")]
         let write_result = rows_io.verify_data_and_sync(io_position, slice).await;
@@ -1071,7 +1072,7 @@ mod tests {
 
         let mut mock_io = MockStorageProvider::new().await;
         
-        row_pointer.save(&mut mock_io).await.unwrap();
+        row_pointer.save(&mut mock_io, true).await.unwrap();
 
         let mut row_pointer_iterator = RowPointerIterator::new(&mut mock_io).await.unwrap();
         
@@ -1094,8 +1095,8 @@ mod tests {
 
         let mut mock_io = MockStorageProvider::new().await;
         
-        row_pointer.save(&mut mock_io).await.unwrap();
-        row_pointer.save(&mut mock_io).await.unwrap();
+        row_pointer.save(&mut mock_io, true).await.unwrap();
+        row_pointer.save(&mut mock_io, true).await.unwrap();
 
         let mut row_pointer_iterator = RowPointerIterator::new(&mut mock_io).await.unwrap();
         
@@ -1120,9 +1121,9 @@ mod tests {
 
         let mut mock_io = MockStorageProvider::new().await;
         
-        row_pointer.save(&mut mock_io).await.unwrap();
-        row_pointer2.save(&mut mock_io).await.unwrap();
-        row_pointer.save(&mut mock_io).await.unwrap();
+        row_pointer.save(&mut mock_io, true).await.unwrap();
+        row_pointer2.save(&mut mock_io, true).await.unwrap();
+        row_pointer.save(&mut mock_io, true).await.unwrap();
 
         let mut row_pointer_iterator = RowPointerIterator::new(&mut mock_io).await.unwrap();
         

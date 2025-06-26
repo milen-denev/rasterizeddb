@@ -35,18 +35,18 @@ impl<'a, 'b, 'c> QueryParser<'a, 'b, 'c> {
 
     // Add more debug output to the main execute function
     fn execute(&mut self) {
-        #[cfg(debug_assertions)]
-        println!("Starting to parse query with {} tokens", self.toks.len());
+        // #[cfg(debug_assertions)]
+        // println!("Starting to parse query with {} tokens", self.toks.len());
         
-        #[cfg(debug_assertions)]
-        for (i, token) in self.toks.iter().enumerate() {
-            println!("Token {}: {:?}", i, token);
-        }
+        // #[cfg(debug_assertions)]
+        // for (i, token) in self.toks.iter().enumerate() {
+        //     println!("Token {}: {:?}", i, token);
+        // }
         
         self.parse_or();
         
-        #[cfg(debug_assertions)]
-        println!("Finished parsing. Final position: {}/{}", self.pos, self.toks.len());
+        // #[cfg(debug_assertions)]
+        // println!("Finished parsing. Final position: {}/{}", self.pos, self.toks.len());
     }
 
     /// Parse OR expressions
@@ -88,8 +88,8 @@ impl<'a, 'b, 'c> QueryParser<'a, 'b, 'c> {
         if let Some(Token::LPar) = self.toks.get(self.pos) {
             // Check if this is a boolean group
             if self.is_boolean_group(self.pos) {
-                #[cfg(debug_assertions)]
-                println!("Parsing boolean group starting at position {}", self.pos);
+                // #[cfg(debug_assertions)]
+                // println!("Parsing boolean group starting at position {}", self.pos);
                 
                 self.pos += 1; // consume '('
                 self.parse_or(); // Parse the boolean expression inside parentheses
@@ -98,8 +98,8 @@ impl<'a, 'b, 'c> QueryParser<'a, 'b, 'c> {
                     panic!("expected closing parenthesis");
                 }
                 
-                #[cfg(debug_assertions)]
-                println!("Finished parsing boolean group, now at position {}", self.pos);
+                // #[cfg(debug_assertions)]
+                // println!("Finished parsing boolean group, now at position {}", self.pos);
                 return;
             }
         }
@@ -114,14 +114,14 @@ impl<'a, 'b, 'c> QueryParser<'a, 'b, 'c> {
         let mut has_comparison = false;
         let mut has_boolean_keyword = false;
         
-        #[cfg(debug_assertions)]
-        println!("Checking if position {} is start of boolean group", start);
+        // #[cfg(debug_assertions)]
+        // println!("Checking if position {} is start of boolean group", start);
         
         while i < self.toks.len() {
-            #[cfg(debug_assertions)]
-            if i < start + 10 { // Limit debug output
-                println!("  Checking token {}: {:?} (depth: {})", i, self.toks[i], depth);
-            }
+            // #[cfg(debug_assertions)]
+            // if i < start + 10 { // Limit debug output
+            //     println!("  Checking token {}: {:?} (depth: {})", i, self.toks[i], depth);
+            // }
             
             match &self.toks[i] {
                 Token::LPar => depth += 1,
@@ -129,34 +129,34 @@ impl<'a, 'b, 'c> QueryParser<'a, 'b, 'c> {
                     depth -= 1;
                     if depth == 0 { 
                         let result = has_comparison || has_boolean_keyword;
-                        #[cfg(debug_assertions)]
-                        println!("  Boolean group detection result: {} (has_comparison: {}, has_boolean_keyword: {})", 
-                            result, has_comparison, has_boolean_keyword);
+                        // #[cfg(debug_assertions)]
+                        // println!("  Boolean group detection result: {} (has_comparison: {}, has_boolean_keyword: {})", 
+                        //     result, has_comparison, has_boolean_keyword);
                         return result; 
                     }
                 },
                 Token::Op(o) if depth >= 1 && ["=","!=",">",">=","<","<="].contains(&o.as_str()) => {
                     has_comparison = true;
-                    #[cfg(debug_assertions)]
-                    println!("  Found comparison operator: {}", o);
+                    // #[cfg(debug_assertions)]
+                    // println!("  Found comparison operator: {}", o);
                 },
                 Token::Next(n) if depth >= 1 => {
                     if ["AND", "OR"].contains(&n.as_str()) {
                         has_boolean_keyword = true;
-                        #[cfg(debug_assertions)]
-                        println!("  Found boolean keyword (Next): {}", n);
+                        // #[cfg(debug_assertions)]
+                        // println!("  Found boolean keyword (Next): {}", n);
                     }
                 },
                 Token::Ident(t) if depth >= 1 => {
                     let upper = &t.0;
                     if ["AND", "OR"].contains(&upper.as_str()) {
                         has_boolean_keyword = true;
-                        #[cfg(debug_assertions)]
-                        println!("  Found boolean keyword (Ident): {}", upper);
+                        // #[cfg(debug_assertions)]
+                        // println!("  Found boolean keyword (Ident): {}", upper);
                     } else if ["CONTAINS", "STARTSWITH", "ENDSWITH"].contains(&upper.as_str()) {
                         has_comparison = true;
-                        #[cfg(debug_assertions)]
-                        println!("  Found string comparison operator: {}", upper);
+                        // #[cfg(debug_assertions)]
+                        // println!("  Found string comparison operator: {}", upper);
                     }
                 },
                 _ => {}
@@ -164,8 +164,8 @@ impl<'a, 'b, 'c> QueryParser<'a, 'b, 'c> {
             i += 1;
         }
         
-        #[cfg(debug_assertions)]
-        println!("  Boolean group detection result: false (reached end without closing paren)");
+        // #[cfg(debug_assertions)]
+        // println!("  Boolean group detection result: false (reached end without closing paren)");
         false
     }
 
@@ -209,8 +209,8 @@ impl<'a, 'b, 'c> QueryParser<'a, 'b, 'c> {
             _ => left_type, 
         };
         
-        #[cfg(debug_assertions)]
-        println!("Adding comparison: {:?} {:?} {:?}", left_op, cmp, right_op);
+        // #[cfg(debug_assertions)]
+        // println!("Adding comparison: {:?} {:?} {:?}", left_op, cmp, right_op);
         
         // Add the comparison with None initially - the logic operations will be set later
         self.query_transformer.add_comparison(

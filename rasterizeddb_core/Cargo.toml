@@ -32,6 +32,7 @@ rand = "0.9.1"
 crossbeam-queue = "0.3.12"
 memory-stats = "1.2.0"
 smallvec = { version = "1.15.0" }
+arc-swap = "1.7.1"
 
 # unix dependencies
 [target.'cfg(unix)'.dependencies]

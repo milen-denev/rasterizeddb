@@ -4,11 +4,12 @@ use std::{
 
 use std::io::*;
 
+use arc_swap::{ArcSwap, Cache};
 use crossbeam_queue::SegQueue;
 use futures::future::join_all;
 use tokio::{io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt}, sync::RwLock, task::yield_now};
 
-use memmap2::{MmapMut, MmapOptions};
+use memmap2::{Mmap, MmapOptions};
 
 use crate::memory_pool::{MemoryBlock, MEMORY_POOL};
 
@@ -28,7 +29,7 @@ pub struct LocalStorageProvider {
     pub(crate) table_name: String,
     pub(crate) file_str: String,
     pub(crate) file_len: AtomicU64,
-    pub(crate) _memory_map: MmapMut,
+    pub(crate) _memory_map: ArcSwap<Option<Mmap>>,
     pub(crate) hash: u32,
     _locked: AtomicBool,
     appender: SegQueue<MemoryBlock>,
@@ -41,6 +42,11 @@ unsafe impl Send for LocalStorageProvider { }
 
 impl Clone for LocalStorageProvider {
     fn clone(&self) -> Self {
+         let map = Some(unsafe { MmapOptions::new()
+            .populate()
+            .map_copy_read_only(&std::fs::File::open(&self.file_str).unwrap())
+            .unwrap() });
+
         Self {
             append_file: self.append_file.clone(),
             write_file: self.write_file.clone(),
@@ -48,9 +54,7 @@ impl Clone for LocalStorageProvider {
             table_name: self.table_name.clone(),
             file_str: self.file_str.clone(),
             file_len: AtomicU64::new(self.file_len.load(std::sync::atomic::Ordering::SeqCst)),
-            _memory_map: unsafe { MmapOptions::new()
-                .map_mut(&std::fs::File::open(&self.file_str).unwrap())
-                .unwrap() },
+            _memory_map: ArcSwap::new(Arc::new(map)),
             hash: CRC.checksum(format!("{}+++{}", self.location, self.table_name).as_bytes()),
             appender: SegQueue::new(),
             _locked: AtomicBool::new(false),
@@ -115,6 +119,11 @@ impl LocalStorageProvider {
 
             let file_len = file_read_mmap.metadata().unwrap().len();
 
+            let map = Some(unsafe { MmapOptions::new()
+                .populate()
+                .map_copy_read_only(&file_read_mmap)
+                .unwrap() });
+
             LocalStorageProvider {
                 append_file: Arc::new(RwLock::new(file_append)),
                 write_file: Arc::new(RwLock::new(file_write)),
@@ -122,10 +131,7 @@ impl LocalStorageProvider {
                 table_name: table_name.to_string(),
                 file_str: file_str.clone(),
                 file_len: AtomicU64::new(file_len),
-                _memory_map: unsafe { MmapOptions::new()
-                    .populate()
-                    .map_mut(&file_read_mmap)
-                    .unwrap() },
+                _memory_map: ArcSwap::new(Arc::new(map)),
                 hash: CRC.checksum(format!("{}+++{}", final_location, table_name).as_bytes()),
                 appender: SegQueue::new(),
                 _locked: AtomicBool::new(false),
@@ -179,6 +185,11 @@ impl LocalStorageProvider {
 
             let file_len = file_read_mmap.metadata().unwrap().len();
 
+            let map = Some(unsafe { MmapOptions::new()
+                .populate()
+                .map_copy_read_only(&file_read_mmap)
+                .unwrap() });
+
             LocalStorageProvider {
                 append_file: Arc::new(RwLock::new(file_append)),
                 write_file: Arc::new(RwLock::new(file_write)),
@@ -186,9 +197,7 @@ impl LocalStorageProvider {
                 table_name: "temp.db".to_string(),
                 file_str: file_str.clone(),
                 file_len: AtomicU64::new(file_len),
-                _memory_map: unsafe { MmapOptions::new()
-                    .map_mut(&file_read_mmap)
-                    .unwrap() },
+                _memory_map: ArcSwap::new(Arc::new(map)),
                 hash: CRC.checksum(format!("{}+++{}", location_str, "CONFIG_TABLE.db").as_bytes()),
                 appender: SegQueue::new(),
                 _locked: AtomicBool::new(false),
@@ -223,70 +232,93 @@ impl LocalStorageProvider {
     }
 
     pub async fn start_append_data_service(&mut self) {
+        const BATCH_SIZE: usize = 4 * 1024 * 1024; // 64MB
+        const SLEEP_DURATION: tokio::time::Duration = tokio::time::Duration::from_millis(10);
+        
+        let mut idle_count = 0;
+        let mut buffer: Vec<u8> = Vec::with_capacity(BATCH_SIZE);
+        
         loop {
-            if self.appender.len() > 0 {
-                //println!("Starting appending data, locking activating.");
-                //self.locked.store(true, std::sync::atomic::Ordering::Relaxed);
-
-                let mut buffer: Vec<u8> = Vec::default();
-
-                let mut size: usize = 0;
-
-                while let Some(block) = self.appender.pop() {
-                    let slice = block.into_slice();
-                    buffer.extend_from_slice(slice);
-                    size = size + slice.len();
-                    if size > 1024 * 1024 * 64 {
-                        break;
-                    }
+            let mut total_size = 0;
+            let mut has_data = false;
+            
+            // Collect data in batches
+            while let Some(block) = self.appender.pop() {
+                has_data = true;
+                let slice = block.into_slice();
+                buffer.extend_from_slice(slice);
+                total_size += slice.len();
+                
+                // Break if we've reached our batch size limit
+                if total_size >= BATCH_SIZE {
+                    break;
                 }
-
-                // let mut file = self.append_file.write().await;
-                // file.write_all(&buffer).await.unwrap();
-
-                // file.flush().await.unwrap();
-                // file.sync_all().await.unwrap();
-
-                // let file_read = std::fs::File::options()
-                //     .read(true)
-                //     .open(&self.file_str)
-                //     .unwrap();
-
-                //let len = self.file_len.load(std::sync::atomic::Ordering::Relaxed);
-                //let write_file = self.write_file.read().await;
-
-                let mut file = self.append_file.write().await;
-
-                file.write_all(&buffer).await.unwrap();
-                file.flush().await.unwrap();
-                file.sync_all().await.unwrap();
-
-                drop(file);
-
-               let file_ = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&self.file_str)
-                    .unwrap();
-
-                let buffer_len = buffer.len();
-
-                let file_len = self.file_len.load(std::sync::atomic::Ordering::Relaxed);
-                file_.set_len(file_len + buffer_len as u64).unwrap();
-
-                self._memory_map = unsafe { MmapOptions::new()
-                    .map_mut(&file_)
-                    .unwrap() };
-
-                self.file_len.fetch_add(buffer.len() as u64, std::sync::atomic::Ordering::Release);
-
-                //self.locked.store(false, std::sync::atomic::Ordering::Relaxed);
-
-                //println!("Finished appending data, unlocking.");
+            }
+            
+            if has_data {
+                idle_count = 0;
+                self.write_batch_data(&mut buffer, total_size).await;
             } else {
-                tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                idle_count += 1;
+                
+                // Adaptive sleep - sleep longer when idle for extended periods
+                let sleep_duration = if idle_count < 100 {
+                    SLEEP_DURATION
+                } else if idle_count < 1000 {
+                    tokio::time::Duration::from_millis(50)
+                } else {
+                    tokio::time::Duration::from_millis(100)
+                };
+                
+                tokio::time::sleep(sleep_duration).await;
             }
         }
+    }
+
+    async fn write_batch_data(&mut self, buffer: &mut Vec<u8>, total_size: usize) {
+        if total_size == 0 {
+            return;
+        }
+
+        // Write the data
+        {
+            let mut file = self.append_file.write().await;
+            
+            file.write_all(buffer).await.unwrap();
+            file.flush().await.unwrap();
+        } // file handle is dropped here
+        
+        // Update file length atomically
+        self.file_len.fetch_add(total_size as u64, std::sync::atomic::Ordering::Release);
+        
+        // Update memory map after writing
+        self.update_memory_map().await;
+
+        buffer.clear(); // Clear the buffer for the next batch
+    }
+
+    async fn update_memory_map(&mut self) {
+        let file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.file_str) 
+        {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("Failed to open file for memory mapping: {}", e);
+                return;
+            }
+        };
+
+        self._memory_map.store(Arc::new(None)); // Clear the previous memory map
+
+        // Create new memory map with the current file size
+        self._memory_map.store(Arc::new(Some(unsafe {
+            MmapOptions::new()
+                .populate()
+                .map_copy_read_only(&file)
+                .unwrap()
+        })));
     }
 }
 
@@ -325,7 +357,6 @@ impl StorageIO for LocalStorageProvider {
             let mut file = self.append_file.write().await;
             file.write_all(&buffer).await.unwrap();
             file.flush().await.unwrap();
-            file.sync_all().await.unwrap();
 
             let file_ = OpenOptions::new()
                 .read(true)
@@ -335,15 +366,19 @@ impl StorageIO for LocalStorageProvider {
 
             let buffer_len = buffer.len();
 
-            let file_len = self.file_len.load(std::sync::atomic::Ordering::Relaxed);
-            file_.set_len(file_len + buffer_len as u64).unwrap();
+            let file_len = self.file_len.fetch_add(buffer.len() as u64, std::sync::atomic::Ordering::Release);
+            _ = file_.set_len(file_len + buffer_len as u64);
 
-            self._memory_map = unsafe { MmapOptions::new()
-                .map_mut(&file_)
-                .unwrap() };
+            self._memory_map.store(Arc::new(None)); // Clear the previous memory map
 
-            self.file_len.fetch_add(buffer.len() as u64, std::sync::atomic::Ordering::Release);
-            
+            // Create a new memory map with the updated file
+            self._memory_map.store(Arc::new(Some(unsafe {
+                MmapOptions::new()
+                    .populate()
+                    .map_copy_read_only(&file_)
+                    .unwrap()
+            })));
+
             //self.locked.store(false, std::sync::atomic::Ordering::Relaxed);
         } else {
             let block = MEMORY_POOL.acquire(buffer.len());
@@ -363,6 +398,7 @@ impl StorageIO for LocalStorageProvider {
         read_file.seek(SeekFrom::Start(*position)).await.unwrap();
         let mut buffer: Vec<u8> = vec![0; length as usize];
         let read_result = read_file.read_exact(&mut buffer).await;
+        
         if read_result.is_err() {
             return Vec::default();
         } else {
@@ -494,7 +530,33 @@ impl StorageIO for LocalStorageProvider {
             // read_file.seek(SeekFrom::Start(*position)).unwrap();
             // read_file.read_exact(buffer).unwrap();
         // } else {
-        buffer.copy_from_slice(&self._memory_map[*position as usize..*position as usize + buffer_len]);
+
+        let memory_map_guard = self._memory_map.load();
+        let memory_map = memory_map_guard.as_ref().as_ref();
+
+        if let Some(memory_map) = memory_map {
+            // If the memory map is available, read from it
+            if memory_map.len() < *position as usize + buffer_len {
+                let mut read_file = std::fs::File::options()
+                    .read(true)
+                    .open(&self.file_str)
+                    .unwrap();
+
+                read_file.seek(SeekFrom::Start(*position)).unwrap();
+                read_file.read_exact(buffer).unwrap();
+            } else {
+                buffer.copy_from_slice(&memory_map[*position as usize..*position as usize + buffer_len]);
+            }
+        } else {
+            // If the memory map is not available, read directly from the file
+            let mut read_file = std::fs::File::options()
+                .read(true)
+                .open(&self.file_str)
+                .unwrap();
+
+            read_file.seek(SeekFrom::Start(*position)).unwrap();
+            read_file.read_exact(buffer).unwrap();
+        }
         //}
 
         *position += buffer_len as u64;
@@ -622,9 +684,10 @@ impl StorageIO for LocalStorageProvider {
             table_name: "temp.db".to_string(),
             file_str: file_str.clone(),
             file_len: AtomicU64::new(file_len),
-            _memory_map: unsafe { MmapOptions::new()
-                    .map_mut(&file_read_mmap)
-                    .unwrap() },
+            _memory_map: ArcSwap::new(Arc::new(Some(unsafe { MmapOptions::new()
+                .populate()
+                .map_copy_read_only(&file_read_mmap)
+                .unwrap() }))),
             hash: CRC.checksum(format!("{}+++{}", final_location, "temp.db").as_bytes()),
             appender: SegQueue::new(),
             _locked: AtomicBool::new(false),
@@ -716,9 +779,10 @@ impl StorageIO for LocalStorageProvider {
             table_name: name.to_string(),
             file_str: new_table.clone(),
             file_len: AtomicU64::new(file_len),
-            _memory_map: unsafe { MmapOptions::new()
-                .map_mut(&file_read_mmap)
-                .unwrap() },
+            _memory_map: ArcSwap::new(Arc::new(Some(unsafe { MmapOptions::new()
+                .populate()
+                .map_copy_read_only(&file_read_mmap)
+                .unwrap() }))),
             hash: CRC.checksum(format!("{}+++{}", final_location, name).as_bytes()),
             appender: SegQueue::new(),
             _locked: AtomicBool::new(false),

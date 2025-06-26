@@ -72,41 +72,41 @@ pub async fn consolidated_read_data_function(schema: TableSchema, id: u64) {
     //loop {
     let mut stopwatch = Stopwatch::start_new();
 
-    let schema_fields = schema.fields.clone();
-    let row_fetch = create_row_fetch(&schema_fields);
+    // let schema_fields = schema.fields.clone();
+    // let row_fetch = create_row_fetch(&schema_fields);
     
     let mut iterator = RowPointerIterator::new(io_pointers).await.unwrap();
     let concurrent_processor = ConcurrentProcessor::new();
 
-    let _all_rows = concurrent_processor.process(
-        &format!(
-        r##"
-            id = {}
-            age < 40 AND 
-            bank_balance > 500.25 AND 
-            name != 'Jane Doe' AND 
-            last_purchase_category CONTAINS 'Elec' AND 
-            last_purchase_amount >= 50.0 AND 
-            is_active = 1 AND 
-            last_purchase_amount < 200.0 AND 
-            last_purchase_notes ENDSWITH 'notes' AND 
-            last_purchase_date = '2023-10-01' OR 
-            id < 100000 AND 
-            age > 25 AND 
-            bank_balance < 5000.00 AND 
-            name STARTSWITH 'J' AND 
-            last_purchase_category = 'Electronics' AND 
-            last_purchase_amount <= 150.0 AND 
-            is_active = 1 AND 
-            last_purchase_amount >= 75.5 AND 
-            last_purchase_notes CONTAINS 'No' AND 
-            last_purchase_date = '2023-10-01'
-        "##, id),
-        row_fetch,
-        schema_fields,
-        io_rows,
-        &mut iterator
-    ).await;  
+    // let _all_rows = concurrent_processor.process(
+    //     &format!(
+    //     r##"
+    //         id = {}
+    //         age < 40 AND 
+    //         bank_balance > 500.25 AND 
+    //         name != 'Jane Doe' AND 
+    //         last_purchase_category CONTAINS 'Elec' AND 
+    //         last_purchase_amount >= 50.0 AND 
+    //         is_active = 1 AND 
+    //         last_purchase_amount < 200.0 AND 
+    //         last_purchase_notes ENDSWITH 'notes' AND 
+    //         last_purchase_date = '2023-10-01' OR 
+    //         id < 100000 AND 
+    //         age > 25 AND 
+    //         bank_balance < 5000.00 AND 
+    //         name STARTSWITH 'J' AND 
+    //         last_purchase_category = 'Electronics' AND 
+    //         last_purchase_amount <= 150.0 AND 
+    //         is_active = 1 AND 
+    //         last_purchase_amount >= 75.5 AND 
+    //         last_purchase_notes CONTAINS 'No' AND 
+    //         last_purchase_date = '2023-10-01'
+    //     "##, id),
+    //     row_fetch,
+    //     schema_fields,
+    //     io_rows,
+    //     &mut iterator
+    // ).await;  
     
     let schema_fields = schema.fields.clone();
     let row_fetch = create_row_fetch(&schema_fields);
@@ -114,8 +114,8 @@ pub async fn consolidated_read_data_function(schema: TableSchema, id: u64) {
     let all_rows = concurrent_processor.process(
         &format!(
         r##"
-            id > 0
-        "##),
+            id = {}
+        "##, id),
         row_fetch,
         schema_fields,
         io_rows,
