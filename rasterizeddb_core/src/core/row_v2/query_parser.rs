@@ -176,7 +176,7 @@ impl<'a, 'b, 'c> QueryParser<'a, 'b, 'c> {
         let op_token = self.next().unwrap_or_else(|| panic!("Unexpected end of token stream"));
         let op = match op_token {
             Token::Op(o) => o,
-            Token::Ident((o, _)) => o,
+            Token::Ident((o, _, _)) => o,
             _ => panic!("expected comparison operator, got {:?}", op_token),
         };
         
@@ -275,7 +275,7 @@ impl<'a, 'b, 'c> QueryParser<'a, 'b, 'c> {
                 let mb = str_to_mb(&s);
                 (ComparisonOperand::Direct(mb), DbType::STRING)
             }
-            Token::Ident((name, db_type)) => {
+            Token::Ident((name, db_type, _write_order)) => {
                 // Simply look up the column data by name - no schema validation needed
                 let mb = self.cols.iter()
                     .find(|(n, _)| n == &name)
@@ -306,7 +306,7 @@ impl<'a, 'b, 'c> QueryParser<'a, 'b, 'c> {
                         _ => None
                     }
                 },
-                Token::Ident((t, _)) => {
+                Token::Ident((t, _, _)) => {
                     match t.as_str() {
                         "AND" => Some(Next::And),
                         "OR" => Some(Next::Or),
@@ -1938,7 +1938,7 @@ bool_buffer: SmallVec::new(),
     }
 
     #[test]
-    #[should_panic(expected =r#"Invalid byte slice: TryFromSliceError(())"#)]
+    #[should_panic(expected ="assertion `left == right` failed\n  left: 1\n right: 4")]
     fn test_column_vs_column_false() {
         let schema = create_schema(); 
         static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {

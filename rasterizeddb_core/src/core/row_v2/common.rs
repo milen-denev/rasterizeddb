@@ -10,6 +10,10 @@ pub trait FromLeBytes: Sized {
     fn to_le_bytes(&self) -> MemoryBlock;
 }
 
+pub trait FromLeBytesUnsafe: Sized {
+    unsafe fn from_le_bytes_unchecked(bytes: &[u8]) -> Self;
+}
+
 macro_rules! impl_from_le_bytes {
     ($($type:ty),*) => {
         $(
@@ -34,8 +38,28 @@ macro_rules! impl_from_le_bytes {
     };
 }
 
+macro_rules! impl_from_le_bytes_unsafe {
+    ($($type:ty),*) => {
+        $(
+            impl FromLeBytesUnsafe for $type {
+                #[inline(always)]
+                #[allow(unsafe_op_in_unsafe_fn)]
+                #[track_caller]
+                unsafe fn from_le_bytes_unchecked(bytes: &[u8]) -> Self {
+                    // SAFETY: Caller must ensure bytes has correct length
+                    let ptr = bytes.as_ptr() as *const $type;
+                    ptr.read_unaligned().into()
+                }
+            }
+        )*
+    };
+}
+
 // Implement the trait for all required types
 impl_from_le_bytes!(i8, u8, i16, u16, i32, u32, i64, u64, i128, u128, f32, f64);
+
+// Implement the trait for all required types with unsafe methods
+impl_from_le_bytes_unsafe!(i8, u8, i16, u16, i32, u32, i64, u64, i128, u128, f32, f64);
 
 // Custom trait for converting from f64
 pub trait FromF64: Sized {

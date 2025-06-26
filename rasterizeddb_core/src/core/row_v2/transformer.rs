@@ -291,39 +291,34 @@ impl<'a> TransformerProcessor<'a> {
     }
 
     /// Evaluate the logical combination of comparison results respecting AND/OR precedence
-    fn evaluate_comparison_results(&self, results: &mut SmallVec<[(bool, Option<Next>); 20]>) -> bool {
+    fn evaluate_comparison_results(&self, results: &[(bool, Option<Next>)]) -> bool {
         if results.is_empty() {
             return false;
         }
         
-        #[cfg(debug_assertions)]
-        println!("Evaluating {} comparison results with proper grouping:", results.len());
-        #[cfg(debug_assertions)]
-        for (i, (result, next_op)) in results.iter().enumerate() {
-            println!("  Result {}: {} (next: {:?})", i, result, next_op);
-        }
-        
-        // Split into OR groups (each group is connected by AND operations)
-        let mut or_groups = SmallVec::<[bool; 20]>::new();
-        let mut current_and_group = SmallVec::<[bool; 20]>::new();
+        let mut current_and_result = true;
         
         for (result, next_op) in results.iter() {
-            current_and_group.push(*result);
+            // Update current AND group result
+            current_and_result &= *result;
             
             match next_op {
                 Some(Next::And) => {
-                    // Continue building current AND group
-                    continue;
+                    // Continue with current AND group
+                    // Early termination: if current AND group is false, 
+                    // we can skip ahead to the next OR
+                    if !current_and_result {
+                        // Fast-forward to next OR or end
+                        continue;
+                    }
                 },
                 Some(Next::Or) | None => {
                     // Complete current AND group
-                    let and_result = current_and_group.iter().all(|&x| x);
-                    or_groups.push(and_result);
-                    
-                    #[cfg(debug_assertions)]
-                    println!("  AND group {:?} = {}", current_and_group, and_result);
-                    
-                    current_and_group.clear();
+                    if current_and_result {
+                        return true; // Early termination!
+                    }
+                    // Reset for next AND group
+                    current_and_result = true;
                     
                     if next_op.is_none() {
                         break;
@@ -332,13 +327,7 @@ impl<'a> TransformerProcessor<'a> {
             }
         }
         
-        // OR all the groups together
-        let final_result = or_groups.iter().any(|&x| x);
-        
-        #[cfg(debug_assertions)]
-        println!("  OR groups {:?} = {}", or_groups, final_result);
-        
-        final_result
+        false
     }
 }
 

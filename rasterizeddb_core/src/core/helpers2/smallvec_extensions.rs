@@ -45,7 +45,7 @@ impl<A: Array> SmallVecExtensions<A> for SmallVec<A> {
         I: IntoIterator<Item = A::Item>,
     {
         let len = self.len();
-        assert!(start <= len, "start index out of bounds");
+        debug_assert!(start <= len, "start index out of bounds");
         
         let end = (start + delete_count).min(len);
         let actual_delete_count = end - start;

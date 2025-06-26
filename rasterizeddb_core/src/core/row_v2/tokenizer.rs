@@ -1,5 +1,5 @@
 use smallvec::SmallVec;
-use std::arch::x86_64::*;
+use std::{arch::x86_64::*, borrow::Cow};
 use std::collections::HashMap;
 
 use crate::{core::{db_type::DbType}, memory_pool::MemoryBlock};
@@ -8,7 +8,7 @@ use super::schema::SchemaField;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
-    Ident((String, DbType)),
+    Ident((String, DbType, u64)),
     Number(NumericValue),
     StringLit(String),
     Op(String),
@@ -242,17 +242,18 @@ unsafe fn scan_identifier_simd(bytes: &[u8], mut pos: usize) -> usize {
 }
 
 // Pre-compute field lookup map for better cache locality
-struct FieldLookup {
-    map: HashMap<String, (String, DbType)>,
+struct FieldLookup<'a> {
+    map: HashMap<Cow<'a, String>, (Cow<'a, String>, DbType, u64)>,
     logical_ops: HashMap<String, String>,
     string_ops: HashMap<String, String>,
 }
 
-impl FieldLookup {
-    fn new(schema: &SmallVec<[SchemaField; 20]>) -> Self {
-        let mut map = HashMap::with_capacity(schema.len());
+impl<'a> FieldLookup<'a> {
+    fn new(schema: &'a SmallVec<[SchemaField; 20]>) -> Self {
+        let mut map = HashMap::<Cow<'a, String>, (Cow<'a, String>, DbType, u64)>::with_capacity(schema.len());
+
         for field in schema.iter() {
-            map.insert(field.name.clone(), (field.name.clone(), field.db_type.clone()));
+            map.insert(Cow::Borrowed(&field.name), (Cow::Borrowed(&field.name), field.db_type.clone(), field.write_order.clone()));
         }
         
         let mut logical_ops = HashMap::new();
@@ -269,7 +270,7 @@ impl FieldLookup {
 }
 
 #[inline(always)]
-pub fn tokenize(s: &str, schema: &SmallVec<[SchemaField; 20]>) -> SmallVec<[Token; 36]> {
+pub fn tokenize<'a>(s: &str, schema: &'a SmallVec<[SchemaField; 20]>) -> SmallVec<[Token; 36]> {
     init_char_table();
     
     let mut out = SmallVec::new();
@@ -280,7 +281,7 @@ pub fn tokenize(s: &str, schema: &SmallVec<[SchemaField; 20]>) -> SmallVec<[Toke
     let field_lookup = FieldLookup::new(schema);
     
     // Track context for field association to maintain type consistency
-    let mut current_field_context: Option<(String, DbType)> = None;
+    let mut current_field_context: Option<(Cow<'a, String>, DbType, u64)> = None;
     let mut expression_type_context: Option<DbType> = None;
     let mut expression_stack: Vec<Option<DbType>> = Vec::new();
     let mut in_parentheses = 0;
@@ -407,7 +408,7 @@ pub fn tokenize(s: &str, schema: &SmallVec<[SchemaField; 20]>) -> SmallVec<[Toke
                     // For string operations, we need to determine the type from context or schema
                     // Since these are operators, we might want to use the current expression type
                     let op_type = expression_type_context.clone().unwrap();
-                    out.push(Token::Ident((normalized.clone(), op_type)));
+                    out.push(Token::Ident((normalized.clone(), op_type, 0)));
                     continue;
                 }
 
@@ -419,8 +420,8 @@ pub fn tokenize(s: &str, schema: &SmallVec<[SchemaField; 20]>) -> SmallVec<[Toke
                 }
                 
                 // Check if this is a field name in the schema
-                if let Some((canonical_name, field_type)) = field_lookup.map.get(id) {
-                    current_field_context = Some((canonical_name.clone(), field_type.clone()));
+                if let Some((canonical_name, field_type, write_order)) = field_lookup.map.get(&id.to_string()) {
+                    current_field_context = Some((canonical_name.clone(), field_type.clone(), write_order.clone()));
                     expression_type_context = Some(field_type.clone());
                     
                     if in_parentheses > 0 {
@@ -431,7 +432,7 @@ pub fn tokenize(s: &str, schema: &SmallVec<[SchemaField; 20]>) -> SmallVec<[Toke
                         }
                     }
                     
-                    out.push(Token::Ident((canonical_name.clone(), field_type.clone())));
+                    out.push(Token::Ident((canonical_name.to_string(), field_type.clone(), write_order.clone())));
                 } else {
                     // Validate field reference
                     if i < bytes.len() {
@@ -524,16 +525,16 @@ pub fn tokenize(s: &str, schema: &SmallVec<[SchemaField; 20]>) -> SmallVec<[Toke
 // Rest of the helper functions remain the same but with optimized implementations
 
 #[inline(always)]
-fn parse_numeric_value(
+fn parse_numeric_value<'a>(
     value_str: &str, 
-    field_context: &Option<(String, DbType)>,
+    field_context: &Option<(Cow<'a, String>, DbType, u64)>,
     expression_context: &Option<DbType>,
 ) -> NumericValue {
     if let Some(db_type) = expression_context {
         return parse_by_db_type(value_str, db_type);
     }
     
-    if let Some((_, db_type)) = field_context {
+    if let Some((_, db_type, _)) = field_context {
         return parse_by_db_type(value_str, db_type);
     }
     
@@ -686,7 +687,7 @@ mod tests {
             is_deleted: false,
             size: 0,
             offset: 0,
-            write_order: 0,
+            write_order: 5,
             is_unique: false,
         });
         schema.push(SchemaField {
@@ -695,14 +696,14 @@ mod tests {
             is_deleted: false,
             size: 0,
             offset: 0,
-            write_order: 0,
+            write_order: 10,
             is_unique: false,
         });
         let tokens = tokenize("field1 + field2", &schema);
         assert_eq!(tokens.len(), 3);
-        assert_eq!(tokens[0], Token::Ident(("field1".to_string(), DbType::F64)));
+        assert_eq!(tokens[0], Token::Ident(("field1".to_string(), DbType::F64, 5)));
         assert_eq!(tokens[1], Token::Op("+".to_string()));
-        assert_eq!(tokens[2], Token::Ident(("field2".to_string(), DbType::F64)));
+        assert_eq!(tokens[2], Token::Ident(("field2".to_string(), DbType::F64, 10)));
     }
 
     #[test]
@@ -727,42 +728,42 @@ mod tests {
         let tokens = tokenize(query, &schema);
         assert_eq!(tokens.len(), 39);
         assert_eq!(tokens[0], Token::LPar);
-        assert_eq!(tokens[1], Token::Ident(("id".to_string(), DbType::U128)));
+        assert_eq!(tokens[1], Token::Ident(("id".to_string(), DbType::U128, 0)));
         assert_eq!(tokens[2], Token::Op("=".to_string()));
         assert_eq!(tokens[3], Token::Number(NumericValue::U128(42)));
         assert_eq!(tokens[4], Token::Next("AND".to_string()));
-        assert_eq!(tokens[5], Token::Ident(("name".to_string(), DbType::STRING)));
-        assert_eq!(tokens[6], Token::Ident(("CONTAINS".to_string(), DbType::STRING)));
+        assert_eq!(tokens[5], Token::Ident(("name".to_string(), DbType::STRING, 1)));
+        assert_eq!(tokens[6], Token::Ident(("CONTAINS".to_string(), DbType::STRING, 2)));
         assert_eq!(tokens[7], Token::StringLit("John".to_string()));
         assert_eq!(tokens[8], Token::RPar);
         assert_eq!(tokens[9], Token::Next("OR".to_string()));
         assert_eq!(tokens[10], Token::LPar);
-        assert_eq!(tokens[11], Token::Ident(("age".to_string(), DbType::U8)));
+        assert_eq!(tokens[11], Token::Ident(("age".to_string(), DbType::U8, 3)));
         assert_eq!(tokens[12], Token::Op(">".to_string()));
         assert_eq!(tokens[13], Token::Number(NumericValue::U8(25)));
         assert_eq!(tokens[14], Token::Next("AND".to_string()));
-        assert_eq!(tokens[15], Token::Ident(("salary".to_string(), DbType::F32)));
+        assert_eq!(tokens[15], Token::Ident(("salary".to_string(), DbType::F32, 4)));
         assert_eq!(tokens[16], Token::Op("<".to_string()));
         assert_eq!(tokens[17], Token::Number(NumericValue::F32(50000.0)));
         assert_eq!(tokens[18], Token::RPar);
         assert_eq!(tokens[19], Token::Next("OR".to_string()));
         assert_eq!(tokens[20], Token::LPar);
-        assert_eq!(tokens[21], Token::Ident(("bank_balance".to_string(), DbType::F64)));
+        assert_eq!(tokens[21], Token::Ident(("bank_balance".to_string(), DbType::F64, 5)));
         assert_eq!(tokens[22], Token::Op(">=".to_string()));
         assert_eq!(tokens[23], Token::Number(NumericValue::F64(1000.43)));
         assert_eq!(tokens[24], Token::Next("AND".to_string()));
-        assert_eq!(tokens[25], Token::Ident(("net_assets".to_string(), DbType::F64)));
+        assert_eq!(tokens[25], Token::Ident(("net_assets".to_string(), DbType::F64, 6)));
         assert_eq!(tokens[26], Token::Op(">".to_string()));
         assert_eq!(tokens[27], Token::Number(NumericValue::F64(800000.0)));
         assert_eq!(tokens[28], Token::RPar);
         assert_eq!(tokens[29], Token::Next("OR".to_string()));
         assert_eq!(tokens[30], Token::LPar);
-        assert_eq!(tokens[31], Token::Ident(("department".to_string(), DbType::STRING)));
-        assert_eq!(tokens[32], Token::Ident(("STARTSWITH".to_string(), DbType::STRING)));
+        assert_eq!(tokens[31], Token::Ident(("department".to_string(), DbType::STRING, 7)));
+        assert_eq!(tokens[32], Token::Ident(("STARTSWITH".to_string(), DbType::STRING, 8)));
         assert_eq!(tokens[33], Token::StringLit("Eng".to_string()));
         assert_eq!(tokens[34], Token::Next("AND".to_string()));
-        assert_eq!(tokens[35], Token::Ident(("email".to_string(), DbType::STRING)));
-        assert_eq!(tokens[36], Token::Ident(("ENDSWITH".to_string(), DbType::STRING)));
+        assert_eq!(tokens[35], Token::Ident(("email".to_string(), DbType::STRING, 9)));
+        assert_eq!(tokens[36], Token::Ident(("ENDSWITH".to_string(), DbType::STRING, 10)));
         assert_eq!(tokens[37], Token::StringLit("example.com".to_string()));
         assert_eq!(tokens[38], Token::RPar);
     }

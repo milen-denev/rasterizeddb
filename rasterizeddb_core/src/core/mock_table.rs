@@ -49,7 +49,7 @@ pub async fn consolidated_write_data_function(times: u64) {
     create_schema(io_schema, "test_table").await;
     
     for i in 0..times {
-        fill_data(i, io_pointers, io_rows).await;
+        fill_data(i, io_pointers, io_rows, times).await;
     }
 }
 
@@ -74,11 +74,11 @@ pub async fn consolidated_read_data_function(schema: TableSchema, id: u64) {
 
     let schema_fields = schema.fields.clone();
     let row_fetch = create_row_fetch(&schema_fields);
+    
     let mut iterator = RowPointerIterator::new(io_pointers).await.unwrap();
-
     let concurrent_processor = ConcurrentProcessor::new();
 
-    let all_rows = concurrent_processor.process(
+    let _all_rows = concurrent_processor.process(
         &format!(
         r##"
             id = {}
@@ -102,6 +102,20 @@ pub async fn consolidated_read_data_function(schema: TableSchema, id: u64) {
             last_purchase_notes CONTAINS 'No' AND 
             last_purchase_date = '2023-10-01'
         "##, id),
+        row_fetch,
+        schema_fields,
+        io_rows,
+        &mut iterator
+    ).await;  
+    
+    let schema_fields = schema.fields.clone();
+    let row_fetch = create_row_fetch(&schema_fields);
+
+    let all_rows = concurrent_processor.process(
+        &format!(
+        r##"
+            id > 0
+        "##),
         row_fetch,
         schema_fields,
         io_rows,
@@ -289,11 +303,12 @@ async fn fill_data<S: StorageIO>(
     id: u64,
     io_pointers: &mut S,
     io_rows: &mut S,
+    times: u64
 ) {
     #[cfg(feature = "enable_long_row")]
     let cluster = 0;
     
-    let row_write = if id == 4_999_999 {
+    let row_write = if id == times - 1 {
         create_row_write(id, Some("Test row with notes".to_string()))
     } else {
         create_row_write(id, None)

@@ -2,7 +2,7 @@ use std::fmt::Debug;
 
 use crate::core::db_type::DbType;
 
-use super::{common::{simd_compare_strings, FromLeBytes}, transformer::ComparerOperation};
+use super::{common::{simd_compare_strings, FromLeBytes, FromLeBytesUnsafe}, transformer::ComparerOperation};
 
 #[inline(always)]
 pub fn perform_comparison_operation(input1: &[u8], input2: &[u8], db_type: &DbType, operation: &ComparerOperation) -> bool {
@@ -27,13 +27,16 @@ pub fn perform_comparison_operation(input1: &[u8], input2: &[u8], db_type: &DbTy
 #[inline(always)]
 fn generic_comparison<T>(input1: &[u8], input2: &[u8], operation: &ComparerOperation) -> bool
 where
-    T: Copy + Default + PartialEq + PartialOrd + FromLeBytes + Debug,
+    T: Copy + Default + PartialEq + PartialOrd + FromLeBytes + FromLeBytesUnsafe + Debug,
 {
-    //#[cfg(debug_assertions)]
-    //println!("Comparing {:?} and {:?}", input1, input2);
-    
-    let num1 = T::from_le_bytes(input1);
-    let num2 = T::from_le_bytes(input2);
+    #[cfg(debug_assertions)]
+    println!("Comparing {:?} and {:?}", input1, input2);
+
+    debug_assert_eq!(input1.len(), std::mem::size_of::<T>());
+    debug_assert_eq!(input2.len(), std::mem::size_of::<T>());
+
+    let num1 = unsafe { T::from_le_bytes_unchecked(input1) };
+    let num2 = unsafe { T::from_le_bytes_unchecked(input2) };
 
     match operation {
         ComparerOperation::Equals => num1 == num2,
@@ -42,7 +45,7 @@ where
         ComparerOperation::GreaterOrEquals => num1 >= num2,
         ComparerOperation::Less => num1 < num2,
         ComparerOperation::LessOrEquals => num1 <= num2,
-        _ => panic!("Unsupported operation for numeric types: {:?}", operation),
+        _ => unsafe { std::hint::unreachable_unchecked() }, // If you're sure this never happens
     }
 }
 

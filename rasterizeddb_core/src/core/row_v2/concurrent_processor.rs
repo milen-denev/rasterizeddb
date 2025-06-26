@@ -91,7 +91,8 @@ impl ConcurrentProcessor {
                         _ => unreachable!()
                     };
 
-                    let schema_field = schema_ref.iter().filter(|x| { *x.name == *column_1.0 }).next().unwrap();
+                    let db_type = column_1.1.clone();
+                    schema_id = column_1.2;
 
                     let transform = token_ref_1.iter().filter(|x| {
                         match x {
@@ -137,13 +138,11 @@ impl ConcurrentProcessor {
                     ).next().unwrap();
 
                     let transformer = ColumnTransformer::new(
-                        schema_field.db_type.clone(),
+                        db_type,
                         value.clone(),
                         ColumnTransformerType::ComparerOperation(operation),
                         None
                     );
-
-                    schema_id = schema_field.write_order;
 
                     Some(transformer)
                 } else {
@@ -152,7 +151,6 @@ impl ConcurrentProcessor {
 
                 // Process each pointer in this batch (same as your original code)
                 for pointer in pointers {
-
                     let tuple_clone_2 = tuple_clone.clone();
                     let (_, io_clone, row_fetch) = &*tuple_clone_2;
 
