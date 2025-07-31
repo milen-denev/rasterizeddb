@@ -12,8 +12,7 @@ use smallvec::SmallVec;
 use crate::{
     core::{
         db_type::DbType, row_v2::row::{Column, Row, RowFetch}, storage_providers::traits::StorageIO
-    }, 
-    memory_pool::{MemoryBlock, MEMORY_POOL}, simds::{self, endianess::*}, BATCH_SIZE, IMMEDIATE_WRITE
+    }, memory_pool::{MemoryBlock, MEMORY_POOL}, simds::{self, endianess::*}, BATCH_SIZE, IMMEDIATE_WRITE
 };
 
 #[cfg(feature = "enable_long_row")]
@@ -823,11 +822,19 @@ impl RowPointer {
                 io.read_data_into_buffer(&mut position, &mut string_size_buffer).await;
                 let string_size = unsafe { simds::endianess::read_u32(string_size_buffer.as_ptr()) };
 
-                // Read the string data
                 let string_block = MEMORY_POOL.acquire(string_size as usize);
-                let string_slice = string_block.into_slice_mut();
 
-                io.read_data_into_buffer(&mut string_row_position, string_slice).await;
+                let string_slice = if let Some(slice_exists) = io.read_slice_pointer(&mut string_row_position, string_size as usize).await {
+                    slice_exists
+                } else {
+                    // Read the string data 
+                    let string_slice = string_block.into_slice_mut();
+                    io.read_data_into_buffer(&mut string_row_position, string_slice).await;
+                    string_slice
+                };
+
+                let default_string_slice = string_block.into_slice_mut();
+                unsafe { std::ptr::copy_nonoverlapping(string_slice.as_ptr(), default_string_slice.as_mut_ptr(), string_size as usize); };
 
                 // Create a column with the string data
                 let column = Column {

@@ -58,6 +58,10 @@ harness = false
 name = "query_executor_benchmarks"
 harness = false
 
+[[bench]]
+name = "simd_copy_benchmarks"
+harness = false
+
 [profile.release]
 opt-level = 3
 debug = false

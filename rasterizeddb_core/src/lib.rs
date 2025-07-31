@@ -16,12 +16,11 @@ pub(crate) const THREADS: usize = 16;
 
 pub(crate) const MAX_PERMITS: usize = 16;
 // Number of row pointers to fetch at once in next_row_pointers
-pub(crate) const BATCH_SIZE: usize = 100;
+pub(crate) const BATCH_SIZE: usize = 5000;
 
 pub(crate) const IMMEDIATE_WRITE: bool = false;
 
 pub const EMPTY_BUFFER: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
-
 
 pub(crate) const WRITE_BATCH_SIZE: usize = 4 * 1024 * 1024; // 4MB
 pub(crate) const WRITE_SLEEP_DURATION: tokio::time::Duration = tokio::time::Duration::from_millis(10);
@@ -125,7 +124,7 @@ pub(crate) static POSITIONS_CACHE: Lazy<Cache<u64, Vec<(u64, u32)>, RandomState>
 /// ```
 pub mod core;
 
-pub(crate) mod instructions;
+pub mod instructions;
 pub mod memory_pool;
 pub mod rql;
 pub mod simds;

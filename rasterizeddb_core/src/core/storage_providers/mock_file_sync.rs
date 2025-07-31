@@ -325,6 +325,10 @@ impl StorageIO for MockStorageProvider {
         *position += buffer_len as u64;
     }
 
+    async fn read_slice_pointer(&self, _position: &mut u64, _len: usize) -> Option<&[u8]> {
+        None
+    }
+
     async fn read_data_to_cursor(&self, position: &mut u64, length: u32) -> Cursor<Vec<u8>> {
         yield_now().await;
         

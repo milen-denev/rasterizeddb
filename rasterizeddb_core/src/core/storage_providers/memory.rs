@@ -102,6 +102,10 @@ impl StorageIO for MemoryStorageProvider {
         }
     }
 
+    async fn read_slice_pointer(&self, _position: &mut u64, _len: usize) -> Option<&[u8]> {
+        None
+    }
+
     async fn read_data_to_cursor(
         &self,
         position: &mut u64,

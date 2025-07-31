@@ -440,86 +440,9 @@ impl StorageIO for LocalStorageProvider {
         }
     }
 
-    #[allow(unreachable_code)]
     async fn read_data_into_buffer(&self, position: &mut u64, buffer: &mut [u8]) {
-        // use crate::{core::row_v2::row_pointer::RowPointer, memory_pool::{MemoryBlock, MEMORY_POOL}};
-        // fn get_range(position: &u64, max: u64) -> (u64,u64) {
-        //     const BLOCK_SIZE: u64 = 1024 * 1024 * 16; // 16MB
-        //     let chunk = position / BLOCK_SIZE;
-        //     let start = chunk * BLOCK_SIZE;
-        //     let mut end = (chunk + 1) * BLOCK_SIZE;
-
-        //     if end > max {
-        //         end = max;
-        //     }
-
-        //     (start, end)
-        // }
-
-        // let range = get_range(position, self.file_len.load(std::sync::atomic::Ordering::Relaxed));
-
-        // if let Some(block) = CACHE_MAP.pin().get(&(range.1, self.hash)) {
-        //     let slice = block.into_slice();
-        //     let new_position = *position - range.0;
-        //     let buffer_len = buffer.len();
-
-        //     if slice.len() > new_position as usize + buffer_len {
-        //         // Copy the available data from the cached block
-        //         buffer.copy_from_slice(&slice[new_position as usize..new_position as usize + buffer_len]);
-        //         *position += buffer_len as u64;
-        //         return;
-        //     } else {
-        //         // This is the case where we need to handle partial read from cache and rest from memory map
-        //         let available_len = slice.len() - new_position as usize; // How much we can read from cache
-                
-        //         // Copy the available part from cache
-        //         buffer[..available_len].copy_from_slice(&slice[new_position as usize..]);
-                
-        //         // Calculate the remaining part position and size
-        //         let remaining_size = buffer_len - available_len;
-        //         let remaining_position = range.0 + new_position as u64 + available_len as u64;
-                
-        //         // Copy the remaining part from memory map
-        //         buffer[available_len..].copy_from_slice(
-        //             &self.memory_map[remaining_position as usize..remaining_position as usize + remaining_size]
-        //         );
-                
-        //         *position += buffer_len as u64;
-        //         return;
-        //     }
-        // } else {
-        //     let range = (range.0, range.1, RowPointer::get_timestamp_seconds());
-        //     let block = MEMORY_POOL.acquire((range.1 - range.0) as usize);
-        //     let slice = block.into_slice_mut();
-
-        //     slice.copy_from_slice(&self.memory_map[range.0 as usize..range.1 as usize]);
-
-        //     CACHE_MAP.pin_owned().insert((range.1, self.hash), block);
-
-        //     let buffer_len = buffer.len() as u64;
-
-        //     *position += buffer_len;
-
-        //     buffer.copy_from_slice(&slice[(*position - range.0) as usize..*position as usize - range.0 as usize + buffer_len as usize]);
-        // }
-
-        // return;
-
-        // #[cfg(windows)]
-        // {
         let buffer_len = buffer.len();
-        //let table_len = self.file_len.load(std::sync::atomic::Ordering::Relaxed);
-
-        // if self.locked.load(std::sync::atomic::Ordering::Relaxed) { //|| self._memory_map.len() < table_len as usize 
-            // let mut read_file = std::fs::File::options()
-            //     .read(true)
-            //     .open(&self.file_str)
-            //     .unwrap();
-
-            // read_file.seek(SeekFrom::Start(*position)).unwrap();
-            // read_file.read_exact(buffer).unwrap();
-        // } else {
-
+        
         if !self._locked.load(std::sync::atomic::Ordering::Relaxed) {
             let memory_map = self._memory_map.as_ref().unwrap();
 
@@ -545,21 +468,20 @@ impl StorageIO for LocalStorageProvider {
             read_file.seek(SeekFrom::Start(*position)).unwrap();
             read_file.read_exact(buffer).unwrap();
         }
-        //}
-
-        *position += buffer_len as u64;
-        // }
         
-        // #[cfg(unix)]
-        // {
-        //     let buffer_len = buffer.len();
-        //     let offset = *position;
-        //     let result = self.io_uring_reader.read_at(offset, buffer_len).await.unwrap();
+        *position += buffer_len as u64;
+    }
 
-        //     buffer.copy_from_slice(&result);
-        //     *position += buffer_len as u64;
-        // }
-
+    async fn read_slice_pointer(&self, position: &mut u64, len: usize) -> Option<&[u8]> {
+        if let Some(memory_map) = &self._memory_map {
+            let start = *position as usize;
+            let end = start + len;
+            if memory_map.len() >= end {
+                *position += len as u64;
+                return Some(&memory_map[start..end]);
+            }
+        }
+        None
     }
 
     async fn read_data_to_cursor(&self, position: &mut u64, length: u32) -> Cursor<Vec<u8>> {
