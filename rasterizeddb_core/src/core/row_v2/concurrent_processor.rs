@@ -5,7 +5,7 @@ use itertools::Either;
 use smallvec::SmallVec;
 use tokio::{sync::{mpsc, Semaphore}, task};
 
-use crate::{core::storage_providers::traits::StorageIO, memory_pool::{MemoryBlock, MEMORY_POOL}};
+use crate::{core::storage_providers::traits::StorageIO, memory_pool::{MemoryBlock, MEMORY_POOL}, MAX_PERMITS};
 use super::{query_parser::parse_query, row::{column_vec_into_vec, Row, RowFetch}, row_pointer::RowPointerIterator, schema::SchemaField, tokenizer::{tokenize, NumericValue, Token}, transformer::{ColumnTransformer, ColumnTransformerType, ComparerOperation, Next, TransformerProcessor}};
 
 pub struct ConcurrentProcessor;
@@ -23,7 +23,7 @@ impl ConcurrentProcessor {
         iterator: &mut RowPointerIterator<'a, S>) -> Vec<Row> {
 
         let (tx, mut rx) = mpsc::unbounded_channel::<Row>();
-        let arc_tuple = Arc::new((Semaphore::new(16), io_rows, row_fetch));
+        let arc_tuple = Arc::new((Semaphore::new(MAX_PERMITS), io_rows, row_fetch));
 
         // Collect handles for all batch tasks
         let mut batch_handles = Vec::new();
@@ -43,6 +43,8 @@ impl ConcurrentProcessor {
 
         // Process batches
         while let Ok(pointers) = iterator.next_row_pointers().await {
+            //println!("pointers: {:?}", pointers);
+
             if pointers.is_empty() {
                 break;
             }
@@ -77,7 +79,6 @@ impl ConcurrentProcessor {
                 let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
                 let mut schema_id: u64 = 0;
 
-                // Disabled until fixed
                 let mut single_transformer_data = if token_ref_1.len() == 3 {
                     let ident = token_ref_1.iter().filter(|x| {
                         match x {
