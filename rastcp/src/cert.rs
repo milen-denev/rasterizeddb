@@ -10,7 +10,7 @@ pub fn generate_self_signed_cert() -> Result<(Vec<CertificateDer<'static>>, Priv
     
     // Get PEM representations
     let cert_pem = cert_key.cert.pem();
-    let key_pem = cert_key.key_pair.serialize_pem();
+    let key_pem = cert_key.signing_key.serialize_pem();
     
     // Parse certificate PEM
     let mut cert_reader = BufReader::new(cert_pem.as_bytes());
