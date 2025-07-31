@@ -5,7 +5,7 @@ use crate::core::db_type::DbType;
 use super::{common::{simd_compare_strings, FromLeBytes, FromLeBytesUnsafe}, transformer::ComparerOperation};
 
 #[inline(always)]
-pub fn perform_comparison_operation(input1: &[u8], input2: &[u8], db_type: &DbType, operation: &ComparerOperation) -> bool {
+pub fn perform_comparison_operation(input2: &[u8], input1: &[u8], db_type: &DbType, operation: &ComparerOperation) -> bool {
     match db_type {
         DbType::I8 => generic_comparison::<i8>(input1, input2, operation),
         DbType::U8 => generic_comparison::<u8>(input1, input2, operation),
@@ -38,6 +38,9 @@ where
     let num1 = unsafe { T::from_le_bytes_unchecked(input1) };
     let num2 = unsafe { T::from_le_bytes_unchecked(input2) };
 
+    // println!("Comparing {:?} and {:?}", num1, num2);
+    // println!("Operation: {:?}", operation);
+
     match operation {
         ComparerOperation::Equals => num1 == num2,
         ComparerOperation::NotEquals => num1 != num2,
@@ -45,7 +48,9 @@ where
         ComparerOperation::GreaterOrEquals => num1 >= num2,
         ComparerOperation::Less => num1 < num2,
         ComparerOperation::LessOrEquals => num1 <= num2,
-        _ => unsafe { std::hint::unreachable_unchecked() }, // If you're sure this never happens
+        ComparerOperation::Contains | ComparerOperation::StartsWith | ComparerOperation::EndsWith => {
+            panic!("Unsupported operation for numeric types: {:?}", operation)
+        }
     }
 }
 
@@ -71,8 +76,8 @@ mod tests {
  
     #[test]
     fn test_numeric_comparisons() {
-        let input1 = 5i32.to_le_bytes();
-        let input2 = 10i32.to_le_bytes();
+        let input1 = 10i32.to_le_bytes();
+        let input2 = 5i32.to_le_bytes();
 
         assert!(perform_comparison_operation(&input1, &input1, &DbType::I32, &ComparerOperation::Equals));
         assert!(!perform_comparison_operation(&input1, &input2, &DbType::I32, &ComparerOperation::Equals));
