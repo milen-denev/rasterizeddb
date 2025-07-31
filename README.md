@@ -1,163 +1,50 @@
+
 # Rasterized DB
-
-## A new schemaless, high-performance database written from scratch in Rust.
-
+## A high-performance database written from scratch in Rust — now fully rewritten.
 ### Vision
 
-#### Why schemaless?
+#### Complete Rewrite
+Rasterized DB has recently undergone a complete rewrite from the ground up and is still in an active state of redevelopment. This major overhaul has brought significant architectural changes to improve stability, performance, and developer experience. Many components are being redesigned for long-term maintainability, and the database will continue to evolve rapidly until its core design reaches maturity.
 
-In Rasterized DB, the schema is maintained on the client side instead of the database. This design allows for flexibility and adaptability. To support this approach, an ORM (Object-Relational Mapper) for Rust will be released soon, catering to a variety of development needs.
+#### From Schemaless to Schema-Full
+Originally conceived as a schemaless database, Rasterized DB is now schema-full. The database itself now manages and enforces the schema, reducing complexity for client applications and enabling stronger data consistency. This change also opens the door to richer query capabilities and deeper optimizations at the storage and execution layers.
 
-#### How Does It Achieve Better Performance Than Conventional Databases?
+#### PostgreSQL Dialect Compatibility
+To make adoption easier, Rasterized DB aims for compatibility with the PostgreSQL SQL dialect, the most widely used and supported SQL standard in production environments. While not all PostgreSQL features are currently implemented, this compatibility goal ensures developers can leverage familiar syntax and tools without learning a proprietary query language from scratch.
 
-Rasterized DB adopts a novel approach inspired by how the web works. For example, when you receive a file with specific headers, the file isn’t re-fetched if it hasn’t expired; instead, the existing copy is used. Similarly, every query in Rasterized DB is hashed. If the same query is repeated, the corresponding row is loaded directly from a specific file location without needing to scan.
+#### Performance Philosophy
+Rasterized DB takes inspiration from how the web handles caching. Just like a browser reuses files when their cache headers indicate they’re still valid, Rasterized DB hashes each query so repeated requests can instantly fetch results from a known storage offset without rescanning the dataset.
 
-Future updates will introduce an in-memory cache for rows, allowing the system to bypass the file system entirely. This will provide a combined functionality similar to Redis and a database, offering fast performance and seamless integration.
+Future updates will introduce in-memory row caching, allowing certain queries to bypass disk entirely. This approach will merge the speed of in-memory stores like Redis with the persistence of a traditional database.
 
 #### Why Rust?
+Rust combines zero-cost abstractions with low-level performance control, making it ideal for building a database that is both fast and safe. Its memory safety guarantees reduce the risk of crashes or data corruption, while still enabling optimizations close to the hardware.
 
-Rust provides high-level, zero-cost abstractions combined with low-level optimization capabilities. This makes development faster while achieving the best possible performance. Rust's safety guarantees also contribute to the reliability and robustness of the database.
+#### Scalability and Future Features
 
-#### Does it have limits?
+Rasterized DB is designed to handle virtually unlimited data sizes, row counts, and column counts. Planned features include:
 
-Rasterized DB is designed with scalability and flexibility in mind, aiming to accommodate all potential use cases. Future updates will introduce support for new and exotic data types, enabling the database to natively handle complex data structures. Examples include one-dimensional and multi-dimensional arrays, vectors, and tensors.
-
-Theoretically, the database can support limitless amounts of data, row sizes, and the number of columns.
-
-#### What is RQL? 
-
-Rasterized Query Language (RQL) is a SQL-inspired dialect tailored to the unique requirements of Rasterized DB. Since the schema is managed by the client and not the database server, traditional SQL cannot be used directly.
-
-RQL is also planned to include advanced features inspired by Microsoft’s Kusto Query Language, enhancing its expressiveness and functionality.
-
-#### Will it have an ORM?
-
-Yes, a standalone ORM for Rust is planned, with a C# version to follow soon after.
-
-#### Which futures are missing?
-
-The following features are currently missing but are planned for future updates:
-
-- Inserting rows (through RQL)
-- Updating rows
-- Deleting rows (through RQL)
-- Vacuuming empty space
+- Advanced data types: arrays, vectors, tensors, and more
+- Row insertion, updates, and deletions via SQL
+- Vacuuming unused space
 - UUID (GUID) support
-- Fully functional RETURN, LIMIT, and SELECT commands among many other SQL features missing
-- Server features
-- Sharding
-- Compression
-- Table Immutability 
+- Fully functional RETURN, LIMIT, and advanced SELECT capabilities
+- Server mode with network access
+- Sharding for horizontal scalability
+- Compression for storage efficiency
+- Table immutability options
 
-Many additional enhancements are also planned to make the database more robust and feature-complete.
+#### ORM & Ecosystem
+An official Rust ORM is in development, with a C# ORM planned afterward. These tools will provide a seamless experience when integrating Rasterized DB into applications.
 
-#### Is it stable?
-Short answer, no. It will get through many refinements and even changes to the table files. Until version 1.0.0 use it on your own risk.
+#### Stability
+Currently, Rasterized DB is not stable. Table formats, storage engines, and query processing internals are likely to change until version 1.0.0. Use it at your own risk in production environments.
 
 ### How to use the current API?
 
-#### Features:
-`enable_index_caching` to enable query caching
-`enable_parallelism` to enable in parallel table chunk scanning
-
 ```rust
-// Imports
-use rasterizeddb_core::{
-    core::{
-        column::Column, 
-        row::InsertOrUpdateRow, 
-        storage_providers::{file_sync::LocalStorageProvider, memory::MemoryStorageProvider}, 
-        table::Table
-    }, rql::parser::parse_rql
-};
-```
-
-#### Create a table
-```rust
-//Local File Storage Database
-let io_sync = LocalStorageProvider::new(
-    "Some\\Folder",
-    "database.db"
-);
-//In-Memory Database
-let io_sync = MemoryStorageProvider::new();
-
-let mut table = Table::init(io_sync, false, false).unwrap();
-```
-
-#### Create columns, rows and insert them
-
-```rust
-let c1 = Column::new(10).unwrap();
-let c2 = Column::new(-10).unwrap();
-let str = 'A'.to_string().repeat(100);
-let c3 = Column::new(str).unwrap();
-
-let mut columns_buffer: Vec<u8> = Vec::with_capacity(
-    c1.len() +
-    c2.len() +
-    c3.len()
-);
-
-columns_buffer.append(&mut c1.content.to_vec());
-columns_buffer.append(&mut c2.content.to_vec());
-columns_buffer.append(&mut c3.content.to_vec());
-
-let insert_row = InsertOrUpdateRow {
-    columns_data: columns_buffer.clone()
-};
-
-table.insert_row(insert_row).await;
-//OR unsafe
-table.insert_row_unsync(insert_row).await;
-```
-
-#### Build in-memory file indexes
-```rust
-table.rebuild_in_memory_indexes();
-```
-
-#### Retrieve a row
-```rust
-//Rasterized Query Language (Alpha)
-let query_evaluation = parse_rql(&format!(
-r#"
-        BEGIN
-        SELECT FROM NAME_DOESNT_MATTER_FOR_NOW
-        WHERE COL(1) = -10
-        LIMIT 2
-        END
-"#
-))
-.unwrap();
-
-let rows = table.execute_query(query_evaluation.parser_result).await?;
-```
-
-#### Update a row
-```rust
-let update_row = InsertOrUpdateRow {
-    columns_data: columns_buffer_update
-};
-
-table.update_row_by_id(3, update_row).await;
-```
-
-#### Delete a row
-```rust
-// Invalidates cache automatically
-table.delete_row_by_id(10).unwrap();
-```
-
-#### Table Maintanance
-```rust
-// Vacuum the table
-// Note: The removed row's ids will be sorted back in use. 
-// So deleted row ID(3) and following rows ID(4), ID(5), ID(X) will become row ID(3), ID(4), ID(X - 1)
-table.vacuum_table().await;
-
-// Must rebuild in-memory file indexes after vacuum
-table.rebuild_in_memory_indexes();
+// COMING SOON
+// Please refer to the main.rs and core/mock_table.rs and core/mock_helpers.rs to see API in use.
 ```
 
 ##### Sponsor
