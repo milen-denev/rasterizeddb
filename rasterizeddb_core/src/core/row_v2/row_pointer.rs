@@ -13,11 +13,8 @@ use crate::{
     core::{
         db_type::DbType, row_v2::row::{Column, Row, RowFetch}, storage_providers::traits::StorageIO
     }, 
-    memory_pool::{MemoryBlock, MEMORY_POOL}, simds::{self, endianess::*}
+    memory_pool::{MemoryBlock, MEMORY_POOL}, simds::{self, endianess::*}, BATCH_SIZE, IMMEDIATE_WRITE
 };
-
-// Number of row pointers to fetch at once in next_row_pointers
-const BATCH_SIZE: usize = 5000;
 
 #[cfg(feature = "enable_long_row")]
 const TOTAL_LENGTH : usize = 
@@ -128,7 +125,6 @@ impl<'a, S: StorageIO> RowPointerIterator<'a, S> {
         let bytes_to_read = std::cmp::min(bytes_remaining, CHUNK_SIZE as u64);
         
         // Clear the buffer and ensure capacity
-
         self.buffer = MEMORY_POOL.acquire(bytes_to_read as usize);
         
         // Read data into the buffer
@@ -295,11 +291,12 @@ impl RowPointer {
 
         row_write: &RowWrite
     ) -> Self {
+
         #[cfg(feature = "enable_long_row")]
-        let id = last_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst) as u128;
+        let id = last_id.fetch_add(1, std::sync::atomic::Ordering::Acquire) as u128;
 
         #[cfg(not(feature = "enable_long_row"))]
-        let id = last_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let id = last_id.fetch_add(1, std::sync::atomic::Ordering::Acquire);
 
         #[cfg(feature = "enable_long_row")]
         let (position, total_bytes, total_string_size) = {
@@ -312,7 +309,7 @@ impl RowPointer {
 
             total_bytes = total_bytes + total_string_size as u64;
 
-            let position = table_length.fetch_add(total_bytes, std::sync::atomic::Ordering::SeqCst);
+            let position = table_length.fetch_add(total_bytes, std::sync::atomic::Ordering::Acquire);
 
             (position, total_bytes, total_string_size)
         };
@@ -328,7 +325,7 @@ impl RowPointer {
 
             total_bytes = total_bytes + total_string_size;
 
-            let position = table_length.fetch_add(total_bytes as u64, std::sync::atomic::Ordering::SeqCst);
+            let position = table_length.fetch_add(total_bytes as u64, std::sync::atomic::Ordering::Acquire);
 
             (position, total_bytes, total_string_size)
         };
@@ -534,6 +531,87 @@ impl RowPointer {
         row_pointer
     }
     
+    /// Deserializes a slice of u8 into a RowPointer
+    pub fn from_slice_unknown(buffer: &[u8]) -> Self {
+        // ID field
+        #[cfg(feature = "enable_long_row")]
+        let id = unsafe { read_u128(buffer.as_ptr()) };
+
+        #[cfg(not(feature = "enable_long_row"))]
+        let id = unsafe { read_u64(buffer.as_ptr()) };
+
+        // Length field
+        #[cfg(feature = "enable_long_row")]
+        let length = unsafe { read_u64(buffer.as_ptr().add(16)) };
+
+        #[cfg(not(feature = "enable_long_row"))]
+        let length = unsafe { read_u32(buffer.as_ptr().add(8)) };
+
+        // Position field (u64 in both cases)
+        #[cfg(feature = "enable_long_row")]
+        let position = unsafe { read_u64(buffer.as_ptr().add(24))};
+
+        #[cfg(not(feature = "enable_long_row"))]
+        let position = unsafe { read_u64(buffer.as_ptr().add(12)) };
+
+        // Deleted field (bool - 1 byte)
+        #[cfg(feature = "enable_long_row")]
+        let deleted = unsafe { read_u8(buffer.as_ptr().add(32)) } != 0;
+
+        #[cfg(not(feature = "enable_long_row"))]
+        let deleted = unsafe { read_u8(buffer.as_ptr().add(20)) } != 0;
+
+        // The following fields only exist in the long row format
+        #[cfg(feature = "enable_long_row")]
+        let checksum = unsafe { read_u32(buffer.as_ptr().add(33)) };
+
+        #[cfg(feature = "enable_long_row")]
+        let cluster = unsafe { read_u32(buffer.as_ptr().add(37)) };
+
+        #[cfg(feature = "enable_long_row")]
+        let deleted_at = unsafe { read_u128(buffer.as_ptr().add(41)) };
+
+        #[cfg(feature = "enable_long_row")]
+        let created_at = unsafe { read_u128(buffer.as_ptr().add(57)) };
+
+        #[cfg(feature = "enable_long_row")]
+        let updated_at = unsafe { read_u128(buffer.as_ptr().add(73)) };
+
+        #[cfg(feature = "enable_long_row")]
+        let version = unsafe { read_u16(buffer.as_ptr().add(89)) };
+
+        #[cfg(feature = "enable_long_row")]
+        let is_active = unsafe { read_u8(buffer.as_ptr().add(91)) } != 0 ;
+
+        // Create the RowPointer struct from the read values
+        let row_pointer = RowPointer {
+            id,
+            length,
+            position,
+            deleted,
+            #[cfg(feature = "enable_long_row")]
+            checksum,
+            #[cfg(feature = "enable_long_row")]
+            cluster,
+            #[cfg(feature = "enable_long_row")]
+            deleted_at,
+            #[cfg(feature = "enable_long_row")]
+            created_at,
+            #[cfg(feature = "enable_long_row")]
+            updated_at,
+            #[cfg(feature = "enable_long_row")]
+            version,
+            #[cfg(feature = "enable_long_row")]
+            is_active,
+            writing_data: WritingData {
+                total_columns_size: 0, // Placeholder, will be set later
+                total_strings_size: 0, // Placeholder, will be set later
+            }
+        };
+
+        row_pointer
+    }
+
     /// Reads a RowPointer from the given StorageIO at the specified position
     pub async fn read_from_io<S: StorageIO>(io: &mut S, position: &mut u64) -> Result<Self> {
         let mut slice: [u8; TOTAL_LENGTH] = [0; TOTAL_LENGTH];
@@ -895,11 +973,11 @@ impl RowPointer {
         slice[row_position as usize..].copy_from_slice(&string_slice);
 
         // Write the row data to the rows_io
-        rows_io.append_data(slice, false).await;
+        rows_io.append_data(slice, IMMEDIATE_WRITE).await;
 
         // Write the pointer last
         // Write the row data to the pointers_io
-        row_pointer.save(pointers_io, false).await?;
+        row_pointer.save(pointers_io, IMMEDIATE_WRITE).await?;
 
         #[cfg(feature = "enable_data_verification")]
         let write_result = rows_io.verify_data_and_sync(io_position, slice).await;
