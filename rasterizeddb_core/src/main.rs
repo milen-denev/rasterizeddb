@@ -20,7 +20,7 @@ async fn main() -> std::io::Result<()> {
     tokio::spawn(io_pointers.start_service());
 
     // rasterizeddb_core::core::mock_table::
-    //     consolidated_write_data_function(5_000_000).await;
+    //     consolidated_write_data_function(5_000_000 * 2).await;
 
     let stdin = std::io::stdin();
     let mut buffer = String::new();
@@ -30,7 +30,7 @@ async fn main() -> std::io::Result<()> {
     for i in 0..100 {
         println!("Iteration: {}", i);
         let schema = get_schema().await;
-        let _ = consolidated_read_data_function(schema, 4_999_999).await;
+        let _ = consolidated_read_data_function(schema, 599_999_999).await;
     }
     
     let stdin = std::io::stdin();

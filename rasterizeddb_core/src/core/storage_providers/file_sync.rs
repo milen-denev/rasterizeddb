@@ -42,8 +42,7 @@ unsafe impl Send for LocalStorageProvider { }
 impl Clone for LocalStorageProvider {
     fn clone(&self) -> Self {
          let map = Some(unsafe { MmapOptions::new()
-            .populate()
-            .map_copy_read_only(&std::fs::File::open(&self.file_str).unwrap())
+            .map(&std::fs::File::open(&self.file_str).unwrap())
             .unwrap() });
 
         Self {
@@ -119,8 +118,7 @@ impl LocalStorageProvider {
             let file_len = file_read_mmap.metadata().unwrap().len();
 
             let map = Some(unsafe { MmapOptions::new()
-                .populate()
-                .map_copy_read_only(&file_read_mmap)
+                .map(&file_read_mmap)
                 .unwrap() });
 
             LocalStorageProvider {
@@ -185,8 +183,7 @@ impl LocalStorageProvider {
             let file_len = file_read_mmap.metadata().unwrap().len();
 
             let map = Some(unsafe { MmapOptions::new()
-                .populate()
-                .map_copy_read_only(&file_read_mmap)
+                .map(&file_read_mmap)
                 .unwrap() });
 
             LocalStorageProvider {
@@ -319,8 +316,7 @@ impl LocalStorageProvider {
         // Create new memory map with the current file size
         self._memory_map = Some(unsafe {
             MmapOptions::new()
-                .populate()
-                .map_copy_read_only(&file)
+                .map(&file)
                 .unwrap()
         });
 
@@ -595,8 +591,7 @@ impl StorageIO for LocalStorageProvider {
             file_str: file_str.clone(),
             file_len: AtomicU64::new(file_len),
             _memory_map: Some(unsafe { MmapOptions::new()
-                .populate()
-                .map_copy_read_only(&file_read_mmap)
+                .map(&file_read_mmap)
                 .unwrap() }),
             hash: CRC.checksum(format!("{}+++{}", final_location, "temp.db").as_bytes()),
             appender: SegQueue::new(),
@@ -690,8 +685,7 @@ impl StorageIO for LocalStorageProvider {
             file_str: new_table.clone(),
             file_len: AtomicU64::new(file_len),
             _memory_map: Some(unsafe { MmapOptions::new()
-                .populate()
-                .map_copy_read_only(&file_read_mmap)
+                .map(&file_read_mmap)
                 .unwrap() }),
             hash: CRC.checksum(format!("{}+++{}", final_location, name).as_bytes()),
             appender: SegQueue::new(),

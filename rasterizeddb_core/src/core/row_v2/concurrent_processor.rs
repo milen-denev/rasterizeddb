@@ -23,7 +23,6 @@ impl ConcurrentProcessor {
         iterator: &mut RowPointerIterator<'a, S>) -> Vec<Row> {
 
         let (tx, mut rx) = mpsc::unbounded_channel::<Row>();
-        let arc_tuple = Arc::new((Semaphore::new(MAX_PERMITS), io_rows, row_fetch));
 
         // Collect handles for all batch tasks
         let mut batch_handles = Vec::new();
@@ -34,11 +33,11 @@ impl ConcurrentProcessor {
             .into_iter()
             .collect::<SmallVec<[SchemaField; 20]>>();
 
-        let schema_arc = Arc::new(table_schema);
-        let query_arc = Arc::new(where_query.to_string());
+        let tokens = tokenize(&where_query, &table_schema);
 
-        let tokens = tokenize(&query_arc, &schema_arc);
-        
+        let arc_tuple = Arc::new((Semaphore::new(MAX_PERMITS), io_rows, row_fetch));
+
+        let schema_arc = Arc::new(table_schema);
         let token_arc_1 = Arc::new(tokens);
 
         // Process batches

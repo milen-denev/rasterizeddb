@@ -163,6 +163,7 @@ impl IntoF64 for f64 {
 ///
 /// # Safety
 /// This function uses unsafe Rust for SIMD intrinsics.
+#[inline(always)]
 pub fn simd_compare_strings(input1: &[u8], input2: &[u8], operation: &ComparerOperation) -> bool {
     match operation {
         ComparerOperation::Equals => unsafe { simd_equals(input1, input2) },
