@@ -12,7 +12,7 @@ use crate::{
         compare_raw_vecs, compare_vecs_ends_with, compare_vecs_eq, compare_vecs_ne,
         compare_vecs_starts_with, contains_subsequence, vec_from_ptr_safe,
     },
-    memory_pool::MemoryChunk,
+    memory_pool::MemoryBlock,
     simds::endianess::{
         read_f32, read_f64, read_i128, read_i16, read_i32, read_i64, read_i8, read_u128, read_u16,
         read_u32, read_u64, read_u8,
@@ -52,7 +52,7 @@ impl Default for Column {
 #[derive(Debug)]
 pub enum ColumnValue {
     TempHolder((DbType, Vec<u8>)),
-    StaticMemoryPointer(MemoryChunk),
+    StaticMemoryPointer(MemoryBlock),
     ManagedMemoryPointer(Pin<Box<Vec<u8>>>),
 }
 
@@ -69,7 +69,11 @@ impl PartialEq for ColumnValue {
                 ColumnValue::StaticMemoryPointer(pointer_a),
                 ColumnValue::StaticMemoryPointer(pointer_b),
             ) => unsafe {
-                compare_raw_vecs(pointer_a.ptr, pointer_b.ptr, pointer_a.size, pointer_b.size)
+                compare_raw_vecs(
+                    pointer_a.into_slice().as_ptr() as *mut u8, 
+                    pointer_b.into_slice().as_ptr() as *mut u8, 
+                    pointer_a.into_slice().len(),  
+                    pointer_b.into_slice().len())
             },
             (ColumnValue::ManagedMemoryPointer(a), ColumnValue::ManagedMemoryPointer(b)) => {
                 compare_vecs_eq(a, b)
@@ -99,7 +103,7 @@ impl Clone for ColumnValue {
 impl ColumnValue {
     pub fn len(&self) -> u32 {
         match self {
-            ColumnValue::StaticMemoryPointer(chunk) => chunk.size,
+            ColumnValue::StaticMemoryPointer(chunk) => chunk.into_slice().len() as u32,
             ColumnValue::ManagedMemoryPointer(vec) => vec.len() as u32,
             _ => panic!("Operation is not supported, column is in temporary state."),
         }
@@ -107,7 +111,7 @@ impl ColumnValue {
 
     pub fn is_empty(&self) -> bool {
         match self {
-            ColumnValue::StaticMemoryPointer(chunk) => chunk.size == 0,
+            ColumnValue::StaticMemoryPointer(chunk) => chunk.into_slice().len() == 0,
             ColumnValue::ManagedMemoryPointer(vec) => vec.is_empty(),
             _ => panic!("Operation is not supported, column is in temporary state."),
         }
@@ -116,7 +120,7 @@ impl ColumnValue {
     pub fn as_slice(&self) -> &[u8] {
         match self {
             ColumnValue::StaticMemoryPointer(chunk) => unsafe {
-                std::slice::from_raw_parts::<u8>(chunk.ptr, chunk.size as usize)
+                std::slice::from_raw_parts::<u8>(chunk.into_slice().as_ptr(), chunk.into_slice().len() as usize)
             },
             ColumnValue::ManagedMemoryPointer(vec) => vec.as_slice(),
             _ => panic!("Operation is not supported, column is in temporary state."),
@@ -126,7 +130,7 @@ impl ColumnValue {
     pub fn to_vec(&self) -> Vec<u8> {
         match self {
             ColumnValue::StaticMemoryPointer(chunk) => {
-                vec_from_ptr_safe(chunk.ptr, chunk.size as usize)
+                vec_from_ptr_safe(chunk.into_slice().as_ptr() as *mut u8, chunk.into_slice().len() as usize)
             }
             ColumnValue::ManagedMemoryPointer(vec) => vec_from_ptr_safe(vec.as_ptr() as *mut u8, vec.len()),
             _ => panic!("Operation is not supported, column is in temporary state."),
@@ -138,14 +142,14 @@ impl ColumnValue {
             ColumnValue::StaticMemoryPointer(chunk) => {
                 assert_eq!(
                     new_values.len(),
-                    chunk.size as usize,
+                    chunk.into_slice().len(),
                     "New values must have the same length"
                 );
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         new_values.as_ptr(),
-                        chunk.ptr,
-                        chunk.size as usize,
+                        chunk.into_slice().as_ptr() as *mut u8,
+                        chunk.into_slice().len(),
                     );
                 }
             }
@@ -163,7 +167,7 @@ impl ColumnValue {
 
     pub fn get_ptr(&self) -> *mut u8 {
         match self {
-            ColumnValue::StaticMemoryPointer(chunk) => chunk.ptr.clone(),
+            ColumnValue::StaticMemoryPointer(chunk) => chunk.into_slice().as_ptr().clone() as *mut u8,
             ColumnValue::ManagedMemoryPointer(vec) => vec.as_ptr() as *mut u8,
             _ => panic!("Operation is not supported, column is in temporary state."),
         }
@@ -450,10 +454,10 @@ impl Column {
     }
 
     // Vector must be dropped before dropping column
-    pub unsafe fn into_chunk(self) -> io::Result<MemoryChunk> {
+    pub unsafe fn into_chunk(self) -> io::Result<MemoryBlock> {
         let chunk = match self.content {
             ColumnValue::StaticMemoryPointer(chunk) => chunk,
-            ColumnValue::ManagedMemoryPointer(vec) => MemoryChunk::from_vec(vec_from_ptr_safe(vec.as_ptr() as *mut u8, vec.len())),
+            ColumnValue::ManagedMemoryPointer(vec) => MemoryBlock::from_vec(vec_from_ptr_safe(vec.as_ptr() as *mut u8, vec.len())),
             _ => panic!("Operation is not supported, column is in temporary state."),
         };
 
@@ -514,12 +518,12 @@ impl Column {
         self.data_type = db_type;
     }
 
-    pub fn from_chunk(data_type: u8, chunk: MemoryChunk) -> Column {
-        let vec = unsafe { chunk.into_vec() };
+    pub fn from_chunk(data_type: u8, chunk: MemoryBlock) -> Column {
+        let vec = chunk.into_slice();
         
         Column {
             data_type: DbType::from_byte(data_type),
-            content: ColumnValue::ManagedMemoryPointer(Box::pin(vec.as_vec().clone())),
+            content: ColumnValue::ManagedMemoryPointer(Box::pin(vec.to_vec().clone())),
         }
     }
 
@@ -557,7 +561,7 @@ impl Column {
                 data_buffer.append(&mut temp_buffer.to_vec());
             }
 
-            let memory_chunk = MemoryChunk::from_vec(data_buffer.to_vec());
+            let memory_chunk = MemoryBlock::from_vec(data_buffer.to_vec());
             let column = Column::from_chunk(column_type, memory_chunk);
 
             columns.push(column);

@@ -1,30 +1,37 @@
 use std::io::{Cursor, SeekFrom};
 
 use orx_concurrent_vec::ConcurrentVec;
+use rand::RngCore;
 
-use super::traits::IOOperationsSync;
+use super::traits::StorageIO;
 
 pub struct MemoryStorageProvider {
     vec: ConcurrentVec<u8>,
+    random_u32: u32,
+    name: String,
 }
 
 impl Clone for MemoryStorageProvider {
     fn clone(&self) -> Self {
         Self {
             vec: self.vec.clone(),
+            random_u32: self.random_u32,
+            name: self.name.clone(),
         }
     }
 }
 
 impl MemoryStorageProvider {
-    pub fn new() -> MemoryStorageProvider {
+    pub fn new(name: &str) -> MemoryStorageProvider {
         MemoryStorageProvider {
             vec: ConcurrentVec::with_doubling_growth(),
+            random_u32: rand::rng().next_u32(),
+            name: name.to_string(),
         }
     }
 }
 
-impl IOOperationsSync for MemoryStorageProvider {
+impl StorageIO for MemoryStorageProvider {
     async fn write_data(&mut self, position: u64, buffer: &[u8]) {
         let end = position + buffer.len() as u64;
 
@@ -95,6 +102,10 @@ impl IOOperationsSync for MemoryStorageProvider {
         }
     }
 
+    async fn read_slice_pointer(&self, _position: &mut u64, _len: usize) -> Option<&[u8]> {
+        None
+    }
+
     async fn read_data_to_cursor(
         &self,
         position: &mut u64,
@@ -125,7 +136,7 @@ impl IOOperationsSync for MemoryStorageProvider {
         return buffer;
     }
 
-    async fn append_data(&mut self, buffer: &[u8]) {
+    async fn append_data(&mut self, buffer: &[u8], _immediate: bool) {
         for u8_value in buffer {
             self.vec.extend(vec![*u8_value; 1]);
         }
@@ -181,6 +192,8 @@ impl IOOperationsSync for MemoryStorageProvider {
     async fn create_temp(&self) -> Self {
         Self {
             vec: ConcurrentVec::with_doubling_growth(),
+            random_u32: rand::rng().next_u32(),
+            name: "temp".to_string(),
         }
     }
 
@@ -197,13 +210,27 @@ impl IOOperationsSync for MemoryStorageProvider {
     }
 
     #[allow(refining_impl_trait)]
-    async fn create_new(&self, _name: String) -> Self {
+    async fn create_new(&self, name: String) -> Self {
         MemoryStorageProvider {
             vec: ConcurrentVec::with_doubling_growth(),
+            random_u32: rand::rng().next_u32(),
+            name: name,
         }
     }
 
     fn drop_io(&mut self) {
         self.vec.clear();
+    }
+    
+    fn get_hash(&self) -> u32 {
+        self.random_u32
+    }
+    
+    fn start_service(&mut self) -> impl Future<Output = ()> + Send + Sync {
+        async {}
+    }
+
+    fn get_name(&self) -> String {
+        self.name.clone()
     }
 }

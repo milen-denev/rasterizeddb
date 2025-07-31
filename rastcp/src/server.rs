@@ -107,7 +107,7 @@ impl TcpServerBuilder {
 
         let socket = Socket::new_raw(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
 
-        _ = socket.set_nodelay(true);
+        _ = socket.set_tcp_nodelay(true);
         _ = socket.set_nonblocking(true);
         _ = socket.set_reuse_address(false);
         _ = socket.set_recv_buffer_size(1024 * 16); // Increased buffer sizes

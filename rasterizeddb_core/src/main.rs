@@ -1,21 +1,45 @@
 use std::sync::Arc;
 use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-
 use log::LevelFilter;
 use rasterizeddb_core::core::database::Database;
-
-use rasterizeddb_core::core::table::Table;
-use rasterizeddb_core::rql::parser::{parse_rql, ParserResult};
+use rasterizeddb_core::core::mock_table::{consolidated_read_data_function, get_schema, IO_POINTERS, IO_ROWS};
+use rasterizeddb_core::core::storage_providers::traits::StorageIO;
 use rasterizeddb_core::{
     core::storage_providers::file_sync::LocalStorageProvider,
     EMPTY_BUFFER,
 };
 
-use tokio::fs::remove_file;
-
 #[tokio::main(flavor = "multi_thread")]
 #[allow(unreachable_code)]
+#[allow(static_mut_refs)]
 async fn main() -> std::io::Result<()> {
+    let io_rows = unsafe { IO_ROWS.force_mut().await };
+    let io_pointers = unsafe { IO_POINTERS.force_mut().await };
+
+    tokio::spawn(io_rows.start_service());
+    tokio::spawn(io_pointers.start_service());
+
+    // rasterizeddb_core::core::mock_table::
+    //     consolidated_write_data_function(5_000_000 * 2).await;
+
+    let stdin = std::io::stdin();
+    let mut buffer = String::new();
+    println!("Press Enter to start...");
+    stdin.read_line(&mut buffer).unwrap();
+
+    for i in 0..100 {
+        println!("Iteration: {}", i);
+        let schema = get_schema().await;
+        let _ = consolidated_read_data_function(schema, 599_999_999).await;
+    }
+    
+    let stdin = std::io::stdin();
+    let mut buffer = String::new();
+    println!("Press Enter to terminate...");
+    stdin.read_line(&mut buffer).unwrap();
+
+    return Ok(());
+
     env_logger::Builder::new()
         .filter_level(LevelFilter::Error)
         .init();
@@ -35,62 +59,6 @@ async fn main() -> std::io::Result<()> {
 
     let _database = Database::new(io_sync).await?;
     _ = tokio::spawn(Database::start_async(Arc::new(_database))).await?;
-
-    return Ok(());
-
-    _ = remove_file("C:\\db\\test.db").await;
-
-    let io_sync = LocalStorageProvider::new(
-        db_file,
-        Some("test.db"),
-    )
-    .await;
-
-    let mut table = Table::init("test_db".into(), io_sync, false, false).await.unwrap();
-
-    let insert_query_evaluation = format!(
-        r#"
-        BEGIN
-        INSERT INTO test_db (COL(I32), COL(STRING))
-        VALUES (5882, 'This is a test2')
-        VALUES (5882, 'This is a test3')
-        VALUES (5882, 'This is a test4')
-        VALUES (5882, 'This is a test5')
-        END
-    "#);
-
-    let query_evaluation = parse_rql(&insert_query_evaluation).unwrap();
-  
-    match query_evaluation.parser_result {
-        ParserResult::InsertEvaluationTokens(insert) => {
-            for row in insert.rows {
-                table.insert_row(row).await;
-            }
-        },
-        _ => {
-            println!("Unsupported database action.");
-        }
-    };
-
-    println!("DONE inserting rows.");
-
-    table.rebuild_in_memory_indexes().await;
-
-    println!("DONE building indexes.");
-
-    let query_evaluation = parse_rql(&format!(
-        r#"
-        BEGIN
-        SELECT FROM test_db
-        WHERE COL(1,STRING) = 'Foo'
-        LIMIT 50
-        END
-    "#
-    )).unwrap();
-
-    let _result = table.execute_query(query_evaluation.parser_result).await.unwrap();
-
-    //println!("total rows from query {:?}", rows.unwrap().len());
 
     return Ok(());
 }

@@ -35,7 +35,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let len = data.len() as u32;
-    let len_bytes = len.to_be_bytes();
+    let len_bytes = len.to_le_bytes();
     
     stream.write_all(&len_bytes).await?;
     stream.write_all(data).await?;

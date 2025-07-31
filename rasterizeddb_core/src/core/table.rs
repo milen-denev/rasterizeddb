@@ -25,7 +25,7 @@ use super::{
         row_prefetching_cursor
     },
     row::{InsertOrUpdateRow, Row},
-    storage_providers::traits::IOOperationsSync,
+    storage_providers::traits::StorageIO,
     support_types::{CursorVector, FileChunk, ReturnResult},
     table_ext::extent_non_string_buffer,
     table_header::TableHeader,
@@ -45,7 +45,7 @@ use crate::core::table_ext::process_all_chunks;
 use crate::POSITIONS_CACHE;
 
 #[allow(dead_code)]
-pub struct Table<S: IOOperationsSync> {
+pub struct Table<S: StorageIO> {
     pub(crate) table_name: String,
     pub(crate) io_sync: Box<S>,
     pub(crate) table_header: Arc<TableHeader>,
@@ -57,7 +57,7 @@ pub struct Table<S: IOOperationsSync> {
     pub(crate) mutated: AtomicBool,
 }
 
-impl<S: IOOperationsSync> Clone for Table<S> {
+impl<S: StorageIO> Clone for Table<S> {
     fn clone(&self) -> Self {
         let is_locked = self.locked.load(Ordering::Relaxed);
         let current_file_length = self.current_file_length.load(Ordering::Relaxed);
@@ -78,10 +78,10 @@ impl<S: IOOperationsSync> Clone for Table<S> {
     }
 }
 
-unsafe impl<S: IOOperationsSync> Send for Table<S> {}
-unsafe impl<S: IOOperationsSync> Sync for Table<S> {}
+unsafe impl<S: StorageIO> Send for Table<S> {}
+unsafe impl<S: StorageIO> Sync for Table<S> {}
 
-impl<S: IOOperationsSync> Table<S> {
+impl<S: StorageIO> Table<S> {
     /// #### STABILIZED
     /// Initializes a new table. compressed and immutable are not implemented yet.
     pub async fn init(table_name: String, mut io_sync: S, compressed: bool, immutable: bool) -> io::Result<Table<S>> {
@@ -258,7 +258,7 @@ impl<S: IOOperationsSync> Table<S> {
         // Get the current file position where this row was inserted
         let current_file_pos = self.current_file_length.load(Ordering::Relaxed) - total_row_size;
         
-        self.io_sync.append_data(&buffer).await;
+        self.io_sync.append_data(&buffer, true).await;
 
         // Update in-memory index
         let chunks_arc_clone = self.in_memory_index.clone();
@@ -516,12 +516,12 @@ impl<S: IOOperationsSync> Table<S> {
 
                                     if db_type != DbType::STRING {
                                         let size = db_type.get_size();
-                                        let memory_chunk = MEMORY_POOL.acquire(size);
+                                        let memory_chunk = MEMORY_POOL.acquire(size as usize);
 
-                                        let mut data_buffer = unsafe { memory_chunk.into_vec() };
+                                        let data_buffer = memory_chunk.into_slice_mut();
 
                                         extent_non_string_buffer(
-                                            data_buffer.as_vec_mut(),
+                                            data_buffer,
                                             &db_type,
                                             &mut cursor_vector,
                                             &mut position,
@@ -555,21 +555,16 @@ impl<S: IOOperationsSync> Table<S> {
                 
                                         let chunk_slice = cursor_vector.vector.as_slice();
                 
-                                        let str_memory_chunk = MEMORY_POOL.acquire(str_length);
+                                        let str_memory_chunk = MEMORY_POOL.acquire(str_length as usize);
                 
-                                        let mut preset_buffer =
-                                            unsafe { str_memory_chunk.into_vec() };
-                
-                                        let preset_buffer_slice = preset_buffer.as_vec_mut();
- 
+                                        let preset_buffer = str_memory_chunk.into_slice_mut();
+
                                         for (i, byte) in chunk_slice[position as usize..position as usize + str_length as usize].iter().enumerate() {
-                                            preset_buffer_slice[i] = *byte;
+                                            preset_buffer[i] = *byte;
                                         }
                 
                                         position += str_length as u64;
                 
-                                        drop(preset_buffer);                
-
                                         let column =
                                             Column::from_chunk(column_type, str_memory_chunk);
 
@@ -726,9 +721,9 @@ impl<S: IOOperationsSync> Table<S> {
 
                         loop {
                             if column_indexes.iter().any(|x| *x == column_index_inner) {
-                                let memory_chunk = MEMORY_POOL.acquire(prefetch_result.length + 1);
+                                let memory_chunk = MEMORY_POOL.acquire(prefetch_result.length as usize + 1);
 
-                                let mut data_buffer = unsafe { memory_chunk.into_vec() };
+                                let mut data_buffer = memory_chunk.into_slice_mut();
 
                                 let column_type = columns_cursor.read_u8().unwrap();
 
@@ -743,14 +738,14 @@ impl<S: IOOperationsSync> Table<S> {
 
                                     let mut preset_buffer = vec![0; db_size as usize];
                                     columns_cursor.read(&mut preset_buffer).unwrap();
-                                    data_buffer.as_vec_mut().write(&mut preset_buffer).unwrap();
+                                    data_buffer.write(&mut preset_buffer).unwrap();
                                 } else {
                                     let str_length =
                                         columns_cursor.read_u32::<LittleEndian>().unwrap();
 
                                     let mut preset_buffer = vec![0; str_length as usize];
                                     columns_cursor.read(&mut preset_buffer).unwrap();
-                                    data_buffer.as_vec_mut().write(&mut preset_buffer).unwrap();
+                                    data_buffer.write(&mut preset_buffer).unwrap();
                                 }
 
                                 let column = Column::from_chunk(column_type, memory_chunk);
