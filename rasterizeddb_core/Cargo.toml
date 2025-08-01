@@ -33,6 +33,7 @@ crossbeam-queue = "0.3.12"
 memory-stats = "1.2.0"
 smallvec = { version = "1.15.1", features = ["union", "write"]}
 arc-swap = "1.7.1"
+fastrand = "2.3.0"
 
 # unix dependencies
 [target.'cfg(unix)'.dependencies]
@@ -60,6 +61,10 @@ harness = false
 
 [[bench]]
 name = "simd_copy_benchmarks"
+harness = false
+
+[[bench]]
+name = "atomic_cache_benchmarks"
 harness = false
 
 [profile.release]
