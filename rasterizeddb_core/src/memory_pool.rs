@@ -1,5 +1,5 @@
 use std::{
-    arch::x86_64::{_mm_prefetch, _MM_HINT_T0}, fmt
+    arch::x86_64::{_mm_prefetch, _MM_HINT_T0}, fmt, hash::Hash
 };
 
 use crate::instructions::{copy_vec_to_ptr, ref_slice, ref_slice_mut};
@@ -9,7 +9,7 @@ pub static MEMORY_POOL: MemoryPool = MemoryPool::new();
 use libmimalloc_sys::{mi_malloc, mi_free};
 
 // Define the maximum size for inline allocation
-const INLINE_CAPACITY: usize = 21;
+const INLINE_CAPACITY: usize = 64;
 
 pub struct MemoryPool;
 
@@ -32,6 +32,7 @@ impl MemoryPool {
             // without more `unsafe` unless we take a `&[u8]` argument to `acquire`.
             // For now, we'll just initialize to zeros.
             MemoryBlock {
+                hash: 0, // Default hash value
                 data: MemoryBlockData { inline_data: data },
                 len: size,
                 is_heap: false,
@@ -46,6 +47,41 @@ impl MemoryPool {
             }
 
             MemoryBlock {
+                hash: 0, // Default hash value
+                data: MemoryBlockData { heap_data: (ptr, size) },
+                len: size, // For heap, len is the full size
+                is_heap: true,
+                should_drop: true
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub fn acquire_with_hash(&self, size: usize) -> MemoryBlock {
+        if size <= INLINE_CAPACITY {
+            // Allocate on the stack (within the union's inline_data)
+            let data = [0u8; INLINE_CAPACITY];
+            // No actual allocation needed, just zeroing the bytes for safety.
+            // We can't directly copy bytes into `inline_data` from an external slice here
+            // without more `unsafe` unless we take a `&[u8]` argument to `acquire`.
+            // For now, we'll just initialize to zeros.
+            MemoryBlock {
+                hash: fastrand::u64(0..u64::MAX), // Default hash value
+                data: MemoryBlockData { inline_data: data },
+                len: size,
+                is_heap: false,
+                should_drop: true
+            }
+        } else {
+            // Allocate on the heap
+            let ptr = unsafe { mi_malloc(size as usize) as *mut u8 };
+
+            if ptr.is_null() {
+                panic!("Allocation failed (likely OOM).");
+            }
+
+            MemoryBlock {
+                hash: fastrand::u64(0..u64::MAX), // Default hash value
                 data: MemoryBlockData { heap_data: (ptr, size) },
                 len: size, // For heap, len is the full size
                 is_heap: true,
@@ -94,6 +130,7 @@ impl Clone for MemoryBlockData {
 
 // The main MemoryBlock struct that manages the union
 pub struct MemoryBlock {
+    hash: u64, // Hash for the block, if needed
     data: MemoryBlockData,
     len: usize, // Actual length of the data
     is_heap: bool, // Discriminant for the union: true if heap, false if inline
@@ -108,6 +145,7 @@ impl Default for MemoryBlock {
     fn default() -> Self {
         // A default MemoryBlock will be an empty, inline block
         MemoryBlock {
+            hash: 0, // Default hash value
             data: MemoryBlockData { inline_data: [0; INLINE_CAPACITY] }, // Initialize with zeros
             len: 0,
             is_heap: false, // It's an inline block
@@ -167,6 +205,7 @@ impl Clone for MemoryBlock {
     fn clone(&self) -> Self {
         if self.is_heap {
             MemoryBlock {
+                hash: self.hash,
                 data: self.data.clone(),
                 len: self.len,
                 is_heap: true,
@@ -174,6 +213,7 @@ impl Clone for MemoryBlock {
             }
         } else {
             MemoryBlock {
+                hash: self.hash,
                 data: self.data.clone(),
                 len: self.len,
                 is_heap: false,
@@ -232,11 +272,37 @@ impl MemoryBlock {
             unsafe { ref_slice_mut(self.data.inline_data.as_ptr() as *mut u8, self.len) }
         }
     }
+
+    #[inline(always)]
+    pub fn from_slice_hashed(&self, slice: &[u8]) -> MemoryBlock {
+        let len = slice.len();
+        let memory_chunk = MEMORY_POOL.acquire_with_hash(len);
+
+        if memory_chunk.is_heap {
+            copy_vec_to_ptr(slice, unsafe { memory_chunk.data.heap_data.0 });
+        } else {
+            copy_vec_to_ptr(slice, unsafe { memory_chunk.data.inline_data.as_ptr() as *mut u8 });
+        }
+
+        memory_chunk
+    }
+}
+
+impl Hash for MemoryBlock {
+    #[inline(always)]
+    fn hash<H: std::hash::Hasher>(&self, _state: &mut H) {
+        if self.hash != 0 {
+            // Use the hash field directly
+            _state.write_u64(self.hash);
+        } else {
+            panic!("MemoryBlock hash is not set. Ensure to use from_slice_hashed or acquire_with_hash.");
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{ptr, sync::{atomic::{AtomicUsize, Ordering}, Arc, Mutex}, thread};
+    use std::{hash::Hasher, ptr, sync::{atomic::{AtomicUsize, Ordering}, Arc, Mutex}, thread};
 
     use super::*;
 
@@ -531,5 +597,30 @@ mod tests {
         // Now blocks should be dropped and memory freed
 
         assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_memory_block_hashing() {
+        let pool = MemoryPool::new();
+        let data = b"test data";
+        
+        // Create a memory block with a specific hash
+        let block = pool.acquire_with_hash(data.len());
+        let slice_mut = block.into_slice_mut();
+        slice_mut.copy_from_slice(data);
+        
+        // Hash the block
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        block.hash(&mut hasher);
+        let hash_value_1 = hasher.finish();
+        
+        // Hash the hash value
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        block.hash.hash(&mut hasher);
+        let hash_value_2 = hasher.finish();
+
+        // Check if the hash matches the expected value
+        assert_ne!(hash_value_1, 0, "Hash should not be zero");
+        assert_eq!(hash_value_2, hash_value_1, "Block hash should match computed hash");
     }
 }
