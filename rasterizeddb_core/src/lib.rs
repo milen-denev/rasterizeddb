@@ -131,3 +131,4 @@ pub mod simds;
 pub mod client;
 pub mod configuration;
 pub mod renderers;
+pub mod cache;
