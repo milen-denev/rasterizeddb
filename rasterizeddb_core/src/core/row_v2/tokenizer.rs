@@ -97,7 +97,6 @@ fn is_id_part_fast(c: u8) -> bool {
 
 // SIMD-optimized whitespace skipping
 #[target_feature(enable = "avx2")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn skip_whitespace_simd(bytes: &[u8], mut pos: usize) -> usize {
     if pos >= bytes.len() {
         return pos;
@@ -145,7 +144,6 @@ unsafe fn skip_whitespace_simd(bytes: &[u8], mut pos: usize) -> usize {
 
 // SIMD-optimized digit scanning
 #[target_feature(enable = "avx2")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn scan_digits_simd(bytes: &[u8], mut pos: usize) -> usize {
     if pos >= bytes.len() {
         return pos;
@@ -187,7 +185,6 @@ unsafe fn scan_digits_simd(bytes: &[u8], mut pos: usize) -> usize {
 // SIMD-optimized identifier scanning
 #[target_feature(enable = "avx2")]
 #[allow(non_snake_case)]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn scan_identifier_simd(bytes: &[u8], mut pos: usize) -> usize {
     if pos >= bytes.len() {
         return pos;
