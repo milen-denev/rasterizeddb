@@ -28,9 +28,7 @@ pub trait StorageIO: Clone + Sync + Send + 'static {
         &self,
         position: &mut u64,
         buffer: &mut [u8],
-    ) -> impl Future<Output = ()> + Send + Sync;
-
-    fn read_slice_pointer(&self, position: &mut u64, len: usize) -> impl Future<Output = Option<&[u8]>> + Send + Sync;
+    ) -> impl Future<Output = Result<(), std::io::Error>> + Send + Sync;
 
     fn read_data_to_cursor(
         &self,

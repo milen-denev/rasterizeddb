@@ -247,7 +247,7 @@ impl StorageIO for MockStorageProvider {
     }
 
     #[allow(unreachable_code)]
-    async fn read_data_into_buffer(&self, position: &mut u64, buffer: &mut [u8]) {
+    async fn read_data_into_buffer(&self, position: &mut u64, buffer: &mut [u8]) -> Result<(), std::io::Error> {
         // use crate::{core::row_v2::row_pointer::RowPointer, memory_pool::{MemoryBlock, MEMORY_POOL}};
         // fn get_range(position: &u64, max: u64) -> (u64,u64) {
         //     const BLOCK_SIZE: u64 = 1024 * 1024 * 16; // 16MB
@@ -323,10 +323,8 @@ impl StorageIO for MockStorageProvider {
         read_file.read_exact(buffer).unwrap();
 
         *position += buffer_len as u64;
-    }
 
-    async fn read_slice_pointer(&self, _position: &mut u64, _len: usize) -> Option<&[u8]> {
-        None
+        Ok(())
     }
 
     async fn read_data_to_cursor(&self, position: &mut u64, length: u32) -> Cursor<Vec<u8>> {

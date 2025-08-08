@@ -88,7 +88,7 @@ impl StorageIO for MemoryStorageProvider {
         return buffer;
     }
 
-    async fn read_data_into_buffer(&self, position: &mut u64, buffer: &mut [u8]) {
+    async fn read_data_into_buffer(&self, position: &mut u64, buffer: &mut [u8]) -> Result<(), std::io::Error> {
         let start = *position;
         let end = *position + buffer.len() as u64 + 1;
 
@@ -100,10 +100,8 @@ impl StorageIO for MemoryStorageProvider {
             x += 1;
             *position += 1;
         }
-    }
 
-    async fn read_slice_pointer(&self, _position: &mut u64, _len: usize) -> Option<&[u8]> {
-        None
+        Ok(())
     }
 
     async fn read_data_to_cursor(
