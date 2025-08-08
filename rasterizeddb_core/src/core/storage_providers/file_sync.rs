@@ -1,9 +1,10 @@
 use std::{
-    fs::{self, remove_file, OpenOptions}, path::Path, sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc}
+    cmp::min, fs::{self, remove_file, OpenOptions}, path::Path, sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc}, usize
 };
 
 use std::io::*;
 
+use arc_swap::ArcSwap;
 use crossbeam_queue::SegQueue;
 use futures::future::join_all;
 use tokio::{io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt}, sync::RwLock, task::yield_now};
@@ -17,10 +18,6 @@ use super::{traits::StorageIO, CRC};
 #[cfg(unix)]
 use super::io_uring_reader::AsyncUringReader;
 
-// pub static CACHE_MAP: std::sync::LazyLock<papaya::HashMap<(u64, u32), MemoryBlock>> = std::sync::LazyLock::new(|| {
-//     papaya::HashMap::new()
-// });
-
 pub struct LocalStorageProvider {
     pub(super) append_file: Arc<RwLock<tokio::fs::File>>,
     pub(super) write_file: Arc<RwLock<tokio::fs::File>>,
@@ -28,7 +25,7 @@ pub struct LocalStorageProvider {
     pub(crate) table_name: String,
     pub(crate) file_str: String,
     pub(crate) file_len: AtomicU64,
-    pub(crate) _memory_map: Option<Mmap>,
+    pub(crate) _memory_map: ArcSwap<Mmap>,
     pub(crate) hash: u32,
     _locked: AtomicBool,
     appender: SegQueue<MemoryBlock>,
@@ -41,7 +38,7 @@ unsafe impl Send for LocalStorageProvider { }
 
 impl Clone for LocalStorageProvider {
     fn clone(&self) -> Self {
-         let map = Some(unsafe { MmapOptions::new()
+        let map = Arc::new(unsafe { MmapOptions::new()
             .map(&std::fs::File::open(&self.file_str).unwrap())
             .unwrap() });
 
@@ -52,7 +49,7 @@ impl Clone for LocalStorageProvider {
             table_name: self.table_name.clone(),
             file_str: self.file_str.clone(),
             file_len: AtomicU64::new(self.file_len.load(std::sync::atomic::Ordering::SeqCst)),
-            _memory_map: map,
+            _memory_map: arc_swap::ArcSwap::new(map),
             hash: CRC.checksum(format!("{}+++{}", self.location, self.table_name).as_bytes()),
             appender: SegQueue::new(),
             _locked: AtomicBool::new(false),
@@ -117,9 +114,9 @@ impl LocalStorageProvider {
 
             let file_len = file_read_mmap.metadata().unwrap().len();
 
-            let map = Some(unsafe { MmapOptions::new()
+            let map = ArcSwap::new(Arc::new(unsafe { MmapOptions::new()
                 .map(&file_read_mmap)
-                .unwrap() });
+                .unwrap() }));
 
             LocalStorageProvider {
                 append_file: Arc::new(RwLock::new(file_append)),
@@ -182,9 +179,9 @@ impl LocalStorageProvider {
 
             let file_len = file_read_mmap.metadata().unwrap().len();
 
-            let map = Some(unsafe { MmapOptions::new()
+            let map = ArcSwap::new(Arc::new(unsafe { MmapOptions::new()
                 .map(&file_read_mmap)
-                .unwrap() });
+                .unwrap() }));
 
             LocalStorageProvider {
                 append_file: Arc::new(RwLock::new(file_append)),
@@ -227,7 +224,7 @@ impl LocalStorageProvider {
         _ = file_write.sync_all();
     }
 
-    pub async fn start_append_data_service(&mut self) {
+    pub async fn start_append_data_service(&self) {
         let mut idle_count = 0;
         let mut buffer: Vec<u8> = Vec::with_capacity(WRITE_BATCH_SIZE);
         
@@ -268,7 +265,7 @@ impl LocalStorageProvider {
         }
     }
 
-    async fn write_batch_data(&mut self, buffer: &mut Vec<u8>, total_size: usize) {
+    async fn write_batch_data(&self, buffer: &mut Vec<u8>, total_size: usize) {
         if total_size == 0 {
             return;
         }
@@ -290,7 +287,7 @@ impl LocalStorageProvider {
         buffer.clear(); // Clear the buffer for the next batch
     }
 
-    async fn update_memory_map(&mut self) {
+    async fn update_memory_map(&self) {
         let file = match OpenOptions::new()
             .read(true)
             .write(true)
@@ -311,16 +308,72 @@ impl LocalStorageProvider {
             }
         }
 
-        self._memory_map = None; // Clear the previous memory map
-
         // Create new memory map with the current file size
-        self._memory_map = Some(unsafe {
+        self._memory_map.store(Arc::new(unsafe {
             MmapOptions::new()
                 .map(&file)
                 .unwrap()
-        });
+        }));
 
         self._locked.store(false, Ordering::Release);
+    }
+
+    fn read_from_memory_map_or_file(
+        &self, 
+        position: u64, 
+        buffer: &mut [u8]
+    ) -> Result<()> {
+        let memory_map = self._memory_map.load();
+        let buffer_len = buffer.len();
+        
+        if memory_map.len() >= position as usize + buffer_len {
+            // Read from memory map
+            let start_idx = position as usize;
+            let end_idx = start_idx + buffer_len;
+            
+            // Bounds check
+            if end_idx <= memory_map.len() {
+                buffer.copy_from_slice(&memory_map[start_idx..end_idx]);
+                
+                return Ok(());
+            }
+        }
+        
+        // Fallback to file reading
+        self.read_from_file_direct(position, buffer)
+    }
+
+    fn read_from_file_direct(
+        &self, 
+        position: u64, 
+        buffer: &mut [u8]
+    ) -> Result<()> {
+        let mut read_file = std::fs::File::options()
+            .read(true)
+            .open(&self.file_str)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, 
+                format!("Failed to open file: {}", e)))?;
+
+        read_file.seek(SeekFrom::Start(position))
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, 
+                format!("Failed to seek to position {}: {}", position, e)))?;
+        
+        read_file.read_exact(buffer)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, 
+                format!("Failed to read {} bytes at position {}: {}", buffer.len(), position, e)))?;
+
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    // This function is used to calculate the range for a given position and size.
+    fn range_for_pos(&self, pos: u64, size: u64, max_size: u64) -> (u64, u64) {
+        let start = (pos / size) * size;
+        let mut end = start + size;
+        if end > max_size {
+            end = max_size;
+        }
+        (start, end)
     }
 }
 
@@ -436,48 +489,42 @@ impl StorageIO for LocalStorageProvider {
         }
     }
 
-    async fn read_data_into_buffer(&self, position: &mut u64, buffer: &mut [u8]) {
+    async fn read_data_into_buffer(&self, position: &mut u64, buffer: &mut [u8]) -> Result<()> {
         let buffer_len = buffer.len();
         
-        if !self._locked.load(std::sync::atomic::Ordering::Relaxed) {
-            let memory_map = self._memory_map.as_ref().unwrap();
+        // Early return for empty buffer
+        if buffer_len == 0 {
+            return Ok(());
+        }
 
-            // If the memory map is available, read from it
-            if memory_map.len() < *position as usize + buffer_len {
-                let mut read_file = std::fs::File::options()
-                    .read(true)
-                    .open(&self.file_str)
-                    .unwrap();
-
-                read_file.seek(SeekFrom::Start(*position)).unwrap();
-                read_file.read_exact(buffer).unwrap();
-            } else {
-                buffer.copy_from_slice(&memory_map[*position as usize..*position as usize + buffer_len]);
-            }
-        } else {
-            // If the memory map is not available, read directly from the file
-            let mut read_file = std::fs::File::options()
-                .read(true)
-                .open(&self.file_str)
-                .unwrap();
-
-            read_file.seek(SeekFrom::Start(*position)).unwrap();
-            read_file.read_exact(buffer).unwrap();
+        let file_len = self.file_len.load(Ordering::SeqCst);
+            
+        // Check if we're trying to read beyond file end
+        if *position >= file_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "Position beyond file end"
+            ));
         }
         
-        *position += buffer_len as u64;
-    }
+        // Adjust buffer length if reading beyond file end
+        let actual_buffer_len = min(buffer_len, (file_len - *position) as usize);
+        let actual_buffer = buffer;
 
-    async fn read_slice_pointer(&self, position: &mut u64, len: usize) -> Option<&[u8]> {
-        if let Some(memory_map) = &self._memory_map {
-            let start = *position as usize;
-            let end = start + len;
-            if memory_map.len() >= end {
-                *position += len as u64;
-                return Some(&memory_map[start..end]);
+        // Cache miss or partial hit - need to read from source
+        let read_result = if !self._locked.load(Ordering::Relaxed) {
+            self.read_from_memory_map_or_file(*position, actual_buffer)
+        } else {
+            self.read_from_file_direct(*position, actual_buffer)
+        };
+
+        match read_result {
+            Ok(_) => {
+                *position += actual_buffer_len as u64;
+                Ok(())
             }
+            Err(e) => Err(e)
         }
-        None
     }
 
     async fn read_data_to_cursor(&self, position: &mut u64, length: u32) -> Cursor<Vec<u8>> {
@@ -535,8 +582,6 @@ impl StorageIO for LocalStorageProvider {
     }
 
     async fn create_temp(&self) -> Self {
-        yield_now().await;
-        
         let delimiter = if cfg!(unix) {
             "/"
         } else if cfg!(windows) {
@@ -590,9 +635,9 @@ impl StorageIO for LocalStorageProvider {
             table_name: "temp.db".to_string(),
             file_str: file_str.clone(),
             file_len: AtomicU64::new(file_len),
-            _memory_map: Some(unsafe { MmapOptions::new()
+            _memory_map: ArcSwap::new(Arc::new(unsafe { MmapOptions::new()
                 .map(&file_read_mmap)
-                .unwrap() }),
+                .unwrap() })),
             hash: CRC.checksum(format!("{}+++{}", final_location, "temp.db").as_bytes()),
             appender: SegQueue::new(),
             _locked: AtomicBool::new(false),
@@ -684,9 +729,9 @@ impl StorageIO for LocalStorageProvider {
             table_name: name.to_string(),
             file_str: new_table.clone(),
             file_len: AtomicU64::new(file_len),
-            _memory_map: Some(unsafe { MmapOptions::new()
+            _memory_map: ArcSwap::new(Arc::new(unsafe { MmapOptions::new()
                 .map(&file_read_mmap)
-                .unwrap() }),
+                .unwrap() })),
             hash: CRC.checksum(format!("{}+++{}", final_location, name).as_bytes()),
             appender: SegQueue::new(),
             _locked: AtomicBool::new(false),
@@ -716,12 +761,10 @@ impl StorageIO for LocalStorageProvider {
     }
     
     async fn start_service(&mut self) {
-        let services = vec![
-            self.start_append_data_service()
-        ];
+        let vec = vec![self.start_append_data_service()];
 
-        join_all(services).await;
-    } 
+        join_all(vec).await;
+    }
 
     fn get_name(&self) -> String {
         self.table_name.clone()
