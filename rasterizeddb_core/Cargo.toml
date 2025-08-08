@@ -4,9 +4,9 @@ version = "0.0.8"
 edition = "2024"
 repository = "https://github.com/milen-denev/rasterizeddb"
 license = "GPL-3.0-only"
-keywords = ["database", "rql", "schemaless-db", "embedded-database"]
+keywords = ["database", "rql", "schemafull-db", "embedded-database"]
 authors = ["Milen Denev"]
-description = "A schemaless, high-performance database written in Rust, designed for speed and scalability."
+description = "A schemafull, high-performance database written in Rust, designed for speed and scalability."
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -30,17 +30,19 @@ temp_testdir = "0.2.3"
 memmap2 = "0.9.7"
 rand = "0.9.2"
 crossbeam-queue = "0.3.12"
+crossbeam-channel = "0.5.15"
 memory-stats = "1.2.0"
 smallvec = { version = "1.15.1", features = ["union", "write"]}
 arc-swap = "1.7.1"
+fastrand = "2.3.0"
 
 # unix dependencies
 [target.'cfg(unix)'.dependencies]
 io-uring = "0.7.9"
-crossbeam-channel = "0.5.15"
 
 [dev-dependencies]
 criterion = { version = "0.7.0" }
+tempfile = "3.20.0"
 
 [[bench]]
 name = "buffer_benchmarks"
@@ -60,6 +62,10 @@ harness = false
 
 [[bench]]
 name = "simd_copy_benchmarks"
+harness = false
+
+[[bench]]
+name = "atomic_cache_benchmarks"
 harness = false
 
 [profile.release]
