@@ -274,7 +274,7 @@ impl MemoryBlock {
     }
 
     #[inline(always)]
-    pub fn from_slice_hashed(&self, slice: &[u8]) -> MemoryBlock {
+    pub fn from_slice_hashed(slice: &[u8]) -> MemoryBlock {
         let len = slice.len();
         let memory_chunk = MEMORY_POOL.acquire_with_hash(len);
 
