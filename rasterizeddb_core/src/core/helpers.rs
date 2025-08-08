@@ -133,7 +133,7 @@ pub(crate) async fn skip_empty_spaces_file(
         if check_next_buffer == EMPTY_BUFFER {
             // Skip through empty spaces in larger blocks when possible
             loop {
-                io_sync
+                _ = io_sync
                     .read_data_into_buffer(file_position, &mut check_next_buffer)
                     .await;
                 

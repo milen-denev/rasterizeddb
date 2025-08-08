@@ -21,6 +21,4 @@ impl<S: StorageIO> Table<S> {
             hard_locked: AtomicBool::new(false)
         }
     }
-
-    //pub fn executute_query(&self, )
 }

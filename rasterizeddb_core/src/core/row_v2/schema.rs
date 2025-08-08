@@ -236,7 +236,7 @@ impl<'a, S: StorageIO> SchemaFieldIterator<'a, S> {
         
         // Read data into the buffer
         let mut read_position = self.position;
-        self.io.read_data_into_buffer(&mut read_position, &mut self.buffer.into_slice_mut()).await;
+        _ = self.io.read_data_into_buffer(&mut read_position, &mut self.buffer.into_slice_mut()).await;
         self.buffer_valid_length = self.buffer.into_slice().len();
         
         // Update position for next read
@@ -324,7 +324,7 @@ impl TableSchema {
 
     pub async fn load(schema_io: &mut impl StorageIO) -> io::Result<Self> {
         let buffer = MEMORY_POOL.acquire(TABLE_SIZE);
-        schema_io.read_data_into_buffer(&mut 0, &mut buffer.into_slice_mut()).await;
+        _ = schema_io.read_data_into_buffer(&mut 0, &mut buffer.into_slice_mut()).await;
         
         let result = match  TableSchema::from_vec(&buffer.into_slice()) {
             Ok(table_schema) => Ok(table_schema),
@@ -597,7 +597,7 @@ impl<'a, S: StorageIO> TableSchemaIterator<'a, S> {
         
         // Read data into the buffer
         let mut read_position = self.position;
-        self.io.read_data_into_buffer(&mut read_position, &mut self.buffer.into_slice_mut()).await;
+        _ = self.io.read_data_into_buffer(&mut read_position, &mut self.buffer.into_slice_mut()).await;
         self.buffer_valid_length = self.buffer.into_slice().len();
         
         // Update position for next read
