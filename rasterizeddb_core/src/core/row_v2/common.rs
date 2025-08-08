@@ -171,14 +171,14 @@ pub fn simd_compare_strings(input1: &[u8], input2: &[u8], operation: &ComparerOp
         ComparerOperation::Contains => unsafe { simd_contains(input1, input2) },
         ComparerOperation::StartsWith => unsafe { simd_starts_with(input1, input2) },
         ComparerOperation::EndsWith => unsafe { simd_ends_with(input1, input2) },
-        ComparerOperation::GreaterOrEquals => unsafe { simd_creater_or_equal(input1, input2) },
+        ComparerOperation::GreaterOrEquals => unsafe { simd_greater_or_equal(input1, input2) },
         _ => panic!("Unsupported operation for string types: {:?}", operation),
     }
 }
 
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn simd_creater_or_equal(input1: &[u8], input2: &[u8]) -> bool {
+unsafe fn simd_greater_or_equal(input1: &[u8], input2: &[u8]) -> bool {
     let len1 = input1.len();
     let len2 = input2.len();
     let min_len = len1.min(len2);
