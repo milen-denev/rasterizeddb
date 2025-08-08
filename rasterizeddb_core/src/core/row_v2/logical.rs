@@ -5,7 +5,7 @@ use crate::core::db_type::DbType;
 use super::{common::{simd_compare_strings, FromLeBytes, FromLeBytesUnsafe}, transformer::ComparerOperation};
 
 #[inline(always)]
-pub fn perform_comparison_operation(input2: &[u8], input1: &[u8], db_type: &DbType, operation: &ComparerOperation) -> bool {
+pub fn perform_comparison_operation(input1: &[u8], input2: &[u8], db_type: &DbType, operation: &ComparerOperation) -> bool {
     match db_type {
         DbType::I8 => generic_comparison::<i8>(input1, input2, operation),
         DbType::U8 => generic_comparison::<u8>(input1, input2, operation),
