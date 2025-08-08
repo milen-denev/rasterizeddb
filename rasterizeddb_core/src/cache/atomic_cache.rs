@@ -1304,7 +1304,7 @@ where
 #[cfg(debug_assertions)]
 mod tests {
   use super::*;
-  use std::{collections::HashSet, sync::atomic::AtomicBool, thread, time::Duration};
+  use std::{sync::atomic::AtomicBool, thread, time::Duration};
 
   trait CacheableValue: Clone + Send + Sync + Default + 'static {
     const IS_LOCK_FREE: bool = size_of::<Self>() <= 8 && align_of::<Self>() <= 8;
