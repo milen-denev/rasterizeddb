@@ -4,7 +4,7 @@ use rasterizeddb_core::core::row_v2::query_parser::{parse_query, tokenize_for_te
 use rasterizeddb_core::core::row_v2::row::Row;
 use rasterizeddb_core::core::row_v2::schema::SchemaField;
 use rasterizeddb_core::core::db_type::DbType;
-use rasterizeddb_core::core::row_v2::tokenizer::tokenize;
+use rasterizeddb_core::core::row_v2::query_tokenizer::tokenize;
 use rasterizeddb_core::core::row_v2::transformer::TransformerProcessor;
 use rasterizeddb_core::memory_pool::{MemoryBlock, MEMORY_POOL};
 use smallvec::SmallVec;

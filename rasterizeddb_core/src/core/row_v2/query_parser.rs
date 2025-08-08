@@ -4,7 +4,7 @@ use smallvec::SmallVec;
 use crate::memory_pool::MemoryBlock;
 use crate::core::db_type::DbType;
 use super::schema::SchemaField;
-use super::tokenizer::{numeric_to_mb, numeric_value_to_db_type, str_to_mb, tokenize, Token};
+use super::query_tokenizer::{numeric_to_mb, numeric_value_to_db_type, str_to_mb, tokenize, Token};
 use super::transformer::{ComparerOperation, ComparisonOperand, MathOperation, Next, TransformerProcessor};
 
 pub fn parse_query<'a, 'b, 'c>(
@@ -357,7 +357,7 @@ mod tests {
     use crate::core::row_v2::row::Row;
     use crate::core::row_v2::schema::SchemaField;
     //use crate::core::row_v2::token_processor::TokenProcessor;
-    use crate::core::row_v2::tokenizer::NumericValue;
+    use crate::core::row_v2::query_tokenizer::NumericValue;
     use crate::core::row_v2::transformer::TransformerProcessor;
     use crate::memory_pool::{MemoryBlock, MEMORY_POOL};
 

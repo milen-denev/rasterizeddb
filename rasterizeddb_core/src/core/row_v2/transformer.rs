@@ -1,7 +1,7 @@
 use itertools::Either;
 use smallvec::SmallVec;
 
-use crate::{core::{db_type::DbType, helpers2::smallvec_extensions::SmallVecExtensions}, memory_pool::MemoryBlock};
+use crate::{core::{db_type::DbType, helpers_v2::smallvec_extensions::SmallVecExtensions}, memory_pool::MemoryBlock};
 
 use super::{logical::perform_comparison_operation, math::perform_math_operation};
 
