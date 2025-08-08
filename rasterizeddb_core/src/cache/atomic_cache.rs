@@ -1,79 +1,74 @@
-use std::hash::Hash;
+//! # AtomicGenericCache
+//!
+//! A high-performance, lock-free generic cache implementation for Rust that provides
+//! thread-safe storage for any type implementing `Clone + Send + Sync + Default`.
+//!
+//! ## Features
+//!
+//! - **Lock-free operations**: Uses atomic operations for maximum concurrency
+//! - **Generic storage**: Supports any type meeting the trait bounds
+//! - **Efficient memory layout**: Optimizes storage for small types (≤8 bytes, ≤8 byte alignment)
+//! - **Fallback storage**: Uses RwLock for larger types that don't fit in atomic storage
+//! - **Versioning**: Tracks modifications to detect concurrent access
+//! - **Metadata tracking**: Stores UTC timestamps and sequence numbers
+//! - **State management**: Uses atomic state transitions for consistency
+//!
+//! ## Usage
+//!
+//! ```rust
+//! use std::sync::Arc;
+//!
+//! let cache = AtomicGenericCache::<String>::new(1024);
+//!
+//! // Insert values
+//! cache.insert("key1", "value1".to_string());
+//! cache.insert("key2", "value2".to_string());
+//!
+//! // Retrieve values
+//! if let Some(value) = cache.get("key1") {
+//!     println!("Found: {}", value);
+//! }
+//!
+//! // Get with metadata
+//! if let Some((value, timestamp, sequence)) = cache.get_with_metadata("key1") {
+//!     println!("Value: {}, Timestamp: {}, Sequence: {}", value, timestamp, sequence);
+//! }
+//! ```
+
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::mem::{align_of, size_of, MaybeUninit};
 use std::ptr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
 use arc_swap::ArcSwap;
 
 /// Cache-line aligned atomic entry structure.
+///
+/// Each entry stores a value along with metadata including state, version,
+/// key hash, timestamp, and sequence number. The entry uses atomic operations
+/// for thread-safe access without locks.
 #[repr(C, align(64))]
 struct AtomicEntry<K, T>
 where
   T: Clone + Send + Sync + 'static,
   K: Hash + Eq + Send + Sync + 'static,
 {
-  /// Combined: state (8 bits) + version (24 bits) + key_hash (32 bits)
-  /// This reduces from 3 separate atomics to 1
-  state_version_hash: AtomicU64,
-  
-  /// Combined: timestamp (32 bits) + sequence (32 bits)
-  /// Reduces another atomic operation
-  timestamp_sequence: AtomicU64,
-  
+  /// Combined state (lower 32 bits) and version (upper 32 bits)
+  state_version: AtomicU64,
+  /// Hash of the key for this entry
+  key_hash: AtomicU64,
   /// Inline storage for small values (≤8 bytes, ≤8 byte alignment)
   value_storage: AtomicU64,
-  
-  /// Fallback storage for larger values - only allocated when needed
+  /// Fallback storage for larger values using UnsafeCell
   value_fallback: Option<ArcSwap<T>>,
-  
-  /// Reduced to single byte to indicate storage type
-  is_inline: bool,
-
-  phantom: std::marker::PhantomData<(K, T)>,
-}
-
-// Optimized state constants - using smaller bit space
-const STATE_EMPTY: u8 = 0;
-const STATE_RESERVED: u8 = 1; 
-const STATE_WRITING: u8 = 2;
-const STATE_WRITTEN: u8 = 3;
-const STATE_TOMBSTONE: u8 = 4;
-
-/// Optimized packing functions with better bit utilization
-#[inline(always)]
-fn pack_state_version_hash(state: u8, version: u32, key_hash: u32) -> u64 {
-  ((state as u64) << 56) | ((version as u64 & 0xFF_FFFF) << 32) | (key_hash as u64)
-}
-
-#[inline(always)]
-fn unpack_state(combined: u64) -> u8 {
-  (combined >> 56) as u8
-}
-
-#[inline(always)]
-fn unpack_version(combined: u64) -> u32 {
-  ((combined >> 32) & 0xFF_FFFF) as u32
-}
-
-#[inline(always)]
-fn unpack_key_hash(combined: u64) -> u32 {
-  combined as u32
-}
-
-#[inline(always)]
-fn pack_timestamp_sequence(timestamp: u32, sequence: u32) -> u64 {
-  ((timestamp as u64) << 32) | (sequence as u64)
-}
-
-#[inline(always)]
-fn unpack_timestamp(combined: u64) -> u32 {
-  (combined >> 32) as u32
-}
-
-#[inline(always)]
-fn unpack_sequence(combined: u64) -> u32 {
-  combined as u32
+  /// UTC timestamp in nanoseconds when the entry was last modified
+  timestamp_nanos: AtomicU64,
+  /// Monotonic sequence number for ordering operations
+  sequence: AtomicU64,
+  phantom_key_type: std::marker::PhantomData<K>,
 }
 
 unsafe impl<K, T> Sync for AtomicEntry<K, T>
@@ -83,7 +78,6 @@ where
   T: Clone + Send + Sync + 'static,
 {
 }
-
 unsafe impl<K, T> Send for AtomicEntry<K, T>
 where
   K: Hash + Eq + Send + Sync + 'static,
@@ -92,32 +86,89 @@ where
 {
 }
 
+/// Entry states for atomic state machine
+const STATE_EMPTY: u32 = 0; // Entry is empty and available
+const STATE_RESERVED: u32 = 1; // Entry is reserved for writing
+const STATE_WRITING: u32 = 2; // Entry is being written to
+const STATE_WRITTEN: u32 = 3; // Entry contains valid data
+const STATE_TOMBSTONE: u32 = 4; // Entry is marked for deletion
+
+/// Packs state and version into a single 64-bit value.
+///
+/// # Arguments
+/// * `state` - The current state (32 bits)
+/// * `version` - The version number (32 bits)
+///
+/// # Returns
+/// Combined 64-bit value with version in upper 32 bits, state in lower 32 bits
+#[inline(always)]
+fn pack_state_version(state: u32, version: u32) -> u64 {
+  ((version as u64) << 32) | (state as u64)
+}
+
+/// Extracts the state from a packed state_version value.
+///
+/// # Arguments
+/// * `state_version` - Combined state and version value
+///
+/// # Returns
+/// The state portion (lower 32 bits)
+#[inline(always)]
+fn unpack_state(state_version: u64) -> u32 {
+  state_version as u32
+}
+
+/// Extracts the version from a packed state_version value.
+///
+/// # Arguments
+/// * `state_version` - Combined state and version value
+///
+/// # Returns
+/// The version portion (upper 32 bits)
+#[inline(always)]
+fn unpack_version(state_version: u64) -> u32 {
+  (state_version >> 32) as u32
+}
+
 impl<K, T> AtomicEntry<K, T>
 where
   T: Clone + Send + Sync + Default + 'static,
   K: Hash + Eq + Send + Sync + 'static,
 {
+  /// Creates a new empty atomic entry.
+  ///
+  /// Determines whether to use inline storage or fallback storage based on
+  /// the size and alignment requirements of type T.
   #[inline]
   fn new() -> Self {
     let use_fallback = size_of::<T>() > 8 || align_of::<T>() > 8;
 
     Self {
-      state_version_hash: AtomicU64::new(pack_state_version_hash(STATE_EMPTY, 0, 0)),
-      timestamp_sequence: AtomicU64::new(0),
+      key_hash: AtomicU64::new(0),
       value_storage: AtomicU64::new(0),
       value_fallback: if use_fallback {
-        Some(ArcSwap::new(Arc::new(T::default())))
+        Some(ArcSwap::from_pointee(T::default()))
       } else {
         None
       },
-      is_inline: !use_fallback,
-      phantom: std::marker::PhantomData,
+      timestamp_nanos: AtomicU64::new(0),
+      sequence: AtomicU64::new(0),
+      state_version: AtomicU64::new(pack_state_version(STATE_EMPTY, 0)),
+      phantom_key_type: std::marker::PhantomData,
     }
   }
 
+  /// Stores a value in the entry using the appropriate storage method.
+  ///
+  /// Small types (≤8 bytes, ≤8 byte alignment) are stored directly in
+  /// `value_storage` using atomic operations. Larger types use the
+  /// fallback RwLock storage.
+  ///
+  /// # Arguments
+  /// * `value` - The value to store
   #[inline]
   fn store_value(&self, value: T) -> std::io::Result<()> {
-    if self.is_inline {
+    if size_of::<T>() <= 8 && align_of::<T>() <= 8 {
       let raw_value = unsafe {
         let mut buffer = MaybeUninit::<[u8; 8]>::uninit();
         ptr::write_bytes(buffer.as_mut_ptr(), 0, 1);
@@ -128,22 +179,25 @@ where
         );
         u64::from_le_bytes(buffer.assume_init())
       };
-      // Use Release ordering to ensure value is visible before state change
-      self.value_storage.store(raw_value, Ordering::Release);
-      Ok(())
+      self.value_storage.store(raw_value, Ordering::Relaxed);
+
+      return Ok(());
     } else if let Some(ref cell) = self.value_fallback {
-      cell.store(value.into());
-      Ok(())
-    } else {
-      Err(std::io::Error::other("Unsupported type size or alignment"))
+      cell.store(Arc::new(value)); 
+      return Ok(());
     }
+
+    Err(std::io::Error::other("Unsupported type size or alignment"))
   }
 
+  /// Loads a value from the entry using the appropriate storage method.
+  ///
+  /// # Returns
+  /// A clone of the stored value, or the default value if storage fails
   #[inline]
   fn load_value(&self) -> T {
-    if self.is_inline {
-      // Use Acquire ordering to ensure we see the latest value
-      let raw_value = self.value_storage.load(Ordering::Acquire);
+    if size_of::<T>() <= 8 && align_of::<T>() <= 8 {
+      let raw_value = self.value_storage.load(Ordering::Relaxed);
       unsafe {
         let buffer = raw_value.to_le_bytes();
         let mut result = MaybeUninit::<T>::uninit();
@@ -161,134 +215,68 @@ where
     }
   }
 
+  /// Gets the current state of the entry.
+  ///
+  /// # Returns
+  /// The current state (STATE_EMPTY, STATE_RESERVED, etc.)
   #[inline]
-  fn get_state_version_hash(&self) -> (u8, u32, u32) {
-    let combined = self.state_version_hash.load(Ordering::Acquire);
-    (
-      unpack_state(combined),
-      unpack_version(combined), 
-      unpack_key_hash(combined)
-    )
+  fn get_state(&self) -> u32 {
+    unpack_state(self.state_version.load(Ordering::Relaxed))
   }
 
+  /// Gets the current version of the entry.
+  ///
+  /// The version is incremented on each state change to detect concurrent modifications.
+  ///
+  /// # Returns
+  /// The current version number
   #[inline]
-  fn compare_exchange_state(
-    &self, 
-    current_state: u8, 
-    new_state: u8,
-    key_hash: u32
-  ) -> Result<(u8, u32, u32), (u8, u32, u32)> {
-    let current_combined = self.state_version_hash.load(Ordering::Acquire);
-    let (state, version, hash) = (
-      unpack_state(current_combined),
-      unpack_version(current_combined),
-      unpack_key_hash(current_combined)
-    );
-    
-    if state == current_state {
-      let new_version = version.wrapping_add(1);
-      let new_combined = pack_state_version_hash(new_state, new_version, key_hash);
-      
-      match self.state_version_hash.compare_exchange_weak(
-        current_combined,
-        new_combined,
-        Ordering::AcqRel,  // Stronger ordering for state changes
-        Ordering::Acquire,
-      ) {
-        Ok(_) => Ok((new_state, new_version, key_hash)),
-        Err(actual) => {
-          let (s, v, h) = (unpack_state(actual), unpack_version(actual), unpack_key_hash(actual));
-          Err((s, v, h))
-        }
-      }
+  fn get_version(&self) -> u32 {
+    unpack_version(self.state_version.load(Ordering::Relaxed))
+  }
+
+  /// Atomically compares and exchanges the state, incrementing the version.
+  ///
+  /// This is the core synchronization primitive for state transitions.
+  ///
+  /// # Arguments
+  /// * `current` - Expected current state
+  /// * `new` - New state to set
+  ///
+  /// # Returns
+  /// Result containing the old state_version on success, or current state_version on failure
+  #[inline]
+  fn compare_exchange_state(&self, current: u32, new: u32) -> Result<u64, u64> {
+    let current_sv = self.state_version.load(Ordering::Relaxed);
+    let current_state = unpack_state(current_sv);
+    let current_version = unpack_version(current_sv);
+
+    if current_state == current {
+      let new_version = current_version.wrapping_add(1);
+      let new_sv = pack_state_version(new, new_version);
+      self.state_version.compare_exchange_weak(
+        current_sv,
+        new_sv,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+      )
     } else {
-      Err((state, version, hash))
+      Err(current_sv)
     }
   }
 
+  /// Sets the state without changing the version.
+  ///
+  /// Used for final state transitions where version consistency is already ensured.
+  ///
+  /// # Arguments
+  /// * `state` - New state to set
   #[inline]
-  #[allow(dead_code)]
-  fn set_state(&self, state: u8, key_hash: u32) {
-    let current_combined = self.state_version_hash.load(Ordering::Relaxed);
-    let current_version = unpack_version(current_combined);
-    let new_combined = pack_state_version_hash(state, current_version, key_hash);
-    self.state_version_hash.store(new_combined, Ordering::Release);
-  }
-
-  /// Update timestamp and sequence in single operation
-  #[inline]
-  fn update_timestamp_sequence(&self, timestamp: u32, sequence: u32) {
-    let combined = pack_timestamp_sequence(timestamp, sequence);
-    self.timestamp_sequence.store(combined, Ordering::Release);
-  }
-
-  #[inline]
-  fn get_timestamp_sequence(&self) -> (u32, u32) {
-    let combined = self.timestamp_sequence.load(Ordering::Acquire);
-    (unpack_timestamp(combined), unpack_sequence(combined))
-  }
-
-  
-  /// Atomically clear this entry - used by clear() method
-  #[inline]
-  fn atomic_clear(&self) -> bool {
-    loop {
-      let current_combined = self.state_version_hash.load(Ordering::Acquire);
-      let (state, version, _) = (
-        unpack_state(current_combined),
-        unpack_version(current_combined),
-        unpack_key_hash(current_combined)
-      );
-      
-      if state != STATE_WRITTEN {
-        return false; // Nothing to clear
-      }
-      
-      let new_combined = pack_state_version_hash(STATE_EMPTY, version.wrapping_add(1), 0);
-      
-      match self.state_version_hash.compare_exchange_weak(
-        current_combined,
-        new_combined,
-        Ordering::AcqRel,
-        Ordering::Acquire,
-      ) {
-        Ok(_) => return true,
-        Err(_) => continue, // Retry
-      }
-    }
-  }
-
-  /// Atomically drain this entry - used by drain() method
-  #[inline]
-  fn atomic_drain(&self) -> Option<(u32, T, u32, u32)> {
-    loop {
-      let current_combined = self.state_version_hash.load(Ordering::Acquire);
-      let (state, version, hash) = (
-        unpack_state(current_combined),
-        unpack_version(current_combined),
-        unpack_key_hash(current_combined)
-      );
-      
-      if state != STATE_WRITTEN {
-        return None; // Nothing to drain
-      }
-      
-      // Load value and metadata before attempting to drain
-      let value = self.load_value();
-      let (timestamp, sequence) = self.get_timestamp_sequence();
-      
-      let new_combined = pack_state_version_hash(STATE_EMPTY, version.wrapping_add(1), 0);
-      
-      match self.state_version_hash.compare_exchange_weak(
-        current_combined,
-        new_combined,
-        Ordering::AcqRel,
-        Ordering::Acquire,
-      ) {
-        Ok(_) => return Some((hash, value, timestamp, sequence)),
-        Err(_) => continue, // Retry
-      }
-    }
+  fn set_state(&self, state: u32) {
+    let current_sv = self.state_version.load(Ordering::Relaxed);
+    let current_version = unpack_version(current_sv);
+    let new_sv = pack_state_version(state, current_version);
+    self.state_version.store(new_sv, Ordering::Release);
   }
 }
 
@@ -302,47 +290,26 @@ where
   }
 }
 
+/// A high-performance, lock-free generic cache implementation.
+///
+/// `AtomicGenericCache` provides thread-safe storage for any type implementing
+/// the required traits. It uses atomic operations for coordination and supports
+/// both inline storage for small types and fallback storage for larger types.
+///
+/// The cache uses a ring buffer approach with atomic state management to provide
+/// lock-free insertion, retrieval, and removal operations.
 pub struct AtomicGenericCache<K, T>
 where
   T: Clone + Send + Sync + 'static,
   K: Hash + Eq + Send + Sync + 'static,
 {
-  /// Hash table buckets - each bucket is a small array of entries
-  buckets: Box<[Bucket<K, T>]>,
-  /// Number of buckets (power of 2)
-  bucket_count: usize,
-  /// Mask for fast bucket selection
-  bucket_mask: usize,
-  /// Global sequence counter
-  global_sequence: AtomicUsize,
-  /// Maximum capacity
-  max_capacity: usize
-}
-
-/// Each bucket contains multiple entries to handle collisions
-struct Bucket<K, T>
-where
-  T: Clone + Send + Sync + 'static,
-  K: Hash + Eq + Send + Sync + 'static,
-{
-  entries: [AtomicEntry<K, T>; 4], // 4 entries per bucket
-}
-
-impl<K, T> Bucket<K, T>
-where
-  T: Clone + Send + Sync + Default + 'static,
-  K: Hash + Eq + Send + Sync + 'static,
-{
-  fn new() -> Self {
-    Self {
-      entries: [
-        AtomicEntry::<K, T>::new(),
-        AtomicEntry::<K, T>::new(),
-        AtomicEntry::<K, T>::new(),
-        AtomicEntry::<K, T>::new(),
-      ]
-    }
-  }
+  /// Array of cache entries, sized to a power of 2
+  entries: Box<[AtomicEntry<K, T>]>,
+  /// Monotonic write index for ring buffer behavior
+  write_index: AtomicUsize,
+  /// Bit mask for fast modulo operations (capacity - 1)
+  capacity_mask: usize,
+  max_capacity: usize,
 }
 
 unsafe impl<K, T> Sync for AtomicGenericCache<K, T>
@@ -352,7 +319,6 @@ where
   T: Clone + Send + Sync + 'static,
 {
 }
-
 unsafe impl<K, T> Send for AtomicGenericCache<K, T>
 where
   K: Hash + Eq + Send + Sync + 'static,
@@ -361,168 +327,172 @@ where
 {
 }
 
+#[allow(dead_code)]
 impl<K, T> AtomicGenericCache<K, T>
 where
   T: Clone + Send + Sync + Default + 'static,
-  K: Clone + Hash + Eq + Send + Sync + 'static,
+  K: Hash + Eq + Send + Sync + 'static,
 {
+  /// Creates a new cache with the specified capacity.
+  ///
+  /// The actual capacity will be rounded up to the next power of 2 and
+  /// will be at least 64 entries for optimal performance.
+  ///
+  /// # Arguments
+  /// * `capacity` - Desired cache capacity
+  ///
+  /// # Returns
+  /// Arc-wrapped cache instance for shared ownership
+  ///
+  /// # Examples
+  /// ```
+  /// let cache = AtomicGenericCache::<String>::new(1024);
+  /// ```
   pub fn new(capacity: usize, max_capacity: usize) -> Arc<Self> {
-    let bucket_count = (capacity / 4).next_power_of_two().max(16);
-    let mut buckets = Vec::with_capacity(bucket_count);
-    
-    for _ in 0..bucket_count {
-      buckets.push(Bucket::<K, T>::new());
+    let capacity = capacity.next_power_of_two().max(64);
+
+    let mut entries = Vec::with_capacity(capacity);
+    for _ in 0..capacity {
+      entries.push(AtomicEntry::new());
     }
 
     Arc::new(Self {
-      buckets: buckets.into_boxed_slice(),
-      bucket_count,
-      bucket_mask: bucket_count - 1,
-      global_sequence: AtomicUsize::new(0),
-      max_capacity
+      entries: entries.into_boxed_slice(),
+      write_index: AtomicUsize::new(0),
+      capacity_mask: capacity - 1,
+      max_capacity,
     })
   }
 
+  /// Computes a hash for the given key.
+  ///
+  /// Uses the default hasher and ensures the result is non-zero for
+  /// better distribution in the cache.
+  ///
+  /// # Arguments
+  /// * `key` - Key to hash
+  ///
+  /// # Returns
+  /// 64-bit hash value (guaranteed non-zero)
   #[inline]
   fn hash_key(&self, key: &K) -> u64 {
-    let hasher = ahash::RandomState::with_seed(0x51_7c_c1_b7_27_22_0a_95);
-    let hash = hasher.hash_one(key);
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    let hash = hasher.finish();
     hash | 1
   }
 
+  /// Gets the current UTC timestamp in nanoseconds.
+  ///
+  /// Returns nanoseconds since Unix epoch (1970-01-01 00:00:00 UTC).
+  /// This is always UTC+0 regardless of system timezone.
+  ///
+  /// # Returns
+  /// UTC timestamp in nanoseconds, or 0 if system time is unavailable
   #[inline]
-  fn get_timestamp_seconds() -> u32 {
+  fn get_timestamp_nanos() -> u64 {
     SystemTime::now()
       .duration_since(UNIX_EPOCH)
       .unwrap_or_default()
-      .as_secs() as u32
+      .as_nanos() as u64
   }
 
+  /// Inserts a key-value pair into the cache.
+  ///
+  /// This operation is lock-free and thread-safe. If the key already exists,
+  /// the value will be updated. The operation uses a ring buffer approach
+  /// to find available slots.
+  ///
+  /// # Arguments
+  /// * `key` - Key to insert (must implement Hash)
+  /// * `value` - Value to store
+  ///
+  /// # Returns
+  /// `true` if the insertion was successful, `false` if the cache is full wrapped in Result<bool, std::io::Error> if successful
+  ///
+  /// # Examples
+  /// ```
+  /// let cache = AtomicGenericCache::<String>::new(1024);
+  /// let success = cache.insert("key1", "value1".to_string()).unwrap();
+  /// assert!(success);
+  /// ```
   pub fn insert(&self, key: K, value: T) -> Result<bool, std::io::Error> {
+    if self.len() >= self.max_capacity && self.max_capacity > 0 {
+      return Ok(false);
+    }
+
     let key_hash = self.hash_key(&key);
-    let key_hash_32 = key_hash as u32;
-    let bucket_idx = (key_hash as usize) & self.bucket_mask;
-    let bucket = &self.buckets[bucket_idx];
-    
-    let timestamp = Self::get_timestamp_seconds();
-    // Pre-increment to ensure sequence is always > 0
-    let sequence = (self.global_sequence.fetch_add(1, Ordering::Relaxed) + 1) as u32;
+    let now = Self::get_timestamp_nanos();
 
     // Try to update existing entry first
-    for entry in &bucket.entries {
-      let (state, _version, hash) = entry.get_state_version_hash();
-      if state == STATE_WRITTEN && hash == key_hash_32 {
-        if let Ok(_) = entry.compare_exchange_state(STATE_WRITTEN, STATE_WRITING, key_hash_32) {
-          entry.store_value(value)?;
-          entry.update_timestamp_sequence(timestamp, sequence);
-          entry.compare_exchange_state(STATE_WRITING, STATE_WRITTEN, key_hash_32)
-            .map_err(|_| std::io::Error::other("State transition failed"))?;
+    if self.try_update_existing(key_hash, &value, now)? {
+      return Ok(true);
+    }
+
+    // Look for available slot using ring buffer approach
+    let max_attempts = self.capacity_mask + 1;
+
+    for attempt in 0..max_attempts {
+      let write_pos = self.write_index.fetch_add(1, Ordering::Relaxed);
+      let index = write_pos & self.capacity_mask;
+      let slot = &self.entries[index];
+
+      if let Ok(res) = self.try_acquire_slot(slot, key_hash, &value, now) {
+        if res {
           return Ok(true);
         }
       }
-    }
 
-    // Try to find empty slot in target bucket
-    for entry in &bucket.entries {
-      let (state, _version, _hash) = entry.get_state_version_hash();
-      if state == STATE_EMPTY || state == STATE_TOMBSTONE {
-        if let Ok(_) = entry.compare_exchange_state(state, STATE_RESERVED, key_hash_32) {
-          entry.store_value(value)?;
-          entry.update_timestamp_sequence(timestamp, sequence);
-          entry.compare_exchange_state(STATE_RESERVED, STATE_WRITTEN, key_hash_32)
-            .map_err(|_| std::io::Error::other("State transition failed"))?;
-          return Ok(true);
-        }
+      // Yield periodically to avoid busy spinning
+      if attempt & 7 == 7 {
+        std::thread::yield_now();
       }
     }
 
-    // Target bucket is full - implement ring buffer behavior
-    // Check if we're at max capacity and need to evict globally
-    if self.max_capacity > 0 && self.len() >= self.max_capacity {
-      // Find and evict the oldest entry globally
-      if let Some((oldest_entry, oldest_hash)) = self.find_oldest_entry() {
-        if let Ok(_) = oldest_entry.compare_exchange_state(STATE_WRITTEN, STATE_TOMBSTONE, oldest_hash) {
-          // Successfully evicted, now try to insert in target bucket again
-          for entry in &bucket.entries {
-            let (state, _version, _hash) = entry.get_state_version_hash();
-            if state == STATE_EMPTY || state == STATE_TOMBSTONE {
-              if let Ok(_) = entry.compare_exchange_state(state, STATE_RESERVED, key_hash_32) {
-                entry.store_value(value)?;
-                entry.update_timestamp_sequence(timestamp, sequence);
-                entry.compare_exchange_state(STATE_RESERVED, STATE_WRITTEN, key_hash_32)
-                  .map_err(|_| std::io::Error::other("State transition failed"))?;
-                return Ok(true);
-              }
-            }
-          }
-        }
-      }
-    }
-
-    // If target bucket is still full, evict the oldest entry in this bucket (ring buffer behavior)
-    if let Some((oldest_entry, oldest_hash)) = self.find_oldest_entry_in_bucket(bucket) {
-      if let Ok(_) = oldest_entry.compare_exchange_state(STATE_WRITTEN, STATE_RESERVED, oldest_hash) {
-        // Reuse this slot
-        oldest_entry.store_value(value)?;
-        oldest_entry.update_timestamp_sequence(timestamp, sequence);
-        oldest_entry.compare_exchange_state(STATE_RESERVED, STATE_WRITTEN, key_hash_32)
-          .map_err(|_| std::io::Error::other("State transition failed"))?;
-        return Ok(true);
-      }
-    }
-
-    Ok(false) // Should rarely happen
+    Ok(false)
   }
 
-  // Helper method to find the oldest entry globally
-  fn find_oldest_entry(&self) -> Option<(&AtomicEntry<K, T>, u32)> {
-    let mut oldest_entry = None;
-    let mut oldest_sequence = u32::MAX;
-    let mut oldest_hash = 0;
-
-    for bucket in self.buckets.iter() {
-      for entry in &bucket.entries {
-        let (state, _version, hash) = entry.get_state_version_hash();
-        if state == STATE_WRITTEN {
-          let (_timestamp, sequence) = entry.get_timestamp_sequence();
-          if sequence < oldest_sequence {
-            oldest_sequence = sequence;
-            oldest_entry = Some(entry);
-            oldest_hash = hash;
-          }
-        }
-      }
-    }
-
-    oldest_entry.map(|entry| (entry, oldest_hash))
-  }
-
-  // Helper method to find the oldest entry in a specific bucket
-  fn find_oldest_entry_in_bucket<'a>(&self, bucket: &'a Bucket<K, T>) -> Option<(&'a AtomicEntry<K, T>, u32)> {
-    let mut oldest_entry = None;
-    let mut oldest_sequence = u32::MAX;
-    let mut oldest_hash = 0;
-
-    for entry in &bucket.entries {
-      let (state, _version, hash) = entry.get_state_version_hash();
-      if state == STATE_WRITTEN {
-        let (_timestamp, sequence) = entry.get_timestamp_sequence();
-        if sequence < oldest_sequence {
-          oldest_sequence = sequence;
-          oldest_entry = Some(entry);
-          oldest_hash = hash;
-        }
-      }
-    }
-
-    oldest_entry.map(move |entry| (entry, oldest_hash))
-  }
-
+  /// Forces insertion of a key-value pair into the cache.
+  ///
+  /// Unlike the regular `insert` function, this operation will always succeed by
+  /// removing the oldest entries if the cache is at max capacity. This ensures
+  /// that new entries can always be added, maintaining a bounded cache size.
+  ///
+  /// # Arguments
+  /// * `key` - Key to insert (must implement Hash)
+  /// * `value` - Value to store
+  ///
+  /// # Returns
+  /// Result containing a tuple:
+  /// - `bool` - Always `true` indicating successful insertion
+  /// - `Vec<(u64, T, u64, u64)>` - Vector of removed entries (key_hash, value, timestamp_nanos, sequence)
+  ///   Empty if no entries needed to be removed.
+  ///
+  /// # Examples
+  /// ```
+  /// let cache = AtomicGenericCache::<String>::new(64, 100); // capacity 64, max 100
+  ///
+  /// // Fill the cache to max capacity
+  /// for i in 0..100 {
+  ///     cache.insert(format!("key{}", i), format!("value{}", i)).unwrap();
+  /// }
+  ///
+  /// // Force insert will remove oldest entries to make space
+  /// let (success, removed_entries) = cache.force_insert("new_key", "new_value".to_string()).unwrap();
+  /// assert!(success);
+  ///
+  /// if !removed_entries.is_empty() {
+  ///     println!("Removed {} oldest entries to make space", removed_entries.len());
+  ///     for (key_hash, value, timestamp, sequence) in removed_entries {
+  ///         println!("Removed: key_hash={}, value={}, sequence={}", key_hash, value, sequence);
+  ///     }
+  /// }
+  /// ```
   pub fn force_insert(
     &self,
     key: K,
     value: T,
-  ) -> Result<(bool, Vec<(u32, T, u32, u32)>), std::io::Error> {
+  ) -> Result<(bool, Vec<(u64, T, u64, u64)>), std::io::Error> {
     let mut removed_entries = Vec::new();
 
     // If we're at max capacity, remove oldest entries to make space
@@ -535,74 +505,210 @@ where
       }
     }
 
-    // Try regular insert first - this will move key and value
-    match self.insert(key, value) {
-      Ok(true) => return Ok((true, removed_entries)),
-      Ok(false) => {
-        // Continue with eviction logic below
-      },
-      Err(e) => return Err(e),
+    let key_hash = self.hash_key(&key);
+    let now = Self::get_timestamp_nanos();
+
+    // Try to update existing entry first
+    if self.try_update_existing(key_hash, &value, now)? {
+      return Ok((true, removed_entries));
     }
 
-    // If insert failed, find oldest entries to evict
-    let mut oldest_entries = Vec::new();
-    let mut min_sequence = u32::MAX;
-    let mut min_bucket_idx = 0;
-    let mut min_entry_idx = 0;
+    // Look for available slot using ring buffer approach
+    let max_attempts = self.capacity_mask + 1;
 
-    // Find the oldest entry across all buckets
-    for (bucket_idx, bucket) in self.buckets.iter().enumerate() {
-      for (entry_idx, entry) in bucket.entries.iter().enumerate() {
-        let (state, _version, _) = entry.get_state_version_hash();
-        if state == STATE_WRITTEN {
-          let (_timestamp, sequence) = entry.get_timestamp_sequence();
-          if sequence < min_sequence {
-            min_sequence = sequence;
-            min_bucket_idx = bucket_idx;
-            min_entry_idx = entry_idx;
+    for attempt in 0..max_attempts {
+      let write_pos = self.write_index.fetch_add(1, Ordering::Relaxed);
+      let index = write_pos & self.capacity_mask;
+      let slot = &self.entries[index];
+
+      if let Ok(res) = self.try_acquire_slot(slot, key_hash, &value, now) {
+        if res {
+          return Ok((true, removed_entries));
+        }
+      }
+
+      // Yield periodically to avoid busy spinning
+      if attempt & 7 == 7 {
+        std::thread::yield_now();
+      }
+    }
+
+    // If we still can't insert after removing oldest entries,
+    // try removing more entries and retry once
+    if !removed_entries.is_empty() || self.max_capacity == 0 {
+      // Remove a few more entries to increase chances of success
+      let additional_removed = self.remove_oldest(3);
+      removed_entries.extend(additional_removed);
+
+      // Retry insertion one more time
+      for attempt in 0..max_attempts {
+        let write_pos = self.write_index.fetch_add(1, Ordering::Relaxed);
+        let index = write_pos & self.capacity_mask;
+        let slot = &self.entries[index];
+
+        if let Ok(res) = self.try_acquire_slot(slot, key_hash, &value, now) {
+          if res {
+            return Ok((true, removed_entries));
           }
         }
-      }
-    }
 
-    // Evict the oldest entry
-    if min_sequence != u32::MAX {
-      let bucket = &self.buckets[min_bucket_idx];
-      let entry = &bucket.entries[min_entry_idx];
-      let (state, _version, hash) = entry.get_state_version_hash();
-      
-      if state == STATE_WRITTEN {
-        let value_old = entry.load_value();
-        let (timestamp, sequence) = entry.get_timestamp_sequence();
-        
-        if let Ok(_) = entry.compare_exchange_state(STATE_WRITTEN, STATE_TOMBSTONE, hash) {
-          oldest_entries.push((hash, value_old, timestamp, sequence));
+        if attempt & 7 == 7 {
+          std::thread::yield_now();
         }
       }
     }
 
-    // Since we can't reuse the moved key and value, we need to return failure
-    // The caller will need to retry the operation
-    removed_entries.extend(oldest_entries);
+    // This should rarely happen, but if it does, we still return the removed entries
+    // The caller can decide whether to retry or handle this edge case
     Ok((false, removed_entries))
   }
 
+  /// Attempts to acquire a specific slot for writing.
+  ///
+  /// Handles the atomic state transitions required for safe slot acquisition.
+  ///
+  /// # Arguments
+  /// * `slot` - The slot to acquire
+  /// * `key_hash` - Hash of the key being inserted
+  /// * `value` - Value to store
+  /// * `timestamp` - UTC timestamp in nanoseconds
+  ///
+  /// # Returns
+  /// `true` if the slot was successfully acquired and written
+  #[inline]
+  fn try_acquire_slot(
+    &self,
+    slot: &AtomicEntry<K, T>,
+    key_hash: u64,
+    value: &T,
+    timestamp: u64,
+  ) -> Result<bool, std::io::Error> {
+    let current_state = slot.get_state();
+
+    match current_state {
+      STATE_EMPTY | STATE_TOMBSTONE => {
+        if slot
+          .compare_exchange_state(current_state, STATE_RESERVED)
+          .is_ok()
+        {
+          self.write_entry_data(slot, key_hash, value.clone(), timestamp)?;
+          slot.set_state(STATE_WRITTEN);
+          Ok(true)
+        } else {
+          Ok(false)
+        }
+      }
+      STATE_WRITTEN => {
+        if slot
+          .compare_exchange_state(STATE_WRITTEN, STATE_WRITING)
+          .is_ok()
+        {
+          self.write_entry_data(slot, key_hash, value.clone(), timestamp)?;
+          slot.set_state(STATE_WRITTEN);
+          Ok(true)
+        } else {
+          Ok(false)
+        }
+      }
+      _ => Ok(false),
+    }
+  }
+
+  /// Attempts to update an existing entry with the same key hash.
+  ///
+  /// Scans all entries looking for a matching key hash and attempts to update it.
+  ///
+  /// # Arguments
+  /// * `key_hash` - Hash of the key to update
+  /// * `value` - New value to store
+  /// * `timestamp` - UTC timestamp in nanoseconds
+  ///
+  /// # Returns
+  /// `true` if an existing entry was found and updated
+  fn try_update_existing(
+    &self,
+    key_hash: u64,
+    value: &T,
+    timestamp: u64,
+  ) -> Result<bool, std::io::Error> {
+    for slot in self.entries.iter() {
+      if slot.get_state() == STATE_WRITTEN
+        && slot.key_hash.load(Ordering::Relaxed) == key_hash
+        && slot
+          .compare_exchange_state(STATE_WRITTEN, STATE_WRITING)
+          .is_ok()
+      {
+        if slot.key_hash.load(Ordering::Relaxed) == key_hash {
+          self.write_entry_data(slot, key_hash, value.clone(), timestamp)?;
+          slot.set_state(STATE_WRITTEN);
+          return Ok(true);
+        } else {
+          slot.set_state(STATE_WRITTEN);
+        }
+      }
+    }
+    Ok(false)
+  }
+
+  /// Writes data to an entry slot.
+  ///
+  /// Updates the sequence number, key hash, value, and timestamp.
+  /// This method assumes the slot is already in a writable state.
+  ///
+  /// # Arguments
+  /// * `slot` - The slot to write to
+  /// * `key_hash` - Hash of the key
+  /// * `value` - Value to store
+  /// * `timestamp` - UTC timestamp in nanoseconds
+  #[inline]
+  fn write_entry_data(
+    &self,
+    slot: &AtomicEntry<K, T>,
+    key_hash: u64,
+    value: T,
+    timestamp: u64,
+  ) -> std::io::Result<()> {
+    // Increment sequence for ordering
+    slot.sequence.fetch_add(1, Ordering::Relaxed);
+    slot.key_hash.store(key_hash, Ordering::Relaxed);
+    let result = slot.store_value(value);
+    slot.timestamp_nanos.store(timestamp, Ordering::Relaxed);
+    result
+  }
+
+  /// Retrieves a value by key from the cache.
+  ///
+  /// This operation is lock-free and thread-safe. Uses version checking
+  /// to ensure consistency during concurrent modifications.
+  ///
+  /// # Arguments
+  /// * `key` - Key to look up (must implement Hash)
+  ///
+  /// # Returns
+  /// `Some(value)` if found, `None` if not found or if concurrent modification detected
+  ///
+  /// # Examples
+  /// ```
+  /// let cache = AtomicGenericCache::<String>::new(1024);
+  /// cache.insert("key1", "value1".to_string());
+  ///
+  /// if let Some(value) = cache.get("key1") {
+  ///     println!("Found: {}", value);
+  /// }
+  /// ```
   pub fn get(&self, key: &K) -> Option<T> {
     let key_hash = self.hash_key(key);
-    let key_hash_32 = key_hash as u32;
-    let bucket_idx = (key_hash as usize) & self.bucket_mask;
-    let bucket = &self.buckets[bucket_idx];
 
-    for entry in &bucket.entries {
-      let (state, version_before, hash) = entry.get_state_version_hash();
-      if state == STATE_WRITTEN && hash == key_hash_32 {
-        let value = entry.load_value();
-        
-        // Verify consistency with single atomic read
-        let (state_after, version_after, hash_after) = entry.get_state_version_hash();
-        if state_after == STATE_WRITTEN && 
-           version_after == version_before && 
-           hash_after == key_hash_32 {
+    for slot in self.entries.iter() {
+      if slot.get_state() == STATE_WRITTEN && slot.key_hash.load(Ordering::Relaxed) == key_hash {
+        let version_before = slot.get_version();
+        let value = slot.load_value();
+
+        // Verify consistency
+        if version_before == slot.get_version()
+          && slot.get_state() == STATE_WRITTEN
+          && slot.key_hash.load(Ordering::Relaxed) == key_hash
+        {
           return Some(value);
         }
       }
@@ -611,39 +717,41 @@ where
     None
   }
 
-  pub fn get_unverified(&self, key: &K) -> Option<T> {
+  /// Retrieves a value along with its metadata by key.
+  ///
+  /// Returns the value along with UTC timestamp and sequence number.
+  ///
+  /// # Arguments
+  /// * `key` - Key to look up (must implement Hash)
+  ///
+  /// # Returns
+  /// `Some((value, timestamp_nanos, sequence))` if found, `None` otherwise.
+  /// The timestamp is in UTC nanoseconds since Unix epoch.
+  ///
+  /// # Examples
+  /// ```
+  /// let cache = AtomicGenericCache::<String>::new(1024);
+  /// cache.insert("key1", "value1".to_string());
+  ///
+  /// if let Some((value, timestamp, sequence)) = cache.get_with_metadata("key1") {
+  ///     println!("Value: {}, UTC Timestamp: {} ns, Sequence: {}", value, timestamp, sequence);
+  /// }
+  /// ```
+  pub fn get_with_metadata(&self, key: &K) -> Option<(T, u64, u64)> {
     let key_hash = self.hash_key(key);
-    let key_hash_32 = key_hash as u32;
-    let bucket_idx = (key_hash as usize) & self.bucket_mask;
-    let bucket = &self.buckets[bucket_idx];
 
-    for entry in &bucket.entries {
-      let (state, _version, hash) = entry.get_state_version_hash();
-      if state == STATE_WRITTEN && hash == key_hash_32 {
-        return Some(entry.load_value());
-      }
-    }
-
-    None
-  }
-
-  pub fn get_with_metadata(&self, key: &K) -> Option<(T, u32, u32)> {
-    let key_hash = self.hash_key(key);
-    let key_hash_32 = key_hash as u32;
-    let bucket_idx = (key_hash as usize) & self.bucket_mask;
-    let bucket = &self.buckets[bucket_idx];
-
-    for entry in &bucket.entries {
-      let (state, version_before, hash) = entry.get_state_version_hash();
-      if state == STATE_WRITTEN && hash == key_hash_32 {
-        let value = entry.load_value();
-        let (timestamp, sequence) = entry.get_timestamp_sequence();
+    for slot in self.entries.iter() {
+      if slot.get_state() == STATE_WRITTEN && slot.key_hash.load(Ordering::Relaxed) == key_hash {
+        let version_before = slot.get_version();
+        let value = slot.load_value();
+        let timestamp = slot.timestamp_nanos.load(Ordering::Relaxed);
+        let sequence = slot.sequence.load(Ordering::Relaxed);
 
         // Verify consistency
-        let (state_after, version_after, hash_after) = entry.get_state_version_hash();
-        if state_after == STATE_WRITTEN && 
-           version_after == version_before && 
-           hash_after == key_hash_32 {
+        if version_before == slot.get_version()
+          && slot.get_state() == STATE_WRITTEN
+          && slot.key_hash.load(Ordering::Relaxed) == key_hash
+        {
           return Some((value, timestamp, sequence));
         }
       }
@@ -652,34 +760,124 @@ where
     None
   }
 
+  /// Retrieves multiple values by their keys from the cache.
+  ///
+  /// This is a bulk operation that looks up all provided keys.
+  ///
+  /// # Arguments
+  /// * `keys` - Vector of keys to look up
+  ///
+  /// # Returns
+  /// Vector of values in the same order as keys. Missing keys result in None entries.
+  ///
+  /// # Examples
+  /// ```
+  /// let cache = AtomicGenericCache::<String>::new(1024);
+  /// cache.insert("key1", "value1".to_string());
+  /// cache.insert("key3", "value3".to_string());
+  ///
+  /// let keys = vec!["key1", "key2", "key3"];
+  /// let values = cache.get_all_by_keys(keys);
+  /// // values will be [Some("value1"), None, Some("value3")]
+  /// ```
   pub fn get_all_by_keys(&self, keys: &Vec<K>) -> Vec<Option<T>> {
     keys.iter().map(|key| self.get(key)).collect()
   }
 
+  /// Checks if the cache contains a specific key.
+  ///
+  /// # Arguments
+  /// * `key` - Key to check (must implement Hash)
+  ///
+  /// # Returns
+  /// `true` if the key exists, `false` otherwise
+  ///
+  /// # Examples
+  /// ```
+  /// let cache = AtomicGenericCache::<String>::new(1024);
+  /// cache.insert("key1", "value1".to_string());
+  ///
+  /// assert!(cache.contains_key("key1"));
+  /// assert!(!cache.contains_key("nonexistent"));
+  /// ```
   #[inline]
   pub fn contains_key(&self, key: &K) -> bool {
     self.get(key).is_some()
   }
 
+  /// Checks if the cache contains any of the specified keys.
+  ///
+  /// # Arguments
+  /// * `keys` - Vector of keys to check
+  ///
+  /// # Returns
+  /// `true` if any of the keys exist, `false` if none exist
+  ///
+  /// # Examples
+  /// ```
+  /// let cache = AtomicGenericCache::<String>::new(1024);
+  /// cache.insert("key1", "value1".to_string());
+  ///
+  /// let keys = vec!["key1", "key2", "key3"];
+  /// assert!(cache.contains_any_key(keys));
+  /// ```
   pub fn contains_any_key(&self, keys: &Vec<K>) -> bool {
     keys.iter().any(|key| self.contains_key(key))
   }
 
+  /// Checks if the cache contains all of the specified keys.
+  ///
+  /// # Arguments
+  /// * `keys` - Vector of keys to check
+  ///
+  /// # Returns
+  /// `true` if all keys exist, `false` if any key is missing
+  ///
+  /// # Examples
+  /// ```
+  /// let cache = AtomicGenericCache::<String>::new(1024);
+  /// cache.insert("key1", "value1".to_string());
+  /// cache.insert("key2", "value2".to_string());
+  ///
+  /// let keys = vec!["key1", "key2"];
+  /// assert!(cache.contains_all_keys(keys));
+  /// ```
   pub fn contains_all_keys(&self, keys: &Vec<K>) -> bool {
     keys.iter().all(|key| self.contains_key(key))
   }
 
+  /// Removes a key-value pair from the cache.
+  ///
+  /// Marks the entry as a tombstone rather than truly deleting it.
+  /// This allows the slot to be reused while maintaining consistency.
+  ///
+  /// # Arguments
+  /// * `key` - Key to remove (must implement Hash)
+  ///
+  /// # Returns
+  /// `Some(value)` if the key was found and removed, `None` otherwise
+  ///
+  /// # Examples
+  /// ```
+  /// let cache = AtomicGenericCache::<String>::new(1024);
+  /// cache.insert("key1", "value1".to_string());
+  ///
+  /// if let Some(removed_value) = cache.remove("key1") {
+  ///     println!("Removed: {}", removed_value);
+  /// }
+  /// ```
   pub fn remove(&self, key: &K) -> Option<T> {
     let key_hash = self.hash_key(key);
-    let key_hash_32 = key_hash as u32;
-    let bucket_idx = (key_hash as usize) & self.bucket_mask;
-    let bucket = &self.buckets[bucket_idx];
 
-    for entry in &bucket.entries {
-      let (state, _version, hash) = entry.get_state_version_hash();
-      if state == STATE_WRITTEN && hash == key_hash_32 {
-        let value = entry.load_value();
-        if let Ok(_) = entry.compare_exchange_state(STATE_WRITTEN, STATE_TOMBSTONE, key_hash_32) {
+    for slot in self.entries.iter() {
+      if slot.get_state() == STATE_WRITTEN && slot.key_hash.load(Ordering::Relaxed) == key_hash {
+        let value = slot.load_value();
+
+        if slot
+          .compare_exchange_state(STATE_WRITTEN, STATE_TOMBSTONE)
+          .is_ok()
+          && slot.key_hash.load(Ordering::Relaxed) == key_hash
+        {
           return Some(value);
         }
       }
@@ -688,29 +886,115 @@ where
     None
   }
 
+  /// Removes multiple key-value pairs from the cache.
+  ///
+  /// This is a bulk operation that attempts to remove all provided keys.
+  ///
+  /// # Arguments
+  /// * `keys` - Vector of keys to remove
+  ///
+  /// # Returns
+  /// Vector of removed values in the same order as keys. Missing keys result in None entries.
+  ///
+  /// # Examples
+  /// ```
+  /// let cache = AtomicGenericCache::<String>::new(1024);
+  /// cache.insert("key1", "value1".to_string());
+  /// cache.insert("key3", "value3".to_string());
+  ///
+  /// let keys = vec!["key1", "key2", "key3"];
+  /// let removed_values = cache.remove_all(keys);
+  /// // removed_values will be [Some("value1"), None, Some("value3")]
+  /// ```
   pub fn remove_all(&self, keys: &Vec<K>) -> Vec<Option<T>> {
     keys.iter().map(|key| self.remove(key)).collect()
   }
 
+  /// Clears all entries from the cache.
+  ///
+  /// Atomically transitions all written entries to empty state.
+  ///
+  /// # Returns
+  /// Number of entries that were cleared
+  ///
+  /// # Examples
+  /// ```
+  /// let cache = AtomicGenericCache::<String>::new(1024);
+  /// cache.insert("key1", "value1".to_string());
+  /// cache.insert("key2", "value2".to_string());
+  ///
+  /// let cleared_count = cache.clear();
+  /// println!("Cleared {} entries", cleared_count);
+  /// ```
   pub fn clear(&self) -> usize {
     let mut cleared = 0;
 
-    for bucket in self.buckets.iter() {
-      for entry in &bucket.entries {
-        if entry.atomic_clear() {
-          cleared += 1;
-        }
+    for slot in self.entries.iter() {
+      if slot
+        .compare_exchange_state(STATE_WRITTEN, STATE_EMPTY)
+        .is_ok()
+      {
+        cleared += 1;
       }
     }
 
     cleared
   }
 
+  /// Removes multiple key-value pairs and returns only the successfully removed values.
+  ///
+  /// Unlike `remove_all`, this function filters out None values and returns only
+  /// the values that were actually found and removed.
+  ///
+  /// # Arguments
+  /// * `keys` - Vector of keys to remove
+  ///
+  /// # Returns
+  /// Vector containing only the values that were successfully removed
+  ///
+  /// # Examples
+  /// ```
+  /// let cache = AtomicGenericCache::<String>::new(1024);
+  /// cache.insert("key1", "value1".to_string());
+  /// cache.insert("key3", "value3".to_string());
+  ///
+  /// let keys = vec!["key1", "key2", "key3"];
+  /// let removed_values = cache.remove_existing(keys);
+  /// // removed_values will be ["value1", "value3"]
+  /// ```
   pub fn remove_existing(&self, keys: &Vec<K>) -> Vec<T> {
     keys.iter().filter_map(|key| self.remove(key)).collect()
   }
 
-  pub fn remove_oldest(&self, count: usize) -> Vec<(u32, T, u32, u32)> {
+  /// Removes the oldest entries from the cache.
+  ///
+  /// This function identifies and removes the oldest entries based on their sequence numbers.
+  /// Entries with lower sequence numbers are considered older and will be removed first.
+  ///
+  /// # Arguments
+  /// * `count` - Maximum number of oldest entries to remove
+  ///
+  /// # Returns
+  /// Vector of removed (key_hash, value, timestamp_nanos, sequence) tuples,
+  /// sorted by sequence number (oldest first). The actual number of removed
+  /// entries may be less than `count` if the cache contains fewer entries.
+  ///
+  /// # Examples
+  /// ```
+  /// let cache = AtomicGenericCache::<String>::new(1024, 2048);
+  /// cache.insert("key1", "value1".to_string());
+  /// cache.insert("key2", "value2".to_string());
+  /// cache.insert("key3", "value3".to_string());
+  ///
+  /// // Remove the 2 oldest entries
+  /// let removed = cache.remove_oldest(2);
+  /// println!("Removed {} oldest entries", removed.len());
+  ///
+  /// for (key_hash, value, timestamp, sequence) in removed {
+  ///     println!("Removed: key_hash={}, value={}, sequence={}", key_hash, value, sequence);
+  /// }
+  /// ```
+  pub fn remove_oldest(&self, count: usize) -> Vec<(u64, T, u64, u64)> {
     if count == 0 {
       return Vec::new();
     }
@@ -718,20 +1002,17 @@ where
     // First, collect all current entries with their metadata
     let mut candidates = Vec::new();
 
-    for bucket in self.buckets.iter() {
-      for entry in &bucket.entries {
-        let (state, version_before, hash) = entry.get_state_version_hash();
-        if state == STATE_WRITTEN {
-          let value = entry.load_value();
-          let (timestamp, sequence) = entry.get_timestamp_sequence();
+    for slot in self.entries.iter() {
+      if slot.get_state() == STATE_WRITTEN {
+        let version_before = slot.get_version();
+        let key_hash = slot.key_hash.load(Ordering::Relaxed);
+        let value = slot.load_value();
+        let timestamp = slot.timestamp_nanos.load(Ordering::Relaxed);
+        let sequence = slot.sequence.load(Ordering::Relaxed);
 
-          // Verify consistency
-          let (state_after, version_after, hash_after) = entry.get_state_version_hash();
-          if state_after == STATE_WRITTEN && 
-             version_after == version_before && 
-             hash_after == hash {
-            candidates.push((entry, hash, value, timestamp, sequence));
-          }
+        // Verify consistency
+        if version_before == slot.get_version() && slot.get_state() == STATE_WRITTEN {
+          candidates.push((slot, key_hash, value, timestamp, sequence));
         }
       }
     }
@@ -743,14 +1024,14 @@ where
     let mut removed = Vec::new();
     let remove_count = count.min(candidates.len());
 
-    for (entry, key_hash, value, timestamp, sequence) in candidates.into_iter().take(remove_count) {
+    for (slot, key_hash, value, timestamp, sequence) in candidates.into_iter().take(remove_count) {
       // Attempt to atomically transition from WRITTEN to TOMBSTONE
-      if entry
-        .compare_exchange_state(STATE_WRITTEN, STATE_TOMBSTONE, key_hash)
+      if slot
+        .compare_exchange_state(STATE_WRITTEN, STATE_TOMBSTONE)
         .is_ok()
       {
         // Double-check that this is still the same entry (sequence hasn't changed)
-        let (_, current_sequence) = entry.get_timestamp_sequence();
+        let current_sequence = slot.sequence.load(Ordering::Relaxed);
         if current_sequence == sequence {
           removed.push((key_hash, value, timestamp, sequence));
         }
@@ -762,37 +1043,50 @@ where
     removed
   }
 
+  /// Returns the number of entries currently in the cache.
+  ///
+  /// Note: This is a snapshot count and may change immediately after the call
+  /// in a concurrent environment.
+  ///
+  /// # Returns
+  /// Number of entries with STATE_WRITTEN
+  ///
+  /// # Examples
+  /// ```
+  /// let cache = AtomicGenericCache::<String>::new(1024);
+  /// cache.insert("key1", "value1".to_string());
+  ///
+  /// println!("Cache contains {} entries", cache.len());
+  /// ```
   #[inline]
   pub fn len(&self) -> usize {
-    self.buckets
+    self
+      .entries
       .iter()
-      .map(|bucket| {
-        bucket.entries
-          .iter()
-          .filter(|entry| {
-            let (state, _, _) = entry.get_state_version_hash();
-            state == STATE_WRITTEN
-          })
-          .count()
-      })
-      .sum()
+      .filter(|slot| slot.get_state() == STATE_WRITTEN)
+      .count()
   }
 
-  /// Check if cache is empty
-  pub fn is_empty(&self) -> bool {
-    self.buckets
-      .iter()
-      .all(|bucket| {
-        bucket.entries
-          .iter()
-          .all(|entry| {
-            let (state, _, _) = entry.get_state_version_hash();
-            state != STATE_WRITTEN
-          })
-      })
-  }
-
-  pub fn entries(&self) -> Vec<(u32, T)> {
+  /// Returns all entries as key-value pairs.
+  ///
+  /// This method returns tuples of (key_hash, value) for all entries in the cache.
+  /// Entries are sorted by sequence number (most recent first).
+  ///
+  /// # Returns
+  /// Vector of (key_hash, value) tuples
+  ///
+  /// # Examples
+  /// ```
+  /// let cache = AtomicGenericCache::<String>::new(1024);
+  /// cache.insert("key1", "value1".to_string());
+  /// cache.insert("key2", "value2".to_string());
+  ///
+  /// let entries = cache.entries();
+  /// for (key_hash, value) in entries {
+  ///     println!("Key hash: {}, Value: {}", key_hash, value);
+  /// }
+  /// ```
+  pub fn entries(&self) -> Vec<(u64, T)> {
     self
       .get_all()
       .into_iter()
@@ -800,13 +1094,43 @@ where
       .collect()
   }
 
-  pub fn drain(&self) -> Vec<(u32, T, u32, u32)> {
+  /// Drains all entries from the cache and returns them as a vector.
+  ///
+  /// This operation clears the cache and returns all entries that were present.
+  /// After this operation, the cache will be empty.
+  ///
+  /// # Returns
+  /// Vector of all entries that were in the cache, sorted by sequence number (most recent first)
+  ///
+  /// # Examples
+  /// ```
+  /// let cache = AtomicGenericCache::<String>::new(1024);
+  /// cache.insert("key1", "value1".to_string());
+  /// cache.insert("key2", "value2".to_string());
+  ///
+  /// let drained_entries = cache.drain();
+  /// assert!(cache.is_empty());
+  /// println!("Drained {} entries", drained_entries.len());
+  /// ```
+  pub fn drain(&self) -> Vec<(u64, T, u64, u64)> {
     let mut results = Vec::new();
 
-    for bucket in self.buckets.iter() {
-      for entry in &bucket.entries {
-        if let Some(drained) = entry.atomic_drain() {
-          results.push(drained);
+    for slot in self.entries.iter() {
+      if slot.get_state() == STATE_WRITTEN {
+        let version_before = slot.get_version();
+        let key = slot.key_hash.load(Ordering::Relaxed);
+        let value = slot.load_value();
+        let timestamp = slot.timestamp_nanos.load(Ordering::Relaxed);
+        let sequence = slot.sequence.load(Ordering::Relaxed);
+
+        // Verify consistency and try to remove
+        if version_before == slot.get_version()
+          && slot.get_state() == STATE_WRITTEN
+          && slot
+            .compare_exchange_state(STATE_WRITTEN, STATE_EMPTY)
+            .is_ok()
+        {
+          results.push((key, value, timestamp, sequence));
         }
       }
     }
@@ -816,28 +1140,79 @@ where
     results
   }
 
+  /// Checks if the cache is empty.
+  ///
+  /// # Returns
+  /// `true` if no entries have STATE_WRITTEN, `false` otherwise
+  ///
+  /// # Examples
+  /// ```
+  /// let cache = AtomicGenericCache::<String>::new(1024);
+  /// assert!(cache.is_empty());
+  ///
+  /// cache.insert("key1", "value1".to_string());
+  /// assert!(!cache.is_empty());
+  /// ```
+  #[inline]
+  pub fn is_empty(&self) -> bool {
+    !self
+      .entries
+      .iter()
+      .any(|slot| slot.get_state() == STATE_WRITTEN)
+  }
+
+  /// Returns the total capacity of the cache.
+  ///
+  /// This is the maximum number of entries the cache can hold.
+  ///
+  /// # Returns
+  /// Total capacity (always a power of 2)
+  ///
+  /// # Examples
+  /// ```
+  /// let cache = AtomicGenericCache::<String>::new(1000);
+  /// println!("Cache capacity: {}", cache.capacity()); // Will be 1024 (next power of 2)
+  /// ```
   #[inline]
   pub fn capacity(&self) -> usize {
-    self.bucket_count * 4
+    self.capacity_mask + 1
   }
 
-  pub fn get_all(&self) -> Vec<(u32, T, u32, u32)> {
+  /// Returns all entries in the cache with their metadata.
+  ///
+  /// Results are sorted by sequence number (most recent first).
+  /// This operation provides a consistent snapshot of the cache contents.
+  ///
+  /// # Returns
+  /// Vector of tuples containing (key_hash, value, timestamp_nanos, sequence).
+  /// Timestamp is in UTC nanoseconds since Unix epoch.
+  ///
+  /// # Examples
+  /// ```
+  /// let cache = AtomicGenericCache::<String>::new(1024);
+  /// cache.insert("key1", "value1".to_string());
+  /// cache.insert("key2", "value2".to_string());
+  ///
+  /// let all_entries = cache.get_all();
+  /// for (key_hash, value, timestamp, sequence) in all_entries {
+  ///     println!("Key hash: {}, Value: {}, UTC Timestamp: {} ns, Sequence: {}",
+  ///              key_hash, value, timestamp, sequence);
+  /// }
+  /// ```
+  pub fn get_all(&self) -> Vec<(u64, T, u64, u64)> {
     let mut results = Vec::new();
 
-    for bucket in self.buckets.iter() {
-      for entry in &bucket.entries {
-        let (state, version_before, hash) = entry.get_state_version_hash();
-        if state == STATE_WRITTEN {
-          let value = entry.load_value();
-          let (timestamp, sequence) = entry.get_timestamp_sequence();
+    for slot in self.entries.iter() {
+      if slot.get_state() == STATE_WRITTEN {
+        let version_before = slot.get_version();
+        let key = slot.key_hash.load(Ordering::Relaxed);
+        let value = slot.load_value();
+        let timestamp = slot.timestamp_nanos.load(Ordering::Relaxed);
+        let sequence = slot.sequence.load(Ordering::Relaxed);
 
-          // Verify consistency
-          let (state_after, version_after, hash_after) = entry.get_state_version_hash();
-          if state_after == STATE_WRITTEN && 
-             version_after == version_before && 
-             hash_after == hash {
-            results.push((hash, value, timestamp, sequence));
-          }
+        // Verify consistency
+        if version_before == slot.get_version() && slot.get_state() == STATE_WRITTEN {
+          results.push((key, value, timestamp, sequence));
         }
       }
     }
@@ -847,28 +1222,52 @@ where
     results
   }
 
+  /// Retains only entries that satisfy the given predicate.
+  ///
+  /// Entries that don't match the predicate are marked as tombstones.
+  ///
+  /// # Arguments
+  /// * `predicate` - Function that takes (value, timestamp_nanos, sequence) and returns bool.
+  ///                 Timestamp is in UTC nanoseconds since Unix epoch.
+  ///
+  /// # Returns
+  /// Number of entries that were removed
+  ///
+  /// # Examples
+  /// ```
+  /// let cache = AtomicGenericCache::<String>::new(1024);
+  /// cache.insert("keep", "important".to_string());
+  /// cache.insert("remove", "unimportant".to_string());
+  ///
+  /// // Keep only entries containing "important"
+  /// let removed_count = cache.retain(|value, _timestamp, _sequence| {
+  ///     value.contains("important")
+  /// });
+  ///
+  /// println!("Removed {} entries", removed_count);
+  /// ```
   pub fn retain<F>(&self, mut predicate: F) -> usize
   where
-    F: FnMut(&T, u32, u32) -> bool,
+    F: FnMut(&T, u64, u64) -> bool,
   {
     let mut removed_count = 0;
 
-    for bucket in self.buckets.iter() {
-      for entry in &bucket.entries {
-        let (state, version_before, hash) = entry.get_state_version_hash();
-        if state == STATE_WRITTEN {
-          let value = entry.load_value();
-          let (timestamp, sequence) = entry.get_timestamp_sequence();
+    for slot in self.entries.iter() {
+      if slot.get_state() == STATE_WRITTEN {
+        let version_before = slot.get_version();
+        let value = slot.load_value();
+        let timestamp = slot.timestamp_nanos.load(Ordering::Relaxed);
+        let sequence = slot.sequence.load(Ordering::Relaxed);
 
-          // Verify consistency
-          let (state_after, version_after, hash_after) = entry.get_state_version_hash();
-          if state_after == STATE_WRITTEN && 
-             version_after == version_before && 
-             hash_after == hash &&
-             !predicate(&value, timestamp, sequence) &&
-             entry.compare_exchange_state(STATE_WRITTEN, STATE_TOMBSTONE, hash).is_ok() {
-            removed_count += 1;
-          }
+        // Verify consistency
+        if version_before == slot.get_version()
+          && slot.get_state() == STATE_WRITTEN
+          && !predicate(&value, timestamp, sequence)
+          && slot
+            .compare_exchange_state(STATE_WRITTEN, STATE_TOMBSTONE)
+            .is_ok()
+        {
+          removed_count += 1;
         }
       }
     }
@@ -876,6 +1275,26 @@ where
     removed_count
   }
 
+  /// Helper method to make hash_key public for HashMap conversions.
+  ///
+  /// This method exposes the internal hashing function so users can
+  /// compute key hashes when working with HashMap conversions.
+  ///
+  /// # Arguments
+  /// * `key` - Key to hash
+  ///
+  /// # Returns
+  /// 64-bit hash value for the key
+  ///
+  /// # Examples
+  /// ```
+  /// let cache = AtomicGenericCache::<String>::new(1024);
+  /// let hash1 = cache.compute_key_hash(&"key1");
+  /// let hash2 = cache.compute_key_hash(&"key2");
+  ///
+  /// assert_ne!(hash1, hash2); // Different keys should have different hashes
+  /// assert_ne!(hash1, 0);     // Hash should be non-zero
+  /// ```
   pub fn compute_key_hash(&self, key: &K) -> u64 {
     self.hash_key(key)
   }
@@ -885,7 +1304,7 @@ where
 #[cfg(debug_assertions)]
 mod tests {
   use super::*;
-  use std::{sync::atomic::AtomicBool, thread, time::Duration};
+  use std::{collections::HashSet, sync::atomic::AtomicBool, thread, time::Duration};
 
   trait CacheableValue: Clone + Send + Sync + Default + 'static {
     const IS_LOCK_FREE: bool = size_of::<Self>() <= 8 && align_of::<Self>() <= 8;
@@ -893,7 +1312,7 @@ mod tests {
 
   impl<T> CacheableValue for T where T: Clone + Send + Sync + Default + 'static {}
 
-  fn create_cache<K: Clone + Hash + Eq + Send + Sync + 'static, T: CacheableValue>(
+  fn create_cache<K: Hash + Eq + Send + Sync + 'static, T: CacheableValue>(
     capacity: usize,
   ) -> Arc<AtomicGenericCache<K, T>> {
     AtomicGenericCache::new(capacity, 0)
@@ -1060,7 +1479,7 @@ mod tests {
       }
     }
 
-    assert!(found_count >= 32); // Should find at least some keys
+    assert!(found_count > 50); // Should find at least some keys
   }
 
   #[test]
@@ -1970,7 +2389,7 @@ mod tests {
     }
 
     let initial_len = cache.len();
-    assert!(initial_len > 80);
+    assert_eq!(initial_len, 100);
 
     // Concurrent drain operations
     let mut handles = vec![];
@@ -1994,7 +2413,7 @@ mod tests {
     assert!(!all_drained.is_empty());
 
     // Verify no duplicate entries were drained
-    let mut key_hashes: Vec<u64> = all_drained.iter().map(|(hash, _, _, _)| *hash as u64).collect::<Vec<u64>>();
+    let mut key_hashes: Vec<u64> = all_drained.iter().map(|(hash, _, _, _)| *hash).collect();
     key_hashes.sort();
     let original_len = key_hashes.len();
     key_hashes.dedup();
@@ -2033,7 +2452,7 @@ mod tests {
       assert!(cache.insert(format!("key_{}", i), i).unwrap());
     }
 
-    assert!(cache.len() > 95);
+    assert_eq!(cache.len(), 100);
 
     cache.clear();
 
@@ -2049,6 +2468,6 @@ mod tests {
       _ = cache.insert(format!("key_{}", i), i);
     }
 
-    assert!(cache.len() <= 530 && cache.capacity() >= 470);
+    assert_eq!(cache.len(), 512);
   }
 }
