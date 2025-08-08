@@ -44,7 +44,7 @@ impl ConcurrentProcessor {
         while let Ok(pointers) = iterator.next_row_pointers().await {
             //println!("pointers: {:?}", pointers);
 
-            if pointers.is_empty() {
+            if pointers.len() == 0 {
                 break;
             }
 
@@ -107,12 +107,12 @@ impl ConcurrentProcessor {
                     };
 
                     let operation = match operations_type.as_str() {
-                        ">" => ComparerOperation::Greater,
-                        "<" => ComparerOperation::Less,
+                        ">" => ComparerOperation::Less, // reverse for logical operations
+                        "<" => ComparerOperation::Greater, // reverse for logical operations
                         "=" => ComparerOperation::Equals,
                         "!=" => ComparerOperation::NotEquals,
-                        ">=" => ComparerOperation::GreaterOrEquals,
-                        "<=" => ComparerOperation::LessOrEquals,
+                        "<=" => ComparerOperation::GreaterOrEquals, // reverse for logical operations
+                        ">=" => ComparerOperation::LessOrEquals, // reverse for logical operations
                         "CONTAINS" => ComparerOperation::Contains,
                         "STARTSWITH" => ComparerOperation::StartsWith,
                         "ENDSWITH" => ComparerOperation::EndsWith,
@@ -139,7 +139,7 @@ impl ConcurrentProcessor {
 
                     let transformer = ColumnTransformer::new(
                         db_type,
-                        value.clone(),
+                        value,
                         ColumnTransformerType::ComparerOperation(operation),
                         None
                     );
@@ -150,7 +150,7 @@ impl ConcurrentProcessor {
                 };
 
                 // Process each pointer in this batch (same as your original code)
-                for pointer in pointers {
+                for pointer in pointers.iter() {
                     let tuple_clone_2 = tuple_clone.clone();
                     let (_, io_clone, row_fetch) = &*tuple_clone_2;
 

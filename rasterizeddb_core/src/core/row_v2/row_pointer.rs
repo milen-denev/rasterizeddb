@@ -128,7 +128,7 @@ impl<'a, S: StorageIO> RowPointerIterator<'a, S> {
         
         // Read data into the buffer
         let mut read_position = self.position;
-        self.io.read_data_into_buffer(&mut read_position, &mut self.buffer.into_slice_mut()).await;
+        _ = self.io.read_data_into_buffer(&mut read_position, &mut self.buffer.into_slice_mut()).await;
         self.buffer_valid_length = self.buffer.into_slice().len();
         
         // Update position for next read
@@ -167,9 +167,9 @@ impl<'a, S: StorageIO> RowPointerIterator<'a, S> {
     }
     
     /// Get multiple RowPointers at once, up to BATCH_SIZE
-    pub async fn next_row_pointers(&mut self) -> Result<Vec<RowPointer>> {
-        let mut pointers = Vec::with_capacity(BATCH_SIZE);
-        
+    pub async fn next_row_pointers(&mut self) -> Result<SmallVec<[RowPointer; BATCH_SIZE]>> {
+        let mut pointers: SmallVec<[RowPointer; BATCH_SIZE]> = SmallVec::new();
+
         for _ in 0..BATCH_SIZE {
             match self.next_row_pointer().await? {
                 Some(pointer) => pointers.push(pointer),
@@ -195,7 +195,7 @@ impl<'a, S: StorageIO> RowPointerIterator<'a, S> {
 
         position = position - TOTAL_LENGTH as u64;
 
-        self.io.read_data_into_buffer(&mut position, &mut slice).await;
+        _ = self.io.read_data_into_buffer(&mut position, &mut slice).await;
 
         let row_pointer = RowPointer::from_slice(&slice);
 
@@ -616,7 +616,7 @@ impl RowPointer {
         let mut slice: [u8; TOTAL_LENGTH] = [0; TOTAL_LENGTH];
 
         // Read all data in one operation
-        io.read_data_into_buffer(position, &mut slice).await;
+        _ = io.read_data_into_buffer(position, &mut slice).await;
 
         let row_pointer = Self::from_slice(&slice);
 
@@ -655,21 +655,21 @@ impl RowPointer {
                 // For strings, we need to read the size first
                 let mut string_position_buffer = [0u8; 8];
 
-                io.read_data_into_buffer(&mut position, &mut string_position_buffer).await;
+                _ = io.read_data_into_buffer(&mut position, &mut string_position_buffer).await;
 
                 // Turn [u8] into u64
                 let mut string_row_position = unsafe { simds::endianess::read_u64(string_position_buffer.as_ptr()) };
 
                 let mut string_size_buffer = [0u8; 4];
 
-                io.read_data_into_buffer(&mut position, &mut string_size_buffer).await;
+                _ = io.read_data_into_buffer(&mut position, &mut string_size_buffer).await;
                 let string_size = unsafe { simds::endianess::read_u32(string_size_buffer.as_ptr()) };
 
                 // Read the string data
                 let string_block = MEMORY_POOL.acquire(string_size as usize);
                 let string_slice = string_block.into_slice_mut();
 
-                io.read_data_into_buffer(&mut string_row_position, string_slice).await;
+                _ = io.read_data_into_buffer(&mut string_row_position, string_slice).await;
 
                 // Create a column with the string data
                 let column = Column {
@@ -689,7 +689,7 @@ impl RowPointer {
                 let slice = block.into_slice_mut();
                 
                 // Read the column data directly into our buffer
-                io.read_data_into_buffer(&mut position, slice).await;
+                _ = io.read_data_into_buffer(&mut position, slice).await;
 
                 // Create a Column object with the read data
                 let column = Column {
@@ -731,21 +731,21 @@ impl RowPointer {
                 // For strings, we need to read the size first
                 let mut string_position_buffer = [0u8; 8];
 
-                io.read_data_into_buffer(&mut position, &mut string_position_buffer).await;
+                _ = io.read_data_into_buffer(&mut position, &mut string_position_buffer).await;
 
                 // Turn [u8] into u64
                 let mut string_row_position = unsafe { simds::endianess::read_u64(string_position_buffer.as_ptr()) };
 
                 let mut string_size_buffer = [0u8; 4];
 
-                io.read_data_into_buffer(&mut position, &mut string_size_buffer).await;
+                _ = io.read_data_into_buffer(&mut position, &mut string_size_buffer).await;
                 let string_size = unsafe { simds::endianess::read_u32(string_size_buffer.as_ptr()) };
 
                 // Read the string data
                 let string_block = MEMORY_POOL.acquire(string_size as usize);
                 let string_slice = string_block.into_slice_mut();
 
-                io.read_data_into_buffer(&mut string_row_position, string_slice).await;
+                _ = io.read_data_into_buffer(&mut string_row_position, string_slice).await;
 
                 // Create a column with the string data
                 let column = Column {
@@ -765,7 +765,7 @@ impl RowPointer {
                 let slice = block.into_slice_mut();
                 
                 // Read the column data directly into our buffer
-                io.read_data_into_buffer(&mut position, slice).await;
+                _ = io.read_data_into_buffer(&mut position, slice).await;
 
                 // Create a Column object with the read data
                 let column = Column {
@@ -812,27 +812,21 @@ impl RowPointer {
                 // For strings, we need to read the size first
                 let mut string_position_buffer = [0u8; 8];
 
-                io.read_data_into_buffer(&mut position, &mut string_position_buffer).await;
+                _ = io.read_data_into_buffer(&mut position, &mut string_position_buffer).await;
 
                 // Turn [u8] into u64
                 let mut string_row_position = unsafe { simds::endianess::read_u64(string_position_buffer.as_ptr()) };
 
                 let mut string_size_buffer = [0u8; 4];
 
-                io.read_data_into_buffer(&mut position, &mut string_size_buffer).await;
+                _ = io.read_data_into_buffer(&mut position, &mut string_size_buffer).await;
                 let string_size = unsafe { simds::endianess::read_u32(string_size_buffer.as_ptr()) };
 
                 let string_block = MEMORY_POOL.acquire(string_size as usize);
 
-                let string_slice = if let Some(slice_exists) = io.read_slice_pointer(&mut string_row_position, string_size as usize).await {
-                    slice_exists
-                } else {
-                    // Read the string data 
-                    let string_slice = string_block.into_slice_mut();
-                    io.read_data_into_buffer(&mut string_row_position, string_slice).await;
-                    string_slice
-                };
-
+                let string_slice = string_block.into_slice_mut();
+                _ = io.read_data_into_buffer(&mut string_row_position, string_slice).await;
+            
                 let default_string_slice = string_block.into_slice_mut();
                 unsafe { std::ptr::copy_nonoverlapping(string_slice.as_ptr(), default_string_slice.as_mut_ptr(), string_size as usize); };
 
@@ -854,7 +848,7 @@ impl RowPointer {
                 let slice = block.into_slice_mut();
                 
                 // Read the column data directly into our buffer
-                io.read_data_into_buffer(&mut position, slice).await;
+                _ = io.read_data_into_buffer(&mut position, slice).await;
 
                 // Create a Column object with the read data
                 let column = Column {
