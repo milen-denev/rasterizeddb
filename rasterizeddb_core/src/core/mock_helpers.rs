@@ -50,7 +50,7 @@ pub fn create_row_write(with_large_string: bool) -> RowWrite {
         let large_string_data = create_large_string_column();
 
         RowWrite {
-            columns_writing_data: vec![
+            columns_writing_data: smallvec::smallvec![
                 ColumnWritePayload {
                     data: string_data,
                     write_order: 0,
@@ -73,7 +73,7 @@ pub fn create_row_write(with_large_string: bool) -> RowWrite {
         }
     } else {
         RowWrite {
-            columns_writing_data: vec![
+            columns_writing_data: smallvec::smallvec![
                 ColumnWritePayload {
                     data: string_data,
                     write_order: 0,
@@ -98,7 +98,7 @@ pub fn create_row_write_custom_i32(val: i32, with_large_string: bool) -> RowWrit
         let large_string_data = create_large_string_column();
 
         RowWrite {
-            columns_writing_data: vec![
+            columns_writing_data: smallvec::smallvec![
                 ColumnWritePayload {
                     data: string_data,
                     write_order: 0,
@@ -121,7 +121,7 @@ pub fn create_row_write_custom_i32(val: i32, with_large_string: bool) -> RowWrit
         }
     } else {
         RowWrite {
-            columns_writing_data: vec![
+            columns_writing_data: smallvec::smallvec![
                 ColumnWritePayload {
                     data: string_data,
                     write_order: 0,

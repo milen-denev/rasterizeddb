@@ -404,7 +404,7 @@ fn create_f64_column(data: f64, write_order: u32) -> ColumnWritePayload {
 
 fn create_row_write(id: u64, notes: Option<String>) -> RowWrite {
     RowWrite {
-        columns_writing_data: vec![
+        columns_writing_data: smallvec::smallvec![
             create_u64_column(id, 0),
             create_string_column("John Doe", 1),
             create_u8_column(30, 2),
