@@ -8,7 +8,8 @@ pub enum QueryPurpose {
     RenameColumn(String),
     InsertRow(String),
     UpdateRow(String),
-    DeleteRow(String)
+    DeleteRow(String),
+    QueryRows(String),
 }
 
 pub fn test() -> bool {
@@ -38,12 +39,14 @@ pub fn recognize_query_purpose(query: &str) -> Option<QueryPurpose> {
         } else {
             None
         }
-    } else if simd_compare_strings(query_bytes, b"INSERT", &StartsWith) {
+    } else if simd_compare_strings(query_bytes, b"INSERT INTO", &StartsWith) {
         Some(InsertRow(query_trimmed.to_string()))
     } else if simd_compare_strings(query_bytes, b"UPDATE", &StartsWith) {
         Some(UpdateRow(query_trimmed.to_string()))
-    } else if simd_compare_strings(query_bytes, b"DELETE", &StartsWith) {
+    } else if simd_compare_strings(query_bytes, b"DELETE FROM", &StartsWith) {
         Some(DeleteRow(query_trimmed.to_string()))
+    } else if simd_compare_strings(query_bytes, b"SELECT", &StartsWith) {
+        Some(QueryRows(query_trimmed.to_string()))
     } else {
         None
     }

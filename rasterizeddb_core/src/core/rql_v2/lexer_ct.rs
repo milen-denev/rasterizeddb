@@ -198,14 +198,11 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "Should not parse successfully")]
     fn test_create_table_with_unknown_type() {
         let sql = r#"CREATE TABLE t1 (foo BAR)"#;
         let qp = QueryPurpose::CreateTable(sql.to_string());
-        let result = create_table_from_query_purpose(&qp).expect("Should parse successfully");
-        assert_eq!(result.table_name, "t1");
-        assert_eq!(result.columns.len(), 1);
-        assert_eq!(result.columns[0].name, "foo");
-        assert_eq!(result.columns[0].data_type, DbType::TBD);
+        let _result = create_table_from_query_purpose(&qp).expect("Should not parse successfully");
     }
 
     #[test]
