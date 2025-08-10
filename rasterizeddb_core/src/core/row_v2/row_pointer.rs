@@ -1069,7 +1069,7 @@ mod tests {
 
     fn create_row_write(id: u64) -> RowWrite {
         RowWrite {
-            columns_writing_data: vec![
+            columns_writing_data: smallvec::smallvec![
                 create_u64_column(id, 0),
                 create_string_column("John Doe", 1),
                 create_u8_column(30, 2),
@@ -1250,7 +1250,7 @@ mod tests {
         i32_slice.copy_from_slice(&i32_bytes);
 
         let row_write = RowWrite {
-            columns_writing_data: vec![
+            columns_writing_data: smallvec::smallvec![
                 ColumnWritePayload {
                     data: string_data,
                     write_order: 0,
@@ -1302,7 +1302,7 @@ mod tests {
         i32_slice.copy_from_slice(&i32_bytes);
 
         let row_write = RowWrite {
-            columns_writing_data: vec![
+            columns_writing_data: smallvec::smallvec![
                 ColumnWritePayload {
                     data: string_data,
                     write_order: 0,

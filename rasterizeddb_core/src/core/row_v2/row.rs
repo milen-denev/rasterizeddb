@@ -17,7 +17,7 @@ pub struct ColumnFetchingData {
 }
 
 pub struct RowWrite {
-    pub columns_writing_data: Vec<ColumnWritePayload>
+    pub columns_writing_data: SmallVec<[ColumnWritePayload; 32]>
 }
 
 pub struct ColumnWritePayload {
