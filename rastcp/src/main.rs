@@ -1,7 +1,11 @@
+use std::env;
+
 use rastcp::{client::TcpClient, server::TcpServerBuilder};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    unsafe { env::set_var("RUST_LOG", "debug"); }
+
     env_logger::init();
     
     tokio::spawn(async move { 
@@ -28,10 +32,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Starting client with insecure certificate verification...");
     // Create a client that accepts any server certificate
-    let mut client = TcpClient::new("127.0.0.1:8080").await?;
+    let mut client = TcpClient::new("127.0.0.1:8080").await.expect("Failed to create client");
     
     // Connect explicitly (optional, as send will connect if needed)
-    client.connect().await?;
+    client.connect().await.expect("Failed to connect to server");
     
     // Send multiple messages over the same connection
     let response1 = client.send(b"Hello, secure world! (1)".to_vec()).await?;

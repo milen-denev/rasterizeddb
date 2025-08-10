@@ -16,9 +16,11 @@ async fn test_client_server_communication() {
     
     let server_handle = tokio::spawn(async move {
         server.run(|data| async move {
+            println!("[SERVER HANDLER] Received data: {}", String::from_utf8_lossy(&data));
             // Echo with prefix
             let mut response = b"Echo: ".to_vec();
             response.extend_from_slice(&data);
+            println!("[SERVER HANDLER] Sending response: {}", String::from_utf8_lossy(&response));
             response
         }).await.unwrap();
     });
@@ -34,9 +36,12 @@ async fn test_client_server_communication() {
         .await
         .unwrap();
     
-    // Send a message
+    println!("[TEST] Connecting client...");
+    client.connect().await.unwrap();
+    println!("[TEST] Client connected. Sending message...");
     let message = b"Hello, test world!".to_vec();
     let response = client.send(message).await.unwrap();
+    println!("[TEST] Message sent. Got response: {}", String::from_utf8_lossy(&response));
     
     assert_eq!(
         String::from_utf8_lossy(&response),
@@ -69,8 +74,11 @@ async fn test_multiple_clients() {
         server.run(move |data| {
             let message_count = message_count_clone.clone();
             async move {
+                println!("[SERVER HANDLER] Received data: {}", String::from_utf8_lossy(&data));
                 let mut count = message_count.lock().await;
                 *count += 1;
+                println!("[SERVER HANDLER] Message count incremented: {}", *count);
+                println!("[SERVER HANDLER] Sending response: {}", String::from_utf8_lossy(&data));
                 data // Simple echo
             }
         }).await.unwrap();
@@ -93,9 +101,14 @@ async fn test_multiple_clients() {
                 .await
                 .unwrap();
             
+            println!("[TEST] Client {} connecting...", i);
+            client.connect().await.unwrap();
+            println!("[TEST] Client {} connected.", i);
             for j in 0..message_per_client {
                 let message = format!("Message {}-{}", i, j).into_bytes();
+                println!("[TEST] Client {} sending message {}...", i, j);
                 let response = client.send(message.clone()).await.unwrap();
+                println!("[TEST] Client {} got response for message {}.", i, j);
                 assert_eq!(response, message);
             }
             

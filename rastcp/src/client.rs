@@ -186,7 +186,12 @@ impl TcpClient {
         debug!("Sent {} bytes", data.len());
         
         // Receive response
-        let response = read_message(stream).await?;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(30), 
+            read_message(stream))
+            .await
+            .expect("Timeout while reading response")?;
+
         debug!("Received {} bytes response", response.len());
         
         Ok(response)

@@ -16,7 +16,7 @@ where
         }
     })?;
     
-    let len = u32::from_be_bytes(len_bytes) as usize;
+    let len = u32::from_le_bytes(len_bytes) as usize;
     let mut buffer = vec![0u8; len];
     stream.read_exact(&mut buffer).await.map_err(|e| {
         if e.kind() == io::ErrorKind::UnexpectedEof {
@@ -36,11 +36,11 @@ where
 {
     let len = data.len() as u32;
     let len_bytes = len.to_le_bytes();
-    
+
     stream.write_all(&len_bytes).await?;
     stream.write_all(data).await?;
     stream.flush().await?;
-    
+
     Ok(())
 }
 
