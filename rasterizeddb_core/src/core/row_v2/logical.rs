@@ -81,10 +81,10 @@ mod tests {
 
         assert!(perform_comparison_operation(&input1, &input1, &DbType::I32, &ComparerOperation::Equals));
         assert!(!perform_comparison_operation(&input1, &input2, &DbType::I32, &ComparerOperation::Equals));
-        assert!(perform_comparison_operation(&input1, &input2, &DbType::I32, &ComparerOperation::Less));
-        assert!(perform_comparison_operation(&input2, &input1, &DbType::I32, &ComparerOperation::Greater));
+        assert!(perform_comparison_operation(&input2, &input1, &DbType::I32, &ComparerOperation::Less));
+        assert!(perform_comparison_operation(&input1, &input2, &DbType::I32, &ComparerOperation::Greater));
         assert!(perform_comparison_operation(&input1, &input1, &DbType::I32, &ComparerOperation::GreaterOrEquals));
-        assert!(perform_comparison_operation(&input1, &input2, &DbType::I32, &ComparerOperation::LessOrEquals));
+        assert!(perform_comparison_operation(&input2, &input1, &DbType::I32, &ComparerOperation::LessOrEquals));
     }
 
     #[test]
