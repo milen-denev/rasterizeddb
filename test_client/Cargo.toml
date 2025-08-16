@@ -7,6 +7,8 @@ edition = "2024"
 rasterizeddb_core = { path = "../rasterizeddb_core" }
 tokio = { version = "1", features = ["full"] }
 stopwatch = "0.0.7"
+env_logger = "0.11.8"
+log = "0.4.27"
 
 [profile.release]
 opt-level = 3

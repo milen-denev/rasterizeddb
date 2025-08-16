@@ -3,7 +3,7 @@ use axum::http::header;
 use axum::Router;
 use axum::{response::Response, routing::get};
 use rasterizeddb_core::client::DbClient;
-use rasterizeddb_core::core::support_types::ReturnResult;
+use rasterizeddb_core::core::row_v2::row::ReturnResult;
 
 static CLIENT: async_lazy::Lazy<DbClient> =
     async_lazy::Lazy::new(|| {
@@ -78,12 +78,12 @@ async fn query() -> Response {
 
     match result {
         ReturnResult::Rows(rows) => {
-            for row in rows.iter() {
-                let columns = row.columns().unwrap();
-                for (i, column) in columns.iter().enumerate() {
-                    output.push_str(&format!("Column ({}): {} | ", i, column.into_value()));
-                }
-                output.push_str("\n");
+            for _row in rows.iter() {
+                // let columns = row.columns().unwrap();
+                // for (i, column) in columns.iter().enumerate() {
+                //     output.push_str(&format!("Column ({}): {} | ", i, column.into_value()));
+                // }
+                // output.push_str("\n");
             }
         },
         ReturnResult::HtmlView(html_string) => {
