@@ -1,4 +1,4 @@
-use std::io;
+use std::{io, sync::Arc};
 
 use itertools::Itertools;
 
@@ -297,6 +297,7 @@ impl<'a, S: StorageIO> SchemaFieldIterator<'a, S> {
     }
 }
 
+#[derive(Debug)]
 pub struct TableSchema {
     pub name: String,
     pub fields: Vec<SchemaField>,
@@ -305,6 +306,7 @@ pub struct TableSchema {
     pub is_immutable: bool
 }
 
+#[derive(Debug)]
 pub struct TableIndex {
     pub name: String,
     pub fields: Vec<String>,
@@ -322,28 +324,32 @@ impl TableSchema {
         }
     }
 
-    pub async fn load(schema_io: &mut impl StorageIO) -> io::Result<Self> {
+    pub async fn load<S: StorageIO>(schema_io: Arc<S>) -> io::Result<Self> {
         let buffer = MEMORY_POOL.acquire(TABLE_SIZE);
         _ = schema_io.read_data_into_buffer(&mut 0, &mut buffer.into_slice_mut()).await;
         
-        let result = match  TableSchema::from_vec(&buffer.into_slice()) {
-            Ok(table_schema) => Ok(table_schema),
+        let result = match TableSchema::from_vec(&buffer.into_slice()) {
+            Ok(mut table_schema) => {
+                let mut field_io = schema_io.create_new(format!("{}_{}", schema_io.get_name().replace(".db", ""), "FIELDS.db")).await;
+                let mut field_iterator = SchemaFieldIterator::new(&mut field_io).await.unwrap();
+
+                let mut all_fields: Vec<SchemaField> = Vec::new();
+
+                while let Ok(mut fields) = field_iterator.next_schema_fields().await {
+                    if fields.is_empty() {
+                        break;
+                    }
+                    all_fields.append(&mut fields);
+                }
+
+                table_schema.fields = all_fields;
+
+                Ok(table_schema)
+            },
             Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, format!("Failed to parse TableSchema: {}", e))),
         };
 
         result
-    }
-
-    /// Saves the schema to a file
-    pub fn save_schema<S: StorageIO>(
-        &self, 
-        _schema_io: &mut S,
-        _indexes_io: &mut S,
-        _field_io: &mut S) -> Result<(), String> {
-        
-
-
-        Ok(())
     }
 
     pub fn into_vec(&self) -> Vec<u8> {
@@ -422,15 +428,15 @@ impl TableSchema {
         })
     }
     
-    pub async fn save(&self, schema_io: &mut impl StorageIO) -> io::Result<()> {
+    pub async fn save<S: StorageIO>(&self, schema_io: Arc<S>) -> io::Result<()> {
         let data = self.into_vec();
-        schema_io.append_data(&data, true).await;
+        schema_io.write_data(0, &data).await;
         Ok(())
     }
 
     pub async fn add_field<S: StorageIO>(
         &mut self, 
-        schema_io: &S, 
+        schema_io: Arc<S>, 
         field_name: String, 
         db_type: DbType, 
         is_unique: bool) {
@@ -491,7 +497,7 @@ impl TableSchema {
 
     pub async fn mark_field_as_deleted<S: StorageIO>(
         &mut self, field_name: &str,
-        schema_io: &S) {
+        schema_io: Arc<S>) {
 
         for field in self.fields.iter_mut() {
             if field.name == field_name {
@@ -519,9 +525,9 @@ impl TableSchema {
 }
 
 /// Iterates over TableSchema objects from a StorageIO in chunks
-pub struct TableSchemaIterator<'a, S: StorageIO> {
+pub struct TableSchemaIterator<S: StorageIO> {
     /// Reference to the storage provider
-    io: &'a mut S,
+    io: Arc<S>,
     /// Current position in the storage
     position: u64,
     /// Buffer to store chunks
@@ -536,9 +542,9 @@ pub struct TableSchemaIterator<'a, S: StorageIO> {
     end_of_data: bool,
 }
 
-impl<'a, S: StorageIO> TableSchemaIterator<'a, S> {
+impl<S: StorageIO> TableSchemaIterator<S> {
     /// Create a new TableSchemaIterator for the given StorageIO
-    pub async fn new(io: &'a mut S) -> io::Result<Self> {
+    pub async fn new(io: Arc<S>) -> io::Result<Self> {
         let total_length = io.get_len().await as usize;
         
         // Use a reasonable chunk size (multiple of TABLE_SIZE)
@@ -877,7 +883,7 @@ mod tests {
     }
 
     // Helper function to save a table schema to storage
-    async fn save_table_schema<S: StorageIO>(schema: &TableSchema, storage: &mut S) -> io::Result<()> {
+    async fn save_table_schema<S: StorageIO>(schema: &TableSchema, storage: Arc<S>) -> io::Result<()> {
         schema.save(storage).await
     }
 
@@ -964,23 +970,23 @@ mod tests {
     
     #[tokio::test]
     async fn test_table_schema_serialize_deserialize() {
-        let mut mock_io = MockStorageProvider::new().await;
+        let mock_io = Arc::new(MockStorageProvider::new().await);
 
         // Create schema with fields and indexes
         let mut schema = create_test_table_schema("orders", Some("order_id"));
-        
-        schema.save(&mut mock_io).await.unwrap();
+
+        schema.save(mock_io.clone()).await.unwrap();
 
         // Add fields
 
         schema.add_field(
-            &mut mock_io, 
+            mock_io.clone(),
             "order_id".to_string(),
             DbType::I64,
             false).await;
         
         schema.add_field(
-            &mut mock_io,
+            mock_io.clone(),
             "created_at".to_string(),
             DbType::U64,
             false).await;
@@ -999,14 +1005,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_table_schema_mutability() {
-        let mut mock_io = MockStorageProvider::new().await;
+        let mock_io = Arc::new(MockStorageProvider::new().await);
 
         // Create schema with fields and indexes
         let schema = create_test_table_schema_immutable("orders", Some("order_id"));
-        
-        schema.save(&mut mock_io).await.unwrap();
 
-        let mut schema_iter = TableSchemaIterator::new(&mut mock_io).await.unwrap();
+        schema.save(mock_io.clone()).await.unwrap();
+
+        let mut schema_iter = TableSchemaIterator::new(mock_io.clone()).await.unwrap();
 
         let schema = schema_iter.next_table_schema().await.unwrap().unwrap();
 
@@ -1016,14 +1022,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_table_schema_mutability_2() {
-        let mut mock_io = MockStorageProvider::new().await;
+       let mock_io = Arc::new(MockStorageProvider::new().await);
 
         // Create schema with fields and indexes
         let schema = create_test_table_schema("orders", Some("order_id"));
-        
-        schema.save(&mut mock_io).await.unwrap();
 
-        let mut schema_iter = TableSchemaIterator::new(&mut mock_io).await.unwrap();
+        schema.save(mock_io.clone()).await.unwrap();
+
+        let mut schema_iter = TableSchemaIterator::new(mock_io.clone()).await.unwrap();
 
         let schema = schema_iter.next_table_schema().await.unwrap().unwrap();
 
@@ -1050,10 +1056,10 @@ mod tests {
     
     #[tokio::test]
     async fn test_table_schema_iterator_empty() {
-        let mut mock_io = MockStorageProvider::new().await;
-        
-        let mut iterator = TableSchemaIterator::new(&mut mock_io).await.unwrap();
-        
+        let mock_io = Arc::new(MockStorageProvider::new().await);
+
+        let mut iterator = TableSchemaIterator::new(mock_io.clone()).await.unwrap();
+
         // Should return None for an empty storage
         assert!(iterator.next_table_schema().await.unwrap().is_none());
     }
@@ -1063,12 +1069,12 @@ mod tests {
         // Create a single table schema
         let table_schema = create_test_table_schema("users", Some("id"));
 
-        let mut mock_io = MockStorageProvider::new().await;
-        
-        save_table_schema(&table_schema, &mut mock_io).await.unwrap();
+        let mock_io = Arc::new(MockStorageProvider::new().await);
 
-        let mut iterator = TableSchemaIterator::new(&mut mock_io).await.unwrap();
-        
+        save_table_schema(&table_schema, mock_io.clone()).await.unwrap();
+
+        let mut iterator = TableSchemaIterator::new(mock_io.clone()).await.unwrap();
+
         // Should return our table schema
         let read_schema = iterator.next_table_schema().await.unwrap().unwrap();
         
@@ -1086,16 +1092,16 @@ mod tests {
         let schema2 = create_test_table_schema("products", Some("product_id"));
         let schema3 = create_test_table_schema("orders", None);
 
-        let mut mock_io = MockStorageProvider::new().await;
-        
+        let mock_io = Arc::new(MockStorageProvider::new().await);
+
         // Save schemas to storage
-        save_table_schema(&schema1, &mut mock_io).await.unwrap();
-        save_table_schema(&schema2, &mut mock_io).await.unwrap();
-        save_table_schema(&schema3, &mut mock_io).await.unwrap();
+        save_table_schema(&schema1, mock_io.clone()).await.unwrap();
+        save_table_schema(&schema2, mock_io.clone()).await.unwrap();
+        save_table_schema(&schema3, mock_io.clone()).await.unwrap();
 
         // Create iterator
-        let mut iterator = TableSchemaIterator::new(&mut mock_io).await.unwrap();
-        
+        let mut iterator = TableSchemaIterator::new(mock_io.clone()).await.unwrap();
+
         // Get first schema
         let read_schema1 = iterator.next_table_schema().await.unwrap().unwrap();
         assert_eq!(read_schema1.name, "users");
@@ -1121,19 +1127,19 @@ mod tests {
         let field_name = format!("{}{}", "G:\\Databases\\Test_Database\\schema1", "_FIELDS.db");
         _ = tokio::fs::remove_file(field_name).await;
 
-        let mut mock_io = crate::core::storage_providers::file_sync::LocalStorageProvider::new("G:\\Databases\\Test_Database", Some("schema1.db")).await;
+        let mock_io = Arc::new(crate::core::storage_providers::file_sync::LocalStorageProvider::new("G:\\Databases\\Test_Database", Some("schema1.db")).await);
 
         // Create schemas
         let schema1 = create_test_table_schema("users", Some("id"));
         let schema2 = create_test_table_schema("products", None);
         
         // Save schemas to storage
-        save_table_schema(&schema1, &mut mock_io).await.unwrap();
-        save_table_schema(&schema2, &mut mock_io).await.unwrap();
-        
+        save_table_schema(&schema1, mock_io.clone()).await.unwrap();
+        save_table_schema(&schema2, mock_io.clone()).await.unwrap();
+
         // Create iterator and read all schemas
-        let mut iterator = TableSchemaIterator::new(&mut mock_io).await.unwrap();
-        
+        let mut iterator = TableSchemaIterator::new(mock_io.clone()).await.unwrap();
+
         assert!(iterator.next_table_schema().await.unwrap().is_some());
         assert!(iterator.next_table_schema().await.unwrap().is_some());
         assert!(iterator.next_table_schema().await.unwrap().is_none());
@@ -1159,8 +1165,8 @@ mod tests {
     #[tokio::test]
     async fn test_table_schema_save_and_iterator() {
         // Create multiple schemas
-        let mut mock_io = MockStorageProvider::new().await;
-        
+        let mock_io = Arc::new(MockStorageProvider::new().await);
+
         // Create and save schemas
         for i in 0..5 {
             let table_name = format!("table{}", i);
@@ -1171,12 +1177,12 @@ mod tests {
             };
             
             let schema = create_test_table_schema(&table_name, primary_key.as_deref());
-            save_table_schema(&schema, &mut mock_io).await.unwrap();
+            save_table_schema(&schema, mock_io.clone()).await.unwrap();
         }
         
         // Read back using iterator
-        let mut iterator = TableSchemaIterator::new(&mut mock_io).await.unwrap();
-        
+        let mut iterator = TableSchemaIterator::new(mock_io.clone()).await.unwrap();
+
         for i in 0..5 {
             let schema = iterator.next_table_schema().await.unwrap().unwrap();
             
@@ -1203,11 +1209,12 @@ mod tests {
         
         let schema = create_test_table_schema(&long_name, Some(&long_pk));
         
-        let mut mock_io = MockStorageProvider::new().await;
-        save_table_schema(&schema, &mut mock_io).await.unwrap();
-        
+        let mock_io = Arc::new(MockStorageProvider::new().await);
+
+        save_table_schema(&schema, mock_io.clone()).await.unwrap();
+
         // Read back using iterator
-        let mut iterator = TableSchemaIterator::new(&mut mock_io).await.unwrap();
+        let mut iterator = TableSchemaIterator::new(mock_io.clone()).await.unwrap();
         let read_schema = iterator.next_table_schema().await.unwrap().unwrap();
         
         // Should be truncated to 128 chars
@@ -1227,47 +1234,47 @@ mod tests {
         // Create schemas
         let mut schema1 = create_test_table_schema("users", Some("id"));
 
-        let mut mock_io = crate::core::storage_providers::file_sync::LocalStorageProvider::new("G:\\Databases\\Test_Database", Some("schema2.db")).await;
+        let mock_io = Arc::new(crate::core::storage_providers::file_sync::LocalStorageProvider::new("G:\\Databases\\Test_Database", Some("schema2.db")).await);
         //let mut mock_io_fields = mock_io.create_new(format!("{}_{}", mock_io.get_name().replace(".db", ""), "FIELDS.db")).await;
 
-        schema1.save(&mut mock_io).await.unwrap();
+        schema1.save(mock_io.clone()).await.unwrap();
 
-        schema1.add_field(&mut mock_io, 
+        schema1.add_field(mock_io.clone(), 
             "email".into(),
             DbType::STRING,
             true).await;
 
         schema1.add_field(
-            &mut mock_io,
+            mock_io.clone(),
             "created_at".into(),
             DbType::U64,
             false).await;
 
         schema1.add_field(
-            &mut mock_io,
+            mock_io.clone(),
             "updated_at".into(),
             DbType::U64,
             false).await;
         
         schema1.add_field(
-            &mut mock_io,
+            mock_io.clone(),
             "first_name".into(),
             DbType::STRING,
             false).await;
         
         schema1.add_field(
-            &mut mock_io,
+            mock_io.clone(),
             "last_name".into(),
             DbType::STRING,
             false).await;
 
         schema1.add_field(
-            &mut mock_io,
+            mock_io.clone(),
             "user_id".into(),
             DbType::U128,
             false).await;
 
-        let mut iterator = TableSchemaIterator::new(&mut mock_io).await.unwrap();
+        let mut iterator = TableSchemaIterator::new(mock_io.clone()).await.unwrap();
         let read_schema1 = iterator.next_table_schema().await.unwrap().unwrap();
         assert_eq!(read_schema1.name, "users");
 
@@ -1331,55 +1338,55 @@ mod tests {
         let mut schema1 = create_test_table_schema("users", Some("id"));
         let schema2 = create_test_table_schema("other_users", Some("id2"));
 
-        let mut mock_io = crate::core::storage_providers::file_sync::LocalStorageProvider::new("G:\\Databases\\Test_Database", Some("schema2.db")).await;
+        let mock_io = Arc::new(crate::core::storage_providers::file_sync::LocalStorageProvider::new("G:\\Databases\\Test_Database", Some("schema2.db")).await);
         //let mut mock_io_fields = mock_io.create_new(format!("{}_{}", mock_io.get_name().replace(".db", ""), "FIELDS.db")).await;
 
-        schema1.save(&mut mock_io).await.unwrap();
-        schema2.save(&mut mock_io).await.unwrap();
+        schema1.save(mock_io.clone()).await.unwrap();
+        schema2.save(mock_io.clone()).await.unwrap();
 
-        schema1.add_field(&mut mock_io, 
+        schema1.add_field(mock_io.clone(),
             "email".into(),
             DbType::STRING,
             true).await;
 
         schema1.add_field(
-            &mut mock_io,
+            mock_io.clone(),
             "created_at".into(),
             DbType::U64,
             false).await;
 
         schema1.add_field(
-            &mut mock_io,
+            mock_io.clone(),
             "updated_at".into(),
             DbType::U64,
             false).await;
         
         schema1.add_field(
-            &mut mock_io,
+            mock_io.clone(),
             "first_name".into(),
             DbType::STRING,
             false).await;
         
         schema1.add_field(
-            &mut mock_io,
+            mock_io.clone(),
             "last_name".into(),
             DbType::STRING,
             false).await;
 
         schema1.add_field(
-            &mut mock_io,
+            mock_io.clone(),
             "user_id".into(),
             DbType::U128,
             false).await;
 
-        schema1.mark_field_as_deleted("user_id", &mut mock_io).await;
-        schema1.mark_field_as_deleted("first_name", &mut mock_io).await;
+        schema1.mark_field_as_deleted("user_id", mock_io.clone()).await;
+        schema1.mark_field_as_deleted("first_name", mock_io.clone()).await;
 
         drop(schema1);
         drop(mock_io);
 
-        let mut mock_io = crate::core::storage_providers::file_sync::LocalStorageProvider::new("G:\\Databases\\Test_Database", Some("schema2.db")).await;
-        let mut iterator = TableSchemaIterator::new(&mut mock_io).await.unwrap();
+        let mock_io = Arc::new(crate::core::storage_providers::file_sync::LocalStorageProvider::new("G:\\Databases\\Test_Database", Some("schema2.db")).await);
+        let mut iterator = TableSchemaIterator::new(mock_io.clone()).await.unwrap();
 
         let read_schema1 = iterator.next_table_schema().await.unwrap().unwrap();
         assert_eq!(read_schema1.name, "users");

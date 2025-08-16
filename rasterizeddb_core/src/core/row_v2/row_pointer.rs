@@ -54,9 +54,9 @@ const CHUNK_SIZE: usize = TOTAL_LENGTH * 3047; // ~64KB chunks
 const CRC: Crc::<u32>  = Crc::<u32>::new(&CRC_32_ISO_HDLC);
 
 /// Iterates over RowPointers from a StorageIO in 64KB chunks
-pub struct RowPointerIterator<'a, S: StorageIO> {
+pub struct RowPointerIterator<S: StorageIO> {
     /// Reference to the storage provider
-    io: &'a mut S,
+    io: Arc<S>,
     /// Current position in the storage
     position: u64,
     /// Buffer to store 64KB chunks
@@ -72,9 +72,9 @@ pub struct RowPointerIterator<'a, S: StorageIO> {
 }
 
 /// Implementation for RowPointerIterator providing methods to create and iterate over RowPointers
-impl<'a, S: StorageIO> RowPointerIterator<'a, S> {
+impl<S: StorageIO> RowPointerIterator<S> {
     /// Create a new RowPointerIterator for the given StorageIO
-    pub async fn new(io: &'a mut S) -> Result<Self> {
+    pub async fn new(io: Arc<S>) -> Result<Self> {
         let total_length = io.get_len().await as usize;
 
         let buffer_size = if total_length > CHUNK_SIZE {
@@ -160,6 +160,12 @@ impl<'a, S: StorageIO> RowPointerIterator<'a, S> {
         slice.copy_from_slice(&self.buffer.into_slice()[self.buffer_index..self.buffer_index + TOTAL_LENGTH]);
         let row_pointer = RowPointer::from_slice(&slice);
         
+        if row_pointer.deleted {
+            // If the row is deleted, skip it and return None
+            self.buffer_index += TOTAL_LENGTH;
+            return Ok(None);
+        }
+
         // Advance the buffer index
         self.buffer_index += TOTAL_LENGTH;
         
@@ -386,7 +392,7 @@ impl RowPointer {
 
     pub async fn save<S: StorageIO>(
         &self,
-        io: &mut S,
+        io: Arc<S>,
         immediate: bool) -> Result<()> {
 
         let block = self.into_memory_block();
@@ -636,7 +642,7 @@ impl RowPointer {
     /// # Returns
     /// 
     /// A Result containing the constructed Row with only the requested columns
-    pub async fn fetch_row<S: StorageIO>(&self, io: &S, row_fetch: &RowFetch) -> Result<Row> {
+    pub async fn fetch_row<S: StorageIO>(&self, io: Arc<S>, row_fetch: &RowFetch) -> Result<Row> {
         // Skip fetching if the row is marked as deleted
         if self.deleted {
             return Err(super::error::RowError::NotFound("Row is marked as deleted".into()));
@@ -649,7 +655,8 @@ impl RowPointer {
 
         // For each column specified in the fetch data
         for column_data in &row_fetch.columns_fetching_data {
-            let mut position = self.position + column_data.column_offset as u64;
+            let row_position = self.position;
+            let mut position = row_position.clone() + column_data.column_offset as u64;
 
             if column_data.column_type == DbType::STRING {
                 // For strings, we need to read the size first
@@ -658,7 +665,7 @@ impl RowPointer {
                 _ = io.read_data_into_buffer(&mut position, &mut string_position_buffer).await;
 
                 // Turn [u8] into u64
-                let mut string_row_position = unsafe { simds::endianess::read_u64(string_position_buffer.as_ptr()) };
+                let mut string_row_position = row_position + unsafe { simds::endianess::read_u64(string_position_buffer.as_ptr()) };
 
                 let mut string_size_buffer = [0u8; 4];
 
@@ -700,82 +707,6 @@ impl RowPointer {
 
                 schema_id += 1;
                 
-                columns.push(column);
-            }
-        }
-        
-        // Create and return the Row with just the fetched columns
-        Ok(Row {
-            position: self.position,
-            columns,
-            length: self.length
-        })
-    }
-
-    pub async fn fetch_row_async<S: StorageIO>(&self, io: Arc<S>, row_fetch: Arc<RowFetch>) -> Result<Row> {
-        // Skip fetching if the row is marked as deleted
-        if self.deleted {
-            return Err(super::error::RowError::NotFound("Row is marked as deleted".into()));
-        }
-        
-        // Create a vector to hold all the columns
-        let mut columns: SmallVec<[Column; 20]> = SmallVec::new();
-        
-        let mut schema_id = 0;
-
-        // For each column specified in the fetch data
-        for column_data in &row_fetch.columns_fetching_data {
-            let mut position = self.position + column_data.column_offset as u64;
-
-            if column_data.column_type == DbType::STRING {
-                // For strings, we need to read the size first
-                let mut string_position_buffer = [0u8; 8];
-
-                _ = io.read_data_into_buffer(&mut position, &mut string_position_buffer).await;
-
-                // Turn [u8] into u64
-                let mut string_row_position = unsafe { simds::endianess::read_u64(string_position_buffer.as_ptr()) };
-
-                let mut string_size_buffer = [0u8; 4];
-
-                _ = io.read_data_into_buffer(&mut position, &mut string_size_buffer).await;
-                let string_size = unsafe { simds::endianess::read_u32(string_size_buffer.as_ptr()) };
-
-                // Read the string data
-                let string_block = MEMORY_POOL.acquire(string_size as usize);
-                let string_slice = string_block.into_slice_mut();
-
-                _ = io.read_data_into_buffer(&mut string_row_position, string_slice).await;
-
-                // Create a column with the string data
-                let column = Column {
-                    schema_id: schema_id,
-                    data: string_block,
-                    column_type: DbType::STRING,
-                };
-
-                schema_id += 1;
-
-                columns.push(column);
-            } else {
-                let c_size = column_data.size;
-
-                // Allocate memory for the column data
-                let block = MEMORY_POOL.acquire(c_size as usize);
-                let slice = block.into_slice_mut();
-                
-                // Read the column data directly into our buffer
-                _ = io.read_data_into_buffer(&mut position, slice).await;
-
-                // Create a Column object with the read data
-                let column = Column {
-                    schema_id: schema_id, // Schema ID would be set based on metadata or query context
-                    data: block,
-                    column_type: column_data.column_type.clone(), // Clone the DbType
-                };
-                
-                schema_id += 1;
-
                 columns.push(column);
             }
         }
@@ -790,7 +721,7 @@ impl RowPointer {
 
     pub async fn fetch_row_reuse_async<S: StorageIO>(
         &self, 
-        io: &&S, 
+        io: Arc<S>,
         row_fetch: &RowFetch,
         row_reuse: &mut Row) {
         // Skip fetching if the row is marked as deleted
@@ -826,9 +757,6 @@ impl RowPointer {
 
                 let string_slice = string_block.into_slice_mut();
                 _ = io.read_data_into_buffer(&mut string_row_position, string_slice).await;
-            
-                let default_string_slice = string_block.into_slice_mut();
-                unsafe { std::ptr::copy_nonoverlapping(string_slice.as_ptr(), default_string_slice.as_mut_ptr(), string_size as usize); };
 
                 // Create a column with the string data
                 let column = Column {
@@ -881,8 +809,8 @@ impl RowPointer {
     ///
     /// A Result containing the created RowPointer on success
     pub async fn write_row<S: StorageIO>(
-        pointers_io: &mut S,
-        rows_io: &mut S,
+        pointers_io: Arc<S>,
+        rows_io: Arc<S>,
 
         #[cfg(feature = "enable_long_row")]
         last_id: &AtomicU64,
@@ -911,10 +839,6 @@ impl RowPointer {
 
         let total_bytes = row_pointer.writing_data.total_columns_size;
         let total_string_size = row_pointer.writing_data.total_strings_size;
-
-        // Count number of string columns
-        // let string_columns_count = row_write.columns_writing_data.iter().filter(|col| col.column_type == DbType::STRING).count();
-        // total_bytes = total_bytes + string_columns_count as u64 * (4 + 8); // 4 bytes for size and 8 bytes for pointer
 
         // Allocate memory to store the row data
         let block = MEMORY_POOL.acquire(total_bytes as usize);
@@ -1136,10 +1060,10 @@ mod tests {
     
     #[tokio::test]
     async fn test_row_pointer_iterator_empty() {
-        let mut mock_io = MockStorageProvider::new().await;
-        
-        let mut iterator = RowPointerIterator::new(&mut mock_io).await.unwrap();
-        
+        let mock_io = Arc::new(MockStorageProvider::new().await);
+
+        let mut iterator = RowPointerIterator::new(mock_io.clone()).await.unwrap();
+
         // Should return None for an empty storage
         assert!(iterator.next_row_pointer().await.unwrap().is_none());
     }
@@ -1149,12 +1073,12 @@ mod tests {
         // Create a single row pointer
         let row_pointer = create_test_row_pointer(1, 100, 50, false);
 
-        let mut mock_io = MockStorageProvider::new().await;
+        let mock_io = Arc::new(MockStorageProvider::new().await);
         
-        row_pointer.save(&mut mock_io, true).await.unwrap();
+        row_pointer.save(mock_io.clone(), true).await.unwrap();
 
-        let mut row_pointer_iterator = RowPointerIterator::new(&mut mock_io).await.unwrap();
-        
+        let mut row_pointer_iterator = RowPointerIterator::new(mock_io.clone()).await.unwrap();
+
         // Should return our row pointer
         let read_pointer = row_pointer_iterator.next_row_pointer().await.unwrap().unwrap();
         
@@ -1172,13 +1096,13 @@ mod tests {
         // Create a single row pointer
         let row_pointer = create_test_row_pointer(1, 100, 50, false);
 
-        let mut mock_io = MockStorageProvider::new().await;
-        
-        row_pointer.save(&mut mock_io, true).await.unwrap();
-        row_pointer.save(&mut mock_io, true).await.unwrap();
+        let mock_io = Arc::new(MockStorageProvider::new().await);
 
-        let mut row_pointer_iterator = RowPointerIterator::new(&mut mock_io).await.unwrap();
-        
+        row_pointer.save(mock_io.clone(), true).await.unwrap();
+        row_pointer.save(mock_io.clone(), true).await.unwrap();
+
+        let mut row_pointer_iterator = RowPointerIterator::new(mock_io.clone()).await.unwrap();
+
         // Should return our row pointer
         let read_pointer = row_pointer_iterator.next_row_pointer().await.unwrap().unwrap();
         
@@ -1198,14 +1122,14 @@ mod tests {
         let row_pointer = create_test_row_pointer(1, 100, 50, false);
         let row_pointer2 = create_test_row_pointer(2, 150, 100, false);
 
-        let mut mock_io = MockStorageProvider::new().await;
-        
-        row_pointer.save(&mut mock_io, true).await.unwrap();
-        row_pointer2.save(&mut mock_io, true).await.unwrap();
-        row_pointer.save(&mut mock_io, true).await.unwrap();
+        let mock_io = Arc::new(MockStorageProvider::new().await);
 
-        let mut row_pointer_iterator = RowPointerIterator::new(&mut mock_io).await.unwrap();
-        
+        row_pointer.save(mock_io.clone(), true).await.unwrap();
+        row_pointer2.save(mock_io.clone(), true).await.unwrap();
+        row_pointer.save(mock_io.clone(), true).await.unwrap();
+
+        let mut row_pointer_iterator = RowPointerIterator::new(mock_io.clone()).await.unwrap();
+
         // Should return our row pointer
         let read_pointer = row_pointer_iterator.next_row_pointer().await.unwrap().unwrap();
         
@@ -1228,8 +1152,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_save_row_pointers() {
-     let mut mock_io_pointers = MockStorageProvider::new().await;
-        let mut mock_io_rows = MockStorageProvider::new().await;
+        let mock_io_pointers = Arc::new(MockStorageProvider::new().await);
+        let mock_io_rows = Arc::new(MockStorageProvider::new().await);
 
         #[cfg(feature = "enable_long_row")]
         let cluster = 0;
@@ -1267,10 +1191,10 @@ mod tests {
         };
 
         let result = RowPointer::write_row(
-            &mut mock_io_pointers, 
-            &mut mock_io_rows, 
-            &last_id, 
-            &table_length, 
+            mock_io_pointers.clone(),
+            mock_io_rows.clone(),
+            &last_id,
+            &table_length,
             #[cfg(feature = "enable_long_row")]
             cluster, 
             &row_write
@@ -1281,8 +1205,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_save_and_read_row_pointers() {
-        let mut mock_io_pointers = MockStorageProvider::new().await;
-        let mut mock_io_rows = MockStorageProvider::new().await;
+        let mock_io_pointers = Arc::new(MockStorageProvider::new().await);
+        let mock_io_rows = Arc::new(MockStorageProvider::new().await);
 
         #[cfg(feature = "enable_long_row")]
         let cluster = 0;
@@ -1319,20 +1243,20 @@ mod tests {
         };
 
         let _result = RowPointer::write_row(
-            &mut mock_io_pointers, 
-            &mut mock_io_rows, 
-            &last_id, 
-            &table_length, 
+            mock_io_pointers.clone(),
+            mock_io_rows.clone(),
+            &last_id,
+            &table_length,
             #[cfg(feature = "enable_long_row")]
             cluster, 
             &row_write
         ).await;
 
         let result = RowPointer::write_row(
-            &mut mock_io_pointers, 
-            &mut mock_io_rows, 
-            &last_id, 
-            &table_length, 
+            mock_io_pointers.clone(),
+            mock_io_rows.clone(),
+            &last_id,
+            &table_length,
             #[cfg(feature = "enable_long_row")]
             cluster, 
             &row_write
@@ -1340,7 +1264,7 @@ mod tests {
 
         assert!(result.is_ok());
 
-        let mut iterator = RowPointerIterator::new(&mut mock_io_pointers).await.unwrap();
+        let mut iterator = RowPointerIterator::new(mock_io_pointers.clone()).await.unwrap();
 
         let next_pointer = iterator.next_row_pointer().await.unwrap().unwrap();
 
@@ -1360,7 +1284,7 @@ mod tests {
         };
 
         let row = next_pointer.fetch_row(
-            &mock_io_rows, 
+            mock_io_rows.clone(),
             &row_fetch
         ).await.unwrap();
 
@@ -1381,8 +1305,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_save_and_read_row_pointers_async() {
-        let mut mock_io_pointers = MockStorageProvider::new().await;
-        let mut mock_io_rows = MockStorageProvider::new().await;
+        let mock_io_pointers = Arc::new(MockStorageProvider::new().await);
+        let mock_io_rows = Arc::new(MockStorageProvider::new().await);
 
         #[cfg(feature = "enable_long_row")]
         let cluster = 0;
@@ -1391,9 +1315,9 @@ mod tests {
         let table_length = AtomicU64::new(0);
 
         let _result = RowPointer::write_row(
-            &mut mock_io_pointers, 
-            &mut mock_io_rows, 
-            &last_id, 
+            mock_io_pointers.clone(),
+            mock_io_rows.clone(),
+            &last_id,
             &table_length, 
             #[cfg(feature = "enable_long_row")]
             cluster, 
@@ -1401,17 +1325,17 @@ mod tests {
         ).await;
 
         let result = RowPointer::write_row(
-            &mut mock_io_pointers, 
-            &mut mock_io_rows, 
-            &last_id, 
-            &table_length, 
+            mock_io_pointers.clone(),
+            mock_io_rows.clone(),
+            &last_id,
+            &table_length,
             #[cfg(feature = "enable_long_row")]
             cluster, 
             &create_row_write(1)
         ).await;
         assert!(result.is_ok());
 
-        let mut iterator = RowPointerIterator::new(&mut mock_io_pointers).await.unwrap();
+        let mut iterator = RowPointerIterator::new(mock_io_pointers.clone()).await.unwrap();
 
         let next_pointer = iterator.next_row_pointer().await.unwrap().unwrap();
 
@@ -1436,7 +1360,7 @@ mod tests {
         };
 
         let row = next_pointer.fetch_row(
-            &mock_io_rows, 
+            mock_io_rows.clone(),
             &row_fetch
         ).await.unwrap();
 
