@@ -84,7 +84,7 @@ unsafe impl<S: StorageIO> Sync for Table<S> {}
 impl<S: StorageIO> Table<S> {
     /// #### STABILIZED
     /// Initializes a new table. compressed and immutable are not implemented yet.
-    pub async fn init(table_name: String, mut io_sync: S, compressed: bool, immutable: bool) -> io::Result<Table<S>> {
+    pub async fn init(table_name: String, io_sync: S, compressed: bool, immutable: bool) -> io::Result<Table<S>> {
         let table_file_len = io_sync.get_len().await;
 
         if table_file_len >= HEADER_SIZE as u64 {
@@ -141,7 +141,7 @@ impl<S: StorageIO> Table<S> {
     /// Initializes a new table. compressed and immutable are not implemented yet.
     pub(crate) async fn init_inner(
         table_name: String, 
-        mut io_sync: S,
+        io_sync: S,
         compressed: bool,
         immutable: bool,
     ) -> io::Result<Table<S>> {

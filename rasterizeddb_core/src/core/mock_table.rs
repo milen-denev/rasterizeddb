@@ -1,4 +1,4 @@
-use std::sync::atomic::AtomicU64;
+use std::sync::{atomic::AtomicU64, Arc};
 
 use stopwatch::Stopwatch;
 
@@ -6,16 +6,16 @@ use crate::{core::{row_v2::{concurrent_processor::ConcurrentProcessor, schema::T
 
 use super::{db_type::DbType, row_v2::{row::{ColumnFetchingData, ColumnWritePayload, RowFetch, RowWrite}, row_pointer::{RowPointer, RowPointerIterator}, schema::{SchemaCalculator, SchemaField, TableSchema}}, storage_providers::{file_sync::LocalStorageProvider, traits::StorageIO}};
 
-pub static mut IO_SCHEMA: async_lazy::Lazy<LocalStorageProvider> =
+pub static mut IO_SCHEMA: async_lazy::Lazy<Arc<LocalStorageProvider>> =
     async_lazy::Lazy::new(|| {
         Box::pin(async {
             let io = LocalStorageProvider::new("G:\\Databases\\Test_Database", Some("table_5M.db")).await;
-            io
+            Arc::new(io)
         })
     });
 
 #[allow(static_mut_refs)]
-pub static mut IO_POINTERS: async_lazy::Lazy<LocalStorageProvider> =
+pub static mut IO_POINTERS: async_lazy::Lazy<Arc<LocalStorageProvider>> =
     async_lazy::Lazy::new(|| {
         Box::pin(async {
             let schema_io = unsafe { IO_SCHEMA.force().await };
@@ -23,12 +23,12 @@ pub static mut IO_POINTERS: async_lazy::Lazy<LocalStorageProvider> =
             let name = schema_io.get_name();
             let name = format!("{}_{}", name.replace(".db", ""), "POINTERS.db");
             let io = LocalStorageProvider::new(&io_location, Some(&name)).await;
-            io
+            Arc::new(io)
         })
     });
 
 #[allow(static_mut_refs)]
-pub static mut IO_ROWS: async_lazy::Lazy<LocalStorageProvider> =
+pub static mut IO_ROWS: async_lazy::Lazy<Arc<LocalStorageProvider>> =
     async_lazy::Lazy::new(|| {
         Box::pin(async {
             let schema_io = unsafe { IO_SCHEMA.force().await };
@@ -36,26 +36,32 @@ pub static mut IO_ROWS: async_lazy::Lazy<LocalStorageProvider> =
             let name = schema_io.get_name();
             let name = format!("{}_{}", name.replace(".db", ""), "ROWS.db");
             let io = LocalStorageProvider::new(&io_location, Some(&name)).await;
-            io
+            Arc::new(io)
         })
     });
 
 #[allow(static_mut_refs)]
 pub async fn consolidated_write_data_function(times: u64) {
-    let io_schema = unsafe { IO_SCHEMA.force_mut().await };
-    let io_pointers = unsafe { IO_POINTERS.force_mut().await };
-    let io_rows = unsafe { IO_ROWS.force_mut().await };
+    let io_schema = unsafe { IO_SCHEMA.force().await };
+    let io_pointers = unsafe { IO_POINTERS.force().await };
+    let io_rows = unsafe { IO_ROWS.force().await };
+
+    let io_schema = io_schema.clone();
 
     create_schema(io_schema, "test_table").await;
     
     for i in 0..times {
+        let io_pointers = io_pointers.clone();
+        let io_rows = io_rows.clone();
+    
         fill_data(i, io_pointers, io_rows, times).await;
     }
 }
 
 #[allow(static_mut_refs)]
 pub async fn get_schema() -> TableSchema {
-    let io_schema = unsafe { IO_SCHEMA.force_mut().await };
+    let io_schema = unsafe { IO_SCHEMA.force().await };
+    let io_schema = io_schema.clone();
     let mut iterator = TableSchemaIterator::new(io_schema).await.unwrap();
     let schema = iterator.next_table_schema().await.unwrap();
     if let Some(schema) = schema {
@@ -66,8 +72,11 @@ pub async fn get_schema() -> TableSchema {
 
 #[allow(static_mut_refs)]
 pub async fn consolidated_read_data_function(schema: TableSchema, _id: u64) {
-    let io_pointers = unsafe { IO_POINTERS.force_mut().await };
-    let io_rows = unsafe { IO_ROWS.force_mut().await };
+    let io_pointers = unsafe { IO_POINTERS.force().await };
+    let io_rows = unsafe { IO_ROWS.force().await };
+    
+    let io_pointers = io_pointers.clone();
+    let io_rows = io_rows.clone();
 
     let mut stopwatch = Stopwatch::start_new();
 
@@ -118,7 +127,7 @@ pub async fn consolidated_read_data_function(schema: TableSchema, _id: u64) {
             id < 2
         "##),
         row_fetch,
-        schema_fields,
+        &schema_fields,
         io_rows,
         &mut iterator
     ).await;
@@ -272,31 +281,31 @@ fn create_test_table_schema(name: &str, primary_key: Option<&str>) -> TableSchem
 }
 
 async fn create_schema<S: StorageIO>(
-    mock_io: &mut S,
+    mock_io: Arc<S>,
     table_name: &str,
 )  -> TableSchema {
     let mut schema = create_test_table_schema(table_name, None);
-    schema.save(mock_io).await.unwrap();
-    schema.add_field(mock_io, "id".into(), DbType::U64, true).await;
-    schema.add_field(mock_io, "name".into(), DbType::STRING, false).await;
-    schema.add_field(mock_io, "age".into(), DbType::U8, false).await;
-    schema.add_field(mock_io, "email".into(), DbType::STRING, false).await;
-    schema.add_field(mock_io, "address".into(), DbType::STRING, false).await;
-    schema.add_field(mock_io, "phone".into(), DbType::STRING, false).await;
-    schema.add_field(mock_io, "is_active".into(), DbType::U8, false).await;   
-    schema.add_field(mock_io, "bank_balance".into(), DbType::F64, false).await;
-    schema.add_field(mock_io, "married".into(), DbType::U8, false).await;
-    schema.add_field(mock_io, "birth_date".into(), DbType::STRING, false).await;
-    schema.add_field(mock_io, "last_login".into(), DbType::STRING, false).await;
-    schema.add_field(mock_io, "last_purchase".into(), DbType::STRING, false).await;
-    schema.add_field(mock_io, "last_purchase_amount".into(), DbType::F32, false).await;
-    schema.add_field(mock_io, "last_purchase_date".into(), DbType::STRING, false).await;
-    schema.add_field(mock_io, "last_purchase_location".into(), DbType::STRING, false).await;
-    schema.add_field(mock_io, "last_purchase_method".into(), DbType::STRING, false).await;
-    schema.add_field(mock_io, "last_purchase_category".into(), DbType::STRING, false).await;
-    schema.add_field(mock_io, "last_purchase_subcategory".into(), DbType::STRING, false).await;
-    schema.add_field(mock_io, "last_purchase_description".into(), DbType::STRING, false).await;
-    schema.add_field(mock_io, "last_purchase_notes".into(), DbType::STRING, false).await;
+    schema.save(mock_io.clone()).await.unwrap();
+    schema.add_field(mock_io.clone(), "id".into(), DbType::U64, true).await;
+    schema.add_field(mock_io.clone(), "name".into(), DbType::STRING, false).await;
+    schema.add_field(mock_io.clone(), "age".into(), DbType::U8, false).await;
+    schema.add_field(mock_io.clone(), "email".into(), DbType::STRING, false).await;
+    schema.add_field(mock_io.clone(), "address".into(), DbType::STRING, false).await;
+    schema.add_field(mock_io.clone(), "phone".into(), DbType::STRING, false).await;
+    schema.add_field(mock_io.clone(), "is_active".into(), DbType::U8, false).await;   
+    schema.add_field(mock_io.clone(), "bank_balance".into(), DbType::F64, false).await;
+    schema.add_field(mock_io.clone(), "married".into(), DbType::U8, false).await;
+    schema.add_field(mock_io.clone(), "birth_date".into(), DbType::STRING, false).await;
+    schema.add_field(mock_io.clone(), "last_login".into(), DbType::STRING, false).await;
+    schema.add_field(mock_io.clone(), "last_purchase".into(), DbType::STRING, false).await;
+    schema.add_field(mock_io.clone(), "last_purchase_amount".into(), DbType::F32, false).await;
+    schema.add_field(mock_io.clone(), "last_purchase_date".into(), DbType::STRING, false).await;
+    schema.add_field(mock_io.clone(), "last_purchase_location".into(), DbType::STRING, false).await;
+    schema.add_field(mock_io.clone(), "last_purchase_method".into(), DbType::STRING, false).await;
+    schema.add_field(mock_io.clone(), "last_purchase_category".into(), DbType::STRING, false).await;
+    schema.add_field(mock_io.clone(), "last_purchase_subcategory".into(), DbType::STRING, false).await;
+    schema.add_field(mock_io.clone(), "last_purchase_description".into(), DbType::STRING, false).await;
+    schema.add_field(mock_io.clone(), "last_purchase_notes".into(), DbType::STRING, false).await;
     schema
 }
 
@@ -305,8 +314,8 @@ static TABLE_LENGTH: AtomicU64 = AtomicU64::new(0);
 
 async fn fill_data<S: StorageIO>(
     id: u64,
-    io_pointers: &mut S,
-    io_rows: &mut S,
+    io_pointers: Arc<S>,
+    io_rows: Arc<S>,
     times: u64
 ) {
     #[cfg(feature = "enable_long_row")]

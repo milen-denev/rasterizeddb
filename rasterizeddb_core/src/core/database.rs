@@ -140,7 +140,7 @@ impl<S: StorageIO + Send + Sync> Database<S> {
             table = self.tables.try_get_mut(&name);
         }
 
-        let mut table = table.unwrap();
+        let table = table.unwrap();
 
         table.io_sync.drop_io();
 
