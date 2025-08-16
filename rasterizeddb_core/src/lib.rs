@@ -7,7 +7,7 @@ use moka::sync::Cache;
 #[cfg(feature = "enable_index_caching")]
 use once_cell::sync::Lazy;
 
-pub(crate) const SERVER_PORT: u16 = 8080;
+pub(crate) const SERVER_PORT: u16 = 61170;
 pub(crate) const HEADER_SIZE: u16 = 39;
 pub(crate) const CHUNK_SIZE: u32 = 4 * 1_000_000;
 
@@ -19,7 +19,7 @@ pub(crate) const MAX_PERMITS: usize = 16;
 // Number of row pointers to fetch at once in next_row_pointers
 pub(crate) const BATCH_SIZE: usize = 1024 * 4;
 
-pub(crate) const IMMEDIATE_WRITE: bool = false;
+pub(crate) const IMMEDIATE_WRITE: bool = true;
 
 pub const EMPTY_BUFFER: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
 
