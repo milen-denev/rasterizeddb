@@ -15,3 +15,4 @@ pub mod columns_v2;
 pub mod mock_helpers;
 pub mod mock_table;
 pub mod rql_v2;
+pub mod database_v2;
