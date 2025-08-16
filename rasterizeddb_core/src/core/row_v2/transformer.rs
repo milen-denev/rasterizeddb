@@ -100,6 +100,10 @@ impl ColumnTransformer {
     pub fn setup_column_2(&mut self, column_2: MemoryBlock) {
         self.column_2 = Some(column_2);
     }
+
+    pub fn clear_column_2(&mut self) {
+        self.column_2 = None;
+    }
 }
 
 /// An enum to represent either a direct memory block or an index to an intermediate result
@@ -280,6 +284,7 @@ impl<'a> TransformerProcessor<'a> {
                     }
                 },
                 Either::Right(comparison_result) => {
+                    transformer.clear_column_2();
                     // Store comparison result
                     comparison_results.push(comparison_result);
                 }
