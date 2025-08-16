@@ -108,8 +108,29 @@ pub unsafe fn compare_raw_vecs(
 }
 
 #[inline(always)]
+#[track_caller]
 pub fn copy_vec_to_ptr(vec: &[u8], dst: *mut u8) {
     unsafe {
+        #[cfg(debug_assertions)]
+        {
+            // Debug assertions to ensure safety
+            debug_assert!(dst.is_null() == false, "Destination pointer is null");
+            debug_assert!(vec.len() > 0, "Source vector is empty");
+
+            // Pointer variables
+            let const_dst = dst as *const u8;
+            let vec_ptr = vec.as_ptr();
+            let vec_len = vec.len();
+            let vec_ptr_end = vec_ptr.add(vec_len);
+
+            let dst_end = dst.add(vec_len) as *const u8;
+
+            // Check overlapping
+            debug_assert!(dst_end.is_null() == false, "Destination pointer is null");
+            debug_assert!(vec_ptr_end.is_null() == false, "Source vector is null");
+            debug_assert!(const_dst < vec_ptr || const_dst > vec_ptr_end, "Memory regions overlap");
+        }
+        
         ptr::copy_nonoverlapping(vec.as_ptr(), dst, vec.len());
     }
 }
