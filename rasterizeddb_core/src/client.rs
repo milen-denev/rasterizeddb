@@ -7,8 +7,7 @@ use rastcp::client::{TcpClient, TcpClientBuilder};
 use tokio::sync::Mutex;
 
 use crate::core::database::QueryExecutionResult;
-use crate::core::row::Row;
-use crate::core::support_types::ReturnResult;
+use crate::core::row_v2::row::{self, ReturnResult};
 use crate::SERVER_PORT;
 
 /// A pooled client connection
@@ -370,7 +369,8 @@ impl DbClient {
     pub fn extract_rows(result: QueryExecutionResult) -> io::Result<Option<ReturnResult>> {
         match result {
             QueryExecutionResult::RowsResult(data) => {
-                Row::deserialize_rows(&data)
+                row::vec_into_rows(&data)
+                    .map(|row| Some(ReturnResult::Rows(row)))
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
             },
             QueryExecutionResult::Error(msg) => {
