@@ -1,13 +1,119 @@
 use smallvec::SmallVec;
 
-use crate::core::{rql_v2::lexer_s1::QueryPurpose, row_v2::{row::{RowWrite, ColumnWritePayload}, schema::SchemaField}};
-use crate::memory_pool::MemoryBlock;
+use crate::core::{db_type::DbType, rql_v2::lexer_s1::QueryPurpose, row_v2::{row::{RowWrite, ColumnWritePayload}, schema::SchemaField}};
+use crate::memory_pool::{MemoryBlock, MEMORY_POOL};
+
+/// Convert a string value to a MemoryBlock based on the database type
+#[inline(always)]
+fn value_to_mb(value_str: &str, db_type: &DbType) -> MemoryBlock {
+    match db_type {
+        DbType::I8 => {
+            let val: i8 = value_str.parse().unwrap_or_default();
+            let bytes = val.to_le_bytes();
+            let mb = MEMORY_POOL.acquire(bytes.len());
+            mb.into_slice_mut().copy_from_slice(&bytes);
+            mb
+        },
+        DbType::I16 => {
+            let val: i16 = value_str.parse().unwrap_or_default();
+            let bytes = val.to_le_bytes();
+            let mb = MEMORY_POOL.acquire(bytes.len());
+            mb.into_slice_mut().copy_from_slice(&bytes);
+            mb
+        },
+        DbType::I32 => {
+            let val: i32 = value_str.parse().unwrap_or_default();
+            let bytes = val.to_le_bytes();
+            let mb = MEMORY_POOL.acquire(bytes.len());
+            mb.into_slice_mut().copy_from_slice(&bytes);
+            mb
+        },
+        DbType::I64 => {
+            let val: i64 = value_str.parse().unwrap_or_default();
+            let bytes = val.to_le_bytes();
+            let mb = MEMORY_POOL.acquire(bytes.len());
+            mb.into_slice_mut().copy_from_slice(&bytes);
+            mb
+        },
+        DbType::I128 => {
+            let val: i128 = value_str.parse().unwrap_or_default();
+            let bytes = val.to_le_bytes();
+            let mb = MEMORY_POOL.acquire(bytes.len());
+            mb.into_slice_mut().copy_from_slice(&bytes);
+            mb
+        },
+        DbType::U8 => {
+            let val: u8 = value_str.parse().unwrap_or_default();
+            let bytes = val.to_le_bytes();
+            let mb = MEMORY_POOL.acquire(bytes.len());
+            mb.into_slice_mut().copy_from_slice(&bytes);
+            mb
+        },
+        DbType::U16 => {
+            let val: u16 = value_str.parse().unwrap_or_default();
+            let bytes = val.to_le_bytes();
+            let mb = MEMORY_POOL.acquire(bytes.len());
+            mb.into_slice_mut().copy_from_slice(&bytes);
+            mb
+        },
+        DbType::U32 => {
+            let val: u32 = value_str.parse().unwrap_or_default();
+            let bytes = val.to_le_bytes();
+            let mb = MEMORY_POOL.acquire(bytes.len());
+            mb.into_slice_mut().copy_from_slice(&bytes);
+            mb
+        },
+        DbType::U64 => {
+            let val: u64 = value_str.parse().unwrap_or_default();
+            let bytes = val.to_le_bytes();
+            let mb = MEMORY_POOL.acquire(bytes.len());
+            mb.into_slice_mut().copy_from_slice(&bytes);
+            mb
+        },
+        DbType::U128 => {
+            let val: u128 = value_str.parse().unwrap_or_default();
+            let bytes = val.to_le_bytes();
+            let mb = MEMORY_POOL.acquire(bytes.len());
+            mb.into_slice_mut().copy_from_slice(&bytes);
+            mb
+        },
+        DbType::F32 => {
+            let val: f32 = value_str.parse().unwrap_or_default();
+            let bytes = val.to_le_bytes();
+            let mb = MEMORY_POOL.acquire(bytes.len());
+            mb.into_slice_mut().copy_from_slice(&bytes);
+            mb
+        },
+        DbType::F64 => {
+            let val: f64 = value_str.parse().unwrap_or_default();
+            let bytes = val.to_le_bytes();
+            let mb = MEMORY_POOL.acquire(bytes.len());
+            mb.into_slice_mut().copy_from_slice(&bytes);
+            mb
+        },
+        DbType::STRING | DbType::CHAR => {
+            // Strip surrounding single or double quotes if present
+            let stripped = if (value_str.starts_with('"') && value_str.ends_with('"')) || (value_str.starts_with('\'') && value_str.ends_with('\'')) {
+                &value_str[1..value_str.len()-1]
+            } else {
+                value_str
+            };
+            let b = stripped.as_bytes();
+            let mb = MEMORY_POOL.acquire(b.len());
+            mb.into_slice_mut().copy_from_slice(b);
+            mb
+        },
+        _ => {
+            panic!("Unsupported database type: {}", db_type);
+        }
+    }
+}
 
 /// Attempts to parse a QueryPurpose::InsertRow variant into a RowWrite object, using the provided schema.
 /// Returns None if the QueryPurpose is not InsertRow or parsing fails.
 pub fn insert_row_from_query_purpose(qp: &QueryPurpose, schema: &[SchemaField]) -> Option<RowWrite> {
 	if let QueryPurpose::InsertRow(sql) = qp {
-		let sql = sql.as_str();
+		let sql = sql.query.as_str();
 		let sql_upper = sql.to_ascii_uppercase();
 		if !sql_upper.starts_with("INSERT INTO") {
 			return None;
@@ -28,17 +134,19 @@ pub fn insert_row_from_query_purpose(qp: &QueryPurpose, schema: &[SchemaField]) 
         for (col_name, value) in columns.iter().zip(values.iter()) {
             // Find schema field
             let schema_field = schema.iter().find(|f| f.name == *col_name)?;
-            // Convert value to MemoryBlock (for now, just store as bytes, real impl may differ)
-            let data = MemoryBlock::from_vec(value.as_bytes().to_vec());
+            
+            // Convert value to MemoryBlock based on the database type
+            let data = value_to_mb(value, &schema_field.db_type);
+
             let payload = ColumnWritePayload {
-            data,
-            write_order: schema_field.write_order as u32, // Could be index or other logic
-            column_type: schema_field.db_type.clone(),
-            size: schema_field.size as u32,
+                data,
+                write_order: schema_field.write_order as u32, // Could be index or other logic
+                column_type: schema_field.db_type.clone(),
+                size: schema_field.size as u32,
             };
+
             columns_writing_data.push(payload);
-        }
-        
+        }        
         // Sort by write_order before creating the RowWrite
         columns_writing_data.sort_by_key(|col| col.write_order);
 		Some(RowWrite { columns_writing_data })
@@ -52,6 +160,7 @@ mod tests {
     use super::*;
     use crate::core::row_v2::schema::SchemaField;
     use crate::core::db_type::DbType;
+    use crate::core::rql_v2::lexer_s1::InsertRowData;
 
     #[test]
     fn test_insert_row_basic() {
@@ -60,7 +169,7 @@ mod tests {
             SchemaField { name: "name".to_string(), db_type: DbType::STRING, size: 4 + 8, offset: 4, write_order: 1, is_unique: false, is_deleted: false },
         ];
         let sql = r#"INSERT INTO users (id, name) VALUES (1, "Alice")"#;
-        let qp = QueryPurpose::InsertRow(sql.to_string());
+        let qp = QueryPurpose::InsertRow(InsertRowData { query: sql.to_string(), table_name: "users".to_string() });
         let row_write = insert_row_from_query_purpose(&qp, &schema).expect("Should parse successfully");
         assert_eq!(row_write.columns_writing_data.len(), 2);
         assert_eq!(row_write.columns_writing_data[0].column_type, DbType::I32);
@@ -75,7 +184,7 @@ mod tests {
             SchemaField { name: "id".to_string(), db_type: DbType::I32, size: 4, offset: 0, write_order: 0, is_unique: false, is_deleted: false },
         ];
         let sql = r#"INSERT INTO users (id, name) VALUES (1, "Alice")"#;
-        let qp = QueryPurpose::InsertRow(sql.to_string());
+        let qp = QueryPurpose::InsertRow(InsertRowData { query: sql.to_string(), table_name: "users".to_string() });
         assert!(insert_row_from_query_purpose(&qp, &schema).is_none());
     }
 
@@ -93,7 +202,7 @@ mod tests {
         ];
 
         let sql = r#"INSERT INTO users (id, name, age, email, active, score, created_at, notes) VALUES (42, "Bob", 27, "bob@example.com", 1, 99.5, 1680000000, "Test user")"#;
-        let qp = QueryPurpose::InsertRow(sql.to_string());
+        let qp = QueryPurpose::InsertRow(InsertRowData { query: sql.to_string(), table_name: "users".to_string() });
         let row_write = insert_row_from_query_purpose(&qp, &schema).expect("Should parse successfully");
         assert_eq!(row_write.columns_writing_data.len(), schema.len());
 
@@ -134,7 +243,7 @@ mod tests {
             SchemaField { name: "age".to_string(), db_type: DbType::I16, size: 2, offset: 20, write_order: 2, is_unique: false, is_deleted: false },
         ];
         let sql = r#"INSERT INTO users (age, id, name) VALUES (30, 100, "Charlie")"#;
-        let qp = QueryPurpose::InsertRow(sql.to_string());
+        let qp = QueryPurpose::InsertRow(InsertRowData { query: sql.to_string(), table_name: "users".to_string() });
         let row_write = insert_row_from_query_purpose(&qp, &schema).expect("Should parse successfully");
         assert_eq!(row_write.columns_writing_data.len(), 3);
 

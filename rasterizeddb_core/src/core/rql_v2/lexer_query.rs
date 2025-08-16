@@ -1,3 +1,5 @@
+use itertools::Itertools;
+
 use crate::core::row_v2::schema::{SchemaField, SchemaCalculator};
 use crate::core::row_v2::row::{RowFetch, ColumnFetchingData};
 use crate::core::row_v2::transformer::ComparerOperation;
@@ -18,9 +20,9 @@ pub struct QueryRows {
 ///
 /// # Returns
 /// (RowFetch, String) - RowFetch for the columns, and the WHERE clause (without the WHERE word)
-pub fn row_fetch_from_select_query(schema: &Vec<SchemaField>, query_purpose: &QueryPurpose) -> Result<QueryRows, String> {
+pub fn row_fetch_from_select_query(query_purpose: &QueryPurpose, schema: &Vec<SchemaField>) -> Result<QueryRows, String> {
 	let sql = match query_purpose {
-		QueryPurpose::QueryRows(sql) => sql.trim(),
+		QueryPurpose::QueryRows(qr_data) => qr_data.query.trim(),
 		_ => return Err("Not a SELECT/QueryRows query".to_string()),
 	};
 	let sql_bytes = sql.as_bytes();
@@ -57,13 +59,14 @@ pub fn row_fetch_from_select_query(schema: &Vec<SchemaField>, query_purpose: &Qu
 
 	// Parse columns
 	let columns: Vec<&str> = if columns_part == "*" {
-		schema.iter().map(|f| f.name.as_str()).collect()
+		schema.iter().sorted_by(|a, b| a.write_order.cmp(&b.write_order)).map(|f| f.name.as_str()).collect()
 	} else {
 		columns_part.split(',').map(|s| s.trim()).collect()
 	};
 
 	let schema_calc = SchemaCalculator::default();
 	let mut columns_fetching_data = Vec::new();
+
 	for col in columns {
 		let field = schema.iter().find(|f| simd_compare_strings(f.name.as_bytes(), col.as_bytes(), &ComparerOperation::Equals))
 			.ok_or_else(|| format!("Column '{}' not found in schema", col))?;
@@ -103,8 +106,13 @@ mod tests {
 	fn test_select_all_columns() {
 		let schema = make_schema();
 		let query = "SELECT * FROM users WHERE age > 18";
-		let qp = crate::core::rql_v2::lexer_s1::QueryPurpose::QueryRows(query.to_string());
-		let qr = row_fetch_from_select_query(&schema, &qp).unwrap();
+		let qp = crate::core::rql_v2::lexer_s1::QueryPurpose::QueryRows(
+			crate::core::rql_v2::lexer_s1::QueryRowsData {
+				table_name: "users".to_string(),
+				query: query.to_string(),
+			}
+		);
+		let qr = row_fetch_from_select_query(&qp, &schema).unwrap();
 		assert_eq!(qr.row_fetch.columns_fetching_data.len(), schema.len());
 		assert_eq!(qr.where_clause, "age > 18");
 		assert_eq!(qr.table_name, "users");
@@ -114,8 +122,13 @@ mod tests {
 	fn test_select_specific_columns() {
 		let schema = make_schema();
 		let query = "SELECT id, name FROM users WHERE name = 'John'";
-		let qp = crate::core::rql_v2::lexer_s1::QueryPurpose::QueryRows(query.to_string());
-		let qr = row_fetch_from_select_query(&schema, &qp).unwrap();
+		let qp = crate::core::rql_v2::lexer_s1::QueryPurpose::QueryRows(
+			crate::core::rql_v2::lexer_s1::QueryRowsData {
+				table_name: "users".to_string(),
+				query: query.to_string(),
+			}
+		);
+		let qr = row_fetch_from_select_query(&qp, &schema).unwrap();
 		assert_eq!(qr.row_fetch.columns_fetching_data.len(), 2);
 		assert_eq!(qr.row_fetch.columns_fetching_data[0].column_type, DbType::U64);
 		assert_eq!(qr.row_fetch.columns_fetching_data[1].column_type, DbType::STRING);
@@ -127,8 +140,13 @@ mod tests {
 	fn test_select_no_where() {
 		let schema = make_schema();
 		let query = "SELECT id, email FROM users";
-		let qp = crate::core::rql_v2::lexer_s1::QueryPurpose::QueryRows(query.to_string());
-		let qr = row_fetch_from_select_query(&schema, &qp).unwrap();
+		let qp = crate::core::rql_v2::lexer_s1::QueryPurpose::QueryRows(
+			crate::core::rql_v2::lexer_s1::QueryRowsData {
+				table_name: "users".to_string(),
+				query: query.to_string(),
+			}
+		);
+		let qr = row_fetch_from_select_query(&qp, &schema).unwrap();
 		assert_eq!(qr.row_fetch.columns_fetching_data.len(), 2);
 		assert_eq!(qr.where_clause, "");
 		assert_eq!(qr.table_name, "users");
@@ -138,8 +156,13 @@ mod tests {
 	fn test_column_not_found() {
 		let schema = make_schema();
 		let query = "SELECT id, not_a_column FROM users";
-		let qp = crate::core::rql_v2::lexer_s1::QueryPurpose::QueryRows(query.to_string());
-		let result = row_fetch_from_select_query(&schema, &qp);
+		let qp = crate::core::rql_v2::lexer_s1::QueryPurpose::QueryRows(
+			crate::core::rql_v2::lexer_s1::QueryRowsData {
+				table_name: "users".to_string(),
+				query: query.to_string(),
+			}
+		);
+		let result = row_fetch_from_select_query(&qp, &schema);
 		assert!(result.is_err());
 	}
 

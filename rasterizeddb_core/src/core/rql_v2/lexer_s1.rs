@@ -1,19 +1,28 @@
 use crate::core::{row_v2::{common::simd_compare_strings, transformer::ComparerOperation}};
 
+#[derive(Debug)]
 pub enum QueryPurpose {
     CreateTable(String),
     DropTable(String),
     AddColumn(String),
     DropColumn(String),
     RenameColumn(String),
-    InsertRow(String),
+    InsertRow(InsertRowData),
     UpdateRow(String),
     DeleteRow(String),
-    QueryRows(String),
+    QueryRows(QueryRowsData),
 }
 
-pub fn test() -> bool {
-    simd_compare_strings(b"hello", b"hello", &ComparerOperation::Equals)
+#[derive(Debug)]
+pub struct InsertRowData {
+    pub table_name: String,
+    pub query: String
+}
+
+#[derive(Debug)]
+pub struct QueryRowsData {
+    pub table_name: String,
+    pub query: String
 }
 
 /// Recognizes common PostgreSQL SQL and returns a QueryPurpose with the query string.
@@ -40,14 +49,35 @@ pub fn recognize_query_purpose(query: &str) -> Option<QueryPurpose> {
             None
         }
     } else if simd_compare_strings(query_bytes, b"INSERT INTO", &StartsWith) {
-        Some(InsertRow(query_trimmed.to_string()))
+        if let Some(table_name_extract) = query_trimmed.split_whitespace().nth(2) {
+            Some(InsertRow(InsertRowData {
+                table_name: table_name_extract.trim().to_string(),
+                query: query_trimmed.to_string()
+            }))
+        } else {
+            None
+        }
     } else if simd_compare_strings(query_bytes, b"UPDATE", &StartsWith) {
         Some(UpdateRow(query_trimmed.to_string()))
     } else if simd_compare_strings(query_bytes, b"DELETE FROM", &StartsWith) {
         Some(DeleteRow(query_trimmed.to_string()))
     } else if simd_compare_strings(query_bytes, b"SELECT", &StartsWith) {
-        Some(QueryRows(query_trimmed.to_string()))
+        // Extract table name after "FROM"
+        let tokens: Vec<&str> = query_trimmed.split_whitespace().collect();
+        if let Some(from_index) = tokens.iter().position(|&t| t.eq_ignore_ascii_case("FROM")) {
+            if let Some(table_name_extract) = tokens.get(from_index + 1) {
+                Some(QueryRows(QueryRowsData {
+                    table_name: table_name_extract.trim().to_string(),
+                    query: query_trimmed.to_string()
+                }))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
     } else {
         None
     }
 }
+

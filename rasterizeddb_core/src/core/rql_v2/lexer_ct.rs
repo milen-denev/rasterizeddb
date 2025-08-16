@@ -1,13 +1,14 @@
 use crate::core::{db_type::DbType, rql_v2::lexer_s1::QueryPurpose};
 
 pub struct CreateColumnData {
-    name: String,
-    data_type: DbType,
+    pub name: String,
+    pub data_type: DbType,
 }
 
 pub struct CreateTable {
-    table_name: String,
-    columns: Vec<CreateColumnData>,
+    pub table_name: String,
+    pub columns: Vec<CreateColumnData>,
+    pub is_immutable: bool,
 }
 
 /// Attempts to parse a QueryPurpose::CreateTable variant into a CreateTable struct.
@@ -75,7 +76,7 @@ pub fn create_table_from_query_purpose(qp: &QueryPurpose) -> Option<CreateTable>
             };
             columns.push(CreateColumnData { name, data_type });
         }
-        Some(CreateTable { table_name, columns })
+        Some(CreateTable { table_name, columns, is_immutable: false })
     } else {
         None
     }
