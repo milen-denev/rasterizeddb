@@ -32,7 +32,7 @@ impl MemoryStorageProvider {
 }
 
 impl StorageIO for MemoryStorageProvider {
-    async fn write_data(&mut self, position: u64, buffer: &[u8]) {
+    async fn write_data(&self, position: u64, buffer: &[u8]) {
         let end = position + buffer.len() as u64;
 
         let mut x = 0;
@@ -51,7 +51,7 @@ impl StorageIO for MemoryStorageProvider {
         }
     }
 
-    async fn write_data_seek(&mut self, seek: std::io::SeekFrom, buffer: &[u8]) {
+    async fn write_data_seek(&self, seek: std::io::SeekFrom, buffer: &[u8]) {
         let needed_len = buffer.len();
         let current_len = self.vec.len();
 
@@ -134,13 +134,13 @@ impl StorageIO for MemoryStorageProvider {
         return buffer;
     }
 
-    async fn append_data(&mut self, buffer: &[u8], _immediate: bool) {
+    async fn append_data(&self, buffer: &[u8], _immediate: bool) {
         for u8_value in buffer {
             self.vec.extend(vec![*u8_value; 1]);
         }
     }
 
-    async fn get_len(&mut self) -> u64 {
+    async fn get_len(&self) -> u64 {
         self.vec.len() as u64
     }
 
@@ -150,7 +150,7 @@ impl StorageIO for MemoryStorageProvider {
         true
     }
 
-    async fn write_data_unsync(&mut self, position: u64, buffer: &[u8]) {
+    async fn write_data_unsync(&self, position: u64, buffer: &[u8]) {
         let end = position + buffer.len() as u64;
 
         let mut x = 0;
@@ -169,19 +169,19 @@ impl StorageIO for MemoryStorageProvider {
         }
     }
 
-    async fn verify_data(&mut self, position: u64, buffer: &[u8]) -> bool {
+    async fn verify_data(&self, position: u64, buffer: &[u8]) -> bool {
         let _position = position;
         let _buffer = buffer;
         true
     }
 
-    async fn verify_data_and_sync(&mut self, position: u64, buffer: &[u8]) -> bool {
+    async fn verify_data_and_sync(&self, position: u64, buffer: &[u8]) -> bool {
         let _position = position;
         let _buffer = buffer;
         true
     }
 
-    async fn append_data_unsync(&mut self, buffer: &[u8]) {
+    async fn append_data_unsync(&self, buffer: &[u8]) {
         for u8_value in buffer {
             self.vec.extend(vec![*u8_value; 1]);
         }
@@ -195,12 +195,13 @@ impl StorageIO for MemoryStorageProvider {
         }
     }
 
-    async fn swap_temp(&mut self, temp_io_sync: &mut Self) {
-        self.vec = temp_io_sync.vec.clone();
-        self.vec.clear();
-        let iter = temp_io_sync.vec.clone_to_vec();
-        self.vec.extend(iter);
-        temp_io_sync.vec.clear();
+    async fn swap_temp(&self, _temp_io_sync: &mut Self) {
+        // self.vec = temp_io_sync.vec.clone();
+        // self.vec.clear();
+        // let iter = temp_io_sync.vec.clone_to_vec();
+        // self.vec.extend(iter);
+        // temp_io_sync.vec.clear();
+        panic!("Swap temp not implemented for MemoryStorageProvider");
     }
 
     fn get_location(&self) -> Option<String> {
@@ -216,15 +217,16 @@ impl StorageIO for MemoryStorageProvider {
         }
     }
 
-    fn drop_io(&mut self) {
-        self.vec.clear();
+    fn drop_io(&self) {
+        //self.vec.clear();
+        panic!("Drop IO not implemented for MemoryStorageProvider");
     }
     
     fn get_hash(&self) -> u32 {
         self.random_u32
     }
     
-    fn start_service(&mut self) -> impl Future<Output = ()> + Send + Sync {
+    fn start_service(&self) -> impl Future<Output = ()> + Send + Sync {
         async {}
     }
 

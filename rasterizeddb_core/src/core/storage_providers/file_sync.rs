@@ -11,7 +11,7 @@ use tokio::{io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt}, sync::RwLock, task:
 
 use memmap2::{Mmap, MmapOptions};
 
-use crate::{memory_pool::{MemoryBlock, MEMORY_POOL}, WRITE_BATCH_SIZE, WRITE_SLEEP_DURATION};
+use crate::{memory_pool::{MemoryBlock, MEMORY_POOL}, IMMEDIATE_WRITE, WRITE_BATCH_SIZE, WRITE_SLEEP_DURATION};
 
 use super::{traits::StorageIO, CRC};
 
@@ -201,7 +201,7 @@ impl LocalStorageProvider {
  
     }
 
-    pub async fn close_files(&mut self) {
+    pub async fn close_files(&self) {
         let file_read = std::fs::File::options()
             .read(true)
             .open(&self.file_str)
@@ -225,6 +225,10 @@ impl LocalStorageProvider {
     }
 
     pub async fn start_append_data_service(&self) {
+        if IMMEDIATE_WRITE {
+            return;
+        }
+        
         let mut idle_count = 0;
         let mut buffer: Vec<u8> = Vec::with_capacity(WRITE_BATCH_SIZE);
         
@@ -378,13 +382,13 @@ impl LocalStorageProvider {
 }
 
 impl StorageIO for LocalStorageProvider {
-    async fn write_data_unsync(&mut self, position: u64, buffer: &[u8]) {
+    async fn write_data_unsync(&self, position: u64, buffer: &[u8]) {
         let mut file = self.write_file.write().await;
         file.seek(SeekFrom::Start(position)).await.unwrap();
         file.write_all(buffer).await.unwrap();
     }
 
-    async fn verify_data(&mut self, position: u64, buffer: &[u8]) -> bool {
+    async fn verify_data(&self, position: u64, buffer: &[u8]) -> bool {
         let mut file_read = tokio::fs::File::options()
             .read(true)
             .open(&self.file_str)
@@ -397,7 +401,7 @@ impl StorageIO for LocalStorageProvider {
         buffer.eq(&file_buffer)
     }
 
-    async fn write_data(&mut self, position: u64, buffer: &[u8]) {
+    async fn write_data(&self, position: u64, buffer: &[u8]) {
         let mut file = self.write_file.write().await;
         file.seek(SeekFrom::Start(position)).await.unwrap();
         file.write_all(buffer).await.unwrap();
@@ -405,7 +409,7 @@ impl StorageIO for LocalStorageProvider {
         file.sync_all().await.unwrap();
     }
 
-    async fn append_data(&mut self, buffer: &[u8], immediate: bool) {
+    async fn append_data(&self, buffer: &[u8], immediate: bool) {
         if immediate {
             let buffer_len = buffer.len();
 
@@ -458,7 +462,7 @@ impl StorageIO for LocalStorageProvider {
         return buffer;
     }
 
-    async fn get_len(&mut self) -> u64 {
+    async fn get_len(&self) -> u64 {
         let read_file = tokio::fs::File::options()
             .read(true)
             .open(&self.file_str)
@@ -547,7 +551,7 @@ impl StorageIO for LocalStorageProvider {
         }
     }
 
-    async fn write_data_seek(&mut self, seek: SeekFrom, buffer: &[u8]) {
+    async fn write_data_seek(&self, seek: SeekFrom, buffer: &[u8]) {
         let mut file = self.write_file.write().await;
         file.seek(seek).await.unwrap();
         file.write_all(buffer).await.unwrap();
@@ -555,7 +559,7 @@ impl StorageIO for LocalStorageProvider {
         file.sync_all().await.unwrap();
     }
 
-    async fn verify_data_and_sync(&mut self, position: u64, buffer: &[u8]) -> bool {
+    async fn verify_data_and_sync(&self, position: u64, buffer: &[u8]) -> bool {
         let mut file = tokio::fs::File::options()
             .read(true)
             .write(true)
@@ -575,7 +579,7 @@ impl StorageIO for LocalStorageProvider {
         }
     }
 
-    async fn append_data_unsync(&mut self, buffer: &[u8]) {
+    async fn append_data_unsync(&self, buffer: &[u8]) {
         let mut file = self.append_file.write().await;
         file.write_all(&buffer).await.unwrap();
         self.file_len.fetch_add(buffer.len() as u64, std::sync::atomic::Ordering::SeqCst);
@@ -646,7 +650,7 @@ impl StorageIO for LocalStorageProvider {
         }
     }
 
-    async fn swap_temp(&mut self, _temp_io_sync: &mut Self) {
+    async fn swap_temp(&self, _temp_io_sync: &mut Self) {
         yield_now().await;
         
         let delimiter = if cfg!(unix) {
@@ -740,7 +744,7 @@ impl StorageIO for LocalStorageProvider {
         }
     }
 
-    fn drop_io(&mut self) {
+    fn drop_io(&self) {
         let delimiter = if cfg!(unix) {
             "/"
         } else if cfg!(windows) {
@@ -760,7 +764,7 @@ impl StorageIO for LocalStorageProvider {
         self.hash
     }
     
-    async fn start_service(&mut self) {
+    async fn start_service(&self) {
         let vec = vec![self.start_append_data_service()];
 
         join_all(vec).await;
