@@ -1,7 +1,6 @@
 use std::{borrow::Cow, io::Read};
 
 use byteorder::ReadBytesExt;
-use log::{debug, info};
 use smallvec::SmallVec;
 
 use crate::{core::db_type::DbType, memory_pool::{MemoryBlock, MEMORY_POOL}};
@@ -68,7 +67,6 @@ impl Row {
 
     pub fn into_vec(self) -> Vec<u8> {
         let mut vec = Vec::new();
-        //vec.extend_from_slice(&self.position.to_le_bytes());
 
         #[cfg(feature = "enable_long_row")]
         const LEN_EMPTY_BUFFER: [u8; 8] = [0u8; 8];
@@ -89,8 +87,6 @@ impl Row {
 
             vec.extend_from_slice(&column.data.into_slice());
             
-            debug!("Writing column with data: {:?}", column.data.into_slice());
-
             size += column_size;
 
             vec.extend_from_slice(&[column.column_type.to_byte()]);
@@ -103,18 +99,24 @@ impl Row {
         #[cfg(not(feature = "enable_long_row"))]
         let len_bytes = (size as u32).to_le_bytes();
 
-        vec[0..len_bytes.len()].copy_from_slice(&len_bytes);
+        vec[0] = len_bytes[0];
+        vec[1] = len_bytes[1];
+        vec[2] = len_bytes[2];
+        vec[3] = len_bytes[3];
 
-        debug!("Row turned into vector: {:?}", vec);
+        #[cfg(feature = "enable_long_row")]
+        {
+            vec[4] = len_bytes[4];
+            vec[5] = len_bytes[5];
+            vec[6] = len_bytes[6];
+            vec[7] = len_bytes[7];
+        }
+
         vec
     }
 
     pub fn from_vec(bytes: &[u8]) -> std::io::Result<Self> {
-        info!("Reading row from vector");
-        debug!("Row bytes: {:?}", bytes);
-
         let mut cursor = std::io::Cursor::new(bytes);
-        //let position = cursor.read_u64::<byteorder::LittleEndian>()?;
 
         #[cfg(feature = "enable_long_row")]
         let length = cursor.read_u64::<byteorder::LittleEndian>()?;
@@ -138,10 +140,6 @@ impl Row {
     }
 
     pub fn from_cursor(cursor: &mut std::io::Cursor<&[u8]>, global_position: &mut u64) -> std::io::Result<Self> {
-        info!("Reading row from cursor, position: {}", global_position);
-
-        //let position = cursor.read_u64::<byteorder::LittleEndian>()?;
-
         #[cfg(feature = "enable_long_row")]
         let length = cursor.read_u64::<byteorder::LittleEndian>()?;
 
@@ -150,7 +148,13 @@ impl Row {
         
         let mut columns = SmallVec::new();
 
-        let mut current_position = global_position.clone() + 4;
+        #[cfg(feature = "enable_long_row")]
+        const ADD_LENGTH: u64 = 8;
+
+        #[cfg(not(feature = "enable_long_row"))]
+        const ADD_LENGTH: u64 = 4;
+
+        let mut current_position = global_position.clone() + ADD_LENGTH;
         let end_position = current_position + length as u64;
 
         cursor.set_position(current_position);
@@ -196,7 +200,6 @@ pub fn vec_into_rows(bytes: &[u8]) -> std::io::Result<Vec<Row>> {
     let len = bytes.len() as u64;
 
     while global_position < len {
-        info!("Reading row at global position: {}", global_position);
         let row = Row::from_cursor(&mut cursor, &mut global_position)?;
         rows.push(row);
     }
