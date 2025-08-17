@@ -1,3 +1,4 @@
+use log::warn;
 use smallvec::SmallVec;
 
 use crate::core::{db_type::DbType, rql_v2::lexer_s1::QueryPurpose, row_v2::{row::{RowWrite, ColumnWritePayload}, schema::SchemaField}};
@@ -112,12 +113,16 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> MemoryBlock {
 /// Attempts to parse a QueryPurpose::InsertRow variant into a RowWrite object, using the provided schema.
 /// Returns None if the QueryPurpose is not InsertRow or parsing fails.
 pub fn insert_row_from_query_purpose(qp: &QueryPurpose, schema: &[SchemaField]) -> Option<RowWrite> {
-	if let QueryPurpose::InsertRow(sql) = qp {
-		let sql = sql.query.as_str();
-		let sql_upper = sql.to_ascii_uppercase();
-		if !sql_upper.starts_with("INSERT INTO") {
-			return None;
-		}
+    if let QueryPurpose::InsertRow(sql) = qp {
+        let sql = sql.query.as_str();
+        // Trim leading whitespace and newlines
+        let sql_trimmed = sql.trim_start_matches(|c: char| c.is_whitespace() || c == '\n' || c == '\r');
+        let sql_upper = sql_trimmed.to_ascii_uppercase();
+        if !sql_upper.starts_with("INSERT INTO") {
+            warn!("Invalid SQL query: {}", sql);
+            return None;
+        }
+        let sql = sql_trimmed;
 		// Parse: INSERT INTO table_name (col1, col2, ...) VALUES (val1, val2, ...)
 		let paren_start = sql.find('(')?;
 		let paren_end = sql.find(')')?;
@@ -211,20 +216,23 @@ mod tests {
             assert_eq!(payload.write_order, field.write_order as u32, "write_order mismatch at col {}", i);
             assert_eq!(payload.column_type, field.db_type, "db_type mismatch at col {}", i);
             assert_eq!(payload.size, field.size as u32, "size mismatch at col {}", i);
-            // Check data bytes (string columns will be quoted, others as stringified numbers or bools)
-            let expected_value = match field.name.as_str() {
-                "id" => b"42".as_ref(),
-                "name" => b"Bob".as_ref(),
-                "age" => b"27".as_ref(),
-                "email" => b"bob@example.com".as_ref(),
-                "active" => b"1".as_ref(),
-                "score" => b"99.5".as_ref(),
-                "created_at" => b"1680000000".as_ref(),
-                "notes" => b"Test user".as_ref(),
-                _ => panic!("Unexpected column"),
+            // Check data bytes (match binary representation for numeric types)
+            let expected_value: Vec<u8> = match field.db_type {
+                DbType::I32 => 42i32.to_le_bytes().to_vec(),
+                DbType::I16 => 27i16.to_le_bytes().to_vec(),
+                DbType::U8 => [1u8].to_vec(),
+                DbType::F64 => 99.5f64.to_le_bytes().to_vec(),
+                DbType::I64 => 1680000000i64.to_le_bytes().to_vec(),
+                DbType::STRING => match field.name.as_str() {
+                    "name" => b"Bob".to_vec(),
+                    "email" => b"bob@example.com".to_vec(),
+                    "notes" => b"Test user".to_vec(),
+                    _ => panic!("Unexpected STRING column name: {}", field.name),
+                },
+                _ => panic!("Unexpected column type: {:?}", field.db_type),
             };
             let actual_bytes = payload.data.into_slice();
-            assert_eq!(actual_bytes, expected_value, "data bytes mismatch at col {}", i);
+            assert_eq!(actual_bytes, expected_value.as_slice(), "data bytes mismatch at col {}", i);
         }
 
         // Check that write_order is sorted
@@ -250,7 +258,7 @@ mod tests {
         // Should be sorted by write_order: id (0), name (1), age (2)
         assert_eq!(row_write.columns_writing_data[0].write_order, 0);
         assert_eq!(row_write.columns_writing_data[0].column_type, DbType::I32);
-        assert_eq!(row_write.columns_writing_data[0].data.into_slice(), b"100");
+        assert_eq!(row_write.columns_writing_data[0].data.into_slice(), 100i32.to_le_bytes());
 
         assert_eq!(row_write.columns_writing_data[1].write_order, 1);
         assert_eq!(row_write.columns_writing_data[1].column_type, DbType::STRING);
@@ -258,6 +266,60 @@ mod tests {
 
         assert_eq!(row_write.columns_writing_data[2].write_order, 2);
         assert_eq!(row_write.columns_writing_data[2].column_type, DbType::I16);
-        assert_eq!(row_write.columns_writing_data[2].data.into_slice(), b"30");
+        assert_eq!(row_write.columns_writing_data[2].data.into_slice(), 30i16.to_le_bytes());
+    }
+
+    #[test]
+    fn test_insert_row_edge_cases() {
+        let schema = vec![
+            SchemaField { name: "id".to_string(), db_type: DbType::I32, size: 4, offset: 0, write_order: 0, is_unique: true, is_deleted: false },
+            SchemaField { name: "flag".to_string(), db_type: DbType::U8, size: 1, offset: 4, write_order: 1, is_unique: false, is_deleted: false },
+            SchemaField { name: "desc".to_string(), db_type: DbType::STRING, size: 32, offset: 5, write_order: 2, is_unique: false, is_deleted: false },
+        ];
+        let sql = r#"INSERT INTO users (id, flag, desc) VALUES (0, 255, "Edge")"#;
+        let qp = QueryPurpose::InsertRow(InsertRowData { query: sql.to_string(), table_name: "users".to_string() });
+        let row_write = insert_row_from_query_purpose(&qp, &schema).expect("Should parse successfully");
+        assert_eq!(row_write.columns_writing_data[0].data.into_slice(), 0i32.to_le_bytes());
+        assert_eq!(row_write.columns_writing_data[1].data.into_slice(), [255u8]);
+        assert_eq!(row_write.columns_writing_data[2].data.into_slice(), b"Edge");
+    }
+
+    #[test]
+    fn test_insert_row_float_and_char() {
+        let schema = vec![
+            SchemaField { name: "score".to_string(), db_type: DbType::F64, size: 8, offset: 0, write_order: 0, is_unique: false, is_deleted: false },
+            SchemaField { name: "grade".to_string(), db_type: DbType::CHAR, size: 1, offset: 8, write_order: 1, is_unique: false, is_deleted: false },
+        ];
+        let sql = r#"INSERT INTO results (score, grade) VALUES (3.14, "A")"#;
+        let qp = QueryPurpose::InsertRow(InsertRowData { query: sql.to_string(), table_name: "results".to_string() });
+        let row_write = insert_row_from_query_purpose(&qp, &schema).expect("Should parse successfully");
+        assert_eq!(row_write.columns_writing_data[0].data.into_slice(), 3.14f64.to_le_bytes());
+        assert_eq!(row_write.columns_writing_data[1].data.into_slice(), b"A");
+    }
+
+    #[test]
+    fn test_insert_row_with_whitespace_and_termination() {
+        let schema = vec![
+            SchemaField { name: "id".to_string(), db_type: DbType::I32, size: 4, offset: 0, write_order: 0, is_unique: true, is_deleted: false },
+            SchemaField { name: "name".to_string(), db_type: DbType::STRING, size: 16, offset: 4, write_order: 1, is_unique: false, is_deleted: false },
+        ];
+        // Leading/trailing whitespace, tabs, newlines, and semicolon termination
+        let sqls = [
+            "   \n\tINSERT INTO users (id, name) VALUES (123, \"Test\")\n\t  ",
+            "\r\nINSERT INTO users (id, name) VALUES (456, \"User\");\n",
+            "\t\n  INSERT INTO users (id, name) VALUES (789, \"Whitespace\")  ;  \n",
+        ];
+        let expected = [123i32.to_le_bytes(), 456i32.to_le_bytes(), 789i32.to_le_bytes()];
+        let expected_names = [
+            &b"Test"[..],
+            &b"User"[..],
+            &b"Whitespace"[..],
+        ];
+        for ((sql, exp_id), exp_name) in sqls.iter().zip(expected.iter()).zip(expected_names.iter()) {
+            let qp = QueryPurpose::InsertRow(InsertRowData { query: sql.to_string(), table_name: "users".to_string() });
+            let row_write = insert_row_from_query_purpose(&qp, &schema).expect("Should parse successfully");
+            assert_eq!(row_write.columns_writing_data[0].data.into_slice(), exp_id);
+            assert_eq!(row_write.columns_writing_data[1].data.into_slice(), *exp_name);
+        }
     }
 }
