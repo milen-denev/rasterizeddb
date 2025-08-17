@@ -37,7 +37,7 @@ async fn main() -> std::io::Result<()> {
     // return Ok(());
 
     env_logger::Builder::new()
-        .filter_level(LevelFilter::Debug)
+        .filter_level(LevelFilter::Error)
         .init();
 
     let database = Database::new("G:\\Databases\\Production").await;
