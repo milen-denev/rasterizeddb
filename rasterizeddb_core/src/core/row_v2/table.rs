@@ -120,6 +120,8 @@ impl<S: StorageIO> Table<S> {
             &mut iterator
         ).await;
 
+        info!("Query executed, returning {} rows", rows.len());
+
         return Ok(rows);
     }
 }
