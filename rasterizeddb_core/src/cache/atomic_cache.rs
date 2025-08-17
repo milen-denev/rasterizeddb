@@ -1302,6 +1302,7 @@ where
 
 #[cfg(test)]
 #[cfg(debug_assertions)]
+#[allow(dead_code)]
 mod tests {
   use super::*;
   use std::{sync::atomic::AtomicBool, thread, time::Duration};
