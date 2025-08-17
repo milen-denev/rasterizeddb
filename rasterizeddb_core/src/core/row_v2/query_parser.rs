@@ -278,7 +278,7 @@ impl<'a, 'b, 'c> QueryParser<'a, 'b, 'c> {
             Token::Ident((name, db_type, _write_order)) => {
                 // Simply look up the column data by name - no schema validation needed
                 let mb = self.cols.iter()
-                    .find(|(n, _)| n == &name)
+                    .find(|(n, _)| *n == *name)
                     .map(|(_, mb)| mb.clone())
                     .unwrap_or_else(|| panic!("Column data not found: '{}'", name));
                 
