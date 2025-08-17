@@ -430,7 +430,7 @@ impl TableSchema {
     
     pub async fn save<S: StorageIO>(&self, schema_io: Arc<S>) -> io::Result<()> {
         let data = self.into_vec();
-        schema_io.write_data(0, &data).await;
+        schema_io.append_data(&data, true).await;
         Ok(())
     }
 
@@ -498,29 +498,28 @@ impl TableSchema {
     pub async fn mark_field_as_deleted<S: StorageIO>(
         &mut self, field_name: &str,
         schema_io: Arc<S>) {
-
-        for field in self.fields.iter_mut() {
-            if field.name == field_name {
-                field.is_deleted = true;
-
-                let mut vec = field.into_vec();
-                let mut field_io = schema_io.create_new(format!("{}_{}", schema_io.get_name().replace(".db", ""), "FIELDS.db")).await;
-                let mut field_iterator = SchemaFieldIterator::new(&mut field_io).await.unwrap();
-
-                let mut position = 0;
-
-                for field in field_iterator.next_schema_fields().await.unwrap() {
-                    if field.name == field_name {
-                        field_io.write_data_seek(io::SeekFrom::Start(position), &mut vec).await;
-                        break;
-                    }
-
-                    position += SCHEMA_FIELD_SIZE;
-                }
-
+        // Reload fields from disk to ensure we have the latest state
+        let mut field_io = schema_io.create_new(format!("{}_{}", schema_io.get_name().replace(".db", ""), "FIELDS.db")).await;
+        let mut field_iterator = SchemaFieldIterator::new(&mut field_io).await.unwrap();
+        let mut all_fields: Vec<SchemaField> = Vec::new();
+        while let Ok(mut fields) = field_iterator.next_schema_fields().await {
+            if fields.is_empty() {
                 break;
             }
+            all_fields.append(&mut fields);
         }
+        let mut position = 0;
+        for field in all_fields.iter_mut() {
+            if field.name == field_name {
+                field.is_deleted = true;
+                let mut vec = field.into_vec();
+                field_io.write_data_seek(io::SeekFrom::Start(position), &mut vec).await;
+                break;
+            }
+            position += SCHEMA_FIELD_SIZE;
+        }
+        // Update self.fields to reflect the change
+        self.fields = all_fields;
     }
 }
 
