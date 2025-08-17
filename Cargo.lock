@@ -2356,7 +2356,9 @@ name = "test_client"
 version = "0.1.0"
 dependencies = [
  "env_logger",
+ "futures",
  "log",
+ "rand 0.9.2",
  "rasterizeddb_core",
  "stopwatch",
  "tokio",
