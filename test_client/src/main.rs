@@ -1,14 +1,19 @@
+#![allow(unused_imports)]
+
+use std::sync::{atomic::{AtomicU64, Ordering}, Arc};
+use futures::future::join_all;
 use log::LevelFilter;
+use rand::Rng;
 use rasterizeddb_core::{client::DbClient, core::{database::QueryExecutionResult, db_type::DbType, row_v2::row::vec_into_rows}};
 
 #[tokio::main(flavor = "multi_thread")]
 #[allow(unreachable_code)]
 async fn main() -> std::io::Result<()> {
     env_logger::Builder::new()
-        .filter_level(LevelFilter::Debug)
+        .filter_level(LevelFilter::Error)
         .init();
 
-    let client = DbClient::new(Some("127.0.0.1")).await.unwrap();
+    let client = Arc::new(DbClient::new(Some("127.0.0.1")).await.unwrap());
 
     // let _query = r##"
     //     CREATE TABLE employees (
@@ -23,36 +28,80 @@ async fn main() -> std::io::Result<()> {
 
     // println!("Create result: {:?}", create_result);
 
-    // let query = r##"
-    //     INSERT INTO employees (id, name, position, salary)
-    //     VALUES (1, 'Alice', 'Engineer', 75000.0);
-    // "##;
+    // let mut features = vec![];
 
-    // let insert_result = client.execute_query(query).await;
+    // let semaphore = Arc::new(tokio::sync::Semaphore::new(16)); 
 
-    // println!("Insert result: {:?}", insert_result);
+    // for i in 0..10_000 {
+    //     let person = generate_person();
+    //     let query = format!(
+    //         r##"
+    //         INSERT INTO employees (id, name, position, salary)
+    //         VALUES ({}, '{}', '{}', {});
+    //         "##,
+    //         i + 1, person.name, person.job_title, person.salary
+    //     );
 
-    // let query = r##"
-    //     INSERT INTO employees (id, name, position, salary)
-    //     VALUES (2, 'Ben', 'Electrician', 65000.0);
-    // "##;
+    //     let client_clone = Arc::clone(&client);
+    //     let semaphore_clone = Arc::clone(&semaphore);
 
-    // let insert_result = client.execute_query(query).await;
+    //     features.push(tokio::spawn(async move {
+    //         let _permit = semaphore_clone.acquire().await.unwrap();
+    //         let _insert_result = client_clone.execute_query(&query).await;
+    //         drop(_permit);
+    //     }));
+    // }
 
-    // println!("Insert result: {:?}", insert_result);
+    // join_all(features).await;
+
+    // tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+
+    // return Ok(());
+
+    // let client_clone = Arc::clone(&client);
+
+    // let total_type: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    // let total_queries = 10;
+
+    // let mut features = vec![];
+
+    // for _ in 0..total_queries {
+    //     let client_clone_2 = Arc::clone(&client_clone);
+    //     let total_type_clone = Arc::clone(&total_type);
+
+    //     features.push(tokio::spawn(async move {
+    //         let query = r##"
+    //             SELECT id FROM employees
+    //             WHERE id = 50
+    //         "##;
+
+    //         let instant = std::time::Instant::now();
+    //         let _select_result = client_clone_2.execute_query(query).await;
+    //         let elapsed = instant.elapsed().as_millis();
+    //         total_type_clone.fetch_add(elapsed as u64, Ordering::SeqCst);
+    //     }));
+    // }
+
+    // join_all(features).await;
+
+    // println!("Total time for {} queries: {} ms", total_queries, total_type.load(Ordering::SeqCst));
 
     let query = r##"
-        SELECT id, name, position, salary FROM employees
-        WHERE id >= 0
+        SELECT name FROM employees
+        WHERE name CONTAINS 'Ga'
     "##;
 
+    let instant = std::time::Instant::now();
     let select_result = client.execute_query(query).await;
+    let elapsed = instant.elapsed().as_millis();
 
-    println!("Select result: {:?}", select_result);
+    println!("Query executed in {} ms", elapsed);
 
     match select_result.unwrap() {
         QueryExecutionResult::RowsResult(rows) => {
+            println!("Rows fetched successfully.");
             let rows = vec_into_rows(&rows).unwrap();
+            println!("Total rows: {}", rows.len());
             for row in rows {
                 for column in &row.columns {
                     if column.column_type == DbType::STRING {
@@ -135,4 +184,52 @@ async fn main() -> std::io::Result<()> {
     // stdin().read_line(&mut buffer).unwrap();
 
     return Ok(());
+}
+
+// A simple struct to hold the generated data.
+struct Person {
+    name: String,
+    job_title: String,
+    salary: f32,
+}
+
+// Function to generate a new `Person` with random data.
+fn generate_person() -> Person {
+    // Create a new thread-local random number generator.
+    let mut rng = rand::rng();
+
+    // Arrays of possible names and job titles.
+    let first_names = [
+        "James", "Mary", "Robert", "Patricia", "John", "Jennifer", "Michael", "Linda",
+        "William", "Elizabeth", "David", "Susan", "Richard", "Jessica",
+    ];
+    let last_names = [
+        "Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller", "Davis",
+        "Rodriguez", "Martinez", "Hernandez", "Lopez", "Gonzalez", "Wilson",
+    ];
+    let job_titles = [
+        "Software Engineer", "Data Scientist", "Product Manager", "UX Designer",
+        "Financial Analyst", "Marketing Specialist", "Human Resources Manager",
+        "Customer Service Representative", "Project Coordinator", "DevOps Engineer",
+    ];
+
+    // Pick a random name from the arrays.
+    let first_name = first_names[rng.random_range(0..first_names.len())];
+    let last_name = last_names[rng.random_range(0..last_names.len())];
+    let name = format!("{} {}", first_name, last_name);
+
+    // Pick a random job title.
+    let job_title = job_titles[rng.random_range(0..job_titles.len())].to_string();
+
+    // Generate a random salary as an f32 within a realistic range.
+    let min_salary = 20000.0;
+    let max_salary = 250000.0;
+    let salary = rng.random_range(min_salary..max_salary);
+
+    // Return the new Person struct.
+    Person {
+        name,
+        job_title,
+        salary,
+    }
 }
