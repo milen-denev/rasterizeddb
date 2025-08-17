@@ -737,7 +737,8 @@ impl RowPointer {
 
         // For each column specified in the fetch data
         for column_data in &row_fetch.columns_fetching_data {
-            let mut position = self.position + column_data.column_offset as u64;
+            let row_position = self.position;
+            let mut position = row_position.clone() + column_data.column_offset as u64;
 
             if column_data.column_type == DbType::STRING {
                 // For strings, we need to read the size first
@@ -746,7 +747,7 @@ impl RowPointer {
                 _ = io.read_data_into_buffer(&mut position, &mut string_position_buffer).await;
 
                 // Turn [u8] into u64
-                let mut string_row_position = unsafe { simds::endianess::read_u64(string_position_buffer.as_ptr()) };
+                let mut string_row_position = row_position + unsafe { simds::endianess::read_u64(string_position_buffer.as_ptr()) };
 
                 let mut string_size_buffer = [0u8; 4];
 
