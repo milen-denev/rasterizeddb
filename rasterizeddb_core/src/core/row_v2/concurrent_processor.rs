@@ -166,11 +166,10 @@ impl ConcurrentProcessor {
                     let tuple_clone_2 = tuple_clone.clone();
                     let (_, row_fetch) = &*tuple_clone_2;
 
-                    let row = pointer.fetch_row(io_rows_clone, &row_fetch).await.unwrap();
-                   
+                    pointer.fetch_row_reuse_async(io_rows_clone, &row_fetch, &mut buffer.row).await;
 
                     let result = if let Some(ref mut single_transformer_d) = single_transformer_data {
-                        let column = row.columns.iter().filter(|x| {
+                        let column = buffer.row.columns.iter().filter(|x| {
                             match x.schema_id {
                                 _ if x.schema_id == schema_id => true,
                                 _ => false
@@ -193,7 +192,7 @@ impl ConcurrentProcessor {
 
                         column_vec_into_vec(
                             mut_hashtable_buffer,
-                            &row.columns,
+                            &buffer.row.columns,
                             &*schema_ref
                         );
 
@@ -212,7 +211,7 @@ impl ConcurrentProcessor {
                     };
 
                     if result {
-                        tx_clone.send(Row::clone_row(&row)).unwrap();
+                        tx_clone.send(Row::clone_row(&buffer.row)).unwrap();
                     }
                 }
 
