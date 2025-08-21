@@ -12,7 +12,7 @@ use smallvec::SmallVec;
 use crate::{
     core::{
         db_type::DbType, row_v2::row::{Column, Row, RowFetch}, storage_providers::traits::StorageIO
-    }, memory_pool::{MemoryBlock, MEMORY_POOL}, simds::{self, endianess::*}, BATCH_SIZE, IMMEDIATE_WRITE
+    }, memory_pool::{MemoryBlock, MEMORY_POOL}, BATCH_SIZE, IMMEDIATE_WRITE
 };
 
 #[cfg(feature = "enable_long_row")]
@@ -459,53 +459,53 @@ impl RowPointer {
     pub fn from_slice(buffer: &[u8; TOTAL_LENGTH]) -> Self {
         // ID field
         #[cfg(feature = "enable_long_row")]
-        let id = unsafe { read_u128(buffer.as_ptr()) };
+        let id = unsafe { u128::from_le_bytes(*buffer.as_ptr().cast::<[u8; 16]>()) };
 
         #[cfg(not(feature = "enable_long_row"))]
-        let id = unsafe { read_u64(buffer.as_ptr()) };
+        let id = unsafe { u64::from_le_bytes(*buffer.as_ptr().cast::<[u8; 8]>()) };
 
         // Length field
         #[cfg(feature = "enable_long_row")]
-        let length = unsafe { read_u64(buffer.as_ptr().add(16)) };
+        let length = unsafe { u64::from_le_bytes(*buffer.as_ptr().add(16).cast::<[u8; 8]>()) };
 
         #[cfg(not(feature = "enable_long_row"))]
-        let length = unsafe { read_u32(buffer.as_ptr().add(8)) };
+        let length = unsafe { u32::from_le_bytes(*buffer.as_ptr().add(8).cast::<[u8; 4]>()) };
 
         // Position field (u64 in both cases)
         #[cfg(feature = "enable_long_row")]
-        let position = unsafe { read_u64(buffer.as_ptr().add(24))};
+        let position = unsafe { u64::from_le_bytes(*buffer.as_ptr().add(24).cast::<[u8; 8]>()) };
 
         #[cfg(not(feature = "enable_long_row"))]
-        let position = unsafe { read_u64(buffer.as_ptr().add(12)) };
+        let position = unsafe { u64::from_le_bytes(*buffer.as_ptr().add(12).cast::<[u8; 8]>()) };
 
         // Deleted field (bool - 1 byte)
         #[cfg(feature = "enable_long_row")]
-        let deleted = unsafe { read_u8(buffer.as_ptr().add(32)) } != 0;
+        let deleted = unsafe { u8::from_le_bytes(*buffer.as_ptr().add(32).cast::<[u8; 1]>()) } != 0;
 
         #[cfg(not(feature = "enable_long_row"))]
-        let deleted = unsafe { read_u8(buffer.as_ptr().add(20)) } != 0;
+        let deleted = unsafe { u8::from_le_bytes(*buffer.as_ptr().add(20).cast::<[u8; 1]>()) } != 0;
 
         // The following fields only exist in the long row format
         #[cfg(feature = "enable_long_row")]
-        let checksum = unsafe { read_u32(buffer.as_ptr().add(33)) };
+        let checksum = unsafe { u32::from_le_bytes(*buffer.as_ptr().add(33).cast::<[u8; 4]>()) };
 
         #[cfg(feature = "enable_long_row")]
-        let cluster = unsafe { read_u32(buffer.as_ptr().add(37)) };
+        let cluster = unsafe { u32::from_le_bytes(*buffer.as_ptr().add(37).cast::<[u8; 4]>()) };
 
         #[cfg(feature = "enable_long_row")]
-        let deleted_at = unsafe { read_u128(buffer.as_ptr().add(41)) };
+        let deleted_at = unsafe { u128::from_le_bytes(*buffer.as_ptr().add(41).cast::<[u8; 16]>()) };
 
         #[cfg(feature = "enable_long_row")]
-        let created_at = unsafe { read_u128(buffer.as_ptr().add(57)) };
+        let created_at = unsafe { u128::from_le_bytes(*buffer.as_ptr().add(57).cast::<[u8; 16]>()) };
 
         #[cfg(feature = "enable_long_row")]
-        let updated_at = unsafe { read_u128(buffer.as_ptr().add(73)) };
+        let updated_at = unsafe { u128::from_le_bytes(*buffer.as_ptr().add(73).cast::<[u8; 16]>()) };
 
         #[cfg(feature = "enable_long_row")]
-        let version = unsafe { read_u16(buffer.as_ptr().add(89)) };
+        let version = unsafe { u16::from_le_bytes(*buffer.as_ptr().add(89).cast::<[u8; 2]>()) };
 
         #[cfg(feature = "enable_long_row")]
-        let is_active = unsafe { read_u8(buffer.as_ptr().add(91)) } != 0 ;
+        let is_active = unsafe { u8::from_le_bytes(*buffer.as_ptr().add(91).cast::<[u8; 1]>()) } != 0;
 
         // Create the RowPointer struct from the read values
         let row_pointer = RowPointer {
@@ -540,53 +540,53 @@ impl RowPointer {
     pub fn from_slice_unknown(buffer: &[u8]) -> Self {
         // ID field
         #[cfg(feature = "enable_long_row")]
-        let id = unsafe { read_u128(buffer.as_ptr()) };
+        let id = unsafe { u128::from_le_bytes(*buffer.as_ptr().cast::<[u8; 16]>()) };
 
         #[cfg(not(feature = "enable_long_row"))]
-        let id = unsafe { read_u64(buffer.as_ptr()) };
+        let id = unsafe { u64::from_le_bytes(*buffer.as_ptr().cast::<[u8; 8]>()) };
 
         // Length field
         #[cfg(feature = "enable_long_row")]
-        let length = unsafe { read_u64(buffer.as_ptr().add(16)) };
+        let length = unsafe { u64::from_le_bytes(*buffer.as_ptr().add(16).cast::<[u8; 8]>()) };
 
         #[cfg(not(feature = "enable_long_row"))]
-        let length = unsafe { read_u32(buffer.as_ptr().add(8)) };
+        let length = unsafe { u32::from_le_bytes(*buffer.as_ptr().add(8).cast::<[u8; 4]>()) };
 
         // Position field (u64 in both cases)
         #[cfg(feature = "enable_long_row")]
-        let position = unsafe { read_u64(buffer.as_ptr().add(24))};
+        let position = unsafe { u64::from_le_bytes(*buffer.as_ptr().add(24).cast::<[u8; 8]>()) };
 
         #[cfg(not(feature = "enable_long_row"))]
-        let position = unsafe { read_u64(buffer.as_ptr().add(12)) };
+        let position = unsafe { u64::from_le_bytes(*buffer.as_ptr().add(12).cast::<[u8; 8]>()) };
 
         // Deleted field (bool - 1 byte)
         #[cfg(feature = "enable_long_row")]
-        let deleted = unsafe { read_u8(buffer.as_ptr().add(32)) } != 0;
+        let deleted = unsafe { u8::from_le_bytes(*buffer.as_ptr().add(32).cast::<[u8; 1]>()) } != 0;
 
         #[cfg(not(feature = "enable_long_row"))]
-        let deleted = unsafe { read_u8(buffer.as_ptr().add(20)) } != 0;
+        let deleted = unsafe { u8::from_le_bytes(*buffer.as_ptr().add(20).cast::<[u8; 1]>()) } != 0;
 
         // The following fields only exist in the long row format
         #[cfg(feature = "enable_long_row")]
-        let checksum = unsafe { read_u32(buffer.as_ptr().add(33)) };
+        let checksum = unsafe { u32::from_le_bytes(*buffer.as_ptr().add(33).cast::<[u8; 4]>()) };
 
         #[cfg(feature = "enable_long_row")]
-        let cluster = unsafe { read_u32(buffer.as_ptr().add(37)) };
+        let cluster = unsafe { u32::from_le_bytes(*buffer.as_ptr().add(37).cast::<[u8; 4]>()) };
 
         #[cfg(feature = "enable_long_row")]
-        let deleted_at = unsafe { read_u128(buffer.as_ptr().add(41)) };
+        let deleted_at = unsafe { u128::from_le_bytes(*buffer.as_ptr().add(41).cast::<[u8; 16]>()) };
 
         #[cfg(feature = "enable_long_row")]
-        let created_at = unsafe { read_u128(buffer.as_ptr().add(57)) };
+        let created_at = unsafe { u128::from_le_bytes(*buffer.as_ptr().add(57).cast::<[u8; 16]>()) };
 
         #[cfg(feature = "enable_long_row")]
-        let updated_at = unsafe { read_u128(buffer.as_ptr().add(73)) };
+        let updated_at = unsafe { u128::from_le_bytes(*buffer.as_ptr().add(73).cast::<[u8; 16]>()) };
 
         #[cfg(feature = "enable_long_row")]
-        let version = unsafe { read_u16(buffer.as_ptr().add(89)) };
+        let version = unsafe { u16::from_le_bytes(*buffer.as_ptr().add(89).cast::<[u8; 2]>()) };
 
         #[cfg(feature = "enable_long_row")]
-        let is_active = unsafe { read_u8(buffer.as_ptr().add(91)) } != 0 ;
+        let is_active = unsafe { u8::from_le_bytes(*buffer.as_ptr().add(91).cast::<[u8; 1]>()) } != 0;
 
         // Create the RowPointer struct from the read values
         let row_pointer = RowPointer {
@@ -649,7 +649,7 @@ impl RowPointer {
         }
         
         // Create a vector to hold all the columns
-        let mut columns: SmallVec<[Column; 20]> = SmallVec::new();
+        let mut columns = Vec::new();
         
         let mut schema_id = 0;
 
@@ -665,12 +665,13 @@ impl RowPointer {
                 _ = io.read_data_into_buffer(&mut position, &mut string_position_buffer).await;
 
                 // Turn [u8] into u64
-                let mut string_row_position = row_position + unsafe { simds::endianess::read_u64(string_position_buffer.as_ptr()) };
+                let mut string_row_position = row_position + u64::from_le_bytes(string_position_buffer);
 
                 let mut string_size_buffer = [0u8; 4];
-
+                
                 _ = io.read_data_into_buffer(&mut position, &mut string_size_buffer).await;
-                let string_size = unsafe { simds::endianess::read_u32(string_size_buffer.as_ptr()) };
+
+                let string_size = u32::from_le_bytes(string_size_buffer);
 
                 // Read the string data
                 let string_block = MEMORY_POOL.acquire(string_size as usize);
@@ -724,6 +725,7 @@ impl RowPointer {
         io: Arc<S>,
         row_fetch: &RowFetch,
         row_reuse: &mut Row) {
+
         // Skip fetching if the row is marked as deleted
         if self.deleted {
             panic!();
@@ -747,17 +749,21 @@ impl RowPointer {
                 _ = io.read_data_into_buffer(&mut position, &mut string_position_buffer).await;
 
                 // Turn [u8] into u64
-                let mut string_row_position = row_position + unsafe { simds::endianess::read_u64(string_position_buffer.as_ptr()) };
+                let mut string_row_position = row_position + u64::from_le_bytes(string_position_buffer);
 
                 let mut string_size_buffer = [0u8; 4];
-
+                
                 _ = io.read_data_into_buffer(&mut position, &mut string_size_buffer).await;
-                let string_size = unsafe { simds::endianess::read_u32(string_size_buffer.as_ptr()) };
+
+                let string_size = u32::from_le_bytes(string_size_buffer);
 
                 let string_block = MEMORY_POOL.acquire(string_size as usize);
 
                 let string_slice = string_block.into_slice_mut();
+
                 _ = io.read_data_into_buffer(&mut string_row_position, string_slice).await;
+
+                //println!("string slice: {:?} at position {:?}", string_slice, string_row_position);
 
                 // Create a column with the string data
                 let column = Column {
@@ -775,7 +781,7 @@ impl RowPointer {
                 // Allocate memory for the column data
                 let block = MEMORY_POOL.acquire(c_size as usize);
                 let slice = block.into_slice_mut();
-                
+
                 // Read the column data directly into our buffer
                 _ = io.read_data_into_buffer(&mut position, slice).await;
 
@@ -791,7 +797,7 @@ impl RowPointer {
                 columns.push(column);
             }
         }
-        
+
         row_reuse.position = self.position;
         row_reuse.length = self.length;
     }
@@ -859,9 +865,16 @@ impl RowPointer {
         for column in row_write.columns_writing_data.iter().sorted_by(|a, b| a.write_order.cmp(&b.write_order)) {
             let end_of_column = row_position + column.size as u64;
 
-            // If it's string a pointer of u64 must be created which will point to
-            // the ending of the row, were the strings are saved.
-            // If it's a known size, integers, floats, etc. it's placed into the buffer.
+            // Data Layout Description:
+            //
+            // For fixed-size data types (integers, floats, booleans, etc.),
+            // the value is placed directly into the main data buffer.
+            //
+            // For variable-length data types, such as strings, a 64-bit pointer
+            // and a 32-bit size field are used. The pointer references the
+            // location where the string's binary data is stored, which is
+            // typically at the end of the buffer, after the fixed-size fields.
+            //
             // Example:
             //              U64 POINTER | U32 SIZE             U64 POINTER | U32 SIZE     BINARY DATA | BINARY DATA
             //    4 bytes | 8 bytes | 4 bytes | 4 bytes | 16 bytes |  8 bytes  |  4 bytes  |   X bytes   |   X bytes  
@@ -917,6 +930,32 @@ impl RowPointer {
 
         Ok(row_pointer)
     }
+
+    // pub async fn verify_row<S: StorageIO>(
+    //     rows_io: Arc<S>,
+    //     row_pointer: &RowPointer,
+    //     row_write: &RowWrite
+    // ) -> bool {
+    //     let mut position = row_pointer.position.clone();
+    //     let data = rows_io.read_data(&mut position, row_pointer.length).await;
+    //     let slice = data.as_slice();
+
+    //     // Verify the data
+    //     let mut is_valid = true;
+
+    //     let mut position = 0;
+
+    //     for (_, column) in row_write.columns_writing_data.iter().enumerate() {
+    //         let column_slice = &slice[position..position as usize + column.size as usize];
+    //         if column_slice != column.data.into_slice() {
+    //             is_valid = false;
+    //             break;
+    //         }
+    //         position += column.size as usize;
+    //     }
+
+    //     is_valid
+    // }
 }
 
 #[cfg(test)]
@@ -1270,7 +1309,7 @@ mod tests {
         let next_pointer = iterator.next_row_pointer().await.unwrap().unwrap();
 
         let row_fetch = RowFetch {
-            columns_fetching_data: vec![
+            columns_fetching_data: smallvec::smallvec![
                 ColumnFetchingData {
                     column_offset: 0,
                     column_type: DbType::STRING,
@@ -1341,7 +1380,7 @@ mod tests {
         let next_pointer = iterator.next_row_pointer().await.unwrap().unwrap();
 
         let row_fetch = RowFetch {
-            columns_fetching_data: vec![
+            columns_fetching_data: smallvec::smallvec![
                 ColumnFetchingData {
                     column_offset: 0,
                     column_type: DbType::U64,
