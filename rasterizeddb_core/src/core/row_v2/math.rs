@@ -43,7 +43,7 @@ where
 {
     let size = std::mem::size_of::<T>();
     
-    assert!(
+    debug_assert!(
         input1.len() % size == 0,
         "Input slices must be divisible by the size of the target type"
     );
@@ -59,7 +59,7 @@ where
         MathOperation::Subtract => num1 - num2,
         MathOperation::Multiply => num1 * num2,
         MathOperation::Divide => {
-            assert!(num2 != T::default(), "Division by zero is not allowed");
+            debug_assert!(num2 != T::default(), "Division by zero is not allowed");
             num1 / num2
         },
         MathOperation::Exponent => {
@@ -70,7 +70,7 @@ where
         MathOperation::Root => {
             let value: f64 = num1.into_f64();
             let root: f64 = num2.into_f64();
-            assert!(root != 0.0, "Root by zero is not allowed");
+            debug_assert!(root != 0.0, "Root by zero is not allowed");
             T::from_f64(value.powf(1.0 / root))
         }
     };
