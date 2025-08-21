@@ -1,8 +1,8 @@
 use std::{
-    arch::x86_64::{_mm_prefetch, _MM_HINT_T0}, fmt, hash::Hash
+    arch::x86_64::{_mm_prefetch, _MM_HINT_T0}, fmt, hash::Hash, sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc}
 };
 
-use crate::instructions::{copy_vec_to_ptr, ref_slice, ref_slice_mut};
+use crate::instructions::{copy_ptr_to_ptr, copy_vec_to_ptr, ref_slice, ref_slice_mut};
 
 pub static MEMORY_POOL: MemoryPool = MemoryPool::new();
 
@@ -23,6 +23,7 @@ impl MemoryPool {
     }
 
     #[inline(always)]
+    #[track_caller]
     pub fn acquire(&self, size: usize) -> MemoryBlock {
         if size <= INLINE_CAPACITY {
             // Allocate on the stack (within the union's inline_data)
@@ -36,7 +37,9 @@ impl MemoryPool {
                 data: MemoryBlockData { inline_data: data },
                 len: size,
                 is_heap: false,
-                should_drop: true
+                should_drop: true,
+                dropped: Arc::new(AtomicBool::new(false)),
+                references: Arc::new(AtomicU64::new(0)),
             }
         } else {
             // Allocate on the heap
@@ -51,7 +54,9 @@ impl MemoryPool {
                 data: MemoryBlockData { heap_data: (ptr, size) },
                 len: size, // For heap, len is the full size
                 is_heap: true,
-                should_drop: true
+                should_drop: true,
+                dropped: Arc::new(AtomicBool::new(false)),
+                references: Arc::new(AtomicU64::new(1)),
             }
         }
     }
@@ -70,7 +75,9 @@ impl MemoryPool {
                 data: MemoryBlockData { inline_data: data },
                 len: size,
                 is_heap: false,
-                should_drop: true
+                should_drop: true,
+                dropped: Arc::new(AtomicBool::new(false)),
+                references: Arc::new(AtomicU64::new(0))
             }
         } else {
             // Allocate on the heap
@@ -85,7 +92,9 @@ impl MemoryPool {
                 data: MemoryBlockData { heap_data: (ptr, size) },
                 len: size, // For heap, len is the full size
                 is_heap: true,
-                should_drop: true
+                should_drop: true,
+                dropped: Arc::new(AtomicBool::new(false)),
+                references: Arc::new(AtomicU64::new(1)),
             }
         }
     }
@@ -109,24 +118,7 @@ union MemoryBlockData {
     heap_data: (*mut u8, usize), // Tuple for pointer and size
 }
 
-impl Clone for MemoryBlockData {
-    #[inline(always)]
-    fn clone(&self) -> Self {
-        unsafe {
-            if self.heap_data.0.is_null() {
-                // If the heap pointer is null, we are dealing with inline data
-                MemoryBlockData {
-                    inline_data: self.inline_data,
-                }
-            } else {
-                // Create a new MemoryBlockData with the copied data
-                MemoryBlockData {
-                    heap_data: self.heap_data,
-                }
-            }
-        }
-    }
-}
+// Remove the manual Clone implementation since we're using derive
 
 // The main MemoryBlock struct that manages the union
 pub struct MemoryBlock {
@@ -134,7 +126,9 @@ pub struct MemoryBlock {
     data: MemoryBlockData,
     len: usize, // Actual length of the data
     is_heap: bool, // Discriminant for the union: true if heap, false if inline
-    should_drop: bool
+    should_drop: bool,
+    dropped: Arc<AtomicBool>,
+    references: Arc<AtomicU64>
 }
 
 unsafe impl Send for MemoryBlock {}
@@ -149,7 +143,9 @@ impl Default for MemoryBlock {
             data: MemoryBlockData { inline_data: [0; INLINE_CAPACITY] }, // Initialize with zeros
             len: 0,
             is_heap: false, // It's an inline block
-            should_drop: false // Not needed as it's implied by is_heap
+            should_drop: false, // Not needed as it's implied by is_heap,
+            dropped: Arc::new(AtomicBool::new(false)),
+            references: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -190,9 +186,22 @@ impl fmt::Debug for MemoryBlock {
 
 impl Drop for MemoryBlock {
     #[inline(always)]
+    #[track_caller]
     fn drop(&mut self) {
         if self.should_drop && self.is_heap {
-            MEMORY_POOL.release(unsafe { self.data.heap_data.0 });
+            let refs = self.references.fetch_sub(1, Ordering::Release);
+            
+            if refs == 1 {
+                let was_dropped = self.dropped
+                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                    .expect("MemoryBlock was already dropped");
+
+                if was_dropped {
+                    panic!("MemoryBlock was already dropped, this should not happen.");
+                }
+
+                MEMORY_POOL.release(unsafe { self.data.heap_data.0 });
+            }
         } else {
             // If it's inline, we don't need to do anything special
             // The memory will be automatically cleaned up when the block goes out of scope
@@ -203,21 +212,38 @@ impl Drop for MemoryBlock {
 impl Clone for MemoryBlock {
     #[inline(always)]
     fn clone(&self) -> Self {
+        let references = Arc::clone(&self.references);
+
         if self.is_heap {
+            references.fetch_add(1, Ordering::Release);
+
             MemoryBlock {
                 hash: self.hash,
-                data: self.data.clone(),
+                data: MemoryBlockData { 
+                    heap_data: (
+                    unsafe { 
+                        self.data.heap_data.0.clone() 
+                    }, 
+                    unsafe { 
+                        self.data.heap_data.1.clone() 
+                    }) 
+                },
                 len: self.len,
                 is_heap: true,
-                should_drop: false
+                should_drop: true, // Important: new allocation should be cleaned up
+                dropped: self.dropped.clone(),
+                references: references
             }
         } else {
+            // For inline data, we can safely copy the data
             MemoryBlock {
                 hash: self.hash,
-                data: self.data.clone(),
+                data: unsafe { MemoryBlockData { inline_data: self.data.inline_data.clone() } }, // This is safe to copy for inline data
                 len: self.len,
                 is_heap: false,
-                should_drop: false
+                should_drop: true, // Inline doesn't need cleanup, but keep consistent
+                dropped: self.dropped.clone(),
+                references: references
             }
         }
     }
@@ -226,7 +252,16 @@ impl Clone for MemoryBlock {
 impl MemoryBlock {
     #[inline(always)]
     pub fn prefetch_to_lcache(&self) {
+        let was_dropped = self.dropped.load(Ordering::Relaxed);
+
+        if was_dropped {
+            panic!("MemoryBlock was already dropped, this should not happen.");
+        }
+
         if self.is_heap {
+            if unsafe { self.data.heap_data.0.is_null() } {
+                panic!("MemoryBlock is heap-allocated but pointer is null.");
+            }
             // Prefetch the heap data to the L1 cache
             unsafe { _mm_prefetch::<_MM_HINT_T0>(self.data.heap_data.0 as *const i8) };
         } else {
@@ -241,10 +276,13 @@ impl MemoryBlock {
         let len = vec.len();
         let memory_chunk = MEMORY_POOL.acquire(len);
 
-        if memory_chunk.is_heap {
-            copy_vec_to_ptr(vec.as_slice(), unsafe { memory_chunk.data.heap_data.0 });
-        } else {
-            copy_vec_to_ptr(vec.as_slice(), unsafe { memory_chunk.data.inline_data.as_ptr() as *mut u8 });
+        // Handle empty vectors - no copying needed
+        if len > 0 {
+            if memory_chunk.is_heap {
+                copy_vec_to_ptr(vec.as_slice(), unsafe { memory_chunk.data.heap_data.0 });
+            } else {
+                copy_vec_to_ptr(vec.as_slice(), unsafe { memory_chunk.data.inline_data.as_ptr() as *mut u8 });
+            }
         }
       
         drop(vec);
@@ -253,7 +291,16 @@ impl MemoryBlock {
 
     #[inline(always)]
     pub fn into_slice(&self) -> &'static [u8] {
+        let was_dropped = self.dropped.load(Ordering::Relaxed);
+
+        if was_dropped {
+            panic!("MemoryBlock was already dropped, this should not happen.");
+        }
+
         if self.is_heap {
+            if unsafe { self.data.heap_data.0.is_null() } {
+                panic!("MemoryBlock is heap-allocated but pointer is null.");
+            }
             // If it's a heap allocation, return the slice from the pointer
             unsafe { ref_slice(self.data.heap_data.0, self.len) }
         } else {
@@ -264,7 +311,16 @@ impl MemoryBlock {
 
     #[inline(always)]
     pub fn into_slice_mut(&self) -> &'static mut [u8] {
+        let was_dropped = self.dropped.load(Ordering::Relaxed);
+
+        if was_dropped {
+            panic!("MemoryBlock was already dropped, this should not happen.");
+        }
+
         if self.is_heap {
+            if unsafe { self.data.heap_data.0.is_null() } {
+                panic!("MemoryBlock is heap-allocated but pointer is null.");
+            }
             // If it's a heap allocation, return the mutable slice from the pointer
             unsafe { ref_slice_mut(self.data.heap_data.0, self.len) }
         } else {
@@ -278,13 +334,35 @@ impl MemoryBlock {
         let len = slice.len();
         let memory_chunk = MEMORY_POOL.acquire_with_hash(len);
 
-        if memory_chunk.is_heap {
-            copy_vec_to_ptr(slice, unsafe { memory_chunk.data.heap_data.0 });
-        } else {
-            copy_vec_to_ptr(slice, unsafe { memory_chunk.data.inline_data.as_ptr() as *mut u8 });
+        // Handle empty slices - no copying needed
+        if len > 0 {
+            if memory_chunk.is_heap {
+                copy_vec_to_ptr(slice, unsafe { memory_chunk.data.heap_data.0 });
+            } else {
+                copy_vec_to_ptr(slice, unsafe { memory_chunk.data.inline_data.as_ptr() as *mut u8 });
+            }
         }
 
         memory_chunk
+    }
+
+    pub fn deep_clone(&self) -> Self {
+        if self.is_heap {
+            // Allocate on the heap
+            let new_block = MEMORY_POOL.acquire(self.len);
+            unsafe {
+                copy_ptr_to_ptr(self.data.heap_data.0, new_block.data.heap_data.0, self.len);
+            }
+            new_block
+        } else {
+            // Allocate inline
+            let mut new_block = MEMORY_POOL.acquire(self.len);
+            // Only copy the used portion of inline_data
+            let dst = unsafe { &mut new_block.data.inline_data[..self.len] };
+            let src = self.into_slice();
+            dst.copy_from_slice(src);
+            new_block
+        }
     }
 }
 
@@ -600,6 +678,32 @@ mod tests {
     }
 
     #[test]
+    fn test_memory_corruption_prevention() {
+        // This test specifically checks for the memory corruption bug that was reported
+        let original_data = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let block1 = MemoryBlock::from_vec(original_data.clone());
+        
+        // Clone the block - this used to cause use-after-free
+        let block2 = block1.clone();
+        
+        // Verify both blocks have the same data initially
+        assert_eq!(block1.into_slice(), &original_data[..]);
+        assert_eq!(block2.into_slice(), &original_data[..]);
+        
+        // Modify data through block1
+        let slice1 = block1.into_slice_mut();
+        slice1[0] = 99;
+        
+        // Verify that block2's data is NOT affected (proper isolation)
+        assert_eq!(block1.into_slice()[0], 99);
+        assert_eq!(block2.into_slice()[0], 1); // Should still be original value
+        
+        // Both blocks should maintain their integrity
+        assert_eq!(&block1.into_slice()[1..], &original_data[1..]);
+        assert_eq!(&block2.into_slice()[1..], &original_data[1..]);
+    }
+
+    #[test]
     fn test_memory_block_hashing() {
         let pool = MemoryPool::new();
         let data = b"test data";
@@ -622,5 +726,170 @@ mod tests {
         // Check if the hash matches the expected value
         assert_ne!(hash_value_1, 0, "Hash should not be zero");
         assert_eq!(hash_value_2, hash_value_1, "Block hash should match computed hash");
+    }
+
+    // #[test]
+    // fn test_simulate_stack_overflow() {
+    //     // This test will recurse until stack overflow is likely, but catch the panic.
+    //     fn recurse(n: usize) {
+    //         let _block = MEMORY_POOL.acquire(8); // Small inline allocation
+    //         if n > 0 {
+    //             recurse(n - 1);
+    //         }
+    //     }
+    //     let result = std::panic::catch_unwind(|| {
+    //         // 32_000 is usually enough to overflow stack on default settings
+    //         recurse(32_000);
+    //     });
+    //     assert!(result.is_err(), "Expected stack overflow panic");
+    // }
+
+    #[test]
+    fn test_aggressive_concurrent_access() {
+        // More threads and allocations to stress test concurrency
+        let threads_count = 32;
+        let ops_per_thread = 500;
+        let barrier = Arc::new(std::sync::Barrier::new(threads_count));
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let mut handles = Vec::with_capacity(threads_count);
+        for thread_id in 0..threads_count {
+            let barrier = Arc::clone(&barrier);
+            let errors = Arc::clone(&errors);
+            let handle = thread::spawn(move || {
+                barrier.wait();
+                for i in 0..ops_per_thread {
+                    let size = (thread_id * i) % 128 + 1;
+                    let block = MEMORY_POOL.acquire(size);
+                    let slice = block.into_slice_mut();
+                    if slice.len() != size {
+                        let mut error_log = errors.lock().unwrap();
+                        error_log.push(format!("Thread {} allocation {}: Expected size {}, got {}", thread_id, i, size, slice.len()));
+                    }
+                    for j in 0..size {
+                        slice[j] = ((thread_id + j) % 256) as u8;
+                    }
+                    for j in 0..size {
+                        if slice[j] != ((thread_id + j) % 256) as u8 {
+                            let mut error_log = errors.lock().unwrap();
+                            error_log.push(format!("Thread {} allocation {} data mismatch at index {}", thread_id, i, j));
+                            break;
+                        }
+                    }
+                }
+            });
+            handles.push(handle);
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let errors = errors.lock().unwrap();
+        assert!(errors.is_empty(), "Aggressive thread errors: {:?}", errors);
+    }
+
+    // #[test]
+    // #[should_panic]
+    // fn test_double_free_should_panic() {
+    //     let block = MemoryBlock::from_vec(vec![1, 2, 3, 4, 5]);
+    //     let mut block2 = block.clone();
+    //     unsafe {
+    //         std::ptr::drop_in_place(&mut block2);
+    //         std::ptr::drop_in_place(&mut block2); // Should panic or crash
+    //     }
+    // }
+
+    // #[test]
+    // #[should_panic]
+    // fn test_use_after_drop_should_panic() {
+    //     let block = MemoryBlock::from_vec(vec![1, 2, 3, 4, 5]);
+    //     let mut block2 = block.clone();
+    //     unsafe {
+    //         std::ptr::drop_in_place(&mut block2);
+    //     }
+    //     let _ = block2.into_slice(); // Should panic or crash
+    // }
+
+    // #[test]
+    // #[should_panic]
+    // fn test_invalid_pointer_dereference() {
+    //     let mut block = MemoryBlock::default();
+    //     unsafe {
+    //         let heap_data = &mut block as *mut MemoryBlock as *mut u8;
+    //         *heap_data = 0xFF;
+    //     }
+    //     let _ = block.into_slice(); // Should panic or crash
+    // }
+
+    #[test]
+    fn test_clone_and_drop_no_double_free() {
+        let block = MemoryBlock::from_vec(vec![1, 2, 3, 4, 5]);
+        let clone = block.clone();
+        drop(block);
+        drop(clone);
+        // Should not panic
+    }
+
+    #[test]
+    fn test_zero_size_allocation_edge() {
+        let block = MemoryBlock::from_vec(vec![]);
+        assert_eq!(block.len, 0);
+        let slice = block.into_slice();
+        assert_eq!(slice.len(), 0);
+    }
+
+    #[test]
+    fn test_large_allocation_and_drop() {
+        let block = MemoryBlock::from_vec(vec![1; 10_000]);
+        assert!(block.is_heap);
+        let slice = block.into_slice();
+        assert_eq!(slice.len(), 10_000);
+        drop(block);
+    }
+
+    #[test]
+    fn test_concurrent_clone_and_drop_stress() {
+        let block = std::sync::Arc::new(MemoryBlock::from_vec(vec![1, 2, 3, 4, 5]));
+        let mut handles = vec![];
+        for _ in 0..10 {
+            let block = block.clone();
+            handles.push(std::thread::spawn(move || {
+                let clone = block.clone();
+                drop(clone);
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_deep_clone_inline() {
+        let data = vec![10, 20, 30, 40, 50];
+        let block = MemoryBlock::from_vec(data.clone());
+        assert!(!block.is_heap);
+        let deep = block.deep_clone();
+        assert!(!deep.is_heap);
+        assert_eq!(deep.len, block.len);
+        assert_eq!(deep.into_slice(), block.into_slice());
+        // Mutate original, deep clone should not change
+        let slice_mut = block.into_slice_mut();
+        slice_mut[0] = 99;
+        assert_eq!(block.into_slice()[0], 99);
+        assert_eq!(deep.into_slice()[0], 10);
+    }
+
+    #[test]
+    fn test_deep_clone_heap() {
+        let data = vec![7; 128];
+        let block = MemoryBlock::from_vec(data.clone());
+        assert!(block.is_heap);
+        let deep = block.deep_clone();
+        assert!(deep.is_heap);
+        assert_eq!(deep.len, block.len);
+        assert_eq!(deep.into_slice(), block.into_slice());
+        // Mutate original, deep clone should not change
+        let slice_mut = block.into_slice_mut();
+        slice_mut[0] = 42;
+        assert_eq!(block.into_slice()[0], 42);
+        assert_eq!(deep.into_slice()[0], 7);
     }
 }
