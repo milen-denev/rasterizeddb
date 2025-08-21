@@ -1,4 +1,5 @@
 #![allow(unused_imports)]
+#![allow(dead_code)]
 
 use std::sync::{atomic::{AtomicU64, Ordering}, Arc};
 use futures::future::join_all;
@@ -15,44 +16,44 @@ async fn main() -> std::io::Result<()> {
 
     let client = Arc::new(DbClient::new(Some("127.0.0.1")).await.unwrap());
 
-    // let _query = r##"
-    //     CREATE TABLE employees (
-    //         id UBIGINT,
-    //         name VARCHAR,
-    //         position VARCHAR,
-    //         salary REAL
-    //     );
-    // "##;
+    let _query = r##"
+        CREATE TABLE employees (
+            id UBIGINT,
+            name VARCHAR,
+            position VARCHAR,
+            salary REAL
+        );
+    "##;
 
-    // let create_result = client.execute_query(_query).await;
+    let create_result = client.execute_query(_query).await;
 
-    // println!("Create result: {:?}", create_result);
+    println!("Create result: {:?}", create_result);
 
-    // let mut features = vec![];
+    let mut features = vec![];
 
-    // let semaphore = Arc::new(tokio::sync::Semaphore::new(16)); 
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(1)); 
 
-    // for i in 0..10_000 {
-    //     let person = generate_person();
-    //     let query = format!(
-    //         r##"
-    //         INSERT INTO employees (id, name, position, salary)
-    //         VALUES ({}, '{}', '{}', {});
-    //         "##,
-    //         i + 1, person.name, person.job_title, person.salary
-    //     );
+    for i in 0..100_000 {
+        let person = generate_person();
+        let query = format!(
+            r##"
+            INSERT INTO employees (id, name, position, salary)
+            VALUES ({}, '{}', '{}', {});
+            "##,
+            i + 1, person.name, person.job_title, person.salary
+        );
 
-    //     let client_clone = Arc::clone(&client);
-    //     let semaphore_clone = Arc::clone(&semaphore);
+        let client_clone = Arc::clone(&client);
+        let semaphore_clone = Arc::clone(&semaphore);
 
-    //     features.push(tokio::spawn(async move {
-    //         let _permit = semaphore_clone.acquire().await.unwrap();
-    //         let _insert_result = client_clone.execute_query(&query).await;
-    //         drop(_permit);
-    //     }));
-    // }
+        features.push(tokio::spawn(async move {
+            let _permit = semaphore_clone.acquire().await.unwrap();
+            let _insert_result = client_clone.execute_query(&query).await;
+            drop(_permit);
+        }));
+    }
 
-    // join_all(features).await;
+    join_all(features).await;
 
     // tokio::time::sleep(std::time::Duration::from_secs(30)).await;
 
@@ -87,8 +88,8 @@ async fn main() -> std::io::Result<()> {
     // println!("Total time for {} queries: {} ms", total_queries, total_type.load(Ordering::SeqCst));
 
     let query = r##"
-        SELECT name FROM employees
-        WHERE name CONTAINS 'Ga'
+        SELECT id, name FROM employees
+        WHERE id = 99999
     "##;
 
     let instant = std::time::Instant::now();
@@ -201,16 +202,60 @@ fn generate_person() -> Person {
     // Arrays of possible names and job titles.
     let first_names = [
         "James", "Mary", "Robert", "Patricia", "John", "Jennifer", "Michael", "Linda",
-        "William", "Elizabeth", "David", "Susan", "Richard", "Jessica",
+        "William", "Elizabeth", "David", "Susan", "Richard", "Jessica", "Thomas", 
+        "Sarah", "Christopher", "Karen", "Daniel", "Nancy", "Paul", "Lisa", "Mark", 
+        "Betty", "Donald", "Dorothy", "George", "Helen", "Steven", "Sandra", "Edward", 
+        "Ashley", "Kenneth", "Donna", "Joseph", "Kimberly", "Brian", "Carol", "Ronald", 
+        "Michelle", "Anthony", "Emily", "Jason", "Amanda", "Jeff", "Deborah", "Ryan", 
+        "Stephanie", "Gary", "Laura", "Nicholas", "Cynthia", "Eric", "Kathleen", "Jacob", 
+        "Amy", "Angela", "Melissa", "Brenda", "Rebecca", "Andrew", "Janet", "Joshua", 
+        "Sharon", "Matthew", "Christine", "Kevin", "Anna", "Jason", "Shirley", "Dennis", 
+        "Pamela", "Walter", "Debra", "Patrick", "Rachel", "Peter", "Nicole", "Douglas", 
+        "Catherine", "Henry", "Samantha", "Carl", "Theresa", "Arthur", "Gloria", "Jerry", 
+        "Evelyn", "Harold", "Frances", "Timothy", "Christina", "Frank", "Judith", "Raymond", 
+        "Rose", "Adam", "Beverly", "Gregory", "Jean", "Larry", "Cheryl", "Jose", "Hannah", 
+        "Jeremy", "Doris", "Stephen", "Julia", "Billy", "Marie", "Kyle", "Diane", "Benjamin",
+        "Alice", "Keith", "Heather", "Roger", "Victoria", "Gerald", "Judith", "Craig", 
+        "Lauren", "Scott", "Brittany", "Joe", "Kelly", "Sam", "Natalie", "Jonathan", "Lois"
     ];
+
     let last_names = [
         "Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller", "Davis",
-        "Rodriguez", "Martinez", "Hernandez", "Lopez", "Gonzalez", "Wilson",
+        "Rodriguez", "Martinez", "Hernandez", "Lopez", "Gonzalez", "Wilson", "Anderson", 
+        "Thomas", "Taylor", "Moore", "Jackson", "White", "Harris", "Martin", "Thompson", 
+        "Young", "Allen", "King", "Wright", "Scott", "Torres", "Nguyen", "Hill", "Flores", 
+        "Green", "Adams", "Nelson", "Baker", "Hall", "Rivera", "Campbell", "Mitchell", 
+        "Carter", "Roberts", "Phillips", "Collins", "Ramirez", "Stewart", "Russell", "Perez", 
+        "Cook", "Morgan", "Bennett", "Bell", "Coleman", "Reed", "Watson", "Diaz", "Washington", 
+        "Cooper", "Wood", "Price", "Hughes", "Patterson", "Kelly", "James", "Ryan", "Walker", 
+        "Cox", "Graham", "Gray", "Henderson", "Kim", "Howard", "Peterson", "Brooks", "Mitchell", 
+        "Price", "Parker", "Morris", "Sanders", "Butler", "Barnes", "Fisher", "Murphy", "Simmons", 
+        "Bailey", "Richardson", "Diaz", "Butler", "Stone", "Phillips", "Ford", "Graham", "Hicks", 
+        "Alexander", "Mason", "Stone", "Cole", "Payne", "Spencer", "Chavez", "Kennedy", "Lane", 
+        "Andrews", "Myers", "Hunter", "Reid", "Marshall", "Stevens", "Elliott", "Snyder", "Palmer",
+        "Bishop", "Harper", "Gordon", "Mills", "Franklin", "Fields", "West", "Porter", "Gilbert", 
+        "Owens", "Holmes", "Powell", "Banks", "Carroll", "Fowler", "Wallace", "Nichols", "Grant"
     ];
+
     let job_titles = [
         "Software Engineer", "Data Scientist", "Product Manager", "UX Designer",
         "Financial Analyst", "Marketing Specialist", "Human Resources Manager",
         "Customer Service Representative", "Project Coordinator", "DevOps Engineer",
+        "Accountant", "Architect", "Teacher", "Nurse", "Graphic Designer", 
+        "Civil Engineer", "Mechanical Engineer", "Electrical Engineer", "Web Developer", 
+        "System Administrator", "Cybersecurity Analyst", "Operations Manager", 
+        "Supply Chain Manager", "Account Executive", "Recruiter", "Paralegal", 
+        "Librarian", "Social Worker", "Journalist", "Editor", "Physician", 
+        "Physical Therapist", "Veterinarian", "Chef", "Bartender", "Plumber", 
+        "Electrician", "Real Estate Agent", "Pilot", "Flight Attendant", 
+        "Business Analyst", "Network Engineer", "Technical Writer", "Game Designer",
+        "Art Director", "Biomedical Engineer", "Chemist", "Economist", "Geologist", 
+        "Mathematician", "Meteorologist", "Urban Planner", "Forester", "Hydrologist", 
+        "Zoologist", "Anthropologist", "Historian", "Curator", "Archivist", 
+        "Criminologist", "Political Scientist", "Sociologist", "Urban Planner",
+        "Psychologist", "Speech-Language Pathologist", "Dietitian", "Physical Trainer", 
+        "Occupational Therapist", "Chiropractor", "Anesthesiologist", "Cardiologist",
+        "Dermatologist", "Neurologist", "Orthopedic Surgeon", "Pediatrician", "Urologist"
     ];
 
     // Pick a random name from the arrays.
