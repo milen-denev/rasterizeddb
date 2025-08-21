@@ -255,15 +255,6 @@ impl<'a> TransformerProcessor<'a> {
 
     /// Execute all transformations and return final result
     pub fn execute(&mut self, comparison_results: &mut SmallVec<[(bool, Option<Next>); 20]>) -> bool {
-
-        // #[cfg(debug_assertions)]
-        // println!("Executing {} transformers and {} intermediate results", self.transformers.len(), self.intermediate_results.len());
-
-        // #[cfg(debug_assertions)]
-        // for transformer in self.transformers.iter() {
-        //     println!("Transformer: {:?}", transformer);
-        // }
-
         // Process all transformers
         while let Some(mut transformer) = self.transformers.pop_front() {
             // If this transformer uses intermediate results, update its memory blocks

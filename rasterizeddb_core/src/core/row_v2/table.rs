@@ -1,5 +1,5 @@
 use std::{io, sync::{atomic::{AtomicBool, AtomicU64}, Arc}};
-use log::info;
+use log::{error, info};
 use std::io::Result;
 
 use crate::core::{row_v2::{concurrent_processor::ConcurrentProcessor, row::{Row, RowFetch, RowWrite}, row_pointer::{RowPointer, RowPointerIterator}, schema::SchemaField}, rql_v2::lexer_ct::CreateColumnData, storage_providers::traits::StorageIO};
@@ -98,8 +98,11 @@ impl<S: StorageIO> Table<S> {
 
 
         if let Err(e) = result {
-            info!("Failed to insert row: {}", e);
+            error!("Failed to insert row: {}", e);
             return Err(io::Error::new(io::ErrorKind::Other, format!("Failed to insert row: {}", e)));
+        } else if let Ok(row_pointer) = result {
+            info!("Successfully inserted row with pointer: {:?}", row_pointer);
+            
         }
 
         return Ok(());

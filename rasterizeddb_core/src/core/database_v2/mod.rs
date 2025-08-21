@@ -224,7 +224,7 @@ async fn load_db_tables<S: StorageIO>(
             1 = 1
         "##),
         row_fetch,
-        schema_fields,
+        &schema_fields.to_vec(),
         io_rows,
         row_pointer_iterator
     ).await;
@@ -252,11 +252,11 @@ async fn load_db_tables<S: StorageIO>(
     tables
 }
 
-fn create_db_data_row_fetch(schema_fields: &Vec<SchemaField>) -> RowFetch {
+fn create_db_data_row_fetch(schema_fields: &SmallVec<[SchemaField; 20]>) -> RowFetch {
     let schema_calculator = SchemaCalculator::default();
 
     RowFetch {
-        columns_fetching_data: vec![
+        columns_fetching_data: smallvec::smallvec![
             ColumnFetchingData {
                 column_offset: schema_calculator.calculate_schema_offset("table_name", schema_fields),
                 column_type: DbType::STRING,

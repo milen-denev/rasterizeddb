@@ -1,4 +1,5 @@
 use itertools::Itertools;
+use smallvec::SmallVec;
 
 use crate::core::row_v2::schema::{SchemaField, SchemaCalculator};
 use crate::core::row_v2::row::{RowFetch, ColumnFetchingData};
@@ -20,7 +21,7 @@ pub struct QueryRows {
 ///
 /// # Returns
 /// (RowFetch, String) - RowFetch for the columns, and the WHERE clause (without the WHERE word)
-pub fn row_fetch_from_select_query(query_purpose: &QueryPurpose, schema: &Vec<SchemaField>) -> Result<QueryRows, String> {
+pub fn row_fetch_from_select_query(query_purpose: &QueryPurpose, schema: &SmallVec<[SchemaField; 20]>) -> Result<QueryRows, String> {
 	let sql = match query_purpose {
 		QueryPurpose::QueryRows(qr_data) => qr_data.query.trim(),
 		_ => return Err("Not a SELECT/QueryRows query".to_string()),
@@ -65,7 +66,7 @@ pub fn row_fetch_from_select_query(query_purpose: &QueryPurpose, schema: &Vec<Sc
 	};
 
 	let schema_calc = SchemaCalculator::default();
-	let mut columns_fetching_data = Vec::new();
+	let mut columns_fetching_data = SmallVec::new();
 
 	for col in columns {
 		let field = schema.iter().find(|f| simd_compare_strings(f.name.as_bytes(), col.as_bytes(), &ComparerOperation::Equals))
@@ -93,8 +94,8 @@ mod tests {
 	use crate::core::row_v2::common::simd_compare_strings;
 	use crate::core::row_v2::transformer::ComparerOperation;
 
-	fn make_schema() -> Vec<SchemaField> {
-		vec![
+	fn make_schema() -> SmallVec<[SchemaField; 20]> {
+		smallvec::smallvec![
 			SchemaField { name: "id".to_string(), db_type: DbType::U64, size: 8, offset: 0, write_order: 0, is_unique: true, is_deleted: false },
 			SchemaField { name: "name".to_string(), db_type: DbType::STRING, size: 32, offset: 8, write_order: 1, is_unique: false, is_deleted: false },
 			SchemaField { name: "age".to_string(), db_type: DbType::U8, size: 1, offset: 40, write_order: 2, is_unique: false, is_deleted: false },

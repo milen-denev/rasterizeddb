@@ -1,5 +1,6 @@
 use std::sync::{atomic::AtomicU64, Arc};
 
+use smallvec::SmallVec;
 use stopwatch::Stopwatch;
 
 use crate::{core::{row_v2::{concurrent_processor::ConcurrentProcessor, schema::TableSchemaIterator}}, memory_pool::MEMORY_POOL};
@@ -127,7 +128,7 @@ pub async fn consolidated_read_data_function(schema: TableSchema, _id: u64) {
             id < 2
         "##),
         row_fetch,
-        &schema_fields,
+        &schema_fields.to_vec(),
         io_rows,
         &mut iterator
     ).await;
@@ -162,11 +163,11 @@ pub async fn consolidated_read_data_function(schema: TableSchema, _id: u64) {
     // }
 }
 
-fn create_row_fetch(schema_fields: &Vec<SchemaField>) -> RowFetch {
+fn create_row_fetch(schema_fields: &SmallVec<[SchemaField; 20]>) -> RowFetch {
     let schema_calculator = SchemaCalculator::default();
 
     RowFetch {
-        columns_fetching_data: vec![
+        columns_fetching_data: smallvec::smallvec![
             ColumnFetchingData {
                 column_offset: schema_calculator.calculate_schema_offset("id", schema_fields),
                 column_type: DbType::U64,

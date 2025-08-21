@@ -1,5 +1,7 @@
 use std::io::Cursor;
 
+use smallvec::SmallVec;
+
 use super::{row::Row, storage_providers::traits::StorageIO};
 
 #[derive(Debug, Default)]
@@ -65,6 +67,6 @@ impl<'a> CursorVector<'a> {
 }
 
 pub enum ReturnResult {
-    Rows(Vec<Row>),
+    Rows(SmallVec<[Row; 32]>),
     HtmlView(String)
 }

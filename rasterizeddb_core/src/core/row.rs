@@ -1,3 +1,5 @@
+use smallvec::SmallVec;
+
 use super::column::Column;
 use super::support_types::ReturnResult;
 
@@ -145,7 +147,7 @@ impl Row {
                         
                         // Read number of rows
                         let row_count = cursor.read_u32::<LittleEndian>()?;
-                        let mut rows = Vec::with_capacity(row_count as usize);
+                        let mut rows = SmallVec::new();
                         
                         // Starting position for reading row data
                         let mut position = cursor.position() as usize + 2; // +2 for the marker bytes

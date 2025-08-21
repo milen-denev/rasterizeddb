@@ -90,7 +90,7 @@ impl StorageIO for MemoryStorageProvider {
 
     async fn read_data_into_buffer(&self, position: &mut u64, buffer: &mut [u8]) -> Result<(), std::io::Error> {
         let start = *position;
-        let end = *position + buffer.len() as u64 + 1;
+        let end = *position + buffer.len() as u64;
 
         let mut x = 0;
 

@@ -6,6 +6,7 @@ use super::helpers::read_row_cursor_whole;
 
 use crate::{renderers::html::render_rows_to_html, rql::parser::ReturnView};
 use super::support_types::ReturnResult;
+use smallvec::SmallVec;
 
 #[cfg(feature = "enable_parallelism")]
 use std::{arch::x86_64::{_mm_prefetch, _MM_HINT_T0}, sync::{atomic::{AtomicU64, Ordering}, Arc}};
@@ -186,10 +187,10 @@ pub(crate) async fn process_all_chunks(
             if return_view == ReturnView::Html {
                 return  Ok(Some(ReturnResult::HtmlView(render_rows_to_html(Ok(Some(all_rows)), table_name).unwrap())));
             } else {
-                return Ok(Some(ReturnResult::Rows(all_rows)));
+                return Ok(Some(ReturnResult::Rows(SmallVec::from_vec(all_rows))));
             }
         } else {
-            return Ok(Some(ReturnResult::Rows(all_rows)));
+            return Ok(Some(ReturnResult::Rows(SmallVec::from_vec(all_rows))));
         }
     }
 }

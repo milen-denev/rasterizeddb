@@ -7,6 +7,7 @@ use std::{
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt, WriteBytesExt};
 use itertools::Itertools;
 use log::debug;
+use smallvec::SmallVec;
 
 use super::{
     super::rql::{
@@ -421,11 +422,11 @@ impl<S: StorageIO> Table<S> {
                 if return_view == ReturnView::Html {
                     return  Ok(Some(ReturnResult::HtmlView(render_rows_to_html(Ok(Some(rows)), &self.table_name).unwrap())));
                 } else {
-                    return Ok(Some(ReturnResult::Rows(rows)));
+                    return Ok(Some(ReturnResult::Rows(SmallVec::from_vec(rows))));
                 }
             }
             else {
-                return Ok(Some(ReturnResult::Rows(rows)));
+                return Ok(Some(ReturnResult::Rows(SmallVec::from_vec(rows))));
             }
         } else if let ParserResult::QueryEvaluationTokens(evaluation_tokens) = parser_result {
             #[cfg(feature = "enable_index_caching")]
@@ -668,11 +669,11 @@ impl<S: StorageIO> Table<S> {
                                         if return_view == ReturnView::Html {
                                             return  Ok(Some(ReturnResult::HtmlView(render_rows_to_html(Ok(Some(rows)), &self.table_name).unwrap())));
                                         } else {
-                                            return Ok(Some(ReturnResult::Rows(rows)));
+                                            return Ok(Some(ReturnResult::Rows(SmallVec::from_vec(rows))));
                                         }
                                     }
                                     else {
-                                        return Ok(Some(ReturnResult::Rows(rows)));
+                                        return Ok(Some(ReturnResult::Rows(SmallVec::from_vec(rows))));
                                     }
                                 }
 
@@ -825,11 +826,11 @@ impl<S: StorageIO> Table<S> {
                                     if return_view == ReturnView::Html {
                                         return  Ok(Some(ReturnResult::HtmlView(render_rows_to_html(Ok(Some(rows)), &self.table_name).unwrap())));
                                     } else {
-                                        return Ok(Some(ReturnResult::Rows(rows)));
+                                        return Ok(Some(ReturnResult::Rows(SmallVec::from_vec(rows))));
                                     }
                                 }
                                 else {
-                                    return Ok(Some(ReturnResult::Rows(rows)));
+                                    return Ok(Some(ReturnResult::Rows(SmallVec::from_vec(rows))));
                                 }
                             }
                         }
@@ -844,11 +845,11 @@ impl<S: StorageIO> Table<S> {
                     if return_view == ReturnView::Html {
                         return  Ok(Some(ReturnResult::HtmlView(render_rows_to_html(Ok(Some(rows)), &self.table_name).unwrap())));
                     } else {
-                        return Ok(Some(ReturnResult::Rows(rows)));
+                        return Ok(Some(ReturnResult::Rows(SmallVec::from_vec(rows))));
                     }
                 }
                 else {
-                    return Ok(Some(ReturnResult::Rows(rows)));
+                    return Ok(Some(ReturnResult::Rows(SmallVec::from_vec(rows))));
                 }
             } else {
                 return Ok(None);

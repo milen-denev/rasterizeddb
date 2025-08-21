@@ -1,6 +1,7 @@
 use std::{io, sync::Arc};
 
 use itertools::Itertools;
+use smallvec::SmallVec;
 
 use crate::{core::{db_type::DbType, storage_providers::traits::StorageIO}, memory_pool::{MemoryBlock, MEMORY_POOL}};
 
@@ -278,9 +279,9 @@ impl<'a, S: StorageIO> SchemaFieldIterator<'a, S> {
     }
     
     /// Get multiple SchemaFields at once, up to BATCH_SIZE
-    pub async fn next_schema_fields(&mut self) -> io::Result<Vec<SchemaField>> {
-        let mut fields = Vec::with_capacity(BATCH_SIZE);
-        
+    pub async fn next_schema_fields(&mut self) -> io::Result<SmallVec<[SchemaField; 20]>> {
+        let mut fields = SmallVec::new();
+
         for _ in 0..BATCH_SIZE {
             match self.next_schema_field().await? {
                 Some(field) => fields.push(field),
@@ -300,9 +301,9 @@ impl<'a, S: StorageIO> SchemaFieldIterator<'a, S> {
 #[derive(Debug)]
 pub struct TableSchema {
     pub name: String,
-    pub fields: Vec<SchemaField>,
+    pub fields: SmallVec<[SchemaField; 20]>,
     pub primary_key: Option<String>,
-    pub indexes: Vec<TableIndex>,
+    pub indexes: SmallVec<[TableIndex; 4]>,
     pub is_immutable: bool
 }
 
@@ -317,9 +318,9 @@ impl TableSchema {
     pub fn new(name: String, is_immutable: bool) -> Self {
         TableSchema {
             name,
-            fields: Vec::new(),
+            fields: SmallVec::new(),
             primary_key: None,
-            indexes: Vec::new(),
+            indexes: SmallVec::new(),
             is_immutable
         }
     }
@@ -333,7 +334,7 @@ impl TableSchema {
                 let mut field_io = schema_io.create_new(format!("{}_{}", schema_io.get_name().replace(".db", ""), "FIELDS.db")).await;
                 let mut field_iterator = SchemaFieldIterator::new(&mut field_io).await.unwrap();
 
-                let mut all_fields: Vec<SchemaField> = Vec::new();
+                let mut all_fields: SmallVec<[SchemaField; 20]> = SmallVec::new();
 
                 while let Ok(mut fields) = field_iterator.next_schema_fields().await {
                     if fields.is_empty() {
@@ -420,9 +421,9 @@ impl TableSchema {
 
         Ok(TableSchema {
             name,
-            fields: Vec::new(), // Fields are stored separately
+            fields: SmallVec::new(), // Fields are stored separately
             primary_key,
-            indexes: Vec::new(), // Indexes are stored separately,
+            indexes: SmallVec::new(), // Indexes are stored separately,
             is_immutable: immutable,
 
         })
@@ -444,7 +445,7 @@ impl TableSchema {
         let mut field_io = schema_io.create_new(format!("{}_{}", schema_io.get_name().replace(".db", ""), "FIELDS.db")).await;
         let mut field_iterator = SchemaFieldIterator::new(&mut field_io).await.unwrap();
 
-        let mut all_fields: Vec<SchemaField> = Vec::new();
+        let mut all_fields: SmallVec<[SchemaField; 20]> = SmallVec::new();
 
         while let Ok(mut fields) = field_iterator.next_schema_fields().await {
             if fields.is_empty() {
@@ -501,7 +502,7 @@ impl TableSchema {
         // Reload fields from disk to ensure we have the latest state
         let mut field_io = schema_io.create_new(format!("{}_{}", schema_io.get_name().replace(".db", ""), "FIELDS.db")).await;
         let mut field_iterator = SchemaFieldIterator::new(&mut field_io).await.unwrap();
-        let mut all_fields: Vec<SchemaField> = Vec::new();
+        let mut all_fields: SmallVec<[SchemaField; 20]> = SmallVec::new();
         while let Ok(mut fields) = field_iterator.next_schema_fields().await {
             if fields.is_empty() {
                 break;
