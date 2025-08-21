@@ -161,6 +161,17 @@ pub unsafe fn ref_slice(ptr: *mut u8, len: usize) -> &'static [u8] {
     std::slice::from_raw_parts(ptr, len)
 }
 
+#[inline(always)]
+#[allow(unsafe_op_in_unsafe_fn)]
+pub unsafe fn copy_ptr_to_ptr(heap_data_1: *mut u8, heap_data_2: *mut u8, len: usize) {
+    if heap_data_1.is_null() || heap_data_2.is_null() {
+        panic!("Cannot copy from/to null pointer.");
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(heap_data_1, heap_data_2, len);
+    }
+}
+
 #[allow(unsafe_op_in_unsafe_fn)]
 #[allow(dead_code)]
 pub unsafe fn simd_memcpy(dst: &mut [u8], src: &[u8]) {
