@@ -360,7 +360,13 @@ impl TcpServer {
         F: Fn(Vec<u8>) -> Fut + Send + Sync,
         Fut: Future<Output = Vec<u8>> + Send,
     {
-        let peer_addr = stream.peer_addr()?;
+        let peer_addr = match stream.peer_addr() {
+            Ok(addr) => addr,
+            Err(e) => {
+                error!("Failed to get peer address: {}", e);
+                return Err(RastcpError::Io(e));
+            }
+        };
         debug!("Accepting TLS connection from {}", peer_addr);
 
         // Apply timeout to TLS handshake to prevent hanging connections
@@ -370,15 +376,13 @@ impl TcpServer {
         ).await {
             Ok(Ok(mut tls_stream)) => {
                 debug!("TLS handshake completed with {}", peer_addr);
-                
                 loop {
                     match read_message(&mut tls_stream).await {
                         Ok(data) => {
                             debug!("Received {} bytes from {}", data.len(), peer_addr);
-                            
                             // Process the data with the handler
                             let response = match tokio::time::timeout(
-                                Duration::from_secs(30), // Add timeout for handler
+                                Duration::from_secs(30),
                                 handler(data)
                             ).await {
                                 Ok(response) => response,
@@ -387,12 +391,14 @@ impl TcpServer {
                                     break;
                                 }
                             };
-                            
                             debug!("Replying with {} bytes to {}", response.len(), peer_addr);
-
                             // Send response back
                             if let Err(e) = write_message(&mut tls_stream, &response).await {
                                 error!("Failed to write response to {}: {}", peer_addr, e);
+                                // Attempt graceful shutdown
+                                if let Err(shutdown_err) = tls_stream.shutdown().await {
+                                    error!("TLS shutdown error with {}: {}", peer_addr, shutdown_err);
+                                }
                                 break;
                             }
                         }
@@ -405,20 +411,22 @@ impl TcpServer {
                             break;
                         }
                         Err(RastcpError::Tls(e)) => {
-                            // Special handling for TLS errors
                             warn!("TLS error from {}: {}", peer_addr, e);
                             break;
                         }
                         Err(e) => {
                             error!("Error reading from {}: {}", peer_addr, e);
+                            // Attempt graceful shutdown
+                            if let Err(shutdown_err) = tls_stream.shutdown().await {
+                                error!("TLS shutdown error with {}: {}", peer_addr, shutdown_err);
+                            }
                             break;
                         }
                     }
                 }
-                
                 // Explicit shutdown to ensure clean TLS termination
                 if let Err(e) = tls_stream.shutdown().await {
-                    debug!("TLS shutdown error with {}: {}", peer_addr, e);
+                    error!("TLS shutdown error with {}: {}", peer_addr, e);
                 }
             },
             Ok(Err(e)) => {
