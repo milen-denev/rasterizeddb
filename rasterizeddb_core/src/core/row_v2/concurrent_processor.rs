@@ -16,7 +16,8 @@ impl ConcurrentProcessor {
 
     pub async fn process<'a, S: StorageIO>(&self, 
         where_query: &str,
-        row_fetch: RowFetch,
+        query_row_fetch: RowFetch,
+        requested_row_fetch: RowFetch,
         table_schema: &Vec<SchemaField>,
         io_rows: Arc<S>,
         iterator: &mut RowPointerIterator<S>) -> Vec<Row> {
@@ -35,7 +36,12 @@ impl ConcurrentProcessor {
 
         let tokens = tokenize(&where_query, &table_schema);
 
-        let arc_tuple: Arc<(Semaphore, RowFetch)> = Arc::new((Semaphore::new(MAX_PERMITS), row_fetch));
+        let arc_tuple: Arc<(Semaphore, RowFetch, RowFetch)> = 
+            Arc::new((
+                Semaphore::new(MAX_PERMITS), 
+                query_row_fetch,
+                requested_row_fetch
+            ));
 
         let schema_arc = Arc::new(table_schema);
         let token_arc_1 = Arc::new(tokens);
@@ -44,8 +50,6 @@ impl ConcurrentProcessor {
 
         // Process batches
         while let Ok(pointers) = iterator.next_row_pointers().await {
-            //println!("pointers: {:?}", pointers);
-
             if pointers.len() == 0 {
                 break;
             }
@@ -85,9 +89,9 @@ impl ConcurrentProcessor {
                 for pointer in pointers.iter() {
                     let io_rows_clone = Arc::clone(&io_rows_2);
                     let tuple_clone_2 = tuple_clone.clone();
-                    let (_, row_fetch) = &*tuple_clone_2;
+                    let (_, query_row_fetch, requested_row_fetch) = &*tuple_clone_2;
 
-                    pointer.fetch_row_reuse_async(io_rows_clone, &row_fetch, &mut buffer.row).await;
+                    pointer.fetch_row_reuse_async(io_rows_clone, &schema_ref, &query_row_fetch, &mut buffer.row).await;
 
                     let result = {
                         let mut_hashtable_buffer = unsafe { &mut *buffer.hashtable_buffer.get() };
@@ -116,6 +120,9 @@ impl ConcurrentProcessor {
                     };
 
                     if result {
+                        let io_rows_clone = Arc::clone(&io_rows_2);
+                        pointer.fetch_row_reuse_async(io_rows_clone, &schema_ref, &requested_row_fetch, &mut buffer.row).await;
+
                         tx_clone.send(Row::clone_row(&buffer.row)).unwrap();
                     }
                 }

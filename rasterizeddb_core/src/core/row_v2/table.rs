@@ -108,7 +108,7 @@ impl<S: StorageIO> Table<S> {
         return Ok(());
     }
 
-    pub async fn query_row(&self, query: &str, schema_fields: &Vec<SchemaField>, row_fetch: RowFetch) -> Result<Vec<Row>> {
+    pub async fn query_row(&self, query: &str, schema_fields: &Vec<SchemaField>,  query_row_fetch: RowFetch, requested_row_fetch: RowFetch) -> Result<Vec<Row>> {
         // Implementation for querying a row from the table
 
         info!("Querying row");
@@ -117,7 +117,8 @@ impl<S: StorageIO> Table<S> {
 
         let rows = self.concurrent_processor.process(
             query,
-            row_fetch,
+            query_row_fetch,
+            requested_row_fetch,
             schema_fields,
             self.io_rows.clone(),
             &mut iterator

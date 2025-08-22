@@ -215,6 +215,7 @@ async fn load_db_tables<S: StorageIO>(
     let schema_fields = &schema.fields;
 
     let row_fetch = create_db_data_row_fetch(schema_fields);
+    let row_fetch2 = create_db_data_row_fetch(schema_fields);
 
     let concurrent_processor = ConcurrentProcessor::new();
 
@@ -224,6 +225,7 @@ async fn load_db_tables<S: StorageIO>(
             1 = 1
         "##),
         row_fetch,
+        row_fetch2,
         &schema_fields.to_vec(),
         io_rows,
         row_pointer_iterator
@@ -258,14 +260,16 @@ fn create_db_data_row_fetch(schema_fields: &SmallVec<[SchemaField; 20]>) -> RowF
     RowFetch {
         columns_fetching_data: smallvec::smallvec![
             ColumnFetchingData {
-                column_offset: schema_calculator.calculate_schema_offset("table_name", schema_fields),
+                column_offset: schema_calculator.calculate_schema_offset("table_name", schema_fields).0,
                 column_type: DbType::STRING,
-                size: 8 + 4
+                size: 8 + 4,
+                schema_id: 0,
             },
             ColumnFetchingData {
-                column_offset: schema_calculator.calculate_schema_offset("clusters", schema_fields),
+                column_offset: schema_calculator.calculate_schema_offset("clusters", schema_fields).0,
                 column_type: DbType::U64,
-                size: 8
+                size: 8,
+                schema_id: 1,
             },
         ],
     }
