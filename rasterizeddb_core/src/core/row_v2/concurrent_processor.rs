@@ -81,86 +81,8 @@ impl ConcurrentProcessor {
                 };
 
                 let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-                let mut schema_id: u64 = 0;
 
-                let mut single_transformer_data: Option<ColumnTransformer> = {
-                    if token_ref_1.len() == 0 {
-                        let ident_res = token_ref_1.iter().filter(|x| {
-                            match x {
-                                Token::Ident(_) => true,
-                                _ => false
-                            }
-                        }).next();
-
-                        if let Some(ident) = ident_res {
-                            let column_1 = match ident {
-                                Token::Ident(column) => column,
-                                _ => unreachable!()
-                            };
-
-                            let db_type = column_1.1.clone();
-                            schema_id = column_1.2;
-
-                            let transform = token_ref_1.iter().filter(|x| {
-                                match x {
-                                    Token::Op(_) => true,
-                                    _ => false
-                                }
-                            }).next().unwrap();
-        
-                            let operations_type = match transform {
-                                Token::Op(op) => op,
-                                _ => unreachable!()
-                            };
-
-                            let operation = match operations_type.as_str() {
-                                ">" => ComparerOperation::Less, // reverse for logical operations
-                                "<" => ComparerOperation::Greater, // reverse for logical operations
-                                "=" => ComparerOperation::Equals,
-                                "!=" => ComparerOperation::NotEquals,
-                                "<=" => ComparerOperation::GreaterOrEquals, // reverse for logical operations
-                                ">=" => ComparerOperation::LessOrEquals, // reverse for logical operations
-                                "CONTAINS" => ComparerOperation::Contains,
-                                "STARTSWITH" => ComparerOperation::StartsWith,
-                                "ENDSWITH" => ComparerOperation::EndsWith,
-                                _ => unreachable!()
-                            };
-
-                            let value = token_ref_1.iter().filter(|x| {
-                                match x {
-                                    Token::Number(_) => true,
-                                    Token::StringLit(_) => true,
-                                    _ => false
-                                }
-                            }).map(|x| 
-                                match x {
-                                    Token::Number(val) => {
-                                        numeric_to_mb(val)
-                                    },
-                                    Token::StringLit(val) => {
-                                        str_to_mb(val)
-                                    },
-                                    _ => unreachable!()
-                                }
-                            ).next().unwrap();
-
-                            let transformer = ColumnTransformer::new(
-                                db_type,
-                                value,
-                                ColumnTransformerType::ComparerOperation(operation),
-                                None
-                            );
-
-                            Some(transformer)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                };      
-
-                // Process each pointer in this batch (same as your original code)
+                // Process each pointer in this batch
                 for pointer in pointers.iter() {
                     let io_rows_clone = Arc::clone(&io_rows_2);
                     let tuple_clone_2 = tuple_clone.clone();
@@ -168,23 +90,7 @@ impl ConcurrentProcessor {
 
                     pointer.fetch_row_reuse_async(io_rows_clone, &row_fetch, &mut buffer.row).await;
 
-                    let result = if let Some(ref mut single_transformer_d) = single_transformer_data {
-                        let column = buffer.row.columns.iter().filter(|x| {
-                            match x.schema_id {
-                                _ if x.schema_id == schema_id => true,
-                                _ => false
-                            }
-                        }).next().unwrap();
-
-                        single_transformer_d.setup_column_2(column.data.clone());
-
-                        if let Either::Right(result) = single_transformer_d.transform_single() {
-                            single_transformer_d.clear_column_2();
-                            result.0 
-                        } else {
-                            false
-                        }
-                    } else {
+                    let result = {
                         let mut_hashtable_buffer = unsafe { &mut *buffer.hashtable_buffer.get() };
 
                         mut_hashtable_buffer.clear();
