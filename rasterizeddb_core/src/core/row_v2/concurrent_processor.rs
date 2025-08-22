@@ -91,7 +91,7 @@ impl ConcurrentProcessor {
                     let tuple_clone_2 = tuple_clone.clone();
                     let (_, query_row_fetch, requested_row_fetch) = &*tuple_clone_2;
 
-                    pointer.fetch_row_reuse_async(io_rows_clone, &schema_ref, &query_row_fetch, &mut buffer.row).await;
+                    pointer.fetch_row_reuse_async(io_rows_clone, &query_row_fetch, &mut buffer.row).await;
 
                     let result = {
                         let mut_hashtable_buffer = unsafe { &mut *buffer.hashtable_buffer.get() };
@@ -121,7 +121,7 @@ impl ConcurrentProcessor {
 
                     if result {
                         let io_rows_clone = Arc::clone(&io_rows_2);
-                        pointer.fetch_row_reuse_async(io_rows_clone, &schema_ref, &requested_row_fetch, &mut buffer.row).await;
+                        pointer.fetch_row_reuse_async(io_rows_clone, &requested_row_fetch, &mut buffer.row).await;
 
                         tx_clone.send(Row::clone_row(&buffer.row)).unwrap();
                     }

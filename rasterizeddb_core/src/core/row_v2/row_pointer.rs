@@ -717,7 +717,6 @@ impl RowPointer {
     pub async fn fetch_row_reuse_async<S: StorageIO>(
         &self, 
         io: Arc<S>,
-        schema: &SmallVec<[SchemaField; 20]>,
         row_fetch: &RowFetch,
         row_reuse: &mut Row) {
 
