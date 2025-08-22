@@ -38,7 +38,7 @@ impl MemoryPool {
                 len: size,
                 is_heap: false,
                 should_drop: true,
-                dropped: Arc::new(AtomicBool::new(false)),
+                //dropped: Arc::new(AtomicBool::new(false)),
                 references: Arc::new(AtomicU64::new(0)),
             }
         } else {
@@ -55,7 +55,7 @@ impl MemoryPool {
                 len: size, // For heap, len is the full size
                 is_heap: true,
                 should_drop: true,
-                dropped: Arc::new(AtomicBool::new(false)),
+                //dropped: Arc::new(AtomicBool::new(false)),
                 references: Arc::new(AtomicU64::new(1)),
             }
         }
@@ -76,7 +76,7 @@ impl MemoryPool {
                 len: size,
                 is_heap: false,
                 should_drop: true,
-                dropped: Arc::new(AtomicBool::new(false)),
+                //dropped: Arc::new(AtomicBool::new(false)),
                 references: Arc::new(AtomicU64::new(0))
             }
         } else {
@@ -93,7 +93,7 @@ impl MemoryPool {
                 len: size, // For heap, len is the full size
                 is_heap: true,
                 should_drop: true,
-                dropped: Arc::new(AtomicBool::new(false)),
+                //dropped: Arc::new(AtomicBool::new(false)),
                 references: Arc::new(AtomicU64::new(1)),
             }
         }
@@ -127,7 +127,7 @@ pub struct MemoryBlock {
     len: usize, // Actual length of the data
     is_heap: bool, // Discriminant for the union: true if heap, false if inline
     should_drop: bool,
-    dropped: Arc<AtomicBool>,
+    //dropped: Arc<AtomicBool>,
     references: Arc<AtomicU64>
 }
 
@@ -144,7 +144,7 @@ impl Default for MemoryBlock {
             len: 0,
             is_heap: false, // It's an inline block
             should_drop: false, // Not needed as it's implied by is_heap,
-            dropped: Arc::new(AtomicBool::new(false)),
+            //dropped: Arc::new(AtomicBool::new(false)),
             references: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -192,13 +192,13 @@ impl Drop for MemoryBlock {
             let refs = self.references.fetch_sub(1, Ordering::Release);
             
             if refs == 1 {
-                let was_dropped = self.dropped
-                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                    .expect("MemoryBlock was already dropped");
+                // let was_dropped = self.dropped
+                //     .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                //     .expect("MemoryBlock was already dropped");
 
-                if was_dropped {
-                    panic!("MemoryBlock was already dropped, this should not happen.");
-                }
+                // if was_dropped {
+                //     panic!("MemoryBlock was already dropped, this should not happen.");
+                // }
 
                 MEMORY_POOL.release(unsafe { self.data.heap_data.0 });
             }
@@ -231,7 +231,7 @@ impl Clone for MemoryBlock {
                 len: self.len,
                 is_heap: true,
                 should_drop: true, // Important: new allocation should be cleaned up
-                dropped: self.dropped.clone(),
+                //dropped: self.dropped.clone(),
                 references: references
             }
         } else {
@@ -242,7 +242,7 @@ impl Clone for MemoryBlock {
                 len: self.len,
                 is_heap: false,
                 should_drop: true, // Inline doesn't need cleanup, but keep consistent
-                dropped: self.dropped.clone(),
+                //dropped: self.dropped.clone(),
                 references: references
             }
         }
@@ -252,16 +252,16 @@ impl Clone for MemoryBlock {
 impl MemoryBlock {
     #[inline(always)]
     pub fn prefetch_to_lcache(&self) {
-        let was_dropped = self.dropped.load(Ordering::Relaxed);
+        // let was_dropped = self.dropped.load(Ordering::Relaxed);
 
-        if was_dropped {
-            panic!("MemoryBlock was already dropped, this should not happen.");
-        }
+        // if was_dropped {
+        //     panic!("MemoryBlock was already dropped, this should not happen.");
+        // }
 
         if self.is_heap {
-            if unsafe { self.data.heap_data.0.is_null() } {
-                panic!("MemoryBlock is heap-allocated but pointer is null.");
-            }
+            // if unsafe { self.data.heap_data.0.is_null() } {
+            //     panic!("MemoryBlock is heap-allocated but pointer is null.");
+            // }
             // Prefetch the heap data to the L1 cache
             unsafe { _mm_prefetch::<_MM_HINT_T0>(self.data.heap_data.0 as *const i8) };
         } else {
@@ -291,16 +291,16 @@ impl MemoryBlock {
 
     #[inline(always)]
     pub fn into_slice(&self) -> &'static [u8] {
-        let was_dropped = self.dropped.load(Ordering::Relaxed);
+        // let was_dropped = self.dropped.load(Ordering::Relaxed);
 
-        if was_dropped {
-            panic!("MemoryBlock was already dropped, this should not happen.");
-        }
+        // if was_dropped {
+        //     panic!("MemoryBlock was already dropped, this should not happen.");
+        // }
 
         if self.is_heap {
-            if unsafe { self.data.heap_data.0.is_null() } {
-                panic!("MemoryBlock is heap-allocated but pointer is null.");
-            }
+            // if unsafe { self.data.heap_data.0.is_null() } {
+            //     panic!("MemoryBlock is heap-allocated but pointer is null.");
+            // }
             // If it's a heap allocation, return the slice from the pointer
             unsafe { ref_slice(self.data.heap_data.0, self.len) }
         } else {
@@ -311,16 +311,16 @@ impl MemoryBlock {
 
     #[inline(always)]
     pub fn into_slice_mut(&self) -> &'static mut [u8] {
-        let was_dropped = self.dropped.load(Ordering::Relaxed);
+        // let was_dropped = self.dropped.load(Ordering::Relaxed);
 
-        if was_dropped {
-            panic!("MemoryBlock was already dropped, this should not happen.");
-        }
+        // if was_dropped {
+        //     panic!("MemoryBlock was already dropped, this should not happen.");
+        // }
 
         if self.is_heap {
-            if unsafe { self.data.heap_data.0.is_null() } {
-                panic!("MemoryBlock is heap-allocated but pointer is null.");
-            }
+            // if unsafe { self.data.heap_data.0.is_null() } {
+            //     panic!("MemoryBlock is heap-allocated but pointer is null.");
+            // }
             // If it's a heap allocation, return the mutable slice from the pointer
             unsafe { ref_slice_mut(self.data.heap_data.0, self.len) }
         } else {
