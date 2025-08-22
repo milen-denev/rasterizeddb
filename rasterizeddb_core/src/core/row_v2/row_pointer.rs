@@ -11,7 +11,7 @@ use smallvec::SmallVec;
 
 use crate::{
     core::{
-        db_type::DbType, row_v2::{row::{Column, Row, RowFetch}, schema::SchemaField}, storage_providers::traits::StorageIO
+        db_type::DbType, row_v2::row::{Column, Row, RowFetch}, storage_providers::traits::StorageIO
     }, memory_pool::{MemoryBlock, MEMORY_POOL}, BATCH_SIZE, IMMEDIATE_WRITE
 };
 
