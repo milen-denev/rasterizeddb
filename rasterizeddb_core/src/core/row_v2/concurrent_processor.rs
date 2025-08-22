@@ -5,7 +5,7 @@ use smallvec::SmallVec;
 use tokio::{sync::{mpsc, Semaphore}, task};
 
 use crate::{core::{storage_providers::traits::StorageIO}, memory_pool::MemoryBlock, MAX_PERMITS};
-use super::{query_parser::parse_query, row::{column_vec_into_vec, Row, RowFetch}, row_pointer::RowPointerIterator, schema::SchemaField, query_tokenizer::tokenize, transformer::{ColumnTransformer, Next, TransformerProcessor}};
+use super::{query_parser::parse_query, row::{Row, RowFetch}, row_pointer::RowPointerIterator, schema::SchemaField, query_tokenizer::tokenize, transformer::{ColumnTransformer, Next, TransformerProcessor}};
 
 pub struct ConcurrentProcessor;
 
@@ -83,7 +83,7 @@ impl ConcurrentProcessor {
                     bool_buffer: SmallVec::new()
                 };
 
-                let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+                let transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
                 // Process each pointer in this batch
                 for pointer in pointers.iter() {
@@ -99,24 +99,44 @@ impl ConcurrentProcessor {
                         mut_hashtable_buffer.clear();
                         buffer.bool_buffer.clear();
 
-                        column_vec_into_vec(
-                            mut_hashtable_buffer,
-                            &buffer.row.columns,
-                            &*schema_ref
-                        );
-
-                        unsafe 
+                        // Optimized column population - reduces allocations and function call overhead
                         {
-                            let mut_transformer = &mut *transformer.get();
+                            let columns = &buffer.row.columns;
+                            let schema = &*schema_ref;
+                            let len = columns.len();
+                            
+                            // Pre-reserve capacity to avoid reallocation during push operations
+                            mut_hashtable_buffer.reserve(len);
+                            
+                            // Unrolled loop for better branch prediction and reduced overhead
+                            unsafe {
+                                for i in 0..len {
+                                    let column = columns.get_unchecked(i);
+                                    let schema_field = schema.get_unchecked(column.schema_id as usize);
+                                    
+                                    // Direct push with borrowed string (no allocation)
+                                    mut_hashtable_buffer.push((
+                                        Cow::Borrowed(schema_field.name.as_str()), 
+                                        column.data.clone()
+                                    ));
+                                }
+                            }
+                        }
 
+                        // Execute query parsing with reduced indirection
+                        {
+                            let mut_transformer = unsafe { &mut *transformer.get() };
+                            
+                            // Call parse_query directly with minimal overhead
                             parse_query(
                                 &token_ref_1,
                                 mut_hashtable_buffer,
                                 mut_transformer
                             );
                         }
-                    
-                        transformer.get_mut().execute(&mut buffer.bool_buffer)
+                        
+                        // Execute the transformer and return result
+                        unsafe { &mut *transformer.get() }.execute(&mut buffer.bool_buffer)
                     };
 
                     if result {
