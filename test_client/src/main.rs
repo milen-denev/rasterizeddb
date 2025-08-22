@@ -33,7 +33,7 @@ async fn main() -> std::io::Result<()> {
 
     let semaphore = Arc::new(tokio::sync::Semaphore::new(1)); 
 
-    for i in 0..100_000 {
+    for i in 0..1000 {
         let person = generate_person();
         let query = format!(
             r##"
@@ -88,8 +88,8 @@ async fn main() -> std::io::Result<()> {
     // println!("Total time for {} queries: {} ms", total_queries, total_type.load(Ordering::SeqCst));
 
     let query = r##"
-        SELECT id, name FROM employees
-        WHERE id = 99999
+        SELECT id, name, position, salary FROM employees
+        WHERE id = 999
     "##;
 
     let instant = std::time::Instant::now();
