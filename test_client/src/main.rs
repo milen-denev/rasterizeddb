@@ -16,44 +16,44 @@ async fn main() -> std::io::Result<()> {
 
     let client = Arc::new(DbClient::new(Some("127.0.0.1")).await.unwrap());
 
-    let _query = r##"
-        CREATE TABLE employees (
-            id UBIGINT,
-            name VARCHAR,
-            position VARCHAR,
-            salary REAL
-        );
-    "##;
+    // let _query = r##"
+    //     CREATE TABLE employees (
+    //         id UBIGINT,
+    //         name VARCHAR,
+    //         position VARCHAR,
+    //         salary REAL
+    //     );
+    // "##;
 
-    let create_result = client.execute_query(_query).await;
+    // let create_result = client.execute_query(_query).await;
 
-    println!("Create result: {:?}", create_result);
+    // println!("Create result: {:?}", create_result);
 
-    let mut features = vec![];
+    // let mut features = vec![];
 
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(1)); 
+    // let semaphore = Arc::new(tokio::sync::Semaphore::new(1)); 
 
-    for i in 0..1000 {
-        let person = generate_person();
-        let query = format!(
-            r##"
-            INSERT INTO employees (id, name, position, salary)
-            VALUES ({}, '{}', '{}', {});
-            "##,
-            i + 1, person.name, person.job_title, person.salary
-        );
+    // for i in 0..1000 {
+    //     let person = generate_person();
+    //     let query = format!(
+    //         r##"
+    //         INSERT INTO employees (id, name, position, salary)
+    //         VALUES ({}, '{}', '{}', {});
+    //         "##,
+    //         i + 1, person.name, person.job_title, person.salary
+    //     );
 
-        let client_clone = Arc::clone(&client);
-        let semaphore_clone = Arc::clone(&semaphore);
+    //     let client_clone = Arc::clone(&client);
+    //     let semaphore_clone = Arc::clone(&semaphore);
 
-        features.push(tokio::spawn(async move {
-            let _permit = semaphore_clone.acquire().await.unwrap();
-            let _insert_result = client_clone.execute_query(&query).await;
-            drop(_permit);
-        }));
-    }
+    //     features.push(tokio::spawn(async move {
+    //         let _permit = semaphore_clone.acquire().await.unwrap();
+    //         let _insert_result = client_clone.execute_query(&query).await;
+    //         drop(_permit);
+    //     }));
+    // }
 
-    join_all(features).await;
+    // join_all(features).await;
 
     // tokio::time::sleep(std::time::Duration::from_secs(30)).await;
 
@@ -89,14 +89,14 @@ async fn main() -> std::io::Result<()> {
 
     let query = r##"
         SELECT id, name, position, salary FROM employees
-        WHERE id = 999
+        WHERE id = 999 AND position CONTAINS 'Zoo'
     "##;
 
     let instant = std::time::Instant::now();
     let select_result = client.execute_query(query).await;
-    let elapsed = instant.elapsed().as_millis();
+    let elapsed = instant.elapsed().as_micros();
 
-    println!("Query executed in {} ms", elapsed);
+    println!("Query executed in {} μs", elapsed);
 
     match select_result.unwrap() {
         QueryExecutionResult::RowsResult(rows) => {
