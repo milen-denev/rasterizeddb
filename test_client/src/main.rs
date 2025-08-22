@@ -89,7 +89,7 @@ async fn main() -> std::io::Result<()> {
 
     let query = r##"
         SELECT id, name, position, salary FROM employees
-        WHERE id = 999 AND position CONTAINS 'Zoo'
+        WHERE id = 999
     "##;
 
     let instant = std::time::Instant::now();
