@@ -1,5 +1,5 @@
 use std::{
-    arch::x86_64::{_mm_prefetch, _MM_HINT_T0}, fmt, hash::Hash, sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc}
+    arch::x86_64::{_mm_prefetch, _MM_HINT_T0}, fmt, hash::Hash, sync::{atomic::{AtomicU64, Ordering}, Arc}
 };
 
 use crate::instructions::{copy_ptr_to_ptr, copy_vec_to_ptr, ref_slice, ref_slice_mut};
