@@ -121,6 +121,7 @@ pub async fn consolidated_read_data_function(schema: TableSchema, _id: u64) {
     
     let schema_fields = schema.fields.clone();
     let row_fetch = create_row_fetch(&schema_fields);
+    let row_fetch2 = create_row_fetch(&schema_fields);
 
     let all_rows = concurrent_processor.process(
         &format!(
@@ -128,6 +129,7 @@ pub async fn consolidated_read_data_function(schema: TableSchema, _id: u64) {
             id < 2
         "##),
         row_fetch,
+        row_fetch2,
         &schema_fields.to_vec(),
         io_rows,
         &mut iterator
@@ -169,9 +171,10 @@ fn create_row_fetch(schema_fields: &SmallVec<[SchemaField; 20]>) -> RowFetch {
     RowFetch {
         columns_fetching_data: smallvec::smallvec![
             ColumnFetchingData {
-                column_offset: schema_calculator.calculate_schema_offset("id", schema_fields),
+                column_offset: schema_calculator.calculate_schema_offset("id", schema_fields).0,
                 column_type: DbType::U64,
-                size: 8
+                size: 8,
+                schema_id: schema_calculator.calculate_schema_offset("id", schema_fields).1
             },
             // ColumnFetchingData {
             //     column_offset: schema_calculator.calculate_schema_offset("name", schema_fields),

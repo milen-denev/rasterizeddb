@@ -16,7 +16,8 @@ pub struct RowFetch {
 pub struct ColumnFetchingData {
     pub column_offset: u32,
     pub column_type: DbType,
-    pub size: u32
+    pub size: u32,
+    pub schema_id: u64
 }
 
 pub struct RowWrite {

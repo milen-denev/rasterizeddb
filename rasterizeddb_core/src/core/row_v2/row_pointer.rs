@@ -11,7 +11,7 @@ use smallvec::SmallVec;
 
 use crate::{
     core::{
-        db_type::DbType, row_v2::row::{Column, Row, RowFetch}, storage_providers::traits::StorageIO
+        db_type::DbType, row_v2::{row::{Column, Row, RowFetch}, schema::SchemaField}, storage_providers::traits::StorageIO
     }, memory_pool::{MemoryBlock, MEMORY_POOL}, BATCH_SIZE, IMMEDIATE_WRITE
 };
 
@@ -651,8 +651,6 @@ impl RowPointer {
         // Create a vector to hold all the columns
         let mut columns = Vec::new();
         
-        let mut schema_id = 0;
-
         // For each column specified in the fetch data
         for column_data in &row_fetch.columns_fetching_data {
             let row_position = self.position;
@@ -681,12 +679,10 @@ impl RowPointer {
 
                 // Create a column with the string data
                 let column = Column {
-                    schema_id: schema_id,
+                    schema_id: column_data.schema_id,
                     data: string_block,
                     column_type: DbType::STRING,
                 };
-
-                schema_id += 1;
 
                 columns.push(column);
             } else {
@@ -701,13 +697,11 @@ impl RowPointer {
 
                 // Create a Column object with the read data
                 let column = Column {
-                    schema_id: schema_id, // Schema ID would be set based on metadata or query context
+                    schema_id: column_data.schema_id,
                     data: block,
                     column_type: column_data.column_type.clone(), // Clone the DbType
                 };
 
-                schema_id += 1;
-                
                 columns.push(column);
             }
         }
@@ -723,6 +717,7 @@ impl RowPointer {
     pub async fn fetch_row_reuse_async<S: StorageIO>(
         &self, 
         io: Arc<S>,
+        schema: &SmallVec<[SchemaField; 20]>,
         row_fetch: &RowFetch,
         row_reuse: &mut Row) {
 
@@ -734,8 +729,6 @@ impl RowPointer {
         // Create a vector to hold all the columns
         let columns = &mut row_reuse.columns;
         columns.clear();
-
-        let mut schema_id = 0;
 
         // For each column specified in the fetch data
         for column_data in &row_fetch.columns_fetching_data {
@@ -763,16 +756,12 @@ impl RowPointer {
 
                 _ = io.read_data_into_buffer(&mut string_row_position, string_slice).await;
 
-                //println!("string slice: {:?} at position {:?}", string_slice, string_row_position);
-
                 // Create a column with the string data
                 let column = Column {
-                    schema_id: schema_id,
+                    schema_id: column_data.schema_id,
                     data: string_block,
                     column_type: DbType::STRING,
                 };
-
-                schema_id += 1;
 
                 columns.push(column);
             } else {
@@ -787,12 +776,10 @@ impl RowPointer {
 
                 // Create a Column object with the read data
                 let column = Column {
-                    schema_id: schema_id, // Schema ID would be set based on metadata or query context
+                    schema_id: column_data.schema_id,
                     data: block,
                     column_type: column_data.column_type.clone(), // Clone the DbType
                 };
-
-                schema_id += 1;
 
                 columns.push(column);
             }
@@ -1313,12 +1300,14 @@ mod tests {
                 ColumnFetchingData {
                     column_offset: 0,
                     column_type: DbType::STRING,
-                    size: string_bytes.len() as u32 + 4
+                    size: string_bytes.len() as u32 + 4,
+                    schema_id: 0,
                 },
                 ColumnFetchingData {
                     column_offset: 8 + 4,
                     column_type: DbType::I32,
-                    size: i32_bytes.len() as u32
+                    size: i32_bytes.len() as u32,
+                    schema_id: 1,
                 },
             ],
         };
@@ -1384,17 +1373,20 @@ mod tests {
                 ColumnFetchingData {
                     column_offset: 0,
                     column_type: DbType::U64,
-                    size: 8
+                    size: 8,
+                    schema_id: 0
                 },
                 ColumnFetchingData {
                     column_offset: 8,
                     column_type: DbType::STRING,
-                    size: 4 + 8
+                    size: 4 + 8,
+                    schema_id: 1
                 },
                 ColumnFetchingData {
                     column_offset: 8 + 4 + 8,
                     column_type: DbType::U8,
-                    size: 1
+                    size: 1,
+                    schema_id: 2
                 }
             ],
         };

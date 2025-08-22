@@ -145,7 +145,8 @@ pub fn get_row_fetch_small_string() -> RowFetch {
             ColumnFetchingData {
                 column_offset: 0,
                 column_type: DbType::STRING,
-                size: 0 // String size is not known yet
+                size: 0, // String size is not known yet,
+                schema_id: 0
             }
         ],
     }
@@ -157,7 +158,8 @@ pub fn get_row_fetch_large_string() -> RowFetch {
             ColumnFetchingData {
                 column_offset: 8 + 4 + 4,
                 column_type: DbType::STRING,
-                size: 0 // String size is not known yet
+                size: 0, // String size is not known yet,
+                schema_id: 1
             },
         ],
     }
@@ -169,7 +171,8 @@ pub fn get_row_fetch_i32() -> RowFetch {
             ColumnFetchingData {
                 column_offset: 8 + 4,
                 column_type: DbType::I32,
-                size: 4
+                size: 4,
+                schema_id: 2
             },
         ],
     }
@@ -181,17 +184,20 @@ pub fn get_row_fetch_all() -> RowFetch {
             ColumnFetchingData {
                 column_offset: 0,
                 column_type: DbType::STRING,
-                size: 0 // String size is not known yet
+                size: 0, // String size is not known yet
+                schema_id: 0
             },
             ColumnFetchingData {
                 column_offset: 8 + 4,
                 column_type: DbType::I32,
-                size: 4
+                size: 4,
+                schema_id: 1
             },
             ColumnFetchingData {
                 column_offset: 8 + 4 + 4,
                 column_type: DbType::STRING,
-                size: 0 // String size is not known yet
+                size: 0, // String size is not known yet
+                schema_id: 2
             },
         ],
     }

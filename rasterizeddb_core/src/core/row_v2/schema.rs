@@ -149,16 +149,16 @@ impl SchemaField {
 pub struct SchemaCalculator;
 
 impl SchemaCalculator {
-    pub fn calculate_schema_offset(&self, field_name: &str, fields: &[SchemaField]) -> u32 {
+    pub fn calculate_schema_offset(&self, field_name: &str, fields: &[SchemaField]) -> (u32, u64) {
         let mut offset = 0;
         for field in fields.iter().sorted_by(|x, y| Ord::cmp(&x.write_order, &y.write_order)) {
             if field.name == field_name {
-                return offset;
+                return (offset, field.write_order);
             }
             //println!("Field: {} - Offset: {}", field.name, offset);
             offset += field.size as u32;
         }
-        offset
+        panic!("Field not found")
     }
 }
 

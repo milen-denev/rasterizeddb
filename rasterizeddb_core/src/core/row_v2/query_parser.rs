@@ -12,7 +12,6 @@ pub fn parse_query<'a, 'b, 'c>(
     columns: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
     transformers: &'b mut TransformerProcessor<'b>,
 ) {
-    //println!("Parsing query: {:?}", toks);
     let mut parser = QueryParser::new(toks, columns, transformers);
     parser.execute();
 }
@@ -35,18 +34,8 @@ impl<'a, 'b, 'c> QueryParser<'a, 'b, 'c> {
 
     // Add more debug output to the main execute function
     fn execute(&mut self) {
-        // #[cfg(debug_assertions)]
-        // println!("Starting to parse query with {} tokens", self.toks.len());
-        
-        // #[cfg(debug_assertions)]
-        // for (i, token) in self.toks.iter().enumerate() {
-        //     println!("Token {}: {:?}", i, token);
-        // }
-        
+
         self.parse_or();
-        
-        // #[cfg(debug_assertions)]
-        // println!("Finished parsing. Final position: {}/{}", self.pos, self.toks.len());
     }
 
     /// Parse OR expressions

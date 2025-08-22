@@ -29,18 +29,12 @@ fn generic_comparison<T>(input1: &[u8], input2: &[u8], operation: &ComparerOpera
 where
     T: Copy + Default + PartialEq + PartialOrd + FromLeBytes + FromLeBytesUnsafe + Debug,
 {
-    // #[cfg(debug_assertions)]
-    // println!("Comparing {:?} and {:?}", input1, input2);
-
     debug_assert_eq!(input1.len(), std::mem::size_of::<T>());
     debug_assert_eq!(input2.len(), std::mem::size_of::<T>());
 
     let num1 = unsafe { T::from_le_bytes_unchecked(input1) };
     let num2 = unsafe { T::from_le_bytes_unchecked(input2) };
-
-    // println!("Comparing {:?} and {:?}", num1, num2);
-    // println!("Operation: {:?}", operation);
-
+    
     match operation {
         ComparerOperation::Equals => num1 == num2,
         ComparerOperation::NotEquals => num1 != num2,
