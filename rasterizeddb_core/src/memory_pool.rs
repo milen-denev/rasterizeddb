@@ -9,7 +9,7 @@ pub static MEMORY_POOL: MemoryPool = MemoryPool::new();
 use libmimalloc_sys::{mi_malloc, mi_free};
 
 // Define the maximum size for inline allocation
-const INLINE_CAPACITY: usize = 21;
+const INLINE_CAPACITY: usize = 64;
 
 pub struct MemoryPool;
 
