@@ -87,41 +87,44 @@ async fn main() -> std::io::Result<()> {
 
     // println!("Total time for {} queries: {} ms", total_queries, total_type.load(Ordering::SeqCst));
 
-    let query = r##"
-        SELECT id, name, position, salary FROM employees
-        WHERE id = 999
-    "##;
+    for _ in 0..10 {   
+        let query = r##"
+            SELECT id, name, position, salary FROM employees
+            WHERE id = 999
+        "##;
 
-    let instant = std::time::Instant::now();
-    let select_result = client.execute_query(query).await;
-    let elapsed = instant.elapsed().as_micros();
+        let instant = std::time::Instant::now();
+        let select_result = client.execute_query(query).await;
+        let elapsed = instant.elapsed().as_micros();
 
-    println!("Query executed in {} μs", elapsed);
+        println!("Query executed in {} μs", elapsed);
 
-    match select_result.unwrap() {
-        QueryExecutionResult::RowsResult(rows) => {
-            println!("Rows fetched successfully.");
-            let rows = vec_into_rows(&rows).unwrap();
-            println!("Total rows: {}", rows.len());
-            for row in rows {
-                for column in &row.columns {
-                    if column.column_type == DbType::STRING {
-                        let value = String::from_utf8(column.data.into_slice().to_vec()).unwrap();
-                        println!("Name / Position: {}", value);
-                    } else if column.column_type == DbType::U64 {
-                        println!("Id: {}", u64::from_le_bytes(column.data.into_slice().try_into().unwrap()));
-                    } else if column.column_type == DbType::F32 {
-                        println!("Salary: {}", f32::from_le_bytes(column.data.into_slice().try_into().unwrap()));
+        match select_result.unwrap() {
+            QueryExecutionResult::RowsResult(rows) => {
+                println!("Rows fetched successfully.");
+                let rows = vec_into_rows(&rows).unwrap();
+                println!("Total rows: {}", rows.len());
+                for row in rows {
+                    for column in &row.columns {
+                        if column.column_type == DbType::STRING {
+                            let value = String::from_utf8(column.data.into_slice().to_vec()).unwrap();
+                            println!("Name / Position: {}", value);
+                        } else if column.column_type == DbType::U64 {
+                            println!("Id: {}", u64::from_le_bytes(column.data.into_slice().try_into().unwrap()));
+                        } else if column.column_type == DbType::F32 {
+                            println!("Salary: {}", f32::from_le_bytes(column.data.into_slice().try_into().unwrap()));
+                        }
                     }
                 }
             }
+            QueryExecutionResult::Error(err) => {
+                eprintln!("Error occurred: {}", err);
+            }
+            _ => {
+                eprintln!("Unexpected result type");
+            }
         }
-        QueryExecutionResult::Error(err) => {
-            eprintln!("Error occurred: {}", err);
-        }
-        _ => {
-            eprintln!("Unexpected result type");
-        }
+
     }
 
     // let rebuild_result = client.execute_query("BEGIN SELECT FROM test_db REBUILD_INDEXES END").await.unwrap();
