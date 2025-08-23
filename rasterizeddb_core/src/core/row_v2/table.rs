@@ -96,13 +96,11 @@ impl<S: StorageIO> Table<S> {
             &row_write
         ).await;
 
-
         if let Err(e) = result {
             error!("Failed to insert row: {}", e);
             return Err(io::Error::new(io::ErrorKind::Other, format!("Failed to insert row: {}", e)));
         } else if let Ok(row_pointer) = result {
             info!("Successfully inserted row with pointer: {:?}", row_pointer);
-            
         }
 
         return Ok(());
