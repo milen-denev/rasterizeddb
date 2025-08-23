@@ -158,7 +158,7 @@ impl SchemaCalculator {
             //println!("Field: {} - Offset: {}", field.name, offset);
             offset += field.size as u32;
         }
-        panic!("Field not found")
+        (0, 0)
     }
 }
 
