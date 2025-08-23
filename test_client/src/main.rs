@@ -1,7 +1,7 @@
 #![allow(unused_imports)]
 #![allow(dead_code)]
 
-use std::sync::{atomic::{AtomicU64, Ordering}, Arc};
+use std::{io::stdin, sync::{atomic::{AtomicU64, Ordering}, Arc}};
 use futures::future::join_all;
 use log::LevelFilter;
 use rand::Rng;
@@ -16,81 +16,81 @@ async fn main() -> std::io::Result<()> {
 
     let client = Arc::new(DbClient::new(Some("127.0.0.1")).await.unwrap());
 
-    // let _query = r##"
-    //     CREATE TABLE employees (
-    //         id UBIGINT,
-    //         name VARCHAR,
-    //         position VARCHAR,
-    //         salary REAL
-    //     );
-    // "##;
+    let _query = r##"
+        CREATE TABLE employees (
+            id UBIGINT,
+            name VARCHAR,
+            job_title VARCHAR,
+            salary REAL,
+            department VARCHAR,
+            age INTEGER,
+            manager VARCHAR,
+            location VARCHAR,
+            hire_date UBIGINT,
+            degree VARCHAR,
+            skills VARCHAR,
+            current_project VARCHAR,
+            performance_score REAL,
+            is_active BOOLEAN,
+            created_at UBIGINT,
+            updated_at UBIGINT,
+            is_fired BOOLEAN
+        );
+    "##;
 
-    // let create_result = client.execute_query(_query).await;
+    let create_result = client.execute_query(_query).await;
 
-    // println!("Create result: {:?}", create_result);
+    println!("Create result: {:?}", create_result);
 
-    // let mut features = vec![];
+    println!("Press any key to continue...");
+    let mut buffer = String::new();
+    stdin().read_line(&mut buffer).unwrap();
 
-    // let semaphore = Arc::new(tokio::sync::Semaphore::new(1)); 
+    let mut features = vec![];
 
-    // for i in 0..1000 {
-    //     let person = generate_person();
-    //     let query = format!(
-    //         r##"
-    //         INSERT INTO employees (id, name, position, salary)
-    //         VALUES ({}, '{}', '{}', {});
-    //         "##,
-    //         i + 1, person.name, person.job_title, person.salary
-    //     );
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(16)); 
 
-    //     let client_clone = Arc::clone(&client);
-    //     let semaphore_clone = Arc::clone(&semaphore);
+    for i in 0..100_000 {
+        let person = generate_person();
+        let query = format!(
+            r##"
+            INSERT INTO employees (
+                id, name, job_title, salary, department, age, manager, location, hire_date,
+                degree, skills, current_project, performance_score, is_active,
+                created_at, updated_at, is_fired
+            )
+            VALUES (
+                {}, '{}', '{}', {}, '{}', {}, '{}', '{}', {},
+                '{}', '{}', '{}', {}, {}, {}, {}, {}
+            );
+            "##,
+            i + 1, person.name, person.job_title, person.salary, person.department, person.age,
+            person.manager, person.location, person.hire_date,
+            person.degree, person.skills, person.current_project, person.performance_score,
+            person.is_active as u8,
+            person.created_at, person.updated_at, person.is_fired as u8
+        );
 
-    //     features.push(tokio::spawn(async move {
-    //         let _permit = semaphore_clone.acquire().await.unwrap();
-    //         let _insert_result = client_clone.execute_query(&query).await;
-    //         drop(_permit);
-    //     }));
-    // }
+        let client_clone = Arc::clone(&client);
+        let semaphore_clone = Arc::clone(&semaphore);
 
-    // join_all(features).await;
+        features.push(tokio::spawn(async move {
+            let _permit = semaphore_clone.acquire().await.unwrap();
+            let _insert_result = client_clone.execute_query(&query).await;
+            drop(_permit);
+        }));
+    }
 
-    // tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    join_all(features).await;
 
-    // return Ok(());
-
-    // let client_clone = Arc::clone(&client);
-
-    // let total_type: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
-    // let total_queries = 10;
-
-    // let mut features = vec![];
-
-    // for _ in 0..total_queries {
-    //     let client_clone_2 = Arc::clone(&client_clone);
-    //     let total_type_clone = Arc::clone(&total_type);
-
-    //     features.push(tokio::spawn(async move {
-    //         let query = r##"
-    //             SELECT id FROM employees
-    //             WHERE id = 50
-    //         "##;
-
-    //         let instant = std::time::Instant::now();
-    //         let _select_result = client_clone_2.execute_query(query).await;
-    //         let elapsed = instant.elapsed().as_millis();
-    //         total_type_clone.fetch_add(elapsed as u64, Ordering::SeqCst);
-    //     }));
-    // }
-
-    // join_all(features).await;
-
-    // println!("Total time for {} queries: {} ms", total_queries, total_type.load(Ordering::SeqCst));
+    println!("Press any key to continue...");
+    let mut buffer = String::new();
+    stdin().read_line(&mut buffer).unwrap();
 
     for _ in 0..10 {   
         let query = r##"
-            SELECT id, name, position, salary FROM employees
-            WHERE id = 999
+            SELECT id, name, job_title, salary FROM employees
+            WHERE id = 99999
         "##;
 
         let instant = std::time::Instant::now();
@@ -124,68 +124,12 @@ async fn main() -> std::io::Result<()> {
                 eprintln!("Unexpected result type");
             }
         }
-
     }
 
-    // let rebuild_result = client.execute_query("BEGIN SELECT FROM test_db REBUILD_INDEXES END").await.unwrap();
+    println!("Press any key to continue...");
 
-    // println!("Rebuild indexes result: {:?}", rebuild_result);
-
-    // for i in 0..1_500_000 {
-    //     let query = format!(
-    //         r#"
-    //         BEGIN
-    //         INSERT INTO test_db (COL(F64), COL(F32), COL(I32), COL(STRING), COL(CHAR), COL(U128))
-    //         VALUES ({}, {}, {}, {}, 'D', {})
-    //         END
-    //     "#, i, i as f64 * -1 as f64, i as i32, "Milen Denev", u128::MAX - i);
-                
-    //     let db_response = client.execute_query(&query).await.unwrap();
-
-    //     // println!("Insert result: {:?}", db_response);
-    // }
-
-    // println!("Done inserting rows.");
-
-    // let mut stopwatch = Stopwatch::new();
-    // stopwatch.start();
-
-    // let query2 = format!(
-    //     r#"
-    //     BEGIN
-    //     SELECT FROM test_db
-    //     WHERE COL(0,I32) = 12440 
-    //     LIMIT 1000000
-    //     END
-    // "#);
-
-    // let db_response2 = client.execute_query(&query2).await.unwrap();
-    // let result = DbClient::extract_rows(db_response2).unwrap().unwrap();
-
-    // stopwatch.stop();
-
-    // for row in result.iter() {
-    //     let columns = row.columns().unwrap();
-    //     for (i, column) in columns.iter().enumerate() {
-    //         println!("Column ({}): {}", i, column.into_value());
-    //     }
-    // }
-
-    // println!("Elapsed {:?}", stopwatch.elapsed());
-
-    // match result {
-    //     ReturnResult::Rows(rows) => {
-    //         println!("Total rows: {}", rows.len());
-    //     },
-    //     ReturnResult::HtmlView(html_string) => {
-    //         println!("Html string: {}", html_string);
-    //     }
-    // }
-
-    // println!("Press any key to continue...");
-
-    // let mut buffer = String::new();
-    // stdin().read_line(&mut buffer).unwrap();
+    let mut buffer = String::new();
+    stdin().read_line(&mut buffer).unwrap();
 
     return Ok(());
 }
@@ -195,6 +139,19 @@ struct Person {
     name: String,
     job_title: String,
     salary: f32,
+    department: String,
+    age: u32,
+    manager: String,
+    location: String,
+    hire_date: u64,
+    degree: String,
+    skills: String,
+    current_project: String,
+    performance_score: f32,
+    is_active: bool,
+    created_at: u64,
+    updated_at: u64,
+    is_fired: bool
 }
 
 // Function to generate a new `Person` with random data.
@@ -260,24 +217,73 @@ fn generate_person() -> Person {
         "Occupational Therapist", "Chiropractor", "Anesthesiologist", "Cardiologist",
         "Dermatologist", "Neurologist", "Orthopedic Surgeon", "Pediatrician", "Urologist"
     ];
+    let departments = [
+        "Engineering", "Marketing", "Sales", "HR", "Finance", "Support", "Legal", "Operations",
+        "Product", "Design", "QA", "IT", "Customer Success", "R&D", "Business Development"
+    ];
+    let locations = [
+        "New York", "San Francisco", "London", "Berlin", "Tokyo", "Toronto", "Sydney", "Paris",
+        "Bangalore", "Shanghai", "Singapore", "Moscow", "Dubai"
+    ];
+    let degrees = [
+        "BSc Computer Science", "MBA", "BA Psychology", "BEng Mechanical", "BS Finance",
+        "PhD Physics", "MS Statistics", "BFA Design", "MA English", "JD Law"
+    ];
+    let skills_list = [
+        "Rust, SQL, Git", "Python, ML, Docker", "JavaScript, React, CSS", "Excel, Accounting",
+        "Recruiting, Interviewing", "Photoshop, Illustrator", "Project Management, Scrum",
+        "Linux, Networking", "Copywriting, SEO", "Negotiation, Sales"
+    ];
+    let projects = [
+        "Migration Tool", "Website Redesign", "Mobile App", "Infrastructure Upgrade",
+        "Marketing Campaign", "HR Portal", "Data Warehouse", "Security Audit"
+    ];
+    let manager_names = [
+        "Alice Smith", "Bob Johnson", "Carol Brown", "Dave Davis", "Eva Wilson", "Frank Thomas"
+    ];
 
     // Pick a random name from the arrays.
     let first_name = first_names[rng.random_range(0..first_names.len())];
     let last_name = last_names[rng.random_range(0..last_names.len())];
     let name = format!("{} {}", first_name, last_name);
 
-    // Pick a random job title.
-    let job_title = job_titles[rng.random_range(0..job_titles.len())].to_string();
-
     // Generate a random salary as an f32 within a realistic range.
     let min_salary = 20000.0;
     let max_salary = 250000.0;
     let salary = rng.random_range(min_salary..max_salary);
+
+    let job_title = job_titles[rng.random_range(0..job_titles.len())].to_string();
+    let department = departments[rng.random_range(0..departments.len())].to_string();
+    let age = rng.random_range(21..=65);
+    let manager = manager_names[rng.random_range(0..manager_names.len())].to_string();
+    let location = locations[rng.random_range(0..locations.len())].to_string();
+    let hire_date = rng.random_range(1000000u64..9000000u64);
+    let degree = degrees[rng.random_range(0..degrees.len())].to_string();
+    let skills = skills_list[rng.random_range(0..skills_list.len())].to_string();
+    let current_project = projects[rng.random_range(0..projects.len())].to_string();
+    let performance_score = rng.random_range(0.0..5.0);
+    let is_active = rng.random_bool(0.9); // 90% chance active
+    let created_at = rng.random_range(1000000u64..9000000u64);
+    let updated_at = rng.random_range(created_at..9000000u64);
+    let is_fired = !is_active && rng.random_bool(0.5);
 
     // Return the new Person struct.
     Person {
         name,
         job_title,
         salary,
+        department,
+        age,
+        manager,
+        location,
+        hire_date,
+        degree,
+        skills,
+        current_project,
+        performance_score,
+        is_active,
+        created_at,
+        updated_at,
+        is_fired,
     }
 }
