@@ -2,11 +2,20 @@ use std::sync::Arc;
 
 use log::LevelFilter;
 use rasterizeddb_core::core::database_v2::Database;
+use tokio::runtime::Builder;
 
-#[tokio::main(flavor = "multi_thread")]
 #[allow(unreachable_code)]
 #[allow(static_mut_refs)]
-async fn main() -> std::io::Result<()> {
+fn main() -> std::io::Result<()> {
+        // 64 MiB
+    let stack_size = 64 * 1024 * 1024;
+
+    let rt = Builder::new_multi_thread()
+        .worker_threads(16)
+        .thread_stack_size(stack_size)
+        .enable_all()
+        .build()?;
+
     // let io_rows = unsafe { IO_ROWS.force_mut().await };
     // let io_pointers = unsafe { IO_POINTERS.force_mut().await };
     // let io_schema = unsafe { IO_SCHEMA.force_mut().await };
@@ -36,13 +45,16 @@ async fn main() -> std::io::Result<()> {
 
     // return Ok(());
 
-    env_logger::Builder::new()
-        .filter_level(LevelFilter::Error)
-        .init();
+     rt.block_on(async {
+        env_logger::Builder::new()
+            .filter_level(LevelFilter::Error)
+            .init();
 
-    let database = Database::new("G:\\Databases\\Production").await;
-    let arc_database = Arc::new(database);
-    _ = Database::start_db(arc_database).await;
+            
+        let database = Database::new("C:\\Databases\\Production").await;
+        let arc_database = Arc::new(database);
+        _ = Database::start_db(arc_database).await;
+    });
 
     return Ok(());
 }
