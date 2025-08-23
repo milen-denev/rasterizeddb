@@ -1,13 +1,13 @@
 # .cargo/config.toml
 
 # Sets the main thread stack size to 128 MB for Linux
-[target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "link-arg=-Wl,-zstack-size=134217728"] # 128 * 1024 * 1024 bytes
+# [target.x86_64-unknown-linux-gnu]
+# rustflags = ["-C", "link-arg=-Wl,-zstack-size=134217728"] # 128 * 1024 * 1024 bytes
 
 # Sets the main thread stack size to 128 MB for macOS
-[target.x86_64-apple-darwin]
-rustflags = ["-C", "link-args=-Wl,-stack_size,0x8000000"] # 128 MB in hexadecimal
+# [target.x86_64-apple-darwin]
+# rustflags = ["-C", "link-args=-Wl,-stack_size,0x8000000"] # 128 MB in hexadecimal
 
 # Sets the main thread stack size to 128 MB for Windows
-[target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "link-args=/STACK:134217728"] # 128 * 1024 * 1024 bytes
+# [target.x86_64-pc-windows-msvc]
+# rustflags = ["-C", "link-args=/STACK:134217728"] # 128 * 1024 * 1024 bytes
