@@ -58,6 +58,7 @@ pub async fn execute(query: QueryPurpose, database: Arc<Database>) -> Vec<u8> {
             debug!("Insert row into table: {}", table_name);
             let table_ref = database.tables.get(table_name);
             let table_clone = table_ref.as_ref().clone();
+
             let table = if let Some(table) = table_clone {
                 table
             } else {
@@ -71,7 +72,9 @@ pub async fn execute(query: QueryPurpose, database: Arc<Database>) -> Vec<u8> {
                 result.extend_from_slice(&mut error_message_bytes);
                 return result.to_vec();
             };
+
             let schema = &table.schema;
+
             // Handle insert row
             if let Some(insert_row) = insert_row_from_query_purpose(&query, &schema.fields) {
                 if table.insert_row(insert_row).await.is_ok() {
