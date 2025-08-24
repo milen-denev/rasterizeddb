@@ -4,8 +4,10 @@ use futures::future::join_all;
 use smallvec::SmallVec;
 use tokio::{sync::{mpsc, Semaphore}, task};
 
-use crate::{core::{storage_providers::traits::StorageIO}, memory_pool::MemoryBlock, MAX_PERMITS};
-use super::{query_parser::parse_query, row::{Row, RowFetch}, row_pointer::RowPointerIterator, schema::SchemaField, query_tokenizer::tokenize, transformer::{ColumnTransformer, Next, TransformerProcessor}};
+use crate::{core::{row_v2::query_parser::QueryParser, storage_providers::traits::StorageIO}, memory_pool::MemoryBlock, MAX_PERMITS_THREADS};
+use super::{row::{Row, RowFetch}, row_pointer::RowPointerIterator, schema::SchemaField, query_tokenizer::tokenize, transformer::{ColumnTransformer, Next, TransformerProcessor}};
+
+pub static EMPTY_STR: &str = "";
 
 pub struct ConcurrentProcessor;
 
@@ -38,7 +40,7 @@ impl ConcurrentProcessor {
 
         let arc_tuple: Arc<(Semaphore, RowFetch, RowFetch)> = 
             Arc::new((
-                Semaphore::new(MAX_PERMITS), 
+                Semaphore::new(MAX_PERMITS_THREADS), 
                 query_row_fetch,
                 requested_row_fetch
             ));
@@ -83,7 +85,10 @@ impl ConcurrentProcessor {
                     bool_buffer: SmallVec::new()
                 };
 
+                
                 let transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+                let mut_transformer = unsafe { &mut *transformer.get() };
+                let parser = UnsafeCell::new(QueryParser::new(&token_ref_1, mut_transformer));
 
                 // Process each pointer in this batch
                 for pointer in pointers.iter() {
@@ -106,14 +111,23 @@ impl ConcurrentProcessor {
                             let len = columns.len();
                             
                             // Pre-reserve capacity to avoid reallocation during push operations
-                            mut_hashtable_buffer.reserve(len);
+                            mut_hashtable_buffer.reserve(schema.len());
                             
                             // Unrolled loop for better branch prediction and reduced overhead
                             unsafe {
                                 for i in 0..len {
                                     let column = columns.get_unchecked(i);
                                     let schema_field = schema.get_unchecked(column.schema_id as usize);
+
+                                    let write_order = schema_field.write_order;
                                     
+                                    if i < write_order as usize {
+                                        // Fill in any missing fields with empty strings
+                                        for _ in i..write_order as usize {
+                                            mut_hashtable_buffer.push((Cow::Borrowed(EMPTY_STR), MemoryBlock::default()));
+                                        }
+                                    }
+
                                     // Direct push with borrowed string (no allocation)
                                     mut_hashtable_buffer.push((
                                         Cow::Borrowed(schema_field.name.as_str()), 
@@ -124,19 +138,19 @@ impl ConcurrentProcessor {
                         }
 
                         // Execute query parsing with reduced indirection
-                        {
-                            let mut_transformer = unsafe { &mut *transformer.get() };
-                            
-                            // Call parse_query directly with minimal overhead
-                            parse_query(
-                                &token_ref_1,
-                                mut_hashtable_buffer,
-                                mut_transformer
-                            );
+                        {   
+                            let mut_parser = unsafe { &mut *parser.get() };
+
+                            mut_parser.reset_for_next_execution();
+
+                            let execute_result = mut_parser.execute(mut_hashtable_buffer);
+                            if execute_result.is_err() {
+                                panic!("Error executing query parser. Error message: {:?}", execute_result.err());
+                            }
+
+                            // Execute the transformer and return result
+                            unsafe { &mut *transformer.get() }.execute(&mut buffer.bool_buffer)
                         }
-                        
-                        // Execute the transformer and return result
-                        unsafe { &mut *transformer.get() }.execute(&mut buffer.bool_buffer)
                     };
 
                     if result {
