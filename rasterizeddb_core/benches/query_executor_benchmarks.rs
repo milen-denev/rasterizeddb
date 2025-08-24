@@ -1,10 +1,10 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use rasterizeddb_core::core::row_v2::concurrent_processor::Buffer;
-use rasterizeddb_core::core::row_v2::query_parser::{parse_query, tokenize_for_test};
+use rasterizeddb_core::core::row_v2::query_parser::{tokenize_for_test, QueryParser};
 use rasterizeddb_core::core::row_v2::row::Row;
 use rasterizeddb_core::core::row_v2::schema::SchemaField;
 use rasterizeddb_core::core::db_type::DbType;
-use rasterizeddb_core::core::row_v2::query_tokenizer::tokenize;
+use rasterizeddb_core::core::row_v2::query_tokenizer::{tokenize, Token};
 use rasterizeddb_core::core::row_v2::transformer::TransformerProcessor;
 use rasterizeddb_core::memory_pool::{MemoryBlock, MEMORY_POOL};
 use smallvec::SmallVec;
@@ -12,6 +12,15 @@ use std::borrow::Cow;
 use std::cell::UnsafeCell;
 use std::hint::black_box;
 use std::sync::LazyLock;
+
+fn parse_query<'a, 'b, 'c>(
+    toks: &'a SmallVec<[Token; 36]>,
+    columns: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
+    transformers: &'b mut TransformerProcessor<'b>,
+) {
+    let mut parser = QueryParser::new(toks, transformers);
+    _ = parser.execute(columns);
+}
 
 fn create_benchmark_schema() -> SmallVec<[SchemaField; 20]> {
     smallvec::smallvec![
