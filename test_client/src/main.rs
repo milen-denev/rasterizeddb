@@ -89,7 +89,7 @@ async fn main() -> std::io::Result<()> {
 
     for _ in 0..10 {   
         let query = r##"
-            SELECT name FROM employees
+            SELECT id, job_title, salary FROM employees
             WHERE id = 99999
         "##;
 
