@@ -1,3 +1,4 @@
+use ahash::{HashSet, HashSetExt};
 use itertools::Either;
 use smallvec::SmallVec;
 
@@ -16,6 +17,27 @@ pub struct ColumnTransformer {
     pub result_store_index: Option<usize>,
     pub result_index_1: Option<usize>,
     pub result_index_2: Option<usize>,
+        
+    // New fields for column index tracking (instead of names for better performance)
+    pub column_1_index: Option<usize>,
+    pub column_2_index: Option<usize>,
+}
+
+impl Clone for ColumnTransformer {
+    fn clone(&self) -> Self {
+        Self {
+            column_type: self.column_type.clone(),
+            column_1: self.column_1.clone(),
+            column_2: self.column_2.clone(),
+            transformer_type: self.transformer_type.clone(),
+            next: self.next.clone(),
+            result_store_index: self.result_store_index,
+            result_index_1: self.result_index_1,
+            result_index_2: self.result_index_2,
+            column_1_index: self.column_1_index,
+            column_2_index: self.column_2_index,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -69,6 +91,8 @@ impl ColumnTransformer {
             result_store_index: None,
             result_index_1: None,
             result_index_2: None,
+            column_1_index: None,
+            column_2_index: None,
         }
     }
 
@@ -104,13 +128,159 @@ impl ColumnTransformer {
     pub fn clear_column_2(&mut self) {
         self.column_2 = None;
     }
-}
 
-/// An enum to represent either a direct memory block or an index to an intermediate result
+    // New methods for column index tracking and updating
+
+    /// Set the index of the first column (for tracking purposes)
+    pub fn set_column_1_index(&mut self, index: usize) {
+        self.column_1_index = Some(index);
+    }
+
+    /// Set the index of the second column (for tracking purposes)
+    pub fn set_column_2_index(&mut self, index: usize) {
+        self.column_2_index = Some(index);
+    }
+
+    /// Update column data using direct array indexing - this is the performance optimization
+    pub fn update_column_data_by_index(&mut self, new_columns: &[MemoryBlock]) {
+        // Update column_1 if it has an index and is not using an intermediate result
+        if let Some(idx1) = self.column_1_index {
+            if self.result_index_1.is_none() {
+                // Direct array access using the stored index
+                if idx1 < new_columns.len() {
+                    self.column_1 = new_columns[idx1].clone();
+                } else {
+                    panic!("Column index {} out of bounds (array length: {})", idx1, new_columns.len());
+                }
+            }
+        }
+        
+        // Update column_2 if it has an index and is not using an intermediate result
+        if let Some(idx2) = self.column_2_index {
+            if self.result_index_2.is_none() {
+                // Direct array access using the stored index
+                if idx2 < new_columns.len() {
+                    self.column_2 = Some(new_columns[idx2].clone());
+                } else {
+                    panic!("Column index {} out of bounds (array length: {})", idx2, new_columns.len());
+                }
+            }
+        }
+    }
+
+    /// Get all column indices that this transformer depends on (for debugging)
+    pub fn get_column_dependencies(&self) -> SmallVec<[usize; 2]> {
+        let mut deps = SmallVec::new();
+        
+        if let Some(idx1) = self.column_1_index {
+            if self.result_index_1.is_none() { // Only direct column dependencies
+                deps.push(idx1);
+            }
+        }
+        
+        if let Some(idx2) = self.column_2_index {
+            if self.result_index_2.is_none() { // Only direct column dependencies
+                deps.push(idx2);
+            }
+        }
+        
+        deps
+    }
+
+    /// Check if this transformer has any direct column dependencies (not intermediate results)
+    pub fn has_direct_column_dependencies(&self) -> bool {
+        (self.column_1_index.is_some() && self.result_index_1.is_none()) ||
+        (self.column_2_index.is_some() && self.result_index_2.is_none())
+    }
+
+    /// Get the column indices used by this transformer
+    pub fn get_used_column_indices(&self) -> Vec<usize> {
+        let mut indices = Vec::new();
+        
+        if let Some(idx1) = self.column_1_index {
+            if self.result_index_1.is_none() {
+                indices.push(idx1);
+            }
+        }
+        
+        if let Some(idx2) = self.column_2_index {
+            if self.result_index_2.is_none() {
+                indices.push(idx2);
+            }
+        }
+        
+        indices
+    }
+
+    /// Check if this transformer uses a specific column index
+    pub fn uses_column_index(&self, column_index: usize) -> bool {
+        (self.column_1_index == Some(column_index) && self.result_index_1.is_none()) ||
+        (self.column_2_index == Some(column_index) && self.result_index_2.is_none())
+    }
+
+    /// Update a specific column by index (alternative method)
+    pub fn update_column_by_index(&mut self, column_index: usize, new_data: MemoryBlock) {
+        if self.column_1_index == Some(column_index) && self.result_index_1.is_none() {
+            self.column_1 = new_data.clone();
+        }
+        
+        if self.column_2_index == Some(column_index) && self.result_index_2.is_none() {
+            self.column_2 = Some(new_data);
+        }
+    }
+
+    /// Get debug information about this transformer
+    pub fn debug_info(&self) -> String {
+        format!(
+            "ColumnTransformer {{ type: {:?}, col1_idx: {:?}, col2_idx: {:?}, result_idx1: {:?}, result_idx2: {:?}, store_idx: {:?} }}",
+            match self.transformer_type {
+                ColumnTransformerType::MathOperation(ref op) => format!("Math({:?})", op),
+                ColumnTransformerType::ComparerOperation(ref op) => format!("Compare({:?})", op),
+            },
+            self.column_1_index,
+            self.column_2_index,
+            self.result_index_1,
+            self.result_index_2,
+            self.result_store_index
+        )
+    }
+
+    /// Validate that the transformer has all required data
+    pub fn validate(&self) -> Result<(), String> {
+        // Check that column_1 has either direct data or an intermediate result index
+        if self.result_index_1.is_none() && self.column_1_index.is_none() {
+            // For literals and constants, this is fine - they don't need column indices
+        }
+
+        // Check that column_2 has data when needed
+        match self.transformer_type {
+            ColumnTransformerType::MathOperation(_) => {
+                if self.column_2.is_none() {
+                    return Err("Math operations require both operands".to_string());
+                }
+            }
+            ColumnTransformerType::ComparerOperation(_) => {
+                if self.column_2.is_none() {
+                    return Err("Comparison operations require both operands".to_string());
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Reset column indices (useful for testing or rebuilding)
+    pub fn clear_column_indices(&mut self) {
+        self.column_1_index = None;
+        self.column_2_index = None;
+    }
+}
+/// An enum to represent either a direct memory block, a memory block with its column index, or an index to an intermediate result
 #[derive(Debug, Clone)]
 pub enum ComparisonOperand {
-    Direct(MemoryBlock),
-    Intermediate(usize),
+    Direct(MemoryBlock),                    // Literal values (numbers, strings)
+    DirectWithIndex(MemoryBlock, usize),    // Column data with its index for fast updates
+    Intermediate(usize),                    // Result from previous math operations
 }
 
 impl From<MemoryBlock> for ComparisonOperand {
@@ -125,23 +295,55 @@ impl From<usize> for ComparisonOperand {
     }
 }
 
+impl ComparisonOperand {
+    /// Get the memory block, regardless of variant
+    pub fn get_memory_block(&self) -> &MemoryBlock {
+        match self {
+            ComparisonOperand::Direct(mb) => mb,
+            ComparisonOperand::DirectWithIndex(mb, _) => mb,
+            ComparisonOperand::Intermediate(_) => panic!("Cannot get memory block from intermediate result"),
+        }
+    }
+
+    /// Get the column index if available
+    pub fn get_column_index(&self) -> Option<usize> {
+        match self {
+            ComparisonOperand::DirectWithIndex(_, idx) => Some(*idx),
+            _ => None,
+        }
+    }
+
+    /// Check if this operand represents a column (has an index)
+    pub fn is_column(&self) -> bool {
+        matches!(self, ComparisonOperand::DirectWithIndex(_, _))
+    }
+
+    /// Check if this operand is an intermediate result
+    pub fn is_intermediate(&self) -> bool {
+        matches!(self, ComparisonOperand::Intermediate(_))
+    }
+}
+
 #[derive(Debug)]
 pub struct TransformerProcessor<'a> {
     pub transformers: &'a mut SmallVec<[ColumnTransformer; 36]>,
-    pub intermediate_results: &'a mut  SmallVec<[MemoryBlock; 20]>,
+    pub intermediate_results: &'a mut SmallVec<[MemoryBlock; 20]>,
 }
 
 impl<'a> TransformerProcessor<'a> {
-    pub fn new(transformers: &'a mut SmallVec<[ColumnTransformer; 36]>, intermediate_results: &'a mut SmallVec<[MemoryBlock; 20]>) -> Self {
+    pub fn new(
+        transformers: &'a mut SmallVec<[ColumnTransformer; 36]>, 
+        intermediate_results: &'a mut SmallVec<[MemoryBlock; 20]>
+    ) -> Self {
         transformers.clear();
         intermediate_results.clear();
         Self {
-            transformers: transformers,
-            intermediate_results: intermediate_results,
+            transformers,
+            intermediate_results,
         }
     }    
     
-    /// Add a math operation transformer
+    /// Add a math operation transformer with automatic column index tracking
     /// Accepts either direct MemoryBlocks or intermediate result indices (usize) as operands.
     pub fn add_math_operation(
         &mut self,
@@ -171,6 +373,10 @@ impl<'a> TransformerProcessor<'a> {
             ComparisonOperand::Direct(mem) => {
                 transformer.column_1 = mem;
             }
+            ComparisonOperand::DirectWithIndex(mem, index) => {
+                transformer.column_1 = mem;
+                transformer.set_column_1_index(index);
+            }
             ComparisonOperand::Intermediate(idx) => {
                 transformer.result_index_1 = Some(idx);
                 // transformer.column_1 remains the placeholder; it will be filled by execute()
@@ -181,6 +387,10 @@ impl<'a> TransformerProcessor<'a> {
         match right_op {
             ComparisonOperand::Direct(mem) => {
                 transformer.setup_column_2(mem);
+            }
+            ComparisonOperand::DirectWithIndex(mem, index) => {
+                transformer.setup_column_2(mem);
+                transformer.set_column_2_index(index);
             }
             ComparisonOperand::Intermediate(idx) => {
                 transformer.result_index_2 = Some(idx);
@@ -226,56 +436,117 @@ impl<'a> TransformerProcessor<'a> {
         
         transformer.setup_column_2(placeholder);
         
-        // Set up the correct operands based on type
-        match (left_operand, right_operand) {
+        // Set up the correct operands based on type and track column indices
+        match (&left_operand, &right_operand) {
             (ComparisonOperand::Direct(mem1), ComparisonOperand::Direct(mem2)) => {
                 // Direct comparison of two memory blocks
-                transformer.column_1 = mem1;
-                transformer.setup_column_2(mem2);
+                transformer.column_1 = mem1.clone();
+                transformer.setup_column_2(mem2.clone());
+            },
+            (ComparisonOperand::DirectWithIndex(mem1, idx1), ComparisonOperand::Direct(mem2)) => {
+                transformer.column_1 = mem1.clone();
+                transformer.setup_column_2(mem2.clone());
+                transformer.set_column_1_index(*idx1);
+            },
+            (ComparisonOperand::Direct(mem1), ComparisonOperand::DirectWithIndex(mem2, idx2)) => {
+                transformer.column_1 = mem1.clone();
+                transformer.setup_column_2(mem2.clone());
+                transformer.set_column_2_index(*idx2);
+            },
+            (ComparisonOperand::DirectWithIndex(mem1, idx1), ComparisonOperand::DirectWithIndex(mem2, idx2)) => {
+                transformer.column_1 = mem1.clone();
+                transformer.setup_column_2(mem2.clone());
+                transformer.set_column_1_index(*idx1);
+                transformer.set_column_2_index(*idx2);
             },
             (ComparisonOperand::Intermediate(idx1), ComparisonOperand::Intermediate(idx2)) => {
                 // Comparison of two intermediate results
-                transformer.result_index_1 = Some(idx1);
-                transformer.result_index_2 = Some(idx2);
+                transformer.result_index_1 = Some(*idx1);
+                transformer.result_index_2 = Some(*idx2);
             },
             (ComparisonOperand::Direct(mem1), ComparisonOperand::Intermediate(idx2)) => {
                 // Direct memory block compared with intermediate result
-                transformer.column_1 = mem1;
-                transformer.result_index_2 = Some(idx2);
+                transformer.column_1 = mem1.clone();
+                transformer.result_index_2 = Some(*idx2);
+            },
+            (ComparisonOperand::DirectWithIndex(mem1, idx1), ComparisonOperand::Intermediate(idx2)) => {
+                // Direct memory block with index compared with intermediate result
+                transformer.column_1 = mem1.clone();
+                transformer.set_column_1_index(*idx1);
+                transformer.result_index_2 = Some(*idx2);
             },
             (ComparisonOperand::Intermediate(idx1), ComparisonOperand::Direct(mem2)) => {
                 // Intermediate result compared with direct memory block
-                transformer.result_index_1 = Some(idx1);
-                transformer.setup_column_2(mem2);
+                transformer.result_index_1 = Some(*idx1);
+                transformer.setup_column_2(mem2.clone());
+            },
+            (ComparisonOperand::Intermediate(idx1), ComparisonOperand::DirectWithIndex(mem2, idx2)) => {
+                // Intermediate result compared with direct memory block with index
+                transformer.result_index_1 = Some(*idx1);
+                transformer.setup_column_2(mem2.clone());
+                transformer.set_column_2_index(*idx2);
             },
         }
         
         self.transformers.push_back(transformer);
     }
 
+    /// Fast column data replacement using indices - this is the performance optimization
+    pub fn replace_row_inputs(&mut self, new_columns: &[MemoryBlock]) {
+        for transformer in self.transformers.iter_mut() {
+            transformer.update_column_data_by_index(new_columns);
+        }
+        
+        // Reset intermediate results for fresh computation
+        self.reset_intermediate_results();
+    }
+
+    /// Reset intermediate results for fresh computation
+    pub fn reset_intermediate_results(&mut self) {
+        self.intermediate_results.clear();
+        let max_store_index = self.transformers.iter()
+            .filter_map(|t| t.result_store_index)
+            .max()
+            .unwrap_or(0);
+        
+        if max_store_index > 0 {
+            self.intermediate_results.resize(max_store_index + 1, MemoryBlock::default());
+        }
+    }
+
     /// Execute all transformations and return final result
     pub fn execute(&mut self, comparison_results: &mut SmallVec<[(bool, Option<Next>); 20]>) -> bool {
-        // Process all transformers
-        while let Some(mut transformer) = self.transformers.pop_front() {
+        // Clear previous results
+        comparison_results.clear();
+        
+        // Process all transformers WITHOUT removing them from the collection
+        for i in 0..self.transformers.len() {
+            // Get a mutable reference to the transformer (don't remove it)
+            let transformer = &mut self.transformers[i];
+            
+            // Create a working copy for processing
+            let mut working_transformer = transformer.clone(); // You need to implement Clone for ColumnTransformer
+            
             // If this transformer uses intermediate results, update its memory blocks
-            if let Some(idx1) = transformer.result_index_1 {
-                transformer.column_1 = self.intermediate_results[idx1].clone();
+            if let Some(idx1) = working_transformer.result_index_1 {
+                working_transformer.column_1 = self.intermediate_results[idx1].clone();
             }
             
-            if let Some(idx2) = transformer.result_index_2 {
-                transformer.setup_column_2(self.intermediate_results[idx2].clone());
+            if let Some(idx2) = working_transformer.result_index_2 {
+                working_transformer.setup_column_2(self.intermediate_results[idx2].clone());
             }
             
             // Process the transformation
-            match transformer.transform_single() {
+            match working_transformer.transform_single() {
                 Either::Left(result) => {
                     // Store math operation result
-                    if let Some(idx) = transformer.result_store_index {
-                        self.intermediate_results[idx] = result;
+                    if let Some(idx) = working_transformer.result_store_index {
+                        if idx < self.intermediate_results.len() {
+                            self.intermediate_results[idx] = result;
+                        }
                     }
                 },
                 Either::Right(comparison_result) => {
-                    transformer.clear_column_2();
                     // Store comparison result
                     comparison_results.push(comparison_result);
                 }
@@ -324,6 +595,32 @@ impl<'a> TransformerProcessor<'a> {
         }
         
         false
+    }
+
+    /// Get all column indices used by transformers (for debugging)
+    pub fn get_used_column_indices(&self) -> HashSet<usize> {
+        let mut indices = HashSet::new();
+        for transformer in self.transformers.iter() {
+            if let Some(idx1) = transformer.column_1_index {
+                if transformer.result_index_1.is_none() {
+                    indices.insert(idx1);
+                }
+            }
+            if let Some(idx2) = transformer.column_2_index {
+                if transformer.result_index_2.is_none() {
+                    indices.insert(idx2);
+                }
+            }
+        }
+        indices
+    }
+
+    /// Check if any transformers have direct column dependencies
+    pub fn has_column_dependencies(&self) -> bool {
+        self.transformers.iter().any(|t| {
+            (t.column_1_index.is_some() && t.result_index_1.is_none()) ||
+            (t.column_2_index.is_some() && t.result_index_2.is_none())
+        })
     }
 }
 
