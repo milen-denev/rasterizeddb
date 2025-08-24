@@ -253,7 +253,7 @@ pub unsafe fn simd_memcpy(dst: &mut [u8], src: &[u8]) {
 /// - This does NOT check for AVX2 support. Use is_x86_feature_detected!("avx2") before calling.
 #[allow(unsafe_op_in_unsafe_fn)]
 pub unsafe fn simd_memcpy_avx2_multi(dst: &mut [u8], src: &[u8]) {
-    assert_eq!(dst.len(), src.len());
+    debug_assert_eq!(dst.len(), src.len());
     let len = dst.len();
     let mut i = 0;
 

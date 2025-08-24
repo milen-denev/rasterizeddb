@@ -140,7 +140,7 @@ impl ColumnValue {
     pub fn replace(&mut self, new_values: &[u8]) {
         match self {
             ColumnValue::StaticMemoryPointer(chunk) => {
-                assert_eq!(
+                debug_assert_eq!(
                     new_values.len(),
                     chunk.into_slice().len(),
                     "New values must have the same length"
