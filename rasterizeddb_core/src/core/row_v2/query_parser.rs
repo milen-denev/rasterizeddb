@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use ahash::{HashSet, HashSetExt};
 use smallvec::SmallVec;
 
 use crate::memory_pool::MemoryBlock;
@@ -12,9 +11,11 @@ pub struct QueryParser<'a, 'b> {
     toks: &'a SmallVec<[Token; 36]>,
     pos: usize,
     query_transformer: &'b mut TransformerProcessor<'b>,
-    first_iteration: bool, // Fixed: singular form
-    // Store column indices that are actually used
-    used_column_indices: HashSet<usize>,
+    first_iteration: bool,
+    // Changed: Use a small vec for typically small column usage, keep sorted & unique
+    used_column_indices: SmallVec<[usize; 16]>,
+    // Reuse a temp buffer for fast path cloning of MemoryBlocks
+    tmp_blocks: SmallVec<[MemoryBlock; 20]>,
 }
 
 impl<'a, 'b> QueryParser<'a, 'b> {
@@ -22,19 +23,20 @@ impl<'a, 'b> QueryParser<'a, 'b> {
         tokens: &'a SmallVec<[Token; 36]>,
         query_transformer: &'b mut TransformerProcessor<'b>,
     ) -> Self {
-        Self { 
-            toks: tokens, 
-            pos: 0, 
-            query_transformer, 
-            first_iteration: true, // Fixed: singular form
-            used_column_indices: HashSet::new() 
+        Self {
+            toks: tokens,
+            pos: 0,
+            query_transformer,
+            first_iteration: true,
+            used_column_indices: SmallVec::new(),
+            tmp_blocks: SmallVec::new(),
         }
     }
 
     /// Reset parser for processing new column data while keeping the optimization
+    #[inline]
     pub fn reset_for_new_data(&mut self) {
-        // Don't reset first_iteration - we want to keep using the fast path
-        // The transformers are already built, we just need new column data
+        // Intentionally empty: we keep first_iteration = false and the collected column indices
     }
 
     /// Reset parser completely (forces reparsing)
@@ -42,60 +44,79 @@ impl<'a, 'b> QueryParser<'a, 'b> {
         self.pos = 0;
         self.first_iteration = true;
         self.used_column_indices.clear();
+        self.tmp_blocks.clear();
     }
 
-    pub fn execute<'c>(&mut self, cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>) -> Result<(), String> {
+    pub fn execute<'c>(
+        &mut self,
+        cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>
+    ) -> Result<(), String> {
         if self.first_iteration {
             self.first_iteration = false;
             self.pos = 0;
             self.used_column_indices.clear();
-            
+
             self.parse_or(cols)?;
-            
-            // This is fine - query with only literals doesn't need column optimization
+
+            // Deduplicate & sort used columns (keeps deterministic ordering)
+            if !self.used_column_indices.is_empty() {
+                self.used_column_indices.sort_unstable();
+                self.used_column_indices.dedup();
+            }
+
             #[cfg(debug_assertions)]
-            if self.used_column_indices.is_empty() {
-                println!("Query contains only literal values - no column optimization needed");
-            } else {
-                println!("First iteration complete. Used columns: {:?}", self.used_column_indices);
+            {
+                if self.used_column_indices.is_empty() {
+                    println!("Query contains only literal values - no column optimization needed");
+                } else {
+                    println!(
+                        "First iteration complete. Used columns: {:?}",
+                        self.used_column_indices
+                    );
+                }
             }
         } else {
-            // Fast path: validate column count and update data
-            if cols.len() == 0 {
+            // Fast path
+            if cols.is_empty() {
                 return Err("No columns provided for fast path".to_string());
             }
-            
+
             // Validate that all used column indices are still valid
-            let max_index = self.used_column_indices.iter().max().copied().unwrap_or(0);
-            if max_index >= cols.len() {
-                return Err(format!("Column index {} out of bounds (max: {})", max_index, cols.len() - 1));
+            if let Some(&max_index) = self.used_column_indices.last() {
+                if max_index >= cols.len() {
+                    return Err(format!(
+                        "Column index {} out of bounds (max: {})",
+                        max_index,
+                        cols.len() - 1
+                    ));
+                }
             }
-            
+
             #[cfg(debug_assertions)]
-            println!("Fast path: updating {} transformers with new column data", 
-                self.query_transformer.transformers.len());
-            
-            // Create the column slice for fast update
-            let vec_blocks: SmallVec<[MemoryBlock; 20]> = cols.iter()
-                .map(|(_, mb)| mb.clone())
-                .collect();
+            println!(
+                "Fast path: updating {} transformers with new column data",
+                self.query_transformer.transformers.len()
+            );
 
-            let slice: &[MemoryBlock] = &vec_blocks;
+            // Rebuild tmp_blocks in-place (avoid reallocation)
+            self.tmp_blocks.clear();
+            self.tmp_blocks
+                .extend(cols.iter().map(|(_, mb)| mb.clone()));
 
+            // SAFETY: self.tmp_blocks lives for &self scope; slice is consistent
+            let slice: &[MemoryBlock] = &self.tmp_blocks;
             self.query_transformer.replace_row_inputs(slice);
         }
-        
+
         Ok(())
     }
 
+    #[inline]
     pub fn reset_for_next_execution(&mut self) {
-        // Reset position but keep first_iteration = false and used_column_indices
         self.pos = 0;
-        // Reset intermediate results but keep transformers
         self.query_transformer.reset_intermediate_results();
     }
-    
-    /// Get debug information about the parser state
+
     pub fn debug_info(&self) -> String {
         format!(
             "QueryParser {{ first_iteration: {}, pos: {}, used_columns: {:?}, transformers: {} }}",
@@ -106,194 +127,231 @@ impl<'a, 'b> QueryParser<'a, 'b> {
         )
     }
 
-    /// Check if the parser is in optimization mode
+    #[inline]
     pub fn is_optimized(&self) -> bool {
         !self.first_iteration && !self.used_column_indices.is_empty()
     }
 
-    /// Parse OR expressions
-    fn parse_or<'c>(&mut self, cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>) -> Result<(), String> {
-        self.parse_and(cols)?;
+    // ---------------- Parsing ----------------
 
-        // After parsing each AND group, check if there's an OR
+    fn parse_or<'c>(
+        &mut self,
+        cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>
+    ) -> Result<(), String> {
+        self.parse_and(cols)?;
         while let Some(Next::Or) = self.peek_logic() {
-            // Before consuming the OR, we need to set the last comparison's next operation
             self.set_last_comparison_next_op(Some(Next::Or));
-            
-            self.next_logic(); // consume OR token
+            self.next_logic();
             self.parse_and(cols)?;
         }
-        
         Ok(())
     }
 
-    /// Parse AND expressions  
-    fn parse_and<'c>(&mut self, cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>) -> Result<(), String> {
+    fn parse_and<'c>(
+        &mut self,
+        cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>
+    ) -> Result<(), String> {
         self.parse_comp_or_group(cols)?;
-        
         while let Some(Next::And) = self.peek_logic() {
-            // Set the previous comparison's next operation to AND
             self.set_last_comparison_next_op(Some(Next::And));
-            
-            self.next_logic(); // consume AND token
+            self.next_logic();
             self.parse_comp_or_group(cols)?;
         }
-        
         Ok(())
     }
-        
-    // Add this helper method to set the next operation on the last added comparison
+
+    #[inline(always)]
     fn set_last_comparison_next_op(&mut self, next_op: Option<Next>) {
         if let Some(last_transformer) = self.query_transformer.transformers.last_mut() {
             last_transformer.next = next_op;
         }
     }
 
-    /// Parse either a grouped boolean expression or a comparison
-    fn parse_comp_or_group<'c>(&mut self, cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>) -> Result<(), String> {
+    fn parse_comp_or_group<'c>(
+        &mut self,
+        cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>
+    ) -> Result<(), String> {
         if let Some(Token::LPar) = self.toks.get(self.pos) {
-            // Check if this is a boolean group
             if self.is_boolean_group(self.pos) {
                 self.pos += 1; // consume '('
-                self.parse_or(cols)?; // Parse the boolean expression inside parentheses
-                if !matches!(self.next().ok_or("Unexpected end of token stream")?, 
-                        Token::RPar) {
-                    return Err("expected closing parenthesis".to_string());
+                self.parse_or(cols)?;
+                match self.next() {
+                    Some(Token::RPar) => return Ok(()),
+                    _ => return Err("expected closing parenthesis".to_string()),
                 }
-                return Ok(());
             }
         }
-        // default to comparison (handles arithmetic grouping)
         self.parse_comparison(cols)
     }
 
-    /// Improved heuristic to check if parentheses at pos wrap a boolean expression
     fn is_boolean_group(&self, start: usize) -> bool {
-        let mut depth = 0;
+        let mut depth = 0usize;
         let mut i = start;
-        let mut has_comparison = false;
-        let mut has_boolean_keyword = false;
-        
-        while i < self.toks.len() {
+        let mut has_comp = false;
+        let mut has_logic = false;
+
+        // Static arrays to avoid re-alloc each call
+        const CMP_OPS: [&str; 6] = ["=", "!=", ">", ">=", "<", "<="];
+        const LOGIC_KWS: [&str; 2] = ["AND", "OR"];
+        const TEXT_CMPS: [&str; 3] = ["CONTAINS", "STARTSWITH", "ENDSWITH"];
+
+        let toks_len = self.toks.len();
+        while i < toks_len {
             match &self.toks[i] {
                 Token::LPar => depth += 1,
                 Token::RPar => {
+                    if depth == 0 {
+                        // Unbalanced - treat as not a group
+                        return false;
+                    }
                     depth -= 1;
-                    if depth == 0 { 
-                        return has_comparison || has_boolean_keyword; 
+                    if depth == 0 {
+                        return has_comp || has_logic;
                     }
-                },
-                Token::Op(o) if depth >= 1 && ["=","!=",">",">=","<","<="].contains(&o.as_str()) => {
-                    has_comparison = true;
-                },
+                }
+                Token::Op(o) if depth >= 1 => {
+                    let s = o.as_str();
+                    if CMP_OPS.contains(&s) {
+                        has_comp = true;
+                        if has_logic {
+                            return true;
+                        }
+                    }
+                }
                 Token::Next(n) if depth >= 1 => {
-                    if ["AND", "OR"].contains(&n.as_str()) {
-                        has_boolean_keyword = true;
+                    let s = n.as_str();
+                    if LOGIC_KWS.contains(&s) {
+                        has_logic = true;
+                        if has_comp {
+                            return true;
+                        }
                     }
-                },
-                Token::Ident(t) if depth >= 1 => {
-                    let upper = &t.0;
-                    if ["AND", "OR"].contains(&upper.as_str()) {
-                        has_boolean_keyword = true;
-                    } else if ["CONTAINS", "STARTSWITH", "ENDSWITH"].contains(&upper.as_str()) {
-                        has_comparison = true;
+                }
+                Token::Ident((t, _, _)) if depth >= 1 => {
+                    let s = t.as_str();
+                    if LOGIC_KWS.contains(&s) {
+                        has_logic = true;
+                        if has_comp {
+                            return true;
+                        }
+                    } else if TEXT_CMPS.contains(&s) {
+                        has_comp = true;
+                        if has_logic {
+                            return true;
+                        }
                     }
-                },
+                }
                 _ => {}
             }
             i += 1;
         }
-        
         false
     }
 
-    fn parse_comparison<'c>(&mut self, cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>) -> Result<(), String> {
+    fn parse_comparison<'c>(
+        &mut self,
+        cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>
+    ) -> Result<(), String> {
         let (left_op, left_type) = self.parse_expr(cols)?;
-        
-        // Handle both Token::Op and Token::Ident for operators
-        let op_token = self.next().ok_or("Unexpected end of token stream")?;
-        let op = match op_token {
-            Token::Op(o) => o,
-            Token::Ident((o, _, _)) => o,
+        let op_token = self
+            .next()
+            .ok_or_else(|| "Unexpected end of token stream".to_string())?;
+
+        let op_str: &str = match &op_token {
+            Token::Op(o) => o.as_str(),
+            Token::Ident((o, _, _)) => o.as_str(),
             _ => return Err(format!("expected comparison operator, got {:?}", op_token)),
         };
-        
+
         let (right_op, right_type) = self.parse_expr(cols)?;
-        
-        let cmp = match op.as_str() {
-            "="  => ComparerOperation::Equals,
+
+        let cmp = match op_str {
+            "=" => ComparerOperation::Equals,
             "!=" => ComparerOperation::NotEquals,
-            ">"  => ComparerOperation::Greater,
+            ">" => ComparerOperation::Greater,
             ">=" => ComparerOperation::GreaterOrEquals,
-            "<"  => ComparerOperation::Less,
+            "<" => ComparerOperation::Less,
             "<=" => ComparerOperation::LessOrEquals,
-            "CONTAINS"    => ComparerOperation::Contains,
-            "STARTSWITH"  => ComparerOperation::StartsWith,
-            "ENDSWITH"    => ComparerOperation::EndsWith,
-            _ => return Err(format!("unknown comparison operator: {}", op)),
+            "CONTAINS" => ComparerOperation::Contains,
+            "STARTSWITH" => ComparerOperation::StartsWith,
+            "ENDSWITH" => ComparerOperation::EndsWith,
+            _ => return Err(format!("unknown comparison operator: {}", op_str)),
         };
-        
-        // Better type handling for string operations
-        let determined_comparison_type = match cmp {
-            ComparerOperation::Contains | 
-            ComparerOperation::StartsWith | 
-            ComparerOperation::EndsWith => {
+
+        // String ops force string comparison type
+        let comparison_type = match cmp {
+            ComparerOperation::Contains
+            | ComparerOperation::StartsWith
+            | ComparerOperation::EndsWith => {
                 if left_type == DbType::STRING || right_type == DbType::STRING {
                     DbType::STRING
                 } else {
-                    DbType::STRING
+                    DbType::STRING // fallback still string
                 }
-            },
-            _ => left_type, 
+            }
+            _ => left_type,
         };
 
-        // Add the comparison with None initially - the logic operations will be set later
         self.query_transformer.add_comparison(
-            determined_comparison_type,
+            comparison_type,
             left_op,
             right_op,
             cmp,
-            None // Will be set by parse_or/parse_and when they know what comes next
+            None,
         );
-        
         Ok(())
     }
 
-    fn parse_expr<'c>(&mut self, cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>) -> Result<(ComparisonOperand, DbType), String> {
-        let (mut lhs_op, mut lhs_type) = self.parse_term(cols)?;
-        
-        while let Some(op_str) = self.peek_op(&["+","-"]) {
-            let math = if op_str == "+" { MathOperation::Add } else { MathOperation::Subtract };
+    fn parse_expr<'c>(
+        &mut self,
+        cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>
+    ) -> Result<(ComparisonOperand, DbType), String> {
+        let (mut lhs_op, lhs_type) = self.parse_term(cols)?;
+        while let Some(op_str) = self.peek_op(&["+", "-"]) {
             self.next(); // consume op
             let (rhs_op, _) = self.parse_term(cols)?;
-            
-            let idx = self.query_transformer.add_math_operation(lhs_type.clone(), lhs_op, rhs_op, math);
+            let math = if op_str == "+" {
+                MathOperation::Add
+            } else {
+                MathOperation::Subtract
+            };
+            let idx = self
+                .query_transformer
+                .add_math_operation(lhs_type.clone(), lhs_op, rhs_op, math);
             lhs_op = ComparisonOperand::Intermediate(idx);
-            lhs_type = lhs_type;
         }
-        
         Ok((lhs_op, lhs_type))
     }
-    
-    fn parse_term<'c>(&mut self, cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>) -> Result<(ComparisonOperand, DbType), String> {
-        let (mut lhs_op, mut lhs_type) = self.parse_factor(cols)?;
-        
-        while let Some(op_str) = self.peek_op(&["*","/"]) {
-            let math = if op_str == "*" { MathOperation::Multiply } else { MathOperation::Divide };
+
+    fn parse_term<'c>(
+        &mut self,
+        cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>
+    ) -> Result<(ComparisonOperand, DbType), String> {
+        let (mut lhs_op, lhs_type) = self.parse_factor(cols)?;
+        while let Some(op_str) = self.peek_op(&["*", "/"]) {
             self.next();
             let (rhs_op, _) = self.parse_factor(cols)?;
-
-            let idx = self.query_transformer.add_math_operation(lhs_type.clone(), lhs_op, rhs_op, math);
+            let math = if op_str == "*" {
+                MathOperation::Multiply
+            } else {
+                MathOperation::Divide
+            };
+            let idx = self
+                .query_transformer
+                .add_math_operation(lhs_type.clone(), lhs_op, rhs_op, math);
             lhs_op = ComparisonOperand::Intermediate(idx);
-            lhs_type = lhs_type;
         }
-        
         Ok((lhs_op, lhs_type))
     }
 
-    fn parse_factor<'c>(&mut self, cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>) -> Result<(ComparisonOperand, DbType), String> {
-        let token = self.next().ok_or("Unexpected end of token stream")?;
-        
+    fn parse_factor<'c>(
+        &mut self,
+        cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>
+    ) -> Result<(ComparisonOperand, DbType), String> {
+        let token = self
+            .next()
+            .ok_or_else(|| "Unexpected end of token stream".to_string())?;
+
         match token {
             Token::Number(n) => {
                 let db_type = numeric_value_to_db_type(&n);
@@ -305,70 +363,69 @@ impl<'a, 'b> QueryParser<'a, 'b> {
                 Ok((ComparisonOperand::Direct(mb), DbType::STRING))
             }
             Token::Ident((_name, db_type, write_order)) => {
-                // Validate bounds before unsafe access
-                // if write_order as usize >= cols.len() {
-                //     return Err(format!("Column index {} out of bounds (max: {})", write_order, cols.len() - 1));
-                // }
-                
-                // Safe column data retrieval
-                let mb = cols[write_order as usize].1.clone();
+                let idx = write_order as usize;
+                if idx >= cols.len() {
+                    return Err(format!(
+                        "Column index {} out of bounds (max: {})",
+                        idx,
+                        cols.len() - 1
+                    ));
+                }
+                // Clone MemoryBlock (cannot borrow across later mut uses)
+                let mb = cols[idx].1.clone();
 
-                // Track which columns are used during first iteration
                 if self.first_iteration {
-                    self.used_column_indices.insert(write_order as usize);
+                    // O(1) amortized push, dedup later
+                    self.used_column_indices.push(idx);
                 }
 
-                Ok((ComparisonOperand::DirectWithIndex(mb, write_order as usize), db_type))
+                Ok((
+                    ComparisonOperand::DirectWithIndex(mb, idx),
+                    db_type,
+                ))
             }
             Token::LPar => {
                 let (inner_op, inner_type) = self.parse_expr(cols)?;
-                if !matches!(self.next().ok_or("Unexpected end of token stream")?, 
-                        Token::RPar) {
-                    return Err("expected closing parenthesis after grouped expression".to_string());
+                match self.next() {
+                    Some(Token::RPar) => Ok((inner_op, inner_type)),
+                    _ => Err("expected closing parenthesis after grouped expression".to_string()),
                 }
-                Ok((inner_op, inner_type))
             }
             t => Err(format!("unexpected factor: {:?}", t)),
         }
     }
 
+    #[inline(always)]
     fn peek_logic(&self) -> Option<Next> {
-        if let Some(token) = self.toks.get(self.pos) {
-            match token {
-                Token::Next(next_val) => {
-                    match next_val.as_str() {
-                        "AND" => Some(Next::And),
-                        "OR" => Some(Next::Or),
-                        _ => None
-                    }
-                },
-                Token::Ident((t, _, _)) => {
-                    match t.as_str() {
-                        "AND" => Some(Next::And),
-                        "OR" => Some(Next::Or),
-                        _ => None
-                    }
-                },
-                _ => None
-            }
-        } else { 
-            None 
+        self.toks.get(self.pos).and_then(|token| match token {
+            Token::Next(n) => match n.as_str() {
+                "AND" => Some(Next::And),
+                "OR" => Some(Next::Or),
+                _ => None,
+            },
+            Token::Ident((t, _, _)) => match t.as_str() {
+                "AND" => Some(Next::And),
+                "OR" => Some(Next::Or),
+                _ => None,
+            },
+            _ => None,
+        })
+    }
+
+    #[inline(always)]
+    fn next_logic(&mut self) {
+        self.pos += 1;
+    }
+
+    #[inline(always)]
+    fn peek_op(&self, allowed: &[&str]) -> Option<String> {
+        match self.toks.get(self.pos) {
+            Some(Token::Op(o)) if allowed.contains(&o.as_str()) => Some(o.clone()),
+            _ => None,
         }
     }
 
-    fn next_logic(&mut self) { 
-        self.pos += 1; 
-    }
-
-    fn peek_op(&self, a: &[&str]) -> Option<String> {
-        if let Some(Token::Op(o)) = self.toks.get(self.pos) {
-            if a.contains(&o.as_str()) { 
-                return Some(o.clone()) 
-            }
-        }
-        None
-    }
-
+    #[inline(always)]
     fn next(&mut self) -> Option<Token> {
         let t = self.toks.get(self.pos).cloned();
         self.pos += 1;
