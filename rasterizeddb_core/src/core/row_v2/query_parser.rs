@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use ahash::{HashSet, HashSetExt};
 use smallvec::SmallVec;
 
 use crate::memory_pool::MemoryBlock;
@@ -7,62 +8,138 @@ use super::schema::SchemaField;
 use super::query_tokenizer::{numeric_to_mb, numeric_value_to_db_type, str_to_mb, tokenize, Token};
 use super::transformer::{ComparerOperation, ComparisonOperand, MathOperation, Next, TransformerProcessor};
 
-pub fn parse_query<'a, 'b, 'c>(
-    toks: &'a SmallVec<[Token; 36]>,
-    columns: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
-    transformers: &'b mut TransformerProcessor<'b>,
-) {
-    let mut parser = QueryParser::new(toks, columns, transformers);
-    parser.execute();
-}
-
-struct QueryParser<'a, 'b, 'c> {
+pub struct QueryParser<'a, 'b> {
     toks: &'a SmallVec<[Token; 36]>,
     pos: usize,
-    cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
     query_transformer: &'b mut TransformerProcessor<'b>,
+    first_iteration: bool, // Fixed: singular form
+    // Store column indices that are actually used
+    used_column_indices: HashSet<usize>,
 }
 
-impl<'a, 'b, 'c> QueryParser<'a, 'b, 'c> {
-    fn new(
+impl<'a, 'b> QueryParser<'a, 'b> {
+    pub fn new(
         tokens: &'a SmallVec<[Token; 36]>,
-        cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
         query_transformer: &'b mut TransformerProcessor<'b>,
     ) -> Self {
-        Self { toks: tokens, pos: 0, cols, query_transformer }
+        Self { 
+            toks: tokens, 
+            pos: 0, 
+            query_transformer, 
+            first_iteration: true, // Fixed: singular form
+            used_column_indices: HashSet::new() 
+        }
     }
 
-    // Add more debug output to the main execute function
-    fn execute(&mut self) {
+    /// Reset parser for processing new column data while keeping the optimization
+    pub fn reset_for_new_data(&mut self) {
+        // Don't reset first_iteration - we want to keep using the fast path
+        // The transformers are already built, we just need new column data
+    }
 
-        self.parse_or();
+    /// Reset parser completely (forces reparsing)
+    pub fn reset_completely(&mut self) {
+        self.pos = 0;
+        self.first_iteration = true;
+        self.used_column_indices.clear();
+    }
+
+    pub fn execute<'c>(&mut self, cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>) -> Result<(), String> {
+        if self.first_iteration {
+            self.first_iteration = false;
+            self.pos = 0;
+            self.used_column_indices.clear();
+            
+            self.parse_or(cols)?;
+            
+            // This is fine - query with only literals doesn't need column optimization
+            #[cfg(debug_assertions)]
+            if self.used_column_indices.is_empty() {
+                println!("Query contains only literal values - no column optimization needed");
+            } else {
+                println!("First iteration complete. Used columns: {:?}", self.used_column_indices);
+            }
+        } else {
+            // Fast path: validate column count and update data
+            if cols.len() == 0 {
+                return Err("No columns provided for fast path".to_string());
+            }
+            
+            // Validate that all used column indices are still valid
+            let max_index = self.used_column_indices.iter().max().copied().unwrap_or(0);
+            if max_index >= cols.len() {
+                return Err(format!("Column index {} out of bounds (max: {})", max_index, cols.len() - 1));
+            }
+            
+            #[cfg(debug_assertions)]
+            println!("Fast path: updating {} transformers with new column data", 
+                self.query_transformer.transformers.len());
+            
+            // Create the column slice for fast update
+            let vec_blocks: SmallVec<[MemoryBlock; 20]> = cols.iter()
+                .map(|(_, mb)| mb.clone())
+                .collect();
+
+            let slice: &[MemoryBlock] = &vec_blocks;
+
+            self.query_transformer.replace_row_inputs(slice);
+        }
+        
+        Ok(())
+    }
+
+    pub fn reset_for_next_execution(&mut self) {
+        // Reset position but keep first_iteration = false and used_column_indices
+        self.pos = 0;
+        // Reset intermediate results but keep transformers
+        self.query_transformer.reset_intermediate_results();
+    }
+    
+    /// Get debug information about the parser state
+    pub fn debug_info(&self) -> String {
+        format!(
+            "QueryParser {{ first_iteration: {}, pos: {}, used_columns: {:?}, transformers: {} }}",
+            self.first_iteration,
+            self.pos,
+            self.used_column_indices,
+            self.query_transformer.transformers.len()
+        )
+    }
+
+    /// Check if the parser is in optimization mode
+    pub fn is_optimized(&self) -> bool {
+        !self.first_iteration && !self.used_column_indices.is_empty()
     }
 
     /// Parse OR expressions
-    fn parse_or(&mut self) {
-        self.parse_and();
-        
+    fn parse_or<'c>(&mut self, cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>) -> Result<(), String> {
+        self.parse_and(cols)?;
+
         // After parsing each AND group, check if there's an OR
         while let Some(Next::Or) = self.peek_logic() {
             // Before consuming the OR, we need to set the last comparison's next operation
             self.set_last_comparison_next_op(Some(Next::Or));
             
             self.next_logic(); // consume OR token
-            self.parse_and();
+            self.parse_and(cols)?;
         }
+        
+        Ok(())
     }
 
     /// Parse AND expressions  
-    fn parse_and(&mut self) {
-        self.parse_comp_or_group();
+    fn parse_and<'c>(&mut self, cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>) -> Result<(), String> {
+        self.parse_comp_or_group(cols)?;
         
         while let Some(Next::And) = self.peek_logic() {
             // Set the previous comparison's next operation to AND
             self.set_last_comparison_next_op(Some(Next::And));
             
             self.next_logic(); // consume AND token
-            self.parse_comp_or_group();
+            self.parse_comp_or_group(cols)?;
         }
+        
+        Ok(())
     }
         
     // Add this helper method to set the next operation on the last added comparison
@@ -73,27 +150,21 @@ impl<'a, 'b, 'c> QueryParser<'a, 'b, 'c> {
     }
 
     /// Parse either a grouped boolean expression or a comparison
-    fn parse_comp_or_group(&mut self) {
+    fn parse_comp_or_group<'c>(&mut self, cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>) -> Result<(), String> {
         if let Some(Token::LPar) = self.toks.get(self.pos) {
             // Check if this is a boolean group
             if self.is_boolean_group(self.pos) {
-                // #[cfg(debug_assertions)]
-                // println!("Parsing boolean group starting at position {}", self.pos);
-                
                 self.pos += 1; // consume '('
-                self.parse_or(); // Parse the boolean expression inside parentheses
-                if !matches!(self.next().unwrap_or_else(|| panic!("Unexpected end of token stream")), 
+                self.parse_or(cols)?; // Parse the boolean expression inside parentheses
+                if !matches!(self.next().ok_or("Unexpected end of token stream")?, 
                         Token::RPar) {
-                    panic!("expected closing parenthesis");
+                    return Err("expected closing parenthesis".to_string());
                 }
-                
-                // #[cfg(debug_assertions)]
-                // println!("Finished parsing boolean group, now at position {}", self.pos);
-                return;
+                return Ok(());
             }
         }
         // default to comparison (handles arithmetic grouping)
-        self.parse_comparison();
+        self.parse_comparison(cols)
     }
 
     /// Improved heuristic to check if parentheses at pos wrap a boolean expression
@@ -103,49 +174,29 @@ impl<'a, 'b, 'c> QueryParser<'a, 'b, 'c> {
         let mut has_comparison = false;
         let mut has_boolean_keyword = false;
         
-        // #[cfg(debug_assertions)]
-        // println!("Checking if position {} is start of boolean group", start);
-        
         while i < self.toks.len() {
-            // #[cfg(debug_assertions)]
-            // if i < start + 10 { // Limit debug output
-            //     println!("  Checking token {}: {:?} (depth: {})", i, self.toks[i], depth);
-            // }
-            
             match &self.toks[i] {
                 Token::LPar => depth += 1,
                 Token::RPar => {
                     depth -= 1;
                     if depth == 0 { 
-                        let result = has_comparison || has_boolean_keyword;
-                        // #[cfg(debug_assertions)]
-                        // println!("  Boolean group detection result: {} (has_comparison: {}, has_boolean_keyword: {})", 
-                        //     result, has_comparison, has_boolean_keyword);
-                        return result; 
+                        return has_comparison || has_boolean_keyword; 
                     }
                 },
                 Token::Op(o) if depth >= 1 && ["=","!=",">",">=","<","<="].contains(&o.as_str()) => {
                     has_comparison = true;
-                    // #[cfg(debug_assertions)]
-                    // println!("  Found comparison operator: {}", o);
                 },
                 Token::Next(n) if depth >= 1 => {
                     if ["AND", "OR"].contains(&n.as_str()) {
                         has_boolean_keyword = true;
-                        // #[cfg(debug_assertions)]
-                        // println!("  Found boolean keyword (Next): {}", n);
                     }
                 },
                 Token::Ident(t) if depth >= 1 => {
                     let upper = &t.0;
                     if ["AND", "OR"].contains(&upper.as_str()) {
                         has_boolean_keyword = true;
-                        // #[cfg(debug_assertions)]
-                        // println!("  Found boolean keyword (Ident): {}", upper);
                     } else if ["CONTAINS", "STARTSWITH", "ENDSWITH"].contains(&upper.as_str()) {
                         has_comparison = true;
-                        // #[cfg(debug_assertions)]
-                        // println!("  Found string comparison operator: {}", upper);
                     }
                 },
                 _ => {}
@@ -153,23 +204,21 @@ impl<'a, 'b, 'c> QueryParser<'a, 'b, 'c> {
             i += 1;
         }
         
-        // #[cfg(debug_assertions)]
-        // println!("  Boolean group detection result: false (reached end without closing paren)");
         false
     }
 
-    fn parse_comparison(&mut self) {
-        let (left_op, left_type) = self.parse_expr();
+    fn parse_comparison<'c>(&mut self, cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>) -> Result<(), String> {
+        let (left_op, left_type) = self.parse_expr(cols)?;
         
         // Handle both Token::Op and Token::Ident for operators
-        let op_token = self.next().unwrap_or_else(|| panic!("Unexpected end of token stream"));
+        let op_token = self.next().ok_or("Unexpected end of token stream")?;
         let op = match op_token {
             Token::Op(o) => o,
             Token::Ident((o, _, _)) => o,
-            _ => panic!("expected comparison operator, got {:?}", op_token),
+            _ => return Err(format!("expected comparison operator, got {:?}", op_token)),
         };
         
-        let (right_op, right_type) = self.parse_expr();
+        let (right_op, right_type) = self.parse_expr(cols)?;
         
         let cmp = match op.as_str() {
             "="  => ComparerOperation::Equals,
@@ -181,7 +230,7 @@ impl<'a, 'b, 'c> QueryParser<'a, 'b, 'c> {
             "CONTAINS"    => ComparerOperation::Contains,
             "STARTSWITH"  => ComparerOperation::StartsWith,
             "ENDSWITH"    => ComparerOperation::EndsWith,
-            _ => panic!("unknown comparison operator: {}", op),
+            _ => return Err(format!("unknown comparison operator: {}", op)),
         };
         
         // Better type handling for string operations
@@ -197,10 +246,7 @@ impl<'a, 'b, 'c> QueryParser<'a, 'b, 'c> {
             },
             _ => left_type, 
         };
-        
-        // #[cfg(debug_assertions)]
-        // println!("Adding comparison: {:?} {:?} {:?}", left_op, cmp, right_op);
-        
+
         // Add the comparison with None initially - the logic operations will be set later
         self.query_transformer.add_comparison(
             determined_comparison_type,
@@ -209,79 +255,80 @@ impl<'a, 'b, 'c> QueryParser<'a, 'b, 'c> {
             cmp,
             None // Will be set by parse_or/parse_and when they know what comes next
         );
+        
+        Ok(())
     }
 
-    fn parse_expr(&mut self) -> (ComparisonOperand, DbType) {
-        let (mut lhs_op, mut lhs_type) = self.parse_term();
+    fn parse_expr<'c>(&mut self, cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>) -> Result<(ComparisonOperand, DbType), String> {
+        let (mut lhs_op, mut lhs_type) = self.parse_term(cols)?;
         
         while let Some(op_str) = self.peek_op(&["+","-"]) {
             let math = if op_str == "+" { MathOperation::Add } else { MathOperation::Subtract };
             self.next(); // consume op
-            let (rhs_op, _) = self.parse_term();
+            let (rhs_op, _) = self.parse_term(cols)?;
             
-            // // Fix: Improved type promotion for arithmetic operations
-            // let result_type = promote_numeric_types(lhs_type.clone(), rhs_type.clone())
-            //     .unwrap_or_else(|| panic!("Cannot perform arithmetic on incompatible types: {:?} and {:?}", lhs_type, rhs_type));
-                
             let idx = self.query_transformer.add_math_operation(lhs_type.clone(), lhs_op, rhs_op, math);
             lhs_op = ComparisonOperand::Intermediate(idx);
             lhs_type = lhs_type;
         }
         
-        (lhs_op, lhs_type)
+        Ok((lhs_op, lhs_type))
     }
     
-    fn parse_term(&mut self) -> (ComparisonOperand, DbType) {
-        let (mut lhs_op, mut lhs_type) = self.parse_factor();
+    fn parse_term<'c>(&mut self, cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>) -> Result<(ComparisonOperand, DbType), String> {
+        let (mut lhs_op, mut lhs_type) = self.parse_factor(cols)?;
         
         while let Some(op_str) = self.peek_op(&["*","/"]) {
             let math = if op_str == "*" { MathOperation::Multiply } else { MathOperation::Divide };
             self.next();
-            let (rhs_op, _) = self.parse_factor();
+            let (rhs_op, _) = self.parse_factor(cols)?;
 
-            // Fix: Improved type promotion for arithmetic operations
-            // let result_type = promote_numeric_types(lhs_type.clone(), rhs_type.clone())
-            //     .unwrap_or_else(|| panic!("Cannot perform arithmetic on incompatible types: {:?} and {:?}", lhs_type, rhs_type));
-                
             let idx = self.query_transformer.add_math_operation(lhs_type.clone(), lhs_op, rhs_op, math);
             lhs_op = ComparisonOperand::Intermediate(idx);
             lhs_type = lhs_type;
         }
         
-        (lhs_op, lhs_type)
+        Ok((lhs_op, lhs_type))
     }
 
-    fn parse_factor(&mut self) -> (ComparisonOperand, DbType) {
-        let token = self.next().unwrap_or_else(|| panic!("Unexpected end of token stream"));
+    fn parse_factor<'c>(&mut self, cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>) -> Result<(ComparisonOperand, DbType), String> {
+        let token = self.next().ok_or("Unexpected end of token stream")?;
         
         match token {
             Token::Number(n) => {
                 let db_type = numeric_value_to_db_type(&n);
                 let mb = numeric_to_mb(&n);
-                (ComparisonOperand::Direct(mb), db_type)
+                Ok((ComparisonOperand::Direct(mb), db_type))
             }
             Token::StringLit(s) => {
                 let mb = str_to_mb(&s);
-                (ComparisonOperand::Direct(mb), DbType::STRING)
+                Ok((ComparisonOperand::Direct(mb), DbType::STRING))
             }
-            Token::Ident((name, db_type, _write_order)) => {
-                // Simply look up the column data by name - no schema validation needed
-                let mb = self.cols.iter()
-                    .find(|(n, _)| *n == *name)
-                    .map(|(_, mb)| mb.clone())
-                    .unwrap_or_else(|| panic!("Column data not found: '{}'", name));
+            Token::Ident((_name, db_type, write_order)) => {
+                // Validate bounds before unsafe access
+                // if write_order as usize >= cols.len() {
+                //     return Err(format!("Column index {} out of bounds (max: {})", write_order, cols.len() - 1));
+                // }
                 
-                (ComparisonOperand::Direct(mb), db_type)
+                // Safe column data retrieval
+                let mb = cols[write_order as usize].1.clone();
+
+                // Track which columns are used during first iteration
+                if self.first_iteration {
+                    self.used_column_indices.insert(write_order as usize);
+                }
+
+                Ok((ComparisonOperand::DirectWithIndex(mb, write_order as usize), db_type))
             }
             Token::LPar => {
-                let (inner_op, inner_type) = self.parse_expr();
-                if !matches!(self.next().unwrap_or_else(|| panic!("Unexpected end of token stream")), 
+                let (inner_op, inner_type) = self.parse_expr(cols)?;
+                if !matches!(self.next().ok_or("Unexpected end of token stream")?, 
                         Token::RPar) {
-                    panic!("expected closing parenthesis after grouped expression");
+                    return Err("expected closing parenthesis after grouped expression".to_string());
                 }
-                (inner_op, inner_type)
+                Ok((inner_op, inner_type))
             }
-            t => panic!("unexpected factor: {:?}", t),
+            t => Err(format!("unexpected factor: {:?}", t)),
         }
     }
 
@@ -341,14 +388,34 @@ mod tests {
     use smallvec::SmallVec;
 
     use crate::core::db_type::DbType;
-    use crate::core::row_v2::concurrent_processor::Buffer;
-    use crate::core::row_v2::query_parser::{parse_query, tokenize_for_test};
+    use crate::core::row_v2::query_parser::QueryParser;
     use crate::core::row_v2::row::Row;
     use crate::core::row_v2::schema::SchemaField;
     //use crate::core::row_v2::token_processor::TokenProcessor;
-    use crate::core::row_v2::query_tokenizer::NumericValue;
-    use crate::core::row_v2::transformer::TransformerProcessor;
+    use crate::core::row_v2::query_tokenizer::{tokenize, NumericValue, Token};
+    use crate::core::row_v2::transformer::{ColumnTransformer, Next, TransformerProcessor};
     use crate::memory_pool::{MemoryBlock, MEMORY_POOL};
+
+    struct Buffer<'a> {
+        pub _hashtable_buffer: UnsafeCell<SmallVec<[(Cow<'a, str>, MemoryBlock); 20]>>,
+        pub _row: Row,
+        pub transformers: SmallVec<[ColumnTransformer; 36]>,
+        pub intermediate_results: SmallVec<[MemoryBlock; 20]>,
+        pub bool_buffer: SmallVec<[(bool, Option<Next>); 20]>
+    }
+
+    fn tokenize_for_test(s: &str, schema: &SmallVec<[SchemaField; 20]>) -> SmallVec<[Token; 36]> {
+        tokenize(s, schema)
+    }
+
+    fn parse_query<'a, 'b, 'c>(
+        toks: &'a SmallVec<[Token; 36]>,
+        columns: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
+        transformers: &'b mut TransformerProcessor<'b>,
+    ) {
+        let mut parser = QueryParser::new(toks, transformers);
+        _ = parser.execute(columns);
+    }
 
     fn create_memory_block_from_i8(value: i8) -> MemoryBlock {
         let bytes = value.to_le_bytes();
@@ -610,8 +677,8 @@ mod tests {
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
@@ -641,8 +708,8 @@ mod tests {
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
@@ -667,8 +734,8 @@ mod tests {
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
@@ -693,8 +760,8 @@ mod tests {
        let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -719,8 +786,8 @@ bool_buffer: SmallVec::new(),
       let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -745,8 +812,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -771,8 +838,8 @@ bool_buffer: SmallVec::new(),
        let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -797,8 +864,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -823,8 +890,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -849,8 +916,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -875,8 +942,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -900,8 +967,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -926,8 +993,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -952,8 +1019,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -978,8 +1045,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -1075,8 +1142,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -1100,8 +1167,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -1125,8 +1192,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -1150,8 +1217,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -1175,8 +1242,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -1201,8 +1268,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -1227,8 +1294,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -1252,8 +1319,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -1277,8 +1344,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -1304,8 +1371,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -1330,8 +1397,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -1357,8 +1424,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -1383,8 +1450,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -1408,8 +1475,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -1434,8 +1501,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -1460,8 +1527,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -1486,8 +1553,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -1515,8 +1582,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -1563,8 +1630,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -1588,8 +1655,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -1613,8 +1680,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -1638,8 +1705,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -1663,8 +1730,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -1688,8 +1755,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -1713,8 +1780,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -1738,8 +1805,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -1763,8 +1830,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -1788,8 +1855,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -1813,8 +1880,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -1838,8 +1905,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -1863,8 +1930,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -1888,8 +1955,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -1913,8 +1980,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -1939,8 +2006,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -1965,8 +2032,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -1992,8 +2059,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
@@ -2019,8 +2086,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -2045,8 +2112,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -2070,8 +2137,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -2095,8 +2162,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -2120,8 +2187,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -2145,8 +2212,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -2170,8 +2237,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -2199,8 +2266,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
 bool_buffer: SmallVec::new(),
@@ -2230,8 +2297,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
@@ -2318,8 +2385,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
@@ -2351,8 +2418,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
@@ -2383,8 +2450,8 @@ bool_buffer: SmallVec::new(),
         let tokens = tokenize_for_test(query, &schema);
 
         let mut buffer = Buffer {
-            hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            row: Row::default(),
+            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
