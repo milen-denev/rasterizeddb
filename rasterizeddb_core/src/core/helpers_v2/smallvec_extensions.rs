@@ -13,6 +13,11 @@ pub trait SmallVecExtensions<A: Array> {
     fn splice<I>(&mut self, start: usize, delete_count: usize, items: I)
     where
         I: IntoIterator<Item = A::Item>;
+
+    /// Extend the SmallVec by cloning all elements from a slice (same semantics as Vec::extend_from_slice)
+    fn extend_from_slice(&mut self, other: &[A::Item])
+    where
+        A::Item: Clone;
 }
 
 impl<A: Array> SmallVecExtensions<A> for SmallVec<A> {
@@ -83,5 +88,23 @@ impl<A: Array> SmallVecExtensions<A> for SmallVec<A> {
         
         // Prevent new_items from dropping
         core::mem::forget(new_items);
+    }
+
+    fn extend_from_slice(&mut self, other: &[A::Item])
+    where
+        A::Item: Clone,
+    {
+        if other.is_empty() {
+            return;
+        }
+
+        // Reserve additional space for the elements we're going to add.
+        // SmallVec::reserve expects the additional number of elements.
+        self.reserve(other.len());
+
+        // Clone each element from the slice into the SmallVec.
+        for item in other {
+            self.push(item.clone());
+        }
     }
 }
