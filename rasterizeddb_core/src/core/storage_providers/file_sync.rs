@@ -1,5 +1,5 @@
 use std::{
-    cmp::min, fs::{self, remove_file, OpenOptions}, path::Path, sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc}, usize
+    cmp::min, fs::{self, remove_file, OpenOptions}, io, path::Path, sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc}, usize
 };
 
 use std::io::*;
@@ -493,42 +493,29 @@ impl StorageIO for LocalStorageProvider {
         }
     }
 
-    async fn read_data_into_buffer(&self, position: &mut u64, buffer: &mut [u8]) -> Result<()> {
-        let buffer_len = buffer.len();
-        
-        // Early return for empty buffer
-        if buffer_len == 0 {
+    async fn read_data_into_buffer(&self, position: &mut u64, buffer: &mut [u8]) -> io::Result<()> {
+        if buffer.is_empty() {
             return Ok(());
         }
 
-        let file_len = self.file_len.load(Ordering::SeqCst);
-            
-        // Check if we're trying to read beyond file end
-        if *position >= file_len {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "Position beyond file end"
-            ));
-        }
-        
-        // Adjust buffer length if reading beyond file end
-        let actual_buffer_len = min(buffer_len, (file_len - *position) as usize);
-        let actual_buffer = buffer;
+        let file_len = self.file_len.load(Ordering::Acquire);
 
-        // Cache miss or partial hit - need to read from source
-        let read_result = if !self._locked.load(Ordering::Relaxed) {
-            self.read_from_memory_map_or_file(*position, actual_buffer)
+        if *position >= file_len {
+            return Err(io::Error::new(ErrorKind::UnexpectedEof, "Position beyond file end"));
+        }
+
+        let read_len = min(buffer.len(), (file_len - *position) as usize);
+        let buf = &mut buffer[..read_len];
+
+        if !self._locked.load(Ordering::Relaxed) {
+            self.read_from_memory_map_or_file(*position, buf)?
         } else {
-            self.read_from_file_direct(*position, actual_buffer)
+            self.read_from_file_direct(*position, buf)?
         };
 
-        match read_result {
-            Ok(_) => {
-                *position += actual_buffer_len as u64;
-                Ok(())
-            }
-            Err(e) => Err(e)
-        }
+        *position += read_len as u64;
+        
+        Ok(())
     }
 
     async fn read_data_to_cursor(&self, position: &mut u64, length: u32) -> Cursor<Vec<u8>> {

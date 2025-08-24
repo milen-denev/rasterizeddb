@@ -718,69 +718,48 @@ impl RowPointer {
         &self, 
         io: Arc<S>,
         row_fetch: &RowFetch,
-        row_reuse: &mut Row) {
-
-        // Skip fetching if the row is marked as deleted
+        row_reuse: &mut Row
+    ) {
         if self.deleted {
-            panic!();
+            panic!("Row is marked as deleted");
         }
-        
-        // Create a vector to hold all the columns
+
         let columns = &mut row_reuse.columns;
         columns.clear();
 
-        // For each column specified in the fetch data
         for column_data in &row_fetch.columns_fetching_data {
-            let row_position = self.position;
-            let mut position = row_position.clone() + column_data.column_offset as u64;
+            let mut position = self.position + column_data.column_offset as u64;
 
             if column_data.column_type == DbType::STRING {
-                // For strings, we need to read the size first
-                let mut string_position_buffer = [0u8; 8];
+                // Read both string position (8 bytes) and size (4 bytes) in one go
+                let mut header = [0u8; 12];
+                io.read_data_into_buffer(&mut position, &mut header).await.unwrap();
 
-                _ = io.read_data_into_buffer(&mut position, &mut string_position_buffer).await;
+                let string_row_position = self.position + u64::from_le_bytes(header[0..8].try_into().unwrap());
+                let string_size = u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize;
 
-                // Turn [u8] into u64
-                let mut string_row_position = row_position + u64::from_le_bytes(string_position_buffer);
-
-                let mut string_size_buffer = [0u8; 4];
-                
-                _ = io.read_data_into_buffer(&mut position, &mut string_size_buffer).await;
-
-                let string_size = u32::from_le_bytes(string_size_buffer);
-
-                let string_block = MEMORY_POOL.acquire(string_size as usize);
-
+                let string_block = MEMORY_POOL.acquire(string_size);
                 let string_slice = string_block.into_slice_mut();
 
-                _ = io.read_data_into_buffer(&mut string_row_position, string_slice).await;
+                io.read_data_into_buffer(&mut (string_row_position.clone()), string_slice).await.unwrap();
 
-                // Create a column with the string data
-                let column = Column {
+                columns.push(Column {
                     schema_id: column_data.schema_id,
                     data: string_block,
                     column_type: DbType::STRING,
-                };
-
-                columns.push(column);
+                });
             } else {
-                let c_size = column_data.size;
-
-                // Allocate memory for the column data
-                let block = MEMORY_POOL.acquire(c_size as usize);
+                let c_size = column_data.size as usize;
+                let block = MEMORY_POOL.acquire(c_size);
                 let slice = block.into_slice_mut();
 
-                // Read the column data directly into our buffer
-                _ = io.read_data_into_buffer(&mut position, slice).await;
+                io.read_data_into_buffer(&mut position, slice).await.unwrap();
 
-                // Create a Column object with the read data
-                let column = Column {
+                columns.push(Column {
                     schema_id: column_data.schema_id,
                     data: block,
-                    column_type: column_data.column_type.clone(), // Clone the DbType
-                };
-
-                columns.push(column);
+                    column_type: column_data.column_type.clone(),
+                });
             }
         }
 
