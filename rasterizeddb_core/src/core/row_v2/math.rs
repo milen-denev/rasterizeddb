@@ -10,7 +10,7 @@ use super::common::{FromF64, FromLeBytes, IntoF64};
 /// `&[u8]` must be in little-endian format.
 #[inline(always)]
 pub fn perform_math_operation(input1: &[u8], input2: &[u8], db_type: &DbType, operation: &MathOperation) -> MemoryBlock {
-    assert_eq!(input1.len(), input2.len(), "Input slices must have the same length");
+    debug_assert_eq!(input1.len(), input2.len(), "Input slices must have the same length");
 
     match db_type {
         DbType::I8 => generic_operation::<i8>(input1, input2, operation),
