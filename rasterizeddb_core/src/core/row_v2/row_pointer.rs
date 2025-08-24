@@ -649,7 +649,7 @@ impl RowPointer {
         }
         
         // Create a vector to hold all the columns
-        let mut columns = Vec::new();
+        let mut columns = SmallVec::new();
         
         // For each column specified in the fetch data
         for column_data in &row_fetch.columns_fetching_data {
