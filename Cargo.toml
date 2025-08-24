@@ -4,7 +4,7 @@ resolver = "3"
 
 [profile.release]
 opt-level = 3
-debug = false
+debug = true
 debug-assertions = false
 overflow-checks = false
 incremental = false
