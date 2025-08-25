@@ -7,11 +7,12 @@ use std::io::*;
 use arc_swap::ArcSwap;
 use crossbeam_queue::SegQueue;
 use futures::future::join_all;
-use tokio::{io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt}, sync::RwLock, task::yield_now};
+use parking_lot::RwLock;
+use tokio::{io::{AsyncReadExt, AsyncSeekExt}, task::yield_now};
 
 use memmap2::{Mmap, MmapOptions};
 
-use crate::{memory_pool::{MemoryBlock, MEMORY_POOL}, IMMEDIATE_WRITE, WRITE_BATCH_SIZE, WRITE_SLEEP_DURATION};
+use crate::{memory_pool::MemoryBlock, IMMEDIATE_WRITE, WRITE_BATCH_SIZE, WRITE_SLEEP_DURATION};
 
 use super::{traits::StorageIO, CRC};
 
@@ -19,8 +20,8 @@ use super::{traits::StorageIO, CRC};
 use super::io_uring_reader::AsyncUringReader;
 
 pub struct LocalStorageProvider {
-    pub(super) append_file: Arc<RwLock<tokio::fs::File>>,
-    pub(super) write_file: Arc<RwLock<tokio::fs::File>>,
+    pub(super) append_file: Arc<RwLock<std::fs::File>>,
+    pub(super) write_file: Arc<RwLock<std::fs::File>>,
     pub(crate) location: String,
     pub(crate) table_name: String,
     pub(crate) file_str: String,
@@ -92,18 +93,16 @@ impl LocalStorageProvider {
                 _ = std::fs::File::create(&file_str).unwrap();
             }
 
-            let file_append = tokio::fs::File::options()
+            let file_append = std::fs::File::options()
                 .read(true)
                 .append(true)
                 .open(&file_str)
-                .await
                 .unwrap();
 
-            let file_write = tokio::fs::File::options()
+            let file_write = std::fs::File::options()
                 .read(true)
                 .write(true)
                 .open(&file_str)
-                .await
                 .unwrap();
 
             let file_read_mmap = std::fs::File::options()
@@ -157,18 +156,16 @@ impl LocalStorageProvider {
     
             _ = std::fs::File::create(&file_str).unwrap();
     
-            let file_append = tokio::fs::File::options()
+            let file_append = std::fs::File::options()
                 .read(true)
                 .append(true)
                 .open(&file_str)
-                .await
                 .unwrap();
     
-            let file_write = tokio::fs::File::options()
+            let file_write = std::fs::File::options()
                 .read(true)
                 .write(true)
                 .open(&file_str)
-                .await
                 .unwrap();
     
             let file_read_mmap = std::fs::File::options()
@@ -276,22 +273,22 @@ impl LocalStorageProvider {
 
         // Write the data
         {
-            let mut file = self.append_file.write().await;
+            let mut file = self.append_file.write();
             
-            file.write_all(buffer).await.unwrap();
-            file.flush().await.unwrap();
+            file.write_all(buffer).unwrap();
+            file.flush().unwrap();
         } // file handle is dropped here
         
         // Update file length atomically
         self.file_len.fetch_add(total_size as u64, std::sync::atomic::Ordering::Release);
         
         // Update memory map after writing
-        self.update_memory_map().await;
+        self.update_memory_map();
 
         buffer.clear(); // Clear the buffer for the next batch
     }
 
-    async fn update_memory_map(&self) {
+    fn update_memory_map(&self) {
         let file = match OpenOptions::new()
             .read(true)
             .write(true)
@@ -369,77 +366,76 @@ impl LocalStorageProvider {
         Ok(())
     }
 
+    /// Compute the rolling cache window for a given position.
+    /// Rules:
+    /// 1. End never exceeds file_len.
+    /// 2. Window length equals cache_size when file_len >= cache_size.
+    /// 3. Window "rolls" in fixed-size buckets aligned to cache_size, except
+    ///    near EOF where it is shifted backward to keep full size.
     #[allow(dead_code)]
-    // This function is used to calculate the range for a given position and size.
-    fn range_for_pos(&self, pos: u64, size: u64, max_size: u64) -> (u64, u64) {
-        let start = (pos / size) * size;
-        let mut end = start + size;
-        if end > max_size {
-            end = max_size;
+    fn compute_range_centered(pos: u64, file_len: u64, cache_size: u64) -> (u64,u64) {
+        if file_len <= cache_size { return (0, file_len); }
+        let half = cache_size / 2;
+        let mut start = pos.saturating_sub(half);
+        if start + cache_size > file_len {
+            start = file_len - cache_size;
         }
+        let end = start + cache_size;
         (start, end)
     }
 }
 
 impl StorageIO for LocalStorageProvider {
     async fn write_data_unsync(&self, position: u64, buffer: &[u8]) {
-        let mut file = self.write_file.write().await;
-        file.seek(SeekFrom::Start(position)).await.unwrap();
-        file.write_all(buffer).await.unwrap();
+        let mut file = self.write_file.write();
+        file.seek(SeekFrom::Start(position)).unwrap();
+        file.write_all(buffer).unwrap();
     }
 
     async fn verify_data(&self, position: u64, buffer: &[u8]) -> bool {
-        let mut file_read = tokio::fs::File::options()
+        let mut file_read = std::fs::File::options()
             .read(true)
             .open(&self.file_str)
-            .await
             .unwrap();
 
-        file_read.seek(SeekFrom::Start(position)).await.unwrap();
+        file_read.seek(SeekFrom::Start(position)).unwrap();
         let mut file_buffer = vec![0; buffer.len() as usize];
-        file_read.read_exact(&mut file_buffer).await.unwrap();
+        file_read.read_exact(&mut file_buffer).unwrap();
         buffer.eq(&file_buffer)
     }
 
     async fn write_data(&self, position: u64, buffer: &[u8]) {
-        let mut file = self.write_file.write().await;
-        file.seek(SeekFrom::Start(position)).await.unwrap();
-        file.write_all(buffer).await.unwrap();
-        file.flush().await.unwrap();
-        file.sync_all().await.unwrap();
+        let mut file = self.write_file.write();
+        file.seek(SeekFrom::Start(position)).unwrap();
+        file.write_all(buffer).unwrap();
+        file.flush().unwrap();
+        file.sync_all().unwrap();
     }
 
-    async fn append_data(&self, buffer: &[u8], immediate: bool) {
-        if immediate {
-            let buffer_len = buffer.len();
+    async fn append_data(&self, buffer: &[u8], _immediate: bool) {
+        let buffer_len = buffer.len();
 
-            let mut file = self.append_file.write().await;
-            file.write_all(&buffer).await.unwrap();
-            file.flush().await.unwrap();
+        let mut file = self.append_file.write();
+        file.write_all(&buffer).unwrap();
+        file.flush().unwrap();
+        file.sync_all().unwrap();
 
-            self.file_len.fetch_add(buffer_len as u64, std::sync::atomic::Ordering::Release);
+        drop(file);
 
-            drop(file);
+        self.file_len.fetch_add(buffer_len as u64, std::sync::atomic::Ordering::Release);
 
-            self.update_memory_map().await;
-        } else {
-            let block = MEMORY_POOL.acquire(buffer.len());
-            let slice = block.into_slice_mut();
-            slice.copy_from_slice(buffer);
-            self.appender.push(block);
-        }
+        self.update_memory_map();
     }
 
     async fn read_data(&self, position: &mut u64, length: u32) -> Vec<u8> {
-        let mut read_file = tokio::fs::File::options()
+        let mut read_file = std::fs::File::options()
             .read(true)
             .open(&self.file_str)
-            .await
             .unwrap();
 
-        read_file.seek(SeekFrom::Start(*position)).await.unwrap();
+        read_file.seek(SeekFrom::Start(*position)).unwrap();
         let mut buffer: Vec<u8> = vec![0; length as usize];
-        let read_result = read_file.read_exact(&mut buffer).await;
+        let read_result = read_file.read_exact(&mut buffer);
         
         if read_result.is_err() {
             return Vec::default();
@@ -493,12 +489,12 @@ impl StorageIO for LocalStorageProvider {
         }
     }
 
-    async fn read_data_into_buffer(&self, position: &mut u64, buffer: &mut [u8]) -> io::Result<()> {
+      async fn read_data_into_buffer(&self, position: &mut u64, buffer: &mut [u8]) -> io::Result<()> {
         if buffer.is_empty() {
             return Ok(());
         }
 
-        let file_len = self.file_len.load(Ordering::Acquire);
+        let file_len = self.file_len.load(Ordering::Relaxed);
 
         if *position >= file_len {
             return Err(io::Error::new(ErrorKind::UnexpectedEof, "Position beyond file end"));
@@ -539,11 +535,11 @@ impl StorageIO for LocalStorageProvider {
     }
 
     async fn write_data_seek(&self, seek: SeekFrom, buffer: &[u8]) {
-        let mut file = self.write_file.write().await;
-        file.seek(seek).await.unwrap();
-        file.write_all(buffer).await.unwrap();
-        file.flush().await.unwrap();
-        file.sync_all().await.unwrap();
+        let mut file = self.write_file.write();
+        file.seek(seek).unwrap();
+        file.write_all(buffer).unwrap();
+        file.flush().unwrap();
+        file.sync_all().unwrap();
     }
 
     async fn verify_data_and_sync(&self, position: u64, buffer: &[u8]) -> bool {
@@ -567,8 +563,8 @@ impl StorageIO for LocalStorageProvider {
     }
 
     async fn append_data_unsync(&self, buffer: &[u8]) {
-        let mut file = self.append_file.write().await;
-        file.write_all(&buffer).await.unwrap();
+        let mut file = self.append_file.write();
+        file.write_all(&buffer).unwrap();
         self.file_len.fetch_add(buffer.len() as u64, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -597,18 +593,16 @@ impl StorageIO for LocalStorageProvider {
 
         _ = std::fs::File::create(&file_str).unwrap();
 
-        let file_append = tokio::fs::File::options()
+        let file_append = std::fs::File::options()
             .read(true)
             .append(true)
             .open(&file_str)
-            .await
             .unwrap();
 
-        let file_write = tokio::fs::File::options()
+        let file_write = std::fs::File::options()
             .read(true)
             .write(true)
             .open(&file_str)
-            .await
             .unwrap();
 
         let file_read_mmap = std::fs::File::options()
@@ -691,18 +685,16 @@ impl StorageIO for LocalStorageProvider {
             _ = std::fs::File::create(&file_path).unwrap();
         }
         
-        let file_append = tokio::fs::File::options()
+        let file_append = std::fs::File::options()
             .read(true)
             .append(true)
             .open(&file_path)
-            .await
             .unwrap();
 
-        let file_write = tokio::fs::File::options()
+        let file_write = std::fs::File::options()
             .read(true)
             .write(true)
             .open(&file_path)
-            .await
             .unwrap();
 
         let file_read_mmap = std::fs::File::options()
