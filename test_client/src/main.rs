@@ -83,7 +83,7 @@ async fn main() -> std::io::Result<()> {
 
     // join_all(features).await;
 
-    // println!("Press any key to continue...");
+    // println!("Finished inserting records. Press any key to continue...");
     // let mut buffer = String::new();
     // stdin().read_line(&mut buffer).unwrap();
 
