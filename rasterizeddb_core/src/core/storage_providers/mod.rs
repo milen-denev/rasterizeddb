@@ -4,6 +4,8 @@ pub mod traits;
 
 pub mod mock_file_sync;
 
+pub mod helpers;
+
 #[cfg(unix)]
 pub mod io_uring_reader;
 
