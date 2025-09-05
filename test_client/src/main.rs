@@ -50,7 +50,7 @@ async fn main() -> std::io::Result<()> {
 
     // let semaphore = Arc::new(tokio::sync::Semaphore::new(16)); 
 
-    // for i in 0..100_000 {
+    // for i in 0..500_000 {
     //     let person = generate_person();
     //     let query = format!(
     //         r##"
@@ -90,7 +90,7 @@ async fn main() -> std::io::Result<()> {
     for _ in 0..10 {   
         let query = r##"
             SELECT id, job_title, salary FROM employees
-            WHERE id = 99999
+            WHERE id = 499999
         "##;
 
         let instant = std::time::Instant::now();
