@@ -19,8 +19,8 @@ stopwatch = "0.0.7"
 futures = "0.3.31"
 async-lazy = { version = "0.1.2", features = ["parking_lot"] }
 dashmap = "6.1.0"
-log = "0.4.27"
-libmimalloc-sys = "0.1.43"
+log = "0.4.28"
+libmimalloc-sys = "0.1.44"
 rastcp = { path = "../rastcp" }
 env_logger = "0.11.8"
 tera = "1.20.0"
@@ -38,11 +38,11 @@ parking_lot = "0.12.4"
 
 # unix dependencies
 [target.'cfg(unix)'.dependencies]
-io-uring = "0.7.9"
+io-uring = "0.7.10"
 
 [dev-dependencies]
 criterion = { version = "0.7.0" }
-tempfile = "3.20.0"
+tempfile = "3.21.0"
 
 [[bench]]
 name = "buffer_benchmarks"
