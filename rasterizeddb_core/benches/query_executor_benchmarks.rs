@@ -1,26 +1,14 @@
 use criterion::{criterion_group, criterion_main, Criterion};
-use rasterizeddb_core::core::row_v2::concurrent_processor::Buffer;
 use rasterizeddb_core::core::row_v2::query_parser::{tokenize_for_test, QueryParser};
-use rasterizeddb_core::core::row_v2::row::Row;
 use rasterizeddb_core::core::row_v2::schema::SchemaField;
 use rasterizeddb_core::core::db_type::DbType;
-use rasterizeddb_core::core::row_v2::query_tokenizer::{tokenize, Token};
-use rasterizeddb_core::core::row_v2::transformer::TransformerProcessor;
+use rasterizeddb_core::core::row_v2::query_tokenizer::tokenize;
+use rasterizeddb_core::core::row_v2::transformer::{ColumnTransformer, Next, TransformerProcessor};
 use rasterizeddb_core::memory_pool::{MemoryBlock, MEMORY_POOL};
 use smallvec::SmallVec;
 use std::borrow::Cow;
-use std::cell::UnsafeCell;
 use std::hint::black_box;
 use std::sync::LazyLock;
-
-fn parse_query<'a, 'b, 'c>(
-    toks: &'a SmallVec<[Token; 36]>,
-    columns: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
-    transformers: &'b mut TransformerProcessor<'b>,
-) {
-    let mut parser = QueryParser::new(toks, transformers);
-    _ = parser.execute(columns);
-}
 
 fn create_benchmark_schema() -> SmallVec<[SchemaField; 20]> {
     smallvec::smallvec![
@@ -44,8 +32,6 @@ fn create_benchmark_schema() -> SmallVec<[SchemaField; 20]> {
         SchemaField::new("test_6".to_string(), DbType::U64, 8, 0, 0, false),
         SchemaField::new("credit_balance".to_string(), DbType::F32, 4, 0, 0, false),
         SchemaField::new("net_assets".to_string(), DbType::I64, 8, 0, 0, false),
-
-
     ]
 }
 
@@ -134,7 +120,7 @@ fn create_memory_block_from_u64(value: u64) -> MemoryBlock {
     data
 }
 
-pub fn setup_test_columns<'a>() -> SmallVec<[(Cow<'a, str>, MemoryBlock); 20]>  {
+pub fn setup_test_columns<'a>() -> SmallVec<[(Cow<'a, str>, MemoryBlock); 20]> {
     let mut columns = SmallVec::new();
 
     columns.push((Cow::Borrowed("id"), create_memory_block_from_i32(42)));
@@ -145,16 +131,22 @@ pub fn setup_test_columns<'a>() -> SmallVec<[(Cow<'a, str>, MemoryBlock); 20]>  
     columns.push((Cow::Borrowed("bank_balance"), create_memory_block_from_f64(1000.43)));
     columns.push((Cow::Borrowed("is_active"), create_memory_block_from_u8(1))); // true
     columns.push((Cow::Borrowed("score"), create_memory_block_from_f32(85.5)));
-    columns.push((Cow::Borrowed("notes"), create_memory_block_from_string("This is an important note for review.")));
-    columns.push((Cow::Borrowed("created_at"), create_memory_block_from_i64(1672531200))); // Example timestamp
+    columns.push((
+        Cow::Borrowed("notes"),
+        create_memory_block_from_string("This is an important note for review."),
+    ));
+    columns.push((
+        Cow::Borrowed("created_at"),
+        create_memory_block_from_i64(1672531200),
+    )); // Example timestamp
 
     columns.push((Cow::Borrowed("credit_balance"), create_memory_block_from_f32(100.50)));
     columns.push((Cow::Borrowed("net_assets"), create_memory_block_from_i64(200000)));
     columns.push((Cow::Borrowed("earth_position"), create_memory_block_from_i8(-50)));
     columns.push((Cow::Borrowed("test_1"), create_memory_block_from_u32(100)));
     columns.push((Cow::Borrowed("test_2"), create_memory_block_from_u16(200)));
-    columns.push((Cow::Borrowed("test_3"), create_memory_block_from_i128(i128::MAX -100)));
-    columns.push((Cow::Borrowed("test_4"), create_memory_block_from_u128(u128::MAX -100)));
+    columns.push((Cow::Borrowed("test_3"), create_memory_block_from_i128(i128::MAX - 100)));
+    columns.push((Cow::Borrowed("test_4"), create_memory_block_from_u128(u128::MAX - 100)));
     columns.push((Cow::Borrowed("test_5"), create_memory_block_from_i16(300)));
     columns.push((Cow::Borrowed("test_6"), create_memory_block_from_u64(400)));
 
@@ -162,118 +154,83 @@ pub fn setup_test_columns<'a>() -> SmallVec<[(Cow<'a, str>, MemoryBlock); 20]>  
 }
 
 fn benchmark_execute_query(c: &mut Criterion) {
-    static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-        let columns_box = Box::new(setup_test_columns());
-        columns_box
-    });
+    static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+        LazyLock::new(|| Box::new(setup_test_columns()));
     let columns = &*COLUMNS;
 
-    let simple_query = "id = 42";
-    let mut buffer = Buffer {
-        // Cleared in this function
-        hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-        // Cleared in read row functions
-        row: Row::default(),
-        // Cleared in new function
-        transformers: SmallVec::new(),
-        // Cleared in new function
-        intermediate_results: SmallVec::new(),
-        // Cleared in this function
-        bool_buffer: SmallVec::new()
+    // Helper to DRY plan-once/execute-many
+    let mut run_bench = |name: &str, query: &str, use_test_tokenizer: bool| {
+    // Dedicated buffers per benchmark to avoid cross-test interference
+    // Build the plan using temporary, non-leaked buffers first
+    let mut transformers_tmp: SmallVec<[ColumnTransformer; 36]> = SmallVec::new();
+    let mut intermediate_tmp: SmallVec<[MemoryBlock; 20]> = SmallVec::new();
+    // bool buffer will be created per-iteration to avoid borrow issues
+
+        let schema = create_benchmark_schema();
+        // Force non-'static lifetime for tokens by owning the query string locally
+        let owned_query = query.to_owned();
+        let tokens = if use_test_tokenizer {
+            tokenize_for_test(black_box(&owned_query), black_box(&schema))
+        } else {
+            tokenize(black_box(&owned_query), black_box(&schema))
+        };
+
+        // Build the plan using a temporary processor with stack-backed buffers
+        {
+            let mut processor_tmp = TransformerProcessor::new(&mut transformers_tmp, &mut intermediate_tmp);
+            let mut parser = QueryParser::new(&tokens, &mut processor_tmp);
+            if let Err(e) = parser.execute(columns) {
+                panic!("QueryParser.execute failed while building plan: {e}");
+            }
+            // End the borrow of processor_tmp by dropping parser first
+            drop(parser);
+            // processor_tmp will be dropped at end of this scope
+        }
+        drop(tokens);
+        drop(owned_query);
+
+        // Leak fresh buffers and create a processor with 'static lifetime for the closure
+        let transformers_leaked: &'static mut SmallVec<[ColumnTransformer; 36]> = Box::leak(Box::new(SmallVec::new()));
+        let intermediate_results_leaked: &'static mut SmallVec<[MemoryBlock; 20]> = Box::leak(Box::new(SmallVec::new()));
+        let processor_leaked: &'static mut TransformerProcessor<'static> =
+            Box::leak(Box::new(TransformerProcessor::new(transformers_leaked, intermediate_results_leaked)));
+        // Move the planned transformers and intermediates into the leaked processor
+        processor_leaked.transformers.extend(transformers_tmp.drain(..));
+        processor_leaked
+            .intermediate_results
+            .extend(intermediate_tmp.drain(..));
+
+        c.bench_function(name, move |b| {
+            b.iter(|| {
+                let mut bool_buffer_local: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
+                let res = processor_leaked.execute_row(&**columns, &mut bool_buffer_local);
+                black_box(res)
+            });
+        });
     };
 
-    let schema = create_benchmark_schema();
-    let tokens = tokenize_for_test(black_box(simple_query), black_box(&schema));
+    // Simple true
+    run_bench("execute_simple_query_true", "id = 42", true);
 
-    c.bench_function("execute_simple_query_true", |b| {
-        b.iter(|| {
-            let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+    // Simple false
+    run_bench("execute_simple_query_false", "id = 50", true);
 
-            parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-            black_box(transformer.get_mut().execute(&mut buffer.bool_buffer));
-        });
-    });
+    // Complex true
+    run_bench(
+        "execute_complex_query_true",
+        "age >= 30 AND name CONTAINS 'John' OR (salary / 2 + 1000 > 25000 AND department STARTSWITH 'Eng') AND bank_balance < 2000.50 OR score = 85.5",
+        true,
+    );
 
-    let simple_query_false = "id = 50";
-    let mut buffer = Buffer {
-        // Cleared in this function
-        hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-        // Cleared in read row functions
-        row: Row::default(),
-        // Cleared in new function
-        transformers: SmallVec::new(),
-        // Cleared in new function
-        intermediate_results: SmallVec::new(),
-        // Cleared in this function
-        bool_buffer: SmallVec::new()
-    };
+    // Complex false
+    run_bench(
+        "execute_complex_query_false",
+        "age < 10 AND name CONTAINS 'NonExistent' OR (salary / 2 + 1000 > 90000 AND department STARTSWITH 'Xyz') AND bank_balance > 20000.50 OR score = 10.0",
+        true,
+    );
 
-    let schema = create_benchmark_schema();
-    let tokens = tokenize_for_test(black_box(simple_query_false), black_box(&schema));
-
-    c.bench_function("execute_simple_query_false", |b| {
-        b.iter(|| {
-            let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-            parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-            black_box(transformer.get_mut().execute(&mut buffer.bool_buffer));
-        });
-    });
-
-    let complex_query_true = "age >= 30 AND name CONTAINS 'John' OR (salary / 2 + 1000 > 25000 AND department STARTSWITH 'Eng') AND bank_balance < 2000.50 OR score = 85.5";
-    let mut buffer = Buffer {
-        // Cleared in this function
-        hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-        // Cleared in read row functions
-        row: Row::default(),
-        // Cleared in new function
-        transformers: SmallVec::new(),
-        // Cleared in new function
-        intermediate_results: SmallVec::new(),
-        // Cleared in this function
-        bool_buffer: SmallVec::new()
-    };
-
-    let schema = create_benchmark_schema();
-    let tokens = tokenize_for_test(black_box(complex_query_true), black_box(&schema));
-
-    c.bench_function("execute_complex_query_true", |b| {
-        b.iter(|| {
-            let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-            parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-            black_box(transformer.get_mut().execute(&mut buffer.bool_buffer));
-        });
-    });
-    
-    let complex_query_false = "age < 10 AND name CONTAINS 'NonExistent' OR (salary / 2 + 1000 > 90000 AND department STARTSWITH 'Xyz') AND bank_balance > 20000.50 OR score = 10.0";
-    let mut buffer = Buffer {
-        // Cleared in this function
-        hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-        // Cleared in read row functions
-        row: Row::default(),
-        // Cleared in new function
-        transformers: SmallVec::new(),
-        // Cleared in new function
-        intermediate_results: SmallVec::new(),
-        // Cleared in this function
-        bool_buffer: SmallVec::new()
-    };
-
-    let schema = create_benchmark_schema();
-    let tokens = tokenize_for_test(black_box(complex_query_false), black_box(&schema));
-
-    c.bench_function("execute_complex_query_false", |b| {
-         b.iter(|| {
-            let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-            parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-            black_box(transformer.get_mut().execute(&mut buffer.bool_buffer));
-        });
-    });
-
-    let long_query_true = 
-    r##"
+    // Long query (uses full tokenizer)
+    let long_query_true = r##"
         id > 10 AND 
         age < 60 AND 
         salary > 20000 AND 
@@ -295,37 +252,9 @@ fn benchmark_execute_query(c: &mut Criterion) {
         notes CONTAINS 'important' AND 
         created_at < 1735689700
     "##;
-    
-    let mut buffer = Buffer {
-        // Cleared in this function
-        hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-        // Cleared in read row functions
-        row: Row::default(),
-        // Cleared in new function
-        transformers: SmallVec::new(),
-        // Cleared in new function
-        intermediate_results: SmallVec::new(),
-        // Cleared in this function
-        bool_buffer: SmallVec::new()
-    };
 
-    let schema = create_benchmark_schema();
-    let tokens = tokenize(black_box(long_query_true), black_box(&schema));
-
-    c.bench_function("execute_long_query_true", |b| {
-        b.iter(|| {
-            let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-            parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-            black_box(transformer.get_mut().execute(&mut buffer.bool_buffer));
-        });
-    });
+    run_bench("execute_long_query_true", long_query_true, false);
 }
 
-criterion_group!(
-    benches,
-    // benchmark_tokenize,
-    // benchmark_parse_query,
-    benchmark_execute_query
-);
+criterion_group!(benches, benchmark_execute_query);
 criterion_main!(benches);
