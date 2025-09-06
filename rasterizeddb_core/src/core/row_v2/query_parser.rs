@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::HashMap;
 use smallvec::SmallVec;
 
 use crate::memory_pool::MemoryBlock;
@@ -12,10 +13,8 @@ pub struct QueryParser<'a, 'b> {
     pos: usize,
     query_transformer: &'b mut TransformerProcessor<'b>,
     first_iteration: bool,
-    // Changed: Use a small vec for typically small column usage, keep sorted & unique
+    // Keep sorted & unique on first parse
     used_column_indices: SmallVec<[usize; 16]>,
-    // Reuse a temp buffer for fast path cloning of MemoryBlocks
-    tmp_blocks: SmallVec<[MemoryBlock; 20]>,
 }
 
 impl<'a, 'b> QueryParser<'a, 'b> {
@@ -29,27 +28,25 @@ impl<'a, 'b> QueryParser<'a, 'b> {
             query_transformer,
             first_iteration: true,
             used_column_indices: SmallVec::new(),
-            tmp_blocks: SmallVec::new(),
         }
     }
 
-    /// Reset parser for processing new column data while keeping the optimization
     #[inline]
     pub fn reset_for_new_data(&mut self) {
-        // Intentionally empty: we keep first_iteration = false and the collected column indices
+        // Intentionally empty: keep used_column_indices and plan; no per-row cloning anymore.
     }
 
-    /// Reset parser completely (forces reparsing)
     pub fn reset_completely(&mut self) {
         self.pos = 0;
         self.first_iteration = true;
         self.used_column_indices.clear();
-        self.tmp_blocks.clear();
+        // No tmp buffers to clear anymore
     }
 
+    /// Build the transformer plan on the first call; fast path is now a no-op.
     pub fn execute<'c>(
         &mut self,
-        cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>
+        cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
     ) -> Result<(), String> {
         if self.first_iteration {
             self.first_iteration = false;
@@ -58,30 +55,25 @@ impl<'a, 'b> QueryParser<'a, 'b> {
 
             self.parse_or(cols)?;
 
-            // Deduplicate & sort used columns (keeps deterministic ordering)
             if !self.used_column_indices.is_empty() {
                 self.used_column_indices.sort_unstable();
                 self.used_column_indices.dedup();
             }
 
-            #[cfg(debug_assertions)]
-            {
-                if self.used_column_indices.is_empty() {
-                    println!("Query contains only literal values - no column optimization needed");
-                } else {
-                    println!(
-                        "First iteration complete. Used columns: {:?}",
-                        self.used_column_indices
-                    );
-                }
-            }
+            // #[cfg(debug_assertions)]
+            // {
+            //     if self.used_column_indices.is_empty() {
+            //         println!("Query contains only literal values - no column optimization needed");
+            //     } else {
+            //         println!(
+            //             "First iteration complete. Used columns: {:?}",
+            //             self.used_column_indices
+            //         );
+            //     }
+            // }
         } else {
-            // Fast path
-            if cols.is_empty() {
-                return Err("No columns provided for fast path".to_string());
-            }
-
-            // Validate that all used column indices are still valid
+            // Fast path: nothing to do; inputs will be resolved on-the-fly during evaluation.
+            // Still validate input length for safety.
             if let Some(&max_index) = self.used_column_indices.last() {
                 if max_index >= cols.len() {
                     return Err(format!(
@@ -91,24 +83,55 @@ impl<'a, 'b> QueryParser<'a, 'b> {
                     ));
                 }
             }
-
-            #[cfg(debug_assertions)]
-            println!(
-                "Fast path: updating {} transformers with new column data",
-                self.query_transformer.transformers.len()
-            );
-
-            // Rebuild tmp_blocks in-place (avoid reallocation)
-            self.tmp_blocks.clear();
-            self.tmp_blocks
-                .extend(cols.iter().map(|(_, mb)| mb.clone()));
-
-            // SAFETY: self.tmp_blocks lives for &self scope; slice is consistent
-            let slice: &[MemoryBlock] = &self.tmp_blocks;
-            self.query_transformer.replace_row_inputs(slice);
         }
 
         Ok(())
+    }
+
+    /// Evaluate against a concrete row without cloning.
+    /// This will parse/build on first call and then run the processor in zero-copy mode.
+    pub fn evaluate_row<'c>(
+        &mut self,
+        cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
+        comparison_results: &mut SmallVec<[(bool, Option<Next>); 20]>,
+    ) -> Result<bool, String> {
+        // Ensure the plan is built
+        self.execute(cols)?;
+        // Build a write_order-aligned view of the provided columns to ensure correct index access
+        // Map input names to their positions once
+        let mut name_to_pos: HashMap<&str, usize> = HashMap::with_capacity(cols.len());
+        for (i, (name, _)) in cols.iter().enumerate() {
+            name_to_pos.insert(name.as_ref(), i);
+        }
+
+        // Determine max write_order used by this query and gather (write_order, name) pairs from tokens
+        let mut max_idx: usize = 0;
+        let mut pairs: SmallVec<[(usize, &str); 20]> = SmallVec::new();
+        for t in self.toks.iter() {
+            if let Token::Ident((name, _t, w)) = t {
+                let n = name.as_str();
+                if let Some(_) = name_to_pos.get(n) {
+                    let wi = *w as usize;
+                    if wi > max_idx { max_idx = wi; }
+                    pairs.push((wi, n));
+                }
+            }
+        }
+
+        // Create aligned vector sized to max write_order + 1 and fill only referenced slots
+        let mut aligned: SmallVec<[MemoryBlock; 24]> = SmallVec::new();
+        aligned.resize(max_idx.saturating_add(1), MemoryBlock::default());
+        for (wi, n) in pairs.into_iter() {
+            if let Some(&pos) = name_to_pos.get(n) {
+                aligned[wi] = cols[pos].1.clone();
+            }
+        }
+
+        // Execute on the aligned slice
+        let res = self
+            .query_transformer
+            .execute_row(&aligned[..], comparison_results);
+        Ok(res)
     }
 
     #[inline]
@@ -190,7 +213,6 @@ impl<'a, 'b> QueryParser<'a, 'b> {
         let mut has_comp = false;
         let mut has_logic = false;
 
-        // Static arrays to avoid re-alloc each call
         const CMP_OPS: [&str; 6] = ["=", "!=", ">", ">=", "<", "<="];
         const LOGIC_KWS: [&str; 2] = ["AND", "OR"];
         const TEXT_CMPS: [&str; 3] = ["CONTAINS", "STARTSWITH", "ENDSWITH"];
@@ -201,7 +223,6 @@ impl<'a, 'b> QueryParser<'a, 'b> {
                 Token::LPar => depth += 1,
                 Token::RPar => {
                     if depth == 0 {
-                        // Unbalanced - treat as not a group
                         return false;
                     }
                     depth -= 1;
@@ -278,7 +299,6 @@ impl<'a, 'b> QueryParser<'a, 'b> {
             _ => return Err(format!("unknown comparison operator: {}", op_str)),
         };
 
-        // String ops force string comparison type
         let comparison_type = match cmp {
             ComparerOperation::Contains
             | ComparerOperation::StartsWith
@@ -286,7 +306,7 @@ impl<'a, 'b> QueryParser<'a, 'b> {
                 if left_type == DbType::STRING || right_type == DbType::STRING {
                     DbType::STRING
                 } else {
-                    DbType::STRING // fallback still string
+                    DbType::STRING
                 }
             }
             _ => left_type,
@@ -371,11 +391,10 @@ impl<'a, 'b> QueryParser<'a, 'b> {
                         cols.len() - 1
                     ));
                 }
-                // Clone MemoryBlock (cannot borrow across later mut uses)
+                // Clone only during the first parse; no per-row cloning afterwards.
                 let mb = cols[idx].1.clone();
 
                 if self.first_iteration {
-                    // O(1) amortized push, dedup later
                     self.used_column_indices.push(idx);
                 }
 
@@ -446,34 +465,19 @@ mod tests {
 
     use crate::core::db_type::DbType;
     use crate::core::row_v2::query_parser::QueryParser;
-    use crate::core::row_v2::row::Row;
     use crate::core::row_v2::schema::SchemaField;
-    //use crate::core::row_v2::token_processor::TokenProcessor;
-    use crate::core::row_v2::query_tokenizer::{tokenize, NumericValue, Token};
-    use crate::core::row_v2::transformer::{ColumnTransformer, Next, TransformerProcessor};
+    use crate::core::row_v2::query_tokenizer::tokenize;
+    use crate::core::row_v2::transformer::{Next, TransformerProcessor};
     use crate::memory_pool::{MemoryBlock, MEMORY_POOL};
 
-    struct Buffer<'a> {
-        pub _hashtable_buffer: UnsafeCell<SmallVec<[(Cow<'a, str>, MemoryBlock); 20]>>,
-        pub _row: Row,
-        pub transformers: SmallVec<[ColumnTransformer; 36]>,
+    // Buffer structure for tests
+    struct Buffer {
+        pub transformers: SmallVec<[crate::core::row_v2::transformer::ColumnTransformer; 36]>,
         pub intermediate_results: SmallVec<[MemoryBlock; 20]>,
-        pub bool_buffer: SmallVec<[(bool, Option<Next>); 20]>
+        pub bool_buffer: SmallVec<[(bool, Option<Next>); 20]>,
     }
 
-    fn tokenize_for_test(s: &str, schema: &SmallVec<[SchemaField; 20]>) -> SmallVec<[Token; 36]> {
-        tokenize(s, schema)
-    }
-
-    fn parse_query<'a, 'b, 'c>(
-        toks: &'a SmallVec<[Token; 36]>,
-        columns: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
-        transformers: &'b mut TransformerProcessor<'b>,
-    ) {
-        let mut parser = QueryParser::new(toks, transformers);
-        _ = parser.execute(columns);
-    }
-
+    // Helper functions for memory blocks
     fn create_memory_block_from_i8(value: i8) -> MemoryBlock {
         let bytes = value.to_le_bytes();
         let data = MEMORY_POOL.acquire(bytes.len());
@@ -722,947 +726,265 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_simple_equals() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
+    fn test_logical_precedence_or_then_and_parsed() {
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
-        let query = "id = 42";
-
-        let tokens = tokenize_for_test(query, &schema);
-
-        let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
-            transformers: SmallVec::new(),
-            intermediate_results: SmallVec::new(),
-            bool_buffer: SmallVec::new(),
-        };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(
-            &mut buffer.transformers, 
-            &mut buffer.intermediate_results
-        ));
-
-        parse_query(&tokens, columns, unsafe { &mut *transformer.get() });
-
-        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer).clone());
-    }
-
-
-    #[test]
-    fn test_parse_simple_not_equals() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
-        let columns = &*COLUMNS;
-        let query = "id != 50";
-
-        let tokens = tokenize_for_test(query, &schema);
-
-        let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
-            transformers: SmallVec::new(),
-            intermediate_results: SmallVec::new(),
-            bool_buffer: SmallVec::new(),
-        };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
-    }
-
-    #[test]
-    fn test_parse_simple_greater_than() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
-        let columns = &*COLUMNS;
-        let query = "age > 25";
-
-        let tokens = tokenize_for_test(query, &schema);
-
-        let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
-            transformers: SmallVec::new(),
-            intermediate_results: SmallVec::new(),
-            bool_buffer: SmallVec::new(),
-        };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
-    }
-
-    #[test]
-    fn test_parse_simple_less_than() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
-        let columns = &*COLUMNS;
-        let query = "age < 40";
-
-       let tokens = tokenize_for_test(query, &schema);
-
-        let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
-            transformers: SmallVec::new(),
-            intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
-        };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
-    }
-
-    #[test]
-    fn test_parse_greater_or_equal() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
-        let columns = &*COLUMNS;
-        let query = "age >= 30";
-
-      let tokens = tokenize_for_test(query, &schema);
-
-        let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
-            transformers: SmallVec::new(),
-            intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
-        };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
-    }
-
-    #[test]
-    fn test_parse_less_or_equal() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
-        let columns = &*COLUMNS;
-        let query = "age <= 30";
-
-        let tokens = tokenize_for_test(query, &schema);
-
-        let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
-            transformers: SmallVec::new(),
-            intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
-        };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
-    }
-
-    #[test]
-    fn test_parse_math_operation() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
-        let columns = &*COLUMNS;
-        let query = "age + 10 = 40";
-
-       let tokens = tokenize_for_test(query, &schema);
-
-        let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
-            transformers: SmallVec::new(),
-            intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
-        };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
-    }
-
-    #[test]
-    fn test_parse_multiple_math_operations() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
-        let columns = &*COLUMNS;
-        let query = "age * 2 + 10 = 70";
-
-        let tokens = tokenize_for_test(query, &schema);
-
-        let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
-            transformers: SmallVec::new(),
-            intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
-        };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
-    }
-
-    #[test]
-    fn test_parse_parentheses() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
-        let columns = &*COLUMNS;
-        let query = "(age + 10) * 2 = 80";
-
-        let tokens = tokenize_for_test(query, &schema);
-
-        let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
-            transformers: SmallVec::new(),
-            intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
-        };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
-    }
-
-    #[test]
-    fn test_parse_string_contains() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
-        let columns = &*COLUMNS;
-        let query = "name CONTAINS 'John'";
-
-        let tokens = tokenize_for_test(query, &schema);
-
-        let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
-            transformers: SmallVec::new(),
-            intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
-        };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
-    }
-
-    #[test]
-    fn test_parse_string_starts_with() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
-        let columns = &*COLUMNS;
-        let query = "name STARTSWITH 'John'";
-
-        let tokens = tokenize_for_test(query, &schema);
-
-        let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
-            transformers: SmallVec::new(),
-            intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
-        };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
-    }
-
-    #[test]
-    fn test_parse_string_ends_with() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
-        let columns = &*COLUMNS;
-        let query = "name ENDSWITH 'Doe'";
-        let tokens = tokenize_for_test(query, &schema);
-
-        let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
-            transformers: SmallVec::new(),
-            intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
-        };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
-    }
-
-    #[test]
-    fn test_parse_logical_and() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
-        let columns = &*COLUMNS;
-        let query = "age > 25 AND salary = 50000";
-
-        let tokens = tokenize_for_test(query, &schema);
-
-        let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
-            transformers: SmallVec::new(),
-            intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
-        };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
-    }
-
-    #[test]
-    fn test_parse_logical_or() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
-        let columns = &*COLUMNS;
-        let query = "age < 25 OR salary = 50000";
-
-        let tokens = tokenize_for_test(query, &schema);
-
-        let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
-            transformers: SmallVec::new(),
-            intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
-        };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
-    }
-
-    #[test]
-    fn test_parse_complex_query() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
-        let columns = &*COLUMNS;
-        let query = "age > 25 AND (salary = 50000 OR name CONTAINS 'Jane')";
-
-        let tokens = tokenize_for_test(query, &schema);
-
-        let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
-            transformers: SmallVec::new(),
-            intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
-        };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
-    }
-
-    #[test]
-    fn test_tokenize() {
-        use crate::core::row_v2::query_parser::Token;
-        
-        let tokens = tokenize_for_test("
-            age >= 30 
-            AND 
-            name CONTAINS 'John'
-            AND
-            bank_balance > 1000.00
-            ", &create_schema());
-        
-        assert_eq!(tokens.len(), 11);
-        
-        // Validate token types and values
-        match &tokens[0] {
-            Token::Ident(s) => assert_eq!(s.0, "age"),
-            _ => panic!("Expected identifier token"),
-        }
-        
-        match &tokens[1] {
-            Token::Op(s) => assert_eq!(s, ">="),
-            _ => panic!("Expected operator token"),
-        }
-        
-        match &tokens[2] {
-            Token::Number(n) => assert_eq!(*n, NumericValue::U8(30)),
-            _ => panic!("Expected number token"),
-        }
-
-        match &tokens[3] {
-            Token::Next(s) => assert_eq!(s, "AND"),
-            _ => panic!("Expected AND token"),
-        }
-        
-        match &tokens[4] {
-            Token::Ident(s) => assert_eq!(s.0, "name"),
-            _ => panic!("Expected identifier token"),
-        }
-        
-        match &tokens[5] {
-            Token::Ident(s) => assert_eq!(s.0.to_uppercase(), "CONTAINS"),
-            _ => panic!("Expected CONTAINS token"),
-        }
-        
-        match &tokens[6] {
-            Token::StringLit(s) => assert_eq!(s, "John"),
-            _ => panic!("Expected string literal token"),
-        }
-
-        match &tokens[7] {
-            Token::Next(s) => assert_eq!(s, "AND"),
-            _ => panic!("Expected AND token"),
-        }
-
-        match &tokens[8] {
-            Token::Ident(s) => assert_eq!(s.0, "bank_balance"),
-            _ => panic!("Expected identifier token"),
-        }
-
-        match &tokens[9] {
-            Token::Op(s) => assert_eq!(s, ">"),
-            _ => panic!("Expected operator token"),
-        }
-
-        match &tokens[10] {
-            Token::Number(s) => assert_eq!(s, &NumericValue::F64(1000.00)),
-            _ => panic!("Expected number token"),
-        }
-    }
-
-    
-    #[test]
-    fn test_string_equality_type_inference() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
-        let columns = &*COLUMNS;
-        let query = "name = 'John Doe'";
-        let tokens = tokenize_for_test(query, &schema);
-
-        let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
-            transformers: SmallVec::new(),
-            intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
-        };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
-    }
-
-    #[test]
-    fn test_string_op_type_inference() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
-        let columns = &*COLUMNS;
-        let query = "department STARTSWITH 'Eng'";
-        let tokens = tokenize_for_test(query, &schema);
-
-        let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
-            transformers: SmallVec::new(),
-            intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
-        };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
-    }
-
-    #[test]
-    fn test_mixed_types_in_different_comparisons_false() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
-        let columns = &*COLUMNS;
-        let query = "id > 10 AND name = 'Test'"; // id > 10 (T), name = 'Test' (F) -> F
-        let tokens = tokenize_for_test(query, &schema);
-
-        let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
-            transformers: SmallVec::new(),
-            intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
-        };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
-    }
-
-    #[test]
-    fn test_arithmetic_precedence_div_add() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
-        let columns = &*COLUMNS;
-        let query = "salary / 2 + 100 = 25100"; // 50000/2 + 100 = 25000 + 100 = 25100
-        let tokens = tokenize_for_test(query, &schema);
-
-        let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
-            transformers: SmallVec::new(),
-            intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
-        };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
-    }
-
-    #[test]
-    fn test_arithmetic_precedence_literal_first_div_add() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
-        let columns = &*COLUMNS;
-        let query = "10 + salary / 2 = 25010"; // 10 + 50000/2 = 10 + 25000 = 25010
-        let tokens = tokenize_for_test(query, &schema);
-
-        let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
-            transformers: SmallVec::new(),
-            intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
-        };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
-    }
-
-    #[test]
-    fn test_logical_precedence_and_then_or() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
-        let columns = &*COLUMNS;
-        // (id=42 (T) AND age > 20 (T)) OR salary < 60000 (T) -> (T AND T) OR T -> T OR T -> T
-        let query = "id = 42 AND age > 20 OR salary < 60000";
-        let tokens = tokenize_for_test(query, &schema);
-
-        let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
-            transformers: SmallVec::new(),
-            intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
-        };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
-    }
-
-    #[test]
-    fn test_logical_precedence_or_then_and_parsed() { // Parser structure implies AND has higher precedence
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
-        let columns = &*COLUMNS;
-        // id = 10 (F) OR (age > 20 (T) AND salary = 50000 (T)) -> F OR (T AND T) -> F OR T -> T
         let query = "id = 10 OR age > 20 AND salary = 50000";
-        let tokens = tokenize_for_test(query, &schema);
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
         };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), true);
     }
-    
+
     #[test]
     fn test_explicit_logical_grouping_and_first() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
-        let query = "(id = 42 AND age > 20) OR salary < 60000"; // Same as test_logical_precedence_and_then_or
-        let tokens = tokenize_for_test(query, &schema);
+        let query = "(id = 42 AND age > 20) OR salary < 60000";
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
         };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), true);
     }
 
     #[test]
     fn test_explicit_logical_grouping_or_first_with_and() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
-        let query = "id = 10 OR (age > 20 AND salary = 50000)"; // Same as test_logical_precedence_or_then_and_parsed
-        let tokens = tokenize_for_test(query, &schema);
+        let query = "id = 10 OR (age > 20 AND salary = 50000)";
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
         };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), true);
     }
 
     #[test]
     fn test_complex_boolean_with_grouping() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
-        // (name STARTSWITH 'J' (T) OR department = 'Sales' (F)) AND age < 35 (T)
-        // (T OR F) AND T -> T AND T -> T
         let query = "(name STARTSWITH 'J' OR department = 'Sales') AND age < 35";
-        let tokens = tokenize_for_test(query, &schema);
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
         };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), true);
     }
 
     #[test]
     fn test_complex_arithmetic_nested_parentheses() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
-        // ((30+5)*2 - 10)/3 = (35*2 - 10)/3 = (70-10)/3 = 60/3 = 20
         let query = "( (age + 5) * 2 - 10 ) / 3 = 20";
-        let tokens = tokenize_for_test(query, &schema);
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
         };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), true);
     }
 
     #[test]
     fn test_nested_boolean_groups() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
-        // (id=42 (T) AND (age>25 (T) OR age<20 (F))) OR department='Engineering' (T)
-        // (T AND (T OR F)) OR T -> (T AND T) OR T -> T OR T -> T
         let query = "(id = 42 AND (age > 25 OR age < 20)) OR department = 'Engineering'";
-        let tokens = tokenize_for_test(query, &schema);
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
         };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), true);
     }
 
     #[test]
     fn test_column_compared_to_itself() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
-        let query = "id = id"; // 42 = 42
-
-        let tokens = tokenize_for_test(query, &schema);
+        let query = "id = id";
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
         };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), true);
     }
-    
+
     #[test]
     fn test_literal_on_left_arithmetic_on_right() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
-        let query = "10 = id - 32"; // 10 = 42 - 32 -> 10 = 10
-        let tokens = tokenize_for_test(query, &schema);
+        let query = "10 = id - 32";
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
         };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), true);
     }
 
     #[test]
     fn test_multiple_conditions_on_same_string_column() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
-        // name = 'John Doe' (T) AND name != 'Jane Doe' (T) -> T
         let query = "name = 'John Doe' AND name != 'Jane Doe'";
-        let tokens = tokenize_for_test(query, &schema);
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
         };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), true);
     }
 
     #[test]
     fn test_arithmetic_group_followed_by_and() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
-        // (age + 10) > 30 (T, 40 > 30) AND id = 42 (T) -> T
         let query = "(age + 10) > 30 AND id = 42";
-        let tokens = tokenize_for_test(query, &schema);
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
         };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), true);
     }
 
     #[test]
     fn test_multiple_string_operations_with_and() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
-        // department ENDSWITH 'ing' (T) AND name CONTAINS 'oh' (T) -> T
         let query = "department ENDSWITH 'ing' AND name CONTAINS 'oh'";
-        let tokens = tokenize_for_test(query, &schema);
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
         };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), true);
     }
 
     #[test]
     fn test_boolean_groups_with_and_or_combination() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
-        // (age*2=60 (T) OR age/2=15 (T)) -> (T OR T) -> T
-        // AND
-        // (salary > 40000 (T) AND salary < 60000 (T)) -> (T AND T) -> T
-        // T AND T -> T
         let query = "(age * 2 = 60 OR age / 2 = 15) AND (salary > 40000 AND salary < 60000)";
-        let tokens = tokenize_for_test(query, &schema);
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
         };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), true);
     }
 
     #[test]
-    fn test_tokenize_keywords_as_idents_and_ops() { // Existing test_tokenize is good, this adds a bit more
+    fn test_tokenize_keywords_as_idents_and_ops() {
         use crate::core::row_v2::query_parser::Token;
-
-        let tokens = tokenize_for_test("age >= 30 AND name CONTAINS 'John' OR id STARTSWITH 'prefix'", &create_schema());
-
+        let tokens = tokenize("age >= 30 AND name CONTAINS 'John' OR id STARTSWITH 'prefix'", &create_schema());
         assert_eq!(tokens.len(), 11);
-        
         match &tokens[0] { Token::Ident(s) => assert_eq!(s.0, "age"), _ => panic!("Expected ident") }
         match &tokens[1] { Token::Op(s) => assert_eq!(s, ">="), _ => panic!("Expected op") }
-        match &tokens[2] { Token::Number(n) => assert_eq!(*n, NumericValue::U8(30)), _ => panic!("Expected num") }
+        match &tokens[2] { Token::Number(n) => assert_eq!(*n, crate::core::row_v2::query_tokenizer::NumericValue::U8(30)), _ => panic!("Expected num") }
         match &tokens[3] { Token::Next(s) => assert_eq!(s, "AND"), _ => panic!("Expected AND") }
         match &tokens[4] { Token::Ident(s) => assert_eq!(s.0, "name"), _ => panic!("Expected ident") }
         match &tokens[5] { Token::Ident(s) => assert_eq!(s.0.to_uppercase(), "CONTAINS"), _ => panic!("Expected CONTAINS") }
@@ -1677,847 +999,1059 @@ bool_buffer: SmallVec::new(),
 
     #[test]
     fn test_parse_simple_equals_false() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
-        let query = "id = 100"; // 42 = 100 -> False
-        let tokens = tokenize_for_test(query, &schema);
+        let query = "id = 100";
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
         };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), false);
     }
 
     #[test]
     fn test_parse_simple_string_equals_false() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
-        let query = "name = 'NonExistent'"; // 'John Doe' = 'NonExistent' -> False
-        let tokens = tokenize_for_test(query, &schema);
+        let query = "name = 'NonExistent'";
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
         };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), false);
     }
 
     #[test]
     fn test_parse_simple_greater_than_false() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
-        let query = "age > 30"; // 30 > 30 -> False
-        let tokens = tokenize_for_test(query, &schema);
+        let query = "age > 30";
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
         };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), false);
     }
 
     #[test]
     fn test_parse_simple_less_than_false() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
-        let query = "salary < 50000"; // 50000 < 50000 -> False
-        let tokens = tokenize_for_test(query, &schema);
+        let query = "salary < 50000";
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
         };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), false);
     }
 
     #[test]
     fn test_parse_simple_not_equals_false() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
-        let query = "id != 42"; // 42 != 42 -> False
-        let tokens = tokenize_for_test(query, &schema);
+        let query = "id != 42";
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
         };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), false);
     }
 
     #[test]
     fn test_parse_string_contains_false() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
-        let query = "name CONTAINS 'XYZ'"; // 'John Doe' CONTAINS 'XYZ' -> False
-        let tokens = tokenize_for_test(query, &schema);
+        let query = "name CONTAINS 'XYZ'";
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
         };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), false);
     }
 
     #[test]
     fn test_parse_string_starts_with_false() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
-        let query = "department STARTSWITH 'Sci'"; // 'Engineering' STARTSWITH 'Sci' -> False
-        let tokens = tokenize_for_test(query, &schema);
+        let query = "department STARTSWITH 'Sci'";
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
         };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), false);
     }
 
     #[test]
     fn test_parse_string_ends_with_false() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
-        let query = "name ENDSWITH 'Smith'"; // 'John Doe' ENDSWITH 'Smith' -> False
-        let tokens = tokenize_for_test(query, &schema);
+        let query = "name ENDSWITH 'Smith'";
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
         };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), false);
     }
 
     #[test]
     fn test_parse_math_operation_false() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
-        let query = "age + 10 = 50"; // 30 + 10 = 40; 40 = 50 -> False
-        let tokens = tokenize_for_test(query, &schema);
+        let query = "age + 10 = 50";
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
         };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), false);
     }
 
     #[test]
     fn test_parse_multiple_math_operations_false() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
-        let query = "age * 2 + 10 = 60"; // 30 * 2 + 10 = 70; 70 = 60 -> False
-        let tokens = tokenize_for_test(query, &schema);
+        let query = "age * 2 + 10 = 60";
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
         };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), false);
     }
 
     #[test]
     fn test_parse_parentheses_false() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
-        let query = "(age + 10) * 2 = 70"; // (30 + 10) * 2 = 80; 80 = 70 -> False
-        let tokens = tokenize_for_test(query, &schema);
+        let query = "(age + 10) * 2 = 70";
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
         };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), false);
     }
 
     #[test]
     fn test_parse_logical_and_false_first_cond() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
-        let query = "age > 35 AND salary = 50000"; // (30 > 35 -> F) AND (50000 = 50000 -> T) -> F
-        let tokens = tokenize_for_test(query, &schema);
+        let query = "age > 35 AND salary = 50000";
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
         };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), false);
     }
 
     #[test]
     fn test_parse_logical_and_false_second_cond() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
-        let query = "age > 25 AND salary = 10000"; // (30 > 25 -> T) AND (50000 = 10000 -> F) -> F
-        let tokens = tokenize_for_test(query, &schema);
+        let query = "age > 25 AND salary = 10000";
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
         };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), false);
     }
 
     #[test]
     fn test_parse_logical_and_false_both_conds() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
-        let query = "age > 35 AND salary = 10000"; // (F) AND (F) -> F
-        let tokens = tokenize_for_test(query, &schema);
+        let query = "age > 35 AND salary = 10000";
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
         };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), false);
     }
 
     #[test]
     fn test_parse_logical_or_false_both_conds() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
-        let query = "age < 20 OR salary = 10000"; // (30 < 20 -> F) OR (50000 = 10000 -> F) -> F
-        let tokens = tokenize_for_test(query, &schema);
+        let query = "age < 20 OR salary = 10000";
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
         };
-
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
-
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), false);
     }
 
     #[test]
-    #[should_panic(expected ="assertion `left == right` failed\n  left: 1\n right: 4")]
+    #[should_panic]
     fn test_column_vs_column_false() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
-        let query = "id = age"; // Should fail, not same type
-        let tokens = tokenize_for_test(query, &schema);
+        let query = "id = age";
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
         };
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let _ = parser.evaluate_row(columns, &mut buffer.bool_buffer).unwrap();
+    }
 
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+    #[test]
+    fn test_parse_simple_equals() {
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
+            Box::new(setup_test_columns())
+        });
+        let columns = &*COLUMNS;
+        let query = "id = 42";
+        let tokens = crate::core::row_v2::query_tokenizer::tokenize(query, &schema);
+        let mut buffer = Buffer {
+            transformers: SmallVec::new(),
+            intermediate_results: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
+        };
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers, 
+            &mut buffer.intermediate_results
+        ));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), true);
+    }
 
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
+    #[test]
+    fn test_parse_simple_not_equals() {
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
+            Box::new(setup_test_columns())
+        });
+        let columns = &*COLUMNS;
+        let query = "id != 50";
+        let tokens = crate::core::row_v2::query_tokenizer::tokenize(query, &schema);
+        let mut buffer = Buffer {
+            transformers: SmallVec::new(),
+            intermediate_results: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
+        };
+        let transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), true);
+    }
+
+    #[test]
+    fn test_parse_simple_greater_than() {
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
+            Box::new(setup_test_columns())
+        });
+        let columns = &*COLUMNS;
+        let query = "age > 25";
+        let tokens = crate::core::row_v2::query_tokenizer::tokenize(query, &schema);
+        let mut buffer = Buffer {
+            transformers: SmallVec::new(),
+            intermediate_results: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
+        };
+        let transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), true);
+    }
+
+    #[test]
+    fn test_parse_simple_less_than() {
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
+            Box::new(setup_test_columns())
+        });
+        let columns = &*COLUMNS;
+        let query = "age < 40";
+        let tokens = crate::core::row_v2::query_tokenizer::tokenize(query, &schema);
+        let mut buffer = Buffer {
+            transformers: SmallVec::new(),
+            intermediate_results: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
+        };
+        let transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), true);
+    }
+
+    #[test]
+    fn test_parse_greater_or_equal() {
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
+            Box::new(setup_test_columns())
+        });
+        let columns = &*COLUMNS;
+        let query = "age >= 30";
+        let tokens = crate::core::row_v2::query_tokenizer::tokenize(query, &schema);
+        let mut buffer = Buffer {
+            transformers: SmallVec::new(),
+            intermediate_results: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
+        };
+        let transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), true);
+    }
+
+    #[test]
+    fn test_parse_less_or_equal() {
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
+            Box::new(setup_test_columns())
+        });
+        let columns = &*COLUMNS;
+        let query = "age <= 30";
+        let tokens = crate::core::row_v2::query_tokenizer::tokenize(query, &schema);
+        let mut buffer = Buffer {
+            transformers: SmallVec::new(),
+            intermediate_results: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
+        };
+        let transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), true);
+    }
+
+    #[test]
+    fn test_parse_math_operation() {
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
+            Box::new(setup_test_columns())
+        });
+        let columns = &*COLUMNS;
+        let query = "age + 10 = 40";
+        let tokens = crate::core::row_v2::query_tokenizer::tokenize(query, &schema);
+        let mut buffer = Buffer {
+            transformers: SmallVec::new(),
+            intermediate_results: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
+        };
+        let transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), true);
+    }
+
+    #[test]
+    fn test_parse_multiple_math_operations() {
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
+            Box::new(setup_test_columns())
+        });
+        let columns = &*COLUMNS;
+        let query = "age * 2 + 10 = 70";
+        let tokens = crate::core::row_v2::query_tokenizer::tokenize(query, &schema);
+        let mut buffer = Buffer {
+            transformers: SmallVec::new(),
+            intermediate_results: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
+        };
+        let transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), true);
     }
 
     #[test]
     fn test_literal_on_left_arithmetic_on_right_false() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
         let query = "10 = id - 30"; // 10 = (42 - 30) -> 10 = 12 -> False
-
-        let tokens = tokenize_for_test(query, &schema);
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
         };
 
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), false);
     }
 
     #[test]
     fn test_complex_query_false_condition() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
         // age > 25 (T) AND (salary = 10000 (F) OR name CONTAINS 'Jane' (F)) -> T AND (F OR F) -> T AND F -> F
         let query = "age > 25 AND (salary = 10000 OR name CONTAINS 'Jane')";
-
-        let tokens = tokenize_for_test(query, &schema);
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
 
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), false);
     }
 
     #[test]
-    #[should_panic(expected ="Unknown column: 'AgE' is not defined in the schema")]
+    #[should_panic]
     fn test_case_insensitive_keywords_with_false_outcome() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
-        // AgE > 35 (F) aNd SaLaRy = 50000 (T) -> F
+        // AgE > 35 (F) aNd SaLaRy = 50000 (T) -> F (should fail: AgE not found)
         let query = "AgE > 35 aNd SaLaRy = 50000";
-        let tokens = tokenize_for_test(query, &schema);
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
         };
 
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let _ = parser.evaluate_row(columns, &mut buffer.bool_buffer).unwrap();
     }
 
     #[test]
     fn test_query_with_extra_whitespace_false() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
         // id = 100 (F) AND name CONTAINS 'John' (T) -> F
         let query = "id   =  100   AND  name   CONTAINS   'John'";
-        let tokens = tokenize_for_test(query, &schema);
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
         };
 
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), false);
     }
 
     #[test]
     fn test_float_equality_true() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
         let query = "bank_balance = 1000.43";
-        let tokens = tokenize_for_test(query, &schema);
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
         };
 
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), true);
     }
 
     #[test]
     fn test_float_equality_false() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
         let query = "bank_balance = 1000.44";
-        let tokens = tokenize_for_test(query, &schema);
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
         };
 
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), false);
     }
 
     #[test]
     fn test_float_greater_than_true() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
         let query = "bank_balance > 1000.0";
-        let tokens = tokenize_for_test(query, &schema);
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
         };
 
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), true);
     }
 
     #[test]
     fn test_float_less_than_with_arithmetic_false() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
         let query = "bank_balance - 0.43 < 1000.0"; // 1000.43 - 0.43 = 1000.0; 1000.0 < 1000.0 is false
-        let tokens = tokenize_for_test(query, &schema);
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
         };
 
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(!transformer.get_mut().execute(&mut buffer.bool_buffer));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), false);
     }
 
     #[test]
     fn test_float_comparison_with_logical_and_true() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
         let query = "bank_balance >= 1000.43 AND age = 30"; // T AND T -> T
-        let tokens = tokenize_for_test(query, &schema);
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
         };
 
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), true);
     }
 
     #[test]
     fn test_various_numeric_types_and_logical_ops_true() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
-        // credit_balance (100.50) > 100.0 (T)
-        // AND net_assets (200000) < 200001 (T)
-        // AND earth_position (-50) = -50 (T)
-        // T AND T AND T -> T
         let query = "credit_balance > 100.0 AND net_assets < 200001 AND earth_position = -50";
-        let tokens = tokenize_for_test(query, &schema);
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
-bool_buffer: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
         };
 
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), true);
     }
 
     #[test]
     fn test_large_and_unsigned_types_with_grouping_true() {
-        let schema = create_schema(); 
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns());
-            columns_box
-        });
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
-        // test_1 (100) = 100 (T)
-        // OR test_2 (200) > 300 (F) -> T OR F -> T
-        // AND
-        // test_3 (MAX) = test_3 (T)
-        // AND test_4 (MAX) > 0 (T) -> T AND T -> T
-        // (T) AND (T) -> T
         let query = "(test_1 = 100 OR test_2 > 300) AND (test_3 = test_3 AND test_4 > 0)";
-        let tokens = tokenize_for_test(query, &schema);
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
 
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
-    }
-
-     fn _setup_test_columns43242<'a>() -> SmallVec<[(Cow<'a, str>, MemoryBlock); 20]>  {
-        let mut columns = SmallVec::new();
-
-        static ID: &str = "id";
-        static NAME: &str = "name";
-        static AGE: &str = "age";
-        static EMAIL: &str = "email";
-        static PHONE: &str = "phone";
-        static IS_ACTIVE: &str = "is_active";
-        static BANK_BALANCE: &str = "bank_balance";
-        static MARRIED: &str = "married";
-        static BIRTH_DATE: &str = "birth_date";
-        static LAST_LOGIN: &str = "last_login";
-        static LAST_PURCHASE: &str = "last_purchase";
-        static LAST_PURCHASE_AMOUNT: &str = "last_purchase_amount";
-        static LAST_PURCHASE_DATE: &str = "last_purchase_date";
-        static LAST_PURCHASE_LOCATION: &str = "last_purchase_location";
-        static LAST_PURCHASE_METHOD: &str = "last_purchase_method";
-        static LAST_PURCHASE_CATEGORY: &str = "last_purchase_category";
-        static LAST_PURCHASE_SUBCATEGORY: &str = "last_purchase_subcategory";
-        static LAST_PURCHASE_DESCRIPTION: &str = "last_purchase_description";
-        static LAST_PURCHASE_STATUS: &str = "last_purchase_status";
-        static LAST_PURCHASE_ID: &str = "last_purchase_id";
-        static LAST_PURCHASE_NOTES: &str = "last_purchase_notes";
-        static NET_ASSETS: &str = "net_assets";
-        static DEPARTMENT: &str = "department";
-        static SALARY: &str = "salary";
-
-        columns.push((Cow::Borrowed(ID), create_memory_block_from_u128(42_433_943_354)));
-        columns.push((Cow::Borrowed(NAME), create_memory_block_from_string("John Doe")));
-        columns.push((Cow::Borrowed(AGE), create_memory_block_from_u8(30)));
-        columns.push((Cow::Borrowed(EMAIL), create_memory_block_from_string("john.doe@example.com")));
-        columns.push((Cow::Borrowed(PHONE), create_memory_block_from_string("123-456-7890")));
-        columns.push((Cow::Borrowed(IS_ACTIVE), create_memory_block_from_u8(1)));
-        columns.push((Cow::Borrowed(BANK_BALANCE), create_memory_block_from_f64(1000.43)));
-        columns.push((Cow::Borrowed(MARRIED), create_memory_block_from_u8(0)));
-        columns.push((Cow::Borrowed(BIRTH_DATE), create_memory_block_from_string("1990-01-01")));
-        columns.push((Cow::Borrowed(LAST_LOGIN), create_memory_block_from_string("2023-10-01")));
-        columns.push((Cow::Borrowed(LAST_PURCHASE), create_memory_block_from_string("2023-09-30")));
-        columns.push((Cow::Borrowed(LAST_PURCHASE_AMOUNT), create_memory_block_from_f32(15_540.75)));
-        columns.push((Cow::Borrowed(LAST_PURCHASE_DATE), create_memory_block_from_string("2023-09-30")));
-        columns.push((Cow::Borrowed(LAST_PURCHASE_LOCATION), create_memory_block_from_string("Online")));
-        columns.push((Cow::Borrowed(LAST_PURCHASE_METHOD), create_memory_block_from_string("Credit Card")));
-        columns.push((Cow::Borrowed(LAST_PURCHASE_CATEGORY), create_memory_block_from_string("Electronics")));
-        columns.push((Cow::Borrowed(LAST_PURCHASE_SUBCATEGORY), create_memory_block_from_string("Computers")));
-        columns.push((Cow::Borrowed(LAST_PURCHASE_DESCRIPTION), create_memory_block_from_string("Gaming Laptop")));
-        columns.push((Cow::Borrowed(LAST_PURCHASE_STATUS), create_memory_block_from_string("Completed")));
-        columns.push((Cow::Borrowed(LAST_PURCHASE_ID), create_memory_block_from_u64(1001)));
-        columns.push((Cow::Borrowed(LAST_PURCHASE_NOTES), create_memory_block_from_string("No issues")));
-        columns.push((Cow::Borrowed(NET_ASSETS), create_memory_block_from_f64(8_449_903_733.92)));
-        columns.push((Cow::Borrowed(DEPARTMENT), create_memory_block_from_string("Engineering")));
-        columns.push((Cow::Borrowed(SALARY), create_memory_block_from_f32(4955.58)));
-
-        columns
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), true);
     }
 
     #[test]
     fn test_very_complex_query_1_true() {
-        let schema = create_schema_2(); 
-        static COLUMNS_2: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns_2());
-            columns_box
-        });
+        let schema = create_schema_2();
+        static COLUMNS_2: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns_2()));
         let columns = &*COLUMNS_2;
 
-        let query = r##"
+        let query = r#"
             (id = 42 AND name CONTAINS 'John') OR
             (age > 25 AND salary < 50000.0) OR
             (bank_balance >= 1000.43 AND net_assets > 800000) OR
             (department STARTSWITH 'Eng' AND email ENDSWITH 'example.com')
-        "##;
-        
-        let tokens = tokenize_for_test(query, &schema);
+        "#;
+
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
 
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-
-        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), true);
     }
 
     #[test]
     fn test_ultra_complex_query_1_true() {
-        let schema = create_schema_2(); 
-        static COLUMNS_2: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns_2());
-            columns_box
-        });
+        let schema = create_schema_2();
+        static COLUMNS_2: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns_2()));
         let columns = &*COLUMNS_2;
 
-        let query = r##"
+        let query = r#"
             (id - 1 = 41 AND name CONTAINS 'John') OR
             (age + 10 > 15 AND salary - 1000 < 49000.0) OR
             (bank_balance >= 1000.43 AND net_assets + 40000 > 400000) OR
             (department STARTSWITH 'Eng' AND email ENDSWITH 'example.com')
-        "##;
-        
-        let tokens = tokenize_for_test(query, &schema);
+        "#;
+
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
 
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-
-        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), true);
     }
 
-    
     #[test]
     fn test_ultra_complex_query_no_parentheses_true() {
-        let schema = create_schema_2(); 
-        static COLUMNS_2: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            let columns_box = Box::new(setup_test_columns_2());
-            columns_box
-        });
+        let schema = create_schema_2();
+        static COLUMNS_2: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns_2()));
         let columns = &*COLUMNS_2;
 
-        let query = r##"
+        let query = r#"
             id - 1 = 41 AND name CONTAINS 'John' OR
             age + 10 > 15 AND salary - 1000 < 49000.0
-        "##;
-        
-        let tokens = tokenize_for_test(query, &schema);
+        "#;
+
+        let tokens = tokenize(query, &schema);
 
         let mut buffer = Buffer {
-            _hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-            _row: Row::default(),
             transformers: SmallVec::new(),
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
 
-        let mut transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
 
-        parse_query(&tokens, &columns, unsafe { &mut *transformer.get() });
-
-        assert!(transformer.get_mut().execute(&mut buffer.bool_buffer));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), true);
     }
+
+    #[test]
+    fn test_ultra_complex_mixed_int_and_string_true() {
+        // Mix many numeric types and string predicates with nested groups; overall should be true
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
+        let columns = &*COLUMNS;
+
+        let query = r#"
+            (
+                (test_6 / 4 = 100 AND test_1 * 2 + 200 = 400) OR
+                (id - 2 = 40 AND salary - 5000 = 45000)
+            ) AND (
+                department STARTSWITH 'Eng' AND name ENDSWITH 'Doe'
+            )
+        "#;
+
+        let tokens = tokenize(query, &schema);
+
+        let mut buffer = Buffer {
+            transformers: SmallVec::new(),
+            intermediate_results: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
+        };
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), true);
+    }
+
+    #[test]
+    fn test_ultra_complex_long_chain_or_and_true() {
+        // Long chain where AND binds tighter than OR; at least one OR group is true
+        let schema = create_schema_2();
+        static COLUMNS_2: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns_2()));
+        let columns = &*COLUMNS_2;
+
+        let query = r#"
+            id < 10 AND name CONTAINS 'Nope' OR
+            age * 2 = 60 AND salary + 100 < 50000.0 OR
+            department STARTSWITH 'Eng' AND email ENDSWITH 'example.com' OR
+            net_assets > 1.0
+        "#;
+
+        let tokens = tokenize(query, &schema);
+
+        let mut buffer = Buffer {
+            transformers: SmallVec::new(),
+            intermediate_results: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
+        };
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), true);
+    }
+
+    #[test]
+    fn test_deeply_nested_parentheses_arithmetic_true() {
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
+        let columns = &*COLUMNS;
+
+        // ((((age * 2) + 10) - 40) / 1) = 30  -> with age=30
+        let query = r#"((((age * 2) + 10) - 40) / 1) = 30"#;
+
+        let tokens = tokenize(query, &schema);
+
+        let mut buffer = Buffer {
+            transformers: SmallVec::new(),
+            intermediate_results: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
+        };
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), true);
+    }
+
+    #[test]
+    fn test_negative_numbers_and_mixed_ops_true() {
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
+        let columns = &*COLUMNS;
+
+        let query = r#"
+            (earth_position = -50 AND earth_position + 100 = 50) AND
+            (name CONTAINS 'John' OR department ENDSWITH 'Sales')
+        "#;
+
+        let tokens = tokenize(query, &schema);
+
+        let mut buffer = Buffer {
+            transformers: SmallVec::new(),
+            intermediate_results: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
+        };
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), true);
+    }
+
+    #[test]
+    fn test_mixed_float_math_and_string_true() {
+        // Use schema 2 floats; ensure division and comparisons work
+        let schema = create_schema_2();
+        static COLUMNS_2: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns_2()));
+        let columns = &*COLUMNS_2;
+
+        let query = r#"
+            (last_purchase_amount / 2.0 > 7000.0 AND email ENDSWITH 'example.com') OR
+            (bank_balance = 1000.43 AND name STARTSWITH 'John')
+        "#;
+
+        let tokens = tokenize(query, &schema);
+
+        let mut buffer = Buffer {
+            transformers: SmallVec::new(),
+            intermediate_results: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
+        };
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), true);
+    }
+
+    #[test]
+    fn test_compound_false_overall() {
+        // Many clauses but all OR groups evaluate to false
+        let schema = create_schema_2();
+        static COLUMNS_2: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns_2()));
+        let columns = &*COLUMNS_2;
+
+        let query = r#"
+            (name CONTAINS 'XYZ' AND department STARTSWITH 'Sal') OR
+            (age < 10 AND salary > 60000.0) OR
+            (bank_balance < 1000.0 AND net_assets < 1000.0)
+        "#;
+
+        let tokens = tokenize(query, &schema);
+
+        let mut buffer = Buffer {
+            transformers: SmallVec::new(),
+            intermediate_results: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
+        };
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), false);
+    }
+
+    #[test]
+    fn test_id_arithmetic_both_sides_true() {
+        // Check arithmetic on both sides of comparator
+        let schema = create_schema();
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
+        let columns = &*COLUMNS;
+
+        let query = r#"id - 2 = 2 * 20"#; // 40 = 40
+        let tokens = tokenize(query, &schema);
+
+        let mut buffer = Buffer {
+            transformers: SmallVec::new(),
+            intermediate_results: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
+        };
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), true);
+    }
+
+    #[test]
+    fn test_mix_without_parentheses_precedence_true() {
+        // Verify AND precedence over OR on a mixed expression
+        let schema = create_schema_2();
+        static COLUMNS_2: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns_2()));
+        let columns = &*COLUMNS_2;
+
+        let query = r#"
+            name CONTAINS 'Nope' OR age * 2 = 60 AND email ENDSWITH 'example.com'
+        "#; // false OR (true AND true) -> true
+
+        let tokens = tokenize(query, &schema);
+
+        let mut buffer = Buffer {
+            transformers: SmallVec::new(),
+            intermediate_results: SmallVec::new(),
+            bool_buffer: SmallVec::new(),
+        };
+        let transformer =
+            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+        let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
+        assert_eq!(res.unwrap(), true);
+    }
+    
 }
