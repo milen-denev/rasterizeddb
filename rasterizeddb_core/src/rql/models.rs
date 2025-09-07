@@ -10,13 +10,13 @@ pub enum ComparerOperation {
     Greater,
     GreaterOrEquals,
     Less,
-    LessOrEquals
+    LessOrEquals,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Next {
     And,
-    Or
+    Or,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -26,7 +26,7 @@ pub enum MathOperation {
     Multiply,
     Divide,
     Exponent,
-    Root
+    Root,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -34,5 +34,5 @@ pub enum Token {
     Column(u32),
     Value(Column),
     Operation(ComparerOperation),
-    Math(MathOperation)
+    Math(MathOperation),
 }

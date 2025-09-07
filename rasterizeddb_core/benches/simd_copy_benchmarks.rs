@@ -1,7 +1,9 @@
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 
-use rasterizeddb_core::instructions::{simd_memcpy, simd_memcpy_aggressive, simd_memcpy_avx2_multi};
+use rasterizeddb_core::instructions::{
+    simd_memcpy, simd_memcpy_aggressive, simd_memcpy_avx2_multi,
+};
 
 fn rust_std_copy(dst: &mut [u8], src: &[u8]) {
     dst.copy_from_slice(src);

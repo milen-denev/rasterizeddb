@@ -1,7 +1,9 @@
 use std::{
-    arch::x86_64::{_mm_prefetch, _MM_HINT_T0},
+    arch::x86_64::{_MM_HINT_T0, _mm_prefetch},
     fmt::{Debug, Display},
-    io::{self, Cursor, Read, Write}, ops::{Deref, DerefMut}, pin::Pin
+    io::{self, Cursor, Read, Write},
+    ops::{Deref, DerefMut},
+    pin::Pin,
 };
 
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -14,8 +16,8 @@ use crate::{
     },
     memory_pool::MemoryBlock,
     simds::endianess::{
-        read_f32, read_f64, read_i128, read_i16, read_i32, read_i64, read_i8, read_u128, read_u16,
-        read_u32, read_u64, read_u8,
+        read_f32, read_f64, read_i8, read_i16, read_i32, read_i64, read_i128, read_u8, read_u16,
+        read_u32, read_u64, read_u128,
     },
 };
 
@@ -45,7 +47,10 @@ impl DerefMut for Column {
 
 impl Default for Column {
     fn default() -> Self {
-        Self { data_type: DbType::TBD, content: Default::default() }
+        Self {
+            data_type: DbType::TBD,
+            content: Default::default(),
+        }
     }
 }
 
@@ -70,10 +75,11 @@ impl PartialEq for ColumnValue {
                 ColumnValue::StaticMemoryPointer(pointer_b),
             ) => unsafe {
                 compare_raw_vecs(
-                    pointer_a.into_slice().as_ptr() as *mut u8, 
-                    pointer_b.into_slice().as_ptr() as *mut u8, 
-                    pointer_a.into_slice().len(),  
-                    pointer_b.into_slice().len())
+                    pointer_a.into_slice().as_ptr() as *mut u8,
+                    pointer_b.into_slice().as_ptr() as *mut u8,
+                    pointer_a.into_slice().len(),
+                    pointer_b.into_slice().len(),
+                )
             },
             (ColumnValue::ManagedMemoryPointer(a), ColumnValue::ManagedMemoryPointer(b)) => {
                 compare_vecs_eq(a, b)
@@ -120,7 +126,10 @@ impl ColumnValue {
     pub fn as_slice(&self) -> &[u8] {
         match self {
             ColumnValue::StaticMemoryPointer(chunk) => unsafe {
-                std::slice::from_raw_parts::<u8>(chunk.into_slice().as_ptr(), chunk.into_slice().len() as usize)
+                std::slice::from_raw_parts::<u8>(
+                    chunk.into_slice().as_ptr(),
+                    chunk.into_slice().len() as usize,
+                )
             },
             ColumnValue::ManagedMemoryPointer(vec) => vec.as_slice(),
             _ => panic!("Operation is not supported, column is in temporary state."),
@@ -129,10 +138,13 @@ impl ColumnValue {
 
     pub fn to_vec(&self) -> Vec<u8> {
         match self {
-            ColumnValue::StaticMemoryPointer(chunk) => {
-                vec_from_ptr_safe(chunk.into_slice().as_ptr() as *mut u8, chunk.into_slice().len() as usize)
+            ColumnValue::StaticMemoryPointer(chunk) => vec_from_ptr_safe(
+                chunk.into_slice().as_ptr() as *mut u8,
+                chunk.into_slice().len() as usize,
+            ),
+            ColumnValue::ManagedMemoryPointer(vec) => {
+                vec_from_ptr_safe(vec.as_ptr() as *mut u8, vec.len())
             }
-            ColumnValue::ManagedMemoryPointer(vec) => vec_from_ptr_safe(vec.as_ptr() as *mut u8, vec.len()),
             _ => panic!("Operation is not supported, column is in temporary state."),
         }
     }
@@ -167,7 +179,9 @@ impl ColumnValue {
 
     pub fn get_ptr(&self) -> *mut u8 {
         match self {
-            ColumnValue::StaticMemoryPointer(chunk) => chunk.into_slice().as_ptr().clone() as *mut u8,
+            ColumnValue::StaticMemoryPointer(chunk) => {
+                chunk.into_slice().as_ptr().clone() as *mut u8
+            }
             ColumnValue::ManagedMemoryPointer(vec) => vec.as_ptr() as *mut u8,
             _ => panic!("Operation is not supported, column is in temporary state."),
         }
@@ -294,10 +308,16 @@ impl Column {
                 let string_value = str::parse::<String>(value.as_ref()).unwrap();
                 buffer.write_all(string_value.as_bytes()).unwrap();
                 Ok(buffer)
-            },
+            }
             "bool" => {
                 let mut buffer: Vec<u8> = Vec::with_capacity(1);
-                buffer.write(&[if str::parse::<bool>(value.as_ref()).unwrap() { 1 } else { 0 }]).unwrap();
+                buffer
+                    .write(&[if str::parse::<bool>(value.as_ref()).unwrap() {
+                        1
+                    } else {
+                        0
+                    }])
+                    .unwrap();
                 Ok(buffer)
             }
             // "datetime" => {
@@ -457,7 +477,9 @@ impl Column {
     pub unsafe fn into_chunk(self) -> io::Result<MemoryBlock> {
         let chunk = match self.content {
             ColumnValue::StaticMemoryPointer(chunk) => chunk,
-            ColumnValue::ManagedMemoryPointer(vec) => MemoryBlock::from_vec(vec_from_ptr_safe(vec.as_ptr() as *mut u8, vec.len())),
+            ColumnValue::ManagedMemoryPointer(vec) => {
+                MemoryBlock::from_vec(vec_from_ptr_safe(vec.as_ptr() as *mut u8, vec.len()))
+            }
             _ => panic!("Operation is not supported, column is in temporary state."),
         };
 
@@ -520,7 +542,7 @@ impl Column {
 
     pub fn from_chunk(data_type: u8, chunk: MemoryBlock) -> Column {
         let vec = chunk.into_slice();
-        
+
         Column {
             data_type: DbType::from_byte(data_type),
             content: ColumnValue::ManagedMemoryPointer(Box::pin(vec.to_vec().clone())),
@@ -528,7 +550,12 @@ impl Column {
     }
 
     pub fn from_raw_clone(data_type: u8, buffer: &[u8]) -> Column {
-        let column_value = { ColumnValue::ManagedMemoryPointer(Box::pin(vec_from_ptr_safe(buffer.as_ptr() as *mut u8, buffer.len()))) };
+        let column_value = {
+            ColumnValue::ManagedMemoryPointer(Box::pin(vec_from_ptr_safe(
+                buffer.as_ptr() as *mut u8,
+                buffer.len(),
+            )))
+        };
 
         Column {
             data_type: DbType::from_byte(data_type),
@@ -668,10 +695,9 @@ impl Column {
                 value.to_string()
             }
             DbType::CHAR => {
-                let value = char::from_u32(LittleEndian::read_u32(
-                    self.content.as_slice().as_ref(),
-                ))
-                .unwrap();
+                let value =
+                    char::from_u32(LittleEndian::read_u32(self.content.as_slice().as_ref()))
+                        .unwrap();
                 value.to_string()
             }
             DbType::STRING => {
@@ -780,7 +806,7 @@ impl Column {
 
                 let i32_1 = unsafe { read_i32(ptr_1) };
                 let i32_2 = unsafe { read_i32(ptr_2) };
-                
+
                 i32_1 > i32_2
             }
             DbType::I64 => {

@@ -1,10 +1,16 @@
 use rastcp::{client::TcpClientBuilder, server::TcpServerBuilder};
-use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::Duration;
 use tokio::time::{sleep, timeout};
 
 // Helper function to create a test server
-async fn create_test_server(addr: &str, port: u16) -> (tokio::task::JoinHandle<()>, Arc<AtomicUsize>) {
+async fn create_test_server(
+    addr: &str,
+    port: u16,
+) -> (tokio::task::JoinHandle<()>, Arc<AtomicUsize>) {
     let message_count = Arc::new(AtomicUsize::new(0));
     let message_count_clone = message_count.clone();
 
@@ -15,10 +21,13 @@ async fn create_test_server(addr: &str, port: u16) -> (tokio::task::JoinHandle<(
         .unwrap();
 
     let handle = tokio::spawn(async move {
-        server.run(move |data| {
-            message_count_clone.fetch_add(1, Ordering::SeqCst);
-            async move { data }
-        }).await.unwrap();
+        server
+            .run(move |data| {
+                message_count_clone.fetch_add(1, Ordering::SeqCst);
+                async move { data }
+            })
+            .await
+            .unwrap();
     });
 
     // Allow server to start
@@ -72,7 +81,9 @@ async fn test_client_reconnection() {
     // Check message count
     assert_eq!(message_count.load(Ordering::SeqCst), 3);
 
-    timeout(Duration::from_millis(100), server_handle).await.ok();
+    timeout(Duration::from_millis(100), server_handle)
+        .await
+        .ok();
 }
 
 #[tokio::test]
@@ -104,7 +115,9 @@ async fn test_large_messages() {
     let large_response = client.send(large_msg.clone()).await.unwrap();
     assert_eq!(large_response.len(), large_msg.len());
 
-    timeout(Duration::from_millis(100), server_handle).await.ok();
+    timeout(Duration::from_millis(100), server_handle)
+        .await
+        .ok();
 }
 
 #[tokio::test]
@@ -158,9 +171,14 @@ async fn test_concurrent_connections() {
     sleep(Duration::from_millis(500)).await;
 
     // Check total message count
-    assert_eq!(message_count.load(Ordering::SeqCst), client_count * messages_per_client);
+    assert_eq!(
+        message_count.load(Ordering::SeqCst),
+        client_count * messages_per_client
+    );
 
-    timeout(Duration::from_millis(100), server_handle).await.ok();
+    timeout(Duration::from_millis(100), server_handle)
+        .await
+        .ok();
 }
 
 #[tokio::test]
@@ -179,11 +197,11 @@ async fn test_connection_timeout() {
     match result {
         Err(rastcp::error::RastcpError::ConnectionTimeout) => {
             // This is the expected outcome
-        },
+        }
         Err(e) => {
             // Other errors might be acceptable depending on OS (like connection refused)
             println!("Got error: {:?}", e);
-        },
+        }
         Ok(_) => {
             panic!("Expected connection to timeout but it succeeded");
         }
@@ -202,13 +220,16 @@ async fn test_client_handler_errors() {
         .unwrap();
 
     let server_handle = tokio::spawn(async move {
-        server.run(|data| async move {
-            // Convert request to string, uppercase it, and send back
-            match String::from_utf8(data) {
-                Ok(s) => s.to_uppercase().into_bytes(),
-                Err(_) => b"Invalid UTF-8".to_vec(),
-            }
-        }).await.unwrap();
+        server
+            .run(|data| async move {
+                // Convert request to string, uppercase it, and send back
+                match String::from_utf8(data) {
+                    Ok(s) => s.to_uppercase().into_bytes(),
+                    Err(_) => b"Invalid UTF-8".to_vec(),
+                }
+            })
+            .await
+            .unwrap();
     });
 
     // Allow server to start
@@ -230,7 +251,9 @@ async fn test_client_handler_errors() {
     let response = client.send(invalid_utf8).await.unwrap();
     assert_eq!(String::from_utf8_lossy(&response), "Invalid UTF-8");
 
-    timeout(Duration::from_millis(100), server_handle).await.ok();
+    timeout(Duration::from_millis(100), server_handle)
+        .await
+        .ok();
 }
 
 // Simple benchmark test to measure throughput
@@ -265,9 +288,14 @@ async fn test_throughput_benchmark() {
     let throughput = (msg_count * msg_size) as f64 / elapsed.as_secs_f64() / 1024.0 / 1024.0;
 
     println!("Throughput: {:.2} MB/s", throughput);
-    println!("Average latency: {:.2} ms", elapsed.as_millis() as f64 / msg_count as f64);
+    println!(
+        "Average latency: {:.2} ms",
+        elapsed.as_millis() as f64 / msg_count as f64
+    );
 
     // No specific assertion, just for information
 
-    timeout(Duration::from_millis(100), server_handle).await.ok();
+    timeout(Duration::from_millis(100), server_handle)
+        .await
+        .ok();
 }

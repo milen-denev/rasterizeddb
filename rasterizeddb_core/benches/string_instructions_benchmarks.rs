@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
 use rasterizeddb_core::core::row_v2::{
     common::simd_compare_strings, transformer::ComparerOperation,
@@ -33,7 +33,6 @@ fn std_ends_with(text: &[u8], suffix: &[u8]) -> bool {
     text_str.ends_with(suffix_str)
 }
 
-
 fn criterion_benchmark_string_ops(c: &mut Criterion) {
     // Data for Equals
     let s_eq_32_a = "0123456789abcdef0123456789abcdef".as_bytes(); // len 32
@@ -53,7 +52,7 @@ fn criterion_benchmark_string_ops(c: &mut Criterion) {
     let pattern_start = "abcdefghijklmnopqrstuvwxyz".as_bytes(); // len 26
     let pattern_end = "ghijklmnopqrstuvwxyz".as_bytes(); // len 20, (matches end of text_main)
     let pattern_not_found = "not_in_the_text_at_all_12345".as_bytes(); // len 29
-   
+
     let mut group = c.benchmark_group("string_operations");
 
     // Equals
@@ -62,34 +61,59 @@ fn criterion_benchmark_string_ops(c: &mut Criterion) {
         ("len35_mismatch_content", s_eq_35_a, s_eq_35_c_diff),
         ("mismatch_len", s_eq_32_a, s_short_other_len),
     ] {
-        group.bench_with_input(BenchmarkId::new("simd_equals", id_suffix), &(s1, s2), |b, (s1, s2)| {
-            b.iter(|| simd_compare_strings(black_box(s1), black_box(s2), &ComparerOperation::Equals))
-        });
-        group.bench_with_input(BenchmarkId::new("std_equals", id_suffix), &(s1, s2), |b, (s1, s2)| {
-            b.iter(|| std_equals(black_box(s1), black_box(s2)))
-        });
+        group.bench_with_input(
+            BenchmarkId::new("simd_equals", id_suffix),
+            &(s1, s2),
+            |b, (s1, s2)| {
+                b.iter(|| {
+                    simd_compare_strings(black_box(s1), black_box(s2), &ComparerOperation::Equals)
+                })
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("std_equals", id_suffix),
+            &(s1, s2),
+            |b, (s1, s2)| b.iter(|| std_equals(black_box(s1), black_box(s2))),
+        );
     }
 
     // NotEquals
     for (id_suffix, s1, s2, expected_simd, expected_std) in [
-        ("len32_mismatch_content", s_eq_32_a, s_eq_32_c_diff, true, true),
+        (
+            "len32_mismatch_content",
+            s_eq_32_a,
+            s_eq_32_c_diff,
+            true,
+            true,
+        ),
         ("len32_match", s_eq_32_a, s_eq_32_b, false, false),
         ("mismatch_len", s_eq_32_a, s_short_other_len, true, true),
     ] {
-        group.bench_with_input(BenchmarkId::new("simd_not_equals", id_suffix), &(s1,s2), |b, (s1,s2)| {
-            b.iter(|| {
-                let res = simd_compare_strings(black_box(s1), black_box(s2), &ComparerOperation::NotEquals);
-                assert_eq!(res, expected_simd);
-            })
-        });
-         group.bench_with_input(BenchmarkId::new("std_not_equals", id_suffix), &(s1,s2), |b, (s1,s2)| {
-            b.iter(|| {
-                let res = !std_equals(black_box(s1), black_box(s2));
-                assert_eq!(res, expected_std);
-            })
-        });
+        group.bench_with_input(
+            BenchmarkId::new("simd_not_equals", id_suffix),
+            &(s1, s2),
+            |b, (s1, s2)| {
+                b.iter(|| {
+                    let res = simd_compare_strings(
+                        black_box(s1),
+                        black_box(s2),
+                        &ComparerOperation::NotEquals,
+                    );
+                    assert_eq!(res, expected_simd);
+                })
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("std_not_equals", id_suffix),
+            &(s1, s2),
+            |b, (s1, s2)| {
+                b.iter(|| {
+                    let res = !std_equals(black_box(s1), black_box(s2));
+                    assert_eq!(res, expected_std);
+                })
+            },
+        );
     }
-
 
     // Contains
     for (id_suffix, text, pattern, expected_simd, expected_std) in [
@@ -98,18 +122,30 @@ fn criterion_benchmark_string_ops(c: &mut Criterion) {
         // SIMD contains returns false for empty pattern, std::str::contains returns true
         ("empty_pattern", text_main, s_empty, false, true),
     ] {
-        group.bench_with_input(BenchmarkId::new("simd_contains", id_suffix), &(text,pattern), |b, (text,pattern)| {
-            b.iter(|| {
-                let res = simd_compare_strings(black_box(text), black_box(pattern), &ComparerOperation::Contains);
-                assert_eq!(res, expected_simd);
-            })
-        });
-        group.bench_with_input(BenchmarkId::new("std_contains", id_suffix), &(text,pattern), |b, (text,pattern)| {
-            b.iter(|| {
-                let res = std_contains(black_box(text), black_box(pattern));
-                assert_eq!(res, expected_std);
-            })
-        });
+        group.bench_with_input(
+            BenchmarkId::new("simd_contains", id_suffix),
+            &(text, pattern),
+            |b, (text, pattern)| {
+                b.iter(|| {
+                    let res = simd_compare_strings(
+                        black_box(text),
+                        black_box(pattern),
+                        &ComparerOperation::Contains,
+                    );
+                    assert_eq!(res, expected_simd);
+                })
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("std_contains", id_suffix),
+            &(text, pattern),
+            |b, (text, pattern)| {
+                b.iter(|| {
+                    let res = std_contains(black_box(text), black_box(pattern));
+                    assert_eq!(res, expected_std);
+                })
+            },
+        );
     }
 
     // StartsWith
@@ -118,18 +154,30 @@ fn criterion_benchmark_string_ops(c: &mut Criterion) {
         ("mismatch", text_main, pattern_mid, false, false),
         ("empty_pattern", text_main, s_empty, true, true), // SIMD starts_with returns true for empty pattern
     ] {
-        group.bench_with_input(BenchmarkId::new("simd_starts_with", id_suffix), &(text,pattern), |b, (text,pattern)| {
-            b.iter(|| {
-                let res = simd_compare_strings(black_box(text), black_box(pattern), &ComparerOperation::StartsWith);
-                assert_eq!(res, expected_simd);
-            })
-        });
-        group.bench_with_input(BenchmarkId::new("std_starts_with", id_suffix), &(text,pattern), |b, (text,pattern)| {
-            b.iter(|| {
-                let res = std_starts_with(black_box(text), black_box(pattern));
-                assert_eq!(res, expected_std);
-            })
-        });
+        group.bench_with_input(
+            BenchmarkId::new("simd_starts_with", id_suffix),
+            &(text, pattern),
+            |b, (text, pattern)| {
+                b.iter(|| {
+                    let res = simd_compare_strings(
+                        black_box(text),
+                        black_box(pattern),
+                        &ComparerOperation::StartsWith,
+                    );
+                    assert_eq!(res, expected_simd);
+                })
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("std_starts_with", id_suffix),
+            &(text, pattern),
+            |b, (text, pattern)| {
+                b.iter(|| {
+                    let res = std_starts_with(black_box(text), black_box(pattern));
+                    assert_eq!(res, expected_std);
+                })
+            },
+        );
     }
 
     // EndsWith
@@ -138,18 +186,30 @@ fn criterion_benchmark_string_ops(c: &mut Criterion) {
         ("mismatch", text_main, pattern_mid, false, false),
         ("empty_pattern", text_main, s_empty, true, true), // SIMD ends_with returns true for empty pattern
     ] {
-        group.bench_with_input(BenchmarkId::new("simd_ends_with", id_suffix), &(text,pattern), |b, (text,pattern)| {
-            b.iter(|| {
-                let res = simd_compare_strings(black_box(text), black_box(pattern), &ComparerOperation::EndsWith);
-                assert_eq!(res, expected_simd);
-            })
-        });
-        group.bench_with_input(BenchmarkId::new("std_ends_with", id_suffix), &(text,pattern), |b, (text,pattern)| {
-            b.iter(|| {
-                let res = std_ends_with(black_box(text), black_box(pattern));
-                assert_eq!(res, expected_std);
-            })
-        });
+        group.bench_with_input(
+            BenchmarkId::new("simd_ends_with", id_suffix),
+            &(text, pattern),
+            |b, (text, pattern)| {
+                b.iter(|| {
+                    let res = simd_compare_strings(
+                        black_box(text),
+                        black_box(pattern),
+                        &ComparerOperation::EndsWith,
+                    );
+                    assert_eq!(res, expected_simd);
+                })
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("std_ends_with", id_suffix),
+            &(text, pattern),
+            |b, (text, pattern)| {
+                b.iter(|| {
+                    let res = std_ends_with(black_box(text), black_box(pattern));
+                    assert_eq!(res, expected_std);
+                })
+            },
+        );
     }
 
     group.finish();

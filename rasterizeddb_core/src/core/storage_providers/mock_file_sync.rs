@@ -1,18 +1,23 @@
 use std::{
     fs::{self, remove_file},
     io::{Cursor, Read, Seek, SeekFrom},
-    path::{Path, PathBuf}, sync::Arc
+    path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use crossbeam_queue::SegQueue;
 use futures::future::join_all;
 use memmap2::{Mmap, MmapOptions};
 use temp_testdir::TempDir;
-use tokio::{io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt}, sync::RwLock, task::yield_now};
+use tokio::{
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    sync::RwLock,
+    task::yield_now,
+};
 
 use crate::memory_pool::MemoryBlock;
 
-use super::{traits::StorageIO, CRC};
+use super::{CRC, traits::StorageIO};
 
 pub struct MockStorageProvider {
     pub(super) append_file: Arc<RwLock<tokio::fs::File>>,
@@ -26,8 +31,8 @@ pub struct MockStorageProvider {
     pub(crate) _memory_map: Mmap,
 }
 
-unsafe impl Sync for MockStorageProvider { }
-unsafe impl Send for MockStorageProvider { }
+unsafe impl Sync for MockStorageProvider {}
+unsafe impl Send for MockStorageProvider {}
 
 impl Clone for MockStorageProvider {
     fn clone(&self) -> Self {
@@ -40,9 +45,11 @@ impl Clone for MockStorageProvider {
             _temp_dir_hold: TempDir::default(),
             hash: CRC.checksum(format!("{}+++{}", self.location, "temp.db").as_bytes()),
             appender: SegQueue::new(),
-            _memory_map: unsafe { MmapOptions::new()
-                .map(&std::fs::File::open(&self.file_str).unwrap())
-                .unwrap() },
+            _memory_map: unsafe {
+                MmapOptions::new()
+                    .map(&std::fs::File::open(&self.file_str).unwrap())
+                    .unwrap()
+            },
         }
     }
 }
@@ -51,7 +58,7 @@ impl MockStorageProvider {
     pub async fn new() -> MockStorageProvider {
         let temp = TempDir::default();
         let file_path = PathBuf::from(temp.as_ref().to_str().unwrap());
-       
+
         let delimiter = if cfg!(unix) {
             "/"
         } else if cfg!(windows) {
@@ -65,7 +72,7 @@ impl MockStorageProvider {
         let location_path = Path::new(&location_str);
 
         _ = std::fs::create_dir(location_path);
-        
+
         let file_str = format!("{}{}{}", location_str, delimiter, "TEMP.db");
 
         let file_append = tokio::fs::File::options()
@@ -83,10 +90,7 @@ impl MockStorageProvider {
             .await
             .unwrap();
 
-        let file_read = std::fs::File::options()
-            .read(true)
-            .open(&file_str)
-            .unwrap();
+        let file_read = std::fs::File::options().read(true).open(&file_str).unwrap();
 
         MockStorageProvider {
             append_file: Arc::new(RwLock::new(file_append)),
@@ -95,11 +99,10 @@ impl MockStorageProvider {
             table_name: "TEMP.db".to_string(),
             file_str: file_str,
             _temp_dir_hold: temp,
-            hash: CRC.checksum(format!("{}+++{}", file_path.to_str().unwrap(), "TEMP.db").as_bytes()),
+            hash: CRC
+                .checksum(format!("{}+++{}", file_path.to_str().unwrap(), "TEMP.db").as_bytes()),
             appender: SegQueue::new(),
-            _memory_map: unsafe { MmapOptions::new()
-                    .map(&file_read)
-                    .unwrap() },
+            _memory_map: unsafe { MmapOptions::new().map(&file_read).unwrap() },
         }
     }
 
@@ -133,7 +136,6 @@ impl MockStorageProvider {
 
                 while let Some(block) = self.appender.pop() {
                     buffer.extend_from_slice(block.into_slice());
-    
                 }
 
                 let mut file = self.append_file.write().await;
@@ -221,7 +223,7 @@ impl StorageIO for MockStorageProvider {
             .open(&self.file_str)
             .await
             .unwrap();
-        
+
         let len = read_file.metadata().await.unwrap().len();
         len
     }
@@ -247,7 +249,11 @@ impl StorageIO for MockStorageProvider {
     }
 
     #[allow(unreachable_code)]
-    async fn read_data_into_buffer(&self, position: &mut u64, buffer: &mut [u8]) -> Result<(), std::io::Error> {
+    async fn read_data_into_buffer(
+        &self,
+        position: &mut u64,
+        buffer: &mut [u8],
+    ) -> Result<(), std::io::Error> {
         // use crate::{core::row_v2::row_pointer::RowPointer, memory_pool::{MemoryBlock, MEMORY_POOL}};
         // fn get_range(position: &u64, max: u64) -> (u64,u64) {
         //     const BLOCK_SIZE: u64 = 1024 * 1024 * 16; // 16MB
@@ -277,19 +283,19 @@ impl StorageIO for MockStorageProvider {
         //     } else {
         //         // This is the case where we need to handle partial read from cache and rest from memory map
         //         let available_len = slice.len() - new_position as usize; // How much we can read from cache
-                
+
         //         // Copy the available part from cache
         //         buffer[..available_len].copy_from_slice(&slice[new_position as usize..]);
-                
+
         //         // Calculate the remaining part position and size
         //         let remaining_size = buffer_len - available_len;
         //         let remaining_position = range.0 + new_position as u64 + available_len as u64;
-                
+
         //         // Copy the remaining part from memory map
         //         buffer[available_len..].copy_from_slice(
         //             &self.memory_map[remaining_position as usize..remaining_position as usize + remaining_size]
         //         );
-                
+
         //         *position += buffer_len as u64;
         //         return;
         //     }
@@ -310,7 +316,7 @@ impl StorageIO for MockStorageProvider {
         // }
 
         // return;
-    
+
         let buffer_len = buffer.len();
         //let table_len = self.file_len.load(std::sync::atomic::Ordering::Relaxed);
 
@@ -329,7 +335,7 @@ impl StorageIO for MockStorageProvider {
 
     async fn read_data_to_cursor(&self, position: &mut u64, length: u32) -> Cursor<Vec<u8>> {
         yield_now().await;
-        
+
         let mut read_file = std::fs::File::options()
             .read(true)
             .open(&self.file_str)
@@ -358,7 +364,7 @@ impl StorageIO for MockStorageProvider {
 
     async fn verify_data_and_sync(&self, position: u64, buffer: &[u8]) -> bool {
         yield_now().await;
-        
+
         let mut file = std::fs::File::options()
             .read(true)
             .write(true)
@@ -414,10 +420,7 @@ impl StorageIO for MockStorageProvider {
             .await
             .unwrap();
 
-        let file_read = std::fs::File::options()
-            .read(true)
-            .open(&file_str)
-            .unwrap();
+        let file_read = std::fs::File::options().read(true).open(&file_str).unwrap();
 
         Self {
             append_file: Arc::new(RwLock::new(file_append)),
@@ -428,15 +431,13 @@ impl StorageIO for MockStorageProvider {
             _temp_dir_hold: TempDir::default(),
             hash: CRC.checksum(format!("{}+++{}", self.location, "TEMP_2.db").as_bytes()),
             appender: SegQueue::new(),
-            _memory_map: unsafe { MmapOptions::new()
-                .map(&file_read)
-                .unwrap() },
+            _memory_map: unsafe { MmapOptions::new().map(&file_read).unwrap() },
         }
     }
 
     async fn swap_temp(&self, _temp_io_sync: &mut Self) {
         yield_now().await;
-        
+
         let delimiter = if cfg!(unix) {
             "/"
         } else if cfg!(windows) {
@@ -469,7 +470,7 @@ impl StorageIO for MockStorageProvider {
             panic!("OS not supported");
         };
 
-        let location_path = Path::new(& self.location);
+        let location_path = Path::new(&self.location);
 
         if !location_path.exists() {
             _ = std::fs::create_dir(location_path);
@@ -481,7 +482,7 @@ impl StorageIO for MockStorageProvider {
         if !file_path.exists() {
             _ = std::fs::File::create(&file_path).unwrap();
         }
-        
+
         let file_append = tokio::fs::File::options()
             .read(true)
             .append(true)
@@ -510,9 +511,7 @@ impl StorageIO for MockStorageProvider {
             _temp_dir_hold: TempDir::default(),
             hash: CRC.checksum(format!("{}+++{}", file_path.to_str().unwrap(), name).as_bytes()),
             appender: SegQueue::new(),
-            _memory_map: unsafe { MmapOptions::new()
-                .map(&file_read)
-                .unwrap() },
+            _memory_map: unsafe { MmapOptions::new().map(&file_read).unwrap() },
         }
     }
 
@@ -531,18 +530,16 @@ impl StorageIO for MockStorageProvider {
 
         remove_file(&path).unwrap();
     }
-    
+
     fn get_hash(&self) -> u32 {
         self.hash
     }
 
     async fn start_service(&self) {
-        let services = vec![
-            self.start_append_data_service()
-        ];
+        let services = vec![self.start_append_data_service()];
 
         join_all(services).await;
-    } 
+    }
 
     fn get_name(&self) -> String {
         self.table_name.clone()

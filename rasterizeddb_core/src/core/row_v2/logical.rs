@@ -2,10 +2,18 @@ use std::fmt::Debug;
 
 use crate::core::db_type::DbType;
 
-use super::{common::{simd_compare_strings, FromLeBytes, FromLeBytesUnsafe}, transformer::ComparerOperation};
+use super::{
+    common::{FromLeBytes, FromLeBytesUnsafe, simd_compare_strings},
+    transformer::ComparerOperation,
+};
 
 #[inline(always)]
-pub fn perform_comparison_operation(input1: &[u8], input2: &[u8], db_type: &DbType, operation: &ComparerOperation) -> bool {
+pub fn perform_comparison_operation(
+    input1: &[u8],
+    input2: &[u8],
+    db_type: &DbType,
+    operation: &ComparerOperation,
+) -> bool {
     match db_type {
         DbType::I8 => generic_comparison::<i8>(input1, input2, operation),
         DbType::U8 => generic_comparison::<u8>(input1, input2, operation),
@@ -20,7 +28,10 @@ pub fn perform_comparison_operation(input1: &[u8], input2: &[u8], db_type: &DbTy
         DbType::F32 => generic_comparison::<f32>(input1, input2, operation),
         DbType::F64 => generic_comparison::<f64>(input1, input2, operation),
         DbType::STRING => string_comparison(input1, input2, operation),
-        _ => panic!("Unsupported data type for comparison operation: {:?}", db_type),
+        _ => panic!(
+            "Unsupported data type for comparison operation: {:?}",
+            db_type
+        ),
     }
 }
 
@@ -34,7 +45,7 @@ where
 
     let num1 = unsafe { T::from_le_bytes_unchecked(input1) };
     let num2 = unsafe { T::from_le_bytes_unchecked(input2) };
-    
+
     match operation {
         ComparerOperation::Equals => num1 == num2,
         ComparerOperation::NotEquals => num1 != num2,
@@ -42,7 +53,9 @@ where
         ComparerOperation::GreaterOrEquals => num1 >= num2,
         ComparerOperation::Less => num1 < num2,
         ComparerOperation::LessOrEquals => num1 <= num2,
-        ComparerOperation::Contains | ComparerOperation::StartsWith | ComparerOperation::EndsWith => {
+        ComparerOperation::Contains
+        | ComparerOperation::StartsWith
+        | ComparerOperation::EndsWith => {
             panic!("Unsupported operation for numeric types: {:?}", operation)
         }
     }
@@ -66,19 +79,52 @@ fn string_comparison(input1: &[u8], input2: &[u8], operation: &ComparerOperation
 
 #[cfg(test)]
 mod tests {
-    use crate::core::{db_type::DbType, row_v2::{logical::perform_comparison_operation, transformer::ComparerOperation}};
- 
+    use crate::core::{
+        db_type::DbType,
+        row_v2::{logical::perform_comparison_operation, transformer::ComparerOperation},
+    };
+
     #[test]
     fn test_numeric_comparisons() {
         let input1 = 10i32.to_le_bytes();
         let input2 = 5i32.to_le_bytes();
 
-        assert!(perform_comparison_operation(&input1, &input1, &DbType::I32, &ComparerOperation::Equals));
-        assert!(!perform_comparison_operation(&input1, &input2, &DbType::I32, &ComparerOperation::Equals));
-        assert!(perform_comparison_operation(&input2, &input1, &DbType::I32, &ComparerOperation::Less));
-        assert!(perform_comparison_operation(&input1, &input2, &DbType::I32, &ComparerOperation::Greater));
-        assert!(perform_comparison_operation(&input1, &input1, &DbType::I32, &ComparerOperation::GreaterOrEquals));
-        assert!(perform_comparison_operation(&input2, &input1, &DbType::I32, &ComparerOperation::LessOrEquals));
+        assert!(perform_comparison_operation(
+            &input1,
+            &input1,
+            &DbType::I32,
+            &ComparerOperation::Equals
+        ));
+        assert!(!perform_comparison_operation(
+            &input1,
+            &input2,
+            &DbType::I32,
+            &ComparerOperation::Equals
+        ));
+        assert!(perform_comparison_operation(
+            &input2,
+            &input1,
+            &DbType::I32,
+            &ComparerOperation::Less
+        ));
+        assert!(perform_comparison_operation(
+            &input1,
+            &input2,
+            &DbType::I32,
+            &ComparerOperation::Greater
+        ));
+        assert!(perform_comparison_operation(
+            &input1,
+            &input1,
+            &DbType::I32,
+            &ComparerOperation::GreaterOrEquals
+        ));
+        assert!(perform_comparison_operation(
+            &input2,
+            &input1,
+            &DbType::I32,
+            &ComparerOperation::LessOrEquals
+        ));
     }
 
     #[test]
@@ -87,9 +133,24 @@ mod tests {
         let input2 = "world".as_bytes();
         let input3 = "hello".as_bytes();
 
-        assert!(perform_comparison_operation(input1, input3, &DbType::STRING, &ComparerOperation::Equals));
-        assert!(!perform_comparison_operation(input1, input2, &DbType::STRING, &ComparerOperation::Equals));
-        assert!(perform_comparison_operation(input1, input2, &DbType::STRING, &ComparerOperation::NotEquals));
+        assert!(perform_comparison_operation(
+            input1,
+            input3,
+            &DbType::STRING,
+            &ComparerOperation::Equals
+        ));
+        assert!(!perform_comparison_operation(
+            input1,
+            input2,
+            &DbType::STRING,
+            &ComparerOperation::Equals
+        ));
+        assert!(perform_comparison_operation(
+            input1,
+            input2,
+            &DbType::STRING,
+            &ComparerOperation::NotEquals
+        ));
     }
 
     #[test]
@@ -97,7 +158,12 @@ mod tests {
     fn test_unsupported_db_type() {
         let input1 = [0u8; 4];
         let input2 = [0u8; 4];
-        perform_comparison_operation(&input1, &input2, &DbType::DATETIME, &ComparerOperation::Equals);
+        perform_comparison_operation(
+            &input1,
+            &input2,
+            &DbType::DATETIME,
+            &ComparerOperation::Equals,
+        );
     }
 
     #[test]

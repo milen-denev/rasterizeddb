@@ -1,15 +1,21 @@
-use std::io::{self, Read, Seek, SeekFrom};
 use log::debug;
+use std::io::{self, Read, Seek, SeekFrom};
 
-use super::{db_type::DbType, support_types::CursorVector};
 use super::helpers::read_row_cursor_whole;
+use super::{db_type::DbType, support_types::CursorVector};
 
-use crate::{renderers::html::render_rows_to_html, rql::parser::ReturnView};
 use super::support_types::ReturnResult;
+use crate::{renderers::html::render_rows_to_html, rql::parser::ReturnView};
 use smallvec::SmallVec;
 
 #[cfg(feature = "enable_parallelism")]
-use std::{arch::x86_64::{_mm_prefetch, _MM_HINT_T0}, sync::{atomic::{AtomicU64, Ordering}, Arc}};
+use std::{
+    arch::x86_64::{_MM_HINT_T0, _mm_prefetch},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 #[cfg(feature = "enable_parallelism")]
 use tokio::sync::mpsc;
@@ -18,17 +24,28 @@ use tokio::sync::mpsc;
 use crate::POSITIONS_CACHE;
 
 #[cfg(feature = "enable_parallelism")]
-use super::{column::Column, helpers::row_prefetching_cursor, row::Row, storage_providers::traits::StorageIO, support_types::FileChunk};
+use super::{
+    column::Column, helpers::row_prefetching_cursor, row::Row,
+    storage_providers::traits::StorageIO, support_types::FileChunk,
+};
 
 #[cfg(feature = "enable_parallelism")]
-use crate::{memory_pool::MEMORY_POOL, rql::{models::{Next, Token}, tokenizer::evaluate_column_result}, simds::endianess::read_u32};
+use crate::{
+    memory_pool::MEMORY_POOL,
+    rql::{
+        models::{Next, Token},
+        tokenizer::evaluate_column_result,
+    },
+    simds::endianess::read_u32,
+};
 
 #[inline(always)]
 pub fn extent_non_string_buffer(
     data_buffer: &'static mut [u8],
     db_type: &DbType,
     cursor_vector: &mut CursorVector,
-    position: &mut u64) {
+    position: &mut u64,
+) {
     let db_size = db_type.get_size();
 
     if db_size == 1 {
@@ -113,9 +130,7 @@ pub(crate) async fn process_all_chunks(
     chunks: Arc<Vec<FileChunk>>,
     parallelism_limit: usize,
 
-    #[cfg(feature = "enable_index_caching")]
-    hash: u64
-
+    #[cfg(feature = "enable_index_caching")] hash: u64,
 ) -> io::Result<Option<ReturnResult>> {
     use futures::future::join_all;
     use tokio::{sync::Semaphore, task};
@@ -129,7 +144,6 @@ pub(crate) async fn process_all_chunks(
     let mut handles = Vec::with_capacity(total_chunks);
 
     for (i, chunk) in chunks.iter().cloned().enumerate() {
-  
         let semaphore_clone = semaphore.clone();
 
         let atomic_u64_clone = atomic_limit.clone();
@@ -142,9 +156,9 @@ pub(crate) async fn process_all_chunks(
             let permit = semaphore_clone.acquire().await.unwrap();
 
             _ = process_chunk_async(
-                chunk.read_chunk_sync(&mut io_sync_inner).await, 
+                chunk.read_chunk_sync(&mut io_sync_inner).await,
                 column_indexes_inner,
-                evaluation_tokens_inner, 
+                evaluation_tokens_inner,
                 limit,
                 select_all,
                 mutated,
@@ -152,11 +166,10 @@ pub(crate) async fn process_all_chunks(
                 atomic_u64_clone,
                 tx_clone,
                 i as u32,
-
                 #[cfg(feature = "enable_index_caching")]
-                hash
-
-            ).await;
+                hash,
+            )
+            .await;
 
             drop(permit); // Release the permit when task finishes
         });
@@ -185,7 +198,9 @@ pub(crate) async fn process_all_chunks(
     } else {
         if let Some(return_view) = return_view {
             if return_view == ReturnView::Html {
-                return  Ok(Some(ReturnResult::HtmlView(render_rows_to_html(Ok(Some(all_rows)), table_name).unwrap())));
+                return Ok(Some(ReturnResult::HtmlView(
+                    render_rows_to_html(Ok(Some(all_rows)), table_name).unwrap(),
+                )));
             } else {
                 return Ok(Some(ReturnResult::Rows(SmallVec::from_vec(all_rows))));
             }
@@ -202,7 +217,7 @@ pub(crate) async fn process_chunk_async(
     column_indexes: Arc<Vec<u32>>,
     mut evaluation_tokens: Vec<(Vec<Token>, Option<Next>)>,
     limit: u64,
-    select_all: bool, 
+    select_all: bool,
     mutated: bool,
     file_chunk: FileChunk,
     atomic_limit: Arc<AtomicU64>,
@@ -210,9 +225,7 @@ pub(crate) async fn process_chunk_async(
 
     _thread_id: u32,
 
-    #[cfg(feature = "enable_index_caching")]
-    hash: u64
-
+    #[cfg(feature = "enable_index_caching")] hash: u64,
 ) -> io::Result<()> {
     debug!("thread: {}", _thread_id);
 
@@ -226,8 +239,7 @@ pub(crate) async fn process_chunk_async(
 
     loop {
         if let Some(prefetch_result) =
-            row_prefetching_cursor(&mut position, &mut cursor_vector, &file_chunk, mutated)
-                .unwrap()
+            row_prefetching_cursor(&mut position, &mut cursor_vector, &file_chunk, mutated).unwrap()
         {
             let mut current_column_index: u32 = 0;
             let first_column_index = position.clone();
@@ -274,9 +286,7 @@ pub(crate) async fn process_chunk_async(
                         #[cfg(target_arch = "x86_64")]
                         {
                             unsafe {
-                                _mm_prefetch::<_MM_HINT_T0>(
-                                    str_len_array_pointer as *const i8,
-                                )
+                                _mm_prefetch::<_MM_HINT_T0>(str_len_array_pointer as *const i8)
                             };
                         }
 
@@ -288,17 +298,19 @@ pub(crate) async fn process_chunk_async(
 
                         let preset_buffer = str_memory_chunk.into_slice_mut();
 
-                        for (i, byte) in chunk_slice[position as usize..position as usize + str_length as usize].iter().enumerate() {
+                        for (i, byte) in chunk_slice
+                            [position as usize..position as usize + str_length as usize]
+                            .iter()
+                            .enumerate()
+                        {
                             preset_buffer[i] = *byte;
                         }
 
                         position += str_length as u64;
 
-                        let column =
-                            Column::from_chunk(column_type, str_memory_chunk);
+                        let column = Column::from_chunk(column_type, str_memory_chunk);
 
-                        required_columns
-                            .push((current_column_index, column));
+                        required_columns.push((current_column_index, column));
                     }
                 } else {
                     let column_type = cursor_vector.vector[position as usize];
@@ -328,9 +340,7 @@ pub(crate) async fn process_chunk_async(
                         #[cfg(target_arch = "x86_64")]
                         {
                             unsafe {
-                                _mm_prefetch::<_MM_HINT_T0>(
-                                    str_len_array_pointer as *const i8,
-                                )
+                                _mm_prefetch::<_MM_HINT_T0>(str_len_array_pointer as *const i8)
                             };
                         }
 
@@ -373,16 +383,13 @@ pub(crate) async fn process_chunk_async(
                 if current_limit < limit {
                     if tx.send(row).is_err() {
                         break;
-                    }    
+                    }
                 }
-                
+
                 #[cfg(feature = "enable_index_caching")]
                 {
                     result_row_vec.push((
-                        file_chunk.current_file_position + first_column_index
-                            - 1
-                            - 8
-                            - 4,
+                        file_chunk.current_file_position + first_column_index - 1 - 8 - 4,
                         prefetch_result.length,
                     ));
                 }
@@ -403,7 +410,7 @@ pub(crate) async fn process_chunk_async(
         } else {
             break;
         }
-    };
+    }
 
     Ok(())
 }

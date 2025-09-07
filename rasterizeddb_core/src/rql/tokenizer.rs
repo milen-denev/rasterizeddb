@@ -13,14 +13,14 @@ pub(crate) fn evaluate_column_result(
 ) -> bool {
     token_results.clear();
     token_results.reserve(evaluation_tokens.len());
-    
+
     for (tokens, next) in evaluation_tokens.iter() {
         // Fast path for empty or invalid token lists
         if tokens.is_empty() {
             token_results.push((false, next.clone()));
             continue;
         }
-        
+
         // Find the operation and validate token structure
         // Expect tokens to be in form: [left_operands..., operation, right_operands...]
         let mut op_idx = None;
@@ -30,7 +30,7 @@ pub(crate) fn evaluate_column_result(
                 break;
             }
         }
-        
+
         let op_idx = match op_idx {
             Some(idx) if idx > 0 && idx < tokens.len() - 1 => idx,
             _ => {
@@ -39,7 +39,7 @@ pub(crate) fn evaluate_column_result(
                 continue;
             }
         };
-        
+
         // Get left side value
         let left = match evaluate_side(&tokens[..op_idx], required_columns) {
             Some(val) => val,
@@ -48,22 +48,22 @@ pub(crate) fn evaluate_column_result(
                 continue;
             }
         };
-        
+
         // Get operation
         let op = match &tokens[op_idx] {
             Token::Operation(op) => op,
             _ => unreachable!("Already checked this is an operation token"),
         };
-        
+
         // Get right side value
-        let right = match evaluate_side(&tokens[op_idx+1..], required_columns) {
+        let right = match evaluate_side(&tokens[op_idx + 1..], required_columns) {
             Some(val) => val,
             None => {
                 token_results.push((false, next.clone()));
                 continue;
             }
         };
-        
+
         // Apply comparison operation
         let result = match op {
             ComparerOperation::Equals => left.equals(&right),
@@ -76,10 +76,10 @@ pub(crate) fn evaluate_column_result(
             ComparerOperation::StartsWith => left.starts_with(&right),
             ComparerOperation::EndsWith => left.ends_with(&right),
         };
-        
+
         token_results.push((result, next.clone()));
     }
-    
+
     get_final_result(token_results)
 }
 
@@ -89,32 +89,31 @@ fn evaluate_side(tokens: &[Token], required_columns: &Vec<(u32, Column)>) -> Opt
     if tokens.is_empty() {
         return None;
     }
-    
+
     // Handle simple case of just one token (column or value)
     if tokens.len() == 1 {
         return match &tokens[0] {
-            Token::Column(col_id) => {
-                required_columns.iter()
-                    .find(|(id, _)| *id == *col_id)
-                    .map(|(_, col)| col.clone())
-            },
+            Token::Column(col_id) => required_columns
+                .iter()
+                .find(|(id, _)| *id == *col_id)
+                .map(|(_, col)| col.clone()),
             Token::Value(val) => Some(val.clone()),
-            _ => None,  // Operation or math without operands is invalid
+            _ => None, // Operation or math without operands is invalid
         };
     }
-    
+
     // Get initial value
     let mut result = match &tokens[0] {
         Token::Column(col_id) => {
             match required_columns.iter().find(|(id, _)| *id == *col_id) {
                 Some((_, col)) => col.clone(),
-                None => return None,  // Column not found
+                None => return None, // Column not found
             }
-        },
+        }
         Token::Value(val) => val.clone(),
-        _ => return None,  // Unexpected token
+        _ => return None, // Unexpected token
     };
-    
+
     // Process all math operations in sequence
     let mut i = 1;
     while i < tokens.len() {
@@ -124,21 +123,21 @@ fn evaluate_side(tokens: &[Token], required_columns: &Vec<(u32, Column)>) -> Opt
             Token::Math(op) => {
                 // Verify we have a value after this math operation
                 if i + 1 >= tokens.len() {
-                    return None;  // Missing right operand
+                    return None; // Missing right operand
                 }
-                
+
                 // Get the right operand
                 let right = match &tokens[i + 1] {
                     Token::Column(col_id) => {
                         match required_columns.iter().find(|(id, _)| *id == *col_id) {
                             Some((_, col)) => col,
-                            None => return None,  // Column not found
+                            None => return None, // Column not found
                         }
-                    },
+                    }
                     Token::Value(val) => val,
-                    _ => return None,  // Invalid right operand
+                    _ => return None, // Invalid right operand
                 };
-                
+
                 // Apply the math operation
                 match op {
                     MathOperation::Add => result.add(right),
@@ -150,16 +149,16 @@ fn evaluate_side(tokens: &[Token], required_columns: &Vec<(u32, Column)>) -> Opt
                             return None;
                         }
                         result.divide(right);
-                    },
-                    _ => return None,  // Unsupported operation
+                    }
+                    _ => return None, // Unsupported operation
                 }
-                
-                i += 2;  // Skip the math op and right operand we just processed
-            },
-            _ => return None,  // Expected math operation but got something else
+
+                i += 2; // Skip the math op and right operand we just processed
+            }
+            _ => return None, // Expected math operation but got something else
         }
     }
-    
+
     Some(result)
 }
 
@@ -202,5 +201,5 @@ fn get_final_result(token_results: &mut Vec<(bool, Option<Next>)>) -> bool {
         }
     }
 
-    final_result 
+    final_result
 }

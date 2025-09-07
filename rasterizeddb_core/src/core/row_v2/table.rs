@@ -1,9 +1,24 @@
-use std::{io, sync::{atomic::{AtomicBool, AtomicU64}, Arc}};
 use log::{error, info};
 use std::io::Result;
+use std::{
+    io,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64},
+    },
+};
 
-use crate::core::{row_v2::{concurrent_processor::ConcurrentProcessor, row::{Row, RowFetch, RowWrite}, row_pointer::{RowPointer, RowPointerIterator}, schema::SchemaField}, rql_v2::lexer_ct::CreateColumnData, storage_providers::traits::StorageIO};
 use super::schema::TableSchema;
+use crate::core::{
+    row_v2::{
+        concurrent_processor::ConcurrentProcessor,
+        row::{Row, RowFetch, RowWrite},
+        row_pointer::{RowPointer, RowPointerIterator},
+        schema::SchemaField,
+    },
+    rql_v2::lexer_ct::CreateColumnData,
+    storage_providers::traits::StorageIO,
+};
 
 pub struct Table<S: StorageIO> {
     pub schema: TableSchema,
@@ -21,17 +36,34 @@ unsafe impl<S: StorageIO> Sync for Table<S> {}
 
 impl<S: StorageIO> Table<S> {
     pub async fn new(table_name: &str, initial_io: Arc<S>, columns: Vec<CreateColumnData>) -> Self {
-        let io_pointers = Arc::new(initial_io.create_new(format!("{}_pointers.db", table_name)).await);
+        let io_pointers = Arc::new(
+            initial_io
+                .create_new(format!("{}_pointers.db", table_name))
+                .await,
+        );
         let io_rows = Arc::new(initial_io.create_new(format!("{}.db", table_name)).await);
-        let io_schema = Arc::new(initial_io.create_new(format!("{}_schema.db", table_name)).await);
+        let io_schema = Arc::new(
+            initial_io
+                .create_new(format!("{}_schema.db", table_name))
+                .await,
+        );
 
         let io_pointers_clone = io_pointers.clone();
         let io_rows_clone = io_rows.clone();
         let io_schema_clone = io_schema.clone();
 
-        tokio::spawn(async move { let clone_io_rows = io_rows_clone.clone(); clone_io_rows.start_service().await });
-        tokio::spawn(async move { let clone_io_pointers = io_pointers_clone.clone(); clone_io_pointers.start_service().await });
-        tokio::spawn(async move { let clone_io_schema = io_schema_clone.clone(); clone_io_schema.start_service().await });
+        tokio::spawn(async move {
+            let clone_io_rows = io_rows_clone.clone();
+            clone_io_rows.start_service().await
+        });
+        tokio::spawn(async move {
+            let clone_io_pointers = io_pointers_clone.clone();
+            clone_io_pointers.start_service().await
+        });
+        tokio::spawn(async move {
+            let clone_io_schema = io_schema_clone.clone();
+            clone_io_schema.start_service().await
+        });
 
         let schema = {
             if let Ok(schema) = TableSchema::load(io_schema.clone()).await {
@@ -39,11 +71,16 @@ impl<S: StorageIO> Table<S> {
             } else {
                 let mut schema = TableSchema::new(table_name.to_string(), false);
 
-                schema.save(io_schema.clone()).await.expect("Failed to save initial schema");
+                schema
+                    .save(io_schema.clone())
+                    .await
+                    .expect("Failed to save initial schema");
 
                 for column in columns {
                     //TODO is_unique
-                    schema.add_field(io_schema.clone(), column.name, column.data_type, false).await;
+                    schema
+                        .add_field(io_schema.clone(), column.name, column.data_type, false)
+                        .await;
                 }
 
                 schema
@@ -54,20 +91,20 @@ impl<S: StorageIO> Table<S> {
 
         let mut pointer_iterator = RowPointerIterator::new(io_pointers.clone()).await.unwrap();
 
-        let (atomic_last_id, atomic_table_length) = if let Some(row_pointer) = pointer_iterator.read_last().await {
-            let last_id = row_pointer.id ; 
-            let atomic_last_id = AtomicU64::new(last_id);
+        let (atomic_last_id, atomic_table_length) =
+            if let Some(row_pointer) = pointer_iterator.read_last().await {
+                let last_id = row_pointer.id;
+                let atomic_last_id = AtomicU64::new(last_id);
 
-            let table_length = row_pointer.position;
-            let atomic_table_length = AtomicU64::new(table_length);
+                let table_length = row_pointer.position;
+                let atomic_table_length = AtomicU64::new(table_length);
 
-            (atomic_last_id, atomic_table_length)
-
-        } else {
-            let atomic_last_id = AtomicU64::new(0);
-            let atomic_table_length = AtomicU64::new(0);
-            (atomic_last_id, atomic_table_length)
-        };
+                (atomic_last_id, atomic_table_length)
+            } else {
+                let atomic_last_id = AtomicU64::new(0);
+                let atomic_table_length = AtomicU64::new(0);
+                (atomic_last_id, atomic_table_length)
+            };
 
         Self {
             schema,
@@ -84,7 +121,10 @@ impl<S: StorageIO> Table<S> {
     pub async fn insert_row(&self, row_write: RowWrite) -> Result<()> {
         // Implementation for inserting a row into the table
 
-        info!("Inserting row with {} columns", row_write.columns_writing_data.len());
+        info!(
+            "Inserting row with {} columns",
+            row_write.columns_writing_data.len()
+        );
 
         let result = RowPointer::write_row(
             self.io_pointers.clone(),
@@ -92,13 +132,17 @@ impl<S: StorageIO> Table<S> {
             &self.last_row_id,
             &self.len,
             #[cfg(feature = "enable_long_row")]
-            cluster, 
-            &row_write
-        ).await;
+            cluster,
+            &row_write,
+        )
+        .await;
 
         if let Err(e) = result {
             error!("Failed to insert row: {}", e);
-            return Err(io::Error::new(io::ErrorKind::Other, format!("Failed to insert row: {}", e)));
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("Failed to insert row: {}", e),
+            ));
         } else if let Ok(row_pointer) = result {
             info!("Successfully inserted row with pointer: {:?}", row_pointer);
         }
@@ -106,21 +150,32 @@ impl<S: StorageIO> Table<S> {
         return Ok(());
     }
 
-    pub async fn query_row(&self, query: &str, schema_fields: &Vec<SchemaField>,  query_row_fetch: RowFetch, requested_row_fetch: RowFetch) -> Result<Vec<Row>> {
+    pub async fn query_row(
+        &self,
+        query: &str,
+        schema_fields: &Vec<SchemaField>,
+        query_row_fetch: RowFetch,
+        requested_row_fetch: RowFetch,
+    ) -> Result<Vec<Row>> {
         // Implementation for querying a row from the table
 
         info!("Querying row");
 
-        let mut iterator = RowPointerIterator::new(self.io_pointers.clone()).await.unwrap();
+        let mut iterator = RowPointerIterator::new(self.io_pointers.clone())
+            .await
+            .unwrap();
 
-        let rows = self.concurrent_processor.process(
-            query,
-            query_row_fetch,
-            requested_row_fetch,
-            schema_fields,
-            self.io_rows.clone(),
-            &mut iterator
-        ).await;
+        let rows = self
+            .concurrent_processor
+            .process(
+                query,
+                query_row_fetch,
+                requested_row_fetch,
+                schema_fields,
+                self.io_rows.clone(),
+                &mut iterator,
+            )
+            .await;
 
         info!("Query executed, returning {} rows", rows.len());
 

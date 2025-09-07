@@ -1,4 +1,7 @@
-use std::{io::{self, Cursor}, sync::atomic::{AtomicBool, AtomicU32, AtomicU64}};
+use std::{
+    io::{self, Cursor},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64},
+};
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
@@ -6,11 +9,11 @@ pub struct TableHeader {
     pub(crate) total_file_length: AtomicU64, // Total length of the file in bytes
     pub(crate) shard_number: AtomicU32,      // Identifier for the shard
     pub(crate) shard_id: AtomicU64,          // Hash of the shard
-    pub(crate) compressed: AtomicBool,       // Compression status: true if compressed, false otherwise
-    pub(crate) first_row_id: AtomicU64,      // ID of the first row
-    pub(crate) last_row_id: AtomicU64,       // ID of the last row
-    pub(crate) immutable: AtomicBool,        // Append only table
-    pub(crate) mutated: AtomicBool
+    pub(crate) compressed: AtomicBool, // Compression status: true if compressed, false otherwise
+    pub(crate) first_row_id: AtomicU64, // ID of the first row
+    pub(crate) last_row_id: AtomicU64, // ID of the last row
+    pub(crate) immutable: AtomicBool,  // Append only table
+    pub(crate) mutated: AtomicBool,
 }
 
 impl TableHeader {
@@ -31,7 +34,7 @@ impl TableHeader {
             first_row_id: AtomicU64::new(first_row_id),
             last_row_id: AtomicU64::new(last_row_id),
             immutable: AtomicBool::new(immutable),
-            mutated: AtomicBool::new(false)
+            mutated: AtomicBool::new(false),
         }
     }
 
@@ -41,31 +44,62 @@ impl TableHeader {
 
         // Write total_file_length as u64
         buffer
-            .write_u64::<LittleEndian>(self.total_file_length.load(std::sync::atomic::Ordering::Relaxed))
+            .write_u64::<LittleEndian>(
+                self.total_file_length
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
             .unwrap();
 
         // Write shard_number as u32
-        buffer.write_u32::<LittleEndian>(self.shard_number.load(std::sync::atomic::Ordering::Relaxed)).unwrap();
+        buffer
+            .write_u32::<LittleEndian>(self.shard_number.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap();
 
         // Write shard hash id as u64
-        buffer.write_u64::<LittleEndian>(self.shard_id.load(std::sync::atomic::Ordering::Relaxed)).unwrap();
+        buffer
+            .write_u64::<LittleEndian>(self.shard_id.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap();
 
         // Write compressed as a single byte (0 for false, 1 for true)
         buffer
-            .write_u8(if self.compressed.load(std::sync::atomic::Ordering::Relaxed) { 1 } else { 0 })
+            .write_u8(
+                if self.compressed.load(std::sync::atomic::Ordering::Relaxed) {
+                    1
+                } else {
+                    0
+                },
+            )
             .unwrap();
 
         // Write first_row_id as u64
-        buffer.write_u64::<LittleEndian>(self.first_row_id.load(std::sync::atomic::Ordering::Relaxed)).unwrap();
+        buffer
+            .write_u64::<LittleEndian>(self.first_row_id.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap();
 
         // Write last_row_id as u64
-        buffer.write_u64::<LittleEndian>(self.last_row_id.load(std::sync::atomic::Ordering::Relaxed)).unwrap();
+        buffer
+            .write_u64::<LittleEndian>(self.last_row_id.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap();
 
         // Write immutable as u8
-        buffer.write_u8(if self.immutable.load(std::sync::atomic::Ordering::Relaxed) { 1 } else { 0 }).unwrap();
+        buffer
+            .write_u8(
+                if self.immutable.load(std::sync::atomic::Ordering::Relaxed) {
+                    1
+                } else {
+                    0
+                },
+            )
+            .unwrap();
 
         // Write mutated as u8
-        buffer.write_u8(if self.mutated.load(std::sync::atomic::Ordering::Relaxed) { 1 } else { 0 }).unwrap();
+        buffer
+            .write_u8(if self.mutated.load(std::sync::atomic::Ordering::Relaxed) {
+                1
+            } else {
+                0
+            })
+            .unwrap();
 
         Ok(buffer)
     }
@@ -101,11 +135,23 @@ impl TableHeader {
             total_file_length: AtomicU64::new(total_file_length),
             shard_number: AtomicU32::new(shard_number),
             shard_id: AtomicU64::new(shard_id),
-            compressed: if compressed == 1 { AtomicBool::new(true) } else { AtomicBool::new(false) },
+            compressed: if compressed == 1 {
+                AtomicBool::new(true)
+            } else {
+                AtomicBool::new(false)
+            },
             first_row_id: AtomicU64::new(first_row_id),
             last_row_id: AtomicU64::new(last_row_id),
-            immutable: if immutable == 1 { AtomicBool::new(true) } else { AtomicBool::new(false) },
-            mutated: if mutated == 1 { AtomicBool::new(true) } else { AtomicBool::new(false) },
+            immutable: if immutable == 1 {
+                AtomicBool::new(true)
+            } else {
+                AtomicBool::new(false)
+            },
+            mutated: if mutated == 1 {
+                AtomicBool::new(true)
+            } else {
+                AtomicBool::new(false)
+            },
         })
     }
 }

@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-
 #[derive(Clone)]
 pub struct Chunk {
     pub start: u64,
@@ -19,7 +18,7 @@ impl Chunk {
     pub fn len(&self) -> usize {
         self.data.len()
     }
-    
+
     #[inline]
     pub fn end(&self) -> u64 {
         self.start + self.len() as u64

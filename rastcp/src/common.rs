@@ -1,8 +1,8 @@
-use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::error::RastcpError;
+use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 // Read a length-prefixed message - generic over any AsyncRead + AsyncWrite stream
-pub async fn read_message<S>(stream: &mut S) -> Result<Vec<u8>, RastcpError> 
+pub async fn read_message<S>(stream: &mut S) -> Result<Vec<u8>, RastcpError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -15,7 +15,7 @@ where
             RastcpError::Io(e)
         }
     })?;
-    
+
     let len = u32::from_le_bytes(len_bytes) as usize;
     let mut buffer = vec![0u8; len];
     stream.read_exact(&mut buffer).await.map_err(|e| {
@@ -25,12 +25,12 @@ where
             RastcpError::Io(e)
         }
     })?;
-    
+
     Ok(buffer)
 }
 
 // Write a length-prefixed message - generic over any AsyncRead + AsyncWrite stream
-pub async fn write_message<S>(stream: &mut S, data: &[u8]) -> Result<(), RastcpError> 
+pub async fn write_message<S>(stream: &mut S, data: &[u8]) -> Result<(), RastcpError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -46,9 +46,9 @@ where
 
 // Read a message with a timeout
 pub async fn read_message_timeout<S>(
-    stream: &mut S, 
-    timeout: std::time::Duration
-) -> Result<Vec<u8>, RastcpError> 
+    stream: &mut S,
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>, RastcpError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -60,10 +60,10 @@ where
 
 // Write a message with a timeout
 pub async fn write_message_timeout<S>(
-    stream: &mut S, 
+    stream: &mut S,
     data: &[u8],
-    timeout: std::time::Duration
-) -> Result<(), RastcpError> 
+    timeout: std::time::Duration,
+) -> Result<(), RastcpError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {

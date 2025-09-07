@@ -1,6 +1,6 @@
 use crate::{
     core::{column::Column, hashing::get_hash, row::InsertOrUpdateRow},
-    memory_pool::MemoryBlock
+    memory_pool::MemoryBlock,
 };
 
 #[cfg(feature = "enable_index_caching")]
@@ -101,21 +101,21 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
             parser_result: ParserResult::DropTable(table_name.to_string()),
         });
     }
-    
+
     // Handle INSERT INTO
     if let Some(insert_start) = query.find("INSERT INTO") {
         let insert_str = query[insert_start + 11..].trim(); // Skip "INSERT INTO"
-        
+
         // Extract table name
         let table_name_end = insert_str
             .find(|c: char| c == '(')
             .ok_or("Missing '(' in INSERT INTO statement")?;
         let table_name = insert_str[..table_name_end].trim();
-        
+
         if table_name.is_empty() {
             return Err("Table name is missing in INSERT INTO statement.".into());
         }
-        
+
         // Extract column specifications
         let columns_start = insert_str.find('(').unwrap() + 1;
         let columns_end = insert_str
@@ -123,42 +123,45 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
             .ok_or("Missing ')' in INSERT INTO statement")?;
 
         let columns_spec = &insert_str[columns_start..columns_end + 1].trim();
-        
+
         // Parse column specifications
-        let column_specs: Vec<&str> = columns_spec
-            .split(',')
-            .map(|s| s.trim())
-            .collect();
+        let column_specs: Vec<&str> = columns_spec.split(',').map(|s| s.trim()).collect();
 
         // Parse column types into a vector of data types
         let mut data_types: Vec<&str> = Vec::new();
         for col_spec in &column_specs {
             if !col_spec.starts_with("COL(") || !col_spec.ends_with(")") {
-            return Err(format!("Invalid column specification: {}", col_spec).into());
+                return Err(format!("Invalid column specification: {}", col_spec).into());
             }
-            
-            let type_name = &col_spec[4..col_spec.len()-1];
+
+            let type_name = &col_spec[4..col_spec.len() - 1];
             data_types.push(type_name);
         }
-            
+
         // Find VALUES statements
-        let values_part = &query[insert_start + 11 + table_name_end + columns_end + 2 - columns_start + 2..end];
-        
+        let values_part =
+            &query[insert_start + 11 + table_name_end + columns_end + 2 - columns_start + 2..end];
+
         // Parse each VALUES statement
         let mut rows: Vec<InsertOrUpdateRow> = Vec::new();
         for values_line in values_part.lines() {
             let values_line = values_line.trim();
             if values_line.starts_with("VALUES") {
                 // Extract values between parentheses
-                let values_start = values_line.find('(').ok_or("Missing '(' in VALUES statement")? + 1;
-                let values_end = values_line.find(')').ok_or("Missing ')' in VALUES statement")?;
+                let values_start = values_line
+                    .find('(')
+                    .ok_or("Missing '(' in VALUES statement")?
+                    + 1;
+                let values_end = values_line
+                    .find(')')
+                    .ok_or("Missing ')' in VALUES statement")?;
                 let values_str = &values_line[values_start..values_end];
-                
+
                 // Split values
                 let mut raw_values: Vec<String> = Vec::new();
                 let mut current_value = String::new();
                 let mut in_string = false;
-                
+
                 for c in values_str.chars() {
                     if c == '\'' && !in_string {
                         in_string = true;
@@ -174,73 +177,77 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
                         current_value.push(c);
                     }
                 }
-                
+
                 // Add the last value if exists
                 if !current_value.is_empty() {
                     raw_values.push(current_value.trim().to_string());
                 }
-                
+
                 // Check that values match columns
                 if raw_values.len() != data_types.len() {
                     return Err(format!(
-                        "Number of values ({}) does not match number of columns ({})", 
-                        raw_values.len(), data_types.len()
-                    ).into());
+                        "Number of values ({}) does not match number of columns ({})",
+                        raw_values.len(),
+                        data_types.len()
+                    )
+                    .into());
                 }
-                
+
                 // Create properly typed columns from values
                 let mut columns: Vec<Column> = Vec::with_capacity(raw_values.len());
-                
+
                 for (i, val) in raw_values.iter().enumerate() {
                     let column = parse_typed_value_with_type(val, data_types[i])?;
                     columns.push(column);
                 }
-                
+
                 // Process columns to create InsertOrUpdateRow
                 let mut column_data: Vec<u8> = Vec::new();
                 for column in columns {
                     let mut column_bytes = column.content.to_vec();
                     column_data.append(&mut column_bytes);
                 }
-                
+
                 // Create row
-                let row = InsertOrUpdateRow { columns_data: column_data };
+                let row = InsertOrUpdateRow {
+                    columns_data: column_data,
+                };
                 rows.push(row);
             }
         }
-        
+
         return Ok(DatabaseAction {
             table_name: table_name.to_string(),
             parser_result: ParserResult::InsertEvaluationTokens(InsertEvaluationResult { rows }),
         });
     }
-    
+
     // Handle DELETE FROM
     if let Some(delete_start) = query.find("DELETE FROM") {
         let delete_str = query[delete_start + 11..].trim(); // Skip "DELETE FROM"
-        
+
         // Extract table name
         let table_name_end = delete_str
             .find(|c: char| c.is_whitespace())
             .unwrap_or(delete_str.len());
         let table_name = delete_str[..table_name_end].trim();
-        
+
         if table_name.is_empty() {
             return Err("Table name is missing in DELETE FROM statement.".into());
         }
-        
+
         // Parse WHERE clause
         let where_result = query.find("WHERE");
         if where_result.is_none() {
             return Err("WHERE statement is missing in DELETE.".into());
         }
-        
+
         let where_i = where_result.unwrap();
         let where_clause = &query[where_i + 5..end].trim();
-        
+
         // Use the refactored function to parse the WHERE clause
         let tokens_vector = parse_where_clause(where_clause);
-        
+
         return Ok(DatabaseAction {
             table_name: table_name.to_string(),
             parser_result: ParserResult::DeleteEvaluationTokens(EvaluationResult {
@@ -248,7 +255,7 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
                 tokens: tokens_vector,
                 limit: i64::MAX, // No limit for DELETE
                 select_all: false,
-                return_view: None
+                return_view: None,
             }),
         });
     }
@@ -273,7 +280,6 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
         select_table.push_str(select_value);
     }
 
-
     let return_result = query.find("RETURN");
     let return_all: bool;
     let mut return_view: Option<ReturnView> = None;
@@ -282,11 +288,11 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
         return_all = true;
     } else {
         return_all = false;
-        
+
         // Parse what comes after RETURN
         let return_start = return_result.unwrap();
         let return_clause = &query[return_start + 6..].trim(); // +6 to skip "RETURN"
-        
+
         if return_clause.starts_with("HTML_VIEW") {
             return_view = Some(ReturnView::Html);
         }
@@ -302,14 +308,14 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
     }
 
     let rebuild_indexes_result = query.find("REBUILD_INDEXES");
-   
+
     if rebuild_indexes_result.is_some() {
         return Ok(DatabaseAction {
             table_name: select_table.clone(),
             parser_result: ParserResult::RebuildIndexes(select_table),
         });
     }
-    
+
     let where_result = query.find("WHERE");
     let mut where_i: usize = 0;
     let select_all: bool;
@@ -357,7 +363,7 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
                 tokens: Vec::default(),
                 limit: limit_i64,
                 select_all: true,
-                return_view: return_view
+                return_view: return_view,
             }),
         });
     }
@@ -377,7 +383,7 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
                 tokens: tokens_vector,
                 limit: limit_i64,
                 select_all: false,
-                return_view: return_view
+                return_view: return_view,
             }),
         });
     }
@@ -385,10 +391,10 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
     // Handle the case where RETURN is specified with HTML_VIEW
     if !return_all && where_result.is_some() {
         let where_clause = &query[where_i + 5..end].trim();
-        
+
         // Use the refactored function to parse the WHERE clause
         let tokens_vector = parse_where_clause(where_clause);
-        
+
         return Ok(DatabaseAction {
             table_name: select_table,
             parser_result: ParserResult::QueryEvaluationTokens(EvaluationResult {
@@ -396,7 +402,7 @@ pub fn parse_rql(query: &str) -> Result<DatabaseAction, String> {
                 tokens: tokens_vector,
                 limit: limit_i64,
                 select_all: false,
-                return_view: return_view
+                return_view: return_view,
             }),
         });
     }
@@ -409,26 +415,26 @@ fn parse_where_clause(where_clause: &str) -> Vec<(Vec<Token>, Option<Next>)> {
     let where_tokens = whitespace_spec_splitter(where_clause);
     let mut tokens_vector: Vec<(Vec<Token>, Option<Next>)> = Vec::default();
     let mut token_vector: Vec<Token> = Vec::default();
-    
+
     let mut where_tokens_iter = where_tokens.into_iter();
     let mut double_continue = false;
     let mut column_type = String::default();
-    
+
     while let Some(token) = where_tokens_iter.next() {
         if double_continue {
             double_continue = false;
             continue;
         }
-        
+
         if token.eq("LIMIT") || token.eq("RETURN") {
             double_continue = true;
             continue;
         }
-        
+
         if token == " " || token.is_empty() {
             continue;
         }
-        
+
         if token.starts_with("COL(") {
             let column_end = token.find(")").unwrap();
             let column_type_and_index = token[4..column_end].trim();
@@ -489,7 +495,7 @@ fn parse_where_clause(where_clause: &str) -> Vec<(Vec<Token>, Option<Next>)> {
             }
         }
     }
-    
+
     tokens_vector.push((token_vector, None));
     tokens_vector
 }
@@ -497,206 +503,165 @@ fn parse_where_clause(where_clause: &str) -> Vec<(Vec<Token>, Option<Next>)> {
 // Helper function to parse a value string into a Column with specific type
 fn parse_typed_value(value_str: &str, data_type: &str) -> std::result::Result<Column, String> {
     match data_type {
-        "I8" => {
-            match value_str.parse::<i8>() {
-                Ok(num) => Ok(Column::new_without_type(num).unwrap()),
-                Err(e) => Err(format!("Failed to parse I8 value '{}': {}", value_str, e))
-            }
+        "I8" => match value_str.parse::<i8>() {
+            Ok(num) => Ok(Column::new_without_type(num).unwrap()),
+            Err(e) => Err(format!("Failed to parse I8 value '{}': {}", value_str, e)),
         },
-        "I16" => {
-            match value_str.parse::<i16>() {
-                Ok(num) => Ok(Column::new_without_type(num).unwrap()),
-                Err(e) => Err(format!("Failed to parse I16 value '{}': {}", value_str, e))
-            }
+        "I16" => match value_str.parse::<i16>() {
+            Ok(num) => Ok(Column::new_without_type(num).unwrap()),
+            Err(e) => Err(format!("Failed to parse I16 value '{}': {}", value_str, e)),
         },
-        "I32" => {
-            match value_str.parse::<i32>() {
-                Ok(num) => { Ok(Column::new_without_type(num).unwrap()) },
-                Err(e) => Err(format!("Failed to parse I32 value '{}': {}", value_str, e))
-            }
+        "I32" => match value_str.parse::<i32>() {
+            Ok(num) => Ok(Column::new_without_type(num).unwrap()),
+            Err(e) => Err(format!("Failed to parse I32 value '{}': {}", value_str, e)),
         },
-        "I64" => {
-            match value_str.parse::<i64>() {
-                Ok(num) => Ok(Column::new_without_type(num).unwrap()),
-                Err(e) => Err(format!("Failed to parse I64 value '{}': {}", value_str, e))
-            }
+        "I64" => match value_str.parse::<i64>() {
+            Ok(num) => Ok(Column::new_without_type(num).unwrap()),
+            Err(e) => Err(format!("Failed to parse I64 value '{}': {}", value_str, e)),
         },
-        "I128" => {
-            match value_str.parse::<i128>() {
-                Ok(num) => Ok(Column::new_without_type(num).unwrap()),
-                Err(e) => Err(format!("Failed to parse I128 value '{}': {}", value_str, e))
-            }
+        "I128" => match value_str.parse::<i128>() {
+            Ok(num) => Ok(Column::new_without_type(num).unwrap()),
+            Err(e) => Err(format!("Failed to parse I128 value '{}': {}", value_str, e)),
         },
-        "U8" => {
-            match value_str.parse::<u8>() {
-                Ok(num) => Ok(Column::new_without_type(num).unwrap()),
-                Err(e) => Err(format!("Failed to parse U8 value '{}': {}", value_str, e))
-            }
+        "U8" => match value_str.parse::<u8>() {
+            Ok(num) => Ok(Column::new_without_type(num).unwrap()),
+            Err(e) => Err(format!("Failed to parse U8 value '{}': {}", value_str, e)),
         },
-        "U16" => {
-            match value_str.parse::<u16>() {
-                Ok(num) => Ok(Column::new_without_type(num).unwrap()),
-                Err(e) => Err(format!("Failed to parse U16 value '{}': {}", value_str, e))
-            }
+        "U16" => match value_str.parse::<u16>() {
+            Ok(num) => Ok(Column::new_without_type(num).unwrap()),
+            Err(e) => Err(format!("Failed to parse U16 value '{}': {}", value_str, e)),
         },
-        "U32" => {
-            match value_str.parse::<u32>() {
-                Ok(num) => Ok(Column::new_without_type(num).unwrap()),
-                Err(e) => Err(format!("Failed to parse U32 value '{}': {}", value_str, e))
-            }
+        "U32" => match value_str.parse::<u32>() {
+            Ok(num) => Ok(Column::new_without_type(num).unwrap()),
+            Err(e) => Err(format!("Failed to parse U32 value '{}': {}", value_str, e)),
         },
-        "U64" => {
-            match value_str.parse::<u64>() {
-                Ok(num) => Ok(Column::new_without_type(num).unwrap()),
-                Err(e) => Err(format!("Failed to parse U64 value '{}': {}", value_str, e))
-            }
+        "U64" => match value_str.parse::<u64>() {
+            Ok(num) => Ok(Column::new_without_type(num).unwrap()),
+            Err(e) => Err(format!("Failed to parse U64 value '{}': {}", value_str, e)),
         },
-        "U128" => {
-            match value_str.parse::<u128>() {
-                Ok(num) => Ok(Column::new_without_type(num).unwrap()),
-                Err(e) => Err(format!("Failed to parse U128 value '{}': {}", value_str, e))
-            }
+        "U128" => match value_str.parse::<u128>() {
+            Ok(num) => Ok(Column::new_without_type(num).unwrap()),
+            Err(e) => Err(format!("Failed to parse U128 value '{}': {}", value_str, e)),
         },
-        "F32" => {
-            match value_str.parse::<f32>() {
-                Ok(num) => Ok(Column::new_without_type(num).unwrap()),
-                Err(e) => Err(format!("Failed to parse F32 value '{}': {}", value_str, e))
-            }
+        "F32" => match value_str.parse::<f32>() {
+            Ok(num) => Ok(Column::new_without_type(num).unwrap()),
+            Err(e) => Err(format!("Failed to parse F32 value '{}': {}", value_str, e)),
         },
-        "F64" => {
-            match value_str.parse::<f64>() {
-                Ok(num) => Ok(Column::new_without_type(num).unwrap()),
-                Err(e) => Err(format!("Failed to parse F64 value '{}': {}", value_str, e))
-            }
+        "F64" => match value_str.parse::<f64>() {
+            Ok(num) => Ok(Column::new_without_type(num).unwrap()),
+            Err(e) => Err(format!("Failed to parse F64 value '{}': {}", value_str, e)),
         },
         "STRING" => {
             // Handle string values (strip quotes if present)
             let string_value = if value_str.starts_with('\'') && value_str.ends_with('\'') {
-                &value_str[1..value_str.len()-1]
+                &value_str[1..value_str.len() - 1]
             } else {
                 value_str
             };
             Ok(Column::new_without_type(string_value.to_string()).unwrap())
-        },
-        "BOOL" => {
-            match value_str.to_lowercase().as_str() {
-                "true" | "1" => Ok(Column::new_without_type(true).unwrap()),
-                "false" | "0" => Ok(Column::new_without_type(false).unwrap()),
-                _ => Err(format!("Failed to parse BOOL value: {}", value_str))
-            }
+        }
+        "BOOL" => match value_str.to_lowercase().as_str() {
+            "true" | "1" => Ok(Column::new_without_type(true).unwrap()),
+            "false" | "0" => Ok(Column::new_without_type(false).unwrap()),
+            _ => Err(format!("Failed to parse BOOL value: {}", value_str)),
         },
         "CHAR" => {
-            if value_str.starts_with('\'') && value_str.ends_with('\'') && value_str.chars().count() == 3 {
+            if value_str.starts_with('\'')
+                && value_str.ends_with('\'')
+                && value_str.chars().count() == 3
+            {
                 let ch = value_str.chars().nth(1).unwrap();
                 Ok(Column::new_without_type(ch).unwrap())
             } else {
                 Err(format!("Invalid CHAR value: {}", value_str))
             }
-        },
-        _ => Err(format!("Unsupported data type: {}", data_type))
-    }.map_err(|e| e.to_string())
+        }
+        _ => Err(format!("Unsupported data type: {}", data_type)),
+    }
+    .map_err(|e| e.to_string())
 }
 
-fn parse_typed_value_with_type(value_str: &str, data_type: &str) -> std::result::Result<Column, String> {
+fn parse_typed_value_with_type(
+    value_str: &str,
+    data_type: &str,
+) -> std::result::Result<Column, String> {
     match data_type {
-        "I8" => {
-            match value_str.parse::<i8>() {
-                Ok(num) => Ok(Column::new(num).unwrap()),
-                Err(e) => Err(format!("Failed to parse I8 value '{}': {}", value_str, e))
-            }
+        "I8" => match value_str.parse::<i8>() {
+            Ok(num) => Ok(Column::new(num).unwrap()),
+            Err(e) => Err(format!("Failed to parse I8 value '{}': {}", value_str, e)),
         },
-        "I16" => {
-            match value_str.parse::<i16>() {
-                Ok(num) => Ok(Column::new(num).unwrap()),
-                Err(e) => Err(format!("Failed to parse I16 value '{}': {}", value_str, e))
-            }
+        "I16" => match value_str.parse::<i16>() {
+            Ok(num) => Ok(Column::new(num).unwrap()),
+            Err(e) => Err(format!("Failed to parse I16 value '{}': {}", value_str, e)),
         },
-        "I32" => {
-            match value_str.parse::<i32>() {
-                Ok(num) => { Ok(Column::new(num).unwrap()) },
-                Err(e) => Err(format!("Failed to parse I32 value '{}': {}", value_str, e))
-            }
+        "I32" => match value_str.parse::<i32>() {
+            Ok(num) => Ok(Column::new(num).unwrap()),
+            Err(e) => Err(format!("Failed to parse I32 value '{}': {}", value_str, e)),
         },
-        "I64" => {
-            match value_str.parse::<i64>() {
-                Ok(num) => Ok(Column::new(num).unwrap()),
-                Err(e) => Err(format!("Failed to parse I64 value '{}': {}", value_str, e))
-            }
+        "I64" => match value_str.parse::<i64>() {
+            Ok(num) => Ok(Column::new(num).unwrap()),
+            Err(e) => Err(format!("Failed to parse I64 value '{}': {}", value_str, e)),
         },
-        "I128" => {
-            match value_str.parse::<i128>() {
-                Ok(num) => Ok(Column::new(num).unwrap()),
-                Err(e) => Err(format!("Failed to parse I128 value '{}': {}", value_str, e))
-            }
+        "I128" => match value_str.parse::<i128>() {
+            Ok(num) => Ok(Column::new(num).unwrap()),
+            Err(e) => Err(format!("Failed to parse I128 value '{}': {}", value_str, e)),
         },
-        "U8" => {
-            match value_str.parse::<u8>() {
-                Ok(num) => Ok(Column::new(num).unwrap()),
-                Err(e) => Err(format!("Failed to parse U8 value '{}': {}", value_str, e))
-            }
+        "U8" => match value_str.parse::<u8>() {
+            Ok(num) => Ok(Column::new(num).unwrap()),
+            Err(e) => Err(format!("Failed to parse U8 value '{}': {}", value_str, e)),
         },
-        "U16" => {
-            match value_str.parse::<u16>() {
-                Ok(num) => Ok(Column::new(num).unwrap()),
-                Err(e) => Err(format!("Failed to parse U16 value '{}': {}", value_str, e))
-            }
+        "U16" => match value_str.parse::<u16>() {
+            Ok(num) => Ok(Column::new(num).unwrap()),
+            Err(e) => Err(format!("Failed to parse U16 value '{}': {}", value_str, e)),
         },
-        "U32" => {
-            match value_str.parse::<u32>() {
-                Ok(num) => Ok(Column::new(num).unwrap()),
-                Err(e) => Err(format!("Failed to parse U32 value '{}': {}", value_str, e))
-            }
+        "U32" => match value_str.parse::<u32>() {
+            Ok(num) => Ok(Column::new(num).unwrap()),
+            Err(e) => Err(format!("Failed to parse U32 value '{}': {}", value_str, e)),
         },
-        "U64" => {
-            match value_str.parse::<u64>() {
-                Ok(num) => Ok(Column::new(num).unwrap()),
-                Err(e) => Err(format!("Failed to parse U64 value '{}': {}", value_str, e))
-            }
+        "U64" => match value_str.parse::<u64>() {
+            Ok(num) => Ok(Column::new(num).unwrap()),
+            Err(e) => Err(format!("Failed to parse U64 value '{}': {}", value_str, e)),
         },
-        "U128" => {
-            match value_str.parse::<u128>() {
-                Ok(num) => Ok(Column::new(num).unwrap()),
-                Err(e) => Err(format!("Failed to parse U128 value '{}': {}", value_str, e))
-            }
+        "U128" => match value_str.parse::<u128>() {
+            Ok(num) => Ok(Column::new(num).unwrap()),
+            Err(e) => Err(format!("Failed to parse U128 value '{}': {}", value_str, e)),
         },
-        "F32" => {
-            match value_str.parse::<f32>() {
-                Ok(num) => Ok(Column::new(num).unwrap()),
-                Err(e) => Err(format!("Failed to parse F32 value '{}': {}", value_str, e))
-            }
+        "F32" => match value_str.parse::<f32>() {
+            Ok(num) => Ok(Column::new(num).unwrap()),
+            Err(e) => Err(format!("Failed to parse F32 value '{}': {}", value_str, e)),
         },
-        "F64" => {
-            match value_str.parse::<f64>() {
-                Ok(num) => Ok(Column::new(num).unwrap()),
-                Err(e) => Err(format!("Failed to parse F64 value '{}': {}", value_str, e))
-            }
+        "F64" => match value_str.parse::<f64>() {
+            Ok(num) => Ok(Column::new(num).unwrap()),
+            Err(e) => Err(format!("Failed to parse F64 value '{}': {}", value_str, e)),
         },
         "STRING" => {
             // Handle string values (strip quotes if present)
             let string_value = if value_str.starts_with('\'') && value_str.ends_with('\'') {
-                &value_str[1..value_str.len()-1]
+                &value_str[1..value_str.len() - 1]
             } else {
                 value_str
             };
             Ok(Column::new(string_value.to_string()).unwrap())
-        },
-        "BOOL" => {
-            match value_str.to_lowercase().as_str() {
-                "true" | "1" => Ok(Column::new(true).unwrap()),
-                "false" | "0" => Ok(Column::new(false).unwrap()),
-                _ => Err(format!("Failed to parse BOOL value: {}", value_str))
-            }
+        }
+        "BOOL" => match value_str.to_lowercase().as_str() {
+            "true" | "1" => Ok(Column::new(true).unwrap()),
+            "false" | "0" => Ok(Column::new(false).unwrap()),
+            _ => Err(format!("Failed to parse BOOL value: {}", value_str)),
         },
         "CHAR" => {
-            if value_str.starts_with('\'') && value_str.ends_with('\'') && value_str.chars().count() == 3 {
+            if value_str.starts_with('\'')
+                && value_str.ends_with('\'')
+                && value_str.chars().count() == 3
+            {
                 let ch = value_str.chars().nth(1).unwrap();
                 Ok(Column::new(ch).unwrap())
             } else {
                 Err(format!("Invalid CHAR value: {}", value_str))
             }
-        },
-        _ => Err(format!("Unsupported data type: {}", data_type))
-    }.map_err(|e| e.to_string())
+        }
+        _ => Err(format!("Unsupported data type: {}", data_type)),
+    }
+    .map_err(|e| e.to_string())
 }
 
 pub struct DatabaseAction {
@@ -720,7 +685,7 @@ pub struct EvaluationResult {
     pub tokens: Vec<(Vec<Token>, Option<Next>)>,
     pub limit: i64,
     pub select_all: bool,
-    pub return_view: Option<ReturnView>
+    pub return_view: Option<ReturnView>,
 }
 
 pub struct InsertEvaluationResult {
@@ -729,5 +694,5 @@ pub struct InsertEvaluationResult {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReturnView {
-    Html
+    Html,
 }

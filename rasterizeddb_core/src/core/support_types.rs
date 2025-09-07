@@ -68,5 +68,5 @@ impl<'a> CursorVector<'a> {
 
 pub enum ReturnResult {
     Rows(SmallVec<[Row; 32]>),
-    HtmlView(String)
+    HtmlView(String),
 }

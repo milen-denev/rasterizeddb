@@ -1,6 +1,9 @@
-use crate::memory_pool::{MemoryBlock, MEMORY_POOL};
+use crate::memory_pool::{MEMORY_POOL, MemoryBlock};
 
-use super::{db_type::DbType, row_v2::row::{ColumnFetchingData, ColumnWritePayload, RowFetch, RowWrite}};
+use super::{
+    db_type::DbType,
+    row_v2::row::{ColumnFetchingData, ColumnWritePayload, RowFetch, RowWrite},
+};
 
 pub fn create_small_string_column() -> MemoryBlock {
     let string_bytes = b"Hello, world!";
@@ -141,46 +144,40 @@ pub fn create_row_write_custom_i32(val: i32, with_large_string: bool) -> RowWrit
 
 pub fn get_row_fetch_small_string() -> RowFetch {
     RowFetch {
-        columns_fetching_data: smallvec::smallvec![
-            ColumnFetchingData {
-                column_offset: 0,
-                column_type: DbType::STRING,
-                size: 0, // String size is not known yet,
-                schema_id: 0
-            }
-        ],
+        columns_fetching_data: smallvec::smallvec![ColumnFetchingData {
+            column_offset: 0,
+            column_type: DbType::STRING,
+            size: 0, // String size is not known yet,
+            schema_id: 0
+        }],
     }
 }
 
 pub fn get_row_fetch_large_string() -> RowFetch {
     RowFetch {
-        columns_fetching_data: smallvec::smallvec![
-            ColumnFetchingData {
-                column_offset: 8 + 4 + 4,
-                column_type: DbType::STRING,
-                size: 0, // String size is not known yet,
-                schema_id: 1
-            },
-        ],
+        columns_fetching_data: smallvec::smallvec![ColumnFetchingData {
+            column_offset: 8 + 4 + 4,
+            column_type: DbType::STRING,
+            size: 0, // String size is not known yet,
+            schema_id: 1
+        },],
     }
 }
 
 pub fn get_row_fetch_i32() -> RowFetch {
     RowFetch {
-        columns_fetching_data: smallvec::smallvec![
-            ColumnFetchingData {
-                column_offset: 8 + 4,
-                column_type: DbType::I32,
-                size: 4,
-                schema_id: 2
-            },
-        ],
+        columns_fetching_data: smallvec::smallvec![ColumnFetchingData {
+            column_offset: 8 + 4,
+            column_type: DbType::I32,
+            size: 4,
+            schema_id: 2
+        },],
     }
 }
 
 pub fn get_row_fetch_all() -> RowFetch {
     RowFetch {
-         columns_fetching_data: smallvec::smallvec![
+        columns_fetching_data: smallvec::smallvec![
             ColumnFetchingData {
                 column_offset: 0,
                 column_type: DbType::STRING,

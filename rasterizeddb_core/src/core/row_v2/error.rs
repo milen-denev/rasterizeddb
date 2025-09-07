@@ -1,5 +1,5 @@
-use std::fmt;
 use std::error::Error;
+use std::fmt;
 use std::io;
 
 /// Custom error type for row operations
@@ -36,7 +36,7 @@ pub enum RowError {
     /// Saving failed errors
     SavingFailed(String),
     /// General errors with custom message
-    Other(String)
+    Other(String),
 }
 
 impl fmt::Display for RowError {

@@ -1,3 +1,3 @@
 pub struct DatabaseArguments {
-    pub location: String
+    pub location: String,
 }

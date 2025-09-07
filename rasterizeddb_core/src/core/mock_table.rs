@@ -1,16 +1,28 @@
-use std::sync::{atomic::AtomicU64, Arc};
+use std::sync::{Arc, atomic::AtomicU64};
 
 use smallvec::SmallVec;
 use stopwatch::Stopwatch;
 
-use crate::{core::{row_v2::{concurrent_processor::ConcurrentProcessor, schema::TableSchemaIterator}}, memory_pool::MEMORY_POOL};
+use crate::{
+    core::row_v2::{concurrent_processor::ConcurrentProcessor, schema::TableSchemaIterator},
+    memory_pool::MEMORY_POOL,
+};
 
-use super::{db_type::DbType, row_v2::{row::{ColumnFetchingData, ColumnWritePayload, RowFetch, RowWrite}, row_pointer::{RowPointer, RowPointerIterator}, schema::{SchemaCalculator, SchemaField, TableSchema}}, storage_providers::{file_sync::LocalStorageProvider, traits::StorageIO}};
+use super::{
+    db_type::DbType,
+    row_v2::{
+        row::{ColumnFetchingData, ColumnWritePayload, RowFetch, RowWrite},
+        row_pointer::{RowPointer, RowPointerIterator},
+        schema::{SchemaCalculator, SchemaField, TableSchema},
+    },
+    storage_providers::{file_sync::LocalStorageProvider, traits::StorageIO},
+};
 
 pub static mut IO_SCHEMA: async_lazy::Lazy<Arc<LocalStorageProvider>> =
     async_lazy::Lazy::new(|| {
         Box::pin(async {
-            let io = LocalStorageProvider::new("G:\\Databases\\Test_Database", Some("table_5M.db")).await;
+            let io = LocalStorageProvider::new("G:\\Databases\\Test_Database", Some("table_5M.db"))
+                .await;
             Arc::new(io)
         })
     });
@@ -29,17 +41,16 @@ pub static mut IO_POINTERS: async_lazy::Lazy<Arc<LocalStorageProvider>> =
     });
 
 #[allow(static_mut_refs)]
-pub static mut IO_ROWS: async_lazy::Lazy<Arc<LocalStorageProvider>> =
-    async_lazy::Lazy::new(|| {
-        Box::pin(async {
-            let schema_io = unsafe { IO_SCHEMA.force().await };
-            let io_location = schema_io.get_location().unwrap();
-            let name = schema_io.get_name();
-            let name = format!("{}_{}", name.replace(".db", ""), "ROWS.db");
-            let io = LocalStorageProvider::new(&io_location, Some(&name)).await;
-            Arc::new(io)
-        })
-    });
+pub static mut IO_ROWS: async_lazy::Lazy<Arc<LocalStorageProvider>> = async_lazy::Lazy::new(|| {
+    Box::pin(async {
+        let schema_io = unsafe { IO_SCHEMA.force().await };
+        let io_location = schema_io.get_location().unwrap();
+        let name = schema_io.get_name();
+        let name = format!("{}_{}", name.replace(".db", ""), "ROWS.db");
+        let io = LocalStorageProvider::new(&io_location, Some(&name)).await;
+        Arc::new(io)
+    })
+});
 
 #[allow(static_mut_refs)]
 pub async fn consolidated_write_data_function(times: u64) {
@@ -50,11 +61,11 @@ pub async fn consolidated_write_data_function(times: u64) {
     let io_schema = io_schema.clone();
 
     create_schema(io_schema, "test_table").await;
-    
+
     for i in 0..times {
         let io_pointers = io_pointers.clone();
         let io_rows = io_rows.clone();
-    
+
         fill_data(i, io_pointers, io_rows, times).await;
     }
 }
@@ -75,7 +86,7 @@ pub async fn get_schema() -> TableSchema {
 pub async fn consolidated_read_data_function(schema: TableSchema, _id: u64) {
     let io_pointers = unsafe { IO_POINTERS.force().await };
     let io_rows = unsafe { IO_ROWS.force().await };
-    
+
     let io_pointers = io_pointers.clone();
     let io_rows = io_rows.clone();
 
@@ -83,63 +94,66 @@ pub async fn consolidated_read_data_function(schema: TableSchema, _id: u64) {
 
     // let schema_fields = schema.fields.clone();
     // let row_fetch = create_row_fetch(&schema_fields);
-    
+
     let mut iterator = RowPointerIterator::new(io_pointers).await.unwrap();
     let concurrent_processor = ConcurrentProcessor::new();
 
     // let all_rows = concurrent_processor.process(
     //     &format!(
     //     r##"
-    //         id = {} 
+    //         id = {}
     //         AND
-    //         age < 40 AND 
-    //         bank_balance > 500.25 AND 
-    //         name != 'Jane Doe' AND 
-    //         last_purchase_category CONTAINS 'Elec' AND 
-    //         last_purchase_amount >= 50.0 AND 
-    //         is_active = 1 AND 
-    //         last_purchase_amount < 200.0 AND 
-    //         last_purchase_notes ENDSWITH 'notes' AND 
+    //         age < 40 AND
+    //         bank_balance > 500.25 AND
+    //         name != 'Jane Doe' AND
+    //         last_purchase_category CONTAINS 'Elec' AND
+    //         last_purchase_amount >= 50.0 AND
+    //         is_active = 1 AND
+    //         last_purchase_amount < 200.0 AND
+    //         last_purchase_notes ENDSWITH 'notes' AND
     //         last_purchase_date = '2023-10-01'
     //         OR
-    //         id < 1 AND 
-    //         age > 25 AND 
-    //         bank_balance < 5000.00 AND 
-    //         name STARTSWITH 'J' AND 
-    //         last_purchase_category = 'Electronics' AND 
-    //         last_purchase_amount <= 150.0 AND 
-    //         is_active = 1 AND 
-    //         last_purchase_amount >= 75.5 AND 
-    //         last_purchase_notes CONTAINS 'No' AND 
+    //         id < 1 AND
+    //         age > 25 AND
+    //         bank_balance < 5000.00 AND
+    //         name STARTSWITH 'J' AND
+    //         last_purchase_category = 'Electronics' AND
+    //         last_purchase_amount <= 150.0 AND
+    //         is_active = 1 AND
+    //         last_purchase_amount >= 75.5 AND
+    //         last_purchase_notes CONTAINS 'No' AND
     //         last_purchase_date = '2023-10-01'
     //     "##, _id),
     //     row_fetch,
     //     schema_fields,
     //     io_rows,
     //     &mut iterator
-    // ).await;  
-    
+    // ).await;
+
     let schema_fields = schema.fields.clone();
     let row_fetch = create_row_fetch(&schema_fields);
     let row_fetch2 = create_row_fetch(&schema_fields);
 
-    let all_rows = concurrent_processor.process(
-        &format!(
-        r##"
+    let all_rows = concurrent_processor
+        .process(
+            &format!(
+                r##"
             id < 2
-        "##),
-        row_fetch,
-        row_fetch2,
-        &schema_fields.to_vec(),
-        io_rows,
-        &mut iterator
-    ).await;
+        "##
+            ),
+            row_fetch,
+            row_fetch2,
+            &schema_fields.to_vec(),
+            io_rows,
+            &mut iterator,
+        )
+        .await;
 
     stopwatch.stop();
 
     println!("Total rows collected: {}", all_rows.len());
     println!("Row fetch took: {:?}", stopwatch.elapsed());
-    
+
     //}
 
     // for row in all_rows {
@@ -171,10 +185,14 @@ fn create_row_fetch(schema_fields: &SmallVec<[SchemaField; 20]>) -> RowFetch {
     RowFetch {
         columns_fetching_data: smallvec::smallvec![
             ColumnFetchingData {
-                column_offset: schema_calculator.calculate_schema_offset("id", schema_fields).0,
+                column_offset: schema_calculator
+                    .calculate_schema_offset("id", schema_fields)
+                    .0,
                 column_type: DbType::U64,
                 size: 8,
-                schema_id: schema_calculator.calculate_schema_offset("id", schema_fields).1
+                schema_id: schema_calculator
+                    .calculate_schema_offset("id", schema_fields)
+                    .1
             },
             // ColumnFetchingData {
             //     column_offset: schema_calculator.calculate_schema_offset("name", schema_fields),
@@ -284,47 +302,124 @@ fn create_test_table_schema(name: &str, primary_key: Option<&str>) -> TableSchem
     table
 }
 
-async fn create_schema<S: StorageIO>(
-    mock_io: Arc<S>,
-    table_name: &str,
-)  -> TableSchema {
+async fn create_schema<S: StorageIO>(mock_io: Arc<S>, table_name: &str) -> TableSchema {
     let mut schema = create_test_table_schema(table_name, None);
     schema.save(mock_io.clone()).await.unwrap();
-    schema.add_field(mock_io.clone(), "id".into(), DbType::U64, true).await;
-    schema.add_field(mock_io.clone(), "name".into(), DbType::STRING, false).await;
-    schema.add_field(mock_io.clone(), "age".into(), DbType::U8, false).await;
-    schema.add_field(mock_io.clone(), "email".into(), DbType::STRING, false).await;
-    schema.add_field(mock_io.clone(), "address".into(), DbType::STRING, false).await;
-    schema.add_field(mock_io.clone(), "phone".into(), DbType::STRING, false).await;
-    schema.add_field(mock_io.clone(), "is_active".into(), DbType::U8, false).await;   
-    schema.add_field(mock_io.clone(), "bank_balance".into(), DbType::F64, false).await;
-    schema.add_field(mock_io.clone(), "married".into(), DbType::U8, false).await;
-    schema.add_field(mock_io.clone(), "birth_date".into(), DbType::STRING, false).await;
-    schema.add_field(mock_io.clone(), "last_login".into(), DbType::STRING, false).await;
-    schema.add_field(mock_io.clone(), "last_purchase".into(), DbType::STRING, false).await;
-    schema.add_field(mock_io.clone(), "last_purchase_amount".into(), DbType::F32, false).await;
-    schema.add_field(mock_io.clone(), "last_purchase_date".into(), DbType::STRING, false).await;
-    schema.add_field(mock_io.clone(), "last_purchase_location".into(), DbType::STRING, false).await;
-    schema.add_field(mock_io.clone(), "last_purchase_method".into(), DbType::STRING, false).await;
-    schema.add_field(mock_io.clone(), "last_purchase_category".into(), DbType::STRING, false).await;
-    schema.add_field(mock_io.clone(), "last_purchase_subcategory".into(), DbType::STRING, false).await;
-    schema.add_field(mock_io.clone(), "last_purchase_description".into(), DbType::STRING, false).await;
-    schema.add_field(mock_io.clone(), "last_purchase_notes".into(), DbType::STRING, false).await;
+    schema
+        .add_field(mock_io.clone(), "id".into(), DbType::U64, true)
+        .await;
+    schema
+        .add_field(mock_io.clone(), "name".into(), DbType::STRING, false)
+        .await;
+    schema
+        .add_field(mock_io.clone(), "age".into(), DbType::U8, false)
+        .await;
+    schema
+        .add_field(mock_io.clone(), "email".into(), DbType::STRING, false)
+        .await;
+    schema
+        .add_field(mock_io.clone(), "address".into(), DbType::STRING, false)
+        .await;
+    schema
+        .add_field(mock_io.clone(), "phone".into(), DbType::STRING, false)
+        .await;
+    schema
+        .add_field(mock_io.clone(), "is_active".into(), DbType::U8, false)
+        .await;
+    schema
+        .add_field(mock_io.clone(), "bank_balance".into(), DbType::F64, false)
+        .await;
+    schema
+        .add_field(mock_io.clone(), "married".into(), DbType::U8, false)
+        .await;
+    schema
+        .add_field(mock_io.clone(), "birth_date".into(), DbType::STRING, false)
+        .await;
+    schema
+        .add_field(mock_io.clone(), "last_login".into(), DbType::STRING, false)
+        .await;
+    schema
+        .add_field(
+            mock_io.clone(),
+            "last_purchase".into(),
+            DbType::STRING,
+            false,
+        )
+        .await;
+    schema
+        .add_field(
+            mock_io.clone(),
+            "last_purchase_amount".into(),
+            DbType::F32,
+            false,
+        )
+        .await;
+    schema
+        .add_field(
+            mock_io.clone(),
+            "last_purchase_date".into(),
+            DbType::STRING,
+            false,
+        )
+        .await;
+    schema
+        .add_field(
+            mock_io.clone(),
+            "last_purchase_location".into(),
+            DbType::STRING,
+            false,
+        )
+        .await;
+    schema
+        .add_field(
+            mock_io.clone(),
+            "last_purchase_method".into(),
+            DbType::STRING,
+            false,
+        )
+        .await;
+    schema
+        .add_field(
+            mock_io.clone(),
+            "last_purchase_category".into(),
+            DbType::STRING,
+            false,
+        )
+        .await;
+    schema
+        .add_field(
+            mock_io.clone(),
+            "last_purchase_subcategory".into(),
+            DbType::STRING,
+            false,
+        )
+        .await;
+    schema
+        .add_field(
+            mock_io.clone(),
+            "last_purchase_description".into(),
+            DbType::STRING,
+            false,
+        )
+        .await;
+    schema
+        .add_field(
+            mock_io.clone(),
+            "last_purchase_notes".into(),
+            DbType::STRING,
+            false,
+        )
+        .await;
     schema
 }
 
 static LAST_ID: AtomicU64 = AtomicU64::new(0);
 static TABLE_LENGTH: AtomicU64 = AtomicU64::new(0);
 
-async fn fill_data<S: StorageIO>(
-    id: u64,
-    io_pointers: Arc<S>,
-    io_rows: Arc<S>,
-    times: u64
-) {
+async fn fill_data<S: StorageIO>(id: u64, io_pointers: Arc<S>, io_rows: Arc<S>, times: u64) {
     #[cfg(feature = "enable_long_row")]
     let cluster = 0;
-    
+
     let row_write = if id == times - 1 {
         create_row_write(id, Some("Test row with notes".to_string()))
     } else {
@@ -333,13 +428,14 @@ async fn fill_data<S: StorageIO>(
 
     let _result = RowPointer::write_row(
         io_pointers,
-        io_rows, 
-        &LAST_ID, 
-        &TABLE_LENGTH, 
+        io_rows,
+        &LAST_ID,
+        &TABLE_LENGTH,
         #[cfg(feature = "enable_long_row")]
-        cluster, 
-        &row_write
-    ).await;
+        cluster,
+        &row_write,
+    )
+    .await;
 
     if _result.is_err() {
         panic!("Error writing row");
@@ -358,7 +454,7 @@ fn create_string_column(data: &str, write_order: u32) -> ColumnWritePayload {
         data: string_data,
         write_order,
         column_type: DbType::STRING,
-        size: 4 + 8
+        size: 4 + 8,
     }
 }
 
@@ -371,7 +467,7 @@ fn create_u8_column(data: u8, write_order: u32) -> ColumnWritePayload {
         data: u8_data,
         write_order,
         column_type: DbType::U8,
-        size: 1
+        size: 1,
     }
 }
 
@@ -384,10 +480,9 @@ fn create_u64_column(data: u64, write_order: u32) -> ColumnWritePayload {
         data: u64_data,
         write_order,
         column_type: DbType::U64,
-        size: 8
+        size: 8,
     }
 }
-
 
 fn create_f32_column(data: f32, write_order: u32) -> ColumnWritePayload {
     let f32_data = MEMORY_POOL.acquire(4);
@@ -398,7 +493,7 @@ fn create_f32_column(data: f32, write_order: u32) -> ColumnWritePayload {
         data: f32_data,
         write_order,
         column_type: DbType::F32,
-        size: 4
+        size: 4,
     }
 }
 
@@ -411,7 +506,7 @@ fn create_f64_column(data: f64, write_order: u32) -> ColumnWritePayload {
         data: f64_data,
         write_order,
         column_type: DbType::F64,
-        size: 8
+        size: 8,
     }
 }
 
@@ -448,8 +543,16 @@ fn create_row_write(id: u64, notes: Option<String>) -> RowWrite {
 fn _print_process_memory_stats(label: &str) {
     if let Some(usage) = memory_stats::memory_stats() {
         println!("--- Memory Stats ({}) ---", label);
-        println!("  Physical Memory: {} bytes ({} MB)", usage.physical_mem, usage.physical_mem / (1024 * 1024));
-        println!("  Virtual Memory:  {} bytes ({} MB)", usage.virtual_mem, usage.virtual_mem / (1024 * 1024));
+        println!(
+            "  Physical Memory: {} bytes ({} MB)",
+            usage.physical_mem,
+            usage.physical_mem / (1024 * 1024)
+        );
+        println!(
+            "  Virtual Memory:  {} bytes ({} MB)",
+            usage.virtual_mem,
+            usage.virtual_mem / (1024 * 1024)
+        );
         println!("----------------------------");
     } else {
         println!("--- Memory Stats ({}) ---", label);

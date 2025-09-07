@@ -1,7 +1,10 @@
 use std::{
-    arch::x86_64::{_mm_prefetch, _MM_HINT_T0},
+    arch::x86_64::{_MM_HINT_T0, _mm_prefetch},
     io::{self, Read, Seek, SeekFrom, Write},
-    sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
 };
 
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -10,20 +13,12 @@ use log::debug;
 use smallvec::SmallVec;
 
 use super::{
-    super::rql::{
-        models::Token, 
-        parser::ParserResult, 
-        tokenizer::evaluate_column_result
-    },
+    super::rql::{models::Token, parser::ParserResult, tokenizer::evaluate_column_result},
     column::Column,
     db_type::DbType,
-    helpers::{ 
-        columns_cursor_to_row_whole, 
-        indexed_row_fetching_file, 
-        read_row_columns, 
-        read_row_cursor_whole, 
-        row_prefetching, 
-        row_prefetching_cursor
+    helpers::{
+        columns_cursor_to_row_whole, indexed_row_fetching_file, read_row_columns,
+        read_row_cursor_whole, row_prefetching, row_prefetching_cursor,
     },
     row::{InsertOrUpdateRow, Row},
     storage_providers::traits::StorageIO,
@@ -33,7 +28,12 @@ use super::{
 };
 
 use crate::{
-    core::helpers::delete_row_file, memory_pool::MEMORY_POOL, renderers::html::render_rows_to_html, rql::{models::Next, parser::ReturnView}, simds::endianess::read_u32, CHUNK_SIZE, EMPTY_BUFFER, HEADER_SIZE 
+    CHUNK_SIZE, EMPTY_BUFFER, HEADER_SIZE,
+    core::helpers::delete_row_file,
+    memory_pool::MEMORY_POOL,
+    renderers::html::render_rows_to_html,
+    rql::{models::Next, parser::ReturnView},
+    simds::endianess::read_u32,
 };
 
 #[cfg(feature = "enable_parallelism")]
@@ -65,16 +65,16 @@ impl<S: StorageIO> Clone for Table<S> {
         let current_row_id = self.current_row_id.load(Ordering::Relaxed);
         let mutated = self.mutated.load(Ordering::Relaxed);
 
-        Self { 
+        Self {
             table_name: self.table_name.clone(),
-            io_sync: self.io_sync.clone(), 
-            table_header: self.table_header.clone(), 
-            in_memory_index: self.in_memory_index.clone(), 
-            current_file_length: AtomicU64::new(current_file_length), 
-            current_row_id: AtomicU64::new(current_row_id), 
-            immutable: self.immutable, 
+            io_sync: self.io_sync.clone(),
+            table_header: self.table_header.clone(),
+            in_memory_index: self.in_memory_index.clone(),
+            current_file_length: AtomicU64::new(current_file_length),
+            current_row_id: AtomicU64::new(current_row_id),
+            immutable: self.immutable,
             locked: AtomicBool::new(is_locked),
-            mutated: AtomicBool::new(mutated) 
+            mutated: AtomicBool::new(mutated),
         }
     }
 }
@@ -85,19 +85,25 @@ unsafe impl<S: StorageIO> Sync for Table<S> {}
 impl<S: StorageIO> Table<S> {
     /// #### STABILIZED
     /// Initializes a new table. compressed and immutable are not implemented yet.
-    pub async fn init(table_name: String, io_sync: S, compressed: bool, immutable: bool) -> io::Result<Table<S>> {
+    pub async fn init(
+        table_name: String,
+        io_sync: S,
+        compressed: bool,
+        immutable: bool,
+    ) -> io::Result<Table<S>> {
         let table_file_len = io_sync.get_len().await;
 
         if table_file_len >= HEADER_SIZE as u64 {
-            
             let buffer = io_sync.read_data(&mut 0, HEADER_SIZE as u32).await;
             let table_header = TableHeader::from_buffer(buffer).unwrap();
 
             let mutated = table_header.mutated.load(Ordering::Relaxed);
-            
+
             let last_row_id: u64 = table_header.last_row_id.load(Ordering::Relaxed);
 
-            table_header.total_file_length.store(io_sync.get_len().await, Ordering::Relaxed);
+            table_header
+                .total_file_length
+                .store(io_sync.get_len().await, Ordering::Relaxed);
 
             let table = Table {
                 table_name,
@@ -116,7 +122,7 @@ impl<S: StorageIO> Table<S> {
             let table_header = TableHeader::new(HEADER_SIZE as u64, 0, 0, compressed, 0, 0, false);
 
             let mutated = table_header.mutated.load(Ordering::Relaxed);
-            
+
             // Serialize the header and write it to the file
             let header_bytes = table_header.to_bytes().unwrap();
 
@@ -141,7 +147,7 @@ impl<S: StorageIO> Table<S> {
     /// #### STABILIZED
     /// Initializes a new table. compressed and immutable are not implemented yet.
     pub(crate) async fn init_inner(
-        table_name: String, 
+        table_name: String,
         io_sync: S,
         compressed: bool,
         immutable: bool,
@@ -155,7 +161,9 @@ impl<S: StorageIO> Table<S> {
             let mutated = table_header.mutated.load(Ordering::Relaxed);
             let last_row_id: u64 = table_header.last_row_id.load(Ordering::Relaxed);
 
-            table_header.total_file_length.store(io_sync.get_len().await, Ordering::Relaxed);
+            table_header
+                .total_file_length
+                .store(io_sync.get_len().await, Ordering::Relaxed);
 
             let table = Table {
                 table_name,
@@ -205,20 +213,21 @@ impl<S: StorageIO> Table<S> {
     async fn update_eof_and_id(&mut self, buffer_size: u64) -> u64 {
         // Get current values from atomics
         let end_of_file = self.current_file_length.load(Ordering::SeqCst);
-        
+
         // If end_of_file is 0, set it to HEADER_SIZE
         let new_end_of_file = if end_of_file == 0 {
             HEADER_SIZE as u64 + buffer_size
         } else {
             end_of_file + buffer_size
         };
-        
+
         // Store new end_of_file value
-        self.current_file_length.store(new_end_of_file, Ordering::SeqCst);
-        
+        self.current_file_length
+            .store(new_end_of_file, Ordering::SeqCst);
+
         // Increment and return row ID atomically
         let new_row_id = self.current_row_id.fetch_add(1, Ordering::SeqCst) + 1;
-        
+
         return new_row_id;
     }
 
@@ -258,7 +267,7 @@ impl<S: StorageIO> Table<S> {
 
         // Get the current file position where this row was inserted
         let current_file_pos = self.current_file_length.load(Ordering::Relaxed) - total_row_size;
-        
+
         self.io_sync.append_data(&buffer, true).await;
 
         // Update in-memory index
@@ -267,10 +276,10 @@ impl<S: StorageIO> Table<S> {
 
         let new_chunks = if let Some(existing_chunks) = chunks_arc_clone.as_ref() {
             let mut chunks = existing_chunks.clone();
-            
+
             if !chunks.is_empty() {
                 let last_chunk = chunks.last_mut().unwrap();
-                
+
                 if last_chunk.chunk_size + row_size <= CHUNK_SIZE {
                     // Row fits in the current chunk, update it
                     last_chunk.chunk_size += row_size;
@@ -291,7 +300,7 @@ impl<S: StorageIO> Table<S> {
                     next_row_id: row_id + 1,
                 });
             }
-            
+
             chunks
         } else {
             // Create new index with first chunk
@@ -303,13 +312,17 @@ impl<S: StorageIO> Table<S> {
             });
             chunks
         };
-        
+
         self.in_memory_index = Arc::new(Some(new_chunks));
 
         // Update table header
-        self.table_header.last_row_id.store(row_id, Ordering::SeqCst);
+        self.table_header
+            .last_row_id
+            .store(row_id, Ordering::SeqCst);
         let table_bytes = self.table_header.to_bytes().unwrap();
-        self.io_sync.write_data_seek(SeekFrom::Start(0), &table_bytes).await;
+        self.io_sync
+            .write_data_seek(SeekFrom::Start(0), &table_bytes)
+            .await;
     }
 
     /// #### STABILIZED
@@ -348,7 +361,7 @@ impl<S: StorageIO> Table<S> {
 
         // Get the current file position where this row was inserted
         let current_file_pos = self.current_file_length.load(Ordering::Relaxed) - total_row_size;
-        
+
         self.io_sync.append_data_unsync(&buffer).await;
 
         // Update in-memory index
@@ -357,10 +370,10 @@ impl<S: StorageIO> Table<S> {
 
         let new_chunks = if let Some(existing_chunks) = chunks_arc_clone.as_ref() {
             let mut chunks = existing_chunks.clone();
-            
+
             if !chunks.is_empty() {
                 let last_chunk = chunks.last_mut().unwrap();
-                
+
                 if last_chunk.chunk_size + row_size <= CHUNK_SIZE {
                     // Row fits in the current chunk, update it
                     last_chunk.chunk_size += row_size;
@@ -381,7 +394,7 @@ impl<S: StorageIO> Table<S> {
                     next_row_id: row_id + 1,
                 });
             }
-            
+
             chunks
         } else {
             // Create new index with first chunk
@@ -393,13 +406,17 @@ impl<S: StorageIO> Table<S> {
             });
             chunks
         };
-        
+
         self.in_memory_index = Arc::new(Some(new_chunks));
 
         // Update table header
-        self.table_header.last_row_id.store(row_id, Ordering::SeqCst);
+        self.table_header
+            .last_row_id
+            .store(row_id, Ordering::SeqCst);
         let table_bytes = self.table_header.to_bytes().unwrap();
-        self.io_sync.write_data_seek(SeekFrom::Start(0), &table_bytes).await;
+        self.io_sync
+            .write_data_seek(SeekFrom::Start(0), &table_bytes)
+            .await;
     }
 
     pub async fn execute_query(
@@ -420,12 +437,13 @@ impl<S: StorageIO> Table<S> {
 
             if let Some(return_view) = return_view {
                 if return_view == ReturnView::Html {
-                    return  Ok(Some(ReturnResult::HtmlView(render_rows_to_html(Ok(Some(rows)), &self.table_name).unwrap())));
+                    return Ok(Some(ReturnResult::HtmlView(
+                        render_rows_to_html(Ok(Some(rows)), &self.table_name).unwrap(),
+                    )));
                 } else {
                     return Ok(Some(ReturnResult::Rows(SmallVec::from_vec(rows))));
                 }
-            }
-            else {
+            } else {
                 return Ok(Some(ReturnResult::Rows(SmallVec::from_vec(rows))));
             }
         } else if let ParserResult::QueryEvaluationTokens(evaluation_tokens) = parser_result {
@@ -469,7 +487,7 @@ impl<S: StorageIO> Table<S> {
                     })
                     .collect_vec();
 
-                #[cfg(feature  = "enable_parallelism")]
+                #[cfg(feature = "enable_parallelism")]
                 {
                     return process_all_chunks(
                         &self.table_name,
@@ -482,16 +500,16 @@ impl<S: StorageIO> Table<S> {
                         &self.io_sync,
                         Arc::new(chunks.clone()),
                         THREADS,
-                        
                         #[cfg(feature = "enable_index_caching")]
-                        hash
-
-                    ).await;
+                        hash,
+                    )
+                    .await;
                 }
 
                 #[allow(unreachable_code)]
                 let mut required_columns: Vec<(u32, Column)> = Vec::default();
-                let mut token_results: Vec<(bool, Option<Next>)> = Vec::with_capacity(evaluation_tokens.len());
+                let mut token_results: Vec<(bool, Option<Next>)> =
+                    Vec::with_capacity(evaluation_tokens.len());
 
                 for chunk in chunks {
                     let buffer = chunk.read_chunk_sync(&mut self.io_sync).await;
@@ -500,7 +518,14 @@ impl<S: StorageIO> Table<S> {
                     let mut position: u64 = 0;
 
                     loop {
-                        if let Some(prefetch_result) = row_prefetching_cursor(&mut position, &mut cursor_vector, chunk, mutated).unwrap() {
+                        if let Some(prefetch_result) = row_prefetching_cursor(
+                            &mut position,
+                            &mut cursor_vector,
+                            chunk,
+                            mutated,
+                        )
+                        .unwrap()
+                        {
                             let mut current_column_index: u32 = 0;
                             let first_column_index = position.clone();
 
@@ -538,11 +563,11 @@ impl<S: StorageIO> Table<S> {
                                             cursor_vector.vector[(position + 2) as usize],
                                             cursor_vector.vector[(position + 3) as usize],
                                         ];
-                
+
                                         position += 4;
-                
+
                                         let str_len_array_pointer = str_len_array.as_ptr();
-                
+
                                         #[cfg(target_arch = "x86_64")]
                                         {
                                             unsafe {
@@ -551,26 +576,30 @@ impl<S: StorageIO> Table<S> {
                                                 )
                                             };
                                         }
-                
+
                                         let str_length = unsafe { read_u32(str_len_array_pointer) };
-                
+
                                         let chunk_slice = cursor_vector.vector.as_slice();
-                
-                                        let str_memory_chunk = MEMORY_POOL.acquire(str_length as usize);
-                
+
+                                        let str_memory_chunk =
+                                            MEMORY_POOL.acquire(str_length as usize);
+
                                         let preset_buffer = str_memory_chunk.into_slice_mut();
 
-                                        for (i, byte) in chunk_slice[position as usize..position as usize + str_length as usize].iter().enumerate() {
+                                        for (i, byte) in chunk_slice[position as usize
+                                            ..position as usize + str_length as usize]
+                                            .iter()
+                                            .enumerate()
+                                        {
                                             preset_buffer[i] = *byte;
                                         }
-                
+
                                         position += str_length as u64;
-                
+
                                         let column =
                                             Column::from_chunk(column_type, str_memory_chunk);
 
-                                        required_columns
-                                            .push((current_column_index, column));
+                                        required_columns.push((current_column_index, column));
                                     }
                                 } else {
                                     let column_type = cursor_vector.vector[position as usize];
@@ -634,7 +663,8 @@ impl<S: StorageIO> Table<S> {
 
                             if evaluation {
                                 let mut cursor = &mut cursor_vector.cursor;
-                                let new_position = first_column_index + prefetch_result.length as u64 + 1;
+                                let new_position =
+                                    first_column_index + prefetch_result.length as u64 + 1;
 
                                 let row = read_row_cursor_whole(
                                     first_column_index,
@@ -667,13 +697,22 @@ impl<S: StorageIO> Table<S> {
 
                                     if let Some(return_view) = return_view {
                                         if return_view == ReturnView::Html {
-                                            return  Ok(Some(ReturnResult::HtmlView(render_rows_to_html(Ok(Some(rows)), &self.table_name).unwrap())));
+                                            return Ok(Some(ReturnResult::HtmlView(
+                                                render_rows_to_html(
+                                                    Ok(Some(rows)),
+                                                    &self.table_name,
+                                                )
+                                                .unwrap(),
+                                            )));
                                         } else {
-                                            return Ok(Some(ReturnResult::Rows(SmallVec::from_vec(rows))));
+                                            return Ok(Some(ReturnResult::Rows(
+                                                SmallVec::from_vec(rows),
+                                            )));
                                         }
-                                    }
-                                    else {
-                                        return Ok(Some(ReturnResult::Rows(SmallVec::from_vec(rows))));
+                                    } else {
+                                        return Ok(Some(ReturnResult::Rows(SmallVec::from_vec(
+                                            rows,
+                                        ))));
                                     }
                                 }
 
@@ -700,7 +739,8 @@ impl<S: StorageIO> Table<S> {
                     })
                     .collect_vec();
 
-                let mut token_results: Vec<(bool, Option<Next>)> = Vec::with_capacity(evaluation_tokens.len());
+                let mut token_results: Vec<(bool, Option<Next>)> =
+                    Vec::with_capacity(evaluation_tokens.len());
                 let mut required_columns: Vec<(u32, Column)> = Vec::default();
                 let mut position = HEADER_SIZE as u64;
 
@@ -722,7 +762,8 @@ impl<S: StorageIO> Table<S> {
 
                         loop {
                             if column_indexes.iter().any(|x| *x == column_index_inner) {
-                                let memory_chunk = MEMORY_POOL.acquire(prefetch_result.length as usize + 1);
+                                let memory_chunk =
+                                    MEMORY_POOL.acquire(prefetch_result.length as usize + 1);
 
                                 let mut data_buffer = memory_chunk.into_slice_mut();
 
@@ -824,12 +865,16 @@ impl<S: StorageIO> Table<S> {
 
                                 if let Some(return_view) = return_view {
                                     if return_view == ReturnView::Html {
-                                        return  Ok(Some(ReturnResult::HtmlView(render_rows_to_html(Ok(Some(rows)), &self.table_name).unwrap())));
+                                        return Ok(Some(ReturnResult::HtmlView(
+                                            render_rows_to_html(Ok(Some(rows)), &self.table_name)
+                                                .unwrap(),
+                                        )));
                                     } else {
-                                        return Ok(Some(ReturnResult::Rows(SmallVec::from_vec(rows))));
+                                        return Ok(Some(ReturnResult::Rows(SmallVec::from_vec(
+                                            rows,
+                                        ))));
                                     }
-                                }
-                                else {
+                                } else {
                                     return Ok(Some(ReturnResult::Rows(SmallVec::from_vec(rows))));
                                 }
                             }
@@ -843,12 +888,13 @@ impl<S: StorageIO> Table<S> {
             if rows.len() > 0 {
                 if let Some(return_view) = return_view {
                     if return_view == ReturnView::Html {
-                        return  Ok(Some(ReturnResult::HtmlView(render_rows_to_html(Ok(Some(rows)), &self.table_name).unwrap())));
+                        return Ok(Some(ReturnResult::HtmlView(
+                            render_rows_to_html(Ok(Some(rows)), &self.table_name).unwrap(),
+                        )));
                     } else {
                         return Ok(Some(ReturnResult::Rows(SmallVec::from_vec(rows))));
                     }
-                }
-                else {
+                } else {
                     return Ok(Some(ReturnResult::Rows(SmallVec::from_vec(rows))));
                 }
             } else {
@@ -888,7 +934,8 @@ impl<S: StorageIO> Table<S> {
 
                 loop {
                     if let Some(prefetch_result) =
-                        row_prefetching_cursor(&mut position, &mut cursor_vector, chunk, mutated).unwrap()
+                        row_prefetching_cursor(&mut position, &mut cursor_vector, chunk, mutated)
+                            .unwrap()
                     {
                         if id == prefetch_result.found_id {
                             let starting_column_position =
@@ -909,7 +956,9 @@ impl<S: StorageIO> Table<S> {
 
                             self.mutated.store(true, Ordering::SeqCst);
                             self.table_header.mutated.store(true, Ordering::SeqCst);
-                            self.io_sync.write_data(0, &self.table_header.to_bytes().unwrap()).await;
+                            self.io_sync
+                                .write_data(0, &self.table_header.to_bytes().unwrap())
+                                .await;
 
                             return Ok(());
                         } else {
@@ -936,9 +985,11 @@ impl<S: StorageIO> Table<S> {
                             .await
                             .unwrap();
 
-                            self.mutated.store(true, Ordering::SeqCst);
-                            self.table_header.mutated.store(true, Ordering::SeqCst);
-                            self.io_sync.write_data(0, &self.table_header.to_bytes().unwrap()).await;
+                        self.mutated.store(true, Ordering::SeqCst);
+                        self.table_header.mutated.store(true, Ordering::SeqCst);
+                        self.io_sync
+                            .write_data(0, &self.table_header.to_bytes().unwrap())
+                            .await;
 
                         return Ok(());
                     } else {
@@ -975,7 +1026,7 @@ impl<S: StorageIO> Table<S> {
 
         // Get table header info for mutation status
         let mutated = self.table_header.mutated.load(Ordering::SeqCst);
-        
+
         // Initialize a temporary storage for the chunks we find
         let mut chunks_vec: Vec<FileChunk> = Vec::with_capacity(32);
         let mut position = HEADER_SIZE as u64;
@@ -994,17 +1045,17 @@ impl<S: StorageIO> Table<S> {
         while position < file_length {
             scan_count += 1;
             if scan_count % 10 == 0 {
-                debug!("Scan progress: {:.2}% ({}/{})", 
-                    (position as f64 / file_length as f64) * 100.0, 
-                    position, file_length);
+                debug!(
+                    "Scan progress: {:.2}% ({}/{})",
+                    (position as f64 / file_length as f64) * 100.0,
+                    position,
+                    file_length
+                );
             }
-        
+
             // Calculate how much to read (either our buffer size or remaining file)
-            let read_size = std::cmp::min(
-                SCAN_BUFFER_SIZE, 
-                (file_length - position) as u32
-            );
-            
+            let read_size = std::cmp::min(SCAN_BUFFER_SIZE, (file_length - position) as u32);
+
             if read_size == 0 {
                 break;
             }
@@ -1012,52 +1063,57 @@ impl<S: StorageIO> Table<S> {
             // Read a large chunk in one operation
             let mut data_position = position;
             let buffer = self.io_sync.read_data(&mut data_position, read_size).await;
-            
+
             // Safety check - ensure we got some data
             if buffer.is_empty() {
                 debug!("Warning: Empty buffer read at position {}", position);
                 position += 1024; // Skip ahead to make progress
                 continue;
             }
-            
+
             // Process the buffer to find START markers and row information
             let mut buffer_position: usize = 0;
             let buffer_length = buffer.len();
             let mut rows_found_in_buffer = 0;
-            
-            while buffer_position + 13 <= buffer_length { // Need at least START + ID + LENGTH
+
+            while buffer_position + 13 <= buffer_length {
+                // Need at least START + ID + LENGTH
                 // Skip empty spaces if table was mutated
                 if mutated && buffer_position < buffer_length && buffer[buffer_position] == 0 {
                     // Fast-forward through empty spaces
                     let mut empty_pos = buffer_position;
-                    while empty_pos + 8 <= buffer_length && 
-                          &buffer[empty_pos..empty_pos+8] == EMPTY_BUFFER.as_slice() {
+                    while empty_pos + 8 <= buffer_length
+                        && &buffer[empty_pos..empty_pos + 8] == EMPTY_BUFFER.as_slice()
+                    {
                         empty_pos += 8;
                     }
-                    
+
                     // If we reached the end of the buffer without finding data
                     if empty_pos + 8 > buffer_length {
                         buffer_position = buffer_length;
                         position += buffer_position as u64;
                         break;
                     }
-                    
+
                     // Find START marker
-                    while empty_pos < buffer_length && buffer[empty_pos] != DbType::START.to_byte() {
+                    while empty_pos < buffer_length && buffer[empty_pos] != DbType::START.to_byte()
+                    {
                         empty_pos += 1;
                     }
-                    
+
                     if empty_pos >= buffer_length {
                         buffer_position = buffer_length;
                         position += buffer_position as u64;
                         break;
                     }
-                    
+
                     buffer_position = empty_pos;
                 }
 
                 // Check for START marker
-                if buffer_position >= buffer_length || buffer[buffer_position] != DbType::START.to_byte() {
+                if buffer_position >= buffer_length
+                    || buffer[buffer_position] != DbType::START.to_byte()
+                {
                     // If no START marker is found, move to next byte and try again
                     buffer_position += 1;
                     continue;
@@ -1071,27 +1127,27 @@ impl<S: StorageIO> Table<S> {
                 }
 
                 // Extract row ID and length
-                let row_id_bytes = &buffer[buffer_position+1..buffer_position+9];
-                let length_bytes = &buffer[buffer_position+9..buffer_position+13];
+                let row_id_bytes = &buffer[buffer_position + 1..buffer_position + 9];
+                let length_bytes = &buffer[buffer_position + 9..buffer_position + 13];
                 let row_id = LittleEndian::read_u64(row_id_bytes);
                 let row_length = LittleEndian::read_u32(length_bytes);
-                
+
                 // Validate the row length is reasonable
                 if row_length > CHUNK_SIZE || row_length == 0 {
                     // This doesn't look like a valid row, skip this byte
                     buffer_position += 1;
                     continue;
                 }
-                
+
                 // Calculate full row size including header and footer
                 let full_row_size = (1 + 8 + 4 + row_length + 1) as u32; // START + ID + LEN + CONTENT + END
                 rows_found_in_buffer += 1;
-                
+
                 // Update the last row ID if this one is larger
                 if row_id > last_row_id {
                     last_row_id = row_id;
                 }
-                
+
                 // Check if current row would make chunk exceed CHUNK_SIZE
                 if current_chunk_size + full_row_size > CHUNK_SIZE {
                     // Add the current chunk without this row
@@ -1102,7 +1158,7 @@ impl<S: StorageIO> Table<S> {
                             next_row_id: row_id,
                         });
                     }
-                    
+
                     // Start a new chunk with this row
                     current_chunk_start = position + buffer_position as u64;
                     current_chunk_size = full_row_size;
@@ -1110,7 +1166,7 @@ impl<S: StorageIO> Table<S> {
                     // Add to current chunk
                     current_chunk_size += full_row_size;
                 }
-                
+
                 // Move to next row - ensure we don't exceed the buffer
                 if buffer_position + full_row_size as usize <= buffer_length {
                     buffer_position += full_row_size as usize;
@@ -1120,7 +1176,7 @@ impl<S: StorageIO> Table<S> {
                     break;
                 }
             }
-            
+
             // Update position for next read
             if buffer_position > 0 {
                 position += buffer_position as u64;
@@ -1135,7 +1191,7 @@ impl<S: StorageIO> Table<S> {
                 debug!("Warning: No rows found in buffer of size {}", buffer_length);
             }
         }
-        
+
         // Always add the final chunk if it has data
         if current_chunk_size > 0 {
             chunks_vec.push(FileChunk {
@@ -1148,18 +1204,30 @@ impl<S: StorageIO> Table<S> {
         // Display indexing results
         let elapsed = start_time.elapsed();
         debug!("Indexing complete in {:.2?}", elapsed);
-        debug!("Indexed from {} to {} bytes ({:.2}% of file)", 
-            HEADER_SIZE, position, (position as f64 / file_length as f64) * 100.0);
-        debug!("Found {} chunks with last row_id {}", chunks_vec.len(), last_row_id);
-        
+        debug!(
+            "Indexed from {} to {} bytes ({:.2}% of file)",
+            HEADER_SIZE,
+            position,
+            (position as f64 / file_length as f64) * 100.0
+        );
+        debug!(
+            "Found {} chunks with last row_id {}",
+            chunks_vec.len(),
+            last_row_id
+        );
+
         // Debug: Print first and last chunk info
         if !chunks_vec.is_empty() {
             let first = &chunks_vec[0];
             let last = &chunks_vec[chunks_vec.len() - 1];
-            debug!("First chunk: start={}, size={}, next_row_id={}", 
-                first.current_file_position, first.chunk_size, first.next_row_id);
-            debug!("Last chunk: start={}, size={}, next_row_id={}", 
-                last.current_file_position, last.chunk_size, last.next_row_id);
+            debug!(
+                "First chunk: start={}, size={}, next_row_id={}",
+                first.current_file_position, first.chunk_size, first.next_row_id
+            );
+            debug!(
+                "Last chunk: start={}, size={}, next_row_id={}",
+                last.current_file_position, last.chunk_size, last.next_row_id
+            );
         }
 
         // Update the in_memory_index
@@ -1168,18 +1236,22 @@ impl<S: StorageIO> Table<S> {
         } else {
             self.in_memory_index = Arc::new(Some(chunks_vec));
         }
-        
+
         // Update last_row_id in current_row_id atomic if needed
         let current_last_row_id = self.current_row_id.load(Ordering::Relaxed);
         if last_row_id > current_last_row_id {
             self.current_row_id.store(last_row_id, Ordering::Relaxed);
-            
+
             // Update the table header
-            self.table_header.last_row_id.store(current_last_row_id, Ordering::Relaxed);
-            self.io_sync.write_data(0, &self.table_header.to_bytes().unwrap()).await;
+            self.table_header
+                .last_row_id
+                .store(current_last_row_id, Ordering::Relaxed);
+            self.io_sync
+                .write_data(0, &self.table_header.to_bytes().unwrap())
+                .await;
         }
     }
-    
+
     /// #### STABILIZED
     /// Updates the row by the given id.
     pub async fn update_row_by_id(&mut self, id: u64, row: InsertOrUpdateRow) {
@@ -1210,7 +1282,7 @@ impl<S: StorageIO> Table<S> {
         let file_length = self.get_current_table_length();
         let mut position = HEADER_SIZE as u64;
 
-        loop {           
+        loop {
             let mutated = self.table_header.mutated.load(Ordering::SeqCst);
 
             if let Some(prefetch_result) =
@@ -1243,7 +1315,10 @@ impl<S: StorageIO> Table<S> {
                         let new_position = position - 8 - 4 - 1;
 
                         self.io_sync.write_data_unsync(new_position, &buffer).await;
-                        let verify_result = self.io_sync.verify_data_and_sync(new_position, &buffer).await;
+                        let verify_result = self
+                            .io_sync
+                            .verify_data_and_sync(new_position, &buffer)
+                            .await;
 
                         #[allow(unreachable_code)]
                         if !verify_result {
@@ -1274,7 +1349,10 @@ impl<S: StorageIO> Table<S> {
                         let new_position = position - 8 - 4 - 1;
 
                         self.io_sync.write_data_unsync(new_position, &buffer).await;
-                        let verify_result = self.io_sync.verify_data_and_sync(new_position, &buffer).await;
+                        let verify_result = self
+                            .io_sync
+                            .verify_data_and_sync(new_position, &buffer)
+                            .await;
 
                         #[allow(unreachable_code)]
                         if !verify_result {
@@ -1285,15 +1363,17 @@ impl<S: StorageIO> Table<S> {
                         let empty_buffer =
                             vec![0 as u8; (current_row_len - update_row_size) as usize];
 
-                        self.io_sync.write_data_unsync(
-                            new_position + update_row_size as u64,
-                            &empty_buffer,
-                        ).await;
-                        
-                        let clean_up_verify_result = self.io_sync.verify_data_and_sync(
-                            new_position + update_row_size as u64,
-                            &empty_buffer,
-                        ).await;
+                        self.io_sync
+                            .write_data_unsync(new_position + update_row_size as u64, &empty_buffer)
+                            .await;
+
+                        let clean_up_verify_result = self
+                            .io_sync
+                            .verify_data_and_sync(
+                                new_position + update_row_size as u64,
+                                &empty_buffer,
+                            )
+                            .await;
 
                         #[allow(unreachable_code)]
                         if !clean_up_verify_result {
@@ -1303,7 +1383,9 @@ impl<S: StorageIO> Table<S> {
 
                         self.mutated.store(true, Ordering::SeqCst);
                         self.table_header.mutated.store(true, Ordering::SeqCst);
-                        self.io_sync.write_data(0, &self.table_header.to_bytes().unwrap()).await;
+                        self.io_sync
+                            .write_data(0, &self.table_header.to_bytes().unwrap())
+                            .await;
 
                         break;
                     } else {
@@ -1324,7 +1406,10 @@ impl<S: StorageIO> Table<S> {
                         buffer.push(255);
 
                         self.io_sync.append_data_unsync(&buffer).await;
-                        let verify_result = self.io_sync.verify_data_and_sync(current_file_len, &buffer).await;
+                        let verify_result = self
+                            .io_sync
+                            .verify_data_and_sync(current_file_len, &buffer)
+                            .await;
 
                         #[allow(unreachable_code)]
                         if !verify_result {
@@ -1336,10 +1421,13 @@ impl<S: StorageIO> Table<S> {
 
                         let new_position = position - 8 - 4 - 1;
 
-                        self.io_sync.write_data_unsync(new_position, &empty_buffer).await;
+                        self.io_sync
+                            .write_data_unsync(new_position, &empty_buffer)
+                            .await;
                         let clean_up_verify_result = self
                             .io_sync
-                            .verify_data_and_sync(new_position, &empty_buffer).await;
+                            .verify_data_and_sync(new_position, &empty_buffer)
+                            .await;
 
                         #[allow(unreachable_code)]
                         if !clean_up_verify_result {
@@ -1349,15 +1437,16 @@ impl<S: StorageIO> Table<S> {
 
                         let chunks_arc_clone = self.in_memory_index.clone();
 
-                        let mut new_chunks = if let Some(existing_chunks) = chunks_arc_clone.as_ref() {
-                            existing_chunks.clone()
-                        } else {
-                            Vec::with_capacity(1)
-                        };
-                        
+                        let mut new_chunks =
+                            if let Some(existing_chunks) = chunks_arc_clone.as_ref() {
+                                existing_chunks.clone()
+                            } else {
+                                Vec::with_capacity(1)
+                            };
+
                         if !new_chunks.is_empty() {
                             let last_chunk = new_chunks.last_mut().unwrap();
-                            
+
                             if last_chunk.chunk_size + update_row_size <= CHUNK_SIZE as u32 {
                                 last_chunk.chunk_size += update_row_size;
                                 last_chunk.next_row_id += 1;
@@ -1375,12 +1464,14 @@ impl<S: StorageIO> Table<S> {
                                 next_row_id: row_id,
                             });
                         }
-                        
+
                         self.in_memory_index = Arc::new(Some(new_chunks));
 
                         self.mutated.store(true, Ordering::SeqCst);
                         self.table_header.mutated.store(true, Ordering::SeqCst);
-                        self.io_sync.write_data(0, &self.table_header.to_bytes().unwrap()).await;
+                        self.io_sync
+                            .write_data(0, &self.table_header.to_bytes().unwrap())
+                            .await;
 
                         break;
                     }
@@ -1398,7 +1489,10 @@ impl<S: StorageIO> Table<S> {
     pub async fn vacuum_table(&mut self) {
         // Acquire lock on the table
         loop {
-            let table_locked = self.locked.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok();
+            let table_locked = self
+                .locked
+                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok();
             if !table_locked {
                 continue;
             } else {
@@ -1407,52 +1501,61 @@ impl<S: StorageIO> Table<S> {
         }
 
         let file_length = self.get_current_table_length();
-        
+
         // Early return for empty tables
         if file_length <= HEADER_SIZE as u64 {
             self.locked.store(false, Ordering::Relaxed);
             return;
         }
-        
+
         const BUFFER_THRESHOLD: usize = 8 * 1024 * 1024; // 8 MB buffer threshold
-        
+
         // Create temporary table
         let temp_io_sync = self.io_sync.create_temp().await;
-        let mut temp_table = Table::init("temp".into(), temp_io_sync, false, false).await.unwrap();
-        
+        let mut temp_table = Table::init("temp".into(), temp_io_sync, false, false)
+            .await
+            .unwrap();
+
         // Batch collection for buffering rows before writing to disk
         let mut row_batch: Vec<InsertOrUpdateRow> = Vec::new();
         let mut current_batch_size: usize = 0;
         let mut total_rows_processed: usize = 0;
-        
+
         // Get table mutation status
         let mutated = self.table_header.mutated.load(Ordering::SeqCst);
-        
+
         // Check if in-memory indexes are available
         let chunks_arc_clone = self.in_memory_index.clone();
-        
+
         if let Some(chunks) = chunks_arc_clone.as_ref() {
-            debug!("Vacuum: processing with in-memory chunks ({} chunks found)", chunks.len());
-            
+            debug!(
+                "Vacuum: processing with in-memory chunks ({} chunks found)",
+                chunks.len()
+            );
+
             for (chunk_idx, chunk) in chunks.iter().enumerate() {
                 // Read an entire chunk into memory at once
                 let buffer = chunk.read_chunk_sync(&mut self.io_sync).await;
                 let mut cursor_vector = CursorVector::new(&buffer);
                 let mut position: u64 = 0;
-                
+
                 loop {
-                    if let Some(prefetch_result) = row_prefetching_cursor(&mut position, &mut cursor_vector, chunk, mutated).unwrap() {
+                    if let Some(prefetch_result) =
+                        row_prefetching_cursor(&mut position, &mut cursor_vector, chunk, mutated)
+                            .unwrap()
+                    {
                         // Use the in-memory cursor data directly rather than re-reading from disk
                         let first_column_index = position;
                         let mut cursor = &mut cursor_vector.cursor;
-                        
+
                         let row = read_row_cursor_whole(
                             first_column_index,
                             prefetch_result.found_id,
                             prefetch_result.length,
                             &mut cursor,
-                        ).unwrap();
-                        
+                        )
+                        .unwrap();
+
                         // Add row to memory buffer
                         let row_size = row.columns_data.len();
                         row_batch.push(InsertOrUpdateRow {
@@ -1460,19 +1563,23 @@ impl<S: StorageIO> Table<S> {
                         });
                         current_batch_size += row_size;
                         total_rows_processed += 1;
-                        
+
                         // Flush buffer when threshold is reached
                         if current_batch_size >= BUFFER_THRESHOLD {
-                            debug!("Vacuum: flushing buffer - chunk {}/{} - {} rows processed", 
-                                   chunk_idx + 1, chunks.len(), total_rows_processed);
-                            
+                            debug!(
+                                "Vacuum: flushing buffer - chunk {}/{} - {} rows processed",
+                                chunk_idx + 1,
+                                chunks.len(),
+                                total_rows_processed
+                            );
+
                             // Write batch to temp table
                             for row_to_insert in row_batch.drain(..) {
                                 temp_table.insert_row_unsync(row_to_insert).await;
                             }
                             current_batch_size = 0;
                         }
-                        
+
                         // Move to next row
                         position += prefetch_result.length as u64 + 1;
                     } else {
@@ -1482,15 +1589,16 @@ impl<S: StorageIO> Table<S> {
             }
         } else {
             debug!("Vacuum: processing without in-memory indexes");
-            
+
             // Process the file sequentially when no in-memory indexes exist
             let mut position: u64 = HEADER_SIZE as u64;
             let mut last_log_pos: u64 = position;
-            
+
             loop {
-                if let Some(prefetch_result) = row_prefetching(&mut self.io_sync, &mut position, file_length, mutated)
-                    .await
-                    .unwrap()
+                if let Some(prefetch_result) =
+                    row_prefetching(&mut self.io_sync, &mut position, file_length, mutated)
+                        .await
+                        .unwrap()
                 {
                     // Read the entire row at once
                     let row = read_row_columns(
@@ -1501,7 +1609,7 @@ impl<S: StorageIO> Table<S> {
                     )
                     .await
                     .unwrap();
-                    
+
                     // Add to memory buffer
                     let row_size = row.columns_data.len();
                     row_batch.push(InsertOrUpdateRow {
@@ -1509,16 +1617,20 @@ impl<S: StorageIO> Table<S> {
                     });
                     current_batch_size += row_size;
                     total_rows_processed += 1;
-                    
+
                     // Flush buffer when threshold is reached
                     if current_batch_size >= BUFFER_THRESHOLD {
-                        let progress = ((position - HEADER_SIZE as u64) as f64 / 
-                                      (file_length - HEADER_SIZE as u64) as f64) * 100.0;
-                        
-                        debug!("Vacuum: flushing buffer - {:.2}% complete ({} rows, {:.2}MB processed)",
-                               progress, total_rows_processed,
-                               (position - last_log_pos) as f64 / 1_048_576.0);
-                        
+                        let progress = ((position - HEADER_SIZE as u64) as f64
+                            / (file_length - HEADER_SIZE as u64) as f64)
+                            * 100.0;
+
+                        debug!(
+                            "Vacuum: flushing buffer - {:.2}% complete ({} rows, {:.2}MB processed)",
+                            progress,
+                            total_rows_processed,
+                            (position - last_log_pos) as f64 / 1_048_576.0
+                        );
+
                         // Write batch to temp table
                         for row_to_insert in row_batch.drain(..) {
                             temp_table.insert_row_unsync(row_to_insert).await;
@@ -1526,7 +1638,7 @@ impl<S: StorageIO> Table<S> {
                         current_batch_size = 0;
                         last_log_pos = position;
                     }
-                    
+
                     // Move to next row
                     position += prefetch_result.length as u64 + 1;
                 } else {
@@ -1534,20 +1646,23 @@ impl<S: StorageIO> Table<S> {
                 }
             }
         }
-        
+
         // Flush any remaining rows in the buffer
         if !row_batch.is_empty() {
-            debug!("Vacuum: flushing final buffer - {} rows total", total_rows_processed);
+            debug!(
+                "Vacuum: flushing final buffer - {} rows total",
+                total_rows_processed
+            );
             for row_to_insert in row_batch.drain(..) {
                 temp_table.insert_row_unsync(row_to_insert).await;
             }
         }
 
         debug!("Vacuum: swapping temporary table with main table");
-        
+
         // Swap the temporary table with the main one
         self.io_sync.swap_temp(&mut temp_table.io_sync).await;
-        
+
         drop(temp_table);
 
         // Reset the in-memory index
@@ -1555,7 +1670,10 @@ impl<S: StorageIO> Table<S> {
 
         // Release the table lock and update state
         loop {
-            let table_locked = self.locked.compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed).is_ok();
+            let table_locked = self
+                .locked
+                .compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok();
             if !table_locked {
                 continue;
             } else {
@@ -1565,8 +1683,10 @@ impl<S: StorageIO> Table<S> {
 
         self.mutated.store(false, Ordering::SeqCst);
         self.table_header.mutated.store(false, Ordering::SeqCst);
-        self.io_sync.write_data(0, &self.table_header.to_bytes().unwrap()).await;
-        
+        self.io_sync
+            .write_data(0, &self.table_header.to_bytes().unwrap())
+            .await;
+
         debug!("Vacuum completed: processed {} rows", total_rows_processed);
     }
 }

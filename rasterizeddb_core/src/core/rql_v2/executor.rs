@@ -2,7 +2,14 @@ use std::sync::Arc;
 
 use log::{debug, error, info};
 
-use crate::core::{database_v2::Database, row_v2::row::rows_into_vec, rql_v2::{lexer_ct::create_table_from_query_purpose, lexer_ir::insert_row_from_query_purpose, lexer_query::row_fetch_from_select_query, lexer_s1::QueryPurpose}};
+use crate::core::{
+    database_v2::Database,
+    row_v2::row::rows_into_vec,
+    rql_v2::{
+        lexer_ct::create_table_from_query_purpose, lexer_ir::insert_row_from_query_purpose,
+        lexer_query::row_fetch_from_select_query, lexer_s1::QueryPurpose,
+    },
+};
 
 pub async fn execute(query: QueryPurpose, database: Arc<Database>) -> Vec<u8> {
     match &query {
@@ -134,7 +141,15 @@ pub async fn execute(query: QueryPurpose, database: Arc<Database>) -> Vec<u8> {
             let schema = &table.schema;
             // Handle insert row
             if let Ok(query_row) = row_fetch_from_select_query(&query, &schema.fields) {
-                if let Ok(rows) = table.query_row(&query_row.where_clause, &schema.fields.to_vec(), query_row.query_row_fetch, query_row.requested_row_fetch).await {
+                if let Ok(rows) = table
+                    .query_row(
+                        &query_row.where_clause,
+                        &schema.fields.to_vec(),
+                        query_row.query_row_fetch,
+                        query_row.requested_row_fetch,
+                    )
+                    .await
+                {
                     info!("Query executed successfully, returning {} rows", rows.len());
                     let mut result: [u8; 1] = [2u8; 1];
                     let mut final_vec = Vec::with_capacity(1 + rows.len());

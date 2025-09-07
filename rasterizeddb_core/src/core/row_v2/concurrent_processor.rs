@@ -2,10 +2,26 @@ use std::{borrow::Cow, cell::UnsafeCell, sync::Arc};
 
 use futures::future::join_all;
 use smallvec::SmallVec;
-use tokio::{sync::{mpsc, Semaphore}, task};
+use tokio::{
+    sync::{Semaphore, mpsc},
+    task,
+};
 
-use crate::{core::{row_v2::{query_parser::QueryParser, transformer::RowBlocks}, storage_providers::traits::StorageIO}, memory_pool::MemoryBlock, MAX_PERMITS_THREADS};
-use super::{row::{Row, RowFetch}, row_pointer::RowPointerIterator, schema::SchemaField, query_tokenizer::tokenize, transformer::{ColumnTransformer, Next, TransformerProcessor}};
+use super::{
+    query_tokenizer::tokenize,
+    row::{Row, RowFetch},
+    row_pointer::RowPointerIterator,
+    schema::SchemaField,
+    transformer::{ColumnTransformer, Next, TransformerProcessor},
+};
+use crate::{
+    MAX_PERMITS_THREADS,
+    core::{
+        row_v2::{query_parser::QueryParser, transformer::RowBlocks},
+        storage_providers::traits::StorageIO,
+    },
+    memory_pool::MemoryBlock,
+};
 
 pub static EMPTY_STR: &str = "";
 
@@ -130,10 +146,7 @@ impl ConcurrentProcessor {
                         let parser_mut = unsafe { &mut *parser_cell.get() };
                         // Do NOT call reset_for_next_execution() per row anymore.
                         if let Err(e) = parser_mut.execute(tmp_vec) {
-                            panic!(
-                                "Error executing query parser while building plan: {:?}",
-                                e
-                            );
+                            panic!("Error executing query parser while building plan: {:?}", e);
                         }
 
                         // Ensure the intermediate buffer has the needed capacity once
@@ -146,13 +159,20 @@ impl ConcurrentProcessor {
                     let result = {
                         // No need to clear bool_buffer; execute_row clears the output slice itself
                         let processor = unsafe { &mut *processor_cell.get() };
-                        processor.execute_row(&RowView::new(&buffer.row, schema_ref.as_slice()), &mut buffer.bool_buffer)
+                        processor.execute_row(
+                            &RowView::new(&buffer.row, schema_ref.as_slice()),
+                            &mut buffer.bool_buffer,
+                        )
                     };
 
                     if result {
                         let io_rows_clone = Arc::clone(&io_rows_batch);
                         pointer
-                            .fetch_row_reuse_async(io_rows_clone, requested_row_fetch, &mut buffer.row)
+                            .fetch_row_reuse_async(
+                                io_rows_clone,
+                                requested_row_fetch,
+                                &mut buffer.row,
+                            )
                             .await;
 
                         // Send a clone out to the aggregator

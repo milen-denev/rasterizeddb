@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use log::LevelFilter;
-use rasterizeddb_core::{core::database_v2::Database, MAX_PERMITS_THREADS};
+use rasterizeddb_core::{MAX_PERMITS_THREADS, core::database_v2::Database};
 use tokio::runtime::Builder;
 
 #[allow(unreachable_code)]
@@ -16,11 +16,11 @@ fn main() -> std::io::Result<()> {
         .enable_all()
         .build()?;
 
-     rt.block_on(async {
+    rt.block_on(async {
         env_logger::Builder::new()
             .filter_level(LevelFilter::Error)
             .init();
-            
+
         let database = Database::new("G:\\Databases\\Production").await;
         let arc_database = Arc::new(database);
         _ = Database::start_db(arc_database).await;

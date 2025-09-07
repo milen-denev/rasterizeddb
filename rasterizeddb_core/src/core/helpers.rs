@@ -1,6 +1,6 @@
 use std::{
-    arch::x86_64::{_mm_prefetch, _MM_HINT_T0},
-    io::{self, Cursor, Read, Seek, SeekFrom}
+    arch::x86_64::{_MM_HINT_T0, _mm_prefetch},
+    io::{self, Cursor, Read, Seek, SeekFrom},
 };
 
 use byteorder::{LittleEndian, ReadBytesExt};
@@ -14,8 +14,8 @@ use super::{
 };
 
 use crate::{
-    simds::endianess::{read_u32, read_u64},
     EMPTY_BUFFER,
+    simds::endianess::{read_u32, read_u64},
 };
 
 #[inline(always)]
@@ -100,11 +100,15 @@ pub(crate) async fn delete_row_file(
 
     // Write the empty buffer to overwrite the data
     // ID (8) LEN (4) START (1)
-    io_sync.write_data_seek(
-        SeekFrom::Start(first_column_index - 4 - 8 - 1),
-        &empty_buffer,
-    ).await;
-    io_sync.verify_data_and_sync(first_column_index - 4 - 8 - 1, &empty_buffer).await;
+    io_sync
+        .write_data_seek(
+            SeekFrom::Start(first_column_index - 4 - 8 - 1),
+            &empty_buffer,
+        )
+        .await;
+    io_sync
+        .verify_data_and_sync(first_column_index - 4 - 8 - 1, &empty_buffer)
+        .await;
 
     Ok(())
 }
@@ -121,31 +125,31 @@ pub(crate) async fn skip_empty_spaces_file(
 
     // Use a loop instead of recursion to prevent stack overflow
     let mut continue_search = true;
-    
+
     while continue_search {
         // Don't read past the end of file
         if file_length <= *file_position {
             return *file_position;
         }
-        
+
         let mut check_next_buffer = io_sync.read_data(file_position, 8).await;
-        
+
         if check_next_buffer == EMPTY_BUFFER {
             // Skip through empty spaces in larger blocks when possible
             loop {
                 _ = io_sync
                     .read_data_into_buffer(file_position, &mut check_next_buffer)
                     .await;
-                
+
                 if file_length <= *file_position {
                     return *file_position;
                 }
-                
+
                 if check_next_buffer != EMPTY_BUFFER {
                     break;
                 }
             }
-            
+
             // Find the exact position of the row start
             if let Some(index_of_row_start) = check_next_buffer
                 .iter()
@@ -174,13 +178,13 @@ pub(crate) async fn skip_empty_spaces_file(
                 // Continue the outer loop to search again
             }
         }
-        
+
         // Safety check to prevent infinite loops
         if *file_position >= file_length {
             return file_length;
         }
     }
-    
+
     *file_position
 }
 
@@ -211,34 +215,33 @@ pub(crate) fn skip_empty_spaces_cursor(
         let mut current_pos = *position as usize;
         let vec_slice = cursor_vector.vector.as_slice();
         let end_pos = (cursor_length as usize).min(vec_slice.len());
-        
+
         while current_pos + 8 <= end_pos {
             let chunk = &vec_slice[current_pos..current_pos + 8];
-            
+
             #[cfg(target_arch = "x86_64")]
             {
                 unsafe { _mm_prefetch::<_MM_HINT_T0>(chunk.as_ptr() as *const i8) };
             }
-            
+
             if chunk != EMPTY_BUFFER {
                 // Found non-empty data
                 break;
             }
-            
+
             current_pos += 8;
         }
-        
+
         *position = current_pos as u64;
-        
+
         if cursor_length as u64 <= *position {
             return Ok(());
         }
-        
+
         // Find the exact position of the row start
         let remaining = &cursor_vector.vector[*position as usize..];
-        if let Some(index_of_row_start) = remaining
-            .iter()
-            .position(|x| *x == DbType::START.to_byte())
+        if let Some(index_of_row_start) =
+            remaining.iter().position(|x| *x == DbType::START.to_byte())
         {
             *position += index_of_row_start as u64;
         } else {
@@ -268,7 +271,7 @@ pub(crate) async fn row_prefetching(
     io_sync: &Box<impl StorageIO>,
     file_position: &mut u64,
     file_length: u64,
-    is_mutated: bool
+    is_mutated: bool,
 ) -> io::Result<Option<RowPrefetchResult>> {
     if *file_position >= file_length {
         return Ok(None);
@@ -277,7 +280,7 @@ pub(crate) async fn row_prefetching(
     if is_mutated {
         *file_position = skip_empty_spaces_file(io_sync, file_position, file_length).await;
     }
-    
+
     // Read header data in one operation to minimize I/O
     let mut cursor = io_sync.read_data_to_cursor(file_position, 1 + 8 + 4).await;
 
@@ -294,10 +297,7 @@ pub(crate) async fn row_prefetching(
     let found_id = cursor.read_u64::<LittleEndian>().unwrap();
     let length = cursor.read_u32::<LittleEndian>().unwrap();
 
-    Ok(Some(RowPrefetchResult {
-        found_id,
-        length,
-    }))
+    Ok(Some(RowPrefetchResult { found_id, length }))
 }
 
 #[inline(always)]
@@ -306,7 +306,7 @@ pub fn row_prefetching_cursor(
     position: &mut u64,
     cursor_vector: &mut CursorVector,
     chunk: &FileChunk,
-    is_mutated: bool
+    is_mutated: bool,
 ) -> io::Result<Option<RowPrefetchResult>> {
     if is_mutated {
         skip_empty_spaces_cursor(position, cursor_vector, chunk.chunk_size)?;
@@ -322,7 +322,7 @@ pub fn row_prefetching_cursor(
     // Use direct slice access for better performance
     let pos = *position as usize;
     let start_byte = slice[pos];
-    
+
     // Prefetch the data we're about to read
     #[cfg(target_arch = "x86_64")]
     unsafe {
@@ -336,17 +336,14 @@ pub fn row_prefetching_cursor(
     // Read ID and length using SIMD-optimized functions
     let id_ptr = &slice[pos + 1] as *const u8;
     let len_ptr = &slice[pos + 9] as *const u8;
-    
+
     let found_id = unsafe { read_u64(id_ptr) };
     let length = unsafe { read_u32(len_ptr) };
 
     // Update position
     *position += 13;
 
-    Ok(Some(RowPrefetchResult {
-        found_id,
-        length,
-    }))
+    Ok(Some(RowPrefetchResult { found_id, length }))
 }
 
 #[inline(always)]
@@ -413,7 +410,7 @@ pub(crate) fn columns_cursor_to_row_whole(
     columns_cursor.set_position(0);
     let mut columns_buffer: Vec<u8> = Vec::with_capacity(length as usize);
     let cursor_data = columns_cursor.get_ref();
-    
+
     columns_buffer.extend_from_slice(&cursor_data[..length as usize]);
 
     Ok(Row {

@@ -3,13 +3,16 @@ use std::{borrow::Cow, io::Read};
 use byteorder::ReadBytesExt;
 use smallvec::SmallVec;
 
-use crate::{core::db_type::DbType, memory_pool::{MemoryBlock, MEMORY_POOL}};
+use crate::{
+    core::db_type::DbType,
+    memory_pool::{MEMORY_POOL, MemoryBlock},
+};
 
 use super::schema::SchemaField;
 
 #[derive(Debug)]
 pub struct RowFetch {
-    pub columns_fetching_data: SmallVec<[ColumnFetchingData; 32]>
+    pub columns_fetching_data: SmallVec<[ColumnFetchingData; 32]>,
 }
 
 #[derive(Debug)]
@@ -17,18 +20,18 @@ pub struct ColumnFetchingData {
     pub column_offset: u32,
     pub column_type: DbType,
     pub size: u32,
-    pub schema_id: u64
+    pub schema_id: u64,
 }
 
 pub struct RowWrite {
-    pub columns_writing_data: SmallVec<[ColumnWritePayload; 32]>
+    pub columns_writing_data: SmallVec<[ColumnWritePayload; 32]>,
 }
 
 pub struct ColumnWritePayload {
     pub data: MemoryBlock,
     pub write_order: u32,
     pub column_type: DbType,
-    pub size: u32
+    pub size: u32,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -47,11 +50,15 @@ impl Row {
         Row {
             position: row.position.clone(),
             columns: columns,
-            length: row.length.clone()
+            length: row.length.clone(),
         }
     }
 
-    pub fn get_column(&self, column_name: &str, schema: &SmallVec<[SchemaField; 20]>) -> Option<MemoryBlock> {
+    pub fn get_column(
+        &self,
+        column_name: &str,
+        schema: &SmallVec<[SchemaField; 20]>,
+    ) -> Option<MemoryBlock> {
         let result = self.columns.iter().find_map(|col| {
             if schema[col.schema_id as usize].name == *column_name {
                 let data = col.data.clone();
@@ -74,7 +81,7 @@ impl Row {
         const LEN_EMPTY_BUFFER: [u8; 4] = [0u8; 4];
 
         vec.extend_from_slice(&LEN_EMPTY_BUFFER);
-        
+
         let mut size: u64 = 0;
 
         for column in self.columns {
@@ -130,24 +137,35 @@ impl Row {
         while cursor.position() < bytes.len() as u64 {
             let column_size = cursor.read_u64::<byteorder::LittleEndian>()?;
             let schema_id = cursor.read_u64::<byteorder::LittleEndian>()?;
-            
+
             let column_data_mb = MEMORY_POOL.acquire(column_size as usize);
             let mut column_data = column_data_mb.into_slice_mut();
             cursor.read_exact(&mut column_data)?;
 
             let column_type = DbType::from_byte(cursor.read_u8()?);
-            columns.push(Column { schema_id, data: column_data_mb, column_type });
+            columns.push(Column {
+                schema_id,
+                data: column_data_mb,
+                column_type,
+            });
         }
-        Ok(Row { position: 0, columns, length })
+        Ok(Row {
+            position: 0,
+            columns,
+            length,
+        })
     }
 
-    pub fn from_cursor(cursor: &mut std::io::Cursor<&[u8]>, global_position: &mut u64) -> std::io::Result<Self> {
+    pub fn from_cursor(
+        cursor: &mut std::io::Cursor<&[u8]>,
+        global_position: &mut u64,
+    ) -> std::io::Result<Self> {
         #[cfg(feature = "enable_long_row")]
         let length = cursor.read_u64::<byteorder::LittleEndian>().unwrap();
 
         #[cfg(not(feature = "enable_long_row"))]
         let length = cursor.read_u32::<byteorder::LittleEndian>().unwrap();
-        
+
         let mut columns = SmallVec::new();
 
         #[cfg(feature = "enable_long_row")]
@@ -165,7 +183,7 @@ impl Row {
             if current_position == end_position {
                 break;
             }
-            
+
             let column_size = cursor.read_u64::<byteorder::LittleEndian>().unwrap();
             let schema_id = cursor.read_u64::<byteorder::LittleEndian>().unwrap();
 
@@ -174,14 +192,22 @@ impl Row {
             cursor.read_exact(&mut column_data).unwrap();
 
             let column_type = DbType::from_byte(cursor.read_u8().unwrap());
-            columns.push(Column { schema_id, data: column_data_mb, column_type });
+            columns.push(Column {
+                schema_id,
+                data: column_data_mb,
+                column_type,
+            });
 
             current_position = current_position + 8 + 8 + column_size + 1;
         }
 
         *global_position += current_position as u64;
 
-        Ok(Row { position: 0, columns, length })
+        Ok(Row {
+            position: 0,
+            columns,
+            length,
+        })
     }
 }
 
@@ -231,16 +257,19 @@ impl Column {
 pub fn column_vec_into_vec<'a>(
     row_mut: &mut SmallVec<[(Cow<'a, str>, MemoryBlock); 20]>,
     columns: &Vec<Column>,
-    schema: &'a SmallVec<[SchemaField; 20]>
+    schema: &'a SmallVec<[SchemaField; 20]>,
 ) {
     for column in columns {
-        row_mut.push((Cow::Borrowed(schema[column.schema_id as usize].name.as_str()), column.data.clone()));
+        row_mut.push((
+            Cow::Borrowed(schema[column.schema_id as usize].name.as_str()),
+            column.data.clone(),
+        ));
     }
 }
 
 pub enum ReturnResult {
     Rows(Vec<Row>),
-    HtmlView(String)
+    HtmlView(String),
 }
 
 #[cfg(test)]
@@ -248,7 +277,7 @@ mod row_tests {
     use super::*;
     use crate::core::db_type::DbType;
 
-    use crate::core::row_v2::query_tokenizer::{numeric_to_mb, str_to_mb, NumericValue};
+    use crate::core::row_v2::query_tokenizer::{NumericValue, numeric_to_mb, str_to_mb};
 
     fn make_numeric_column(schema_id: u64, value: NumericValue, column_type: DbType) -> Column {
         let mb = numeric_to_mb(&value);
@@ -293,11 +322,14 @@ mod row_tests {
         let row = make_test_row(42, smallvec::smallvec![col1, col2], 0);
         let vec = row.clone().into_vec();
         let row2 = Row::from_vec(&vec).unwrap();
-    assert_eq!(row2.columns.len(), 2);
-    assert_eq!(row2.columns[0].data.into_slice(), &0x05040301i32.to_le_bytes());
-    assert_eq!(row2.columns[1].data.into_slice(), b"hello");
-    assert_eq!(row2.columns[0].column_type, DbType::I32);
-    assert_eq!(row2.columns[1].column_type, DbType::STRING);
+        assert_eq!(row2.columns.len(), 2);
+        assert_eq!(
+            row2.columns[0].data.into_slice(),
+            &0x05040301i32.to_le_bytes()
+        );
+        assert_eq!(row2.columns[1].data.into_slice(), b"hello");
+        assert_eq!(row2.columns[0].column_type, DbType::I32);
+        assert_eq!(row2.columns[1].column_type, DbType::STRING);
     }
 
     #[test]
@@ -310,16 +342,19 @@ mod row_tests {
 
     #[test]
     fn test_rows_into_vec_and_vec_into_rows_multiple_rows() {
-    let col1 = make_numeric_column(0, NumericValue::I32(2020), DbType::I32);
-    let col2 = make_string_column(1, "world", DbType::STRING);
-    let row1 = make_test_row(1, smallvec::smallvec![col1.clone()], 0);
-    let row2 = make_test_row(2, smallvec::smallvec![col2.clone()], 0);
-    let rows = vec![row1.clone(), row2.clone()];
-    let vec = rows_into_vec(rows.clone());
-    let rows2 = vec_into_rows(&vec).unwrap();
-    assert_eq!(rows2.len(), 2);
-    assert_eq!(rows2[0].columns[0].data.into_slice(), &2020i32.to_le_bytes());
-    assert_eq!(rows2[1].columns[0].data.into_slice(), b"world");
+        let col1 = make_numeric_column(0, NumericValue::I32(2020), DbType::I32);
+        let col2 = make_string_column(1, "world", DbType::STRING);
+        let row1 = make_test_row(1, smallvec::smallvec![col1.clone()], 0);
+        let row2 = make_test_row(2, smallvec::smallvec![col2.clone()], 0);
+        let rows = vec![row1.clone(), row2.clone()];
+        let vec = rows_into_vec(rows.clone());
+        let rows2 = vec_into_rows(&vec).unwrap();
+        assert_eq!(rows2.len(), 2);
+        assert_eq!(
+            rows2[0].columns[0].data.into_slice(),
+            &2020i32.to_le_bytes()
+        );
+        assert_eq!(rows2[1].columns[0].data.into_slice(), b"world");
     }
 
     #[test]
@@ -331,53 +366,53 @@ mod row_tests {
 
     #[test]
     fn test_row_from_cursor_and_from_vec_equivalence() {
-    let col1 = make_numeric_column(0, NumericValue::I32(789), DbType::I32);
-    let row = make_test_row(0, smallvec::smallvec![col1.clone()], 0);
-    let vec = row.clone().into_vec();
-    let mut cursor = std::io::Cursor::new(vec.as_slice());
-    let mut global_position = 0u64;
-    let row2 = Row::from_cursor(&mut cursor, &mut global_position).unwrap();
-    assert_eq!(row2.columns.len(), 1);
-    assert_eq!(row2.columns[0].data.into_slice(), &789i32.to_le_bytes());
-    assert_eq!(row2.columns[0].column_type, DbType::I32);
+        let col1 = make_numeric_column(0, NumericValue::I32(789), DbType::I32);
+        let row = make_test_row(0, smallvec::smallvec![col1.clone()], 0);
+        let vec = row.clone().into_vec();
+        let mut cursor = std::io::Cursor::new(vec.as_slice());
+        let mut global_position = 0u64;
+        let row2 = Row::from_cursor(&mut cursor, &mut global_position).unwrap();
+        assert_eq!(row2.columns.len(), 1);
+        assert_eq!(row2.columns[0].data.into_slice(), &789i32.to_le_bytes());
+        assert_eq!(row2.columns[0].column_type, DbType::I32);
     }
 
     #[test]
     fn test_row_from_cursor_multiple_rows() {
-    let col1 = make_numeric_column(0, NumericValue::I32(1), DbType::I32);
-    let col2 = make_string_column(1, "2", DbType::STRING);
-    let row1 = make_test_row(0, smallvec::smallvec![col1.clone()], 0);
-    let row2 = make_test_row(0, smallvec::smallvec![col2.clone()], 0);
-    let vec = rows_into_vec(vec![row1.clone(), row2.clone()]);
-    let mut cursor = std::io::Cursor::new(vec.as_slice());
-    let mut global_position = 0u64;
-    let r1 = Row::from_cursor(&mut cursor, &mut global_position).unwrap();
-    let r2 = Row::from_cursor(&mut cursor, &mut global_position).unwrap();
-    assert_eq!(r1.columns[0].data.into_slice(), &1i32.to_le_bytes());
-    assert_eq!(r2.columns[0].data.into_slice(), b"2");
+        let col1 = make_numeric_column(0, NumericValue::I32(1), DbType::I32);
+        let col2 = make_string_column(1, "2", DbType::STRING);
+        let row1 = make_test_row(0, smallvec::smallvec![col1.clone()], 0);
+        let row2 = make_test_row(0, smallvec::smallvec![col2.clone()], 0);
+        let vec = rows_into_vec(vec![row1.clone(), row2.clone()]);
+        let mut cursor = std::io::Cursor::new(vec.as_slice());
+        let mut global_position = 0u64;
+        let r1 = Row::from_cursor(&mut cursor, &mut global_position).unwrap();
+        let r2 = Row::from_cursor(&mut cursor, &mut global_position).unwrap();
+        assert_eq!(r1.columns[0].data.into_slice(), &1i32.to_le_bytes());
+        assert_eq!(r2.columns[0].data.into_slice(), b"2");
     }
 
     #[test]
     fn test_row_into_vec_column_types_and_schema_ids() {
-    let col1 = make_numeric_column(5, NumericValue::I32(100), DbType::I32);
-    let col2 = make_string_column(7, "abc", DbType::STRING);
-    let row = make_test_row(0, smallvec::smallvec![col1.clone(), col2.clone()], 0);
-    let vec = row.clone().into_vec();
-    let row2 = Row::from_vec(&vec).unwrap();
-    assert_eq!(row2.columns[0].schema_id, 5);
-    assert_eq!(row2.columns[1].schema_id, 7);
-    assert_eq!(row2.columns[0].column_type, DbType::I32);
-    assert_eq!(row2.columns[1].column_type, DbType::STRING);
+        let col1 = make_numeric_column(5, NumericValue::I32(100), DbType::I32);
+        let col2 = make_string_column(7, "abc", DbType::STRING);
+        let row = make_test_row(0, smallvec::smallvec![col1.clone(), col2.clone()], 0);
+        let vec = row.clone().into_vec();
+        let row2 = Row::from_vec(&vec).unwrap();
+        assert_eq!(row2.columns[0].schema_id, 5);
+        assert_eq!(row2.columns[1].schema_id, 7);
+        assert_eq!(row2.columns[0].column_type, DbType::I32);
+        assert_eq!(row2.columns[1].column_type, DbType::STRING);
     }
 
     #[test]
     fn test_row_into_vec_and_from_vec_with_large_data() {
-    let long_str = "a".repeat(1000);
-    let col = make_string_column(0, &long_str, DbType::STRING);
-    let row = make_test_row(0, smallvec::smallvec![col.clone()], 0);
-    let vec = row.clone().into_vec();
-    let row2 = Row::from_vec(&vec).unwrap();
-    assert_eq!(row2.columns[0].data.into_slice(), long_str.as_bytes());
+        let long_str = "a".repeat(1000);
+        let col = make_string_column(0, &long_str, DbType::STRING);
+        let row = make_test_row(0, smallvec::smallvec![col.clone()], 0);
+        let vec = row.clone().into_vec();
+        let row2 = Row::from_vec(&vec).unwrap();
+        assert_eq!(row2.columns[0].data.into_slice(), long_str.as_bytes());
     }
 
     #[test]
@@ -388,7 +423,7 @@ mod row_tests {
         assert_eq!(row2.columns.len(), 0);
     }
 
-        #[test]
+    #[test]
     fn test_row_with_very_large_numeric_column() {
         // Create a column with 100 i32 values
         let large_vec: Vec<i32> = (0..100).collect();
@@ -439,9 +474,15 @@ mod row_tests {
         // Create 10 rows, each with a large numeric and string column
         let mut rows = Vec::new();
         for i in 0..10 {
-            let num_bytes: Vec<u8> = (0..10).flat_map(|v| ((v as i32 + i as i32).to_le_bytes().to_vec())).collect();
+            let num_bytes: Vec<u8> = (0..10)
+                .flat_map(|v| ((v as i32 + i as i32).to_le_bytes().to_vec()))
+                .collect();
             let str_val = format!("row{}_{}", i, "Y".repeat(10));
-            let col_num = make_string_column(0, std::str::from_utf8(&num_bytes).unwrap_or(""), DbType::STRING);
+            let col_num = make_string_column(
+                0,
+                std::str::from_utf8(&num_bytes).unwrap_or(""),
+                DbType::STRING,
+            );
             let col_str = make_string_column(1, &str_val, DbType::STRING);
             let row = make_test_row(i, smallvec::smallvec![col_num, col_str], 0);
             rows.push(row);

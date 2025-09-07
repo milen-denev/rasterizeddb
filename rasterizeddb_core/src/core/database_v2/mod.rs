@@ -1,11 +1,29 @@
-use std::{io, sync::{atomic::AtomicU64, Arc}};
+use std::{
+    io,
+    sync::{Arc, atomic::AtomicU64},
+};
 
 use dashmap::DashMap;
 use log::{debug, error, info};
 use rastcp::server::{TcpServer, TcpServerBuilder};
-use smallvec::{smallvec, SmallVec};
+use smallvec::{SmallVec, smallvec};
 
-use crate::{core::{db_type::DbType, row_v2::{concurrent_processor::ConcurrentProcessor, row::{ColumnFetchingData, ColumnWritePayload, RowFetch, RowWrite}, row_pointer::{RowPointer, RowPointerIterator}, schema::{SchemaCalculator, SchemaField, TableSchema}, table::Table}, rql_v2::{executor::execute, lexer_ct::CreateTable, lexer_s1::recognize_query_purpose}, storage_providers::{file_sync::LocalStorageProvider, traits::StorageIO}}, memory_pool::MEMORY_POOL, SERVER_PORT};
+use crate::{
+    SERVER_PORT,
+    core::{
+        db_type::DbType,
+        row_v2::{
+            concurrent_processor::ConcurrentProcessor,
+            row::{ColumnFetchingData, ColumnWritePayload, RowFetch, RowWrite},
+            row_pointer::{RowPointer, RowPointerIterator},
+            schema::{SchemaCalculator, SchemaField, TableSchema},
+            table::Table,
+        },
+        rql_v2::{executor::execute, lexer_ct::CreateTable, lexer_s1::recognize_query_purpose},
+        storage_providers::{file_sync::LocalStorageProvider, traits::StorageIO},
+    },
+    memory_pool::MEMORY_POOL,
+};
 
 pub mod args;
 
@@ -36,23 +54,39 @@ impl Database {
             tokio::fs::create_dir_all(location).await.unwrap();
         }
 
-        let io_pointers = Arc::new(LocalStorageProvider::new(location, Some("db_data_pointers.db")).await);
+        let io_pointers =
+            Arc::new(LocalStorageProvider::new(location, Some("db_data_pointers.db")).await);
         let io_rows = Arc::new(LocalStorageProvider::new(location, Some("db_data_rows.db")).await);
-        let io_schema = Arc::new(LocalStorageProvider::new(location, Some("db_data_schema.db")).await);
+        let io_schema =
+            Arc::new(LocalStorageProvider::new(location, Some("db_data_schema.db")).await);
 
         let io_pointers_clone = io_pointers.clone();
         let io_rows_clone = io_rows.clone();
         let io_schema_clone = io_schema.clone();
 
-        tokio::spawn(async move { let clone_io_rows = io_rows_clone.clone(); clone_io_rows.start_service().await });
-        tokio::spawn(async move { let clone_io_pointers = io_pointers_clone.clone(); clone_io_pointers.start_service().await });
-        tokio::spawn(async move { let clone_io_schema = io_schema_clone.clone(); clone_io_schema.start_service().await });
+        tokio::spawn(async move {
+            let clone_io_rows = io_rows_clone.clone();
+            clone_io_rows.start_service().await
+        });
+        tokio::spawn(async move {
+            let clone_io_pointers = io_pointers_clone.clone();
+            clone_io_pointers.start_service().await
+        });
+        tokio::spawn(async move {
+            let clone_io_schema = io_schema_clone.clone();
+            clone_io_schema.start_service().await
+        });
 
         let schema = load_db_data_schema(io_schema.clone()).await;
         let mut iterator = RowPointerIterator::new(io_pointers.clone()).await.unwrap();
-        let tables_names: Vec<(String, u64)> = load_db_tables(&schema, &mut iterator, io_rows.clone()).await;
+        let tables_names: Vec<(String, u64)> =
+            load_db_tables(&schema, &mut iterator, io_rows.clone()).await;
 
-        debug!("Loaded {} tables from database: {:?}", tables_names.len(), tables_names);
+        debug!(
+            "Loaded {} tables from database: {:?}",
+            tables_names.len(),
+            tables_names
+        );
 
         let tables = DashMap::new();
 
@@ -65,7 +99,7 @@ impl Database {
             tables,
             db_io_pointers: io_pointers,
             db_io_rows: io_rows,
-            db_io_schema: io_schema
+            db_io_schema: io_schema,
         }
     }
 
@@ -74,7 +108,10 @@ impl Database {
         let columns = create_table.columns;
 
         if self.tables.contains_key(table_name) {
-            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "Table already exists"));
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "Table already exists",
+            ));
         }
 
         let name_mb = MEMORY_POOL.acquire(table_name.len());
@@ -88,24 +125,26 @@ impl Database {
         let row_write = RowWrite {
             columns_writing_data: smallvec![
                 ColumnWritePayload {
-                    column_type:DbType::STRING,
-                    size: 8 + 4, 
-                    data: name_mb, 
+                    column_type: DbType::STRING,
+                    size: 8 + 4,
+                    data: name_mb,
                     write_order: 0
                 },
                 ColumnWritePayload {
-                    column_type:DbType::U64,
-                    size: 8, 
-                    data: clusters_mb, 
+                    column_type: DbType::U64,
+                    size: 8,
+                    data: clusters_mb,
                     write_order: 1
                 }
-            ]
+            ],
         };
 
-        let mut pointer_iterator = RowPointerIterator::new(self.db_io_pointers.clone()).await.unwrap();
+        let mut pointer_iterator = RowPointerIterator::new(self.db_io_pointers.clone())
+            .await
+            .unwrap();
 
         if let Some(row_pointer) = pointer_iterator.read_last().await {
-            let last_id = row_pointer.id ; 
+            let last_id = row_pointer.id;
             let atomic_last_id = AtomicU64::new(last_id);
 
             let table_length = row_pointer.position;
@@ -120,12 +159,16 @@ impl Database {
                 &atomic_last_id,
                 &atomic_table_length,
                 #[cfg(feature = "enable_long_row")]
-                cluster, 
-                &row_write
-            ).await;
+                cluster,
+                &row_write,
+            )
+            .await;
 
             if result.is_err() {
-                return Err(io::Error::new(io::ErrorKind::Other, "Failed to write row pointer."));
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "Failed to write row pointer.",
+                ));
             }
         } else {
             let atomic_last_id = AtomicU64::new(0);
@@ -140,12 +183,16 @@ impl Database {
                 &atomic_last_id,
                 &atomic_table_length,
                 #[cfg(feature = "enable_long_row")]
-                cluster, 
-                &row_write
-            ).await;
+                cluster,
+                &row_write,
+            )
+            .await;
 
             if result.is_err() {
-                return Err(io::Error::new(io::ErrorKind::Other, "Failed to write initial row pointer."));
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "Failed to write initial row pointer.",
+                ));
             }
         }
 
@@ -165,22 +212,18 @@ impl Database {
         let fut = async move {
             info!("Database started, listening on port {}", SERVER_PORT);
             let receiver_clone = receiver.clone();
-            _ = receiver_clone.run_with_context(
-                db,
-                process_incoming_queries
-            ).await;
+            _ = receiver_clone
+                .run_with_context(db, process_incoming_queries)
+                .await;
         };
-        
+
         _ = tokio::spawn(fut).await;
 
         Ok(())
     }
 }
 
-async fn load_db_data_schema<S: StorageIO>(
-    schema_io: Arc<S>
-)  -> TableSchema {
-
+async fn load_db_data_schema<S: StorageIO>(schema_io: Arc<S>) -> TableSchema {
     let schema = {
         if let Ok(schema) = TableSchema::load(schema_io.clone()).await {
             info!("Loaded schema: {:?}", schema);
@@ -189,8 +232,22 @@ async fn load_db_data_schema<S: StorageIO>(
             info!("Schema not found, creating new schema");
             let mut table = TableSchema::new("db_data".to_string(), false);
 
-            table.add_field(schema_io.clone(), "table_name".to_string(), DbType::STRING, true).await;
-            table.add_field(schema_io.clone(), "clusters".to_string(), DbType::U64, false).await;
+            table
+                .add_field(
+                    schema_io.clone(),
+                    "table_name".to_string(),
+                    DbType::STRING,
+                    true,
+                )
+                .await;
+            table
+                .add_field(
+                    schema_io.clone(),
+                    "clusters".to_string(),
+                    DbType::U64,
+                    false,
+                )
+                .await;
 
             table.save(schema_io).await.unwrap();
 
@@ -206,7 +263,7 @@ async fn load_db_data_schema<S: StorageIO>(
 async fn load_db_tables<S: StorageIO>(
     schema: &TableSchema,
     row_pointer_iterator: &mut RowPointerIterator<S>,
-    io_rows: Arc<S>
+    io_rows: Arc<S>,
 ) -> Vec<(String, u64)> {
     info!("Loading database tables");
 
@@ -219,17 +276,20 @@ async fn load_db_tables<S: StorageIO>(
 
     let concurrent_processor = ConcurrentProcessor::new();
 
-    let all_rows = concurrent_processor.process(
-        &format!(
-        r##"
+    let all_rows = concurrent_processor
+        .process(
+            &format!(
+                r##"
             1 = 1
-        "##),
-        row_fetch,
-        row_fetch2,
-        &schema_fields.to_vec(),
-        io_rows,
-        row_pointer_iterator
-    ).await;
+        "##
+            ),
+            row_fetch,
+            row_fetch2,
+            &schema_fields.to_vec(),
+            io_rows,
+            row_pointer_iterator,
+        )
+        .await;
 
     let small_vec_fields = SmallVec::from_vec(schema_fields.to_vec());
 
@@ -260,13 +320,17 @@ fn create_db_data_row_fetch(schema_fields: &SmallVec<[SchemaField; 20]>) -> RowF
     RowFetch {
         columns_fetching_data: smallvec::smallvec![
             ColumnFetchingData {
-                column_offset: schema_calculator.calculate_schema_offset("table_name", schema_fields).0,
+                column_offset: schema_calculator
+                    .calculate_schema_offset("table_name", schema_fields)
+                    .0,
                 column_type: DbType::STRING,
                 size: 8 + 4,
                 schema_id: 0,
             },
             ColumnFetchingData {
-                column_offset: schema_calculator.calculate_schema_offset("clusters", schema_fields).0,
+                column_offset: schema_calculator
+                    .calculate_schema_offset("clusters", schema_fields)
+                    .0,
                 column_type: DbType::U64,
                 size: 8,
                 schema_id: 1,
@@ -281,7 +345,7 @@ pub(crate) async fn process_incoming_queries(
     request_vec: Vec<u8>,
 ) -> Vec<u8> {
     let query = String::from_utf8_lossy(&request_vec);
-    
+
     info!("Received query: {}", query);
 
     if let Some(query_purpose) = recognize_query_purpose(&query) {

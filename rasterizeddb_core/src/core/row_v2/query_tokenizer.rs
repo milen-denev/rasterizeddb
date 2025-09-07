@@ -1,10 +1,10 @@
 use smallvec::SmallVec;
-use std::{arch::x86_64::*, borrow::Cow};
 use std::collections::HashMap;
+use std::{arch::x86_64::*, borrow::Cow};
 
-use crate::{core::{db_type::DbType}, memory_pool::MemoryBlock};
-use crate::memory_pool::MEMORY_POOL;
 use super::schema::SchemaField;
+use crate::memory_pool::MEMORY_POOL;
+use crate::{core::db_type::DbType, memory_pool::MemoryBlock};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
@@ -50,22 +50,36 @@ fn init_char_table() {
         if INIT_DONE {
             return;
         }
-        
+
         for i in 0..256 {
             let c = i as u8 as char;
             let mut class = 0u8;
-            
-            if c.is_whitespace() { class |= CHAR_WHITESPACE; }
-            if c.is_ascii_digit() { class |= CHAR_DIGIT; }
-            if c.is_alphabetic() { class |= CHAR_ALPHA; }
-            if c == '_' { class |= CHAR_UNDERSCORE; }
-            if matches!(c, '<' | '>' | '!' | '=' | '+' | '-' | '*' | '/') { class |= CHAR_OPERATOR; }
-            if c == '\'' { class |= CHAR_QUOTE; }
-            if matches!(c, '(' | ')') { class |= CHAR_PAREN; }
-            
+
+            if c.is_whitespace() {
+                class |= CHAR_WHITESPACE;
+            }
+            if c.is_ascii_digit() {
+                class |= CHAR_DIGIT;
+            }
+            if c.is_alphabetic() {
+                class |= CHAR_ALPHA;
+            }
+            if c == '_' {
+                class |= CHAR_UNDERSCORE;
+            }
+            if matches!(c, '<' | '>' | '!' | '=' | '+' | '-' | '*' | '/') {
+                class |= CHAR_OPERATOR;
+            }
+            if c == '\'' {
+                class |= CHAR_QUOTE;
+            }
+            if matches!(c, '(' | ')') {
+                class |= CHAR_PAREN;
+            }
+
             CHAR_CLASS_TABLE[i] = class;
         }
-        
+
         INIT_DONE = true;
     }
 }
@@ -105,21 +119,21 @@ unsafe fn skip_whitespace_simd(bytes: &[u8], mut pos: usize) -> usize {
     // Process 32 bytes at a time with AVX2
     while pos + 32 <= bytes.len() {
         let chunk = unsafe { _mm256_loadu_si256(bytes.as_ptr().add(pos) as *const __m256i) };
-        
+
         // Create masks for different whitespace characters
         let space_mask = _mm256_cmpeq_epi8(chunk, _mm256_set1_epi8(b' ' as i8));
         let tab_mask = _mm256_cmpeq_epi8(chunk, _mm256_set1_epi8(b'\t' as i8));
         let newline_mask = _mm256_cmpeq_epi8(chunk, _mm256_set1_epi8(b'\n' as i8));
         let cr_mask = _mm256_cmpeq_epi8(chunk, _mm256_set1_epi8(b'\r' as i8));
-        
+
         // Combine all whitespace masks
         let ws_mask = _mm256_or_si256(
             _mm256_or_si256(space_mask, tab_mask),
-            _mm256_or_si256(newline_mask, cr_mask)
+            _mm256_or_si256(newline_mask, cr_mask),
         );
-        
+
         let mask_int = _mm256_movemask_epi8(ws_mask) as u32;
-        
+
         if mask_int == 0xFFFFFFFF {
             // All 32 bytes are whitespace
             pos += 32;
@@ -133,12 +147,12 @@ unsafe fn skip_whitespace_simd(bytes: &[u8], mut pos: usize) -> usize {
             break;
         }
     }
-    
+
     // Handle remaining bytes
     while pos < bytes.len() && is_whitespace_fast(bytes[pos]) {
         pos += 1;
     }
-    
+
     pos
 }
 
@@ -152,14 +166,14 @@ unsafe fn scan_digits_simd(bytes: &[u8], mut pos: usize) -> usize {
     // Process 32 bytes at a time
     while pos + 32 <= bytes.len() {
         let chunk = unsafe { _mm256_loadu_si256(bytes.as_ptr().add(pos) as *const __m256i) };
-        
+
         // Check for digits (0-9)
         let ge_0 = _mm256_cmpgt_epi8(chunk, _mm256_set1_epi8(b'0' as i8 - 1));
         let le_9 = _mm256_cmpgt_epi8(_mm256_set1_epi8(b'9' as i8 + 1), chunk);
         let digit_mask = _mm256_and_si256(ge_0, le_9);
-        
+
         let mask_int = _mm256_movemask_epi8(digit_mask) as u32;
-        
+
         if mask_int == 0xFFFFFFFF {
             // All 32 bytes are digits
             pos += 32;
@@ -173,12 +187,12 @@ unsafe fn scan_digits_simd(bytes: &[u8], mut pos: usize) -> usize {
             break;
         }
     }
-    
+
     // Handle remaining bytes
     while pos < bytes.len() && is_digit_fast(bytes[pos]) {
         pos += 1;
     }
-    
+
     pos
 }
 
@@ -193,32 +207,32 @@ unsafe fn scan_identifier_simd(bytes: &[u8], mut pos: usize) -> usize {
     // Process 32 bytes at a time
     while pos + 32 <= bytes.len() {
         let chunk = unsafe { _mm256_loadu_si256(bytes.as_ptr().add(pos) as *const __m256i) };
-        
+
         // Check for letters (A-Z, a-z)
         let ge_A = _mm256_cmpgt_epi8(chunk, _mm256_set1_epi8(b'A' as i8 - 1));
         let le_Z = _mm256_cmpgt_epi8(_mm256_set1_epi8(b'Z' as i8 + 1), chunk);
         let upper_mask = _mm256_and_si256(ge_A, le_Z);
-        
+
         let ge_a = _mm256_cmpgt_epi8(chunk, _mm256_set1_epi8(b'a' as i8 - 1));
         let le_z = _mm256_cmpgt_epi8(_mm256_set1_epi8(b'z' as i8 + 1), chunk);
         let lower_mask = _mm256_and_si256(ge_a, le_z);
-        
+
         // Check for digits
         let ge_0 = _mm256_cmpgt_epi8(chunk, _mm256_set1_epi8(b'0' as i8 - 1));
         let le_9 = _mm256_cmpgt_epi8(_mm256_set1_epi8(b'9' as i8 + 1), chunk);
         let digit_mask = _mm256_and_si256(ge_0, le_9);
-        
+
         // Check for underscore
         let underscore_mask = _mm256_cmpeq_epi8(chunk, _mm256_set1_epi8(b'_' as i8));
-        
+
         // Combine all valid identifier character masks
         let id_mask = _mm256_or_si256(
             _mm256_or_si256(upper_mask, lower_mask),
-            _mm256_or_si256(digit_mask, underscore_mask)
+            _mm256_or_si256(digit_mask, underscore_mask),
         );
-        
+
         let mask_int = _mm256_movemask_epi8(id_mask) as u32;
-        
+
         if mask_int == 0xFFFFFFFF {
             // All 32 bytes are identifier characters
             pos += 32;
@@ -232,12 +246,12 @@ unsafe fn scan_identifier_simd(bytes: &[u8], mut pos: usize) -> usize {
             break;
         }
     }
-    
+
     // Handle remaining bytes
     while pos < bytes.len() && is_id_part_fast(bytes[pos]) {
         pos += 1;
     }
-    
+
     pos
 }
 
@@ -250,42 +264,54 @@ struct FieldLookup<'a> {
 
 impl<'a> FieldLookup<'a> {
     fn new(schema: &'a SmallVec<[SchemaField; 20]>) -> Self {
-        let mut map = HashMap::<Cow<'a, String>, (Cow<'a, String>, DbType, u64)>::with_capacity(schema.len());
+        let mut map =
+            HashMap::<Cow<'a, String>, (Cow<'a, String>, DbType, u64)>::with_capacity(schema.len());
 
         for field in schema.iter() {
-            map.insert(Cow::Borrowed(&field.name), (Cow::Borrowed(&field.name), field.db_type.clone(), field.write_order.clone()));
+            map.insert(
+                Cow::Borrowed(&field.name),
+                (
+                    Cow::Borrowed(&field.name),
+                    field.db_type.clone(),
+                    field.write_order.clone(),
+                ),
+            );
         }
-        
+
         let mut logical_ops = HashMap::new();
         logical_ops.insert("and".to_string(), "AND".to_string());
         logical_ops.insert("or".to_string(), "OR".to_string());
-        
+
         let mut string_ops = HashMap::new();
         string_ops.insert("contains".to_string(), "CONTAINS".to_string());
         string_ops.insert("startswith".to_string(), "STARTSWITH".to_string());
         string_ops.insert("endswith".to_string(), "ENDSWITH".to_string());
 
-        Self { map, logical_ops, string_ops }
+        Self {
+            map,
+            logical_ops,
+            string_ops,
+        }
     }
 }
 
 #[inline(always)]
 pub fn tokenize<'a>(s: &str, schema: &'a SmallVec<[SchemaField; 20]>) -> SmallVec<[Token; 36]> {
     init_char_table();
-    
+
     let mut out = SmallVec::new();
     let bytes = s.as_bytes();
     let mut i = 0;
-    
+
     // Pre-compute lookup structures
     let field_lookup = FieldLookup::new(schema);
-    
+
     // Track context for field association to maintain type consistency
     let mut current_field_context: Option<(Cow<'a, String>, DbType, u64)> = None;
     let mut expression_type_context: Option<DbType> = None;
     let mut expression_stack: Vec<Option<DbType>> = Vec::new();
     let mut in_parentheses = 0;
-    
+
     // Helper to determine if a minus sign should be considered part of a number
     #[inline(always)]
     fn is_negative_number_start(tokens: &[Token], bytes: &[u8], i: usize) -> bool {
@@ -293,15 +319,16 @@ pub fn tokenize<'a>(s: &str, schema: &'a SmallVec<[SchemaField; 20]>) -> SmallVe
         if !next_is_digit {
             return false;
         }
-        
-        i == 0 || match tokens.last() {
-            Some(Token::Op(_)) => true,
-            Some(Token::LPar) => true,
-            None => true,
-            _ => false,
-        }
+
+        i == 0
+            || match tokens.last() {
+                Some(Token::Op(_)) => true,
+                Some(Token::LPar) => true,
+                None => true,
+                _ => false,
+            }
     }
-    
+
     // Process tokens with SIMD optimization
     while i < bytes.len() {
         // Skip whitespace using SIMD
@@ -309,9 +336,9 @@ pub fn tokenize<'a>(s: &str, schema: &'a SmallVec<[SchemaField; 20]>) -> SmallVe
         if i >= bytes.len() {
             break;
         }
-        
+
         let c = bytes[i];
-        
+
         match c {
             b'\'' => {
                 // Handle string literals
@@ -323,18 +350,16 @@ pub fn tokenize<'a>(s: &str, schema: &'a SmallVec<[SchemaField; 20]>) -> SmallVe
                 if j >= bytes.len() {
                     panic!("Unclosed string literal starting at position {}", i);
                 }
-                
+
                 // SAFETY: We know this is valid UTF-8 since it came from a &str
-                let lit = unsafe { 
-                    std::str::from_utf8_unchecked(&bytes[start..j]).to_string()
-                };
+                let lit = unsafe { std::str::from_utf8_unchecked(&bytes[start..j]).to_string() };
                 out.push(Token::StringLit(lit));
                 i = j + 1;
-                
+
                 expression_type_context = Some(DbType::STRING);
                 current_field_context = None;
-            },
-            
+            }
+
             _ if is_digit_fast(c) => {
                 // Handle numeric literals with SIMD optimization
                 let start = i;
@@ -344,65 +369,53 @@ pub fn tokenize<'a>(s: &str, schema: &'a SmallVec<[SchemaField; 20]>) -> SmallVe
                     i += 1;
                     i = unsafe { scan_digits_simd(bytes, i) };
                 }
-                
-                let num_str = unsafe {
-                    std::str::from_utf8_unchecked(&bytes[start..i])
-                };
-                
-                let numeric_value = parse_numeric_value(
-                    num_str, 
-                    &current_field_context, 
-                    &expression_type_context
-                );
-                
+
+                let num_str = unsafe { std::str::from_utf8_unchecked(&bytes[start..i]) };
+
+                let numeric_value =
+                    parse_numeric_value(num_str, &current_field_context, &expression_type_context);
+
                 let num_type = numeric_value_to_db_type(&numeric_value);
                 if expression_type_context.is_none() {
                     expression_type_context = Some(num_type);
                 }
-                
+
                 out.push(Token::Number(numeric_value));
-            },
-            
+            }
+
             b'-' if is_negative_number_start(&out, bytes, i) => {
                 // Handle negative numbers
                 let start = i;
                 i += 1;
                 i = unsafe { scan_digits_simd(bytes, i) };
-                
+
                 if i < bytes.len() && bytes[i] == b'.' {
                     i += 1;
                     i = unsafe { scan_digits_simd(bytes, i) };
                 }
-                
-                let num_str = unsafe {
-                    std::str::from_utf8_unchecked(&bytes[start..i])
-                };
-                
-                let numeric_value = parse_numeric_value(
-                    num_str, 
-                    &current_field_context, 
-                    &expression_type_context
-                );
-                
+
+                let num_str = unsafe { std::str::from_utf8_unchecked(&bytes[start..i]) };
+
+                let numeric_value =
+                    parse_numeric_value(num_str, &current_field_context, &expression_type_context);
+
                 let num_type = numeric_value_to_db_type(&numeric_value);
                 if expression_type_context.is_none() {
                     expression_type_context = Some(num_type);
                 }
-                
+
                 out.push(Token::Number(numeric_value));
-            },
-            
+            }
+
             _ if is_id_start_fast(c) => {
                 // Handle identifiers with SIMD optimization
                 let start = i;
                 i = unsafe { scan_identifier_simd(bytes, i) };
-                
-                let id = unsafe {
-                    std::str::from_utf8_unchecked(&bytes[start..i])
-                };
+
+                let id = unsafe { std::str::from_utf8_unchecked(&bytes[start..i]) };
 
                 let id_lower: String = id.to_lowercase();
-                
+
                 // Check for special operators using pre-computed maps
                 if let Some(normalized) = field_lookup.string_ops.get(&id_lower) {
                     // For string operations, we need to determine the type from context or schema
@@ -418,12 +431,18 @@ pub fn tokenize<'a>(s: &str, schema: &'a SmallVec<[SchemaField; 20]>) -> SmallVe
                     current_field_context = None;
                     continue;
                 }
-                
+
                 // Check if this is a field name in the schema
-                if let Some((canonical_name, field_type, write_order)) = field_lookup.map.get(&id.to_string()) {
-                    current_field_context = Some((canonical_name.clone(), field_type.clone(), write_order.clone()));
+                if let Some((canonical_name, field_type, write_order)) =
+                    field_lookup.map.get(&id.to_string())
+                {
+                    current_field_context = Some((
+                        canonical_name.clone(),
+                        field_type.clone(),
+                        write_order.clone(),
+                    ));
                     expression_type_context = Some(field_type.clone());
-                    
+
                     if in_parentheses > 0 {
                         if expression_stack.len() < in_parentheses {
                             expression_stack.push(Some(field_type.clone()));
@@ -431,37 +450,45 @@ pub fn tokenize<'a>(s: &str, schema: &'a SmallVec<[SchemaField; 20]>) -> SmallVe
                             expression_stack[in_parentheses - 1] = Some(field_type.clone());
                         }
                     }
-                    
-                    out.push(Token::Ident((canonical_name.to_string(), field_type.clone(), write_order.clone())));
+
+                    out.push(Token::Ident((
+                        canonical_name.to_string(),
+                        field_type.clone(),
+                        write_order.clone(),
+                    )));
                 } else {
                     // Validate field reference
                     if i < bytes.len() {
                         let mut next_i = i;
                         next_i = unsafe { skip_whitespace_simd(bytes, next_i) };
-                        
+
                         if next_i < bytes.len() {
                             let next_char = bytes[next_i];
-                            if matches!(next_char, b'=' | b'>' | b'<' | b'!') || 
-                               (next_i + 8 <= bytes.len() && &bytes[next_i..next_i+8] == b"CONTAINS") ||
-                               (next_i + 10 <= bytes.len() && &bytes[next_i..next_i+10] == b"STARTSWITH") ||
-                               (next_i + 8 <= bytes.len() && &bytes[next_i..next_i+8] == b"ENDSWITH") {
+                            if matches!(next_char, b'=' | b'>' | b'<' | b'!')
+                                || (next_i + 8 <= bytes.len()
+                                    && &bytes[next_i..next_i + 8] == b"CONTAINS")
+                                || (next_i + 10 <= bytes.len()
+                                    && &bytes[next_i..next_i + 10] == b"STARTSWITH")
+                                || (next_i + 8 <= bytes.len()
+                                    && &bytes[next_i..next_i + 8] == b"ENDSWITH")
+                            {
                                 panic!("Unknown column: '{}' is not defined in the schema", id);
                             }
                         }
                     }
-                    
+
                     // For identifiers not found in schema, this should probably be an error
                     // since all valid fields should be in the schema
                     // But if you want to allow unknown identifiers, you could use a default type
                     panic!("Unknown identifier: '{}' is not defined in the schema", id);
                 }
-            },
-            
+            }
+
             b'(' => {
                 out.push(Token::LPar);
                 i += 1;
                 in_parentheses += 1;
-                
+
                 if expression_type_context.is_some() {
                     if in_parentheses > expression_stack.len() {
                         expression_stack.push(expression_type_context.clone());
@@ -469,56 +496,54 @@ pub fn tokenize<'a>(s: &str, schema: &'a SmallVec<[SchemaField; 20]>) -> SmallVe
                         expression_stack[in_parentheses - 1] = expression_type_context.clone();
                     }
                 }
-            },
+            }
 
             b')' => {
                 out.push(Token::RPar);
                 i += 1;
-                
+
                 if in_parentheses > 0 {
-                    if in_parentheses <= expression_stack.len() && expression_stack[in_parentheses - 1].is_some() {
+                    if in_parentheses <= expression_stack.len()
+                        && expression_stack[in_parentheses - 1].is_some()
+                    {
                         expression_type_context = expression_stack[in_parentheses - 1].clone();
                     }
                     in_parentheses -= 1;
                 }
-            },
-            
-            b'<'|b'>'|b'!'|b'=' => {
+            }
+
+            b'<' | b'>' | b'!' | b'=' => {
                 let saved_context = expression_type_context.clone();
-                
+
                 let mut op_end = i + 1;
                 if op_end < bytes.len() && bytes[op_end] == b'=' {
                     op_end += 1;
                 }
-                
-                let op = unsafe {
-                    std::str::from_utf8_unchecked(&bytes[i..op_end]).to_string()
-                };
+
+                let op = unsafe { std::str::from_utf8_unchecked(&bytes[i..op_end]).to_string() };
                 out.push(Token::Op(op));
                 i = op_end;
-                
+
                 expression_type_context = saved_context;
                 current_field_context = None;
-            },
-            
-            b'+'|b'-'|b'*'|b'/' => {
-                let op_str = unsafe {
-                    std::str::from_utf8_unchecked(&bytes[i..i+1]).to_string()
-                };
+            }
+
+            b'+' | b'-' | b'*' | b'/' => {
+                let op_str = unsafe { std::str::from_utf8_unchecked(&bytes[i..i + 1]).to_string() };
                 out.push(Token::Op(op_str));
                 i += 1;
-            },
-            
+            }
+
             b',' => {
                 i += 1;
                 current_field_context = None;
                 expression_type_context = None;
-            },
-            
+            }
+
             _ => panic!("unexpected character: '{}'", c as char),
         }
     }
-    
+
     out
 }
 
@@ -526,18 +551,18 @@ pub fn tokenize<'a>(s: &str, schema: &'a SmallVec<[SchemaField; 20]>) -> SmallVe
 
 #[inline(always)]
 fn parse_numeric_value<'a>(
-    value_str: &str, 
+    value_str: &str,
     field_context: &Option<(Cow<'a, String>, DbType, u64)>,
     expression_context: &Option<DbType>,
 ) -> NumericValue {
     if let Some(db_type) = expression_context {
         return parse_by_db_type(value_str, db_type);
     }
-    
+
     if let Some((_, db_type, _)) = field_context {
         return parse_by_db_type(value_str, db_type);
     }
-    
+
     parse_default(value_str)
 }
 
@@ -603,18 +628,18 @@ pub fn numeric_to_mb(v: &NumericValue) -> MemoryBlock {
         }};
     }
     let b = match v {
-        NumericValue::I8(n)   => direct!(n),
-        NumericValue::I16(n)  => direct!(n),
-        NumericValue::I32(n)  => direct!(n),
-        NumericValue::I64(n)  => direct!(n),
+        NumericValue::I8(n) => direct!(n),
+        NumericValue::I16(n) => direct!(n),
+        NumericValue::I32(n) => direct!(n),
+        NumericValue::I64(n) => direct!(n),
         NumericValue::I128(n) => direct!(n),
-        NumericValue::U8(n)   => direct!(n),
-        NumericValue::U16(n)  => direct!(n),
-        NumericValue::U32(n)  => direct!(n),
-        NumericValue::U64(n)  => direct!(n),
+        NumericValue::U8(n) => direct!(n),
+        NumericValue::U16(n) => direct!(n),
+        NumericValue::U32(n) => direct!(n),
+        NumericValue::U64(n) => direct!(n),
         NumericValue::U128(n) => direct!(n),
-        NumericValue::F32(f)  => direct!(f),
-        NumericValue::F64(f)  => direct!(f),
+        NumericValue::F32(f) => direct!(f),
+        NumericValue::F64(f) => direct!(f),
     };
     b
 }
@@ -662,16 +687,79 @@ mod tests {
             SchemaField::new("birth_date".to_string(), DbType::STRING, 12, 0, 7, false), // Assuming STRING, could be DATETIME
             SchemaField::new("last_login".to_string(), DbType::STRING, 12, 0, 8, false), // Assuming STRING, could be DATETIME
             SchemaField::new("last_purchase".to_string(), DbType::STRING, 12, 0, 9, false), // Assuming STRING, could be DATETIME
-            SchemaField::new("last_purchase_amount".to_string(), DbType::F32, 4, 0, 10, false),
-            SchemaField::new("last_purchase_date".to_string(), DbType::STRING, 12, 0, 11, false), // Assuming STRING, could be DATETIME
-            SchemaField::new("last_purchase_location".to_string(), DbType::STRING, 12, 0, 12, false),
-            SchemaField::new("last_purchase_method".to_string(), DbType::STRING, 12, 0, 13, false),
-            SchemaField::new("last_purchase_category".to_string(), DbType::STRING, 12, 0, 14, false),
-            SchemaField::new("last_purchase_subcategory".to_string(), DbType::STRING, 12, 0, 15, false),
-            SchemaField::new("last_purchase_description".to_string(), DbType::STRING, 12, 0, 16, false),
-            SchemaField::new("last_purchase_status".to_string(), DbType::STRING, 12, 0, 17, false),
+            SchemaField::new(
+                "last_purchase_amount".to_string(),
+                DbType::F32,
+                4,
+                0,
+                10,
+                false
+            ),
+            SchemaField::new(
+                "last_purchase_date".to_string(),
+                DbType::STRING,
+                12,
+                0,
+                11,
+                false
+            ), // Assuming STRING, could be DATETIME
+            SchemaField::new(
+                "last_purchase_location".to_string(),
+                DbType::STRING,
+                12,
+                0,
+                12,
+                false
+            ),
+            SchemaField::new(
+                "last_purchase_method".to_string(),
+                DbType::STRING,
+                12,
+                0,
+                13,
+                false
+            ),
+            SchemaField::new(
+                "last_purchase_category".to_string(),
+                DbType::STRING,
+                12,
+                0,
+                14,
+                false
+            ),
+            SchemaField::new(
+                "last_purchase_subcategory".to_string(),
+                DbType::STRING,
+                12,
+                0,
+                15,
+                false
+            ),
+            SchemaField::new(
+                "last_purchase_description".to_string(),
+                DbType::STRING,
+                12,
+                0,
+                16,
+                false
+            ),
+            SchemaField::new(
+                "last_purchase_status".to_string(),
+                DbType::STRING,
+                12,
+                0,
+                17,
+                false
+            ),
             SchemaField::new("last_purchase_id".to_string(), DbType::U64, 8, 0, 18, false),
-            SchemaField::new("last_purchase_notes".to_string(), DbType::STRING, 12, 0, 19, false),
+            SchemaField::new(
+                "last_purchase_notes".to_string(),
+                DbType::STRING,
+                12,
+                0,
+                19,
+                false
+            ),
             SchemaField::new("net_assets".to_string(), DbType::F64, 8, 0, 20, false),
             SchemaField::new("department".to_string(), DbType::STRING, 12, 0, 21, false),
             SchemaField::new("salary".to_string(), DbType::F32, 4, 0, 22, false),
@@ -701,9 +789,15 @@ mod tests {
         });
         let tokens = tokenize("field1 + field2", &schema);
         assert_eq!(tokens.len(), 3);
-        assert_eq!(tokens[0], Token::Ident(("field1".to_string(), DbType::F64, 5)));
+        assert_eq!(
+            tokens[0],
+            Token::Ident(("field1".to_string(), DbType::F64, 5))
+        );
         assert_eq!(tokens[1], Token::Op("+".to_string()));
-        assert_eq!(tokens[2], Token::Ident(("field2".to_string(), DbType::F64, 10)));
+        assert_eq!(
+            tokens[2],
+            Token::Ident(("field2".to_string(), DbType::F64, 10))
+        );
     }
 
     #[test]
@@ -732,8 +826,14 @@ mod tests {
         assert_eq!(tokens[2], Token::Op("=".to_string()));
         assert_eq!(tokens[3], Token::Number(NumericValue::U128(42)));
         assert_eq!(tokens[4], Token::Next("AND".to_string()));
-        assert_eq!(tokens[5], Token::Ident(("name".to_string(), DbType::STRING, 1)));
-        assert_eq!(tokens[6], Token::Ident(("CONTAINS".to_string(), DbType::STRING, 0)));
+        assert_eq!(
+            tokens[5],
+            Token::Ident(("name".to_string(), DbType::STRING, 1))
+        );
+        assert_eq!(
+            tokens[6],
+            Token::Ident(("CONTAINS".to_string(), DbType::STRING, 0))
+        );
         assert_eq!(tokens[7], Token::StringLit("John".to_string()));
         assert_eq!(tokens[8], Token::RPar);
         assert_eq!(tokens[9], Token::Next("OR".to_string()));
@@ -742,28 +842,49 @@ mod tests {
         assert_eq!(tokens[12], Token::Op(">".to_string()));
         assert_eq!(tokens[13], Token::Number(NumericValue::U8(25)));
         assert_eq!(tokens[14], Token::Next("AND".to_string()));
-        assert_eq!(tokens[15], Token::Ident(("salary".to_string(), DbType::F32, 22)));
+        assert_eq!(
+            tokens[15],
+            Token::Ident(("salary".to_string(), DbType::F32, 22))
+        );
         assert_eq!(tokens[16], Token::Op("<".to_string()));
         assert_eq!(tokens[17], Token::Number(NumericValue::F32(50000.0)));
         assert_eq!(tokens[18], Token::RPar);
         assert_eq!(tokens[19], Token::Next("OR".to_string()));
         assert_eq!(tokens[20], Token::LPar);
-        assert_eq!(tokens[21], Token::Ident(("bank_balance".to_string(), DbType::F64, 6)));
+        assert_eq!(
+            tokens[21],
+            Token::Ident(("bank_balance".to_string(), DbType::F64, 6))
+        );
         assert_eq!(tokens[22], Token::Op(">=".to_string()));
         assert_eq!(tokens[23], Token::Number(NumericValue::F64(1000.43)));
         assert_eq!(tokens[24], Token::Next("AND".to_string()));
-        assert_eq!(tokens[25], Token::Ident(("net_assets".to_string(), DbType::F64, 20)));
+        assert_eq!(
+            tokens[25],
+            Token::Ident(("net_assets".to_string(), DbType::F64, 20))
+        );
         assert_eq!(tokens[26], Token::Op(">".to_string()));
         assert_eq!(tokens[27], Token::Number(NumericValue::F64(800000.0)));
         assert_eq!(tokens[28], Token::RPar);
         assert_eq!(tokens[29], Token::Next("OR".to_string()));
         assert_eq!(tokens[30], Token::LPar);
-        assert_eq!(tokens[31], Token::Ident(("department".to_string(), DbType::STRING, 21)));
-        assert_eq!(tokens[32], Token::Ident(("STARTSWITH".to_string(), DbType::STRING, 0)));
+        assert_eq!(
+            tokens[31],
+            Token::Ident(("department".to_string(), DbType::STRING, 21))
+        );
+        assert_eq!(
+            tokens[32],
+            Token::Ident(("STARTSWITH".to_string(), DbType::STRING, 0))
+        );
         assert_eq!(tokens[33], Token::StringLit("Eng".to_string()));
         assert_eq!(tokens[34], Token::Next("AND".to_string()));
-        assert_eq!(tokens[35], Token::Ident(("email".to_string(), DbType::STRING, 3)));
-        assert_eq!(tokens[36], Token::Ident(("ENDSWITH".to_string(), DbType::STRING, 0)));
+        assert_eq!(
+            tokens[35],
+            Token::Ident(("email".to_string(), DbType::STRING, 3))
+        );
+        assert_eq!(
+            tokens[36],
+            Token::Ident(("ENDSWITH".to_string(), DbType::STRING, 0))
+        );
         assert_eq!(tokens[37], Token::StringLit("example.com".to_string()));
         assert_eq!(tokens[38], Token::RPar);
     }

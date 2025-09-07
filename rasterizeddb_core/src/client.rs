@@ -1,14 +1,14 @@
-use std::io;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
 use byteorder::{ByteOrder, LittleEndian};
 use rastcp::client::{TcpClient, TcpClientBuilder};
+use std::io;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
+use crate::SERVER_PORT;
 use crate::core::database::QueryExecutionResult;
 use crate::core::row_v2::row::{self, ReturnResult};
-use crate::SERVER_PORT;
 
 /// A pooled client connection
 struct PooledClient {
@@ -25,9 +25,11 @@ impl PooledClient {
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e.to_string()))?;
 
-        client.connect().await
+        client
+            .connect()
+            .await
             .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e.to_string()))?;
-            
+
         Ok(PooledClient {
             client,
             last_used: Instant::now(),
@@ -43,8 +45,10 @@ impl PooledClient {
                 .build()
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e.to_string()))?;
-                
-            self.client.connect().await
+
+            self.client
+                .connect()
+                .await
                 .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e.to_string()))?;
         }
         self.last_used = Instant::now();
@@ -65,14 +69,20 @@ impl PooledClientGuard {
             pool,
         }
     }
-    
+
     async fn send(&mut self, data: Vec<u8>) -> io::Result<Vec<u8>> {
         if let Some(client) = &mut self.client {
             client.last_used = Instant::now();
-            client.client.send(data).await
+            client
+                .client
+                .send(data)
+                .await
                 .map_err(|e| io::Error::new(io::ErrorKind::ConnectionAborted, e.to_string()))
         } else {
-            Err(io::Error::new(io::ErrorKind::Other, "Client already returned to pool"))
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Client already returned to pool",
+            ))
         }
     }
 }
@@ -107,10 +117,14 @@ struct DbClientPool {
 
 impl DbClientPool {
     /// Create a new client pool
-    async fn new(addr: Option<&str>, min_pool_size: usize, max_pool_size: usize) -> io::Result<Self> {
+    async fn new(
+        addr: Option<&str>,
+        min_pool_size: usize,
+        max_pool_size: usize,
+    ) -> io::Result<Self> {
         let address = addr.unwrap_or("127.0.0.1");
         let server_address = format!("{}:{}", address, SERVER_PORT);
-        
+
         // Create initial connection pool
         let mut clients = Vec::with_capacity(min_pool_size);
         for _ in 0..min_pool_size {
@@ -126,7 +140,7 @@ impl DbClientPool {
                 }
             }
         }
-        
+
         Ok(DbClientPool {
             available_clients: Arc::new(Mutex::new(clients)),
             server_address,
@@ -137,11 +151,11 @@ impl DbClientPool {
             idle_timeout: Duration::from_secs(300), // 5 minutes
         })
     }
-    
+
     /// Get a client from the pool or create a new one
     async fn get_client(&self) -> io::Result<PooledClientGuard> {
         let mut clients_opt = None;
-        
+
         // Try to get a client from the pool
         {
             let mut clients = self.available_clients.lock().await;
@@ -160,77 +174,81 @@ impl DbClientPool {
                 }
             }
         }
-        
+
         // If we couldn't get a client immediately and the pool is at max capacity,
         // wait for one to become available
         if clients_opt.is_none() {
             let mut retry_count = 0;
             while retry_count < 10 {
                 tokio::time::sleep(Duration::from_millis(100)).await;
-                
+
                 let mut clients = self.available_clients.lock().await;
                 if !clients.is_empty() {
                     clients_opt = Some(clients.remove(0));
                     break;
                 }
-                
+
                 retry_count += 1;
             }
-            
+
             if clients_opt.is_none() {
                 return Err(io::Error::new(
-                    io::ErrorKind::ResourceBusy, 
-                    "No available connections in the pool"
+                    io::ErrorKind::ResourceBusy,
+                    "No available connections in the pool",
                 ));
             }
         }
-        
+
         // At this point, we should definitely have a client
         let mut client_to_use = clients_opt.unwrap();
-        
+
         // Ensure the connection is active
         if let Err(_) = client_to_use.ensure_connected(&self.server_address).await {
             // If connection fails, create a new one
             client_to_use = PooledClient::new(&self.server_address).await?;
         }
-        
+
         // Create a guard that will return the client to the pool when dropped
-        Ok(PooledClientGuard::new(client_to_use, self.available_clients.clone()))
+        Ok(PooledClientGuard::new(
+            client_to_use,
+            self.available_clients.clone(),
+        ))
     }
-    
+
     /// Perform connection pool maintenance
     async fn maintain_pool(&self) -> io::Result<()> {
         let mut clients = self.available_clients.lock().await;
         let now = Instant::now();
-        
+
         // Store current length before modification
         let current_len = clients.len();
-        
+
         // Calculate minimum connections to keep
         let min_to_keep = self.min_pool_size;
-        
+
         // Remove idle connections exceeding min_pool_size
         if current_len > min_to_keep {
             // Pre-determine which clients to keep based on last_used time
             let mut to_remove = Vec::new();
             for i in 0..clients.len() {
-                if clients.len() - to_remove.len() > min_to_keep && 
-                   now.duration_since(clients[i].last_used) >= self.idle_timeout {
+                if clients.len() - to_remove.len() > min_to_keep
+                    && now.duration_since(clients[i].last_used) >= self.idle_timeout
+                {
                     to_remove.push(i);
                 }
             }
-            
+
             // Remove clients in reverse order to maintain correct indices
             for &i in to_remove.iter().rev() {
                 clients.remove(i);
             }
-            
+
             // Update the current size counter
             if clients.len() != current_len {
                 self.current_size.store(clients.len(), Ordering::Release);
             }
         }
-        
+
         // Ensure we have at least min_pool_size connections
         let current_len = clients.len();
         if current_len < min_to_keep {
@@ -242,7 +260,7 @@ impl DbClientPool {
             }
             self.current_size.store(clients.len(), Ordering::Release);
         }
-        
+
         Ok(())
     }
 }
@@ -259,9 +277,9 @@ impl DbClient {
         // Default pool sizes
         let min_pool_size = 2;
         let max_pool_size = 10;
-        
+
         let pool = DbClientPool::new(addr, min_pool_size, max_pool_size).await?;
-        
+
         // Start a background task to maintain the pool
         let pool_arc = Arc::new(pool);
         let pool_ref = Arc::clone(&pool_arc);
@@ -272,7 +290,7 @@ impl DbClient {
                 let _ = pool_ref.maintain_pool().await;
             }
         });
-        
+
         Ok(DbClient {
             pool: pool_arc,
             connected: AtomicBool::new(true),
@@ -281,12 +299,12 @@ impl DbClient {
 
     /// Create a new database client with custom pool settings
     pub async fn with_pool_settings(
-        addr: Option<&str>, 
-        min_pool_size: usize, 
-        max_pool_size: usize
+        addr: Option<&str>,
+        min_pool_size: usize,
+        max_pool_size: usize,
     ) -> io::Result<Self> {
         let pool = DbClientPool::new(addr, min_pool_size, max_pool_size).await?;
-        
+
         // Start a background task to maintain the pool
         let pool_arc = Arc::new(pool);
         let pool_ref = Arc::clone(&pool_arc);
@@ -297,7 +315,7 @@ impl DbClient {
                 let _ = pool_ref.maintain_pool().await;
             }
         });
-        
+
         Ok(DbClient {
             pool: pool_arc,
             connected: AtomicBool::new(true),
@@ -326,15 +344,18 @@ impl DbClient {
     pub async fn execute_query(&self, query: &str) -> io::Result<QueryExecutionResult> {
         // Make sure we're connected
         if !self.connected.load(Ordering::Relaxed) {
-            return Err(io::Error::new(io::ErrorKind::NotConnected, "Client is disconnected"));
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Client is disconnected",
+            ));
         }
-        
+
         // Get a client from the pool
         let mut client_guard = self.pool.get_client().await?;
-        
+
         // Send the query
         let response = client_guard.send(query.as_bytes().to_vec()).await?;
-        
+
         // Parse the response
         if response.is_empty() {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "Empty response"));
@@ -345,38 +366,41 @@ impl DbClient {
             0 => Ok(QueryExecutionResult::Ok),
             1 => {
                 if response.len() < 9 {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid rows affected response"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Invalid rows affected response",
+                    ));
                 }
                 let rows_affected = LittleEndian::read_u64(&response[1..9]);
                 Ok(QueryExecutionResult::RowsAffected(rows_affected))
-            },
+            }
             2 => {
                 // Extract the serialized rows data (everything after the marker byte)
                 let rows_data = response[1..].to_vec();
                 Ok(QueryExecutionResult::RowsResult(Box::new(rows_data)))
-            },
+            }
             3 => {
                 // Error message is a UTF-8 string after the marker byte
-                let error_message = String::from_utf8(response[1..].to_vec())
-                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid error message"))?;
+                let error_message = String::from_utf8(response[1..].to_vec()).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "Invalid error message")
+                })?;
                 Ok(QueryExecutionResult::Error(error_message))
-            },
-            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid result type marker")),
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid result type marker",
+            )),
         }
     }
 
     /// Helper method to extract rows from a QueryExecutionResult
     pub fn extract_rows(result: QueryExecutionResult) -> io::Result<Option<ReturnResult>> {
         match result {
-            QueryExecutionResult::RowsResult(data) => {
-                row::vec_into_rows(&data)
-                    .map(|row| Some(ReturnResult::Rows(row)))
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
-            },
-            QueryExecutionResult::Error(msg) => {
-                Err(io::Error::new(io::ErrorKind::Other, msg))
-            },
-            _ => Ok(None)
+            QueryExecutionResult::RowsResult(data) => row::vec_into_rows(&data)
+                .map(|row| Some(ReturnResult::Rows(row)))
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
+            QueryExecutionResult::Error(msg) => Err(io::Error::new(io::ErrorKind::Other, msg)),
+            _ => Ok(None),
         }
     }
 
@@ -390,7 +414,7 @@ impl DbClient {
         self.close().await?;
         self.connect().await
     }
-    
+
     /// Get current pool stats
     pub fn get_pool_stats(&self) -> (usize, usize) {
         let current_size = self.pool.current_size.load(Ordering::Relaxed);

@@ -1,13 +1,7 @@
 use io_uring::{IoUring, opcode, types};
-use std::{
-    fs::File,
-    io,
-    os::fd::AsRawFd,
-    sync::Arc,
-    thread,
-};
+use std::{fs::File, io, os::fd::AsRawFd, sync::Arc, thread};
 
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use futures::channel::oneshot;
 
 /// A single read request sent to the background io_uring thread.
@@ -43,13 +37,11 @@ impl AsyncUringReader {
         let (tx, rx): (Sender<ReadRequest>, Receiver<ReadRequest>) = unbounded();
 
         // 5) Move ring, file, and wrapper into the thread so File isn't closed
-        thread::spawn(move || {
-            process_loop(ring, fd_wrapper, rx)
-        });
+        thread::spawn(move || process_loop(ring, fd_wrapper, rx));
 
         Ok(AsyncUringReader { tx: Arc::new(tx) })
     }
-    
+
     /// Asynchronously read `size` bytes at `offset`.
     /// Returns a Vec<u8> of exactly `size` length on success.
     pub async fn read_at(&self, offset: u64, size: usize) -> io::Result<Vec<u8>> {
@@ -71,11 +63,7 @@ impl AsyncUringReader {
     }
 }
 
-fn process_loop(
-    mut ring: IoUring,
-    fd: types::Fd,
-    rx: Receiver<ReadRequest>,
-) {
+fn process_loop(mut ring: IoUring, fd: types::Fd, rx: Receiver<ReadRequest>) {
     // `file` stays alive here so its FD never closes
     for mut req in rx.iter() {
         let len = req.buffer.len().min(u32::MAX as usize) as u32;
@@ -86,10 +74,9 @@ fn process_loop(
 
         unsafe {
             if let Err(_) = ring.submission().push(&sqe) {
-                let _ = req.responder.send(Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "SQE queue full",
-                )));
+                let _ = req
+                    .responder
+                    .send(Err(io::Error::new(io::ErrorKind::Other, "SQE queue full")));
                 continue;
             }
         }

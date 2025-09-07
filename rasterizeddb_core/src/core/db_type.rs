@@ -30,7 +30,6 @@ impl Display for DbType {
 }
 
 impl DbType {
-
     #[inline(always)]
     pub fn to_byte(&self) -> u8 {
         match self {

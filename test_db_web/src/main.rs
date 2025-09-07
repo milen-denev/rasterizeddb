@@ -1,19 +1,26 @@
+use axum::Router;
 use axum::body::Body;
 use axum::http::header;
-use axum::Router;
 use axum::{response::Response, routing::get};
 use rasterizeddb_core::client::DbClient;
 use rasterizeddb_core::core::row_v2::row::ReturnResult;
 
-static CLIENT: async_lazy::Lazy<DbClient> =
-    async_lazy::Lazy::new(|| {
-        Box::pin(async {
-            let client = DbClient::with_pool_settings(Some("127.0.0.1"), 10, 1000).await.unwrap();
-            client.execute_query("BEGIN CREATE TABLE test_db (FALSE, FALSE) END").await.unwrap();
-            client.execute_query("BEGIN SELECT FROM test_db REBUILD_INDEXES END").await.unwrap();
-            client
-        })
-    });
+static CLIENT: async_lazy::Lazy<DbClient> = async_lazy::Lazy::new(|| {
+    Box::pin(async {
+        let client = DbClient::with_pool_settings(Some("127.0.0.1"), 10, 1000)
+            .await
+            .unwrap();
+        client
+            .execute_query("BEGIN CREATE TABLE test_db (FALSE, FALSE) END")
+            .await
+            .unwrap();
+        client
+            .execute_query("BEGIN SELECT FROM test_db REBUILD_INDEXES END")
+            .await
+            .unwrap();
+        client
+    })
+});
 
 #[tokio::main]
 async fn main() {
@@ -40,8 +47,10 @@ async fn index() -> Response {
         INSERT INTO test_db (COL(I32), COL(I32), COL(STRING), COL(F64))
         VALUES ({}, {}, '{}', {})
         END
-    "#, x as f64, y, "Hello, World!", z);
-                
+    "#,
+        x as f64, y, "Hello, World!", z
+    );
+
     let db_response = client.execute_query(&query).await;
 
     if db_response.is_ok() {
@@ -85,11 +94,14 @@ async fn query() -> Response {
                 // }
                 // output.push_str("\n");
             }
-        },
+        }
         ReturnResult::HtmlView(html_string) => {
             output.push_str(&html_string);
         }
     }
 
-    Response::builder().header(header::CONTENT_TYPE, "text/html; charset=UTF-8").body(Body::new(output)).unwrap()
+    Response::builder()
+        .header(header::CONTENT_TYPE, "text/html; charset=UTF-8")
+        .body(Body::new(output))
+        .unwrap()
 }

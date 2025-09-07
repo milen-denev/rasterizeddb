@@ -2,7 +2,10 @@ use ahash::{HashSet, HashSetExt};
 use itertools::Either;
 use smallvec::SmallVec;
 
-use crate::{core::{db_type::DbType, helpers_v2::smallvec_extensions::SmallVecExtensions}, memory_pool::MemoryBlock};
+use crate::{
+    core::{db_type::DbType, helpers_v2::smallvec_extensions::SmallVecExtensions},
+    memory_pool::MemoryBlock,
+};
 
 use super::{logical::perform_comparison_operation, math::perform_math_operation};
 
@@ -187,12 +190,10 @@ impl ColumnTransformer {
                     operation,
                 ))
             }
-            ColumnTransformerType::ComparerOperation(ref operation) => {
-                Either::Right((
-                    perform_comparison_operation(input1, input2, &self.column_type, operation),
-                    self.next.clone(),
-                ))
-            }
+            ColumnTransformerType::ComparerOperation(ref operation) => Either::Right((
+                perform_comparison_operation(input1, input2, &self.column_type, operation),
+                self.next.clone(),
+            )),
         }
     }
 
@@ -455,8 +456,12 @@ impl<'a> TransformerProcessor<'a> {
         let right_operand = right.into();
 
         let placeholder = MemoryBlock::default();
-        let mut transformer =
-            ColumnTransformer::new(column_type, placeholder.clone(), ColumnTransformerType::ComparerOperation(operation), next);
+        let mut transformer = ColumnTransformer::new(
+            column_type,
+            placeholder.clone(),
+            ColumnTransformerType::ComparerOperation(operation),
+            next,
+        );
         transformer.setup_column_2(placeholder);
 
         match (&left_operand, &right_operand) {
@@ -474,7 +479,10 @@ impl<'a> TransformerProcessor<'a> {
                 transformer.setup_column_2(m2.clone());
                 transformer.set_column_2_index(*i2);
             }
-            (ComparisonOperand::DirectWithIndex(m1, i1), ComparisonOperand::DirectWithIndex(m2, i2)) => {
+            (
+                ComparisonOperand::DirectWithIndex(m1, i1),
+                ComparisonOperand::DirectWithIndex(m2, i2),
+            ) => {
                 transformer.column_1 = m1.clone();
                 transformer.setup_column_2(m2.clone());
                 transformer.set_column_1_index(*i1);
@@ -511,8 +519,10 @@ impl<'a> TransformerProcessor<'a> {
     #[inline]
     fn ensure_intermediate_capacity(&mut self) {
         if self.intermediate_results.len() <= self.max_result_store_index {
-            self.intermediate_results
-                .resize(self.max_result_store_index.saturating_add(1), MemoryBlock::default());
+            self.intermediate_results.resize(
+                self.max_result_store_index.saturating_add(1),
+                MemoryBlock::default(),
+            );
         }
     }
 
@@ -548,48 +558,6 @@ impl<'a> TransformerProcessor<'a> {
 
         self.evaluate_comparison_results(comparison_results)
     }
-
-    /// Legacy execute that assumed per-row cloning via replace_row_inputs; kept for backward compatibility.
-    /// Prefer execute_row.
-    // pub fn execute(
-    //     &mut self,
-    //     comparison_results: &mut SmallVec<[(bool, Option<Next>); 20]>,
-    // ) -> bool {
-    //     // This now assumes column_1/column_2 are already set to literals or intermediates only.
-    //     // For dynamic columns, prefer execute_row with a row view.
-    //     comparison_results.clear();
-
-    //     for idx in 0..self.transformers.len() {
-    //         let (_before, after) = self.transformers.split_at_mut(idx);
-    //         let transformer = &mut after[0];
-
-    //         if let Some(r1) = transformer.result_index_1 {
-    //             debug_assert!(r1 < self.intermediate_results.len());
-    //             transformer.column_1 = self.intermediate_results[r1].clone();
-    //         }
-    //         if let Some(r2) = transformer.result_index_2 {
-    //             debug_assert!(r2 < self.intermediate_results.len());
-    //             transformer.setup_column_2(self.intermediate_results[r2].clone());
-    //         }
-
-    //         match transformer.transform_single() {
-    //             Either::Left(result) => {
-    //                 if let Some(store_idx) = transformer.result_store_index {
-    //                     if store_idx >= self.intermediate_results.len() {
-    //                         self.intermediate_results
-    //                             .resize(store_idx + 1, MemoryBlock::default());
-    //                     }
-    //                     self.intermediate_results[store_idx] = result;
-    //                 }
-    //             }
-    //             Either::Right(comp) => {
-    //                 comparison_results.push(comp);
-    //             }
-    //         }
-    //     }
-
-    //     self.evaluate_comparison_results(comparison_results)
-    // }
 
     fn evaluate_comparison_results(&self, results: &[(bool, Option<Next>)]) -> bool {
         if results.is_empty() {
@@ -639,7 +607,9 @@ impl<'a> TransformerProcessor<'a> {
     }
 
     pub fn has_column_dependencies(&self) -> bool {
-        self.transformers.iter().any(|t| t.has_direct_column_dependencies())
+        self.transformers
+            .iter()
+            .any(|t| t.has_direct_column_dependencies())
     }
 
     pub fn reset_intermediate_results(&mut self) {
@@ -665,7 +635,10 @@ impl<'a> TransformerProcessor<'a> {
             if let Some(r1) = t.result_index_1 {
                 assert!(
                     r1 < self.intermediate_results.len()
-                        || self.transformers.iter().any(|tt| tt.result_store_index == Some(r1)),
+                        || self
+                            .transformers
+                            .iter()
+                            .any(|tt| tt.result_store_index == Some(r1)),
                     "Transformer {} references unknown intermediate {}",
                     i,
                     r1
@@ -674,7 +647,10 @@ impl<'a> TransformerProcessor<'a> {
             if let Some(r2) = t.result_index_2 {
                 assert!(
                     r2 < self.intermediate_results.len()
-                        || self.transformers.iter().any(|tt| tt.result_store_index == Some(r2)),
+                        || self
+                            .transformers
+                            .iter()
+                            .any(|tt| tt.result_store_index == Some(r2)),
                     "Transformer {} references unknown intermediate {}",
                     i,
                     r2
@@ -694,8 +670,7 @@ impl<'a> TransformerProcessor<'a> {
                         i
                     );
                 }
-                ColumnTransformerType::ComparerOperation(_) => {
-                }
+                ColumnTransformerType::ComparerOperation(_) => {}
             }
         }
     }
@@ -705,7 +680,7 @@ impl<'a> TransformerProcessor<'a> {
 mod tests {
     use super::*;
     use crate::memory_pool::MEMORY_POOL;
-    
+
     fn create_memory_block_from_f64(value: f64) -> MemoryBlock {
         let bytes = value.to_le_bytes();
         let data = MEMORY_POOL.acquire(bytes.len());
@@ -715,14 +690,6 @@ mod tests {
     }
 
     fn create_memory_block_from_u8(value: u8) -> MemoryBlock {
-        let bytes = value.to_le_bytes();
-        let data = MEMORY_POOL.acquire(bytes.len());
-        let slice = data.into_slice_mut();
-        slice.copy_from_slice(&bytes);
-        data
-    }
-
-    fn create_memory_block_from_u128(value: u128) -> MemoryBlock {
         let bytes = value.to_le_bytes();
         let data = MEMORY_POOL.acquire(bytes.len());
         let slice = data.into_slice_mut();
@@ -745,7 +712,6 @@ mod tests {
         slice.copy_from_slice(bytes);
         data
     }
-
 
     // Helper for a row view
     struct TestRow([MemoryBlock; 2]);
@@ -870,7 +836,6 @@ mod tests {
             _ => panic!("Expected bool result"),
         }
     }
-
 
     #[test]
     fn test_transform_on_row_comparer_not_contains() {
@@ -1027,7 +992,13 @@ mod tests {
         let email = create_memory_block_from_string("john.doe@example.com");
         let department = create_memory_block_from_string("Engineering");
         let bank_balance = create_memory_block_from_f64(1000.43);
-        let row = [id.clone(), name.clone(), email.clone(), department.clone(), bank_balance.clone()];
+        let row = [
+            id.clone(),
+            name.clone(),
+            email.clone(),
+            department.clone(),
+            bank_balance.clone(),
+        ];
 
         let mut transformers: SmallVec<[ColumnTransformer; 36]> = SmallVec::new();
         let mut inter: SmallVec<[MemoryBlock; 20]> = SmallVec::new();

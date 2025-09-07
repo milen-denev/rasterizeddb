@@ -1,4 +1,4 @@
-use crate::core::{row_v2::{common::simd_compare_strings, transformer::ComparerOperation}};
+use crate::core::row_v2::{common::simd_compare_strings, transformer::ComparerOperation};
 
 #[derive(Debug)]
 pub enum QueryPurpose {
@@ -16,19 +16,19 @@ pub enum QueryPurpose {
 #[derive(Debug)]
 pub struct InsertRowData {
     pub table_name: String,
-    pub query: String
+    pub query: String,
 }
 
 #[derive(Debug)]
 pub struct QueryRowsData {
     pub table_name: String,
-    pub query: String
+    pub query: String,
 }
 
 /// Recognizes common PostgreSQL SQL and returns a QueryPurpose with the query string.
 pub fn recognize_query_purpose(query: &str) -> Option<QueryPurpose> {
-    use QueryPurpose::*;
     use ComparerOperation::StartsWith;
+    use QueryPurpose::*;
     let query_trimmed = query.trim_start();
     let query_upper = query_trimmed.to_ascii_uppercase();
     let query_bytes = query_upper.as_bytes();
@@ -52,7 +52,7 @@ pub fn recognize_query_purpose(query: &str) -> Option<QueryPurpose> {
         if let Some(table_name_extract) = query_trimmed.split_whitespace().nth(2) {
             Some(InsertRow(InsertRowData {
                 table_name: table_name_extract.trim().to_string(),
-                query: query_trimmed.to_string()
+                query: query_trimmed.to_string(),
             }))
         } else {
             None
@@ -68,7 +68,7 @@ pub fn recognize_query_purpose(query: &str) -> Option<QueryPurpose> {
             if let Some(table_name_extract) = tokens.get(from_index + 1) {
                 Some(QueryRows(QueryRowsData {
                     table_name: table_name_extract.trim().to_string(),
-                    query: query_trimmed.to_string()
+                    query: query_trimmed.to_string(),
                 }))
             } else {
                 None
@@ -80,4 +80,3 @@ pub fn recognize_query_purpose(query: &str) -> Option<QueryPurpose> {
         None
     }
 }
-

@@ -1,12 +1,14 @@
+use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::collections::HashMap;
-use smallvec::SmallVec;
 
-use crate::memory_pool::MemoryBlock;
-use crate::core::db_type::DbType;
+use super::query_tokenizer::{Token, numeric_to_mb, numeric_value_to_db_type, str_to_mb, tokenize};
 use super::schema::SchemaField;
-use super::query_tokenizer::{numeric_to_mb, numeric_value_to_db_type, str_to_mb, tokenize, Token};
-use super::transformer::{ComparerOperation, ComparisonOperand, MathOperation, Next, TransformerProcessor};
+use super::transformer::{
+    ComparerOperation, ComparisonOperand, MathOperation, Next, TransformerProcessor,
+};
+use crate::core::db_type::DbType;
+use crate::memory_pool::MemoryBlock;
 
 pub struct QueryParser<'a, 'b> {
     toks: &'a SmallVec<[Token; 36]>,
@@ -60,17 +62,17 @@ impl<'a, 'b> QueryParser<'a, 'b> {
                 self.used_column_indices.dedup();
             }
 
-            // #[cfg(debug_assertions)]
-            // {
-            //     if self.used_column_indices.is_empty() {
-            //         println!("Query contains only literal values - no column optimization needed");
-            //     } else {
-            //         println!(
-            //             "First iteration complete. Used columns: {:?}",
-            //             self.used_column_indices
-            //         );
-            //     }
-            // }
+            #[cfg(debug_assertions)]
+            {
+                if self.used_column_indices.is_empty() {
+                    println!("Query contains only literal values - no column optimization needed");
+                } else {
+                    println!(
+                        "First iteration complete. Used columns: {:?}",
+                        self.used_column_indices
+                    );
+                }
+            }
         } else {
             // Fast path: nothing to do; inputs will be resolved on-the-fly during evaluation.
             // Still validate input length for safety.
@@ -112,7 +114,9 @@ impl<'a, 'b> QueryParser<'a, 'b> {
                 let n = name.as_str();
                 if let Some(_) = name_to_pos.get(n) {
                     let wi = *w as usize;
-                    if wi > max_idx { max_idx = wi; }
+                    if wi > max_idx {
+                        max_idx = wi;
+                    }
                     pairs.push((wi, n));
                 }
             }
@@ -159,7 +163,7 @@ impl<'a, 'b> QueryParser<'a, 'b> {
 
     fn parse_or<'c>(
         &mut self,
-        cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>
+        cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
     ) -> Result<(), String> {
         self.parse_and(cols)?;
         while let Some(Next::Or) = self.peek_logic() {
@@ -172,7 +176,7 @@ impl<'a, 'b> QueryParser<'a, 'b> {
 
     fn parse_and<'c>(
         &mut self,
-        cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>
+        cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
     ) -> Result<(), String> {
         self.parse_comp_or_group(cols)?;
         while let Some(Next::And) = self.peek_logic() {
@@ -192,7 +196,7 @@ impl<'a, 'b> QueryParser<'a, 'b> {
 
     fn parse_comp_or_group<'c>(
         &mut self,
-        cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>
+        cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
     ) -> Result<(), String> {
         if let Some(Token::LPar) = self.toks.get(self.pos) {
             if self.is_boolean_group(self.pos) {
@@ -271,7 +275,7 @@ impl<'a, 'b> QueryParser<'a, 'b> {
 
     fn parse_comparison<'c>(
         &mut self,
-        cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>
+        cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
     ) -> Result<(), String> {
         let (left_op, left_type) = self.parse_expr(cols)?;
         let op_token = self
@@ -312,19 +316,14 @@ impl<'a, 'b> QueryParser<'a, 'b> {
             _ => left_type,
         };
 
-        self.query_transformer.add_comparison(
-            comparison_type,
-            left_op,
-            right_op,
-            cmp,
-            None,
-        );
+        self.query_transformer
+            .add_comparison(comparison_type, left_op, right_op, cmp, None);
         Ok(())
     }
 
     fn parse_expr<'c>(
         &mut self,
-        cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>
+        cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
     ) -> Result<(ComparisonOperand, DbType), String> {
         let (mut lhs_op, lhs_type) = self.parse_term(cols)?;
         while let Some(op_str) = self.peek_op(&["+", "-"]) {
@@ -335,9 +334,9 @@ impl<'a, 'b> QueryParser<'a, 'b> {
             } else {
                 MathOperation::Subtract
             };
-            let idx = self
-                .query_transformer
-                .add_math_operation(lhs_type.clone(), lhs_op, rhs_op, math);
+            let idx =
+                self.query_transformer
+                    .add_math_operation(lhs_type.clone(), lhs_op, rhs_op, math);
             lhs_op = ComparisonOperand::Intermediate(idx);
         }
         Ok((lhs_op, lhs_type))
@@ -345,7 +344,7 @@ impl<'a, 'b> QueryParser<'a, 'b> {
 
     fn parse_term<'c>(
         &mut self,
-        cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>
+        cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
     ) -> Result<(ComparisonOperand, DbType), String> {
         let (mut lhs_op, lhs_type) = self.parse_factor(cols)?;
         while let Some(op_str) = self.peek_op(&["*", "/"]) {
@@ -356,9 +355,9 @@ impl<'a, 'b> QueryParser<'a, 'b> {
             } else {
                 MathOperation::Divide
             };
-            let idx = self
-                .query_transformer
-                .add_math_operation(lhs_type.clone(), lhs_op, rhs_op, math);
+            let idx =
+                self.query_transformer
+                    .add_math_operation(lhs_type.clone(), lhs_op, rhs_op, math);
             lhs_op = ComparisonOperand::Intermediate(idx);
         }
         Ok((lhs_op, lhs_type))
@@ -366,7 +365,7 @@ impl<'a, 'b> QueryParser<'a, 'b> {
 
     fn parse_factor<'c>(
         &mut self,
-        cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>
+        cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
     ) -> Result<(ComparisonOperand, DbType), String> {
         let token = self
             .next()
@@ -398,10 +397,7 @@ impl<'a, 'b> QueryParser<'a, 'b> {
                     self.used_column_indices.push(idx);
                 }
 
-                Ok((
-                    ComparisonOperand::DirectWithIndex(mb, idx),
-                    db_type,
-                ))
+                Ok((ComparisonOperand::DirectWithIndex(mb, idx), db_type))
             }
             Token::LPar => {
                 let (inner_op, inner_type) = self.parse_expr(cols)?;
@@ -458,17 +454,17 @@ pub fn tokenize_for_test(s: &str, schema: &SmallVec<[SchemaField; 20]>) -> Small
 
 #[cfg(test)]
 mod tests {
+    use smallvec::SmallVec;
     use std::borrow::Cow;
     use std::cell::UnsafeCell;
     use std::sync::LazyLock;
-    use smallvec::SmallVec;
 
     use crate::core::db_type::DbType;
     use crate::core::row_v2::query_parser::QueryParser;
-    use crate::core::row_v2::schema::SchemaField;
     use crate::core::row_v2::query_tokenizer::tokenize;
+    use crate::core::row_v2::schema::SchemaField;
     use crate::core::row_v2::transformer::{Next, TransformerProcessor};
-    use crate::memory_pool::{MemoryBlock, MEMORY_POOL};
+    use crate::memory_pool::{MEMORY_POOL, MemoryBlock};
 
     // Buffer structure for tests
     struct Buffer {
@@ -584,14 +580,14 @@ mod tests {
 
     fn create_schema() -> SmallVec<[SchemaField; 20]> {
         smallvec::smallvec![
-            SchemaField::new("id".to_string(), DbType::I32, 4 , 0, 0, false),
-            SchemaField::new("age".to_string(), DbType::U8, 1 , 0, 1, false),
-            SchemaField::new("salary".to_string(), DbType::I32, 4 , 0, 2, false),
-            SchemaField::new("name".to_string(), DbType::STRING, 4 + 8 , 0, 3, false),
-            SchemaField::new("department".to_string(), DbType::STRING, 4 + 8 , 0, 4, false),
-            SchemaField::new("bank_balance".to_string(), DbType::F64, 8 , 0, 5, false),
-            SchemaField::new("credit_balance".to_string(), DbType::F32, 4 , 0, 6, false),
-            SchemaField::new("net_assets".to_string(), DbType::I64, 8 , 0, 7, false),
+            SchemaField::new("id".to_string(), DbType::I32, 4, 0, 0, false),
+            SchemaField::new("age".to_string(), DbType::U8, 1, 0, 1, false),
+            SchemaField::new("salary".to_string(), DbType::I32, 4, 0, 2, false),
+            SchemaField::new("name".to_string(), DbType::STRING, 4 + 8, 0, 3, false),
+            SchemaField::new("department".to_string(), DbType::STRING, 4 + 8, 0, 4, false),
+            SchemaField::new("bank_balance".to_string(), DbType::F64, 8, 0, 5, false),
+            SchemaField::new("credit_balance".to_string(), DbType::F32, 4, 0, 6, false),
+            SchemaField::new("net_assets".to_string(), DbType::I64, 8, 0, 7, false),
             SchemaField::new("earth_position".to_string(), DbType::I8, 1, 0, 8, false),
             SchemaField::new("test_1".to_string(), DbType::U32, 4, 0, 9, false),
             SchemaField::new("test_2".to_string(), DbType::U16, 2, 0, 10, false),
@@ -615,23 +611,86 @@ mod tests {
             SchemaField::new("birth_date".to_string(), DbType::STRING, 12, 0, 7, false), // Assuming STRING, could be DATETIME
             SchemaField::new("last_login".to_string(), DbType::STRING, 12, 0, 8, false), // Assuming STRING, could be DATETIME
             SchemaField::new("last_purchase".to_string(), DbType::STRING, 12, 0, 9, false), // Assuming STRING, could be DATETIME
-            SchemaField::new("last_purchase_amount".to_string(), DbType::F32, 4, 0, 10, false),
-            SchemaField::new("last_purchase_date".to_string(), DbType::STRING, 12, 0, 11, false), // Assuming STRING, could be DATETIME
-            SchemaField::new("last_purchase_location".to_string(), DbType::STRING, 12, 0, 12, false),
-            SchemaField::new("last_purchase_method".to_string(), DbType::STRING, 12, 0, 13, false),
-            SchemaField::new("last_purchase_category".to_string(), DbType::STRING, 12, 0, 14, false),
-            SchemaField::new("last_purchase_subcategory".to_string(), DbType::STRING, 12, 0, 15, false),
-            SchemaField::new("last_purchase_description".to_string(), DbType::STRING, 12, 0, 16, false),
-            SchemaField::new("last_purchase_status".to_string(), DbType::STRING, 12, 0, 17, false),
+            SchemaField::new(
+                "last_purchase_amount".to_string(),
+                DbType::F32,
+                4,
+                0,
+                10,
+                false
+            ),
+            SchemaField::new(
+                "last_purchase_date".to_string(),
+                DbType::STRING,
+                12,
+                0,
+                11,
+                false
+            ), // Assuming STRING, could be DATETIME
+            SchemaField::new(
+                "last_purchase_location".to_string(),
+                DbType::STRING,
+                12,
+                0,
+                12,
+                false
+            ),
+            SchemaField::new(
+                "last_purchase_method".to_string(),
+                DbType::STRING,
+                12,
+                0,
+                13,
+                false
+            ),
+            SchemaField::new(
+                "last_purchase_category".to_string(),
+                DbType::STRING,
+                12,
+                0,
+                14,
+                false
+            ),
+            SchemaField::new(
+                "last_purchase_subcategory".to_string(),
+                DbType::STRING,
+                12,
+                0,
+                15,
+                false
+            ),
+            SchemaField::new(
+                "last_purchase_description".to_string(),
+                DbType::STRING,
+                12,
+                0,
+                16,
+                false
+            ),
+            SchemaField::new(
+                "last_purchase_status".to_string(),
+                DbType::STRING,
+                12,
+                0,
+                17,
+                false
+            ),
             SchemaField::new("last_purchase_id".to_string(), DbType::U64, 8, 0, 18, false),
-            SchemaField::new("last_purchase_notes".to_string(), DbType::STRING, 12, 0, 19, false),
+            SchemaField::new(
+                "last_purchase_notes".to_string(),
+                DbType::STRING,
+                12,
+                0,
+                19,
+                false
+            ),
             SchemaField::new("net_assets".to_string(), DbType::F64, 8, 0, 20, false),
             SchemaField::new("department".to_string(), DbType::STRING, 12, 0, 21, false),
             SchemaField::new("salary".to_string(), DbType::F32, 4, 0, 22, false),
         ]
     }
 
-    fn setup_test_columns<'a>() -> SmallVec<[(Cow<'a, str>, MemoryBlock); 20]>  {
+    fn setup_test_columns<'a>() -> SmallVec<[(Cow<'a, str>, MemoryBlock); 20]> {
         let mut columns = SmallVec::new();
 
         static ID: &str = "id";
@@ -653,23 +712,47 @@ mod tests {
         columns.push((Cow::Borrowed(ID), create_memory_block_from_i32(42)));
         columns.push((Cow::Borrowed(AGE), create_memory_block_from_u8(30)));
         columns.push((Cow::Borrowed(SALARY), create_memory_block_from_i32(50000)));
-        columns.push((Cow::Borrowed(NAME), create_memory_block_from_string("John Doe")));
-        columns.push((Cow::Borrowed(DEPARTMENT), create_memory_block_from_string("Engineering")));
-        columns.push((Cow::Borrowed(BANK_BALANCE), create_memory_block_from_f64(1000.43)));
-        columns.push((Cow::Borrowed(CREDIT_BALANCE), create_memory_block_from_f32(100.50)));
-        columns.push((Cow::Borrowed(NET_ASSETS), create_memory_block_from_i64(200000)));
-        columns.push((Cow::Borrowed(EARTH_POSITION), create_memory_block_from_i8(-50)));
+        columns.push((
+            Cow::Borrowed(NAME),
+            create_memory_block_from_string("John Doe"),
+        ));
+        columns.push((
+            Cow::Borrowed(DEPARTMENT),
+            create_memory_block_from_string("Engineering"),
+        ));
+        columns.push((
+            Cow::Borrowed(BANK_BALANCE),
+            create_memory_block_from_f64(1000.43),
+        ));
+        columns.push((
+            Cow::Borrowed(CREDIT_BALANCE),
+            create_memory_block_from_f32(100.50),
+        ));
+        columns.push((
+            Cow::Borrowed(NET_ASSETS),
+            create_memory_block_from_i64(200000),
+        ));
+        columns.push((
+            Cow::Borrowed(EARTH_POSITION),
+            create_memory_block_from_i8(-50),
+        ));
         columns.push((Cow::Borrowed(TEST_1), create_memory_block_from_u32(100)));
         columns.push((Cow::Borrowed(TEST_2), create_memory_block_from_u16(200)));
-        columns.push((Cow::Borrowed(TEST_3), create_memory_block_from_i128(i128::MAX)));
-        columns.push((Cow::Borrowed(TEST_4), create_memory_block_from_u128(u128::MAX)));
+        columns.push((
+            Cow::Borrowed(TEST_3),
+            create_memory_block_from_i128(i128::MAX),
+        ));
+        columns.push((
+            Cow::Borrowed(TEST_4),
+            create_memory_block_from_u128(u128::MAX),
+        ));
         columns.push((Cow::Borrowed(TEST_5), create_memory_block_from_i16(300)));
         columns.push((Cow::Borrowed(TEST_6), create_memory_block_from_u64(400)));
 
         columns
     }
 
-    fn setup_test_columns_2<'a>() -> SmallVec<[(Cow<'a, str>, MemoryBlock); 20]>  {
+    fn setup_test_columns_2<'a>() -> SmallVec<[(Cow<'a, str>, MemoryBlock); 20]> {
         let mut columns = SmallVec::new();
 
         static ID: &str = "id";
@@ -697,29 +780,89 @@ mod tests {
         static DEPARTMENT: &str = "department";
         static SALARY: &str = "salary";
 
-        columns.push((Cow::Borrowed(ID), create_memory_block_from_u128(42_433_943_354)));
-        columns.push((Cow::Borrowed(NAME), create_memory_block_from_string("John Doe")));
+        columns.push((
+            Cow::Borrowed(ID),
+            create_memory_block_from_u128(42_433_943_354),
+        ));
+        columns.push((
+            Cow::Borrowed(NAME),
+            create_memory_block_from_string("John Doe"),
+        ));
         columns.push((Cow::Borrowed(AGE), create_memory_block_from_u8(30)));
-        columns.push((Cow::Borrowed(EMAIL), create_memory_block_from_string("john.doe@example.com")));
-        columns.push((Cow::Borrowed(PHONE), create_memory_block_from_string("123-456-7890")));
+        columns.push((
+            Cow::Borrowed(EMAIL),
+            create_memory_block_from_string("john.doe@example.com"),
+        ));
+        columns.push((
+            Cow::Borrowed(PHONE),
+            create_memory_block_from_string("123-456-7890"),
+        ));
         columns.push((Cow::Borrowed(IS_ACTIVE), create_memory_block_from_u8(1)));
-        columns.push((Cow::Borrowed(BANK_BALANCE), create_memory_block_from_f64(1000.43)));
+        columns.push((
+            Cow::Borrowed(BANK_BALANCE),
+            create_memory_block_from_f64(1000.43),
+        ));
         columns.push((Cow::Borrowed(MARRIED), create_memory_block_from_u8(0)));
-        columns.push((Cow::Borrowed(BIRTH_DATE), create_memory_block_from_string("1990-01-01")));
-        columns.push((Cow::Borrowed(LAST_LOGIN), create_memory_block_from_string("2023-10-01")));
-        columns.push((Cow::Borrowed(LAST_PURCHASE), create_memory_block_from_string("2023-09-30")));
-        columns.push((Cow::Borrowed(LAST_PURCHASE_AMOUNT), create_memory_block_from_f32(15_540.75)));
-        columns.push((Cow::Borrowed(LAST_PURCHASE_DATE), create_memory_block_from_string("2023-09-30")));
-        columns.push((Cow::Borrowed(LAST_PURCHASE_LOCATION), create_memory_block_from_string("Online")));
-        columns.push((Cow::Borrowed(LAST_PURCHASE_METHOD), create_memory_block_from_string("Credit Card")));
-        columns.push((Cow::Borrowed(LAST_PURCHASE_CATEGORY), create_memory_block_from_string("Electronics")));
-        columns.push((Cow::Borrowed(LAST_PURCHASE_SUBCATEGORY), create_memory_block_from_string("Computers")));
-        columns.push((Cow::Borrowed(LAST_PURCHASE_DESCRIPTION), create_memory_block_from_string("Gaming Laptop")));
-        columns.push((Cow::Borrowed(LAST_PURCHASE_STATUS), create_memory_block_from_string("Completed")));
-        columns.push((Cow::Borrowed(LAST_PURCHASE_ID), create_memory_block_from_u64(1001)));
-        columns.push((Cow::Borrowed(LAST_PURCHASE_NOTES), create_memory_block_from_string("No issues")));
-        columns.push((Cow::Borrowed(NET_ASSETS), create_memory_block_from_f64(8_449_903_733.92)));
-        columns.push((Cow::Borrowed(DEPARTMENT), create_memory_block_from_string("Engineering")));
+        columns.push((
+            Cow::Borrowed(BIRTH_DATE),
+            create_memory_block_from_string("1990-01-01"),
+        ));
+        columns.push((
+            Cow::Borrowed(LAST_LOGIN),
+            create_memory_block_from_string("2023-10-01"),
+        ));
+        columns.push((
+            Cow::Borrowed(LAST_PURCHASE),
+            create_memory_block_from_string("2023-09-30"),
+        ));
+        columns.push((
+            Cow::Borrowed(LAST_PURCHASE_AMOUNT),
+            create_memory_block_from_f32(15_540.75),
+        ));
+        columns.push((
+            Cow::Borrowed(LAST_PURCHASE_DATE),
+            create_memory_block_from_string("2023-09-30"),
+        ));
+        columns.push((
+            Cow::Borrowed(LAST_PURCHASE_LOCATION),
+            create_memory_block_from_string("Online"),
+        ));
+        columns.push((
+            Cow::Borrowed(LAST_PURCHASE_METHOD),
+            create_memory_block_from_string("Credit Card"),
+        ));
+        columns.push((
+            Cow::Borrowed(LAST_PURCHASE_CATEGORY),
+            create_memory_block_from_string("Electronics"),
+        ));
+        columns.push((
+            Cow::Borrowed(LAST_PURCHASE_SUBCATEGORY),
+            create_memory_block_from_string("Computers"),
+        ));
+        columns.push((
+            Cow::Borrowed(LAST_PURCHASE_DESCRIPTION),
+            create_memory_block_from_string("Gaming Laptop"),
+        ));
+        columns.push((
+            Cow::Borrowed(LAST_PURCHASE_STATUS),
+            create_memory_block_from_string("Completed"),
+        ));
+        columns.push((
+            Cow::Borrowed(LAST_PURCHASE_ID),
+            create_memory_block_from_u64(1001),
+        ));
+        columns.push((
+            Cow::Borrowed(LAST_PURCHASE_NOTES),
+            create_memory_block_from_string("No issues"),
+        ));
+        columns.push((
+            Cow::Borrowed(NET_ASSETS),
+            create_memory_block_from_f64(8_449_903_733.92),
+        ));
+        columns.push((
+            Cow::Borrowed(DEPARTMENT),
+            create_memory_block_from_string("Engineering"),
+        ));
         columns.push((Cow::Borrowed(SALARY), create_memory_block_from_f32(4955.58)));
 
         columns
@@ -739,8 +882,10 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), true);
@@ -760,8 +905,10 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), true);
@@ -781,8 +928,10 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), true);
@@ -802,8 +951,10 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), true);
@@ -823,8 +974,10 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), true);
@@ -844,8 +997,10 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), true);
@@ -865,8 +1020,10 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), true);
@@ -886,8 +1043,10 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), true);
@@ -907,8 +1066,10 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), true);
@@ -928,8 +1089,10 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), true);
@@ -949,8 +1112,10 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), true);
@@ -970,8 +1135,10 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), true);
@@ -980,19 +1147,58 @@ mod tests {
     #[test]
     fn test_tokenize_keywords_as_idents_and_ops() {
         use crate::core::row_v2::query_parser::Token;
-        let tokens = tokenize("age >= 30 AND name CONTAINS 'John' OR id STARTSWITH 'prefix'", &create_schema());
+        let tokens = tokenize(
+            "age >= 30 AND name CONTAINS 'John' OR id STARTSWITH 'prefix'",
+            &create_schema(),
+        );
         assert_eq!(tokens.len(), 11);
-        match &tokens[0] { Token::Ident(s) => assert_eq!(s.0, "age"), _ => panic!("Expected ident") }
-        match &tokens[1] { Token::Op(s) => assert_eq!(s, ">="), _ => panic!("Expected op") }
-        match &tokens[2] { Token::Number(n) => assert_eq!(*n, crate::core::row_v2::query_tokenizer::NumericValue::U8(30)), _ => panic!("Expected num") }
-        match &tokens[3] { Token::Next(s) => assert_eq!(s, "AND"), _ => panic!("Expected AND") }
-        match &tokens[4] { Token::Ident(s) => assert_eq!(s.0, "name"), _ => panic!("Expected ident") }
-        match &tokens[5] { Token::Ident(s) => assert_eq!(s.0.to_uppercase(), "CONTAINS"), _ => panic!("Expected CONTAINS") }
-        match &tokens[6] { Token::StringLit(s) => assert_eq!(s, "John"), _ => panic!("Expected str lit") }
-        match &tokens[7] { Token::Next(s) => assert_eq!(s, "OR"), _ => panic!("Expected OR") }
-        match &tokens[8] { Token::Ident(s) => assert_eq!(s.0, "id"), _ => panic!("Expected ident") }
-        match &tokens[9] { Token::Ident(s) => assert_eq!(s.0.to_uppercase(), "STARTSWITH"), _ => panic!("Expected STARTSWITH") }
-        match &tokens[10] { Token::StringLit(s) => assert_eq!(s, "prefix"), _ => panic!("Expected str lit") }
+        match &tokens[0] {
+            Token::Ident(s) => assert_eq!(s.0, "age"),
+            _ => panic!("Expected ident"),
+        }
+        match &tokens[1] {
+            Token::Op(s) => assert_eq!(s, ">="),
+            _ => panic!("Expected op"),
+        }
+        match &tokens[2] {
+            Token::Number(n) => assert_eq!(
+                *n,
+                crate::core::row_v2::query_tokenizer::NumericValue::U8(30)
+            ),
+            _ => panic!("Expected num"),
+        }
+        match &tokens[3] {
+            Token::Next(s) => assert_eq!(s, "AND"),
+            _ => panic!("Expected AND"),
+        }
+        match &tokens[4] {
+            Token::Ident(s) => assert_eq!(s.0, "name"),
+            _ => panic!("Expected ident"),
+        }
+        match &tokens[5] {
+            Token::Ident(s) => assert_eq!(s.0.to_uppercase(), "CONTAINS"),
+            _ => panic!("Expected CONTAINS"),
+        }
+        match &tokens[6] {
+            Token::StringLit(s) => assert_eq!(s, "John"),
+            _ => panic!("Expected str lit"),
+        }
+        match &tokens[7] {
+            Token::Next(s) => assert_eq!(s, "OR"),
+            _ => panic!("Expected OR"),
+        }
+        match &tokens[8] {
+            Token::Ident(s) => assert_eq!(s.0, "id"),
+            _ => panic!("Expected ident"),
+        }
+        match &tokens[9] {
+            Token::Ident(s) => assert_eq!(s.0.to_uppercase(), "STARTSWITH"),
+            _ => panic!("Expected STARTSWITH"),
+        }
+        match &tokens[10] {
+            Token::StringLit(s) => assert_eq!(s, "prefix"),
+            _ => panic!("Expected str lit"),
+        }
     }
 
     // --- 20 not true tests ---
@@ -1011,8 +1217,10 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), false);
@@ -1032,8 +1240,10 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), false);
@@ -1053,8 +1263,10 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), false);
@@ -1074,8 +1286,10 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), false);
@@ -1095,8 +1309,10 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), false);
@@ -1116,8 +1332,10 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), false);
@@ -1137,8 +1355,10 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), false);
@@ -1158,8 +1378,10 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), false);
@@ -1179,8 +1401,10 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), false);
@@ -1200,8 +1424,10 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), false);
@@ -1221,8 +1447,10 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), false);
@@ -1242,8 +1470,10 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), false);
@@ -1263,8 +1493,10 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), false);
@@ -1284,8 +1516,10 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), false);
@@ -1305,8 +1539,10 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), false);
@@ -1327,18 +1563,21 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
-        let _ = parser.evaluate_row(columns, &mut buffer.bool_buffer).unwrap();
+        let _ = parser
+            .evaluate_row(columns, &mut buffer.bool_buffer)
+            .unwrap();
     }
 
     #[test]
     fn test_parse_simple_equals() {
         let schema = create_schema();
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            Box::new(setup_test_columns())
-        });
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
         let query = "id = 42";
         let tokens = crate::core::row_v2::query_tokenizer::tokenize(query, &schema);
@@ -1348,8 +1587,8 @@ mod tests {
             bool_buffer: SmallVec::new(),
         };
         let transformer = UnsafeCell::new(TransformerProcessor::new(
-            &mut buffer.transformers, 
-            &mut buffer.intermediate_results
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
         ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
@@ -1359,9 +1598,8 @@ mod tests {
     #[test]
     fn test_parse_simple_not_equals() {
         let schema = create_schema();
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            Box::new(setup_test_columns())
-        });
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
         let query = "id != 50";
         let tokens = crate::core::row_v2::query_tokenizer::tokenize(query, &schema);
@@ -1370,7 +1608,10 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), true);
@@ -1379,9 +1620,8 @@ mod tests {
     #[test]
     fn test_parse_simple_greater_than() {
         let schema = create_schema();
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            Box::new(setup_test_columns())
-        });
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
         let query = "age > 25";
         let tokens = crate::core::row_v2::query_tokenizer::tokenize(query, &schema);
@@ -1390,7 +1630,10 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), true);
@@ -1399,9 +1642,8 @@ mod tests {
     #[test]
     fn test_parse_simple_less_than() {
         let schema = create_schema();
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            Box::new(setup_test_columns())
-        });
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
         let query = "age < 40";
         let tokens = crate::core::row_v2::query_tokenizer::tokenize(query, &schema);
@@ -1410,7 +1652,10 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), true);
@@ -1419,9 +1664,8 @@ mod tests {
     #[test]
     fn test_parse_greater_or_equal() {
         let schema = create_schema();
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            Box::new(setup_test_columns())
-        });
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
         let query = "age >= 30";
         let tokens = crate::core::row_v2::query_tokenizer::tokenize(query, &schema);
@@ -1430,7 +1674,10 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), true);
@@ -1439,9 +1686,8 @@ mod tests {
     #[test]
     fn test_parse_less_or_equal() {
         let schema = create_schema();
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            Box::new(setup_test_columns())
-        });
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
         let query = "age <= 30";
         let tokens = crate::core::row_v2::query_tokenizer::tokenize(query, &schema);
@@ -1450,7 +1696,10 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), true);
@@ -1459,9 +1708,8 @@ mod tests {
     #[test]
     fn test_parse_math_operation() {
         let schema = create_schema();
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            Box::new(setup_test_columns())
-        });
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
         let query = "age + 10 = 40";
         let tokens = crate::core::row_v2::query_tokenizer::tokenize(query, &schema);
@@ -1470,7 +1718,10 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), true);
@@ -1479,9 +1730,8 @@ mod tests {
     #[test]
     fn test_parse_multiple_math_operations() {
         let schema = create_schema();
-        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> = LazyLock::new(|| {
-            Box::new(setup_test_columns())
-        });
+        static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
+            LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
         let query = "age * 2 + 10 = 70";
         let tokens = crate::core::row_v2::query_tokenizer::tokenize(query, &schema);
@@ -1490,7 +1740,10 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer = UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), true);
@@ -1511,8 +1764,10 @@ mod tests {
             bool_buffer: SmallVec::new(),
         };
 
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
 
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
@@ -1535,8 +1790,10 @@ mod tests {
             bool_buffer: SmallVec::new(),
         };
 
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
 
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
@@ -1560,11 +1817,15 @@ mod tests {
             bool_buffer: SmallVec::new(),
         };
 
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
 
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
-        let _ = parser.evaluate_row(columns, &mut buffer.bool_buffer).unwrap();
+        let _ = parser
+            .evaluate_row(columns, &mut buffer.bool_buffer)
+            .unwrap();
     }
 
     #[test]
@@ -1583,8 +1844,10 @@ mod tests {
             bool_buffer: SmallVec::new(),
         };
 
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
 
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
@@ -1606,8 +1869,10 @@ mod tests {
             bool_buffer: SmallVec::new(),
         };
 
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
 
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
@@ -1629,8 +1894,10 @@ mod tests {
             bool_buffer: SmallVec::new(),
         };
 
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
 
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
@@ -1652,8 +1919,10 @@ mod tests {
             bool_buffer: SmallVec::new(),
         };
 
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
 
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
@@ -1675,8 +1944,10 @@ mod tests {
             bool_buffer: SmallVec::new(),
         };
 
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
 
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
@@ -1698,8 +1969,10 @@ mod tests {
             bool_buffer: SmallVec::new(),
         };
 
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
 
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
@@ -1721,8 +1994,10 @@ mod tests {
             bool_buffer: SmallVec::new(),
         };
 
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
 
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
@@ -1744,8 +2019,10 @@ mod tests {
             bool_buffer: SmallVec::new(),
         };
 
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
 
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
@@ -1774,8 +2051,10 @@ mod tests {
             bool_buffer: SmallVec::new(),
         };
 
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
 
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
@@ -1804,8 +2083,10 @@ mod tests {
             bool_buffer: SmallVec::new(),
         };
 
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
 
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
@@ -1832,8 +2113,10 @@ mod tests {
             bool_buffer: SmallVec::new(),
         };
 
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
 
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
@@ -1864,8 +2147,10 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), true);
@@ -1893,8 +2178,10 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), true);
@@ -1917,8 +2204,10 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), true);
@@ -1943,8 +2232,10 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), true);
@@ -1970,8 +2261,10 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), true);
@@ -1998,8 +2291,10 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), false);
@@ -2021,8 +2316,10 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), true);
@@ -2047,11 +2344,12 @@ mod tests {
             intermediate_results: SmallVec::new(),
             bool_buffer: SmallVec::new(),
         };
-        let transformer =
-            UnsafeCell::new(TransformerProcessor::new(&mut buffer.transformers, &mut buffer.intermediate_results));
+        let transformer = UnsafeCell::new(TransformerProcessor::new(
+            &mut buffer.transformers,
+            &mut buffer.intermediate_results,
+        ));
         let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
         let res = parser.evaluate_row(columns, &mut buffer.bool_buffer);
         assert_eq!(res.unwrap(), true);
     }
-    
 }

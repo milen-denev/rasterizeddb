@@ -1,12 +1,18 @@
 use std::{
-    arch::x86_64::{_mm_prefetch, _MM_HINT_T0}, fmt, hash::Hash, sync::{atomic::{AtomicU64, Ordering}, Arc}
+    arch::x86_64::{_MM_HINT_T0, _mm_prefetch},
+    fmt,
+    hash::Hash,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use crate::instructions::{copy_ptr_to_ptr, copy_vec_to_ptr, ref_slice, ref_slice_mut};
 
 pub static MEMORY_POOL: MemoryPool = MemoryPool::new();
 
-use libmimalloc_sys::{mi_malloc, mi_free};
+use libmimalloc_sys::{mi_free, mi_malloc};
 
 // Define the maximum size for inline allocation
 const INLINE_CAPACITY: usize = 64;
@@ -18,7 +24,7 @@ unsafe impl Sync for MemoryPool {}
 
 impl MemoryPool {
     #[inline(always)]
-    pub const  fn new() -> Self {
+    pub const fn new() -> Self {
         Self
     }
 
@@ -51,7 +57,9 @@ impl MemoryPool {
 
             MemoryBlock {
                 hash: 0, // Default hash value
-                data: MemoryBlockData { heap_data: (ptr, size) },
+                data: MemoryBlockData {
+                    heap_data: (ptr, size),
+                },
                 len: size, // For heap, len is the full size
                 is_heap: true,
                 should_drop: true,
@@ -77,7 +85,7 @@ impl MemoryPool {
                 is_heap: false,
                 should_drop: true,
                 //dropped: Arc::new(AtomicBool::new(false)),
-                references: Arc::new(AtomicU64::new(0))
+                references: Arc::new(AtomicU64::new(0)),
             }
         } else {
             // Allocate on the heap
@@ -89,7 +97,9 @@ impl MemoryPool {
 
             MemoryBlock {
                 hash: fastrand::u64(0..u64::MAX), // Default hash value
-                data: MemoryBlockData { heap_data: (ptr, size) },
+                data: MemoryBlockData {
+                    heap_data: (ptr, size),
+                },
                 len: size, // For heap, len is the full size
                 is_heap: true,
                 should_drop: true,
@@ -124,25 +134,27 @@ union MemoryBlockData {
 pub struct MemoryBlock {
     hash: u64, // Hash for the block, if needed
     data: MemoryBlockData,
-    len: usize, // Actual length of the data
+    len: usize,    // Actual length of the data
     is_heap: bool, // Discriminant for the union: true if heap, false if inline
     should_drop: bool,
     //dropped: Arc<AtomicBool>,
-    references: Arc<AtomicU64>
+    references: Arc<AtomicU64>,
 }
 
 unsafe impl Send for MemoryBlock {}
 unsafe impl Sync for MemoryBlock {}
 
 impl Default for MemoryBlock {
-     #[inline(always)]
+    #[inline(always)]
     fn default() -> Self {
         // A default MemoryBlock will be an empty, inline block
         MemoryBlock {
             hash: 0, // Default hash value
-            data: MemoryBlockData { inline_data: [0; INLINE_CAPACITY] }, // Initialize with zeros
+            data: MemoryBlockData {
+                inline_data: [0; INLINE_CAPACITY],
+            }, // Initialize with zeros
             len: 0,
-            is_heap: false, // It's an inline block
+            is_heap: false,     // It's an inline block
             should_drop: false, // Not needed as it's implied by is_heap,
             //dropped: Arc::new(AtomicBool::new(false)),
             references: Arc::new(AtomicU64::new(0)),
@@ -190,7 +202,7 @@ impl Drop for MemoryBlock {
     fn drop(&mut self) {
         if self.should_drop && self.is_heap {
             let refs = self.references.fetch_sub(1, Ordering::Release);
-            
+
             if refs == 1 {
                 // let was_dropped = self.dropped
                 //     .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -219,31 +231,31 @@ impl Clone for MemoryBlock {
 
             MemoryBlock {
                 hash: self.hash,
-                data: MemoryBlockData { 
-                    heap_data: (
-                    unsafe { 
-                        self.data.heap_data.0.clone() 
-                    }, 
-                    unsafe { 
-                        self.data.heap_data.1.clone() 
-                    }) 
+                data: MemoryBlockData {
+                    heap_data: (unsafe { self.data.heap_data.0.clone() }, unsafe {
+                        self.data.heap_data.1.clone()
+                    }),
                 },
                 len: self.len,
                 is_heap: true,
                 should_drop: true, // Important: new allocation should be cleaned up
                 //dropped: self.dropped.clone(),
-                references: references
+                references: references,
             }
         } else {
             // For inline data, we can safely copy the data
             MemoryBlock {
                 hash: self.hash,
-                data: unsafe { MemoryBlockData { inline_data: self.data.inline_data.clone() } }, // This is safe to copy for inline data
+                data: unsafe {
+                    MemoryBlockData {
+                        inline_data: self.data.inline_data.clone(),
+                    }
+                }, // This is safe to copy for inline data
                 len: self.len,
                 is_heap: false,
                 should_drop: true, // Inline doesn't need cleanup, but keep consistent
                 //dropped: self.dropped.clone(),
-                references: references
+                references: references,
             }
         }
     }
@@ -281,10 +293,12 @@ impl MemoryBlock {
             if memory_chunk.is_heap {
                 copy_vec_to_ptr(vec.as_slice(), unsafe { memory_chunk.data.heap_data.0 });
             } else {
-                copy_vec_to_ptr(vec.as_slice(), unsafe { memory_chunk.data.inline_data.as_ptr() as *mut u8 });
+                copy_vec_to_ptr(vec.as_slice(), unsafe {
+                    memory_chunk.data.inline_data.as_ptr() as *mut u8
+                });
             }
         }
-      
+
         drop(vec);
         memory_chunk
     }
@@ -339,7 +353,9 @@ impl MemoryBlock {
             if memory_chunk.is_heap {
                 copy_vec_to_ptr(slice, unsafe { memory_chunk.data.heap_data.0 });
             } else {
-                copy_vec_to_ptr(slice, unsafe { memory_chunk.data.inline_data.as_ptr() as *mut u8 });
+                copy_vec_to_ptr(slice, unsafe {
+                    memory_chunk.data.inline_data.as_ptr() as *mut u8
+                });
             }
         }
 
@@ -373,14 +389,24 @@ impl Hash for MemoryBlock {
             // Use the hash field directly
             _state.write_u64(self.hash);
         } else {
-            panic!("MemoryBlock hash is not set. Ensure to use from_slice_hashed or acquire_with_hash.");
+            panic!(
+                "MemoryBlock hash is not set. Ensure to use from_slice_hashed or acquire_with_hash."
+            );
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{hash::Hasher, ptr, sync::{atomic::{AtomicUsize, Ordering}, Arc, Mutex}, thread};
+    use std::{
+        hash::Hasher,
+        ptr,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+        thread,
+    };
 
     use super::*;
 
@@ -449,10 +475,10 @@ mod tests {
         for i in 0..100 {
             vec.push((i % 256) as u8);
         }
-        
+
         let block = MemoryBlock::from_vec(vec.clone());
         assert!(block.is_heap);
-        
+
         // Verify data integrity
         let slice = block.into_slice();
         for i in 0..100 {
@@ -467,10 +493,10 @@ mod tests {
         for i in 0..INLINE_CAPACITY {
             vec.push((i % 256) as u8);
         }
-        
+
         let block = MemoryBlock::from_vec(vec.clone());
         assert!(!block.is_heap);
-        
+
         // Verify data integrity
         let slice = block.into_slice();
         for i in 0..INLINE_CAPACITY {
@@ -492,7 +518,7 @@ mod tests {
         let block = MEMORY_POOL.acquire(10);
         // Just ensure it doesn't panic
         block.prefetch_to_lcache();
-        
+
         let block = MEMORY_POOL.acquire(100);
         block.prefetch_to_lcache();
     }
@@ -506,11 +532,11 @@ mod tests {
     #[test]
     fn test_exact_capacity_boundary() {
         let pool = MemoryPool::new();
-        
+
         // Test exactly at INLINE_CAPACITY
         let block_inline = pool.acquire(INLINE_CAPACITY);
         assert!(!block_inline.is_heap);
-        
+
         // Test one byte over INLINE_CAPACITY
         let block_heap = pool.acquire(INLINE_CAPACITY + 1);
         assert!(block_heap.is_heap);
@@ -520,7 +546,7 @@ mod tests {
     fn test_should_drop_flag() {
         let mut block = MEMORY_POOL.acquire(100);
         assert!(block.should_drop);
-        
+
         // Prevent drop from freeing memory
         block.should_drop = false;
         // This should not free the memory or panic
@@ -532,7 +558,7 @@ mod tests {
         assert!(!block.is_heap); // Should use inline storage for zero-size
         assert_eq!(block.len, 0);
     }
-    
+
     #[test]
     fn test_large_allocations() {
         // Test with a large allocation (1MB)
@@ -540,13 +566,13 @@ mod tests {
         let block = MEMORY_POOL.acquire(size);
         assert!(block.is_heap);
         assert_eq!(block.len, size);
-        
+
         // Make sure we can write to all of it
         let slice_mut = block.into_slice_mut();
         for i in 0..size {
             slice_mut[i] = (i % 256) as u8;
         }
-        
+
         // Verify the data
         for i in 0..size {
             assert_eq!(slice_mut[i], (i % 256) as u8);
@@ -558,25 +584,25 @@ mod tests {
         // Test that memory_pool can be safely used from multiple threads
         let threads_count = 10;
         let ops_per_thread = 100;
-        
+
         let barrier = Arc::new(std::sync::Barrier::new(threads_count));
         let errors = Arc::new(Mutex::new(Vec::new()));
-        
+
         let mut handles = Vec::with_capacity(threads_count);
-        
+
         for thread_id in 0..threads_count {
             let barrier = Arc::clone(&barrier);
             let errors = Arc::clone(&errors);
-            
+
             let handle = thread::spawn(move || {
                 // Wait for all threads to be ready
                 barrier.wait();
-                
+
                 for i in 0..ops_per_thread {
                     let size = (thread_id * i) % 100 + 1; // Vary sizes
-                    
+
                     let block = MEMORY_POOL.acquire(size);
-                    
+
                     // Check if allocation was successful
                     if block.is_heap && size > INLINE_CAPACITY {
                         let slice = block.into_slice_mut();
@@ -584,15 +610,18 @@ mod tests {
                             let mut error_log = errors.lock().unwrap();
                             error_log.push(format!(
                                 "Thread {} allocation {}: Expected size {}, got {}",
-                                thread_id, i, size, slice.len()
+                                thread_id,
+                                i,
+                                size,
+                                slice.len()
                             ));
                         }
-                        
+
                         // Write some data
                         for j in 0..size {
                             slice[j] = ((thread_id + j) % 256) as u8;
                         }
-                        
+
                         // Read it back and verify
                         for j in 0..size {
                             if slice[j] != ((thread_id + j) % 256) as u8 {
@@ -611,7 +640,10 @@ mod tests {
                             let mut error_log = errors.lock().unwrap();
                             error_log.push(format!(
                                 "Thread {} inline allocation {}: Expected size {}, got {}",
-                                thread_id, i, size, slice.len()
+                                thread_id,
+                                i,
+                                size,
+                                slice.len()
                             ));
                         }
                     } else {
@@ -623,20 +655,20 @@ mod tests {
                     }
                 }
             });
-            
+
             handles.push(handle);
         }
-        
+
         // Wait for all threads to finish
         for handle in handles {
             handle.join().unwrap();
         }
-        
+
         // Check if there were any errors
         let errors = errors.lock().unwrap();
         assert!(errors.is_empty(), "Thread errors: {:?}", errors);
     }
-    
+
     #[test]
     fn test_memory_block_from_vec_empty() {
         let vec = Vec::<u8>::new();
@@ -645,31 +677,30 @@ mod tests {
         let slice = block.into_slice();
         assert_eq!(slice.len(), 0);
     }
-    
+
     #[test]
     fn test_drop_behavior() {
-        
         // Create a struct to track if drop is called
         static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
-        
+
         struct DropCounter;
         impl Drop for DropCounter {
             fn drop(&mut self) {
                 DROP_COUNT.fetch_add(1, Ordering::SeqCst);
             }
         }
-        
+
         // Scope to ensure drop
         {
             // Create some heap allocations
             let _dc = DropCounter;
             let _blocks: Vec<_> = (0..10).map(|_| MEMORY_POOL.acquire(100)).collect();
             assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 0);
-            
+
             // DropCounter should still be alive
             drop(_dc);
             assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 1);
-            
+
             // All blocks should still be alive
         }
         // Now blocks should be dropped and memory freed
@@ -682,22 +713,22 @@ mod tests {
         // This test specifically checks for the memory corruption bug that was reported
         let original_data = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
         let block1 = MemoryBlock::from_vec(original_data.clone());
-        
+
         // Clone the block - this used to cause use-after-free
         let block2 = block1.clone();
-        
+
         // Verify both blocks have the same data initially
         assert_eq!(block1.into_slice(), &original_data[..]);
         assert_eq!(block2.into_slice(), &original_data[..]);
-        
+
         // Modify data through block1
         let slice1 = block1.into_slice_mut();
         slice1[0] = 99;
-        
+
         // Verify that block2's data is NOT affected (proper isolation)
         assert_eq!(block1.into_slice()[0], 99);
         assert_eq!(block2.into_slice()[0], 1); // Should still be original value
-        
+
         // Both blocks should maintain their integrity
         assert_eq!(&block1.into_slice()[1..], &original_data[1..]);
         assert_eq!(&block2.into_slice()[1..], &original_data[1..]);
@@ -707,17 +738,17 @@ mod tests {
     fn test_memory_block_hashing() {
         let pool = MemoryPool::new();
         let data = b"test data";
-        
+
         // Create a memory block with a specific hash
         let block = pool.acquire_with_hash(data.len());
         let slice_mut = block.into_slice_mut();
         slice_mut.copy_from_slice(data);
-        
+
         // Hash the block
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         block.hash(&mut hasher);
         let hash_value_1 = hasher.finish();
-        
+
         // Hash the hash value
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         block.hash.hash(&mut hasher);
@@ -725,7 +756,10 @@ mod tests {
 
         // Check if the hash matches the expected value
         assert_ne!(hash_value_1, 0, "Hash should not be zero");
-        assert_eq!(hash_value_2, hash_value_1, "Block hash should match computed hash");
+        assert_eq!(
+            hash_value_2, hash_value_1,
+            "Block hash should match computed hash"
+        );
     }
 
     // #[test]
@@ -763,7 +797,13 @@ mod tests {
                     let slice = block.into_slice_mut();
                     if slice.len() != size {
                         let mut error_log = errors.lock().unwrap();
-                        error_log.push(format!("Thread {} allocation {}: Expected size {}, got {}", thread_id, i, size, slice.len()));
+                        error_log.push(format!(
+                            "Thread {} allocation {}: Expected size {}, got {}",
+                            thread_id,
+                            i,
+                            size,
+                            slice.len()
+                        ));
                     }
                     for j in 0..size {
                         slice[j] = ((thread_id + j) % 256) as u8;
@@ -771,7 +811,10 @@ mod tests {
                     for j in 0..size {
                         if slice[j] != ((thread_id + j) % 256) as u8 {
                             let mut error_log = errors.lock().unwrap();
-                            error_log.push(format!("Thread {} allocation {} data mismatch at index {}", thread_id, i, j));
+                            error_log.push(format!(
+                                "Thread {} allocation {} data mismatch at index {}",
+                                thread_id, i, j
+                            ));
                             break;
                         }
                     }

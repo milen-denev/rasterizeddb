@@ -1,5 +1,6 @@
 use std::{
-    arch::{asm, x86_64::*}, ptr
+    arch::{asm, x86_64::*},
+    ptr,
 };
 
 #[inline]
@@ -93,7 +94,7 @@ pub unsafe fn compare_raw_vecs(
     if vec_a_len != vec_b_len {
         return false;
     }
-    
+
     unsafe {
         asm!(
             "repe cmpsb",
@@ -128,9 +129,12 @@ pub fn copy_vec_to_ptr(vec: &[u8], dst: *mut u8) {
             // Check overlapping
             debug_assert!(dst_end.is_null() == false, "Destination pointer is null");
             debug_assert!(vec_ptr_end.is_null() == false, "Source vector is null");
-            debug_assert!(const_dst < vec_ptr || const_dst > vec_ptr_end, "Memory regions overlap");
+            debug_assert!(
+                const_dst < vec_ptr || const_dst > vec_ptr_end,
+                "Memory regions overlap"
+            );
         }
-        
+
         ptr::copy_nonoverlapping(vec.as_ptr(), dst, vec.len());
     }
 }

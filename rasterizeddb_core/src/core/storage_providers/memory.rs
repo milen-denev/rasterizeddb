@@ -88,7 +88,11 @@ impl StorageIO for MemoryStorageProvider {
         return buffer;
     }
 
-    async fn read_data_into_buffer(&self, position: &mut u64, buffer: &mut [u8]) -> Result<(), std::io::Error> {
+    async fn read_data_into_buffer(
+        &self,
+        position: &mut u64,
+        buffer: &mut [u8],
+    ) -> Result<(), std::io::Error> {
         let start = *position;
         let end = *position + buffer.len() as u64;
 
@@ -221,11 +225,11 @@ impl StorageIO for MemoryStorageProvider {
         //self.vec.clear();
         panic!("Drop IO not implemented for MemoryStorageProvider");
     }
-    
+
     fn get_hash(&self) -> u32 {
         self.random_u32
     }
-    
+
     fn start_service(&self) -> impl Future<Output = ()> + Send + Sync {
         async {}
     }

@@ -19,20 +19,28 @@ pub fn create_table_from_query_purpose(qp: &QueryPurpose) -> Option<CreateTable>
         // Robustly extract table name after CREATE and TABLE, skipping arbitrary whitespace
         let sql_upper = sql.to_ascii_uppercase();
         let mut words = sql_upper.split_whitespace();
-        if words.next()? != "CREATE" { return None; }
-        if words.next()? != "TABLE" { return None; }
+        if words.next()? != "CREATE" {
+            return None;
+        }
+        if words.next()? != "TABLE" {
+            return None;
+        }
         // Find the start of the table name in the original string
         let mut after_create_table = sql;
         for _ in 0..2 {
             let idx = after_create_table.find(|c: char| !c.is_whitespace())?;
             after_create_table = &after_create_table[idx..];
-            let ws = after_create_table.find(char::is_whitespace).unwrap_or(after_create_table.len());
+            let ws = after_create_table
+                .find(char::is_whitespace)
+                .unwrap_or(after_create_table.len());
             after_create_table = &after_create_table[ws..];
         }
         let idx = after_create_table.find(|c: char| !c.is_whitespace())?;
         after_create_table = &after_create_table[idx..];
         // Table name is up to the next whitespace or '('
-        let paren_idx = after_create_table.find('(').unwrap_or(after_create_table.len());
+        let paren_idx = after_create_table
+            .find('(')
+            .unwrap_or(after_create_table.len());
         let mut table_name = after_create_table[..paren_idx].trim();
         if let Some(ws_idx) = table_name.find(char::is_whitespace) {
             table_name = &table_name[..ws_idx];
@@ -41,11 +49,13 @@ pub fn create_table_from_query_purpose(qp: &QueryPurpose) -> Option<CreateTable>
         // Find the part between the first '(' and the last ')'
         let start = sql.find('(')?;
         let end = sql.rfind(')')?;
-        let columns_str = &sql[start+1..end];
+        let columns_str = &sql[start + 1..end];
         let mut columns = Vec::new();
         for col_def in columns_str.split(',') {
             let col_def = col_def.trim();
-            if col_def.is_empty() { continue; }
+            if col_def.is_empty() {
+                continue;
+            }
             // Split by whitespace to get name and type
             let mut parts = col_def.split_whitespace();
             let name = parts.next()?.trim_matches('"').to_string();
@@ -72,11 +82,15 @@ pub fn create_table_from_query_purpose(qp: &QueryPurpose) -> Option<CreateTable>
                 "DATETIME" | "TIMESTAMP" => DbType::DATETIME,
                 // Boolean
                 "BOOL" | "BOOLEAN" => DbType::U8,
-                _ => return None
+                _ => return None,
             };
             columns.push(CreateColumnData { name, data_type });
         }
-        Some(CreateTable { table_name, columns, is_immutable: false })
+        Some(CreateTable {
+            table_name,
+            columns,
+            is_immutable: false,
+        })
     } else {
         None
     }
@@ -112,26 +126,56 @@ mod tests {
         let qp = QueryPurpose::CreateTable(sql.to_string());
         let result = create_table_from_query_purpose(&qp).expect("Should parse successfully");
         let types = [
-            DbType::I8, DbType::I16, DbType::I32, DbType::I64,
-            DbType::U8, DbType::U16, DbType::U32, DbType::U64,
-            DbType::F32, DbType::F32, DbType::F64,
-            DbType::CHAR, DbType::STRING, DbType::STRING, DbType::STRING,
-            DbType::DATETIME, DbType::DATETIME,
-            DbType::U8, DbType::U8
+            DbType::I8,
+            DbType::I16,
+            DbType::I32,
+            DbType::I64,
+            DbType::U8,
+            DbType::U16,
+            DbType::U32,
+            DbType::U64,
+            DbType::F32,
+            DbType::F32,
+            DbType::F64,
+            DbType::CHAR,
+            DbType::STRING,
+            DbType::STRING,
+            DbType::STRING,
+            DbType::DATETIME,
+            DbType::DATETIME,
+            DbType::U8,
+            DbType::U8,
         ];
         let names = [
-            "i8_col", "i16_col", "i32_col", "i64_col",
-            "u8_col", "u16_col", "u32_col", "u64_col",
-            "float_col", "real_col", "double_col",
-            "char_col", "text_col", "varchar_col", "string_col",
-            "datetime_col", "timestamp_col",
-            "bool_col", "boolean_col"
+            "i8_col",
+            "i16_col",
+            "i32_col",
+            "i64_col",
+            "u8_col",
+            "u16_col",
+            "u32_col",
+            "u64_col",
+            "float_col",
+            "real_col",
+            "double_col",
+            "char_col",
+            "text_col",
+            "varchar_col",
+            "string_col",
+            "datetime_col",
+            "timestamp_col",
+            "bool_col",
+            "boolean_col",
         ];
         assert_eq!(result.table_name, "all_types");
         assert_eq!(result.columns.len(), types.len());
         for (i, col) in result.columns.iter().enumerate() {
             assert_eq!(col.name, names[i]);
-            assert_eq!(&col.data_type, &types[i], "Type mismatch for column {}", col.name);
+            assert_eq!(
+                &col.data_type, &types[i],
+                "Type mismatch for column {}",
+                col.name
+            );
         }
     }
 
