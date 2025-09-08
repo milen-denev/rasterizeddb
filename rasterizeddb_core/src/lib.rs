@@ -17,7 +17,7 @@ pub(crate) const THREADS: usize = 16;
 pub const MAX_PERMITS_THREADS: usize = 16;
 
 // Number of row pointers to fetch at once in next_row_pointers
-pub(crate) const BATCH_SIZE: usize = 1024 * 32;
+pub(crate) const BATCH_SIZE: usize = 1024 * 64;
 
 pub(crate) const IMMEDIATE_WRITE: bool = true;
 
