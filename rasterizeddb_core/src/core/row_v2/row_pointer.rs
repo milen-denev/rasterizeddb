@@ -765,9 +765,29 @@ impl RowPointer {
         }
 
         let columns = &mut row_reuse.columns;
-        columns.clear();
 
-        for column_data in &row_fetch.columns_fetching_data {
+        // Ensure we have exactly the needed number of column slots without dropping reusable ones unnecessarily.
+        let needed = row_fetch.columns_fetching_data.len();
+        let current_len = columns.len();
+
+        if current_len < needed {
+            // Grow columns with cheap placeholders; these will be overwritten below.
+            columns.reserve(needed - current_len);
+            for _ in 0..(needed - current_len) {
+                columns.push(Column {
+                    schema_id: 0,
+                    data: MemoryBlock::default(),
+                    column_type: DbType::U8, // placeholder, will be set properly
+                });
+            }
+        } else if current_len > needed {
+            // Drop only the excess; common case keeps length stable so this won't happen often.
+            columns.truncate(needed);
+        }
+
+        // Reuse buffers in-place when sizes match; otherwise, replace the MemoryBlock.
+        // This avoids frequent drop+alloc cycles and SmallVec push/clear overhead.
+        for (i, column_data) in row_fetch.columns_fetching_data.iter().enumerate() {
             let mut position = self.position + column_data.column_offset as u64;
 
             if column_data.column_type == DbType::STRING {
@@ -777,36 +797,45 @@ impl RowPointer {
                     .await
                     .unwrap();
 
-                let string_row_position =
-                    self.position + u64::from_le_bytes(header[0..8].try_into().unwrap());
-                let string_size = u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize;
+                let mut string_row_position = self.position
+                    + u64::from_le_bytes(<[u8; 8]>::try_from(&header[0..8]).unwrap());
 
-                let string_block = MEMORY_POOL.acquire(string_size);
-                let string_slice = string_block.into_slice_mut();
+                let string_size = u32::from_le_bytes(<[u8; 4]>::try_from(&header[8..12]).unwrap())
+                    as usize;
 
-                io.read_data_into_buffer(&mut (string_row_position.clone()), string_slice)
+                // Ensure buffer capacity matches string_size
+                let col = &mut columns[i];
+                let current_size = col.data.into_slice().len();
+                
+                if current_size != string_size {
+                    col.data = MEMORY_POOL.acquire(string_size);
+                }
+                
+                let string_slice = col.data.into_slice_mut();
+
+                io.read_data_into_buffer(&mut string_row_position, string_slice)
                     .await
                     .unwrap();
 
-                columns.push(Column {
-                    schema_id: column_data.schema_id,
-                    data: string_block,
-                    column_type: DbType::STRING,
-                });
+                col.schema_id = column_data.schema_id;
+                col.column_type = DbType::STRING;
             } else {
                 let c_size = column_data.size as usize;
-                let block = MEMORY_POOL.acquire(c_size);
-                let slice = block.into_slice_mut();
+
+                // Ensure buffer capacity matches c_size
+                let col = &mut columns[i];
+                let current_size = col.data.into_slice().len();
+                if current_size != c_size {
+                    col.data = MEMORY_POOL.acquire(c_size);
+                }
+                let slice = col.data.into_slice_mut();
 
                 io.read_data_into_buffer(&mut position, slice)
                     .await
                     .unwrap();
 
-                columns.push(Column {
-                    schema_id: column_data.schema_id,
-                    data: block,
-                    column_type: column_data.column_type.clone(),
-                });
+                col.schema_id = column_data.schema_id;
+                col.column_type = column_data.column_type.clone();
             }
         }
 
