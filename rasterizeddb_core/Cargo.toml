@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 repository = "https://github.com/milen-denev/rasterizeddb"
 license = "GPL-3.0-only"
-keywords = ["database", "rql", "embedded-database"]
+keywords = ["database", "embedded-database"]
 authors = ["Milen Denev"]
 description = "A schemafull, high-performance database written in Rust, designed for speed and scalability."
 
