@@ -59,7 +59,7 @@ async fn main() -> std::io::Result<()> {
 
     // let semaphore = Arc::new(tokio::sync::Semaphore::new(16));
 
-    // for i in 0..500_000 {
+    // for i in 2_500_000..3_500_000 {
     //     let person = generate_person();
     //     let query = format!(
     //         r##"
@@ -96,10 +96,10 @@ async fn main() -> std::io::Result<()> {
     // let mut buffer = String::new();
     // stdin().read_line(&mut buffer).unwrap();
 
-    for _ in 0..1 {
+    for _ in 0..50 {
         let query = r##"
             SELECT id FROM employees
-            WHERE id < 5
+            WHERE id = 2499999
         "##;
 
         let instant = std::time::Instant::now();
