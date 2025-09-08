@@ -1,6 +1,18 @@
 
 # Rasterized DB
 ## A high-performance database written from scratch in Rust — now fully rewritten.
+
+### Guide on how to run
+
+rasterizeddb_server-PLATFORM-x64.exe --location /your-location/bla-bla --concurrent_threads 16 --batch_size 16000
+
+*batch_size*: recommended value is 16K, but you can play around with more or less depending on your case. The lesser the number of rows, the lower the batch size must be.
+*concurrent_threads*: must equal to the number of CPU threads of lower.
+
+### Guide on how to run the client-side
+
+Refer to *test_client/src/main.rs* for examples! 
+
 ### Vision
 
 #### Complete Rewrite
