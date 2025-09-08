@@ -6,52 +6,69 @@ on:
       - 'v*'
 
 jobs:
-  build-release:
-    name: Build and Publish Release
+  build-linux:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
       - name: Install Rust toolchain
         uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
           profile: minimal
           override: true
-
-      - name: Add Linux and Windows targets
-        run: |
-          rustup target add x86_64-unknown-linux-gnu
-          rustup target add x86_64-pc-windows-gnu
-
-      - name: Install cross for cross-compilation
-        run: cargo install cross
-
       - name: Build Linux x64 executable
-        run: cross build --release --target x86_64-unknown-linux-gnu
+        run: cargo build --release --target x86_64-unknown-linux-gnu
+      - name: Rename Linux executable
+        run: mv target/x86_64-unknown-linux-gnu/release/rasterizeddb rasterizeddb-linux-x64
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rasterizeddb-linux-x64
+          path: rasterizeddb-linux-x64
 
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          target: x86_64-pc-windows-msvc
+          profile: minimal
+          override: true
       - name: Build Windows x64 executable
-        run: cross build --release --target x86_64-pc-windows-gnu
+        run: cargo build --release --target x86_64-pc-windows-msvc
+      - name: Rename Windows executable
+        run: ren target\x86_64-pc-windows-msvc\release\rasterizeddb.exe rasterizeddb-windows-x64.exe
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rasterizeddb-windows-x64.exe
+          path: rasterizeddb-windows-x64.exe
 
-      - name: Rename executables
-        run: |
-          mv target/x86_64-unknown-linux-gnu/release/rasterizeddb rasterizeddb-linux-x64
-          mv target/x86_64-pc-windows-gnu/release/rasterizeddb.exe rasterizeddb-windows-x64.exe
-
+  release:
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
       - name: Generate release changelog
         id: changelog
         run: |
           echo "changelog<<EOF" >> $GITHUB_ENV
           git log --pretty=format:"* %s (%h)" $(git describe --tags --abbrev=0 @^)..@ >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
-
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
           body: ${{ env.changelog }}
           files: |
-            rasterizeddb-linux-x64
-            rasterizeddb-windows-x64.exe
+            artifacts/rasterizeddb-linux-x64/rasterizeddb-linux-x64
+            artifacts/rasterizeddb-windows-x64.exe/rasterizeddb-windows-x64.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
