@@ -45,7 +45,7 @@ impl MemoryPool {
                 is_heap: false,
                 should_drop: true,
                 //dropped: Arc::new(AtomicBool::new(false)),
-                references: Arc::new(AtomicU64::new(0)),
+                references: None,
             }
         } else {
             // Allocate on the heap
@@ -64,7 +64,7 @@ impl MemoryPool {
                 is_heap: true,
                 should_drop: true,
                 //dropped: Arc::new(AtomicBool::new(false)),
-                references: Arc::new(AtomicU64::new(1)),
+                references: Some(Arc::new(AtomicU64::new(1))),
             }
         }
     }
@@ -85,7 +85,7 @@ impl MemoryPool {
                 is_heap: false,
                 should_drop: true,
                 //dropped: Arc::new(AtomicBool::new(false)),
-                references: Arc::new(AtomicU64::new(0)),
+                references: None,
             }
         } else {
             // Allocate on the heap
@@ -104,7 +104,7 @@ impl MemoryPool {
                 is_heap: true,
                 should_drop: true,
                 //dropped: Arc::new(AtomicBool::new(false)),
-                references: Arc::new(AtomicU64::new(1)),
+                references: Some(Arc::new(AtomicU64::new(1))),
             }
         }
     }
@@ -138,7 +138,7 @@ pub struct MemoryBlock {
     is_heap: bool, // Discriminant for the union: true if heap, false if inline
     should_drop: bool,
     //dropped: Arc<AtomicBool>,
-    references: Arc<AtomicU64>,
+    references: Option<Arc<AtomicU64>>,
 }
 
 unsafe impl Send for MemoryBlock {}
@@ -157,7 +157,7 @@ impl Default for MemoryBlock {
             is_heap: false,     // It's an inline block
             should_drop: false, // Not needed as it's implied by is_heap,
             //dropped: Arc::new(AtomicBool::new(false)),
-            references: Arc::new(AtomicU64::new(0)),
+            references: None,
         }
     }
 }
@@ -201,7 +201,11 @@ impl Drop for MemoryBlock {
     #[track_caller]
     fn drop(&mut self) {
         if self.should_drop && self.is_heap {
-            let refs = self.references.fetch_sub(1, Ordering::Release);
+            let refs = self
+                .references
+                .as_ref()
+                .expect("heap blocks must have a ref counter")
+                .fetch_sub(1, Ordering::Release);
 
             if refs == 1 {
                 // let was_dropped = self.dropped
@@ -224,9 +228,12 @@ impl Drop for MemoryBlock {
 impl Clone for MemoryBlock {
     #[inline(always)]
     fn clone(&self) -> Self {
-        let references = Arc::clone(&self.references);
-
         if self.is_heap {
+            let references = self
+                .references
+                .as_ref()
+                .expect("heap blocks must have a ref counter")
+                .clone();
             references.fetch_add(1, Ordering::Release);
 
             MemoryBlock {
@@ -240,7 +247,7 @@ impl Clone for MemoryBlock {
                 is_heap: true,
                 should_drop: true, // Important: new allocation should be cleaned up
                 //dropped: self.dropped.clone(),
-                references: references,
+                references: Some(references),
             }
         } else {
             // For inline data, we can safely copy the data
@@ -255,7 +262,7 @@ impl Clone for MemoryBlock {
                 is_heap: false,
                 should_drop: true, // Inline doesn't need cleanup, but keep consistent
                 //dropped: self.dropped.clone(),
-                references: references,
+                references: None,
             }
         }
     }
