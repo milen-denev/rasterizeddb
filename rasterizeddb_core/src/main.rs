@@ -1,4 +1,4 @@
-use std::{char::MAX, sync::Arc};
+use std::sync::Arc;
 
 use log::LevelFilter;
 use rasterizeddb_core::{core::database::Database, BATCH_SIZE, MAX_PERMITS_THREADS};

@@ -1,6 +1,5 @@
 pub mod database;
 pub mod db_type;
-pub mod hashing;
 pub mod helpers;
 pub mod mock_helpers;
 pub mod mock_table;
