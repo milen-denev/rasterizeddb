@@ -6,7 +6,7 @@ use log::LevelFilter;
 use rand::Rng;
 use rasterizeddb_core::{
     client::DbClient,
-    core::{database::QueryExecutionResult, db_type::DbType, row_v2::row::vec_into_rows},
+    core::{ db_type::DbType, row::row::vec_into_rows, support_types::QueryExecutionResult},
 };
 use std::{
     io::stdin,

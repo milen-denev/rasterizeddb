@@ -1,9 +1,9 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use rasterizeddb_core::core::db_type::DbType;
-use rasterizeddb_core::core::row_v2::query_parser::{QueryParser, tokenize_for_test};
-use rasterizeddb_core::core::row_v2::query_tokenizer::tokenize;
-use rasterizeddb_core::core::row_v2::schema::SchemaField;
-use rasterizeddb_core::core::row_v2::transformer::{ColumnTransformer, Next, TransformerProcessor};
+use rasterizeddb_core::core::processor::transformer::{ColumnTransformer, Next, TransformerProcessor};
+use rasterizeddb_core::core::row::schema::SchemaField;
+use rasterizeddb_core::core::tokenizer::query_parser::{tokenize_for_test, QueryParser};
+use rasterizeddb_core::core::tokenizer::query_tokenizer::tokenize;
 use rasterizeddb_core::memory_pool::{MEMORY_POOL, MemoryBlock};
 use smallvec::SmallVec;
 use std::borrow::Cow;

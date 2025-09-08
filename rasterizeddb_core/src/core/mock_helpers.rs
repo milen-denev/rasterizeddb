@@ -2,7 +2,7 @@ use crate::memory_pool::{MEMORY_POOL, MemoryBlock};
 
 use super::{
     db_type::DbType,
-    row_v2::row::{ColumnFetchingData, ColumnWritePayload, RowFetch, RowWrite},
+    row::row::{ColumnFetchingData, ColumnWritePayload, RowFetch, RowWrite},
 };
 
 pub fn create_small_string_column() -> MemoryBlock {

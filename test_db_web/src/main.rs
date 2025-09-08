@@ -3,7 +3,7 @@ use axum::body::Body;
 use axum::http::header;
 use axum::{response::Response, routing::get};
 use rasterizeddb_core::client::DbClient;
-use rasterizeddb_core::core::row_v2::row::ReturnResult;
+use rasterizeddb_core::core::row::row::ReturnResult;
 
 static CLIENT: async_lazy::Lazy<DbClient> = async_lazy::Lazy::new(|| {
     Box::pin(async {

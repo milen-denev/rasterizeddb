@@ -4,13 +4,13 @@ use smallvec::SmallVec;
 use stopwatch::Stopwatch;
 
 use crate::{
-    core::row_v2::{concurrent_processor::ConcurrentProcessor, schema::TableSchemaIterator},
+    core::{processor::concurrent_processor::ConcurrentProcessor, row::schema::TableSchemaIterator},
     memory_pool::MEMORY_POOL,
 };
 
 use super::{
     db_type::DbType,
-    row_v2::{
+    row::{
         row::{ColumnFetchingData, ColumnWritePayload, RowFetch, RowWrite},
         row_pointer::{RowPointer, RowPointerIterator},
         schema::{SchemaCalculator, SchemaField, TableSchema},

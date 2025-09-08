@@ -1,7 +1,7 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use rasterizeddb_core::core::db_type::DbType;
-use rasterizeddb_core::core::row_v2::query_parser::tokenize_for_test;
-use rasterizeddb_core::core::row_v2::schema::SchemaField;
+use rasterizeddb_core::core::row::schema::SchemaField;
+use rasterizeddb_core::core::tokenizer::query_parser::tokenize_for_test;
 use smallvec::SmallVec;
 use std::hint::black_box;
 

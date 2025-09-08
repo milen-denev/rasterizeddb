@@ -6,9 +6,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
+use crate::core::support_types::QueryExecutionResult;
 use crate::SERVER_PORT;
-use crate::core::database::QueryExecutionResult;
-use crate::core::row_v2::row::{self, ReturnResult};
+use crate::core::row::row::{self, ReturnResult};
 
 /// A pooled client connection
 struct PooledClient {
