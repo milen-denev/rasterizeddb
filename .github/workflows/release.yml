@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-release:
+    name: Build and Publish Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+
+      - name: Add Linux and Windows targets
+        run: |
+          rustup target add x86_64-unknown-linux-gnu
+          rustup target add x86_64-pc-windows-gnu
+
+      - name: Install cross for cross-compilation
+        run: cargo install cross
+
+      - name: Build Linux x64 executable
+        run: cross build --release --target x86_64-unknown-linux-gnu
+
+      - name: Build Windows x64 executable
+        run: cross build --release --target x86_64-pc-windows-gnu
+
+      - name: Rename executables
+        run: |
+          mv target/x86_64-unknown-linux-gnu/release/rasterizeddb rasterizeddb-linux-x64
+          mv target/x86_64-pc-windows-gnu/release/rasterizeddb.exe rasterizeddb-windows-x64.exe
+
+      - name: Generate release changelog
+        id: changelog
+        run: |
+          echo "changelog<<EOF" >> $GITHUB_ENV
+          git log --pretty=format:"* %s (%h)" $(git describe --tags --abbrev=0 @^)..@ >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          body: ${{ env.changelog }}
+          files: |
+            rasterizeddb-linux-x64
+            rasterizeddb-windows-x64.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
