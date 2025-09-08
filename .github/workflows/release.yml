@@ -15,17 +15,15 @@ jobs:
         uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
-          profile: minimal
-          override: true
-      - name: Build Linux x64 executable
-        run: cargo build --release --target x86_64-unknown-linux-gnu
+      - name: Build rasterizeddb_core for Linux x64
+        run: cargo build --release -p rasterizeddb_core
       - name: Rename Linux executable
-        run: mv target/x86_64-unknown-linux-gnu/release/rasterizeddb rasterizeddb-linux-x64
+        run: mv target/release/rasterizeddb_core rasterizeddb_server-linux-x64
       - name: Upload Linux artifact
         uses: actions/upload-artifact@v4
         with:
-          name: rasterizeddb-linux-x64
-          path: rasterizeddb-linux-x64
+          name: rasterizeddb_server-linux-x64
+          path: rasterizeddb_server-linux-x64
 
   build-windows:
     runs-on: windows-latest
@@ -36,18 +34,15 @@ jobs:
         uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
-          target: x86_64-pc-windows-msvc
-          profile: minimal
-          override: true
-      - name: Build Windows x64 executable
-        run: cargo build --release --target x86_64-pc-windows-msvc
+      - name: Build rasterizeddb_core for Windows x64
+        run: cargo build --release -p rasterizeddb_core
       - name: Rename Windows executable
-        run: ren target\x86_64-pc-windows-msvc\release\rasterizeddb.exe rasterizeddb-windows-x64.exe
+        run: ren target\release\rasterizeddb_core.exe rasterizeddb_server-windows-x64.exe
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
-          name: rasterizeddb-windows-x64.exe
-          path: rasterizeddb-windows-x64.exe
+          name: rasterizeddb_server-windows-x64.exe
+          path: rasterizeddb_server-windows-x64.exe
 
   release:
     needs: [build-linux, build-windows]
@@ -68,7 +63,7 @@ jobs:
         with:
           body: ${{ env.changelog }}
           files: |
-            artifacts/rasterizeddb-linux-x64/rasterizeddb-linux-x64
-            artifacts/rasterizeddb-windows-x64.exe/rasterizeddb-windows-x64.exe
+            artifacts/rasterizeddb_server-linux-x64/rasterizeddb_server-linux-x64
+            artifacts/rasterizeddb_server-windows-x64.exe/rasterizeddb_server-windows-x64.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
