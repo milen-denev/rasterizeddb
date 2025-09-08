@@ -14,10 +14,10 @@ pub(crate) const CHUNK_SIZE: u32 = 4 * 1_000_000;
 #[cfg(feature = "enable_parallelism")]
 pub(crate) const THREADS: usize = 16;
 
-pub const MAX_PERMITS_THREADS: usize = 16;
+pub static mut MAX_PERMITS_THREADS: usize = 16;
 
 // Number of row pointers to fetch at once in next_row_pointers
-pub(crate) const BATCH_SIZE: usize = 1024 * 64;
+pub static BATCH_SIZE: usize = 1024 * 64;
 
 pub(crate) const IMMEDIATE_WRITE: bool = true;
 
@@ -131,5 +131,4 @@ pub mod configuration;
 pub mod instructions;
 pub mod memory_pool;
 pub mod renderers;
-pub mod rql;
 pub mod simds;
