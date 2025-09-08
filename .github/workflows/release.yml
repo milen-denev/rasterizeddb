@@ -70,25 +70,9 @@ jobs:
           pattern: rasterizeddb_server-*
           merge-multiple: true
 
-      - name: Generate release changelog
-        id: changelog
-        run: |
-          PREV_TAG=$(git describe --tags --abbrev=0 @^ 2>/dev/null || echo "")
-          if [ -n "$PREV_TAG" ]; then
-            RANGE="$PREV_TAG..@"
-          else
-            RANGE="$(git rev-list --max-parents=0 HEAD)..@"
-          fi
-          {
-            echo "changelog<<'EOF'"
-            git log --pretty=format:"* %s (%h)" $RANGE
-            echo "EOF"
-          } >> $GITHUB_ENV
-
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          body: ${{ env.changelog }}
           files: |
             artifacts/rasterizeddb_server-linux-x64
             artifacts/rasterizeddb_server-windows-x64.exe
