@@ -61,18 +61,6 @@ impl<'a, 'b> QueryParser<'a, 'b> {
                 self.used_column_indices.sort_unstable();
                 self.used_column_indices.dedup();
             }
-
-            #[cfg(debug_assertions)]
-            {
-                if self.used_column_indices.is_empty() {
-                    println!("Query contains only literal values - no column optimization needed");
-                } else {
-                    println!(
-                        "First iteration complete. Used columns: {:?}",
-                        self.used_column_indices
-                    );
-                }
-            }
         } else {
             // Fast path: nothing to do; inputs will be resolved on-the-fly during evaluation.
             // Still validate input length for safety.
