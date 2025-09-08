@@ -48,16 +48,21 @@ jobs:
     needs: [build-linux, build-windows]
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: ./artifacts
+
       - name: Generate release changelog
         id: changelog
         run: |
           echo "changelog<<EOF" >> $GITHUB_ENV
           git log --pretty=format:"* %s (%h)" $(git describe --tags --abbrev=0 @^)..@ >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
+
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
