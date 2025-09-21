@@ -1,14 +1,16 @@
 use std::sync::Arc;
+use std::env;
 
 use log::LevelFilter;
 use rasterizeddb_core::{core::database::Database, BATCH_SIZE, MAX_PERMITS_THREADS};
 use tokio::runtime::Builder;
 
+use rasterizeddb_core::configuration::Configuration;
+
 #[allow(unreachable_code)]
 #[allow(static_mut_refs)]
 fn main() -> std::io::Result<()> {
-    use std::env;
-    use rasterizeddb_core::configuration::Configuration;
+
     // 32 MiB
     let stack_size = 32 * 1024 * 1024;
 
