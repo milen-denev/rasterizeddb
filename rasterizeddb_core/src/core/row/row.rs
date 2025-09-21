@@ -473,7 +473,7 @@ mod row_tests {
         let mut rows = Vec::new();
         for i in 0..10 {
             let num_bytes: Vec<u8> = (0..10)
-                .flat_map(|v| ((v as i32 + i as i32).to_le_bytes().to_vec()))
+                .flat_map(|v| (v as i32 + i as i32).to_le_bytes().to_vec())
                 .collect();
             let str_val = format!("row{}_{}", i, "Y".repeat(10));
             let col_num = make_string_column(
