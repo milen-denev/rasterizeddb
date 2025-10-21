@@ -1432,9 +1432,9 @@ dependencies = [
 
 [[package]]
 name = "orx-pinned-vec"
-version = "3.17.0"
+version = "3.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fcd865a63f5d56134bd5e5d7ffe6e2a6a8458d79f625ebf7b56c43292829e96c"
+checksum = "d38ff024d902a587fefdc502598107bbbf3d2a5350d63247bef34bd6a5518de9"
 dependencies = [
  "orx-iterable",
  "orx-pseudo-default",
