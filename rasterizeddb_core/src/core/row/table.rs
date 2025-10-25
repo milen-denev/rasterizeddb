@@ -52,18 +52,18 @@ impl<S: StorageIO> Table<S> {
         let io_rows_clone = io_rows.clone();
         let io_schema_clone = io_schema.clone();
 
-        tokio::spawn(async move {
+        compio::runtime::spawn(async move {
             let clone_io_rows = io_rows_clone.clone();
             clone_io_rows.start_service().await
-        });
-        tokio::spawn(async move {
+        }).detach();
+        compio::runtime::spawn(async move {
             let clone_io_pointers = io_pointers_clone.clone();
             clone_io_pointers.start_service().await
-        });
-        tokio::spawn(async move {
+        }).detach();
+        compio::runtime::spawn(async move {
             let clone_io_schema = io_schema_clone.clone();
             clone_io_schema.start_service().await
-        });
+        }).detach();
 
         let schema = {
             if let Ok(schema) = TableSchema::load(io_schema.clone()).await {

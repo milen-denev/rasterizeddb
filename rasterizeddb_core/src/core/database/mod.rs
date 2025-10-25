@@ -40,10 +40,10 @@ pub struct Database {
 
 impl Database {
     pub async fn new(location: &str) -> Self {
-        let dir_exists = tokio::fs::metadata(location).await.is_ok();
+        let dir_exists = compio::fs::metadata(location).await.is_ok();
 
         if !dir_exists {
-            tokio::fs::create_dir_all(location).await.unwrap();
+            compio::fs::create_dir_all(location).await.unwrap();
         }
 
         let io_pointers =
@@ -56,18 +56,18 @@ impl Database {
         let io_rows_clone = io_rows.clone();
         let io_schema_clone = io_schema.clone();
 
-        tokio::spawn(async move {
+        compio::runtime::spawn(async move {
             let clone_io_rows = io_rows_clone.clone();
             clone_io_rows.start_service().await
-        });
-        tokio::spawn(async move {
+        }).detach();
+        compio::runtime::spawn(async move {
             let clone_io_pointers = io_pointers_clone.clone();
             clone_io_pointers.start_service().await
-        });
-        tokio::spawn(async move {
+        }).detach();
+        compio::runtime::spawn(async move {
             let clone_io_schema = io_schema_clone.clone();
             clone_io_schema.start_service().await
-        });
+        }).detach();
 
         let schema = load_db_data_schema(io_schema.clone()).await;
         let mut iterator = RowPointerIterator::new(io_pointers.clone()).await.unwrap();
@@ -209,7 +209,7 @@ impl Database {
                 .await;
         };
 
-        _ = tokio::spawn(fut).await;
+        _ = compio::runtime::spawn(fut).await;
 
         Ok(())
     }

@@ -1,25 +1,18 @@
 use std::{
-    cmp::min,
-    fs::{self, OpenOptions, remove_file},
-    path::Path,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
-    usize,
+    cmp::min, fs::{self, remove_file, OpenOptions}, os::windows::io::FromRawHandle, path::Path, sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering}, Arc
+    }, thread::{self, yield_now}, time::Duration, usize
 };
 
 use std::io::{self, Cursor, ErrorKind, Read, Seek, SeekFrom, Write};
 
 use arc_swap::{ArcSwap, cache::Cache};
+use compio::{driver::{AsRawFd, Proactor}, io::AsyncReadAt};
+use futures::{channel::oneshot, join};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use crossbeam_queue::SegQueue;
 use parking_lot::{Mutex, RwLock};
-use tokio::{
-    io::{AsyncReadExt, AsyncSeekExt},
-    task::yield_now,
-};
 
 use memmap2::{Mmap, MmapOptions};
 
@@ -30,8 +23,7 @@ use std::os::windows::fs::FileExt;
 use std::os::unix::fs::FileExt;
 
 use crate::{
-    IMMEDIATE_WRITE, WRITE_BATCH_SIZE, WRITE_SLEEP_DURATION,
-    core::storage_providers::helpers::Chunk, memory_pool::MemoryBlock,
+    core::storage_providers::{file_reader_driver::{open_file, FileReader}, helpers::Chunk}, memory_pool::MemoryBlock, IMMEDIATE_WRITE, WRITE_BATCH_SIZE
 };
 
 use super::{CRC, traits::StorageIO};
@@ -77,6 +69,7 @@ pub struct LocalStorageProvider {
     chunk: ArcSwap<Chunk>,
     chunk_reload: Mutex<()>,
     chunk_size: usize,
+    read_file_custom: FileReader
 }
 
 unsafe impl Sync for LocalStorageProvider {}
@@ -89,6 +82,8 @@ impl Clone for LocalStorageProvider {
                 .map(&std::fs::File::open(&self.file_str).unwrap())
                 .unwrap()
         });
+
+        let read_file_custom = FileReader::new(self.file_str.to_string());
 
         Self {
             append_file: self.append_file.clone(),
@@ -110,7 +105,8 @@ impl Clone for LocalStorageProvider {
             io_uring_reader: self.io_uring_reader.clone(),
             chunk: ArcSwap::new(Chunk::empty()),
             chunk_reload: Mutex::new(()),
-            chunk_size: CACHED_CHUNK_SIZE, // 16MB chunks
+            chunk_size: CACHED_CHUNK_SIZE, // 16MB chunks,
+            read_file_custom: read_file_custom
         }
     }
 }
@@ -198,9 +194,12 @@ impl LocalStorageProvider {
                 .write(true)
                 .open(&temp_file_str)
                 .unwrap();
+
             let temp_len = std::fs::metadata(&temp_file_str)
                 .map(|m| m.len())
                 .unwrap_or(0);
+
+            let read_file_custom = FileReader::new(file_str.to_string());
 
             LocalStorageProvider {
                 append_file: Arc::new(RwLock::new(file_append)),
@@ -223,6 +222,7 @@ impl LocalStorageProvider {
                 chunk: ArcSwap::new(Chunk::empty()),
                 chunk_reload: Mutex::new(()),
                 chunk_size: CACHED_CHUNK_SIZE, // 16MB chunks
+                read_file_custom: read_file_custom
             }
         } else {
             let delimiter = if cfg!(unix) {
@@ -288,6 +288,8 @@ impl LocalStorageProvider {
                 .map(|m| m.len())
                 .unwrap_or(0);
 
+            let read_file_custom = FileReader::new(file_str.to_string());
+
             LocalStorageProvider {
                 append_file: Arc::new(RwLock::new(file_append)),
                 write_file: Arc::new(RwLock::new(file_write)),
@@ -308,7 +310,8 @@ impl LocalStorageProvider {
                 io_uring_reader: AsyncUringReader::new(&file_str, 1024).unwrap(),
                 chunk: ArcSwap::new(Chunk::empty()),
                 chunk_reload: Mutex::new(()),
-                chunk_size: CACHED_CHUNK_SIZE, // 16MB chunks
+                chunk_size: CACHED_CHUNK_SIZE, // 16MB chunks,
+                read_file_custom: read_file_custom
             }
         }
     }
@@ -335,52 +338,7 @@ impl LocalStorageProvider {
         _ = file_append.sync_all();
         _ = file_write.sync_all();
     }
-
-    pub async fn start_append_data_service(&self) {
-        if IMMEDIATE_WRITE {
-            return;
-        }
-
-        let mut idle_count = 0;
-        let mut buffer: Vec<u8> = Vec::with_capacity(WRITE_BATCH_SIZE);
-
-        loop {
-            let mut total_size = 0;
-            let mut has_data = false;
-
-            // Collect data in batches
-            while let Some(block) = self.appender.pop() {
-                has_data = true;
-                let slice = block.into_slice();
-                buffer.extend_from_slice(slice);
-                total_size += slice.len();
-
-                // Break if we've reached our batch size limit
-                if total_size >= WRITE_BATCH_SIZE {
-                    break;
-                }
-            }
-
-            if has_data {
-                idle_count = 0;
-                self.write_batch_data(&mut buffer, total_size).await;
-            } else {
-                idle_count += 1;
-
-                // Adaptive sleep - sleep longer when idle for extended periods
-                let sleep_duration = if idle_count < 100 {
-                    WRITE_SLEEP_DURATION
-                } else if idle_count < 1000 {
-                    tokio::time::Duration::from_millis(50)
-                } else {
-                    tokio::time::Duration::from_millis(100)
-                };
-
-                tokio::time::sleep(sleep_duration).await;
-            }
-        }
-    }
-
+    
     async fn write_batch_data(&self, buffer: &mut Vec<u8>, total_size: usize) {
         if total_size == 0 {
             return;
@@ -744,6 +702,7 @@ impl LocalStorageProvider {
 
         // (1) Single mmap region copy first (most common path)
         let copied = self.mmap_copy_region(pos, &mut buffer[total_copied..], file_len);
+        
         if copied > 0 {
             pos += copied as u64;
             total_copied += copied;
@@ -864,7 +823,7 @@ impl StorageIO for LocalStorageProvider {
     async fn append_data(&self, buffer: &[u8], _immediate: bool) {
         // If a flush is ongoing, wait briefly until it completes to keep ordering simple.
         while self.append_blocked.load(Ordering::Acquire) {
-            yield_now().await;
+            thread::yield_now();
         }
 
         // Stage data into the temp file
@@ -884,10 +843,12 @@ impl StorageIO for LocalStorageProvider {
     async fn read_data(&self, position: &mut u64, length: u32) -> Vec<u8> {
         // Compute a single-snapshot logical length
         let main_len = self.load_file_len();
+
         // Wait if flush in progress to keep boundary stable
         while self.append_blocked.load(Ordering::Acquire) {
-            yield_now().await;
+            thread::yield_now();
         }
+
         let temp_len = self.temp_file_len.load(Ordering::Acquire);
         let logical_len = main_len + temp_len;
 
@@ -905,15 +866,15 @@ impl StorageIO for LocalStorageProvider {
             let avail_main = (main_len - pos) as usize;
             let to_read = need.min(avail_main);
             if to_read > 0 {
-                let mut f = std::fs::File::options()
-                    .read(true)
-                    .open(&self.file_str)
-                    .unwrap();
-                f.seek(SeekFrom::Start(pos)).unwrap();
-                if f.read_exact(&mut out[..to_read]).is_err() {
+                // Use optimized FileReader for main file reads
+                let n = self
+                    .read_file_custom
+                    .read_data_into_buffer(pos, &mut out[..to_read]);
+                if n != to_read {
+                    // Preserve previous behavior: bail out on unexpected read error
                     return Vec::default();
                 }
-                filled += to_read;
+                filled += n;
             }
         }
 
@@ -929,52 +890,6 @@ impl StorageIO for LocalStorageProvider {
 
         *position += filled as u64;
         out.truncate(filled);
-        out
-    }
-
-    async fn read_data_to_end(&self, position: u64) -> Vec<u8> {
-        // Snapshot logical length and allocate result accordingly
-        let main_len = self.load_file_len();
-        while self.append_blocked.load(Ordering::Acquire) {
-            yield_now().await;
-        }
-        let temp_len = self.temp_file_len.load(Ordering::Acquire);
-        let logical_len = main_len + temp_len;
-        if position >= logical_len {
-            return Vec::new();
-        }
-
-        let need = (logical_len - position) as usize;
-        let mut out = vec![0u8; need];
-        let mut filled = 0usize;
-
-        // Main part
-        if position < main_len {
-            let mut f = tokio::fs::File::options()
-                .read(true)
-                .open(&self.file_str)
-                .await
-                .unwrap();
-            f.seek(SeekFrom::Start(position)).await.unwrap();
-            let avail_main = (main_len - position) as usize;
-            let to_read = need.min(avail_main);
-            // Read synchronously to avoid double-seek in async
-            tokio::task::block_in_place(|| {
-                let mut rf = std::fs::File::open(&self.file_str).unwrap();
-                rf.seek(SeekFrom::Start(position)).unwrap();
-                rf.read_exact(&mut out[..to_read]).unwrap();
-            });
-            filled += to_read;
-        }
-        // Temp part
-        if filled < need {
-            let temp_off = position.saturating_sub(main_len);
-            let n = self
-                .temp_pread_exact_or_partial(temp_off, &mut out[filled..])
-                .unwrap_or(0);
-            filled += n;
-            out.truncate(filled);
-        }
         out
     }
 
@@ -1014,96 +929,59 @@ impl StorageIO for LocalStorageProvider {
         let main_len = self.load_file_len();
         
         while self.append_blocked.load(Ordering::Relaxed) {
-            yield_now().await;
+            thread::yield_now();
         }
 
-        let temp_len = self.temp_file_len.load(Ordering::Relaxed);
-        let file_len = main_len + temp_len; // logical length
         let total_len = buffer.len();
 
         let mut overall_copied = 0usize;
+        let mut pos = *position;
 
-        loop {
-            match self.read_data_into_buffer_fast(position, &mut buffer[overall_copied..], file_len)
-            {
-                FastPathResult::Done => {
-                    return Ok(());
-                }
-                FastPathResult::NeedChunk => {
-                    // If we're in the temp region, don't try to load chunks from main file.
-                    if *position >= main_len {
-                        let temp_off = *position - main_len;
-                        let slice = &mut buffer[overall_copied..];
-                        let n = self.temp_pread_exact_or_partial(temp_off, slice)?;
-                        *position += n as u64;
-                        overall_copied += n;
-                        if overall_copied == total_len {
-                            return Ok(());
-                        }
-                        return Err(io::Error::new(
-                            ErrorKind::UnexpectedEof,
-                            "Reached logical EOF",
-                        ));
-                    }
-                    // Load chunk for current position in main file
-                    self.load_chunk_for(*position).await?;
-                    continue; // retry fast path
-                }
-                FastPathResult::EofNone => {
-                    // If EOF relative to main file but temp has data and our position is inside logical range,
-                    // try to read from temp staging directly.
-                    if *position < file_len && *position >= main_len {
-                        let temp_off = *position - main_len;
-                        if overall_copied < total_len {
-                            let slice = &mut buffer[overall_copied..];
-                            let n = self.temp_pread_exact_or_partial(temp_off, slice)?;
-                            *position += n as u64;
-                            overall_copied += n;
-                        }
-                        if overall_copied == total_len {
-                            return Ok(());
-                        } else {
-                            return Err(io::Error::new(
-                                ErrorKind::UnexpectedEof,
-                                "Reached logical EOF",
-                            ));
-                        }
-                    }
+        // Read from main file first using FileReader
+        if pos < main_len {
+            let avail_main = (main_len - pos) as usize;
+            let to_read = total_len.min(avail_main);
+            if to_read > 0 {
+                let n = self.read_file_custom.read_data_into_buffer(pos, &mut buffer[..to_read]);
+                if n != to_read {
+                    // Partial read, treat as EOF
+                    *position += n as u64;
+                    overall_copied += n;
                     return Err(io::Error::new(
                         ErrorKind::UnexpectedEof,
-                        "Position beyond file end",
+                        format!("Requested {} bytes, got {} (main file EOF)", total_len, overall_copied),
                     ));
                 }
-                FastPathResult::EofPartial(copied) => {
-                    overall_copied += copied;
-                    // If we hit EOF in main region but temp has data and pos is in temp, continue from temp
-                    if *position < file_len && *position >= main_len && overall_copied < total_len {
-                        let temp_off = *position - main_len;
-                        let slice = &mut buffer[overall_copied..];
-                        let n = self.temp_pread_exact_or_partial(temp_off, slice)?;
-                        *position += n as u64;
-                        overall_copied += n;
-                        if overall_copied == total_len {
-                            return Ok(());
-                        }
-                    }
-                    return Err(io::Error::new(
-                        ErrorKind::UnexpectedEof,
-                        format!(
-                            "Requested {} bytes, got {} (reached logical EOF)",
-                            total_len, overall_copied
-                        ),
-                    ));
-                }
+                pos += n as u64;
+                overall_copied += n;
             }
         }
+
+        // If still remaining, read from temp staging
+        if overall_copied < total_len {
+            let temp_off = pos.saturating_sub(main_len);
+            let to_read = total_len - overall_copied;
+            let n = self.temp_pread_exact_or_partial(temp_off, &mut buffer[overall_copied..overall_copied + to_read])?;
+            pos += n as u64;
+            overall_copied += n;
+            if overall_copied < total_len {
+                *position = pos;
+                return Err(io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    format!("Requested {} bytes, got {} (reached logical EOF)", total_len, overall_copied),
+                ));
+            }
+        }
+
+        *position = pos;
+        Ok(())
     }
 
     async fn read_data_to_cursor(&self, position: &mut u64, length: u32) -> Cursor<Vec<u8>> {
         // Snapshot lengths
         let main_len = self.load_file_len();
         while self.append_blocked.load(Ordering::Acquire) {
-            yield_now().await;
+            thread::yield_now();
         }
         let temp_len = self.temp_file_len.load(Ordering::Acquire);
         let logical_len = main_len + temp_len;
@@ -1117,22 +995,22 @@ impl StorageIO for LocalStorageProvider {
         let mut filled = 0usize;
         let pos = *position;
 
+        // Read from main file first using FileReader
         if pos < main_len {
             let avail_main = (main_len - pos) as usize;
             let to_read = need.min(avail_main);
             if to_read > 0 {
-                let mut f = std::fs::File::options()
-                    .read(true)
-                    .open(&self.file_str)
-                    .unwrap();
-                f.seek(SeekFrom::Start(pos)).unwrap();
-                if f.read_exact(&mut out[..to_read]).is_err() {
+                let n = self
+                    .read_file_custom
+                    .read_data_into_buffer(pos, &mut out[..to_read]);
+                if n != to_read {
                     return Cursor::new(Vec::default());
                 }
-                filled += to_read;
+                filled += n;
             }
         }
 
+        // If still remaining, read from temp staging
         if filled < need {
             let temp_off = pos.saturating_sub(main_len);
             let n = self
@@ -1157,19 +1035,16 @@ impl StorageIO for LocalStorageProvider {
     }
 
     async fn verify_data_and_sync(&self, position: u64, buffer: &[u8]) -> bool {
-        let mut file = tokio::fs::File::options()
-            .read(true)
-            .write(true)
-            .open(&self.file_str)
-            .await
-            .unwrap();
-
-        file.seek(SeekFrom::Start(position)).await.unwrap();
+        let read_file = &self.read_file_custom;
         let mut file_buffer = vec![0; buffer.len() as usize];
-        file.read_exact(&mut file_buffer).await.unwrap();
+        let result = read_file.read_data_into_buffer(position, &mut file_buffer);
+
+        if result == 0 {
+            return false;
+        }
 
         if buffer.eq(&file_buffer) {
-            file.sync_data().await.unwrap();
+            // MUST ADD SYNC TO ENSURE DURABILITY
             true
         } else {
             false
@@ -1246,6 +1121,9 @@ impl StorageIO for LocalStorageProvider {
         let staged_len = std::fs::metadata(&temp_file_str)
             .map(|m| m.len())
             .unwrap_or(0);
+
+        let read_file_custom = FileReader::new(temp_file_str.to_string());
+
         Self {
             append_file: Arc::new(RwLock::new(file_append)),
             write_file: Arc::new(RwLock::new(file_write)),
@@ -1268,13 +1146,12 @@ impl StorageIO for LocalStorageProvider {
             io_uring_reader: AsyncUringReader::new(&file_str, 1024).unwrap(),
             chunk: ArcSwap::new(Chunk::empty()),
             chunk_reload: Mutex::new(()),
-            chunk_size: CACHED_CHUNK_SIZE, // 16MB chunks
+            chunk_size: CACHED_CHUNK_SIZE, // 16MB chunks,
+            read_file_custom
         }
     }
 
     async fn swap_temp(&self, _temp_io_sync: &mut Self) {
-        yield_now().await;
-
         let delimiter = if cfg!(unix) {
             "/"
         } else if cfg!(windows) {
@@ -1360,6 +1237,9 @@ impl StorageIO for LocalStorageProvider {
         let staged_len = std::fs::metadata(&temp_file_str)
             .map(|m| m.len())
             .unwrap_or(0);
+
+        let read_file_custom = FileReader::new(temp_file_str.to_string());
+
         LocalStorageProvider {
             append_file: Arc::new(RwLock::new(file_append)),
             write_file: Arc::new(RwLock::new(file_write)),
@@ -1383,6 +1263,7 @@ impl StorageIO for LocalStorageProvider {
             chunk: ArcSwap::new(Chunk::empty()),
             chunk_reload: Mutex::new(()),
             chunk_size: CACHED_CHUNK_SIZE, // 16MB chunks
+            read_file_custom
         }
     }
 
@@ -1415,12 +1296,12 @@ impl StorageIO for LocalStorageProvider {
                     let _ = p.flush_temp_to_main().await; // ignore errors for now
                 } else {
                     // avoid hot spinning
-                    tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                    thread::sleep(Duration::from_secs(30));
                 }
             }
         }
 
-        tokio::join!(self.start_append_data_service(), flush_loop(self));
+        flush_loop(self).await;
     }
 
     fn get_name(&self) -> String {
@@ -1444,14 +1325,16 @@ mod test {
     use std::{
         fs::OpenOptions,
         io::{Seek, SeekFrom, Write},
-        sync::atomic::Ordering,
+        sync::atomic::Ordering, time::Duration,
     };
 
+    use compio::runtime::spawn;
+    use futures::join;
     use rand::{RngCore, SeedableRng, rngs::StdRng};
 
     use crate::core::storage_providers::{file_sync::LocalStorageProvider, traits::StorageIO};
 
-    #[tokio::test]
+    #[compio::test]
     async fn test_basic_read_full_within_mmap() {
         let file_size = 16 * 1024;
         let (provider, data, _extra) = create_provider(file_size, 0).await;
@@ -1467,7 +1350,7 @@ mod test {
         assert_eq!(&buf, &data[0..3000]);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn test_read_cross_multiple_chunks_inside_mmap() {
         // Make buffer span several chunk boundaries but stay inside initial mmap.
         let file_size = 64 * 1024;
@@ -1485,7 +1368,7 @@ mod test {
         assert_eq!(&buf, &data[start as usize..start as usize + 10_000]);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn test_read_beyond_initial_mmap_uses_chunk_path() {
         // Create a file, mmap only the initial part, then append more bytes
         // and update file_len without remapping to force the chunk fallback.
@@ -1514,7 +1397,7 @@ mod test {
         assert_eq!(&buf2, &extra_data[3000..5000]);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn test_partial_eof_error_after_partial_copy() {
         let file_size = 10 * 1024;
         let (provider, data, _extra) = create_provider(file_size, 0).await;
@@ -1535,7 +1418,7 @@ mod test {
         assert_eq!(&buf[..100], &data[file_size - 100..file_size]);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn test_position_beyond_file_end_immediate_eof() {
         let file_size = 8192;
         let (provider, _data, _extra) = create_provider(file_size, 0).await;
@@ -1551,7 +1434,7 @@ mod test {
         assert_eq!(pos, (file_size + 10) as u64); // unchanged
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn test_large_read_entire_file() {
         let file_size = 32 * 1024;
         let (provider, data, _extra) = create_provider(file_size, 0).await;
@@ -1567,7 +1450,7 @@ mod test {
         assert_eq!(&buf, &data[..]);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn test_multiple_sequential_reads_advancing_position() {
         let file_size = 16 * 1024;
         let (provider, data, _extra) = create_provider(file_size, 0).await;
@@ -1641,7 +1524,7 @@ mod test {
         format!("{prefix}_{nanos}_{}", std::process::id())
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn test_append_read_without_flush() {
         let init = 4096usize;
         let (provider, _initial_data, _extra) = create_provider(init, 0).await;
@@ -1666,7 +1549,7 @@ mod test {
         assert_eq!(l, init + staged.len());
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn test_cross_boundary_read_main_then_temp() {
         let init = 2048usize;
         let (provider, initial_data, _extra) = create_provider(init, 0).await;
@@ -1686,7 +1569,7 @@ mod test {
         assert_eq!(&buf[100..], &staged[..100]);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn test_flush_then_read_full() {
         let init = 1024usize;
         let (provider, _initial_data, _extra) = create_provider(init, 0).await;
@@ -1709,7 +1592,7 @@ mod test {
         assert_eq!(out, staged);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn test_multiple_appends_then_read_back() {
         let init = 4096usize;
         let (provider, _initial_data, _extra) = create_provider(init, 0).await;
@@ -1760,10 +1643,10 @@ mod test {
         assert_eq!(pos2, (init + total) as u64);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn test_concurrent_appends_and_reads() {
         use std::sync::Arc;
-        use tokio::time::{sleep, Duration};
+        use compio::time::sleep;
 
         let init = 2048usize;
         let (provider, _initial_data, _extra) = create_provider(init, 0).await;
@@ -1788,7 +1671,7 @@ mod test {
         // Writer task: append chunks with tiny delays
         let w_expected = expected.clone();
         let w_chunks = chunks.clone();
-        let writer_task = tokio::spawn(async move {
+        let writer_task = spawn(async move {
             for ch in w_chunks.iter() {
                 StorageIO::append_data(&*writer, ch, false).await;
                 // small jitter
@@ -1801,7 +1684,7 @@ mod test {
 
         // Reader task: keep reading as data becomes available
         let r_expected = expected.clone();
-        let reader_task = tokio::spawn(async move {
+        let reader_task = spawn(async move {
             let mut pos = init as u64;
             let mut consumed = 0usize;
             let total = r_expected.len();
@@ -1828,7 +1711,7 @@ mod test {
             assert_eq!(pos, (init + total) as u64);
         });
 
-        let _ = tokio::join!(writer_task, reader_task);
+        let _ = join!(writer_task, reader_task);
 
         // Final length check
         let final_len = provider.get_len().await as usize;

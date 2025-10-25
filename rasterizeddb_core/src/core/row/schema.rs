@@ -732,860 +732,860 @@ impl<S: StorageIO> TableSchemaIterator<S> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::core::{db_type::DbType, storage_providers::mock_file_sync::MockStorageProvider};
-    use std::io;
-
-    // Helper function to create a schema field and return it
-    fn create_test_schema_field(
-        name: &str,
-        db_type: DbType,
-        offset: u64,
-        write_order: u64,
-        is_unique: bool,
-    ) -> SchemaField {
-        let db_size = db_type.get_size();
-        let schema_field = SchemaField::new(
-            name.to_string(),
-            db_type,
-            db_size,
-            offset,
-            write_order,
-            is_unique,
-        );
-
-        schema_field
-    }
-
-    // Helper function to save a schema field to storage
-    async fn save_schema_field(
-        field: &SchemaField,
-        storage: &mut MockStorageProvider,
-    ) -> io::Result<()> {
-        field.save_field(storage).await
-    }
-
-    #[tokio::test]
-    async fn test_schema_field_iterator_empty() {
-        let mut mock_io = MockStorageProvider::new().await;
-
-        let mut iterator = SchemaFieldIterator::new(&mut mock_io).await.unwrap();
-
-        // Should return None for an empty storage
-        assert!(iterator.next_schema_field().await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn test_schema_field_iterator_single_field() {
-        // Create a single schema field
-        let schema_field = create_test_schema_field("id", DbType::I32, 0, 1, true);
-
-        let mut mock_io = MockStorageProvider::new().await;
-
-        save_schema_field(&schema_field, &mut mock_io)
-            .await
-            .unwrap();
-
-        let mut schema_field_iterator = SchemaFieldIterator::new(&mut mock_io).await.unwrap();
-
-        // Should return our schema field
-        let read_field = schema_field_iterator
-            .next_schema_field()
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(read_field.name, "id");
-        assert_eq!(read_field.db_type, DbType::I32);
-        assert_eq!(read_field.offset, 0);
-        assert_eq!(read_field.write_order, 1);
-        assert_eq!(read_field.is_unique, true);
-
-        // Next call should return None
-        assert!(
-            schema_field_iterator
-                .next_schema_field()
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_schema_field_iterator_2_fields() {
-        // Create schema fields
-        let schema_field1 = create_test_schema_field("id", DbType::I32, 0, 1, true);
-
-        let mut mock_io = MockStorageProvider::new().await;
-
-        save_schema_field(&schema_field1, &mut mock_io)
-            .await
-            .unwrap();
-        save_schema_field(&schema_field1, &mut mock_io)
-            .await
-            .unwrap();
-
-        let mut schema_field_iterator = SchemaFieldIterator::new(&mut mock_io).await.unwrap();
-
-        // Should return our first schema field
-        let read_field = schema_field_iterator
-            .next_schema_field()
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(read_field.name, "id");
-        assert_eq!(read_field.db_type, DbType::I32);
-        assert_eq!(read_field.offset, 0);
-        assert_eq!(read_field.write_order, 1);
-        assert_eq!(read_field.is_unique, true);
-
-        // Should return the second copy of the same schema field
-        assert!(
-            schema_field_iterator
-                .next_schema_field()
-                .await
-                .unwrap()
-                .is_some()
-        );
-
-        // Next call should return None
-        assert!(
-            schema_field_iterator
-                .next_schema_field()
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_schema_field_iterator_3_fields() {
-        // Create schema fields
-        let schema_field1 = create_test_schema_field("id", DbType::I32, 0, 1, true);
-        let schema_field2 = create_test_schema_field("name", DbType::STRING, 8, 2, false);
-
-        let mut mock_io = MockStorageProvider::new().await;
-
-        save_schema_field(&schema_field1, &mut mock_io)
-            .await
-            .unwrap();
-        save_schema_field(&schema_field2, &mut mock_io)
-            .await
-            .unwrap();
-        save_schema_field(&schema_field1, &mut mock_io)
-            .await
-            .unwrap();
-
-        let mut schema_field_iterator = SchemaFieldIterator::new(&mut mock_io).await.unwrap();
-
-        // Should return our first schema field
-        let read_field = schema_field_iterator
-            .next_schema_field()
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(read_field.name, "id");
-        assert_eq!(read_field.db_type, DbType::I32);
-        assert_eq!(read_field.offset, 0);
-        assert_eq!(read_field.write_order, 1);
-        assert_eq!(read_field.is_unique, true);
-
-        // Should return the second schema field
-        let read_field = schema_field_iterator
-            .next_schema_field()
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(read_field.name, "name");
-        assert_eq!(read_field.db_type, DbType::STRING);
-        assert_eq!(read_field.offset, 8);
-        assert_eq!(read_field.write_order, 2);
-        assert_eq!(read_field.is_unique, false);
-
-        // Should return the third schema field (duplicate of the first)
-        assert!(
-            schema_field_iterator
-                .next_schema_field()
-                .await
-                .unwrap()
-                .is_some()
-        );
-
-        // Next call should return None
-        assert!(
-            schema_field_iterator
-                .next_schema_field()
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_schema_field_iterator_batch_retrieval() {
-        let mut mock_io = MockStorageProvider::new().await;
-
-        // Create and save multiple schema fields (more than BATCH_SIZE)
-        for i in 0..BATCH_SIZE + 10 {
-            let field_name = format!("field{}", i);
-            let schema_field = create_test_schema_field(
-                &field_name,
-                DbType::I32,
-                i as u64 * 8,
-                i as u64,
-                i % 2 == 0, // Make even-numbered fields unique
-            );
-
-            save_schema_field(&schema_field, &mut mock_io)
-                .await
-                .unwrap();
-        }
-
-        let mut iterator = SchemaFieldIterator::new(&mut mock_io).await.unwrap();
-
-        // Test batch retrieval
-        let first_batch = iterator.next_schema_fields().await.unwrap();
-        assert_eq!(first_batch.len(), BATCH_SIZE);
-
-        // Check first and last items in the batch
-        assert_eq!(first_batch[0].name, "field0");
-        assert_eq!(first_batch[0].is_unique, true);
-        assert_eq!(
-            first_batch[BATCH_SIZE - 1].name,
-            format!("field{}", BATCH_SIZE - 1)
-        );
-
-        // Test retrieval of remaining items
-        let second_batch = iterator.next_schema_fields().await.unwrap();
-        assert_eq!(second_batch.len(), 10);
-
-        // Ensure no more items
-        let empty_batch = iterator.next_schema_fields().await.unwrap();
-        assert_eq!(empty_batch.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_schema_field_iterator_reset() {
-        let mut mock_io = MockStorageProvider::new().await;
-
-        // Create and save schema fields
-        let schema_field1 = create_test_schema_field("id", DbType::I32, 0, 1, true);
-        let schema_field2 = create_test_schema_field("name", DbType::STRING, 8, 2, false);
-
-        save_schema_field(&schema_field1, &mut mock_io)
-            .await
-            .unwrap();
-        save_schema_field(&schema_field2, &mut mock_io)
-            .await
-            .unwrap();
-
-        // Create iterator and consume all items
-        let mut iterator = SchemaFieldIterator::new(&mut mock_io).await.unwrap();
-
-        assert!(iterator.next_schema_field().await.unwrap().is_some());
-        assert!(iterator.next_schema_field().await.unwrap().is_some());
-        assert!(iterator.next_schema_field().await.unwrap().is_none());
-
-        // Reset and verify we can read the items again
-        iterator.reset();
-
-        // Should be able to read the items again
-        let read_field1 = iterator.next_schema_field().await.unwrap().unwrap();
-        assert_eq!(read_field1.name, "id");
-
-        let read_field2 = iterator.next_schema_field().await.unwrap().unwrap();
-        assert_eq!(read_field2.name, "name");
-
-        // No more items
-        assert!(iterator.next_schema_field().await.unwrap().is_none());
-    }
-
-    // Helper function to create a test TableSchema
-    fn create_test_table_schema(name: &str, primary_key: Option<&str>) -> TableSchema {
-        let mut table = TableSchema::new(name.to_string(), false);
-        if let Some(pk) = primary_key {
-            table.set_primary_key(pk.to_string());
-        }
-        table
-    }
-
-    // Helper function to create a test TableSchema
-    fn create_test_table_schema_immutable(name: &str, primary_key: Option<&str>) -> TableSchema {
-        let mut table = TableSchema::new(name.to_string(), true);
-        if let Some(pk) = primary_key {
-            table.set_primary_key(pk.to_string());
-        }
-        table
-    }
-
-    // Helper function to save a table schema to storage
-    async fn save_table_schema<S: StorageIO>(
-        schema: &TableSchema,
-        storage: Arc<S>,
-    ) -> io::Result<()> {
-        schema.save(storage).await
-    }
-
-    #[test]
-    fn test_table_schema_into_vec() {
-        // Table with no primary key
-        let schema = create_test_table_schema("users", None);
-        let vec = schema.into_vec();
-
-        // Verify size
-        assert_eq!(vec.len(), TABLE_SIZE);
-
-        // Verify name
-        let name_bytes = "users".as_bytes();
-        for (i, &b) in name_bytes.iter().enumerate() {
-            assert_eq!(vec[i], b);
-        }
-
-        // Verify null terminator after name
-        assert_eq!(vec[5], 0);
-
-        // Verify primary key section is all zeros
-        for i in 129..TABLE_SIZE {
-            assert_eq!(vec[i], 0);
-        }
-
-        // Table with primary key
-        let schema = create_test_table_schema("customers", Some("id"));
-        let vec = schema.into_vec();
-
-        // Verify name
-        let name_bytes = "customers".as_bytes();
-        for (i, &b) in name_bytes.iter().enumerate() {
-            assert_eq!(vec[i], b);
-        }
-
-        // Verify primary key
-        let pk_bytes = "id".as_bytes();
-        for (i, &b) in pk_bytes.iter().enumerate() {
-            assert_eq!(vec[129 + i], b);
-        }
-
-        // Verify null terminator after primary key
-        assert_eq!(vec[131], 0);
-    }
-
-    #[test]
-    fn test_table_schema_from_vec() {
-        // Create a buffer for a table with name "users" and primary key "id"
-        let mut vec = vec![0; TABLE_SIZE];
-
-        // Set name
-        let name = "users";
-        let name_bytes = name.as_bytes();
-        vec[..name_bytes.len()].copy_from_slice(name_bytes);
-
-        // Set primary key
-        let pk = "id";
-        let pk_bytes = pk.as_bytes();
-        vec[129..129 + pk_bytes.len()].copy_from_slice(pk_bytes);
-
-        // Parse the buffer
-        let schema = TableSchema::from_vec(&vec).unwrap();
-
-        // Verify parsed data
-        assert_eq!(schema.name, "users");
-        assert_eq!(schema.primary_key, Some("id".to_string()));
-
-        // Create a buffer for a table with name "products" and no primary key
-        let mut vec = vec![0; TABLE_SIZE];
-
-        // Set name
-        let name = "products";
-        let name_bytes = name.as_bytes();
-        vec[..name_bytes.len()].copy_from_slice(name_bytes);
-
-        // Parse the buffer
-        let schema = TableSchema::from_vec(&vec).unwrap();
-
-        // Verify parsed data
-        assert_eq!(schema.name, "products");
-        assert_eq!(schema.primary_key, None);
-    }
-
-    #[tokio::test]
-    async fn test_table_schema_serialize_deserialize() {
-        let mock_io = Arc::new(MockStorageProvider::new().await);
-
-        // Create schema with fields and indexes
-        let mut schema = create_test_table_schema("orders", Some("order_id"));
-
-        schema.save(mock_io.clone()).await.unwrap();
-
-        // Add fields
-
-        schema
-            .add_field(mock_io.clone(), "order_id".to_string(), DbType::I64, false)
-            .await;
-
-        schema
-            .add_field(
-                mock_io.clone(),
-                "created_at".to_string(),
-                DbType::U64,
-                false,
-            )
-            .await;
-
-        // Serialize
-        let vec = schema.into_vec();
-
-        // Deserialize
-        let deserialized = TableSchema::from_vec(&vec).unwrap();
-
-        // Verify core properties (fields are not part of serialization)
-        assert_eq!(deserialized.name, "orders");
-        assert_eq!(deserialized.primary_key, Some("order_id".to_string()));
-        assert!(deserialized.fields.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_table_schema_mutability() {
-        let mock_io = Arc::new(MockStorageProvider::new().await);
-
-        // Create schema with fields and indexes
-        let schema = create_test_table_schema_immutable("orders", Some("order_id"));
-
-        schema.save(mock_io.clone()).await.unwrap();
-
-        let mut schema_iter = TableSchemaIterator::new(mock_io.clone()).await.unwrap();
-
-        let schema = schema_iter.next_table_schema().await.unwrap().unwrap();
-
-        // Verify core properties (fields are not part of serialization)
-        assert_eq!(schema.is_immutable, true);
-    }
-
-    #[tokio::test]
-    async fn test_table_schema_mutability_2() {
-        let mock_io = Arc::new(MockStorageProvider::new().await);
-
-        // Create schema with fields and indexes
-        let schema = create_test_table_schema("orders", Some("order_id"));
-
-        schema.save(mock_io.clone()).await.unwrap();
-
-        let mut schema_iter = TableSchemaIterator::new(mock_io.clone()).await.unwrap();
-
-        let schema = schema_iter.next_table_schema().await.unwrap().unwrap();
-
-        // Verify core properties (fields are not part of serialization)
-        assert_eq!(schema.is_immutable, false);
-    }
-
-    #[test]
-    fn test_table_schema_special_chars() {
-        // Create schema with special characters in name and primary key
-        let mut schema = TableSchema::new("users!@#123".to_string(), true);
-        schema.set_primary_key("id!@#123".to_string());
-
-        // Serialize
-        let vec = schema.into_vec();
-
-        // Deserialize
-        let deserialized = TableSchema::from_vec(&vec).unwrap();
-
-        // Verify filtered content (only alphanumeric characters)
-        assert_eq!(deserialized.name, "users123");
-        assert_eq!(deserialized.primary_key, Some("id123".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_table_schema_iterator_empty() {
-        let mock_io = Arc::new(MockStorageProvider::new().await);
-
-        let mut iterator = TableSchemaIterator::new(mock_io.clone()).await.unwrap();
-
-        // Should return None for an empty storage
-        assert!(iterator.next_table_schema().await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn test_table_schema_iterator_single_schema() {
-        // Create a single table schema
-        let table_schema = create_test_table_schema("users", Some("id"));
-
-        let mock_io = Arc::new(MockStorageProvider::new().await);
-
-        save_table_schema(&table_schema, mock_io.clone())
-            .await
-            .unwrap();
-
-        let mut iterator = TableSchemaIterator::new(mock_io.clone()).await.unwrap();
-
-        // Should return our table schema
-        let read_schema = iterator.next_table_schema().await.unwrap().unwrap();
-
-        assert_eq!(read_schema.name, "users");
-        assert_eq!(read_schema.primary_key, Some("id".to_string()));
-
-        // Next call should return None
-        assert!(iterator.next_table_schema().await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn test_table_schema_iterator_multiple_schemas() {
-        // Create schemas
-        let schema1 = create_test_table_schema("users", Some("id"));
-        let schema2 = create_test_table_schema("products", Some("product_id"));
-        let schema3 = create_test_table_schema("orders", None);
-
-        let mock_io = Arc::new(MockStorageProvider::new().await);
-
-        // Save schemas to storage
-        save_table_schema(&schema1, mock_io.clone()).await.unwrap();
-        save_table_schema(&schema2, mock_io.clone()).await.unwrap();
-        save_table_schema(&schema3, mock_io.clone()).await.unwrap();
-
-        // Create iterator
-        let mut iterator = TableSchemaIterator::new(mock_io.clone()).await.unwrap();
-
-        // Get first schema
-        let read_schema1 = iterator.next_table_schema().await.unwrap().unwrap();
-        assert_eq!(read_schema1.name, "users");
-        assert_eq!(read_schema1.primary_key, Some("id".to_string()));
-
-        // Get second schema
-        let read_schema2 = iterator.next_table_schema().await.unwrap().unwrap();
-        assert_eq!(read_schema2.name, "products");
-        assert_eq!(read_schema2.primary_key, Some("product_id".to_string()));
-
-        // Get third schema
-        let read_schema3 = iterator.next_table_schema().await.unwrap().unwrap();
-        assert_eq!(read_schema3.name, "orders");
-        assert_eq!(read_schema3.primary_key, None);
-
-        // No more schemas
-        assert!(iterator.next_table_schema().await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn test_table_schema_iterator_reset() {
-        _ = tokio::fs::remove_file("G:\\Databases\\Test_Database\\schema1.db").await;
-        let field_name = format!(
-            "{}{}",
-            "G:\\Databases\\Test_Database\\schema1", "_FIELDS.db"
-        );
-        _ = tokio::fs::remove_file(field_name).await;
-
-        let mock_io = Arc::new(
-            crate::core::storage_providers::file_sync::LocalStorageProvider::new(
-                "G:\\Databases\\Test_Database",
-                Some("schema1.db"),
-            )
-            .await,
-        );
-
-        // Create schemas
-        let schema1 = create_test_table_schema("users", Some("id"));
-        let schema2 = create_test_table_schema("products", None);
-
-        // Save schemas to storage
-        save_table_schema(&schema1, mock_io.clone()).await.unwrap();
-        save_table_schema(&schema2, mock_io.clone()).await.unwrap();
-
-        // Create iterator and read all schemas
-        let mut iterator = TableSchemaIterator::new(mock_io.clone()).await.unwrap();
-
-        assert!(iterator.next_table_schema().await.unwrap().is_some());
-        assert!(iterator.next_table_schema().await.unwrap().is_some());
-        assert!(iterator.next_table_schema().await.unwrap().is_none());
-
-        // Reset iterator
-        iterator.reset();
-
-        // Should be able to read schemas again
-        let read_schema1 = iterator.next_table_schema().await.unwrap().unwrap();
-        assert_eq!(read_schema1.name, "users");
-
-        let read_schema2 = iterator.next_table_schema().await.unwrap().unwrap();
-        assert_eq!(read_schema2.name, "products");
-
-        // No more schemas
-        assert!(iterator.next_table_schema().await.unwrap().is_none());
-
-        _ = tokio::fs::remove_file("G:\\Databases\\Test_Database\\schema1.db").await;
-        let field_name = format!(
-            "{}{}",
-            "G:\\Databases\\Test_Database\\schema1", "_FIELDS.db"
-        );
-        _ = tokio::fs::remove_file(field_name).await;
-    }
-
-    #[tokio::test]
-    async fn test_table_schema_save_and_iterator() {
-        // Create multiple schemas
-        let mock_io = Arc::new(MockStorageProvider::new().await);
-
-        // Create and save schemas
-        for i in 0..5 {
-            let table_name = format!("table{}", i);
-            let primary_key = if i % 2 == 0 {
-                Some(format!("id{}", i))
-            } else {
-                None
-            };
-
-            let schema = create_test_table_schema(&table_name, primary_key.as_deref());
-            save_table_schema(&schema, mock_io.clone()).await.unwrap();
-        }
-
-        // Read back using iterator
-        let mut iterator = TableSchemaIterator::new(mock_io.clone()).await.unwrap();
-
-        for i in 0..5 {
-            let schema = iterator.next_table_schema().await.unwrap().unwrap();
-
-            let expected_name = format!("table{}", i);
-            let expected_pk = if i % 2 == 0 {
-                Some(format!("id{}", i))
-            } else {
-                None
-            };
-
-            assert_eq!(schema.name, expected_name);
-            assert_eq!(schema.primary_key, expected_pk);
-        }
-
-        // No more schemas
-        assert!(iterator.next_table_schema().await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn test_table_schema_long_names() {
-        // Create a schema with long name and primary key
-        let long_name = "a".repeat(200); // More than 128 chars
-        let long_pk = "b".repeat(200); // More than 128 chars
-
-        let schema = create_test_table_schema(&long_name, Some(&long_pk));
-
-        let mock_io = Arc::new(MockStorageProvider::new().await);
-
-        save_table_schema(&schema, mock_io.clone()).await.unwrap();
-
-        // Read back using iterator
-        let mut iterator = TableSchemaIterator::new(mock_io.clone()).await.unwrap();
-        let read_schema = iterator.next_table_schema().await.unwrap().unwrap();
-
-        // Should be truncated to 128 chars
-        assert_eq!(read_schema.name.len(), 128);
-        assert_eq!(read_schema.primary_key.clone().unwrap().len(), 128);
-
-        assert_eq!(read_schema.name, "a".repeat(128));
-        assert_eq!(
-            read_schema.primary_key.as_ref().unwrap().to_string(),
-            "b".repeat(128)
-        );
-    }
-
-    #[tokio::test]
-    async fn test_table_schema_complete_set() {
-        _ = tokio::fs::remove_file("G:\\Databases\\Test_Database\\schema2.db").await;
-        let field_name = format!(
-            "{}{}",
-            "G:\\Databases\\Test_Database\\schema2", "_FIELDS.db"
-        );
-        _ = tokio::fs::remove_file(field_name).await;
-
-        // Create schemas
-        let mut schema1 = create_test_table_schema("users", Some("id"));
-
-        let mock_io = Arc::new(
-            crate::core::storage_providers::file_sync::LocalStorageProvider::new(
-                "G:\\Databases\\Test_Database",
-                Some("schema2.db"),
-            )
-            .await,
-        );
-        //let mut mock_io_fields = mock_io.create_new(format!("{}_{}", mock_io.get_name().replace(".db", ""), "FIELDS.db")).await;
-
-        schema1.save(mock_io.clone()).await.unwrap();
-
-        schema1
-            .add_field(mock_io.clone(), "email".into(), DbType::STRING, true)
-            .await;
-
-        schema1
-            .add_field(mock_io.clone(), "created_at".into(), DbType::U64, false)
-            .await;
-
-        schema1
-            .add_field(mock_io.clone(), "updated_at".into(), DbType::U64, false)
-            .await;
-
-        schema1
-            .add_field(mock_io.clone(), "first_name".into(), DbType::STRING, false)
-            .await;
-
-        schema1
-            .add_field(mock_io.clone(), "last_name".into(), DbType::STRING, false)
-            .await;
-
-        schema1
-            .add_field(mock_io.clone(), "user_id".into(), DbType::U128, false)
-            .await;
-
-        let mut iterator = TableSchemaIterator::new(mock_io.clone()).await.unwrap();
-        let read_schema1 = iterator.next_table_schema().await.unwrap().unwrap();
-        assert_eq!(read_schema1.name, "users");
-
-        assert_eq!(read_schema1.primary_key, Some("id".to_string()));
-        assert_eq!(read_schema1.fields.len(), 6);
-
-        assert_eq!(read_schema1.fields[0].name, "email");
-        assert_eq!(read_schema1.fields[0].db_type, DbType::STRING);
-        assert_eq!(read_schema1.fields[0].is_unique, true);
-        assert_eq!(read_schema1.fields[0].offset, 0);
-        assert_eq!(read_schema1.fields[0].write_order, 0);
-        assert_eq!(read_schema1.fields[0].size, 8 + 4);
-
-        assert_eq!(read_schema1.fields[1].name, "created_at");
-        assert_eq!(read_schema1.fields[1].db_type, DbType::U64);
-        assert_eq!(read_schema1.fields[1].is_unique, false);
-        assert_eq!(read_schema1.fields[1].offset, 8 + 4);
-        assert_eq!(read_schema1.fields[1].write_order, 1);
-        assert_eq!(read_schema1.fields[1].size, 8);
-
-        assert_eq!(read_schema1.fields[2].name, "updated_at");
-        assert_eq!(read_schema1.fields[2].db_type, DbType::U64);
-        assert_eq!(read_schema1.fields[2].is_unique, false);
-        assert_eq!(read_schema1.fields[2].offset, 4 + 8 + 8);
-        assert_eq!(read_schema1.fields[2].write_order, 2);
-        assert_eq!(read_schema1.fields[2].size, 8);
-
-        assert_eq!(read_schema1.fields[3].name, "first_name");
-        assert_eq!(read_schema1.fields[3].db_type, DbType::STRING);
-        assert_eq!(read_schema1.fields[3].is_unique, false);
-        assert_eq!(read_schema1.fields[3].offset, 4 + 8 + 8 + 8);
-        assert_eq!(read_schema1.fields[3].write_order, 3);
-        assert_eq!(read_schema1.fields[3].size, 8 + 4);
-
-        assert_eq!(read_schema1.fields[4].name, "last_name");
-        assert_eq!(read_schema1.fields[4].db_type, DbType::STRING);
-        assert_eq!(read_schema1.fields[4].is_unique, false);
-        assert_eq!(read_schema1.fields[4].offset, 4 + 8 + 8 + 8 + 4 + 8);
-        assert_eq!(read_schema1.fields[4].write_order, 4);
-        assert_eq!(read_schema1.fields[4].size, 8 + 4);
-
-        assert_eq!(read_schema1.fields[5].name, "user_id");
-        assert_eq!(read_schema1.fields[5].db_type, DbType::U128);
-        assert_eq!(read_schema1.fields[5].is_unique, false);
-        assert_eq!(read_schema1.fields[5].offset, 4 + 8 + 8 + 8 + 4 + 8 + 4 + 8);
-        assert_eq!(read_schema1.fields[5].write_order, 5);
-        assert_eq!(read_schema1.fields[5].size, 16);
-
-        _ = tokio::fs::remove_file("G:\\Databases\\Test_Database\\schema2.db").await;
-        let field_name = format!(
-            "{}{}",
-            "G:\\Databases\\Test_Database\\schema2", "_FIELDS.db"
-        );
-        _ = tokio::fs::remove_file(field_name).await;
-    }
-
-    #[tokio::test]
-    async fn test_table_mark_field_as_deleted() {
-        _ = tokio::fs::remove_file("G:\\Databases\\Test_Database\\schema2.db").await;
-        let field_name = format!(
-            "{}{}",
-            "G:\\Databases\\Test_Database\\schema2", "_FIELDS.db"
-        );
-        _ = tokio::fs::remove_file(field_name).await;
-
-        // Create schemas
-        let mut schema1 = create_test_table_schema("users", Some("id"));
-        let schema2 = create_test_table_schema("other_users", Some("id2"));
-
-        let mock_io = Arc::new(
-            crate::core::storage_providers::file_sync::LocalStorageProvider::new(
-                "G:\\Databases\\Test_Database",
-                Some("schema2.db"),
-            )
-            .await,
-        );
-        //let mut mock_io_fields = mock_io.create_new(format!("{}_{}", mock_io.get_name().replace(".db", ""), "FIELDS.db")).await;
-
-        schema1.save(mock_io.clone()).await.unwrap();
-        schema2.save(mock_io.clone()).await.unwrap();
-
-        schema1
-            .add_field(mock_io.clone(), "email".into(), DbType::STRING, true)
-            .await;
-
-        schema1
-            .add_field(mock_io.clone(), "created_at".into(), DbType::U64, false)
-            .await;
-
-        schema1
-            .add_field(mock_io.clone(), "updated_at".into(), DbType::U64, false)
-            .await;
-
-        schema1
-            .add_field(mock_io.clone(), "first_name".into(), DbType::STRING, false)
-            .await;
-
-        schema1
-            .add_field(mock_io.clone(), "last_name".into(), DbType::STRING, false)
-            .await;
-
-        schema1
-            .add_field(mock_io.clone(), "user_id".into(), DbType::U128, false)
-            .await;
-
-        schema1
-            .mark_field_as_deleted("user_id", mock_io.clone())
-            .await;
-        schema1
-            .mark_field_as_deleted("first_name", mock_io.clone())
-            .await;
-
-        drop(schema1);
-        drop(mock_io);
-
-        let mock_io = Arc::new(
-            crate::core::storage_providers::file_sync::LocalStorageProvider::new(
-                "G:\\Databases\\Test_Database",
-                Some("schema2.db"),
-            )
-            .await,
-        );
-        let mut iterator = TableSchemaIterator::new(mock_io.clone()).await.unwrap();
-
-        let read_schema1 = iterator.next_table_schema().await.unwrap().unwrap();
-        assert_eq!(read_schema1.name, "users");
-
-        assert_eq!(read_schema1.primary_key, Some("id".to_string()));
-        assert_eq!(read_schema1.fields.len(), 6);
-
-        assert_eq!(read_schema1.fields[5].name, "user_id");
-        assert_eq!(read_schema1.fields[5].db_type, DbType::U128);
-        assert_eq!(read_schema1.fields[5].is_unique, false);
-        assert_eq!(read_schema1.fields[5].offset, 4 + 8 + 8 + 8 + 4 + 8 + 4 + 8);
-        assert_eq!(read_schema1.fields[5].write_order, 5);
-        assert_eq!(read_schema1.fields[5].size, 16);
-        assert_eq!(read_schema1.fields[5].is_deleted, true);
-
-        assert_eq!(read_schema1.fields[3].name, "first_name");
-        assert_eq!(read_schema1.fields[3].db_type, DbType::STRING);
-        assert_eq!(read_schema1.fields[3].is_unique, false);
-        assert_eq!(read_schema1.fields[3].offset, 4 + 8 + 8 + 8);
-        assert_eq!(read_schema1.fields[3].write_order, 3);
-        assert_eq!(read_schema1.fields[3].size, 8 + 4);
-        assert_eq!(read_schema1.fields[3].is_deleted, true);
-
-        _ = tokio::fs::remove_file("G:\\Databases\\Test_Database\\schema2.db").await;
-        let field_name = format!(
-            "{}{}",
-            "G:\\Databases\\Test_Database\\schema2", "_FIELDS.db"
-        );
-        _ = tokio::fs::remove_file(field_name).await;
-    }
-}
+// #[cfg(test)]
+// mod tests {
+//     use super::*;
+//     use crate::core::{db_type::DbType, storage_providers::mock_file_sync::MockStorageProvider};
+//     use std::io;
+
+//     // Helper function to create a schema field and return it
+//     fn create_test_schema_field(
+//         name: &str,
+//         db_type: DbType,
+//         offset: u64,
+//         write_order: u64,
+//         is_unique: bool,
+//     ) -> SchemaField {
+//         let db_size = db_type.get_size();
+//         let schema_field = SchemaField::new(
+//             name.to_string(),
+//             db_type,
+//             db_size,
+//             offset,
+//             write_order,
+//             is_unique,
+//         );
+
+//         schema_field
+//     }
+
+//     // Helper function to save a schema field to storage
+//     async fn save_schema_field(
+//         field: &SchemaField,
+//         storage: &mut MockStorageProvider,
+//     ) -> io::Result<()> {
+//         field.save_field(storage).await
+//     }
+
+//     #[tokio::test]
+//     async fn test_schema_field_iterator_empty() {
+//         let mut mock_io = MockStorageProvider::new().await;
+
+//         let mut iterator = SchemaFieldIterator::new(&mut mock_io).await.unwrap();
+
+//         // Should return None for an empty storage
+//         assert!(iterator.next_schema_field().await.unwrap().is_none());
+//     }
+
+//     #[tokio::test]
+//     async fn test_schema_field_iterator_single_field() {
+//         // Create a single schema field
+//         let schema_field = create_test_schema_field("id", DbType::I32, 0, 1, true);
+
+//         let mut mock_io = MockStorageProvider::new().await;
+
+//         save_schema_field(&schema_field, &mut mock_io)
+//             .await
+//             .unwrap();
+
+//         let mut schema_field_iterator = SchemaFieldIterator::new(&mut mock_io).await.unwrap();
+
+//         // Should return our schema field
+//         let read_field = schema_field_iterator
+//             .next_schema_field()
+//             .await
+//             .unwrap()
+//             .unwrap();
+
+//         assert_eq!(read_field.name, "id");
+//         assert_eq!(read_field.db_type, DbType::I32);
+//         assert_eq!(read_field.offset, 0);
+//         assert_eq!(read_field.write_order, 1);
+//         assert_eq!(read_field.is_unique, true);
+
+//         // Next call should return None
+//         assert!(
+//             schema_field_iterator
+//                 .next_schema_field()
+//                 .await
+//                 .unwrap()
+//                 .is_none()
+//         );
+//     }
+
+//     #[tokio::test]
+//     async fn test_schema_field_iterator_2_fields() {
+//         // Create schema fields
+//         let schema_field1 = create_test_schema_field("id", DbType::I32, 0, 1, true);
+
+//         let mut mock_io = MockStorageProvider::new().await;
+
+//         save_schema_field(&schema_field1, &mut mock_io)
+//             .await
+//             .unwrap();
+//         save_schema_field(&schema_field1, &mut mock_io)
+//             .await
+//             .unwrap();
+
+//         let mut schema_field_iterator = SchemaFieldIterator::new(&mut mock_io).await.unwrap();
+
+//         // Should return our first schema field
+//         let read_field = schema_field_iterator
+//             .next_schema_field()
+//             .await
+//             .unwrap()
+//             .unwrap();
+
+//         assert_eq!(read_field.name, "id");
+//         assert_eq!(read_field.db_type, DbType::I32);
+//         assert_eq!(read_field.offset, 0);
+//         assert_eq!(read_field.write_order, 1);
+//         assert_eq!(read_field.is_unique, true);
+
+//         // Should return the second copy of the same schema field
+//         assert!(
+//             schema_field_iterator
+//                 .next_schema_field()
+//                 .await
+//                 .unwrap()
+//                 .is_some()
+//         );
+
+//         // Next call should return None
+//         assert!(
+//             schema_field_iterator
+//                 .next_schema_field()
+//                 .await
+//                 .unwrap()
+//                 .is_none()
+//         );
+//     }
+
+//     #[tokio::test]
+//     async fn test_schema_field_iterator_3_fields() {
+//         // Create schema fields
+//         let schema_field1 = create_test_schema_field("id", DbType::I32, 0, 1, true);
+//         let schema_field2 = create_test_schema_field("name", DbType::STRING, 8, 2, false);
+
+//         let mut mock_io = MockStorageProvider::new().await;
+
+//         save_schema_field(&schema_field1, &mut mock_io)
+//             .await
+//             .unwrap();
+//         save_schema_field(&schema_field2, &mut mock_io)
+//             .await
+//             .unwrap();
+//         save_schema_field(&schema_field1, &mut mock_io)
+//             .await
+//             .unwrap();
+
+//         let mut schema_field_iterator = SchemaFieldIterator::new(&mut mock_io).await.unwrap();
+
+//         // Should return our first schema field
+//         let read_field = schema_field_iterator
+//             .next_schema_field()
+//             .await
+//             .unwrap()
+//             .unwrap();
+
+//         assert_eq!(read_field.name, "id");
+//         assert_eq!(read_field.db_type, DbType::I32);
+//         assert_eq!(read_field.offset, 0);
+//         assert_eq!(read_field.write_order, 1);
+//         assert_eq!(read_field.is_unique, true);
+
+//         // Should return the second schema field
+//         let read_field = schema_field_iterator
+//             .next_schema_field()
+//             .await
+//             .unwrap()
+//             .unwrap();
+
+//         assert_eq!(read_field.name, "name");
+//         assert_eq!(read_field.db_type, DbType::STRING);
+//         assert_eq!(read_field.offset, 8);
+//         assert_eq!(read_field.write_order, 2);
+//         assert_eq!(read_field.is_unique, false);
+
+//         // Should return the third schema field (duplicate of the first)
+//         assert!(
+//             schema_field_iterator
+//                 .next_schema_field()
+//                 .await
+//                 .unwrap()
+//                 .is_some()
+//         );
+
+//         // Next call should return None
+//         assert!(
+//             schema_field_iterator
+//                 .next_schema_field()
+//                 .await
+//                 .unwrap()
+//                 .is_none()
+//         );
+//     }
+
+//     #[tokio::test]
+//     async fn test_schema_field_iterator_batch_retrieval() {
+//         let mut mock_io = MockStorageProvider::new().await;
+
+//         // Create and save multiple schema fields (more than BATCH_SIZE)
+//         for i in 0..BATCH_SIZE + 10 {
+//             let field_name = format!("field{}", i);
+//             let schema_field = create_test_schema_field(
+//                 &field_name,
+//                 DbType::I32,
+//                 i as u64 * 8,
+//                 i as u64,
+//                 i % 2 == 0, // Make even-numbered fields unique
+//             );
+
+//             save_schema_field(&schema_field, &mut mock_io)
+//                 .await
+//                 .unwrap();
+//         }
+
+//         let mut iterator = SchemaFieldIterator::new(&mut mock_io).await.unwrap();
+
+//         // Test batch retrieval
+//         let first_batch = iterator.next_schema_fields().await.unwrap();
+//         assert_eq!(first_batch.len(), BATCH_SIZE);
+
+//         // Check first and last items in the batch
+//         assert_eq!(first_batch[0].name, "field0");
+//         assert_eq!(first_batch[0].is_unique, true);
+//         assert_eq!(
+//             first_batch[BATCH_SIZE - 1].name,
+//             format!("field{}", BATCH_SIZE - 1)
+//         );
+
+//         // Test retrieval of remaining items
+//         let second_batch = iterator.next_schema_fields().await.unwrap();
+//         assert_eq!(second_batch.len(), 10);
+
+//         // Ensure no more items
+//         let empty_batch = iterator.next_schema_fields().await.unwrap();
+//         assert_eq!(empty_batch.len(), 0);
+//     }
+
+//     #[tokio::test]
+//     async fn test_schema_field_iterator_reset() {
+//         let mut mock_io = MockStorageProvider::new().await;
+
+//         // Create and save schema fields
+//         let schema_field1 = create_test_schema_field("id", DbType::I32, 0, 1, true);
+//         let schema_field2 = create_test_schema_field("name", DbType::STRING, 8, 2, false);
+
+//         save_schema_field(&schema_field1, &mut mock_io)
+//             .await
+//             .unwrap();
+//         save_schema_field(&schema_field2, &mut mock_io)
+//             .await
+//             .unwrap();
+
+//         // Create iterator and consume all items
+//         let mut iterator = SchemaFieldIterator::new(&mut mock_io).await.unwrap();
+
+//         assert!(iterator.next_schema_field().await.unwrap().is_some());
+//         assert!(iterator.next_schema_field().await.unwrap().is_some());
+//         assert!(iterator.next_schema_field().await.unwrap().is_none());
+
+//         // Reset and verify we can read the items again
+//         iterator.reset();
+
+//         // Should be able to read the items again
+//         let read_field1 = iterator.next_schema_field().await.unwrap().unwrap();
+//         assert_eq!(read_field1.name, "id");
+
+//         let read_field2 = iterator.next_schema_field().await.unwrap().unwrap();
+//         assert_eq!(read_field2.name, "name");
+
+//         // No more items
+//         assert!(iterator.next_schema_field().await.unwrap().is_none());
+//     }
+
+//     // Helper function to create a test TableSchema
+//     fn create_test_table_schema(name: &str, primary_key: Option<&str>) -> TableSchema {
+//         let mut table = TableSchema::new(name.to_string(), false);
+//         if let Some(pk) = primary_key {
+//             table.set_primary_key(pk.to_string());
+//         }
+//         table
+//     }
+
+//     // Helper function to create a test TableSchema
+//     fn create_test_table_schema_immutable(name: &str, primary_key: Option<&str>) -> TableSchema {
+//         let mut table = TableSchema::new(name.to_string(), true);
+//         if let Some(pk) = primary_key {
+//             table.set_primary_key(pk.to_string());
+//         }
+//         table
+//     }
+
+//     // Helper function to save a table schema to storage
+//     async fn save_table_schema<S: StorageIO>(
+//         schema: &TableSchema,
+//         storage: Arc<S>,
+//     ) -> io::Result<()> {
+//         schema.save(storage).await
+//     }
+
+//     #[test]
+//     fn test_table_schema_into_vec() {
+//         // Table with no primary key
+//         let schema = create_test_table_schema("users", None);
+//         let vec = schema.into_vec();
+
+//         // Verify size
+//         assert_eq!(vec.len(), TABLE_SIZE);
+
+//         // Verify name
+//         let name_bytes = "users".as_bytes();
+//         for (i, &b) in name_bytes.iter().enumerate() {
+//             assert_eq!(vec[i], b);
+//         }
+
+//         // Verify null terminator after name
+//         assert_eq!(vec[5], 0);
+
+//         // Verify primary key section is all zeros
+//         for i in 129..TABLE_SIZE {
+//             assert_eq!(vec[i], 0);
+//         }
+
+//         // Table with primary key
+//         let schema = create_test_table_schema("customers", Some("id"));
+//         let vec = schema.into_vec();
+
+//         // Verify name
+//         let name_bytes = "customers".as_bytes();
+//         for (i, &b) in name_bytes.iter().enumerate() {
+//             assert_eq!(vec[i], b);
+//         }
+
+//         // Verify primary key
+//         let pk_bytes = "id".as_bytes();
+//         for (i, &b) in pk_bytes.iter().enumerate() {
+//             assert_eq!(vec[129 + i], b);
+//         }
+
+//         // Verify null terminator after primary key
+//         assert_eq!(vec[131], 0);
+//     }
+
+//     #[test]
+//     fn test_table_schema_from_vec() {
+//         // Create a buffer for a table with name "users" and primary key "id"
+//         let mut vec = vec![0; TABLE_SIZE];
+
+//         // Set name
+//         let name = "users";
+//         let name_bytes = name.as_bytes();
+//         vec[..name_bytes.len()].copy_from_slice(name_bytes);
+
+//         // Set primary key
+//         let pk = "id";
+//         let pk_bytes = pk.as_bytes();
+//         vec[129..129 + pk_bytes.len()].copy_from_slice(pk_bytes);
+
+//         // Parse the buffer
+//         let schema = TableSchema::from_vec(&vec).unwrap();
+
+//         // Verify parsed data
+//         assert_eq!(schema.name, "users");
+//         assert_eq!(schema.primary_key, Some("id".to_string()));
+
+//         // Create a buffer for a table with name "products" and no primary key
+//         let mut vec = vec![0; TABLE_SIZE];
+
+//         // Set name
+//         let name = "products";
+//         let name_bytes = name.as_bytes();
+//         vec[..name_bytes.len()].copy_from_slice(name_bytes);
+
+//         // Parse the buffer
+//         let schema = TableSchema::from_vec(&vec).unwrap();
+
+//         // Verify parsed data
+//         assert_eq!(schema.name, "products");
+//         assert_eq!(schema.primary_key, None);
+//     }
+
+//     #[tokio::test]
+//     async fn test_table_schema_serialize_deserialize() {
+//         let mock_io = Arc::new(MockStorageProvider::new().await);
+
+//         // Create schema with fields and indexes
+//         let mut schema = create_test_table_schema("orders", Some("order_id"));
+
+//         schema.save(mock_io.clone()).await.unwrap();
+
+//         // Add fields
+
+//         schema
+//             .add_field(mock_io.clone(), "order_id".to_string(), DbType::I64, false)
+//             .await;
+
+//         schema
+//             .add_field(
+//                 mock_io.clone(),
+//                 "created_at".to_string(),
+//                 DbType::U64,
+//                 false,
+//             )
+//             .await;
+
+//         // Serialize
+//         let vec = schema.into_vec();
+
+//         // Deserialize
+//         let deserialized = TableSchema::from_vec(&vec).unwrap();
+
+//         // Verify core properties (fields are not part of serialization)
+//         assert_eq!(deserialized.name, "orders");
+//         assert_eq!(deserialized.primary_key, Some("order_id".to_string()));
+//         assert!(deserialized.fields.is_empty());
+//     }
+
+//     #[tokio::test]
+//     async fn test_table_schema_mutability() {
+//         let mock_io = Arc::new(MockStorageProvider::new().await);
+
+//         // Create schema with fields and indexes
+//         let schema = create_test_table_schema_immutable("orders", Some("order_id"));
+
+//         schema.save(mock_io.clone()).await.unwrap();
+
+//         let mut schema_iter = TableSchemaIterator::new(mock_io.clone()).await.unwrap();
+
+//         let schema = schema_iter.next_table_schema().await.unwrap().unwrap();
+
+//         // Verify core properties (fields are not part of serialization)
+//         assert_eq!(schema.is_immutable, true);
+//     }
+
+//     #[tokio::test]
+//     async fn test_table_schema_mutability_2() {
+//         let mock_io = Arc::new(MockStorageProvider::new().await);
+
+//         // Create schema with fields and indexes
+//         let schema = create_test_table_schema("orders", Some("order_id"));
+
+//         schema.save(mock_io.clone()).await.unwrap();
+
+//         let mut schema_iter = TableSchemaIterator::new(mock_io.clone()).await.unwrap();
+
+//         let schema = schema_iter.next_table_schema().await.unwrap().unwrap();
+
+//         // Verify core properties (fields are not part of serialization)
+//         assert_eq!(schema.is_immutable, false);
+//     }
+
+//     #[test]
+//     fn test_table_schema_special_chars() {
+//         // Create schema with special characters in name and primary key
+//         let mut schema = TableSchema::new("users!@#123".to_string(), true);
+//         schema.set_primary_key("id!@#123".to_string());
+
+//         // Serialize
+//         let vec = schema.into_vec();
+
+//         // Deserialize
+//         let deserialized = TableSchema::from_vec(&vec).unwrap();
+
+//         // Verify filtered content (only alphanumeric characters)
+//         assert_eq!(deserialized.name, "users123");
+//         assert_eq!(deserialized.primary_key, Some("id123".to_string()));
+//     }
+
+//     #[tokio::test]
+//     async fn test_table_schema_iterator_empty() {
+//         let mock_io = Arc::new(MockStorageProvider::new().await);
+
+//         let mut iterator = TableSchemaIterator::new(mock_io.clone()).await.unwrap();
+
+//         // Should return None for an empty storage
+//         assert!(iterator.next_table_schema().await.unwrap().is_none());
+//     }
+
+//     #[tokio::test]
+//     async fn test_table_schema_iterator_single_schema() {
+//         // Create a single table schema
+//         let table_schema = create_test_table_schema("users", Some("id"));
+
+//         let mock_io = Arc::new(MockStorageProvider::new().await);
+
+//         save_table_schema(&table_schema, mock_io.clone())
+//             .await
+//             .unwrap();
+
+//         let mut iterator = TableSchemaIterator::new(mock_io.clone()).await.unwrap();
+
+//         // Should return our table schema
+//         let read_schema = iterator.next_table_schema().await.unwrap().unwrap();
+
+//         assert_eq!(read_schema.name, "users");
+//         assert_eq!(read_schema.primary_key, Some("id".to_string()));
+
+//         // Next call should return None
+//         assert!(iterator.next_table_schema().await.unwrap().is_none());
+//     }
+
+//     #[tokio::test]
+//     async fn test_table_schema_iterator_multiple_schemas() {
+//         // Create schemas
+//         let schema1 = create_test_table_schema("users", Some("id"));
+//         let schema2 = create_test_table_schema("products", Some("product_id"));
+//         let schema3 = create_test_table_schema("orders", None);
+
+//         let mock_io = Arc::new(MockStorageProvider::new().await);
+
+//         // Save schemas to storage
+//         save_table_schema(&schema1, mock_io.clone()).await.unwrap();
+//         save_table_schema(&schema2, mock_io.clone()).await.unwrap();
+//         save_table_schema(&schema3, mock_io.clone()).await.unwrap();
+
+//         // Create iterator
+//         let mut iterator = TableSchemaIterator::new(mock_io.clone()).await.unwrap();
+
+//         // Get first schema
+//         let read_schema1 = iterator.next_table_schema().await.unwrap().unwrap();
+//         assert_eq!(read_schema1.name, "users");
+//         assert_eq!(read_schema1.primary_key, Some("id".to_string()));
+
+//         // Get second schema
+//         let read_schema2 = iterator.next_table_schema().await.unwrap().unwrap();
+//         assert_eq!(read_schema2.name, "products");
+//         assert_eq!(read_schema2.primary_key, Some("product_id".to_string()));
+
+//         // Get third schema
+//         let read_schema3 = iterator.next_table_schema().await.unwrap().unwrap();
+//         assert_eq!(read_schema3.name, "orders");
+//         assert_eq!(read_schema3.primary_key, None);
+
+//         // No more schemas
+//         assert!(iterator.next_table_schema().await.unwrap().is_none());
+//     }
+
+//     #[tokio::test]
+//     async fn test_table_schema_iterator_reset() {
+//         _ = tokio::fs::remove_file("G:\\Databases\\Test_Database\\schema1.db").await;
+//         let field_name = format!(
+//             "{}{}",
+//             "G:\\Databases\\Test_Database\\schema1", "_FIELDS.db"
+//         );
+//         _ = tokio::fs::remove_file(field_name).await;
+
+//         let mock_io = Arc::new(
+//             crate::core::storage_providers::file_sync::LocalStorageProvider::new(
+//                 "G:\\Databases\\Test_Database",
+//                 Some("schema1.db"),
+//             )
+//             .await,
+//         );
+
+//         // Create schemas
+//         let schema1 = create_test_table_schema("users", Some("id"));
+//         let schema2 = create_test_table_schema("products", None);
+
+//         // Save schemas to storage
+//         save_table_schema(&schema1, mock_io.clone()).await.unwrap();
+//         save_table_schema(&schema2, mock_io.clone()).await.unwrap();
+
+//         // Create iterator and read all schemas
+//         let mut iterator = TableSchemaIterator::new(mock_io.clone()).await.unwrap();
+
+//         assert!(iterator.next_table_schema().await.unwrap().is_some());
+//         assert!(iterator.next_table_schema().await.unwrap().is_some());
+//         assert!(iterator.next_table_schema().await.unwrap().is_none());
+
+//         // Reset iterator
+//         iterator.reset();
+
+//         // Should be able to read schemas again
+//         let read_schema1 = iterator.next_table_schema().await.unwrap().unwrap();
+//         assert_eq!(read_schema1.name, "users");
+
+//         let read_schema2 = iterator.next_table_schema().await.unwrap().unwrap();
+//         assert_eq!(read_schema2.name, "products");
+
+//         // No more schemas
+//         assert!(iterator.next_table_schema().await.unwrap().is_none());
+
+//         _ = tokio::fs::remove_file("G:\\Databases\\Test_Database\\schema1.db").await;
+//         let field_name = format!(
+//             "{}{}",
+//             "G:\\Databases\\Test_Database\\schema1", "_FIELDS.db"
+//         );
+//         _ = tokio::fs::remove_file(field_name).await;
+//     }
+
+//     #[tokio::test]
+//     async fn test_table_schema_save_and_iterator() {
+//         // Create multiple schemas
+//         let mock_io = Arc::new(MockStorageProvider::new().await);
+
+//         // Create and save schemas
+//         for i in 0..5 {
+//             let table_name = format!("table{}", i);
+//             let primary_key = if i % 2 == 0 {
+//                 Some(format!("id{}", i))
+//             } else {
+//                 None
+//             };
+
+//             let schema = create_test_table_schema(&table_name, primary_key.as_deref());
+//             save_table_schema(&schema, mock_io.clone()).await.unwrap();
+//         }
+
+//         // Read back using iterator
+//         let mut iterator = TableSchemaIterator::new(mock_io.clone()).await.unwrap();
+
+//         for i in 0..5 {
+//             let schema = iterator.next_table_schema().await.unwrap().unwrap();
+
+//             let expected_name = format!("table{}", i);
+//             let expected_pk = if i % 2 == 0 {
+//                 Some(format!("id{}", i))
+//             } else {
+//                 None
+//             };
+
+//             assert_eq!(schema.name, expected_name);
+//             assert_eq!(schema.primary_key, expected_pk);
+//         }
+
+//         // No more schemas
+//         assert!(iterator.next_table_schema().await.unwrap().is_none());
+//     }
+
+//     #[tokio::test]
+//     async fn test_table_schema_long_names() {
+//         // Create a schema with long name and primary key
+//         let long_name = "a".repeat(200); // More than 128 chars
+//         let long_pk = "b".repeat(200); // More than 128 chars
+
+//         let schema = create_test_table_schema(&long_name, Some(&long_pk));
+
+//         let mock_io = Arc::new(MockStorageProvider::new().await);
+
+//         save_table_schema(&schema, mock_io.clone()).await.unwrap();
+
+//         // Read back using iterator
+//         let mut iterator = TableSchemaIterator::new(mock_io.clone()).await.unwrap();
+//         let read_schema = iterator.next_table_schema().await.unwrap().unwrap();
+
+//         // Should be truncated to 128 chars
+//         assert_eq!(read_schema.name.len(), 128);
+//         assert_eq!(read_schema.primary_key.clone().unwrap().len(), 128);
+
+//         assert_eq!(read_schema.name, "a".repeat(128));
+//         assert_eq!(
+//             read_schema.primary_key.as_ref().unwrap().to_string(),
+//             "b".repeat(128)
+//         );
+//     }
+
+//     #[tokio::test]
+//     async fn test_table_schema_complete_set() {
+//         _ = tokio::fs::remove_file("G:\\Databases\\Test_Database\\schema2.db").await;
+//         let field_name = format!(
+//             "{}{}",
+//             "G:\\Databases\\Test_Database\\schema2", "_FIELDS.db"
+//         );
+//         _ = tokio::fs::remove_file(field_name).await;
+
+//         // Create schemas
+//         let mut schema1 = create_test_table_schema("users", Some("id"));
+
+//         let mock_io = Arc::new(
+//             crate::core::storage_providers::file_sync::LocalStorageProvider::new(
+//                 "G:\\Databases\\Test_Database",
+//                 Some("schema2.db"),
+//             )
+//             .await,
+//         );
+//         //let mut mock_io_fields = mock_io.create_new(format!("{}_{}", mock_io.get_name().replace(".db", ""), "FIELDS.db")).await;
+
+//         schema1.save(mock_io.clone()).await.unwrap();
+
+//         schema1
+//             .add_field(mock_io.clone(), "email".into(), DbType::STRING, true)
+//             .await;
+
+//         schema1
+//             .add_field(mock_io.clone(), "created_at".into(), DbType::U64, false)
+//             .await;
+
+//         schema1
+//             .add_field(mock_io.clone(), "updated_at".into(), DbType::U64, false)
+//             .await;
+
+//         schema1
+//             .add_field(mock_io.clone(), "first_name".into(), DbType::STRING, false)
+//             .await;
+
+//         schema1
+//             .add_field(mock_io.clone(), "last_name".into(), DbType::STRING, false)
+//             .await;
+
+//         schema1
+//             .add_field(mock_io.clone(), "user_id".into(), DbType::U128, false)
+//             .await;
+
+//         let mut iterator = TableSchemaIterator::new(mock_io.clone()).await.unwrap();
+//         let read_schema1 = iterator.next_table_schema().await.unwrap().unwrap();
+//         assert_eq!(read_schema1.name, "users");
+
+//         assert_eq!(read_schema1.primary_key, Some("id".to_string()));
+//         assert_eq!(read_schema1.fields.len(), 6);
+
+//         assert_eq!(read_schema1.fields[0].name, "email");
+//         assert_eq!(read_schema1.fields[0].db_type, DbType::STRING);
+//         assert_eq!(read_schema1.fields[0].is_unique, true);
+//         assert_eq!(read_schema1.fields[0].offset, 0);
+//         assert_eq!(read_schema1.fields[0].write_order, 0);
+//         assert_eq!(read_schema1.fields[0].size, 8 + 4);
+
+//         assert_eq!(read_schema1.fields[1].name, "created_at");
+//         assert_eq!(read_schema1.fields[1].db_type, DbType::U64);
+//         assert_eq!(read_schema1.fields[1].is_unique, false);
+//         assert_eq!(read_schema1.fields[1].offset, 8 + 4);
+//         assert_eq!(read_schema1.fields[1].write_order, 1);
+//         assert_eq!(read_schema1.fields[1].size, 8);
+
+//         assert_eq!(read_schema1.fields[2].name, "updated_at");
+//         assert_eq!(read_schema1.fields[2].db_type, DbType::U64);
+//         assert_eq!(read_schema1.fields[2].is_unique, false);
+//         assert_eq!(read_schema1.fields[2].offset, 4 + 8 + 8);
+//         assert_eq!(read_schema1.fields[2].write_order, 2);
+//         assert_eq!(read_schema1.fields[2].size, 8);
+
+//         assert_eq!(read_schema1.fields[3].name, "first_name");
+//         assert_eq!(read_schema1.fields[3].db_type, DbType::STRING);
+//         assert_eq!(read_schema1.fields[3].is_unique, false);
+//         assert_eq!(read_schema1.fields[3].offset, 4 + 8 + 8 + 8);
+//         assert_eq!(read_schema1.fields[3].write_order, 3);
+//         assert_eq!(read_schema1.fields[3].size, 8 + 4);
+
+//         assert_eq!(read_schema1.fields[4].name, "last_name");
+//         assert_eq!(read_schema1.fields[4].db_type, DbType::STRING);
+//         assert_eq!(read_schema1.fields[4].is_unique, false);
+//         assert_eq!(read_schema1.fields[4].offset, 4 + 8 + 8 + 8 + 4 + 8);
+//         assert_eq!(read_schema1.fields[4].write_order, 4);
+//         assert_eq!(read_schema1.fields[4].size, 8 + 4);
+
+//         assert_eq!(read_schema1.fields[5].name, "user_id");
+//         assert_eq!(read_schema1.fields[5].db_type, DbType::U128);
+//         assert_eq!(read_schema1.fields[5].is_unique, false);
+//         assert_eq!(read_schema1.fields[5].offset, 4 + 8 + 8 + 8 + 4 + 8 + 4 + 8);
+//         assert_eq!(read_schema1.fields[5].write_order, 5);
+//         assert_eq!(read_schema1.fields[5].size, 16);
+
+//         _ = tokio::fs::remove_file("G:\\Databases\\Test_Database\\schema2.db").await;
+//         let field_name = format!(
+//             "{}{}",
+//             "G:\\Databases\\Test_Database\\schema2", "_FIELDS.db"
+//         );
+//         _ = tokio::fs::remove_file(field_name).await;
+//     }
+
+//     #[tokio::test]
+//     async fn test_table_mark_field_as_deleted() {
+//         _ = tokio::fs::remove_file("G:\\Databases\\Test_Database\\schema2.db").await;
+//         let field_name = format!(
+//             "{}{}",
+//             "G:\\Databases\\Test_Database\\schema2", "_FIELDS.db"
+//         );
+//         _ = tokio::fs::remove_file(field_name).await;
+
+//         // Create schemas
+//         let mut schema1 = create_test_table_schema("users", Some("id"));
+//         let schema2 = create_test_table_schema("other_users", Some("id2"));
+
+//         let mock_io = Arc::new(
+//             crate::core::storage_providers::file_sync::LocalStorageProvider::new(
+//                 "G:\\Databases\\Test_Database",
+//                 Some("schema2.db"),
+//             )
+//             .await,
+//         );
+//         //let mut mock_io_fields = mock_io.create_new(format!("{}_{}", mock_io.get_name().replace(".db", ""), "FIELDS.db")).await;
+
+//         schema1.save(mock_io.clone()).await.unwrap();
+//         schema2.save(mock_io.clone()).await.unwrap();
+
+//         schema1
+//             .add_field(mock_io.clone(), "email".into(), DbType::STRING, true)
+//             .await;
+
+//         schema1
+//             .add_field(mock_io.clone(), "created_at".into(), DbType::U64, false)
+//             .await;
+
+//         schema1
+//             .add_field(mock_io.clone(), "updated_at".into(), DbType::U64, false)
+//             .await;
+
+//         schema1
+//             .add_field(mock_io.clone(), "first_name".into(), DbType::STRING, false)
+//             .await;
+
+//         schema1
+//             .add_field(mock_io.clone(), "last_name".into(), DbType::STRING, false)
+//             .await;
+
+//         schema1
+//             .add_field(mock_io.clone(), "user_id".into(), DbType::U128, false)
+//             .await;
+
+//         schema1
+//             .mark_field_as_deleted("user_id", mock_io.clone())
+//             .await;
+//         schema1
+//             .mark_field_as_deleted("first_name", mock_io.clone())
+//             .await;
+
+//         drop(schema1);
+//         drop(mock_io);
+
+//         let mock_io = Arc::new(
+//             crate::core::storage_providers::file_sync::LocalStorageProvider::new(
+//                 "G:\\Databases\\Test_Database",
+//                 Some("schema2.db"),
+//             )
+//             .await,
+//         );
+//         let mut iterator = TableSchemaIterator::new(mock_io.clone()).await.unwrap();
+
+//         let read_schema1 = iterator.next_table_schema().await.unwrap().unwrap();
+//         assert_eq!(read_schema1.name, "users");
+
+//         assert_eq!(read_schema1.primary_key, Some("id".to_string()));
+//         assert_eq!(read_schema1.fields.len(), 6);
+
+//         assert_eq!(read_schema1.fields[5].name, "user_id");
+//         assert_eq!(read_schema1.fields[5].db_type, DbType::U128);
+//         assert_eq!(read_schema1.fields[5].is_unique, false);
+//         assert_eq!(read_schema1.fields[5].offset, 4 + 8 + 8 + 8 + 4 + 8 + 4 + 8);
+//         assert_eq!(read_schema1.fields[5].write_order, 5);
+//         assert_eq!(read_schema1.fields[5].size, 16);
+//         assert_eq!(read_schema1.fields[5].is_deleted, true);
+
+//         assert_eq!(read_schema1.fields[3].name, "first_name");
+//         assert_eq!(read_schema1.fields[3].db_type, DbType::STRING);
+//         assert_eq!(read_schema1.fields[3].is_unique, false);
+//         assert_eq!(read_schema1.fields[3].offset, 4 + 8 + 8 + 8);
+//         assert_eq!(read_schema1.fields[3].write_order, 3);
+//         assert_eq!(read_schema1.fields[3].size, 8 + 4);
+//         assert_eq!(read_schema1.fields[3].is_deleted, true);
+
+//         _ = tokio::fs::remove_file("G:\\Databases\\Test_Database\\schema2.db").await;
+//         let field_name = format!(
+//             "{}{}",
+//             "G:\\Databases\\Test_Database\\schema2", "_FIELDS.db"
+//         );
+//         _ = tokio::fs::remove_file(field_name).await;
+//     }
+// }

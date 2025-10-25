@@ -1,16 +1,15 @@
-use std::sync::Arc;
+use std::{num::NonZero, sync::Arc};
 use std::env;
 
 use log::LevelFilter;
 use rasterizeddb_core::{core::database::Database, BATCH_SIZE, MAX_PERMITS_THREADS};
-use tokio::runtime::Builder;
 
 use rasterizeddb_core::configuration::Configuration;
 
 #[allow(unreachable_code)]
 #[allow(static_mut_refs)]
-fn main() -> std::io::Result<()> {
-
+#[compio::main]
+async fn main() -> std::io::Result<()> {
     // 32 MiB
     let stack_size = 32 * 1024 * 1024;
 
@@ -62,22 +61,29 @@ fn main() -> std::io::Result<()> {
 
     *batch_ref = config.batch_size.unwrap_or(1024 * 64);
 
-    let rt = Builder::new_multi_thread()
-        .worker_threads(config.concurrent_threads.unwrap_or(unsafe { MAX_PERMITS_THREADS }))
-        .thread_stack_size(stack_size)
-        .enable_all()
+    let dispatcher = compio::dispatcher::DispatcherBuilder::new()
+        .concurrent(true)
+        .stack_size(stack_size)
+        .worker_threads(NonZero::new(config.concurrent_threads.unwrap_or(unsafe { MAX_PERMITS_THREADS })).unwrap())
         .build()?;
 
-    rt.block_on(async {
-        env_logger::Builder::new()
-            .filter_level(LevelFilter::Error)
-            .init();
+    let config_clone = config.clone();
+    let location_clone = config_clone.location.expect("Database location must be provided with --location <path>").clone();
 
-        let db_location = config.location.as_deref().expect("Database location must be provided with --location <path>");
-        let database = Database::new(db_location).await;
-        let arc_database = Arc::new(database);
-        _ = Database::start_db(arc_database).await;
-    });
+    let result = dispatcher.dispatch(move || {
+        async {
+            env_logger::Builder::new()
+                .filter_level(LevelFilter::Error)
+                .init();
+
+            let db_location = location_clone;
+            let database = Database::new(&db_location).await;
+            let arc_database = Arc::new(database);
+            _ = Database::start_db(arc_database).await;
+        }
+    }).unwrap();
+
+    result.await.expect("Dispatcher task failed");
 
     Ok(())
 }

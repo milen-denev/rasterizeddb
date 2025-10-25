@@ -16,7 +16,7 @@ use std::{
     },
 };
 
-#[tokio::main(flavor = "multi_thread")]
+#[compio::main]
 #[allow(unreachable_code)]
 async fn main() -> std::io::Result<()> {
     env_logger::Builder::new()
@@ -25,76 +25,76 @@ async fn main() -> std::io::Result<()> {
 
     let client = Arc::new(DbClient::new(Some("127.0.0.1")).await.unwrap());
 
-    let _query = r##"
-        CREATE TABLE employees (
-            id UBIGINT,
-            name VARCHAR,
-            job_title VARCHAR,
-            salary REAL,
-            department VARCHAR,
-            age INTEGER,
-            manager VARCHAR,
-            location VARCHAR,
-            hire_date UBIGINT,
-            degree VARCHAR,
-            skills VARCHAR,
-            current_project VARCHAR,
-            performance_score REAL,
-            is_active BOOLEAN,
-            created_at UBIGINT,
-            updated_at UBIGINT,
-            is_fired BOOLEAN
-        );
-    "##;
+    // let _query = r##"
+    //     CREATE TABLE employees (
+    //         id UBIGINT,
+    //         name VARCHAR,
+    //         job_title VARCHAR,
+    //         salary REAL,
+    //         department VARCHAR,
+    //         age INTEGER,
+    //         manager VARCHAR,
+    //         location VARCHAR,
+    //         hire_date UBIGINT,
+    //         degree VARCHAR,
+    //         skills VARCHAR,
+    //         current_project VARCHAR,
+    //         performance_score REAL,
+    //         is_active BOOLEAN,
+    //         created_at UBIGINT,
+    //         updated_at UBIGINT,
+    //         is_fired BOOLEAN
+    //     );
+    // "##;
 
-    let create_result = client.execute_query(_query).await;
+    // let create_result = client.execute_query(_query).await;
 
-    println!("Create result: {:?}", create_result);
+    // println!("Create result: {:?}", create_result);
 
-    println!("Press any key to continue...");
-    let mut buffer = String::new();
-    stdin().read_line(&mut buffer).unwrap();
+    // println!("Press any key to continue...");
+    // let mut buffer = String::new();
+    // stdin().read_line(&mut buffer).unwrap();
 
-    let mut features = vec![];
+    // let mut features = vec![];
 
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(16));
+    // let semaphore = Arc::new(tokio::sync::Semaphore::new(16));
 
-    for i in 2_500_000..3_500_000 {
-        let person = generate_person();
-        let query = format!(
-            r##"
-            INSERT INTO employees (
-                id, name, job_title, salary, department, age, manager, location, hire_date,
-                degree, skills, current_project, performance_score, is_active,
-                created_at, updated_at, is_fired
-            )
-            VALUES (
-                {}, '{}', '{}', {}, '{}', {}, '{}', '{}', {},
-                '{}', '{}', '{}', {}, {}, {}, {}, {}
-            );
-            "##,
-            i + 1, person.name, person.job_title, person.salary, person.department, person.age,
-            person.manager, person.location, person.hire_date,
-            person.degree, person.skills, person.current_project, person.performance_score,
-            person.is_active as u8,
-            person.created_at, person.updated_at, person.is_fired as u8
-        );
+    // for i in 2_500_000..3_500_000 {
+    //     let person = generate_person();
+    //     let query = format!(
+    //         r##"
+    //         INSERT INTO employees (
+    //             id, name, job_title, salary, department, age, manager, location, hire_date,
+    //             degree, skills, current_project, performance_score, is_active,
+    //             created_at, updated_at, is_fired
+    //         )
+    //         VALUES (
+    //             {}, '{}', '{}', {}, '{}', {}, '{}', '{}', {},
+    //             '{}', '{}', '{}', {}, {}, {}, {}, {}
+    //         );
+    //         "##,
+    //         i + 1, person.name, person.job_title, person.salary, person.department, person.age,
+    //         person.manager, person.location, person.hire_date,
+    //         person.degree, person.skills, person.current_project, person.performance_score,
+    //         person.is_active as u8,
+    //         person.created_at, person.updated_at, person.is_fired as u8
+    //     );
 
-        let client_clone = Arc::clone(&client);
-        let semaphore_clone = Arc::clone(&semaphore);
+    //     let client_clone = Arc::clone(&client);
+    //     let semaphore_clone = Arc::clone(&semaphore);
 
-        features.push(tokio::spawn(async move {
-            let _permit = semaphore_clone.acquire().await.unwrap();
-            let _insert_result = client_clone.execute_query(&query).await;
-            drop(_permit);
-        }));
-    }
+    //     features.push(compio::runtime::spawn(async move {
+    //         let _permit = semaphore_clone.acquire().await.unwrap();
+    //         let _insert_result = client_clone.execute_query(&query).await;
+    //         drop(_permit);
+    //     }));
+    // }
 
-    join_all(features).await;
+    // join_all(features).await;
 
-    println!("Finished inserting records. Press any key to continue...");
-    let mut buffer = String::new();
-    stdin().read_line(&mut buffer).unwrap();
+    // println!("Finished inserting records. Press any key to continue...");
+    // let mut buffer = String::new();
+    // stdin().read_line(&mut buffer).unwrap();
 
     for _ in 0..50 {
         let query = r##"

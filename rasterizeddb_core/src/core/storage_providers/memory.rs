@@ -126,18 +126,6 @@ impl StorageIO for MemoryStorageProvider {
         return Cursor::new(buffer);
     }
 
-    async fn read_data_to_end(&self, position: u64) -> Vec<u8> {
-        let total_len = self.vec.len() as u64;
-        let mut buffer: Vec<u8> = Vec::with_capacity((total_len - position) as usize);
-
-        for i in position..total_len {
-            let u8_value: u8 = self.vec[i as usize].map(|x| *x);
-            buffer.push(u8_value);
-        }
-
-        return buffer;
-    }
-
     async fn append_data(&self, buffer: &[u8], _immediate: bool) {
         for u8_value in buffer {
             self.vec.extend(vec![*u8_value; 1]);

@@ -1,11 +1,9 @@
-use std::{borrow::Cow, cell::UnsafeCell, sync::Arc};
+use std::{borrow::Cow, cell::UnsafeCell, sync::{mpsc, Arc}};
 
+use async_lock::Semaphore;
 use futures::future::join_all;
+use itertools::Itertools;
 use smallvec::SmallVec;
-use tokio::{
-    sync::{Semaphore, mpsc},
-    task,
-};
 
 use super::{
     transformer::{ColumnTransformer, Next, TransformerProcessor},
@@ -35,7 +33,7 @@ impl ConcurrentProcessor {
         io_rows: Arc<S>,
         iterator: &mut RowPointerIterator<S>,
     ) -> Vec<Row> {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Row>();
+        let (tx, rx) = mpsc::channel::<Row>();
 
         let mut batch_handles = Vec::new();
         iterator.reset();
@@ -71,9 +69,9 @@ impl ConcurrentProcessor {
             let tokens_ref = Arc::clone(&tokens_arc);
             let io_rows_batch = Arc::clone(&io_rows_outer);
 
-            let batch_handle = task::spawn(async move {
+            let batch_handle = compio::runtime::spawn(async move {
                 // Acquire a permit for this batch
-                let _batch_permit = tuple_clone.0.acquire().await.unwrap();
+                let _batch_permit = tuple_clone.0.acquire();
 
                 // Local row buffer reused across all pointers in this batch
                 let row = Row::default();
@@ -190,11 +188,16 @@ impl ConcurrentProcessor {
         drop(tx);
 
         // Aggregator
-        let aggregator_handle = tokio::spawn(async move {
+        let aggregator_handle = compio::runtime::spawn(async move {
             let mut collected_rows = Vec::with_capacity(50);
 
-            if !rx.is_empty() {
-                rx.recv_many(&mut collected_rows, usize::MAX).await;
+            while rx.iter().try_len().unwrap_or_default() != 0 {
+                let row = match rx.recv() {
+                    Ok(r) => r,
+                    Err(_) => continue, // channel closed
+                };
+
+                collected_rows.push(row);
             }
 
             drop(rx);

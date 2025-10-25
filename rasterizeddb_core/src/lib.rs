@@ -8,8 +8,6 @@ pub static BATCH_SIZE: usize = 1024 * 64;
 pub(crate) const IMMEDIATE_WRITE: bool = true;
 
 pub(crate) const WRITE_BATCH_SIZE: usize = 4 * 1024 * 1024; // 4MB
-pub(crate) const WRITE_SLEEP_DURATION: tokio::time::Duration =
-    tokio::time::Duration::from_millis(10);
 
 pub mod core;
 

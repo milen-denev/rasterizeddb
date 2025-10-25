@@ -9,7 +9,7 @@ authors = ["Milen Denev"]
 description = "A schemafull, high-performance database written in Rust, designed for speed and scalability."
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
+# tokio = { version = "1", features = ["full"] }
 byteorder = "1.5.0"
 itertools = "0.14"
 ahash = "0.8"
@@ -35,10 +35,16 @@ smallvec = { version = "1.15.1", features = ["union", "write"]}
 arc-swap = "1.7.1"
 fastrand = "2.3.0"
 parking_lot = "0.12.4"
+compio = { version = "0.16.0", features = ["macros", "dispatcher", "time"] }
+async-lock = "3.4.1"
 
 # unix dependencies
 [target.'cfg(unix)'.dependencies]
 io-uring = "0.7.10"
+
+# windows dependencies
+[target.'cfg(windows)'.dependencies]
+windows-sys = "0.61.1"
 
 [dev-dependencies]
 criterion = { version = "0.7.0" }

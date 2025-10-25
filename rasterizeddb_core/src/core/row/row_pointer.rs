@@ -1009,529 +1009,529 @@ impl RowPointer {
     // }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::core::{
-        row::row::{ColumnFetchingData, ColumnWritePayload},
-        storage_providers::mock_file_sync::MockStorageProvider,
-    };
-
-    fn create_string_column(data: &str, write_order: u32) -> ColumnWritePayload {
-        let string_bytes = data.as_bytes();
-
-        let string_data = MEMORY_POOL.acquire(string_bytes.len());
-        let string_slice = string_data.into_slice_mut();
-
-        string_slice[0..].copy_from_slice(string_bytes);
-
-        ColumnWritePayload {
-            data: string_data,
-            write_order,
-            column_type: DbType::STRING,
-            size: 4 + 8,
-        }
-    }
-
-    fn create_u8_column(data: u8, write_order: u32) -> ColumnWritePayload {
-        let u8_data = MEMORY_POOL.acquire(1);
-        let u8_slice = u8_data.into_slice_mut();
-        u8_slice.copy_from_slice(&data.to_le_bytes());
-
-        ColumnWritePayload {
-            data: u8_data,
-            write_order,
-            column_type: DbType::U8,
-            size: 1,
-        }
-    }
-
-    fn create_u64_column(data: u64, write_order: u32) -> ColumnWritePayload {
-        let u64_data = MEMORY_POOL.acquire(8);
-        let u64_slice = u64_data.into_slice_mut();
-        u64_slice.copy_from_slice(&data.to_le_bytes());
-
-        ColumnWritePayload {
-            data: u64_data,
-            write_order,
-            column_type: DbType::U64,
-            size: 8,
-        }
-    }
-
-    fn create_f32_column(data: f32, write_order: u32) -> ColumnWritePayload {
-        let f32_data = MEMORY_POOL.acquire(4);
-        let f32_slice = f32_data.into_slice_mut();
-        f32_slice.copy_from_slice(&data.to_le_bytes());
-
-        ColumnWritePayload {
-            data: f32_data,
-            write_order,
-            column_type: DbType::F32,
-            size: 4,
-        }
-    }
-
-    fn create_f64_column(data: f64, write_order: u32) -> ColumnWritePayload {
-        let f64_data = MEMORY_POOL.acquire(8);
-        let f64_slice = f64_data.into_slice_mut();
-        f64_slice.copy_from_slice(&data.to_le_bytes());
-
-        ColumnWritePayload {
-            data: f64_data,
-            write_order,
-            column_type: DbType::F64,
-            size: 8,
-        }
-    }
-
-    fn create_row_write(id: u64) -> RowWrite {
-        RowWrite {
-            columns_writing_data: smallvec::smallvec![
-                create_u64_column(id, 0),
-                create_string_column("John Doe", 1),
-                create_u8_column(30, 2),
-                create_string_column("john.doe@example.com", 3),
-                create_string_column("123 Main St", 4),
-                create_string_column("555-1234", 5),
-                create_u8_column(1, 6),
-                create_f64_column(1000.50, 7),
-                create_u8_column(0, 8),
-                create_string_column("1990-01-01", 9),
-                create_string_column("2023-10-01", 10),
-                create_string_column("Sunsung Phone Andomega 10", 11),
-                create_f32_column(100.0, 12),
-                create_string_column("2023-10-01", 13),
-                create_string_column("New York", 14),
-                create_string_column("Credit Card", 15),
-                create_string_column("Electronics", 16),
-                create_string_column("Smartphones", 17),
-                create_string_column("Latest model", 18),
-                create_string_column("No notes", 19),
-            ],
-        }
-    }
-
-    // Helper function to create a row pointer and return its serialized form
-    fn create_test_row_pointer(id: u64, position: u64, length: u32, deleted: bool) -> RowPointer {
-        #[cfg(feature = "enable_long_row")]
-        {
-            RowPointer {
-                id: id as u128,
-                length: length as u64,
-                position,
-                deleted,
-                checksum: 0,
-                cluster: 0,
-                deleted_at: 0,
-                created_at: 0,
-                updated_at: 0,
-                version: 0,
-                is_active: true,
-                writing_data: WritingData {
-                    total_columns_size: 0,
-                    total_strings_size: 0,
-                },
-            }
-        }
-
-        #[cfg(not(feature = "enable_long_row"))]
-        {
-            RowPointer {
-                id,
-                length,
-                position,
-                deleted,
-                writing_data: WritingData {
-                    total_columns_size: 0,
-                    total_strings_size: 0,
-                },
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn test_row_pointer_iterator_empty() {
-        let mock_io = Arc::new(MockStorageProvider::new().await);
-
-        let mut iterator = RowPointerIterator::new(mock_io.clone()).await.unwrap();
-
-        // Should return None for an empty storage
-        assert!(iterator.next_row_pointer().await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn test_row_pointer_iterator_single_pointer() {
-        // Create a single row pointer
-        let row_pointer = create_test_row_pointer(1, 100, 50, false);
-
-        let mock_io = Arc::new(MockStorageProvider::new().await);
-
-        row_pointer.save(mock_io.clone(), true).await.unwrap();
-
-        let mut row_pointer_iterator = RowPointerIterator::new(mock_io.clone()).await.unwrap();
-
-        // Should return our row pointer
-        let read_pointer = row_pointer_iterator
-            .next_row_pointer()
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(read_pointer.id, 1);
-        assert_eq!(read_pointer.position, 100);
-        assert_eq!(read_pointer.length, 50);
-        assert_eq!(read_pointer.deleted, false);
-
-        assert!(
-            row_pointer_iterator
-                .next_row_pointer()
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_row_pointer_iterator_2_pointers() {
-        // Create a single row pointer
-        let row_pointer = create_test_row_pointer(1, 100, 50, false);
-
-        let mock_io = Arc::new(MockStorageProvider::new().await);
-
-        row_pointer.save(mock_io.clone(), true).await.unwrap();
-        row_pointer.save(mock_io.clone(), true).await.unwrap();
-
-        let mut row_pointer_iterator = RowPointerIterator::new(mock_io.clone()).await.unwrap();
-
-        // Should return our row pointer
-        let read_pointer = row_pointer_iterator
-            .next_row_pointer()
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(read_pointer.id, 1);
-        assert_eq!(read_pointer.position, 100);
-        assert_eq!(read_pointer.length, 50);
-        assert_eq!(read_pointer.deleted, false);
-
-        // Next call should return None
-        assert!(
-            row_pointer_iterator
-                .next_row_pointer()
-                .await
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            row_pointer_iterator
-                .next_row_pointer()
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_row_pointer_iterator_3_pointers() {
-        // Create a single row pointer
-        let row_pointer = create_test_row_pointer(1, 100, 50, false);
-        let row_pointer2 = create_test_row_pointer(2, 150, 100, false);
-
-        let mock_io = Arc::new(MockStorageProvider::new().await);
-
-        row_pointer.save(mock_io.clone(), true).await.unwrap();
-        row_pointer2.save(mock_io.clone(), true).await.unwrap();
-        row_pointer.save(mock_io.clone(), true).await.unwrap();
-
-        let mut row_pointer_iterator = RowPointerIterator::new(mock_io.clone()).await.unwrap();
-
-        // Should return our row pointer
-        let read_pointer = row_pointer_iterator
-            .next_row_pointer()
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(read_pointer.id, 1);
-        assert_eq!(read_pointer.position, 100);
-        assert_eq!(read_pointer.length, 50);
-        assert_eq!(read_pointer.deleted, false);
-
-        let read_pointer = row_pointer_iterator
-            .next_row_pointer()
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(read_pointer.id, 2);
-        assert_eq!(read_pointer.position, 150);
-        assert_eq!(read_pointer.length, 100);
-        assert_eq!(read_pointer.deleted, false);
-
-        // Next call should return None
-        assert!(
-            row_pointer_iterator
-                .next_row_pointer()
-                .await
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            row_pointer_iterator
-                .next_row_pointer()
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_save_row_pointers() {
-        let mock_io_pointers = Arc::new(MockStorageProvider::new().await);
-        let mock_io_rows = Arc::new(MockStorageProvider::new().await);
-
-        #[cfg(feature = "enable_long_row")]
-        let cluster = 0;
-
-        let last_id = AtomicU64::new(0);
-        let table_length = AtomicU64::new(0);
-
-        let string_bytes = b"Hello, world!";
-
-        let string_data = MEMORY_POOL.acquire(string_bytes.len());
-        let string_slice = string_data.into_slice_mut();
-
-        string_slice[0..].copy_from_slice(string_bytes);
-
-        let i32_bytes = 42_i32.to_le_bytes();
-        let i32_data = MEMORY_POOL.acquire(i32_bytes.len());
-        let i32_slice = i32_data.into_slice_mut();
-        i32_slice.copy_from_slice(&i32_bytes);
-
-        let row_write = RowWrite {
-            columns_writing_data: smallvec::smallvec![
-                ColumnWritePayload {
-                    data: string_data,
-                    write_order: 0,
-                    column_type: DbType::STRING,
-                    size: 4 + 8 // String Size + String Pointer
-                },
-                ColumnWritePayload {
-                    data: i32_data,
-                    write_order: 1,
-                    column_type: DbType::I32,
-                    size: i32_bytes.len() as u32
-                },
-            ],
-        };
-
-        let result = RowPointer::write_row(
-            mock_io_pointers.clone(),
-            mock_io_rows.clone(),
-            &last_id,
-            &table_length,
-            #[cfg(feature = "enable_long_row")]
-            cluster,
-            &row_write,
-        )
-        .await;
-
-        assert!(result.is_ok())
-    }
-
-    #[tokio::test]
-    async fn test_save_and_read_row_pointers() {
-        let mock_io_pointers = Arc::new(MockStorageProvider::new().await);
-        let mock_io_rows = Arc::new(MockStorageProvider::new().await);
-
-        #[cfg(feature = "enable_long_row")]
-        let cluster = 0;
-
-        let last_id = AtomicU64::new(0);
-        let table_length = AtomicU64::new(0);
-
-        let string_bytes = b"Hello, world!";
-
-        let string_data = MEMORY_POOL.acquire(string_bytes.len());
-        let string_slice = string_data.into_slice_mut();
-        string_slice[0..].copy_from_slice(string_bytes);
-
-        let i32_bytes = 42_i32.to_le_bytes();
-        let i32_data = MEMORY_POOL.acquire(i32_bytes.len());
-        let i32_slice = i32_data.into_slice_mut();
-        i32_slice.copy_from_slice(&i32_bytes);
-
-        let row_write = RowWrite {
-            columns_writing_data: smallvec::smallvec![
-                ColumnWritePayload {
-                    data: string_data,
-                    write_order: 0,
-                    column_type: DbType::STRING,
-                    size: 4 + 8 // String Size + String Pointer
-                },
-                ColumnWritePayload {
-                    data: i32_data,
-                    write_order: 1,
-                    column_type: DbType::I32,
-                    size: i32_bytes.len() as u32
-                },
-            ],
-        };
-
-        let _result = RowPointer::write_row(
-            mock_io_pointers.clone(),
-            mock_io_rows.clone(),
-            &last_id,
-            &table_length,
-            #[cfg(feature = "enable_long_row")]
-            cluster,
-            &row_write,
-        )
-        .await;
-
-        let result = RowPointer::write_row(
-            mock_io_pointers.clone(),
-            mock_io_rows.clone(),
-            &last_id,
-            &table_length,
-            #[cfg(feature = "enable_long_row")]
-            cluster,
-            &row_write,
-        )
-        .await;
-
-        assert!(result.is_ok());
-
-        let mut iterator = RowPointerIterator::new(mock_io_pointers.clone())
-            .await
-            .unwrap();
-
-        let next_pointer = iterator.next_row_pointer().await.unwrap().unwrap();
-
-        let row_fetch = RowFetch {
-            columns_fetching_data: smallvec::smallvec![
-                ColumnFetchingData {
-                    column_offset: 0,
-                    column_type: DbType::STRING,
-                    size: string_bytes.len() as u32 + 4,
-                    schema_id: 0,
-                },
-                ColumnFetchingData {
-                    column_offset: 8 + 4,
-                    column_type: DbType::I32,
-                    size: i32_bytes.len() as u32,
-                    schema_id: 1,
-                },
-            ],
-        };
-
-        let row = next_pointer
-            .fetch_row(mock_io_rows.clone(), &row_fetch)
-            .await
-            .unwrap();
-
-        row.columns
-            .iter()
-            .for_each(|column| match column.column_type {
-                DbType::STRING => {
-                    let string_slice = column.data.into_slice();
-                    assert_eq!(&string_slice[0..], string_bytes);
-                }
-                DbType::I32 => {
-                    let i32_slice = column.data.into_slice();
-                    assert_eq!(i32_slice, i32_bytes);
-                }
-                _ => {}
-            });
-    }
-
-    #[tokio::test]
-    async fn test_save_and_read_row_pointers_async() {
-        let mock_io_pointers = Arc::new(MockStorageProvider::new().await);
-        let mock_io_rows = Arc::new(MockStorageProvider::new().await);
-
-        #[cfg(feature = "enable_long_row")]
-        let cluster = 0;
-
-        let last_id = AtomicU64::new(0);
-        let table_length = AtomicU64::new(0);
-
-        let _result = RowPointer::write_row(
-            mock_io_pointers.clone(),
-            mock_io_rows.clone(),
-            &last_id,
-            &table_length,
-            #[cfg(feature = "enable_long_row")]
-            cluster,
-            &create_row_write(0),
-        )
-        .await;
-
-        let result = RowPointer::write_row(
-            mock_io_pointers.clone(),
-            mock_io_rows.clone(),
-            &last_id,
-            &table_length,
-            #[cfg(feature = "enable_long_row")]
-            cluster,
-            &create_row_write(1),
-        )
-        .await;
-        assert!(result.is_ok());
-
-        let mut iterator = RowPointerIterator::new(mock_io_pointers.clone())
-            .await
-            .unwrap();
-
-        let next_pointer = iterator.next_row_pointer().await.unwrap().unwrap();
-
-        let row_fetch = RowFetch {
-            columns_fetching_data: smallvec::smallvec![
-                ColumnFetchingData {
-                    column_offset: 0,
-                    column_type: DbType::U64,
-                    size: 8,
-                    schema_id: 0
-                },
-                ColumnFetchingData {
-                    column_offset: 8,
-                    column_type: DbType::STRING,
-                    size: 4 + 8,
-                    schema_id: 1
-                },
-                ColumnFetchingData {
-                    column_offset: 8 + 4 + 8,
-                    column_type: DbType::U8,
-                    size: 1,
-                    schema_id: 2
-                }
-            ],
-        };
-
-        let row = next_pointer
-            .fetch_row(mock_io_rows.clone(), &row_fetch)
-            .await
-            .unwrap();
-
-        row.columns
-            .iter()
-            .for_each(|column| match column.column_type {
-                DbType::U8 => {
-                    let u8_slice = column.data.into_slice();
-                    assert_eq!(u8_slice, &[30]);
-                }
-                DbType::STRING => {
-                    let string_slice = column.data.into_slice();
-                    assert_eq!(&string_slice[0..], b"John Doe");
-                }
-                DbType::U64 => {
-                    let u64_bytes = 0_u64.to_le_bytes();
-                    let u64_slice = column.data.into_slice();
-                    assert_eq!(u64_slice, u64_bytes);
-                }
-                _ => {}
-            });
-    }
-}
+// #[cfg(test)]
+// mod tests {
+//     use super::*;
+//     use crate::core::{
+//         row::row::{ColumnFetchingData, ColumnWritePayload},
+//         storage_providers::mock_file_sync::MockStorageProvider,
+//     };
+
+//     fn create_string_column(data: &str, write_order: u32) -> ColumnWritePayload {
+//         let string_bytes = data.as_bytes();
+
+//         let string_data = MEMORY_POOL.acquire(string_bytes.len());
+//         let string_slice = string_data.into_slice_mut();
+
+//         string_slice[0..].copy_from_slice(string_bytes);
+
+//         ColumnWritePayload {
+//             data: string_data,
+//             write_order,
+//             column_type: DbType::STRING,
+//             size: 4 + 8,
+//         }
+//     }
+
+//     fn create_u8_column(data: u8, write_order: u32) -> ColumnWritePayload {
+//         let u8_data = MEMORY_POOL.acquire(1);
+//         let u8_slice = u8_data.into_slice_mut();
+//         u8_slice.copy_from_slice(&data.to_le_bytes());
+
+//         ColumnWritePayload {
+//             data: u8_data,
+//             write_order,
+//             column_type: DbType::U8,
+//             size: 1,
+//         }
+//     }
+
+//     fn create_u64_column(data: u64, write_order: u32) -> ColumnWritePayload {
+//         let u64_data = MEMORY_POOL.acquire(8);
+//         let u64_slice = u64_data.into_slice_mut();
+//         u64_slice.copy_from_slice(&data.to_le_bytes());
+
+//         ColumnWritePayload {
+//             data: u64_data,
+//             write_order,
+//             column_type: DbType::U64,
+//             size: 8,
+//         }
+//     }
+
+//     fn create_f32_column(data: f32, write_order: u32) -> ColumnWritePayload {
+//         let f32_data = MEMORY_POOL.acquire(4);
+//         let f32_slice = f32_data.into_slice_mut();
+//         f32_slice.copy_from_slice(&data.to_le_bytes());
+
+//         ColumnWritePayload {
+//             data: f32_data,
+//             write_order,
+//             column_type: DbType::F32,
+//             size: 4,
+//         }
+//     }
+
+//     fn create_f64_column(data: f64, write_order: u32) -> ColumnWritePayload {
+//         let f64_data = MEMORY_POOL.acquire(8);
+//         let f64_slice = f64_data.into_slice_mut();
+//         f64_slice.copy_from_slice(&data.to_le_bytes());
+
+//         ColumnWritePayload {
+//             data: f64_data,
+//             write_order,
+//             column_type: DbType::F64,
+//             size: 8,
+//         }
+//     }
+
+//     fn create_row_write(id: u64) -> RowWrite {
+//         RowWrite {
+//             columns_writing_data: smallvec::smallvec![
+//                 create_u64_column(id, 0),
+//                 create_string_column("John Doe", 1),
+//                 create_u8_column(30, 2),
+//                 create_string_column("john.doe@example.com", 3),
+//                 create_string_column("123 Main St", 4),
+//                 create_string_column("555-1234", 5),
+//                 create_u8_column(1, 6),
+//                 create_f64_column(1000.50, 7),
+//                 create_u8_column(0, 8),
+//                 create_string_column("1990-01-01", 9),
+//                 create_string_column("2023-10-01", 10),
+//                 create_string_column("Sunsung Phone Andomega 10", 11),
+//                 create_f32_column(100.0, 12),
+//                 create_string_column("2023-10-01", 13),
+//                 create_string_column("New York", 14),
+//                 create_string_column("Credit Card", 15),
+//                 create_string_column("Electronics", 16),
+//                 create_string_column("Smartphones", 17),
+//                 create_string_column("Latest model", 18),
+//                 create_string_column("No notes", 19),
+//             ],
+//         }
+//     }
+
+//     // Helper function to create a row pointer and return its serialized form
+//     fn create_test_row_pointer(id: u64, position: u64, length: u32, deleted: bool) -> RowPointer {
+//         #[cfg(feature = "enable_long_row")]
+//         {
+//             RowPointer {
+//                 id: id as u128,
+//                 length: length as u64,
+//                 position,
+//                 deleted,
+//                 checksum: 0,
+//                 cluster: 0,
+//                 deleted_at: 0,
+//                 created_at: 0,
+//                 updated_at: 0,
+//                 version: 0,
+//                 is_active: true,
+//                 writing_data: WritingData {
+//                     total_columns_size: 0,
+//                     total_strings_size: 0,
+//                 },
+//             }
+//         }
+
+//         #[cfg(not(feature = "enable_long_row"))]
+//         {
+//             RowPointer {
+//                 id,
+//                 length,
+//                 position,
+//                 deleted,
+//                 writing_data: WritingData {
+//                     total_columns_size: 0,
+//                     total_strings_size: 0,
+//                 },
+//             }
+//         }
+//     }
+
+//     #[tokio::test]
+//     async fn test_row_pointer_iterator_empty() {
+//         let mock_io = Arc::new(MockStorageProvider::new().await);
+
+//         let mut iterator = RowPointerIterator::new(mock_io.clone()).await.unwrap();
+
+//         // Should return None for an empty storage
+//         assert!(iterator.next_row_pointer().await.unwrap().is_none());
+//     }
+
+//     #[tokio::test]
+//     async fn test_row_pointer_iterator_single_pointer() {
+//         // Create a single row pointer
+//         let row_pointer = create_test_row_pointer(1, 100, 50, false);
+
+//         let mock_io = Arc::new(MockStorageProvider::new().await);
+
+//         row_pointer.save(mock_io.clone(), true).await.unwrap();
+
+//         let mut row_pointer_iterator = RowPointerIterator::new(mock_io.clone()).await.unwrap();
+
+//         // Should return our row pointer
+//         let read_pointer = row_pointer_iterator
+//             .next_row_pointer()
+//             .await
+//             .unwrap()
+//             .unwrap();
+
+//         assert_eq!(read_pointer.id, 1);
+//         assert_eq!(read_pointer.position, 100);
+//         assert_eq!(read_pointer.length, 50);
+//         assert_eq!(read_pointer.deleted, false);
+
+//         assert!(
+//             row_pointer_iterator
+//                 .next_row_pointer()
+//                 .await
+//                 .unwrap()
+//                 .is_none()
+//         );
+//     }
+
+//     #[tokio::test]
+//     async fn test_row_pointer_iterator_2_pointers() {
+//         // Create a single row pointer
+//         let row_pointer = create_test_row_pointer(1, 100, 50, false);
+
+//         let mock_io = Arc::new(MockStorageProvider::new().await);
+
+//         row_pointer.save(mock_io.clone(), true).await.unwrap();
+//         row_pointer.save(mock_io.clone(), true).await.unwrap();
+
+//         let mut row_pointer_iterator = RowPointerIterator::new(mock_io.clone()).await.unwrap();
+
+//         // Should return our row pointer
+//         let read_pointer = row_pointer_iterator
+//             .next_row_pointer()
+//             .await
+//             .unwrap()
+//             .unwrap();
+
+//         assert_eq!(read_pointer.id, 1);
+//         assert_eq!(read_pointer.position, 100);
+//         assert_eq!(read_pointer.length, 50);
+//         assert_eq!(read_pointer.deleted, false);
+
+//         // Next call should return None
+//         assert!(
+//             row_pointer_iterator
+//                 .next_row_pointer()
+//                 .await
+//                 .unwrap()
+//                 .is_some()
+//         );
+//         assert!(
+//             row_pointer_iterator
+//                 .next_row_pointer()
+//                 .await
+//                 .unwrap()
+//                 .is_none()
+//         );
+//     }
+
+//     #[tokio::test]
+//     async fn test_row_pointer_iterator_3_pointers() {
+//         // Create a single row pointer
+//         let row_pointer = create_test_row_pointer(1, 100, 50, false);
+//         let row_pointer2 = create_test_row_pointer(2, 150, 100, false);
+
+//         let mock_io = Arc::new(MockStorageProvider::new().await);
+
+//         row_pointer.save(mock_io.clone(), true).await.unwrap();
+//         row_pointer2.save(mock_io.clone(), true).await.unwrap();
+//         row_pointer.save(mock_io.clone(), true).await.unwrap();
+
+//         let mut row_pointer_iterator = RowPointerIterator::new(mock_io.clone()).await.unwrap();
+
+//         // Should return our row pointer
+//         let read_pointer = row_pointer_iterator
+//             .next_row_pointer()
+//             .await
+//             .unwrap()
+//             .unwrap();
+
+//         assert_eq!(read_pointer.id, 1);
+//         assert_eq!(read_pointer.position, 100);
+//         assert_eq!(read_pointer.length, 50);
+//         assert_eq!(read_pointer.deleted, false);
+
+//         let read_pointer = row_pointer_iterator
+//             .next_row_pointer()
+//             .await
+//             .unwrap()
+//             .unwrap();
+
+//         assert_eq!(read_pointer.id, 2);
+//         assert_eq!(read_pointer.position, 150);
+//         assert_eq!(read_pointer.length, 100);
+//         assert_eq!(read_pointer.deleted, false);
+
+//         // Next call should return None
+//         assert!(
+//             row_pointer_iterator
+//                 .next_row_pointer()
+//                 .await
+//                 .unwrap()
+//                 .is_some()
+//         );
+//         assert!(
+//             row_pointer_iterator
+//                 .next_row_pointer()
+//                 .await
+//                 .unwrap()
+//                 .is_none()
+//         );
+//     }
+
+//     #[tokio::test]
+//     async fn test_save_row_pointers() {
+//         let mock_io_pointers = Arc::new(MockStorageProvider::new().await);
+//         let mock_io_rows = Arc::new(MockStorageProvider::new().await);
+
+//         #[cfg(feature = "enable_long_row")]
+//         let cluster = 0;
+
+//         let last_id = AtomicU64::new(0);
+//         let table_length = AtomicU64::new(0);
+
+//         let string_bytes = b"Hello, world!";
+
+//         let string_data = MEMORY_POOL.acquire(string_bytes.len());
+//         let string_slice = string_data.into_slice_mut();
+
+//         string_slice[0..].copy_from_slice(string_bytes);
+
+//         let i32_bytes = 42_i32.to_le_bytes();
+//         let i32_data = MEMORY_POOL.acquire(i32_bytes.len());
+//         let i32_slice = i32_data.into_slice_mut();
+//         i32_slice.copy_from_slice(&i32_bytes);
+
+//         let row_write = RowWrite {
+//             columns_writing_data: smallvec::smallvec![
+//                 ColumnWritePayload {
+//                     data: string_data,
+//                     write_order: 0,
+//                     column_type: DbType::STRING,
+//                     size: 4 + 8 // String Size + String Pointer
+//                 },
+//                 ColumnWritePayload {
+//                     data: i32_data,
+//                     write_order: 1,
+//                     column_type: DbType::I32,
+//                     size: i32_bytes.len() as u32
+//                 },
+//             ],
+//         };
+
+//         let result = RowPointer::write_row(
+//             mock_io_pointers.clone(),
+//             mock_io_rows.clone(),
+//             &last_id,
+//             &table_length,
+//             #[cfg(feature = "enable_long_row")]
+//             cluster,
+//             &row_write,
+//         )
+//         .await;
+
+//         assert!(result.is_ok())
+//     }
+
+//     #[tokio::test]
+//     async fn test_save_and_read_row_pointers() {
+//         let mock_io_pointers = Arc::new(MockStorageProvider::new().await);
+//         let mock_io_rows = Arc::new(MockStorageProvider::new().await);
+
+//         #[cfg(feature = "enable_long_row")]
+//         let cluster = 0;
+
+//         let last_id = AtomicU64::new(0);
+//         let table_length = AtomicU64::new(0);
+
+//         let string_bytes = b"Hello, world!";
+
+//         let string_data = MEMORY_POOL.acquire(string_bytes.len());
+//         let string_slice = string_data.into_slice_mut();
+//         string_slice[0..].copy_from_slice(string_bytes);
+
+//         let i32_bytes = 42_i32.to_le_bytes();
+//         let i32_data = MEMORY_POOL.acquire(i32_bytes.len());
+//         let i32_slice = i32_data.into_slice_mut();
+//         i32_slice.copy_from_slice(&i32_bytes);
+
+//         let row_write = RowWrite {
+//             columns_writing_data: smallvec::smallvec![
+//                 ColumnWritePayload {
+//                     data: string_data,
+//                     write_order: 0,
+//                     column_type: DbType::STRING,
+//                     size: 4 + 8 // String Size + String Pointer
+//                 },
+//                 ColumnWritePayload {
+//                     data: i32_data,
+//                     write_order: 1,
+//                     column_type: DbType::I32,
+//                     size: i32_bytes.len() as u32
+//                 },
+//             ],
+//         };
+
+//         let _result = RowPointer::write_row(
+//             mock_io_pointers.clone(),
+//             mock_io_rows.clone(),
+//             &last_id,
+//             &table_length,
+//             #[cfg(feature = "enable_long_row")]
+//             cluster,
+//             &row_write,
+//         )
+//         .await;
+
+//         let result = RowPointer::write_row(
+//             mock_io_pointers.clone(),
+//             mock_io_rows.clone(),
+//             &last_id,
+//             &table_length,
+//             #[cfg(feature = "enable_long_row")]
+//             cluster,
+//             &row_write,
+//         )
+//         .await;
+
+//         assert!(result.is_ok());
+
+//         let mut iterator = RowPointerIterator::new(mock_io_pointers.clone())
+//             .await
+//             .unwrap();
+
+//         let next_pointer = iterator.next_row_pointer().await.unwrap().unwrap();
+
+//         let row_fetch = RowFetch {
+//             columns_fetching_data: smallvec::smallvec![
+//                 ColumnFetchingData {
+//                     column_offset: 0,
+//                     column_type: DbType::STRING,
+//                     size: string_bytes.len() as u32 + 4,
+//                     schema_id: 0,
+//                 },
+//                 ColumnFetchingData {
+//                     column_offset: 8 + 4,
+//                     column_type: DbType::I32,
+//                     size: i32_bytes.len() as u32,
+//                     schema_id: 1,
+//                 },
+//             ],
+//         };
+
+//         let row = next_pointer
+//             .fetch_row(mock_io_rows.clone(), &row_fetch)
+//             .await
+//             .unwrap();
+
+//         row.columns
+//             .iter()
+//             .for_each(|column| match column.column_type {
+//                 DbType::STRING => {
+//                     let string_slice = column.data.into_slice();
+//                     assert_eq!(&string_slice[0..], string_bytes);
+//                 }
+//                 DbType::I32 => {
+//                     let i32_slice = column.data.into_slice();
+//                     assert_eq!(i32_slice, i32_bytes);
+//                 }
+//                 _ => {}
+//             });
+//     }
+
+//     #[tokio::test]
+//     async fn test_save_and_read_row_pointers_async() {
+//         let mock_io_pointers = Arc::new(MockStorageProvider::new().await);
+//         let mock_io_rows = Arc::new(MockStorageProvider::new().await);
+
+//         #[cfg(feature = "enable_long_row")]
+//         let cluster = 0;
+
+//         let last_id = AtomicU64::new(0);
+//         let table_length = AtomicU64::new(0);
+
+//         let _result = RowPointer::write_row(
+//             mock_io_pointers.clone(),
+//             mock_io_rows.clone(),
+//             &last_id,
+//             &table_length,
+//             #[cfg(feature = "enable_long_row")]
+//             cluster,
+//             &create_row_write(0),
+//         )
+//         .await;
+
+//         let result = RowPointer::write_row(
+//             mock_io_pointers.clone(),
+//             mock_io_rows.clone(),
+//             &last_id,
+//             &table_length,
+//             #[cfg(feature = "enable_long_row")]
+//             cluster,
+//             &create_row_write(1),
+//         )
+//         .await;
+//         assert!(result.is_ok());
+
+//         let mut iterator = RowPointerIterator::new(mock_io_pointers.clone())
+//             .await
+//             .unwrap();
+
+//         let next_pointer = iterator.next_row_pointer().await.unwrap().unwrap();
+
+//         let row_fetch = RowFetch {
+//             columns_fetching_data: smallvec::smallvec![
+//                 ColumnFetchingData {
+//                     column_offset: 0,
+//                     column_type: DbType::U64,
+//                     size: 8,
+//                     schema_id: 0
+//                 },
+//                 ColumnFetchingData {
+//                     column_offset: 8,
+//                     column_type: DbType::STRING,
+//                     size: 4 + 8,
+//                     schema_id: 1
+//                 },
+//                 ColumnFetchingData {
+//                     column_offset: 8 + 4 + 8,
+//                     column_type: DbType::U8,
+//                     size: 1,
+//                     schema_id: 2
+//                 }
+//             ],
+//         };
+
+//         let row = next_pointer
+//             .fetch_row(mock_io_rows.clone(), &row_fetch)
+//             .await
+//             .unwrap();
+
+//         row.columns
+//             .iter()
+//             .for_each(|column| match column.column_type {
+//                 DbType::U8 => {
+//                     let u8_slice = column.data.into_slice();
+//                     assert_eq!(u8_slice, &[30]);
+//                 }
+//                 DbType::STRING => {
+//                     let string_slice = column.data.into_slice();
+//                     assert_eq!(&string_slice[0..], b"John Doe");
+//                 }
+//                 DbType::U64 => {
+//                     let u64_bytes = 0_u64.to_le_bytes();
+//                     let u64_slice = column.data.into_slice();
+//                     assert_eq!(u64_slice, u64_bytes);
+//                 }
+//                 _ => {}
+//             });
+//     }
+// }

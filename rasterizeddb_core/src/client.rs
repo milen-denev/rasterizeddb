@@ -4,7 +4,7 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use parking_lot::Mutex;
 
 use crate::core::support_types::QueryExecutionResult;
 use crate::SERVER_PORT;
@@ -94,12 +94,8 @@ impl Drop for PooledClientGuard {
             // Use a blocking operation to return the client to the pool
             // This is acceptable in a Drop implementation
             let pool = self.pool.clone();
-            let _ = tokio::task::block_in_place(|| {
-                futures::executor::block_on(async {
-                    let mut guard = pool.lock().await;
-                    guard.push(client);
-                })
-            });
+            let mut guard = pool.lock();
+            guard.push(client);
         }
     }
 }
@@ -158,7 +154,7 @@ impl DbClientPool {
 
         // Try to get a client from the pool
         {
-            let mut clients = self.available_clients.lock().await;
+            let mut clients = self.available_clients.lock();
             if !clients.is_empty() {
                 // Take a client from the pool if available
                 let client = clients.remove(0);
@@ -180,9 +176,9 @@ impl DbClientPool {
         if clients_opt.is_none() {
             let mut retry_count = 0;
             while retry_count < 10 {
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                compio::time::sleep(Duration::from_millis(100)).await;
 
-                let mut clients = self.available_clients.lock().await;
+                let mut clients = self.available_clients.lock();
                 if !clients.is_empty() {
                     clients_opt = Some(clients.remove(0));
                     break;
@@ -217,7 +213,7 @@ impl DbClientPool {
 
     /// Perform connection pool maintenance
     async fn maintain_pool(&self) -> io::Result<()> {
-        let mut clients = self.available_clients.lock().await;
+        let mut clients = self.available_clients.lock();
         let now = Instant::now();
 
         // Store current length before modification
@@ -283,13 +279,13 @@ impl DbClient {
         // Start a background task to maintain the pool
         let pool_arc = Arc::new(pool);
         let pool_ref = Arc::clone(&pool_arc);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60));
+        compio::runtime::spawn(async move {
+            let mut interval = compio::time::interval(Duration::from_secs(60));
             loop {
                 interval.tick().await;
                 let _ = pool_ref.maintain_pool().await;
             }
-        });
+        }).detach();
 
         Ok(DbClient {
             pool: pool_arc,
@@ -308,13 +304,13 @@ impl DbClient {
         // Start a background task to maintain the pool
         let pool_arc = Arc::new(pool);
         let pool_ref = Arc::clone(&pool_arc);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60));
+        compio::runtime::spawn(async move {
+            let mut interval = compio::time::interval(Duration::from_secs(60));
             loop {
                 interval.tick().await;
                 let _ = pool_ref.maintain_pool().await;
             }
-        });
+        }).detach();
 
         Ok(DbClient {
             pool: pool_arc,

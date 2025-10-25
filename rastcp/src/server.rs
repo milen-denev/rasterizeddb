@@ -10,9 +10,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, TcpStream};
-use tokio_rustls::TlsAcceptor;
+use compio::net::{TcpListener, TcpStream};
+use compio::tls::TlsAcceptor;
 
 use crate::cert::generate_self_signed_cert;
 use crate::common::{read_message, write_message};
@@ -129,14 +128,14 @@ impl TcpServerBuilder {
             .map_err(|e| RastcpError::SocketKeepAliveError(e.to_string()))?;
 
         let listener: std::net::TcpListener = socket.into();
-        let tokio_listener = TcpListener::from_std(listener).unwrap();
+        let compio_listener = TcpListener::from_std(listener).unwrap();
 
         let acceptor = TlsAcceptor::from(Arc::new(server_config));
 
         info!("Server built to listen on {}:{}", self.addr, self.port);
 
         Ok(TcpServer {
-            listener: tokio_listener,
+            listener: compio_listener,
             acceptor,
             max_connections: self.max_connections,
             current_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -180,7 +179,7 @@ impl TcpServer {
                         current, max, backoff
                     );
 
-                    tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                    compio::time::sleep(std::time::Duration::from_millis(backoff)).await;
                     continue;
                 } else {
                     consecutive_max_connections = 0;
@@ -188,7 +187,7 @@ impl TcpServer {
             }
 
             // Use timeout for accepting connections to avoid blocking indefinitely
-            match tokio::time::timeout(Duration::from_secs(1), self.listener.accept()).await {
+            match compio::time::timeout(Duration::from_secs(1), self.listener.accept()).await {
                 Ok(Ok((stream, addr))) => {
                     info!("New connection from {}", addr);
 
@@ -200,7 +199,7 @@ impl TcpServer {
                     let current = conn_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     debug!("Active connections: {}", current + 1);
 
-                    tokio::spawn(async move {
+                    compio::runtime::spawn(async move {
                         if let Err(e) = Self::handle_connection(stream, acceptor, handler).await {
                             error!("Connection error: {}", e);
                         }
@@ -208,11 +207,11 @@ impl TcpServer {
                         let remaining =
                             conn_counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) - 1;
                         debug!("Connection closed. Active connections: {}", remaining);
-                    });
+                    }).detach();
                 }
                 Ok(Err(e)) => {
                     error!("Failed to accept connection: {}", e);
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    compio::time::sleep(Duration::from_millis(10)).await;
                 }
                 Err(_) => {
                     // Timeout on accept - just continue
@@ -256,7 +255,7 @@ impl TcpServer {
                         current, max, backoff
                     );
 
-                    tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                    compio::time::sleep(std::time::Duration::from_millis(backoff)).await;
                     continue;
                 } else {
                     consecutive_max_connections = 0;
@@ -264,7 +263,7 @@ impl TcpServer {
             }
 
             // Use timeout for accepting connections to avoid blocking indefinitely
-            match tokio::time::timeout(Duration::from_secs(1), self.listener.accept()).await {
+            match compio::time::timeout(Duration::from_secs(1), self.listener.accept()).await {
                 Ok(Ok((stream, addr))) => {
                     info!("New connection from {}", addr);
 
@@ -277,7 +276,7 @@ impl TcpServer {
                     let current = conn_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     debug!("Active connections: {}", current + 1);
 
-                    tokio::spawn(async move {
+                    compio::runtime::spawn(async move {
                         if let Err(e) =
                             Self::handle_connection_with_context(stream, acceptor, context, handler)
                                 .await
@@ -288,11 +287,11 @@ impl TcpServer {
                         let remaining =
                             conn_counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) - 1;
                         debug!("Connection closed. Active connections: {}", remaining);
-                    });
+                    }).detach();
                 }
                 Ok(Err(e)) => {
                     error!("Failed to accept connection: {}", e);
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    compio::time::sleep(Duration::from_millis(10)).await;
                 }
                 Err(_) => {
                     // Timeout on accept - just continue
@@ -305,12 +304,12 @@ impl TcpServer {
     // New method that accepts a mutable reference to a context through Arc<Mutex<>>
     pub async fn run_with_shared_context<A, F, Fut>(
         &self,
-        context: Arc<tokio::sync::Mutex<A>>,
+            context: Arc<futures_util::lock::Mutex<A>>,
         handler: F,
     ) -> Result<(), RastcpError>
     where
         A: Send + Sync + 'static,
-        F: Fn(Arc<tokio::sync::Mutex<A>>, Vec<u8>) -> Fut + Send + Sync + Clone + 'static,
+        F: Fn(Arc<futures_util::lock::Mutex<A>>, Vec<u8>) -> Fut + Send + Sync + Clone + 'static,
         Fut: Future<Output = Vec<u8>> + Send + 'static,
     {
         let acceptor = self.acceptor.clone();
@@ -336,7 +335,7 @@ impl TcpServer {
                         current, max, backoff
                     );
 
-                    tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                    compio::time::sleep(std::time::Duration::from_millis(backoff)).await;
                     continue;
                 } else {
                     consecutive_max_connections = 0;
@@ -344,7 +343,7 @@ impl TcpServer {
             }
 
             // Use timeout for accepting connections to avoid blocking indefinitely
-            match tokio::time::timeout(Duration::from_secs(1), self.listener.accept()).await {
+            match compio::time::timeout(Duration::from_secs(1), self.listener.accept()).await {
                 Ok(Ok((stream, addr))) => {
                     info!("New connection from {}", addr);
 
@@ -357,7 +356,7 @@ impl TcpServer {
                     let current = conn_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     debug!("Active connections: {}", current + 1);
 
-                    tokio::spawn(async move {
+                    compio::runtime::spawn(async move {
                         if let Err(e) = Self::handle_connection_with_shared_context(
                             stream, acceptor, context, handler,
                         )
@@ -369,11 +368,11 @@ impl TcpServer {
                         let remaining =
                             conn_counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) - 1;
                         debug!("Connection closed. Active connections: {}", remaining);
-                    });
+                    }).detach();
                 }
                 Ok(Err(e)) => {
                     error!("Failed to accept connection: {}", e);
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    compio::time::sleep(Duration::from_millis(10)).await;
                 }
                 Err(_) => {
                     // Timeout on accept - just continue
@@ -402,7 +401,7 @@ impl TcpServer {
         debug!("Accepting TLS connection from {}", peer_addr);
 
         // Apply timeout to TLS handshake to prevent hanging connections
-        match tokio::time::timeout(Duration::from_secs(30), acceptor.accept(stream)).await {
+        match compio::time::timeout(Duration::from_secs(30), acceptor.accept(stream)).await {
             Ok(Ok(mut tls_stream)) => {
                 debug!("TLS handshake completed with {}", peer_addr);
                 loop {
@@ -411,7 +410,7 @@ impl TcpServer {
                             debug!("Received {} bytes from {}", data.len(), peer_addr);
                             // Process the data with the handler
                             let response =
-                                match tokio::time::timeout(Duration::from_secs(30), handler(data))
+                                match compio::time::timeout(Duration::from_secs(30), handler(data))
                                     .await
                                 {
                                     Ok(response) => response,
@@ -424,13 +423,6 @@ impl TcpServer {
                             // Send response back
                             if let Err(e) = write_message(&mut tls_stream, &response).await {
                                 error!("Failed to write response to {}: {}", peer_addr, e);
-                                // Attempt graceful shutdown
-                                if let Err(shutdown_err) = tls_stream.shutdown().await {
-                                    error!(
-                                        "TLS shutdown error with {}: {}",
-                                        peer_addr, shutdown_err
-                                    );
-                                }
                                 break;
                             }
                         }
@@ -450,18 +442,11 @@ impl TcpServer {
                         }
                         Err(e) => {
                             error!("Error reading from {}: {}", peer_addr, e);
-                            // Attempt graceful shutdown
-                            if let Err(shutdown_err) = tls_stream.shutdown().await {
-                                error!("TLS shutdown error with {}: {}", peer_addr, shutdown_err);
-                            }
                             break;
                         }
                     }
                 }
-                // Explicit shutdown to ensure clean TLS termination
-                if let Err(e) = tls_stream.shutdown().await {
-                    error!("TLS shutdown error with {}: {}", peer_addr, e);
-                }
+                // Drop tls_stream to close connection
             }
             Ok(Err(e)) => {
                 error!("TLS handshake failed with {}: {}", peer_addr, e);
@@ -490,7 +475,7 @@ impl TcpServer {
         debug!("Accepting TLS connection from {}", peer_addr);
 
         // Apply timeout to TLS handshake to prevent hanging connections
-        match tokio::time::timeout(Duration::from_secs(30), acceptor.accept(stream)).await {
+        match compio::time::timeout(Duration::from_secs(30), acceptor.accept(stream)).await {
             Ok(Ok(mut tls_stream)) => {
                 debug!("TLS handshake completed with {}", peer_addr);
 
@@ -501,8 +486,8 @@ impl TcpServer {
 
                             // Process the data with the handler, passing the context
                             let context_clone = context.clone();
-                            let response = match tokio::time::timeout(
-                                Duration::from_secs(30), // Add timeout for handler
+                            let response = match compio::time::timeout(
+                                Duration::from_secs(30),
                                 handler(context_clone, data),
                             )
                             .await
@@ -544,10 +529,7 @@ impl TcpServer {
                     }
                 }
 
-                // Explicit shutdown to ensure clean TLS termination
-                if let Err(e) = tls_stream.shutdown().await {
-                    debug!("TLS shutdown error with {}: {}", peer_addr, e);
-                }
+                // Drop tls_stream to close connection
             }
             Ok(Err(e)) => {
                 error!("TLS handshake failed with {}: {}", peer_addr, e);
@@ -564,19 +546,19 @@ impl TcpServer {
     async fn handle_connection_with_shared_context<A, F, Fut>(
         stream: TcpStream,
         acceptor: TlsAcceptor,
-        context: Arc<tokio::sync::Mutex<A>>,
+            context: Arc<futures_util::lock::Mutex<A>>,
         handler: F,
     ) -> Result<(), RastcpError>
     where
         A: Send + Sync,
-        F: Fn(Arc<tokio::sync::Mutex<A>>, Vec<u8>) -> Fut + Send + Sync,
+    F: Fn(Arc<futures_util::lock::Mutex<A>>, Vec<u8>) -> Fut + Send + Sync,
         Fut: Future<Output = Vec<u8>> + Send,
     {
         let peer_addr = stream.peer_addr()?;
         debug!("Accepting TLS connection from {}", peer_addr);
 
         // Apply timeout to TLS handshake to prevent hanging connections
-        match tokio::time::timeout(Duration::from_secs(30), acceptor.accept(stream)).await {
+        match compio::time::timeout(Duration::from_secs(30), acceptor.accept(stream)).await {
             Ok(Ok(mut tls_stream)) => {
                 debug!("TLS handshake completed with {}", peer_addr);
 
@@ -586,8 +568,8 @@ impl TcpServer {
                             debug!("Received {} bytes from {}", data.len(), peer_addr);
 
                             // Process the data with the handler, passing the shared context
-                            let response = match tokio::time::timeout(
-                                Duration::from_secs(30), // Add timeout for handler
+                            let response = match compio::time::timeout(
+                                Duration::from_secs(30),
                                 handler(context.clone(), data),
                             )
                             .await
@@ -629,10 +611,7 @@ impl TcpServer {
                     }
                 }
 
-                // Explicit shutdown to ensure clean TLS termination
-                if let Err(e) = tls_stream.shutdown().await {
-                    debug!("TLS shutdown error with {}: {}", peer_addr, e);
-                }
+                // Drop tls_stream to close connection
             }
             Ok(Err(e)) => {
                 error!("TLS handshake failed with {}: {}", peer_addr, e);

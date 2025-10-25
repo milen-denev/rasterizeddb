@@ -49,8 +49,6 @@ pub trait StorageIO: Clone + Sync + Send + 'static {
         length: u32,
     ) -> impl Future<Output = Cursor<Vec<u8>>> + Send + Sync;
 
-    fn read_data_to_end(&self, position: u64) -> impl Future<Output = Vec<u8>> + Send + Sync;
-
     fn append_data(&self, buffer: &[u8], immediate: bool)
     -> impl Future<Output = ()> + Send + Sync;
 

@@ -4,8 +4,8 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, Error, SignatureScheme};
 use std::sync::Arc;
-use tokio::net::TcpStream;
-use tokio_rustls::{TlsConnector, client::TlsStream};
+use compio::net::TcpStream;
+use compio::tls::{TlsConnector, TlsStream};
 
 use crate::common::{read_message, write_message};
 use crate::config::ConfigBuilderExt;
@@ -156,7 +156,7 @@ impl TcpClient {
     pub async fn connect(&mut self) -> Result<(), RastcpError> {
         if self.connection.is_none() {
             let stream = match self.timeout {
-                Some(timeout) => tokio::time::timeout(timeout, TcpStream::connect(&self.addr))
+                Some(timeout) => compio::time::timeout(timeout, TcpStream::connect(&self.addr))
                     .await
                     .map_err(|_| RastcpError::ConnectionTimeout)??,
                 None => TcpStream::connect(&self.addr).await?,
@@ -166,7 +166,7 @@ impl TcpClient {
 
             let tls_stream = self
                 .connector
-                .connect(self.server_name.clone(), stream)
+                .connect(self.addr.split(':').next().unwrap_or("localhost"), stream)
                 .await?;
             debug!("TLS connection established");
 
@@ -177,12 +177,15 @@ impl TcpClient {
 
     // Modified send method to use the existing connection
     pub async fn send(&mut self, data: Vec<u8>) -> Result<Vec<u8>, RastcpError> {
-        // Connect if not connected
+        // Lazily establish the connection if needed so callers don't have to invoke connect() explicitly
         if !self.is_connected() {
-            return Err(RastcpError::NotConnected);
+            self.connect().await?;
         }
 
-        let stream = self.connection.as_mut().unwrap();
+        let stream = match self.connection.as_mut() {
+            Some(stream) => stream,
+            None => return Err(RastcpError::NotConnected),
+        };
 
         // Send data using the connection
         write_message(stream, &data).await?;
@@ -190,9 +193,15 @@ impl TcpClient {
 
         // Receive response
         let response =
-            tokio::time::timeout(std::time::Duration::from_secs(30), read_message(stream))
-                .await
-                .expect("Timeout while reading response")?;
+            match compio::time::timeout(
+                std::time::Duration::from_secs(30),
+                read_message(stream),
+            )
+            .await
+            {
+                Ok(res) => res?,
+                Err(_) => return Err(RastcpError::ConnectionTimeout),
+            };
 
         debug!("Received {} bytes response", response.len());
 
