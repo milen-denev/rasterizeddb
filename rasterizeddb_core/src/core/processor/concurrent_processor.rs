@@ -48,9 +48,7 @@ impl ConcurrentProcessor {
         let tokens = tokenize(&where_query, &table_schema);
 
         let shared_tuple: Arc<(Semaphore, RowFetch, RowFetch)> = Arc::new((
-            Semaphore::new(unsafe {
-                MAX_PERMITS_THREADS
-            }),
+            Semaphore::new(*MAX_PERMITS_THREADS.get().unwrap()),
             query_row_fetch,
             requested_row_fetch,
         ));

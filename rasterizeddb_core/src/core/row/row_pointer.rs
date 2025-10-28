@@ -185,10 +185,10 @@ impl<S: StorageIO> RowPointerIterator<S> {
     }
 
     /// Get multiple RowPointers at once, up to BATCH_SIZE
-    pub async fn next_row_pointers(&mut self) -> Result<SmallVec<[RowPointer; BATCH_SIZE]>> {
-        let mut pointers: SmallVec<[RowPointer; BATCH_SIZE]> = SmallVec::new();
+    pub async fn next_row_pointers(&mut self) -> Result<Vec<RowPointer>> {
+        let mut pointers: Vec<RowPointer> = Vec::new();
 
-        for _ in 0..BATCH_SIZE {
+        for _ in 0..*BATCH_SIZE.get().unwrap() {
             match self.next_row_pointer().await? {
                 Some(pointer) => pointers.push(pointer),
                 None => break,
