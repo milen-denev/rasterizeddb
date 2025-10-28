@@ -7,6 +7,10 @@ pub struct Chunk {
 }
 
 impl Chunk {
+    pub fn new(start: u64, data: Arc<[u8]>) -> Arc<Self> {
+        Arc::new(Self { start, data })
+    }
+    
     pub fn empty() -> Arc<Self> {
         Arc::new(Self {
             start: 0,
