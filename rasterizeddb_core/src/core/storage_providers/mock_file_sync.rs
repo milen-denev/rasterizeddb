@@ -1,6 +1,6 @@
 use std::{
     fs::{self, remove_file},
-    io::{Cursor, Read, Seek, SeekFrom},
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -10,7 +10,7 @@ use futures::future::join_all;
 use memmap2::{Mmap, MmapOptions};
 use temp_testdir::TempDir;
 use tokio::{
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    io::{AsyncSeekExt, AsyncWriteExt},
     sync::RwLock,
     task::yield_now,
 };
@@ -185,38 +185,6 @@ impl StorageIO for MockStorageProvider {
         file.sync_all().await.unwrap();
     }
 
-    async fn read_data(&self, position: &mut u64, length: u32) -> Vec<u8> {
-        yield_now().await;
-
-        let mut read_file = std::fs::File::options()
-            .read(true)
-            .open(&self.file_str)
-            .unwrap();
-
-        read_file.seek(SeekFrom::Start(*position)).unwrap();
-        let mut buffer: Vec<u8> = vec![0; length as usize];
-        let read_result = read_file.read_exact(&mut buffer);
-        if read_result.is_err() {
-            return Vec::default();
-        } else {
-            *position += length as u64;
-            return buffer;
-        }
-    }
-
-    async fn read_data_to_end(&self, position: u64) -> Vec<u8> {
-        let mut read_file = tokio::fs::File::options()
-            .read(true)
-            .open(&self.file_str)
-            .await
-            .unwrap();
-
-        read_file.seek(SeekFrom::Start(position)).await.unwrap();
-        let mut buffer: Vec<u8> = Vec::default();
-        read_file.read_to_end(&mut buffer).await.unwrap();
-        return buffer;
-    }
-
     async fn get_len(&self) -> u64 {
         let read_file = tokio::fs::File::options()
             .read(true)
@@ -331,27 +299,6 @@ impl StorageIO for MockStorageProvider {
         *position += buffer_len as u64;
 
         Ok(())
-    }
-
-    async fn read_data_to_cursor(&self, position: &mut u64, length: u32) -> Cursor<Vec<u8>> {
-        yield_now().await;
-
-        let mut read_file = std::fs::File::options()
-            .read(true)
-            .open(&self.file_str)
-            .unwrap();
-
-        read_file.seek(SeekFrom::Start(*position)).unwrap();
-        let mut buffer: Vec<u8> = vec![0; length as usize];
-        let result = read_file.read_exact(&mut buffer);
-        if result.is_err() {
-            Cursor::new(Vec::default())
-        } else {
-            *position += length as u64;
-            let mut cursor = Cursor::new(buffer);
-            cursor.set_position(0);
-            return cursor;
-        }
     }
 
     async fn write_data_seek(&self, seek: SeekFrom, buffer: &[u8]) {

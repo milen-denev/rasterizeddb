@@ -1,4 +1,4 @@
-use std::io::{Cursor, SeekFrom};
+use std::io::SeekFrom;
 
 use orx_concurrent_vec::ConcurrentVec;
 use rand::RngCore;
@@ -74,20 +74,6 @@ impl StorageIO for MemoryStorageProvider {
         }
     }
 
-    async fn read_data(&self, position: &mut u64, length: u32) -> Vec<u8> {
-        let mut buffer: Vec<u8> = Vec::with_capacity(length as usize);
-        let start = *position;
-        let end = *position + length as u64;
-
-        for i in start..end {
-            let u8_value: u8 = self.vec[i as usize].map(|x| *x);
-            buffer.push(u8_value);
-            *position += 1;
-        }
-
-        return buffer;
-    }
-
     async fn read_data_into_buffer(
         &self,
         position: &mut u64,
@@ -106,36 +92,6 @@ impl StorageIO for MemoryStorageProvider {
         }
 
         Ok(())
-    }
-
-    async fn read_data_to_cursor(
-        &self,
-        position: &mut u64,
-        length: u32,
-    ) -> std::io::Cursor<Vec<u8>> {
-        let mut buffer: Vec<u8> = Vec::with_capacity(length as usize);
-        let start = *position;
-        let end = *position + length as u64;
-
-        for i in start..end {
-            let u8_value: u8 = self.vec[i as usize].map(|x| *x);
-            buffer.push(u8_value);
-            *position += 1;
-        }
-
-        return Cursor::new(buffer);
-    }
-
-    async fn read_data_to_end(&self, position: u64) -> Vec<u8> {
-        let total_len = self.vec.len() as u64;
-        let mut buffer: Vec<u8> = Vec::with_capacity((total_len - position) as usize);
-
-        for i in position..total_len {
-            let u8_value: u8 = self.vec[i as usize].map(|x| *x);
-            buffer.push(u8_value);
-        }
-
-        return buffer;
     }
 
     async fn append_data(&self, buffer: &[u8], _immediate: bool) {

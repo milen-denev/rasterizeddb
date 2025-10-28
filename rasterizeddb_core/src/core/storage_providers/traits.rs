@@ -1,6 +1,6 @@
 use std::{
     future::Future,
-    io::{Cursor, SeekFrom},
+    io::SeekFrom,
 };
 
 pub type IOError = std::io::Error;
@@ -31,25 +31,11 @@ pub trait StorageIO: Clone + Sync + Send + 'static {
         buffer: &[u8],
     ) -> impl Future<Output = ()> + Send + Sync;
 
-    fn read_data(
-        &self,
-        position: &mut u64,
-        length: u32,
-    ) -> impl Future<Output = Vec<u8>> + Send + Sync;
-
     fn read_data_into_buffer(
         &self,
         position: &mut u64,
         buffer: &mut [u8],
     ) -> impl Future<Output = Result<(), std::io::Error>> + Send + Sync;
-
-    fn read_data_to_cursor(
-        &self,
-        position: &mut u64,
-        length: u32,
-    ) -> impl Future<Output = Cursor<Vec<u8>>> + Send + Sync;
-
-    fn read_data_to_end(&self, position: u64) -> impl Future<Output = Vec<u8>> + Send + Sync;
 
     fn append_data(&self, buffer: &[u8], immediate: bool)
     -> impl Future<Output = ()> + Send + Sync;
