@@ -7,7 +7,7 @@ edition = "2024"
 tokio = { version = "1.47", features = ["full"] }
 rustls = { version = "0.23" }
 tokio-rustls = "0.26"
-rustls-pemfile = "2.2.0"
+rustls-pemfile = "2.2"
 thiserror = "2.0"
 log = "0.4"
 env_logger = "0.11"
