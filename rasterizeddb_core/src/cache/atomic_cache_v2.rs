@@ -889,7 +889,6 @@ where
 }
 
 #[cfg(test)]
-#[cfg(debug_assertions)]
 mod tests {
   use crate::memory_pool::{MemoryBlock, MEMORY_POOL};
 

@@ -1307,7 +1307,6 @@ where
 }
 
 #[cfg(test)]
-#[cfg(debug_assertions)]
 #[allow(dead_code)]
 mod tests {
     use super::*;
