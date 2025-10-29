@@ -110,41 +110,10 @@ impl StorageIO for MemoryStorageProvider {
         true
     }
 
-    async fn write_data_unsync(&self, position: u64, buffer: &[u8]) {
-        let end = position + buffer.len() as u64;
-
-        let mut x = 0;
-
-        let needed_len = buffer.len();
-        let current_len = self.vec.len();
-
-        if current_len < needed_len {
-            self.vec.extend(vec![0; needed_len as usize]);
-        }
-
-        for i in position..end {
-            let u8_value = buffer[x];
-            self.vec[i as usize].update(|x| *x = u8_value);
-            x += 1;
-        }
-    }
-
     async fn verify_data(&self, position: u64, buffer: &[u8]) -> bool {
         let _position = position;
         let _buffer = buffer;
         true
-    }
-
-    async fn verify_data_and_sync(&self, position: u64, buffer: &[u8]) -> bool {
-        let _position = position;
-        let _buffer = buffer;
-        true
-    }
-
-    async fn append_data_unsync(&self, buffer: &[u8]) {
-        for u8_value in buffer {
-            self.vec.extend(vec![*u8_value; 1]);
-        }
     }
 
     async fn create_temp(&self) -> Self {

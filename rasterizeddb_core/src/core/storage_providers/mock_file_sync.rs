@@ -150,12 +150,6 @@ impl MockStorageProvider {
 }
 
 impl StorageIO for MockStorageProvider {
-    async fn write_data_unsync(&self, position: u64, buffer: &[u8]) {
-        let mut file = self.write_file.write().await;
-        file.seek(SeekFrom::Start(position)).await.unwrap();
-        file.write_all(buffer).await.unwrap();
-    }
-
     async fn verify_data(&self, position: u64, buffer: &[u8]) -> bool {
         yield_now().await;
 
@@ -307,31 +301,6 @@ impl StorageIO for MockStorageProvider {
         file.write_all(buffer).await.unwrap();
         file.flush().await.unwrap();
         file.sync_all().await.unwrap();
-    }
-
-    async fn verify_data_and_sync(&self, position: u64, buffer: &[u8]) -> bool {
-        yield_now().await;
-
-        let mut file = std::fs::File::options()
-            .read(true)
-            .write(true)
-            .open(&self.file_str)
-            .unwrap();
-
-        file.seek(SeekFrom::Start(position)).unwrap();
-        let mut file_buffer = vec![0; buffer.len() as usize];
-        file.read_exact(&mut file_buffer).unwrap();
-        if buffer.eq(&file_buffer) {
-            file.sync_data().unwrap();
-            true
-        } else {
-            false
-        }
-    }
-
-    async fn append_data_unsync(&self, buffer: &[u8]) {
-        let mut file = self.append_file.write().await;
-        file.write_all(&buffer).await.unwrap();
     }
 
     async fn create_temp(&self) -> Self {

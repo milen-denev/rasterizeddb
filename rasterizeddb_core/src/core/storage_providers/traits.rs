@@ -8,20 +8,8 @@ pub type IOResult<T> = std::result::Result<T, IOError>;
 
 #[allow(async_fn_in_trait)]
 pub trait StorageIO: Clone + Sync + Send + 'static {
-    fn write_data_unsync(
-        &self,
-        position: u64,
-        buffer: &[u8],
-    ) -> impl Future<Output = ()> + Send + Sync;
-
     fn verify_data(&self, position: u64, buffer: &[u8])
     -> impl Future<Output = bool> + Send + Sync;
-
-    fn verify_data_and_sync(
-        &self,
-        position: u64,
-        buffer: &[u8],
-    ) -> impl Future<Output = bool> + Send + Sync;
 
     fn write_data(&self, position: u64, buffer: &[u8]) -> impl Future<Output = ()> + Send + Sync;
 
@@ -39,8 +27,6 @@ pub trait StorageIO: Clone + Sync + Send + 'static {
 
     fn append_data(&self, buffer: &[u8], immediate: bool)
     -> impl Future<Output = ()> + Send + Sync;
-
-    fn append_data_unsync(&self, buffer: &[u8]) -> impl Future<Output = ()> + Send + Sync;
 
     fn get_len(&self) -> impl Future<Output = u64> + Send + Sync;
 

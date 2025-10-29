@@ -9,9 +9,7 @@ use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use arc_swap::ArcSwap;
 use crossbeam_queue::SegQueue;
 use parking_lot::{Mutex, RwLock};
-use tokio::{
-    io::{AsyncReadExt, AsyncSeekExt}, task::yield_now
-};
+use tokio::task::yield_now;
 
 use memmap2::{Mmap, MmapOptions};
 
@@ -986,12 +984,6 @@ impl LocalStorageProvider {
 }
 
 impl StorageIO for LocalStorageProvider {
-    async fn write_data_unsync(&self, position: u64, buffer: &[u8]) {
-        let mut file = self.write_file.write();
-        file.seek(SeekFrom::Start(position)).unwrap();
-        file.write_all(buffer).unwrap();
-    }
-
     async fn verify_data(&self, position: u64, buffer: &[u8]) -> bool {
         let mut file_read = std::fs::File::options()
             .read(true)
@@ -1084,37 +1076,6 @@ impl StorageIO for LocalStorageProvider {
         file.write_all(buffer).unwrap();
         file.flush().unwrap();
         file.sync_all().unwrap();
-    }
-
-    async fn verify_data_and_sync(&self, position: u64, buffer: &[u8]) -> bool {
-        let mut file = tokio::fs::File::options()
-            .read(true)
-            .write(true)
-            .open(&self.file_str)
-            .await
-            .unwrap();
-
-        file.seek(SeekFrom::Start(position)).await.unwrap();
-        let mut file_buffer = vec![0; buffer.len() as usize];
-        file.read_exact(&mut file_buffer).await.unwrap();
-
-        if buffer.eq(&file_buffer) {
-            file.sync_data().await.unwrap();
-            true
-        } else {
-            false
-        }
-    }
-
-    async fn append_data_unsync(&self, buffer: &[u8]) {
-        // Keep behavior for unsynced path consistent: stage to temp as well.
-        let mut tf = self.temp_file.write();
-        tf.seek(SeekFrom::End(0)).unwrap();
-        tf.write_all(&buffer).unwrap();
-        let _ = tf.flush();
-        self.temp_has_data.store(true, Ordering::Release);
-        self.temp_file_len
-            .fetch_add(buffer.len() as u64, Ordering::Release);
     }
 
     async fn create_temp(&self) -> Self {
