@@ -8,7 +8,7 @@ use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 
 use arc_swap::ArcSwap;
 use log::error;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use tokio::task::yield_now;
 
 use memmap2::{Mmap, MmapOptions};
@@ -19,21 +19,12 @@ use std::os::windows::fs::FileExt;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 
-use crate::core::storage_providers::helpers::Chunk;
+// Removed chunk cache; no longer need helpers::Chunk
 
 use super::{CRC, traits::StorageIO};
 
-#[cfg(unix)]
-use super::io_uring_reader::AsyncUringReader;
-
-type StdResult<T, E> = std::result::Result<T, E>;
-
-const DIRECT_READ_BYPASS_FACTOR: usize = 4; // if remaining >= chunk_size * this => direct read
-const CACHED_CHUNK_SIZE: usize = 32 * 1024 * 1024; // 32MB chunks
-
 pub enum FastPathResult {
     Done,              // fully satisfied
-    NeedChunk,         // must load a chunk that is not present
     EofPartial(usize), // partial bytes copied (usize) then EOF
     EofNone,           // position at/after EOF before copying
 }
@@ -57,12 +48,7 @@ pub struct LocalStorageProvider {
     // true when there is data in temp_file waiting to be flushed
     temp_has_data: AtomicBool,
     // used to temporarily block appends during flush
-    append_blocked: AtomicBool,
-    #[cfg(unix)]
-    io_uring_reader: AsyncUringReader,
-    chunk: ArcSwap<Chunk>,
-    chunk_reload: Mutex<()>,
-    chunk_size: usize
+    append_blocked: AtomicBool
 }
 
 unsafe impl Sync for LocalStorageProvider {}
@@ -90,12 +76,7 @@ impl Clone for LocalStorageProvider {
             hash: CRC.checksum(format!("{}+++{}", self.location, self.table_name).as_bytes()),
             _locked: AtomicBool::new(false),
             temp_has_data: AtomicBool::new(self.temp_has_data.load(Ordering::Relaxed)),
-            append_blocked: AtomicBool::new(false),
-            #[cfg(unix)]
-            io_uring_reader: self.io_uring_reader.clone(),
-            chunk: ArcSwap::new(Chunk::empty()),
-            chunk_reload: Mutex::new(()),
-            chunk_size: CACHED_CHUNK_SIZE, // 16MB chunks
+            append_blocked: AtomicBool::new(false)
         }
     }
 }
@@ -215,12 +196,7 @@ impl LocalStorageProvider {
                 _locked: AtomicBool::new(false),
                 temp_file_len: AtomicU64::new(temp_len),
                 temp_has_data: AtomicBool::new(false),
-                append_blocked: AtomicBool::new(false),
-                #[cfg(unix)]
-                io_uring_reader: AsyncUringReader::new(&file_str, 1024).unwrap(),
-                chunk: ArcSwap::new(Chunk::empty()),
-                chunk_reload: Mutex::new(()),
-                chunk_size: CACHED_CHUNK_SIZE, // 16MB chunks
+                append_blocked: AtomicBool::new(false)
             };
 
             // If there are staged bytes in temp file, flush them into the main file.
@@ -334,12 +310,7 @@ impl LocalStorageProvider {
                 _locked: AtomicBool::new(false),
                 temp_file_len: AtomicU64::new(temp_len),
                 temp_has_data: AtomicBool::new(false),
-                append_blocked: AtomicBool::new(false),
-                #[cfg(unix)]
-                io_uring_reader: AsyncUringReader::new(&file_str, 1024).unwrap(),
-                chunk: ArcSwap::new(Chunk::empty()),
-                chunk_reload: Mutex::new(()),
-                chunk_size: CACHED_CHUNK_SIZE, // 16MB chunks
+                append_blocked: AtomicBool::new(false)
             };
 
             if temp_len > 0 && file_len > 0 {
@@ -462,87 +433,6 @@ impl LocalStorageProvider {
     self._locked.store(false, Ordering::Release);
     }
 
-    #[allow(dead_code)]
-    fn read_from_memory_map_or_file(
-        &self,
-        position: u64,
-        buffer: &mut [u8],
-    ) -> std::io::Result<()> {
-        let memory_map = self._memory_map.load();
-
-        let buffer_len = buffer.len();
-
-        if memory_map.len() >= position as usize + buffer_len {
-            // Read from memory map
-            let start_idx = position as usize;
-            let end_idx = start_idx + buffer_len;
-
-            // Bounds check
-            if end_idx <= memory_map.len() {
-                buffer.copy_from_slice(&memory_map[start_idx..end_idx]);
-
-                return Ok(());
-            }
-        }
-
-        // Fallback to file reading
-        self.read_from_file_direct(position, buffer)
-    }
-
-    #[allow(dead_code)]
-    fn read_from_file_direct(&self, position: u64, buffer: &mut [u8]) -> std::io::Result<()> {
-        let mut read_file = std::fs::File::options()
-            .read(true)
-            .open(&self.file_str)
-            .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to open file: {}", e),
-                )
-            })?;
-
-        read_file.seek(SeekFrom::Start(position)).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to seek to position {}: {}", position, e),
-            )
-        })?;
-
-        read_file.read_exact(buffer).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!(
-                    "Failed to read {} bytes at position {}: {}",
-                    buffer.len(),
-                    position,
-                    e
-                ),
-            )
-        })?;
-
-        Ok(())
-    }
-
-    /// Compute the rolling cache window for a given position.
-    /// Rules:
-    /// 1. End never exceeds file_len.
-    /// 2. Window length equals cache_size when file_len >= cache_size.
-    /// 3. Window "rolls" in fixed-size buckets aligned to cache_size, except
-    ///    near EOF where it is shifted backward to keep full size.
-    #[allow(dead_code)]
-    fn compute_range_centered(pos: u64, file_len: u64, cache_size: u64) -> (u64, u64) {
-        if file_len <= cache_size {
-            return (0, file_len);
-        }
-        let half = cache_size / 2;
-        let mut start = pos.saturating_sub(half);
-        if start + cache_size > file_len {
-            start = file_len - cache_size;
-        }
-        let end = start + cache_size;
-        (start, end)
-    }
-
     #[inline(always)]
     fn load_file_len(&self) -> u64 {
         // If writers publish length with Release, Acquire here would be stricter.
@@ -590,52 +480,6 @@ impl LocalStorageProvider {
         }
     }
 
-    /* --------- Chunk loading (single-flight) --------- */
-    #[cold]
-    async fn load_chunk_for(&self, pos: u64) -> io::Result<Arc<Chunk>> {
-        let aligned = self.align_chunk_start(pos);
-        let _g = self.chunk_reload.lock();
-
-        // Double-check after acquiring lock (another task may have loaded it).
-        if let Some(hit) = self.try_chunk_hit(pos) {
-            return Ok(hit);
-        }
-
-        let mut temp = vec![0u8; self.chunk_size];
-        let n = self.pread_exact_or_partial(aligned, &mut temp)?;
-        if n == 0 {
-            return Err(io::Error::new(
-                ErrorKind::UnexpectedEof,
-                "EOF loading chunk",
-            ));
-        }
-        temp.truncate(n);
-        let new_chunk = Arc::new(Chunk {
-            start: aligned,
-            data: temp.into_boxed_slice().into(),
-        });
-        self.chunk.store(new_chunk.clone());
-        Ok(new_chunk)
-    }
-
-    #[inline(always)]
-    fn align_chunk_start(&self, pos: u64) -> u64 {
-        let cs = self.chunk_size as u64;
-        (pos / cs) * cs
-    }
-
-    #[inline(always)]
-    fn try_chunk_hit(&self, pos: u64) -> Option<Arc<Chunk>> {
-        let c = self.chunk.load_full();
-        if c.contains(pos) { Some(c) } else { None }
-    }
-
-    /* --------- Legacy direct file path (if you keep it) --------- */
-    #[allow(dead_code)]
-    fn read_from_file_direct_legacy(&self, pos: u64, dst: &mut [u8]) -> io::Result<usize> {
-        self.pread_exact_or_partial(pos, dst)
-    }
-
     // Single large mmap copy if possible. Returns bytes copied.
     #[inline(always)]
     fn mmap_copy_region(&self, pos: u64, buf: &mut [u8], file_len: u64) -> usize {
@@ -656,44 +500,6 @@ impl LocalStorageProvider {
         // bounds guaranteed by max_span
         buf[..to_copy].copy_from_slice(&mmap[start..end]);
         to_copy
-    }
-
-    #[inline(always)]
-    fn direct_large_read(&self, pos: u64, buf: &mut [u8], file_len: u64) -> io::Result<usize> {
-        // Clamp size to remain within file_len.
-        if pos >= file_len {
-            return Ok(0);
-        }
-        let max_avail = (file_len - pos) as usize;
-        let to_read = buf.len().min(max_avail);
-        let slice = &mut buf[..to_read];
-        let n = self.pread_exact_or_partial(pos, slice)?;
-        Ok(n)
-    }
-
-    #[inline(always)]
-    fn fast_chunk_copy(
-        &self,
-        pos: u64,
-        buf: &mut [u8],
-        file_len: u64,
-    ) -> StdResult<(usize, bool), FastPathResult> {
-        // Returns (bytes_copied, fully_satisfied?). On miss returns Err(NeedChunk).
-        if pos >= file_len {
-            return Err(FastPathResult::EofNone);
-        }
-        if let Some(chunk) = self.try_chunk_hit(pos) {
-            let offset = (pos - chunk.start) as usize;
-            let avail = chunk.data.len() - offset;
-            let to_copy = avail.min(buf.len()).min((file_len - pos) as usize);
-            if to_copy == 0 {
-                return Err(FastPathResult::EofNone);
-            }
-            buf[..to_copy].copy_from_slice(&chunk.data[offset..offset + to_copy]);
-            Ok((to_copy, to_copy == buf.len()))
-        } else {
-            Err(FastPathResult::NeedChunk)
-        }
     }
 
     // Synchronous fast path attempt: returns a FastPathResult; never awaits.
@@ -724,12 +530,33 @@ impl LocalStorageProvider {
             }
         }
 
-        // (2) If large remaining region, bypass chunk caching and read directly
-        let remaining = buffer.len() - total_copied;
-        if remaining >= self.chunk_size * DIRECT_READ_BYPASS_FACTOR {
-            match self.direct_large_read(pos, &mut buffer[total_copied..], file_len) {
-                Ok(n) if n == 0 => {
-                    // EOF right here
+        // (2) Direct read loop to fill remaining buffer without chunk caching
+        while total_copied < buffer.len() {
+            // Clamp to logical EOF
+            if pos >= file_len {
+                if total_copied == 0 {
+                    return FastPathResult::EofNone;
+                } else {
+                    *position = pos;
+                    return FastPathResult::EofPartial(total_copied);
+                }
+            }
+
+            let avail = (file_len - pos) as usize;
+            let want = buffer.len() - total_copied;
+            let to_read = avail.min(want);
+            if to_read == 0 {
+                if total_copied == 0 {
+                    return FastPathResult::EofNone;
+                } else {
+                    *position = pos;
+                    return FastPathResult::EofPartial(total_copied);
+                }
+            }
+
+            match self.pread_exact_or_partial(pos, &mut buffer[total_copied..total_copied + to_read]) {
+                Ok(0) => {
+                    // EOF encountered
                     if total_copied == 0 {
                         return FastPathResult::EofNone;
                     } else {
@@ -744,10 +571,9 @@ impl LocalStorageProvider {
                         *position = pos;
                         return FastPathResult::Done;
                     }
-                    // If still remaining, proceed to chunk stage
+                    // continue loop to fill more
                 }
                 Err(e) => {
-                    // Treat errors other than EOF immediately
                     if e.kind() == ErrorKind::UnexpectedEof {
                         if total_copied == 0 {
                             return FastPathResult::EofNone;
@@ -756,7 +582,7 @@ impl LocalStorageProvider {
                             return FastPathResult::EofPartial(total_copied);
                         }
                     }
-                    // For simplicity bubble up as partial EOF (or you can wrap in io::Error later)
+                    // Treat other errors as EOF-equivalent for fast-path signaling
                     if total_copied == 0 {
                         return FastPathResult::EofNone;
                     } else {
@@ -764,39 +590,6 @@ impl LocalStorageProvider {
                         return FastPathResult::EofPartial(total_copied);
                     }
                 }
-            }
-        }
-
-        // (3) Chunk loop (fast hits or single-flight miss)
-        while total_copied < buffer.len() {
-            match self.fast_chunk_copy(pos, &mut buffer[total_copied..], file_len) {
-                Ok((n, full)) => {
-                    pos += n as u64;
-                    total_copied += n;
-                    if full {
-                        *position = pos;
-                        return FastPathResult::Done;
-                    }
-                    continue; // more buffer to fill
-                }
-                Err(FastPathResult::NeedChunk) => {
-                    // We must jump to async path for chunk load
-                    *position = pos; // update progress before handing off
-                    if total_copied > 0 {
-                        return FastPathResult::EofPartial(total_copied).into_need_chunk_hint();
-                    }
-                    return FastPathResult::NeedChunk;
-                }
-                Err(FastPathResult::EofNone) => {
-                    if total_copied == 0 {
-                        return FastPathResult::EofNone;
-                    } else {
-                        *position = pos;
-                        return FastPathResult::EofPartial(total_copied);
-                    }
-                }
-                Err(FastPathResult::EofPartial(_)) => unreachable!(),
-                Err(other) => return other,
             }
         }
 
@@ -838,26 +631,6 @@ impl LocalStorageProvider {
             {
                 FastPathResult::Done => {
                     return Ok(());
-                }
-                FastPathResult::NeedChunk => {
-                    // If we're in the temp region, don't try to load chunks from main file.
-                    if *position >= main_len {
-                        let temp_off = *position - main_len;
-                        let slice = &mut buffer[overall_copied..];
-                        let n = self.temp_pread_exact_or_partial(temp_off, slice)?;
-                        *position += n as u64;
-                        overall_copied += n;
-                        if overall_copied == total_len {
-                            return Ok(());
-                        }
-                        return Err(io::Error::new(
-                            ErrorKind::UnexpectedEof,
-                            "Reached logical EOF",
-                        ));
-                    }
-                    // Load chunk for current position in main file
-                    self.load_chunk_for(*position).await?;
-                    continue; // retry fast path
                 }
                 FastPathResult::EofNone => {
                     // If EOF relative to main file but temp has data and our position is inside logical range,
@@ -1095,11 +868,6 @@ impl StorageIO for LocalStorageProvider {
             _locked: AtomicBool::new(false),
             temp_has_data: AtomicBool::new(false),
             append_blocked: AtomicBool::new(false),
-            #[cfg(unix)]
-            io_uring_reader: AsyncUringReader::new(&file_str, 1024).unwrap(),
-            chunk: ArcSwap::new(Chunk::empty()),
-            chunk_reload: Mutex::new(()),
-            chunk_size: CACHED_CHUNK_SIZE, // 16MB chunks
         };
 
         if staged_len > 0 && file_len > 0 {
@@ -1214,12 +982,7 @@ impl StorageIO for LocalStorageProvider {
             hash: CRC.checksum(format!("{}+++{}", final_location, name).as_bytes()),
             _locked: AtomicBool::new(false),
             temp_has_data: AtomicBool::new(false),
-            append_blocked: AtomicBool::new(false),
-            #[cfg(unix)]
-            io_uring_reader: AsyncUringReader::new(&new_table, 1024).unwrap(),
-            chunk: ArcSwap::new(Chunk::empty()),
-            chunk_reload: Mutex::new(()),
-            chunk_size: CACHED_CHUNK_SIZE, // 16MB chunks
+            append_blocked: AtomicBool::new(false)
         };
 
         if staged_len > 0 && file_len > 0 {
@@ -1272,18 +1035,6 @@ impl StorageIO for LocalStorageProvider {
 
     fn get_name(&self) -> String {
         self.table_name.clone()
-    }
-}
-
-// Helper: transform EofPartial to NeedChunk hint if you want to treat partial before miss differently.
-// Here just a simple extension method (optional).
-trait IntoNeedChunk {
-    fn into_need_chunk_hint(self) -> Self;
-}
-
-impl IntoNeedChunk for FastPathResult {
-    fn into_need_chunk_hint(self) -> Self {
-        self
     }
 }
 
