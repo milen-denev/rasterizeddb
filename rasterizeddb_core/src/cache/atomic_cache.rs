@@ -35,8 +35,7 @@
 //! }
 //! ```
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::mem::{MaybeUninit, align_of, size_of};
 use std::ptr;
 use std::sync::Arc;
@@ -44,6 +43,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
+use ahash::RandomState;
 
 /// Cache-line aligned atomic entry structure.
 ///
@@ -141,7 +141,7 @@ where
     /// the size and alignment requirements of type T.
     #[inline]
     fn new() -> Self {
-        let use_fallback = size_of::<T>() > 8 || align_of::<T>() > 8;
+        let use_fallback = size_of::<T>() > 8 || align_of::<T>() > 8 || std::mem::needs_drop::<T>();
 
         Self {
             key_hash: AtomicU64::new(0),
@@ -221,7 +221,8 @@ where
     /// The current state (STATE_EMPTY, STATE_RESERVED, etc.)
     #[inline]
     fn get_state(&self) -> u32 {
-        unpack_state(self.state_version.load(Ordering::Relaxed))
+        // Acquire so that subsequent loads of fields observe data published by writers
+        unpack_state(self.state_version.load(Ordering::Acquire))
     }
 
     /// Gets the current version of the entry.
@@ -232,7 +233,7 @@ where
     /// The current version number
     #[inline]
     fn get_version(&self) -> u32 {
-        unpack_version(self.state_version.load(Ordering::Relaxed))
+        unpack_version(self.state_version.load(Ordering::Acquire))
     }
 
     /// Atomically compares and exchanges the state, incrementing the version.
@@ -254,12 +255,9 @@ where
         if current_state == current {
             let new_version = current_version.wrapping_add(1);
             let new_sv = pack_state_version(new, new_version);
-            self.state_version.compare_exchange_weak(
-                current_sv,
-                new_sv,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            )
+            // Publish with AcqRel on success; Acquire on failure to synchronize
+            self.state_version
+                .compare_exchange(current_sv, new_sv, Ordering::AcqRel, Ordering::Acquire)
         } else {
             Err(current_sv)
         }
@@ -310,6 +308,10 @@ where
     /// Bit mask for fast modulo operations (capacity - 1)
     capacity_mask: usize,
     max_capacity: usize,
+    /// Global monotonic sequence counter for total ordering across entries
+    sequence_counter: AtomicU64,
+    /// Fast non-cryptographic hasher state (ahash)
+    hasher: RandomState,
 }
 
 unsafe impl<K, T> Sync for AtomicGenericCache<K, T>
@@ -361,6 +363,9 @@ where
             write_index: AtomicUsize::new(0),
             capacity_mask: capacity - 1,
             max_capacity,
+            // Start from 1 so tests asserting non-zero sequence pass
+            sequence_counter: AtomicU64::new(1),
+            hasher: RandomState::default(),
         })
     }
 
@@ -376,9 +381,9 @@ where
     /// 64-bit hash value (guaranteed non-zero)
     #[inline]
     fn hash_key(&self, key: &K) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        key.hash(&mut hasher);
-        let hash = hasher.finish();
+        let mut h = self.hasher.build_hasher();
+        key.hash(&mut h);
+        let hash = h.finish();
         hash | 1
     }
 
@@ -668,8 +673,9 @@ where
         value: T,
         timestamp: u64,
     ) -> std::io::Result<()> {
-        // Increment sequence for ordering
-        slot.sequence.fetch_add(1, Ordering::Relaxed);
+        // Assign a global sequence for total ordering across cache
+        let seq = self.sequence_counter.fetch_add(1, Ordering::Relaxed);
+        slot.sequence.store(seq, Ordering::Relaxed);
         slot.key_hash.store(key_hash, Ordering::Relaxed);
         let result = slot.store_value(value);
         slot.timestamp_nanos.store(timestamp, Ordering::Relaxed);
