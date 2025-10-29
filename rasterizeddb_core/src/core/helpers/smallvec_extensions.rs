@@ -108,3 +108,87 @@ impl<A: Array> SmallVecExtensions<A> for SmallVec<A> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::SmallVecExtensions;
+    use smallvec::SmallVec;
+
+    #[test]
+    fn push_back_and_pop_front_basic_inline() {
+        let mut sv: SmallVec<[i32; 4]> = SmallVec::new();
+
+        sv.push_back(1);
+        sv.push_back(2);
+        sv.push_back(3);
+
+        assert_eq!(sv.len(), 3);
+        assert_eq!(sv.pop_front(), Some(1));
+        assert_eq!(sv.as_slice(), &[2, 3]);
+        assert_eq!(sv.len(), 2);
+    }
+
+    #[test]
+    fn pop_front_empty_returns_none() {
+        let mut sv: SmallVec<[i32; 2]> = SmallVec::new();
+        assert_eq!(sv.pop_front(), None);
+        assert!(sv.is_empty());
+    }
+
+    #[test]
+    fn pop_front_until_partial_on_heap_backed() {
+        // Force heap allocation by exceeding inline capacity (4)
+        let mut sv: SmallVec<[i32; 4]> = SmallVec::new();
+        for i in 0..10 {
+            sv.push_back(i);
+        }
+
+        assert_eq!(sv.len(), 10);
+        assert_eq!(sv.pop_front(), Some(0));
+        assert_eq!(sv.pop_front(), Some(1));
+        assert_eq!(sv.pop_front(), Some(2));
+        assert_eq!(sv.as_slice(), &[3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(sv.len(), 7);
+    }
+
+    #[test]
+    fn splice_delete_only_middle_range() {
+        let mut sv: SmallVec<[i32; 8]> = SmallVec::from_buf([1, 2, 3, 4, 5, 0, 0, 0]);
+        // Truncate to actual initial len 5
+        sv.truncate(5);
+
+        // Remove 3 elements starting at index 1: remove 2,3,4
+        sv.splice(1, 3, std::iter::empty());
+        assert_eq!(sv.as_slice(), &[1, 5]);
+    }
+
+    #[test]
+    fn splice_insert_only_no_delete() {
+        let mut sv: SmallVec<[i32; 4]> = SmallVec::from_slice(&[1, 2]);
+        sv.splice(1, 0, [9, 9]);
+        assert_eq!(sv.as_slice(), &[1, 9, 9, 2]);
+    }
+
+    #[test]
+    fn splice_replace_with_more_items() {
+        let mut sv: SmallVec<[i32; 8]> = SmallVec::from_slice(&[1, 2, 3, 4, 5]);
+        // Replace [2,3] with [8,9,10]
+        sv.splice(1, 2, [8, 9, 10]);
+        assert_eq!(sv.as_slice(), &[1, 8, 9, 10, 4, 5]);
+    }
+
+    #[test]
+    fn extend_from_slice_with_strings_clone_items() {
+        let mut sv: SmallVec<[String; 2]> = SmallVec::new();
+        let other = ["a".to_string(), "b".to_string(), "c".to_string()];
+        sv.extend_from_slice(&other);
+
+        assert_eq!(sv.len(), 3);
+        assert_eq!(sv.as_slice(), &["a", "b", "c"]);
+
+        // Ensure original slice is intact (cloned, not moved)
+        assert_eq!(other[0], "a");
+        assert_eq!(other[1], "b");
+        assert_eq!(other[2], "c");
+    }
+}
