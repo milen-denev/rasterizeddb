@@ -152,7 +152,10 @@ impl SchemaField {
 
     pub async fn save_field(&self, io: &mut impl StorageIO) -> io::Result<()> {
         let data = self.into_vec();
+
+        // True only if appending multiple fields in a batch, no background service is running.
         io.append_data(&data, true).await;
+
         Ok(())
     }
 }
@@ -496,7 +499,7 @@ impl TableSchema {
 
     pub async fn save<S: StorageIO>(&self, schema_io: Arc<S>) -> io::Result<()> {
         let data = self.into_vec();
-        schema_io.append_data(&data, true).await;
+        schema_io.append_data(&data, false).await;
         Ok(())
     }
 

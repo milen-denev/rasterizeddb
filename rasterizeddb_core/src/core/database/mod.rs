@@ -48,7 +48,10 @@ impl Database {
 
         let io_pointers =
             Arc::new(LocalStorageProvider::new(location, Some("db_data_pointers.db")).await);
-        let io_rows = Arc::new(LocalStorageProvider::new(location, Some("db_data_rows.db")).await);
+
+        let io_rows = 
+            Arc::new(LocalStorageProvider::new(location, Some("db_data_rows.db")).await);
+
         let io_schema =
             Arc::new(LocalStorageProvider::new(location, Some("db_data_schema.db")).await);
 
@@ -57,20 +60,13 @@ impl Database {
         let io_schema_clone = io_schema.clone();
 
         tokio::spawn(async move {
-            let clone_io_rows = io_rows_clone.clone();
-            clone_io_rows.start_service().await
+            tokio::join!(io_rows_clone.start_service(), io_pointers_clone.start_service(), io_schema_clone.start_service());
         });
-        tokio::spawn(async move {
-            let clone_io_pointers = io_pointers_clone.clone();
-            clone_io_pointers.start_service().await
-        });
-        tokio::spawn(async move {
-            let clone_io_schema = io_schema_clone.clone();
-            clone_io_schema.start_service().await
-        });
-
+        
         let schema = load_db_data_schema(io_schema.clone()).await;
+
         let mut iterator = RowPointerIterator::new(io_pointers.clone()).await.unwrap();
+
         let tables_names: Vec<(String, u64)> =
             load_db_tables(&schema, &mut iterator, io_rows.clone()).await;
 
@@ -331,7 +327,6 @@ fn create_db_data_row_fetch(schema_fields: &SmallVec<[SchemaField; 20]>) -> RowF
     }
 }
 
-#[allow(unused_variables)]
 pub(crate) async fn process_incoming_queries(
     database: Arc<Database>,
     request_vec: Vec<u8>,
