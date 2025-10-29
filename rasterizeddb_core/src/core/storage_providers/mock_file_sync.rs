@@ -5,8 +5,6 @@ use std::{
     sync::Arc,
 };
 
-use crossbeam_queue::SegQueue;
-use futures::future::join_all;
 use memmap2::{Mmap, MmapOptions};
 use temp_testdir::TempDir;
 use tokio::{
@@ -14,8 +12,6 @@ use tokio::{
     sync::RwLock,
     task::yield_now,
 };
-
-use crate::memory_pool::MemoryBlock;
 
 use super::{CRC, traits::StorageIO};
 
@@ -27,7 +23,6 @@ pub struct MockStorageProvider {
     pub(crate) file_str: String,
     _temp_dir_hold: TempDir,
     pub(crate) hash: u32,
-    appender: SegQueue<MemoryBlock>,
     pub(crate) _memory_map: Mmap,
 }
 
@@ -44,7 +39,6 @@ impl Clone for MockStorageProvider {
             file_str: self.file_str.clone(),
             _temp_dir_hold: TempDir::default(),
             hash: CRC.checksum(format!("{}+++{}", self.location, "temp.db").as_bytes()),
-            appender: SegQueue::new(),
             _memory_map: unsafe {
                 MmapOptions::new()
                     .map(&std::fs::File::open(&self.file_str).unwrap())
@@ -101,7 +95,6 @@ impl MockStorageProvider {
             _temp_dir_hold: temp,
             hash: CRC
                 .checksum(format!("{}+++{}", file_path.to_str().unwrap(), "TEMP.db").as_bytes()),
-            appender: SegQueue::new(),
             _memory_map: unsafe { MmapOptions::new().map(&file_read).unwrap() },
         }
     }
@@ -127,25 +120,6 @@ impl MockStorageProvider {
         _ = file_read.sync_all();
         _ = file_append.sync_all();
         _ = file_write.sync_all();
-    }
-
-    pub async fn start_append_data_service(&self) {
-        loop {
-            if self.appender.len() > 0 {
-                let mut buffer: Vec<u8> = Vec::default();
-
-                while let Some(block) = self.appender.pop() {
-                    buffer.extend_from_slice(block.into_slice());
-                }
-
-                let mut file = self.append_file.write().await;
-                file.write_all(&buffer).await.unwrap();
-                file.flush().await.unwrap();
-                file.sync_all().await.unwrap();
-            } else {
-                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-            }
-        }
     }
 }
 
@@ -346,7 +320,6 @@ impl StorageIO for MockStorageProvider {
             file_str: file_str,
             _temp_dir_hold: TempDir::default(),
             hash: CRC.checksum(format!("{}+++{}", self.location, "TEMP_2.db").as_bytes()),
-            appender: SegQueue::new(),
             _memory_map: unsafe { MmapOptions::new().map(&file_read).unwrap() },
         }
     }
@@ -426,7 +399,6 @@ impl StorageIO for MockStorageProvider {
             file_str: new_table.clone(),
             _temp_dir_hold: TempDir::default(),
             hash: CRC.checksum(format!("{}+++{}", file_path.to_str().unwrap(), name).as_bytes()),
-            appender: SegQueue::new(),
             _memory_map: unsafe { MmapOptions::new().map(&file_read).unwrap() },
         }
     }
@@ -452,9 +424,7 @@ impl StorageIO for MockStorageProvider {
     }
 
     async fn start_service(&self) {
-        let services = vec![self.start_append_data_service()];
-
-        join_all(services).await;
+        return;
     }
 
     fn get_name(&self) -> String {
