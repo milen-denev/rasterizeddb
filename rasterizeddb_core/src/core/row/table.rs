@@ -41,7 +41,9 @@ impl<S: StorageIO> Table<S> {
                 .create_new(format!("{}_pointers.db", table_name))
                 .await,
         );
+
         let io_rows = Arc::new(initial_io.create_new(format!("{}.db", table_name)).await);
+
         let io_schema = Arc::new(
             initial_io
                 .create_new(format!("{}_schema.db", table_name))
@@ -53,16 +55,7 @@ impl<S: StorageIO> Table<S> {
         let io_schema_clone = io_schema.clone();
 
         tokio::spawn(async move {
-            let clone_io_rows = io_rows_clone.clone();
-            clone_io_rows.start_service().await
-        });
-        tokio::spawn(async move {
-            let clone_io_pointers = io_pointers_clone.clone();
-            clone_io_pointers.start_service().await
-        });
-        tokio::spawn(async move {
-            let clone_io_schema = io_schema_clone.clone();
-            clone_io_schema.start_service().await
+            tokio::join!(io_rows_clone.start_service(), io_pointers_clone.start_service(), io_schema_clone.start_service());
         });
 
         let schema = {
