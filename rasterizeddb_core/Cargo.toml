@@ -35,10 +35,6 @@ fastrand = "2.3"
 parking_lot = "0.12"
 clap = { version = "4.5.51", features = ["derive"] }
 
-# unix dependencies
-[target.'cfg(unix)'.dependencies]
-io-uring = "0.7"
-
 [dev-dependencies]
 criterion = { version = "0.7" }
 tempfile = "3.21"
