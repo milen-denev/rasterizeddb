@@ -7,7 +7,7 @@ use std::{
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 
 use arc_swap::ArcSwap;
-use crossbeam_queue::SegQueue;
+use log::error;
 use parking_lot::{Mutex, RwLock};
 use tokio::task::yield_now;
 
@@ -19,9 +19,7 @@ use std::os::windows::fs::FileExt;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 
-use crate::{
-    core::storage_providers::helpers::Chunk, memory_pool::{MemoryBlock}, IMMEDIATE_WRITE, WRITE_BATCH_SIZE, WRITE_SLEEP_DURATION
-};
+use crate::core::storage_providers::helpers::Chunk;
 
 use super::{CRC, traits::StorageIO};
 
@@ -60,7 +58,6 @@ pub struct LocalStorageProvider {
     temp_has_data: AtomicBool,
     // used to temporarily block appends during flush
     append_blocked: AtomicBool,
-    appender: SegQueue<MemoryBlock>,
     #[cfg(unix)]
     io_uring_reader: AsyncUringReader,
     chunk: ArcSwap<Chunk>,
@@ -91,7 +88,6 @@ impl Clone for LocalStorageProvider {
             file_len: AtomicU64::new(self.file_len.load(std::sync::atomic::Ordering::SeqCst)),
             _memory_map: Arc::new(arc_swap::ArcSwap::new(map)),
             hash: CRC.checksum(format!("{}+++{}", self.location, self.table_name).as_bytes()),
-            appender: SegQueue::new(),
             _locked: AtomicBool::new(false),
             temp_has_data: AtomicBool::new(self.temp_has_data.load(Ordering::Relaxed)),
             append_blocked: AtomicBool::new(false),
@@ -216,7 +212,6 @@ impl LocalStorageProvider {
                 file_len: AtomicU64::new(file_len),
                 _memory_map: map,
                 hash: CRC.checksum(format!("{}+++{}", final_location, table_name).as_bytes()),
-                appender: SegQueue::new(),
                 _locked: AtomicBool::new(false),
                 temp_file_len: AtomicU64::new(temp_len),
                 temp_has_data: AtomicBool::new(false),
@@ -336,7 +331,6 @@ impl LocalStorageProvider {
                 file_len: AtomicU64::new(file_len),
                 _memory_map: map,
                 hash: CRC.checksum(format!("{}+++{}", location_str, "CONFIG_TABLE.db").as_bytes()),
-                appender: SegQueue::new(),
                 _locked: AtomicBool::new(false),
                 temp_file_len: AtomicU64::new(temp_len),
                 temp_has_data: AtomicBool::new(false),
@@ -379,74 +373,6 @@ impl LocalStorageProvider {
         _ = file_write.sync_all();
     }
 
-    pub async fn start_append_data_service(&self) {
-        if IMMEDIATE_WRITE {
-            return;
-        }
-
-        let mut idle_count = 0;
-        let mut buffer: Vec<u8> = Vec::with_capacity(WRITE_BATCH_SIZE);
-
-        loop {
-            let mut total_size = 0;
-            let mut has_data = false;
-
-            // Collect data in batches
-            while let Some(block) = self.appender.pop() {
-                has_data = true;
-                let slice = block.into_slice();
-                buffer.extend_from_slice(slice);
-                total_size += slice.len();
-
-                // Break if we've reached our batch size limit
-                if total_size >= WRITE_BATCH_SIZE {
-                    break;
-                }
-            }
-
-            if has_data {
-                idle_count = 0;
-                self.write_batch_data(&mut buffer, total_size).await;
-            } else {
-                idle_count += 1;
-
-                // Adaptive sleep - sleep longer when idle for extended periods
-                let sleep_duration = if idle_count < 100 {
-                    WRITE_SLEEP_DURATION
-                } else if idle_count < 1000 {
-                    tokio::time::Duration::from_millis(50)
-                } else {
-                    tokio::time::Duration::from_millis(100)
-                };
-
-                tokio::time::sleep(sleep_duration).await;
-            }
-        }
-    }
-
-    async fn write_batch_data(&self, buffer: &mut Vec<u8>, total_size: usize) {
-        if total_size == 0 {
-            return;
-        }
-
-        // Write the data
-        {
-            let mut file = self.append_file.write();
-
-            file.write_all(buffer).unwrap();
-            file.flush().unwrap();
-        } // file handle is dropped here
-
-        // Update file length atomically
-        self.file_len
-            .fetch_add(total_size as u64, std::sync::atomic::Ordering::Release);
-
-        // Update memory map after writing
-        self.update_memory_map();
-
-        buffer.clear(); // Clear the buffer for the next batch
-    }
-
     // Move any staged bytes from temp file into the main file atomically with respect to appends.
     async fn flush_temp_to_main(&self) -> io::Result<usize> {
         // Try to acquire the append block; if already blocked, another flush is running.
@@ -472,6 +398,7 @@ impl LocalStorageProvider {
         // Snapshot temp length from atomic and read payload
         let mut temp = self.temp_file.write();
         let len = self.temp_file_len.swap(0, Ordering::AcqRel) as usize;
+
         if len == 0 {
             // nothing to do
             self.temp_has_data.store(false, Ordering::Release);
@@ -493,8 +420,8 @@ impl LocalStorageProvider {
         }
 
         // Truncate temp file back to zero for next round
-        temp.set_len(0)?;
         temp.seek(SeekFrom::Start(0))?;
+        temp.set_len(0)?;
         let _ = temp.flush();
 
         // Publish new file_len and refresh mmap
@@ -1032,6 +959,7 @@ impl StorageIO for LocalStorageProvider {
             tf.write_all(buffer).unwrap();
             let _ = tf.flush();
         }
+
         // Mark that we have staged data
         self.temp_has_data.store(true, Ordering::Release);
         self.temp_file_len
@@ -1164,7 +1092,6 @@ impl StorageIO for LocalStorageProvider {
                 MmapOptions::new().map(&file_read_mmap).unwrap()
             }))),
             hash: CRC.checksum(format!("{}+++{}", final_location, "temp.db").as_bytes()),
-            appender: SegQueue::new(),
             _locked: AtomicBool::new(false),
             temp_has_data: AtomicBool::new(false),
             append_blocked: AtomicBool::new(false),
@@ -1285,7 +1212,6 @@ impl StorageIO for LocalStorageProvider {
                 MmapOptions::new().map(&file_read_mmap).unwrap()
             }))),
             hash: CRC.checksum(format!("{}+++{}", final_location, name).as_bytes()),
-            appender: SegQueue::new(),
             _locked: AtomicBool::new(false),
             temp_has_data: AtomicBool::new(false),
             append_blocked: AtomicBool::new(false),
@@ -1324,20 +1250,24 @@ impl StorageIO for LocalStorageProvider {
     }
 
     async fn start_service(&self) {
+
         // Run both the legacy batch service (if used elsewhere) and the temp flush service.
         async fn flush_loop(p: &LocalStorageProvider) {
             loop {
                 // Fast path: only flush when we know there's staged data
                 if p.temp_has_data.load(Ordering::Acquire) {
-                    let _ = p.flush_temp_to_main().await; // ignore errors for now
+                    let res = p.flush_temp_to_main().await; // ignore errors for now
+                    if res.is_err() {
+                        error!("Error flushing temp to main: {:?}", res.err());
+                    }
                 } else {
                     // avoid hot spinning
-                    tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                 }
             }
         }
 
-        tokio::join!(self.start_append_data_service(), flush_loop(self));
+        tokio::join!(flush_loop(self));
     }
 
     fn get_name(&self) -> String {
@@ -1726,5 +1656,209 @@ mod test {
         // Final length check
         let final_len = provider.get_len().await as usize;
         assert_eq!(final_len, init + expected.len());
+    }
+
+    #[tokio::test]
+    async fn test_append_immediate_then_read_back() {
+        use rand::{RngCore, SeedableRng, rngs::StdRng};
+
+        let init = 4096usize;
+        let (provider, initial_data, _extra) = create_provider(init, 0).await;
+
+        // Prepare data to append immediately (persisted directly to main file)
+        let mut rng = StdRng::seed_from_u64(0xA11CE);
+        let mut appended = vec![0u8; 5000];
+        rng.fill_bytes(&mut appended);
+
+        // Append with immediate=true
+        StorageIO::append_data(&provider, &appended, true).await;
+
+        // Length should reflect persisted bytes only (no temp staging)
+        let len = provider.get_len().await as usize;
+        assert_eq!(len, init + appended.len());
+
+        // Verify file contents at the appended position
+        let mut pos = init as u64;
+        let mut out = vec![0u8; appended.len()];
+        provider.read_data_into_buffer(&mut pos, &mut out).await.unwrap();
+        assert_eq!(pos, (init + appended.len()) as u64);
+        assert_eq!(out, appended);
+
+        // Spot-check: earlier bytes (from initial) are unchanged
+        let mut pos2 = (init - 128) as u64;
+        let mut head = vec![0u8; 128];
+        provider.read_data_into_buffer(&mut pos2, &mut head).await.unwrap();
+        assert_eq!(head, initial_data[init - 128 .. init]);
+
+        // verify_data API should also pass for the appended range
+        let ok = StorageIO::verify_data(&provider, init as u64, &appended).await;
+        assert!(ok);
+    }
+
+    #[tokio::test]
+    async fn test_append_immediate_then_staged_then_read_across_both() {
+        use rand::{RngCore, SeedableRng, rngs::StdRng};
+
+        let init = 2048usize;
+        let (provider, _initial_data, _extra) = create_provider(init, 0).await;
+
+        let mut rng = StdRng::seed_from_u64(0xBADA55);
+        let mut a_immediate = vec![0u8; 1500];
+        rng.fill_bytes(&mut a_immediate);
+        let mut b_staged = vec![0u8; 1700];
+        rng.fill_bytes(&mut b_staged);
+
+        // First append persisted immediately
+        StorageIO::append_data(&provider, &a_immediate, true).await;
+        // Then stage more data (not flushed yet)
+        StorageIO::append_data(&provider, &b_staged, false).await;
+
+        // Logical length should include both
+        let len = provider.get_len().await as usize;
+        assert_eq!(len, init + a_immediate.len() + b_staged.len());
+
+        // Read a buffer spanning the end of immediate part into staged part
+        let mut pos = (init + a_immediate.len() - 200) as u64; // start 200 bytes before boundary
+        let mut out = vec![0u8; 600]; // 200 from A + 400 from B
+        provider.read_data_into_buffer(&mut pos, &mut out).await.unwrap();
+        assert_eq!(pos, (init + a_immediate.len() - 200 + 600) as u64);
+        assert_eq!(&out[..200], &a_immediate[a_immediate.len() - 200 ..]);
+        assert_eq!(&out[200..600], &b_staged[..400]);
+
+        // Full read of the whole appended logical tail should also succeed
+        let mut pos2 = init as u64;
+        let mut all = vec![0u8; a_immediate.len() + b_staged.len()];
+        provider.read_data_into_buffer(&mut pos2, &mut all).await.unwrap();
+        assert_eq!(pos2, (init + all.len()) as u64);
+        assert_eq!(all, [a_immediate.as_slice(), b_staged.as_slice()].concat());
+    }
+
+    #[tokio::test]
+    async fn test_many_small_appends_mixed_then_piecewise_reads() {
+        use rand::{RngCore, SeedableRng, rngs::StdRng};
+
+        let init = 1024usize;
+        let (provider, _initial_data, _extra) = create_provider(init, 0).await;
+
+        let mut rng = StdRng::seed_from_u64(0xFACEFEED);
+        let mut expected_main: Vec<u8> = Vec::new();
+        let mut expected_temp: Vec<u8> = Vec::new();
+        // Alternate between immediate and staged appends, variable sizes
+        for i in 0..30 {
+            let size = 50 + (rng.next_u32() as usize % 700); // 50..749 bytes
+            let mut buf = vec![0u8; size];
+            rng.fill_bytes(&mut buf);
+            let immediate = i % 2 == 0; // even -> immediate, odd -> staged
+            StorageIO::append_data(&provider, &buf, immediate).await;
+            if immediate {
+                expected_main.extend_from_slice(&buf);
+            } else {
+                expected_temp.extend_from_slice(&buf);
+            }
+        }
+
+        // Verify logical length matches
+        let len = provider.get_len().await as usize;
+        assert_eq!(len, init + expected_main.len() + expected_temp.len());
+
+        // Piecewise reads of random sizes, ensuring correctness across boundaries
+        let mut pos = init as u64;
+        let mut consumed = 0usize;
+        let combined: Vec<u8> = {
+            let mut v = expected_main.clone();
+            v.extend_from_slice(&expected_temp);
+            v
+        };
+        while consumed < combined.len() {
+            let remaining = combined.len() - consumed;
+            let step = 1 + (rng.next_u32() as usize % 500); // 1..500 bytes
+            let to_read = step.min(remaining);
+            let mut buf = vec![0u8; to_read];
+            let before = pos;
+            let _ = provider.read_data_into_buffer(&mut pos, &mut buf).await; // may EOF at exact logical end
+            let got = (pos - before) as usize;
+            assert_eq!(&buf[..got], &combined[consumed .. consumed + got]);
+            consumed += got;
+        }
+        assert_eq!(pos, (init + combined.len()) as u64);
+    }
+
+    #[tokio::test]
+    async fn test_service_flush_from_temp_to_main_with_length_checks() {
+        use rand::{RngCore, SeedableRng, rngs::StdRng};
+        use tokio::time::{sleep, Duration};
+        use std::sync::Arc;
+
+        // Initial main file content
+        let init = 4096usize;
+        let (provider_raw, initial_data, _extra) = create_provider(init, 0).await;
+        let provider = Arc::new(provider_raw);
+
+        // Prepare staged bytes (append to temp only)
+        let mut rng = StdRng::seed_from_u64(0xFEEDFACE);
+        let mut staged = vec![0u8; 3000];
+        rng.fill_bytes(&mut staged);
+
+        // Append to TMP (no immediate write)
+        StorageIO::append_data(&*provider, &staged, false).await;
+
+        // Length checks BEFORE flush
+        let main_len_before = provider.file_len.load(Ordering::Acquire) as usize;
+        let temp_len_before = provider.temp_file_len.load(Ordering::Acquire) as usize;
+        let total_len_before = provider.get_len().await as usize;
+        assert_eq!(main_len_before, init);
+        assert_eq!(temp_len_before, staged.len());
+        assert_eq!(total_len_before, init + staged.len());
+
+        // Read across boundary BEFORE flush: last 100 of main + first 200 of temp
+        let mut pos = (init - 100) as u64;
+        let mut out = vec![0u8; 300];
+        provider.read_data_into_buffer(&mut pos, &mut out).await.unwrap();
+        assert_eq!(pos, (init + 200) as u64);
+        assert_eq!(&out[..100], &initial_data[init - 100 .. init]);
+        assert_eq!(&out[100..], &staged[..200]);
+
+        // Read within temp BEFORE flush
+        let mut pos2 = init as u64;
+        let mut temp_slice = vec![0u8; 512];
+        provider.read_data_into_buffer(&mut pos2, &mut temp_slice).await.unwrap();
+        assert_eq!(&temp_slice, &staged[..512]);
+
+        // Start background service which includes the flush loop
+        let p = provider.clone();
+
+        tokio::spawn(async move {
+            tokio::join!(p.start_service());
+        });
+
+        // Wait for flush to complete (temp_len -> 0 and main_len increased)
+        let expected_main_after = init + staged.len();
+        let mut waited = 0u64;
+        
+        loop {
+            let ml = provider.file_len.load(Ordering::Acquire) as usize;
+            let tl = provider.temp_file_len.load(Ordering::Acquire) as usize;
+            if ml == expected_main_after && tl == 0 { break; }
+            if waited > 5_000 { // 5s timeout
+                panic!("Timed out waiting for background flush: main_len={ml}, temp_len={tl}");
+            }
+            sleep(Duration::from_millis(10)).await;
+            waited += 10;
+        }
+
+        // Length checks AFTER flush
+        let main_len_after = provider.file_len.load(Ordering::Acquire) as usize;
+        let temp_len_after = provider.temp_file_len.load(Ordering::Acquire) as usize;
+        let total_len_after = provider.get_len().await as usize;
+        assert_eq!(main_len_after, init + staged.len());
+        assert_eq!(temp_len_after, 0);
+        assert_eq!(total_len_after, init + staged.len());
+
+        // Read appended region AFTER flush (should be from main now)
+        let mut pos3 = init as u64;
+        let mut out2 = vec![0u8; staged.len()];
+        provider.read_data_into_buffer(&mut pos3, &mut out2).await.unwrap();
+        assert_eq!(pos3, (init + staged.len()) as u64);
+        assert_eq!(out2, staged);
     }
 }
