@@ -28,13 +28,12 @@ crc = "3.3"
 temp_testdir = "0.2"
 memmap2 = "0.9"
 rand = "0.9.2"
-crossbeam-queue = "0.3"
-crossbeam-channel = "0.5"
 memory-stats = "1.2.0"
 smallvec = { version = "1.15", features = ["union", "write"]}
 arc-swap = "1.7"
 fastrand = "2.3"
 parking_lot = "0.12"
+clap = { version = "4.5.51", features = ["derive"] }
 
 # unix dependencies
 [target.'cfg(unix)'.dependencies]

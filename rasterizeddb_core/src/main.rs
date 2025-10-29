@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::env;
+use clap::Parser;
 
 use log::LevelFilter;
 use rasterizeddb_core::{core::database::Database, BATCH_SIZE, MAX_PERMITS_THREADS};
@@ -7,48 +7,38 @@ use tokio::runtime::Builder;
 
 use rasterizeddb_core::configuration::Configuration;
 
+#[derive(Parser, Debug)]
+#[command(name = "rasterizeddb_core", version, about = "RasterizedDB Core Server")]
+struct Args {
+    /// Database location directory
+    #[arg(long, value_name = "PATH")]
+    location: Option<String>,
+
+    /// Batch size for processing
+    #[arg(long = "batch-size", alias = "batch_size", value_name = "N")]
+    batch_size: Option<usize>,
+
+    /// Number of concurrent worker threads
+    #[arg(long = "concurrent-threads", alias = "concurrent_threads", value_name = "N")]
+    concurrent_threads: Option<usize>,
+
+    /// Logging level (off, error, warn, info, debug, trace)
+    #[arg(long = "log-level", alias = "log_level", value_name = "LEVEL")]
+    log_level: Option<LevelFilter>,
+}
+
 fn main() -> std::io::Result<()> {
     // 32 MiB
     const STACK_SIZE: usize = 32 * 1024 * 1024;
 
-    // Parse command line arguments
-    let args: Vec<String> = env::args().collect();
-    let mut config = Configuration {
-        location: None,
-        batch_size: None,
-        concurrent_threads: None,
-    };
+    // Parse command line arguments with clap
+    let args = Args::parse();
 
-    // Simple argument parsing: --location <path> --batch_size <n> --concurrent_threads <n>
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--location" => {
-                if i + 1 < args.len() {
-                    config.location = Some(args[i + 1].clone());
-                    i += 1;
-                }
-            }
-            "--batch_size" => {
-                if i + 1 < args.len() {
-                    if let Ok(val) = args[i + 1].parse::<usize>() {
-                        config.batch_size = Some(val);
-                    }
-                    i += 1;
-                }
-            }
-            "--concurrent_threads" => {
-                if i + 1 < args.len() {
-                    if let Ok(val) = args[i + 1].parse::<usize>() {
-                        config.concurrent_threads = Some(val);
-                    }
-                    i += 1;
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
+    let config = Configuration {
+        location: args.location.clone(),
+        batch_size: args.batch_size,
+        concurrent_threads: args.concurrent_threads,
+    };
 
     MAX_PERMITS_THREADS.set(config.concurrent_threads.unwrap_or(16)).unwrap();
     BATCH_SIZE.set(config.batch_size.unwrap_or(1024 * 64)).unwrap();
@@ -60,8 +50,9 @@ fn main() -> std::io::Result<()> {
         .build()?;
 
     rt.block_on(async {
+        let level = args.log_level.unwrap_or(LevelFilter::Info);
         env_logger::Builder::new()
-            .filter_level(LevelFilter::Error)
+            .filter_level(level)
             .init();
 
         #[cfg(debug_assertions)]
