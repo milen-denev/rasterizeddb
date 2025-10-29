@@ -40,10 +40,6 @@ criterion = { version = "0.7" }
 tempfile = "3.21"
 
 [[bench]]
-name = "buffer_benchmarks"
-harness = false
-
-[[bench]]
 name = "string_instructions_benchmarks"
 harness = false
 
