@@ -36,8 +36,6 @@
 //! ```
 
 use std::hash::{BuildHasher, Hash, Hasher};
-use std::mem::{MaybeUninit, align_of, size_of};
-use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -60,10 +58,8 @@ where
     state_version: AtomicU64,
     /// Hash of the key for this entry
     key_hash: AtomicU64,
-    /// Inline storage for small values (≤8 bytes, ≤8 byte alignment)
-    value_storage: AtomicU64,
-    /// Fallback storage for larger values using UnsafeCell
-    value_fallback: Option<ArcSwap<T>>,
+    /// Storage for values using ArcSwap
+    value_storage: ArcSwap<T>,
     /// UTC timestamp in nanoseconds when the entry was last modified
     timestamp_nanos: AtomicU64,
     /// Monotonic sequence number for ordering operations
@@ -141,16 +137,9 @@ where
     /// the size and alignment requirements of type T.
     #[inline]
     fn new() -> Self {
-        let use_fallback = size_of::<T>() > 8 || align_of::<T>() > 8 || std::mem::needs_drop::<T>();
-
         Self {
             key_hash: AtomicU64::new(0),
-            value_storage: AtomicU64::new(0),
-            value_fallback: if use_fallback {
-                Some(ArcSwap::from_pointee(T::default()))
-            } else {
-                None
-            },
+            value_storage: ArcSwap::from_pointee(T::default()),
             timestamp_nanos: AtomicU64::new(0),
             sequence: AtomicU64::new(0),
             state_version: AtomicU64::new(pack_state_version(STATE_EMPTY, 0)),
@@ -168,26 +157,8 @@ where
     /// * `value` - The value to store
     #[inline]
     fn store_value(&self, value: T) -> std::io::Result<()> {
-        if size_of::<T>() <= 8 && align_of::<T>() <= 8 {
-            let raw_value = unsafe {
-                let mut buffer = MaybeUninit::<[u8; 8]>::uninit();
-                ptr::write_bytes(buffer.as_mut_ptr(), 0, 1);
-                ptr::copy_nonoverlapping(
-                    &value as *const T as *const u8,
-                    buffer.as_mut_ptr() as *mut u8,
-                    size_of::<T>(),
-                );
-                u64::from_le_bytes(buffer.assume_init())
-            };
-            self.value_storage.store(raw_value, Ordering::Relaxed);
-
-            return Ok(());
-        } else if let Some(ref cell) = self.value_fallback {
-            cell.store(Arc::new(value));
-            return Ok(());
-        }
-
-        Err(std::io::Error::other("Unsupported type size or alignment"))
+        self.value_storage.store(Arc::new(value));
+        return Ok(());
     }
 
     /// Loads a value from the entry using the appropriate storage method.
@@ -196,23 +167,7 @@ where
     /// A clone of the stored value, or the default value if storage fails
     #[inline]
     fn load_value(&self) -> T {
-        if size_of::<T>() <= 8 && align_of::<T>() <= 8 {
-            let raw_value = self.value_storage.load(Ordering::Relaxed);
-            unsafe {
-                let buffer = raw_value.to_le_bytes();
-                let mut result = MaybeUninit::<T>::uninit();
-                ptr::copy_nonoverlapping(
-                    buffer.as_ptr(),
-                    result.as_mut_ptr() as *mut u8,
-                    size_of::<T>(),
-                );
-                result.assume_init()
-            }
-        } else if let Some(ref cell) = self.value_fallback {
-            cell.load().as_ref().clone()
-        } else {
-            T::default()
-        }
+        self.value_storage.load().as_ref().clone()
     }
 
     /// Gets the current state of the entry.
