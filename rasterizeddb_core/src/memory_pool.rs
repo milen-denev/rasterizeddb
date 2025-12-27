@@ -1,11 +1,11 @@
 use std::{
     arch::x86_64::{_MM_HINT_T0, _mm_prefetch},
     fmt,
-    hash::Hash,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    //hash::Hash,
+    // sync::{
+    //     Arc,
+    //     atomic::{AtomicU64, Ordering},
+    // },
 };
 
 use crate::instructions::{copy_ptr_to_ptr, copy_vec_to_ptr, ref_slice, ref_slice_mut};
@@ -15,7 +15,7 @@ pub static MEMORY_POOL: MemoryPool = MemoryPool::new();
 use libmimalloc_sys::{mi_free, mi_malloc};
 
 // Define the maximum size for inline allocation
-const INLINE_CAPACITY: usize = 64;
+const INLINE_CAPACITY: usize = 128;
 
 pub struct MemoryPool;
 
@@ -39,72 +39,32 @@ impl MemoryPool {
             // without more `unsafe` unless we take a `&[u8]` argument to `acquire`.
             // For now, we'll just initialize to zeros.
             MemoryBlock {
-                hash: 0, // Default hash value
+                //hash: 0, // Default hash value
                 data: MemoryBlockData { inline_data: data },
                 len: size,
                 is_heap: false,
-                should_drop: true,
+                //should_drop: true,
                 //dropped: Arc::new(AtomicBool::new(false)),
-                references: None,
+                //references: None,
             }
         } else {
             // Allocate on the heap
-            let ptr = unsafe { mi_malloc(size as usize) as *mut u8 };
+            let ptr = unsafe { mi_malloc(size) as *mut u8 };
 
             if ptr.is_null() {
                 panic!("Allocation failed (likely OOM).");
             }
 
             MemoryBlock {
-                hash: 0, // Default hash value
+                //hash: 0, // Default hash value
                 data: MemoryBlockData {
                     heap_data: (ptr, size),
                 },
                 len: size, // For heap, len is the full size
                 is_heap: true,
-                should_drop: true,
+                //should_drop: true,
                 //dropped: Arc::new(AtomicBool::new(false)),
-                references: Some(Arc::new(AtomicU64::new(1))),
-            }
-        }
-    }
-
-    #[inline(always)]
-    pub fn acquire_with_hash(&self, size: usize) -> MemoryBlock {
-        if size <= INLINE_CAPACITY {
-            // Allocate on the stack (within the union's inline_data)
-            let data = [0u8; INLINE_CAPACITY];
-            // No actual allocation needed, just zeroing the bytes for safety.
-            // We can't directly copy bytes into `inline_data` from an external slice here
-            // without more `unsafe` unless we take a `&[u8]` argument to `acquire`.
-            // For now, we'll just initialize to zeros.
-            MemoryBlock {
-                hash: fastrand::u64(0..u64::MAX), // Default hash value
-                data: MemoryBlockData { inline_data: data },
-                len: size,
-                is_heap: false,
-                should_drop: true,
-                //dropped: Arc::new(AtomicBool::new(false)),
-                references: None,
-            }
-        } else {
-            // Allocate on the heap
-            let ptr = unsafe { mi_malloc(size as usize) as *mut u8 };
-
-            if ptr.is_null() {
-                panic!("Allocation failed (likely OOM).");
-            }
-
-            MemoryBlock {
-                hash: fastrand::u64(0..u64::MAX), // Default hash value
-                data: MemoryBlockData {
-                    heap_data: (ptr, size),
-                },
-                len: size, // For heap, len is the full size
-                is_heap: true,
-                should_drop: true,
-                //dropped: Arc::new(AtomicBool::new(false)),
-                references: Some(Arc::new(AtomicU64::new(1))),
+                //references: None, //Some(Arc::new(AtomicU64::new(1))),
             }
         }
     }
@@ -132,13 +92,13 @@ union MemoryBlockData {
 
 // The main MemoryBlock struct that manages the union
 pub struct MemoryBlock {
-    hash: u64, // Hash for the block, if needed
+    //hash: u64, // Hash for the block, if needed
     data: MemoryBlockData,
     len: usize,    // Actual length of the data
     is_heap: bool, // Discriminant for the union: true if heap, false if inline
-    should_drop: bool,
+    //should_drop: bool,
     //dropped: Arc<AtomicBool>,
-    references: Option<Arc<AtomicU64>>,
+    //references: Option<Arc<AtomicU64>>,
 }
 
 unsafe impl Send for MemoryBlock {}
@@ -149,15 +109,15 @@ impl Default for MemoryBlock {
     fn default() -> Self {
         // A default MemoryBlock will be an empty, inline block
         MemoryBlock {
-            hash: 0, // Default hash value
+            //hash: 0, // Default hash value
             data: MemoryBlockData {
                 inline_data: [0; INLINE_CAPACITY],
             }, // Initialize with zeros
             len: 0,
             is_heap: false,     // It's an inline block
-            should_drop: false, // Not needed as it's implied by is_heap,
+            //should_drop: false, // Not needed as it's implied by is_heap,
             //dropped: Arc::new(AtomicBool::new(false)),
-            references: None,
+            //references: None,
         }
     }
 }
@@ -200,14 +160,14 @@ impl Drop for MemoryBlock {
     #[inline(always)]
     #[track_caller]
     fn drop(&mut self) {
-        if self.should_drop && self.is_heap {
-            let refs = self
-                .references
-                .as_ref()
-                .expect("heap blocks must have a ref counter")
-                .fetch_sub(1, Ordering::Release);
+        if self.is_heap {
+            // let refs = self
+            //     .references
+            //     .as_ref()
+            //     .expect("heap blocks must have a ref counter")
+            //     .fetch_sub(1, Ordering::Release);
 
-            if refs == 1 {
+            //if refs == 1 {
                 // let was_dropped = self.dropped
                 //     .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
                 //     .expect("MemoryBlock was already dropped");
@@ -216,8 +176,10 @@ impl Drop for MemoryBlock {
                 //     panic!("MemoryBlock was already dropped, this should not happen.");
                 // }
 
-                MEMORY_POOL.release(unsafe { self.data.heap_data.0 });
-            }
+                // MEMORY_POOL.release(unsafe { self.data.heap_data.0 });
+            //}
+
+            MEMORY_POOL.release(unsafe { self.data.heap_data.0 });
         } else {
             // If it's inline, we don't need to do anything special
             // The memory will be automatically cleaned up when the block goes out of scope
@@ -229,15 +191,15 @@ impl Clone for MemoryBlock {
     #[inline(always)]
     fn clone(&self) -> Self {
         if self.is_heap {
-            let references = self
-                .references
-                .as_ref()
-                .expect("heap blocks must have a ref counter")
-                .clone();
-            references.fetch_add(1, Ordering::Release);
+            // let references = self
+            //     .references
+            //     .as_ref()
+            //     .expect("heap blocks must have a ref counter")
+            //     .clone();
+            // references.fetch_add(1, Ordering::Release);
 
             MemoryBlock {
-                hash: self.hash,
+                //hash: self.hash,
                 data: MemoryBlockData {
                     heap_data: (unsafe { self.data.heap_data.0.clone() }, unsafe {
                         self.data.heap_data.1.clone()
@@ -245,14 +207,14 @@ impl Clone for MemoryBlock {
                 },
                 len: self.len,
                 is_heap: true,
-                should_drop: true, // Important: new allocation should be cleaned up
+                //should_drop: true, // Important: new allocation should be cleaned up
                 //dropped: self.dropped.clone(),
-                references: Some(references),
+                //references: None //Some(references),
             }
         } else {
             // For inline data, we can safely copy the data
             MemoryBlock {
-                hash: self.hash,
+                //hash: self.hash,
                 data: unsafe {
                     MemoryBlockData {
                         inline_data: self.data.inline_data.clone(),
@@ -260,9 +222,9 @@ impl Clone for MemoryBlock {
                 }, // This is safe to copy for inline data
                 len: self.len,
                 is_heap: false,
-                should_drop: true, // Inline doesn't need cleanup, but keep consistent
+                //should_drop: true, // Inline doesn't need cleanup, but keep consistent
                 //dropped: self.dropped.clone(),
-                references: None,
+                //references: None,
             }
         }
     }
@@ -350,25 +312,6 @@ impl MemoryBlock {
         }
     }
 
-    #[inline(always)]
-    pub fn from_slice_hashed(slice: &[u8]) -> MemoryBlock {
-        let len = slice.len();
-        let memory_chunk = MEMORY_POOL.acquire_with_hash(len);
-
-        // Handle empty slices - no copying needed
-        if len > 0 {
-            if memory_chunk.is_heap {
-                copy_vec_to_ptr(slice, unsafe { memory_chunk.data.heap_data.0 });
-            } else {
-                copy_vec_to_ptr(slice, unsafe {
-                    memory_chunk.data.inline_data.as_ptr() as *mut u8
-                });
-            }
-        }
-
-        memory_chunk
-    }
-
     pub fn deep_clone(&self) -> Self {
         if self.is_heap {
             // Allocate on the heap
@@ -389,19 +332,19 @@ impl MemoryBlock {
     }
 }
 
-impl Hash for MemoryBlock {
-    #[inline(always)]
-    fn hash<H: std::hash::Hasher>(&self, _state: &mut H) {
-        if self.hash != 0 {
-            // Use the hash field directly
-            _state.write_u64(self.hash);
-        } else {
-            panic!(
-                "MemoryBlock hash is not set. Ensure to use from_slice_hashed or acquire_with_hash."
-            );
-        }
-    }
-}
+// impl Hash for MemoryBlock {
+//     #[inline(always)]
+//     fn hash<H: std::hash::Hasher>(&self, _state: &mut H) {
+//         if self.hash != 0 {
+//             // Use the hash field directly
+//             _state.write_u64(self.hash);
+//         } else {
+//             panic!(
+//                 "MemoryBlock hash is not set. Ensure to use from_slice_hashed or acquire_with_hash."
+//             );
+//         }
+//     }
+// }
 
 #[cfg(test)]
 mod tests {
@@ -547,16 +490,6 @@ mod tests {
         // Test one byte over INLINE_CAPACITY
         let block_heap = pool.acquire(INLINE_CAPACITY + 1);
         assert!(block_heap.is_heap);
-    }
-
-    #[test]
-    fn test_should_drop_flag() {
-        let mut block = MEMORY_POOL.acquire(100);
-        assert!(block.should_drop);
-
-        // Prevent drop from freeing memory
-        block.should_drop = false;
-        // This should not free the memory or panic
     }
 
     #[test]
@@ -739,34 +672,6 @@ mod tests {
         // Both blocks should maintain their integrity
         assert_eq!(&block1.into_slice()[1..], &original_data[1..]);
         assert_eq!(&block2.into_slice()[1..], &original_data[1..]);
-    }
-
-    #[test]
-    fn test_memory_block_hashing() {
-        let pool = MemoryPool::new();
-        let data = b"test data";
-
-        // Create a memory block with a specific hash
-        let block = pool.acquire_with_hash(data.len());
-        let slice_mut = block.into_slice_mut();
-        slice_mut.copy_from_slice(data);
-
-        // Hash the block
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        block.hash(&mut hasher);
-        let hash_value_1 = hasher.finish();
-
-        // Hash the hash value
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        block.hash.hash(&mut hasher);
-        let hash_value_2 = hasher.finish();
-
-        // Check if the hash matches the expected value
-        assert_ne!(hash_value_1, 0, "Hash should not be zero");
-        assert_eq!(
-            hash_value_2, hash_value_1,
-            "Block hash should match computed hash"
-        );
     }
 
     // #[test]
