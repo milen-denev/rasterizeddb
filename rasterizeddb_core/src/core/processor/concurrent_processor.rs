@@ -1,5 +1,6 @@
-use std::{borrow::Cow, cell::UnsafeCell, sync::Arc};
+use std::{borrow::Cow, cell::UnsafeCell, sync::{Arc, OnceLock}};
 
+use crc::{CRC_64_ECMA_182, Crc};
 use futures::future::join_all;
 use smallvec::SmallVec;
 use tokio::{
@@ -12,12 +13,15 @@ use super::{
 };
 
 use crate::{
-    core::{
-        processor::transformer::RowBlocks, row::{row::{Row, RowFetch}, row_pointer::RowPointerIterator, schema::SchemaField}, storage_providers::traits::StorageIO, tokenizer::{query_parser::QueryParser, query_tokenizer::tokenize}
-    }, memory_pool::MemoryBlock, MAX_PERMITS_THREADS
+    MAX_PERMITS_THREADS, cache::atomic_cache::AtomicGenericCache, core::{
+        processor::transformer::RowBlocks, row::{row::{Row, RowFetch}, row_pointer::{RowPointer, RowPointerIterator}, schema::SchemaField}, storage_providers::traits::StorageIO, tokenizer::{query_parser::QueryParser, query_tokenizer::tokenize}
+    }, memory_pool::MemoryBlock
 };
 
 pub static EMPTY_STR: &str = "";
+pub static ATOMIC_CACHE: OnceLock<Arc<AtomicGenericCache<u64, Arc<Vec<RowPointer>>>>> = OnceLock::new();
+pub static ENABLE_CACHE: OnceLock<bool> = OnceLock::new();
+const CRC_64: Crc<u64> = Crc::<u64>::new(&CRC_64_ECMA_182);
 
 pub struct ConcurrentProcessor;
 
@@ -36,26 +40,86 @@ impl ConcurrentProcessor {
         iterator: &mut RowPointerIterator<S>,
     ) -> Vec<Row> {
         let (tx, mut rx) = mpsc::unbounded_channel::<Row>();
-
-        let mut batch_handles = Vec::new();
-        iterator.reset();
-
-        let table_schema = table_schema
-            .iter()
-            .cloned()
-            .collect::<SmallVec<[SchemaField; 20]>>();
-
-        let tokens = tokenize(&where_query, &table_schema);
-
+    
         let shared_tuple: Arc<(Semaphore, RowFetch, RowFetch)> = Arc::new((
             Semaphore::new(*MAX_PERMITS_THREADS.get().unwrap()),
             query_row_fetch,
             requested_row_fetch,
         ));
 
+        let table_schema = table_schema
+            .iter()
+            .cloned()
+            .collect::<SmallVec<[SchemaField; 20]>>();
+
+        let io_rows_outer = Arc::clone(&io_rows);
+
+        let cache_enabled = *ENABLE_CACHE.get().unwrap();
+        let crc64_hash;
+
+        let entries_available = if cache_enabled {
+            crc64_hash = CRC_64.checksum(where_query.as_bytes());
+            let cache = ATOMIC_CACHE.get().unwrap();
+            let entries = cache.get(&crc64_hash);
+            if let Some(entries) = entries {
+                for pointer in entries.iter() {
+                    if pointer.deleted {
+                        continue;
+                    }
+
+                    let io_rows_clone = Arc::clone(&io_rows_outer);
+                    let (_, _, requested_row_fetch) = &*shared_tuple;
+
+                    // Fetch the requested row
+                    let mut row = Row::default();
+
+                    pointer
+                        .fetch_row_reuse_async(
+                            io_rows_clone,
+                            requested_row_fetch,
+                            &mut row,
+                        )
+                        .await;
+
+                    // Send a clone out to the aggregator
+                    if tx.send(Row::clone_row(&row)).is_err() {
+                        // Receiver dropped; stop early
+                        break;
+                    }
+                }
+
+                true
+            } else {
+                false
+            }
+        } else {
+            crc64_hash = 0;
+            false
+        };
+
+        if entries_available {
+            // If cache entries were found and processed, skip further processing.
+            drop(tx);
+            let mut collected_rows = Vec::with_capacity(50);
+
+            if !rx.is_empty() {
+                rx.recv_many(&mut collected_rows, usize::MAX).await;
+            }
+
+            drop(rx);
+
+            return collected_rows;
+        }
+
+        let (tx_rp, mut rx_rp) = mpsc::unbounded_channel::<RowPointer>();
+        
+        let mut batch_handles = Vec::new();
+        iterator.reset();
+
+        let tokens = tokenize(&where_query, &table_schema);
+        
         let schema_arc = Arc::new(table_schema);
         let tokens_arc = Arc::new(tokens);
-        let io_rows_outer = Arc::clone(&io_rows);
 
         // Process batches
         while let Ok(pointers) = iterator.next_row_pointers().await {
@@ -65,6 +129,7 @@ impl ConcurrentProcessor {
 
             let tuple_clone = Arc::clone(&shared_tuple);
             let tx_clone = tx.clone();
+            let tx_rp_clone = tx_rp.clone();
             let schema_ref = Arc::clone(&schema_arc);
             let tokens_ref = Arc::clone(&tokens_arc);
             let io_rows_batch = Arc::clone(&io_rows_outer);
@@ -96,6 +161,10 @@ impl ConcurrentProcessor {
                 let mut plan_built = false;
 
                 for pointer in pointers.iter() {
+                    if pointer.deleted {
+                        continue;
+                    }
+
                     let io_rows_clone = Arc::clone(&io_rows_batch);
                     let (_, query_row_fetch, requested_row_fetch) = &*tuple_clone;
 
@@ -160,6 +229,12 @@ impl ConcurrentProcessor {
                     };
 
                     if result {
+                        if tx_rp_clone.send(pointer.clone()).is_err() {
+                            log::error!("Failed to send row pointer to cache inserter");
+                            // Receiver dropped; stop early
+                            break;
+                        }
+
                         let io_rows_clone = Arc::clone(&io_rows_batch);
                         pointer
                             .fetch_row_reuse_async(
@@ -171,6 +246,7 @@ impl ConcurrentProcessor {
 
                         // Send a clone out to the aggregator
                         if tx_clone.send(Row::clone_row(&buffer.row)).is_err() {
+                            log::error!("Failed to send row to aggregator");
                             // Receiver dropped; stop early
                             break;
                         }
@@ -196,11 +272,28 @@ impl ConcurrentProcessor {
             }
 
             drop(rx);
+
             collected_rows
         });
 
         // Await the aggregator to finish collecting rows.
         let all_rows = aggregator_handle.await.unwrap();
+
+        if crc64_hash != 0 {
+            let mut pointers = Vec::with_capacity(50);
+            if !rx_rp.is_empty() {
+                rx_rp.recv_many(&mut pointers, usize::MAX).await;
+            }
+
+            drop(rx_rp);
+
+            // Store the resulting pointers in the cache
+            let cache = ATOMIC_CACHE.get().unwrap();
+
+            if cache.insert(crc64_hash, Arc::new(pointers)).is_err() {
+                log::error!("Failed to insert entries into cache for hash {}", crc64_hash);
+            }
+        }
 
         all_rows
     }
