@@ -86,13 +86,17 @@ impl ConcurrentProcessor {
                     // Fetch the requested row
                     let mut row = Row::default();
 
-                    pointer
+                    if pointer
                         .fetch_row_reuse_async(
                             io_rows_clone,
                             requested_row_fetch,
                             &mut row,
                         )
-                        .await;
+                        .await
+                        .is_err()
+                    {
+                        continue;
+                    }
 
                     // Send a clone out to the aggregator
                     if tx.send(Row::clone_row(&row)).await.is_err() {
@@ -252,9 +256,13 @@ impl ConcurrentProcessor {
                     let reading_time = stopwatch::Stopwatch::start_new();
 
                     // Read the minimal set of columns needed for the WHERE evaluation
-                    pointer
+                    if pointer
                         .fetch_row_reuse_async(io_rows_clone, query_row_fetch, &mut buffer.row)
-                        .await;
+                        .await
+                        .is_err()
+                    {
+                        continue;
+                    }
 
                     let elapsed_ns = reading_time.elapsed().as_nanos() as u64;
                     reading_time_total_clone_2.fetch_add(elapsed_ns, std::sync::atomic::Ordering::Relaxed);
@@ -325,13 +333,17 @@ impl ConcurrentProcessor {
 
                         let io_rows_clone = std::sync::Arc::clone(&io_rows_batch);
 
-                        pointer
+                        if pointer
                             .fetch_row_reuse_async(
                                 io_rows_clone,
                                 requested_row_fetch,
                                 &mut buffer.row,
                             )
-                            .await;
+                            .await
+                            .is_err()
+                        {
+                            continue;
+                        }
 
                         let elapsed_ns = reading_time.elapsed().as_nanos() as u64;
                         reading_time_total_clone_2.fetch_add(elapsed_ns, std::sync::atomic::Ordering::Relaxed);

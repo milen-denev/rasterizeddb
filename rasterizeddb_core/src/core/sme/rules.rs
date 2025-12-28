@@ -10,6 +10,26 @@ pub enum SemanticRuleOp {
     BelowExclusive = 1,
     AboveOrEqual = 2,
     BetweenInclusive = 3,
+
+    // ---- String-derived semantic rules ----
+    /// Bitset (256 bits) of first bytes observed in the window.
+    /// Stored as lower[0..16] + upper[0..16].
+    StrFirstByteSet = 10,
+    /// Bitset (256 bits) of last bytes observed in the window.
+    /// Stored as lower[0..16] + upper[0..16].
+    StrLastByteSet = 11,
+    /// Bitset (256 bits) of bytes observed anywhere in the window's strings.
+    /// Stored as lower[0..16] + upper[0..16].
+    StrCharSet = 12,
+    /// Min/max string byte length observed in the window.
+    /// Stored as u64 LE in lower[0..8] and upper[0..8].
+    StrLenRange = 13,
+    /// Max run length (consecutive repeats) observed in the window.
+    /// Stored as [0, max] as u64 LE in lower/upper.
+    StrMaxRunLen = 14,
+    /// Max count of any single byte observed in the window (frequency within one string).
+    /// Stored as [0, max] as u64 LE in lower/upper.
+    StrMaxCharCount = 15,
 }
 
 impl SemanticRuleOp {
@@ -20,6 +40,12 @@ impl SemanticRuleOp {
             1 => Self::BelowExclusive,
             2 => Self::AboveOrEqual,
             3 => Self::BetweenInclusive,
+            10 => Self::StrFirstByteSet,
+            11 => Self::StrLastByteSet,
+            12 => Self::StrCharSet,
+            13 => Self::StrLenRange,
+            14 => Self::StrMaxRunLen,
+            15 => Self::StrMaxCharCount,
             _ => panic!("Invalid SemanticRuleOp byte: {}", b),
         }
     }

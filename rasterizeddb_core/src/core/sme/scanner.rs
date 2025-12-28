@@ -33,6 +33,15 @@ const MAX_RULES_FILE_RATIO: f64 = 0.10;
 /// Larger values produce fewer, wider rules (more false positives, smaller file).
 const BASE_ROWS_PER_RULE: u64 = 256;
 
+/// How many semantic rule records we emit per STRING column per window.
+///
+/// See `StringWindowRuleBuilder::flush_window_rules`.
+const STRING_RULES_PER_COL: u64 = 6;
+
+/// If a string is longer than this, we avoid scanning it byte-by-byte for some
+/// metrics and instead conservatively over-approximate (to avoid false negatives).
+const STRING_METRIC_SCAN_CAP: usize = 8192;
+
 /// Spawns a periodic background task that scans a table and writes semantic rules to
 /// `TABLENAME_rules.db`.
 ///
@@ -76,6 +85,11 @@ struct NumericColumn {
     schema_idx: usize,
     db_type: DbType,
     stats: NumericStats,
+}
+
+#[derive(Debug, Clone)]
+struct StringColumn {
+    schema_idx: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -252,7 +266,8 @@ async fn scan_once_build_rules<S: StorageIO>(
     rules_io: Arc<S>,
 ) -> std::io::Result<()> {
     let mut numeric_cols = build_numeric_columns(schema);
-    if numeric_cols.is_empty() {
+    let string_cols = build_string_columns(schema);
+    if numeric_cols.is_empty() && string_cols.is_empty() {
         // Still write a meta record so downstream knows we scanned.
         let meta = ScanMeta {
             pointers_len_bytes: pointers_io.get_len().await,
@@ -262,36 +277,57 @@ async fn scan_once_build_rules<S: StorageIO>(
         return Ok(());
     }
 
-    // PASS 1: collect min/max + reservoir samples for ALL numeric columns.
-    let (meta_stats, _row_fetch) =
-        collect_numeric_stats(schema, &mut numeric_cols, pointers_io.clone(), rows_io.clone())
-            .await?;
+    // PASS 1 (numeric only): collect min/max + reservoir samples for ALL numeric columns.
+    // For string-only tables, skip this pass.
+    let meta_stats = if numeric_cols.is_empty() {
+        ScanMeta {
+            pointers_len_bytes: pointers_io.get_len().await,
+            last_row_id: 0,
+        }
+    } else {
+        let (meta, _row_fetch) =
+            collect_numeric_stats(schema, &mut numeric_cols, pointers_io.clone(), rows_io.clone())
+                .await?;
+        meta
+    };
 
     // Enforce an on-disk budget for the rule file.
     let table_bytes = pointers_io.get_len().await.saturating_add(rows_io.get_len().await);
     let max_rules_bytes = ((table_bytes as f64) * MAX_RULES_FILE_RATIO).floor() as u64;
     let max_rules = std::cmp::max(1, max_rules_bytes / (SemanticRule::BYTE_LEN as u64));
 
-    let row_count = numeric_cols
-        .first()
-        .map(|c| c.stats.count())
-        .unwrap_or(0);
+    let (row_count, last_row_id_fast) = if !numeric_cols.is_empty() {
+        (
+            numeric_cols
+                .first()
+                .map(|c| c.stats.count())
+                .unwrap_or(0),
+            meta_stats.last_row_id,
+        )
+    } else {
+        count_rows_fast(pointers_io.clone()).await?
+    };
+
     let numeric_col_count = numeric_cols.len() as u64;
+    let string_col_count = string_cols.len() as u64;
+    let signals_per_window = numeric_col_count
+        .saturating_add(string_col_count.saturating_mul(STRING_RULES_PER_COL));
 
     // Choose a window size (rows_per_rule) that will keep:
-    // total_rules ~= cols * ceil(rows/rows_per_rule) <= max_rules.
-    let required_rows_per_rule = if numeric_col_count == 0 {
+    // total_rules ~= signals_per_window * ceil(rows/rows_per_rule) <= max_rules.
+    let required_rows_per_rule = if signals_per_window == 0 {
         BASE_ROWS_PER_RULE
     } else {
-        ceil_div_u64(numeric_col_count.saturating_mul(row_count), max_rules)
+        ceil_div_u64(signals_per_window.saturating_mul(row_count), max_rules)
     };
     let rows_per_rule = std::cmp::max(1, std::cmp::max(BASE_ROWS_PER_RULE, required_rows_per_rule));
 
-    // PASS 2: build bounded windowed rules.
-    let rules_by_col = build_window_rules(
+    // PASS 2: build bounded windowed rules (numeric + string-derived).
+    let (rules_by_col, string_rules, last_row_id_seen) = build_window_rules(
         table_name,
         schema,
         &numeric_cols,
+        &string_cols,
         rows_per_rule,
         pointers_io.clone(),
         rows_io.clone(),
@@ -302,11 +338,12 @@ async fn scan_once_build_rules<S: StorageIO>(
     for rules in rules_by_col.into_iter() {
         flat_rules.extend(rules);
     }
+    flat_rules.extend(string_rules);
 
     // Use pointers IO len at *end* of scan (may have grown during scanning).
     let meta = ScanMeta {
         pointers_len_bytes: pointers_io.get_len().await,
-        last_row_id: meta_stats.last_row_id,
+        last_row_id: std::cmp::max(last_row_id_fast, last_row_id_seen),
     };
 
     SemanticRuleStore::save_rules_atomic_with_meta(rules_io.clone(), Some(meta), &flat_rules).await?;
@@ -462,6 +499,19 @@ fn format_bounds(
             let hi_bits = u64::from_le_bytes(upper[0..8].try_into().unwrap());
             (format!("{} ({:?})", f64::from_bits(lo_bits), op), format!("{}", f64::from_bits(hi_bits)))
         }
+        DbType::STRING => match op {
+            SemanticRuleOp::StrFirstByteSet
+            | SemanticRuleOp::StrLastByteSet
+            | SemanticRuleOp::StrCharSet => (format!("<bitset {:?}>", op), "".to_string()),
+            SemanticRuleOp::StrLenRange
+            | SemanticRuleOp::StrMaxRunLen
+            | SemanticRuleOp::StrMaxCharCount => {
+                let lo = u64::from_le_bytes(lower[0..8].try_into().unwrap());
+                let hi = u64::from_le_bytes(upper[0..8].try_into().unwrap());
+                (format!("{} ({:?})", lo, op), format!("{}", hi))
+            }
+            _ => ("<n/a>".to_string(), "<n/a>".to_string()),
+        },
         _ => ("<n/a>".to_string(), "<n/a>".to_string()),
     }
 }
@@ -521,6 +571,56 @@ fn build_row_fetch_for_columns(schema: &[SchemaField], columns: &[NumericColumn]
     }
 }
 
+fn build_string_columns(schema: &[SchemaField]) -> Vec<StringColumn> {
+    schema
+        .iter()
+        .enumerate()
+        .filter_map(|(schema_idx, f)| {
+            if f.db_type == DbType::STRING {
+                Some(StringColumn { schema_idx })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+async fn count_rows_fast<S: StorageIO>(pointers_io: Arc<S>) -> std::io::Result<(u64, u64)> {
+    let mut iterator = RowPointerIterator::new(pointers_io.clone()).await.map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::Other, format!("RowPointerIterator: {}", e))
+    })?;
+
+    let mut count = 0u64;
+    let mut last_row_id = 0u64;
+    let mut empty_rounds: u8 = 0;
+
+    loop {
+        let pointers = iterator.next_row_pointers().await.map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::Other, format!("RowPointerIterator: {}", e))
+        })?;
+
+        if pointers.is_empty() {
+            iterator.refresh_total_length().await;
+            empty_rounds += 1;
+            if empty_rounds >= 2 {
+                break;
+            }
+            continue;
+        }
+        empty_rounds = 0;
+
+        for p in pointers.iter() {
+            if p.deleted {
+                continue;
+            }
+            count += 1;
+            last_row_id = p.id;
+        }
+    }
+
+    Ok((count, last_row_id))
+}
+
 async fn collect_numeric_stats<S: StorageIO>(
     schema: &[SchemaField],
     numeric_cols: &mut [NumericColumn],
@@ -564,9 +664,13 @@ async fn collect_numeric_stats<S: StorageIO>(
             }
             last_row_id = pointer.id;
 
-            pointer
+            if pointer
                 .fetch_row_reuse_async(rows_io.clone(), &row_fetch, &mut row)
-                .await;
+                .await
+                .is_err()
+            {
+                continue;
+            }
 
             for col in row.columns.iter() {
                 let schema_idx = col.schema_id as usize;
@@ -776,24 +880,238 @@ impl ColumnWindowRuleBuilder {
     }
 }
 
+fn build_row_fetch_for_mixed_columns(
+    schema: &[SchemaField],
+    numeric_cols: &[NumericColumn],
+    string_cols: &[StringColumn],
+) -> RowFetch {
+    let mut v = smallvec::SmallVec::<[ColumnFetchingData; 32]>::new();
+
+    for c in numeric_cols {
+        let f = &schema[c.schema_idx];
+        v.push(ColumnFetchingData {
+            column_offset: f.offset as u32,
+            column_type: f.db_type.clone(),
+            size: f.size,
+            schema_id: c.schema_idx as u64,
+        });
+    }
+
+    for c in string_cols {
+        let f = &schema[c.schema_idx];
+        v.push(ColumnFetchingData {
+            column_offset: f.offset as u32,
+            column_type: f.db_type.clone(),
+            size: f.size,
+            schema_id: c.schema_idx as u64,
+        });
+    }
+
+    RowFetch {
+        columns_fetching_data: v,
+    }
+}
+
+#[derive(Debug)]
+struct StringWindowRuleBuilder {
+    table_name: String,
+    column_schema_id: u64,
+    seq: u64,
+
+    win_first_set: [u8; 32],
+    win_last_set: [u8; 32],
+    win_charset: [u8; 32],
+    win_min_len: Option<u64>,
+    win_max_len: Option<u64>,
+    win_max_run_len: u64,
+    win_max_char_count: u64,
+
+    rules: Vec<SemanticRule>,
+}
+
+impl StringWindowRuleBuilder {
+    fn new(table_name: &str, column_schema_id: u64) -> Self {
+        Self {
+            table_name: table_name.to_string(),
+            column_schema_id,
+            seq: 0,
+            win_first_set: [0u8; 32],
+            win_last_set: [0u8; 32],
+            win_charset: [0u8; 32],
+            win_min_len: None,
+            win_max_len: None,
+            win_max_run_len: 0,
+            win_max_char_count: 0,
+            rules: Vec::new(),
+        }
+    }
+
+    #[inline]
+    fn set_bit(mask: &mut [u8; 32], byte: u8) {
+        let idx = byte as usize;
+        mask[idx >> 3] |= 1u8 << (idx & 7);
+    }
+
+    fn push_bytes(&mut self, bytes: &[u8]) {
+        let len = bytes.len() as u64;
+        self.win_min_len = Some(self.win_min_len.map(|v| v.min(len)).unwrap_or(len));
+        self.win_max_len = Some(self.win_max_len.map(|v| v.max(len)).unwrap_or(len));
+
+        if bytes.is_empty() {
+            return;
+        }
+
+        Self::set_bit(&mut self.win_first_set, bytes[0]);
+        Self::set_bit(&mut self.win_last_set, bytes[bytes.len() - 1]);
+
+        if bytes.len() > STRING_METRIC_SCAN_CAP {
+            // Conservative over-approx to avoid false negatives.
+            self.win_charset = [0xFFu8; 32];
+            self.win_max_run_len = self.win_max_run_len.max(len);
+            self.win_max_char_count = self.win_max_char_count.max(len);
+            return;
+        }
+
+        for &b in bytes {
+            Self::set_bit(&mut self.win_charset, b);
+        }
+
+        // Max run length (consecutive repeats)
+        let mut run_max: u64 = 1;
+        let mut run: u64 = 1;
+        for i in 1..bytes.len() {
+            if bytes[i] == bytes[i - 1] {
+                run += 1;
+            } else {
+                run_max = run_max.max(run);
+                run = 1;
+            }
+        }
+        run_max = run_max.max(run);
+        self.win_max_run_len = self.win_max_run_len.max(run_max);
+
+        // Max count of a single byte in the whole string
+        let mut counts = [0u16; 256];
+        let mut max_count: u16 = 0;
+        for &b in bytes {
+            let c = &mut counts[b as usize];
+            *c = c.saturating_add(1);
+            if *c > max_count {
+                max_count = *c;
+            }
+        }
+        self.win_max_char_count = self.win_max_char_count.max(max_count as u64);
+    }
+
+    fn flush_window_rules(&mut self, start_row_id: u64, end_row_id: u64) {
+        if start_row_id > end_row_id {
+            self.reset_window();
+            return;
+        }
+
+        let min_len = self.win_min_len.unwrap_or(0);
+        let max_len = self.win_max_len.unwrap_or(0);
+
+        let rule_id_base = make_rule_id(&self.table_name, self.column_schema_id, self.seq);
+        self.seq = self.seq.wrapping_add(1);
+
+        let mut push_rule = |op: SemanticRuleOp, lower: [u8; 16], upper: [u8; 16]| {
+            self.rules.push(SemanticRule {
+                rule_id: rule_id_base ^ (op as u8 as u64),
+                column_schema_id: self.column_schema_id,
+                column_type: DbType::STRING,
+                op,
+                lower,
+                upper,
+                start_row_id,
+                end_row_id,
+            });
+        };
+
+        // First byte set
+        let mut lo = [0u8; 16];
+        let mut hi = [0u8; 16];
+        lo.copy_from_slice(&self.win_first_set[0..16]);
+        hi.copy_from_slice(&self.win_first_set[16..32]);
+        push_rule(SemanticRuleOp::StrFirstByteSet, lo, hi);
+
+        // Last byte set
+        let mut lo = [0u8; 16];
+        let mut hi = [0u8; 16];
+        lo.copy_from_slice(&self.win_last_set[0..16]);
+        hi.copy_from_slice(&self.win_last_set[16..32]);
+        push_rule(SemanticRuleOp::StrLastByteSet, lo, hi);
+
+        // Charset
+        let mut lo = [0u8; 16];
+        let mut hi = [0u8; 16];
+        lo.copy_from_slice(&self.win_charset[0..16]);
+        hi.copy_from_slice(&self.win_charset[16..32]);
+        push_rule(SemanticRuleOp::StrCharSet, lo, hi);
+
+        // Length range
+        let mut lo = [0u8; 16];
+        let mut hi = [0u8; 16];
+        lo[0..8].copy_from_slice(&min_len.to_le_bytes());
+        hi[0..8].copy_from_slice(&max_len.to_le_bytes());
+        push_rule(SemanticRuleOp::StrLenRange, lo, hi);
+
+        // Max run length (store [0, max])
+        let lo = [0u8; 16];
+        let mut hi = [0u8; 16];
+        hi[0..8].copy_from_slice(&self.win_max_run_len.to_le_bytes());
+        push_rule(SemanticRuleOp::StrMaxRunLen, lo, hi);
+
+        // Max char count (store [0, max])
+        let lo = [0u8; 16];
+        let mut hi = [0u8; 16];
+        hi[0..8].copy_from_slice(&self.win_max_char_count.to_le_bytes());
+        push_rule(SemanticRuleOp::StrMaxCharCount, lo, hi);
+
+        self.reset_window();
+    }
+
+    fn reset_window(&mut self) {
+        self.win_first_set = [0u8; 32];
+        self.win_last_set = [0u8; 32];
+        self.win_charset = [0u8; 32];
+        self.win_min_len = None;
+        self.win_max_len = None;
+        self.win_max_run_len = 0;
+        self.win_max_char_count = 0;
+    }
+}
+
 async fn build_window_rules<S: StorageIO>(
     table_name: &str,
     schema: &[SchemaField],
     numeric_cols: &[NumericColumn],
+    string_cols: &[StringColumn],
     rows_per_rule: u64,
     pointers_io: Arc<S>,
     rows_io: Arc<S>,
-) -> std::io::Result<Vec<Vec<SemanticRule>>> {
-    let row_fetch = build_row_fetch_for_columns(schema, numeric_cols);
+) -> std::io::Result<(Vec<Vec<SemanticRule>>, Vec<SemanticRule>, u64)> {
+    let row_fetch = build_row_fetch_for_mixed_columns(schema, numeric_cols, string_cols);
 
-    // schema_idx -> numeric_cols index
-    let mut index_map = vec![usize::MAX; schema.len()];
+    // schema_idx -> numeric builder index
+    let mut numeric_index_map = vec![usize::MAX; schema.len()];
     for (i, c) in numeric_cols.iter().enumerate() {
-        index_map[c.schema_idx] = i;
+        numeric_index_map[c.schema_idx] = i;
+    }
+
+    // schema_idx -> string builder index
+    let mut string_index_map = vec![usize::MAX; schema.len()];
+    for (i, c) in string_cols.iter().enumerate() {
+        string_index_map[c.schema_idx] = i;
     }
 
     let mut builders: Vec<ColumnWindowRuleBuilder> =
         numeric_cols.iter().map(ColumnWindowRuleBuilder::new).collect();
+
+    let mut string_builders: Vec<StringWindowRuleBuilder> = string_cols
+        .iter()
+        .map(|c| StringWindowRuleBuilder::new(table_name, c.schema_idx as u64))
+        .collect();
 
     let mut iterator = RowPointerIterator::new(pointers_io.clone()).await.map_err(|e| {
         std::io::Error::new(std::io::ErrorKind::Other, format!("RowPointerIterator: {}", e))
@@ -805,6 +1123,7 @@ async fn build_window_rules<S: StorageIO>(
     let mut row_index: u64 = 0;
     let mut window_start_row_id: Option<u64> = None;
     let mut prev_row_id: u64 = 0;
+    let mut last_row_id_seen: u64 = 0;
 
     loop {
         let pointers = iterator.next_row_pointers().await.map_err(|e| {
@@ -827,37 +1146,51 @@ async fn build_window_rules<S: StorageIO>(
             }
 
             let row_id = pointer.id;
+            last_row_id_seen = row_id;
+
             if window_start_row_id.is_none() {
                 window_start_row_id = Some(row_id);
             }
 
-            if rows_per_rule > 0 && row_index > 0 && (row_index % rows_per_rule) == 0 {
-                let start = window_start_row_id.unwrap_or(row_id);
+            if pointer
+                .fetch_row_reuse_async(rows_io.clone(), &row_fetch, &mut row)
+                .await
+                .is_err()
+            {
+                continue;
+            }
+
+            for col in row.columns.iter() {
+                let schema_idx = col.schema_id as usize;
+
+                let ni = *numeric_index_map.get(schema_idx).unwrap_or(&usize::MAX);
+                if ni != usize::MAX {
+                    let db_type = &schema[schema_idx].db_type;
+                    let v = decode_numeric_value(db_type, &col.data);
+                    builders[ni].push_value(v);
+                    continue;
+                }
+
+                let si = *string_index_map.get(schema_idx).unwrap_or(&usize::MAX);
+                if si != usize::MAX {
+                    string_builders[si].push_bytes(col.data.into_slice());
+                }
+            }
+
+            row_index = row_index.saturating_add(1);
+            prev_row_id = row_id;
+
+            if rows_per_rule != 0 && row_index % rows_per_rule == 0 {
+                let start = window_start_row_id.unwrap_or(prev_row_id);
                 let end = prev_row_id;
                 for b in builders.iter_mut() {
                     b.flush_window(table_name, start, end);
                 }
-                window_start_row_id = Some(row_id);
-            }
-
-            prev_row_id = row_id;
-
-            pointer
-                .fetch_row_reuse_async(rows_io.clone(), &row_fetch, &mut row)
-                .await;
-
-            for col in row.columns.iter() {
-                let schema_idx = col.schema_id as usize;
-                let mapped = *index_map.get(schema_idx).unwrap_or(&usize::MAX);
-                if mapped == usize::MAX {
-                    continue;
+                for sb in string_builders.iter_mut() {
+                    sb.flush_window_rules(start, end);
                 }
-                let db_type = &schema[schema_idx].db_type;
-                let v = decode_numeric_value(db_type, &col.data);
-                builders[mapped].push_value(v);
+                window_start_row_id = None;
             }
-
-            row_index = row_index.saturating_add(1);
         }
     }
 
@@ -867,9 +1200,18 @@ async fn build_window_rules<S: StorageIO>(
         for b in builders.iter_mut() {
             b.flush_window(table_name, start, end);
         }
+        for sb in string_builders.iter_mut() {
+            sb.flush_window_rules(start, end);
+        }
     }
 
-    Ok(builders.into_iter().map(|b| b.rules).collect())
+    let numeric_rules = builders.into_iter().map(|b| b.rules).collect();
+    let mut string_rules = Vec::new();
+    for sb in string_builders.into_iter() {
+        string_rules.extend(sb.rules);
+    }
+
+    Ok((numeric_rules, string_rules, last_row_id_seen))
 }
 
 #[inline]

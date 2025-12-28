@@ -797,7 +797,7 @@ impl RowPointer {
         io: Arc<S>,
         row_fetch: &RowFetch,
         row_reuse: &mut Row,
-    ) {
+    ) -> std::io::Result<()> {
         if self.deleted {
             panic!("Row is marked as deleted");
         }
@@ -831,9 +831,7 @@ impl RowPointer {
             if column_data.column_type == DbType::STRING {
                 // Read both string position (8 bytes) and size (4 bytes) in one go
                 let mut header = [0u8; 12];
-                io.read_data_into_buffer(&mut position, &mut header)
-                    .await
-                    .unwrap();
+                io.read_data_into_buffer(&mut position, &mut header).await?;
 
                 let mut string_row_position = self.position
                     + u64::from_le_bytes(<[u8; 8]>::try_from(&header[0..8]).unwrap());
@@ -852,8 +850,7 @@ impl RowPointer {
                 let string_slice = col.data.into_slice_mut();
 
                 io.read_data_into_buffer(&mut string_row_position, string_slice)
-                    .await
-                    .unwrap();
+                    .await?;
 
                 col.schema_id = column_data.schema_id;
                 col.column_type = DbType::STRING;
@@ -868,9 +865,7 @@ impl RowPointer {
                 }
                 let slice = col.data.into_slice_mut();
 
-                io.read_data_into_buffer(&mut position, slice)
-                    .await
-                    .unwrap();
+                io.read_data_into_buffer(&mut position, slice).await?;
 
                 col.schema_id = column_data.schema_id;
                 col.column_type = column_data.column_type.clone();
@@ -879,6 +874,8 @@ impl RowPointer {
 
         row_reuse.position = self.position;
         row_reuse.length = self.length;
+
+        Ok(())
     }
 
     /// Writes a row to storage using the given RowWrite payload
