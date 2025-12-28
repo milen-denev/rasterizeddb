@@ -349,7 +349,6 @@ impl MemoryBlock {
 #[cfg(test)]
 mod tests {
     use std::{
-        hash::Hasher,
         ptr,
         sync::{
             Arc, Mutex,
