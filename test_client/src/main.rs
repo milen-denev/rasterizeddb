@@ -97,10 +97,10 @@ async fn main() -> std::io::Result<()> {
     let mut buffer = String::new();
     stdin().read_line(&mut buffer).unwrap();
 
-    for _ in 0..10_000 {
+    for _ in 0..5 {
         let query = r##"
-            SELECT id, salary, age FROM employees
-            WHERE id > 1040 AND id < 1050 AND salary >= 200000.13 OR age = 29 AND id > 90000
+            SELECT id, salary, age, name FROM employees
+            WHERE id > 1040 AND id < 1050 AND salary >= 200000.13 OR age = 29 AND id > 90000 AND name STARTSWITH 'J'
         "##;
 
         let instant = std::time::Instant::now();
@@ -109,44 +109,44 @@ async fn main() -> std::io::Result<()> {
 
         println!("Query executed in {} μs", elapsed);
 
-        // match select_result.unwrap() {
-        //     QueryExecutionResult::RowsResult(rows) => {
-        //         println!("Rows fetched successfully.");
-        //         let rows = vec_into_rows(&rows).unwrap();
-        //         println!("Total rows: {}", rows.len());
-        //         for row in rows {
-        //             for column in &row.columns {
-        //                 if column.column_type == DbType::STRING {
-        //                     let value =
-        //                         String::from_utf8(column.data.into_slice().to_vec()).unwrap();
-        //                     println!("Name / Position: {}", value);
-        //                 } else if column.column_type == DbType::U64 {
-        //                     println!(
-        //                         "Id: {}",
-        //                         u64::from_le_bytes(column.data.into_slice().try_into().unwrap())
-        //                     );
-        //                 } else if column.column_type == DbType::F32 {
-        //                     println!(
-        //                         "Salary: {}",
-        //                         f32::from_le_bytes(column.data.into_slice().try_into().unwrap())
-        //                     );
-        //                 } else if column.column_type == DbType::I32 {
-        //                     println!(
-        //                         "Age: {}",
-        //                         i32::from_le_bytes(column.data.into_slice().try_into().unwrap())
-        //                     );
-        //                 }
-        //             }
-        //             println!();
-        //         }
-        //     }
-        //     QueryExecutionResult::Error(err) => {
-        //         eprintln!("Error occurred: {}", err);
-        //     }
-        //     _ => {
-        //         eprintln!("Unexpected result type");
-        //     }
-        // }
+        match select_result.unwrap() {
+            QueryExecutionResult::RowsResult(rows) => {
+                println!("Rows fetched successfully.");
+                let rows = vec_into_rows(&rows).unwrap();
+                println!("Total rows: {}", rows.len());
+                for row in rows {
+                    for column in &row.columns {
+                        if column.column_type == DbType::STRING {
+                            let value =
+                                String::from_utf8(column.data.into_slice().to_vec()).unwrap();
+                            println!("Name / Position: {}", value);
+                        } else if column.column_type == DbType::U64 {
+                            println!(
+                                "Id: {}",
+                                u64::from_le_bytes(column.data.into_slice().try_into().unwrap())
+                            );
+                        } else if column.column_type == DbType::F32 {
+                            println!(
+                                "Salary: {}",
+                                f32::from_le_bytes(column.data.into_slice().try_into().unwrap())
+                            );
+                        } else if column.column_type == DbType::I32 {
+                            println!(
+                                "Age: {}",
+                                i32::from_le_bytes(column.data.into_slice().try_into().unwrap())
+                            );
+                        }
+                    }
+                    println!();
+                }
+            }
+            QueryExecutionResult::Error(err) => {
+                eprintln!("Error occurred: {}", err);
+            }
+            _ => {
+                eprintln!("Unexpected result type");
+            }
+        }
     }
 
     println!("Press any key to continue...");

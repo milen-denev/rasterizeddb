@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{env, sync::Arc};
 use clap::Parser;
 
 use log::LevelFilter;
@@ -88,6 +88,7 @@ fn main() -> std::io::Result<()> {
         .build()?;
 
     rt.block_on(async {
+        unsafe { env::set_var("RUST_BACKTRACE", "0"); }
         let level = args.log_level.unwrap_or(LevelFilter::Error);
         env_logger::Builder::new()
             .filter_level(level)
