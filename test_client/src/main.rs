@@ -25,27 +25,27 @@ async fn main() -> std::io::Result<()> {
 
     let client = Arc::new(DbClient::new(Some("127.0.0.1")).await.unwrap());
 
-    let _query = r##"
-        CREATE TABLE employees (
-            id UBIGINT,
-            name VARCHAR,
-            job_title VARCHAR,
-            salary REAL,
-            department VARCHAR,
-            age INTEGER,
-            manager VARCHAR,
-            location VARCHAR,
-            hire_date UBIGINT,
-            degree VARCHAR,
-            skills VARCHAR,
-            current_project VARCHAR,
-            performance_score REAL,
-            is_active BOOLEAN,
-            created_at UBIGINT,
-            updated_at UBIGINT,
-            is_fired BOOLEAN
-        );
-    "##;
+    // let _query = r##"
+    //     CREATE TABLE employees (
+    //         id UBIGINT,
+    //         name VARCHAR,
+    //         job_title VARCHAR,
+    //         salary REAL,
+    //         department VARCHAR,
+    //         age INTEGER,
+    //         manager VARCHAR,
+    //         location VARCHAR,
+    //         hire_date UBIGINT,
+    //         degree VARCHAR,
+    //         skills VARCHAR,
+    //         current_project VARCHAR,
+    //         performance_score REAL,
+    //         is_active BOOLEAN,
+    //         created_at UBIGINT,
+    //         updated_at UBIGINT,
+    //         is_fired BOOLEAN
+    //     );
+    // "##;
 
     // let create_result = client.execute_query(_query).await;
 
@@ -94,13 +94,13 @@ async fn main() -> std::io::Result<()> {
 
     // println!("Finished inserting records. Press any key to continue...");
 
-    // let mut buffer = String::new();
-    // stdin().read_line(&mut buffer).unwrap();
+    let mut buffer = String::new();
+    stdin().read_line(&mut buffer).unwrap();
 
-    for _ in 0..100_000_000 {
+    for _ in 0..10_000 {
         let query = r##"
-            SELECT id FROM employees
-            WHERE id = 99999
+            SELECT id, salary, age FROM employees
+            WHERE id > 1040 AND id < 1050 AND salary >= 200000.13 OR age = 29 AND id > 90000
         "##;
 
         let instant = std::time::Instant::now();
@@ -109,44 +109,44 @@ async fn main() -> std::io::Result<()> {
 
         println!("Query executed in {} μs", elapsed);
 
-        match select_result.unwrap() {
-            QueryExecutionResult::RowsResult(rows) => {
-                println!("Rows fetched successfully.");
-                let rows = vec_into_rows(&rows).unwrap();
-                println!("Total rows: {}", rows.len());
-                for row in rows {
-                    for column in &row.columns {
-                        if column.column_type == DbType::STRING {
-                            let value =
-                                String::from_utf8(column.data.into_slice().to_vec()).unwrap();
-                            println!("Name / Position: {}", value);
-                        } else if column.column_type == DbType::U64 {
-                            println!(
-                                "Id: {}",
-                                u64::from_le_bytes(column.data.into_slice().try_into().unwrap())
-                            );
-                        } else if column.column_type == DbType::F32 {
-                            println!(
-                                "Salary: {}",
-                                f32::from_le_bytes(column.data.into_slice().try_into().unwrap())
-                            );
-                        } else if column.column_type == DbType::I32 {
-                            println!(
-                                "Age: {}",
-                                i32::from_le_bytes(column.data.into_slice().try_into().unwrap())
-                            );
-                        }
-                    }
-                    println!();
-                }
-            }
-            QueryExecutionResult::Error(err) => {
-                eprintln!("Error occurred: {}", err);
-            }
-            _ => {
-                eprintln!("Unexpected result type");
-            }
-        }
+        // match select_result.unwrap() {
+        //     QueryExecutionResult::RowsResult(rows) => {
+        //         println!("Rows fetched successfully.");
+        //         let rows = vec_into_rows(&rows).unwrap();
+        //         println!("Total rows: {}", rows.len());
+        //         for row in rows {
+        //             for column in &row.columns {
+        //                 if column.column_type == DbType::STRING {
+        //                     let value =
+        //                         String::from_utf8(column.data.into_slice().to_vec()).unwrap();
+        //                     println!("Name / Position: {}", value);
+        //                 } else if column.column_type == DbType::U64 {
+        //                     println!(
+        //                         "Id: {}",
+        //                         u64::from_le_bytes(column.data.into_slice().try_into().unwrap())
+        //                     );
+        //                 } else if column.column_type == DbType::F32 {
+        //                     println!(
+        //                         "Salary: {}",
+        //                         f32::from_le_bytes(column.data.into_slice().try_into().unwrap())
+        //                     );
+        //                 } else if column.column_type == DbType::I32 {
+        //                     println!(
+        //                         "Age: {}",
+        //                         i32::from_le_bytes(column.data.into_slice().try_into().unwrap())
+        //                     );
+        //                 }
+        //             }
+        //             println!();
+        //         }
+        //     }
+        //     QueryExecutionResult::Error(err) => {
+        //         eprintln!("Error occurred: {}", err);
+        //     }
+        //     _ => {
+        //         eprintln!("Unexpected result type");
+        //     }
+        // }
     }
 
     println!("Press any key to continue...");
@@ -613,7 +613,7 @@ fn generate_person() -> Person {
 
     let job_title = job_titles[rng.random_range(0..job_titles.len())].to_string();
     let department = departments[rng.random_range(0..departments.len())].to_string();
-    let age = rng.random_range(21..=65);
+    let age = rng.random_range(18..=76);
     let manager = manager_names[rng.random_range(0..manager_names.len())].to_string();
     let location = locations[rng.random_range(0..locations.len())].to_string();
     let hire_date = rng.random_range(1000000u64..9000000u64);
