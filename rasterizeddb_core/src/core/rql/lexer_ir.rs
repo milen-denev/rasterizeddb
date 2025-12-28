@@ -242,6 +242,14 @@ pub fn insert_row_from_query_purpose(
         let values = parse_csv_values(values_str);
 
         if columns.len() != values.len() {
+            warn!(
+                "INSERT parse failed: columns/values count mismatch (columns={}, values={}). values_str_len={} columns_str_len={} sql_prefix={:?}",
+                columns.len(),
+                values.len(),
+                values_str.len(),
+                columns_str.len(),
+                &sql_trimmed.chars().take(200).collect::<String>()
+            );
             return None;
         }
 
@@ -249,7 +257,14 @@ pub fn insert_row_from_query_purpose(
 
         for (col_name, value) in columns.iter().zip(values.iter()) {
             // Find schema field
-            let schema_field = schema.iter().find(|f| f.name == *col_name)?;
+            let Some(schema_field) = schema.iter().find(|f| f.name == *col_name) else {
+                warn!(
+                    "INSERT parse failed: column {:?} not found in schema (schema_fields={:?})",
+                    col_name,
+                    schema.iter().map(|f| f.name.as_str()).collect::<Vec<_>>()
+                );
+                return None;
+            };
             // Convert value to MemoryBlock based on the database type
             let data = value_to_mb(value, &schema_field.db_type);
 
