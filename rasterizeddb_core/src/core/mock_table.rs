@@ -136,6 +136,7 @@ pub async fn consolidated_read_data_function(schema: TableSchema, _id: u64) {
 
     let all_rows = concurrent_processor
         .process(
+            &schema.name,
             &format!(
                 r##"
             id < 2

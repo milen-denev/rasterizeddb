@@ -115,6 +115,44 @@ impl<S: StorageIO> RowPointerIterator<S> {
         self.end_of_data = false;
     }
 
+    #[inline]
+    pub fn io(&self) -> Arc<S> {
+        Arc::clone(&self.io)
+    }
+
+    /// Refreshes the underlying IO length.
+    ///
+    /// This is important for long-running scans where new pointers may be appended
+    /// while the iterator is reading.
+    pub async fn refresh_total_length(&mut self) {
+        let new_len = self.io.get_len().await as usize;
+        if new_len > self.total_length {
+            self.total_length = new_len;
+            // If we previously marked end_of_data but there is more data now, continue.
+            if self.position < self.total_length as u64 {
+                self.end_of_data = false;
+            }
+        }
+    }
+
+    /// Seeks the iterator to an absolute byte offset within the pointers IO.
+    ///
+    /// The offset must be aligned to `TOTAL_LENGTH`.
+    pub async fn seek_to_byte_position(&mut self, byte_pos: u64) -> Result<()> {
+        if (byte_pos as usize) % TOTAL_LENGTH != 0 {
+            return Err(super::error::RowError::Other(format!(
+                "RowPointerIterator seek must be aligned to TOTAL_LENGTH={}, got {}",
+                TOTAL_LENGTH, byte_pos
+            )));
+        }
+        self.position = byte_pos;
+        self.buffer_index = 0;
+        self.buffer_valid_length = 0;
+        self.end_of_data = false;
+        self.refresh_total_length().await;
+        self.load_next_chunk().await
+    }
+
     /// Load the next chunk of data into the buffer
     async fn load_next_chunk(&mut self) -> Result<()> {
         // Reset buffer index

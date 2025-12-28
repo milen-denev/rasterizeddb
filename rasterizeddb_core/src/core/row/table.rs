@@ -11,6 +11,7 @@ use std::{
 use super::schema::TableSchema;
 use crate::core::processor::concurrent_processor::ConcurrentProcessor;
 use crate::core::rql::lexer_ct::CreateColumnData;
+use crate::core::sme::scanner::spawn_table_rules_scanner;
 use crate::core::{
     row::{
         row::{Row, RowFetch, RowWrite},
@@ -19,6 +20,8 @@ use crate::core::{
     },
     storage_providers::traits::StorageIO,
 };
+
+use std::time::Duration;
 
 pub struct Table<S: StorageIO> {
     pub schema: TableSchema,
@@ -81,6 +84,17 @@ impl<S: StorageIO> Table<S> {
         };
 
         info!("Loaded schema: {:?}", schema);
+
+        // SME: periodically scan table and emit semantic rules to `TABLENAME_rules.db`.
+        // Interval is intentionally conservative for now; can be made configurable later.
+        spawn_table_rules_scanner(
+            initial_io.clone(),
+            table_name.to_string(),
+            schema.fields.clone(),
+            io_pointers.clone(),
+            io_rows.clone(),
+            Duration::from_secs(60),
+        );
 
         let mut pointer_iterator = RowPointerIterator::new(io_pointers.clone()).await.unwrap();
 
@@ -161,6 +175,7 @@ impl<S: StorageIO> Table<S> {
         let rows = self
             .concurrent_processor
             .process(
+                &self.schema.name,
                 query,
                 query_row_fetch,
                 requested_row_fetch,

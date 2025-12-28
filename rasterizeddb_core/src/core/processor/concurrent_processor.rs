@@ -1,10 +1,13 @@
-use std::{borrow::Cow, cell::UnsafeCell, sync::{Arc, OnceLock}};
+use std::{borrow::Cow, cell::UnsafeCell, sync::{OnceLock, atomic::AtomicU64}};
+
+use rclite::Arc;
 
 use crc::{CRC_64_ECMA_182, Crc};
 use futures::future::join_all;
 use smallvec::SmallVec;
+
 use tokio::{
-    sync::{Semaphore, mpsc},
+    sync::Semaphore,
     task,
 };
 
@@ -18,8 +21,10 @@ use crate::{
     }, memory_pool::MemoryBlock
 };
 
+use crate::{BATCH_SIZE, semantics_enabled, core::sme::semantic_mapping_engine::{SME, SemanticMappingEngine}};
+
 pub static EMPTY_STR: &str = "";
-pub static ATOMIC_CACHE: OnceLock<Arc<AtomicGenericCache<u64, Arc<Vec<RowPointer>>>>> = OnceLock::new();
+pub static ATOMIC_CACHE: OnceLock<std::sync::Arc<AtomicGenericCache<u64, Arc<Vec<RowPointer>>>>> = OnceLock::new();
 pub static ENABLE_CACHE: OnceLock<bool> = OnceLock::new();
 const CRC_64: Crc<u64> = Crc::<u64>::new(&CRC_64_ECMA_182);
 
@@ -32,14 +37,22 @@ impl ConcurrentProcessor {
 
     pub async fn process<'a, S: StorageIO>(
         &self,
+        table_name: &str,
         where_query: &str,
         query_row_fetch: RowFetch,
         requested_row_fetch: RowFetch,
         table_schema: &Vec<SchemaField>,
-        io_rows: Arc<S>,
+        io_rows: std::sync::Arc<S>,
         iterator: &mut RowPointerIterator<S>,
     ) -> Vec<Row> {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Row>();
+        let prep_stopwatch = std::time::Instant::now();
+
+        log::info!(
+            "Starting concurrent processing for query: {}",
+            where_query
+        );
+
+        let (tx, rx) = kanal::unbounded_async::<Row>();
     
         let shared_tuple: Arc<(Semaphore, RowFetch, RowFetch)> = Arc::new((
             Semaphore::new(*MAX_PERMITS_THREADS.get().unwrap()),
@@ -52,7 +65,7 @@ impl ConcurrentProcessor {
             .cloned()
             .collect::<SmallVec<[SchemaField; 20]>>();
 
-        let io_rows_outer = Arc::clone(&io_rows);
+        let io_rows_outer = std::sync::Arc::clone(&io_rows);
 
         let cache_enabled = *ENABLE_CACHE.get().unwrap();
         let crc64_hash;
@@ -67,7 +80,7 @@ impl ConcurrentProcessor {
                         continue;
                     }
 
-                    let io_rows_clone = Arc::clone(&io_rows_outer);
+                    let io_rows_clone = std::sync::Arc::clone(&io_rows_outer);
                     let (_, _, requested_row_fetch) = &*shared_tuple;
 
                     // Fetch the requested row
@@ -82,7 +95,7 @@ impl ConcurrentProcessor {
                         .await;
 
                     // Send a clone out to the aggregator
-                    if tx.send(Row::clone_row(&row)).is_err() {
+                    if tx.send(Row::clone_row(&row)).await.is_err() {
                         // Receiver dropped; stop early
                         break;
                     }
@@ -103,7 +116,7 @@ impl ConcurrentProcessor {
             let mut collected_rows = Vec::with_capacity(50);
 
             if !rx.is_empty() {
-                rx.recv_many(&mut collected_rows, usize::MAX).await;
+                rx.drain_into(&mut collected_rows).unwrap();
             }
 
             drop(rx);
@@ -111,7 +124,7 @@ impl ConcurrentProcessor {
             return collected_rows;
         }
 
-        let (tx_rp, mut rx_rp) = mpsc::unbounded_channel::<RowPointer>();
+        let (tx_rp, rx_rp) = kanal::unbounded_async::<RowPointer>();
         
         let mut batch_handles = Vec::new();
         iterator.reset();
@@ -121,8 +134,73 @@ impl ConcurrentProcessor {
         let schema_arc = Arc::new(table_schema);
         let tokens_arc = Arc::new(tokens);
 
+        log::info!(
+            "Preperation for query completed in {:.2?}",
+            prep_stopwatch.elapsed()
+        );
+
+        let semantic_stopwatch = std::time::Instant::now();
+        log::info!("Starting semantic processing for query: {}", where_query);
+
+        // If SME semantics are enabled and SME can build candidates for this query/table,
+        // only iterate those. Otherwise fall back to scanning all pointers.
+        let mut sme_candidates: Option<(Arc<Vec<RowPointer>>, usize)> = if semantics_enabled() {
+            let pointers_io = iterator.io();
+            let sme = SME.get_or_init(|| rclite::Arc::new(SemanticMappingEngine::new()));
+            sme.get_or_build_candidates_for_table_tokens(
+                table_name,
+                &*tokens_arc,
+                schema_arc.as_slice(),
+                std::sync::Arc::clone(&io_rows_outer),
+                pointers_io,
+            )
+            .await
+            .map(|arc| (arc, 0usize))
+        } else {
+            None
+        };
+
+        if sme_candidates.is_some() {
+            log::info!(
+                "Semantic processing will use candidate row pointers, with {} candidates for query: {}",
+                sme_candidates.as_ref().unwrap().0.len(),
+                where_query
+            );
+        } else {
+            log::info!(
+                "Semantic processing will scan all row pointers for query: {}",
+                where_query
+            );
+        }
+
+        log::info!(
+            "Semantic processing setup completed in {:.2?}",
+            semantic_stopwatch.elapsed()
+        );
+
+        let reading_time_total = Arc::new(AtomicU64::new(0));
+
         // Process batches
-        while let Ok(pointers) = iterator.next_row_pointers().await {
+        loop {
+            let reading_time_total_clone = reading_time_total.clone();
+
+            let pointers: Vec<RowPointer> = if let Some((cands, idx)) = &mut sme_candidates {
+                let batch_size = *BATCH_SIZE.get().unwrap();
+                if *idx >= cands.len() {
+                    Vec::new()
+                } else {
+                    let end = std::cmp::min(*idx + batch_size, cands.len());
+                    let out = cands[*idx..end].to_vec();
+                    *idx = end;
+                    out
+                }
+            } else {
+                match iterator.next_row_pointers().await {
+                    Ok(p) => p,
+                    Err(_) => Vec::new(),
+                }
+            };
+
             if pointers.is_empty() {
                 break;
             }
@@ -132,9 +210,11 @@ impl ConcurrentProcessor {
             let tx_rp_clone = tx_rp.clone();
             let schema_ref = Arc::clone(&schema_arc);
             let tokens_ref = Arc::clone(&tokens_arc);
-            let io_rows_batch = Arc::clone(&io_rows_outer);
+            let io_rows_batch = std::sync::Arc::clone(&io_rows_outer);
 
             let batch_handle = task::spawn(async move {
+                let reading_time_total_clone_2 = Arc::clone(&reading_time_total_clone);
+
                 // Acquire a permit for this batch
                 let _batch_permit = tuple_clone.0.acquire().await.unwrap();
 
@@ -165,13 +245,19 @@ impl ConcurrentProcessor {
                         continue;
                     }
 
-                    let io_rows_clone = Arc::clone(&io_rows_batch);
+                    let io_rows_clone = std::sync::Arc::clone(&io_rows_batch);
                     let (_, query_row_fetch, requested_row_fetch) = &*tuple_clone;
+
+                    
+                    let reading_time = stopwatch::Stopwatch::start_new();
 
                     // Read the minimal set of columns needed for the WHERE evaluation
                     pointer
                         .fetch_row_reuse_async(io_rows_clone, query_row_fetch, &mut buffer.row)
                         .await;
+
+                    let elapsed_ns = reading_time.elapsed().as_nanos() as u64;
+                    reading_time_total_clone_2.fetch_add(elapsed_ns, std::sync::atomic::Ordering::Relaxed);
 
                     // On the first row, parse and build the plan using a temporary vector.
                     if !plan_built {
@@ -229,13 +315,16 @@ impl ConcurrentProcessor {
                     };
 
                     if result {
-                        if tx_rp_clone.send(pointer.clone()).is_err() {
+                        if tx_rp_clone.send(pointer.clone()).await.is_err() {
                             log::error!("Failed to send row pointer to cache inserter");
                             // Receiver dropped; stop early
                             break;
                         }
 
-                        let io_rows_clone = Arc::clone(&io_rows_batch);
+                        let reading_time = stopwatch::Stopwatch::start_new();
+
+                        let io_rows_clone = std::sync::Arc::clone(&io_rows_batch);
+
                         pointer
                             .fetch_row_reuse_async(
                                 io_rows_clone,
@@ -244,8 +333,11 @@ impl ConcurrentProcessor {
                             )
                             .await;
 
+                        let elapsed_ns = reading_time.elapsed().as_nanos() as u64;
+                        reading_time_total_clone_2.fetch_add(elapsed_ns, std::sync::atomic::Ordering::Relaxed);
+
                         // Send a clone out to the aggregator
-                        if tx_clone.send(Row::clone_row(&buffer.row)).is_err() {
+                        if tx_clone.send(Row::clone_row(&buffer.row)).await.is_err() {
                             log::error!("Failed to send row to aggregator");
                             // Receiver dropped; stop early
                             break;
@@ -268,7 +360,7 @@ impl ConcurrentProcessor {
             let mut collected_rows = Vec::with_capacity(50);
 
             if !rx.is_empty() {
-                rx.recv_many(&mut collected_rows, usize::MAX).await;
+                rx.drain_into(&mut collected_rows).unwrap();
             }
 
             drop(rx);
@@ -282,7 +374,7 @@ impl ConcurrentProcessor {
         if crc64_hash != 0 {
             let mut pointers = Vec::with_capacity(50);
             if !rx_rp.is_empty() {
-                rx_rp.recv_many(&mut pointers, usize::MAX).await;
+                rx_rp.drain_into(&mut pointers).unwrap();
             }
 
             drop(rx_rp);
@@ -294,6 +386,14 @@ impl ConcurrentProcessor {
                 log::error!("Failed to insert entries into cache for hash {}", crc64_hash);
             }
         }
+
+        let total_reading_ns = reading_time_total.load(std::sync::atomic::Ordering::Relaxed);
+        log::info!(
+            "Total reading time for query '{}' : {:.2?} over {} rows",
+            where_query,
+            std::time::Duration::from_nanos(total_reading_ns),
+            all_rows.len()
+        );
 
         all_rows
     }

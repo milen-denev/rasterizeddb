@@ -320,7 +320,7 @@ impl ColumnTransformer {
     }
 }
 
-// NOTE: Consider refactoring ComparisonOperand to remove DirectWithIndex and keep only Column(idx) for columns.
+// TODO: Consider refactoring ComparisonOperand to remove DirectWithIndex and keep only Column(idx) for columns.
 #[derive(Debug, Clone)]
 pub enum ComparisonOperand {
     Direct(MemoryBlock),

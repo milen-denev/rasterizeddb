@@ -266,6 +266,7 @@ async fn load_db_tables<S: StorageIO>(
 
     let all_rows = concurrent_processor
         .process(
+            &schema.name,
             &format!(
                 r##"
             1 = 1

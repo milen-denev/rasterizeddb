@@ -9,3 +9,4 @@ pub mod support_types;
 pub mod tokenizer;
 pub mod processor;
 pub mod rql;
+pub mod sme;
