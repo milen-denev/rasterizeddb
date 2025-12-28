@@ -24,20 +24,27 @@ libmimalloc-sys = "0.1"
 rastcp = { path = "../rastcp" }
 env_logger = "0.11"
 tera = "1.20"
-crc = "3.3"
+crc = "3.4"
 temp_testdir = "0.2"
 memmap2 = "0.9"
 rand = "0.9"
 memory-stats = "1.2"
 smallvec = { version = "1.15", features = ["union", "write"]}
-arc-swap = "1.7"
+arc-swap = "1.8"
 fastrand = "2.3"
 parking_lot = "0.12"
 clap = { version = "4.5", features = ["derive"] }
+kanal = "0.1"
+rclite = "0.4.1"
+
+# NOTE: Cargo does not support `cfg(debug_assertions)` for platform-specific dependencies.
+# These are always available, but only used behind `#[cfg(debug_assertions)]` in code.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [dev-dependencies]
-criterion = { version = "0.7" }
-tempfile = "3.23"
+criterion = { version = "0.8" }
+tempfile = "3"
 
 [[bench]]
 name = "string_instructions_benchmarks"
