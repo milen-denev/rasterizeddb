@@ -4,8 +4,10 @@
         {
             "label": "buildCargo",
             "type": "shell",
-            "command": "cargo build",
-            "args": [],
+            "command": "cargo",
+            "args": [
+                "build"
+            ],
             "presentation": {
                 "reveal": "always",
             },
