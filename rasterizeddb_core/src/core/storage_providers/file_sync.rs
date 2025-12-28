@@ -200,7 +200,9 @@ impl LocalStorageProvider {
             };
 
             // If there are staged bytes in temp file, flush them into the main file.
-            if temp_len > 0 && file_len > 0 {
+            // This must run even when the main file is empty; otherwise bytes can be stranded
+            // in the temp file across restarts and readers will observe an empty main file.
+            if temp_len > 0 {
                 let _ = local_storage_provider.flush_temp_to_main().await;
             }
 
@@ -313,7 +315,7 @@ impl LocalStorageProvider {
                 append_blocked: AtomicBool::new(false)
             };
 
-            if temp_len > 0 && file_len > 0 {
+            if temp_len > 0 {
                 let _ = local_storage_provider.flush_temp_to_main().await;
             }
 
@@ -870,7 +872,7 @@ impl StorageIO for LocalStorageProvider {
             append_blocked: AtomicBool::new(false),
         };
 
-        if staged_len > 0 && file_len > 0 {
+        if staged_len > 0 {
             let _ = local_storage_provider.flush_temp_to_main().await;
         }
 
@@ -985,7 +987,7 @@ impl StorageIO for LocalStorageProvider {
             append_blocked: AtomicBool::new(false)
         };
 
-        if staged_len > 0 && file_len > 0 {
+        if staged_len > 0 {
             let _ = local_storage_provider.flush_temp_to_main().await;
         }
 
