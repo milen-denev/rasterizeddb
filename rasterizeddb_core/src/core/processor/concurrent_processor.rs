@@ -144,8 +144,9 @@ impl ConcurrentProcessor {
         );
 
         let semantic_stopwatch = std::time::Instant::now();
-        log::info!("Starting semantic processing for query: {}", where_query);
-
+        if semantics_enabled() {
+            log::info!("Starting semantic processing for query: {}", where_query);
+        }
         // If SME semantics are enabled and SME can build candidates for this query/table,
         // only iterate those. Otherwise fall back to scanning all pointers.
         let mut sme_candidates: Option<(Arc<Vec<RowPointer>>, usize)> = if semantics_enabled() {
@@ -171,17 +172,21 @@ impl ConcurrentProcessor {
                 where_query
             );
         } else {
-            log::info!(
-                "Semantic processing will scan all row pointers for query: {}",
-                where_query
-            );
+            if semantics_enabled() {
+                log::info!(
+                    "Semantic processing will scan all row pointers for query: {}",
+                    where_query
+                );
+            }
         }
 
-        log::info!(
-            "Semantic processing setup completed in {:.2?}",
-            semantic_stopwatch.elapsed()
-        );
-
+        if semantics_enabled() {
+            log::info!(
+                "Semantic processing setup completed in {:.2?}",
+                semantic_stopwatch.elapsed()
+            );
+        }
+        
         let reading_time_total = Arc::new(AtomicU64::new(0));
 
         // Process batches

@@ -81,29 +81,36 @@ impl SemanticMappingEngine {
             return Some(cached);
         }
 
-        let rules_io = SemanticRuleStore::open_rules_io(io_rows, table_name).await;
-        let (meta, rules) = SemanticRuleStore::load_meta_and_rules(rules_io).await.ok()?;
-        if rules.is_empty() {
-            return None;
-        }
-
         let plan = RuleTransformerPlan::from_tokens(tokens, schema)?;
         if plan.predicates.is_empty() {
             return None;
         }
 
-        // Index rules by column id for faster evaluation.
-        let mut by_col: Vec<Vec<crate::core::sme::rules::SemanticRule>> = vec![Vec::new(); schema.len()];
-        for r in rules.into_iter() {
-            if r.op == crate::core::sme::rules::SemanticRuleOp::Meta {
-                continue;
-            }
-            let idx = r.column_schema_id as usize;
-            if idx < by_col.len() {
-                by_col[idx].push(r);
+        let rules_io = SemanticRuleStore::open_rules_io(io_rows, table_name).await;
+
+        // v2-only: use header index to load only the columns referenced by this query.
+        let header = SemanticRuleStore::try_load_header_v2(rules_io.clone()).await.ok()??;
+
+        let mut needed_cols: SmallVec<[u64; 8]> = SmallVec::new();
+        for p in plan.predicates.iter() {
+            let col = p.column_schema_id();
+            if (col as usize) < schema.len() && !needed_cols.contains(&col) {
+                needed_cols.push(col);
             }
         }
 
+        let mut by_col: Vec<Vec<crate::core::sme::rules::SemanticRule>> = vec![Vec::new(); schema.len()];
+        let loaded = SemanticRuleStore::load_rules_for_columns_v2(rules_io.clone(), &header, &needed_cols)
+            .await
+            .ok()?;
+        for (col, rules) in loaded {
+            let idx = col as usize;
+            if idx < by_col.len() {
+                by_col[idx] = rules;
+            }
+        }
+
+        let meta = header.meta;
         let intervals = plan.evaluate(&by_col, meta)?;
         if intervals.is_empty() {
             // Still allow scanning only appended rows if we have meta.
@@ -117,7 +124,9 @@ impl SemanticMappingEngine {
 
         let arc = rclite::Arc::new(built);
         self.put_candidates_for_table_tokens(table_name, tokens, rclite::Arc::clone(&arc));
-        Some(arc)
+        return Some(arc);
+
+        // (all returns handled above)
     }
 }
 
@@ -171,6 +180,16 @@ enum RuleNext {
 struct RulePredicate {
     constraint: RuleConstraint,
     next: Option<RuleNext>,
+}
+
+impl RulePredicate {
+    #[inline]
+    fn column_schema_id(&self) -> u64 {
+        match &self.constraint {
+            RuleConstraint::Numeric(c) => c.column_schema_id,
+            RuleConstraint::String(c) => c.column_schema_id,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -827,21 +846,13 @@ unsafe fn simd_filter_eq_i64_avx2(
     let mut out = Vec::new();
     let mut i = 0usize;
     let val_v = _mm256_set1_epi64x(val);
+    let idx = _mm_set_epi32(3 * 72, 2 * 72, 1 * 72, 0 * 72);
+    let base_ptr = rules.as_ptr() as *const u8;
 
     while i + 4 <= rules.len() {
-        let mut lo_arr = [0i64; 4];
-        let mut hi_arr = [0i64; 4];
-        for lane in 0..4 {
-            if let Some((lo, hi)) = decode_rule_i64(&rules[i + lane]) {
-                lo_arr[lane] = lo;
-                hi_arr[lane] = hi;
-            } else {
-                lo_arr[lane] = i64::MIN;
-                hi_arr[lane] = i64::MAX;
-            }
-        }
-        let lo_v = _mm256_loadu_si256(lo_arr.as_ptr() as *const __m256i);
-        let hi_v = _mm256_loadu_si256(hi_arr.as_ptr() as *const __m256i);
+        let current_ptr = base_ptr.add(i * 72);
+        let lo_v = _mm256_i32gather_epi64(current_ptr.add(24) as *const i64, idx, 1);
+        let hi_v = _mm256_i32gather_epi64(current_ptr.add(40) as *const i64, idx, 1);
 
         // We want: lo <= val && hi >= val
         // lo <= val  <=>  !(lo > val)  <=>  !cmpgt(lo, val)
@@ -852,10 +863,12 @@ unsafe fn simd_filter_eq_i64_avx2(
         let bad = _mm256_or_si256(lo_gt_val, val_gt_hi);
         let mask = !(_mm256_movemask_pd(_mm256_castsi256_pd(bad)) as u32);
 
-        for lane in 0..4 {
-            if (mask & (1u32 << lane)) != 0 {
-                let r = &rules[i + lane];
-                out.push((r.start_row_id, r.end_row_id));
+        if mask != 0 {
+            for lane in 0..4 {
+                if (mask & (1u32 << lane)) != 0 {
+                    let r = &rules[i + lane];
+                    out.push((r.start_row_id, r.end_row_id));
+                }
             }
         }
         i += 4;
@@ -884,21 +897,17 @@ unsafe fn simd_filter_eq_u64_avx2(
     let mut i = 0usize;
     let val_i = u64_ordered_to_i64(val);
     let val_v = _mm256_set1_epi64x(val_i);
+    let idx = _mm_set_epi32(3 * 72, 2 * 72, 1 * 72, 0 * 72);
+    let base_ptr = rules.as_ptr() as *const u8;
+    let sign_flip = _mm256_set1_epi64x(i64::MIN);
 
     while i + 4 <= rules.len() {
-        let mut lo_arr = [0i64; 4];
-        let mut hi_arr = [0i64; 4];
-        for lane in 0..4 {
-            if let Some((lo, hi)) = decode_rule_u64(&rules[i + lane]) {
-                lo_arr[lane] = u64_ordered_to_i64(lo);
-                hi_arr[lane] = u64_ordered_to_i64(hi);
-            } else {
-                lo_arr[lane] = i64::MIN;
-                hi_arr[lane] = i64::MAX;
-            }
-        }
-        let lo_v = _mm256_loadu_si256(lo_arr.as_ptr() as *const __m256i);
-        let hi_v = _mm256_loadu_si256(hi_arr.as_ptr() as *const __m256i);
+        let current_ptr = base_ptr.add(i * 72);
+        let lo_raw = _mm256_i32gather_epi64(current_ptr.add(24) as *const i64, idx, 1);
+        let hi_raw = _mm256_i32gather_epi64(current_ptr.add(40) as *const i64, idx, 1);
+        
+        let lo_v = _mm256_xor_si256(lo_raw, sign_flip);
+        let hi_v = _mm256_xor_si256(hi_raw, sign_flip);
 
         // We want: lo <= val && hi >= val
         // Using signed comparison on ordered-mapped values.
@@ -907,10 +916,12 @@ unsafe fn simd_filter_eq_u64_avx2(
         let bad = _mm256_or_si256(lo_gt_val, val_gt_hi);
         let mask = !(_mm256_movemask_pd(_mm256_castsi256_pd(bad)) as u32);
 
-        for lane in 0..4 {
-            if (mask & (1u32 << lane)) != 0 {
-                let r = &rules[i + lane];
-                out.push((r.start_row_id, r.end_row_id));
+        if mask != 0 {
+            for lane in 0..4 {
+                if (mask & (1u32 << lane)) != 0 {
+                    let r = &rules[i + lane];
+                    out.push((r.start_row_id, r.end_row_id));
+                }
             }
         }
         i += 4;
@@ -938,21 +949,13 @@ unsafe fn simd_filter_eq_f64_avx2(
     let mut out = Vec::new();
     let mut i = 0usize;
     let val_v = _mm256_set1_pd(val);
+    let idx = _mm_set_epi32(3 * 72, 2 * 72, 1 * 72, 0 * 72);
+    let base_ptr = rules.as_ptr() as *const u8;
 
     while i + 4 <= rules.len() {
-        let mut lo_arr = [0f64; 4];
-        let mut hi_arr = [0f64; 4];
-        for lane in 0..4 {
-            if let Some((lo, hi)) = decode_rule_f64(&rules[i + lane]) {
-                lo_arr[lane] = lo;
-                hi_arr[lane] = hi;
-            } else {
-                lo_arr[lane] = f64::NEG_INFINITY;
-                hi_arr[lane] = f64::INFINITY;
-            }
-        }
-        let lo_v = _mm256_loadu_pd(lo_arr.as_ptr());
-        let hi_v = _mm256_loadu_pd(hi_arr.as_ptr());
+        let current_ptr = base_ptr.add(i * 72);
+        let lo_v = _mm256_i32gather_pd(current_ptr.add(24) as *const f64, idx, 1);
+        let hi_v = _mm256_i32gather_pd(current_ptr.add(40) as *const f64, idx, 1);
 
         // We want: lo <= val && hi >= val
         // _mm256_cmp_pd with _CMP_LE_OQ (Less-equal, ordered, non-signaling)
@@ -964,10 +967,12 @@ unsafe fn simd_filter_eq_f64_avx2(
         let good = _mm256_and_pd(lo_le_val, val_le_hi);
         let mask = _mm256_movemask_pd(good) as u32;
 
-        for lane in 0..4 {
-            if (mask & (1u32 << lane)) != 0 {
-                let r = &rules[i + lane];
-                out.push((r.start_row_id, r.end_row_id));
+        if mask != 0 {
+            for lane in 0..4 {
+                if (mask & (1u32 << lane)) != 0 {
+                    let r = &rules[i + lane];
+                    out.push((r.start_row_id, r.end_row_id));
+                }
             }
         }
         i += 4;
@@ -1079,22 +1084,13 @@ unsafe fn simd_filter_i64_avx2(
 
     let mut out = Vec::new();
     let mut i = 0usize;
-    while i + 4 <= rules.len() {
-        let mut lo_arr = [0i64; 4];
-        let mut hi_arr = [0i64; 4];
-        for lane in 0..4 {
-            if let Some((lo, hi)) = decode_rule_i64(&rules[i + lane]) {
-                lo_arr[lane] = lo;
-                hi_arr[lane] = hi;
-            } else {
-                // Force match conservatively.
-                lo_arr[lane] = i64::MIN;
-                hi_arr[lane] = i64::MAX;
-            }
-        }
+    let idx = _mm_set_epi32(3 * 72, 2 * 72, 1 * 72, 0 * 72);
+    let base_ptr = rules.as_ptr() as *const u8;
 
-        let lo_v = _mm256_loadu_si256(lo_arr.as_ptr() as *const __m256i);
-        let hi_v = _mm256_loadu_si256(hi_arr.as_ptr() as *const __m256i);
+    while i + 4 <= rules.len() {
+        let current_ptr = base_ptr.add(i * 72);
+        let lo_v = _mm256_i32gather_epi64(current_ptr.add(24) as *const i64, idx, 1);
+        let hi_v = _mm256_i32gather_epi64(current_ptr.add(40) as *const i64, idx, 1);
 
         let mut mask = !0u32; // 4 lanes.
         if let Some((b, inc)) = lower {
@@ -1115,10 +1111,12 @@ unsafe fn simd_filter_i64_avx2(
             mask &= _mm256_movemask_pd(_mm256_castsi256_pd(upper_ok)) as u32;
         }
 
-        for lane in 0..4 {
-            if (mask & (1u32 << lane)) != 0 {
-                let r = &rules[i + lane];
-                out.push((r.start_row_id, r.end_row_id));
+        if mask != 0 {
+            for lane in 0..4 {
+                if (mask & (1u32 << lane)) != 0 {
+                    let r = &rules[i + lane];
+                    out.push((r.start_row_id, r.end_row_id));
+                }
             }
         }
 
@@ -1219,21 +1217,17 @@ unsafe fn simd_filter_u64_avx2(
 
     let mut out = Vec::new();
     let mut i = 0usize;
-    while i + 4 <= rules.len() {
-        let mut lo_arr = [0i64; 4];
-        let mut hi_arr = [0i64; 4];
-        for lane in 0..4 {
-            if let Some((lo, hi)) = decode_rule_u64(&rules[i + lane]) {
-                lo_arr[lane] = u64_ordered_to_i64(lo);
-                hi_arr[lane] = u64_ordered_to_i64(hi);
-            } else {
-                lo_arr[lane] = i64::MIN;
-                hi_arr[lane] = i64::MAX;
-            }
-        }
+    let idx = _mm_set_epi32(3 * 72, 2 * 72, 1 * 72, 0 * 72);
+    let base_ptr = rules.as_ptr() as *const u8;
+    let sign_flip = _mm256_set1_epi64x(i64::MIN);
 
-        let lo_v = _mm256_loadu_si256(lo_arr.as_ptr() as *const __m256i);
-        let hi_v = _mm256_loadu_si256(hi_arr.as_ptr() as *const __m256i);
+    while i + 4 <= rules.len() {
+        let current_ptr = base_ptr.add(i * 72);
+        let lo_raw = _mm256_i32gather_epi64(current_ptr.add(24) as *const i64, idx, 1);
+        let hi_raw = _mm256_i32gather_epi64(current_ptr.add(40) as *const i64, idx, 1);
+        
+        let lo_v = _mm256_xor_si256(lo_raw, sign_flip);
+        let hi_v = _mm256_xor_si256(hi_raw, sign_flip);
 
         let mut mask = !0u32;
         if let Some((b_u, inc)) = lower {
@@ -1254,10 +1248,12 @@ unsafe fn simd_filter_u64_avx2(
             mask &= _mm256_movemask_pd(_mm256_castsi256_pd(upper_ok)) as u32;
         }
 
-        for lane in 0..4 {
-            if (mask & (1u32 << lane)) != 0 {
-                let r = &rules[i + lane];
-                out.push((r.start_row_id, r.end_row_id));
+        if mask != 0 {
+            for lane in 0..4 {
+                if (mask & (1u32 << lane)) != 0 {
+                    let r = &rules[i + lane];
+                    out.push((r.start_row_id, r.end_row_id));
+                }
             }
         }
         i += 4;
@@ -1351,21 +1347,13 @@ unsafe fn simd_filter_f64_avx2(
     use std::arch::x86_64::*;
     let mut out = Vec::new();
     let mut i = 0usize;
-    while i + 4 <= rules.len() {
-        let mut lo_arr = [0f64; 4];
-        let mut hi_arr = [0f64; 4];
-        for lane in 0..4 {
-            if let Some((lo, hi)) = decode_rule_f64(&rules[i + lane]) {
-                lo_arr[lane] = lo;
-                hi_arr[lane] = hi;
-            } else {
-                lo_arr[lane] = f64::NEG_INFINITY;
-                hi_arr[lane] = f64::INFINITY;
-            }
-        }
+    let idx = _mm_set_epi32(3 * 72, 2 * 72, 1 * 72, 0 * 72);
+    let base_ptr = rules.as_ptr() as *const u8;
 
-        let lo_v = _mm256_loadu_pd(lo_arr.as_ptr());
-        let hi_v = _mm256_loadu_pd(hi_arr.as_ptr());
+    while i + 4 <= rules.len() {
+        let current_ptr = base_ptr.add(i * 72);
+        let lo_v = _mm256_i32gather_pd(current_ptr.add(24) as *const f64, idx, 1);
+        let hi_v = _mm256_i32gather_pd(current_ptr.add(40) as *const f64, idx, 1);
 
         let mut mask = !0u32;
         if let Some((b, inc)) = lower {
@@ -1387,10 +1375,12 @@ unsafe fn simd_filter_f64_avx2(
             mask &= _mm256_movemask_pd(upper_ok) as u32;
         }
 
-        for lane in 0..4 {
-            if (mask & (1u32 << lane)) != 0 {
-                let r = &rules[i + lane];
-                out.push((r.start_row_id, r.end_row_id));
+        if mask != 0 {
+            for lane in 0..4 {
+                if (mask & (1u32 << lane)) != 0 {
+                    let r = &rules[i + lane];
+                    out.push((r.start_row_id, r.end_row_id));
+                }
             }
         }
         i += 4;
@@ -1859,78 +1849,66 @@ unsafe fn simd_filter_string_metric_u64_avx2(
 
     let mut out = Vec::new();
     let mut i = 0usize;
-
-    // Precompute ordered bounds for unsigned comparisons.
-    let lower_i = lower.map(|(v, _)| u64_ordered_to_i64(v));
-    let upper_i = upper.map(|(v, _)| u64_ordered_to_i64(v));
+    let idx = _mm_set_epi32(3 * 72, 2 * 72, 1 * 72, 0 * 72);
+    let base_ptr = rules.as_ptr() as *const u8;
+    let sign_flip = _mm256_set1_epi64x(i64::MIN);
+    
+    let lower_i = lower.map(|(v, inc)| (u64_ordered_to_i64(v), inc));
+    let upper_i = upper.map(|(v, inc)| (u64_ordered_to_i64(v), inc));
+    
+    let target_op = _mm256_set1_epi64x(op as u8 as i64);
 
     while i + 4 <= rules.len() {
-        // Gather 4 rules.
-        let mut lo_arr = [0i64; 4];
-        let mut hi_arr = [0i64; 4];
-        let mut ok_mask: u32 = 0;
+        let current_ptr = base_ptr.add(i * 72);
+        
+        // Check op. Op is at offset 17.
+        // Gather u64 at offset 16.
+        let meta_v = _mm256_i32gather_epi64(current_ptr.add(16) as *const i64, idx, 1);
+        // Shift right 8 bits to get op in lowest byte.
+        let op_v = _mm256_srli_epi64(meta_v, 8);
+        // Mask with 0xFF
+        let op_v = _mm256_and_si256(op_v, _mm256_set1_epi64x(0xFF));
+        
+        let op_match = _mm256_cmpeq_epi64(op_v, target_op);
+        
+        // Gather lower/upper
+        let lo_raw = _mm256_i32gather_epi64(current_ptr.add(24) as *const i64, idx, 1);
+        let hi_raw = _mm256_i32gather_epi64(current_ptr.add(40) as *const i64, idx, 1);
+        
+        let lo_v = _mm256_xor_si256(lo_raw, sign_flip);
+        let hi_v = _mm256_xor_si256(hi_raw, sign_flip);
 
-        for lane in 0..4 {
-            let r = &rules[i + lane];
-            if r.op != op {
-                continue;
-            }
-            if let Some((lo_u, hi_u)) = decode_string_metric_u64(r) {
-                lo_arr[lane] = u64_ordered_to_i64(lo_u);
-                hi_arr[lane] = u64_ordered_to_i64(hi_u);
-                ok_mask |= 1u32 << lane;
-            }
-        }
-
-        if ok_mask != 0 {
-            let lo_v = _mm256_loadu_si256(lo_arr.as_ptr() as *const __m256i);
-            let hi_v = _mm256_loadu_si256(hi_arr.as_ptr() as *const __m256i);
-
-            // Start with all valid lanes.
-            let mut lane_ok = ok_mask;
-
-            if let Some((_, inc)) = lower {
-                let b = lower_i.unwrap();
+        let mut mask = _mm256_movemask_pd(_mm256_castsi256_pd(op_match)) as u32;
+        
+        if mask != 0 {
+            if let Some((b, inc)) = lower_i {
                 let b_v = _mm256_set1_epi64x(b);
-                // We want: hi >= b (or hi > b if exclusive)
-                let hi_lt_b = _mm256_cmpgt_epi64(b_v, hi_v);
+                let hi_gt_b = _mm256_cmpgt_epi64(hi_v, b_v);
                 let hi_eq_b = _mm256_cmpeq_epi64(hi_v, b_v);
-                let bad = if inc {
-                    hi_lt_b
-                } else {
-                    _mm256_or_si256(hi_lt_b, hi_eq_b)
-                };
-                let bad_mask = (_mm256_movemask_pd(_mm256_castsi256_pd(bad)) as u32) & 0xF;
-                lane_ok &= !bad_mask;
+                let lower_ok = if inc { _mm256_or_si256(hi_gt_b, hi_eq_b) } else { hi_gt_b };
+                mask &= _mm256_movemask_pd(_mm256_castsi256_pd(lower_ok)) as u32;
             }
-
-            if let Some((_, inc)) = upper {
-                let b = upper_i.unwrap();
+            if let Some((b, inc)) = upper_i {
                 let b_v = _mm256_set1_epi64x(b);
-                // We want: lo <= b (or lo < b if exclusive)
                 let lo_gt_b = _mm256_cmpgt_epi64(lo_v, b_v);
                 let lo_eq_b = _mm256_cmpeq_epi64(lo_v, b_v);
-                let bad = if inc {
-                    lo_gt_b
-                } else {
-                    _mm256_or_si256(lo_gt_b, lo_eq_b)
-                };
-                let bad_mask = (_mm256_movemask_pd(_mm256_castsi256_pd(bad)) as u32) & 0xF;
-                lane_ok &= !bad_mask;
+                let lo_le_b = _mm256_xor_si256(_mm256_set1_epi64x(-1), lo_gt_b);
+                let upper_ok = if inc { lo_le_b } else { _mm256_andnot_si256(lo_eq_b, lo_le_b) };
+                mask &= _mm256_movemask_pd(_mm256_castsi256_pd(upper_ok)) as u32;
             }
-
-            for lane in 0..4 {
-                if (lane_ok >> lane) & 1 == 1 {
-                    let r = &rules[i + lane];
-                    out.push((r.start_row_id, r.end_row_id));
+            
+            if mask != 0 {
+                for lane in 0..4 {
+                    if (mask & (1u32 << lane)) != 0 {
+                        let r = &rules[i + lane];
+                        out.push((r.start_row_id, r.end_row_id));
+                    }
                 }
             }
         }
-
         i += 4;
     }
 
-    // Tail scalar.
     for r in rules[i..].iter() {
         if r.op != op {
             continue;
@@ -1941,7 +1919,6 @@ unsafe fn simd_filter_string_metric_u64_avx2(
             }
         }
     }
-
     out
 }
 
@@ -2209,7 +2186,7 @@ fn intersect_intervals(a: &[(u64, u64)], b: &[(u64, u64)]) -> Vec<(u64, u64)> {
             j += 1;
         }
     }
-    normalize_intervals(out)
+    out
 }
 
 async fn build_candidates_from_intervals<S: StorageIO>(
