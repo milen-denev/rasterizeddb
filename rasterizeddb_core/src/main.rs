@@ -58,11 +58,11 @@ fn main() -> std::io::Result<()> {
     let cache_size = args.cache_size.unwrap_or(100_000);
     let min_size = if cache_size < 1024 { 1024 } else { cache_size };
 
-    //#[cfg(debug_assertions)]
+    #[cfg(debug_assertions)]
     let enable_cache = args.enable_cache.unwrap_or(false);
 
-    //#[cfg(not(debug_assertions))]
-    //let enable_cache = args.enable_cache.unwrap_or(true);
+    #[cfg(not(debug_assertions))]
+    let enable_cache = args.enable_cache.unwrap_or(true);
 
     if enable_cache {
         ATOMIC_CACHE.get_or_init(|| {
@@ -94,11 +94,11 @@ fn main() -> std::io::Result<()> {
             .filter_level(level)
             .init();
 
-        //#[cfg(debug_assertions)]
+        #[cfg(debug_assertions)]
         let db_location = config.location.as_deref().unwrap_or("G:/Databases/Production/");
         
-        //#[cfg(not(debug_assertions))]
-        //let db_location = config.location.as_deref().expect("Database location must be provided with --location <path>");
+        #[cfg(not(debug_assertions))]
+        let db_location = config.location.as_deref().expect("Database location must be provided with --location <path>");
         
         let database = Database::new(db_location).await;
         let arc_database = Arc::new(database);
