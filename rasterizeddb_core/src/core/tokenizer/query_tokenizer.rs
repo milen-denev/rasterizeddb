@@ -516,8 +516,15 @@ pub fn tokenize<'a>(s: &str, schema: &'a SmallVec<[SchemaField; 20]>) -> SmallVe
                 let saved_context = expression_type_context.clone();
 
                 let mut op_end = i + 1;
-                if op_end < bytes.len() && bytes[op_end] == b'=' {
-                    op_end += 1;
+                if op_end < bytes.len() {
+                    // Two-character operators.
+                    // - <=, >=, !=, ==
+                    // - <> (SQL not-equals)
+                    if bytes[op_end] == b'=' {
+                        op_end += 1;
+                    } else if bytes[i] == b'<' && bytes[op_end] == b'>' {
+                        op_end += 1;
+                    }
                 }
 
                 let op = unsafe { std::str::from_utf8_unchecked(&bytes[i..op_end]).to_string() };
