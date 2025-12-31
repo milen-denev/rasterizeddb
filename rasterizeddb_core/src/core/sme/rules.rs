@@ -65,11 +65,16 @@ impl SemanticRuleOp {
 /// - start_row_id: u64
 /// - end_row_id: u64
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[repr(C)]
 pub struct SemanticRule {
     pub rule_id: u64,
     pub column_schema_id: u64,
     pub column_type: DbType,
     pub op: SemanticRuleOp,
+
+    /// Reserved padding to keep this struct's layout stable and aligned with the on-disk
+    /// 72-byte record format.
+    pub reserved: [u8; 6],
 
     /// Type-dependent bounds.
     ///
@@ -94,7 +99,7 @@ impl SemanticRule {
         out[8..16].copy_from_slice(&self.column_schema_id.to_le_bytes());
         out[16] = self.column_type.to_byte();
         out[17] = self.op as u8;
-        // out[18..24] reserved = zeros
+        out[18..24].copy_from_slice(&self.reserved);
         out[24..40].copy_from_slice(&self.lower);
         out[40..56].copy_from_slice(&self.upper);
         out[56..64].copy_from_slice(&self.start_row_id.to_le_bytes());
@@ -110,6 +115,9 @@ impl SemanticRule {
         let column_type = DbType::from_byte(bytes[16]);
         let op = SemanticRuleOp::from_byte(bytes[17]);
 
+        let mut reserved = [0u8; 6];
+        reserved.copy_from_slice(&bytes[18..24]);
+
         let mut lower = [0u8; 16];
         let mut upper = [0u8; 16];
         lower.copy_from_slice(&bytes[24..40]);
@@ -123,6 +131,7 @@ impl SemanticRule {
             column_schema_id,
             column_type,
             op,
+            reserved,
             lower,
             upper,
             start_row_id,

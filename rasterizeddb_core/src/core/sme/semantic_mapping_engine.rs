@@ -11,6 +11,7 @@ use crate::core::{
         schema::SchemaField,
     },
     sme::rule_store::{ScanMeta, SemanticRuleStore},
+    sme::sme_avx,
     storage_providers::traits::StorageIO,
     tokenizer::query_tokenizer::{NumericValue, Token},
 };
@@ -135,6 +136,7 @@ struct NumericConstraint {
     column_schema_id: u64,
     lower: Option<(NumericScalar, bool)>, // (value, inclusive)
     upper: Option<(NumericScalar, bool)>, // (value, inclusive)
+    not_equals: Option<NumericScalar>,
 }
 
 #[derive(Debug, Clone)]
@@ -153,6 +155,8 @@ struct StringConstraint {
     // These are safe lower-bounds for all string kinds.
     max_run_lower: Option<(u64, bool)>,
     max_count_lower: Option<(u64, bool)>,
+
+    match_always: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,6 +165,7 @@ enum StringConstraintKind {
     Contains,
     StartsWith,
     EndsWith,
+    NotEquals,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -271,22 +276,28 @@ impl RuleTransformerPlan {
                 continue;
             }
 
-            // Ident Op StringLit [Next]  (only supports '=' for SME)
+            // Ident Op StringLit [Next]
             if let (Some(Token::Ident((_name, db_type, write_order))), Some(Token::Op(op)), Some(Token::StringLit(lit))) =
                 (tokens.get(i), tokens.get(i + 1), tokens.get(i + 2))
             {
                 if *db_type != DbType::STRING {
                     return None;
                 }
-                if op.as_str() != "=" {
-                    return None;
-                }
+                
+                let kind = match op.as_str() {
+                    "=" => StringConstraintKind::Equals,
+                    "!=" | "<>" => StringConstraintKind::NotEquals,
+                    "STARTSWITH" => StringConstraintKind::StartsWith,
+                    "ENDSWITH" => StringConstraintKind::EndsWith,
+                    "CONTAINS" => StringConstraintKind::Contains,
+                    _ => return None,
+                };
 
                 let schema_idx = schema
                     .iter()
                     .position(|f| f.write_order as u64 == *write_order)? as u64;
 
-                let constraint = string_constraint_from_parts(schema_idx, StringConstraintKind::Equals, lit);
+                let constraint = string_constraint_from_parts(schema_idx, kind, lit);
                 let mut next: Option<RuleNext> = None;
                 if let Some(Token::Next(s)) = tokens.get(i + 3) {
                     next = match s.as_str() {
@@ -377,13 +388,15 @@ impl RuleTransformerPlan {
 
             let local = match &p.constraint {
                 RuleConstraint::Numeric(c) => {
-                    normalize_intervals(collect_matching_intervals_numeric(&rules_by_col[col], c))
+                    let v = collect_matching_intervals_numeric(&rules_by_col[col], c)?;
+                    normalize_intervals(v)
                 }
                 RuleConstraint::String(c) => {
                     let v = collect_matching_intervals_string(&rules_by_col[col], c)?;
                     normalize_intervals(v)
                 }
             };
+
             current_and = Some(match current_and {
                 None => local,
                 Some(prev) => intersect_intervals(&prev, &local),
@@ -423,9 +436,11 @@ impl RuleTransformerPlan {
 fn collect_matching_intervals_numeric(
     rules: &[crate::core::sme::rules::SemanticRule],
     c: &NumericConstraint,
-) -> Vec<(u64, u64)> {
+) -> Option<Vec<(u64, u64)>> {
+    // If we don't have semantic rules for this column, we can't safely narrow candidates.
+    // Returning None forces the caller to fall back to scanning all pointers.
     if rules.is_empty() {
-        return Vec::new();
+        return None;
     }
 
     // SIMD fast paths only apply to constraints that can be represented as i64/u64/f64.
@@ -433,37 +448,37 @@ fn collect_matching_intervals_numeric(
         DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 => {
             let lower = c.lower.and_then(|(v, inc)| numeric_scalar_to_i64(v).map(|vv| (vv, inc)));
             let upper = c.upper.and_then(|(v, inc)| numeric_scalar_to_i64(v).map(|vv| (vv, inc)));
-            if lower.is_some() || upper.is_some() {
+            if c.not_equals.is_none() && (lower.is_some() || upper.is_some()) {
                 if let (Some((l, true)), Some((u, true))) = (lower, upper) {
                     if l == u {
-                        return simd_or_scalar_filter_eq_i64(rules, l);
+                        return Some(simd_or_scalar_filter_eq_i64(rules, l));
                     }
                 }
-                return simd_or_scalar_filter_i64(rules, lower, upper);
+                return Some(simd_or_scalar_filter_i64(rules, lower, upper));
             }
         }
         DbType::U8 | DbType::U16 | DbType::U32 | DbType::U64 => {
             let lower = c.lower.and_then(|(v, inc)| numeric_scalar_to_u64(v).map(|vv| (vv, inc)));
             let upper = c.upper.and_then(|(v, inc)| numeric_scalar_to_u64(v).map(|vv| (vv, inc)));
-            if lower.is_some() || upper.is_some() {
+            if c.not_equals.is_none() && (lower.is_some() || upper.is_some()) {
                 if let (Some((l, true)), Some((u, true))) = (lower, upper) {
                     if l == u {
-                        return simd_or_scalar_filter_eq_u64(rules, l);
+                        return Some(simd_or_scalar_filter_eq_u64(rules, l));
                     }
                 }
-                return simd_or_scalar_filter_u64(rules, lower, upper);
+                return Some(simd_or_scalar_filter_u64(rules, lower, upper));
             }
         }
         DbType::F32 | DbType::F64 => {
             let lower = c.lower.and_then(|(v, inc)| numeric_scalar_to_f64(v).map(|vv| (vv, inc)));
             let upper = c.upper.and_then(|(v, inc)| numeric_scalar_to_f64(v).map(|vv| (vv, inc)));
-            if lower.is_some() || upper.is_some() {
+            if c.not_equals.is_none() && (lower.is_some() || upper.is_some()) {
                 if let (Some((l, true)), Some((u, true))) = (lower, upper) {
                     if (l - u).abs() < f64::EPSILON {
-                        return simd_or_scalar_filter_eq_f64(rules, l);
+                        return Some(simd_or_scalar_filter_eq_f64(rules, l));
                     }
                 }
-                return simd_or_scalar_filter_f64(rules, lower, upper);
+                return Some(simd_or_scalar_filter_f64(rules, lower, upper));
             }
         }
         _ => {}
@@ -476,7 +491,7 @@ fn collect_matching_intervals_numeric(
             out.push((r.start_row_id, r.end_row_id));
         }
     }
-    out
+    Some(out)
 }
 
 fn collect_matching_intervals_string(
@@ -487,6 +502,14 @@ fn collect_matching_intervals_string(
 
     if rules.is_empty() {
         return None;
+    }
+
+    if c.match_always {
+        let mut out = Vec::with_capacity(rules.len());
+        for r in rules {
+            out.push((r.start_row_id, r.end_row_id));
+        }
+        return Some(out);
     }
 
     // If the column has no string-derived rules, don't attempt SME.
@@ -592,7 +615,7 @@ fn numeric_scalar_to_f64(v: NumericScalar) -> Option<f64> {
     }
 }
 
-fn decode_rule_i64(rule: &crate::core::sme::rules::SemanticRule) -> Option<(i64, i64)> {
+pub(super) fn decode_rule_i64(rule: &crate::core::sme::rules::SemanticRule) -> Option<(i64, i64)> {
     match rule.column_type {
         DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 => {
             let lo = i128::from_le_bytes(rule.lower);
@@ -645,7 +668,7 @@ fn decode_rule_i64(rule: &crate::core::sme::rules::SemanticRule) -> Option<(i64,
     }
 }
 
-fn decode_rule_u64(rule: &crate::core::sme::rules::SemanticRule) -> Option<(u64, u64)> {
+pub(super) fn decode_rule_u64(rule: &crate::core::sme::rules::SemanticRule) -> Option<(u64, u64)> {
     match rule.column_type {
         DbType::U8 | DbType::U16 | DbType::U32 | DbType::U64 => {
             let lo = u128::from_le_bytes(rule.lower);
@@ -698,7 +721,7 @@ fn decode_rule_u64(rule: &crate::core::sme::rules::SemanticRule) -> Option<(u64,
     }
 }
 
-fn decode_rule_f64(rule: &crate::core::sme::rules::SemanticRule) -> Option<(f64, f64)> {
+pub(super) fn decode_rule_f64(rule: &crate::core::sme::rules::SemanticRule) -> Option<(f64, f64)> {
     match rule.column_type {
         DbType::F32 | DbType::F64 => {
             let lo_bits = u64::from_le_bytes(rule.lower[0..8].try_into().ok()?);
@@ -709,7 +732,7 @@ fn decode_rule_f64(rule: &crate::core::sme::rules::SemanticRule) -> Option<(f64,
     }
 }
 
-fn interval_i64_matches(lo: i64, hi: i64, lower: Option<(i64, bool)>, upper: Option<(i64, bool)>) -> bool {
+pub(super) fn interval_i64_matches(lo: i64, hi: i64, lower: Option<(i64, bool)>, upper: Option<(i64, bool)>) -> bool {
     if let Some((b, inc)) = lower {
         if inc {
             if hi < b {
@@ -731,7 +754,7 @@ fn interval_i64_matches(lo: i64, hi: i64, lower: Option<(i64, bool)>, upper: Opt
     true
 }
 
-fn interval_u64_matches(lo: u64, hi: u64, lower: Option<(u64, bool)>, upper: Option<(u64, bool)>) -> bool {
+pub(super) fn interval_u64_matches(lo: u64, hi: u64, lower: Option<(u64, bool)>, upper: Option<(u64, bool)>) -> bool {
     if let Some((b, inc)) = lower {
         if inc {
             if hi < b {
@@ -753,7 +776,7 @@ fn interval_u64_matches(lo: u64, hi: u64, lower: Option<(u64, bool)>, upper: Opt
     true
 }
 
-fn interval_f64_matches(lo: f64, hi: f64, lower: Option<(f64, bool)>, upper: Option<(f64, bool)>) -> bool {
+pub(super) fn interval_f64_matches(lo: f64, hi: f64, lower: Option<(f64, bool)>, upper: Option<(f64, bool)>) -> bool {
     if let Some((b, inc)) = lower {
         if inc {
             if hi < b {
@@ -779,7 +802,7 @@ fn simd_or_scalar_filter_eq_i64(rules: &[crate::core::sme::rules::SemanticRule],
     #[cfg(all(target_arch = "x86_64"))]
     {
         if std::arch::is_x86_feature_detected!("avx2") {
-            unsafe { return simd_filter_eq_i64_avx2(rules, val) }
+            unsafe { return sme_avx::simd_filter_eq_i64_avx2(rules, val) }
         }
     }
     let mut out = Vec::new();
@@ -799,7 +822,7 @@ fn simd_or_scalar_filter_eq_u64(rules: &[crate::core::sme::rules::SemanticRule],
     #[cfg(all(target_arch = "x86_64"))]
     {
         if std::arch::is_x86_feature_detected!("avx2") {
-            unsafe { return simd_filter_eq_u64_avx2(rules, val) }
+            unsafe { return sme_avx::simd_filter_eq_u64_avx2(rules, val) }
         }
     }
     let mut out = Vec::new();
@@ -819,165 +842,11 @@ fn simd_or_scalar_filter_eq_f64(rules: &[crate::core::sme::rules::SemanticRule],
     #[cfg(all(target_arch = "x86_64"))]
     {
         if std::arch::is_x86_feature_detected!("avx2") {
-            unsafe { return simd_filter_eq_f64_avx2(rules, val) }
+            unsafe { return sme_avx::simd_filter_eq_f64_avx2(rules, val) }
         }
     }
     let mut out = Vec::new();
     for r in rules.iter() {
-        if let Some((lo, hi)) = decode_rule_f64(r) {
-            if val >= lo && val <= hi {
-                out.push((r.start_row_id, r.end_row_id));
-            }
-        } else {
-            out.push((r.start_row_id, r.end_row_id));
-        }
-    }
-    out
-}
-
-#[cfg(target_arch = "x86_64")]
-#[allow(unsafe_op_in_unsafe_fn)]
-#[target_feature(enable = "avx2")]
-unsafe fn simd_filter_eq_i64_avx2(
-    rules: &[crate::core::sme::rules::SemanticRule],
-    val: i64,
-) -> Vec<(u64, u64)> {
-    use std::arch::x86_64::*;
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    let val_v = _mm256_set1_epi64x(val);
-    let idx = _mm_set_epi32(3 * 72, 2 * 72, 1 * 72, 0 * 72);
-    let base_ptr = rules.as_ptr() as *const u8;
-
-    while i + 4 <= rules.len() {
-        let current_ptr = base_ptr.add(i * 72);
-        let lo_v = _mm256_i32gather_epi64(current_ptr.add(24) as *const i64, idx, 1);
-        let hi_v = _mm256_i32gather_epi64(current_ptr.add(40) as *const i64, idx, 1);
-
-        // We want: lo <= val && hi >= val
-        // lo <= val  <=>  !(lo > val)  <=>  !cmpgt(lo, val)
-        // hi >= val  <=>  !(val > hi)  <=>  !cmpgt(val, hi)
-        
-        let lo_gt_val = _mm256_cmpgt_epi64(lo_v, val_v);
-        let val_gt_hi = _mm256_cmpgt_epi64(val_v, hi_v);
-        let bad = _mm256_or_si256(lo_gt_val, val_gt_hi);
-        let mask = !(_mm256_movemask_pd(_mm256_castsi256_pd(bad)) as u32);
-
-        if mask != 0 {
-            for lane in 0..4 {
-                if (mask & (1u32 << lane)) != 0 {
-                    let r = &rules[i + lane];
-                    out.push((r.start_row_id, r.end_row_id));
-                }
-            }
-        }
-        i += 4;
-    }
-    for r in rules[i..].iter() {
-        if let Some((lo, hi)) = decode_rule_i64(r) {
-            if val >= lo && val <= hi {
-                out.push((r.start_row_id, r.end_row_id));
-            }
-        } else {
-            out.push((r.start_row_id, r.end_row_id));
-        }
-    }
-    out
-}
-
-#[cfg(target_arch = "x86_64")]
-#[allow(unsafe_op_in_unsafe_fn)]
-#[target_feature(enable = "avx2")]
-unsafe fn simd_filter_eq_u64_avx2(
-    rules: &[crate::core::sme::rules::SemanticRule],
-    val: u64,
-) -> Vec<(u64, u64)> {
-    use std::arch::x86_64::*;
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    let val_i = u64_ordered_to_i64(val);
-    let val_v = _mm256_set1_epi64x(val_i);
-    let idx = _mm_set_epi32(3 * 72, 2 * 72, 1 * 72, 0 * 72);
-    let base_ptr = rules.as_ptr() as *const u8;
-    let sign_flip = _mm256_set1_epi64x(i64::MIN);
-
-    while i + 4 <= rules.len() {
-        let current_ptr = base_ptr.add(i * 72);
-        let lo_raw = _mm256_i32gather_epi64(current_ptr.add(24) as *const i64, idx, 1);
-        let hi_raw = _mm256_i32gather_epi64(current_ptr.add(40) as *const i64, idx, 1);
-        
-        let lo_v = _mm256_xor_si256(lo_raw, sign_flip);
-        let hi_v = _mm256_xor_si256(hi_raw, sign_flip);
-
-        // We want: lo <= val && hi >= val
-        // Using signed comparison on ordered-mapped values.
-        let lo_gt_val = _mm256_cmpgt_epi64(lo_v, val_v);
-        let val_gt_hi = _mm256_cmpgt_epi64(val_v, hi_v);
-        let bad = _mm256_or_si256(lo_gt_val, val_gt_hi);
-        let mask = !(_mm256_movemask_pd(_mm256_castsi256_pd(bad)) as u32);
-
-        if mask != 0 {
-            for lane in 0..4 {
-                if (mask & (1u32 << lane)) != 0 {
-                    let r = &rules[i + lane];
-                    out.push((r.start_row_id, r.end_row_id));
-                }
-            }
-        }
-        i += 4;
-    }
-    for r in rules[i..].iter() {
-        if let Some((lo, hi)) = decode_rule_u64(r) {
-            if val >= lo && val <= hi {
-                out.push((r.start_row_id, r.end_row_id));
-            }
-        } else {
-            out.push((r.start_row_id, r.end_row_id));
-        }
-    }
-    out
-}
-
-#[cfg(target_arch = "x86_64")]
-#[allow(unsafe_op_in_unsafe_fn)]
-#[target_feature(enable = "avx2")]
-unsafe fn simd_filter_eq_f64_avx2(
-    rules: &[crate::core::sme::rules::SemanticRule],
-    val: f64,
-) -> Vec<(u64, u64)> {
-    use std::arch::x86_64::*;
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    let val_v = _mm256_set1_pd(val);
-    let idx = _mm_set_epi32(3 * 72, 2 * 72, 1 * 72, 0 * 72);
-    let base_ptr = rules.as_ptr() as *const u8;
-
-    while i + 4 <= rules.len() {
-        let current_ptr = base_ptr.add(i * 72);
-        let lo_v = _mm256_i32gather_pd(current_ptr.add(24) as *const f64, idx, 1);
-        let hi_v = _mm256_i32gather_pd(current_ptr.add(40) as *const f64, idx, 1);
-
-        // We want: lo <= val && hi >= val
-        // _mm256_cmp_pd with _CMP_LE_OQ (Less-equal, ordered, non-signaling)
-        // lo <= val
-        let lo_le_val = _mm256_cmp_pd(lo_v, val_v, _CMP_LE_OQ);
-        // val <= hi  <=>  hi >= val
-        let val_le_hi = _mm256_cmp_pd(val_v, hi_v, _CMP_LE_OQ);
-        
-        let good = _mm256_and_pd(lo_le_val, val_le_hi);
-        let mask = _mm256_movemask_pd(good) as u32;
-
-        if mask != 0 {
-            for lane in 0..4 {
-                if (mask & (1u32 << lane)) != 0 {
-                    let r = &rules[i + lane];
-                    out.push((r.start_row_id, r.end_row_id));
-                }
-            }
-        }
-        i += 4;
-    }
-    for r in rules[i..].iter() {
         if let Some((lo, hi)) = decode_rule_f64(r) {
             if val >= lo && val <= hi {
                 out.push((r.start_row_id, r.end_row_id));
@@ -998,11 +867,11 @@ fn simd_or_scalar_filter_i64(
     {
         if std::arch::is_x86_feature_detected!("avx512f") {
             // SAFETY: guarded by runtime feature detection.
-            unsafe { return simd_filter_i64_avx512(rules, lower, upper) }
+            unsafe { return sme_avx::simd_filter_i64_avx512(rules, lower, upper) }
         }
         if std::arch::is_x86_feature_detected!("avx2") {
             // SAFETY: guarded by runtime feature detection.
-            unsafe { return simd_filter_i64_avx2(rules, lower, upper) }
+            unsafe { return sme_avx::simd_filter_i64_avx2(rules, lower, upper) }
         }
     }
 
@@ -1028,10 +897,10 @@ fn simd_or_scalar_filter_u64(
     #[cfg(all(target_arch = "x86_64"))]
     {
         if std::arch::is_x86_feature_detected!("avx512f") {
-            unsafe { return simd_filter_u64_avx512(rules, lower, upper) }
+            unsafe { return sme_avx::simd_filter_u64_avx512(rules, lower, upper) }
         }
         if std::arch::is_x86_feature_detected!("avx2") {
-            unsafe { return simd_filter_u64_avx2(rules, lower, upper) }
+            unsafe { return sme_avx::simd_filter_u64_avx2(rules, lower, upper) }
         }
     }
 
@@ -1054,406 +923,15 @@ fn simd_or_scalar_filter_f64(
     #[cfg(all(target_arch = "x86_64"))]
     {
         if std::arch::is_x86_feature_detected!("avx512f") {
-            unsafe { return simd_filter_f64_avx512(rules, lower, upper) }
+            unsafe { return sme_avx::simd_filter_f64_avx512(rules, lower, upper) }
         }
         if std::arch::is_x86_feature_detected!("avx2") {
-            unsafe { return simd_filter_f64_avx2(rules, lower, upper) }
+            unsafe { return sme_avx::simd_filter_f64_avx2(rules, lower, upper) }
         }
     }
 
     let mut out = Vec::new();
     for r in rules.iter() {
-        if let Some((lo, hi)) = decode_rule_f64(r) {
-            if interval_f64_matches(lo, hi, lower, upper) {
-                out.push((r.start_row_id, r.end_row_id));
-            }
-        }
-    }
-    out
-}
-
-#[cfg(target_arch = "x86_64")]
-#[allow(unsafe_op_in_unsafe_fn)]
-#[target_feature(enable = "avx2")]
-unsafe fn simd_filter_i64_avx2(
-    rules: &[crate::core::sme::rules::SemanticRule],
-    lower: Option<(i64, bool)>,
-    upper: Option<(i64, bool)>,
-) -> Vec<(u64, u64)> {
-    use std::arch::x86_64::*;
-
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    let idx = _mm_set_epi32(3 * 72, 2 * 72, 1 * 72, 0 * 72);
-    let base_ptr = rules.as_ptr() as *const u8;
-
-    while i + 4 <= rules.len() {
-        let current_ptr = base_ptr.add(i * 72);
-        let lo_v = _mm256_i32gather_epi64(current_ptr.add(24) as *const i64, idx, 1);
-        let hi_v = _mm256_i32gather_epi64(current_ptr.add(40) as *const i64, idx, 1);
-
-        let mut mask = !0u32; // 4 lanes.
-        if let Some((b, inc)) = lower {
-            let b_v = _mm256_set1_epi64x(b);
-            // lower_ok: hi >= b (inclusive) OR hi > b (exclusive)
-            let hi_gt_b = _mm256_cmpgt_epi64(hi_v, b_v);
-            let hi_eq_b = _mm256_cmpeq_epi64(hi_v, b_v);
-            let lower_ok = if inc { _mm256_or_si256(hi_gt_b, hi_eq_b) } else { hi_gt_b };
-            mask &= _mm256_movemask_pd(_mm256_castsi256_pd(lower_ok)) as u32;
-        }
-        if let Some((b, inc)) = upper {
-            let b_v = _mm256_set1_epi64x(b);
-            // upper_ok: lo <= b (inclusive) OR lo < b (exclusive)
-            let lo_gt_b = _mm256_cmpgt_epi64(lo_v, b_v);
-            let lo_eq_b = _mm256_cmpeq_epi64(lo_v, b_v);
-            let lo_le_b = _mm256_xor_si256(_mm256_set1_epi64x(-1), lo_gt_b);
-            let upper_ok = if inc { lo_le_b } else { _mm256_andnot_si256(lo_eq_b, lo_le_b) };
-            mask &= _mm256_movemask_pd(_mm256_castsi256_pd(upper_ok)) as u32;
-        }
-
-        if mask != 0 {
-            for lane in 0..4 {
-                if (mask & (1u32 << lane)) != 0 {
-                    let r = &rules[i + lane];
-                    out.push((r.start_row_id, r.end_row_id));
-                }
-            }
-        }
-
-        i += 4;
-    }
-
-    for r in rules[i..].iter() {
-        if let Some((lo, hi)) = decode_rule_i64(r) {
-            if interval_i64_matches(lo, hi, lower, upper) {
-                out.push((r.start_row_id, r.end_row_id));
-            }
-        }
-    }
-
-    out
-}
-
-#[cfg(target_arch = "x86_64")]
-#[allow(unsafe_op_in_unsafe_fn)]
-#[target_feature(enable = "avx512f")]
-unsafe fn simd_filter_i64_avx512(
-    rules: &[crate::core::sme::rules::SemanticRule],
-    lower: Option<(i64, bool)>,
-    upper: Option<(i64, bool)>,
-) -> Vec<(u64, u64)> {
-    use std::arch::x86_64::*;
-
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    while i + 8 <= rules.len() {
-        let mut lo_arr = [0i64; 8];
-        let mut hi_arr = [0i64; 8];
-        for lane in 0..8 {
-            if let Some((lo, hi)) = decode_rule_i64(&rules[i + lane]) {
-                lo_arr[lane] = lo;
-                hi_arr[lane] = hi;
-            } else {
-                lo_arr[lane] = i64::MIN;
-                hi_arr[lane] = i64::MAX;
-            }
-        }
-
-        let lo_v = _mm512_loadu_si512(lo_arr.as_ptr() as *const _);
-        let hi_v = _mm512_loadu_si512(hi_arr.as_ptr() as *const _);
-
-        let mut mask: u8 = 0xFF;
-        if let Some((b, inc)) = lower {
-            let b_v = _mm512_set1_epi64(b);
-            let gt = _mm512_cmpgt_epi64_mask(hi_v, b_v);
-            let eq = _mm512_cmpeq_epi64_mask(hi_v, b_v);
-            let lower_ok = if inc { gt | eq } else { gt };
-            mask &= lower_ok as u8;
-        }
-        if let Some((b, inc)) = upper {
-            let b_v = _mm512_set1_epi64(b);
-            let lt = _mm512_cmpgt_epi64_mask(b_v, lo_v);
-            let eq = _mm512_cmpeq_epi64_mask(lo_v, b_v);
-            let upper_ok = if inc { lt | eq } else { lt };
-            mask &= upper_ok as u8;
-        }
-
-        for lane in 0..8 {
-            if (mask & (1u8 << lane)) != 0 {
-                let r = &rules[i + lane];
-                out.push((r.start_row_id, r.end_row_id));
-            }
-        }
-
-        i += 8;
-    }
-
-    for r in rules[i..].iter() {
-        if let Some((lo, hi)) = decode_rule_i64(r) {
-            if interval_i64_matches(lo, hi, lower, upper) {
-                out.push((r.start_row_id, r.end_row_id));
-            }
-        }
-    }
-
-    out
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline]
-fn u64_ordered_to_i64(x: u64) -> i64 {
-    (x ^ 0x8000_0000_0000_0000u64) as i64
-}
-
-#[cfg(target_arch = "x86_64")]
-#[allow(unsafe_op_in_unsafe_fn)]
-#[target_feature(enable = "avx2")]
-unsafe fn simd_filter_u64_avx2(
-    rules: &[crate::core::sme::rules::SemanticRule],
-    lower: Option<(u64, bool)>,
-    upper: Option<(u64, bool)>,
-) -> Vec<(u64, u64)> {
-    use std::arch::x86_64::*;
-
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    let idx = _mm_set_epi32(3 * 72, 2 * 72, 1 * 72, 0 * 72);
-    let base_ptr = rules.as_ptr() as *const u8;
-    let sign_flip = _mm256_set1_epi64x(i64::MIN);
-
-    while i + 4 <= rules.len() {
-        let current_ptr = base_ptr.add(i * 72);
-        let lo_raw = _mm256_i32gather_epi64(current_ptr.add(24) as *const i64, idx, 1);
-        let hi_raw = _mm256_i32gather_epi64(current_ptr.add(40) as *const i64, idx, 1);
-        
-        let lo_v = _mm256_xor_si256(lo_raw, sign_flip);
-        let hi_v = _mm256_xor_si256(hi_raw, sign_flip);
-
-        let mut mask = !0u32;
-        if let Some((b_u, inc)) = lower {
-            let b = u64_ordered_to_i64(b_u);
-            let b_v = _mm256_set1_epi64x(b);
-            let hi_gt_b = _mm256_cmpgt_epi64(hi_v, b_v);
-            let hi_eq_b = _mm256_cmpeq_epi64(hi_v, b_v);
-            let lower_ok = if inc { _mm256_or_si256(hi_gt_b, hi_eq_b) } else { hi_gt_b };
-            mask &= _mm256_movemask_pd(_mm256_castsi256_pd(lower_ok)) as u32;
-        }
-        if let Some((b_u, inc)) = upper {
-            let b = u64_ordered_to_i64(b_u);
-            let b_v = _mm256_set1_epi64x(b);
-            let lo_gt_b = _mm256_cmpgt_epi64(lo_v, b_v);
-            let lo_eq_b = _mm256_cmpeq_epi64(lo_v, b_v);
-            let lo_le_b = _mm256_xor_si256(_mm256_set1_epi64x(-1), lo_gt_b);
-            let upper_ok = if inc { lo_le_b } else { _mm256_andnot_si256(lo_eq_b, lo_le_b) };
-            mask &= _mm256_movemask_pd(_mm256_castsi256_pd(upper_ok)) as u32;
-        }
-
-        if mask != 0 {
-            for lane in 0..4 {
-                if (mask & (1u32 << lane)) != 0 {
-                    let r = &rules[i + lane];
-                    out.push((r.start_row_id, r.end_row_id));
-                }
-            }
-        }
-        i += 4;
-    }
-
-    for r in rules[i..].iter() {
-        if let Some((lo, hi)) = decode_rule_u64(r) {
-            if interval_u64_matches(lo, hi, lower, upper) {
-                out.push((r.start_row_id, r.end_row_id));
-            }
-        }
-    }
-    out
-}
-
-#[cfg(target_arch = "x86_64")]
-#[allow(unsafe_op_in_unsafe_fn)]
-#[target_feature(enable = "avx512f")]
-unsafe fn simd_filter_u64_avx512(
-    rules: &[crate::core::sme::rules::SemanticRule],
-    lower: Option<(u64, bool)>,
-    upper: Option<(u64, bool)>,
-) -> Vec<(u64, u64)> {
-    use std::arch::x86_64::*;
-
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    while i + 8 <= rules.len() {
-        let mut lo_arr = [0i64; 8];
-        let mut hi_arr = [0i64; 8];
-        for lane in 0..8 {
-            if let Some((lo, hi)) = decode_rule_u64(&rules[i + lane]) {
-                lo_arr[lane] = u64_ordered_to_i64(lo);
-                hi_arr[lane] = u64_ordered_to_i64(hi);
-            } else {
-                lo_arr[lane] = i64::MIN;
-                hi_arr[lane] = i64::MAX;
-            }
-        }
-
-        let lo_v = _mm512_loadu_si512(lo_arr.as_ptr() as *const _);
-        let hi_v = _mm512_loadu_si512(hi_arr.as_ptr() as *const _);
-
-        let mut mask: u8 = 0xFF;
-        if let Some((b_u, inc)) = lower {
-            let b = u64_ordered_to_i64(b_u);
-            let b_v = _mm512_set1_epi64(b);
-            let gt = _mm512_cmpgt_epi64_mask(hi_v, b_v);
-            let eq = _mm512_cmpeq_epi64_mask(hi_v, b_v);
-            let lower_ok = if inc { gt | eq } else { gt };
-            mask &= lower_ok as u8;
-        }
-        if let Some((b_u, inc)) = upper {
-            let b = u64_ordered_to_i64(b_u);
-            let b_v = _mm512_set1_epi64(b);
-            let lt = _mm512_cmpgt_epi64_mask(b_v, lo_v);
-            let eq = _mm512_cmpeq_epi64_mask(lo_v, b_v);
-            let upper_ok = if inc { lt | eq } else { lt };
-            mask &= upper_ok as u8;
-        }
-
-        for lane in 0..8 {
-            if (mask & (1u8 << lane)) != 0 {
-                let r = &rules[i + lane];
-                out.push((r.start_row_id, r.end_row_id));
-            }
-        }
-
-        i += 8;
-    }
-
-    for r in rules[i..].iter() {
-        if let Some((lo, hi)) = decode_rule_u64(r) {
-            if interval_u64_matches(lo, hi, lower, upper) {
-                out.push((r.start_row_id, r.end_row_id));
-            }
-        }
-    }
-
-    out
-}
-
-#[cfg(target_arch = "x86_64")]
-#[allow(unsafe_op_in_unsafe_fn)]
-#[target_feature(enable = "avx2")]
-unsafe fn simd_filter_f64_avx2(
-    rules: &[crate::core::sme::rules::SemanticRule],
-    lower: Option<(f64, bool)>,
-    upper: Option<(f64, bool)>,
-) -> Vec<(u64, u64)> {
-    use std::arch::x86_64::*;
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    let idx = _mm_set_epi32(3 * 72, 2 * 72, 1 * 72, 0 * 72);
-    let base_ptr = rules.as_ptr() as *const u8;
-
-    while i + 4 <= rules.len() {
-        let current_ptr = base_ptr.add(i * 72);
-        let lo_v = _mm256_i32gather_pd(current_ptr.add(24) as *const f64, idx, 1);
-        let hi_v = _mm256_i32gather_pd(current_ptr.add(40) as *const f64, idx, 1);
-
-        let mut mask = !0u32;
-        if let Some((b, inc)) = lower {
-            let b_v = _mm256_set1_pd(b);
-            let lower_ok = if inc {
-                _mm256_cmp_pd(hi_v, b_v, _CMP_GE_OQ)
-            } else {
-                _mm256_cmp_pd(hi_v, b_v, _CMP_GT_OQ)
-            };
-            mask &= _mm256_movemask_pd(lower_ok) as u32;
-        }
-        if let Some((b, inc)) = upper {
-            let b_v = _mm256_set1_pd(b);
-            let upper_ok = if inc {
-                _mm256_cmp_pd(lo_v, b_v, _CMP_LE_OQ)
-            } else {
-                _mm256_cmp_pd(lo_v, b_v, _CMP_LT_OQ)
-            };
-            mask &= _mm256_movemask_pd(upper_ok) as u32;
-        }
-
-        if mask != 0 {
-            for lane in 0..4 {
-                if (mask & (1u32 << lane)) != 0 {
-                    let r = &rules[i + lane];
-                    out.push((r.start_row_id, r.end_row_id));
-                }
-            }
-        }
-        i += 4;
-    }
-
-    for r in rules[i..].iter() {
-        if let Some((lo, hi)) = decode_rule_f64(r) {
-            if interval_f64_matches(lo, hi, lower, upper) {
-                out.push((r.start_row_id, r.end_row_id));
-            }
-        }
-    }
-    out
-}
-
-#[cfg(target_arch = "x86_64")]
-#[allow(unsafe_op_in_unsafe_fn)]
-#[target_feature(enable = "avx512f")]
-unsafe fn simd_filter_f64_avx512(
-    rules: &[crate::core::sme::rules::SemanticRule],
-    lower: Option<(f64, bool)>,
-    upper: Option<(f64, bool)>,
-) -> Vec<(u64, u64)> {
-    use std::arch::x86_64::*;
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    while i + 8 <= rules.len() {
-        let mut lo_arr = [0f64; 8];
-        let mut hi_arr = [0f64; 8];
-        for lane in 0..8 {
-            if let Some((lo, hi)) = decode_rule_f64(&rules[i + lane]) {
-                lo_arr[lane] = lo;
-                hi_arr[lane] = hi;
-            } else {
-                lo_arr[lane] = f64::NEG_INFINITY;
-                hi_arr[lane] = f64::INFINITY;
-            }
-        }
-
-        let lo_v = _mm512_loadu_pd(lo_arr.as_ptr());
-        let hi_v = _mm512_loadu_pd(hi_arr.as_ptr());
-
-        let mut mask: u8 = 0xFF;
-        if let Some((b, inc)) = lower {
-            let b_v = _mm512_set1_pd(b);
-            let lower_ok = if inc {
-                _mm512_cmp_pd_mask(hi_v, b_v, _CMP_GE_OQ)
-            } else {
-                _mm512_cmp_pd_mask(hi_v, b_v, _CMP_GT_OQ)
-            };
-            mask &= lower_ok as u8;
-        }
-        if let Some((b, inc)) = upper {
-            let b_v = _mm512_set1_pd(b);
-            let upper_ok = if inc {
-                _mm512_cmp_pd_mask(lo_v, b_v, _CMP_LE_OQ)
-            } else {
-                _mm512_cmp_pd_mask(lo_v, b_v, _CMP_LT_OQ)
-            };
-            mask &= upper_ok as u8;
-        }
-
-        for lane in 0..8 {
-            if (mask & (1u8 << lane)) != 0 {
-                let r = &rules[i + lane];
-                out.push((r.start_row_id, r.end_row_id));
-            }
-        }
-
-        i += 8;
-    }
-
-    for r in rules[i..].iter() {
         if let Some((lo, hi)) = decode_rule_f64(r) {
             if interval_f64_matches(lo, hi, lower, upper) {
                 out.push((r.start_row_id, r.end_row_id));
@@ -1520,6 +998,8 @@ fn flip_op(op: &str) -> String {
         "<=" => ">=".to_string(),
         ">" => "<".to_string(),
         ">=" => "<=".to_string(),
+        "!=" => "!=".to_string(),
+        "<>" => "<>".to_string(),
         other => other.to_string(),
     }
 }
@@ -1537,26 +1017,37 @@ fn constraint_from_parts(
             column_schema_id,
             lower: Some((scalar, true)),
             upper: Some((scalar, true)),
+            not_equals: None,
         }),
         "<" => Some(NumericConstraint {
             column_schema_id,
             lower: None,
             upper: Some((scalar, false)),
+            not_equals: None,
         }),
         "<=" => Some(NumericConstraint {
             column_schema_id,
             lower: None,
             upper: Some((scalar, true)),
+            not_equals: None,
         }),
         ">" => Some(NumericConstraint {
             column_schema_id,
             lower: Some((scalar, false)),
             upper: None,
+            not_equals: None,
         }),
         ">=" => Some(NumericConstraint {
             column_schema_id,
             lower: Some((scalar, true)),
             upper: None,
+            not_equals: None,
+        }),
+        "!=" | "<>" => Some(NumericConstraint {
+            column_schema_id,
+            lower: None,
+            upper: None,
+            not_equals: Some(scalar),
         }),
         _ => None,
     }
@@ -1580,8 +1071,18 @@ fn coerce_numeric(db_type: DbType, num: &NumericValue) -> Option<NumericScalar> 
                 NumericValue::U32(v) => *v as i128,
                 NumericValue::U64(v) => (*v).try_into().ok()?,
                 NumericValue::U128(v) => (*v).try_into().ok()?,
-                NumericValue::F32(v) => *v as i128,
-                NumericValue::F64(v) => *v as i128,
+                NumericValue::F32(v) => {
+                    if v.fract() != 0.0 {
+                        return None;
+                    }
+                    *v as i128
+                }
+                NumericValue::F64(v) => {
+                    if v.fract() != 0.0 {
+                        return None;
+                    }
+                    *v as i128
+                }
             };
             Some(NumericScalar::Signed(v))
         }
@@ -1601,8 +1102,18 @@ fn coerce_numeric(db_type: DbType, num: &NumericValue) -> Option<NumericScalar> 
                 NumericValue::U32(v) => *v as u128,
                 NumericValue::U64(v) => *v as u128,
                 NumericValue::U128(v) => *v,
-                NumericValue::F32(v) => u128::try_from(*v as i128).ok()?,
-                NumericValue::F64(v) => u128::try_from(*v as i128).ok()?,
+                NumericValue::F32(v) => {
+                    if v.fract() != 0.0 {
+                        return None;
+                    }
+                    u128::try_from(*v as i128).ok()?
+                }
+                NumericValue::F64(v) => {
+                    if v.fract() != 0.0 {
+                        return None;
+                    }
+                    u128::try_from(*v as i128).ok()?
+                }
             };
             Some(NumericScalar::Unsigned(v))
         }
@@ -1641,11 +1152,14 @@ fn string_constraint_from_parts(
 
     let (max_run, max_count) = string_metrics_from_bytes(&pattern);
 
+    let match_always = matches!(kind, StringConstraintKind::NotEquals);
+
     let (len_lower, len_upper) = match kind {
         StringConstraintKind::Equals => (Some((len, true)), Some((len, true))),
         StringConstraintKind::Contains
         | StringConstraintKind::StartsWith
         | StringConstraintKind::EndsWith => (Some((len, true)), None),
+        StringConstraintKind::NotEquals => (None, None),
     };
 
     StringConstraint {
@@ -1658,11 +1172,12 @@ fn string_constraint_from_parts(
             StringConstraintKind::Equals | StringConstraintKind::EndsWith => required_last,
             _ => None,
         },
-        required_charset,
+        required_charset: if match_always { [0u8; 32] } else { required_charset },
         len_lower,
         len_upper,
-        max_run_lower: if max_run > 0 { Some((max_run, true)) } else { None },
-        max_count_lower: if max_count > 0 { Some((max_count, true)) } else { None },
+        max_run_lower: if !match_always && max_run > 0 { Some((max_run, true)) } else { None },
+        max_count_lower: if !match_always && max_count > 0 { Some((max_count, true)) } else { None },
+        match_always,
     }
 }
 
@@ -1728,12 +1243,12 @@ fn filter_rules_metric_u64(
         if std::arch::is_x86_feature_detected!("avx512f") {
             // Safety: guarded by runtime feature detection.
             unsafe {
-                return simd_filter_string_metric_u64_avx512(rules, op, lower, upper);
+                return sme_avx::simd_filter_string_metric_u64_avx512(rules, op, lower, upper);
             }
         }
         if std::arch::is_x86_feature_detected!("avx2") {
             unsafe {
-                return simd_filter_string_metric_u64_avx2(rules, op, lower, upper);
+                return sme_avx::simd_filter_string_metric_u64_avx2(rules, op, lower, upper);
             }
         }
     }
@@ -1779,7 +1294,7 @@ fn rule_bitset256(rule: &crate::core::sme::rules::SemanticRule) -> [u8; 32] {
 }
 
 #[inline]
-fn decode_string_metric_u64(rule: &crate::core::sme::rules::SemanticRule) -> Option<(u64, u64)> {
+pub(super) fn decode_string_metric_u64(rule: &crate::core::sme::rules::SemanticRule) -> Option<(u64, u64)> {
     if rule.column_type != DbType::STRING {
         return None;
     }
@@ -1793,12 +1308,12 @@ fn bitset256_contains(rule_mask: &[u8; 32], required: &[u8; 32]) -> bool {
     {
         if std::arch::is_x86_feature_detected!("avx512bw") {
             unsafe {
-                return bitset256_contains_avx512bw(rule_mask.as_ptr(), required.as_ptr());
+                return sme_avx::bitset256_contains_avx512bw(rule_mask.as_ptr(), required.as_ptr());
             }
         }
         if std::arch::is_x86_feature_detected!("avx2") {
             unsafe {
-                return bitset256_contains_avx2(rule_mask.as_ptr(), required.as_ptr());
+                return sme_avx::bitset256_contains_avx2(rule_mask.as_ptr(), required.as_ptr());
             }
         }
     }
@@ -1809,202 +1324,6 @@ fn bitset256_contains(rule_mask: &[u8; 32], required: &[u8; 32]) -> bool {
         }
     }
     true
-}
-
-#[cfg(target_arch = "x86_64")]
-#[allow(unsafe_op_in_unsafe_fn)]
-#[target_feature(enable = "avx2")]
-unsafe fn bitset256_contains_avx2(rule_mask: *const u8, required: *const u8) -> bool {
-    use std::arch::x86_64::*;
-    let m = _mm256_loadu_si256(rule_mask as *const __m256i);
-    let r = _mm256_loadu_si256(required as *const __m256i);
-    let and = _mm256_and_si256(m, r);
-    let eq = _mm256_cmpeq_epi8(and, r);
-    (_mm256_movemask_epi8(eq) as u32) == 0xFFFF_FFFFu32
-}
-
-#[cfg(target_arch = "x86_64")]
-#[allow(unsafe_op_in_unsafe_fn)]
-#[target_feature(enable = "avx512bw")]
-unsafe fn bitset256_contains_avx512bw(rule_mask: *const u8, required: *const u8) -> bool {
-    use std::arch::x86_64::*;
-    let lane_mask: __mmask64 = 0xFFFF_FFFFu64;
-    let m = _mm512_maskz_loadu_epi8(lane_mask, rule_mask as *const i8);
-    let r = _mm512_maskz_loadu_epi8(lane_mask, required as *const i8);
-    let and = _mm512_and_si512(m, r);
-    let eq_mask = _mm512_cmpeq_epi8_mask(and, r);
-    eq_mask == u64::MAX
-}
-
-#[cfg(target_arch = "x86_64")]
-#[allow(unsafe_op_in_unsafe_fn)]
-#[target_feature(enable = "avx2")]
-unsafe fn simd_filter_string_metric_u64_avx2(
-    rules: &[crate::core::sme::rules::SemanticRule],
-    op: crate::core::sme::rules::SemanticRuleOp,
-    lower: Option<(u64, bool)>,
-    upper: Option<(u64, bool)>,
-) -> Vec<(u64, u64)> {
-    use std::arch::x86_64::*;
-
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    let idx = _mm_set_epi32(3 * 72, 2 * 72, 1 * 72, 0 * 72);
-    let base_ptr = rules.as_ptr() as *const u8;
-    let sign_flip = _mm256_set1_epi64x(i64::MIN);
-    
-    let lower_i = lower.map(|(v, inc)| (u64_ordered_to_i64(v), inc));
-    let upper_i = upper.map(|(v, inc)| (u64_ordered_to_i64(v), inc));
-    
-    let target_op = _mm256_set1_epi64x(op as u8 as i64);
-
-    while i + 4 <= rules.len() {
-        let current_ptr = base_ptr.add(i * 72);
-        
-        // Check op. Op is at offset 17.
-        // Gather u64 at offset 16.
-        let meta_v = _mm256_i32gather_epi64(current_ptr.add(16) as *const i64, idx, 1);
-        // Shift right 8 bits to get op in lowest byte.
-        let op_v = _mm256_srli_epi64(meta_v, 8);
-        // Mask with 0xFF
-        let op_v = _mm256_and_si256(op_v, _mm256_set1_epi64x(0xFF));
-        
-        let op_match = _mm256_cmpeq_epi64(op_v, target_op);
-        
-        // Gather lower/upper
-        let lo_raw = _mm256_i32gather_epi64(current_ptr.add(24) as *const i64, idx, 1);
-        let hi_raw = _mm256_i32gather_epi64(current_ptr.add(40) as *const i64, idx, 1);
-        
-        let lo_v = _mm256_xor_si256(lo_raw, sign_flip);
-        let hi_v = _mm256_xor_si256(hi_raw, sign_flip);
-
-        let mut mask = _mm256_movemask_pd(_mm256_castsi256_pd(op_match)) as u32;
-        
-        if mask != 0 {
-            if let Some((b, inc)) = lower_i {
-                let b_v = _mm256_set1_epi64x(b);
-                let hi_gt_b = _mm256_cmpgt_epi64(hi_v, b_v);
-                let hi_eq_b = _mm256_cmpeq_epi64(hi_v, b_v);
-                let lower_ok = if inc { _mm256_or_si256(hi_gt_b, hi_eq_b) } else { hi_gt_b };
-                mask &= _mm256_movemask_pd(_mm256_castsi256_pd(lower_ok)) as u32;
-            }
-            if let Some((b, inc)) = upper_i {
-                let b_v = _mm256_set1_epi64x(b);
-                let lo_gt_b = _mm256_cmpgt_epi64(lo_v, b_v);
-                let lo_eq_b = _mm256_cmpeq_epi64(lo_v, b_v);
-                let lo_le_b = _mm256_xor_si256(_mm256_set1_epi64x(-1), lo_gt_b);
-                let upper_ok = if inc { lo_le_b } else { _mm256_andnot_si256(lo_eq_b, lo_le_b) };
-                mask &= _mm256_movemask_pd(_mm256_castsi256_pd(upper_ok)) as u32;
-            }
-            
-            if mask != 0 {
-                for lane in 0..4 {
-                    if (mask & (1u32 << lane)) != 0 {
-                        let r = &rules[i + lane];
-                        out.push((r.start_row_id, r.end_row_id));
-                    }
-                }
-            }
-        }
-        i += 4;
-    }
-
-    for r in rules[i..].iter() {
-        if r.op != op {
-            continue;
-        }
-        if let Some((lo, hi)) = decode_string_metric_u64(r) {
-            if interval_u64_matches(lo, hi, lower, upper) {
-                out.push((r.start_row_id, r.end_row_id));
-            }
-        }
-    }
-    out
-}
-
-#[cfg(target_arch = "x86_64")]
-#[allow(unsafe_op_in_unsafe_fn)]
-#[target_feature(enable = "avx512f")]
-unsafe fn simd_filter_string_metric_u64_avx512(
-    rules: &[crate::core::sme::rules::SemanticRule],
-    op: crate::core::sme::rules::SemanticRuleOp,
-    lower: Option<(u64, bool)>,
-    upper: Option<(u64, bool)>,
-) -> Vec<(u64, u64)> {
-    use std::arch::x86_64::*;
-
-    let mut out = Vec::new();
-    let mut i = 0usize;
-
-    let lower_i = lower.map(|(v, _)| u64_ordered_to_i64(v));
-    let upper_i = upper.map(|(v, _)| u64_ordered_to_i64(v));
-
-    while i + 8 <= rules.len() {
-        let mut lo_arr = [0i64; 8];
-        let mut hi_arr = [0i64; 8];
-        let mut ok_mask: u32 = 0;
-
-        for lane in 0..8 {
-            let r = &rules[i + lane];
-            if r.op != op {
-                continue;
-            }
-            if let Some((lo_u, hi_u)) = decode_string_metric_u64(r) {
-                lo_arr[lane] = u64_ordered_to_i64(lo_u);
-                hi_arr[lane] = u64_ordered_to_i64(hi_u);
-                ok_mask |= 1u32 << lane;
-            }
-        }
-
-        if ok_mask != 0 {
-            let lo_v = _mm512_loadu_si512(lo_arr.as_ptr() as *const __m512i);
-            let hi_v = _mm512_loadu_si512(hi_arr.as_ptr() as *const __m512i);
-
-            let mut lane_ok: u32 = ok_mask;
-
-            if let Some((_, inc)) = lower {
-                let b = lower_i.unwrap();
-                let b_v = _mm512_set1_epi64(b);
-                // Want: hi >= b (or hi > b if exclusive)
-                let hi_lt_b = _mm512_cmpgt_epi64_mask(b_v, hi_v);
-                let hi_eq_b = _mm512_cmpeq_epi64_mask(hi_v, b_v);
-                let bad = if inc { hi_lt_b } else { hi_lt_b | hi_eq_b };
-                lane_ok &= !(bad as u32);
-            }
-
-            if let Some((_, inc)) = upper {
-                let b = upper_i.unwrap();
-                let b_v = _mm512_set1_epi64(b);
-                // Want: lo <= b (or lo < b if exclusive)
-                let lo_gt_b = _mm512_cmpgt_epi64_mask(lo_v, b_v);
-                let lo_eq_b = _mm512_cmpeq_epi64_mask(lo_v, b_v);
-                let bad = if inc { lo_gt_b } else { lo_gt_b | lo_eq_b };
-                lane_ok &= !(bad as u32);
-            }
-
-            for lane in 0..8 {
-                if (lane_ok >> lane) & 1 == 1 {
-                    let r = &rules[i + lane];
-                    out.push((r.start_row_id, r.end_row_id));
-                }
-            }
-        }
-
-        i += 8;
-    }
-
-    for r in rules[i..].iter() {
-        if r.op != op {
-            continue;
-        }
-        if let Some((lo, hi)) = decode_string_metric_u64(r) {
-            if interval_u64_matches(lo, hi, lower, upper) {
-                out.push((r.start_row_id, r.end_row_id));
-            }
-        }
-    }
-
-    out
 }
 
 fn rule_might_match_constraint(rule: &crate::core::sme::rules::SemanticRule, c: &NumericConstraint) -> bool {
@@ -2035,7 +1354,39 @@ fn rule_might_match_constraint(rule: &crate::core::sme::rules::SemanticRule, c: 
         return true;
     }
 
+    if let Some(neq) = c.not_equals {
+        if scalars_equal(rule_lo, neq) && scalars_equal(rule_hi, neq) {
+            return false;
+        }
+    }
+
     interval_intersects_constraint(rule_lo, rule_hi, c)
+}
+
+fn scalars_equal(a: NumericScalar, b: NumericScalar) -> bool {
+    match (a, b) {
+        (NumericScalar::Signed(x), NumericScalar::Signed(y)) => x == y,
+        (NumericScalar::Unsigned(x), NumericScalar::Unsigned(y)) => x == y,
+        (NumericScalar::Float(x), NumericScalar::Float(y)) => (x - y).abs() < f64::EPSILON,
+        (NumericScalar::Signed(x), NumericScalar::Unsigned(y)) => {
+            if x < 0 {
+                false
+            } else {
+                (x as u128) == y
+            }
+        }
+        (NumericScalar::Unsigned(x), NumericScalar::Signed(y)) => {
+            if y < 0 {
+                false
+            } else {
+                x == (y as u128)
+            }
+        }
+        (NumericScalar::Signed(x), NumericScalar::Float(y)) => (x as f64 - y).abs() < f64::EPSILON,
+        (NumericScalar::Float(x), NumericScalar::Signed(y)) => (x - y as f64).abs() < f64::EPSILON,
+        (NumericScalar::Unsigned(x), NumericScalar::Float(y)) => (x as f64 - y).abs() < f64::EPSILON,
+        (NumericScalar::Float(x), NumericScalar::Unsigned(y)) => (x - y as f64).abs() < f64::EPSILON,
+    }
 }
 
 fn interval_intersects_constraint(lo: NumericScalar, hi: NumericScalar, c: &NumericConstraint) -> bool {
@@ -2189,6 +1540,22 @@ fn intersect_intervals(a: &[(u64, u64)], b: &[(u64, u64)]) -> Vec<(u64, u64)> {
     out
 }
 
+#[inline]
+fn id_in_intervals(id: u64, intervals: &[(u64, u64)]) -> bool {
+    if intervals.is_empty() {
+        return false;
+    }
+
+    // Intervals are normalized and sorted by start.
+    // Find the last interval whose start <= id.
+    let idx = intervals.partition_point(|(s, _)| *s <= id);
+    if idx == 0 {
+        return false;
+    }
+    let (s, e) = intervals[idx - 1];
+    id >= s && id <= e
+}
+
 async fn build_candidates_from_intervals<S: StorageIO>(
     pointers_io: Arc<S>,
     meta: Option<ScanMeta>,
@@ -2196,7 +1563,6 @@ async fn build_candidates_from_intervals<S: StorageIO>(
 ) -> crate::core::row::error::Result<Vec<RowPointer>> {
     let mut it = RowPointerIterator::new(pointers_io).await?;
     let mut out = Vec::new();
-    let mut interval_idx = 0usize;
 
     loop {
         let batch = it.next_row_pointers().await?;
@@ -2217,14 +1583,7 @@ async fn build_candidates_from_intervals<S: StorageIO>(
                 }
             }
 
-            while interval_idx < intervals.len() && pointer.id > intervals[interval_idx].1 {
-                interval_idx += 1;
-            }
-            if interval_idx >= intervals.len() {
-                continue;
-            }
-            let (s, e) = intervals[interval_idx];
-            if pointer.id >= s && pointer.id <= e {
+            if id_in_intervals(pointer.id, intervals) {
                 out.push(pointer);
             }
         }

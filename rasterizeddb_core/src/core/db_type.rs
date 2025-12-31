@@ -1,6 +1,7 @@
 use std::fmt::Display;
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Clone)]
+#[repr(u8)]
 pub enum DbType {
     I8,
     I16,
