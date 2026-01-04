@@ -6,5 +6,5 @@ pub mod sme_avx;
 
 #[cfg(test)]
 mod sme_tests {
-	include!("sms_tests.rs");
+	include!("sme_tests.rs");
 }
