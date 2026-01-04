@@ -590,41 +590,6 @@ impl LocalStorageProvider {
         self._locked.load(Ordering::Relaxed)
     }
 
-    /* --------- Low-level disk read (pread style) --------- */
-    #[inline(always)]
-    fn pread_exact_or_partial(&self, pos: u64, buf: &mut [u8]) -> io::Result<usize> {
-        // Dedicated read-only handle avoids lock contention.
-        let file_ref = &*self.read_file;
-
-        #[cfg(unix)]
-        {
-            let n = file_ref.read_at(buf, pos)?;
-            Ok(n)
-        }
-
-        #[cfg(windows)]
-        {
-            let n = file_ref.seek_read(buf, pos)?;
-            Ok(n)
-        }
-    }
-
-    #[inline(always)]
-    fn temp_pread_exact_or_partial(&self, pos: u64, buf: &mut [u8]) -> io::Result<usize> {
-        let file_ref = &*self.temp_read_file;
-
-        #[cfg(unix)]
-        {
-            let n = file_ref.read_at(buf, pos)?;
-            Ok(n)
-        }
-        #[cfg(windows)]
-        {
-            let n = file_ref.seek_read(buf, pos)?;
-            Ok(n)
-        }
-    }
-
     #[inline(always)]
     fn temp_mem_copy_region(&self, temp_off: u64, dst: &mut [u8]) -> usize {
         if dst.is_empty() {
@@ -672,99 +637,22 @@ impl LocalStorageProvider {
         })
     }
 
-    // Synchronous fast path attempt: returns a FastPathResult; never awaits.
-    fn read_data_into_buffer_fast(
+    // Synchronous fast path attempt: returns bytes copied from mmap.
+    fn read_from_mmap(
         &self,
-        position: &mut u64,
+        position: u64,
         buffer: &mut [u8],
         file_len: u64,
-    ) -> FastPathResult {
+    ) -> usize {
         if buffer.is_empty() {
-            return FastPathResult::Done;
+            return 0;
         }
-        if *position >= file_len {
-            return FastPathResult::EofNone;
+        if position >= file_len {
+            return 0;
         }
-
-        let mut total_copied = 0usize;
-        let mut pos = *position;
 
         // (1) Single mmap region copy first (most common path)
-        let copied = self.mmap_copy_region(pos, &mut buffer[total_copied..], file_len);
-        if copied > 0 {
-            pos += copied as u64;
-            total_copied += copied;
-            if total_copied == buffer.len() {
-                *position = pos;
-                return FastPathResult::Done;
-            }
-        }
-
-        // (2) Direct read loop to fill remaining buffer without chunk caching
-        while total_copied < buffer.len() {
-            // Clamp to logical EOF
-            if pos >= file_len {
-                if total_copied == 0 {
-                    return FastPathResult::EofNone;
-                } else {
-                    *position = pos;
-                    return FastPathResult::EofPartial(total_copied);
-                }
-            }
-
-            let avail = (file_len - pos) as usize;
-            let want = buffer.len() - total_copied;
-            let to_read = avail.min(want);
-            if to_read == 0 {
-                if total_copied == 0 {
-                    return FastPathResult::EofNone;
-                } else {
-                    *position = pos;
-                    return FastPathResult::EofPartial(total_copied);
-                }
-            }
-
-            match self.pread_exact_or_partial(pos, &mut buffer[total_copied..total_copied + to_read]) {
-                Ok(0) => {
-                    // EOF encountered
-                    if total_copied == 0 {
-                        return FastPathResult::EofNone;
-                    } else {
-                        *position = pos;
-                        return FastPathResult::EofPartial(total_copied);
-                    }
-                }
-                Ok(n) => {
-                    pos += n as u64;
-                    total_copied += n;
-                    if total_copied == buffer.len() {
-                        *position = pos;
-                        return FastPathResult::Done;
-                    }
-                    // continue loop to fill more
-                }
-                Err(e) => {
-                    if e.kind() == ErrorKind::UnexpectedEof {
-                        if total_copied == 0 {
-                            return FastPathResult::EofNone;
-                        } else {
-                            *position = pos;
-                            return FastPathResult::EofPartial(total_copied);
-                        }
-                    }
-                    // Treat other errors as EOF-equivalent for fast-path signaling
-                    if total_copied == 0 {
-                        return FastPathResult::EofNone;
-                    } else {
-                        *position = pos;
-                        return FastPathResult::EofPartial(total_copied);
-                    }
-                }
-            }
-        }
-
-        *position = pos;
-        FastPathResult::Done
+        self.mmap_copy_region(position, buffer, file_len)
     }
 
     #[inline(always)]
@@ -795,49 +683,92 @@ impl LocalStorageProvider {
         }
 
         let total_len = buffer.len();
-
-        // Ultra-fast path: no temp data, and the request is fully within main.
-        // This keeps the mmap benchmarks as close as possible to a single memcpy.
-        if temp_len == 0 {
-            let pos = *position;
-            if pos < main_len {
-                let need = total_len as u64;
-                if pos + need <= main_len {
-                    let copied = self.mmap_copy_region(pos, buffer, main_len);
-                    if copied == total_len {
-                        *position = pos + need;
-                        return Ok(());
-                    }
-                }
-            }
-        }
-
         let mut overall_copied = 0usize;
 
         // Phase 1: read from main file only (mmap + pread), clamped to main_len.
         if *position < main_len {
-            match self.read_data_into_buffer_fast(position, buffer, main_len) {
-                FastPathResult::Done => return Ok(()),
-                FastPathResult::EofNone => {
-                    // We reached the end of main (or observed EOF) before copying anything.
+            let avail = main_len - *position;
+            let phase1_target = min(avail as usize, total_len - overall_copied);
+            let start_copied = overall_copied;
+
+            // 1. Try mmap
+            let mmap_copied = self.read_from_mmap(*position, &mut buffer[overall_copied..overall_copied+phase1_target], main_len);
+            overall_copied += mmap_copied;
+            *position += mmap_copied as u64;
+
+            // 2. Fallback to disk (blocking)
+            while overall_copied < start_copied + phase1_target {
+                let needed = (start_copied + phase1_target) - overall_copied;
+                let file_ref = self.read_file.clone();
+                let read_pos = *position;
+
+                let mut temp_buf = byte_vec_pool().get();
+                let cap = temp_buf.capacity();
+                if cap < needed {
+                    temp_buf.reserve(needed - cap);
                 }
-                FastPathResult::EofPartial(copied) => {
-                    overall_copied = copied;
+                unsafe { temp_buf.set_len(needed); }
+
+                let res = tokio::task::spawn_blocking(move || {
+                    #[cfg(unix)]
+                    let r = file_ref.read_at(&mut temp_buf, read_pos);
+                    #[cfg(windows)]
+                    let r = file_ref.seek_read(&mut temp_buf, read_pos);
+                    (r, temp_buf)
+                }).await.map_err(|e| io::Error::new(ErrorKind::Other, e))?;
+
+                let (read_res, temp_buf) = res;
+                let n = read_res?;
+
+                if n == 0 {
+                     return Err(io::Error::new(ErrorKind::UnexpectedEof, "Unexpected EOF in main file"));
                 }
+
+                buffer[overall_copied..overall_copied + n].copy_from_slice(&temp_buf[..n]);
+                overall_copied += n;
+                *position += n as u64;
             }
         }
 
         // Phase 2: if logical length extends into temp, read remaining bytes from temp.
         if overall_copied < total_len {
             if *position >= main_len {
-                let temp_off = *position - main_len;
-                let slice = &mut buffer[overall_copied..];
-                let mut n = self.temp_mem_copy_region(temp_off, slice);
-                if n == 0 {
-                    n = self.temp_pread_exact_or_partial(temp_off, slice)?;
-                }
-                *position += n as u64;
-                overall_copied += n;
+                 let temp_pos = *position - main_len;
+                 let to_read = min((file_len - *position) as usize, total_len - overall_copied);
+
+                 // 1. Try memory mirror
+                 let copied = self.temp_mem_copy_region(temp_pos, &mut buffer[overall_copied..overall_copied+to_read]);
+                 overall_copied += copied;
+                 *position += copied as u64;
+
+                 // 2. Fallback to disk (blocking)
+                 if copied < to_read {
+                     let needed = to_read - copied;
+                     let current_temp_pos = *position - main_len;
+                     let file_ref = self.temp_read_file.clone();
+
+                     let mut temp_buf = byte_vec_pool().get();
+                     let cap = temp_buf.capacity();
+                     if cap < needed {
+                         temp_buf.reserve(needed - cap);
+                     }
+                     unsafe { temp_buf.set_len(needed); }
+
+                     let res = tokio::task::spawn_blocking(move || {
+                        #[cfg(unix)]
+                        let r = file_ref.read_at(&mut temp_buf, current_temp_pos);
+                        #[cfg(windows)]
+                        let r = file_ref.seek_read(&mut temp_buf, current_temp_pos);
+                        (r, temp_buf)
+                     }).await.map_err(|e| io::Error::new(ErrorKind::Other, e))?;
+
+                     let (read_res, temp_buf) = res;
+                     let n = read_res?;
+
+                     buffer[overall_copied..overall_copied + n].copy_from_slice(&temp_buf[..n]);
+                     overall_copied += n;
+                     *position += n as u64;
+                 }
             }
         }
 
@@ -951,6 +882,38 @@ impl StorageIO for LocalStorageProvider {
 
     async fn read_data_into_buffer(&self, position: &mut u64, buffer: &mut [u8]) -> io::Result<()> {
         self.read_data_into_buffer_internal(position, buffer).await
+    }
+
+    async fn read_vectored(&self, reads: &mut [(u64, &mut [u8])]) -> io::Result<()> {
+        let mut pending = Vec::with_capacity(reads.len());
+        let main_len = self.load_file_len();
+
+        for (i, (pos, buf)) in reads.iter_mut().enumerate() {
+            if buf.is_empty() { continue; }
+
+            // Try mmap if within main file
+            if *pos < main_len {
+                let copied = self.read_from_mmap(*pos, buf, main_len);
+                if copied == buf.len() {
+                    continue; // Done
+                }
+                // Partial or no mmap.
+                pending.push((i, *pos + copied as u64, copied));
+            } else {
+                // Temp file or EOF
+                pending.push((i, *pos, 0));
+            }
+        }
+
+        if pending.is_empty() { return Ok(()); }
+
+        // Process pending reads
+        for (idx, pos, offset) in pending {
+            let (_, buf) = &mut reads[idx];
+            let mut p = pos;
+            self.read_data_into_buffer_internal(&mut p, &mut buf[offset..]).await?;
+        }
+        Ok(())
     }
 
     async fn write_data_seek(&self, seek: SeekFrom, buffer: &[u8]) {
@@ -1453,11 +1416,14 @@ mod test {
 
     fn unique_name(prefix: &str) -> String {
         use std::time::{SystemTime, UNIX_EPOCH};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let count = COUNTER.fetch_add(1, Ordering::Relaxed);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        format!("{prefix}_{nanos}_{}", std::process::id())
+        format!("{prefix}_{nanos}_{}_{}", std::process::id(), count)
     }
 
     #[tokio::test]
@@ -1831,5 +1797,32 @@ mod test {
         provider.read_data_into_buffer(&mut pos3, &mut out2).await.unwrap();
         assert_eq!(pos3, (init + staged.len()) as u64);
         assert_eq!(out2, staged);
+    }
+
+    #[tokio::test]
+    async fn test_read_vectored() {
+        let init = 4096usize;
+        let (provider, data, _extra) = create_provider(init, 0).await;
+
+        let mut buf1 = vec![0u8; 100];
+        let mut buf2 = vec![0u8; 200];
+        let mut buf3 = vec![0u8; 50];
+
+        // We need to construct the slice of tuples.
+        // Since &mut [u8] is not Copy, we can't easily put them in a vec and then take a slice of mutable references?
+        // Wait, `read_vectored` takes `&mut [(u64, &mut [u8])]`.
+        // We can create a mutable array or vec of tuples.
+        
+        let mut reads: Vec<(u64, &mut [u8])> = vec![
+            (0, &mut buf1),
+            (1000, &mut buf2),
+            (4000, &mut buf3),
+        ];
+
+        provider.read_vectored(&mut reads).await.unwrap();
+
+        assert_eq!(&buf1[..], &data[0..100]);
+        assert_eq!(&buf2[..], &data[1000..1200]);
+        assert_eq!(&buf3[..], &data[4000..4050]);
     }
 }
