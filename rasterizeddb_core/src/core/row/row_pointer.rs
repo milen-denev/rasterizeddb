@@ -729,67 +729,99 @@ impl RowPointer {
         }
 
         // Create a vector to hold all the columns
-        let mut columns = SmallVec::new();
+        let mut columns: SmallVec<[Column; 32]> = SmallVec::with_capacity(row_fetch.columns_fetching_data.len());
+        
+        // Pre-allocate columns with placeholders
+        for _ in 0..row_fetch.columns_fetching_data.len() {
+             columns.push(Column {
+                 schema_id: 0,
+                 data: MemoryBlock::default(),
+                 column_type: DbType::U8,
+             });
+        }
 
-        // For each column specified in the fetch data
-        for column_data in &row_fetch.columns_fetching_data {
-            let row_position = self.position;
-            let mut position = row_position.clone() + column_data.column_offset as u64;
+        let mut string_headers_buffer: SmallVec<[u8; 128]> = SmallVec::new();
+        let mut first_pass_reads: SmallVec<[(u64, &mut [u8]); 32]> = SmallVec::new();
+        let mut string_col_indices: SmallVec<[usize; 8]> = SmallVec::new();
 
+        for (i, column_data) in row_fetch.columns_fetching_data.iter().enumerate() {
             if column_data.column_type == DbType::STRING {
-                // For strings, we need to read the size first
-                let mut string_position_buffer = [0u8; 8];
-
-                _ = io
-                    .read_data_into_buffer(&mut position, &mut string_position_buffer)
-                    .await;
-
-                // Turn [u8] into u64
-                let mut string_row_position =
-                    row_position + u64::from_le_bytes(string_position_buffer);
-
-                let mut string_size_buffer = [0u8; 4];
-
-                _ = io
-                    .read_data_into_buffer(&mut position, &mut string_size_buffer)
-                    .await;
-
-                let string_size = u32::from_le_bytes(string_size_buffer);
-
-                // Read the string data
-                let string_block = MEMORY_POOL.acquire(string_size as usize);
-                let string_slice = string_block.into_slice_mut();
-
-                _ = io
-                    .read_data_into_buffer(&mut string_row_position, string_slice)
-                    .await;
-
-                // Create a column with the string data
-                let column = Column {
-                    schema_id: column_data.schema_id,
-                    data: string_block,
-                    column_type: DbType::STRING,
-                };
-
-                columns.push(column);
+                string_col_indices.push(i);
             } else {
-                let c_size = column_data.size;
+                let position = self.position + column_data.column_offset as u64;
+                let c_size = column_data.size as usize;
+                
+                let block = MEMORY_POOL.acquire(c_size);
+                let col = &mut columns[i];
+                col.data = block;
+                col.schema_id = column_data.schema_id;
+                col.column_type = column_data.column_type.clone();
+                
+                first_pass_reads.push((position, col.data.into_slice_mut()));
+            }
+        }
 
-                // Allocate memory for the column data
-                let block = MEMORY_POOL.acquire(c_size as usize);
-                let slice = block.into_slice_mut();
+        if !string_col_indices.is_empty() {
+            string_headers_buffer.resize(string_col_indices.len() * 12, 0);
+            
+            for (chunk, &col_idx) in string_headers_buffer.chunks_exact_mut(12).zip(string_col_indices.iter()) {
+                 let column_data = &row_fetch.columns_fetching_data[col_idx];
+                 let position = self.position + column_data.column_offset as u64;
+                 first_pass_reads.push((position, chunk));
+            }
+        }
 
-                // Read the column data directly into our buffer
-                _ = io.read_data_into_buffer(&mut position, slice).await;
+        if !first_pass_reads.is_empty() {
+             _ = io.read_vectored(&mut first_pass_reads).await;
+        }
+        
+        drop(first_pass_reads);
 
-                // Create a Column object with the read data
-                let column = Column {
-                    schema_id: column_data.schema_id,
-                    data: block,
-                    column_type: column_data.column_type.clone(), // Clone the DbType
-                };
+        if !string_col_indices.is_empty() {
+            let mut second_pass_reads: SmallVec<[(u64, &mut [u8]); 8]> = SmallVec::new();
+            let row_start = self.position;
+            let row_len = self.length as u64;
+            let row_end = row_start.saturating_add(row_len);
+            const MAX_REASONABLE_STRING_BYTES: usize = 64 * 1024 * 1024;
+            
+            for (chunk, &col_idx) in string_headers_buffer.chunks_exact(12).zip(string_col_indices.iter()) {
+                let string_row_position = self.position
+                    + u64::from_le_bytes(chunk[0..8].try_into().unwrap());
+                let string_size = u32::from_le_bytes(chunk[8..12].try_into().unwrap()) as usize;
 
-                columns.push(column);
+                let col = &mut columns[col_idx];
+                col.schema_id = row_fetch.columns_fetching_data[col_idx].schema_id;
+                col.column_type = DbType::STRING;
+
+                if string_size == 0 {
+                    col.data = MemoryBlock::default();
+                    continue;
+                }
+
+                if string_size > MAX_REASONABLE_STRING_BYTES {
+                    return Err(super::error::RowError::InvalidData(format!(
+                        "Invalid string size {} (too large)",
+                        string_size
+                    )));
+                }
+
+                // Ensure the string data pointer + size stays within the row bounds.
+                if string_row_position < row_start
+                    || string_row_position > row_end
+                    || string_row_position.saturating_add(string_size as u64) > row_end
+                {
+                    return Err(super::error::RowError::InvalidData(format!(
+                        "Invalid string range: pos={} size={} row_start={} row_end={} (likely misread header)",
+                        string_row_position, string_size, row_start, row_end
+                    )));
+                }
+
+                col.data = MEMORY_POOL.acquire(string_size);
+                second_pass_reads.push((string_row_position, col.data.into_slice_mut()));
+            }
+            
+            if !second_pass_reads.is_empty() {
+                 _ = io.read_vectored(&mut second_pass_reads).await;
             }
         }
 
@@ -834,50 +866,98 @@ impl RowPointer {
 
         // Reuse buffers in-place when sizes match; otherwise, replace the MemoryBlock.
         // This avoids frequent drop+alloc cycles and SmallVec push/clear overhead.
+        let mut string_headers_buffer: SmallVec<[u8; 128]> = SmallVec::new();
+        let mut first_pass_reads: SmallVec<[(u64, &mut [u8]); 32]> = SmallVec::new();
+        let mut string_col_indices: SmallVec<[usize; 8]> = SmallVec::new();
+
         for (i, column_data) in row_fetch.columns_fetching_data.iter().enumerate() {
-            let mut position = self.position + column_data.column_offset as u64;
-
             if column_data.column_type == DbType::STRING {
-                // Read both string position (8 bytes) and size (4 bytes) in one go
-                let mut header = [0u8; 12];
-                io.read_data_into_buffer(&mut position, &mut header).await?;
-
-                let mut string_row_position = self.position
-                    + u64::from_le_bytes(<[u8; 8]>::try_from(&header[0..8]).unwrap());
-
-                let string_size = u32::from_le_bytes(<[u8; 4]>::try_from(&header[8..12]).unwrap())
-                    as usize;
-
-                // Ensure buffer capacity matches string_size
+                string_col_indices.push(i);
+            } else {
+                let position = self.position + column_data.column_offset as u64;
                 let col = &mut columns[i];
-                let current_size = col.data.into_slice().len();
+                let c_size = column_data.size as usize;
+
+                if col.data.into_slice().len() != c_size {
+                    col.data = MEMORY_POOL.acquire(c_size);
+                }
                 
-                if current_size != string_size {
+                col.schema_id = column_data.schema_id;
+                col.column_type = column_data.column_type.clone();
+                
+                first_pass_reads.push((position, col.data.into_slice_mut()));
+            }
+        }
+
+        if !string_col_indices.is_empty() {
+            string_headers_buffer.resize(string_col_indices.len() * 12, 0);
+            
+            for (chunk, &col_idx) in string_headers_buffer.chunks_exact_mut(12).zip(string_col_indices.iter()) {
+                 let column_data = &row_fetch.columns_fetching_data[col_idx];
+                 let position = self.position + column_data.column_offset as u64;
+                 first_pass_reads.push((position, chunk));
+            }
+        }
+
+        if !first_pass_reads.is_empty() {
+            io.read_vectored(&mut first_pass_reads).await?;
+        }
+        
+        drop(first_pass_reads);
+
+        if !string_col_indices.is_empty() {
+            let mut second_pass_reads: SmallVec<[(u64, &mut [u8]); 8]> = SmallVec::new();
+            let row_start = self.position;
+            let row_len = self.length as u64;
+            let row_end = row_start.saturating_add(row_len);
+            const MAX_REASONABLE_STRING_BYTES: usize = 64 * 1024 * 1024;
+            
+            for (chunk, &col_idx) in string_headers_buffer.chunks_exact(12).zip(string_col_indices.iter()) {
+                let string_row_position = self.position
+                    + u64::from_le_bytes(chunk[0..8].try_into().unwrap());
+                let string_size = u32::from_le_bytes(chunk[8..12].try_into().unwrap()) as usize;
+                
+                let col = &mut columns[col_idx];
+
+                if string_size == 0 {
+                    col.data = MemoryBlock::default();
+                    col.schema_id = row_fetch.columns_fetching_data[col_idx].schema_id;
+                    col.column_type = DbType::STRING;
+                    continue;
+                }
+
+                if string_size > MAX_REASONABLE_STRING_BYTES {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("Invalid string size {} (too large)", string_size),
+                    ));
+                }
+
+                if string_row_position < row_start
+                    || string_row_position > row_end
+                    || string_row_position.saturating_add(string_size as u64) > row_end
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "Invalid string range: pos={} size={} row_start={} row_end={} (likely misread header)",
+                            string_row_position, string_size, row_start, row_end
+                        ),
+                    ));
+                }
+
+                if col.data.into_slice().len() != string_size {
                     col.data = MEMORY_POOL.acquire(string_size);
                 }
                 
-                let string_slice = col.data.into_slice_mut();
-
-                io.read_data_into_buffer(&mut string_row_position, string_slice)
-                    .await?;
-
-                col.schema_id = column_data.schema_id;
+                col.schema_id = row_fetch.columns_fetching_data[col_idx].schema_id;
                 col.column_type = DbType::STRING;
-            } else {
-                let c_size = column_data.size as usize;
-
-                // Ensure buffer capacity matches c_size
-                let col = &mut columns[i];
-                let current_size = col.data.into_slice().len();
-                if current_size != c_size {
-                    col.data = MEMORY_POOL.acquire(c_size);
-                }
-                let slice = col.data.into_slice_mut();
-
-                io.read_data_into_buffer(&mut position, slice).await?;
-
-                col.schema_id = column_data.schema_id;
-                col.column_type = column_data.column_type.clone();
+                
+                second_pass_reads.push((string_row_position, col.data.into_slice_mut()));
+            }
+            
+            if !second_pass_reads.is_empty() {
+                io.read_vectored(&mut second_pass_reads).await?;
             }
         }
 
