@@ -1,11 +1,6 @@
 use std::{
     arch::x86_64::{_MM_HINT_T0, _mm_prefetch},
-    fmt,
-    //hash::Hash,
-    // sync::{
-    //     Arc,
-    //     atomic::{AtomicU64, Ordering},
-    // },
+    fmt
 };
 
 use crate::instructions::{copy_ptr_to_ptr, copy_vec_to_ptr, ref_slice, ref_slice_mut};
@@ -15,7 +10,9 @@ pub static MEMORY_POOL: MemoryPool = MemoryPool::new();
 use libmimalloc_sys::{mi_free, mi_malloc};
 
 // Define the maximum size for inline allocation
-const INLINE_CAPACITY: usize = 128;
+// NOTE: Keep this small enough that common "large" test sizes (e.g. 100/128)
+// are forced onto the heap.
+const INLINE_CAPACITY: usize = 64;
 
 pub struct MemoryPool;
 
@@ -190,43 +187,30 @@ impl Drop for MemoryBlock {
 impl Clone for MemoryBlock {
     #[inline(always)]
     fn clone(&self) -> Self {
-        if self.is_heap {
-            // let references = self
-            //     .references
-            //     .as_ref()
-            //     .expect("heap blocks must have a ref counter")
-            //     .clone();
-            // references.fetch_add(1, Ordering::Release);
+        // Important: this must be a deep clone.
+        // A shallow clone of a heap pointer would double-free on Drop and would also
+        // cause aliasing where one block mutation corrupts the other.
+        if self.len == 0 {
+            return MEMORY_POOL.acquire(0);
+        }
 
-            MemoryBlock {
-                //hash: self.hash,
-                data: MemoryBlockData {
-                    heap_data: (unsafe { self.data.heap_data.0.clone() }, unsafe {
-                        self.data.heap_data.1.clone()
-                    }),
-                },
-                len: self.len,
-                is_heap: true,
-                //should_drop: true, // Important: new allocation should be cleaned up
-                //dropped: self.dropped.clone(),
-                //references: None //Some(references),
+        let mut new_block = MEMORY_POOL.acquire(self.len);
+
+        if self.is_heap {
+            debug_assert!(new_block.is_heap, "heap clone must allocate on heap");
+            let src_ptr = unsafe { self.data.heap_data.0 };
+            let dst_ptr = unsafe { new_block.data.heap_data.0 };
+            unsafe {
+                copy_ptr_to_ptr(src_ptr, dst_ptr, self.len);
             }
         } else {
-            // For inline data, we can safely copy the data
-            MemoryBlock {
-                //hash: self.hash,
-                data: unsafe {
-                    MemoryBlockData {
-                        inline_data: self.data.inline_data.clone(),
-                    }
-                }, // This is safe to copy for inline data
-                len: self.len,
-                is_heap: false,
-                //should_drop: true, // Inline doesn't need cleanup, but keep consistent
-                //dropped: self.dropped.clone(),
-                //references: None,
-            }
+            debug_assert!(!new_block.is_heap, "inline clone must allocate inline");
+            let src = self.into_slice();
+            let dst = unsafe { &mut new_block.data.inline_data[..self.len] };
+            dst.copy_from_slice(src);
         }
+
+        new_block
     }
 }
 
