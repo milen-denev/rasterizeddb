@@ -1,14 +1,19 @@
 use std::{
-    cmp::min, fs::{self, remove_file, OpenOptions}, path::Path, sync::{
+    cmp::min, fs::{self, remove_file}, path::Path, sync::{
         atomic::{AtomicBool, AtomicU64, Ordering}, Arc
     }, usize
 };
+
+use std::cell::RefCell;
 
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 
 use arc_swap::ArcSwap;
 use log::error;
 use parking_lot::RwLock;
+use rclite::Arc as RcArc;
+use opool::{Pool, PoolAllocator};
+use std::sync::OnceLock;
 use tokio::task::yield_now;
 
 use memmap2::{Mmap, MmapOptions};
@@ -32,17 +37,26 @@ pub enum FastPathResult {
 pub struct LocalStorageProvider {
     pub(super) append_file: Arc<RwLock<std::fs::File>>,
     pub(super) write_file: Arc<RwLock<std::fs::File>>,
+    // Dedicated read-only handles so read paths avoid lock contention.
+    pub(super) read_file: RcArc<std::fs::File>,
     pub(crate) location: String,
     pub(crate) table_name: String,
     pub(crate) file_str: String,
     // temp staging file used for append_data()
     pub(crate) temp_file_str: String,
     pub(super) temp_file: Arc<RwLock<std::fs::File>>,
+    pub(super) temp_read_file: RcArc<std::fs::File>,
+    // In-memory mirror of staged temp bytes (fast path for reads).
+    pub(super) temp_mem: RwLock<Vec<u8>>,
+    pub(super) temp_mem_len: AtomicU64,
     // length of staged temp file bytes, maintained atomically (no metadata in read paths)
     pub(super) temp_file_len: AtomicU64,
     pub file_len: AtomicU64,
     // Memory map published with ArcSwap and owned by Arc to allow thread-local caches to own a handle safely.
     pub(crate) _memory_map: Arc<ArcSwap<Mmap>>,
+    // Monotonic generation counter; bumped whenever the mmap is refreshed.
+    // Used to cheaply invalidate per-thread cached mmap handles.
+    pub(crate) mmap_gen: AtomicU64,
     pub(crate) hash: u32,
     _locked: AtomicBool,
     // true when there is data in temp_file waiting to be flushed
@@ -62,23 +76,73 @@ impl Clone for LocalStorageProvider {
                 .unwrap()
         });
 
+        let read_file = RcArc::new(
+            std::fs::File::options()
+                .read(true)
+                .open(&self.file_str)
+                .unwrap(),
+        );
+        let temp_read_file = RcArc::new(
+            std::fs::File::options()
+                .read(true)
+                .open(&self.temp_file_str)
+                .unwrap(),
+        );
+
         Self {
             append_file: self.append_file.clone(),
             write_file: self.write_file.clone(),
+            read_file,
             location: self.location.clone(),
             table_name: self.table_name.clone(),
             file_str: self.file_str.clone(),
             temp_file_str: self.temp_file_str.clone(),
             temp_file: self.temp_file.clone(),
+            temp_read_file,
+            temp_mem: RwLock::new(self.temp_mem.read().clone()),
+            temp_mem_len: AtomicU64::new(self.temp_mem_len.load(Ordering::Acquire)),
             temp_file_len: AtomicU64::new(self.temp_file_len.load(Ordering::Acquire)),
             file_len: AtomicU64::new(self.file_len.load(std::sync::atomic::Ordering::SeqCst)),
             _memory_map: Arc::new(arc_swap::ArcSwap::new(map)),
+            mmap_gen: AtomicU64::new(1),
             hash: CRC.checksum(format!("{}+++{}", self.location, self.table_name).as_bytes()),
             _locked: AtomicBool::new(false),
             temp_has_data: AtomicBool::new(self.temp_has_data.load(Ordering::Relaxed)),
             append_blocked: AtomicBool::new(false)
         }
     }
+}
+
+struct ByteVecAllocator;
+
+impl PoolAllocator<Vec<u8>> for ByteVecAllocator {
+    #[inline]
+    fn allocate(&self) -> Vec<u8> {
+        Vec::with_capacity(1024 * 1024)
+    }
+
+    #[inline]
+    fn reset(&self, obj: &mut Vec<u8>) {
+        obj.clear();
+    }
+}
+
+static BYTE_VEC_POOL: OnceLock<Pool<ByteVecAllocator, Vec<u8>>> = OnceLock::new();
+
+#[inline]
+fn byte_vec_pool() -> &'static Pool<ByteVecAllocator, Vec<u8>> {
+    BYTE_VEC_POOL.get_or_init(|| Pool::new(64, ByteVecAllocator))
+}
+
+// Remapping a growing file can be expensive. We remap lazily only when the mmap coverage
+// falls behind the logical file length by a meaningful amount.
+const REMAP_GROWTH_THRESHOLD: u64 = 8 * 1024 * 1024;
+
+thread_local! {
+    // (provider_key, generation, cached mmap)
+    // IMPORTANT: this must be keyed per provider; otherwise different providers would
+    // incorrectly share a cached mmap within the same thread.
+    static TLS_MMAP_CACHE: RefCell<(u64, u64, Option<Arc<Mmap>>)> = RefCell::new((0, 0, None));
 }
 
 impl LocalStorageProvider {
@@ -132,6 +196,13 @@ impl LocalStorageProvider {
                 .open(&file_str)
                 .unwrap();
 
+            let read_file = RcArc::new(
+                std::fs::File::options()
+                    .read(true)
+                    .open(&file_str)
+                    .unwrap(),
+            );
+
             // Ensure temp staging file exists next to main file
             let temp_file_str = format!("{}.tmp", file_str);
 
@@ -145,6 +216,13 @@ impl LocalStorageProvider {
                 .write(true)
                 .open(&temp_file_str)
                 .unwrap();
+
+            let temp_read_file = RcArc::new(
+                std::fs::File::options()
+                    .read(true)
+                    .open(&temp_file_str)
+                    .unwrap(),
+            );
             
             #[cfg(not(test))]
             let temp_len = std::fs::metadata(&temp_file_str).map(|m| m.len()).unwrap_or(0);
@@ -185,13 +263,18 @@ impl LocalStorageProvider {
             let local_storage_provider =LocalStorageProvider {
                 append_file: Arc::new(RwLock::new(file_append)),
                 write_file: Arc::new(RwLock::new(file_write)),
+                read_file,
                 location: final_location.to_string(),
                 table_name: table_name.to_string(),
                 file_str: file_str.clone(),
                 temp_file_str,
                 temp_file: Arc::new(RwLock::new(temp_file)),
+                temp_read_file,
+                temp_mem: RwLock::new(Vec::new()),
+                temp_mem_len: AtomicU64::new(0),
                 file_len: AtomicU64::new(file_len),
                 _memory_map: map,
+                mmap_gen: AtomicU64::new(1),
                 hash: CRC.checksum(format!("{}+++{}", final_location, table_name).as_bytes()),
                 _locked: AtomicBool::new(false),
                 temp_file_len: AtomicU64::new(temp_len),
@@ -250,6 +333,13 @@ impl LocalStorageProvider {
                 .open(&file_str)
                 .unwrap();
 
+            let read_file = RcArc::new(
+                std::fs::File::options()
+                    .read(true)
+                    .open(&file_str)
+                    .unwrap(),
+            );
+
             // Ensure temp staging file exists next to main file
             let temp_file_str = format!("{}.tmp", file_str);
             if !Path::new(&temp_file_str).exists() {
@@ -261,6 +351,13 @@ impl LocalStorageProvider {
                 .write(true)
                 .open(&temp_file_str)
                 .unwrap();
+
+            let temp_read_file = RcArc::new(
+                std::fs::File::options()
+                    .read(true)
+                    .open(&temp_file_str)
+                    .unwrap(),
+            );
             #[cfg(not(test))]
             let temp_len = std::fs::metadata(&temp_file_str).map(|m| m.len()).unwrap_or(0);
                 
@@ -301,13 +398,18 @@ impl LocalStorageProvider {
             let local_storage_provider = LocalStorageProvider {
                 append_file: Arc::new(RwLock::new(file_append)),
                 write_file: Arc::new(RwLock::new(file_write)),
+                read_file,
                 location: location_str.to_string(),
                 table_name: "temp.db".to_string(),
                 file_str: file_str.clone(),
                 temp_file_str,
                 temp_file: Arc::new(RwLock::new(temp_file)),
+                temp_read_file,
+                temp_mem: RwLock::new(Vec::new()),
+                temp_mem_len: AtomicU64::new(0),
                 file_len: AtomicU64::new(file_len),
                 _memory_map: map,
+                mmap_gen: AtomicU64::new(1),
                 hash: CRC.checksum(format!("{}+++{}", location_str, "CONFIG_TABLE.db").as_bytes()),
                 _locked: AtomicBool::new(false),
                 temp_file_len: AtomicU64::new(temp_len),
@@ -368,8 +470,7 @@ impl LocalStorageProvider {
 
         let _reset = Reset(&self.append_blocked);
 
-        // Snapshot temp length from atomic and read payload
-        let mut temp = self.temp_file.write();
+        // Snapshot temp length from atomic.
         let len = self.temp_file_len.swap(0, Ordering::AcqRel) as usize;
 
         if len == 0 {
@@ -378,24 +479,54 @@ impl LocalStorageProvider {
             return Ok(0);
         }
 
-        // Read all staged bytes
-        temp.seek(SeekFrom::Start(0))?;
-        let mut buf = vec![0u8; len];
-        temp.read_exact(&mut buf)?;
+        // Prefer writing from the in-memory staging buffer (if it fully covers the staged range).
+        let mut wrote_from_mem = false;
+        if self.temp_mem_len.load(Ordering::Acquire) == len as u64 {
+            let mut mem = self.temp_mem.write();
+            if mem.len() == len {
+                let mut main = self.append_file.write();
+                main.write_all(&mem)?;
+                main.flush()?;
+                let _ = main.sync_all();
+                mem.clear();
+                self.temp_mem_len.store(0, Ordering::Release);
+                wrote_from_mem = true;
+            }
+        }
 
-        // Append to main file
-        {
+        if !wrote_from_mem {
+            let mut buf = byte_vec_pool().get();
+            let cap = buf.capacity();
+            if cap < len {
+                buf.reserve(len - cap);
+            }
+            buf.resize(len, 0u8);
+
+            // Read all staged bytes from the temp file.
+            // NOTE: we keep using the locked temp handle to avoid cursor races with staging writes.
+            {
+                let mut temp = self.temp_file.write();
+                temp.seek(SeekFrom::Start(0))?;
+                temp.read_exact(&mut buf[..])?;
+            }
+
             let mut main = self.append_file.write();
-            main.write_all(&buf)?;
+            main.write_all(&buf[..])?;
             main.flush()?;
-            // Optional: fsync for durability
             let _ = main.sync_all();
+
+            // We flushed staged bytes; drop any in-memory mirror.
+            self.temp_mem.write().clear();
+            self.temp_mem_len.store(0, Ordering::Release);
         }
 
         // Truncate temp file back to zero for next round
-        temp.seek(SeekFrom::Start(0))?;
-        temp.set_len(0)?;
-        let _ = temp.flush();
+        {
+            let mut temp = self.temp_file.write();
+            temp.seek(SeekFrom::Start(0))?;
+            temp.set_len(0)?;
+            let _ = temp.flush();
+        }
 
         // Publish new file_len and refresh mmap
         self.file_len.fetch_add(len as u64, Ordering::Release);
@@ -407,17 +538,8 @@ impl LocalStorageProvider {
     }
 
     fn update_memory_map(&self) {
-        let file = match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&self.file_str)
-        {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("Failed to open file for memory mapping: {}", e);
-                return;
-            }
-        };
+        // Reuse the dedicated read-only handle; avoids repeated open/close overhead.
+        let file = &*self.read_file;
 
         // Acquire a simple spin lock to serialize remapping
         while self
@@ -430,9 +552,31 @@ impl LocalStorageProvider {
 
         // Create new memory map with the current file size
         self._memory_map
-            .store(Arc::new(unsafe { MmapOptions::new().map(&file).unwrap() }));
+            .store(Arc::new(unsafe { MmapOptions::new().map(file).unwrap() }));
+
+        // Bump generation to invalidate thread-local caches.
+        // Acquire/Release pairing ensures that if a thread observes a new generation,
+        // it also observes the newly stored mmap.
+        self.mmap_gen.fetch_add(1, Ordering::Release);
 
     self._locked.store(false, Ordering::Release);
+    }
+
+    #[inline(always)]
+    fn with_cached_mmap<R>(&self, f: impl FnOnce(&Mmap) -> R) -> R {
+        let provider_key = Arc::as_ptr(&self._memory_map) as usize as u64;
+        let generation = self.mmap_gen.load(Ordering::Acquire);
+        TLS_MMAP_CACHE.with(|cell| {
+            let mut state = cell.borrow_mut();
+            if state.2.is_none() || state.0 != provider_key || state.1 != generation {
+                // Clone the Arc<Mmap> behind ArcSwap's guard and keep it in TLS.
+                state.0 = provider_key;
+                state.1 = generation;
+                state.2 = Some(Arc::clone(&*self._memory_map.load()));
+            }
+            let mmap_arc = state.2.as_ref().unwrap();
+            f(&*mmap_arc)
+        })
     }
 
     #[inline(always)]
@@ -449,59 +593,83 @@ impl LocalStorageProvider {
     /* --------- Low-level disk read (pread style) --------- */
     #[inline(always)]
     fn pread_exact_or_partial(&self, pos: u64, buf: &mut [u8]) -> io::Result<usize> {
-        // Choose which file descriptor to read from; assuming append_file.
-        // We do not take a lock because we use read_at / seek_read that doesn't modify cursor.
-        let file_guard = self.append_file.read();
+        // Dedicated read-only handle avoids lock contention.
+        let file_ref = &*self.read_file;
 
         #[cfg(unix)]
         {
-            let n = file_guard.read_at(buf, pos)?;
+            let n = file_ref.read_at(buf, pos)?;
             Ok(n)
         }
 
         #[cfg(windows)]
         {
-            let n = file_guard.seek_read(buf, pos)?;
+            let n = file_ref.seek_read(buf, pos)?;
             Ok(n)
         }
     }
 
     #[inline(always)]
     fn temp_pread_exact_or_partial(&self, pos: u64, buf: &mut [u8]) -> io::Result<usize> {
-        let file_guard = self.temp_file.read();
+        let file_ref = &*self.temp_read_file;
 
         #[cfg(unix)]
         {
-            let n = file_guard.read_at(buf, pos)?;
+            let n = file_ref.read_at(buf, pos)?;
             Ok(n)
         }
         #[cfg(windows)]
         {
-            let n = file_guard.seek_read(buf, pos)?;
+            let n = file_ref.seek_read(buf, pos)?;
             Ok(n)
         }
+    }
+
+    #[inline(always)]
+    fn temp_mem_copy_region(&self, temp_off: u64, dst: &mut [u8]) -> usize {
+        if dst.is_empty() {
+            return 0;
+        }
+
+        let mem_len = self.temp_mem_len.load(Ordering::Acquire);
+        if mem_len == 0 {
+            return 0;
+        }
+        if temp_off >= mem_len {
+            return 0;
+        }
+
+        let mem = self.temp_mem.read();
+        let start = temp_off as usize;
+        if start >= mem.len() {
+            return 0;
+        }
+        let avail = mem.len() - start;
+        let to_copy = dst.len().min(avail);
+        dst[..to_copy].copy_from_slice(&mem[start..start + to_copy]);
+        to_copy
     }
 
     // Single large mmap copy if possible. Returns bytes copied.
     #[inline(always)]
     fn mmap_copy_region(&self, pos: u64, buf: &mut [u8], file_len: u64) -> usize {
-        let mmap = self._memory_map.load();
-
-        let mmap_len = mmap.len() as u64;
-        if pos >= mmap_len {
-            return 0;
-        }
-        // effective end limited by both mmap coverage and logical file length
-        let max_span = (mmap_len - pos).min(file_len - pos);
-        if max_span == 0 {
-            return 0;
-        }
-        let to_copy = min(buf.len(), max_span as usize);
-        let start = pos as usize;
-        let end = start + to_copy;
-        // bounds guaranteed by max_span
-        buf[..to_copy].copy_from_slice(&mmap[start..end]);
-        to_copy
+        self.with_cached_mmap(|mmap| {
+            let mmap_len = mmap.len() as u64;
+            if pos >= mmap_len {
+                return 0;
+            }
+            // effective end limited by both mmap coverage and logical file length
+            let max_span = (mmap_len - pos).min(file_len - pos);
+            if max_span == 0 {
+                return 0;
+            }
+            let to_copy = min(buf.len(), max_span as usize);
+            let start = pos as usize;
+            let end = start + to_copy;
+            // bounds guaranteed by max_span
+            buf[..to_copy].copy_from_slice(&mmap[start..end]);
+            to_copy
+        })
     }
 
     // Synchronous fast path attempt: returns a FastPathResult; never awaits.
@@ -599,88 +767,87 @@ impl LocalStorageProvider {
         FastPathResult::Done
     }
 
-    async fn read_data_into_buffer_internal(&self, position: &mut u64, buffer: &mut [u8]) -> io::Result<()> {
+    #[inline(always)]
+    async fn read_data_into_buffer_internal(
+        &self,
+        position: &mut u64,
+        buffer: &mut [u8],
+    ) -> io::Result<()> {
         if buffer.is_empty() {
             return Ok(());
         }
 
         // Snapshot lengths
         let main_len = self.load_file_len();
-        
-        while self.append_blocked.load(Ordering::Relaxed) {
-            yield_now().await;
+        // Avoid `await` in the hot read path; if a flush is in progress, do a short spin.
+        // Flushes are expected to be rare relative to reads.
+        while self.append_blocked.load(Ordering::Acquire) {
+            std::hint::spin_loop();
         }
 
-        let temp_len = self.temp_file_len.load(Ordering::Relaxed);
-
+        let temp_len = self.temp_file_len.load(Ordering::Acquire);
         let file_len = main_len + temp_len; // logical length
 
         // Immediate EOF if the requested position is beyond the logical end.
         // This ensures callers get UnexpectedEof and position remains unchanged.
         if *position >= file_len {
-            return Err(io::Error::new(
-                ErrorKind::UnexpectedEof,
-                "Position beyond file end",
-            ));
+            return Err(io::Error::new(ErrorKind::UnexpectedEof, "Position beyond file end"));
         }
 
         let total_len = buffer.len();
 
-        let mut overall_copied = 0usize;
-
-        loop {
-            match self.read_data_into_buffer_fast(position, &mut buffer[overall_copied..], file_len)
-            {
-                FastPathResult::Done => {
-                    return Ok(());
-                }
-                FastPathResult::EofNone => {
-                    // If EOF relative to main file but temp has data and our position is inside logical range,
-                    // try to read from temp staging directly.
-                    if *position < file_len && *position >= main_len {
-                        let temp_off = *position - main_len;
-                        if overall_copied < total_len {
-                            let slice = &mut buffer[overall_copied..];
-                            let n = self.temp_pread_exact_or_partial(temp_off, slice)?;
-                            *position += n as u64;
-                            overall_copied += n;
-                        }
-                        if overall_copied == total_len {
-                            return Ok(());
-                        } else {
-                            return Err(io::Error::new(
-                                ErrorKind::UnexpectedEof,
-                                "Reached logical EOF",
-                            ));
-                        }
+        // Ultra-fast path: no temp data, and the request is fully within main.
+        // This keeps the mmap benchmarks as close as possible to a single memcpy.
+        if temp_len == 0 {
+            let pos = *position;
+            if pos < main_len {
+                let need = total_len as u64;
+                if pos + need <= main_len {
+                    let copied = self.mmap_copy_region(pos, buffer, main_len);
+                    if copied == total_len {
+                        *position = pos + need;
+                        return Ok(());
                     }
-                    return Err(io::Error::new(
-                        ErrorKind::UnexpectedEof,
-                        "Position beyond file end",
-                    ));
-                }
-                FastPathResult::EofPartial(copied) => {
-                    overall_copied += copied;
-                    // If we hit EOF in main region but temp has data and pos is in temp, continue from temp
-                    if *position < file_len && *position >= main_len && overall_copied < total_len {
-                        let temp_off = *position - main_len;
-                        let slice = &mut buffer[overall_copied..];
-                        let n = self.temp_pread_exact_or_partial(temp_off, slice)?;
-                        *position += n as u64;
-                        overall_copied += n;
-                        if overall_copied == total_len {
-                            return Ok(());
-                        }
-                    }
-                    return Err(io::Error::new(
-                        ErrorKind::UnexpectedEof,
-                        format!(
-                            "Requested {} bytes, got {} (reached logical EOF)",
-                            total_len, overall_copied
-                        ),
-                    ));
                 }
             }
+        }
+
+        let mut overall_copied = 0usize;
+
+        // Phase 1: read from main file only (mmap + pread), clamped to main_len.
+        if *position < main_len {
+            match self.read_data_into_buffer_fast(position, buffer, main_len) {
+                FastPathResult::Done => return Ok(()),
+                FastPathResult::EofNone => {
+                    // We reached the end of main (or observed EOF) before copying anything.
+                }
+                FastPathResult::EofPartial(copied) => {
+                    overall_copied = copied;
+                }
+            }
+        }
+
+        // Phase 2: if logical length extends into temp, read remaining bytes from temp.
+        if overall_copied < total_len {
+            if *position >= main_len {
+                let temp_off = *position - main_len;
+                let slice = &mut buffer[overall_copied..];
+                let mut n = self.temp_mem_copy_region(temp_off, slice);
+                if n == 0 {
+                    n = self.temp_pread_exact_or_partial(temp_off, slice)?;
+                }
+                *position += n as u64;
+                overall_copied += n;
+            }
+        }
+
+        if overall_copied == total_len {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                ErrorKind::UnexpectedEof,
+                format!("Requested {} bytes, got {} (reached logical EOF)", total_len, overall_copied),
+            ))
         }
     }
 }
@@ -714,10 +881,15 @@ impl StorageIO for LocalStorageProvider {
             file.flush().unwrap();
             // Ensure file length and data are durable for any new handles
             let _ = file.sync_all();
-            // Update file length atomically and refresh mmap so readers see new bytes
-            self.file_len
-                .fetch_add(buffer.len() as u64, Ordering::Release);
-            self.update_memory_map();
+            // Update file length atomically and refresh mmap only if it is far behind.
+            let new_len = self
+                .file_len
+                .fetch_add(buffer.len() as u64, Ordering::Release)
+                + buffer.len() as u64;
+            let mmap_len = self._memory_map.load().len() as u64;
+            if new_len > mmap_len + REMAP_GROWTH_THRESHOLD {
+                self.update_memory_map();
+            }
             return;
         }
 
@@ -734,6 +906,14 @@ impl StorageIO for LocalStorageProvider {
             tf.write_all(buffer).unwrap();
             let _ = tf.flush();
         }
+
+        // Mirror staged bytes in memory for faster read-back.
+        {
+            let mut mem = self.temp_mem.write();
+            mem.extend_from_slice(buffer);
+        }
+        self.temp_mem_len
+            .fetch_add(buffer.len() as u64, Ordering::Release);
 
         // Mark that we have staged data
         self.temp_has_data.store(true, Ordering::Release);
@@ -824,6 +1004,13 @@ impl StorageIO for LocalStorageProvider {
             .open(&file_str)
             .unwrap();
 
+        let read_file = RcArc::new(
+            std::fs::File::options()
+                .read(true)
+                .open(&file_str)
+                .unwrap(),
+        );
+
         // Do NOT truncate here. We may be opening an existing companion file (e.g. FIELDS.db)
         // from tests or runtime, and truncation would destroy previously appended data.
         let file_len = file_read_mmap.metadata().unwrap().len();
@@ -838,6 +1025,13 @@ impl StorageIO for LocalStorageProvider {
             .write(true)
             .open(&temp_file_str)
             .unwrap();
+
+        let temp_read_file = RcArc::new(
+            std::fs::File::options()
+                .read(true)
+                .open(&temp_file_str)
+                .unwrap(),
+        );
 
         // Preserve any existing staged temp bytes; tests may rely on persistence across openings.
         let mut staged_len = std::fs::metadata(&temp_file_str).map(|m| m.len()).unwrap_or(0);
@@ -856,16 +1050,21 @@ impl StorageIO for LocalStorageProvider {
         let local_storage_provider = Self {
             append_file: Arc::new(RwLock::new(file_append)),
             write_file: Arc::new(RwLock::new(file_write)),
+            read_file,
             location: final_location.to_string(),
             table_name: "temp.db".to_string(),
             file_str: file_str.clone(),
             temp_file_str,
             temp_file: Arc::new(RwLock::new(temp_file)),
+            temp_read_file,
+            temp_mem: RwLock::new(Vec::new()),
+            temp_mem_len: AtomicU64::new(0),
             temp_file_len: AtomicU64::new(staged_len),
             file_len: AtomicU64::new(file_len),
             _memory_map: Arc::new(ArcSwap::new(Arc::new(unsafe {
                 MmapOptions::new().map(&file_read_mmap).unwrap()
             }))),
+            mmap_gen: AtomicU64::new(1),
             hash: CRC.checksum(format!("{}+++{}", final_location, "temp.db").as_bytes()),
             _locked: AtomicBool::new(false),
             temp_has_data: AtomicBool::new(false),
@@ -951,6 +1150,13 @@ impl StorageIO for LocalStorageProvider {
             .open(&file_path)
             .unwrap();
 
+        let read_file = RcArc::new(
+            std::fs::File::options()
+                .read(true)
+                .open(&file_path)
+                .unwrap(),
+        );
+
         let temp_file_str = format!("{}.tmp", new_table);
 
         if !Path::new(&temp_file_str).exists() {
@@ -963,6 +1169,13 @@ impl StorageIO for LocalStorageProvider {
             .write(true)
             .open(&temp_file_str)
             .unwrap();
+
+        let temp_read_file = RcArc::new(
+            std::fs::File::options()
+                .read(true)
+                .open(&temp_file_str)
+                .unwrap(),
+        );
         
         let staged_len = std::fs::metadata(&temp_file_str).map(|m| m.len()).unwrap_or(0);
 
@@ -971,16 +1184,21 @@ impl StorageIO for LocalStorageProvider {
         let local_storage_provider = Self {
             append_file: Arc::new(RwLock::new(file_append)),
             write_file: Arc::new(RwLock::new(file_write)),
+            read_file,
             location: final_location.to_string(),
             table_name: name.to_string(),
             file_str: new_table.clone(),
             temp_file_str,
             temp_file: Arc::new(RwLock::new(temp_file)),
+            temp_read_file,
+            temp_mem: RwLock::new(Vec::new()),
+            temp_mem_len: AtomicU64::new(0),
             temp_file_len: AtomicU64::new(staged_len),
             file_len: AtomicU64::new(file_len),
             _memory_map: Arc::new(ArcSwap::new(Arc::new(unsafe {
                 MmapOptions::new().map(&file_read_mmap).unwrap()
             }))),
+            mmap_gen: AtomicU64::new(1),
             hash: CRC.checksum(format!("{}+++{}", final_location, name).as_bytes()),
             _locked: AtomicBool::new(false),
             temp_has_data: AtomicBool::new(false),
