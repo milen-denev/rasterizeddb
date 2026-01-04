@@ -6,6 +6,20 @@
 
 rasterizeddb_server-PLATFORM-x64.exe --location /your-location/bla-bla --concurrent_threads 16 --batch_size 16000
 
+### PostgreSQL network compatibility (pgwire)
+
+The server can also speak the PostgreSQL v3 wire protocol ("pgwire") so that tools like `psql` can connect.
+
+- Start the server in pgwire mode (trust auth, no SSL):
+	- `cargo run -p rasterizeddb_core -- --location <PATH> --protocol pgwire --pg-addr 127.0.0.1 --pg-port 5432`
+- Connect with psql:
+	- `psql "sslmode=require host=127.0.0.1 port=5432 user=any dbname=any"`
+
+Notes:
+- This is a *network-level* Postgres simulation: it supports the startup/auth flow and simple queries, and forwards supported SQL (CREATE/INSERT/SELECT) into RasterizedDB’s current SQL parser/executor.
+- TLS is enabled by default in pgwire mode (self-signed cert unless `--pg-cert/--pg-key` are provided).
+- The extended query protocol (prepared statements) is not implemented yet.
+
 *batch_size*: recommended value is 16K, but you can play around with more or less depending on your case. The lesser the number of rows, the lower the batch size must be.
 *concurrent_threads*: must equal to the number of CPU threads of lower.
 
