@@ -3,8 +3,10 @@ use std::{
     future::Future,
     io::SeekFrom,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::Mutex,
 };
+
+use rclite::Arc;
 
 use smallvec::{smallvec, SmallVec};
 

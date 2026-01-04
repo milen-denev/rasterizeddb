@@ -1,4 +1,6 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
+
+use rclite::Arc;
 
 use crc::{CRC_64_ECMA_182, Crc};
 use dashmap::DashMap;

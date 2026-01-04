@@ -1,4 +1,6 @@
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
+
+use rclite::Arc;
 
 use smallvec::SmallVec;
 
