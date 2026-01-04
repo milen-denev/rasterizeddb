@@ -26,10 +26,12 @@ use super::{
 use serde::Serialize;
 
 const SAMPLE_CAP: usize = 4096;
+
 /// Hard cap: semantic rules file must not exceed this fraction of the table's on-disk bytes.
 ///
 /// Table bytes are approximated as `rows_io.len + pointers_io.len`.
 const MAX_RULES_FILE_RATIO: f64 = 0.10;
+
 /// Base granularity knob: how many rows are summarized into a single rule (per numeric column).
 ///
 /// Larger values produce fewer, wider rules (more false positives, smaller file).
@@ -311,26 +313,74 @@ async fn scan_once_build_rules<S: StorageIO>(
     };
 
     let numeric_col_count = numeric_cols.len() as u64;
-    let string_col_count = string_cols.len() as u64;
-    let signals_per_window = numeric_col_count
-        .saturating_add(string_col_count.saturating_mul(STRING_RULES_PER_COL));
+    let string_col_count_full = string_cols.len() as u64;
 
-    // Choose a window size (rows_per_rule) that will keep:
-    // total_rules ~= signals_per_window * ceil(rows/rows_per_rule) <= max_rules.
-    let required_rows_per_rule = if signals_per_window == 0 {
-        BASE_ROWS_PER_RULE
+    // If the budget is too small to even store a single window of all rules,
+    // prefer keeping numeric rules (exact/min-max) and drop string-derived rules (fuzzy).
+    // This avoids unsafe filtering behavior when a string column is missing some ops.
+    let minimal_rules_numeric_only = numeric_col_count;
+    let minimal_rules_all = minimal_rules_numeric_only
+        .saturating_add(string_col_count_full.saturating_mul(STRING_RULES_PER_COL));
+    let include_string_rules = string_col_count_full != 0
+        && (minimal_rules_numeric_only == 0 || minimal_rules_all <= max_rules);
+
+    let string_cols_effective: &[StringColumn] = if include_string_rules {
+        string_cols.as_slice()
     } else {
-        ceil_div_u64(signals_per_window.saturating_mul(row_count), max_rules)
+        &[]
     };
-    let rows_per_rule = std::cmp::max(1, std::cmp::max(BASE_ROWS_PER_RULE, required_rows_per_rule));
+    let string_col_count = string_cols_effective.len() as u64;
+
+    // Adaptive granularity (separate windows):
+    // - Numeric columns emit 1 rule per window per column.
+    // - String columns emit STRING_RULES_PER_COL rules per window per column.
+    // Cost-based balancing assigns string windows ~STRING_RULES_PER_COL times larger,
+    // which frees budget to shrink numeric windows.
+    let (numeric_rows_per_rule, string_rows_per_rule) = if numeric_col_count != 0
+        && string_col_count != 0
+    {
+        // With string windows ~6x bigger, the string cost per *row* becomes roughly equal
+        // to numeric cost per *row* (6 rules/window at 6x rows/window).
+        let effective_signals_per_numeric_window = numeric_col_count.saturating_add(string_col_count);
+        let required_numeric_rows = if effective_signals_per_numeric_window == 0 {
+            BASE_ROWS_PER_RULE
+        } else {
+            ceil_div_u64(
+                effective_signals_per_numeric_window.saturating_mul(row_count),
+                max_rules,
+            )
+        };
+        let n = std::cmp::max(1, std::cmp::max(BASE_ROWS_PER_RULE, required_numeric_rows));
+        let s = std::cmp::max(1, n.saturating_mul(STRING_RULES_PER_COL));
+        (n, s)
+    } else if numeric_col_count != 0 {
+        let required_numeric_rows = if numeric_col_count == 0 {
+            BASE_ROWS_PER_RULE
+        } else {
+            ceil_div_u64(numeric_col_count.saturating_mul(row_count), max_rules)
+        };
+        let n = std::cmp::max(1, std::cmp::max(BASE_ROWS_PER_RULE, required_numeric_rows));
+        (n, 0)
+    } else {
+        // string-only
+        let string_signals_per_window = string_col_count.saturating_mul(STRING_RULES_PER_COL);
+        let required_string_rows = if string_signals_per_window == 0 {
+            BASE_ROWS_PER_RULE
+        } else {
+            ceil_div_u64(string_signals_per_window.saturating_mul(row_count), max_rules)
+        };
+        let s = std::cmp::max(1, std::cmp::max(BASE_ROWS_PER_RULE, required_string_rows));
+        (0, s)
+    };
 
     // PASS 2: build bounded windowed rules (numeric + string-derived).
     let (rules_by_col, string_rules, last_row_id_seen) = build_window_rules(
         table_name,
         schema,
         &numeric_cols,
-        &string_cols,
-        rows_per_rule,
+        string_cols_effective,
+        numeric_rows_per_rule,
+        string_rows_per_rule,
         pointers_io.clone(),
         rows_io.clone(),
     )
@@ -1091,7 +1141,8 @@ async fn build_window_rules<S: StorageIO>(
     schema: &[SchemaField],
     numeric_cols: &[NumericColumn],
     string_cols: &[StringColumn],
-    rows_per_rule: u64,
+    numeric_rows_per_rule: u64,
+    string_rows_per_rule: u64,
     pointers_io: Arc<S>,
     rows_io: Arc<S>,
 ) -> std::io::Result<(Vec<Vec<SemanticRule>>, Vec<SemanticRule>, u64)> {
@@ -1124,9 +1175,14 @@ async fn build_window_rules<S: StorageIO>(
     let mut row = Row::default();
     let mut empty_rounds: u8 = 0;
 
-    let mut row_index: u64 = 0;
-    let mut window_start_row_id: Option<u64> = None;
-    let mut prev_row_id: u64 = 0;
+    let mut numeric_rows_in_window: u64 = 0;
+    let mut string_rows_in_window: u64 = 0;
+
+    let mut numeric_window_start_row_id: Option<u64> = None;
+    let mut string_window_start_row_id: Option<u64> = None;
+
+    let mut numeric_prev_row_id: u64 = 0;
+    let mut string_prev_row_id: u64 = 0;
     let mut last_row_id_seen: u64 = 0;
 
     loop {
@@ -1152,8 +1208,11 @@ async fn build_window_rules<S: StorageIO>(
             let row_id = pointer.id;
             last_row_id_seen = row_id;
 
-            if window_start_row_id.is_none() {
-                window_start_row_id = Some(row_id);
+            if numeric_rows_per_rule != 0 && numeric_window_start_row_id.is_none() {
+                numeric_window_start_row_id = Some(row_id);
+            }
+            if string_rows_per_rule != 0 && string_window_start_row_id.is_none() {
+                string_window_start_row_id = Some(row_id);
             }
 
             if pointer
@@ -1181,29 +1240,47 @@ async fn build_window_rules<S: StorageIO>(
                 }
             }
 
-            row_index = row_index.saturating_add(1);
-            prev_row_id = row_id;
+            if numeric_rows_per_rule != 0 {
+                numeric_rows_in_window = numeric_rows_in_window.saturating_add(1);
+                numeric_prev_row_id = row_id;
+                if numeric_rows_in_window >= numeric_rows_per_rule {
+                    let start = numeric_window_start_row_id.unwrap_or(numeric_prev_row_id);
+                    let end = numeric_prev_row_id;
+                    for b in builders.iter_mut() {
+                        b.flush_window(table_name, start, end);
+                    }
+                    numeric_window_start_row_id = None;
+                    numeric_rows_in_window = 0;
+                }
+            }
 
-            if rows_per_rule != 0 && row_index % rows_per_rule == 0 {
-                let start = window_start_row_id.unwrap_or(prev_row_id);
-                let end = prev_row_id;
-                for b in builders.iter_mut() {
-                    b.flush_window(table_name, start, end);
+            if string_rows_per_rule != 0 {
+                string_rows_in_window = string_rows_in_window.saturating_add(1);
+                string_prev_row_id = row_id;
+                if string_rows_in_window >= string_rows_per_rule {
+                    let start = string_window_start_row_id.unwrap_or(string_prev_row_id);
+                    let end = string_prev_row_id;
+                    for sb in string_builders.iter_mut() {
+                        sb.flush_window_rules(start, end);
+                    }
+                    string_window_start_row_id = None;
+                    string_rows_in_window = 0;
                 }
-                for sb in string_builders.iter_mut() {
-                    sb.flush_window_rules(start, end);
-                }
-                window_start_row_id = None;
             }
         }
     }
 
-    if row_index > 0 {
-        let start = window_start_row_id.unwrap_or(prev_row_id);
-        let end = prev_row_id;
+    if numeric_rows_in_window > 0 {
+        let start = numeric_window_start_row_id.unwrap_or(numeric_prev_row_id);
+        let end = numeric_prev_row_id;
         for b in builders.iter_mut() {
             b.flush_window(table_name, start, end);
         }
+    }
+
+    if string_rows_in_window > 0 {
+        let start = string_window_start_row_id.unwrap_or(string_prev_row_id);
+        let end = string_prev_row_id;
         for sb in string_builders.iter_mut() {
             sb.flush_window_rules(start, end);
         }
