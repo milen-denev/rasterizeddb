@@ -1,7 +1,7 @@
 use byteorder::{ByteOrder, LittleEndian};
 use rastcp::client::{TcpClient, TcpClientBuilder};
 use std::io;
-use std::sync::Arc;
+use rclite::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;

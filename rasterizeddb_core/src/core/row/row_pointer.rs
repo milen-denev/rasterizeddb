@@ -1,7 +1,9 @@
 use std::{
     io::Cursor,
-    sync::{Arc, atomic::AtomicU64},
+    sync::atomic::AtomicU64,
 };
+
+use rclite::Arc;
 
 use super::{error::Result, row::RowWrite};
 use byteorder::{LittleEndian, WriteBytesExt};
@@ -225,15 +227,22 @@ impl<S: StorageIO> RowPointerIterator<S> {
     /// Get multiple RowPointers at once, up to BATCH_SIZE
     pub async fn next_row_pointers(&mut self) -> Result<Vec<RowPointer>> {
         let mut pointers: Vec<RowPointer> = Vec::new();
+        self.next_row_pointers_into(&mut pointers).await?;
+        Ok(pointers)
+    }
+
+    /// Fills `out` with up to BATCH_SIZE pointers, reusing its allocation.
+    pub async fn next_row_pointers_into(&mut self, out: &mut Vec<RowPointer>) -> Result<()> {
+        out.clear();
 
         for _ in 0..*BATCH_SIZE.get().unwrap() {
             match self.next_row_pointer().await? {
-                Some(pointer) => pointers.push(pointer),
+                Some(pointer) => out.push(pointer),
                 None => break,
             }
         }
 
-        Ok(pointers)
+        Ok(())
     }
 
     pub async fn next(&mut self) -> Result<Option<RowPointer>> {

@@ -1,4 +1,6 @@
-use std::sync::{Arc, atomic::AtomicU64};
+use std::sync::atomic::AtomicU64;
+
+use rclite::Arc;
 
 use smallvec::SmallVec;
 use stopwatch::Stopwatch;
@@ -147,6 +149,8 @@ pub async fn consolidated_read_data_function(schema: TableSchema, _id: u64) {
             &schema_fields.to_vec(),
             io_rows,
             &mut iterator,
+            None,
+            None,
         )
         .await;
 

@@ -1,7 +1,9 @@
 use std::{
     io,
-    sync::{Arc, atomic::AtomicU64},
+    sync::atomic::AtomicU64,
 };
+
+use rclite::Arc;
 
 use dashmap::DashMap;
 use log::{debug, error, info};
@@ -277,6 +279,8 @@ async fn load_db_tables<S: StorageIO>(
             &schema_fields.to_vec(),
             io_rows,
             row_pointer_iterator,
+            None,
+            None,
         )
         .await;
 

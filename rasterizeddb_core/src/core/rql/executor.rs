@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use rclite::Arc;
 
 use log::{debug, error, info};
 
@@ -145,6 +145,8 @@ pub async fn execute(query: QueryPurpose, database: Arc<Database>) -> Vec<u8> {
                         &schema.fields.to_vec(),
                         query_row.query_row_fetch,
                         query_row.requested_row_fetch,
+                        query_row.limit,
+                        query_row.order_by,
                     )
                     .await
                 {

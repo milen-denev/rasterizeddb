@@ -2,11 +2,10 @@ use log::{error, info};
 use std::io::Result;
 use std::{
     io,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64},
-    },
+    sync::atomic::{AtomicBool, AtomicU64},
 };
+
+use rclite::Arc;
 
 use super::schema::TableSchema;
 use crate::core::processor::concurrent_processor::ConcurrentProcessor;
@@ -163,6 +162,8 @@ impl<S: StorageIO> Table<S> {
         schema_fields: &Vec<SchemaField>,
         query_row_fetch: RowFetch,
         requested_row_fetch: RowFetch,
+        limit: Option<u64>,
+        order_by: Option<String>,
     ) -> Result<Vec<Row>> {
         // Implementation for querying a row from the table
 
@@ -182,6 +183,8 @@ impl<S: StorageIO> Table<S> {
                 schema_fields,
                 self.io_rows.clone(),
                 &mut iterator,
+                limit,
+                order_by,
             )
             .await;
 

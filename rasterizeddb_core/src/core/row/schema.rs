@@ -1,4 +1,6 @@
-use std::{io, sync::Arc};
+use std::io;
+
+use rclite::Arc;
 
 use itertools::Itertools;
 use smallvec::SmallVec;
@@ -166,6 +168,7 @@ pub struct SchemaCalculator;
 impl SchemaCalculator {
     pub fn calculate_schema_offset(&self, field_name: &str, fields: &[SchemaField]) -> (u32, u64) {
         let mut offset = 0;
+
         for field in fields
             .iter()
             .sorted_by(|x, y| Ord::cmp(&x.write_order, &y.write_order))
@@ -174,8 +177,9 @@ impl SchemaCalculator {
                 return (offset, field.write_order);
             }
             //println!("Field: {} - Offset: {}", field.name, offset);
-            offset += field.size as u32;
+            offset = offset.saturating_add(field.size as u32);
         }
+        
         (0, 0)
     }
 }
