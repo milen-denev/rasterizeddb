@@ -1,6 +1,8 @@
-use std::{borrow::Cow, cell::UnsafeCell, sync::{OnceLock, atomic::AtomicU64}};
+use std::{borrow::Cow, cell::UnsafeCell, sync::{OnceLock, atomic::{AtomicBool, AtomicU64}}};
 
 use rclite::Arc;
+
+use opool::{Pool, PoolAllocator};
 
 use crc::{CRC_64_ECMA_182, Crc};
 use futures::future::join_all;
@@ -28,6 +30,33 @@ pub static ATOMIC_CACHE: OnceLock<std::sync::Arc<AtomicGenericCache<u64, Arc<Vec
 pub static ENABLE_CACHE: OnceLock<bool> = OnceLock::new();
 const CRC_64: Crc<u64> = Crc::<u64>::new(&CRC_64_ECMA_182);
 
+struct RowPointerVecAllocator;
+
+impl PoolAllocator<Vec<RowPointer>> for RowPointerVecAllocator {
+    #[inline]
+    fn allocate(&self) -> Vec<RowPointer> {
+        let cap = BATCH_SIZE.get().copied().unwrap_or(1024 * 64);
+        Vec::with_capacity(cap)
+    }
+
+    #[inline]
+    fn reset(&self, obj: &mut Vec<RowPointer>) {
+        obj.clear();
+    }
+}
+
+static ROW_POINTER_VEC_POOL: OnceLock<Pool<RowPointerVecAllocator, Vec<RowPointer>>> = OnceLock::new();
+
+#[inline]
+fn row_pointer_vec_pool() -> &'static Pool<RowPointerVecAllocator, Vec<RowPointer>> {
+    ROW_POINTER_VEC_POOL.get_or_init(|| {
+        let max_threads = MAX_PERMITS_THREADS.get().copied().unwrap_or(16);
+        // Keep this modest; the pool can grow on demand.
+        let slots = (max_threads * 2).clamp(32, 512);
+        Pool::new(slots, RowPointerVecAllocator)
+    })
+}
+
 pub struct ConcurrentProcessor;
 
 impl ConcurrentProcessor {
@@ -42,8 +71,10 @@ impl ConcurrentProcessor {
         query_row_fetch: RowFetch,
         requested_row_fetch: RowFetch,
         table_schema: &Vec<SchemaField>,
-        io_rows: std::sync::Arc<S>,
+        io_rows: Arc<S>,
         iterator: &mut RowPointerIterator<S>,
+        limit: Option<u64>,
+        order_by: Option<String>,
     ) -> Vec<Row> {
         let prep_stopwatch = std::time::Instant::now();
 
@@ -53,6 +84,11 @@ impl ConcurrentProcessor {
         );
 
         let (tx, rx) = kanal::unbounded_async::<Row>();
+
+        // LIMIT enforcement: global counter across all tasks.
+        // The increment/threshold check is performed inside the `if result { }` section.
+        let limit_counter = Arc::new(AtomicU64::new(0));
+        let stop_processing = Arc::new(AtomicBool::new(false));
     
         let shared_tuple: Arc<(Semaphore, RowFetch, RowFetch)> = Arc::new((
             Semaphore::new(*MAX_PERMITS_THREADS.get().unwrap()),
@@ -65,7 +101,7 @@ impl ConcurrentProcessor {
             .cloned()
             .collect::<SmallVec<[SchemaField; 20]>>();
 
-        let io_rows_outer = std::sync::Arc::clone(&io_rows);
+        let io_rows_outer = Arc::clone(&io_rows);
 
         let cache_enabled = *ENABLE_CACHE.get().unwrap();
         let crc64_hash;
@@ -80,7 +116,7 @@ impl ConcurrentProcessor {
                         continue;
                     }
 
-                    let io_rows_clone = std::sync::Arc::clone(&io_rows_outer);
+                    let io_rows_clone = Arc::clone(&io_rows_outer);
                     let (_, _, requested_row_fetch) = &*shared_tuple;
 
                     // Fetch the requested row
@@ -133,7 +169,13 @@ impl ConcurrentProcessor {
         let mut batch_handles = Vec::new();
         iterator.reset();
 
-        let tokens = tokenize(&where_query, &table_schema);
+        // Empty WHERE means "match all rows"; skip tokenization/parsing entirely.
+        let no_filter = where_query.trim().is_empty();
+        let tokens: SmallVec<[crate::core::tokenizer::query_tokenizer::Token; 36]> = if no_filter {
+            SmallVec::new()
+        } else {
+            tokenize(&where_query, &table_schema)
+        };
         
         let schema_arc = Arc::new(table_schema);
         let tokens_arc = Arc::new(tokens);
@@ -156,7 +198,7 @@ impl ConcurrentProcessor {
                 table_name,
                 &*tokens_arc,
                 schema_arc.as_slice(),
-                std::sync::Arc::clone(&io_rows_outer),
+                Arc::clone(&io_rows_outer),
                 pointers_io,
             )
             .await
@@ -191,26 +233,32 @@ impl ConcurrentProcessor {
 
         // Process batches
         loop {
+            if stop_processing.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+
             let reading_time_total_clone = reading_time_total.clone();
 
-            let pointers: Vec<RowPointer> = if let Some((cands, idx)) = &mut sme_candidates {
+            let mut pointers = row_pointer_vec_pool().get();
+
+            if let Some((cands, idx)) = &mut sme_candidates {
                 let batch_size = *BATCH_SIZE.get().unwrap();
-                if *idx >= cands.len() {
-                    Vec::new()
-                } else {
+                if *idx < cands.len() {
                     let end = std::cmp::min(*idx + batch_size, cands.len());
-                    let out = cands[*idx..end].to_vec();
+                    pointers.extend(cands[*idx..end].iter().cloned());
                     *idx = end;
-                    out
                 }
             } else {
-                match iterator.next_row_pointers().await {
-                    Ok(p) => p,
-                    Err(_) => Vec::new(),
+                if iterator.next_row_pointers_into(&mut *pointers).await.is_err() {
+                    pointers.clear();
                 }
-            };
+            }
 
             if pointers.is_empty() {
+                break;
+            }
+
+            if stop_processing.load(std::sync::atomic::Ordering::Relaxed) {
                 break;
             }
 
@@ -219,13 +267,93 @@ impl ConcurrentProcessor {
             let tx_rp_clone = tx_rp.clone();
             let schema_ref = Arc::clone(&schema_arc);
             let tokens_ref = Arc::clone(&tokens_arc);
-            let io_rows_batch = std::sync::Arc::clone(&io_rows_outer);
+            let io_rows_batch = Arc::clone(&io_rows_outer);
+
+            let limit_opt = limit;
+            let limit_counter_ref = Arc::clone(&limit_counter);
+            let stop_ref = Arc::clone(&stop_processing);
+            let no_filter = no_filter;
 
             let batch_handle = task::spawn(async move {
                 let reading_time_total_clone_2 = Arc::clone(&reading_time_total_clone);
 
                 // Acquire a permit for this batch
                 let _batch_permit = tuple_clone.0.acquire().await.unwrap();
+
+                // Fast-path for queries without WHERE: accept all non-deleted rows.
+                if no_filter {
+                    let mut row = Row::default();
+
+                    for pointer in pointers.iter() {
+                        if stop_ref.load(std::sync::atomic::Ordering::Relaxed) {
+                            break;
+                        }
+
+                        if pointer.deleted {
+                            continue;
+                        }
+
+                        // Quick stop check for LIMIT to avoid unnecessary fetch work.
+                        if let Some(limit_val) = limit_opt {
+                            if limit_counter_ref.load(std::sync::atomic::Ordering::Relaxed) >= limit_val {
+                                stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                                break;
+                            }
+                        }
+
+                        let reading_time = stopwatch::Stopwatch::start_new();
+                        let io_rows_clone = Arc::clone(&io_rows_batch);
+                        let (_, _, requested_row_fetch) = &*tuple_clone;
+
+                        if pointer
+                            .fetch_row_reuse_async(
+                                io_rows_clone,
+                                requested_row_fetch,
+                                &mut row,
+                            )
+                            .await
+                            .is_err()
+                        {
+                            continue;
+                        }
+
+                        let elapsed_ns = reading_time.elapsed().as_nanos() as u64;
+                        reading_time_total_clone_2.fetch_add(elapsed_ns, std::sync::atomic::Ordering::Relaxed);
+
+                        // LIMIT is enforced on successfully fetched/emitted rows.
+                        if let Some(limit_val) = limit_opt {
+                            let reserved = limit_counter_ref.fetch_update(
+                                std::sync::atomic::Ordering::Relaxed,
+                                std::sync::atomic::Ordering::Relaxed,
+                                |cur| if cur <= limit_val { Some(cur + 1) } else { None },
+                            );
+
+                            match reserved {
+                                Ok(prev) => {
+                                    if prev + 1 >= limit_val {
+                                        stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                }
+                                Err(_) => {
+                                    stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    break;
+                                }
+                            }
+                        }
+
+                        if tx_rp_clone.send(pointer.clone()).await.is_err() {
+                            log::error!("Failed to send row pointer to cache inserter");
+                            break;
+                        }
+
+                        if tx_clone.send(Row::clone_row(&row)).await.is_err() {
+                            log::error!("Failed to send row to aggregator");
+                            break;
+                        }
+                    }
+
+                    return;
+                }
 
                 // Local row buffer reused across all pointers in this batch
                 let row = Row::default();
@@ -250,11 +378,15 @@ impl ConcurrentProcessor {
                 let mut plan_built = false;
 
                 for pointer in pointers.iter() {
+                    if stop_ref.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+
                     if pointer.deleted {
                         continue;
                     }
 
-                    let io_rows_clone = std::sync::Arc::clone(&io_rows_batch);
+                    let io_rows_clone = Arc::clone(&io_rows_batch);
                     let (_, query_row_fetch, requested_row_fetch) = &*tuple_clone;
 
                     
@@ -328,15 +460,9 @@ impl ConcurrentProcessor {
                     };
 
                     if result {
-                        if tx_rp_clone.send(pointer.clone()).await.is_err() {
-                            log::error!("Failed to send row pointer to cache inserter");
-                            // Receiver dropped; stop early
-                            break;
-                        }
-
                         let reading_time = stopwatch::Stopwatch::start_new();
 
-                        let io_rows_clone = std::sync::Arc::clone(&io_rows_batch);
+                        let io_rows_clone = Arc::clone(&io_rows_batch);
 
                         if pointer
                             .fetch_row_reuse_async(
@@ -352,6 +478,39 @@ impl ConcurrentProcessor {
 
                         let elapsed_ns = reading_time.elapsed().as_nanos() as u64;
                         reading_time_total_clone_2.fetch_add(elapsed_ns, std::sync::atomic::Ordering::Relaxed);
+
+                        // LIMIT is enforced on successfully fetched/emitted rows.
+                        if let Some(limit_val) = limit_opt {
+                            // Quick stop check to avoid extra work.
+                            if limit_counter_ref.load(std::sync::atomic::Ordering::Relaxed) >= limit_val {
+                                stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                                break;
+                            }
+
+                            let reserved = limit_counter_ref.fetch_update(
+                                std::sync::atomic::Ordering::Relaxed,
+                                std::sync::atomic::Ordering::Relaxed,
+                                |cur| if cur <= limit_val { Some(cur + 1) } else { None },
+                            );
+
+                            match reserved {
+                                Ok(prev) => {
+                                    if prev + 1 >= limit_val {
+                                        stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                }
+                                Err(_) => {
+                                    stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    break;
+                                }
+                            }
+                        }
+
+                        if tx_rp_clone.send(pointer.clone()).await.is_err() {
+                            log::error!("Failed to send row pointer to cache inserter");
+                            // Receiver dropped; stop early
+                            break;
+                        }
 
                         // Send a clone out to the aggregator
                         if tx_clone.send(Row::clone_row(&buffer.row)).await.is_err() {
@@ -386,7 +545,28 @@ impl ConcurrentProcessor {
         });
 
         // Await the aggregator to finish collecting rows.
-        let all_rows = aggregator_handle.await.unwrap();
+        let mut all_rows = aggregator_handle.await.unwrap();
+
+        // ORDER BY: after collection, sort the resulting rows.
+        if let Some(order_field) = &order_by {
+            let order_idx = schema_arc
+                .iter()
+                .position(|f| f.name.eq_ignore_ascii_case(order_field.as_str()));
+
+            if let Some(schema_id) = order_idx {
+                let schema_ref = schema_arc.clone();
+                all_rows.sort_by(|a, b| compare_rows_by_schema_id(a, b, schema_id, schema_ref.as_slice()));
+            } else {
+                log::warn!("ORDER BY field '{}' not found in schema; skipping sort", order_field);
+            }
+        }
+
+        // Safety: even though LIMIT is enforced strictly at send-time, keep a final cap.
+        if let Some(limit_val) = limit {
+            if all_rows.len() > limit_val as usize {
+                all_rows.truncate(limit_val as usize);
+            }
+        }
 
         if crc64_hash != 0 {
             let mut pointers = Vec::with_capacity(50);
@@ -413,6 +593,92 @@ impl ConcurrentProcessor {
         );
 
         all_rows
+    }
+}
+
+fn compare_rows_by_schema_id(
+    a: &Row,
+    b: &Row,
+    schema_id: usize,
+    schema: &[SchemaField],
+) -> std::cmp::Ordering {
+    let a_col = a.columns.iter().find(|c| c.schema_id as usize == schema_id);
+    let b_col = b.columns.iter().find(|c| c.schema_id as usize == schema_id);
+
+    match (a_col, b_col) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (Some(ac), Some(bc)) => {
+            // Prefer the schema's declared type (more stable than per-column), fallback to column type.
+            let db_type = schema
+                .get(schema_id)
+                .map(|f| f.db_type.clone())
+                .unwrap_or_else(|| ac.column_type.clone());
+            compare_bytes_as_type(db_type, ac.data.into_slice(), bc.data.into_slice())
+        }
+    }
+}
+
+fn compare_bytes_as_type(db_type: crate::core::db_type::DbType, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    use crate::core::db_type::DbType;
+
+    match db_type {
+        DbType::STRING | DbType::UNKNOWN | DbType::START | DbType::END | DbType::DATETIME => a.cmp(b),
+        DbType::CHAR => a.cmp(b),
+        DbType::I8 => read_num::<1, i8>(a, b, i8::from_le_bytes),
+        DbType::I16 => read_num::<2, i16>(a, b, i16::from_le_bytes),
+        DbType::I32 => read_num::<4, i32>(a, b, i32::from_le_bytes),
+        DbType::I64 => read_num::<8, i64>(a, b, i64::from_le_bytes),
+        DbType::I128 => read_num::<16, i128>(a, b, i128::from_le_bytes),
+        DbType::U8 => read_num::<1, u8>(a, b, u8::from_le_bytes),
+        DbType::U16 => read_num::<2, u16>(a, b, u16::from_le_bytes),
+        DbType::U32 => read_num::<4, u32>(a, b, u32::from_le_bytes),
+        DbType::U64 => read_num::<8, u64>(a, b, u64::from_le_bytes),
+        DbType::U128 => read_num::<16, u128>(a, b, u128::from_le_bytes),
+        DbType::BOOL => read_num::<1, u8>(a, b, u8::from_le_bytes),
+        DbType::F32 => {
+            let av = read_float::<4, f32>(a, f32::from_le_bytes);
+            let bv = read_float::<4, f32>(b, f32::from_le_bytes);
+            av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal)
+        }
+        DbType::F64 => {
+            let av = read_float::<8, f64>(a, f64::from_le_bytes);
+            let bv = read_float::<8, f64>(b, f64::from_le_bytes);
+            av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal)
+        }
+        DbType::NULL => std::cmp::Ordering::Equal,
+    }
+}
+
+fn read_num<const N: usize, T: Ord + Copy>(
+    a: &[u8],
+    b: &[u8],
+    f: fn([u8; N]) -> T,
+) -> std::cmp::Ordering {
+    let aa = a.get(0..N);
+    let bb = b.get(0..N);
+    if let (Some(aa), Some(bb)) = (aa, bb) {
+        let mut arr_a = [0u8; N];
+        let mut arr_b = [0u8; N];
+        arr_a.copy_from_slice(aa);
+        arr_b.copy_from_slice(bb);
+        let av = f(arr_a);
+        let bv = f(arr_b);
+        av.cmp(&bv)
+    } else {
+        a.cmp(b)
+    }
+}
+
+fn read_float<const N: usize, T: Copy>(a: &[u8], f: fn([u8; N]) -> T) -> T {
+    if let Some(aa) = a.get(0..N) {
+        let mut arr_a = [0u8; N];
+        arr_a.copy_from_slice(aa);
+        f(arr_a)
+    } else {
+        // Fallback: treat missing/invalid as 0
+        f([0u8; N])
     }
 }
 
