@@ -36,6 +36,12 @@ parking_lot = "0.12"
 clap = { version = "4.5", features = ["derive"] }
 kanal = "0.1"
 rclite = "0.4.1"
+opool = "0.2.0"
+
+# pgwire TLS
+rustls = "0.23"
+tokio-rustls = "0.26"
+rustls-pemfile = "2.2"
 
 # NOTE: Cargo does not support `cfg(debug_assertions)` for platform-specific dependencies.
 # These are always available, but only used behind `#[cfg(debug_assertions)]` in code.
@@ -64,6 +70,10 @@ harness = false
 
 [[bench]]
 name = "atomic_cache_benchmarks"
+harness = false
+
+[[bench]]
+name = "file_sync_benchmarks"
 harness = false
 
 [features]
