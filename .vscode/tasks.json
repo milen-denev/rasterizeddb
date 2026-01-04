@@ -2,20 +2,18 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "buildCargo",
+           "label": "buildCargo",
             "type": "shell",
-            "command": "cargo",
-            "args": [
-                "build"
-            ],
+            "command": "cargo build",
+            "args": [],
             "presentation": {
                 "reveal": "always",
             },
             "problemMatcher": [],
 			"options": {
-				// "shell": {
-				// 	"executable": "nu"
-				// }
+				"shell": {
+					"executable": "powershell.exe"
+				}
 			}
         },
         {
