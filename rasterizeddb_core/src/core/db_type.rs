@@ -15,6 +15,7 @@ pub enum DbType {
     U128,
     F32,
     F64,
+    BOOL,
     CHAR,
     STRING,
     DATETIME,
@@ -50,6 +51,7 @@ impl DbType {
             DbType::CHAR => 13,
             DbType::STRING => 14,
             DbType::DATETIME => 15,
+            DbType::BOOL => 16,
             DbType::UNKNOWN => 252,
             DbType::NULL => 253,
             DbType::START => 254,
@@ -76,6 +78,7 @@ impl DbType {
             13 => DbType::CHAR,
             14 => DbType::STRING,
             15 => DbType::DATETIME,
+            16 => DbType::BOOL,
             252 => DbType::UNKNOWN,
             253 => DbType::NULL,
             254 => DbType::START,
@@ -100,13 +103,47 @@ impl DbType {
             DbType::U128 => 16,
             DbType::F32 => 4,
             DbType::F64 => 8,
+            DbType::BOOL => 1,
             DbType::CHAR => 4,
             DbType::STRING => 4 + 8,
             DbType::UNKNOWN => 0,
             DbType::NULL => 1,
             DbType::START => 1,
             DbType::END => 1,
-            DbType::DATETIME => todo!(),
+            DbType::DATETIME => 8,
+        }
+    }
+
+    pub fn pg_oid(&self) -> u32 {
+        match self {
+            DbType::BOOL => 16,
+            DbType::I8 | DbType::I16 | DbType::I32 => 23, // int4
+            DbType::I64 => 20, // int8
+            DbType::U8 | DbType::U16 | DbType::U32 | DbType::U64 => 20, // best-effort
+            DbType::F32 => 700,
+            DbType::F64 => 701,
+            DbType::STRING => 25, // TEXT
+            DbType::DATETIME => 1114, // timestamp
+            _ => 25, // fallback TEXT
+        }
+    }
+
+    pub fn pg_type_size(&self) -> i16 {
+        match self {
+            DbType::BOOL => 1,
+            DbType::I8 => 1,
+            DbType::I16 => 2,
+            DbType::I32 => 4,
+            DbType::I64 => 8,
+            DbType::U8 => 1,
+            DbType::U16 => 2,
+            DbType::U32 => 4,
+            DbType::U64 => 8,
+            DbType::F32 => 4,
+            DbType::F64 => 8,
+            DbType::STRING => -1,
+            DbType::DATETIME => 8,
+            _ => -1,
         }
     }
 }
