@@ -10,10 +10,7 @@ use rasterizeddb_core::{
 };
 use std::{
     io::stdin,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
 };
 
 #[tokio::main(flavor = "multi_thread")]
@@ -23,84 +20,154 @@ async fn main() -> std::io::Result<()> {
         .filter_level(LevelFilter::Error)
         .init();
 
-    let client = Arc::new(DbClient::new(Some("127.0.0.1")).await.unwrap());
+    loop {
+        let client = Arc::new(DbClient::new(Some("127.0.0.1")).await.unwrap());
 
-    // let _query = r##"
-    //     CREATE TABLE employees (
-    //         id UBIGINT,
-    //         name VARCHAR,
-    //         job_title VARCHAR,
-    //         salary REAL,
-    //         department VARCHAR,
-    //         age INTEGER,
-    //         manager VARCHAR,
-    //         location VARCHAR,
-    //         hire_date UBIGINT,
-    //         degree VARCHAR,
-    //         skills VARCHAR,
-    //         current_project VARCHAR,
-    //         performance_score REAL,
-    //         is_active BOOLEAN,
-    //         created_at UBIGINT,
-    //         updated_at UBIGINT,
-    //         is_fired BOOLEAN
-    //     );
-    // "##;
+        let choice = prompt_menu_choice();
+        match choice {
+            1 => {
+                let create_result = create_table(&client).await;
+                println!("Create result: {:?}", create_result);
+                pause("Press any key to continue...");
+                insert_rows(&client).await;
+                pause("Press any key to continue...");
+                run_queries(&client).await;
+            }
+            2 => {
+                pause("Press any key to continue...");
+                insert_rows(&client).await;
+                pause("Press any key to continue...");
+                run_queries(&client).await;
+            }
+            3 => {
+                pause("Press any key to continue...");
+                run_queries(&client).await;
+            }
+            _ => unreachable!(),
+        }
+        
+        println!("Press any key to try again...");
+        let mut buffer = String::new(); 
+        stdin().read_line(&mut buffer).unwrap();
+    }
+    
+    Ok(())
+}
 
-    // let create_result = client.execute_query(_query).await;
+fn prompt_menu_choice() -> u8 {
+    println!(
+        "Choose an option:\n\
+1. Create Table, Add rows and query\n\
+2. Add rows and Query\n\
+3. Query only\n"
+    );
 
-    // println!("Create result: {:?}", create_result);
+    loop {
+        println!("Enter 1, 2, or 3:");
+        let mut buffer = String::new();
+        stdin().read_line(&mut buffer).unwrap();
+        match buffer.trim() {
+            "1" => return 1,
+            "2" => return 2,
+            "3" => return 3,
+            _ => println!("Invalid choice."),
+        }
+    }
+}
 
-    // println!("Press any key to continue...");
-    // let mut buffer = String::new();
-    // stdin().read_line(&mut buffer).unwrap();
-
-    // let mut features = vec![];
-
-    // let semaphore = Arc::new(tokio::sync::Semaphore::new(16));
-
-    // for i in 0..100_000 {
-    //     let person = generate_person();
-    //     let query = format!(
-    //         r##"
-    //         INSERT INTO employees (
-    //             id, name, job_title, salary, department, age, manager, location, hire_date,
-    //             degree, skills, current_project, performance_score, is_active,
-    //             created_at, updated_at, is_fired
-    //         )
-    //         VALUES (
-    //             {}, '{}', '{}', {}, '{}', {}, '{}', '{}', {},
-    //             '{}', '{}', '{}', {}, {}, {}, {}, {}
-    //         );
-    //         "##,
-    //         i + 1, person.name, person.job_title, person.salary, person.department, person.age,
-    //         person.manager, person.location, person.hire_date,
-    //         person.degree, person.skills, person.current_project, person.performance_score,
-    //         person.is_active as u8,
-    //         person.created_at, person.updated_at, person.is_fired as u8
-    //     );
-
-    //     let client_clone = Arc::clone(&client);
-    //     let semaphore_clone = Arc::clone(&semaphore);
-
-    //     features.push(tokio::spawn(async move {
-    //         let _permit = semaphore_clone.acquire().await.unwrap();
-    //         let _insert_result = client_clone.execute_query(&query).await;
-    //         drop(_permit);
-    //     }));
-    // }
-
-    // join_all(features).await;
-
-    // println!("Finished inserting records. Press any key to continue...");
-
+fn pause(message: &str) {
+    println!("{}", message);
     let mut buffer = String::new();
     stdin().read_line(&mut buffer).unwrap();
+}
 
+async fn create_table(client: &Arc<DbClient>) -> Result<QueryExecutionResult, std::io::Error> {
+    let query = r##"
+        CREATE TABLE employees (
+            id UBIGINT,
+            name VARCHAR,
+            job_title VARCHAR,
+            salary REAL,
+            department VARCHAR,
+            age INTEGER,
+            manager VARCHAR,
+            location VARCHAR,
+            hire_date UBIGINT,
+            degree VARCHAR,
+            skills VARCHAR,
+            current_project VARCHAR,
+            performance_score REAL,
+            is_active BOOLEAN,
+            created_at UBIGINT,
+            updated_at UBIGINT,
+            is_fired BOOLEAN
+        );
+    "##;
+
+    client.execute_query(query).await
+}
+
+async fn insert_rows(client: &Arc<DbClient>) {
+    for _i in 0..5 {
+        let mut features = vec![];
+
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(16));
+
+        for i in 0..100_000 {
+            let person = generate_person();
+            let query = format!(
+                r##"
+                INSERT INTO employees (
+                    id, name, job_title, salary, department, age, manager, location, hire_date,
+                    degree, skills, current_project, performance_score, is_active,
+                    created_at, updated_at, is_fired
+                )
+                VALUES (
+                    {}, '{}', '{}', {}, '{}', {}, '{}', '{}', {},
+                    '{}', '{}', '{}', {}, {}, {}, {}, {}
+                );
+                "##,
+                (i + 1) + (_i * 100_000),
+                person.name,
+                person.job_title,
+                person.salary,
+                person.department,
+                person.age,
+                person.manager,
+                person.location,
+                person.hire_date,
+                person.degree,
+                person.skills,
+                person.current_project,
+                person.performance_score,
+                person.is_active,
+                person.created_at,
+                person.updated_at,
+                person.is_fired
+            );
+
+            let client_clone = Arc::clone(client);
+            let semaphore_clone = Arc::clone(&semaphore);
+
+            features.push(tokio::spawn(async move {
+                let _permit = semaphore_clone.acquire().await.unwrap();
+                let _insert_result = client_clone.execute_query(&query).await;
+            }));
+        }
+
+        join_all(features).await;
+
+        println!("Batch {} inserted.", _i + 1);
+    }
+
+    println!("Finished inserting records.");
+}
+
+async fn run_queries(client: &Arc<DbClient>) {
     for _ in 0..5 {
         let query = r##"
             SELECT id, salary, age, name FROM employees
-            WHERE id > 1040 AND id < 1050 AND salary >= 200000.13 OR age = 29 AND id > 90000 AND name STARTSWITH 'J'
+            WHERE id = 100000 OR id = 200000 OR id = 300000 OR id = 400000 OR id = 500000
         "##;
 
         let instant = std::time::Instant::now();
@@ -109,52 +176,23 @@ async fn main() -> std::io::Result<()> {
 
         println!("Query executed in {} μs", elapsed);
 
-        match select_result.unwrap() {
-            QueryExecutionResult::RowsResult(rows) => {
+        match select_result {
+            Ok(QueryExecutionResult::RowsResult(rows)) => {
                 println!("Rows fetched successfully.");
                 let rows = vec_into_rows(&rows).unwrap();
                 println!("Total rows: {}", rows.len());
-                for row in rows {
-                    for column in &row.columns {
-                        if column.column_type == DbType::STRING {
-                            let value =
-                                String::from_utf8(column.data.into_slice().to_vec()).unwrap();
-                            println!("Name / Position: {}", value);
-                        } else if column.column_type == DbType::U64 {
-                            println!(
-                                "Id: {}",
-                                u64::from_le_bytes(column.data.into_slice().try_into().unwrap())
-                            );
-                        } else if column.column_type == DbType::F32 {
-                            println!(
-                                "Salary: {}",
-                                f32::from_le_bytes(column.data.into_slice().try_into().unwrap())
-                            );
-                        } else if column.column_type == DbType::I32 {
-                            println!(
-                                "Age: {}",
-                                i32::from_le_bytes(column.data.into_slice().try_into().unwrap())
-                            );
-                        }
-                    }
-                    println!();
-                }
             }
-            QueryExecutionResult::Error(err) => {
+            Ok(QueryExecutionResult::Error(err)) => {
                 eprintln!("Error occurred: {}", err);
             }
-            _ => {
+            Ok(_) => {
                 eprintln!("Unexpected result type");
+            }
+            Err(err) => {
+                eprintln!("Query failed: {}", err);
             }
         }
     }
-
-    println!("Press any key to continue...");
-
-    let mut buffer = String::new();
-    stdin().read_line(&mut buffer).unwrap();
-
-    return Ok(());
 }
 
 // A simple struct to hold the generated data.
