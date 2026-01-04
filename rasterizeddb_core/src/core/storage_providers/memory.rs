@@ -94,6 +94,13 @@ impl StorageIO for MemoryStorageProvider {
         Ok(())
     }
 
+    async fn read_vectored(&self, reads: &mut [(u64, &mut [u8])]) -> Result<(), std::io::Error> {
+        for (pos, buf) in reads {
+            self.read_data_into_buffer(pos, buf).await?;
+        }
+        Ok(())
+    }
+
     async fn append_data(&self, buffer: &[u8], _immediate: bool) {
         for u8_value in buffer {
             self.vec.extend(vec![*u8_value; 1]);

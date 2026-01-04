@@ -269,6 +269,13 @@ impl StorageIO for MockStorageProvider {
         Ok(())
     }
 
+    async fn read_vectored(&self, reads: &mut [(u64, &mut [u8])]) -> Result<(), std::io::Error> {
+        for (pos, buf) in reads {
+            self.read_data_into_buffer(pos, buf).await?;
+        }
+        Ok(())
+    }
+
     async fn write_data_seek(&self, seek: SeekFrom, buffer: &[u8]) {
         let mut file = self.write_file.write().await;
         file.seek(seek).await.unwrap();

@@ -25,6 +25,11 @@ pub trait StorageIO: Clone + Sync + Send + 'static {
         buffer: &mut [u8],
     ) -> impl Future<Output = Result<(), std::io::Error>> + Send + Sync;
 
+    fn read_vectored(
+        &self,
+        reads: &mut [(u64, &mut [u8])],
+    ) -> impl Future<Output = Result<(), std::io::Error>> + Send + Sync;
+
     fn append_data(&self, buffer: &[u8], immediate: bool)
     -> impl Future<Output = ()> + Send + Sync;
 
