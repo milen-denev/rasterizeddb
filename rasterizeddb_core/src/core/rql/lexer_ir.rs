@@ -13,6 +13,29 @@ use crate::memory_pool::{MEMORY_POOL, MemoryBlock};
 /// Convert a string value to a MemoryBlock based on the database type
 #[inline(always)]
 fn value_to_mb(value_str: &str, db_type: &DbType) -> MemoryBlock {
+    #[inline(always)]
+    fn strip_surrounding_quotes(s: &str) -> &str {
+        let s = s.trim();
+        if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
+            if s.len() >= 2 {
+                return &s[1..s.len() - 1];
+            }
+        }
+        s
+    }
+
+    #[inline(always)]
+    fn parse_postgres_bool(s: &str) -> Option<u8> {
+        // PostgreSQL accepts many inputs for bool:
+        // https://www.postgresql.org/docs/current/datatype-boolean.html
+        let lower = s.trim().to_ascii_lowercase();
+        match lower.as_str() {
+            "true" | "t" | "yes" | "y" | "on" | "1" => Some(1),
+            "false" | "f" | "no" | "n" | "off" | "0" => Some(0),
+            _ => None,
+        }
+    }
+
     match db_type {
         DbType::I8 => {
             let val: i8 = value_str.parse().unwrap_or_default();
@@ -98,15 +121,38 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> MemoryBlock {
             mb.into_slice_mut().copy_from_slice(&bytes);
             mb
         }
+        DbType::BOOL => {
+            let stripped = strip_surrounding_quotes(value_str);
+            let val_u8 = parse_postgres_bool(stripped).unwrap_or_else(|| {
+                warn!(
+                    "Failed to parse BOOL value {:?}; defaulting to false",
+                    value_str
+                );
+                0
+            });
+            let bytes = val_u8.to_le_bytes();
+            let mb = MEMORY_POOL.acquire(bytes.len());
+            mb.into_slice_mut().copy_from_slice(&bytes);
+            mb
+        }
+        DbType::DATETIME => {
+            // Internal representation is 8 bytes.
+            // Currently we accept integer epochs (seconds/ms/us) as i64.
+            let stripped = strip_surrounding_quotes(value_str);
+            let val: i64 = stripped.parse().unwrap_or_else(|_| {
+                warn!(
+                    "Failed to parse DATETIME value {:?} as i64; defaulting to 0",
+                    value_str
+                );
+                0
+            });
+            let bytes = val.to_le_bytes();
+            let mb = MEMORY_POOL.acquire(bytes.len());
+            mb.into_slice_mut().copy_from_slice(&bytes);
+            mb
+        }
         DbType::STRING | DbType::CHAR => {
-            // Strip surrounding single or double quotes if present
-            let stripped = if (value_str.starts_with('"') && value_str.ends_with('"'))
-                || (value_str.starts_with('\'') && value_str.ends_with('\''))
-            {
-                &value_str[1..value_str.len() - 1]
-            } else {
-                value_str
-            };
+            let stripped = strip_surrounding_quotes(value_str);
             let b = stripped.as_bytes();
             let mb = MEMORY_POOL.acquire(b.len());
             mb.into_slice_mut().copy_from_slice(b);
@@ -682,6 +728,53 @@ mod tests {
                 *exp_name
             );
         }
+    }
+
+    #[test]
+    fn test_insert_row_bool_postgres_literals() {
+        let schema = vec![
+            SchemaField {
+                name: "ok".to_string(),
+                db_type: DbType::BOOL,
+                size: 1,
+                offset: 0,
+                write_order: 0,
+                is_unique: false,
+                is_deleted: false,
+            },
+            SchemaField {
+                name: "flag".to_string(),
+                db_type: DbType::BOOL,
+                size: 1,
+                offset: 1,
+                write_order: 1,
+                is_unique: false,
+                is_deleted: false,
+            },
+        ];
+
+        let sql = r#"INSERT INTO t (ok, flag) VALUES (true, 'f')"#;
+        let qp = QueryPurpose::InsertRow(InsertRowData {
+            query: sql.to_string(),
+            table_name: "t".to_string(),
+        });
+        let row_write =
+            insert_row_from_query_purpose(&qp, &schema).expect("Should parse successfully");
+        assert_eq!(row_write.columns_writing_data.len(), 2);
+        assert_eq!(row_write.columns_writing_data[0].column_type, DbType::BOOL);
+        assert_eq!(row_write.columns_writing_data[0].data.into_slice(), [1u8]);
+        assert_eq!(row_write.columns_writing_data[1].column_type, DbType::BOOL);
+        assert_eq!(row_write.columns_writing_data[1].data.into_slice(), [0u8]);
+
+        let sql2 = r#"INSERT INTO t (ok, flag) VALUES (On, 0)"#;
+        let qp2 = QueryPurpose::InsertRow(InsertRowData {
+            query: sql2.to_string(),
+            table_name: "t".to_string(),
+        });
+        let row_write2 =
+            insert_row_from_query_purpose(&qp2, &schema).expect("Should parse successfully");
+        assert_eq!(row_write2.columns_writing_data[0].data.into_slice(), [1u8]);
+        assert_eq!(row_write2.columns_writing_data[1].data.into_slice(), [0u8]);
     }
 
     #[test]

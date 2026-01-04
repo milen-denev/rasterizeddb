@@ -56,32 +56,49 @@ pub fn create_table_from_query_purpose(qp: &QueryPurpose) -> Option<CreateTable>
             if col_def.is_empty() {
                 continue;
             }
-            // Split by whitespace to get name and type
-            let mut parts = col_def.split_whitespace();
-            let name = parts.next()?.trim_matches('"').to_string();
-            let type_str = parts.next()?;
-            // Map SQL type to DbType (very basic mapping, extend as needed)
-            let data_type = match type_str.to_ascii_uppercase().as_str() {
-                // Signed ints
-                "BIGINT" | "INT8" => DbType::I64,
-                "INT" | "INTEGER" | "INT4" => DbType::I32,
-                "SMALLINT" | "INT2" => DbType::I16,
-                "TINYINT" | "INT1" => DbType::I8,
-                // Unsigned ints
+            // Split by whitespace to get name and (potentially multi-token) type
+            let tokens: Vec<&str> = col_def.split_whitespace().collect();
+            if tokens.len() < 2 {
+                return None;
+            }
+
+            let name = tokens[0].trim_matches('"').to_string();
+            let (type_phrase, _tokens_used) = parse_type_phrase(&tokens[1..])?;
+
+            // Map SQL type to DbType (Postgres-friendly mapping; extend as needed)
+            let data_type = match type_phrase.as_str() {
+                // Signed ints (Postgres)
+                "BIGINT" | "INT8" | "INT64" => DbType::I64,
+                "INT" | "INTEGER" | "INT4" | "INT32" => DbType::I32,
+                "SMALLINT" | "INT2" | "INT16" => DbType::I16,
+                // Not Postgres-native, but common elsewhere
+                "TINYINT" | "INT1" | "INT8S" => DbType::I8,
+
+                // Unsigned ints (NOT Postgres-native; kept for compatibility)
                 "UBIGINT" | "UINT64" | "UINT8" => DbType::U64,
                 "UINT" | "UINT32" | "UINT4" => DbType::U32,
                 "USMALLINT" | "UINT16" | "UINT2" => DbType::U16,
                 "UTINYINT" | "UINT1" => DbType::U8,
-                // Float
-                "FLOAT" | "REAL" => DbType::F32,
-                "DOUBLE" | "DOUBLE PRECISION" => DbType::F64,
-                // Char/String
-                "CHAR" => DbType::CHAR,
-                "TEXT" | "VARCHAR" | "STRING" => DbType::STRING,
-                // Date/time
-                "DATETIME" | "TIMESTAMP" => DbType::DATETIME,
-                // Boolean
-                "BOOL" | "BOOLEAN" => DbType::U8,
+
+                // Floats (Postgres)
+                "REAL" | "FLOAT4" => DbType::F32,
+                "DOUBLE" | "DOUBLE PRECISION" | "FLOAT8" => DbType::F64,
+                // In Postgres, FLOAT is an alias of double precision unless precision is provided;
+                // we treat bare FLOAT as F64.
+                "FLOAT" => DbType::F64,
+
+                // Char/String (Postgres)
+                "CHAR" | "CHARACTER" => DbType::CHAR,
+                "TEXT" | "VARCHAR" | "CHARACTER VARYING" | "STRING" => DbType::STRING,
+
+                // Date/time (Postgres)
+                "DATETIME" | "TIMESTAMP" | "TIMESTAMPTZ" | "TIMESTAMP WITH TIME ZONE" => {
+                    DbType::DATETIME
+                }
+
+                // Boolean (Postgres)
+                "BOOL" | "BOOLEAN" => DbType::BOOL,
+
                 _ => return None,
             };
             columns.push(CreateColumnData { name, data_type });
@@ -94,6 +111,53 @@ pub fn create_table_from_query_purpose(qp: &QueryPurpose) -> Option<CreateTable>
     } else {
         None
     }
+}
+
+fn strip_parens(token: &str) -> &str {
+    token.split('(').next().unwrap_or(token)
+}
+
+fn eq_token(token: &str, expected_upper: &str) -> bool {
+    strip_parens(token).eq_ignore_ascii_case(expected_upper)
+}
+
+fn normalize_token_upper(token: &str) -> String {
+    strip_parens(token).to_ascii_uppercase()
+}
+
+/// Parses a SQL type phrase from a token stream that begins at the type.
+/// Returns the normalized uppercase type phrase and number of tokens consumed.
+fn parse_type_phrase(tokens: &[&str]) -> Option<(String, usize)> {
+    if tokens.is_empty() {
+        return None;
+    }
+
+    // DOUBLE PRECISION
+    if tokens.len() >= 2 && eq_token(tokens[0], "DOUBLE") && eq_token(tokens[1], "PRECISION") {
+        return Some(("DOUBLE PRECISION".to_string(), 2));
+    }
+
+    // CHARACTER VARYING
+    if tokens.len() >= 2 && eq_token(tokens[0], "CHARACTER") && eq_token(tokens[1], "VARYING") {
+        return Some(("CHARACTER VARYING".to_string(), 2));
+    }
+
+    // TIMESTAMP WITH TIME ZONE
+    if tokens.len() >= 4
+        && eq_token(tokens[0], "TIMESTAMP")
+        && eq_token(tokens[1], "WITH")
+        && eq_token(tokens[2], "TIME")
+        && eq_token(tokens[3], "ZONE")
+    {
+        return Some(("TIMESTAMP WITH TIME ZONE".to_string(), 4));
+    }
+
+    // TIMESTAMPTZ is a Postgres alias
+    if eq_token(tokens[0], "TIMESTAMPTZ") {
+        return Some(("TIMESTAMPTZ".to_string(), 1));
+    }
+
+    Some((normalize_token_upper(tokens[0]), 1))
 }
 
 #[cfg(test)]
@@ -134,7 +198,7 @@ mod tests {
             DbType::U16,
             DbType::U32,
             DbType::U64,
-            DbType::F32,
+            DbType::F64,
             DbType::F32,
             DbType::F64,
             DbType::CHAR,
@@ -143,8 +207,8 @@ mod tests {
             DbType::STRING,
             DbType::DATETIME,
             DbType::DATETIME,
-            DbType::U8,
-            DbType::U8,
+            DbType::BOOL,
+            DbType::BOOL,
         ];
         let names = [
             "i8_col",
@@ -264,5 +328,23 @@ mod tests {
         let sql = r#"CREATE TABLE missing_paren id INT, name TEXT"#;
         let qp = QueryPurpose::CreateTable(sql.to_string());
         assert!(create_table_from_query_purpose(&qp).is_none());
+    }
+
+    #[test]
+    fn test_create_table_postgres_parameterized_and_timestamptz() {
+        let sql = r#"CREATE TABLE t (
+            name VARCHAR(32),
+            tag CHARACTER VARYING(10),
+            created TIMESTAMP WITH TIME ZONE,
+            ok BOOLEAN
+        )"#;
+        let qp = QueryPurpose::CreateTable(sql.to_string());
+        let result = create_table_from_query_purpose(&qp).expect("Should parse successfully");
+        assert_eq!(result.table_name, "t");
+        assert_eq!(result.columns.len(), 4);
+        assert_eq!(result.columns[0].data_type, DbType::STRING);
+        assert_eq!(result.columns[1].data_type, DbType::STRING);
+        assert_eq!(result.columns[2].data_type, DbType::DATETIME);
+        assert_eq!(result.columns[3].data_type, DbType::BOOL);
     }
 }

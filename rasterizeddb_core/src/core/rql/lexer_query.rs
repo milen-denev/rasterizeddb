@@ -1,4 +1,5 @@
 use itertools::Itertools;
+use log::info;
 use smallvec::SmallVec;
 use std::collections::HashSet;
 
@@ -10,6 +11,8 @@ pub struct QueryRows {
     pub query_row_fetch: RowFetch,
     pub requested_row_fetch: RowFetch,
     pub where_clause: String,
+    pub limit: Option<u64>,
+    pub order_by: Option<String>,
 }
 
 /// Extracts column names referenced in a WHERE clause
@@ -76,7 +79,8 @@ pub fn row_fetch_from_select_query(
         QueryPurpose::QueryRows(qr_data) => qr_data.query.trim(),
         _ => return Err("Not a SELECT/QueryRows query".to_string()),
     };
-    let sql_bytes = sql.as_bytes();
+    let sql_upper = sql.to_ascii_uppercase();
+    let sql_bytes = sql_upper.as_bytes();
     let select_prefix = b"SELECT ";
     let from_kw = b" FROM ";
     if !simd_compare_strings(
@@ -100,27 +104,84 @@ pub fn row_fetch_from_select_query(
     let from_pos = from_pos.ok_or("Missing FROM in SELECT query")?;
 
     let columns_part = sql[select_prefix.len()..from_pos].trim();
+
     let after_from = &sql[from_pos + from_kw.len()..];
-    let where_kw = b" WHERE ";
-    let mut where_pos = None;
-    let after_from_bytes = after_from.as_bytes();
-    for i in 0..after_from_bytes.len().saturating_sub(where_kw.len()) {
-        if simd_compare_strings(
-            &after_from_bytes[i..i + where_kw.len()],
-            where_kw,
-            &ComparerOperation::Equals,
-        ) {
-            where_pos = Some(i);
-            break;
-        }
-    }
-    let (table_part, where_part) = if let Some(idx) = where_pos {
-        (
-            after_from[..idx].trim(),
-            after_from[idx + where_kw.len()..].trim(),
-        )
+    let after_from_upper = &sql_upper[from_pos + from_kw.len()..];
+
+    // Find optional clauses (positions are within after_from).
+    let where_pos = after_from_upper.find(" WHERE ");
+    let order_pos = after_from_upper.find(" ORDER BY ");
+    let limit_pos = after_from_upper.find(" LIMIT ");
+
+    // Table name ends at the earliest clause marker.
+    let table_end = [where_pos, order_pos, limit_pos]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(after_from.len());
+
+    let table_part = after_from[..table_end].trim();
+
+    // WHERE clause is everything after WHERE up to ORDER BY / LIMIT.
+    let where_part = if let Some(wp) = where_pos {
+        let start = wp + " WHERE ".len();
+        let end = [order_pos, limit_pos]
+            .into_iter()
+            .flatten()
+            .filter(|p| *p >= start)
+            .min()
+            .unwrap_or(after_from.len());
+        after_from[start..end].trim()
     } else {
-        (after_from.trim(), "")
+        ""
+    };
+
+    // ORDER BY field (single field for now), optionally with ASC/DESC.
+    let order_by = if let Some(op) = order_pos {
+        let start = op + " ORDER BY ".len();
+        let end = [limit_pos]
+            .into_iter()
+            .flatten()
+            .filter(|p| *p >= start)
+            .min()
+            .unwrap_or(after_from.len());
+        let expr = after_from[start..end].trim();
+        if expr.is_empty() {
+            return Err("ORDER BY is present but no field was provided".to_string());
+        }
+        let field_token = expr
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_matches('"');
+        if field_token.is_empty() {
+            return Err("ORDER BY is present but no field was provided".to_string());
+        }
+
+        let schema_field = schema
+            .iter()
+            .find(|f| f.name.eq_ignore_ascii_case(field_token))
+            .ok_or_else(|| format!("ORDER BY field '{}' not found in schema", field_token))?;
+
+        Some(schema_field.name.clone())
+    } else {
+        None
+    };
+
+    // LIMIT value
+    let limit = if let Some(lp) = limit_pos {
+        let start = lp + " LIMIT ".len();
+        let expr = after_from[start..].trim();
+        if expr.is_empty() {
+            return Err("LIMIT is present but no value was provided".to_string());
+        }
+        let token = expr.split_whitespace().next().unwrap_or("");
+        let n = token
+            .parse::<u64>()
+            .map_err(|_| format!("Invalid LIMIT value '{}'", token))?;
+        Some(n)
+    } else {
+        None
     };
 
     // Parse requested columns (SELECT columns)
@@ -183,7 +244,7 @@ pub fn row_fetch_from_select_query(
         });
     }
 
-    Ok(QueryRows {
+    let query_rows = QueryRows {
         table_name: table_part.to_string(),
         query_row_fetch: RowFetch {
             columns_fetching_data: query_columns_fetching_data,
@@ -192,7 +253,13 @@ pub fn row_fetch_from_select_query(
             columns_fetching_data: requested_columns_fetching_data,
         },
         where_clause: where_part.to_string(),
-    })
+        limit,
+        order_by,
+    };
+
+    info!("Parsed QueryRows: {:?}", query_rows);
+
+    Ok(query_rows)
 }
 
 #[cfg(test)]
@@ -259,6 +326,8 @@ mod tests {
         assert_eq!(qr.query_row_fetch.columns_fetching_data.len(), 1); // Only 'age' for WHERE clause
         assert_eq!(qr.where_clause, "age > 18");
         assert_eq!(qr.table_name, "users");
+        assert_eq!(qr.limit, None);
+        assert_eq!(qr.order_by, None);
     }
 
     #[test]
@@ -284,6 +353,8 @@ mod tests {
         assert_eq!(qr.query_row_fetch.columns_fetching_data.len(), 1); // Only 'name' for WHERE clause
         assert_eq!(qr.where_clause, "name = 'John'");
         assert_eq!(qr.table_name, "users");
+        assert_eq!(qr.limit, None);
+        assert_eq!(qr.order_by, None);
     }
 
     #[test]
@@ -301,6 +372,8 @@ mod tests {
         assert_eq!(qr.query_row_fetch.columns_fetching_data.len(), 0); // No WHERE clause, so no query columns
         assert_eq!(qr.where_clause, "");
         assert_eq!(qr.table_name, "users");
+        assert_eq!(qr.limit, None);
+        assert_eq!(qr.order_by, None);
     }
 
     #[test]
@@ -372,6 +445,8 @@ mod tests {
 
         assert_eq!(qr.where_clause, "age > 18 AND name CONTAINS 'John'");
         assert_eq!(qr.table_name, "users");
+        assert_eq!(qr.limit, None);
+        assert_eq!(qr.order_by, None);
     }
 
     #[test]
@@ -394,5 +469,56 @@ mod tests {
 
         assert_eq!(qr.where_clause, "id = 999 AND age > 21");
         assert_eq!(qr.table_name, "users");
+        assert_eq!(qr.limit, None);
+        assert_eq!(qr.order_by, None);
+    }
+
+    #[test]
+    fn test_select_with_order_by_and_limit() {
+        let schema = make_schema();
+        let query = "SELECT id, name FROM users WHERE age > 18 ORDER BY name LIMIT 10";
+        let qp = crate::core::rql::lexer_s1::QueryPurpose::QueryRows(
+            crate::core::rql::lexer_s1::QueryRowsData {
+                table_name: "users".to_string(),
+                query: query.to_string(),
+            },
+        );
+        let qr = row_fetch_from_select_query(&qp, &schema).unwrap();
+
+        assert_eq!(qr.table_name, "users");
+        assert_eq!(qr.where_clause, "age > 18");
+        assert_eq!(qr.order_by.as_deref(), Some("name"));
+        assert_eq!(qr.limit, Some(10));
+    }
+
+    #[test]
+    fn test_select_with_limit_only() {
+        let schema = make_schema();
+        let query = "SELECT id FROM users LIMIT 5";
+        let qp = crate::core::rql::lexer_s1::QueryPurpose::QueryRows(
+            crate::core::rql::lexer_s1::QueryRowsData {
+                table_name: "users".to_string(),
+                query: query.to_string(),
+            },
+        );
+        let qr = row_fetch_from_select_query(&qp, &schema).unwrap();
+        assert_eq!(qr.table_name, "users");
+        assert_eq!(qr.where_clause, "");
+        assert_eq!(qr.order_by, None);
+        assert_eq!(qr.limit, Some(5));
+    }
+
+    #[test]
+    fn test_select_with_order_by_unknown_column_should_fail() {
+        let schema = make_schema();
+        let query = "SELECT id FROM users ORDER BY not_a_column";
+        let qp = crate::core::rql::lexer_s1::QueryPurpose::QueryRows(
+            crate::core::rql::lexer_s1::QueryRowsData {
+                table_name: "users".to_string(),
+                query: query.to_string(),
+            },
+        );
+        let result = row_fetch_from_select_query(&qp, &schema);
+        assert!(result.is_err());
     }
 }
