@@ -131,6 +131,13 @@ impl StorageIO for MemFile {
         Ok(())
     }
 
+    async fn read_vectored(&self, reads: &mut [(u64, &mut [u8])]) -> IOResult<()> {
+        for (pos, buf) in reads {
+            self.read_data_into_buffer(pos, buf).await?;
+        }
+        Ok(())
+    }
+
     async fn append_data(&self, buffer: &[u8], _immediate: bool) {
         let buf = self.buf();
         let mut buf = buf.lock().unwrap();
