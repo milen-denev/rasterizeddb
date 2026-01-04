@@ -1,4 +1,6 @@
-use std::{env, sync::Arc};
+use std::env;
+
+use rclite::Arc;
 use clap::Parser;
 
 use log::LevelFilter;
@@ -6,6 +8,24 @@ use rasterizeddb_core::{BATCH_SIZE, ENABLE_SEMANTICS, MAX_PERMITS_THREADS, cache
 use tokio::runtime::Builder;
 
 use rasterizeddb_core::configuration::Configuration;
+use clap::ValueEnum;
+
+#[derive(Clone, Debug, ValueEnum)]
+enum PgTlsMode {
+    /// No TLS. Uses cleartext only.
+    Disable,
+    /// Use TLS if client requests it (SSLRequest), otherwise allow cleartext.
+    Prefer,
+    /// Require TLS (reject cleartext StartupMessage).
+    Require,
+}
+#[derive(Clone, Debug, ValueEnum)]
+enum Protocol {
+    /// Custom rastcp protocol (existing default)
+    Rastcp,
+    /// PostgreSQL wire protocol (pgwire) for network-level Postgres compatibility
+    Pgwire,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "rasterizeddb_core", version, about = "RasterizedDB Core Server")]
@@ -37,6 +57,30 @@ struct Args {
     /// Enable or disable SME semantics (default: true)
     #[arg(long = "enable-semantics", alias = "enable_semantics", value_name = "BOOL")]
     enable_semantics: Option<bool>,
+
+    /// Server protocol to use: rastcp or pgwire (default: rastcp)
+    #[arg(long, value_enum, default_value_t = Protocol::Rastcp)]
+    protocol: Protocol,
+
+    /// pgwire listen address (default: 127.0.0.1)
+    #[arg(long = "pg-addr", default_value = "127.0.0.1")]
+    pg_addr: String,
+
+    /// pgwire listen port (default: 5432)
+    #[arg(long = "pg-port", default_value_t = 5432)]
+    pg_port: u16,
+
+    /// pgwire TLS mode (default: require)
+    #[arg(long = "pg-tls", value_enum, default_value_t = PgTlsMode::Require)]
+    pg_tls: PgTlsMode,
+
+    /// Path to PEM-encoded TLS certificate chain for pgwire (optional)
+    #[arg(long = "pg-cert", value_name = "PATH")]
+    pg_cert: Option<String>,
+
+    /// Path to PEM-encoded TLS private key for pgwire (optional)
+    #[arg(long = "pg-key", value_name = "PATH")]
+    pg_key: Option<String>,
 }
 
 fn main() -> std::io::Result<()> {
@@ -102,7 +146,28 @@ fn main() -> std::io::Result<()> {
         
         let database = Database::new(db_location).await;
         let arc_database = Arc::new(database);
-        _ = Database::start_db(arc_database).await;
+
+        match args.protocol {
+            Protocol::Rastcp => {
+                _ = Database::start_db(arc_database).await;
+            }
+            Protocol::Pgwire => {
+                // Run a PostgreSQL-wire-compatible server.
+                let tls_mode = match args.pg_tls {
+                    PgTlsMode::Disable => rasterizeddb_core::pgwire::TlsMode::Disable,
+                    PgTlsMode::Prefer => rasterizeddb_core::pgwire::TlsMode::Prefer,
+                    PgTlsMode::Require => rasterizeddb_core::pgwire::TlsMode::Require,
+                };
+
+                let tls = rasterizeddb_core::pgwire::TlsConfig {
+                    mode: tls_mode,
+                    cert_path: args.pg_cert.clone(),
+                    key_path: args.pg_key.clone(),
+                };
+
+                _ = rasterizeddb_core::pgwire::start_pgwire(arc_database, &args.pg_addr, args.pg_port, tls).await;
+            }
+        }
     });
 
     Ok(())
