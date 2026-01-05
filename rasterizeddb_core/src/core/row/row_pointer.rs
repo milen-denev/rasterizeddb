@@ -782,8 +782,11 @@ impl RowPointer {
                 col.data = block;
                 col.schema_id = column_data.schema_id;
                 col.column_type = column_data.column_type.clone();
-                
-                first_pass_reads.push((position, col.data.into_slice_mut()));
+
+                let ptr = col.data.as_mut_ptr();
+                let len = col.data.len();
+                let buf = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+                first_pass_reads.push((position, buf));
             }
         }
 
@@ -843,7 +846,10 @@ impl RowPointer {
                 }
 
                 col.data = MEMORY_POOL.acquire(string_size);
-                second_pass_reads.push((string_row_position, col.data.into_slice_mut()));
+                let ptr = col.data.as_mut_ptr();
+                let len = col.data.len();
+                let buf = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+                second_pass_reads.push((string_row_position, buf));
             }
             
             if !second_pass_reads.is_empty() {
@@ -910,8 +916,11 @@ impl RowPointer {
                 
                 col.schema_id = column_data.schema_id;
                 col.column_type = column_data.column_type.clone();
-                
-                first_pass_reads.push((position, col.data.into_slice_mut()));
+
+                let ptr = col.data.as_mut_ptr();
+                let len = col.data.len();
+                let buf = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+                first_pass_reads.push((position, buf));
             }
         }
 
@@ -978,8 +987,11 @@ impl RowPointer {
                 
                 col.schema_id = row_fetch.columns_fetching_data[col_idx].schema_id;
                 col.column_type = DbType::STRING;
-                
-                second_pass_reads.push((string_row_position, col.data.into_slice_mut()));
+
+                let ptr = col.data.as_mut_ptr();
+                let len = col.data.len();
+                let buf = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+                second_pass_reads.push((string_row_position, buf));
             }
             
             if !second_pass_reads.is_empty() {
@@ -1035,12 +1047,12 @@ impl RowPointer {
         let total_string_size = row_pointer.writing_data.total_strings_size;
 
         // Allocate memory to store the row data
-        let block = MEMORY_POOL.acquire(total_bytes as usize);
+        let mut block = MEMORY_POOL.acquire(total_bytes as usize);
         let slice = block.into_slice_mut();
 
         let mut row_position = 0;
 
-        let string_block = MEMORY_POOL.acquire(total_string_size as usize);
+        let mut string_block = MEMORY_POOL.acquire(total_string_size as usize);
         let string_slice = string_block.into_slice_mut();
 
         let mut end_of_row: u64 = row_write
@@ -1335,7 +1347,7 @@ mod tests {
     fn create_string_column(data: &str, write_order: u32) -> ColumnWritePayload {
         let string_bytes = data.as_bytes();
 
-        let string_data = MEMORY_POOL.acquire(string_bytes.len());
+        let mut string_data = MEMORY_POOL.acquire(string_bytes.len());
         let string_slice = string_data.into_slice_mut();
 
         string_slice[0..].copy_from_slice(string_bytes);
@@ -1349,7 +1361,7 @@ mod tests {
     }
 
     fn create_u8_column(data: u8, write_order: u32) -> ColumnWritePayload {
-        let u8_data = MEMORY_POOL.acquire(1);
+        let mut u8_data = MEMORY_POOL.acquire(1);
         let u8_slice = u8_data.into_slice_mut();
         u8_slice.copy_from_slice(&data.to_le_bytes());
 
@@ -1362,7 +1374,7 @@ mod tests {
     }
 
     fn create_u64_column(data: u64, write_order: u32) -> ColumnWritePayload {
-        let u64_data = MEMORY_POOL.acquire(8);
+        let mut u64_data = MEMORY_POOL.acquire(8);
         let u64_slice = u64_data.into_slice_mut();
         u64_slice.copy_from_slice(&data.to_le_bytes());
 
@@ -1375,7 +1387,7 @@ mod tests {
     }
 
     fn create_f32_column(data: f32, write_order: u32) -> ColumnWritePayload {
-        let f32_data = MEMORY_POOL.acquire(4);
+        let mut f32_data = MEMORY_POOL.acquire(4);
         let f32_slice = f32_data.into_slice_mut();
         f32_slice.copy_from_slice(&data.to_le_bytes());
 
@@ -1388,7 +1400,7 @@ mod tests {
     }
 
     fn create_f64_column(data: f64, write_order: u32) -> ColumnWritePayload {
-        let f64_data = MEMORY_POOL.acquire(8);
+        let mut f64_data = MEMORY_POOL.acquire(8);
         let f64_slice = f64_data.into_slice_mut();
         f64_slice.copy_from_slice(&data.to_le_bytes());
 
@@ -1615,13 +1627,13 @@ mod tests {
 
         let string_bytes = b"Hello, world!";
 
-        let string_data = MEMORY_POOL.acquire(string_bytes.len());
+        let mut string_data = MEMORY_POOL.acquire(string_bytes.len());
         let string_slice = string_data.into_slice_mut();
 
         string_slice[0..].copy_from_slice(string_bytes);
 
         let i32_bytes = 42_i32.to_le_bytes();
-        let i32_data = MEMORY_POOL.acquire(i32_bytes.len());
+        let mut i32_data = MEMORY_POOL.acquire(i32_bytes.len());
         let i32_slice = i32_data.into_slice_mut();
         i32_slice.copy_from_slice(&i32_bytes);
 
@@ -1669,12 +1681,12 @@ mod tests {
 
         let string_bytes = b"Hello, world!";
 
-        let string_data = MEMORY_POOL.acquire(string_bytes.len());
+        let mut string_data = MEMORY_POOL.acquire(string_bytes.len());
         let string_slice = string_data.into_slice_mut();
         string_slice[0..].copy_from_slice(string_bytes);
 
         let i32_bytes = 42_i32.to_le_bytes();
-        let i32_data = MEMORY_POOL.acquire(i32_bytes.len());
+        let mut i32_data = MEMORY_POOL.acquire(i32_bytes.len());
         let i32_slice = i32_data.into_slice_mut();
         i32_slice.copy_from_slice(&i32_bytes);
 
