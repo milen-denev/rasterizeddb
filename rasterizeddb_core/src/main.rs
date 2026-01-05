@@ -122,7 +122,7 @@ fn main() -> std::io::Result<()> {
         });
     }
 
-    let enable_semantics = args.enable_semantics.unwrap_or(true);
+    let enable_semantics = args.enable_semantics.unwrap_or(false);
     ENABLE_SEMANTICS.get_or_init(|| enable_semantics);
 
     let rt = Builder::new_multi_thread()
@@ -132,8 +132,8 @@ fn main() -> std::io::Result<()> {
         .build()?;
 
     rt.block_on(async {
-        unsafe { env::set_var("RUST_BACKTRACE", "0"); }
-        let level = args.log_level.unwrap_or(LevelFilter::Error);
+        unsafe { env::set_var("RUST_BACKTRACE", "full"); }
+        let level = args.log_level.unwrap_or(LevelFilter::Trace);
         env_logger::Builder::new()
             .filter_level(level)
             .init();

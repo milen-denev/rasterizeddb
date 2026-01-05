@@ -108,7 +108,7 @@ async fn create_table(client: &Arc<DbClient>) -> Result<QueryExecutionResult, st
 }
 
 async fn insert_rows(client: &Arc<DbClient>) {
-    for _i in 0..5 {
+    for _i in 0..50 {
         let mut features = vec![];
 
         let semaphore = Arc::new(tokio::sync::Semaphore::new(16));
@@ -167,7 +167,7 @@ async fn run_queries(client: &Arc<DbClient>) {
     for _ in 0..5 {
         let query = r##"
             SELECT id, salary, age, name FROM employees
-            WHERE id = 100000 OR id = 200000 OR id = 300000 OR id = 400000 OR id = 500000
+            WHERE id > 0 AND id < 100
         "##;
 
         let instant = std::time::Instant::now();
