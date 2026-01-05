@@ -230,7 +230,7 @@ impl ConcurrentProcessor {
             );
         }
         
-        //let reading_time_total = Arc::new(AtomicU64::new(0));
+        let reading_time_total = Arc::new(AtomicU64::new(0));
 
         // Process batches
         loop {
@@ -238,7 +238,7 @@ impl ConcurrentProcessor {
                 break;
             }
 
-            //let reading_time_total_clone = reading_time_total.clone();
+            let reading_time_total_clone = reading_time_total.clone();
 
             let mut pointers = row_pointer_vec_pool().get();
 
@@ -276,7 +276,7 @@ impl ConcurrentProcessor {
             let no_filter = no_filter;
 
             let batch_handle = task::spawn(async move {
-                //let reading_time_total_clone_2 = Arc::clone(&reading_time_total_clone);
+                let reading_time_total_clone_2 = Arc::clone(&reading_time_total_clone);
 
                 // Acquire a permit for this batch
                 let _batch_permit = tuple_clone.0.acquire().await.unwrap();
@@ -302,7 +302,7 @@ impl ConcurrentProcessor {
                             }
                         }
 
-                        //let reading_time = stopwatch::Stopwatch::start_new();
+                        let reading_time = std::time::Instant::now();
                         let io_rows_clone = Arc::clone(&io_rows_batch);
                         let (_, _, requested_row_fetch) = &*tuple_clone;
 
@@ -318,8 +318,8 @@ impl ConcurrentProcessor {
                             continue;
                         }
 
-                        // let elapsed_ns = reading_time.elapsed().as_nanos() as u64;
-                        // reading_time_total_clone_2.fetch_add(elapsed_ns, std::sync::atomic::Ordering::Relaxed);
+                        let elapsed_ns = reading_time.elapsed().as_nanos() as u64;
+                        reading_time_total_clone_2.fetch_add(elapsed_ns, std::sync::atomic::Ordering::Relaxed);
 
                         // LIMIT is enforced on successfully fetched/emitted rows.
                         if let Some(limit_val) = limit_opt {
@@ -390,7 +390,7 @@ impl ConcurrentProcessor {
                     let io_rows_clone = Arc::clone(&io_rows_batch);
                     let (_, query_row_fetch, requested_row_fetch) = &*tuple_clone;
 
-                    // let reading_time = stopwatch::Stopwatch::start_new();
+                    let reading_time = std::time::Instant::now();
 
                     // Read the minimal set of columns needed for the WHERE evaluation
                     if pointer
@@ -402,8 +402,8 @@ impl ConcurrentProcessor {
                         continue;
                     }
 
-                    // let elapsed_ns = reading_time.elapsed().as_nanos() as u64;
-                    // reading_time_total_clone_2.fetch_add(elapsed_ns, std::sync::atomic::Ordering::Relaxed);
+                    let elapsed_ns = reading_time.elapsed().as_nanos() as u64;
+                    reading_time_total_clone_2.fetch_add(elapsed_ns, std::sync::atomic::Ordering::Relaxed);
 
                     // On the first row, parse and build the plan using a temporary vector.
                     if !plan_built {
@@ -464,7 +464,7 @@ impl ConcurrentProcessor {
 
                         let io_rows_clone = Arc::clone(&io_rows_batch);
 
-                        // let reading_time = stopwatch::Stopwatch::start_new();
+                        let reading_time = std::time::Instant::now();
 
                         if pointer
                             .fetch_row_reuse_async(
@@ -479,8 +479,8 @@ impl ConcurrentProcessor {
                             continue;
                         }
 
-                        // let elapsed_ns = reading_time.elapsed().as_nanos() as u64;
-                        // reading_time_total_clone_2.fetch_add(elapsed_ns, std::sync::atomic::Ordering::Relaxed);
+                        let elapsed_ns = reading_time.elapsed().as_nanos() as u64;
+                        reading_time_total_clone_2.fetch_add(elapsed_ns, std::sync::atomic::Ordering::Relaxed);
 
                         // LIMIT is enforced on successfully fetched/emitted rows.
                         if let Some(limit_val) = limit_opt {
@@ -587,14 +587,14 @@ impl ConcurrentProcessor {
             }
         }
 
-        // let total_reading_ns = reading_time_total.load(std::sync::atomic::Ordering::Relaxed);
+        let total_reading_ns = reading_time_total.load(std::sync::atomic::Ordering::Relaxed);
 
-        // log::info!(
-        //     "Total reading time for query '{}' : {:?} over {} rows",
-        //     where_query,
-        //     std::time::Duration::from_nanos(total_reading_ns),
-        //     all_rows.len()
-        // );
+        log::info!(
+            "Total reading time for query '{}' : {:.2?} over {} rows",
+            where_query,
+            std::time::Duration::from_nanos(total_reading_ns),
+            all_rows.len()
+        );
 
         all_rows
     }
