@@ -531,6 +531,124 @@ async fn ext_cov_employees_end_to_end_queries() {
     let rows = assert_rows(&res, "SELECT all employees after DELETE");
     assert_eq!(rows.len(), rows_to_insert - 5, "row count after DELETE mismatch");
 
+    // Query 11: concurrent mixed workload (INSERT/UPDATE/DELETE/SELECT), then verify final state.
+    // Keep operations on mostly-disjoint row sets to make the result deterministic.
+    let base_count_after_q10 = rows_to_insert - 5;
+    let concurrent_insert_n: u64 = 20;
+    let insert_start_id: u64 = 1001;
+    let delete_start_id: u64 = 50;
+    let delete_end_id: u64 = 55;
+    let update_start_id: u64 = 2;
+    let update_end_id: u64 = 11;
+    let update_salary: f32 = 77777.0;
+
+    let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+    // Concurrent inserts.
+    for i in 0..concurrent_insert_n {
+        let database = database.clone();
+        let id = insert_start_id + i;
+        handles.push(tokio::spawn(async move {
+            let insert_sql = format!(
+                r##"INSERT INTO employees (id, name, job_title, salary, department, age, manager, location, hire_date, degree, skills, current_project, performance_score, is_active, created_at, updated_at, is_fired)
+                    VALUES ({}, 'Conc{:04}', 'Engineer', 55555.5, 'Engineering', 33, 'ConcMgr', 'Remote', 1600000000, 'BS', 'Rust', 'Apollo', 99.9, 1, 1700000000, 1700000001, 0);"##,
+                id, id
+            );
+            let res = exec(&database, &insert_sql).await;
+            assert_ok(&res, "concurrent INSERT INTO employees");
+        }));
+    }
+
+    // Concurrent updates on an existing, non-deleted range.
+    {
+        let database = database.clone();
+        handles.push(tokio::spawn(async move {
+            let update_sql = format!(
+                r##"UPDATE employees SET manager = 'CONC_MGR', salary = {} WHERE id >= {} AND id <= {}"##,
+                update_salary, update_start_id, update_end_id
+            );
+            let res = exec(&database, &update_sql).await;
+            assert_ok(&res, "concurrent UPDATE employees");
+        }));
+    }
+
+    // Concurrent deletes on a disjoint range.
+    {
+        let database = database.clone();
+        handles.push(tokio::spawn(async move {
+            let delete_sql = format!(
+                r##"DELETE FROM employees WHERE id >= {} AND id <= {}"##,
+                delete_start_id, delete_end_id
+            );
+            let res = exec(&database, &delete_sql).await;
+            assert_ok(&res, "concurrent DELETE FROM employees");
+        }));
+    }
+
+    // Concurrent queries (don’t assume stable row counts mid-flight; just validate they succeed).
+    for _ in 0..8 {
+        let database = database.clone();
+        handles.push(tokio::spawn(async move {
+            for _ in 0..20 {
+                let res = exec(&database, "SELECT id FROM employees WHERE id > 0 LIMIT 25").await;
+                let _rows = assert_rows(&res, "concurrent SELECT LIMIT");
+            }
+        }));
+    }
+
+    for h in handles {
+        h.await.expect("concurrent task panicked");
+    }
+
+    // Verify: inserts exist.
+    let q11_verify_inserts = format!(
+        r##"SELECT id FROM employees WHERE id >= {} AND id < {}"##,
+        insert_start_id,
+        insert_start_id + concurrent_insert_n
+    );
+    let res = exec(&database, &q11_verify_inserts).await;
+    let rows = assert_rows(&res, "verify concurrent inserts");
+    assert_eq!(rows.len(), concurrent_insert_n as usize, "inserted row count mismatch");
+
+    // Verify: updates applied.
+    let q11_verify_updates = format!(
+        r##"SELECT id, manager, salary FROM employees WHERE id >= {} AND id <= {}"##,
+        update_start_id, update_end_id
+    );
+    let res = exec(&database, &q11_verify_updates).await;
+    let rows = assert_rows(&res, "verify concurrent updates");
+    assert_eq!(rows.len(), (update_end_id - update_start_id + 1) as usize);
+    for row in rows {
+        let manager = mb_to_string(
+            row.get_column("manager", schema)
+                .expect("manager")
+                .into_slice(),
+        );
+        let salary = mb_to_f32(
+            row.get_column("salary", schema)
+                .expect("salary")
+                .into_slice(),
+        );
+        assert_eq!(manager, "CONC_MGR");
+        assert!((salary - update_salary).abs() < 0.01, "concurrent updated salary mismatch");
+    }
+
+    // Verify: deletes applied.
+    let q11_verify_deletes = format!(
+        r##"SELECT id FROM employees WHERE id >= {} AND id <= {}"##,
+        delete_start_id, delete_end_id
+    );
+    let res = exec(&database, &q11_verify_deletes).await;
+    let rows = assert_rows(&res, "verify concurrent deletes");
+    assert_eq!(rows.len(), 0, "deleted rows should be absent");
+
+    // Verify: final row count matches expected.
+    let expected_final_count = base_count_after_q10 + (concurrent_insert_n as usize)
+        - ((delete_end_id - delete_start_id + 1) as usize);
+    let res = exec(&database, "SELECT id FROM employees WHERE id > 0").await;
+    let rows = assert_rows(&res, "final SELECT all employees after concurrent workload");
+    assert_eq!(rows.len(), expected_final_count, "final row count mismatch");
+
     // Ensure we used the executor path the user wanted (not the network client).
     let _ = QueryPurpose::CreateTable(String::new());
 }
