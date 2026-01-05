@@ -3,16 +3,69 @@ use std::{
     fmt
 };
 
-use crate::instructions::{copy_ptr_to_ptr, copy_vec_to_ptr, ref_slice, ref_slice_mut};
+#[cfg(feature = "memory_pool_reuse")]
+use std::{
+    sync::{Arc, OnceLock},
+    sync::atomic::{AtomicUsize, Ordering},
+};
+
+#[cfg(feature = "memory_pool_reuse")]
+use crate::cache::atomic_cache::AtomicGenericCache;
+
+use crate::instructions::{copy_ptr_to_ptr, copy_vec_to_ptr};
 
 pub static MEMORY_POOL: MemoryPool = MemoryPool::new();
 
 use libmimalloc_sys::{mi_free, mi_malloc};
 
+#[cfg(feature = "memory_pool_reuse")]
+#[derive(Clone)]
+struct ReuseSlot(Arc<AtomicUsize>);
+
+#[cfg(feature = "memory_pool_reuse")]
+impl Default for ReuseSlot {
+    fn default() -> Self {
+        Self(Arc::new(AtomicUsize::new(0)))
+    }
+}
+
+#[cfg(feature = "memory_pool_reuse")]
+static HEAP_REUSE: OnceLock<Arc<AtomicGenericCache<usize, ReuseSlot>>> = OnceLock::new();
+
+#[cfg(feature = "memory_pool_reuse")]
+const MAX_REUSE_BYTES: usize = 1024 * 128; // 128 KiB
+
+#[cfg(feature = "memory_pool_reuse")]
+#[inline(always)]
+fn heap_size_class(size: usize) -> usize {
+    // Power-of-two size classes keep the number of buckets tiny and stable.
+    // This intentionally trades some internal fragmentation for speed.
+    size.next_power_of_two()
+}
+
+#[cfg(feature = "memory_pool_reuse")]
+#[inline(always)]
+fn heap_reuse_cache() -> &'static AtomicGenericCache<usize, ReuseSlot> {
+    HEAP_REUSE
+        .get_or_init(|| {
+            // Small, bounded number of buckets: 128..=1 MiB => 14 entries.
+            let cache = AtomicGenericCache::new(64, 1024);
+
+            let mut sz = (INLINE_CAPACITY + 1).next_power_of_two();
+            while sz <= MAX_REUSE_BYTES {
+                let _ = cache.insert(sz, ReuseSlot::default());
+                sz <<= 1;
+            }
+
+            cache
+        })
+        .as_ref()
+}
+
 // Define the maximum size for inline allocation
 // NOTE: Keep this small enough that common "large" test sizes (e.g. 100/128)
 // are forced onto the heap.
-const INLINE_CAPACITY: usize = 64;
+const INLINE_CAPACITY: usize = 16;
 
 pub struct MemoryPool;
 
@@ -40,13 +93,36 @@ impl MemoryPool {
                 data: MemoryBlockData { inline_data: data },
                 len: size,
                 is_heap: false,
-                //should_drop: true,
-                //dropped: Arc::new(AtomicBool::new(false)),
-                //references: None,
             }
         } else {
-            // Allocate on the heap
-            let ptr = unsafe { mi_malloc(size) as *mut u8 };
+            // Allocate on the heap (optionally reusing an existing block of the same size class)
+            #[cfg(feature = "memory_pool_reuse")]
+            let alloc_size = if size <= MAX_REUSE_BYTES {
+                heap_size_class(size)
+            } else {
+                size
+            };
+
+            #[cfg(not(feature = "memory_pool_reuse"))]
+            let alloc_size = size;
+
+            #[cfg(feature = "memory_pool_reuse")]
+            if alloc_size <= MAX_REUSE_BYTES {
+                if let Some(slot) = heap_reuse_cache().get(&alloc_size) {
+                    let ptr_usize = slot.0.swap(0, Ordering::AcqRel);
+                    if ptr_usize != 0 {
+                        return MemoryBlock {
+                            data: MemoryBlockData {
+                                heap_data: (ptr_usize as *mut u8, alloc_size),
+                            },
+                            len: size,
+                            is_heap: true,
+                        };
+                    }
+                }
+            }
+
+            let ptr = unsafe { mi_malloc(alloc_size) as *mut u8 };
 
             if ptr.is_null() {
                 panic!("Allocation failed (likely OOM).");
@@ -55,13 +131,10 @@ impl MemoryPool {
             MemoryBlock {
                 //hash: 0, // Default hash value
                 data: MemoryBlockData {
-                    heap_data: (ptr, size),
+                    heap_data: (ptr, alloc_size),
                 },
-                len: size, // For heap, len is the full size
+                len: size, // len is the logical size; allocation may be larger
                 is_heap: true,
-                //should_drop: true,
-                //dropped: Arc::new(AtomicBool::new(false)),
-                //references: None, //Some(Arc::new(AtomicU64::new(1))),
             }
         }
     }
@@ -75,6 +148,30 @@ impl MemoryPool {
         unsafe {
             mi_free(ptr as *mut _);
         }
+    }
+
+    #[cfg(feature = "memory_pool_reuse")]
+    #[inline(always)]
+    fn recycle_or_free(&self, ptr: *mut u8, allocated_size: usize) {
+        if ptr.is_null() {
+            panic!("Invalid operation, releasing null pointer.");
+        }
+
+        if allocated_size <= MAX_REUSE_BYTES {
+            if let Some(slot) = heap_reuse_cache().get(&allocated_size) {
+                // Keep at most one cached block per size class.
+                // If already occupied, free immediately (bounded memory usage).
+                if slot
+                    .0
+                    .compare_exchange(0, ptr as usize, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    return;
+                }
+            }
+        }
+
+        self.release(ptr);
     }
 }
 
@@ -93,9 +190,6 @@ pub struct MemoryBlock {
     data: MemoryBlockData,
     len: usize,    // Actual length of the data
     is_heap: bool, // Discriminant for the union: true if heap, false if inline
-    //should_drop: bool,
-    //dropped: Arc<AtomicBool>,
-    //references: Option<Arc<AtomicU64>>,
 }
 
 unsafe impl Send for MemoryBlock {}
@@ -109,12 +203,9 @@ impl Default for MemoryBlock {
             //hash: 0, // Default hash value
             data: MemoryBlockData {
                 inline_data: [0; INLINE_CAPACITY],
-            }, // Initialize with zeros
+            },
             len: 0,
-            is_heap: false,     // It's an inline block
-            //should_drop: false, // Not needed as it's implied by is_heap,
-            //dropped: Arc::new(AtomicBool::new(false)),
-            //references: None,
+            is_heap: false,
         }
     }
 }
@@ -158,25 +249,18 @@ impl Drop for MemoryBlock {
     #[track_caller]
     fn drop(&mut self) {
         if self.is_heap {
-            // let refs = self
-            //     .references
-            //     .as_ref()
-            //     .expect("heap blocks must have a ref counter")
-            //     .fetch_sub(1, Ordering::Release);
+            let (ptr, allocated_size) = unsafe { self.data.heap_data };
 
-            //if refs == 1 {
-                // let was_dropped = self.dropped
-                //     .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                //     .expect("MemoryBlock was already dropped");
+            #[cfg(feature = "memory_pool_reuse")]
+            {
+                MEMORY_POOL.recycle_or_free(ptr, allocated_size);
+                return;
+            }
 
-                // if was_dropped {
-                //     panic!("MemoryBlock was already dropped, this should not happen.");
-                // }
-
-                // MEMORY_POOL.release(unsafe { self.data.heap_data.0 });
-            //}
-
-            MEMORY_POOL.release(unsafe { self.data.heap_data.0 });
+            #[cfg(not(feature = "memory_pool_reuse"))]
+            {
+                MEMORY_POOL.release(ptr);
+            }
         } else {
             // If it's inline, we don't need to do anything special
             // The memory will be automatically cleaned up when the block goes out of scope
@@ -216,17 +300,31 @@ impl Clone for MemoryBlock {
 
 impl MemoryBlock {
     #[inline(always)]
-    pub fn prefetch_to_lcache(&self) {
-        // let was_dropped = self.dropped.load(Ordering::Relaxed);
+    pub fn len(&self) -> usize {
+        self.len
+    }
 
-        // if was_dropped {
-        //     panic!("MemoryBlock was already dropped, this should not happen.");
-        // }
-
+    #[inline(always)]
+    pub fn as_ptr(&self) -> *const u8 {
         if self.is_heap {
-            // if unsafe { self.data.heap_data.0.is_null() } {
-            //     panic!("MemoryBlock is heap-allocated but pointer is null.");
-            // }
+            unsafe { self.data.heap_data.0 as *const u8 }
+        } else {
+            unsafe { self.data.inline_data.as_ptr() }
+        }
+    }
+
+    #[inline(always)]
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        if self.is_heap {
+            unsafe { self.data.heap_data.0 }
+        } else {
+            unsafe { self.data.inline_data.as_mut_ptr() }
+        }
+    }
+
+    #[inline(always)]
+    pub fn prefetch_to_lcache(&self) {
+        if self.is_heap {
             // Prefetch the heap data to the L1 cache
             unsafe { _mm_prefetch::<_MM_HINT_T0>(self.data.heap_data.0 as *const i8) };
         } else {
@@ -257,42 +355,24 @@ impl MemoryBlock {
     }
 
     #[inline(always)]
-    pub fn into_slice(&self) -> &'static [u8] {
-        // let was_dropped = self.dropped.load(Ordering::Relaxed);
-
-        // if was_dropped {
-        //     panic!("MemoryBlock was already dropped, this should not happen.");
-        // }
-
+    pub fn into_slice(&self) -> &[u8] {
         if self.is_heap {
-            // if unsafe { self.data.heap_data.0.is_null() } {
-            //     panic!("MemoryBlock is heap-allocated but pointer is null.");
-            // }
-            // If it's a heap allocation, return the slice from the pointer
-            unsafe { ref_slice(self.data.heap_data.0, self.len) }
+            let ptr = unsafe { self.data.heap_data.0 };
+            debug_assert!(!ptr.is_null(), "heap pointer must not be null");
+            unsafe { std::slice::from_raw_parts(ptr as *const u8, self.len) }
         } else {
-            // If it's inline, return the slice from the inline data
-            unsafe { ref_slice(self.data.inline_data.as_ptr() as *mut u8, self.len) }
+            unsafe { &self.data.inline_data[..self.len] }
         }
     }
 
     #[inline(always)]
-    pub fn into_slice_mut(&self) -> &'static mut [u8] {
-        // let was_dropped = self.dropped.load(Ordering::Relaxed);
-
-        // if was_dropped {
-        //     panic!("MemoryBlock was already dropped, this should not happen.");
-        // }
-
+    pub fn into_slice_mut(&mut self) -> &mut [u8] {
         if self.is_heap {
-            // if unsafe { self.data.heap_data.0.is_null() } {
-            //     panic!("MemoryBlock is heap-allocated but pointer is null.");
-            // }
-            // If it's a heap allocation, return the mutable slice from the pointer
-            unsafe { ref_slice_mut(self.data.heap_data.0, self.len) }
+            let ptr = unsafe { self.data.heap_data.0 };
+            debug_assert!(!ptr.is_null(), "heap pointer must not be null");
+            unsafe { std::slice::from_raw_parts_mut(ptr, self.len) }
         } else {
-            // If it's inline, return the mutable slice from the inline data
-            unsafe { ref_slice_mut(self.data.inline_data.as_ptr() as *mut u8, self.len) }
+            unsafe { &mut self.data.inline_data[..self.len] }
         }
     }
 
@@ -315,20 +395,6 @@ impl MemoryBlock {
         }
     }
 }
-
-// impl Hash for MemoryBlock {
-//     #[inline(always)]
-//     fn hash<H: std::hash::Hasher>(&self, _state: &mut H) {
-//         if self.hash != 0 {
-//             // Use the hash field directly
-//             _state.write_u64(self.hash);
-//         } else {
-//             panic!(
-//                 "MemoryBlock hash is not set. Ensure to use from_slice_hashed or acquire_with_hash."
-//             );
-//         }
-//     }
-// }
 
 #[cfg(test)]
 mod tests {
@@ -440,7 +506,7 @@ mod tests {
     #[test]
     fn test_memory_block_into_slice_mut() {
         let vec = vec![1, 2, 3, 4, 5];
-        let block = MemoryBlock::from_vec(vec);
+        let mut block = MemoryBlock::from_vec(vec);
         let slice_mut = block.into_slice_mut();
         slice_mut[0] = 10;
         assert_eq!(block.into_slice()[0], 10);
@@ -486,7 +552,7 @@ mod tests {
     fn test_large_allocations() {
         // Test with a large allocation (1MB)
         let size = 1024 * 1024;
-        let block = MEMORY_POOL.acquire(size);
+        let mut block = MEMORY_POOL.acquire(size);
         assert!(block.is_heap);
         assert_eq!(block.len, size);
 
@@ -524,7 +590,7 @@ mod tests {
                 for i in 0..ops_per_thread {
                     let size = (thread_id * i) % 100 + 1; // Vary sizes
 
-                    let block = MEMORY_POOL.acquire(size);
+                    let mut block = MEMORY_POOL.acquire(size);
 
                     // Check if allocation was successful
                     if block.is_heap && size > INLINE_CAPACITY {
@@ -635,7 +701,7 @@ mod tests {
     fn test_memory_corruption_prevention() {
         // This test specifically checks for the memory corruption bug that was reported
         let original_data = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
-        let block1 = MemoryBlock::from_vec(original_data.clone());
+        let mut block1 = MemoryBlock::from_vec(original_data.clone());
 
         // Clone the block - this used to cause use-after-free
         let block2 = block1.clone();
@@ -657,22 +723,6 @@ mod tests {
         assert_eq!(&block2.into_slice()[1..], &original_data[1..]);
     }
 
-    // #[test]
-    // fn test_simulate_stack_overflow() {
-    //     // This test will recurse until stack overflow is likely, but catch the panic.
-    //     fn recurse(n: usize) {
-    //         let _block = MEMORY_POOL.acquire(8); // Small inline allocation
-    //         if n > 0 {
-    //             recurse(n - 1);
-    //         }
-    //     }
-    //     let result = std::panic::catch_unwind(|| {
-    //         // 32_000 is usually enough to overflow stack on default settings
-    //         recurse(32_000);
-    //     });
-    //     assert!(result.is_err(), "Expected stack overflow panic");
-    // }
-
     #[test]
     fn test_aggressive_concurrent_access() {
         // More threads and allocations to stress test concurrency
@@ -688,7 +738,7 @@ mod tests {
                 barrier.wait();
                 for i in 0..ops_per_thread {
                     let size = (thread_id * i) % 128 + 1;
-                    let block = MEMORY_POOL.acquire(size);
+                    let mut block = MEMORY_POOL.acquire(size);
                     let slice = block.into_slice_mut();
                     if slice.len() != size {
                         let mut error_log = errors.lock().unwrap();
@@ -723,39 +773,6 @@ mod tests {
         let errors = errors.lock().unwrap();
         assert!(errors.is_empty(), "Aggressive thread errors: {:?}", errors);
     }
-
-    // #[test]
-    // #[should_panic]
-    // fn test_double_free_should_panic() {
-    //     let block = MemoryBlock::from_vec(vec![1, 2, 3, 4, 5]);
-    //     let mut block2 = block.clone();
-    //     unsafe {
-    //         std::ptr::drop_in_place(&mut block2);
-    //         std::ptr::drop_in_place(&mut block2); // Should panic or crash
-    //     }
-    // }
-
-    // #[test]
-    // #[should_panic]
-    // fn test_use_after_drop_should_panic() {
-    //     let block = MemoryBlock::from_vec(vec![1, 2, 3, 4, 5]);
-    //     let mut block2 = block.clone();
-    //     unsafe {
-    //         std::ptr::drop_in_place(&mut block2);
-    //     }
-    //     let _ = block2.into_slice(); // Should panic or crash
-    // }
-
-    // #[test]
-    // #[should_panic]
-    // fn test_invalid_pointer_dereference() {
-    //     let mut block = MemoryBlock::default();
-    //     unsafe {
-    //         let heap_data = &mut block as *mut MemoryBlock as *mut u8;
-    //         *heap_data = 0xFF;
-    //     }
-    //     let _ = block.into_slice(); // Should panic or crash
-    // }
 
     #[test]
     fn test_clone_and_drop_no_double_free() {
@@ -802,7 +819,7 @@ mod tests {
     #[test]
     fn test_deep_clone_inline() {
         let data = vec![10, 20, 30, 40, 50];
-        let block = MemoryBlock::from_vec(data.clone());
+        let mut block = MemoryBlock::from_vec(data.clone());
         assert!(!block.is_heap);
         let deep = block.deep_clone();
         assert!(!deep.is_heap);
@@ -818,7 +835,7 @@ mod tests {
     #[test]
     fn test_deep_clone_heap() {
         let data = vec![7; 128];
-        let block = MemoryBlock::from_vec(data.clone());
+        let mut block = MemoryBlock::from_vec(data.clone());
         assert!(block.is_heap);
         let deep = block.deep_clone();
         assert!(deep.is_heap);
