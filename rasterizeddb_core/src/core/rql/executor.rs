@@ -85,9 +85,11 @@ pub async fn execute(query: QueryPurpose, database: Arc<Database>) -> Vec<u8> {
             // Handle insert row
             if let Some(insert_row) = insert_row_from_query_purpose(&query, &schema.fields) {
                 if table.insert_row(insert_row).await.is_ok() {
-                    let mut result: [u8; 1] = [0u8; 1];
-                    result[0] = 0;
-                    return result.to_vec();
+                    // Keep status=0 for backward compatibility, but also include rows-affected.
+                    // pgwire can use this to emit INSERT 0 <n>.
+                    let mut result = vec![0u8];
+                    result.extend_from_slice(&1u64.to_le_bytes());
+                    return result;
                 } else {
                     error!("Failed to insert row");
                     let mut result: [u8; 1] = [1u8; 1];
@@ -175,9 +177,10 @@ pub async fn execute(query: QueryPurpose, database: Arc<Database>) -> Vec<u8> {
             {
                 Ok(n) => {
                     info!("Updated {} rows", n);
-                    let mut result: [u8; 1] = [0u8; 1];
-                    result[0] = 0;
-                    return result.to_vec();
+                    // Keep status=0 for backward compatibility, but also include rows-affected.
+                    let mut result = vec![0u8];
+                    result.extend_from_slice(&n.to_le_bytes());
+                    return result;
                 }
                 Err(e) => {
                     error!("Failed to update rows: {}", e);
@@ -251,9 +254,10 @@ pub async fn execute(query: QueryPurpose, database: Arc<Database>) -> Vec<u8> {
             {
                 Ok(n) => {
                     info!("Deleted {} rows", n);
-                    let mut result: [u8; 1] = [0u8; 1];
-                    result[0] = 0;
-                    return result.to_vec();
+                    // Keep status=0 for backward compatibility, but also include rows-affected.
+                    let mut result = vec![0u8];
+                    result.extend_from_slice(&n.to_le_bytes());
+                    return result;
                 }
                 Err(e) => {
                     error!("Failed to delete rows: {}", e);
