@@ -458,6 +458,79 @@ async fn ext_cov_employees_end_to_end_queries() {
     let res = exec(&database, q7).await;
     assert_error_contains(&res, "schema mismatch", "invalid ORDER BY");
 
+    // Query 8: UPDATE a single row and verify the mutation via SELECT.
+    let q8 = r##"UPDATE employees SET salary = 12345.67, department = 'Engineering', is_active = 1 WHERE id = 1"##;
+    let res = exec(&database, q8).await;
+    assert_ok(&res, "UPDATE single employee");
+
+    let q8_verify = r##"SELECT id, salary, department, is_active FROM employees WHERE id = 1"##;
+    let res = exec(&database, q8_verify).await;
+    let rows = assert_rows(&res, "SELECT updated employee");
+    assert_eq!(rows.len(), 1, "expected exactly 1 updated row for id=1");
+    let row = &rows[0];
+    let id = mb_to_u64(
+        row.get_column("id", schema)
+            .expect("id")
+            .into_slice(),
+    );
+    assert_eq!(id, 1);
+    let salary = mb_to_f32(
+        row.get_column("salary", schema)
+            .expect("salary")
+            .into_slice(),
+    );
+    assert!((salary - 12345.67).abs() < 0.01, "updated salary mismatch");
+    let department = mb_to_string(
+        row.get_column("department", schema)
+            .expect("department")
+            .into_slice(),
+    );
+    assert_eq!(department, "Engineering");
+    let is_active = mb_to_bool(
+        row.get_column("is_active", schema)
+            .expect("is_active")
+            .into_slice(),
+    );
+    assert!(is_active, "expected updated is_active=true");
+
+    // Query 9: UPDATE multiple rows (string column), then verify all matching rows changed.
+    let q9 = r##"UPDATE employees SET location = 'UPDATED_LOC' WHERE department = 'Sales'"##;
+    let res = exec(&database, q9).await;
+    assert_ok(&res, "UPDATE employees location for Sales");
+
+    let q9_verify = r##"SELECT id, department, location FROM employees WHERE department = 'Sales'"##;
+    let res = exec(&database, q9_verify).await;
+    let rows = assert_rows(&res, "SELECT updated Sales employees");
+    for row in rows {
+        let department = mb_to_string(
+            row.get_column("department", schema)
+                .expect("department")
+                .into_slice(),
+        );
+        assert_eq!(department, "Sales");
+        let location = mb_to_string(
+            row.get_column("location", schema)
+                .expect("location")
+                .into_slice(),
+        );
+        assert_eq!(location, "UPDATED_LOC");
+    }
+
+    // Query 10: DELETE a range of rows, then verify they are gone and total row count decreased.
+    let q10 = r##"DELETE FROM employees WHERE id >= 71 AND id <= 75"##;
+    let res = exec(&database, q10).await;
+    assert_ok(&res, "DELETE employees id 71..75");
+
+    let q10_verify_absent = r##"SELECT id FROM employees WHERE id >= 71 AND id <= 75"##;
+    let res = exec(&database, q10_verify_absent).await;
+    let rows = assert_rows(&res, "SELECT deleted employees should be absent");
+    assert_eq!(rows.len(), 0, "deleted rows should not be returned");
+
+    let q10_verify_count = r##"SELECT id FROM employees WHERE id > 0"##;
+    let res = exec(&database, q10_verify_count).await;
+    let rows = assert_rows(&res, "SELECT all employees after DELETE");
+    assert_eq!(rows.len(), rows_to_insert - 5, "row count after DELETE mismatch");
+
     // Ensure we used the executor path the user wanted (not the network client).
     let _ = QueryPurpose::CreateTable(String::new());
 }
