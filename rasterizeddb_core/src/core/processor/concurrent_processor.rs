@@ -26,10 +26,18 @@ use crate::{
 
 use crate::{BATCH_SIZE, semantics_enabled, core::sme::semantic_mapping_engine::{SME, SemanticMappingEngine}};
 
+use crate::core::tokenizer::query_tokenizer::Token;
+
 pub static EMPTY_STR: &str = "";
 pub static ATOMIC_CACHE: OnceLock<std::sync::Arc<AtomicGenericCache<u64, Arc<Vec<RowPointer>>>>> = OnceLock::new();
 pub static ENABLE_CACHE: OnceLock<bool> = OnceLock::new();
 const CRC_64: Crc<u64> = Crc::<u64>::new(&CRC_64_ECMA_182);
+
+#[derive(Debug, Clone)]
+pub struct RowPointerWithOffset {
+    pub pointer_record_pos: u64,
+    pub pointer: RowPointer,
+}
 
 struct RowPointerVecAllocator;
 
@@ -65,174 +73,100 @@ impl ConcurrentProcessor {
         Self {}
     }
 
-    pub async fn process<'a, S: StorageIO>(
-        &self,
-        table_name: &str,
+    async fn try_collect_cached_rows<S: StorageIO>(
         where_query: &str,
-        query_row_fetch: RowFetch,
-        requested_row_fetch: RowFetch,
-        table_schema: &Vec<SchemaField>,
-        io_rows: Arc<S>,
-        iterator: &mut RowPointerIterator<S>,
-        limit: Option<u64>,
-        order_by: Option<String>,
-    ) -> Vec<Row> {
-        let prep_stopwatch = std::time::Instant::now();
-
-        log::info!(
-            "Starting concurrent processing for query: {}",
-            where_query
-        );
-
-        let (tx, rx) = kanal::unbounded_async::<Row>();
-
-        // LIMIT enforcement: global counter across all tasks.
-        // The increment/threshold check is performed inside the `if result { }` section.
-        let limit_counter = Arc::new(AtomicU64::new(0));
-        let stop_processing = Arc::new(AtomicBool::new(false));
-
-        // Important: for ORDER BY queries, we must not stop early based on LIMIT,
-        // otherwise we only sort a prefix of the matching rows.
-        let enforce_limit_early = limit.is_some() && order_by.is_none();
-    
-        let shared_tuple: Arc<(Semaphore, RowFetch, RowFetch)> = Arc::new((
-            Semaphore::new(*MAX_PERMITS_THREADS.get().unwrap()),
-            query_row_fetch,
-            requested_row_fetch,
-        ));
-
-        let table_schema = table_schema
-            .iter()
-            .cloned()
-            .collect::<SmallVec<[SchemaField; 20]>>();
-
-        let io_rows_outer = Arc::clone(&io_rows);
-
+        requested_row_fetch: &RowFetch,
+        io_rows: &Arc<S>,
+    ) -> Option<(u64, Vec<Row>)> {
         let cache_enabled = *ENABLE_CACHE.get().unwrap();
-        let crc64_hash;
-
-        let entries_available = if cache_enabled {
-            crc64_hash = CRC_64.checksum(where_query.as_bytes());
-            let cache = ATOMIC_CACHE.get().unwrap();
-            let entries = cache.get(&crc64_hash);
-            if let Some(entries) = entries {
-                for pointer in entries.iter() {
-                    if pointer.deleted {
-                        continue;
-                    }
-
-                    let io_rows_clone = Arc::clone(&io_rows_outer);
-                    let (_, _, requested_row_fetch) = &*shared_tuple;
-
-                    // Fetch the requested row
-                    let mut row = Row::default();
-
-                    if pointer
-                        .fetch_row_reuse_async(
-                            io_rows_clone,
-                            requested_row_fetch,
-                            &mut row,
-                        )
-                        .await
-                        .is_err()
-                    {
-                        continue;
-                    }
-
-                    // Send a clone out to the aggregator
-                    if tx.send(Row::clone_row(&row)).await.is_err() {
-                        // Receiver dropped; stop early
-                        break;
-                    }
-                }
-
-                true
-            } else {
-                false
-            }
-        } else {
-            crc64_hash = 0;
-            false
-        };
-
-        if entries_available {
-            let mut collected_rows = Vec::with_capacity(50);
-
-            if !rx.is_empty() {
-                rx.drain_into(&mut collected_rows).unwrap();
-            }
-
-            drop(rx);
-
-            return collected_rows;
+        if !cache_enabled {
+            return None;
         }
 
-        let (tx_rp, rx_rp) = kanal::unbounded_async::<RowPointer>();
-        
-        let mut batch_handles = Vec::new();
-        iterator.reset();
+        let crc64_hash = CRC_64.checksum(where_query.as_bytes());
+        let cache = ATOMIC_CACHE.get().unwrap();
+        let entries = cache.get(&crc64_hash)?;
 
+        let mut collected_rows = Vec::with_capacity(50);
+        let mut row = Row::default();
+
+        for pointer in entries.iter() {
+            if pointer.deleted {
+                continue;
+            }
+
+            let io_rows_clone = Arc::clone(io_rows);
+            if pointer
+                .fetch_row_reuse_async(io_rows_clone, requested_row_fetch, &mut row)
+                .await
+                .is_err()
+            {
+                continue;
+            }
+
+            collected_rows.push(Row::clone_row(&row));
+        }
+
+        Some((crc64_hash, collected_rows))
+    }
+
+    #[inline]
+    fn prepare_query(where_query: &str, table_schema: &SmallVec<[SchemaField; 20]>) -> (bool, Arc<SmallVec<[SchemaField; 20]>>, Arc<SmallVec<[Token; 36]>>) {
         // Empty WHERE means "match all rows"; skip tokenization/parsing entirely.
         let no_filter = where_query.trim().is_empty();
-        let tokens: SmallVec<[crate::core::tokenizer::query_tokenizer::Token; 36]> = if no_filter {
+        let tokens: SmallVec<[Token; 36]> = if no_filter {
             SmallVec::new()
         } else {
-            tokenize(&where_query, &table_schema)
+            tokenize(&where_query, table_schema)
         };
-        
-        let schema_arc = Arc::new(table_schema);
+
+        let schema_arc = Arc::new(table_schema.clone());
         let tokens_arc = Arc::new(tokens);
+        (no_filter, schema_arc, tokens_arc)
+    }
 
-        log::info!(
-            "Preperation for query completed in {:.2?}",
-            prep_stopwatch.elapsed()
-        );
-
-        let semantic_stopwatch = std::time::Instant::now();
-        if semantics_enabled() {
-            log::info!("Starting semantic processing for query: {}", where_query);
-        }
-        // If SME semantics are enabled and SME can build candidates for this query/table,
-        // only iterate those. Otherwise fall back to scanning all pointers.
-        let mut sme_candidates: Option<(Arc<Vec<RowPointer>>, usize)> = if semantics_enabled() {
-            let pointers_io = iterator.io();
-            let sme = SME.get_or_init(|| rclite::Arc::new(SemanticMappingEngine::new()));
-            sme.get_or_build_candidates_for_table_tokens(
-                table_name,
-                &*tokens_arc,
-                schema_arc.as_slice(),
-                Arc::clone(&io_rows_outer),
-                pointers_io,
-            )
-            .await
-            .map(|arc| (arc, 0usize))
-        } else {
-            None
-        };
-
-        if sme_candidates.is_some() {
-            log::info!(
-                "Semantic processing will use candidate row pointers, with {} candidates for query: {}",
-                sme_candidates.as_ref().unwrap().0.len(),
-                where_query
-            );
-        } else {
-            if semantics_enabled() {
-                log::info!(
-                    "Semantic processing will scan all row pointers for query: {}",
-                    where_query
-                );
-            }
+    async fn maybe_build_sme_candidates<S: StorageIO>(
+        table_name: &str,
+        tokens: &Arc<SmallVec<[Token; 36]>>,
+        schema: &Arc<SmallVec<[SchemaField; 20]>>,
+        io_rows: &Arc<S>,
+        iterator: &RowPointerIterator<S>,
+    ) -> Option<(Arc<Vec<RowPointer>>, usize)> {
+        if !semantics_enabled() {
+            return None;
         }
 
-        if semantics_enabled() {
-            log::info!(
-                "Semantic processing setup completed in {:.2?}",
-                semantic_stopwatch.elapsed()
-            );
-        }
-        
-        let reading_time_total = Arc::new(AtomicU64::new(0));
+        let pointers_io = iterator.io();
+        let sme = SME.get_or_init(|| rclite::Arc::new(SemanticMappingEngine::new()));
+        sme.get_or_build_candidates_for_table_tokens(
+            table_name,
+            &*tokens,
+            schema.as_slice(),
+            Arc::clone(io_rows),
+            pointers_io,
+        )
+        .await
+        .map(|arc| (arc, 0usize))
+    }
+
+    async fn spawn_batch_tasks<S: StorageIO>(
+        iterator: &mut RowPointerIterator<S>,
+        mut sme_candidates: Option<(Arc<Vec<RowPointer>>, usize)>,
+        shared_tuple: Arc<(Semaphore, RowFetch, RowFetch)>,
+        schema_arc: Arc<SmallVec<[SchemaField; 20]>>,
+        tokens_arc: Arc<SmallVec<[Token; 36]>>,
+        io_rows_outer: Arc<S>,
+        tx: kanal::AsyncSender<Row>,
+        tx_rp: kanal::AsyncSender<RowPointer>,
+        limit: Option<u64>,
+        enforce_limit_early: bool,
+        no_filter: bool,
+        limit_counter: Arc<AtomicU64>,
+        stop_processing: Arc<AtomicBool>,
+        reading_time_total: Arc<AtomicU64>,
+    ) -> Vec<tokio::task::JoinHandle<()>> {
+        let mut batch_handles = Vec::new();
+        iterator.reset();
 
         // Process batches
         loop {
@@ -240,7 +174,7 @@ impl ConcurrentProcessor {
                 break;
             }
 
-            let reading_time_total_clone = reading_time_total.clone();
+            let reading_time_total_clone = Arc::clone(&reading_time_total);
 
             let mut pointers = row_pointer_vec_pool().get();
 
@@ -326,7 +260,8 @@ impl ConcurrentProcessor {
                         }
 
                         let elapsed_ns = reading_time.elapsed().as_nanos() as u64;
-                        reading_time_total_clone_2.fetch_add(elapsed_ns, std::sync::atomic::Ordering::Relaxed);
+                        reading_time_total_clone_2
+                            .fetch_add(elapsed_ns, std::sync::atomic::Ordering::Relaxed);
 
                         // LIMIT is enforced on successfully fetched/emitted rows.
                         if enforce_limit_early {
@@ -340,7 +275,10 @@ impl ConcurrentProcessor {
                                 match reserved {
                                     Ok(prev) => {
                                         if prev + 1 >= limit_val {
-                                            stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                                            stop_ref.store(
+                                                true,
+                                                std::sync::atomic::Ordering::Relaxed,
+                                            );
                                         }
                                     }
                                     Err(_) => {
@@ -412,7 +350,8 @@ impl ConcurrentProcessor {
                     }
 
                     let elapsed_ns = reading_time.elapsed().as_nanos() as u64;
-                    reading_time_total_clone_2.fetch_add(elapsed_ns, std::sync::atomic::Ordering::Relaxed);
+                    reading_time_total_clone_2
+                        .fetch_add(elapsed_ns, std::sync::atomic::Ordering::Relaxed);
 
                     // On the first row, parse and build the plan using a temporary vector.
                     if !plan_built {
@@ -450,7 +389,10 @@ impl ConcurrentProcessor {
                         let parser_mut = unsafe { &mut *parser_cell.get() };
                         // Do NOT call reset_for_next_execution() per row anymore.
                         if let Err(e) = parser_mut.execute(tmp_vec) {
-                            panic!("Error executing query parser while building plan: {:?}", e);
+                            panic!(
+                                "Error executing query parser while building plan: {:?}",
+                                e
+                            );
                         }
 
                         // Ensure the intermediate buffer has the needed capacity once
@@ -470,7 +412,6 @@ impl ConcurrentProcessor {
                     };
 
                     if result {
-
                         let io_rows_clone = Arc::clone(&io_rows_batch);
 
                         let reading_time = std::time::Instant::now();
@@ -493,7 +434,8 @@ impl ConcurrentProcessor {
                         }
 
                         let elapsed_ns = reading_time.elapsed().as_nanos() as u64;
-                        reading_time_total_clone_2.fetch_add(elapsed_ns, std::sync::atomic::Ordering::Relaxed);
+                        reading_time_total_clone_2
+                            .fetch_add(elapsed_ns, std::sync::atomic::Ordering::Relaxed);
 
                         // LIMIT is enforced on successfully fetched/emitted rows.
                         // For ORDER BY queries, don't stop early; we must sort the full result set.
@@ -516,7 +458,10 @@ impl ConcurrentProcessor {
                                 match reserved {
                                     Ok(prev) => {
                                         if prev + 1 >= limit_val {
-                                            stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                                            stop_ref.store(
+                                                true,
+                                                std::sync::atomic::Ordering::Relaxed,
+                                            );
                                         }
                                     }
                                     Err(_) => {
@@ -546,40 +491,45 @@ impl ConcurrentProcessor {
             batch_handles.push(batch_handle);
         }
 
-        // Wait for all batch tasks to complete
-        join_all(batch_handles).await;
+        batch_handles
+    }
 
-        // Drop the sender to signal that no more rows will be sent
-        drop(tx);
+    #[inline]
+    fn drain_rows(rx: kanal::AsyncReceiver<Row>) -> Vec<Row> {
+        let mut collected_rows = Vec::with_capacity(50);
+        if !rx.is_empty() {
+            rx.drain_into(&mut collected_rows).unwrap();
+        }
+        drop(rx);
+        collected_rows
+    }
 
-        // Aggregator
-        let aggregator_handle = tokio::spawn(async move {
-            let mut collected_rows = Vec::with_capacity(50);
+    #[inline]
+    fn drain_row_pointers(rx_rp: kanal::AsyncReceiver<RowPointer>) -> Vec<RowPointer> {
+        let mut pointers = Vec::with_capacity(50);
+        if !rx_rp.is_empty() {
+            rx_rp.drain_into(&mut pointers).unwrap();
+        }
+        drop(rx_rp);
+        pointers
+    }
 
-            if !rx.is_empty() {
-                rx.drain_into(&mut collected_rows).unwrap();
-            }
-
-            drop(rx);
-
-            collected_rows
-        });
-
-        // Await the aggregator to finish collecting rows.
-        let mut all_rows = aggregator_handle.await.unwrap();
-
+    fn sort_rows_if_needed(
+        all_rows: &mut Vec<Row>,
+        schema_arc: &Arc<SmallVec<[SchemaField; 20]>>,
+        order_by: &Option<String>,
+    ) {
         // ORDER BY: after collection, sort the resulting rows.
         // NOTE: Row/Column schema_id uses SchemaField.write_order (not vector index).
-        if let Some(order_field) = &order_by {
+        if let Some(order_field) = order_by {
             let order_write_order = schema_arc
                 .iter()
                 .find(|f| f.name.eq_ignore_ascii_case(order_field.as_str()))
                 .map(|f| f.write_order as usize);
 
             if let Some(schema_id) = order_write_order {
-                let schema_ref = schema_arc.clone();
                 all_rows.sort_by(|a, b| {
-                    compare_rows_by_schema_id(a, b, schema_id, schema_ref.as_slice())
+                    compare_rows_by_schema_id(a, b, schema_id, schema_arc.as_slice())
                 });
             } else {
                 log::warn!(
@@ -588,6 +538,134 @@ impl ConcurrentProcessor {
                 );
             }
         }
+    }
+
+    pub async fn process<'a, S: StorageIO>(
+        &self,
+        table_name: &str,
+        where_query: &str,
+        query_row_fetch: RowFetch,
+        requested_row_fetch: RowFetch,
+        table_schema: &Vec<SchemaField>,
+        io_rows: Arc<S>,
+        iterator: &mut RowPointerIterator<S>,
+        limit: Option<u64>,
+        order_by: Option<String>,
+    ) -> Vec<Row> {
+        let prep_stopwatch = std::time::Instant::now();
+
+        log::info!(
+            "Starting concurrent processing for query: {}",
+            where_query
+        );
+
+        // Cache fast-path (if enabled)
+        if let Some((_hash, rows)) =
+            Self::try_collect_cached_rows(where_query, &requested_row_fetch, &io_rows).await
+        {
+            return rows;
+        }
+
+        let (tx, rx) = kanal::unbounded_async::<Row>();
+        let (tx_rp, rx_rp) = kanal::unbounded_async::<RowPointer>();
+
+        // LIMIT enforcement: global counter across all tasks.
+        // The increment/threshold check is performed inside the `if result { }` section.
+        let limit_counter = Arc::new(AtomicU64::new(0));
+        let stop_processing = Arc::new(AtomicBool::new(false));
+
+        // Important: for ORDER BY queries, we must not stop early based on LIMIT,
+        // otherwise we only sort a prefix of the matching rows.
+        let enforce_limit_early = limit.is_some() && order_by.is_none();
+
+        let shared_tuple: Arc<(Semaphore, RowFetch, RowFetch)> = Arc::new((
+            Semaphore::new(*MAX_PERMITS_THREADS.get().unwrap()),
+            query_row_fetch,
+            requested_row_fetch,
+        ));
+
+        let table_schema = table_schema
+            .iter()
+            .cloned()
+            .collect::<SmallVec<[SchemaField; 20]>>();
+
+        let io_rows_outer = Arc::clone(&io_rows);
+
+        let crc64_hash = if *ENABLE_CACHE.get().unwrap() {
+            CRC_64.checksum(where_query.as_bytes())
+        } else {
+            0
+        };
+
+        let (no_filter, schema_arc, tokens_arc) = Self::prepare_query(where_query, &table_schema);
+
+        log::info!(
+            "Preperation for query completed in {:.2?}",
+            prep_stopwatch.elapsed()
+        );
+
+        let semantic_stopwatch = std::time::Instant::now();
+        if semantics_enabled() {
+            log::info!("Starting semantic processing for query: {}", where_query);
+        }
+
+        // If SME semantics are enabled and SME can build candidates for this query/table,
+        // only iterate those. Otherwise fall back to scanning all pointers.
+        let sme_candidates =
+            Self::maybe_build_sme_candidates(table_name, &tokens_arc, &schema_arc, &io_rows_outer, iterator)
+                .await;
+
+        if sme_candidates.is_some() {
+            log::info!(
+                "Semantic processing will use candidate row pointers, with {} candidates for query: {}",
+                sme_candidates.as_ref().unwrap().0.len(),
+                where_query
+            );
+        } else {
+            if semantics_enabled() {
+                log::info!(
+                    "Semantic processing will scan all row pointers for query: {}",
+                    where_query
+                );
+            }
+        }
+
+        if semantics_enabled() {
+            log::info!(
+                "Semantic processing setup completed in {:.2?}",
+                semantic_stopwatch.elapsed()
+            );
+        }
+        
+        let reading_time_total = Arc::new(AtomicU64::new(0));
+
+        let batch_handles = Self::spawn_batch_tasks(
+            iterator,
+            sme_candidates,
+            Arc::clone(&shared_tuple),
+            Arc::clone(&schema_arc),
+            Arc::clone(&tokens_arc),
+            Arc::clone(&io_rows_outer),
+            tx.clone(),
+            tx_rp.clone(),
+            limit,
+            enforce_limit_early,
+            no_filter,
+            Arc::clone(&limit_counter),
+            Arc::clone(&stop_processing),
+            Arc::clone(&reading_time_total),
+        )
+        .await;
+
+        // Wait for all batch tasks to complete
+        join_all(batch_handles).await;
+
+        // Drop the sender to signal that no more rows will be sent
+        drop(tx);
+
+        let mut all_rows = Self::drain_rows(rx);
+
+        Self::sort_rows_if_needed(&mut all_rows, &schema_arc, &order_by);
 
         // Safety: even though LIMIT is enforced strictly at send-time, keep a final cap.
         if let Some(limit_val) = limit {
@@ -597,16 +675,10 @@ impl ConcurrentProcessor {
         }
 
         if crc64_hash != 0 {
-            let mut pointers = Vec::with_capacity(50);
-            if !rx_rp.is_empty() {
-                rx_rp.drain_into(&mut pointers).unwrap();
-            }
-
-            drop(rx_rp);
+            let pointers = Self::drain_row_pointers(rx_rp);
 
             // Store the resulting pointers in the cache
             let cache = ATOMIC_CACHE.get().unwrap();
-
             if cache.insert(crc64_hash, Arc::new(pointers)).is_err() {
                 log::error!("Failed to insert entries into cache for hash {}", crc64_hash);
             }
@@ -622,6 +694,309 @@ impl ConcurrentProcessor {
         );
 
         all_rows
+    }
+
+    /// Concurrently evaluates a WHERE clause and returns matching row pointers (with their pointer-record offsets).
+    ///
+    /// This is intended for UPDATE/DELETE operations where the caller must mutate the pointer record
+    /// (tombstone or update-in-place/append).
+    pub async fn process_row_pointers<S: StorageIO>(
+        &self,
+        table_name: &str,
+        where_query: &str,
+        query_row_fetch: RowFetch,
+        table_schema: &SmallVec<[SchemaField; 20]>,
+        io_rows: Arc<S>,
+        iterator: &mut RowPointerIterator<S>,
+        limit: Option<u64>,
+    ) -> Vec<RowPointerWithOffset> {
+        let prep_stopwatch = std::time::Instant::now();
+
+        log::info!(
+            "Starting concurrent pointer processing for query: {}",
+            where_query
+        );
+
+        let (tx, rx) = kanal::unbounded_async::<RowPointerWithOffset>();
+
+        let limit_counter = Arc::new(AtomicU64::new(0));
+        let stop_processing = Arc::new(AtomicBool::new(false));
+
+        let shared_tuple: Arc<(Semaphore, RowFetch)> = Arc::new((
+            Semaphore::new(*MAX_PERMITS_THREADS.get().unwrap()),
+            query_row_fetch,
+        ));
+
+        let table_schema = table_schema
+            .iter()
+            .cloned()
+            .collect::<SmallVec<[SchemaField; 20]>>();
+
+        let io_rows_outer = Arc::clone(&io_rows);
+
+        // Empty WHERE means "match all rows"; skip tokenization/parsing entirely.
+        let no_filter = where_query.trim().is_empty();
+        let tokens: SmallVec<[Token; 36]> = if no_filter {
+            SmallVec::new()
+        } else {
+            tokenize(&where_query, &table_schema)
+        };
+
+        let schema_arc = Arc::new(table_schema);
+        let tokens_arc = Arc::new(tokens);
+
+        log::info!(
+            "Preperation for pointer query completed in {:.2?}",
+            prep_stopwatch.elapsed()
+        );
+
+        if semantics_enabled() {
+            // NOTE: SME candidates currently don't carry pointer-record offsets.
+            // For correctness of UPDATE/DELETE (which must write pointer records), we conservatively
+            // fall back to scanning all pointers here.
+            log::info!(
+                "Semantic processing is enabled, but pointer-record offsets are required; scanning all row pointers for query: {}",
+                where_query
+            );
+        }
+
+        let reading_time_total = Arc::new(AtomicU64::new(0));
+
+        let mut batch_handles = Vec::new();
+        iterator.reset();
+
+        loop {
+            if stop_processing.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+
+            let mut pointers: Vec<RowPointerWithOffset> = Vec::with_capacity(*BATCH_SIZE.get().unwrap());
+
+            for _ in 0..*BATCH_SIZE.get().unwrap() {
+                match iterator.next_row_pointer_with_offset().await {
+                    Ok(Some((pointer_record_pos, pointer))) => {
+                        pointers.push(RowPointerWithOffset {
+                            pointer_record_pos,
+                            pointer,
+                        });
+                    }
+                    Ok(None) => break,
+                    Err(_) => break,
+                }
+            }
+
+            if pointers.is_empty() {
+                break;
+            }
+
+            if stop_processing.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+
+            let tuple_clone = Arc::clone(&shared_tuple);
+            let tx_clone = tx.clone();
+            let schema_ref = Arc::clone(&schema_arc);
+            let tokens_ref = Arc::clone(&tokens_arc);
+            let io_rows_batch = Arc::clone(&io_rows_outer);
+
+            let limit_opt = limit;
+            let limit_counter_ref = Arc::clone(&limit_counter);
+            let stop_ref = Arc::clone(&stop_processing);
+            let no_filter = no_filter;
+            let reading_time_total_clone = Arc::clone(&reading_time_total);
+
+            let batch_handle = task::spawn(async move {
+                // Acquire a permit for this batch
+                let _batch_permit = tuple_clone.0.acquire().await.unwrap();
+
+                // Fast-path for empty WHERE: accept all non-deleted pointers.
+                if no_filter {
+                    for pwo in pointers.into_iter() {
+                        if stop_ref.load(std::sync::atomic::Ordering::Relaxed) {
+                            break;
+                        }
+
+                        if pwo.pointer.deleted {
+                            continue;
+                        }
+
+                        if let Some(limit_val) = limit_opt {
+                            // Stop once we have emitted limit rows.
+                            if limit_counter_ref.load(std::sync::atomic::Ordering::Relaxed)
+                                >= limit_val
+                            {
+                                stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                                break;
+                            }
+
+                            let reserved = limit_counter_ref.fetch_update(
+                                std::sync::atomic::Ordering::Relaxed,
+                                std::sync::atomic::Ordering::Relaxed,
+                                |cur| if cur <= limit_val { Some(cur + 1) } else { None },
+                            );
+
+                            if reserved.is_err() {
+                                stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                                break;
+                            }
+                        }
+
+                        if tx_clone.send(pwo).await.is_err() {
+                            break;
+                        }
+                    }
+
+                    return;
+                }
+
+                // Local row buffer reused across all pointers in this batch
+                let row = Row::default();
+                let mut buffer = Buffer {
+                    hashtable_buffer: UnsafeCell::new(SmallVec::new()),
+                    row,
+                    transformers: SmallVec::new(),
+                    intermediate_results: SmallVec::new(),
+                    bool_buffer: SmallVec::new(),
+                };
+
+                // Build a processor and parser once per batch
+                let processor_cell = UnsafeCell::new(TransformerProcessor::new(
+                    &mut buffer.transformers,
+                    &mut buffer.intermediate_results,
+                ));
+                let processor_mut = unsafe { &mut *processor_cell.get() };
+                let parser_cell = UnsafeCell::new(QueryParser::new(&tokens_ref, processor_mut));
+                let mut plan_built = false;
+
+                for pwo in pointers.into_iter() {
+                    if stop_ref.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+
+                    if pwo.pointer.deleted {
+                        continue;
+                    }
+
+                    let io_rows_clone = Arc::clone(&io_rows_batch);
+                    let (_, query_row_fetch) = &*tuple_clone;
+
+                    let reading_time = std::time::Instant::now();
+
+                    if pwo
+                        .pointer
+                        .fetch_row_reuse_async(io_rows_clone, query_row_fetch, &mut buffer.row)
+                        .await
+                        .is_err()
+                    {
+                        continue;
+                    }
+
+                    let elapsed_ns = reading_time.elapsed().as_nanos() as u64;
+                    reading_time_total_clone.fetch_add(
+                        elapsed_ns,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+
+                    if !plan_built {
+                        let tmp_vec = unsafe { &mut *buffer.hashtable_buffer.get() };
+                        tmp_vec.clear();
+
+                        {
+                            let columns = &buffer.row.columns;
+                            let schema = &*schema_ref;
+
+                            tmp_vec.clear();
+                            tmp_vec.resize(
+                                schema.len(),
+                                (Cow::Borrowed(EMPTY_STR), MemoryBlock::default()),
+                            );
+
+                            for column in columns.iter() {
+                                // Here `schema_id` is write_order.
+                                let write_order = column.schema_id as usize;
+                                if let Some(schema_field) = schema.iter().find(|f| f.write_order as usize == write_order) {
+                                    if let Some(entry) = tmp_vec.get_mut(write_order) {
+                                        *entry = (
+                                            Cow::Borrowed(schema_field.name.as_str()),
+                                            column.data.clone(),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        let parser_mut = unsafe { &mut *parser_cell.get() };
+                        if let Err(e) = parser_mut.execute(tmp_vec) {
+                            panic!(
+                                "Error executing query parser while building plan: {:?}",
+                                e
+                            );
+                        }
+
+                        unsafe { &mut *processor_cell.get() }.replace_row_inputs(&[]);
+                        plan_built = true;
+                    }
+
+                    let result = {
+                        let processor = unsafe { &mut *processor_cell.get() };
+                        processor.execute_row(
+                            &RowView::new(&buffer.row, schema_ref.as_slice()),
+                            &mut buffer.bool_buffer,
+                        )
+                    };
+
+                    if result {
+                        if let Some(limit_val) = limit_opt {
+                            if limit_counter_ref.load(std::sync::atomic::Ordering::Relaxed)
+                                >= limit_val
+                            {
+                                stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                                break;
+                            }
+
+                            let reserved = limit_counter_ref.fetch_update(
+                                std::sync::atomic::Ordering::Relaxed,
+                                std::sync::atomic::Ordering::Relaxed,
+                                |cur| if cur <= limit_val { Some(cur + 1) } else { None },
+                            );
+
+                            if reserved.is_err() {
+                                stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                                break;
+                            }
+                        }
+
+                        if tx_clone.send(pwo).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+
+            batch_handles.push(batch_handle);
+        }
+
+        join_all(batch_handles).await;
+        drop(tx);
+
+        let mut matches = Vec::with_capacity(50);
+        if !rx.is_empty() {
+            rx.drain_into(&mut matches).unwrap();
+        }
+        drop(rx);
+
+        let total_reading_ns = reading_time_total.load(std::sync::atomic::Ordering::Relaxed);
+        log::info!(
+            "Total reading time for pointer query '{}' : {:.2?} over {} pointers",
+            where_query,
+            std::time::Duration::from_nanos(total_reading_ns),
+            matches.len()
+        );
+
+        // Keep SME referenced to avoid unused warnings on some feature combos.
+        let _ = table_name;
+
+        matches
     }
 }
 
