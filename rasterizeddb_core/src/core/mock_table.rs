@@ -450,7 +450,7 @@ async fn fill_data<S: StorageIO>(id: u64, io_pointers: Arc<S>, io_rows: Arc<S>, 
 fn create_string_column(data: &str, write_order: u32) -> ColumnWritePayload {
     let string_bytes = data.as_bytes();
 
-    let string_data = MEMORY_POOL.acquire(string_bytes.len());
+    let mut string_data = MEMORY_POOL.acquire(string_bytes.len());
     let string_slice = string_data.into_slice_mut();
 
     string_slice[0..].copy_from_slice(string_bytes);
@@ -464,7 +464,7 @@ fn create_string_column(data: &str, write_order: u32) -> ColumnWritePayload {
 }
 
 fn create_u8_column(data: u8, write_order: u32) -> ColumnWritePayload {
-    let u8_data = MEMORY_POOL.acquire(1);
+    let mut u8_data = MEMORY_POOL.acquire(1);
     let u8_slice = u8_data.into_slice_mut();
     u8_slice.copy_from_slice(&data.to_le_bytes());
 
@@ -477,7 +477,7 @@ fn create_u8_column(data: u8, write_order: u32) -> ColumnWritePayload {
 }
 
 fn create_u64_column(data: u64, write_order: u32) -> ColumnWritePayload {
-    let u64_data = MEMORY_POOL.acquire(8);
+    let mut u64_data = MEMORY_POOL.acquire(8);
     let u64_slice = u64_data.into_slice_mut();
     u64_slice.copy_from_slice(&data.to_le_bytes());
 
@@ -490,7 +490,7 @@ fn create_u64_column(data: u64, write_order: u32) -> ColumnWritePayload {
 }
 
 fn create_f32_column(data: f32, write_order: u32) -> ColumnWritePayload {
-    let f32_data = MEMORY_POOL.acquire(4);
+    let mut f32_data = MEMORY_POOL.acquire(4);
     let f32_slice = f32_data.into_slice_mut();
     f32_slice.copy_from_slice(&data.to_le_bytes());
 
@@ -503,7 +503,7 @@ fn create_f32_column(data: f32, write_order: u32) -> ColumnWritePayload {
 }
 
 fn create_f64_column(data: f64, write_order: u32) -> ColumnWritePayload {
-    let f64_data = MEMORY_POOL.acquire(8);
+    let mut f64_data = MEMORY_POOL.acquire(8);
     let f64_slice = f64_data.into_slice_mut();
     f64_slice.copy_from_slice(&data.to_le_bytes());
 

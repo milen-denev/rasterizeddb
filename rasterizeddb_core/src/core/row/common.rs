@@ -28,7 +28,7 @@ macro_rules! impl_from_le_bytes {
                 #[inline(always)]
                 fn to_le_bytes(&self) -> MemoryBlock {
                     let len = std::mem::size_of::<$type>();
-                    let memory = MEMORY_POOL.acquire(len);
+                    let mut memory = MEMORY_POOL.acquire(len);
                     let slice = memory.into_slice_mut();
                     slice.copy_from_slice(&(*self).to_le_bytes());
                     memory

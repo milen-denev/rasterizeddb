@@ -62,7 +62,7 @@ where
         "Input slices must be divisible by the size of the target type"
     );
 
-    let block = MEMORY_POOL.acquire(input1.len());
+    let mut block = MEMORY_POOL.acquire(input1.len());
     let result = block.into_slice_mut();
 
     let num1 = T::from_le_bytes(input1);
@@ -437,8 +437,10 @@ mod tests {
     #[test]
     #[should_panic(expected = "Input slices must have the same length")]
     fn test_unequal_length_inputs() {
-        let input1 = to_le_bytes(5i32).into_slice();
-        let input2 = to_le_bytes(3i16).into_slice();
+        let input1_block =  to_le_bytes(5i32);
+        let input2_block =  to_le_bytes(3i16);
+        let input1 = input1_block.into_slice();
+        let input2 = input2_block.into_slice();
         perform_math_operation(input1, input2, &DbType::I32, &MathOperation::Add);
     }
 

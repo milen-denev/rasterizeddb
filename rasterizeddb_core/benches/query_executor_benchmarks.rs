@@ -38,84 +38,84 @@ fn create_benchmark_schema() -> SmallVec<[SchemaField; 20]> {
 // Helper functions to create memory blocks for benchmark data
 fn create_memory_block_from_i32(value: i32) -> MemoryBlock {
     let bytes = value.to_le_bytes();
-    let data = MEMORY_POOL.acquire(bytes.len());
+    let mut data = MEMORY_POOL.acquire(bytes.len());
     data.into_slice_mut().copy_from_slice(&bytes);
     data
 }
 
 fn create_memory_block_from_u8(value: u8) -> MemoryBlock {
     let bytes = value.to_le_bytes();
-    let data = MEMORY_POOL.acquire(bytes.len());
+    let mut data = MEMORY_POOL.acquire(bytes.len());
     data.into_slice_mut().copy_from_slice(&bytes);
     data
 }
 
 fn create_memory_block_from_string(value: &str) -> MemoryBlock {
     let bytes = value.as_bytes();
-    let data = MEMORY_POOL.acquire(bytes.len());
+    let mut data = MEMORY_POOL.acquire(bytes.len());
     data.into_slice_mut().copy_from_slice(bytes);
     data
 }
 
 fn create_memory_block_from_f64(value: f64) -> MemoryBlock {
     let bytes = value.to_le_bytes();
-    let data = MEMORY_POOL.acquire(bytes.len());
+    let mut data = MEMORY_POOL.acquire(bytes.len());
     data.into_slice_mut().copy_from_slice(&bytes);
     data
 }
 
 fn create_memory_block_from_f32(value: f32) -> MemoryBlock {
     let bytes = value.to_le_bytes();
-    let data = MEMORY_POOL.acquire(bytes.len());
+    let mut data = MEMORY_POOL.acquire(bytes.len());
     data.into_slice_mut().copy_from_slice(&bytes);
     data
 }
 
 fn create_memory_block_from_i64(value: i64) -> MemoryBlock {
     let bytes = value.to_le_bytes();
-    let data = MEMORY_POOL.acquire(bytes.len());
+    let mut data = MEMORY_POOL.acquire(bytes.len());
     data.into_slice_mut().copy_from_slice(&bytes);
     data
 }
 fn create_memory_block_from_i8(value: i8) -> MemoryBlock {
     let bytes = value.to_le_bytes();
-    let data = MEMORY_POOL.acquire(bytes.len());
+    let mut data = MEMORY_POOL.acquire(bytes.len());
     data.into_slice_mut().copy_from_slice(&bytes);
     data
 }
 fn create_memory_block_from_u32(value: u32) -> MemoryBlock {
     let bytes = value.to_le_bytes();
-    let data = MEMORY_POOL.acquire(bytes.len());
+    let mut data = MEMORY_POOL.acquire(bytes.len());
     data.into_slice_mut().copy_from_slice(&bytes);
     data
 }
 fn create_memory_block_from_u16(value: u16) -> MemoryBlock {
     let bytes = value.to_le_bytes();
-    let data = MEMORY_POOL.acquire(bytes.len());
+    let mut data = MEMORY_POOL.acquire(bytes.len());
     data.into_slice_mut().copy_from_slice(&bytes);
     data
 }
 fn create_memory_block_from_i128(value: i128) -> MemoryBlock {
     let bytes = value.to_le_bytes();
-    let data = MEMORY_POOL.acquire(bytes.len());
+    let mut data = MEMORY_POOL.acquire(bytes.len());
     data.into_slice_mut().copy_from_slice(&bytes);
     data
 }
 fn create_memory_block_from_u128(value: u128) -> MemoryBlock {
     let bytes = value.to_le_bytes();
-    let data = MEMORY_POOL.acquire(bytes.len());
+    let mut data = MEMORY_POOL.acquire(bytes.len());
     data.into_slice_mut().copy_from_slice(&bytes);
     data
 }
 fn create_memory_block_from_i16(value: i16) -> MemoryBlock {
     let bytes = value.to_le_bytes();
-    let data = MEMORY_POOL.acquire(bytes.len());
+    let mut data = MEMORY_POOL.acquire(bytes.len());
     data.into_slice_mut().copy_from_slice(&bytes);
     data
 }
 fn create_memory_block_from_u64(value: u64) -> MemoryBlock {
     let bytes = value.to_le_bytes();
-    let data = MEMORY_POOL.acquire(bytes.len());
+    let mut data = MEMORY_POOL.acquire(bytes.len());
     data.into_slice_mut().copy_from_slice(&bytes);
     data
 }

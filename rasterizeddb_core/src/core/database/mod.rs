@@ -104,11 +104,11 @@ impl Database {
             ));
         }
 
-        let name_mb = MEMORY_POOL.acquire(table_name.len());
+        let mut name_mb = MEMORY_POOL.acquire(table_name.len());
         let name_data = name_mb.into_slice_mut();
         name_data.copy_from_slice(table_name.as_bytes());
 
-        let clusters_mb = MEMORY_POOL.acquire(8);
+        let mut clusters_mb = MEMORY_POOL.acquire(8);
         let clusters_data = clusters_mb.into_slice_mut();
         clusters_data.copy_from_slice(&[0u8; 8]);
 

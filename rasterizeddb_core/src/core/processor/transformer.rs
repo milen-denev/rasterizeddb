@@ -681,7 +681,7 @@ mod tests {
 
     fn create_memory_block_from_f64(value: f64) -> MemoryBlock {
         let bytes = value.to_le_bytes();
-        let data = MEMORY_POOL.acquire(bytes.len());
+        let mut data = MEMORY_POOL.acquire(bytes.len());
         let slice = data.into_slice_mut();
         slice.copy_from_slice(&bytes);
         data
@@ -689,7 +689,7 @@ mod tests {
 
     fn create_memory_block_from_u8(value: u8) -> MemoryBlock {
         let bytes = value.to_le_bytes();
-        let data = MEMORY_POOL.acquire(bytes.len());
+        let mut data = MEMORY_POOL.acquire(bytes.len());
         let slice = data.into_slice_mut();
         slice.copy_from_slice(&bytes);
         data
@@ -697,7 +697,7 @@ mod tests {
 
     fn create_memory_block_from_i32(value: i32) -> MemoryBlock {
         let bytes = value.to_le_bytes();
-        let data = MEMORY_POOL.acquire(bytes.len());
+        let mut data = MEMORY_POOL.acquire(bytes.len());
         let slice = data.into_slice_mut();
         slice.copy_from_slice(&bytes);
         data
@@ -705,7 +705,7 @@ mod tests {
 
     fn create_memory_block_from_string(value: &str) -> MemoryBlock {
         let bytes = value.as_bytes();
-        let data = MEMORY_POOL.acquire(bytes.len());
+        let mut data = MEMORY_POOL.acquire(bytes.len());
         let slice = data.into_slice_mut();
         slice.copy_from_slice(bytes);
         data

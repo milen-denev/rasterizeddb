@@ -40,84 +40,84 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> MemoryBlock {
         DbType::I8 => {
             let val: i8 = value_str.parse().unwrap_or_default();
             let bytes = val.to_le_bytes();
-            let mb = MEMORY_POOL.acquire(bytes.len());
+            let mut mb = MEMORY_POOL.acquire(bytes.len());
             mb.into_slice_mut().copy_from_slice(&bytes);
             mb
         }
         DbType::I16 => {
             let val: i16 = value_str.parse().unwrap_or_default();
             let bytes = val.to_le_bytes();
-            let mb = MEMORY_POOL.acquire(bytes.len());
+            let mut mb = MEMORY_POOL.acquire(bytes.len());
             mb.into_slice_mut().copy_from_slice(&bytes);
             mb
         }
         DbType::I32 => {
             let val: i32 = value_str.parse().unwrap_or_default();
             let bytes = val.to_le_bytes();
-            let mb = MEMORY_POOL.acquire(bytes.len());
+            let mut mb = MEMORY_POOL.acquire(bytes.len());
             mb.into_slice_mut().copy_from_slice(&bytes);
             mb
         }
         DbType::I64 => {
             let val: i64 = value_str.parse().unwrap_or_default();
             let bytes = val.to_le_bytes();
-            let mb = MEMORY_POOL.acquire(bytes.len());
+            let mut mb = MEMORY_POOL.acquire(bytes.len());
             mb.into_slice_mut().copy_from_slice(&bytes);
             mb
         }
         DbType::I128 => {
             let val: i128 = value_str.parse().unwrap_or_default();
             let bytes = val.to_le_bytes();
-            let mb = MEMORY_POOL.acquire(bytes.len());
+            let mut mb = MEMORY_POOL.acquire(bytes.len());
             mb.into_slice_mut().copy_from_slice(&bytes);
             mb
         }
         DbType::U8 => {
             let val: u8 = value_str.parse().unwrap_or_default();
             let bytes = val.to_le_bytes();
-            let mb = MEMORY_POOL.acquire(bytes.len());
+            let mut mb = MEMORY_POOL.acquire(bytes.len());
             mb.into_slice_mut().copy_from_slice(&bytes);
             mb
         }
         DbType::U16 => {
             let val: u16 = value_str.parse().unwrap_or_default();
             let bytes = val.to_le_bytes();
-            let mb = MEMORY_POOL.acquire(bytes.len());
+            let mut mb = MEMORY_POOL.acquire(bytes.len());
             mb.into_slice_mut().copy_from_slice(&bytes);
             mb
         }
         DbType::U32 => {
             let val: u32 = value_str.parse().unwrap_or_default();
             let bytes = val.to_le_bytes();
-            let mb = MEMORY_POOL.acquire(bytes.len());
+            let mut mb = MEMORY_POOL.acquire(bytes.len());
             mb.into_slice_mut().copy_from_slice(&bytes);
             mb
         }
         DbType::U64 => {
             let val: u64 = value_str.parse().unwrap_or_default();
             let bytes = val.to_le_bytes();
-            let mb = MEMORY_POOL.acquire(bytes.len());
+            let mut mb = MEMORY_POOL.acquire(bytes.len());
             mb.into_slice_mut().copy_from_slice(&bytes);
             mb
         }
         DbType::U128 => {
             let val: u128 = value_str.parse().unwrap_or_default();
             let bytes = val.to_le_bytes();
-            let mb = MEMORY_POOL.acquire(bytes.len());
+            let mut mb = MEMORY_POOL.acquire(bytes.len());
             mb.into_slice_mut().copy_from_slice(&bytes);
             mb
         }
         DbType::F32 => {
             let val: f32 = value_str.parse().unwrap_or_default();
             let bytes = val.to_le_bytes();
-            let mb = MEMORY_POOL.acquire(bytes.len());
+            let mut mb = MEMORY_POOL.acquire(bytes.len());
             mb.into_slice_mut().copy_from_slice(&bytes);
             mb
         }
         DbType::F64 => {
             let val: f64 = value_str.parse().unwrap_or_default();
             let bytes = val.to_le_bytes();
-            let mb = MEMORY_POOL.acquire(bytes.len());
+            let mut mb = MEMORY_POOL.acquire(bytes.len());
             mb.into_slice_mut().copy_from_slice(&bytes);
             mb
         }
@@ -131,7 +131,7 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> MemoryBlock {
                 0
             });
             let bytes = val_u8.to_le_bytes();
-            let mb = MEMORY_POOL.acquire(bytes.len());
+            let mut mb = MEMORY_POOL.acquire(bytes.len());
             mb.into_slice_mut().copy_from_slice(&bytes);
             mb
         }
@@ -147,14 +147,14 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> MemoryBlock {
                 0
             });
             let bytes = val.to_le_bytes();
-            let mb = MEMORY_POOL.acquire(bytes.len());
+            let mut mb = MEMORY_POOL.acquire(bytes.len());
             mb.into_slice_mut().copy_from_slice(&bytes);
             mb
         }
         DbType::STRING | DbType::CHAR => {
             let stripped = strip_surrounding_quotes(value_str);
             let b = stripped.as_bytes();
-            let mb = MEMORY_POOL.acquire(b.len());
+            let mut mb = MEMORY_POOL.acquire(b.len());
             mb.into_slice_mut().copy_from_slice(b);
             mb
         }

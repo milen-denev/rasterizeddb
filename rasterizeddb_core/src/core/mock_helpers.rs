@@ -8,7 +8,7 @@ use super::{
 pub fn create_small_string_column() -> MemoryBlock {
     let string_bytes = b"Hello, world!";
 
-    let string_data = MEMORY_POOL.acquire(string_bytes.len());
+    let mut string_data = MEMORY_POOL.acquire(string_bytes.len());
     let string_slice = string_data.into_slice_mut();
 
     string_slice[0..].copy_from_slice(string_bytes);
@@ -20,7 +20,7 @@ pub fn create_large_string_column() -> MemoryBlock {
     let large_string = "Data - ".repeat(25);
     let large_string_bytes = large_string.as_bytes();
 
-    let large_string_data = MEMORY_POOL.acquire(large_string_bytes.len());
+    let mut large_string_data = MEMORY_POOL.acquire(large_string_bytes.len());
     let large_string_slice = large_string_data.into_slice_mut();
 
     large_string_slice[0..].copy_from_slice(large_string_bytes);
@@ -30,7 +30,7 @@ pub fn create_large_string_column() -> MemoryBlock {
 
 pub fn create_i32_column() -> MemoryBlock {
     let i32_bytes = 42_i32.to_le_bytes();
-    let i32_data = MEMORY_POOL.acquire(4);
+    let mut i32_data = MEMORY_POOL.acquire(4);
     let i32_slice = i32_data.into_slice_mut();
     i32_slice.copy_from_slice(&i32_bytes);
 
@@ -39,7 +39,7 @@ pub fn create_i32_column() -> MemoryBlock {
 
 pub fn i32_column(val: i32) -> MemoryBlock {
     let i32_bytes = val.to_le_bytes();
-    let i32_data = MEMORY_POOL.acquire(4);
+    let mut i32_data = MEMORY_POOL.acquire(4);
     let i32_slice = i32_data.into_slice_mut();
     i32_slice.copy_from_slice(&i32_bytes);
 

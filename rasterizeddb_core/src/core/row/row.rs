@@ -138,7 +138,7 @@ impl Row {
             let column_size = cursor.read_u64::<byteorder::LittleEndian>()?;
             let schema_id = cursor.read_u64::<byteorder::LittleEndian>()?;
 
-            let column_data_mb = MEMORY_POOL.acquire(column_size as usize);
+            let mut column_data_mb = MEMORY_POOL.acquire(column_size as usize);
             let mut column_data = column_data_mb.into_slice_mut();
             cursor.read_exact(&mut column_data)?;
 
@@ -187,7 +187,7 @@ impl Row {
             let column_size = cursor.read_u64::<byteorder::LittleEndian>().unwrap();
             let schema_id = cursor.read_u64::<byteorder::LittleEndian>().unwrap();
 
-            let column_data_mb = MEMORY_POOL.acquire(column_size as usize);
+            let mut column_data_mb = MEMORY_POOL.acquire(column_size as usize);
             let mut column_data = column_data_mb.into_slice_mut();
             cursor.read_exact(&mut column_data).unwrap();
 

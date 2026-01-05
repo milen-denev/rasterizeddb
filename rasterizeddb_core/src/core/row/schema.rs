@@ -379,10 +379,20 @@ impl TableSchema {
     }
 
     pub async fn load<S: StorageIO>(schema_io: Arc<S>) -> io::Result<Self> {
-        let buffer = MEMORY_POOL.acquire(TABLE_SIZE);
-        _ = schema_io
+        // If the schema file is empty or too small, treat it as uninitialized.
+        // This avoids "successfully" loading a zeroed buffer and ending up with an empty schema.
+        let schema_len = schema_io.get_len().await;
+        if schema_len < TABLE_SIZE as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "Schema not initialized",
+            ));
+        }
+
+        let mut buffer = MEMORY_POOL.acquire(TABLE_SIZE);
+        schema_io
             .read_data_into_buffer(&mut 0, &mut buffer.into_slice_mut())
-            .await;
+            .await?;
 
         let mut table_schema = match TableSchema::from_vec(&buffer.into_slice()) {
             Ok(s) => s,
@@ -419,9 +429,9 @@ impl TableSchema {
             }
         }
 
-    table_schema.fields = deduped;
+        table_schema.fields = deduped;
 
-    Ok(table_schema)
+        Ok(table_schema)
     }
 
     pub fn into_vec(&self) -> Vec<u8> {

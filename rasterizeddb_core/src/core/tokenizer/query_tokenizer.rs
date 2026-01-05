@@ -629,7 +629,7 @@ pub fn numeric_to_mb(v: &NumericValue) -> MemoryBlock {
     macro_rules! direct {
         ($val:expr) => {{
             let bytes = $val.to_le_bytes();
-            let mb = MEMORY_POOL.acquire(bytes.len());
+            let mut mb = MEMORY_POOL.acquire(bytes.len());
             mb.into_slice_mut().copy_from_slice(&bytes);
             mb
         }};
@@ -654,7 +654,7 @@ pub fn numeric_to_mb(v: &NumericValue) -> MemoryBlock {
 #[inline(always)]
 pub fn str_to_mb(s: &str) -> MemoryBlock {
     let b = s.as_bytes();
-    let mb = MEMORY_POOL.acquire(b.len());
+    let mut mb = MEMORY_POOL.acquire(b.len());
     mb.into_slice_mut().copy_from_slice(b);
     mb
 }
