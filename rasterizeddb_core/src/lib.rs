@@ -21,7 +21,7 @@ pub fn semantics_enabled() -> bool {
 	}
 }
 
-pub(crate) const IMMEDIATE_WRITE: bool = false;
+pub(crate) const IMMEDIATE_WRITE: bool = true;
 
 pub mod core;
 
