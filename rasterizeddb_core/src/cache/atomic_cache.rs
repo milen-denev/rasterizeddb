@@ -12,29 +12,6 @@
 //! - **Versioning**: Tracks modifications to detect concurrent access
 //! - **Metadata tracking**: Stores UTC timestamps and sequence numbers
 //! - **State management**: Uses atomic state transitions for consistency
-//!
-//! ## Usage
-//!
-//! ```rust
-//! use std::sync::Arc;
-//!
-//! let cache = AtomicGenericCache::<String>::new(1024);
-//!
-//! // Insert values
-//! cache.insert("key1", "value1".to_string());
-//! cache.insert("key2", "value2".to_string());
-//!
-//! // Retrieve values
-//! if let Some(value) = cache.get("key1") {
-//!     println!("Found: {}", value);
-//! }
-//!
-//! // Get with metadata
-//! if let Some((value, timestamp, sequence)) = cache.get_with_metadata("key1") {
-//!     println!("Value: {}, Timestamp: {}, Sequence: {}", value, timestamp, sequence);
-//! }
-//! ```
-
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -300,11 +277,6 @@ where
     ///
     /// # Returns
     /// Arc-wrapped cache instance for shared ownership
-    ///
-    /// # Examples
-    /// ```
-    /// let cache = AtomicGenericCache::<String>::new(1024);
-    /// ```
     pub fn new(capacity: usize, max_capacity: usize) -> Arc<Self> {
         let capacity = capacity.next_power_of_two().max(64);
 
@@ -369,13 +341,6 @@ where
     ///
     /// # Returns
     /// `true` if the insertion was successful, `false` if the cache is full wrapped in Result<bool, std::io::Error> if successful
-    ///
-    /// # Examples
-    /// ```
-    /// let cache = AtomicGenericCache::<String>::new(1024);
-    /// let success = cache.insert("key1", "value1".to_string()).unwrap();
-    /// assert!(success);
-    /// ```
     pub fn insert(&self, key: K, value: T) -> Result<bool, std::io::Error> {
         if self.len() >= self.max_capacity && self.max_capacity > 0 {
             return Ok(false);
@@ -427,27 +392,6 @@ where
     /// - `bool` - Always `true` indicating successful insertion
     /// - `Vec<(u64, T, u64, u64)>` - Vector of removed entries (key_hash, value, timestamp_nanos, sequence)
     ///   Empty if no entries needed to be removed.
-    ///
-    /// # Examples
-    /// ```
-    /// let cache = AtomicGenericCache::<String>::new(64, 100); // capacity 64, max 100
-    ///
-    /// // Fill the cache to max capacity
-    /// for i in 0..100 {
-    ///     cache.insert(format!("key{}", i), format!("value{}", i)).unwrap();
-    /// }
-    ///
-    /// // Force insert will remove oldest entries to make space
-    /// let (success, removed_entries) = cache.force_insert("new_key", "new_value".to_string()).unwrap();
-    /// assert!(success);
-    ///
-    /// if !removed_entries.is_empty() {
-    ///     println!("Removed {} oldest entries to make space", removed_entries.len());
-    ///     for (key_hash, value, timestamp, sequence) in removed_entries {
-    ///         println!("Removed: key_hash={}, value={}, sequence={}", key_hash, value, sequence);
-    ///     }
-    /// }
-    /// ```
     pub fn force_insert(
         &self,
         key: K,
@@ -647,16 +591,6 @@ where
     ///
     /// # Returns
     /// `Some(value)` if found, `None` if not found or if concurrent modification detected
-    ///
-    /// # Examples
-    /// ```
-    /// let cache = AtomicGenericCache::<String>::new(1024);
-    /// cache.insert("key1", "value1".to_string());
-    ///
-    /// if let Some(value) = cache.get("key1") {
-    ///     println!("Found: {}", value);
-    /// }
-    /// ```
     pub fn get(&self, key: &K) -> Option<T> {
         let key_hash = self.hash_key(key);
 
@@ -690,16 +624,6 @@ where
     /// # Returns
     /// `Some((value, timestamp_nanos, sequence))` if found, `None` otherwise.
     /// The timestamp is in UTC nanoseconds since Unix epoch.
-    ///
-    /// # Examples
-    /// ```
-    /// let cache = AtomicGenericCache::<String>::new(1024);
-    /// cache.insert("key1", "value1".to_string());
-    ///
-    /// if let Some((value, timestamp, sequence)) = cache.get_with_metadata("key1") {
-    ///     println!("Value: {}, UTC Timestamp: {} ns, Sequence: {}", value, timestamp, sequence);
-    /// }
-    /// ```
     pub fn get_with_metadata(&self, key: &K) -> Option<(T, u64, u64)> {
         let key_hash = self.hash_key(key);
 
@@ -734,17 +658,6 @@ where
     ///
     /// # Returns
     /// Vector of values in the same order as keys. Missing keys result in None entries.
-    ///
-    /// # Examples
-    /// ```
-    /// let cache = AtomicGenericCache::<String>::new(1024);
-    /// cache.insert("key1", "value1".to_string());
-    /// cache.insert("key3", "value3".to_string());
-    ///
-    /// let keys = vec!["key1", "key2", "key3"];
-    /// let values = cache.get_all_by_keys(keys);
-    /// // values will be [Some("value1"), None, Some("value3")]
-    /// ```
     pub fn get_all_by_keys(&self, keys: &Vec<K>) -> Vec<Option<T>> {
         keys.iter().map(|key| self.get(key)).collect()
     }
@@ -756,15 +669,6 @@ where
     ///
     /// # Returns
     /// `true` if the key exists, `false` otherwise
-    ///
-    /// # Examples
-    /// ```
-    /// let cache = AtomicGenericCache::<String>::new(1024);
-    /// cache.insert("key1", "value1".to_string());
-    ///
-    /// assert!(cache.contains_key("key1"));
-    /// assert!(!cache.contains_key("nonexistent"));
-    /// ```
     #[inline]
     pub fn contains_key(&self, key: &K) -> bool {
         self.get(key).is_some()
@@ -777,15 +681,6 @@ where
     ///
     /// # Returns
     /// `true` if any of the keys exist, `false` if none exist
-    ///
-    /// # Examples
-    /// ```
-    /// let cache = AtomicGenericCache::<String>::new(1024);
-    /// cache.insert("key1", "value1".to_string());
-    ///
-    /// let keys = vec!["key1", "key2", "key3"];
-    /// assert!(cache.contains_any_key(keys));
-    /// ```
     pub fn contains_any_key(&self, keys: &Vec<K>) -> bool {
         keys.iter().any(|key| self.contains_key(key))
     }
@@ -797,16 +692,6 @@ where
     ///
     /// # Returns
     /// `true` if all keys exist, `false` if any key is missing
-    ///
-    /// # Examples
-    /// ```
-    /// let cache = AtomicGenericCache::<String>::new(1024);
-    /// cache.insert("key1", "value1".to_string());
-    /// cache.insert("key2", "value2".to_string());
-    ///
-    /// let keys = vec!["key1", "key2"];
-    /// assert!(cache.contains_all_keys(keys));
-    /// ```
     pub fn contains_all_keys(&self, keys: &Vec<K>) -> bool {
         keys.iter().all(|key| self.contains_key(key))
     }
@@ -821,16 +706,6 @@ where
     ///
     /// # Returns
     /// `Some(value)` if the key was found and removed, `None` otherwise
-    ///
-    /// # Examples
-    /// ```
-    /// let cache = AtomicGenericCache::<String>::new(1024);
-    /// cache.insert("key1", "value1".to_string());
-    ///
-    /// if let Some(removed_value) = cache.remove("key1") {
-    ///     println!("Removed: {}", removed_value);
-    /// }
-    /// ```
     pub fn remove(&self, key: &K) -> Option<T> {
         let key_hash = self.hash_key(key);
 
@@ -862,17 +737,6 @@ where
     ///
     /// # Returns
     /// Vector of removed values in the same order as keys. Missing keys result in None entries.
-    ///
-    /// # Examples
-    /// ```
-    /// let cache = AtomicGenericCache::<String>::new(1024);
-    /// cache.insert("key1", "value1".to_string());
-    /// cache.insert("key3", "value3".to_string());
-    ///
-    /// let keys = vec!["key1", "key2", "key3"];
-    /// let removed_values = cache.remove_all(keys);
-    /// // removed_values will be [Some("value1"), None, Some("value3")]
-    /// ```
     pub fn remove_all(&self, keys: &Vec<K>) -> Vec<Option<T>> {
         keys.iter().map(|key| self.remove(key)).collect()
     }
@@ -883,16 +747,6 @@ where
     ///
     /// # Returns
     /// Number of entries that were cleared
-    ///
-    /// # Examples
-    /// ```
-    /// let cache = AtomicGenericCache::<String>::new(1024);
-    /// cache.insert("key1", "value1".to_string());
-    /// cache.insert("key2", "value2".to_string());
-    ///
-    /// let cleared_count = cache.clear();
-    /// println!("Cleared {} entries", cleared_count);
-    /// ```
     pub fn clear(&self) -> usize {
         let mut cleared = 0;
 
@@ -918,17 +772,6 @@ where
     ///
     /// # Returns
     /// Vector containing only the values that were successfully removed
-    ///
-    /// # Examples
-    /// ```
-    /// let cache = AtomicGenericCache::<String>::new(1024);
-    /// cache.insert("key1", "value1".to_string());
-    /// cache.insert("key3", "value3".to_string());
-    ///
-    /// let keys = vec!["key1", "key2", "key3"];
-    /// let removed_values = cache.remove_existing(keys);
-    /// // removed_values will be ["value1", "value3"]
-    /// ```
     pub fn remove_existing(&self, keys: &Vec<K>) -> Vec<T> {
         keys.iter().filter_map(|key| self.remove(key)).collect()
     }
@@ -945,22 +788,6 @@ where
     /// Vector of removed (key_hash, value, timestamp_nanos, sequence) tuples,
     /// sorted by sequence number (oldest first). The actual number of removed
     /// entries may be less than `count` if the cache contains fewer entries.
-    ///
-    /// # Examples
-    /// ```
-    /// let cache = AtomicGenericCache::<String>::new(1024, 2048);
-    /// cache.insert("key1", "value1".to_string());
-    /// cache.insert("key2", "value2".to_string());
-    /// cache.insert("key3", "value3".to_string());
-    ///
-    /// // Remove the 2 oldest entries
-    /// let removed = cache.remove_oldest(2);
-    /// println!("Removed {} oldest entries", removed.len());
-    ///
-    /// for (key_hash, value, timestamp, sequence) in removed {
-    ///     println!("Removed: key_hash={}, value={}, sequence={}", key_hash, value, sequence);
-    /// }
-    /// ```
     pub fn remove_oldest(&self, count: usize) -> Vec<(u64, T, u64, u64)> {
         if count == 0 {
             return Vec::new();
@@ -1019,14 +846,6 @@ where
     ///
     /// # Returns
     /// Number of entries with STATE_WRITTEN
-    ///
-    /// # Examples
-    /// ```
-    /// let cache = AtomicGenericCache::<String>::new(1024);
-    /// cache.insert("key1", "value1".to_string());
-    ///
-    /// println!("Cache contains {} entries", cache.len());
-    /// ```
     #[inline]
     pub fn len(&self) -> usize {
         self.entries
@@ -1042,18 +861,6 @@ where
     ///
     /// # Returns
     /// Vector of (key_hash, value) tuples
-    ///
-    /// # Examples
-    /// ```
-    /// let cache = AtomicGenericCache::<String>::new(1024);
-    /// cache.insert("key1", "value1".to_string());
-    /// cache.insert("key2", "value2".to_string());
-    ///
-    /// let entries = cache.entries();
-    /// for (key_hash, value) in entries {
-    ///     println!("Key hash: {}, Value: {}", key_hash, value);
-    /// }
-    /// ```
     pub fn entries(&self) -> Vec<(u64, T)> {
         self.get_all()
             .into_iter()
@@ -1068,17 +875,6 @@ where
     ///
     /// # Returns
     /// Vector of all entries that were in the cache, sorted by sequence number (most recent first)
-    ///
-    /// # Examples
-    /// ```
-    /// let cache = AtomicGenericCache::<String>::new(1024);
-    /// cache.insert("key1", "value1".to_string());
-    /// cache.insert("key2", "value2".to_string());
-    ///
-    /// let drained_entries = cache.drain();
-    /// assert!(cache.is_empty());
-    /// println!("Drained {} entries", drained_entries.len());
-    /// ```
     pub fn drain(&self) -> Vec<(u64, T, u64, u64)> {
         let mut results = Vec::new();
 
@@ -1111,15 +907,6 @@ where
     ///
     /// # Returns
     /// `true` if no entries have STATE_WRITTEN, `false` otherwise
-    ///
-    /// # Examples
-    /// ```
-    /// let cache = AtomicGenericCache::<String>::new(1024);
-    /// assert!(cache.is_empty());
-    ///
-    /// cache.insert("key1", "value1".to_string());
-    /// assert!(!cache.is_empty());
-    /// ```
     #[inline]
     pub fn is_empty(&self) -> bool {
         !self
@@ -1134,12 +921,6 @@ where
     ///
     /// # Returns
     /// Total capacity (always a power of 2)
-    ///
-    /// # Examples
-    /// ```
-    /// let cache = AtomicGenericCache::<String>::new(1000);
-    /// println!("Cache capacity: {}", cache.capacity()); // Will be 1024 (next power of 2)
-    /// ```
     #[inline]
     pub fn capacity(&self) -> usize {
         self.capacity_mask + 1
@@ -1153,19 +934,6 @@ where
     /// # Returns
     /// Vector of tuples containing (key_hash, value, timestamp_nanos, sequence).
     /// Timestamp is in UTC nanoseconds since Unix epoch.
-    ///
-    /// # Examples
-    /// ```
-    /// let cache = AtomicGenericCache::<String>::new(1024);
-    /// cache.insert("key1", "value1".to_string());
-    /// cache.insert("key2", "value2".to_string());
-    ///
-    /// let all_entries = cache.get_all();
-    /// for (key_hash, value, timestamp, sequence) in all_entries {
-    ///     println!("Key hash: {}, Value: {}, UTC Timestamp: {} ns, Sequence: {}",
-    ///              key_hash, value, timestamp, sequence);
-    /// }
-    /// ```
     pub fn get_all(&self) -> Vec<(u64, T, u64, u64)> {
         let mut results = Vec::new();
 
@@ -1199,20 +967,6 @@ where
     ///
     /// # Returns
     /// Number of entries that were removed
-    ///
-    /// # Examples
-    /// ```
-    /// let cache = AtomicGenericCache::<String>::new(1024);
-    /// cache.insert("keep", "important".to_string());
-    /// cache.insert("remove", "unimportant".to_string());
-    ///
-    /// // Keep only entries containing "important"
-    /// let removed_count = cache.retain(|value, _timestamp, _sequence| {
-    ///     value.contains("important")
-    /// });
-    ///
-    /// println!("Removed {} entries", removed_count);
-    /// ```
     pub fn retain<F>(&self, mut predicate: F) -> usize
     where
         F: FnMut(&T, u64, u64) -> bool,
@@ -1252,16 +1006,6 @@ where
     ///
     /// # Returns
     /// 64-bit hash value for the key
-    ///
-    /// # Examples
-    /// ```
-    /// let cache = AtomicGenericCache::<String>::new(1024);
-    /// let hash1 = cache.compute_key_hash(&"key1");
-    /// let hash2 = cache.compute_key_hash(&"key2");
-    ///
-    /// assert_ne!(hash1, hash2); // Different keys should have different hashes
-    /// assert_ne!(hash1, 0);     // Hash should be non-zero
-    /// ```
     pub fn compute_key_hash(&self, key: &K) -> u64 {
         self.hash_key(key)
     }
