@@ -90,6 +90,10 @@ impl ConcurrentProcessor {
         // The increment/threshold check is performed inside the `if result { }` section.
         let limit_counter = Arc::new(AtomicU64::new(0));
         let stop_processing = Arc::new(AtomicBool::new(false));
+
+        // Important: for ORDER BY queries, we must not stop early based on LIMIT,
+        // otherwise we only sort a prefix of the matching rows.
+        let enforce_limit_early = limit.is_some() && order_by.is_none();
     
         let shared_tuple: Arc<(Semaphore, RowFetch, RowFetch)> = Arc::new((
             Semaphore::new(*MAX_PERMITS_THREADS.get().unwrap()),
@@ -152,8 +156,6 @@ impl ConcurrentProcessor {
         };
 
         if entries_available {
-            // If cache entries were found and processed, skip further processing.
-            drop(tx);
             let mut collected_rows = Vec::with_capacity(50);
 
             if !rx.is_empty() {
@@ -273,6 +275,7 @@ impl ConcurrentProcessor {
             let limit_opt = limit;
             let limit_counter_ref = Arc::clone(&limit_counter);
             let stop_ref = Arc::clone(&stop_processing);
+            let enforce_limit_early = enforce_limit_early;
             let no_filter = no_filter;
 
             let batch_handle = task::spawn(async move {
@@ -295,10 +298,14 @@ impl ConcurrentProcessor {
                         }
 
                         // Quick stop check for LIMIT to avoid unnecessary fetch work.
-                        if let Some(limit_val) = limit_opt {
-                            if limit_counter_ref.load(std::sync::atomic::Ordering::Relaxed) >= limit_val {
-                                stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
-                                break;
+                        if enforce_limit_early {
+                            if let Some(limit_val) = limit_opt {
+                                if limit_counter_ref.load(std::sync::atomic::Ordering::Relaxed)
+                                    >= limit_val
+                                {
+                                    stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    break;
+                                }
                             }
                         }
 
@@ -322,22 +329,24 @@ impl ConcurrentProcessor {
                         reading_time_total_clone_2.fetch_add(elapsed_ns, std::sync::atomic::Ordering::Relaxed);
 
                         // LIMIT is enforced on successfully fetched/emitted rows.
-                        if let Some(limit_val) = limit_opt {
-                            let reserved = limit_counter_ref.fetch_update(
-                                std::sync::atomic::Ordering::Relaxed,
-                                std::sync::atomic::Ordering::Relaxed,
-                                |cur| if cur <= limit_val { Some(cur + 1) } else { None },
-                            );
+                        if enforce_limit_early {
+                            if let Some(limit_val) = limit_opt {
+                                let reserved = limit_counter_ref.fetch_update(
+                                    std::sync::atomic::Ordering::Relaxed,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                    |cur| if cur <= limit_val { Some(cur + 1) } else { None },
+                                );
 
-                            match reserved {
-                                Ok(prev) => {
-                                    if prev + 1 >= limit_val {
-                                        stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                                match reserved {
+                                    Ok(prev) => {
+                                        if prev + 1 >= limit_val {
+                                            stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                                        }
                                     }
-                                }
-                                Err(_) => {
-                                    stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
-                                    break;
+                                    Err(_) => {
+                                        stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -466,16 +475,20 @@ impl ConcurrentProcessor {
 
                         let reading_time = std::time::Instant::now();
 
-                        if pointer
+                        if let Err(e) = pointer
                             .fetch_row_reuse_async(
                                 io_rows_clone,
                                 requested_row_fetch,
                                 &mut buffer.row,
                             )
                             .await
-                            .is_err()
                         {
-                            error!("Failed to fetch requested row for pointer {:?}", pointer);
+                            error!(
+                                "Failed to fetch requested row for pointer {:?}: kind={:?} err={}",
+                                pointer,
+                                e.kind(),
+                                e
+                            );
                             continue;
                         }
 
@@ -483,28 +496,33 @@ impl ConcurrentProcessor {
                         reading_time_total_clone_2.fetch_add(elapsed_ns, std::sync::atomic::Ordering::Relaxed);
 
                         // LIMIT is enforced on successfully fetched/emitted rows.
-                        if let Some(limit_val) = limit_opt {
-                            // Quick stop check to avoid extra work.
-                            if limit_counter_ref.load(std::sync::atomic::Ordering::Relaxed) >= limit_val {
-                                stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
-                                break;
-                            }
-
-                            let reserved = limit_counter_ref.fetch_update(
-                                std::sync::atomic::Ordering::Relaxed,
-                                std::sync::atomic::Ordering::Relaxed,
-                                |cur| if cur <= limit_val { Some(cur + 1) } else { None },
-                            );
-
-                            match reserved {
-                                Ok(prev) => {
-                                    if prev + 1 >= limit_val {
-                                        stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
-                                    }
-                                }
-                                Err(_) => {
+                        // For ORDER BY queries, don't stop early; we must sort the full result set.
+                        if enforce_limit_early {
+                            if let Some(limit_val) = limit_opt {
+                                // Quick stop check to avoid extra work.
+                                if limit_counter_ref.load(std::sync::atomic::Ordering::Relaxed)
+                                    >= limit_val
+                                {
                                     stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
                                     break;
+                                }
+
+                                let reserved = limit_counter_ref.fetch_update(
+                                    std::sync::atomic::Ordering::Relaxed,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                    |cur| if cur <= limit_val { Some(cur + 1) } else { None },
+                                );
+
+                                match reserved {
+                                    Ok(prev) => {
+                                        if prev + 1 >= limit_val {
+                                            stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                                        }
+                                    }
+                                    Err(_) => {
+                                        stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -551,16 +569,23 @@ impl ConcurrentProcessor {
         let mut all_rows = aggregator_handle.await.unwrap();
 
         // ORDER BY: after collection, sort the resulting rows.
+        // NOTE: Row/Column schema_id uses SchemaField.write_order (not vector index).
         if let Some(order_field) = &order_by {
-            let order_idx = schema_arc
+            let order_write_order = schema_arc
                 .iter()
-                .position(|f| f.name.eq_ignore_ascii_case(order_field.as_str()));
+                .find(|f| f.name.eq_ignore_ascii_case(order_field.as_str()))
+                .map(|f| f.write_order as usize);
 
-            if let Some(schema_id) = order_idx {
+            if let Some(schema_id) = order_write_order {
                 let schema_ref = schema_arc.clone();
-                all_rows.sort_by(|a, b| compare_rows_by_schema_id(a, b, schema_id, schema_ref.as_slice()));
+                all_rows.sort_by(|a, b| {
+                    compare_rows_by_schema_id(a, b, schema_id, schema_ref.as_slice())
+                });
             } else {
-                log::warn!("ORDER BY field '{}' not found in schema; skipping sort", order_field);
+                log::warn!(
+                    "ORDER BY field '{}' not found in schema; skipping sort",
+                    order_field
+                );
             }
         }
 
@@ -615,8 +640,10 @@ fn compare_rows_by_schema_id(
         (Some(_), None) => std::cmp::Ordering::Greater,
         (Some(ac), Some(bc)) => {
             // Prefer the schema's declared type (more stable than per-column), fallback to column type.
+            // schema_id here is SchemaField.write_order, not necessarily the schema slice index.
             let db_type = schema
-                .get(schema_id)
+                .iter()
+                .find(|f| f.write_order as usize == schema_id)
                 .map(|f| f.db_type.clone())
                 .unwrap_or_else(|| ac.column_type.clone());
             compare_bytes_as_type(db_type, ac.data.into_slice(), bc.data.into_slice())
