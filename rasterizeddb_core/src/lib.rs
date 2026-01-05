@@ -31,7 +31,6 @@ pub mod configuration;
 pub mod instructions;
 pub mod memory_pool;
 pub mod pgwire;
-pub mod renderers;
 pub mod simds;
 
 #[cfg(test)]
