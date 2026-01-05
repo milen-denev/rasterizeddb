@@ -33,3 +33,6 @@ pub mod memory_pool;
 pub mod pgwire;
 pub mod renderers;
 pub mod simds;
+
+#[cfg(test)]
+mod ext_cov_tests;
