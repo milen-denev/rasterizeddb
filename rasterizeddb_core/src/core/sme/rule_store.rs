@@ -11,6 +11,11 @@ use super::rules::SemanticRule;
 pub struct ScanMeta {
     /// Length of the pointers IO (bytes) at the end of the scan.
     pub pointers_len_bytes: u64,
+    /// Fingerprint of the pointers IO contents at the end of the scan.
+    ///
+    /// This allows detecting in-place pointer updates (updates/deletes) that
+    /// don't change file length.
+    pub pointers_fingerprint: u64,
     /// Last scanned row pointer id at the end of the scan.
     pub last_row_id: u64,
 }
@@ -20,6 +25,10 @@ pub struct ScanMeta {
 // Header enables loading only specific column rule ranges.
 const RULES_FILE_VERSION_V2: u32 = 2;
 const RULES_HEADER_FIXED_LEN_V2: usize = 32;
+
+// v3 adds pointers_fingerprint (u64) to ScanMeta.
+const RULES_FILE_VERSION_V3: u32 = 3;
+const RULES_HEADER_FIXED_LEN_V3: usize = 40;
 
 const RULES_HEADER_FLAG_META_PRESENT: u32 = 1;
 
@@ -90,14 +99,16 @@ impl SemanticRuleStore {
         }
 
         let entry_count = by_col.len() as u32;
-        let header_len = (RULES_HEADER_FIXED_LEN_V2 + (entry_count as usize) * 24) as u32;
+        let header_len = (RULES_HEADER_FIXED_LEN_V3 + (entry_count as usize) * 24) as u32;
 
         let mut flags: u32 = 0;
         let mut pointers_len_bytes: u64 = 0;
+        let mut pointers_fingerprint: u64 = 0;
         let mut last_row_id: u64 = 0;
         if let Some(m) = meta {
             flags |= RULES_HEADER_FLAG_META_PRESENT;
             pointers_len_bytes = m.pointers_len_bytes;
+            pointers_fingerprint = m.pointers_fingerprint;
             last_row_id = m.last_row_id;
         }
 
@@ -119,9 +130,10 @@ impl SemanticRuleStore {
         let total_len = header_len as usize + (rules.len() * SemanticRule::BYTE_LEN);
         let mut bytes = Vec::with_capacity(total_len);
 
-        bytes.extend_from_slice(&RULES_FILE_VERSION_V2.to_le_bytes());
+        bytes.extend_from_slice(&RULES_FILE_VERSION_V3.to_le_bytes());
         bytes.extend_from_slice(&header_len.to_le_bytes());
         bytes.extend_from_slice(&pointers_len_bytes.to_le_bytes());
+        bytes.extend_from_slice(&pointers_fingerprint.to_le_bytes());
         bytes.extend_from_slice(&last_row_id.to_le_bytes());
         bytes.extend_from_slice(&entry_count.to_le_bytes());
         bytes.extend_from_slice(&flags.to_le_bytes());
@@ -163,26 +175,78 @@ impl SemanticRuleStore {
             return Ok(None);
         }
 
-        if file_len < RULES_HEADER_FIXED_LEN_V2 as u64 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Rules file too small for header: {}", file_len),
-            ));
-        }
-
-        let mut fixed = [0u8; RULES_HEADER_FIXED_LEN_V2];
         let mut pos = 0u64;
-        rules_io.read_data_into_buffer(&mut pos, &mut fixed).await?;
+        let mut ver = [0u8; 4];
+        rules_io.read_data_into_buffer(&mut pos, &mut ver).await?;
+        let version = u32::from_le_bytes(ver);
 
-        let version = u32::from_le_bytes(fixed[0..4].try_into().unwrap());
-        if version != RULES_FILE_VERSION_V2 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Unsupported rules file version: {}", version),
-            ));
-        }
+        let (header_fixed_len, pointers_len_bytes, pointers_fingerprint, last_row_id, entry_count, flags, header_len) =
+            if version == RULES_FILE_VERSION_V2 {
+                if file_len < RULES_HEADER_FIXED_LEN_V2 as u64 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Rules file too small for v2 header: {}", file_len),
+                    ));
+                }
 
-        let header_len = u32::from_le_bytes(fixed[4..8].try_into().unwrap()) as u64;
+                let mut rest = [0u8; RULES_HEADER_FIXED_LEN_V2 - 4];
+                rules_io.read_data_into_buffer(&mut pos, &mut rest).await?;
+                let mut fixed = [0u8; RULES_HEADER_FIXED_LEN_V2];
+                fixed[0..4].copy_from_slice(&ver);
+                fixed[4..].copy_from_slice(&rest);
+
+                let header_len = u32::from_le_bytes(fixed[4..8].try_into().unwrap()) as u64;
+                let pointers_len_bytes = u64::from_le_bytes(fixed[8..16].try_into().unwrap());
+                let last_row_id = u64::from_le_bytes(fixed[16..24].try_into().unwrap());
+                let entry_count = u32::from_le_bytes(fixed[24..28].try_into().unwrap()) as usize;
+                let flags = u32::from_le_bytes(fixed[28..32].try_into().unwrap());
+
+                (
+                    RULES_HEADER_FIXED_LEN_V2 as u64,
+                    pointers_len_bytes,
+                    0u64,
+                    last_row_id,
+                    entry_count,
+                    flags,
+                    header_len,
+                )
+            } else if version == RULES_FILE_VERSION_V3 {
+                if file_len < RULES_HEADER_FIXED_LEN_V3 as u64 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Rules file too small for v3 header: {}", file_len),
+                    ));
+                }
+
+                let mut rest = [0u8; RULES_HEADER_FIXED_LEN_V3 - 4];
+                rules_io.read_data_into_buffer(&mut pos, &mut rest).await?;
+                let mut fixed = [0u8; RULES_HEADER_FIXED_LEN_V3];
+                fixed[0..4].copy_from_slice(&ver);
+                fixed[4..].copy_from_slice(&rest);
+
+                let header_len = u32::from_le_bytes(fixed[4..8].try_into().unwrap()) as u64;
+                let pointers_len_bytes = u64::from_le_bytes(fixed[8..16].try_into().unwrap());
+                let pointers_fingerprint = u64::from_le_bytes(fixed[16..24].try_into().unwrap());
+                let last_row_id = u64::from_le_bytes(fixed[24..32].try_into().unwrap());
+                let entry_count = u32::from_le_bytes(fixed[32..36].try_into().unwrap()) as usize;
+                let flags = u32::from_le_bytes(fixed[36..40].try_into().unwrap());
+
+                (
+                    RULES_HEADER_FIXED_LEN_V3 as u64,
+                    pointers_len_bytes,
+                    pointers_fingerprint,
+                    last_row_id,
+                    entry_count,
+                    flags,
+                    header_len,
+                )
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Unsupported rules file version: {}", version),
+                ));
+            };
+
         if header_len < RULES_HEADER_FIXED_LEN_V2 as u64 || header_len > file_len {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -190,12 +254,7 @@ impl SemanticRuleStore {
             ));
         }
 
-        let pointers_len_bytes = u64::from_le_bytes(fixed[8..16].try_into().unwrap());
-        let last_row_id = u64::from_le_bytes(fixed[16..24].try_into().unwrap());
-        let entry_count = u32::from_le_bytes(fixed[24..28].try_into().unwrap()) as usize;
-        let flags = u32::from_le_bytes(fixed[28..32].try_into().unwrap());
-
-        let expected_header_len = (RULES_HEADER_FIXED_LEN_V2 as u64) + (entry_count as u64) * 24;
+        let expected_header_len = header_fixed_len + (entry_count as u64) * 24;
         if header_len != expected_header_len {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -209,7 +268,7 @@ impl SemanticRuleStore {
         let mut ranges: Vec<ColumnRulesRange> = Vec::with_capacity(entry_count);
         if entry_count != 0 {
             let mut buf = vec![0u8; (entry_count * 24) as usize];
-            let mut pos = RULES_HEADER_FIXED_LEN_V2 as u64;
+            let mut pos = header_fixed_len;
             rules_io.read_data_into_buffer(&mut pos, &mut buf).await?;
             for chunk in buf.chunks_exact(24) {
                 let column_schema_id = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
@@ -248,6 +307,7 @@ impl SemanticRuleStore {
         let meta = if (flags & RULES_HEADER_FLAG_META_PRESENT) != 0 {
             Some(ScanMeta {
                 pointers_len_bytes,
+                pointers_fingerprint,
                 last_row_id,
             })
         } else {

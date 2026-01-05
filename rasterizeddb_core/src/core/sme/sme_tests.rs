@@ -998,6 +998,7 @@ async fn sme_meta_appended_rows_included_when_no_rule_matches() {
 
     let meta = Some(crate::core::sme::rule_store::ScanMeta {
         pointers_len_bytes: 0,
+        pointers_fingerprint: 0,
         last_row_id: 3,
     });
 

@@ -46,6 +46,28 @@ const STRING_RULES_PER_COL: u64 = 6;
 /// metrics and instead conservatively over-approximate (to avoid false negatives).
 const STRING_METRIC_SCAN_CAP: usize = 8192;
 
+const POINTERS_FINGERPRINT_CHUNK: usize = 16 * 1024;
+
+async fn compute_pointers_fingerprint<S: StorageIO>(pointers_io: Arc<S>) -> std::io::Result<u64> {
+    use std::hash::Hasher;
+
+    let file_len = pointers_io.get_len().await;
+    let mut h = ahash::AHasher::default();
+    h.write_u64(file_len);
+
+    let mut pos = 0u64;
+    let mut buf = vec![0u8; POINTERS_FINGERPRINT_CHUNK];
+    while pos < file_len {
+        let remaining = (file_len - pos) as usize;
+        let to_read = std::cmp::min(remaining, buf.len());
+        let slice = &mut buf[..to_read];
+        pointers_io.read_data_into_buffer(&mut pos, slice).await?;
+        h.write(slice);
+    }
+
+    Ok(h.finish())
+}
+
 /// Spawns a periodic background task that scans a table and writes semantic rules to
 /// `TABLENAME_rules.db`.
 ///
@@ -72,14 +94,23 @@ pub fn spawn_table_rules_scanner<S: StorageIO>(
                 // Fast-path: if the pointers IO has not changed since the last scan,
                 // skip rebuilding the semantic rules map.
                 //
-                // In this codebase, inserts/updates/deletes are expected to append new
-                // row pointer records, which changes the pointers file length.
                 let cur_pointers_len = table_pointers_io.get_len().await;
                 if let Ok(Some(header)) = SemanticRuleStore::try_load_header_v2(rules_io.clone()).await {
                     if let Some(meta) = header.meta {
                         if meta.pointers_len_bytes == cur_pointers_len {
-                            tokio::time::sleep(interval).await;
-                            continue;
+                            // Length unchanged: could still be an in-place pointer mutation
+                            // (updates/deletes). Use a content fingerprint to detect that.
+                            //
+                            // For legacy v2 headers, pointers_fingerprint will be 0; treat
+                            // that as "unknown" and rebuild once to upgrade metadata.
+                            if meta.pointers_fingerprint != 0 {
+                                if let Ok(cur_fp) = compute_pointers_fingerprint(table_pointers_io.clone()).await {
+                                    if cur_fp == meta.pointers_fingerprint {
+                                        tokio::time::sleep(interval).await;
+                                        continue;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -293,6 +324,7 @@ async fn scan_once_build_rules<S: StorageIO>(
         // Still write a meta record so downstream knows we scanned.
         let meta = ScanMeta {
             pointers_len_bytes: pointers_io.get_len().await,
+            pointers_fingerprint: compute_pointers_fingerprint(pointers_io.clone()).await?,
             last_row_id: 0,
         };
         SemanticRuleStore::save_rules_atomic_with_meta(rules_io, Some(meta), &[]).await?;
@@ -304,6 +336,7 @@ async fn scan_once_build_rules<S: StorageIO>(
     let meta_stats = if numeric_cols.is_empty() {
         ScanMeta {
             pointers_len_bytes: pointers_io.get_len().await,
+            pointers_fingerprint: 0,
             last_row_id: 0,
         }
     } else {
@@ -413,6 +446,7 @@ async fn scan_once_build_rules<S: StorageIO>(
     // Use pointers IO len at *end* of scan (may have grown during scanning).
     let meta = ScanMeta {
         pointers_len_bytes: pointers_io.get_len().await,
+        pointers_fingerprint: compute_pointers_fingerprint(pointers_io.clone()).await?,
         last_row_id: std::cmp::max(last_row_id_fast, last_row_id_seen),
     };
 
@@ -759,6 +793,7 @@ async fn collect_numeric_stats<S: StorageIO>(
     Ok((
         ScanMeta {
             pointers_len_bytes: pointers_io.get_len().await,
+            pointers_fingerprint: 0,
             last_row_id,
         },
         row_fetch,

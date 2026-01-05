@@ -275,6 +275,7 @@ async fn scan_once_build_rules<S: StorageIO>(
         // Still write a meta record so downstream knows we scanned.
         let meta = ScanMeta {
             pointers_len_bytes: pointers_io.get_len().await,
+            pointers_fingerprint: 0,
             last_row_id: 0,
         };
         SemanticRuleStore::save_rules_atomic_with_meta(rules_io, Some(meta), &[]).await?;
@@ -286,6 +287,7 @@ async fn scan_once_build_rules<S: StorageIO>(
     let meta_stats = if numeric_cols.is_empty() {
         ScanMeta {
             pointers_len_bytes: pointers_io.get_len().await,
+            pointers_fingerprint: 0,
             last_row_id: 0,
         }
     } else {
@@ -395,6 +397,7 @@ async fn scan_once_build_rules<S: StorageIO>(
     // Use pointers IO len at *end* of scan (may have grown during scanning).
     let meta = ScanMeta {
         pointers_len_bytes: pointers_io.get_len().await,
+        pointers_fingerprint: 0,
         last_row_id: std::cmp::max(last_row_id_fast, last_row_id_seen),
     };
 
@@ -741,6 +744,7 @@ async fn collect_numeric_stats<S: StorageIO>(
     Ok((
         ScanMeta {
             pointers_len_bytes: pointers_io.get_len().await,
+            pointers_fingerprint: 0,
             last_row_id,
         },
         row_fetch,
