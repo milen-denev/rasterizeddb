@@ -179,7 +179,7 @@ impl TcpClient {
     pub async fn send(&mut self, data: Vec<u8>) -> Result<Vec<u8>, RastcpError> {
         // Connect if not connected
         if !self.is_connected() {
-            return Err(RastcpError::NotConnected);
+            self.connect().await?;
         }
 
         let stream = self.connection.as_mut().unwrap();
