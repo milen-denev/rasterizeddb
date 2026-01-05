@@ -1,4 +1,4 @@
-use log::warn;
+use log::{error, warn};
 use smallvec::SmallVec;
 
 use crate::core::row::row::{ColumnWritePayload, RowWrite};
@@ -178,7 +178,7 @@ pub fn insert_row_from_query_purpose(
             sql.trim_start_matches(|c: char| c.is_whitespace() || c == '\n' || c == '\r');
         let sql_upper = sql_trimmed.to_ascii_uppercase();
         if !sql_upper.starts_with("INSERT INTO") {
-            warn!("Invalid SQL query: {}", sql);
+            error!("INSERT parse failed: query does not start with INSERT INTO. prefix={:?}", sql_trimmed.chars().take(80).collect::<String>());
             return None;
         }
         let sql = sql_trimmed;
@@ -263,17 +263,59 @@ pub fn insert_row_from_query_purpose(
         }
 
         // Find columns block after "INSERT INTO table_name"
-        let insert_kw = sql_upper.find("INSERT INTO")?;
+        let insert_kw = match sql_upper.find("INSERT INTO") {
+            Some(v) => v,
+            None => {
+                error!("INSERT parse failed: could not find INSERT INTO keyword. prefix={:?}", sql_trimmed.chars().take(120).collect::<String>());
+                return None;
+            }
+        };
         // Skip table name: find first '(' after "INSERT INTO"
-        let table_paren_start = sql[insert_kw..].find('(')? + insert_kw;
-        let (col_start, col_end) = extract_paren_block(sql, '(', ')', table_paren_start)?;
+        let table_paren_start = match sql[insert_kw..].find('(') {
+            Some(v) => v + insert_kw,
+            None => {
+                error!("INSERT parse failed: missing column list parentheses after INSERT INTO. prefix={:?}", sql_trimmed.chars().take(200).collect::<String>());
+                return None;
+            }
+        };
+        let (col_start, col_end) = match extract_paren_block(sql, '(', ')', table_paren_start) {
+            Some(v) => v,
+            None => {
+                error!("INSERT parse failed: could not extract column list parentheses block. prefix={:?}", sql_trimmed.chars().take(200).collect::<String>());
+                return None;
+            }
+        };
         let columns_str = &sql[col_start + 1..col_end];
 
         // Find values block after "VALUES"
-        let values_kw = sql_upper.find("VALUES")?;
-        let values_kw_real = values_kw + sql[values_kw..].to_ascii_lowercase().find("values")?;
-        let values_paren_start = sql[values_kw_real..].find('(')? + values_kw_real;
-        let (val_start, val_end) = extract_paren_block(sql, '(', ')', values_paren_start)?;
+        let values_kw = match sql_upper.find("VALUES") {
+            Some(v) => v,
+            None => {
+                error!("INSERT parse failed: missing VALUES keyword. prefix={:?}", sql_trimmed.chars().take(200).collect::<String>());
+                return None;
+            }
+        };
+        let values_kw_real = match sql[values_kw..].to_ascii_lowercase().find("values") {
+            Some(v) => values_kw + v,
+            None => {
+                error!("INSERT parse failed: could not locate VALUES keyword in original query. prefix={:?}", sql_trimmed.chars().take(200).collect::<String>());
+                return None;
+            }
+        };
+        let values_paren_start = match sql[values_kw_real..].find('(') {
+            Some(v) => v + values_kw_real,
+            None => {
+                error!("INSERT parse failed: missing VALUES(...) parentheses. prefix={:?}", sql_trimmed.chars().take(220).collect::<String>());
+                return None;
+            }
+        };
+        let (val_start, val_end) = match extract_paren_block(sql, '(', ')', values_paren_start) {
+            Some(v) => v,
+            None => {
+                error!("INSERT parse failed: could not extract VALUES parentheses block. prefix={:?}", sql_trimmed.chars().take(220).collect::<String>());
+                return None;
+            }
+        };
         let values_str = &sql[val_start + 1..val_end];
 
         // Parse columns (simple split since column names shouldn't contain commas)
@@ -288,7 +330,7 @@ pub fn insert_row_from_query_purpose(
         let values = parse_csv_values(values_str);
 
         if columns.len() != values.len() {
-            warn!(
+            error!(
                 "INSERT parse failed: columns/values count mismatch (columns={}, values={}). values_str_len={} columns_str_len={} sql_prefix={:?}",
                 columns.len(),
                 values.len(),
@@ -304,7 +346,7 @@ pub fn insert_row_from_query_purpose(
         for (col_name, value) in columns.iter().zip(values.iter()) {
             // Find schema field
             let Some(schema_field) = schema.iter().find(|f| f.name == *col_name) else {
-                warn!(
+                error!(
                     "INSERT parse failed: column {:?} not found in schema (schema_fields={:?})",
                     col_name,
                     schema.iter().map(|f| f.name.as_str()).collect::<Vec<_>>()

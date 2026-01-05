@@ -84,7 +84,11 @@ pub struct RowPointerIterator<S: StorageIO> {
 impl<S: StorageIO> RowPointerIterator<S> {
     /// Create a new RowPointerIterator for the given StorageIO
     pub async fn new(io: Arc<S>) -> Result<Self> {
-        let total_length = io.get_len().await as usize;
+        // Only consider fully written pointers; callers may append concurrently.
+        let total_length = {
+            let len = io.get_len().await as usize;
+            len - (len % TOTAL_LENGTH)
+        };
 
         let buffer_size = if total_length > CHUNK_SIZE {
             CHUNK_SIZE
@@ -128,8 +132,9 @@ impl<S: StorageIO> RowPointerIterator<S> {
     /// while the iterator is reading.
     pub async fn refresh_total_length(&mut self) {
         let new_len = self.io.get_len().await as usize;
-        if new_len > self.total_length {
-            self.total_length = new_len;
+        let aligned = new_len - (new_len % TOTAL_LENGTH);
+        if aligned > self.total_length {
+            self.total_length = aligned;
             // If we previously marked end_of_data but there is more data now, continue.
             if self.position < self.total_length as u64 {
                 self.end_of_data = false;
@@ -159,6 +164,7 @@ impl<S: StorageIO> RowPointerIterator<S> {
     async fn load_next_chunk(&mut self) -> Result<()> {
         // Reset buffer index
         self.buffer_index = 0;
+        self.buffer_valid_length = 0;
 
         // Check if we've reached the end of the storage
         if self.position >= self.total_length as u64 {
@@ -166,20 +172,43 @@ impl<S: StorageIO> RowPointerIterator<S> {
             return Ok(());
         }
 
-        // Calculate how many bytes to read (may be less than CHUNK_SIZE at the end)
+        // Calculate how many bytes to read (may be less than CHUNK_SIZE at the end).
+        // Always read whole pointer records.
         let bytes_remaining = self.total_length as u64 - self.position;
-        let bytes_to_read = std::cmp::min(bytes_remaining, CHUNK_SIZE as u64);
+        if bytes_remaining < TOTAL_LENGTH as u64 {
+            self.end_of_data = true;
+            return Ok(());
+        }
+
+        let bytes_to_read_raw = std::cmp::min(bytes_remaining, CHUNK_SIZE as u64);
+        let bytes_to_read = bytes_to_read_raw - (bytes_to_read_raw % (TOTAL_LENGTH as u64));
+        if bytes_to_read == 0 {
+            self.end_of_data = true;
+            return Ok(());
+        }
 
         // Clear the buffer and ensure capacity
         self.buffer = MEMORY_POOL.acquire(bytes_to_read as usize);
 
         // Read data into the buffer
         let mut read_position = self.position;
-        _ = self
+        match self
             .io
             .read_data_into_buffer(&mut read_position, &mut self.buffer.into_slice_mut())
-            .await;
-        self.buffer_valid_length = self.buffer.into_slice().len();
+            .await
+        {
+            Ok(()) => {
+                self.buffer_valid_length = bytes_to_read as usize;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                // Treat as a transient end-of-data (e.g., concurrent append/flush races).
+                // Caller may refresh_total_length() and resume later.
+                self.end_of_data = true;
+                self.buffer_valid_length = 0;
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
+        }
 
         // Update position for next read
         self.position += bytes_to_read;
@@ -189,39 +218,36 @@ impl<S: StorageIO> RowPointerIterator<S> {
 
     /// Get the next RowPointer from the buffer, loading a new chunk if necessary
     pub async fn next_row_pointer(&mut self) -> Result<Option<RowPointer>> {
-        // If we've reached the end of the data, return None
-        if self.end_of_data {
-            return Ok(None);
-        }
-
-        // If we've reached the end of the current buffer, load the next chunk
-        if self.buffer_index >= self.buffer_valid_length {
-            self.load_next_chunk().await?;
-
-            // If loading the next chunk reached the end of data, return None
+        loop {
+            // If we've reached the end of the data, return None
             if self.end_of_data {
                 return Ok(None);
             }
-        }
 
-        let mut slice: [u8; TOTAL_LENGTH] = [0; TOTAL_LENGTH];
+            // If we don't have a full pointer record available, load the next chunk.
+            if self.buffer_index + TOTAL_LENGTH > self.buffer_valid_length {
+                self.load_next_chunk().await?;
+                if self.end_of_data {
+                    return Ok(None);
+                }
+            }
 
-        // Parse the RowPointer from the buffer
-        slice.copy_from_slice(
-            &self.buffer.into_slice()[self.buffer_index..self.buffer_index + TOTAL_LENGTH],
-        );
-        let row_pointer = RowPointer::from_slice(&slice);
+            let mut slice: [u8; TOTAL_LENGTH] = [0; TOTAL_LENGTH];
+            slice.copy_from_slice(
+                &self.buffer.into_slice()[self.buffer_index..self.buffer_index + TOTAL_LENGTH],
+            );
 
-        if row_pointer.deleted {
-            // If the row is deleted, skip it and return None
+            // Advance the buffer index before any early-continue.
             self.buffer_index += TOTAL_LENGTH;
-            return Ok(None);
+
+            let row_pointer = RowPointer::from_slice(&slice);
+            if row_pointer.deleted {
+                // Skip deleted pointers; keep scanning within the same chunk.
+                continue;
+            }
+
+            return Ok(Some(row_pointer));
         }
-
-        // Advance the buffer index
-        self.buffer_index += TOTAL_LENGTH;
-
-        Ok(Some(row_pointer))
     }
 
     /// Get multiple RowPointers at once, up to BATCH_SIZE
@@ -488,7 +514,7 @@ impl RowPointer {
 
     /// Serializes the RowPointer into a Vec<u8>
     pub fn into_memory_block(&self) -> MemoryBlock {
-        let block = MEMORY_POOL.acquire(TOTAL_LENGTH as usize);
+        let mut block = MEMORY_POOL.acquire(TOTAL_LENGTH as usize);
         let slice = block.into_slice_mut();
 
         debug_assert!(slice.len() == TOTAL_LENGTH, "Buffer size mismatch");
@@ -1140,6 +1166,171 @@ mod tests {
         row::row::{ColumnFetchingData, ColumnWritePayload},
         storage_providers::mock_file_sync::MockStorageProvider,
     };
+
+    #[derive(Clone)]
+    struct InMemoryIo {
+        data: std::sync::Arc<Vec<u8>>,
+    }
+
+    impl crate::core::storage_providers::traits::StorageIO for InMemoryIo {
+        async fn verify_data(&self, _position: u64, _buffer: &[u8]) -> bool {
+            true
+        }
+
+        async fn write_data(&self, _position: u64, _buffer: &[u8]) {}
+
+        async fn write_data_seek(&self, _seek: std::io::SeekFrom, _buffer: &[u8]) {}
+
+        async fn read_data_into_buffer(
+            &self,
+            position: &mut u64,
+            buffer: &mut [u8],
+        ) -> std::result::Result<(), std::io::Error> {
+            let start = *position as usize;
+            let end = start.saturating_add(buffer.len());
+            if end > self.data.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "InMemoryIo EOF",
+                ));
+            }
+            buffer.copy_from_slice(&self.data[start..end]);
+            *position += buffer.len() as u64;
+            Ok(())
+        }
+
+        async fn read_vectored(
+            &self,
+            reads: &mut [(u64, &mut [u8])],
+        ) -> std::result::Result<(), std::io::Error> {
+            for (pos, buf) in reads {
+                let mut p = *pos;
+                self.read_data_into_buffer(&mut p, buf).await?;
+            }
+            Ok(())
+        }
+
+        async fn append_data(&self, _buffer: &[u8], _immediate: bool) {}
+
+        async fn get_len(&self) -> u64 {
+            self.data.len() as u64
+        }
+
+        fn exists(_location: &str, _table_name: &str) -> bool {
+            false
+        }
+
+        async fn create_temp(&self) -> Self {
+            self.clone()
+        }
+
+        async fn swap_temp(&self, _temp_io_sync: &mut Self) {}
+
+        fn get_location(&self) -> Option<String> {
+            None
+        }
+
+        async fn create_new(&self, _name: String) -> Self {
+            self.clone()
+        }
+
+        fn drop_io(&self) {}
+
+        fn get_hash(&self) -> u32 {
+            0
+        }
+
+        async fn start_service(&self) {}
+
+        fn get_name(&self) -> String {
+            "InMemoryIo".to_string()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_row_pointer_iterator_ignores_partial_trailing_bytes() {
+        // One valid pointer record, then some trailing bytes that don't make a full record.
+        let pointer = create_test_row_pointer(1, 100, 50, false);
+        let block = pointer.into_memory_block();
+        let mut bytes = block.into_slice().to_vec();
+        bytes.extend_from_slice(&[1, 2, 3, 4, 5]);
+
+        let io = Arc::new(InMemoryIo {
+            data: std::sync::Arc::new(bytes),
+        });
+        let mut iterator = RowPointerIterator::new(io).await.unwrap();
+
+        let p1 = iterator.next_row_pointer().await.unwrap().unwrap();
+        assert_eq!(p1.id, 1);
+        assert_eq!(p1.position, 100);
+        assert_eq!(p1.deleted, false);
+
+        let p2 = iterator.next_row_pointer().await.unwrap();
+        assert!(p2.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_row_pointer_iterator_stops_on_unexpected_eof_without_garbage() {
+        #[derive(Clone)]
+        struct AlwaysEofIo;
+
+        impl crate::core::storage_providers::traits::StorageIO for AlwaysEofIo {
+            async fn verify_data(&self, _position: u64, _buffer: &[u8]) -> bool {
+                true
+            }
+            async fn write_data(&self, _position: u64, _buffer: &[u8]) {}
+            async fn write_data_seek(&self, _seek: std::io::SeekFrom, _buffer: &[u8]) {}
+            async fn read_data_into_buffer(
+                &self,
+                _position: &mut u64,
+                _buffer: &mut [u8],
+            ) -> std::result::Result<(), std::io::Error> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "AlwaysEofIo",
+                ))
+            }
+            async fn read_vectored(
+                &self,
+                _reads: &mut [(u64, &mut [u8])],
+            ) -> std::result::Result<(), std::io::Error> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "AlwaysEofIo",
+                ))
+            }
+            async fn append_data(&self, _buffer: &[u8], _immediate: bool) {}
+            async fn get_len(&self) -> u64 {
+                TOTAL_LENGTH as u64
+            }
+            fn exists(_location: &str, _table_name: &str) -> bool {
+                false
+            }
+            async fn create_temp(&self) -> Self {
+                self.clone()
+            }
+            async fn swap_temp(&self, _temp_io_sync: &mut Self) {}
+            fn get_location(&self) -> Option<String> {
+                None
+            }
+            async fn create_new(&self, _name: String) -> Self {
+                self.clone()
+            }
+            fn drop_io(&self) {}
+            fn get_hash(&self) -> u32 {
+                0
+            }
+            async fn start_service(&self) {}
+            fn get_name(&self) -> String {
+                "AlwaysEofIo".to_string()
+            }
+        }
+
+        let io = Arc::new(AlwaysEofIo);
+        let mut iterator = RowPointerIterator::new(io).await.unwrap();
+        let next = iterator.next_row_pointer().await.unwrap();
+        assert!(next.is_none());
+    }
 
     fn create_string_column(data: &str, write_order: u32) -> ColumnWritePayload {
         let string_bytes = data.as_bytes();

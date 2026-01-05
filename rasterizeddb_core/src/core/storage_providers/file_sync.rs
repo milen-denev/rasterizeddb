@@ -581,8 +581,9 @@ impl LocalStorageProvider {
 
     #[inline(always)]
     fn load_file_len(&self) -> u64 {
-        // If writers publish length with Release, Acquire here would be stricter.
-        self.file_len.load(Ordering::Relaxed)
+        // Writers publish length with Release; use Acquire to avoid seeing stale lengths
+        // that can produce spurious UnexpectedEof under concurrency.
+        self.file_len.load(Ordering::Acquire)
     }
 
     #[inline(always)]
@@ -939,11 +940,10 @@ impl StorageIO for LocalStorageProvider {
             _ = std::fs::create_dir_all(location_path);
         }
 
-        let final_location = if self.location.ends_with(delimiter) {
-            self.location[self.location.len() - 1..].replace(delimiter, "")
-        } else {
-            format!("{}", self.location)
-        };
+        let final_location = self
+            .location
+            .trim_end_matches(|c| c == '\\' || c == '/')
+            .to_string();
 
         let file_str = format!("{}{}{}", final_location, delimiter, "temp.db");
 
@@ -1082,11 +1082,10 @@ impl StorageIO for LocalStorageProvider {
             _ = std::fs::create_dir_all(location_path);
         }
 
-        let final_location = if self.location.ends_with(delimiter) {
-            self.location[self.location.len() - 1..].replace(delimiter, "")
-        } else {
-            format!("{}", self.location)
-        };
+        let final_location = self
+            .location
+            .trim_end_matches(|c| c == '\\' || c == '/')
+            .to_string();
 
         let new_table = format!("{}{}{}", final_location, delimiter, name);
         let file_path = Path::new(&new_table);

@@ -503,7 +503,9 @@ impl TableSchema {
 
     pub async fn save<S: StorageIO>(&self, schema_io: Arc<S>) -> io::Result<()> {
         let data = self.into_vec();
-        schema_io.append_data(&data, false).await;
+        // Schema is small and critical; persist immediately so CREATE TABLE is durable
+        // even if the process crashes before any background flush runs.
+        schema_io.append_data(&data, true).await;
         Ok(())
     }
 
