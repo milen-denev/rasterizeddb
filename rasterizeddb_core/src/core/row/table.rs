@@ -1,4 +1,6 @@
 use log::{error, info};
+use itertools::Itertools;
+use smallvec::SmallVec;
 use std::io::Result;
 use std::{
     io,
@@ -19,6 +21,9 @@ use crate::core::{
     },
     storage_providers::traits::StorageIO,
 };
+
+use crate::core::row::row::{ColumnFetchingData, ColumnWritePayload};
+use crate::core::row::schema::SchemaCalculator;
 
 use std::time::Duration;
 
@@ -192,5 +197,186 @@ impl<S: StorageIO> Table<S> {
         info!("Query executed, returning {} rows", rows.len());
 
         return Ok(rows);
+    }
+
+    fn build_full_row_fetch(schema_fields: &SmallVec<[SchemaField; 20]>) -> RowFetch {
+        let schema_calc = SchemaCalculator::default();
+        let mut columns_fetching_data = smallvec::SmallVec::new();
+        for field in schema_fields
+            .iter()
+            .sorted_by(|a, b| a.write_order.cmp(&b.write_order))
+        {
+            let offset = schema_calc.calculate_schema_offset(&field.name, schema_fields);
+            columns_fetching_data.push(ColumnFetchingData {
+                column_offset: offset.0,
+                column_type: field.db_type.clone(),
+                size: field.size,
+                schema_id: offset.1,
+            });
+        }
+        RowFetch {
+            columns_fetching_data,
+        }
+    }
+
+    pub async fn delete_rows(
+        &self,
+        where_clause: &str,
+        query_row_fetch: RowFetch,
+        limit: Option<u64>,
+    ) -> Result<u64> {
+        info!("Deleting rows");
+
+        let mut iterator = RowPointerIterator::new(self.io_pointers.clone())
+            .await
+            .unwrap();
+
+        let matches = self
+            .concurrent_processor
+            .process_row_pointers(
+                &self.schema.name,
+                where_clause,
+                query_row_fetch,
+                &self.schema.fields,
+                self.io_rows.clone(),
+                &mut iterator,
+                limit,
+            )
+            .await;
+
+        let mut deleted_count: u64 = 0;
+        for mut pwo in matches.into_iter() {
+            if pwo.pointer.deleted {
+                continue;
+            }
+
+            if let Err(e) = pwo
+                .pointer
+                .delete(self.io_pointers.clone(), pwo.pointer_record_pos)
+                .await
+            {
+                error!("Failed to delete row pointer {:?}: {}", pwo.pointer, e);
+                continue;
+            }
+
+            deleted_count = deleted_count.saturating_add(1);
+        }
+
+        Ok(deleted_count)
+    }
+
+    pub async fn update_rows(
+        &self,
+        where_clause: &str,
+        query_row_fetch: RowFetch,
+        updates: smallvec::SmallVec<[ColumnWritePayload; 32]>,
+        limit: Option<u64>,
+    ) -> Result<u64> {
+        info!("Updating rows");
+
+        let mut iterator = RowPointerIterator::new(self.io_pointers.clone())
+            .await
+            .unwrap();
+
+        let matches = self
+            .concurrent_processor
+            .process_row_pointers(
+                &self.schema.name,
+                where_clause,
+                query_row_fetch,
+                &self.schema.fields,
+                self.io_rows.clone(),
+                &mut iterator,
+                limit,
+            )
+            .await;
+
+        let full_fetch = Self::build_full_row_fetch(&self.schema.fields);
+
+        let mut updated_count: u64 = 0;
+        let mut row = Row::default();
+
+        for pwo in matches.into_iter() {
+            if pwo.pointer.deleted {
+                continue;
+            }
+
+            // Load full row so we can merge updates.
+            if pwo
+                .pointer
+                .fetch_row_reuse_async(self.io_rows.clone(), &full_fetch, &mut row)
+                .await
+                .is_err()
+            {
+                continue;
+            }
+
+            // Build RowWrite from the existing row (all columns), keyed by write_order.
+            let mut row_write = RowWrite {
+                columns_writing_data: smallvec::SmallVec::new(),
+            };
+
+            for field in self
+                .schema
+                .fields
+                .iter()
+                .sorted_by(|a, b| a.write_order.cmp(&b.write_order))
+            {
+                let write_order = field.write_order as u32;
+                let col = row
+                    .columns
+                    .iter()
+                    .find(|c| c.schema_id as u32 == write_order);
+
+                if let Some(col) = col {
+                    row_write.columns_writing_data.push(ColumnWritePayload {
+                        data: col.data.clone(),
+                        write_order,
+                        column_type: field.db_type.clone(),
+                        size: field.size,
+                    });
+                } else {
+                    // Missing columns shouldn't normally happen for a full fetch; treat as empty.
+                    row_write.columns_writing_data.push(ColumnWritePayload {
+                        data: crate::memory_pool::MemoryBlock::default(),
+                        write_order,
+                        column_type: field.db_type.clone(),
+                        size: field.size,
+                    });
+                }
+            }
+
+            // Apply updates in-place in the RowWrite payloads.
+            for upd in updates.iter() {
+                if let Some(existing) = row_write
+                    .columns_writing_data
+                    .iter_mut()
+                    .find(|c| c.write_order == upd.write_order)
+                {
+                    existing.data = upd.data.clone();
+                    existing.column_type = upd.column_type.clone();
+                    existing.size = upd.size;
+                }
+            }
+
+            let mut pointer = pwo.pointer.clone();
+
+            let update_result = pointer
+                .update(
+                    self.io_pointers.clone(),
+                    self.io_rows.clone(),
+                    pwo.pointer_record_pos,
+                    &self.last_row_id,
+                    &self.len,
+                    &row_write,
+                )
+                .await;
+
+            if update_result.is_ok() {
+                updated_count = updated_count.saturating_add(1);
+            }
+        }
+
+        Ok(updated_count)
     }
 }

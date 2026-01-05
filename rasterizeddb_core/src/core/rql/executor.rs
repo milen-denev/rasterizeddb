@@ -6,6 +6,8 @@ use crate::core::{
     database::Database, row::row::rows_into_vec, rql::{
         lexer_ct::create_table_from_query_purpose, lexer_ir::insert_row_from_query_purpose,
         lexer_query::row_fetch_from_select_query, lexer_s1::QueryPurpose,
+        lexer_ur::update_row_from_query_purpose,
+        lexer_dr::delete_row_from_query_purpose,
     }
 };
 
@@ -110,12 +112,159 @@ pub async fn execute(query: QueryPurpose, database: Arc<Database>) -> Vec<u8> {
             }
         }
         QueryPurpose::UpdateRow(_) => {
-            // Handle update row
-            todo!("Handle update row");
+            let schema_fields;
+
+            // Parse UPDATE ... using schema
+            // We need the table to obtain schema, so first read the table name in a lightweight way.
+            let table_name = match &query {
+                QueryPurpose::UpdateRow(sql) => sql.split_whitespace().nth(1).unwrap_or("").trim_matches('"').to_string(),
+                _ => String::new(),
+            };
+
+            if table_name.is_empty() {
+                error!("UPDATE missing table name");
+                let mut result: [u8; 1] = [1u8; 1];
+                result[0] = 3;
+                let mut result = result.to_vec();
+                let error_message = "UPDATE missing table name";
+                result.extend_from_slice(error_message.as_bytes());
+                return result;
+            }
+
+            let table_ref = database.tables.get(&table_name);
+            let table_clone = table_ref.as_ref().clone();
+            let table = if let Some(table) = table_clone {
+                table
+            } else {
+                error!("Table not found");
+                let mut result: [u8; 1] = [1u8; 1];
+                result[0] = 3;
+                let mut result = result.to_vec();
+                let error_message = "Table not found";
+                result.extend_from_slice(error_message.as_bytes());
+                return result;
+            };
+
+            schema_fields = &table.schema.fields;
+
+            let schema_sv = schema_fields
+                .iter()
+                .cloned()
+                .collect::<smallvec::SmallVec<[crate::core::row::schema::SchemaField; 20]>>();
+
+            let update_plan = if let Some(plan) = update_row_from_query_purpose(&query, &schema_sv) {
+                plan
+            } else {
+                error!("Cannot parse UPDATE query");
+                let mut result: [u8; 1] = [1u8; 1];
+                result[0] = 3;
+                let mut result = result.to_vec();
+                let error_message = "Cannot parse UPDATE query";
+                result.extend_from_slice(error_message.as_bytes());
+                return result;
+            };
+
+            match table
+                .update_rows(
+                    &update_plan.where_clause,
+                    update_plan.query_row_fetch,
+                    update_plan.updates,
+                    None,
+                )
+                .await
+            {
+                Ok(n) => {
+                    info!("Updated {} rows", n);
+                    let mut result: [u8; 1] = [0u8; 1];
+                    result[0] = 0;
+                    return result.to_vec();
+                }
+                Err(e) => {
+                    error!("Failed to update rows: {}", e);
+                    let mut result: [u8; 1] = [1u8; 1];
+                    result[0] = 3;
+                    let mut result = result.to_vec();
+                    let error_message = "Error occurred";
+                    result.extend_from_slice(error_message.as_bytes());
+                    return result;
+                }
+            }
         }
         QueryPurpose::DeleteRow(_) => {
-            // Handle delete row
-            todo!("Handle delete row");
+            // Parse DELETE ... using schema
+            let table_name = match &query {
+                QueryPurpose::DeleteRow(sql) => sql
+                    .split_whitespace()
+                    .nth(2)
+                    .unwrap_or("")
+                    .trim_matches('"')
+                    .to_string(),
+                _ => String::new(),
+            };
+
+            if table_name.is_empty() {
+                error!("DELETE missing table name");
+                let mut result: [u8; 1] = [1u8; 1];
+                result[0] = 3;
+                let mut result = result.to_vec();
+                let error_message = "DELETE missing table name";
+                result.extend_from_slice(error_message.as_bytes());
+                return result;
+            }
+
+            let table_ref = database.tables.get(&table_name);
+            let table_clone = table_ref.as_ref().clone();
+            let table = if let Some(table) = table_clone {
+                table
+            } else {
+                error!("Table not found");
+                let mut result: [u8; 1] = [1u8; 1];
+                result[0] = 3;
+                let mut result = result.to_vec();
+                let error_message = "Table not found";
+                result.extend_from_slice(error_message.as_bytes());
+                return result;
+            };
+
+            let schema_sv = table
+                .schema
+                .fields
+                .iter()
+                .cloned()
+                .collect::<smallvec::SmallVec<[crate::core::row::schema::SchemaField; 20]>>();
+
+            let delete_plan = if let Some(plan) = delete_row_from_query_purpose(&query, &schema_sv) {
+                plan
+            } else {
+                error!("Cannot parse DELETE query");
+                let mut result: [u8; 1] = [1u8; 1];
+                result[0] = 3;
+                let mut result = result.to_vec();
+                let error_message = "Cannot parse DELETE query";
+                result.extend_from_slice(error_message.as_bytes());
+                return result;
+            };
+
+            match table
+                .delete_rows(&delete_plan.where_clause, delete_plan.query_row_fetch, None)
+                .await
+            {
+                Ok(n) => {
+                    info!("Deleted {} rows", n);
+                    let mut result: [u8; 1] = [0u8; 1];
+                    result[0] = 0;
+                    return result.to_vec();
+                }
+                Err(e) => {
+                    error!("Failed to delete rows: {}", e);
+                    let mut result: [u8; 1] = [1u8; 1];
+                    result[0] = 3;
+                    let mut result = result.to_vec();
+                    let error_message = "Error occurred";
+                    result.extend_from_slice(error_message.as_bytes());
+                    return result;
+                }
+            }
         }
         QueryPurpose::QueryRows(query_rows) => {
             // Handle query rows
