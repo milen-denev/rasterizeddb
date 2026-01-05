@@ -66,6 +66,17 @@ impl SemanticMappingEngine {
         self.candidates.remove(&key);
     }
 
+    /// Clears all cached candidate sets.
+    ///
+    /// Candidate sets are derived from semantic rules + current pointer state.
+    /// After INSERT/UPDATE/DELETE, cached candidates may be stale (e.g. may still
+    /// include tombstoned pointers), so callers should invalidate.
+    pub fn clear_candidates(&self) -> usize {
+        let n = self.candidates.len();
+        self.candidates.clear();
+        n
+    }
+
     /// Returns cached candidates if present; otherwise attempts to build candidates
     /// from the persisted semantic rules for this table.
     ///

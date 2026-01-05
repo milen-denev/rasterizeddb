@@ -12,7 +12,9 @@ use rclite::Arc;
 use super::schema::TableSchema;
 use crate::core::processor::concurrent_processor::ConcurrentProcessor;
 use crate::core::rql::lexer_ct::CreateColumnData;
+use crate::core::processor::concurrent_processor::{ATOMIC_CACHE, ENABLE_CACHE};
 use crate::core::sme::scanner::spawn_table_rules_scanner;
+use crate::core::sme::semantic_mapping_engine::SME;
 use crate::core::{
     row::{
         row::{Row, RowFetch, RowWrite},
@@ -42,6 +44,23 @@ unsafe impl<S: StorageIO> Send for Table<S> {}
 unsafe impl<S: StorageIO> Sync for Table<S> {}
 
 impl<S: StorageIO> Table<S> {
+    #[inline]
+    fn invalidate_query_caches(&self) {
+        // Query-result cache (WHERE -> Vec<RowPointer>) lives across queries.
+        // Since deletes/updates tombstone pointers (but don't remove row bytes),
+        // cached pointers can cause deleted rows to reappear until restart.
+        if ENABLE_CACHE.get().copied().unwrap_or(false) {
+            if let Some(cache) = ATOMIC_CACHE.get() {
+                _ = cache.clear();
+            }
+        }
+
+        // SME candidate cache can also go stale across mutations.
+        if let Some(engine) = SME.get() {
+            _ = engine.clear_candidates();
+        }
+    }
+
     pub async fn new(table_name: &str, initial_io: Arc<S>, columns: Vec<CreateColumnData>) -> Self {
         let io_pointers = Arc::new(
             initial_io
@@ -159,6 +178,8 @@ impl<S: StorageIO> Table<S> {
             info!("Successfully inserted row with pointer: {:?}", row_pointer);
         }
 
+        self.invalidate_query_caches();
+
         return Ok(());
     }
 
@@ -260,6 +281,10 @@ impl<S: StorageIO> Table<S> {
             }
 
             deleted_count = deleted_count.saturating_add(1);
+        }
+
+        if deleted_count > 0 {
+            self.invalidate_query_caches();
         }
 
         Ok(deleted_count)
@@ -375,6 +400,10 @@ impl<S: StorageIO> Table<S> {
             if update_result.is_ok() {
                 updated_count = updated_count.saturating_add(1);
             }
+        }
+
+        if updated_count > 0 {
+            self.invalidate_query_caches();
         }
 
         Ok(updated_count)

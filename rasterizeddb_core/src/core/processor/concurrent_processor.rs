@@ -74,6 +74,7 @@ impl ConcurrentProcessor {
     }
 
     async fn try_collect_cached_rows<S: StorageIO>(
+        table_name: &str,
         where_query: &str,
         requested_row_fetch: &RowFetch,
         io_rows: &Arc<S>,
@@ -83,7 +84,7 @@ impl ConcurrentProcessor {
             return None;
         }
 
-        let crc64_hash = CRC_64.checksum(where_query.as_bytes());
+        let crc64_hash = CRC_64.checksum(table_name.as_bytes()) ^ CRC_64.checksum(where_query.as_bytes());
         let cache = ATOMIC_CACHE.get().unwrap();
         let entries = cache.get(&crc64_hash)?;
 
@@ -561,7 +562,7 @@ impl ConcurrentProcessor {
 
         // Cache fast-path (if enabled)
         if let Some((_hash, rows)) =
-            Self::try_collect_cached_rows(where_query, &requested_row_fetch, &io_rows).await
+            Self::try_collect_cached_rows(table_name, where_query, &requested_row_fetch, &io_rows).await
         {
             return rows;
         }
@@ -592,7 +593,7 @@ impl ConcurrentProcessor {
         let io_rows_outer = Arc::clone(&io_rows);
 
         let crc64_hash = if *ENABLE_CACHE.get().unwrap() {
-            CRC_64.checksum(where_query.as_bytes())
+            CRC_64.checksum(table_name.as_bytes()) ^ CRC_64.checksum(where_query.as_bytes())
         } else {
             0
         };
