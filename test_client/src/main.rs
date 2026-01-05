@@ -6,10 +6,19 @@ use log::LevelFilter;
 use rand::Rng;
 use rasterizeddb_core::{
     client::DbClient,
-    core::{ db_type::DbType, row::row::vec_into_rows, support_types::QueryExecutionResult},
+    core::{
+        db_type::DbType,
+        row::{
+            row::{vec_into_rows, ColumnWritePayload, RowWrite},
+            row_pointer::RowPointer,
+        },
+        storage_providers::traits::StorageIO,
+        support_types::QueryExecutionResult,
+    },
 };
 use std::{
     io::stdin,
+    sync::atomic::AtomicU64,
     sync::Arc,
 };
 
@@ -21,11 +30,11 @@ async fn main() -> std::io::Result<()> {
         .init();
 
     loop {
-        let client = Arc::new(DbClient::new(Some("127.0.0.1")).await.unwrap());
-
         let choice = prompt_menu_choice();
         match choice {
             1 => {
+                let client = Arc::new(DbClient::new(Some("127.0.0.1")).await.unwrap());
+
                 let create_result = create_table(&client).await;
                 println!("Create result: {:?}", create_result);
                 pause("Press any key to continue...");
@@ -34,14 +43,22 @@ async fn main() -> std::io::Result<()> {
                 run_queries(&client).await;
             }
             2 => {
+                let client = Arc::new(DbClient::new(Some("127.0.0.1")).await.unwrap());
+
                 pause("Press any key to continue...");
                 insert_rows(&client).await;
                 pause("Press any key to continue...");
                 run_queries(&client).await;
             }
             3 => {
+                let client = Arc::new(DbClient::new(Some("127.0.0.1")).await.unwrap());
+
                 pause("Press any key to continue...");
                 run_queries(&client).await;
+            }
+            4 => {
+                pause("Press any key to start generating 5,000,000 rows...");
+                generate_rows_and_pointers_to_disk().await?;
             }
             _ => unreachable!(),
         }
@@ -59,20 +76,317 @@ fn prompt_menu_choice() -> u8 {
         "Choose an option:\n\
 1. Create Table, Add rows and query\n\
 2. Add rows and Query\n\
-3. Query only\n"
+3. Query only\n\
+4. Generate 5,000,000 rows + pointers to disk (in-memory build)\n"
     );
 
     loop {
-        println!("Enter 1, 2, or 3:");
+        println!("Enter 1, 2, 3, or 4:");
         let mut buffer = String::new();
         stdin().read_line(&mut buffer).unwrap();
         match buffer.trim() {
             "1" => return 1,
             "2" => return 2,
             "3" => return 3,
+            "4" => return 4,
             _ => println!("Invalid choice."),
         }
     }
+}
+
+#[derive(Clone)]
+struct InMemoryVecStorage {
+    data: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    name: String,
+    hash: u32,
+}
+
+impl InMemoryVecStorage {
+    fn new(name: &str, initial_capacity: usize) -> Self {
+        Self {
+            data: std::sync::Arc::new(std::sync::Mutex::new(Vec::with_capacity(initial_capacity))),
+            name: name.to_string(),
+            hash: 0,
+        }
+    }
+
+    fn take_all(&self) -> Vec<u8> {
+        let mut guard = self.data.lock().unwrap();
+        std::mem::take(&mut *guard)
+    }
+}
+
+impl StorageIO for InMemoryVecStorage {
+    async fn verify_data(&self, _position: u64, _buffer: &[u8]) -> bool {
+        true
+    }
+
+    async fn write_data(&self, position: u64, buffer: &[u8]) {
+        let mut guard = self.data.lock().unwrap();
+        let end = position as usize + buffer.len();
+        if guard.len() < end {
+            guard.resize(end, 0);
+        }
+        guard[position as usize..end].copy_from_slice(buffer);
+    }
+
+    async fn write_data_seek(&self, seek: std::io::SeekFrom, buffer: &[u8]) {
+        match seek {
+            std::io::SeekFrom::Start(pos) => self.write_data(pos, buffer).await,
+            _ => panic!("InMemoryVecStorage::write_data_seek only supports SeekFrom::Start"),
+        }
+    }
+
+    async fn read_data_into_buffer(
+        &self,
+        position: &mut u64,
+        buffer: &mut [u8],
+    ) -> Result<(), std::io::Error> {
+        let guard = self.data.lock().unwrap();
+        let start = *position as usize;
+        let end = start + buffer.len();
+        if end > guard.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "read past end",
+            ));
+        }
+        buffer.copy_from_slice(&guard[start..end]);
+        *position += buffer.len() as u64;
+        Ok(())
+    }
+
+    async fn read_vectored(&self, reads: &mut [(u64, &mut [u8])]) -> Result<(), std::io::Error> {
+        for (pos, buf) in reads {
+            let mut p = *pos;
+            self.read_data_into_buffer(&mut p, buf).await?;
+        }
+        Ok(())
+    }
+
+    async fn append_data(&self, buffer: &[u8], _immediate: bool) {
+        let mut guard = self.data.lock().unwrap();
+        guard.extend_from_slice(buffer);
+    }
+
+    async fn get_len(&self) -> u64 {
+        let guard = self.data.lock().unwrap();
+        guard.len() as u64
+    }
+
+    fn exists(_location: &str, _table_name: &str) -> bool {
+        true
+    }
+
+    async fn create_temp(&self) -> Self {
+        Self::new("temp", 0)
+    }
+
+    async fn swap_temp(&self, _temp_io_sync: &mut Self) {
+        panic!("swap_temp not supported for InMemoryVecStorage")
+    }
+
+    fn get_location(&self) -> Option<String> {
+        None
+    }
+
+    async fn create_new(&self, name: String) -> Self {
+        Self::new(&name, 0)
+    }
+
+    fn drop_io(&self) {
+        // no-op
+    }
+
+    fn get_hash(&self) -> u32 {
+        self.hash
+    }
+
+    async fn start_service(&self) {}
+
+    fn get_name(&self) -> String {
+        self.name.clone()
+    }
+}
+
+fn make_bytes_payload(bytes: &[u8], write_order: u32, column_type: DbType) -> ColumnWritePayload {
+    let mut data_mb = rasterizeddb_core::memory_pool::MEMORY_POOL.acquire(bytes.len());
+    let slice = data_mb.into_slice_mut();
+    slice.copy_from_slice(bytes);
+
+    ColumnWritePayload {
+        data: data_mb,
+        write_order,
+        column_type: column_type.clone(),
+        size: column_type.get_size(),
+    }
+}
+
+fn make_string_payload(value: &str, write_order: u32) -> ColumnWritePayload {
+    let bytes = value.as_bytes();
+    let mut data_mb = rasterizeddb_core::memory_pool::MEMORY_POOL.acquire(bytes.len());
+    let slice = data_mb.into_slice_mut();
+    slice.copy_from_slice(bytes);
+
+    ColumnWritePayload {
+        data: data_mb,
+        write_order,
+        column_type: DbType::STRING,
+        size: DbType::STRING.get_size(),
+    }
+}
+
+fn make_employee_row_write(i: u64) -> RowWrite {
+    // Keep strings relatively small and mostly fixed-size to make memory usage predictable.
+    let name = format!("Employee {:07}", i);
+    let job_title = "Software Engineer";
+    let department = "Engineering";
+    let manager = "Alice Smith";
+    let location = "New York";
+    let degree = "BSc Computer Science";
+    let skills = "Rust, SQL, Git";
+    let current_project = "Migration Tool";
+
+    let id = (i + 1) as u64;
+    let salary: f32 = 50_000.0 + ((i % 200_000) as f32);
+    let age: i32 = 18 + (i % 59) as i32;
+    let hire_date: u64 = 1_000_000 + (i % 8_000_000);
+    let performance_score: f32 = ((i % 500) as f32) / 100.0;
+    let is_active: u8 = if (i % 10) != 0 { 1 } else { 0 };
+    let created_at: u64 = 1_000_000 + (i % 8_000_000);
+    let updated_at: u64 = created_at + (i % 1_000);
+    let is_fired: u8 = if is_active == 0 && (i % 2) == 0 { 1 } else { 0 };
+
+    let mut row_write = RowWrite {
+        columns_writing_data: Default::default(),
+    };
+
+    // write_order MUST match table column order.
+    row_write
+        .columns_writing_data
+        .push(make_bytes_payload(&id.to_le_bytes(), 0, DbType::U64));
+    row_write.columns_writing_data.push(make_string_payload(&name, 1));
+    row_write
+        .columns_writing_data
+        .push(make_string_payload(job_title, 2));
+    row_write
+        .columns_writing_data
+        .push(make_bytes_payload(&salary.to_le_bytes(), 3, DbType::F32));
+    row_write
+        .columns_writing_data
+        .push(make_string_payload(department, 4));
+    row_write
+        .columns_writing_data
+        .push(make_bytes_payload(&age.to_le_bytes(), 5, DbType::I32));
+    row_write.columns_writing_data.push(make_string_payload(manager, 6));
+    row_write
+        .columns_writing_data
+        .push(make_string_payload(location, 7));
+    row_write
+        .columns_writing_data
+        .push(make_bytes_payload(&hire_date.to_le_bytes(), 8, DbType::U64));
+    row_write.columns_writing_data.push(make_string_payload(degree, 9));
+    row_write.columns_writing_data.push(make_string_payload(skills, 10));
+    row_write
+        .columns_writing_data
+        .push(make_string_payload(current_project, 11));
+    row_write
+        .columns_writing_data
+        .push(make_bytes_payload(&performance_score.to_le_bytes(), 12, DbType::F32));
+    row_write
+        .columns_writing_data
+        .push(make_bytes_payload(&[is_active], 13, DbType::BOOL));
+    row_write
+        .columns_writing_data
+        .push(make_bytes_payload(&created_at.to_le_bytes(), 14, DbType::U64));
+    row_write
+        .columns_writing_data
+        .push(make_bytes_payload(&updated_at.to_le_bytes(), 15, DbType::U64));
+    row_write
+        .columns_writing_data
+        .push(make_bytes_payload(&[is_fired], 16, DbType::BOOL));
+
+    row_write
+}
+
+async fn generate_rows_and_pointers_to_disk() -> std::io::Result<()> {
+    const ROWS_PATH: &str = r"G:\Databases\Production\employees.db";
+    const POINTERS_PATH: &str = r"G:\Databases\Production\employees_pointers.db";
+    const ROW_COUNT: u64 = 5_000_000;
+
+    // Very rough capacity hints to reduce reallocations.
+    // If you increase average string sizes, memory usage will grow significantly.
+    let rows_io = rclite::Arc::new(InMemoryVecStorage::new("employees_rows", 512 * 1024 * 1024));
+    let pointers_io = rclite::Arc::new(InMemoryVecStorage::new(
+        "employees_pointers",
+        (ROW_COUNT as usize).saturating_mul(24),
+    ));
+
+    let last_id = AtomicU64::new(0);
+    let table_length = AtomicU64::new(0);
+
+    println!("Generating {} rows in memory...", ROW_COUNT);
+    let start = std::time::Instant::now();
+
+    for i in 0..ROW_COUNT {
+        let row_write = make_employee_row_write(i);
+
+        let _pointer = RowPointer::write_row(
+            pointers_io.clone(),
+            rows_io.clone(),
+            &last_id,
+            &table_length,
+            #[cfg(feature = "enable_long_row")]
+            0,
+            &row_write,
+        )
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e:?}")))?;
+
+        if i > 0 && i % 100_000 == 0 {
+            let elapsed = start.elapsed().as_secs_f64();
+            let rows_per_sec = (i as f64) / elapsed.max(0.0001);
+            println!(
+                "  {} / {} rows (≈{:.0} rows/s)",
+                i,
+                ROW_COUNT,
+                rows_per_sec
+            );
+        }
+    }
+
+    let gen_elapsed = start.elapsed();
+    println!("Generation complete in {:.2?}", gen_elapsed);
+
+    // Ensure target directory exists.
+    if let Some(parent) = std::path::Path::new(ROWS_PATH).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    println!("Flushing buffers to disk...");
+    let rows_bytes = rows_io.take_all();
+    let pointers_bytes = pointers_io.take_all();
+
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(ROWS_PATH)?;
+        f.write_all(&rows_bytes)?;
+    }
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(POINTERS_PATH)?;
+        f.write_all(&pointers_bytes)?;
+    }
+
+    println!(
+        "Wrote rows: {} bytes, pointers: {} bytes",
+        rows_bytes.len(),
+        pointers_bytes.len()
+    );
+    println!("Rows file: {ROWS_PATH}");
+    println!("Pointers file: {POINTERS_PATH}");
+
+    Ok(())
 }
 
 fn pause(message: &str) {
@@ -167,7 +481,7 @@ async fn run_queries(client: &Arc<DbClient>) {
     for _ in 0..5 {
         let query = r##"
             SELECT id, salary, age, name FROM employees
-            WHERE id > 0 AND id < 100
+            WHERE id > 0 AND id <= 100
         "##;
 
         let instant = std::time::Instant::now();
