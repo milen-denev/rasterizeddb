@@ -62,11 +62,29 @@ pub fn spawn_table_rules_scanner<S: StorageIO>(
     table_pointers_io: Arc<S>,
     table_rows_io: Arc<S>,
     interval: Duration,
+    only_rebuild_if_table_changed: bool,
 ) {
     tokio::spawn(async move {
         let rules_io = SemanticRuleStore::open_rules_io(base_io.clone(), &table_name).await;
 
         loop {
+            if only_rebuild_if_table_changed {
+                // Fast-path: if the pointers IO has not changed since the last scan,
+                // skip rebuilding the semantic rules map.
+                //
+                // In this codebase, inserts/updates/deletes are expected to append new
+                // row pointer records, which changes the pointers file length.
+                let cur_pointers_len = table_pointers_io.get_len().await;
+                if let Ok(Some(header)) = SemanticRuleStore::try_load_header_v2(rules_io.clone()).await {
+                    if let Some(meta) = header.meta {
+                        if meta.pointers_len_bytes == cur_pointers_len {
+                            tokio::time::sleep(interval).await;
+                            continue;
+                        }
+                    }
+                }
+            }
+
             if let Err(e) = scan_once_build_rules(
                 &table_name,
                 table_schema_fields.as_slice(),

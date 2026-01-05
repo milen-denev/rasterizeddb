@@ -93,6 +93,7 @@ impl<S: StorageIO> Table<S> {
             io_pointers.clone(),
             io_rows.clone(),
             Duration::from_secs(60),
+            true,
         );
 
         let mut pointer_iterator = RowPointerIterator::new(io_pointers.clone()).await.unwrap();
