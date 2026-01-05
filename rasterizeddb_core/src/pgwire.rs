@@ -517,6 +517,25 @@ where
         }
     };
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum PurposeKind {
+        CreateTable,
+        InsertRow,
+        UpdateRow,
+        DeleteRow,
+        QueryRows,
+        Other,
+    }
+
+    let purpose_kind = match &purpose {
+        QueryPurpose::CreateTable(_) => PurposeKind::CreateTable,
+        QueryPurpose::InsertRow(_) => PurposeKind::InsertRow,
+        QueryPurpose::UpdateRow(_) => PurposeKind::UpdateRow,
+        QueryPurpose::DeleteRow(_) => PurposeKind::DeleteRow,
+        QueryPurpose::QueryRows(_) => PurposeKind::QueryRows,
+        _ => PurposeKind::Other,
+    };
+
     // Precompute SELECT column metadata (needed even if result set is empty).
     let select_fields = match &purpose {
         QueryPurpose::QueryRows(qr) => {
@@ -547,7 +566,13 @@ where
         _ => None,
     };
 
-    let resp = execute(purpose, database.clone()).await;
+    // `execute` consumes QueryPurpose, but we still want `purpose_kind`/`select_fields`.
+    // Re-recognize the query to get an owned QueryPurpose to pass into the engine.
+    let purpose_exec = recognize_query_purpose(stmt).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "query purpose disappeared")
+    })?;
+
+    let resp = execute(purpose_exec, database.clone()).await;
     if resp.is_empty() {
         send_error_response(stream, "XX000", "empty engine response").await?;
         return Ok(());
@@ -555,7 +580,28 @@ where
 
     match resp[0] {
         0 => {
-            send_command_complete(stream, "OK").await?;
+            // OK. Some engine paths also append an 8-byte LE rows-affected count after the tag.
+            let rows_affected = if resp.len() >= 9 {
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(&resp[1..9]);
+                Some(u64::from_le_bytes(arr))
+            } else {
+                None
+            };
+
+            let tag = match (purpose_kind, rows_affected) {
+                (PurposeKind::CreateTable, _) => "CREATE TABLE".to_string(),
+                (PurposeKind::InsertRow, Some(n)) => format!("INSERT 0 {}", n),
+                (PurposeKind::UpdateRow, Some(n)) => format!("UPDATE {}", n),
+                (PurposeKind::DeleteRow, Some(n)) => format!("DELETE {}", n),
+                // Fall back to conventional tags with unknown counts.
+                (PurposeKind::InsertRow, None) => "INSERT 0 0".to_string(),
+                (PurposeKind::UpdateRow, None) => "UPDATE 0".to_string(),
+                (PurposeKind::DeleteRow, None) => "DELETE 0".to_string(),
+                _ => "OK".to_string(),
+            };
+
+            send_command_complete(stream, &tag).await?;
         }
         1 => {
             if resp.len() < 9 {
@@ -565,7 +611,13 @@ where
             let mut arr = [0u8; 8];
             arr.copy_from_slice(&resp[1..9]);
             let rows = u64::from_le_bytes(arr);
-            send_command_complete(stream, &format!("UPDATE {}", rows)).await?;
+            let tag = match purpose_kind {
+                PurposeKind::DeleteRow => format!("DELETE {}", rows),
+                PurposeKind::InsertRow => format!("INSERT 0 {}", rows),
+                PurposeKind::UpdateRow => format!("UPDATE {}", rows),
+                _ => format!("UPDATE {}", rows),
+            };
+            send_command_complete(stream, &tag).await?;
         }
         2 => {
             let rows_bytes = &resp[1..];
