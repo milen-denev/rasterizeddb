@@ -34,7 +34,7 @@ static TCP_SERVER: async_lazy::Lazy<Arc<TcpServer>> = async_lazy::Lazy::new(|| {
 });
 
 pub struct Database {
-    pub tables: DashMap<String, Arc<Table<LocalStorageProvider>>>,
+    pub tables: DashMap<String, Arc<Table<LocalStorageProvider>>, ahash::RandomState>,
     pub db_io_pointers: Arc<LocalStorageProvider>,
     pub db_io_rows: Arc<LocalStorageProvider>,
     pub db_io_schema: Arc<LocalStorageProvider>,
@@ -78,7 +78,7 @@ impl Database {
             tables_names
         );
 
-        let tables = DashMap::new();
+        let tables = DashMap::with_hasher(ahash::RandomState::new());
 
         for (table_name, _) in tables_names {
             let table = Table::new(&table_name, io_pointers.clone(), vec![]).await;

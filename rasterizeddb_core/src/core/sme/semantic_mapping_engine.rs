@@ -27,13 +27,13 @@ const CRC_64: Crc<u64> = Crc::<u64>::new(&CRC_64_ECMA_182);
 
 pub struct SemanticMappingEngine {
     // Key: crc64(table_name) ^ crc64(where_query)
-    candidates: DashMap<u64, rclite::Arc<Vec<RowPointer>>>,
+    candidates: DashMap<u64, rclite::Arc<Vec<RowPointer>>, ahash::RandomState>,
 }
 
 impl SemanticMappingEngine {
     pub fn new() -> Self {
         Self {
-            candidates: DashMap::new(),
+            candidates: DashMap::with_hasher(ahash::RandomState::new()),
         }
     }
 
