@@ -77,9 +77,10 @@ name = "file_sync_benchmarks"
 harness = false
 
 [features]
-default = []
+default = ["memory_pool_reuse"]
 enable_long_row = []
 enable_data_verification = []
+memory_pool_reuse = []
 
 # [target.'cfg(target_arch = "x86_64")']
 # rustflags = ["-C", "target-cpu=native", "-C", "target-feature=+avx2"]
