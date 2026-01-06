@@ -1,5 +1,6 @@
 use std::sync::atomic::AtomicU64;
 
+use cacheguard::CacheGuard;
 use rclite::Arc;
 
 use smallvec::SmallVec;
@@ -418,8 +419,8 @@ async fn create_schema<S: StorageIO>(mock_io: Arc<S>, table_name: &str) -> Table
     schema
 }
 
-static LAST_ID: AtomicU64 = AtomicU64::new(0);
-static TABLE_LENGTH: AtomicU64 = AtomicU64::new(0);
+static LAST_ID: CacheGuard<AtomicU64> = CacheGuard::new(AtomicU64::new(0));
+static TABLE_LENGTH: CacheGuard<AtomicU64> = CacheGuard::new(AtomicU64::new(0));
 
 async fn fill_data<S: StorageIO>(id: u64, io_pointers: Arc<S>, io_rows: Arc<S>, times: u64) {
     #[cfg(feature = "enable_long_row")]

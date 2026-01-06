@@ -1,3 +1,4 @@
+use cacheguard::CacheGuard;
 use log::{error, info};
 use itertools::Itertools;
 use smallvec::SmallVec;
@@ -34,9 +35,9 @@ pub struct Table<S: StorageIO> {
     pub io_pointers: Arc<S>,
     pub io_rows: Arc<S>,
     pub io_schema: Arc<S>,
-    pub hard_locked: AtomicBool,
-    pub len: AtomicU64,
-    pub last_row_id: AtomicU64,
+    pub hard_locked: CacheGuard<AtomicBool>,
+    pub len: CacheGuard<AtomicU64>,
+    pub last_row_id: CacheGuard<AtomicU64>,
     pub concurrent_processor: ConcurrentProcessor,
 }
 
@@ -142,9 +143,9 @@ impl<S: StorageIO> Table<S> {
             io_pointers,
             io_rows,
             io_schema,
-            hard_locked: AtomicBool::new(false),
-            len: atomic_table_length,
-            last_row_id: atomic_last_id,
+            hard_locked: AtomicBool::new(false).into(),
+            len: atomic_table_length.into(),
+            last_row_id: atomic_last_id.into(),
             concurrent_processor: ConcurrentProcessor::new(),
         }
     }

@@ -9,6 +9,7 @@ use std::cell::RefCell;
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 
 use arc_swap::ArcSwap;
+use cacheguard::CacheGuard;
 use log::error;
 use parking_lot::RwLock;
 use rclite::Arc as RcArc;
@@ -48,21 +49,21 @@ pub struct LocalStorageProvider {
     pub(super) temp_read_file: RcArc<std::fs::File>,
     // In-memory mirror of staged temp bytes (fast path for reads).
     pub(super) temp_mem: RwLock<Vec<u8>>,
-    pub(super) temp_mem_len: AtomicU64,
+    pub(super) temp_mem_len: CacheGuard<AtomicU64>,
     // length of staged temp file bytes, maintained atomically (no metadata in read paths)
-    pub(super) temp_file_len: AtomicU64,
-    pub file_len: AtomicU64,
+    pub(super) temp_file_len: CacheGuard<AtomicU64>,
+    pub file_len: CacheGuard<AtomicU64>,
     // Memory map published with ArcSwap and owned by Arc to allow thread-local caches to own a handle safely.
     pub(crate) _memory_map: Arc<ArcSwap<Mmap>>,
     // Monotonic generation counter; bumped whenever the mmap is refreshed.
     // Used to cheaply invalidate per-thread cached mmap handles.
-    pub(crate) mmap_gen: AtomicU64,
+    pub(crate) mmap_gen: CacheGuard<AtomicU64>,
     pub(crate) hash: u32,
-    _locked: AtomicBool,
+    _locked: CacheGuard<AtomicBool>,
     // true when there is data in temp_file waiting to be flushed
-    temp_has_data: AtomicBool,
+    temp_has_data: CacheGuard<AtomicBool>,
     // used to temporarily block appends during flush
-    append_blocked: AtomicBool
+    append_blocked: CacheGuard<AtomicBool>
 }
 
 unsafe impl Sync for LocalStorageProvider {}
@@ -100,15 +101,15 @@ impl Clone for LocalStorageProvider {
             temp_file: self.temp_file.clone(),
             temp_read_file,
             temp_mem: RwLock::new(self.temp_mem.read().clone()),
-            temp_mem_len: AtomicU64::new(self.temp_mem_len.load(Ordering::Acquire)),
-            temp_file_len: AtomicU64::new(self.temp_file_len.load(Ordering::Acquire)),
-            file_len: AtomicU64::new(self.file_len.load(std::sync::atomic::Ordering::SeqCst)),
+            temp_mem_len: AtomicU64::new(self.temp_mem_len.load(Ordering::Acquire)).into(),
+            temp_file_len: AtomicU64::new(self.temp_file_len.load(Ordering::Acquire)).into(),
+            file_len: AtomicU64::new(self.file_len.load(std::sync::atomic::Ordering::SeqCst)).into(),
             _memory_map: Arc::new(arc_swap::ArcSwap::new(map)),
-            mmap_gen: AtomicU64::new(1),
+            mmap_gen: AtomicU64::new(1).into(),
             hash: CRC.checksum(format!("{}+++{}", self.location, self.table_name).as_bytes()),
-            _locked: AtomicBool::new(false),
-            temp_has_data: AtomicBool::new(self.temp_has_data.load(Ordering::Relaxed)),
-            append_blocked: AtomicBool::new(false)
+            _locked: AtomicBool::new(false).into(),
+            temp_has_data: AtomicBool::new(self.temp_has_data.load(Ordering::Relaxed)).into(),
+            append_blocked: AtomicBool::new(false).into()
         }
     }
 }
@@ -271,15 +272,15 @@ impl LocalStorageProvider {
                 temp_file: Arc::new(RwLock::new(temp_file)),
                 temp_read_file,
                 temp_mem: RwLock::new(Vec::new()),
-                temp_mem_len: AtomicU64::new(0),
-                file_len: AtomicU64::new(file_len),
+                temp_mem_len: AtomicU64::new(0).into(),
+                file_len: AtomicU64::new(file_len).into(),
                 _memory_map: map,
-                mmap_gen: AtomicU64::new(1),
+                mmap_gen: AtomicU64::new(1).into(),
                 hash: CRC.checksum(format!("{}+++{}", final_location, table_name).as_bytes()),
-                _locked: AtomicBool::new(false),
-                temp_file_len: AtomicU64::new(temp_len),
-                temp_has_data: AtomicBool::new(false),
-                append_blocked: AtomicBool::new(false)
+                _locked: AtomicBool::new(false).into(),
+                temp_file_len: AtomicU64::new(temp_len).into(),
+                temp_has_data: AtomicBool::new(false).into(),
+                append_blocked: AtomicBool::new(false).into()
             };
 
             // If there are staged bytes in temp file, flush them into the main file.
@@ -406,15 +407,15 @@ impl LocalStorageProvider {
                 temp_file: Arc::new(RwLock::new(temp_file)),
                 temp_read_file,
                 temp_mem: RwLock::new(Vec::new()),
-                temp_mem_len: AtomicU64::new(0),
-                file_len: AtomicU64::new(file_len),
+                temp_mem_len: AtomicU64::new(0).into(),
+                file_len: AtomicU64::new(file_len).into(),
                 _memory_map: map,
-                mmap_gen: AtomicU64::new(1),
+                mmap_gen: AtomicU64::new(1).into(),
                 hash: CRC.checksum(format!("{}+++{}", location_str, "CONFIG_TABLE.db").as_bytes()),
-                _locked: AtomicBool::new(false),
-                temp_file_len: AtomicU64::new(temp_len),
-                temp_has_data: AtomicBool::new(false),
-                append_blocked: AtomicBool::new(false)
+                _locked: AtomicBool::new(false).into(),
+                temp_file_len: AtomicU64::new(temp_len).into(),
+                temp_has_data: AtomicBool::new(false).into(),
+                append_blocked: AtomicBool::new(false).into()
             };
 
             if temp_len > 0 {
@@ -1021,17 +1022,17 @@ impl StorageIO for LocalStorageProvider {
             temp_file: Arc::new(RwLock::new(temp_file)),
             temp_read_file,
             temp_mem: RwLock::new(Vec::new()),
-            temp_mem_len: AtomicU64::new(0),
-            temp_file_len: AtomicU64::new(staged_len),
-            file_len: AtomicU64::new(file_len),
+            temp_mem_len: AtomicU64::new(0).into(),
+            temp_file_len: AtomicU64::new(staged_len).into(),
+            file_len: AtomicU64::new(file_len).into(),
             _memory_map: Arc::new(ArcSwap::new(Arc::new(unsafe {
                 MmapOptions::new().map(&file_read_mmap).unwrap()
             }))),
-            mmap_gen: AtomicU64::new(1),
+            mmap_gen: AtomicU64::new(1).into(),
             hash: CRC.checksum(format!("{}+++{}", final_location, "temp.db").as_bytes()),
-            _locked: AtomicBool::new(false),
-            temp_has_data: AtomicBool::new(false),
-            append_blocked: AtomicBool::new(false),
+            _locked: AtomicBool::new(false).into(),
+            temp_has_data: AtomicBool::new(false).into(),
+            append_blocked: AtomicBool::new(false).into(),
         };
 
         if staged_len > 0 {
@@ -1154,17 +1155,17 @@ impl StorageIO for LocalStorageProvider {
             temp_file: Arc::new(RwLock::new(temp_file)),
             temp_read_file,
             temp_mem: RwLock::new(Vec::new()),
-            temp_mem_len: AtomicU64::new(0),
-            temp_file_len: AtomicU64::new(staged_len),
-            file_len: AtomicU64::new(file_len),
+            temp_mem_len: AtomicU64::new(0).into(),
+            temp_file_len: AtomicU64::new(staged_len).into(),
+            file_len: AtomicU64::new(file_len).into(),
             _memory_map: Arc::new(ArcSwap::new(Arc::new(unsafe {
                 MmapOptions::new().map(&file_read_mmap).unwrap()
             }))),
-            mmap_gen: AtomicU64::new(1),
+            mmap_gen: AtomicU64::new(1).into(),
             hash: CRC.checksum(format!("{}+++{}", final_location, name).as_bytes()),
-            _locked: AtomicBool::new(false),
-            temp_has_data: AtomicBool::new(false),
-            append_blocked: AtomicBool::new(false)
+            _locked: AtomicBool::new(false).into(),
+            temp_has_data: AtomicBool::new(false).into(),
+            append_blocked: AtomicBool::new(false).into()
         };
 
         if staged_len > 0 {

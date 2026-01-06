@@ -20,6 +20,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use arc_swap::ArcSwap;
 use ahash::RandomState;
 
+use cacheguard::CacheGuard;
+
 /// Cache-line aligned atomic entry structure.
 ///
 /// Each entry stores a value along with metadata including state, version,
@@ -32,15 +34,15 @@ where
     K: Hash + Eq + Send + Sync + 'static,
 {
     /// Combined state (lower 32 bits) and version (upper 32 bits)
-    state_version: AtomicU64,
+    state_version: CacheGuard<AtomicU64>,
     /// Hash of the key for this entry
-    key_hash: AtomicU64,
+    key_hash: CacheGuard<AtomicU64>,
     /// Storage for values using ArcSwap
     value_storage: ArcSwap<T>,
     /// UTC timestamp in nanoseconds when the entry was last modified
-    timestamp_nanos: AtomicU64,
+    timestamp_nanos: CacheGuard<AtomicU64>,
     /// Monotonic sequence number for ordering operations
-    sequence: AtomicU64,
+    sequence: CacheGuard<AtomicU64>,
     phantom_key_type: std::marker::PhantomData<K>,
 }
 
@@ -115,11 +117,11 @@ where
     #[inline]
     fn new() -> Self {
         Self {
-            key_hash: AtomicU64::new(0),
+            key_hash: AtomicU64::new(0).into(),
             value_storage: ArcSwap::from_pointee(T::default()),
-            timestamp_nanos: AtomicU64::new(0),
-            sequence: AtomicU64::new(0),
-            state_version: AtomicU64::new(pack_state_version(STATE_EMPTY, 0)),
+            timestamp_nanos: AtomicU64::new(0).into(),
+            sequence: AtomicU64::new(0).into(),
+            state_version: AtomicU64::new(pack_state_version(STATE_EMPTY, 0)).into(),
             phantom_key_type: std::marker::PhantomData,
         }
     }
@@ -236,12 +238,12 @@ where
     /// Array of cache entries, sized to a power of 2
     entries: Box<[AtomicEntry<K, T>]>,
     /// Monotonic write index for ring buffer behavior
-    write_index: AtomicUsize,
+    write_index: CacheGuard<AtomicUsize>,
     /// Bit mask for fast modulo operations (capacity - 1)
     capacity_mask: usize,
     max_capacity: usize,
     /// Global monotonic sequence counter for total ordering across entries
-    sequence_counter: AtomicU64,
+    sequence_counter: CacheGuard<AtomicU64>,
     /// Fast non-cryptographic hasher state (ahash)
     hasher: RandomState,
 }
@@ -287,11 +289,11 @@ where
 
         Arc::new(Self {
             entries: entries.into_boxed_slice(),
-            write_index: AtomicUsize::new(0),
+            write_index: AtomicUsize::new(0).into(),
             capacity_mask: capacity - 1,
             max_capacity,
             // Start from 1 so tests asserting non-zero sequence pass
-            sequence_counter: AtomicU64::new(1),
+            sequence_counter: AtomicU64::new(1).into(),
             hasher: RandomState::default(),
         })
     }
