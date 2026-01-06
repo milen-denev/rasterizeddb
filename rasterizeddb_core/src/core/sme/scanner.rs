@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use cacheguard::CacheGuard;
 use rclite::Arc;
 
 use smallvec::SmallVec;
@@ -22,6 +23,8 @@ use super::{
     rules::{f64_bits_to_16le, i128_to_16le, u128_to_16le, SemanticRule, SemanticRuleOp},
 };
 
+use super::semantic_mapping_engine::SME;
+
 #[cfg(debug_assertions)]
 use serde::Serialize;
 
@@ -35,7 +38,7 @@ const MAX_RULES_FILE_RATIO: f64 = 0.10;
 /// Base granularity knob: how many rows are summarized into a single rule (per numeric column).
 ///
 /// Larger values produce fewer, wider rules (more false positives, smaller file).
-const BASE_ROWS_PER_RULE: u64 = 256;
+const BASE_ROWS_PER_RULE: u64 = 1024;
 
 /// How many semantic rule records we emit per STRING column per window.
 ///
@@ -76,61 +79,100 @@ async fn compute_pointers_fingerprint<S: StorageIO>(pointers_io: Arc<S>) -> std:
 /// - Build windowed min/max rules: every N rows, emit exactly one rule per numeric column
 ///   covering that window's min/max. This guarantees bounded rule counts.
 /// - Automatically widen N (rows_per_rule) to keep rules <= MAX_RULES_FILE_RATIO.
-/// - Include newly appended rows while scanning by refreshing pointer IO length.
+/// Include newly appended rows while scanning by refreshing pointer IO length.
+///
+/// Scanning is on-demand (triggered by INSERT/UPDATE/DELETE), not periodic.
 pub fn spawn_table_rules_scanner<S: StorageIO>(
     base_io: Arc<S>,
     table_name: String,
     table_schema_fields: SmallVec<[SchemaField; 20]>,
     table_pointers_io: Arc<S>,
     table_rows_io: Arc<S>,
-    interval: Duration,
+    debounce: Duration,
     only_rebuild_if_table_changed: bool,
-) {
+) -> TableRulesScannerHandle {
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let pending = Arc::new(CacheGuard::new(std::sync::atomic::AtomicBool::new(false)));
+
+    let handle = TableRulesScannerHandle {
+        notify: Arc::clone(&notify),
+        pending: Arc::clone(&pending),
+    };
+
     tokio::spawn(async move {
         let rules_io = SemanticRuleStore::open_rules_io(base_io.clone(), &table_name).await;
 
         loop {
-            if only_rebuild_if_table_changed {
-                // Fast-path: if the pointers IO has not changed since the last scan,
-                // skip rebuilding the semantic rules map.
-                //
-                let cur_pointers_len = table_pointers_io.get_len().await;
-                if let Ok(Some(header)) = SemanticRuleStore::try_load_header_v2(rules_io.clone()).await {
-                    if let Some(meta) = header.meta {
-                        if meta.pointers_len_bytes == cur_pointers_len {
-                            // Length unchanged: could still be an in-place pointer mutation
-                            // (updates/deletes). Use a content fingerprint to detect that.
-                            //
-                            // For legacy v2 headers, pointers_fingerprint will be 0; treat
-                            // that as "unknown" and rebuild once to upgrade metadata.
-                            if meta.pointers_fingerprint != 0 {
-                                if let Ok(cur_fp) = compute_pointers_fingerprint(table_pointers_io.clone()).await {
-                                    if cur_fp == meta.pointers_fingerprint {
-                                        tokio::time::sleep(interval).await;
-                                        continue;
+            // Wait until a caller requests a scan.
+            notify.notified().await;
+
+            // Debounce/coalesce rapid bursts of mutations.
+            if debounce != Duration::from_secs(0) {
+                tokio::time::sleep(debounce).await;
+            }
+
+            // Drain all pending scan requests.
+            while pending.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                if only_rebuild_if_table_changed {
+                    // Fast-path: if the pointers IO has not changed since the last scan,
+                    // skip rebuilding the semantic rules map.
+                    let cur_pointers_len = table_pointers_io.get_len().await;
+                    if let Ok(Some(header)) = SemanticRuleStore::try_load_header_v2(rules_io.clone()).await {
+                        if let Some(meta) = header.meta {
+                            if meta.pointers_len_bytes == cur_pointers_len {
+                                // Length unchanged: could still be an in-place pointer mutation.
+                                // Use fingerprint to detect that when available.
+                                if meta.pointers_fingerprint != 0 {
+                                    if let Ok(cur_fp) = compute_pointers_fingerprint(table_pointers_io.clone()).await {
+                                        if cur_fp == meta.pointers_fingerprint {
+                                            // No detected change; clear dirty and stop draining.
+                                            if let Some(engine) = SME.get() {
+                                                engine.clear_table_rules_dirty(&table_name);
+                                            }
+                                            break;
+                                        }
                                     }
                                 }
                             }
                         }
                     }
                 }
-            }
 
-            if let Err(e) = scan_once_build_rules(
-                &table_name,
-                table_schema_fields.as_slice(),
-                table_pointers_io.clone(),
-                table_rows_io.clone(),
-                rules_io.clone(),
-            )
-            .await
-            {
-                log::error!("SME scan failed for table {}: {}", table_name, e);
-            }
+                if let Err(e) = scan_once_build_rules(
+                    &table_name,
+                    table_schema_fields.as_slice(),
+                    table_pointers_io.clone(),
+                    table_rows_io.clone(),
+                    rules_io.clone(),
+                )
+                .await
+                {
+                    log::error!("SME scan failed for table {}: {}", table_name, e);
+                }
 
-            tokio::time::sleep(interval).await;
+                // Rules are now up to date (best-effort). Allow SME to use them again.
+                if let Some(engine) = SME.get() {
+                    engine.clear_table_rules_dirty(&table_name);
+                }
+            }
         }
     });
+
+    handle
+}
+
+#[derive(Clone)]
+pub struct TableRulesScannerHandle {
+    notify: Arc<tokio::sync::Notify>,
+    pending: Arc<CacheGuard<std::sync::atomic::AtomicBool>>,
+}
+
+impl TableRulesScannerHandle {
+    #[inline]
+    pub fn request_scan(&self) {
+        self.pending.store(true, std::sync::atomic::Ordering::Release);
+        self.notify.notify_one();
+    }
 }
 
 #[derive(Debug, Clone)]
