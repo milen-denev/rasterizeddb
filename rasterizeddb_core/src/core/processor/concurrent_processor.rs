@@ -1,5 +1,6 @@
 use std::{borrow::Cow, cell::UnsafeCell, sync::{OnceLock, atomic::{AtomicBool, AtomicU64}}};
 
+use cacheguard::CacheGuard;
 use log::error;
 use rclite::Arc;
 
@@ -162,9 +163,9 @@ impl ConcurrentProcessor {
         limit: Option<u64>,
         enforce_limit_early: bool,
         no_filter: bool,
-        limit_counter: Arc<AtomicU64>,
-        stop_processing: Arc<AtomicBool>,
-        reading_time_total: Arc<AtomicU64>,
+        limit_counter: Arc<CacheGuard<AtomicU64>>,
+        stop_processing: Arc<CacheGuard<AtomicBool>>,
+        reading_time_total: Arc<CacheGuard<AtomicU64>>,
     ) -> Vec<tokio::task::JoinHandle<()>> {
         let mut batch_handles = Vec::new();
         iterator.reset();
@@ -572,8 +573,8 @@ impl ConcurrentProcessor {
 
         // LIMIT enforcement: global counter across all tasks.
         // The increment/threshold check is performed inside the `if result { }` section.
-        let limit_counter = Arc::new(AtomicU64::new(0));
-        let stop_processing = Arc::new(AtomicBool::new(false));
+        let limit_counter: Arc<CacheGuard<AtomicU64>> = Arc::new(AtomicU64::new(0).into());
+        let stop_processing: Arc<CacheGuard<AtomicBool>> = Arc::new(AtomicBool::new(false).into());
 
         // Important: for ORDER BY queries, we must not stop early based on LIMIT,
         // otherwise we only sort a prefix of the matching rows.
@@ -638,7 +639,7 @@ impl ConcurrentProcessor {
             );
         }
         
-        let reading_time_total = Arc::new(AtomicU64::new(0));
+        let reading_time_total: Arc<CacheGuard<AtomicU64>> = Arc::new(AtomicU64::new(0).into());
 
         let batch_handles = Self::spawn_batch_tasks(
             iterator,
