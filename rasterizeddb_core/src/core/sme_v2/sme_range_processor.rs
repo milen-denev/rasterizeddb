@@ -90,14 +90,6 @@ pub fn candidate_row_ranges_for_query_scalar(
     merge_row_ranges(out)
 }
 
-#[inline]
-pub fn candidate_row_ranges_for_i128_query_scalar(
-    query: i128,
-    rules: &[NumericCorrelationRule],
-) -> smallvec::SmallVec<[RowRange; 64]> {
-    candidate_row_ranges_for_query_scalar(NumericScalar::Signed(query), rules)
-}
-
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn avx2_lane_any(mask: i32, lane: usize) -> bool {
@@ -954,7 +946,7 @@ mod tests {
                 }
 
                 let query = 950i128;
-                let scalar = super::candidate_row_ranges_for_i128_query_scalar(query, &rules);
+                let scalar = super::candidate_row_ranges_for_query(NumericScalar::Signed(query), &rules);
                 let avx2 = unsafe { super::candidate_row_ranges_for_i128_query_avx2(query, &rules) };
                 assert_eq!(scalar, avx2);
 
