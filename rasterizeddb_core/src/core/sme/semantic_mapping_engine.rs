@@ -12,8 +12,7 @@ use crate::core::{
         row_pointer::{RowPointer, RowPointerIterator},
         schema::SchemaField,
     },
-    sme::rule_store::{ScanMeta, SemanticRuleStore},
-    sme::sme_avx,
+    sme::{rule_store::{ScanMeta, SemanticRuleStore}, rules::{SemanticRule, SemanticRuleOp}, sme_avx},
     storage_providers::traits::StorageIO,
     tokenizer::query_tokenizer::{NumericValue, Token},
 };
@@ -43,7 +42,7 @@ pub struct SemanticMappingEngine {
 #[derive(Debug, Clone)]
 struct TableRulesV2 {
     meta: Option<ScanMeta>,
-    by_col: Vec<Vec<crate::core::sme::rules::SemanticRule>>,
+    by_col: Vec<Vec<SemanticRule>>,
 }
 
 impl SemanticMappingEngine {
@@ -165,7 +164,7 @@ impl SemanticMappingEngine {
         // v2/v3 rules file header. If absent, there are no persisted rules.
         let header = SemanticRuleStore::try_load_header_v2(rules_io.clone()).await.ok()??;
 
-        let mut by_col: Vec<Vec<crate::core::sme::rules::SemanticRule>> = vec![Vec::new(); schema.len()];
+        let mut by_col: Vec<Vec<SemanticRule>> = vec![Vec::new(); schema.len()];
 
         // Load all columns present in the header up front.
         let mut cols_to_load: SmallVec<[u64; 16]> = SmallVec::new();
@@ -480,7 +479,7 @@ impl RuleTransformerPlan {
 
     fn evaluate(
         &self,
-        rules_by_col: &[Vec<crate::core::sme::rules::SemanticRule>],
+        rules_by_col: &[Vec<SemanticRule>],
         meta: Option<ScanMeta>,
     ) -> Option<Vec<(u64, u64)>> {
         if self.predicates.is_empty() {
@@ -548,7 +547,7 @@ impl RuleTransformerPlan {
 }
 
 fn collect_matching_intervals_numeric(
-    rules: &[crate::core::sme::rules::SemanticRule],
+    rules: &[SemanticRule],
     c: &NumericConstraint,
 ) -> Option<Vec<(u64, u64)>> {
     // If we don't have semantic rules for this column, we can't safely narrow candidates.
@@ -609,10 +608,10 @@ fn collect_matching_intervals_numeric(
 }
 
 fn collect_matching_intervals_string(
-    rules: &[crate::core::sme::rules::SemanticRule],
+    rules: &[SemanticRule],
     c: &StringConstraint,
 ) -> Option<Vec<(u64, u64)>> {
-    use crate::core::sme::rules::SemanticRuleOp;
+    use SemanticRuleOp;
 
     if rules.is_empty() {
         return None;
@@ -729,7 +728,7 @@ fn numeric_scalar_to_f64(v: NumericScalar) -> Option<f64> {
     }
 }
 
-pub(super) fn decode_rule_i64(rule: &crate::core::sme::rules::SemanticRule) -> Option<(i64, i64)> {
+pub(super) fn decode_rule_i64(rule: &SemanticRule) -> Option<(i64, i64)> {
     match rule.column_type {
         DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 => {
             let lo = i128::from_le_bytes(rule.lower);
@@ -782,7 +781,7 @@ pub(super) fn decode_rule_i64(rule: &crate::core::sme::rules::SemanticRule) -> O
     }
 }
 
-pub(super) fn decode_rule_u64(rule: &crate::core::sme::rules::SemanticRule) -> Option<(u64, u64)> {
+pub(super) fn decode_rule_u64(rule: &SemanticRule) -> Option<(u64, u64)> {
     match rule.column_type {
         DbType::U8 | DbType::U16 | DbType::U32 | DbType::U64 => {
             let lo = u128::from_le_bytes(rule.lower);
@@ -835,7 +834,7 @@ pub(super) fn decode_rule_u64(rule: &crate::core::sme::rules::SemanticRule) -> O
     }
 }
 
-pub(super) fn decode_rule_f64(rule: &crate::core::sme::rules::SemanticRule) -> Option<(f64, f64)> {
+pub(super) fn decode_rule_f64(rule: &SemanticRule) -> Option<(f64, f64)> {
     match rule.column_type {
         DbType::F32 | DbType::F64 => {
             let lo_bits = u64::from_le_bytes(rule.lower[0..8].try_into().ok()?);
@@ -912,7 +911,7 @@ pub(super) fn interval_f64_matches(lo: f64, hi: f64, lower: Option<(f64, bool)>,
     true
 }
 
-fn simd_or_scalar_filter_eq_i64(rules: &[crate::core::sme::rules::SemanticRule], val: i64) -> Vec<(u64, u64)> {
+fn simd_or_scalar_filter_eq_i64(rules: &[SemanticRule], val: i64) -> Vec<(u64, u64)> {
     #[cfg(all(target_arch = "x86_64"))]
     {
         if std::arch::is_x86_feature_detected!("avx2") {
@@ -932,7 +931,7 @@ fn simd_or_scalar_filter_eq_i64(rules: &[crate::core::sme::rules::SemanticRule],
     out
 }
 
-fn simd_or_scalar_filter_eq_u64(rules: &[crate::core::sme::rules::SemanticRule], val: u64) -> Vec<(u64, u64)> {
+fn simd_or_scalar_filter_eq_u64(rules: &[SemanticRule], val: u64) -> Vec<(u64, u64)> {
     #[cfg(all(target_arch = "x86_64"))]
     {
         if std::arch::is_x86_feature_detected!("avx2") {
@@ -952,7 +951,7 @@ fn simd_or_scalar_filter_eq_u64(rules: &[crate::core::sme::rules::SemanticRule],
     out
 }
 
-fn simd_or_scalar_filter_eq_f64(rules: &[crate::core::sme::rules::SemanticRule], val: f64) -> Vec<(u64, u64)> {
+fn simd_or_scalar_filter_eq_f64(rules: &[SemanticRule], val: f64) -> Vec<(u64, u64)> {
     #[cfg(all(target_arch = "x86_64"))]
     {
         if std::arch::is_x86_feature_detected!("avx2") {
@@ -973,7 +972,7 @@ fn simd_or_scalar_filter_eq_f64(rules: &[crate::core::sme::rules::SemanticRule],
 }
 
 fn simd_or_scalar_filter_i64(
-    rules: &[crate::core::sme::rules::SemanticRule],
+    rules: &[SemanticRule],
     lower: Option<(i64, bool)>,
     upper: Option<(i64, bool)>,
 ) -> Vec<(u64, u64)> {
@@ -1004,7 +1003,7 @@ fn simd_or_scalar_filter_i64(
 }
 
 fn simd_or_scalar_filter_u64(
-    rules: &[crate::core::sme::rules::SemanticRule],
+    rules: &[SemanticRule],
     lower: Option<(u64, bool)>,
     upper: Option<(u64, bool)>,
 ) -> Vec<(u64, u64)> {
@@ -1030,7 +1029,7 @@ fn simd_or_scalar_filter_u64(
 }
 
 fn simd_or_scalar_filter_f64(
-    rules: &[crate::core::sme::rules::SemanticRule],
+    rules: &[SemanticRule],
     lower: Option<(f64, bool)>,
     upper: Option<(f64, bool)>,
 ) -> Vec<(u64, u64)> {
@@ -1347,8 +1346,8 @@ fn string_metrics_from_bytes(bytes: &[u8]) -> (u64, u64) {
 }
 
 fn filter_rules_metric_u64(
-    rules: &[crate::core::sme::rules::SemanticRule],
-    op: crate::core::sme::rules::SemanticRuleOp,
+    rules: &[SemanticRule],
+    op: SemanticRuleOp,
     lower: Option<(u64, bool)>,
     upper: Option<(u64, bool)>,
 ) -> Vec<(u64, u64)> {
@@ -1382,8 +1381,8 @@ fn filter_rules_metric_u64(
 }
 
 fn filter_rules_bitset(
-    rules: &[crate::core::sme::rules::SemanticRule],
-    op: crate::core::sme::rules::SemanticRuleOp,
+    rules: &[SemanticRule],
+    op: SemanticRuleOp,
     required: &[u8; 32],
 ) -> Vec<(u64, u64)> {
     let mut out = Vec::new();
@@ -1400,7 +1399,7 @@ fn filter_rules_bitset(
 }
 
 #[inline]
-fn rule_bitset256(rule: &crate::core::sme::rules::SemanticRule) -> [u8; 32] {
+fn rule_bitset256(rule: &SemanticRule) -> [u8; 32] {
     let mut out = [0u8; 32];
     out[0..16].copy_from_slice(&rule.lower);
     out[16..32].copy_from_slice(&rule.upper);
@@ -1408,7 +1407,7 @@ fn rule_bitset256(rule: &crate::core::sme::rules::SemanticRule) -> [u8; 32] {
 }
 
 #[inline]
-pub(super) fn decode_string_metric_u64(rule: &crate::core::sme::rules::SemanticRule) -> Option<(u64, u64)> {
+pub(super) fn decode_string_metric_u64(rule: &SemanticRule) -> Option<(u64, u64)> {
     if rule.column_type != DbType::STRING {
         return None;
     }
@@ -1440,8 +1439,8 @@ fn bitset256_contains(rule_mask: &[u8; 32], required: &[u8; 32]) -> bool {
     true
 }
 
-fn rule_might_match_constraint(rule: &crate::core::sme::rules::SemanticRule, c: &NumericConstraint) -> bool {
-    use crate::core::sme::rules::SemanticRuleOp;
+fn rule_might_match_constraint(rule: &SemanticRule, c: &NumericConstraint) -> bool {
+    use SemanticRuleOp;
 
     // Convert rule bounds into a scalar interval.
     let (rule_lo, rule_hi) = match rule.column_type {
