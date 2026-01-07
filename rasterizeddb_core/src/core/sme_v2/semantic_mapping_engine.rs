@@ -9,9 +9,12 @@ use crate::core::{
 };
 
 use super::{
-    rule_store::{CorrelationRuleStore, NumericColumnRulesIndex, RulesFileHeaderV2},
-    rules::{intersect_ranges, normalize_ranges, NumericRuleRecordDisk, NumericScalar, RowRange},
-    sme_simd,
+    rule_store::{CorrelationRuleStore, RulesFileHeaderV2},
+    rules::{
+        intersect_ranges, normalize_ranges, NumericCorrelationRule, NumericRuleOp, NumericScalar,
+        RowRange,
+    },
+    sme_range_processor,
 };
 
 /// Global singleton instance for SME v2.
@@ -20,15 +23,16 @@ pub static SME_V2: OnceLock<Arc<SemanticMappingEngineV2>> = OnceLock::new();
 pub struct SemanticMappingEngineV2 {
     // This cache avoids re-reading header bytes repeatedly.
     headers: DashMap<String, Arc<RulesFileHeaderV2>, ahash::RandomState>,
-    // Cache for loaded column indices: (table_name, column_schema_id) -> Index
-    indices: DashMap<(String, u64), Arc<NumericColumnRulesIndex>, ahash::RandomState>,
+    // Cache for fully loaded per-column rules: (table_name, column_schema_id) -> Rules
+    // This is the format expected by `sme_range_processor`.
+    rules: DashMap<(String, u64), Arc<Vec<NumericCorrelationRule>>, ahash::RandomState>,
 }
 
 impl SemanticMappingEngineV2 {
     pub fn new() -> Self {
         Self {
             headers: DashMap::with_hasher(ahash::RandomState::new()),
-            indices: DashMap::with_hasher(ahash::RandomState::new()),
+            rules: DashMap::with_hasher(ahash::RandomState::new()),
         }
     }
 
@@ -284,38 +288,40 @@ impl SemanticMappingEngineV2 {
         Ok(Some(header))
     }
 
-    /// Loads rules for a specific column from disk using the per-column ranges.
-    pub async fn load_numeric_rule_records_for_column<S: StorageIO>(
+    /// Loads and caches fully materialized numeric rules for one column.
+    ///
+    /// This matches the data model expected by `sme_range_processor`.
+    pub async fn load_numeric_rules_for_column<S: StorageIO>(
         &self,
         base_io: Arc<S>,
         table_name: &str,
         column_schema_id: u64,
-    ) -> std::io::Result<Option<Arc<NumericColumnRulesIndex>>> {
-        if let Some(idx) = self.indices.get(&(table_name.to_string(), column_schema_id)) {
-            return Ok(Some(Arc::clone(idx.value())));
+    ) -> std::io::Result<Option<Arc<Vec<NumericCorrelationRule>>>> {
+        if let Some(rules) = self.rules.get(&(table_name.to_string(), column_schema_id)) {
+            return Ok(Some(Arc::clone(rules.value())));
         }
 
-        log::trace!("load_numeric_rule_records_for_column: {}, col={}", table_name, column_schema_id);
-        let rules_io = CorrelationRuleStore::open_rules_io(base_io, table_name).await;
-
-        let header = CorrelationRuleStore::try_load_header_v2(rules_io.clone()).await?;
+        let header = self.get_or_load_header(base_io.clone(), table_name).await?;
         let Some(header) = header else {
-            log::trace!("load_numeric_rule_records_for_column: no header found");
             return Ok(None);
         };
 
-        if let Some(idx) = CorrelationRuleStore::load_numeric_column_rules_index_for_column::<S>(
+        let rules_io = CorrelationRuleStore::open_rules_io(base_io, table_name).await;
+        let rules = CorrelationRuleStore::load_numeric_rules_for_column::<S>(
             rules_io,
             &header,
             column_schema_id,
         )
-        .await? {
-            let idx_arc = Arc::new(idx);
-            self.indices.insert((table_name.to_string(), column_schema_id), Arc::clone(&idx_arc));
-            Ok(Some(idx_arc))
-        } else {
-            Ok(None)
+        .await?;
+
+        if rules.is_empty() {
+            return Ok(None);
         }
+
+        let rules = Arc::new(rules);
+        self.rules
+            .insert((table_name.to_string(), column_schema_id), Arc::clone(&rules));
+        Ok(Some(rules))
     }
 
     /// Builds the tightest candidate row ranges for an equality search `column == query`.
@@ -331,85 +337,49 @@ impl SemanticMappingEngineV2 {
         column_schema_id: u64,
         query: NumericScalar,
     ) -> std::io::Result<Option<Vec<RowRange>>> {
-        let start = std::time::Instant::now();
-        log::trace!("candidates_for_numeric_equals: table={}, col={}, query={:?}", table_name, column_schema_id, query);
-        
-        let rules_io = CorrelationRuleStore::open_rules_io(base_io.clone(), table_name).await;
-        // Ensure header loaded (consistency)
-        let header = self.get_or_load_header(base_io.clone(), table_name).await?;
-        let Some(_header) = header else {
+        log::trace!(
+            "candidates_for_numeric_equals: table={}, col={}, query={:?}",
+            table_name,
+            column_schema_id,
+            query
+        );
+
+        let Some(rules) = self
+            .load_numeric_rules_for_column(base_io, table_name, column_schema_id)
+            .await?
+        else {
             return Ok(None);
         };
 
-        let Some(idx) = self.load_numeric_rule_records_for_column(
-            base_io,
-            table_name,
-            column_schema_id
-        ).await?
-        else {
-             log::trace!("candidates_for_numeric_equals: no index for column");
-             return Ok(None);
+        let Some(column_type) = rules.first().map(|r| r.column_type.clone()) else {
+            return Ok(None);
         };
 
-        if idx.lt.is_empty() && idx.gt.is_empty() {
-             log::trace!("candidates_for_numeric_equals: index empty");
-             return Ok(None);
-        }
-
-        let col_type = idx.column_type.clone();
-        let query = match coerce_query_scalar(&col_type, query) {
+        let query = match coerce_query_scalar(&column_type, query) {
             Ok(q) => q,
             Err(_) => return Ok(None),
         };
 
-        let (best_lt_indices, best_gt_indices) = pick_best_rules(&col_type, &idx.lt, &idx.gt, query);
-        
-        if best_lt_indices.is_empty() && best_gt_indices.is_empty() {
-               log::trace!("candidates_for_numeric_equals: no covering rules found");
-               return Ok(None);
+        // Split by operation to avoid checking op inside the SIMD selection loop.
+        let mut lt_rules = Vec::new();
+        let mut gt_rules = Vec::new();
+        for r in rules.iter() {
+            match r.op {
+                NumericRuleOp::LessThan => lt_rules.push(r.clone()),
+                NumericRuleOp::GreaterThan => gt_rules.push(r.clone()),
+            }
         }
 
-        // Parallel load from multiple rules
-        let mut lt_ranges = None;
-        if !best_lt_indices.is_empty() {
-             let mut futures = Vec::new();
-             for i in best_lt_indices {
-                 let r = idx.lt[i];
-                 let io = rules_io.clone();
-                 futures.push(async move { CorrelationRuleStore::load_ranges_for_rule::<S>(io, r).await });
-             }
-             let results = futures::future::join_all(futures).await;
-             let mut combined = Vec::new();
-             for res in results {
-                 if let Ok(r) = res { combined.extend(r); }
-             }
-             lt_ranges = Some(normalize_ranges(combined));
-        }
+        let lt = sme_range_processor::candidate_row_ranges_for_query(query, &lt_rules).to_vec();
+        let gt = sme_range_processor::candidate_row_ranges_for_query(query, &gt_rules).to_vec();
 
-        let mut gt_ranges = None;
-        if !best_gt_indices.is_empty() {
-             let mut futures = Vec::new();
-             for i in best_gt_indices {
-                 let r = idx.gt[i];
-                 let io = rules_io.clone();
-                 futures.push(async move { CorrelationRuleStore::load_ranges_for_rule::<S>(io, r).await });
-             }
-             let results = futures::future::join_all(futures).await;
-             let mut combined = Vec::new();
-             for res in results {
-                 if let Ok(r) = res { combined.extend(r); }
-             }
-             gt_ranges = Some(normalize_ranges(combined));
-        }
-        
-        let result = match (lt_ranges, gt_ranges) {
-            (Some(l), Some(g)) => intersect_ranges(&l, &g),
-            (Some(l), None) => l,
-            (None, Some(g)) => g,
-            (None, None) => return Ok(None),
+        let result = match (lt.is_empty(), gt.is_empty()) {
+            (true, true) => return Ok(None),
+            (false, true) => lt,
+            (true, false) => gt,
+            (false, false) => intersect_ranges(&lt, &gt),
         };
-        
-        log::trace!("candidates_for_numeric_equals: result {} ranges in {:.2?}", result.len(), start.elapsed());
+
         Ok(Some(normalize_ranges(result)))
     }
 
@@ -422,51 +392,72 @@ impl SemanticMappingEngineV2 {
         op: &str,
         query: NumericScalar,
     ) -> std::io::Result<Option<Vec<RowRange>>> {
-        log::trace!("candidates_for_numeric_range: table={}, col={}, op={}, query={:?}", table_name, column_schema_id, op, query);
-        
-        let header = self.get_or_load_header(base_io.clone(), table_name).await?;
-        let Some(_header) = header else {
-            return Ok(None);
-        };
-
-        let rules_io = CorrelationRuleStore::open_rules_io(base_io.clone(), table_name).await;
-        let Some(idx) = self.load_numeric_rule_records_for_column(
-            base_io,
+        log::trace!(
+            "candidates_for_numeric_range: table={}, col={}, op={}, query={:?}",
             table_name,
-            column_schema_id
-        ).await?
+            column_schema_id,
+            op,
+            query
+        );
+
+        let Some(rules) = self
+            .load_numeric_rules_for_column(base_io, table_name, column_schema_id)
+            .await?
         else {
             return Ok(None);
         };
 
-        let col_type = idx.column_type.clone();
-        let query = match coerce_query_scalar(&col_type, query) {
+        let Some(column_type) = rules.first().map(|r| r.column_type.clone()) else {
+            return Ok(None);
+        };
+
+        let query = match coerce_query_scalar(&column_type, query) {
             Ok(q) => q,
             Err(_) => return Ok(None),
         };
 
-        let best_rules = pick_best_range_rule(&col_type, &idx.lt, &idx.gt, op, query);
-
-        if best_rules.is_empty() {
-             return Ok(None);
+        let mut lt_rules = Vec::new();
+        let mut gt_rules = Vec::new();
+        for r in rules.iter() {
+            match r.op {
+                NumericRuleOp::LessThan => lt_rules.push(r.clone()),
+                NumericRuleOp::GreaterThan => gt_rules.push(r.clone()),
+            }
         }
 
-        let mut futures = Vec::new();
-        for (is_gt, i) in best_rules {
-             let record = if is_gt { idx.gt[i] } else { idx.lt[i] };
-             let r_io = rules_io.clone();
-             futures.push(async move {
-                  CorrelationRuleStore::load_ranges_for_rule::<S>(r_io, record).await
-             });
+        // `sme_range_processor` uses strict comparisons:
+        // - LT: query < threshold
+        // - GT: query > threshold
+        // For SQL '<' and '>' we need to also accept threshold == query on the threshold side.
+        let ranges: smallvec::SmallVec<[RowRange; 64]> = match op {
+            "<" => {
+                let mut out = sme_range_processor::candidate_row_ranges_for_query(query, &lt_rules);
+                for r in lt_rules.iter() {
+                    if r.value == query {
+                        out.extend_from_slice(&r.ranges);
+                    }
+                }
+                sme_range_processor::merge_row_ranges(out)
+            }
+            "<=" => sme_range_processor::candidate_row_ranges_for_query(query, &lt_rules),
+            ">" => {
+                let mut out = sme_range_processor::candidate_row_ranges_for_query(query, &gt_rules);
+                for r in gt_rules.iter() {
+                    if r.value == query {
+                        out.extend_from_slice(&r.ranges);
+                    }
+                }
+                sme_range_processor::merge_row_ranges(out)
+            }
+            ">=" => sme_range_processor::candidate_row_ranges_for_query(query, &gt_rules),
+            _ => return Ok(None),
+        };
+
+        if ranges.is_empty() {
+            return Ok(None);
         }
-        
-        let results = futures::future::join_all(futures).await;
-        let mut combined = Vec::new();
-        for res in results {
-            if let Ok(r) = res { combined.extend(r); }
-        }
-        
-        Ok(Some(normalize_ranges(combined)))
+
+        Ok(Some(ranges.to_vec()))
     }
 }
 
@@ -547,490 +538,3 @@ fn row_pointer_id_u64(id: u128) -> u64 {
 #[cfg(not(feature = "enable_long_row"))]
 #[inline]
 fn _row_pointer_id_u64(id: u64) -> u64 { id }
-
-fn pick_best_rules(
-    column_type: &DbType,
-    lt: &[NumericRuleRecordDisk],
-    gt: &[NumericRuleRecordDisk],
-    query: NumericScalar,
-) -> (Vec<usize>, Vec<usize>) {
-    match query {
-        NumericScalar::Signed(q) => {
-            if matches!(column_type, DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64) {
-                let q64 = q as i64;
-                (pick_best_lt_i64(lt, q64), pick_best_gt_i64(gt, q64))
-            } else {
-                let mut best_lt = Vec::new();
-                let mut best_lt_thr = i128::MIN;
-                let mut found_lt = false;
-
-                for (i, r) in lt.iter().copied().enumerate() {
-                    let thr = match r.decoded_scalar(column_type) { NumericScalar::Signed(v) => v, _ => continue };
-                    if q < thr {
-                        // We want min thr > q.
-                        // wait, previous logic: if q < thr (thr is upper bound). We want tightest upper bound.
-                        // So we minimize thr.
-                        if !found_lt || thr < best_lt_thr {
-                            best_lt_thr = thr;
-                            best_lt.clear();
-                            best_lt.push(i);
-                            found_lt = true;
-                        } else if thr == best_lt_thr {
-                            best_lt.push(i);
-                        }
-                    }
-                }
-
-                let mut best_gt = Vec::new();
-                let mut best_gt_thr = i128::MIN; // Placeholder
-                let mut found_gt = false;
-
-                for (i, r) in gt.iter().copied().enumerate() {
-                    let thr = match r.decoded_scalar(column_type) { NumericScalar::Signed(v) => v, _ => continue };
-                    if q > thr {
-                         // We want max thr < q.
-                        if !found_gt || thr > best_gt_thr {
-                            best_gt_thr = thr;
-                            best_gt.clear();
-                            best_gt.push(i);
-                            found_gt = true;
-                        } else if thr == best_gt_thr {
-                            best_gt.push(i);
-                        }
-                    }
-                }
-                (best_lt, best_gt)
-            }
-        }
-        NumericScalar::Unsigned(q) => {
-            if matches!(column_type, DbType::U8 | DbType::U16 | DbType::U32 | DbType::U64) {
-                let q64 = q as u64;
-                (pick_best_lt_u64(lt, q64), pick_best_gt_u64(gt, q64))
-            } else {
-                 let mut best_lt = Vec::new();
-                let mut best_lt_thr = u128::MAX;
-                let mut found_lt = false;
-
-                for (i, r) in lt.iter().copied().enumerate() {
-                    let thr = match r.decoded_scalar(column_type) { NumericScalar::Unsigned(v) => v, _ => continue };
-                    if q < thr {
-                        if !found_lt || thr < best_lt_thr {
-                            best_lt_thr = thr;
-                            best_lt.clear();
-                            best_lt.push(i);
-                            found_lt = true;
-                        } else if thr == best_lt_thr {
-                            best_lt.push(i);
-                        }
-                    }
-                }
-                
-                let mut best_gt = Vec::new();
-                let mut best_gt_thr = u128::MIN;
-                let mut found_gt = false;
-
-                for (i, r) in gt.iter().copied().enumerate() {
-                    let thr = match r.decoded_scalar(column_type) { NumericScalar::Unsigned(v) => v, _ => continue };
-                    if q > thr {
-                         if !found_gt || thr > best_gt_thr {
-                            best_gt_thr = thr;
-                            best_gt.clear();
-                            best_gt.push(i);
-                            found_gt = true;
-                        } else if thr == best_gt_thr {
-                            best_gt.push(i);
-                        }
-                    }
-                }
-                (best_lt, best_gt)
-            }
-        }
-        NumericScalar::Float(q) => {
-            let q64 = q;
-            (pick_best_lt_f64(lt, q64), pick_best_gt_f64(gt, q64))
-        }
-    }
-}
-
-fn pick_best_lt_i64(records: &[NumericRuleRecordDisk], query: i64) -> Vec<usize> {
-    if records.is_empty() { return Vec::new(); }
-    let matches = sme_simd::select_gt_i64(records, query);
-    helper_minimize_i64(records, matches)
-}
-
-fn pick_best_gt_i64(records: &[NumericRuleRecordDisk], query: i64) -> Vec<usize> {
-    if records.is_empty() { return Vec::new(); }
-    let matches = sme_simd::select_lt_i64(records, query);
-    helper_maximize_i64(records, matches)
-}
-
-fn pick_best_lt_u64(records: &[NumericRuleRecordDisk], query: u64) -> Vec<usize> {
-    if records.is_empty() { return Vec::new(); }
-    let matches = sme_simd::select_gt_u64(records, query);
-    helper_minimize_u64(records, matches)
-}
-
-fn pick_best_gt_u64(records: &[NumericRuleRecordDisk], query: u64) -> Vec<usize> {
-    if records.is_empty() { return Vec::new(); }
-    let matches = sme_simd::select_lt_u64(records, query);
-    helper_maximize_u64(records, matches)
-}
-
-fn pick_best_lt_f64(records: &[NumericRuleRecordDisk], query: f64) -> Vec<usize> {
-    if records.is_empty() { return Vec::new(); }
-    let matches = sme_simd::select_gt_f64(records, query);
-    helper_minimize_f64(records, matches)
-}
-
-fn pick_best_gt_f64(records: &[NumericRuleRecordDisk], query: f64) -> Vec<usize> {
-    if records.is_empty() { return Vec::new(); }
-    let matches = sme_simd::select_lt_f64(records, query);
-    helper_maximize_f64(records, matches)
-}
-
-fn helper_minimize_i64(records: &[NumericRuleRecordDisk], indices: Vec<usize>) -> Vec<usize> {
-    if indices.is_empty() { return Vec::new(); }
-    let mut best_val = i64::MAX;
-    let mut best_idxs = Vec::new();
-    let mut first = true;
-    for idx in indices {
-        let val = i64::from_le_bytes(records[idx].value[0..8].try_into().unwrap());
-        if first || val < best_val {
-            best_val = val;
-            best_idxs.clear();
-            best_idxs.push(idx);
-            first = false;
-        } else if val == best_val {
-            best_idxs.push(idx);
-        }
-    }
-    best_idxs
-}
-
-fn helper_maximize_i64(records: &[NumericRuleRecordDisk], indices: Vec<usize>) -> Vec<usize> {
-    if indices.is_empty() { return Vec::new(); }
-    let mut best_val = i64::MIN;
-    let mut best_idxs = Vec::new();
-    let mut first = true;
-    for idx in indices {
-        let val = i64::from_le_bytes(records[idx].value[0..8].try_into().unwrap());
-        if first || val > best_val {
-            best_val = val;
-            best_idxs.clear();
-            best_idxs.push(idx);
-            first = false;
-        } else if val == best_val {
-            best_idxs.push(idx);
-        }
-    }
-    best_idxs
-}
-
-fn helper_minimize_u64(records: &[NumericRuleRecordDisk], indices: Vec<usize>) -> Vec<usize> {
-    if indices.is_empty() { return Vec::new(); }
-    let mut best_val = u64::MAX;
-    let mut best_idxs = Vec::new();
-    let mut first = true;
-    for idx in indices {
-        let val = u64::from_le_bytes(records[idx].value[0..8].try_into().unwrap());
-        if first || val < best_val {
-            best_val = val;
-            best_idxs.clear();
-            best_idxs.push(idx);
-            first = false;
-        } else if val == best_val {
-            best_idxs.push(idx);
-        }
-    }
-    best_idxs
-}
-
-fn helper_maximize_u64(records: &[NumericRuleRecordDisk], indices: Vec<usize>) -> Vec<usize> {
-    if indices.is_empty() { return Vec::new(); }
-    let mut best_val = u64::MIN;
-    let mut best_idxs = Vec::new();
-    let mut first = true;
-    for idx in indices {
-        let val = u64::from_le_bytes(records[idx].value[0..8].try_into().unwrap());
-        if first || val > best_val {
-            best_val = val;
-            best_idxs.clear();
-            best_idxs.push(idx);
-            first = false;
-        } else if val == best_val {
-            best_idxs.push(idx);
-        }
-    }
-    best_idxs
-}
-
-fn helper_minimize_f64(records: &[NumericRuleRecordDisk], indices: Vec<usize>) -> Vec<usize> {
-    if indices.is_empty() { return Vec::new(); }
-    let mut best_val = f64::MAX;
-    let mut best_idxs = Vec::new();
-    let mut first = true;
-    for idx in indices {
-        let val_bits = u64::from_le_bytes(records[idx].value[0..8].try_into().unwrap());
-        let val = f64::from_bits(val_bits);
-        if first || val < best_val {
-            best_val = val;
-            best_idxs.clear();
-            best_idxs.push(idx);
-            first = false;
-        } else if (val - best_val).abs() < f64::EPSILON {
-            best_idxs.push(idx);
-        }
-    }
-    best_idxs
-}
-
-fn helper_maximize_f64(records: &[NumericRuleRecordDisk], indices: Vec<usize>) -> Vec<usize> {
-    if indices.is_empty() { return Vec::new(); }
-    let mut best_val = f64::MIN;
-    let mut best_idxs = Vec::new();
-    let mut first = true;
-    for idx in indices {
-        let val_bits = u64::from_le_bytes(records[idx].value[0..8].try_into().unwrap());
-        let val = f64::from_bits(val_bits);
-        if first || val > best_val {
-            best_val = val;
-            best_idxs.clear();
-            best_idxs.push(idx);
-            first = false;
-        } else if (val - best_val).abs() < f64::EPSILON {
-            best_idxs.push(idx);
-        }
-    }
-    best_idxs
-}
-
-fn pick_best_range_rule(
-    column_type: &DbType,
-    lt: &[NumericRuleRecordDisk],
-    gt: &[NumericRuleRecordDisk],
-    op: &str,
-    query: NumericScalar,
-) -> Vec<(bool, usize)> {
-    match query {
-        NumericScalar::Signed(q) => match op {
-            ">" => {
-                let mut best_thr = i128::MIN;
-                let mut best_idxs = Vec::new();
-                let mut found = false;
-                for (i, r) in gt.iter().enumerate() {
-                    let thr = match r.decoded_scalar(column_type) { NumericScalar::Signed(v) => v, _ => continue };
-                    if thr <= q { 
-                        if !found || thr > best_thr {
-                            best_thr = thr;
-                            best_idxs.clear();
-                            best_idxs.push((true, i));
-                            found = true;
-                        } else if thr == best_thr {
-                            best_idxs.push((true, i));
-                        }
-                    }
-                }
-                best_idxs
-            }
-            ">=" => {
-                let mut best_thr = i128::MIN;
-                let mut best_idxs = Vec::new();
-                let mut found = false;
-                for (i, r) in gt.iter().enumerate() {
-                    let thr = match r.decoded_scalar(column_type) { NumericScalar::Signed(v) => v, _ => continue };
-                    if thr < q { 
-                        if !found || thr > best_thr {
-                            best_thr = thr;
-                            best_idxs.clear();
-                            best_idxs.push((true, i));
-                            found = true;
-                        } else if thr == best_thr {
-                            best_idxs.push((true, i));
-                        }
-                    }
-                }
-                best_idxs
-            }
-            "<" => {
-                let mut best_thr = i128::MAX;
-                let mut best_idxs = Vec::new();
-                let mut found = false;
-                for (i, r) in lt.iter().enumerate() {
-                    let thr = match r.decoded_scalar(column_type) { NumericScalar::Signed(v) => v, _ => continue };
-                    if thr >= q { 
-                        if !found || thr < best_thr {
-                            best_thr = thr;
-                            best_idxs.clear();
-                            best_idxs.push((false, i));
-                            found = true;
-                        } else if thr == best_thr {
-                            best_idxs.push((false, i));
-                        }
-                    }
-                }
-                best_idxs
-            }
-            "<=" => {
-                let mut best_thr = i128::MAX;
-                let mut best_idxs = Vec::new();
-                let mut found = false;
-                for (i, r) in lt.iter().enumerate() {
-                    let thr = match r.decoded_scalar(column_type) { NumericScalar::Signed(v) => v, _ => continue };
-                    if thr > q { 
-                        if !found || thr < best_thr {
-                            best_thr = thr;
-                            best_idxs.clear();
-                            best_idxs.push((false, i));
-                            found = true;
-                        } else if thr == best_thr {
-                            best_idxs.push((false, i));
-                        }
-                    }
-                }
-                best_idxs
-            }
-            _ => Vec::new(),
-        },
-        NumericScalar::Unsigned(q) => match op {
-            ">" => {
-                // GT Rule T <= Q. Maximize T.
-                // Use SIMD helper to finding candidates then filter
-                if matches!(column_type, DbType::U8 | DbType::U16 | DbType::U32 | DbType::U64) {
-                    let candidates_lt = sme_simd::select_lt_u64(gt, q as u64);
-                    let candidates_eq = sme_simd::select_eq_u64(gt, q as u64);
-                    let mut all_indices = candidates_lt;
-                    all_indices.extend(candidates_eq);
-                    
-                    let best = helper_maximize_u64(gt, all_indices);
-                    best.into_iter().map(|i| (true, i)).collect()
-                } else {
-                    let mut best_thr = u128::MIN;
-                    let mut best_idxs = Vec::new();
-                    let mut found = false;
-                    for (i, r) in gt.iter().enumerate() {
-                        let thr = match r.decoded_scalar(column_type) { NumericScalar::Unsigned(v) => v, _ => continue };
-                        if thr <= q { 
-                            if !found || thr > best_thr {
-                                best_thr = thr;
-                                best_idxs.clear();
-                                best_idxs.push((true, i));
-                                found = true;
-                            } else if thr == best_thr {
-                                best_idxs.push((true, i));
-                            }
-                        }
-                    }
-                    best_idxs
-                }
-            }
-            ">=" => {
-                if matches!(column_type, DbType::U8 | DbType::U16 | DbType::U32 | DbType::U64) {
-                    let candidates = sme_simd::select_lt_u64(gt, q as u64);
-                    let best = helper_maximize_u64(gt, candidates);
-                    best.into_iter().map(|i| (true, i)).collect()
-                } else {
-                    let mut best_thr = u128::MIN;
-                     let mut best_idxs = Vec::new();
-                    let mut found = false;
-                    for (i, r) in gt.iter().enumerate() {
-                        let thr = match r.decoded_scalar(column_type) { NumericScalar::Unsigned(v) => v, _ => continue };
-                        if thr < q { 
-                            if !found || thr > best_thr {
-                                best_thr = thr;
-                                best_idxs.clear();
-                                best_idxs.push((true, i));
-                                found = true;
-                            } else if thr == best_thr {
-                                best_idxs.push((true, i));
-                            }
-                        }
-                    }
-                    best_idxs
-                }
-            }
-            "<" => {
-                if matches!(column_type, DbType::U8 | DbType::U16 | DbType::U32 | DbType::U64) {
-                    let candidates_gt = sme_simd::select_gt_u64(lt, q as u64);
-                    let candidates_eq = sme_simd::select_eq_u64(lt, q as u64);
-                    let mut all = candidates_gt;
-                    all.extend(candidates_eq);
-                    let best = helper_minimize_u64(lt, all);
-                    best.into_iter().map(|i| (false, i)).collect()
-                } else {
-                    let mut best_thr = u128::MAX;
-                    let mut best_idxs = Vec::new();
-                    let mut found = false;
-                    for (i, r) in lt.iter().enumerate() {
-                        let thr = match r.decoded_scalar(column_type) { NumericScalar::Unsigned(v) => v, _ => continue };
-                        if thr >= q { 
-                            if !found || thr < best_thr {
-                                best_thr = thr;
-                                best_idxs.clear();
-                                best_idxs.push((false, i));
-                                found = true;
-                            } else if thr == best_thr {
-                                best_idxs.push((false, i));
-                            }
-                        }
-                    }
-                    best_idxs
-                }
-            }
-            "<=" => {
-                 if matches!(column_type, DbType::U8 | DbType::U16 | DbType::U32 | DbType::U64) {
-                    let candidates = sme_simd::select_gt_u64(lt, q as u64);
-                    let best = helper_minimize_u64(lt, candidates);
-                    best.into_iter().map(|i| (false, i)).collect()
-                } else {
-                    let mut best_thr = u128::MAX;
-                    let mut best_idxs = Vec::new();
-                    let mut found = false;
-                    for (i, r) in lt.iter().enumerate() {
-                        let thr = match r.decoded_scalar(column_type) { NumericScalar::Unsigned(v) => v, _ => continue };
-                        if thr > q { 
-                            if !found || thr < best_thr {
-                                best_thr = thr;
-                                best_idxs.clear();
-                                best_idxs.push((false, i));
-                                found = true;
-                            } else if thr == best_thr {
-                                best_idxs.push((false, i));
-                            }
-                        }
-                    }
-                    best_idxs
-                }
-            }
-            _ => Vec::new(),
-        },
-        NumericScalar::Float(q) => match op {
-            ">" => {
-                let candidates_lt = sme_simd::select_lt_f64(gt, q);
-                let candidates_eq = sme_simd::select_eq_f64(gt, q);
-                let mut all = candidates_lt;
-                all.extend(candidates_eq);
-                let best = helper_maximize_f64(gt, all);
-                best.into_iter().map(|i| (true, i)).collect()
-            }
-            ">=" => {
-                let candidates = sme_simd::select_lt_f64(gt, q);
-                let best = helper_maximize_f64(gt, candidates);
-                best.into_iter().map(|i| (true, i)).collect()
-            }
-            "<" => {
-                let candidates_gt = sme_simd::select_gt_f64(lt, q);
-                let candidates_eq = sme_simd::select_eq_f64(lt, q);
-                let mut all = candidates_gt;
-                all.extend(candidates_eq);
-                let best = helper_minimize_f64(lt, all);
-                best.into_iter().map(|i| (false, i)).collect()
-            }
-            "<=" => {
-                let candidates = sme_simd::select_gt_f64(lt, q);
-                let best = helper_minimize_f64(lt, candidates);
-                best.into_iter().map(|i| (false, i)).collect()
-            }
-            _ => Vec::new(),
-        },
-    }
-}
