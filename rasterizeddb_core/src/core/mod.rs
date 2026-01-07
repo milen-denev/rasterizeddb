@@ -10,3 +10,4 @@ pub mod tokenizer;
 pub mod processor;
 pub mod rql;
 pub mod sme;
+pub mod sme_v2;

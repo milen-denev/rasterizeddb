@@ -139,7 +139,7 @@ fn main() -> std::io::Result<()> {
             .init();
 
         #[cfg(debug_assertions)]
-        let db_location = config.location.as_deref().unwrap_or("G:/Databases/Production/");
+        let db_location = config.location.as_deref().unwrap_or("G:/Databases/Production_2/");
         
         #[cfg(not(debug_assertions))]
         let db_location = config.location.as_deref().expect("Database location must be provided with --location <path>");

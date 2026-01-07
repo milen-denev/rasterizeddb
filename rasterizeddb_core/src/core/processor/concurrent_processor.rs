@@ -25,7 +25,16 @@ use crate::{
     }, memory_pool::MemoryBlock
 };
 
-use crate::{BATCH_SIZE, semantics_enabled, core::sme::semantic_mapping_engine::{SME, SemanticMappingEngine}};
+use crate::{BATCH_SIZE, semantics_enabled};
+
+#[cfg(not(feature = "sme_v2"))]
+use crate::core::sme::semantic_mapping_engine::{SME, SemanticMappingEngine};
+
+#[cfg(feature = "sme_v2")]
+use crate::core::sme_v2::{
+    semantic_mapping_engine::{SemanticMappingEngineV2, SME_V2},
+    rules::{intersect_ranges, normalize_ranges, NumericScalar, RowRange},
+};
 
 use crate::core::tokenizer::query_tokenizer::Token;
 
@@ -127,6 +136,7 @@ impl ConcurrentProcessor {
         (no_filter, schema_arc, tokens_arc)
     }
 
+    #[cfg(not(feature = "sme_v2"))]
     async fn maybe_build_sme_candidates<S: StorageIO>(
         table_name: &str,
         tokens: &Arc<SmallVec<[Token; 36]>>,
@@ -151,6 +161,201 @@ impl ConcurrentProcessor {
         .map(|arc| (arc, 0usize))
     }
 
+    #[cfg(feature = "sme_v2")]
+    async fn maybe_build_sme_candidates<S: StorageIO>(
+        table_name: &str,
+        tokens: &Arc<SmallVec<[Token; 36]>>,
+        schema: &Arc<SmallVec<[SchemaField; 20]>>,
+        io_rows: &Arc<S>,
+        iterator: &RowPointerIterator<S>,
+    ) -> Option<(Arc<Vec<RowPointer>>, usize)> {
+        let _ = schema;
+        let _ = io_rows;
+
+        if !semantics_enabled() {
+            return None;
+        }
+
+        let start = std::time::Instant::now();
+        log::trace!("maybe_build_sme_candidates: starting for table {}", table_name);
+
+        // SME v2 currently supports a minimal predicate subset:
+        //   <ident> = <number>
+        // and combines multiple such predicates by intersecting row-id ranges.
+        // If the query contains parentheses or OR, fall back to full scan.
+        for t in tokens.iter() {
+            if matches!(t, Token::LPar | Token::RPar) {
+                log::trace!("maybe_build_sme_candidates: query contains parens, skipping SME");
+                return None;
+            }
+            if let Token::Next(s) = t {
+                if s.eq_ignore_ascii_case("or") {
+                    log::trace!("maybe_build_sme_candidates: query contains OR, skipping SME");
+                    return None;
+                }
+            }
+        }
+
+        let engine = SME_V2.get_or_init(|| rclite::Arc::new(SemanticMappingEngineV2::new()));
+        let pointers_io = iterator.io();
+
+        let mut ranges: Option<Vec<RowRange>> = None;
+
+        // Pattern match token triplets: Ident, Op("="), Number
+        let toks = &**tokens;
+        if toks.len() < 3 {
+             log::trace!("maybe_build_sme_candidates: query too short for predicates");
+            return None;
+        }
+
+        for w in toks.windows(3) {
+            let (Token::Ident((_name, db_type, schema_id)), Token::Op(op), Token::Number(num)) =
+                (&w[0], &w[1], &w[2])
+            else {
+                continue;
+            };
+
+            if op != "=" {
+                 log::trace!("maybe_build_sme_candidates: found non-equality op '{}', ignoring predicate", op);
+                continue;
+            }
+
+            let query = Self::numeric_value_to_scalar(num);
+            let query = match Self::coerce_scalar_for_db_type(db_type, query) {
+                Some(q) => q,
+                None => {
+                    log::trace!("maybe_build_sme_candidates: type coercion failed for {:?} -> {:?}", num, db_type);
+                    continue
+                },
+            };
+
+             log::trace!("maybe_build_sme_candidates: solving predicate col_{} = {:?}", schema_id, query);
+            let mut r = engine
+                .candidates_for_numeric_equals(
+                    Arc::clone(&pointers_io),
+                    table_name,
+                    *schema_id,
+                    query,
+                )
+                .await
+                .ok()?;
+            r = normalize_ranges(r);
+            log::trace!("maybe_build_sme_candidates: got {} ranges for predicate", r.len());
+
+            ranges = Some(match ranges {
+                None => r,
+                Some(prev) => intersect_ranges(&prev, &r),
+            });
+        }
+
+        let Some(mut ranges) = ranges else {
+            log::trace!("maybe_build_sme_candidates: no ranges derived from query");
+            return None;
+        };
+
+        ranges = normalize_ranges(ranges);
+        if ranges.is_empty() {
+            log::info!("maybe_build_sme_candidates: intersection empty, 0 candidates in {:.2?}", start.elapsed());
+            return Some((Arc::new(Vec::new()), 0));
+        }
+
+        log::debug!(
+            "maybe_build_sme_candidates: resolved {} ranges, scanning pointers...", 
+            ranges.len()
+        );
+
+        // Convert row-id ranges to candidate RowPointers by scanning pointer records only.
+        let mut it = RowPointerIterator::new(pointers_io.clone()).await.ok()?;
+        it.reset();
+
+        let mut out: Vec<RowPointer> = Vec::new();
+        let mut batch: Vec<RowPointer> = Vec::new();
+
+        let mut range_idx = 0usize;
+        loop {
+            batch.clear();
+            it.next_row_pointers_into(&mut batch).await.ok()?;
+            if batch.is_empty() {
+                break;
+            }
+
+            for p in batch.iter() {
+                if p.deleted {
+                    continue;
+                }
+                let id_u64 = Self::row_pointer_id_u64(p.id);
+
+                while range_idx < ranges.len() && id_u64 > ranges[range_idx].end_row_id {
+                    range_idx += 1;
+                }
+                if range_idx >= ranges.len() {
+                    break;
+                }
+                if id_u64 >= ranges[range_idx].start_row_id && id_u64 <= ranges[range_idx].end_row_id {
+                    out.push(p.clone());
+                }
+            }
+
+            if range_idx >= ranges.len() {
+                break;
+            }
+        }
+        
+        log::info!("maybe_build_sme_candidates: built {} candidates in {:.2?}", out.len(), start.elapsed());
+
+        Some((Arc::new(out), 0))
+    }
+
+
+#[cfg(feature = "sme_v2")]
+#[inline]
+fn numeric_value_to_scalar(v: &crate::core::tokenizer::query_tokenizer::NumericValue) -> NumericScalar {
+    use crate::core::tokenizer::query_tokenizer::NumericValue;
+    match v {
+        NumericValue::I8(x) => NumericScalar::Signed(*x as i128),
+        NumericValue::I16(x) => NumericScalar::Signed(*x as i128),
+        NumericValue::I32(x) => NumericScalar::Signed(*x as i128),
+        NumericValue::I64(x) => NumericScalar::Signed(*x as i128),
+        NumericValue::I128(x) => NumericScalar::Signed(*x),
+        NumericValue::U8(x) => NumericScalar::Unsigned(*x as u128),
+        NumericValue::U16(x) => NumericScalar::Unsigned(*x as u128),
+        NumericValue::U32(x) => NumericScalar::Unsigned(*x as u128),
+        NumericValue::U64(x) => NumericScalar::Unsigned(*x as u128),
+        NumericValue::U128(x) => NumericScalar::Unsigned(*x),
+        NumericValue::F32(x) => NumericScalar::Float(*x as f64),
+        NumericValue::F64(x) => NumericScalar::Float(*x),
+    }
+}
+
+#[cfg(feature = "sme_v2")]
+#[inline]
+fn coerce_scalar_for_db_type(db_type: &crate::core::db_type::DbType, q: NumericScalar) -> Option<NumericScalar> {
+    use crate::core::db_type::DbType;
+    match (db_type, q) {
+        (DbType::F32 | DbType::F64, NumericScalar::Float(v)) => Some(NumericScalar::Float(v)),
+        (DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::I128, NumericScalar::Signed(v)) => Some(NumericScalar::Signed(v)),
+        (DbType::U8 | DbType::U16 | DbType::U32 | DbType::U64 | DbType::U128, NumericScalar::Unsigned(v)) => Some(NumericScalar::Unsigned(v)),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "sme_v2")]
+#[cfg(feature = "enable_long_row")]
+#[inline]
+fn row_pointer_id_u64(id: u128) -> u64 {
+    if id > (u64::MAX as u128) {
+        u64::MAX
+    } else {
+        id as u64
+    }
+}
+
+#[cfg(feature = "sme_v2")]
+#[cfg(not(feature = "enable_long_row"))]
+#[inline]
+fn row_pointer_id_u64(id: u64) -> u64 {
+    id
+}
     async fn spawn_batch_tasks<S: StorageIO>(
         iterator: &mut RowPointerIterator<S>,
         mut sme_candidates: Option<(Arc<Vec<RowPointer>>, usize)>,

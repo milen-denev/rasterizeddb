@@ -14,7 +14,17 @@ use super::schema::TableSchema;
 use crate::core::processor::concurrent_processor::ConcurrentProcessor;
 use crate::core::rql::lexer_ct::CreateColumnData;
 use crate::core::processor::concurrent_processor::{ATOMIC_CACHE, ENABLE_CACHE};
+
+#[cfg(not(feature = "sme_v2"))]
 use crate::core::sme::scanner::{spawn_table_rules_scanner, TableRulesScannerHandle};
+
+#[cfg(feature = "sme_v2")]
+use crate::core::sme_v2::scanner::{
+    spawn_table_rules_scanner_v2 as spawn_table_rules_scanner,
+    TableRulesScannerHandleV2 as TableRulesScannerHandle,
+};
+
+#[cfg(not(feature = "sme_v2"))]
 use crate::core::sme::semantic_mapping_engine::SME;
 use crate::core::{
     row::{
@@ -58,9 +68,12 @@ impl<S: StorageIO> Table<S> {
             }
         }
 
-        // SME candidate cache can also go stale across mutations.
-        if let Some(engine) = SME.get() {
-            _ = engine.clear_candidates();
+        // SME v1 candidate cache can also go stale across mutations.
+        #[cfg(not(feature = "sme_v2"))]
+        {
+            if let Some(engine) = SME.get() {
+                _ = engine.clear_candidates();
+            }
         }
     }
 
@@ -161,10 +174,13 @@ impl<S: StorageIO> Table<S> {
             row_write.columns_writing_data.len()
         );
 
-        // Ensure SME never uses stale rules across mutations.
-        if let Some(engine) = SME.get() {
-            engine.mark_table_rules_dirty(&self.schema.name);
-            _ = engine.remove_table_rules_for_table(&self.schema.name);
+        // Ensure SME v1 never uses stale rules across mutations.
+        #[cfg(not(feature = "sme_v2"))]
+        {
+            if let Some(engine) = SME.get() {
+                engine.mark_table_rules_dirty(&self.schema.name);
+                _ = engine.remove_table_rules_for_table(&self.schema.name);
+            }
         }
 
         let result = RowPointer::write_row(
@@ -180,8 +196,11 @@ impl<S: StorageIO> Table<S> {
 
         if let Err(e) = result {
             error!("Failed to insert row: {}", e);
-            if let Some(engine) = SME.get() {
-                engine.clear_table_rules_dirty(&self.schema.name);
+            #[cfg(not(feature = "sme_v2"))]
+            {
+                if let Some(engine) = SME.get() {
+                    engine.clear_table_rules_dirty(&self.schema.name);
+                }
             }
             return Err(io::Error::new(
                 io::ErrorKind::Other,
@@ -300,9 +319,12 @@ impl<S: StorageIO> Table<S> {
             }
 
             if !marked_dirty {
-                if let Some(engine) = SME.get() {
-                    engine.mark_table_rules_dirty(&self.schema.name);
-                    _ = engine.remove_table_rules_for_table(&self.schema.name);
+                #[cfg(not(feature = "sme_v2"))]
+                {
+                    if let Some(engine) = SME.get() {
+                        engine.mark_table_rules_dirty(&self.schema.name);
+                        _ = engine.remove_table_rules_for_table(&self.schema.name);
+                    }
                 }
                 marked_dirty = true;
             }
@@ -432,9 +454,12 @@ impl<S: StorageIO> Table<S> {
 
             if update_result.is_ok() {
                 if !marked_dirty {
-                    if let Some(engine) = SME.get() {
-                        engine.mark_table_rules_dirty(&self.schema.name);
-                        _ = engine.remove_table_rules_for_table(&self.schema.name);
+                    #[cfg(not(feature = "sme_v2"))]
+                    {
+                        if let Some(engine) = SME.get() {
+                            engine.mark_table_rules_dirty(&self.schema.name);
+                            _ = engine.remove_table_rules_for_table(&self.schema.name);
+                        }
                     }
                     marked_dirty = true;
                 }
