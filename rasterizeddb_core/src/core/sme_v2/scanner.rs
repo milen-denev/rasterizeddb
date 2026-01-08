@@ -35,20 +35,29 @@ use crate::core::{
 
 use super::{
     rule_store::CorrelationRuleStore,
-    rules::{normalize_ranges, NumericCorrelationRule, NumericRuleOp, NumericScalar, RowRange},
+    rules::{
+        normalize_ranges,
+        NumericCorrelationRule,
+        NumericRuleOp,
+        NumericScalar,
+        RowRange,
+        StringCorrelationRule,
+        StringRuleOp,
+    },
 };
 
 #[cfg(debug_assertions)]
 use serde::Serialize;
 
-const RULES_SIZE_VARIABLE: usize = 48;
+const RULES_SIZE_VARIABLE: usize = 32;
 
 const SAMPLE_CAP: usize = 1024 * 4 * RULES_SIZE_VARIABLE;
 const THRESHOLD_COUNT: usize = 8 * RULES_SIZE_VARIABLE;
 
 // Candidate search breadth around the base percentile indices.
 // Kept intentionally small because this runs during full-table scans.
-const CANDIDATE_STEPS: [isize; 11] = [-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5];
+//const CANDIDATE_STEPS: [isize; 11] = [-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5];
+const CANDIDATE_STEPS: [isize; 5] = [-2, -1, 0, 1, 2];
 
 // Scoring weights for choosing thresholds.
 // For integer-like columns, we heavily penalize a high number of disjoint ranges.
@@ -66,6 +75,16 @@ const FLOAT_COARSEN_TARGET_MAX_RANGES: usize = 256;
 // Max percentage of the total rows a single rule is allowed to cover (1-100).
 // Rules covering more than this are discarded as being "too broad" (essentially full-table scans).
 const MAX_RULE_COVERAGE_PERCENT: u64 = 10;
+
+#[allow(dead_code)]
+const STRING_SAMPLE_CAP: usize = 4096;
+
+const STRING_PREFIX_SUFFIX_LENS: [usize; 7] = [1, 2, 4, 6, 8, 12, 16];
+const STRING_PREFIX_CANDIDATES: usize = 24;
+const STRING_SUFFIX_CANDIDATES: usize = 24;
+const STRING_CONTAINS_BYTE_CANDIDATES: usize = 12;
+const STRING_CONTAINS_COUNTS: [u8; 3] = [0, 1, 2];
+const STRING_FINAL_RULES_MAX: usize = 48;
 
 /// Spawns a background task that rebuilds SME v2 correlation rules on-demand.
 ///
@@ -378,10 +397,7 @@ fn scalar_key(v: NumericScalar) -> [u8; 16] {
 
 #[inline]
 fn ranges_candidate_rows(ranges: &[RowRange]) -> u64 {
-    ranges
-        .iter()
-        .map(|r| r.end_row_id.saturating_sub(r.start_row_id).saturating_add(1))
-        .sum()
+    ranges.iter().map(|r| r.row_count).sum()
 }
 
 #[inline]
@@ -409,14 +425,20 @@ fn coarsen_ranges_with_gap(mut ranges: Vec<RowRange>, max_gap: u64) -> Vec<RowRa
     if ranges.len() <= 1 {
         return ranges;
     }
-    ranges.sort_by_key(|r| r.start_row_id);
+
+    use crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN;
+    let len = ROW_POINTER_RECORD_LEN as u64;
+
+    ranges.sort_by_key(|r| r.start_pointer_pos);
     let mut out: Vec<RowRange> = Vec::with_capacity(ranges.len());
     let mut cur = ranges[0];
     for r in ranges.into_iter().skip(1) {
         // Allow merging ranges that are close, to reduce fragmentation.
-        let can_merge = r.start_row_id <= cur.end_row_id.saturating_add(max_gap).saturating_add(1);
+        let cur_end_excl = cur.end_pointer_pos_exclusive();
+        let can_merge = r.start_pointer_pos <= cur_end_excl.saturating_add(max_gap.saturating_mul(len));
         if can_merge {
-            cur.end_row_id = cur.end_row_id.max(r.end_row_id);
+            let new_end_excl = cur_end_excl.max(r.end_pointer_pos_exclusive());
+            cur.row_count = (new_end_excl.saturating_sub(cur.start_pointer_pos)) / len;
         } else {
             out.push(cur);
             cur = r;
@@ -531,20 +553,28 @@ fn optimize_ranges_dynamic(
              iterations += 1;
              improved = false;
              if clustered.len() <= 1 { break; }
+
+             use crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN;
+             let len = ROW_POINTER_RECORD_LEN as u64;
              
              // Find smallest gap
              let mut min_gap = u64::MAX;
              let mut min_gap_idx = 0;
              for i in 0..clustered.len()-1 {
-                 let g = clustered[i+1].start_row_id.saturating_sub(clustered[i].end_row_id).saturating_sub(1);
+                 let cur_end_excl = clustered[i].end_pointer_pos_exclusive();
+                 let next_start = clustered[i + 1].start_pointer_pos;
+                 let g = if next_start > cur_end_excl {
+                     (next_start - cur_end_excl) / len
+                 } else {
+                     0
+                 };
                  if g < min_gap {
                      min_gap = g;
                      min_gap_idx = i;
                  }
              }
              
-             let new_end = clustered[min_gap_idx+1].end_row_id;
-             let added_rows = min_gap; // roughly
+             let added_rows = min_gap;
              
              // Dynamic Squashing:
              // If we have a huge number of ranges, we increase the "weight" (value) of removing a range.
@@ -571,7 +601,9 @@ fn optimize_ranges_dynamic(
              // Merge if profitable OR if we are mandated to reduce size (hard limit)
              if cost < benefit || clustered.len() > FLOAT_COARSEN_TARGET_MAX_RANGES {
                  // Do merge
-                 clustered[min_gap_idx].end_row_id = new_end;
+                 let start = clustered[min_gap_idx].start_pointer_pos;
+                 let new_end_excl = clustered[min_gap_idx + 1].end_pointer_pos_exclusive();
+                 clustered[min_gap_idx].row_count = (new_end_excl.saturating_sub(start)) / len;
                  clustered.remove(min_gap_idx+1);
                  improved = true;
              }
@@ -621,45 +653,150 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
     let concurrency = *crate::MAX_PERMITS_THREADS.get().unwrap_or(&16);
     let concurrency = concurrency.max(1);
 
-    // Identify numeric columns.
-    let mut numeric_fields: Vec<(usize, u64, DbType, u32)> = Vec::new();
+    #[derive(Clone)]
+    struct FieldInfo {
+        schema_id: u64,
+        db_type: DbType,
+        fetch_idx: usize,
+    }
+
+    // Identify numeric and string columns.
+    let mut numeric_fields: Vec<FieldInfo> = Vec::new();
+    let mut string_fields: Vec<FieldInfo> = Vec::new();
     let schema_calc = SchemaCalculator::default();
+
+    let mut columns_fetching_data = SmallVec::new();
     for (idx, f) in schema.iter().enumerate() {
-        if NumericStats::new(&f.db_type).is_none() {
+        let (offset, schema_id) = schema_calc.calculate_schema_offset(&f.name, schema);
+        let size = schema[idx].size as u32;
+
+        if NumericStats::new(&f.db_type).is_some() {
+            columns_fetching_data.push(crate::core::row::row::ColumnFetchingData {
+                column_offset: offset,
+                column_type: f.db_type.clone(),
+                size,
+                schema_id,
+            });
+            let fetch_idx = columns_fetching_data.len() - 1;
+            numeric_fields.push(FieldInfo {
+                schema_id,
+                db_type: f.db_type.clone(),
+                fetch_idx,
+            });
             continue;
         }
-        let (offset, schema_id) = schema_calc.calculate_schema_offset(&f.name, schema);
-        numeric_fields.push((idx, schema_id, f.db_type.clone(), offset));
+
+        if f.db_type == DbType::STRING {
+            columns_fetching_data.push(crate::core::row::row::ColumnFetchingData {
+                column_offset: offset,
+                column_type: f.db_type.clone(),
+                size,
+                schema_id,
+            });
+            let fetch_idx = columns_fetching_data.len() - 1;
+            string_fields.push(FieldInfo {
+                schema_id,
+                db_type: f.db_type.clone(),
+                fetch_idx,
+            });
+        }
     }
 
-    if numeric_fields.is_empty() {
-        log::info!("scan_whole_table_build_rules: no numeric columns found, writing empty rules");
+    if numeric_fields.is_empty() && string_fields.is_empty() {
+        log::info!(
+            "scan_whole_table_build_rules: no numeric or string columns found, writing empty rules"
+        );
         let rules_io = CorrelationRuleStore::open_rules_io(base_io, table_name).await;
-        return CorrelationRuleStore::save_numeric_rules_atomic::<S>(rules_io, &[]).await;
+        return CorrelationRuleStore::save_rules_atomic::<S>(rules_io, &[], &[]).await;
     }
 
-    log::trace!("scan_whole_table_build_rules: found {} numeric columns. Using concurrency: {}", numeric_fields.len(), concurrency);
+    log::trace!(
+        "scan_whole_table_build_rules: found {} numeric + {} string columns. Using concurrency: {}",
+        numeric_fields.len(),
+        string_fields.len(),
+        concurrency
+    );
 
-    // Build a RowFetch for just numeric columns.
-    let mut columns_fetching_data = SmallVec::new();
-    for (idx, schema_id, db_type, offset) in numeric_fields.iter() {
-        let size = schema[*idx].size as u32;
-        columns_fetching_data.push(crate::core::row::row::ColumnFetchingData {
-            column_offset: *offset,
-            column_type: db_type.clone(),
-            size,
-            schema_id: *schema_id,
-        });
-    }
+    // Build a RowFetch for numeric + string columns.
     let row_fetch = RowFetch { columns_fetching_data };
     let row_fetch = Arc::new(row_fetch);
     let numeric_fields = Arc::new(numeric_fields);
+    let string_fields = Arc::new(string_fields);
+
+    // Schema maps for pass 2
+    let mut numeric_schema_id_to_fetch: BTreeMap<u64, (usize, DbType)> = BTreeMap::new();
+    for f in numeric_fields.iter() {
+        numeric_schema_id_to_fetch.insert(f.schema_id, (f.fetch_idx, f.db_type.clone()));
+    }
+    let numeric_schema_id_to_fetch = Arc::new(numeric_schema_id_to_fetch);
+
+    let mut string_schema_id_to_fetch: BTreeMap<u64, usize> = BTreeMap::new();
+    for f in string_fields.iter() {
+        string_schema_id_to_fetch.insert(f.schema_id, f.fetch_idx);
+    }
+    let string_schema_id_to_fetch = Arc::new(string_schema_id_to_fetch);
 
     // PASS 1: collect stats.
     let pass1_start = std::time::Instant::now();
+
+    #[derive(Clone)]
+    struct StringStats {
+        seen: u64,
+        prefix_counts: std::collections::HashMap<Vec<u8>, u32>,
+        suffix_counts: std::collections::HashMap<Vec<u8>, u32>,
+        byte_freq: [u32; 256],
+    }
+
+    impl StringStats {
+        fn new() -> Self {
+            Self {
+                seen: 0,
+                prefix_counts: std::collections::HashMap::new(),
+                suffix_counts: std::collections::HashMap::new(),
+                byte_freq: [0u32; 256],
+            }
+        }
+
+        fn update(&mut self, bytes: &[u8]) {
+            self.seen = self.seen.saturating_add(1);
+            if bytes.is_empty() {
+                return;
+            }
+
+            for &b in bytes.iter() {
+                self.byte_freq[b as usize] = self.byte_freq[b as usize].saturating_add(1);
+            }
+
+            for &len in STRING_PREFIX_SUFFIX_LENS.iter() {
+                if let Some(p) = utf8_safe_prefix(bytes, len) {
+                    if !p.is_empty() {
+                        *self.prefix_counts.entry(p).or_insert(0) += 1;
+                    }
+                }
+                if let Some(s) = utf8_safe_suffix(bytes, len) {
+                    if !s.is_empty() {
+                        *self.suffix_counts.entry(s).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+
+        fn merge_from(&mut self, other: StringStats) {
+            self.seen = self.seen.saturating_add(other.seen);
+            for (k, v) in other.prefix_counts.into_iter() {
+                *self.prefix_counts.entry(k).or_insert(0) += v;
+            }
+            for (k, v) in other.suffix_counts.into_iter() {
+                *self.suffix_counts.entry(k).or_insert(0) += v;
+            }
+            for i in 0..256 {
+                self.byte_freq[i] = self.byte_freq[i].saturating_add(other.byte_freq[i]);
+            }
+        }
+    }
     
-    // Producer: Read RowPointers
-    let (tx, rx) = tokio::sync::mpsc::channel::<Vec<RowPointer>>(concurrency * 4);
+    // Producer: Read RowPointers (with their byte offset in the pointers file).
+    let (tx, rx) = tokio::sync::mpsc::channel::<Vec<(u64, RowPointer)>>(concurrency * 4);
     let rx = Arc::new(tokio::sync::Mutex::new(rx));
     
     let pointers_io_clone = pointers_io.clone();
@@ -669,9 +806,19 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
             Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("RowPointerIterator: {}", e))),
         };
         loop {
-            let mut chunk = Vec::new(); // RowPointerIterator will fill this based on its internal batch size (usually 64KB)
-            if let Err(e) = iter.next_row_pointers_into(&mut chunk).await {
-                return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("RowPointerIterator: {}", e)));
+            let mut chunk: Vec<(u64, RowPointer)> = Vec::new();
+            // Keep chunk sizes consistent with the iterator batching.
+            for _ in 0..*crate::BATCH_SIZE.get().unwrap() {
+                match iter.next_row_pointer_with_offset().await {
+                    Ok(Some((pos, p))) => chunk.push((pos, p)),
+                    Ok(None) => break,
+                    Err(e) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("RowPointerIterator: {}", e),
+                        ))
+                    }
+                }
             }
             if chunk.is_empty() {
                 break;
@@ -689,12 +836,15 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
         let rows_io = rows_io.clone();
         let row_fetch = row_fetch.clone();
         let numeric_fields = numeric_fields.clone();
+        let string_fields = string_fields.clone();
         
         handles.push(tokio::spawn(async move {
             let mut stats: Vec<NumericStats> = numeric_fields
                 .iter()
-                .map(|(_, _, t, _)| NumericStats::new(t).unwrap())
+                .map(|f| NumericStats::new(&f.db_type).unwrap())
                 .collect();
+
+            let mut string_stats: Vec<StringStats> = (0..string_fields.len()).map(|_| StringStats::new()).collect();
                 
             let mut row = crate::core::row::row::Row::default();
             
@@ -706,16 +856,26 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
                 
                 match chunk_opt {
                     Some(chunk) => {
-                        for p in chunk {
+                        for (_pos, p) in chunk {
                             if p.deleted { continue; }
                             if let Err(_) = p.fetch_row_reuse_async(rows_io.clone(), &row_fetch, &mut row).await {
                                 // Ignore read errors in background scan
                                 continue;
                             }
-                            for (i, (_, _, db_type, _)) in numeric_fields.iter().enumerate() {
-                                let col = &row.columns[i];
+                            for (i, f) in numeric_fields.iter().enumerate() {
+                                let col = &row.columns[f.fetch_idx];
+                                let db_type = &f.db_type;
                                 if let Some(v) = decode_numeric_value(db_type, col.data.into_slice()) {
                                     stats[i].update(v);
+                                }
+                            }
+
+                            for (i, f) in string_fields.iter().enumerate() {
+                                let col = &row.columns[f.fetch_idx];
+                                let bytes = col.data.into_slice();
+                                // Only accept valid UTF-8 source values.
+                                if std::str::from_utf8(bytes).is_ok() {
+                                    string_stats[i].update(bytes);
                                 }
                             }
                         }
@@ -723,7 +883,7 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
                     None => break,
                 }
             }
-            stats
+            (stats, string_stats)
         }));
     }
 
@@ -732,12 +892,16 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
         return Err(e);
     }
     
-    // Aggregate stats
+    // Aggregate numeric + string stats
     let mut aggregated_stats: Vec<Option<NumericStats>> = (0..numeric_fields.len()).map(|_| None).collect();
+    let mut aggregated_string_stats: Vec<Option<StringStats>> = (0..string_fields.len()).map(|_| None).collect();
     
     for h in handles {
-        let thread_stats = h.await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-        for (i, s) in thread_stats.into_iter().enumerate() {
+        let (thread_numeric, thread_strings) = h
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+
+        for (i, s) in thread_numeric.into_iter().enumerate() {
              match &mut aggregated_stats[i] {
                  None => aggregated_stats[i] = Some(s),
                  Some(current) => {
@@ -793,6 +957,13 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
                  }
              }
         }
+
+        for (i, s) in thread_strings.into_iter().enumerate() {
+            match &mut aggregated_string_stats[i] {
+                None => aggregated_string_stats[i] = Some(s),
+                Some(current) => current.merge_from(s),
+            }
+        }
     }
     
     // Unwrap aggregated stats
@@ -800,6 +971,11 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
         // Should not happen, but safe fallback
         NumericStats::new(&DbType::I64).unwrap()
     })).collect();
+
+    let string_stats: Vec<StringStats> = aggregated_string_stats
+        .into_iter()
+        .map(|s| s.unwrap_or_else(StringStats::new))
+        .collect();
 
     log::info!("scan_whole_table_build_rules: Pass 1 (stats) done in {:.2?}", pass1_start.elapsed());
 
@@ -816,7 +992,9 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
     let mut plans: Vec<ColumnCandidatePlan> = Vec::new();
     let mut rules_by_col: Vec<(u64, Vec<NumericCorrelationRule>)> = Vec::new();
 
-    for (i, (_, schema_id, db_type, _)) in numeric_fields.iter().enumerate() {
+    for (i, f) in numeric_fields.iter().enumerate() {
+        let schema_id = &f.schema_id;
+        let db_type = &f.db_type;
         let sorted_samples = stats[i].sorted_unique_samples();
         if sorted_samples.is_empty() {
             log::trace!("scan_whole_table_build_rules: col {} has no samples, skipping", schema_id);
@@ -886,14 +1064,97 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
         rules_by_col.push((*schema_id, rules));
     }
 
-    log::info!("scan_whole_table_build_rules: Generated {} candidate plans", plans.len());
-    let rules_by_col = Arc::new(rules_by_col);
+    // Build string candidate rules per column from string stats.
+    let mut string_candidate_rules_by_col: Vec<(u64, Vec<StringCorrelationRule>)> = Vec::new();
+    for (i, f) in string_fields.iter().enumerate() {
+        let schema_id = f.schema_id;
+        let db_type = f.db_type.clone();
+        let st = &string_stats[i];
 
-    // PASS 2: build row-id ranges.
+        // Pick top prefixes
+        let mut prefixes: Vec<(Vec<u8>, u32)> = st.prefix_counts.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        prefixes.sort_by(|a, b| b.1.cmp(&a.1));
+        prefixes.truncate(STRING_PREFIX_CANDIDATES);
+
+        // Pick top suffixes
+        let mut suffixes: Vec<(Vec<u8>, u32)> = st.suffix_counts.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        suffixes.sort_by(|a, b| b.1.cmp(&a.1));
+        suffixes.truncate(STRING_SUFFIX_CANDIDATES);
+
+        // Pick top ASCII bytes for contains
+        let mut bytes: Vec<(u8, u32)> = (0u8..=255u8)
+            .map(|b| (b, st.byte_freq[b as usize]))
+            .filter(|(b, c)| *c > 0 && (32u8..=126u8).contains(b))
+            .collect();
+        bytes.sort_by(|a, b| b.1.cmp(&a.1));
+        bytes.truncate(STRING_CONTAINS_BYTE_CANDIDATES);
+
+        let mut rules: Vec<StringCorrelationRule> = Vec::new();
+
+        for (p, _) in prefixes.into_iter() {
+            let Some(s) = std::str::from_utf8(&p).ok().map(|s| s.to_string()) else {
+                continue;
+            };
+            rules.push(StringCorrelationRule {
+                column_schema_id: schema_id,
+                column_type: db_type.clone(),
+                op: StringRuleOp::StartsWith,
+                count: 1,
+                value: s,
+                ranges: Vec::new(),
+            });
+        }
+
+        for (p, _) in suffixes.into_iter() {
+            let Some(s) = std::str::from_utf8(&p).ok().map(|s| s.to_string()) else {
+                continue;
+            };
+            rules.push(StringCorrelationRule {
+                column_schema_id: schema_id,
+                column_type: db_type.clone(),
+                op: StringRuleOp::EndsWith,
+                count: 1,
+                value: s,
+                ranges: Vec::new(),
+            });
+        }
+
+        for (b, _) in bytes.into_iter() {
+            let token = (b as char).to_string();
+            for &count in STRING_CONTAINS_COUNTS.iter() {
+                rules.push(StringCorrelationRule {
+                    column_schema_id: schema_id,
+                    column_type: db_type.clone(),
+                    op: StringRuleOp::Contains,
+                    count,
+                    value: token.clone(),
+                    ranges: Vec::new(),
+                });
+            }
+        }
+
+        // Keep a hard cap to avoid pathological candidate explosion.
+        if rules.len() > 256 {
+            rules.truncate(256);
+        }
+        if !rules.is_empty() {
+            string_candidate_rules_by_col.push((schema_id, rules));
+        }
+    }
+
+    log::info!(
+        "scan_whole_table_build_rules: Generated {} numeric plans and {} string candidate columns",
+        plans.len(),
+        string_candidate_rules_by_col.len()
+    );
+    let rules_by_col = Arc::new(rules_by_col);
+    let string_rules_by_col = Arc::new(string_candidate_rules_by_col);
+
+    // PASS 2: build pointer-file ranges.
     let pass2_start = std::time::Instant::now();
     
     // Producer for Pass 2
-    let (tx2, rx2) = tokio::sync::mpsc::channel::<Vec<RowPointer>>(concurrency * 4);
+    let (tx2, rx2) = tokio::sync::mpsc::channel::<Vec<(u64, RowPointer)>>(concurrency * 4);
     let rx2 = Arc::new(tokio::sync::Mutex::new(rx2));
     
     let pointers_io_clone_2 = pointers_io.clone();
@@ -903,9 +1164,18 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
             Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("RowPointerIterator 2: {}", e))),
         };
         loop {
-            let mut chunk = Vec::new();
-            if let Err(e) = iter.next_row_pointers_into(&mut chunk).await {
-                return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("RowPointerIterator 2: {}", e)));
+            let mut chunk: Vec<(u64, RowPointer)> = Vec::new();
+            for _ in 0..*crate::BATCH_SIZE.get().unwrap() {
+                match iter.next_row_pointer_with_offset().await {
+                    Ok(Some((pos, p))) => chunk.push((pos, p)),
+                    Ok(None) => break,
+                    Err(e) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("RowPointerIterator 2: {}", e),
+                        ))
+                    }
+                }
             }
             if chunk.is_empty() { break; }
             if tx2.send(chunk).await.is_err() { break; }
@@ -915,29 +1185,24 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
 
     let mut handles_2 = Vec::with_capacity(concurrency);
     
-    // Map schema_id -> index into rules_by_col and into row columns.
-    // Need this map inside threads.
-    let mut schema_id_to_col_idx: BTreeMap<u64, usize> = BTreeMap::new();
-    for (col_idx, (_, schema_id, _, _)) in numeric_fields.iter().enumerate() {
-        schema_id_to_col_idx.insert(*schema_id, col_idx);
-    }
-    let schema_id_to_col_idx = Arc::new(schema_id_to_col_idx);
-
     for _ in 0..concurrency {
         let rx2 = rx2.clone();
         let rows_io = rows_io.clone();
         let row_fetch = row_fetch.clone();
         let rules_by_col = rules_by_col.clone();
-        let numeric_fields = numeric_fields.clone();
-        let schema_id_to_col_idx = schema_id_to_col_idx.clone();
+        let string_rules_by_col = string_rules_by_col.clone();
+        let numeric_schema_id_to_fetch = numeric_schema_id_to_fetch.clone();
+        let string_schema_id_to_fetch = string_schema_id_to_fetch.clone();
         
         handles_2.push(tokio::spawn(async move {
-            // Local storage for ranges: Vec of (column_idx_in_rules_by_col, rule_idx, Vec<RowRange>)
-            // Or simpler: clone the structure of rules_by_col but only keep ranges.
-            // But rules_by_col structure is complex.
-            // Let's use a flat-ish accumulator: Vec<Vec<Vec<RowRange>>> matched by index to rules_by_col
-            let mut local_ranges: Vec<Vec<Vec<RowRange>>> = rules_by_col.iter()
-                .map(|(_, rules)| vec![Vec::with_capacity(rules.len()); rules.len()]) // Init with vectors
+            let mut local_ranges_numeric: Vec<Vec<Vec<RowRange>>> = rules_by_col
+                .iter()
+                .map(|(_, rules)| vec![Vec::with_capacity(rules.len()); rules.len()])
+                .collect();
+
+            let mut local_ranges_string: Vec<Vec<Vec<RowRange>>> = string_rules_by_col
+                .iter()
+                .map(|(_, rules)| vec![Vec::with_capacity(rules.len()); rules.len()])
                 .collect();
                 
             // Temp buffering for checking "open" ranges within a chunk is useful for compression,
@@ -954,46 +1219,91 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
                 let Some(chunk) = chunk_opt else { break; };
                 
                 // Per-chunk open state to compress ranges locally
-                let mut open: Vec<Vec<Option<RowRange>>> = rules_by_col
+                let mut open_numeric: Vec<Vec<Option<RowRange>>> = rules_by_col
                     .iter()
                     .map(|(_, rules)| vec![None; rules.len()])
                     .collect();
 
-                for p in chunk {
+                let mut open_string: Vec<Vec<Option<RowRange>>> = string_rules_by_col
+                    .iter()
+                    .map(|(_, rules)| vec![None; rules.len()])
+                    .collect();
+
+                use crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN;
+                let len = ROW_POINTER_RECORD_LEN as u64;
+
+                for (pointer_pos, p) in chunk {
                     if p.deleted { continue; }
-                    let row_id: u64 = row_id_u64(p.id);
                     if let Err(_) = p.fetch_row_reuse_async(rows_io.clone(), &row_fetch, &mut row).await { continue; }
 
                     for (col_rules_idx, (schema_id, rules)) in rules_by_col.iter().enumerate() {
-                        let Some(col_idx) = schema_id_to_col_idx.get(schema_id).copied() else { continue; };
-                        let db_type = &numeric_fields[col_idx].2;
-                        let col = &row.columns[col_idx];
-                        let Some(v) = decode_numeric_value(db_type, col.data.into_slice()) else { continue; };
+                        let Some((fetch_idx, db_type)) = numeric_schema_id_to_fetch.get(schema_id).cloned() else { continue; };
+                        let col = &row.columns[fetch_idx];
+                        let Some(v) = decode_numeric_value(&db_type, col.data.into_slice()) else { continue; };
 
                         for (rule_idx, rule) in rules.iter().enumerate() {
                             let is_match = value_satisfies_rule(v, rule.op, rule.value);
                             if is_match {
-                                match &mut open[col_rules_idx][rule_idx] {
+                                match &mut open_numeric[col_rules_idx][rule_idx] {
                                     None => {
-                                        open[col_rules_idx][rule_idx] = Some(RowRange {
-                                            start_row_id: row_id,
-                                            end_row_id: row_id,
+                                        open_numeric[col_rules_idx][rule_idx] = Some(RowRange {
+                                            start_pointer_pos: pointer_pos,
+                                            row_count: 1,
                                         });
                                     }
                                     Some(r) => {
-                                        if row_id == r.end_row_id.saturating_add(1) {
-                                            r.end_row_id = row_id;
+                                        let expected_next = r.start_pointer_pos.saturating_add(r.row_count.saturating_mul(len));
+                                        if pointer_pos == expected_next {
+                                            r.row_count = r.row_count.saturating_add(1);
                                         } else {
-                                            local_ranges[col_rules_idx][rule_idx].push(*r);
+                                            local_ranges_numeric[col_rules_idx][rule_idx].push(*r);
                                             *r = RowRange {
-                                                start_row_id: row_id,
-                                                end_row_id: row_id,
+                                                start_pointer_pos: pointer_pos,
+                                                row_count: 1,
                                             };
                                         }
                                     }
                                 }
-                            } else if let Some(r) = open[col_rules_idx][rule_idx].take() {
-                                local_ranges[col_rules_idx][rule_idx].push(r);
+                            } else if let Some(r) = open_numeric[col_rules_idx][rule_idx].take() {
+                                local_ranges_numeric[col_rules_idx][rule_idx].push(r);
+                            }
+                        }
+                    }
+
+                    for (col_rules_idx, (schema_id, rules)) in string_rules_by_col.iter().enumerate() {
+                        let Some(fetch_idx) = string_schema_id_to_fetch.get(schema_id).copied() else { continue; };
+                        let col = &row.columns[fetch_idx];
+                        let bytes = col.data.into_slice();
+                        // Only evaluate on valid UTF-8 row values.
+                        if std::str::from_utf8(bytes).is_err() {
+                            continue;
+                        }
+
+                        for (rule_idx, rule) in rules.iter().enumerate() {
+                            let is_match = string_satisfies_rule(bytes, rule.op, rule.value.as_bytes(), rule.count);
+                            if is_match {
+                                match &mut open_string[col_rules_idx][rule_idx] {
+                                    None => {
+                                        open_string[col_rules_idx][rule_idx] = Some(RowRange {
+                                            start_pointer_pos: pointer_pos,
+                                            row_count: 1,
+                                        });
+                                    }
+                                    Some(r) => {
+                                        let expected_next = r.start_pointer_pos.saturating_add(r.row_count.saturating_mul(len));
+                                        if pointer_pos == expected_next {
+                                            r.row_count = r.row_count.saturating_add(1);
+                                        } else {
+                                            local_ranges_string[col_rules_idx][rule_idx].push(*r);
+                                            *r = RowRange {
+                                                start_pointer_pos: pointer_pos,
+                                                row_count: 1,
+                                            };
+                                        }
+                                    }
+                                }
+                            } else if let Some(r) = open_string[col_rules_idx][rule_idx].take() {
+                                local_ranges_string[col_rules_idx][rule_idx].push(r);
                             }
                         }
                     }
@@ -1002,13 +1312,21 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
                 // Flush open for this chunk
                 for (col_rules_idx, rules) in rules_by_col.iter().enumerate() {
                     for (rule_idx, _) in rules.1.iter().enumerate() {
-                        if let Some(r) = open[col_rules_idx][rule_idx].take() {
-                            local_ranges[col_rules_idx][rule_idx].push(r);
+                        if let Some(r) = open_numeric[col_rules_idx][rule_idx].take() {
+                            local_ranges_numeric[col_rules_idx][rule_idx].push(r);
+                        }
+                    }
+                }
+
+                for (col_rules_idx, rules) in string_rules_by_col.iter().enumerate() {
+                    for (rule_idx, _) in rules.1.iter().enumerate() {
+                        if let Some(r) = open_string[col_rules_idx][rule_idx].take() {
+                            local_ranges_string[col_rules_idx][rule_idx].push(r);
                         }
                     }
                 }
             }
-            local_ranges
+            (local_ranges_numeric, local_ranges_string)
         }));
     }
 
@@ -1017,15 +1335,27 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
     }
     
     // Collect and merge ranges
-    let mut merged_ranges: Vec<Vec<Vec<RowRange>>> = rules_by_col.iter()
+    let mut merged_ranges_numeric: Vec<Vec<Vec<RowRange>>> = rules_by_col
+        .iter()
+        .map(|(_, rules)| vec![Vec::new(); rules.len()])
+        .collect();
+
+    let mut merged_ranges_string: Vec<Vec<Vec<RowRange>>> = string_rules_by_col
+        .iter()
         .map(|(_, rules)| vec![Vec::new(); rules.len()])
         .collect();
 
     for h in handles_2 {
-        let thread_ranges = h.await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-        for (col_idx, rules_ranges) in thread_ranges.into_iter().enumerate() {
+        let (thread_numeric, thread_string) = h.await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        for (col_idx, rules_ranges) in thread_numeric.into_iter().enumerate() {
             for (rule_idx, ranges) in rules_ranges.into_iter().enumerate() {
-                merged_ranges[col_idx][rule_idx].extend(ranges);
+                merged_ranges_numeric[col_idx][rule_idx].extend(ranges);
+            }
+        }
+
+        for (col_idx, rules_ranges) in thread_string.into_iter().enumerate() {
+            for (rule_idx, ranges) in rules_ranges.into_iter().enumerate() {
+                merged_ranges_string[col_idx][rule_idx].extend(ranges);
             }
         }
     }
@@ -1037,7 +1367,7 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
     for (col_idx, (schema_id, rules)) in rules_by_col.iter().enumerate() {
         let mut new_rules = Vec::with_capacity(rules.len());
         for (rule_idx, rule) in rules.iter().enumerate() {
-            let raw_ranges = std::mem::take(&mut merged_ranges[col_idx][rule_idx]);
+            let raw_ranges = std::mem::take(&mut merged_ranges_numeric[col_idx][rule_idx]);
             // This normalize handles sorting and merging touching ranges
             let ranges = normalize_ranges(raw_ranges);
             
@@ -1054,6 +1384,25 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
     
     // Reassign rules by col for usage in optimization below
     let rules_by_col = final_rules_by_col;
+
+    // Build string candidate rules with ranges.
+    let mut string_rules_by_col_with_ranges: Vec<(u64, Vec<StringCorrelationRule>)> = Vec::new();
+    for (col_idx, (schema_id, rules)) in string_rules_by_col.iter().enumerate() {
+        let mut new_rules = Vec::with_capacity(rules.len());
+        for (rule_idx, rule) in rules.iter().enumerate() {
+            let raw_ranges = std::mem::take(&mut merged_ranges_string[col_idx][rule_idx]);
+            let ranges = normalize_ranges(raw_ranges);
+            new_rules.push(StringCorrelationRule {
+                column_schema_id: rule.column_schema_id,
+                column_type: rule.column_type.clone(),
+                op: rule.op,
+                count: rule.count,
+                value: rule.value.clone(),
+                ranges,
+            });
+        }
+        string_rules_by_col_with_ranges.push((*schema_id, new_rules));
+    }
 
     log::info!("scan_whole_table_build_rules: Pass 2 (range building) done in {:.2?}", pass2_start.elapsed());
 
@@ -1176,18 +1525,16 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
         
         // Post-processing: Filter out rules that cover too much of the dataset.
         if !out_rules.is_empty() {
-             let max_row_id = out_rules.iter()
-                 .flat_map(|r| r.ranges.iter().map(|range| range.end_row_id))
-                 .max()
-                 .unwrap_or(0);
-             
-             if max_row_id > 0 {
-                 let threshold = (max_row_id as u128 * MAX_RULE_COVERAGE_PERCENT as u128 / 100) as u64;
-                 out_rules.retain(|r| {
-                     let covered = ranges_candidate_rows(&r.ranges);
-                     covered <= threshold
-                 });
-             }
+            use crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN;
+            let total_rows = pointers_io
+                .get_len()
+                .await
+                / (ROW_POINTER_RECORD_LEN as u64);
+
+            if total_rows > 0 {
+                let threshold = (total_rows as u128 * MAX_RULE_COVERAGE_PERCENT as u128 / 100) as u64;
+                out_rules.retain(|r| ranges_candidate_rows(&r.ranges) <= threshold);
+            }
              
              let mut seen_coverage = std::collections::HashSet::new();
              out_rules.retain(|r| {
@@ -1203,8 +1550,47 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
     log::info!("scan_whole_table_build_rules: Plan optimization done in {:.2?}", opt_start.elapsed());
     log::info!("scan_whole_table_build_rules: completed total in {:.2?}", total_start.elapsed());
 
+    // Select best string rules per column (trial-and-error scoring of candidates).
+    let mut final_string_rules_by_col: Vec<(u64, Vec<StringCorrelationRule>)> = Vec::new();
+    for (schema_id, rules) in string_rules_by_col_with_ranges.into_iter() {
+        let mut scored: Vec<(u64, StringCorrelationRule)> = rules
+            .into_iter()
+            .map(|r| {
+                let score = score_rule_ranges(&r.ranges, SCORE_RANGE_COUNT_WEIGHT_INT, SCORE_CANDIDATE_ROWS_WEIGHT_INT);
+                (score, r)
+            })
+            .collect();
+        scored.sort_by_key(|(s, _)| *s);
+
+        let mut out = Vec::new();
+        for (_s, r) in scored.into_iter() {
+            out.push(r);
+            if out.len() >= STRING_FINAL_RULES_MAX {
+                break;
+            }
+        }
+
+        // Apply broad-rule filter like numeric rules.
+        if !out.is_empty() {
+            use crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN;
+            let total_rows = pointers_io
+                .get_len()
+                .await
+                / (ROW_POINTER_RECORD_LEN as u64);
+
+            if total_rows > 0 {
+                let threshold = (total_rows as u128 * MAX_RULE_COVERAGE_PERCENT as u128 / 100) as u64;
+                out.retain(|r| ranges_candidate_rows(&r.ranges) <= threshold);
+            }
+        }
+
+        if !out.is_empty() {
+            final_string_rules_by_col.push((schema_id, out));
+        }
+    }
+
     let rules_io = CorrelationRuleStore::open_rules_io(base_io.clone(), table_name).await;
-    CorrelationRuleStore::save_numeric_rules_atomic::<S>(rules_io, &final_chosen_rules_by_col).await?;
+    CorrelationRuleStore::save_rules_atomic::<S>(rules_io, &final_chosen_rules_by_col, &final_string_rules_by_col).await?;
 
     #[cfg(debug_assertions)]
     {
@@ -1279,7 +1665,7 @@ async fn save_rules_json_atomic<S: StorageIO>(
                 ranges: r
                     .ranges
                     .iter()
-                    .map(|rr| (rr.start_row_id, rr.end_row_id))
+                    .map(|rr| (rr.start_pointer_pos, rr.row_count))
                     .collect(),
             });
         }
@@ -1325,22 +1711,6 @@ fn decode_numeric_value(db_type: &DbType, bytes: &[u8]) -> Option<NumericScalar>
     }
 }
 
-#[cfg(feature = "enable_long_row")]
-#[inline]
-fn row_id_u64(id: u128) -> u64 {
-    if id > (u64::MAX as u128) {
-        u64::MAX
-    } else {
-        id as u64
-    }
-}
-
-#[cfg(not(feature = "enable_long_row"))]
-#[inline]
-fn row_id_u64(id: u64) -> u64 {
-    id
-}
-
 fn value_satisfies_rule(v: NumericScalar, op: NumericRuleOp, threshold: NumericScalar) -> bool {
     match (v, threshold) {
         (NumericScalar::Signed(x), NumericScalar::Signed(t)) => match op {
@@ -1356,5 +1726,66 @@ fn value_satisfies_rule(v: NumericScalar, op: NumericRuleOp, threshold: NumericS
             NumericRuleOp::GreaterThan => x > t,
         },
         _ => false,
+    }
+}
+
+fn utf8_safe_prefix(bytes: &[u8], max_len: usize) -> Option<Vec<u8>> {
+    let n = std::cmp::min(max_len, bytes.len());
+    for k in (0..=n).rev() {
+        if std::str::from_utf8(&bytes[..k]).is_ok() {
+            return Some(bytes[..k].to_vec());
+        }
+    }
+    None
+}
+
+fn utf8_safe_suffix(bytes: &[u8], max_len: usize) -> Option<Vec<u8>> {
+    let n = std::cmp::min(max_len, bytes.len());
+    let start0 = bytes.len().saturating_sub(n);
+    for start in start0..=bytes.len() {
+        let slice = &bytes[start..];
+        if slice.len() <= max_len && std::str::from_utf8(slice).is_ok() {
+            return Some(slice.to_vec());
+        }
+    }
+    None
+}
+
+fn count_substring_occurrences(haystack: &[u8], needle: &[u8]) -> u64 {
+    if needle.is_empty() {
+        return 0;
+    }
+    if haystack.len() < needle.len() {
+        return 0;
+    }
+
+    let mut i = 0usize;
+    let mut count = 0u64;
+    while i + needle.len() <= haystack.len() {
+        if &haystack[i..i + needle.len()] == needle {
+            count += 1;
+            // Non-overlapping by default.
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    count
+}
+
+fn string_satisfies_rule(value: &[u8], op: StringRuleOp, needle: &[u8], count: u8) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    match op {
+        StringRuleOp::StartsWith => value.starts_with(needle),
+        StringRuleOp::EndsWith => value.ends_with(needle),
+        StringRuleOp::Contains => {
+            if count == 0 {
+                !value.windows(needle.len()).any(|w| w == needle)
+            } else {
+                count_substring_occurrences(value, needle) >= (count as u64)
+            }
+        }
     }
 }

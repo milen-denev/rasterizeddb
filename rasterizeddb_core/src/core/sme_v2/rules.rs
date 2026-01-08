@@ -1,4 +1,4 @@
-use crate::core::db_type::DbType;
+use crate::core::{db_type::DbType, row::row_pointer::ROW_POINTER_RECORD_LEN};
 
 /// Numeric correlation rule operation.
 ///
@@ -29,8 +29,108 @@ impl NumericRuleOp {
 /// Row-id range (inclusive).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RowRange {
-    pub start_row_id: u64,
-    pub end_row_id: u64,
+    /// Starting byte offset inside the row-pointer file.
+    ///
+    /// Must be aligned to `ROW_POINTER_RECORD_LEN`.
+    pub start_pointer_pos: u64,
+    /// Number of row-pointer records to read starting at `start_pointer_pos`.
+    pub row_count: u64,
+}
+
+impl RowRange {
+    #[inline]
+    pub fn end_pointer_pos_exclusive(self) -> u64 {
+        use crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN;
+        let len = ROW_POINTER_RECORD_LEN as u64;
+        self.start_pointer_pos
+            .saturating_add(self.row_count.saturating_mul(len))
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.row_count == 0
+    }
+
+    /// Returns the inclusive end pointer position (byte offset) covered by this range.
+    ///
+    /// If `row_count == u64::MAX`, this is treated as an unbounded range and returns `u64::MAX`.
+    #[inline]
+    pub fn end_pointer_pos_inclusive(&self) -> u64 {
+        if self.row_count == 0 {
+            return self.start_pointer_pos;
+        }
+        if self.row_count == u64::MAX {
+            return u64::MAX;
+        }
+
+        let rec = ROW_POINTER_RECORD_LEN as u64;
+        debug_assert!(rec > 0);
+        debug_assert!(self.start_pointer_pos % rec == 0);
+
+        // end = start + (row_count - 1) * rec
+        let delta = self.row_count.saturating_sub(1).saturating_mul(rec);
+        self.start_pointer_pos.saturating_add(delta)
+    }
+
+    /// Constructs a range from inclusive pointer bounds.
+    ///
+    /// If `end_pointer_pos_inclusive == u64::MAX`, the resulting range is treated as unbounded
+    /// and will have `row_count == u64::MAX`.
+    #[inline]
+    pub fn from_pointer_bounds_inclusive(start_pointer_pos: u64, end_pointer_pos_inclusive: u64) -> Self {
+        let rec = ROW_POINTER_RECORD_LEN as u64;
+        debug_assert!(rec > 0);
+        debug_assert!(start_pointer_pos % rec == 0);
+
+        if end_pointer_pos_inclusive == u64::MAX {
+            return Self {
+                start_pointer_pos,
+                row_count: u64::MAX,
+            };
+        }
+
+        debug_assert!(end_pointer_pos_inclusive >= start_pointer_pos);
+        debug_assert!((end_pointer_pos_inclusive - start_pointer_pos) % rec == 0);
+
+        let rows_minus_1 = (end_pointer_pos_inclusive - start_pointer_pos) / rec;
+        Self {
+            start_pointer_pos,
+            row_count: rows_minus_1.saturating_add(1),
+        }
+    }
+    
+    /// Convenience for tests/fixtures: construct from inclusive *virtual row indices*.
+    ///
+    /// The virtual row index `i` maps to pointer position `i * ROW_POINTER_RECORD_LEN`.
+    #[inline]
+    pub fn from_row_id_range_inclusive(start_row_id: u64, end_row_id: u64) -> Self {
+        let rec = ROW_POINTER_RECORD_LEN as u64;
+        debug_assert!(rec > 0);
+
+        let start_pointer_pos = match start_row_id.checked_mul(rec) {
+            Some(v) => v,
+            None => {
+                // Saturate to the largest aligned pointer position.
+                u64::MAX - (u64::MAX % rec)
+            }
+        };
+        if end_row_id == u64::MAX {
+            return Self {
+                start_pointer_pos,
+                row_count: u64::MAX,
+            };
+        }
+
+        debug_assert!(end_row_id >= start_row_id);
+        let row_count = end_row_id
+            .saturating_sub(start_row_id)
+            .saturating_add(1);
+
+        Self {
+            start_pointer_pos,
+            row_count,
+        }
+    }
 }
 
 /// In-memory numeric correlation rule.
@@ -40,6 +140,46 @@ pub struct NumericCorrelationRule {
     pub column_type: DbType,
     pub op: NumericRuleOp,
     pub value: NumericScalar,
+    pub ranges: Vec<RowRange>,
+}
+
+/// String correlation rule operation.
+///
+/// Interpreted as a predicate on the stored row value when building ranges.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StringRuleOp {
+    StartsWith = 1,
+    EndsWith = 2,
+    Contains = 3,
+}
+
+impl StringRuleOp {
+    #[inline]
+    pub fn from_byte(b: u8) -> Option<Self> {
+        match b {
+            1 => Some(Self::StartsWith),
+            2 => Some(Self::EndsWith),
+            3 => Some(Self::Contains),
+            _ => None,
+        }
+    }
+}
+
+pub const STRING_RULE_VALUE_MAX_BYTES: usize = 16;
+
+/// In-memory string correlation rule.
+///
+/// `count` is primarily meaningful for `Contains`:
+/// - `Contains` + `value="A"` + `count=1` => contains at least 1 'A'
+/// - `Contains` + `value="A"` + `count=5` => contains at least 5 'A'
+#[derive(Debug, Clone, PartialEq)]
+pub struct StringCorrelationRule {
+    pub column_schema_id: u64,
+    pub column_type: DbType,
+    pub op: StringRuleOp,
+    pub count: u8,
+    pub value: String,
     pub ranges: Vec<RowRange>,
 }
 
@@ -131,18 +271,114 @@ impl NumericRuleRecordDisk {
     }
 }
 
+/// Fixed-size on-disk string rule record.
+///
+/// Layout (32 bytes):
+/// - op: u8
+/// - count: u8
+/// - value_len: u8 (0..=16, UTF-8 bytes)
+/// - padding: u8
+/// - value: [u8; 16] (UTF-8 bytes, remainder zeroed)
+/// - ranges_offset: u64 (absolute file offset)
+/// - ranges_count: u32
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StringRuleRecordDisk {
+    pub op: u8,
+    pub count: u8,
+    pub value_len: u8,
+    pub value: [u8; 16],
+    pub ranges_offset: u64,
+    pub ranges_count: u32,
+}
+
+impl StringRuleRecordDisk {
+    pub const BYTE_LEN: usize = 32;
+
+    #[inline]
+    pub fn encode(&self) -> [u8; Self::BYTE_LEN] {
+        let mut out = [0u8; Self::BYTE_LEN];
+        out[0] = self.op;
+        out[1] = self.count;
+        out[2] = self.value_len;
+        out[3] = 0;
+        out[4..20].copy_from_slice(&self.value);
+        out[20..28].copy_from_slice(&self.ranges_offset.to_le_bytes());
+        out[28..32].copy_from_slice(&self.ranges_count.to_le_bytes());
+        out
+    }
+
+    #[inline]
+    pub fn decode(bytes: &[u8; Self::BYTE_LEN]) -> Option<Self> {
+        let op = bytes[0];
+        let count = bytes[1];
+        let value_len = bytes[2];
+        if value_len as usize > STRING_RULE_VALUE_MAX_BYTES {
+            return None;
+        }
+        if StringRuleOp::from_byte(op).is_none() {
+            return None;
+        }
+
+        let mut value = [0u8; 16];
+        value.copy_from_slice(&bytes[4..20]);
+
+        let ranges_offset = u64::from_le_bytes(bytes[20..28].try_into().unwrap());
+        let ranges_count = u32::from_le_bytes(bytes[28..32].try_into().unwrap());
+
+        Some(Self {
+            op,
+            count,
+            value_len,
+            value,
+            ranges_offset,
+            ranges_count,
+        })
+    }
+
+    #[inline]
+    pub fn decoded_value(&self) -> Option<String> {
+        let len = self.value_len as usize;
+        let bytes = &self.value[..len];
+        std::str::from_utf8(bytes).ok().map(|s| s.to_string())
+    }
+}
+
+#[inline]
+pub fn encode_string_rule_value(value: &str) -> Option<(u8, [u8; 16])> {
+    let bytes = value.as_bytes();
+    if bytes.len() > STRING_RULE_VALUE_MAX_BYTES {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    out[..bytes.len()].copy_from_slice(bytes);
+    Some((bytes.len() as u8, out))
+}
+
 #[inline]
 pub fn normalize_ranges(mut ranges: Vec<RowRange>) -> Vec<RowRange> {
     if ranges.len() <= 1 {
         return ranges;
     }
-    ranges.sort_by_key(|r| r.start_row_id);
+
+    use crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN;
+    let len = ROW_POINTER_RECORD_LEN as u64;
+
+    ranges.sort_by_key(|r| r.start_pointer_pos);
     let mut out = Vec::with_capacity(ranges.len());
 
     let mut cur = ranges[0];
     for r in ranges.into_iter().skip(1) {
-        if r.start_row_id <= cur.end_row_id.saturating_add(1) {
-            cur.end_row_id = cur.end_row_id.max(r.end_row_id);
+        if cur.row_count == 0 {
+            cur = r;
+            continue;
+        }
+
+        let cur_end_excl = cur.end_pointer_pos_exclusive();
+        // Merge overlapping or directly-adjacent byte spans.
+        if r.start_pointer_pos <= cur_end_excl {
+            let new_end_excl = cur_end_excl.max(r.end_pointer_pos_exclusive());
+            let new_count = (new_end_excl.saturating_sub(cur.start_pointer_pos)) / len;
+            cur.row_count = new_count;
         } else {
             out.push(cur);
             cur = r;
@@ -154,20 +390,42 @@ pub fn normalize_ranges(mut ranges: Vec<RowRange>) -> Vec<RowRange> {
 
 #[inline]
 pub fn intersect_ranges(a: &[RowRange], b: &[RowRange]) -> Vec<RowRange> {
+    use crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN;
+    let len = ROW_POINTER_RECORD_LEN as u64;
+
     let mut out = Vec::new();
     let mut i = 0usize;
     let mut j = 0usize;
     while i < a.len() && j < b.len() {
-        let lo = a[i].start_row_id.max(b[j].start_row_id);
-        let hi = a[i].end_row_id.min(b[j].end_row_id);
+        let ra = a[i];
+        let rb = b[j];
+
+        // Convert to record-index intervals (inclusive) to avoid alignment issues.
+        if ra.row_count == 0 {
+            i += 1;
+            continue;
+        }
+        if rb.row_count == 0 {
+            j += 1;
+            continue;
+        }
+
+        let a_start = ra.start_pointer_pos / len;
+        let a_end = ra.end_pointer_pos_inclusive() / len;
+        let b_start = rb.start_pointer_pos / len;
+        let b_end = rb.end_pointer_pos_inclusive() / len;
+
+        let lo = a_start.max(b_start);
+        let hi = a_end.min(b_end);
         if lo <= hi {
+            let count = hi - lo + 1;
             out.push(RowRange {
-                start_row_id: lo,
-                end_row_id: hi,
+                start_pointer_pos: lo.saturating_mul(len),
+                row_count: count,
             });
         }
 
-        if a[i].end_row_id < b[j].end_row_id {
+        if a_end < b_end {
             i += 1;
         } else {
             j += 1;

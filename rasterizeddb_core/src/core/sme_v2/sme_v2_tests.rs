@@ -184,14 +184,8 @@ async fn writes_header_and_loads_numeric_rules_for_column() {
             op: NumericRuleOp::LessThan,
             value: NumericScalar::Signed(25),
             ranges: vec![
-                RowRange {
-                    start_row_id: 200,
-                    end_row_id: 500,
-                },
-                RowRange {
-                    start_row_id: 800,
-                    end_row_id: 1200,
-                },
+                RowRange::from_row_id_range_inclusive(200, 500),
+                RowRange::from_row_id_range_inclusive(800, 1200),
             ],
         },
         NumericCorrelationRule {
@@ -200,14 +194,8 @@ async fn writes_header_and_loads_numeric_rules_for_column() {
             op: NumericRuleOp::GreaterThan,
             value: NumericScalar::Signed(20),
             ranges: vec![
-                RowRange {
-                    start_row_id: 150,
-                    end_row_id: 250,
-                },
-                RowRange {
-                    start_row_id: 2300,
-                    end_row_id: 3200,
-                },
+                RowRange::from_row_id_range_inclusive(150, 250),
+                RowRange::from_row_id_range_inclusive(2300, 3200),
             ],
         },
     ];
@@ -218,10 +206,7 @@ async fn writes_header_and_loads_numeric_rules_for_column() {
         column_type: crate::core::db_type::DbType::U64,
         op: NumericRuleOp::LessThan,
         value: NumericScalar::Unsigned(123),
-        ranges: vec![RowRange {
-            start_row_id: 1,
-            end_row_id: 2,
-        }],
+        ranges: vec![RowRange::from_row_id_range_inclusive(1, 2)],
     }];
 
     CorrelationRuleStore::save_numeric_rules_atomic::<_>(
@@ -236,7 +221,8 @@ async fn writes_header_and_loads_numeric_rules_for_column() {
         .unwrap()
         .unwrap();
 
-    assert_eq!(header.columns.len(), 2);
+    assert_eq!(header.numeric_columns.len(), 2);
+    assert_eq!(header.string_columns.len(), 0);
 
     let loaded_age = CorrelationRuleStore::load_numeric_rules_for_column::<_>(
         io.clone(),

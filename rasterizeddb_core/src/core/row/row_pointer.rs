@@ -47,6 +47,11 @@ const TOTAL_LENGTH : usize =
     1 // deleted (bool)
     ;
 
+/// Fixed serialized byte length of a `RowPointer` record in the row-pointer file.
+///
+/// This depends on the `enable_long_row` feature flag.
+pub const ROW_POINTER_RECORD_LEN: usize = TOTAL_LENGTH;
+
 #[cfg(feature = "enable_long_row")]
 #[cfg(not(debug_assertions))]
 const CHUNK_SIZE: usize = TOTAL_LENGTH * 3047; // ~320KB chunks

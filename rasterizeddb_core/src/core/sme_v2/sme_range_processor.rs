@@ -1,4 +1,5 @@
-use crate::core::sme_v2::rules::{NumericCorrelationRule, NumericRuleOp, NumericScalar, RowRange};
+use crate::core::{row::row_pointer::ROW_POINTER_RECORD_LEN, sme_v2::rules::{NumericCorrelationRule, NumericRuleOp, NumericScalar, RowRange}};
+
 
 /// Returns merged candidate row ranges for a numeric query.
 ///
@@ -559,20 +560,28 @@ unsafe fn candidate_row_ranges_for_u128_query_avx2(
 
 #[inline]
 pub fn row_ranges_overlap(a: RowRange, b: RowRange) -> bool {
-    // Inclusive overlap: [a.start, a.end] intersects [b.start, b.end]
-    a.start_row_id <= b.end_row_id && b.start_row_id <= a.end_row_id
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    // Inclusive overlap in pointer space: [a.start, a.end] intersects [b.start, b.end]
+    let a_start = a.start_pointer_pos;
+    let a_end = a.end_pointer_pos_inclusive();
+    let b_start = b.start_pointer_pos;
+    let b_end = b.end_pointer_pos_inclusive();
+    a_start <= b_end && b_start <= a_end
 }
 
-/// Sorts by `start_row_id`, then merges overlapping or directly-adjacent ranges.
+/// Sorts by `start_pointer_pos`, then merges overlapping or directly-adjacent ranges.
 pub fn merge_row_ranges(mut ranges: smallvec::SmallVec<[RowRange; 64]>) -> smallvec::SmallVec<[RowRange; 64]> {
+    ranges.retain(|r| !r.is_empty());
     if ranges.len() <= 1 {
         return ranges;
     }
 
     ranges.sort_unstable_by(|a, b| {
-        a.start_row_id
-            .cmp(&b.start_row_id)
-            .then_with(|| a.end_row_id.cmp(&b.end_row_id))
+        a.start_pointer_pos
+            .cmp(&b.start_pointer_pos)
+            .then_with(|| a.end_pointer_pos_inclusive().cmp(&b.end_pointer_pos_inclusive()))
     });
 
     // SAFETY: we just sorted by start/end, and RowRange is Copy (no drop hazards).
@@ -587,8 +596,8 @@ pub fn merge_row_ranges(mut ranges: smallvec::SmallVec<[RowRange; 64]>) -> small
 ///
 /// # Safety
 /// Caller must guarantee:
-/// - `ranges` is sorted by `(start_row_id, end_row_id)` ascending.
-/// - every element satisfies `start_row_id <= end_row_id`.
+/// - `ranges` is sorted by `(start_pointer_pos, end_pointer_pos_inclusive)` ascending.
+/// - every element has `row_count > 0`.
 ///
 /// If these invariants are violated, the result may be incorrect.
 pub unsafe fn merge_row_ranges_sorted_in_place_unchecked(
@@ -602,21 +611,31 @@ pub unsafe fn merge_row_ranges_sorted_in_place_unchecked(
     // In-place compaction: write merged ranges back into the same buffer.
     let ptr = ranges.as_mut_ptr();
     let mut write = 0usize;
-    let mut cur = unsafe { *ptr };
+    let first = unsafe { *ptr };
+    debug_assert!(!first.is_empty());
+    let rec = ROW_POINTER_RECORD_LEN as u64;
+    debug_assert!(rec > 0);
+
+    let mut cur_start = first.start_pointer_pos;
+    let mut cur_end = first.end_pointer_pos_inclusive();
 
     for read in 1..len {
         let r = unsafe { *ptr.add(read) };
-        let cur_end_plus_1 = cur.end_row_id.saturating_add(1);
-        if r.start_row_id <= cur_end_plus_1 {
-            cur.end_row_id = cur.end_row_id.max(r.end_row_id);
+        debug_assert!(!r.is_empty());
+        let r_start = r.start_pointer_pos;
+        let r_end = r.end_pointer_pos_inclusive();
+        let cur_end_plus_rec = cur_end.saturating_add(rec);
+        if r_start <= cur_end_plus_rec {
+            cur_end = cur_end.max(r_end);
         } else {
-            unsafe { *ptr.add(write) = cur };
+            unsafe { *ptr.add(write) = RowRange::from_pointer_bounds_inclusive(cur_start, cur_end) };
             write += 1;
-            cur = r;
+            cur_start = r_start;
+            cur_end = r_end;
         }
     }
 
-    unsafe { *ptr.add(write) = cur };
+    unsafe { *ptr.add(write) = RowRange::from_pointer_bounds_inclusive(cur_start, cur_end) };
     write += 1;
 
     // SAFETY: write <= len always holds.
@@ -688,14 +707,41 @@ unsafe fn any_overlap_avx2_with_ranges(a: &[RowRange], b: &[RowRange]) -> bool {
         unsafe { _mm256_andnot_si256(gt, ones) }
     }
 
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Bounds {
+        start: u64,
+        end: u64,
+    }
+
+    let mut b_bounds: Vec<Bounds> = Vec::with_capacity(b.len());
+    for rb in b {
+        if rb.is_empty() {
+            continue;
+        }
+        b_bounds.push(Bounds {
+            start: rb.start_pointer_pos,
+            end: rb.end_pointer_pos_inclusive(),
+        });
+    }
+    if b_bounds.is_empty() {
+        return false;
+    }
+
     for ra in a {
-        let a_start = _mm256_set1_epi64x(ra.start_row_id as i64);
-        let a_end = _mm256_set1_epi64x(ra.end_row_id as i64);
+        if ra.is_empty() {
+            continue;
+        }
+        let a_start_u = ra.start_pointer_pos;
+        let a_end_u = ra.end_pointer_pos_inclusive();
+        let a_start = _mm256_set1_epi64x(a_start_u as i64);
+        let a_end = _mm256_set1_epi64x(a_end_u as i64);
 
         let mut i = 0usize;
         // Load 2 ranges at a time (32 bytes): [s0,e0,s1,e1] in 64-bit lanes.
-        while i + 2 <= n {
-            let v = unsafe { _mm256_loadu_si256(b.as_ptr().add(i) as *const __m256i) };
+        let n2 = b_bounds.len();
+        while i + 2 <= n2 {
+            let v = unsafe { _mm256_loadu_si256(b_bounds.as_ptr().add(i) as *const __m256i) };
             // starts = [s0,s1,s0,s1], ends = [e0,e1,e0,e1]
             let b_start = _mm256_permute4x64_epi64(v, 0x88);
             let b_end = _mm256_permute4x64_epi64(v, 0xDD);
@@ -712,8 +758,9 @@ unsafe fn any_overlap_avx2_with_ranges(a: &[RowRange], b: &[RowRange]) -> bool {
         }
 
         // Tail.
-        for j in i..n {
-            if row_ranges_overlap(*ra, b[j]) {
+        for j in i..n2 {
+            let rb = b_bounds[j];
+            if a_start_u <= rb.end && rb.start <= a_end_u {
                 return true;
             }
         }
@@ -741,10 +788,7 @@ mod tests {
         for _ in 0..n {
             let s = lcg_next(&mut state) % max_start;
             let len = (lcg_next(&mut state) % max_len).max(1);
-            out.push(RowRange {
-                start_row_id: s,
-                end_row_id: s.saturating_add(len),
-            });
+            out.push(RowRange::from_row_id_range_inclusive(s, s.saturating_add(len)));
         }
         out
     }
@@ -758,18 +802,9 @@ mod tests {
                 op: NumericRuleOp::LessThan,
                 value: NumericScalar::Signed(1000),
                 ranges: vec![
-                    RowRange {
-                        start_row_id: 10,
-                        end_row_id: 20,
-                    },
-                    RowRange {
-                        start_row_id: 100,
-                        end_row_id: 120,
-                    },
-                    RowRange {
-                        start_row_id: 330,
-                        end_row_id: 420,
-                    },
+                    RowRange::from_row_id_range_inclusive(10, 20),
+                    RowRange::from_row_id_range_inclusive(100, 120),
+                    RowRange::from_row_id_range_inclusive(330, 420),
                 ],
             },
             NumericCorrelationRule {
@@ -778,18 +813,9 @@ mod tests {
                 op: NumericRuleOp::GreaterThan,
                 value: NumericScalar::Signed(800),
                 ranges: vec![
-                    RowRange {
-                        start_row_id: 350,
-                        end_row_id: 420,
-                    },
-                    RowRange {
-                        start_row_id: 70,
-                        end_row_id: 140,
-                    },
-                    RowRange {
-                        start_row_id: 220,
-                        end_row_id: 340,
-                    },
+                    RowRange::from_row_id_range_inclusive(350, 420),
+                    RowRange::from_row_id_range_inclusive(70, 140),
+                    RowRange::from_row_id_range_inclusive(220, 340),
                 ],
             },
             NumericCorrelationRule {
@@ -798,36 +824,18 @@ mod tests {
                 op: NumericRuleOp::GreaterThan,
                 value: NumericScalar::Signed(900),
                 ranges: vec![
-                    RowRange {
-                        start_row_id: 380,
-                        end_row_id: 450,
-                    },
-                    RowRange {
-                        start_row_id: 40,
-                        end_row_id: 120,
-                    },
-                    RowRange {
-                        start_row_id: 130,
-                        end_row_id: 320,
-                    },
+                    RowRange::from_row_id_range_inclusive(380, 450),
+                    RowRange::from_row_id_range_inclusive(40, 120),
+                    RowRange::from_row_id_range_inclusive(130, 320),
                 ],
             },
         ];
 
         let got = candidate_row_ranges_for_query(NumericScalar::Signed(850), &rules);
         let expected: smallvec::SmallVec<[RowRange; 64]> = smallvec::smallvec![
-            RowRange {
-                start_row_id: 10,
-                end_row_id: 20,
-            },
-            RowRange {
-                start_row_id: 70,
-                end_row_id: 140,
-            },
-            RowRange {
-                start_row_id: 220,
-                end_row_id: 420,
-            },
+            RowRange::from_row_id_range_inclusive(10, 20),
+            RowRange::from_row_id_range_inclusive(70, 140),
+            RowRange::from_row_id_range_inclusive(220, 420),
         ];
         assert_eq!(got, expected);
     }
@@ -835,32 +843,14 @@ mod tests {
     #[test]
     fn overlap_scalar_and_avx2_agree_on_simple_cases() {
         let a = vec![
-            RowRange {
-                start_row_id: 10,
-                end_row_id: 20,
-            },
-            RowRange {
-                start_row_id: 100,
-                end_row_id: 120,
-            },
-            RowRange {
-                start_row_id: 330,
-                end_row_id: 420,
-            },
+            RowRange::from_row_id_range_inclusive(10, 20),
+            RowRange::from_row_id_range_inclusive(100, 120),
+            RowRange::from_row_id_range_inclusive(330, 420),
         ];
         let b = vec![
-            RowRange {
-                start_row_id: 350,
-                end_row_id: 420,
-            },
-            RowRange {
-                start_row_id: 70,
-                end_row_id: 140,
-            },
-            RowRange {
-                start_row_id: 220,
-                end_row_id: 340,
-            },
+            RowRange::from_row_id_range_inclusive(350, 420),
+            RowRange::from_row_id_range_inclusive(70, 140),
+            RowRange::from_row_id_range_inclusive(220, 340),
         ];
 
         let scalar = any_overlap_scalar(&a, &b);
@@ -868,10 +858,7 @@ mod tests {
         assert_eq!(scalar, simd);
         assert!(scalar);
 
-        let c = vec![RowRange {
-            start_row_id: 500,
-            end_row_id: 600,
-        }];
+        let c = vec![RowRange::from_row_id_range_inclusive(500, 600)];
         let scalar2 = any_overlap_scalar(&a, &c);
         let simd2 = any_overlap_avx2(&a, &c);
         assert_eq!(scalar2, simd2);
@@ -895,24 +882,12 @@ mod tests {
     #[test]
     fn overlap_handles_odd_lengths_and_tail() {
         // Ensure the 2-at-a-time AVX2 loop hits the tail path correctly.
-        let a = vec![RowRange {
-            start_row_id: 10,
-            end_row_id: 20,
-        }];
+        let a = vec![RowRange::from_row_id_range_inclusive(10, 20)];
         let b = vec![
-            RowRange {
-                start_row_id: 0,
-                end_row_id: 5,
-            },
-            RowRange {
-                start_row_id: 30,
-                end_row_id: 40,
-            },
+            RowRange::from_row_id_range_inclusive(0, 5),
+            RowRange::from_row_id_range_inclusive(30, 40),
             // Tail element overlaps.
-            RowRange {
-                start_row_id: 15,
-                end_row_id: 16,
-            },
+            RowRange::from_row_id_range_inclusive(15, 16),
         ];
 
         let scalar = any_overlap_scalar(&a, &b);
@@ -925,14 +900,8 @@ mod tests {
     fn overlap_unsigned_u64_above_i64_max_is_correct() {
         // If unsigned comparisons were accidentally done as signed, these would fail.
         let big = (i64::MAX as u64) + 123;
-        let a = vec![RowRange {
-            start_row_id: big,
-            end_row_id: big + 100,
-        }];
-        let b = vec![RowRange {
-            start_row_id: big + 50,
-            end_row_id: big + 60,
-        }];
+        let a = vec![RowRange::from_row_id_range_inclusive(big, big + 100)];
+        let b = vec![RowRange::from_row_id_range_inclusive(big + 50, big + 60)];
 
         let scalar = any_overlap_scalar(&a, &b);
         let simd = any_overlap_avx2(&a, &b);
@@ -965,7 +934,10 @@ mod tests {
                 // Make enough rules to force the function into the AVX2 path (len >= 16).
                 let mut rules = Vec::new();
                 for i in 0..32u64 {
+                    
                     let op = if i % 2 == 0 {
+                        
+
                         NumericRuleOp::LessThan
                     } else {
                         NumericRuleOp::GreaterThan
@@ -976,10 +948,7 @@ mod tests {
                         column_type: DbType::I128,
                         op,
                         value: NumericScalar::Signed(threshold),
-                        ranges: vec![RowRange {
-                            start_row_id: i * 10,
-                            end_row_id: i * 10 + 5,
-                        }],
+                        ranges: vec![RowRange::from_row_id_range_inclusive(i * 10, i * 10 + 5)],
                     });
                 }
 
@@ -998,26 +967,11 @@ mod tests {
     #[test]
     fn merge_sorted_in_place_unchecked_matches_merge_row_ranges() {
         let a: smallvec::SmallVec<[RowRange; 64]> = smallvec::smallvec![
-            RowRange {
-                start_row_id: 10,
-                end_row_id: 20,
-            },
-            RowRange {
-                start_row_id: 21,
-                end_row_id: 30,
-            },
-            RowRange {
-                start_row_id: 100,
-                end_row_id: 120,
-            },
-            RowRange {
-                start_row_id: 110,
-                end_row_id: 130,
-            },
-            RowRange {
-                start_row_id: 1000,
-                end_row_id: 1000,
-            },
+            RowRange::from_row_id_range_inclusive(10, 20),
+            RowRange::from_row_id_range_inclusive(21, 30),
+            RowRange::from_row_id_range_inclusive(100, 120),
+            RowRange::from_row_id_range_inclusive(110, 130),
+            RowRange::from_row_id_range_inclusive(1000, 1000),
         ];
 
         // This is already sorted by (start,end).
@@ -1029,18 +983,9 @@ mod tests {
         assert_eq!(b, c);
 
         let expected: smallvec::SmallVec<[RowRange; 64]> = smallvec::smallvec![
-            RowRange {
-                start_row_id: 10,
-                end_row_id: 30,
-            },
-            RowRange {
-                start_row_id: 100,
-                end_row_id: 130,
-            },
-            RowRange {
-                start_row_id: 1000,
-                end_row_id: 1000,
-            },
+            RowRange::from_row_id_range_inclusive(10, 30),
+            RowRange::from_row_id_range_inclusive(100, 130),
+            RowRange::from_row_id_range_inclusive(1000, 1000),
         ];
         assert_eq!(b, expected);
     }

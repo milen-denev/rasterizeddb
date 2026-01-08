@@ -8,10 +8,11 @@ use crate::core::{db_type::DbType, sme_v2::sme_range_processor_comp, storage_pro
 use super::{
     rule_store::{CorrelationRuleStore, RulesFileHeaderV2},
     rules::{
-        intersect_ranges, normalize_ranges, NumericCorrelationRule, NumericScalar,
-        RowRange,
+        intersect_ranges, normalize_ranges, NumericCorrelationRule, NumericScalar, RowRange,
+        StringCorrelationRule, StringRuleOp,
     },
     sme_range_processor,
+    sme_range_processor_str,
 };
 
 /// Global singleton instance for SME v2.
@@ -23,6 +24,8 @@ pub struct SemanticMappingEngineV2 {
     // Cache for fully loaded per-column rules: (table_name, column_schema_id) -> Rules
     // This is the format expected by `sme_range_processor`.
     rules: DashMap<(String, u64), Arc<Vec<NumericCorrelationRule>>, ahash::RandomState>,
+    // Cache for fully loaded per-column string rules.
+    string_rules: DashMap<(String, u64), Arc<Vec<StringCorrelationRule>>, ahash::RandomState>,
 }
 
 impl SemanticMappingEngineV2 {
@@ -30,6 +33,7 @@ impl SemanticMappingEngineV2 {
         Self {
             headers: DashMap::with_hasher(ahash::RandomState::new()),
             rules: DashMap::with_hasher(ahash::RandomState::new()),
+            string_rules: DashMap::with_hasher(ahash::RandomState::new()),
         }
     }
 
@@ -47,8 +51,23 @@ impl SemanticMappingEngineV2 {
         pointers_io: Arc<S>,
         limit: Option<u64>,
     ) -> Option<Arc<Vec<crate::core::row::row_pointer::RowPointer>>> {
-        use crate::core::tokenizer::query_tokenizer::{Token, NumericValue};
-        use crate::core::row::row_pointer::{RowPointer, RowPointerIterator};
+        use crate::core::tokenizer::query_tokenizer::Token;
+        use crate::core::row::row_pointer::RowPointer;
+        use std::time::Instant;
+
+        #[inline]
+        fn log_step(table: &str, step: &str, total_start: Instant, step_start: Instant) {
+            log::info!(
+                "SME v2: candidates: table={} step={} t_ms={} dt_ms={}",
+                table,
+                step,
+                total_start.elapsed().as_millis(),
+                step_start.elapsed().as_millis(),
+            );
+        }
+
+        let total_start = Instant::now();
+        let step_start = Instant::now();
 
         if tokens.is_empty() {
             log::trace!("SME v2: empty tokens, skipping");
@@ -68,7 +87,10 @@ impl SemanticMappingEngineV2 {
             }
         }
 
-        // Parse simple AND-only triplets: Ident Op Number [(Next "and") ...]
+        log_step(table_name, "validate_tokens", total_start, step_start);
+
+        // Parse simple AND-only triplets: Ident Op (Number|StringLit) [(Next "and") ...]
+        let step_start = Instant::now();
         let mut i = 0usize;
         // Collect futures for parallel execution
         let mut checks = Vec::new();
@@ -78,35 +100,40 @@ impl SemanticMappingEngineV2 {
                 Token::Ident((n, t, id)) => (n.clone(), t.clone(), *id),
                 _ => return None,
             };
-            let op = match &tokens[i + 1] {
+
+            // Middle token can be either:
+            // - Token::Op("=", "<", ">", ...)
+            // - Token::Ident(("CONTAINS"|"STARTSWITH"|"ENDSWITH", DbType::STRING, 0))
+            //   (this is how the tokenizer currently emits string ops)
+            let op_token = &tokens[i + 1];
+            let op_str: &str = match op_token {
                 Token::Op(s) => s.as_str(),
-                _ => return None,
-            };
-            let num = match &tokens[i + 2] {
-                Token::Number(v) => v,
+                Token::Ident((s, _, _)) => s.as_str(),
                 _ => return None,
             };
 
-            // Only handle numeric identifiers; skip non-numeric columns
-            let q_scalar = match num {
-                NumericValue::I8(_)
-                | NumericValue::I16(_)
-                | NumericValue::I32(_)
-                | NumericValue::I64(_)
-                | NumericValue::I128(_)
-                | NumericValue::U8(_)
-                | NumericValue::U16(_)
-                | NumericValue::U32(_)
-                | NumericValue::U64(_)
-                | NumericValue::U128(_)
-                | NumericValue::F32(_)
-                | NumericValue::F64(_) => {
+            let string_query_op: Option<StringRuleOp> = match op_str {
+                "CONTAINS" => Some(StringRuleOp::Contains),
+                "STARTSWITH" => Some(StringRuleOp::StartsWith),
+                "ENDSWITH" => Some(StringRuleOp::EndsWith),
+                _ => None,
+            };
+            let rhs = &tokens[i + 2];
+
+            // Only handle numeric and string columns.
+            let q_numeric_scalar: Option<NumericScalar> = match rhs {
+                Token::Number(num) => {
                     let scalar = numeric_value_to_scalar(num);
                     match coerce_scalar_for_db_type(&col_type, scalar) {
-                        Some(s) => s,
+                        Some(s) => Some(s),
                         None => return None,
                     }
                 }
+                _ => None,
+            };
+            let q_string_lit: Option<String> = match rhs {
+                Token::StringLit(s) => Some(s.clone()),
+                _ => None,
             };
             
             // Advance parser first to ensure validity
@@ -121,9 +148,13 @@ impl SemanticMappingEngineV2 {
             }
 
             // Prepare async check
-            let owned_op = op.to_string();
+            let owned_op = op_str.to_string();
             let owned_table = table_name.to_string();
             let io_clone = io_rows.clone();
+            let owned_col_type = col_type.clone();
+            let owned_string = q_string_lit.clone();
+            let owned_numeric = q_numeric_scalar;
+            let owned_string_op = string_query_op;
             
             // We use Box::pin to store different Futures in the same Vec
             let check_future = async move {
@@ -135,35 +166,52 @@ impl SemanticMappingEngineV2 {
                  // Using `Box::pin(async ...)` creates a future. If that future borrows `self`, it's lifetime bounded.
                  // This matches `join_all` requirements.
                  match owned_op.as_str() {
-                    "=" | "==" => self
-                        .candidates_for_numeric_equals(
-                            io_clone,
-                            &owned_table,
-                            col_schema_id,
-                            q_scalar,
-                        )
-                        .await,
-                    ">" | ">=" | "<" | "<=" => self
-                        .candidates_for_numeric_range(
-                            io_clone,
-                            &owned_table,
-                            col_schema_id,
-                            &owned_op,
-                            q_scalar,
-                        )
-                        .await,
+                    "=" | "==" => {
+                        if owned_col_type == DbType::STRING {
+                            let Some(s) = owned_string else { return Ok(None); };
+                            return self
+                                .candidates_for_string_predicate(io_clone, &owned_table, col_schema_id, &s, None)
+                                .await;
+                        }
+
+                        let Some(q_scalar) = owned_numeric else { return Ok(None); };
+                        self
+                            .candidates_for_numeric_equals(io_clone, &owned_table, col_schema_id, q_scalar)
+                            .await
+                    }
+                    ">" | ">=" | "<" | "<=" => {
+                        let Some(q_scalar) = owned_numeric else { return Ok(None); };
+                        self
+                            .candidates_for_numeric_range(io_clone, &owned_table, col_schema_id, &owned_op, q_scalar)
+                            .await
+                    }
+                    "CONTAINS" | "STARTSWITH" | "ENDSWITH" => {
+                        if owned_col_type != DbType::STRING {
+                            return Ok(None);
+                        }
+                        let Some(s) = owned_string else { return Ok(None); };
+                        let Some(op) = owned_string_op else { return Ok(None); };
+                        self
+                            .candidates_for_string_predicate(io_clone, &owned_table, col_schema_id, &s, Some(op))
+                            .await
+                    }
                     _ => Ok(None),
                 }
             };
             checks.push(check_future);
         }
 
+        log_step(table_name, "parse_triplets", total_start, step_start);
+
         // Execute all checks in parallel
+        let step_start = Instant::now();
         let results = futures::future::join_all(checks).await;
+        log_step(table_name, "execute_predicates", total_start, step_start);
 
         let mut accumulated: Option<Vec<RowRange>> = None;
         let mut any_restriction_found = false;
 
+        let step_start = Instant::now();
         for res in results {
             let ranges = match res {
                 Ok(Some(v)) => normalize_ranges(v),
@@ -182,6 +230,8 @@ impl SemanticMappingEngineV2 {
             });
         }
 
+        log_step(table_name, "intersect_ranges", total_start, step_start);
+
         if !any_restriction_found {
              // No supported rules found for any predicate -> Fallback to full scan
              return None;
@@ -193,45 +243,65 @@ impl SemanticMappingEngineV2 {
             return Some(Arc::new(Vec::new()));
         }
 
-        // Convert ranges to intervals and filter pointers in batches
-        let intervals: Vec<(u64, u64)> = final_ranges
-            .iter()
-            .map(|r| (r.start_row_id, r.end_row_id))
-            .collect();
+        // Directly read the candidate row pointers from the pointers file.
+        // Each RowRange is (start_pointer_pos, row_count), so we can read and decode in-place.
+        use crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN;
+        let rec_len = ROW_POINTER_RECORD_LEN as u64;
 
-        // Helper: binary search over normalized intervals
-        #[inline]
-        fn id_in_intervals(id: u64, intervals: &[(u64, u64)]) -> bool {
-            if intervals.is_empty() { return false; }
-            let idx = intervals.partition_point(|(s, _)| *s <= id);
-            if idx == 0 { return false; }
-            let (s, e) = intervals[idx - 1];
-            id >= s && id <= e
-        }
+        log::info!(
+            "SME v2: candidates: table={} step=read_pointer_ranges t_ms={} ranges={}",
+            table_name,
+            total_start.elapsed().as_millis(),
+            final_ranges.len(),
+        );
 
-        let mut it = match RowPointerIterator::new(pointers_io).await {
-            Ok(i) => i,
-            Err(_) => return None,
-        };
-
+        let scan_step_start = Instant::now();
         let mut out: Vec<RowPointer> = Vec::new();
-        loop {
-            let batch = match it.next_row_pointers().await {
-                Ok(b) => b,
-                Err(_) => return None,
-            };
-            if batch.is_empty() { break; }
 
-            // Filter batch
-            for p in batch.into_iter() {
-                if p.deleted { continue; }
-                if id_in_intervals(p.id, &intervals) {
+        // Chunk reads to avoid huge allocations for broad ranges.
+        const READ_CHUNK_POINTERS: u64 = 8192;
+
+        for rr in final_ranges.iter().copied() {
+            if rr.row_count == 0 {
+                continue;
+            }
+            if (rr.start_pointer_pos % rec_len) != 0 {
+                // Corrupt/mismatched rules file; bail out to full-scan fallback.
+                return None;
+            }
+
+            let mut remaining = rr.row_count;
+            let mut pos = rr.start_pointer_pos;
+            while remaining > 0 {
+                let take = remaining.min(READ_CHUNK_POINTERS);
+                let span_bytes = take.saturating_mul(rec_len);
+                let mut buf = vec![0u8; span_bytes as usize];
+                let mut read_pos = pos;
+                if pointers_io.read_data_into_buffer(&mut read_pos, &mut buf).await.is_err() {
+                    return None;
+                }
+
+                for chunk in buf.chunks_exact(ROW_POINTER_RECORD_LEN) {
+                    let p = RowPointer::from_slice_unknown(chunk);
+                    if p.deleted {
+                        continue;
+                    }
                     out.push(p);
                 }
+
+                pos = pos.saturating_add(span_bytes);
+                remaining -= take;
             }
         }
 
-        log::info!("SME v2: built {} candidates (limit request: {:?})", out.len(), limit);
+        log_step(table_name, "read_row_pointers", total_start, scan_step_start);
+        log::info!(
+            "SME v2: candidates: table={} step=done t_ms={} built={} limit={:?}",
+            table_name,
+            total_start.elapsed().as_millis(),
+            out.len(),
+            limit,
+        );
         Some(Arc::new(out))
     }
 
@@ -241,18 +311,37 @@ impl SemanticMappingEngineV2 {
         base_io: Arc<S>,
         table_name: &str,
     ) -> std::io::Result<Option<Arc<RulesFileHeaderV2>>> {
+        use std::time::Instant;
+        let start = Instant::now();
+
         if let Some(h) = self.headers.get(table_name) {
+            log::info!(
+                "SME v2: get_or_load_header: table={} cache=hit dt_ms={}",
+                table_name,
+                start.elapsed().as_millis()
+            );
             return Ok(Some(Arc::clone(h.value())));
         }
 
         let rules_io = CorrelationRuleStore::open_rules_io(base_io, table_name).await;
         let Some(header) = CorrelationRuleStore::try_load_header_v2(rules_io).await? else {
+            log::info!(
+                "SME v2: get_or_load_header: table={} cache=miss result=none dt_ms={}",
+                table_name,
+                start.elapsed().as_millis()
+            );
             return Ok(None);
         };
 
         let header = Arc::new(header);
         self.headers
             .insert(table_name.to_string(), Arc::clone(&header));
+
+        log::info!(
+            "SME v2: get_or_load_header: table={} cache=miss result=some dt_ms={}",
+            table_name,
+            start.elapsed().as_millis()
+        );
         Ok(Some(header))
     }
 
@@ -265,12 +354,27 @@ impl SemanticMappingEngineV2 {
         table_name: &str,
         column_schema_id: u64,
     ) -> std::io::Result<Option<Arc<Vec<NumericCorrelationRule>>>> {
+        use std::time::Instant;
+        let start = Instant::now();
+
         if let Some(rules) = self.rules.get(&(table_name.to_string(), column_schema_id)) {
+            log::info!(
+                "SME v2: load_numeric_rules_for_column: table={} col={} cache=hit dt_ms={}",
+                table_name,
+                column_schema_id,
+                start.elapsed().as_millis()
+            );
             return Ok(Some(Arc::clone(rules.value())));
         }
 
         let header = self.get_or_load_header(base_io.clone(), table_name).await?;
         let Some(header) = header else {
+            log::info!(
+                "SME v2: load_numeric_rules_for_column: table={} col={} cache=miss header=none dt_ms={}",
+                table_name,
+                column_schema_id,
+                start.elapsed().as_millis()
+            );
             return Ok(None);
         };
 
@@ -283,13 +387,142 @@ impl SemanticMappingEngineV2 {
         .await?;
 
         if rules.is_empty() {
+            log::info!(
+                "SME v2: load_numeric_rules_for_column: table={} col={} cache=miss rules=empty dt_ms={}",
+                table_name,
+                column_schema_id,
+                start.elapsed().as_millis()
+            );
             return Ok(None);
         }
 
         let rules = Arc::new(rules);
         self.rules
             .insert((table_name.to_string(), column_schema_id), Arc::clone(&rules));
+
+        log::info!(
+            "SME v2: load_numeric_rules_for_column: table={} col={} cache=miss rules=some dt_ms={}",
+            table_name,
+            column_schema_id,
+            start.elapsed().as_millis()
+        );
         Ok(Some(rules))
+    }
+
+    /// Loads and caches fully materialized string rules for one column.
+    pub async fn load_string_rules_for_column<S: StorageIO>(
+        &self,
+        base_io: Arc<S>,
+        table_name: &str,
+        column_schema_id: u64,
+    ) -> std::io::Result<Option<Arc<Vec<StringCorrelationRule>>>> {
+        use std::time::Instant;
+        let start = Instant::now();
+
+        if let Some(rules) = self
+            .string_rules
+            .get(&(table_name.to_string(), column_schema_id))
+        {
+            log::info!(
+                "SME v2: load_string_rules_for_column: table={} col={} cache=hit dt_ms={}",
+                table_name,
+                column_schema_id,
+                start.elapsed().as_millis()
+            );
+            return Ok(Some(Arc::clone(rules.value())));
+        }
+
+        let header = self.get_or_load_header(base_io.clone(), table_name).await?;
+        let Some(header) = header else {
+            log::info!(
+                "SME v2: load_string_rules_for_column: table={} col={} cache=miss header=none dt_ms={}",
+                table_name,
+                column_schema_id,
+                start.elapsed().as_millis()
+            );
+            return Ok(None);
+        };
+
+        let rules_io = CorrelationRuleStore::open_rules_io(base_io, table_name).await;
+        let rules = CorrelationRuleStore::load_string_rules_for_column::<S>(
+            rules_io,
+            &header,
+            column_schema_id,
+        )
+        .await?;
+
+        if rules.is_empty() {
+            log::info!(
+                "SME v2: load_string_rules_for_column: table={} col={} cache=miss rules=empty dt_ms={}",
+                table_name,
+                column_schema_id,
+                start.elapsed().as_millis()
+            );
+            return Ok(None);
+        }
+
+        let rules = Arc::new(rules);
+        self.string_rules
+            .insert((table_name.to_string(), column_schema_id), Arc::clone(&rules));
+
+        log::info!(
+            "SME v2: load_string_rules_for_column: table={} col={} cache=miss rules=some dt_ms={}",
+            table_name,
+            column_schema_id,
+            start.elapsed().as_millis()
+        );
+        Ok(Some(rules))
+    }
+
+    pub async fn candidates_for_string_predicate<S: StorageIO>(
+        &self,
+        base_io: Arc<S>,
+        table_name: &str,
+        column_schema_id: u64,
+        query: &str,
+        query_op: Option<StringRuleOp>,
+    ) -> std::io::Result<Option<Vec<RowRange>>> {
+        use std::time::Instant;
+        let total_start = Instant::now();
+        let step_start = Instant::now();
+
+        let Some(rules) = self
+            .load_string_rules_for_column(base_io, table_name, column_schema_id)
+            .await?
+        else {
+            log::info!(
+                "SME v2: candidates_for_string_predicate: table={} col={} step=no_rules t_ms={} dt_ms={}",
+                table_name,
+                column_schema_id,
+                total_start.elapsed().as_millis(),
+                step_start.elapsed().as_millis()
+            );
+            return Ok(None);
+        };
+
+        let ranges = sme_range_processor_str::candidate_row_ranges_for_query_string(
+            query,
+            query_op,
+            rules.as_slice(),
+        );
+        if ranges.is_empty() {
+            return Ok(None);
+        }
+
+        // Convert to Vec and normalize defensively.
+        let ranges = normalize_ranges(ranges.into_iter().collect());
+        if ranges.is_empty() {
+            return Ok(None);
+        }
+
+        log::info!(
+            "SME v2: candidates_for_string_predicate: table={} col={} step=done t_ms={} out_ranges={}",
+            table_name,
+            column_schema_id,
+            total_start.elapsed().as_millis(),
+            ranges.len(),
+        );
+        Ok(Some(ranges))
     }
 
     /// Builds the tightest candidate row ranges for an equality search `column == query`.
@@ -305,6 +538,10 @@ impl SemanticMappingEngineV2 {
         column_schema_id: u64,
         query: NumericScalar,
     ) -> std::io::Result<Option<Vec<RowRange>>> {
+        use std::time::Instant;
+        let total_start = Instant::now();
+        let mut step_start = Instant::now();
+
         log::trace!(
             "candidates_for_numeric_equals: table={}, col={}, query={:?}",
             table_name,
@@ -316,31 +553,83 @@ impl SemanticMappingEngineV2 {
             .load_numeric_rules_for_column(base_io, table_name, column_schema_id)
             .await?
         else {
+            log::info!(
+                "SME v2: candidates_for_numeric_equals: table={} col={} step=no_rules t_ms={} dt_ms={}",
+                table_name,
+                column_schema_id,
+                total_start.elapsed().as_millis(),
+                step_start.elapsed().as_millis()
+            );
             return Ok(None);
         };
+
+        log::info!(
+            "SME v2: candidates_for_numeric_equals: table={} col={} step=load_rules t_ms={} dt_ms={}",
+            table_name,
+            column_schema_id,
+            total_start.elapsed().as_millis(),
+            step_start.elapsed().as_millis()
+        );
 
         let Some(column_type) = rules.first().map(|r| r.column_type.clone()) else {
+            log::info!(
+                "SME v2: candidates_for_numeric_equals: table={} col={} step=no_column_type t_ms={}",
+                table_name,
+                column_schema_id,
+                total_start.elapsed().as_millis(),
+            );
             return Ok(None);
         };
 
+        step_start = Instant::now();
         let query = match coerce_query_scalar(&column_type, query) {
             Ok(q) => q,
-            Err(_) => return Ok(None),
+            Err(_) => {
+                log::info!(
+                    "SME v2: candidates_for_numeric_equals: table={} col={} step=coerce_query failed t_ms={} dt_ms={}",
+                    table_name,
+                    column_schema_id,
+                    total_start.elapsed().as_millis(),
+                    step_start.elapsed().as_millis()
+                );
+                return Ok(None);
+            }
         };
 
+        log::info!(
+            "SME v2: candidates_for_numeric_equals: table={} col={} step=coerce_query t_ms={} dt_ms={}",
+            table_name,
+            column_schema_id,
+            total_start.elapsed().as_millis(),
+            step_start.elapsed().as_millis()
+        );
+
+        step_start = Instant::now();
         let ranges = sme_range_processor::candidate_row_ranges_for_query(
             query,
             rules.as_slice(),
+        );
+
+        log::info!(
+            "SME v2: candidates_for_numeric_equals: table={} col={} step=compute_ranges t_ms={} dt_ms={} ranges={}",
+            table_name,
+            column_schema_id,
+            total_start.elapsed().as_millis(),
+            step_start.elapsed().as_millis(),
+            ranges.len(),
         );
 
         if ranges.is_empty() {
             return Ok(None);
         };
 
-        if ranges.is_empty() {
-            return Ok(None);
-        }
-
+        log::info!(
+            "SME v2: candidates_for_numeric_equals: table={} col={} step=done t_ms={} out_ranges={}",
+            table_name,
+            column_schema_id,
+            total_start.elapsed().as_millis(),
+            ranges.len(),
+        );
         Ok(Some(ranges.to_vec()))
     }
 
@@ -353,6 +642,10 @@ impl SemanticMappingEngineV2 {
         op: &str,
         query: NumericScalar,
     ) -> std::io::Result<Option<Vec<RowRange>>> {
+        use std::time::Instant;
+        let total_start = Instant::now();
+        let mut step_start = Instant::now();
+
         log::trace!(
             "candidates_for_numeric_range: table={}, col={}, op={}, query={:?}",
             table_name,
@@ -365,17 +658,61 @@ impl SemanticMappingEngineV2 {
             .load_numeric_rules_for_column(base_io, table_name, column_schema_id)
             .await?
         else {
+            log::info!(
+                "SME v2: candidates_for_numeric_range: table={} col={} op={} step=no_rules t_ms={} dt_ms={}",
+                table_name,
+                column_schema_id,
+                op,
+                total_start.elapsed().as_millis(),
+                step_start.elapsed().as_millis()
+            );
             return Ok(None);
         };
+
+        log::info!(
+            "SME v2: candidates_for_numeric_range: table={} col={} op={} step=load_rules t_ms={} dt_ms={}",
+            table_name,
+            column_schema_id,
+            op,
+            total_start.elapsed().as_millis(),
+            step_start.elapsed().as_millis()
+        );
 
         let Some(column_type) = rules.first().map(|r| r.column_type.clone()) else {
+            log::info!(
+                "SME v2: candidates_for_numeric_range: table={} col={} op={} step=no_column_type t_ms={}",
+                table_name,
+                column_schema_id,
+                op,
+                total_start.elapsed().as_millis(),
+            );
             return Ok(None);
         };
 
+        step_start = Instant::now();
         let query = match coerce_query_scalar(&column_type, query) {
             Ok(q) => q,
-            Err(_) => return Ok(None),
+            Err(_) => {
+                log::info!(
+                    "SME v2: candidates_for_numeric_range: table={} col={} op={} step=coerce_query failed t_ms={} dt_ms={}",
+                    table_name,
+                    column_schema_id,
+                    op,
+                    total_start.elapsed().as_millis(),
+                    step_start.elapsed().as_millis()
+                );
+                return Ok(None);
+            }
         };
+
+        log::info!(
+            "SME v2: candidates_for_numeric_range: table={} col={} op={} step=coerce_query t_ms={} dt_ms={}",
+            table_name,
+            column_schema_id,
+            op,
+            total_start.elapsed().as_millis(),
+            step_start.elapsed().as_millis()
+        );
 
         let comparison = match op {
             "<" => sme_range_processor_comp::ComparisonType::LessThan,
@@ -385,16 +722,35 @@ impl SemanticMappingEngineV2 {
             _ => return Ok(None),
         };
 
+        step_start = Instant::now();
         let ranges = 
             sme_range_processor_comp::candidate_row_ranges_for_comparison_query(
             query,
             comparison,
             rules.as_slice());
 
+        log::info!(
+            "SME v2: candidates_for_numeric_range: table={} col={} op={} step=compute_ranges t_ms={} dt_ms={} ranges={}",
+            table_name,
+            column_schema_id,
+            op,
+            total_start.elapsed().as_millis(),
+            step_start.elapsed().as_millis(),
+            ranges.len(),
+        );
+
         if ranges.is_empty() {
             return Ok(None);
         }
 
+        log::info!(
+            "SME v2: candidates_for_numeric_range: table={} col={} op={} step=done t_ms={} out_ranges={}",
+            table_name,
+            column_schema_id,
+            op,
+            total_start.elapsed().as_millis(),
+            ranges.len(),
+        );
         Ok(Some(ranges.to_vec()))
     }
 }
