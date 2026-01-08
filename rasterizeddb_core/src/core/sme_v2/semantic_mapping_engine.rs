@@ -3,7 +3,7 @@ use std::sync::OnceLock;
 use dashmap::DashMap;
 use rclite::Arc;
 
-use crate::core::{db_type::DbType, storage_providers::traits::StorageIO};
+use crate::core::{db_type::DbType, sme_v2::sme_range_processor_comp, storage_providers::traits::StorageIO};
 
 use super::{
     rule_store::{CorrelationRuleStore, RulesFileHeaderV2},
@@ -328,11 +328,12 @@ impl SemanticMappingEngineV2 {
             Err(_) => return Ok(None),
         };
 
-        let Some(ranges) = sme_range_processor::candidate_row_ranges_for_value_comparison(
+        let ranges = sme_range_processor::candidate_row_ranges_for_query(
             query,
-            sme_range_processor::ValueComparison::Equal,
             rules.as_slice(),
-        ) else {
+        );
+
+        if ranges.is_empty() {
             return Ok(None);
         };
 
@@ -377,20 +378,18 @@ impl SemanticMappingEngineV2 {
         };
 
         let comparison = match op {
-            "<" => sme_range_processor::ValueComparison::LessThan,
-            "<=" => sme_range_processor::ValueComparison::LessThanOrEqual,
-            ">" => sme_range_processor::ValueComparison::GreaterThan,
-            ">=" => sme_range_processor::ValueComparison::GreaterThanOrEqual,
+            "<" => sme_range_processor_comp::ComparisonType::LessThan,
+            "<=" => sme_range_processor_comp::ComparisonType::LessThanOrEqual,
+            ">" => sme_range_processor_comp::ComparisonType::GreaterThan,
+            ">=" => sme_range_processor_comp::ComparisonType::GreaterThanOrEqual,
             _ => return Ok(None),
         };
 
-        let Some(ranges) = sme_range_processor::candidate_row_ranges_for_value_comparison(
+        let ranges = 
+            sme_range_processor_comp::candidate_row_ranges_for_comparison_query(
             query,
             comparison,
-            rules.as_slice(),
-        ) else {
-            return Ok(None);
-        };
+            rules.as_slice());
 
         if ranges.is_empty() {
             return Ok(None);

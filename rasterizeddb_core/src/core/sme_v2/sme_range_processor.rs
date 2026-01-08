@@ -1,315 +1,5 @@
 use crate::core::sme_v2::rules::{NumericCorrelationRule, NumericRuleOp, NumericScalar, RowRange};
 
-/// Query predicate over row values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ValueComparison {
-    LessThan,
-    LessThanOrEqual,
-    GreaterThan,
-    GreaterThanOrEqual,
-    Equal,
-}
-
-/// Selects candidate row ranges for a query predicate over row values.
-///
-/// IMPORTANT: scanner-built `NumericCorrelationRule` ranges represent rows where
-/// the *row value* satisfies the rule predicate:
-/// - `LessThan`: `value < threshold`
-/// - `GreaterThan`: `value > threshold`
-///
-/// This function chooses threshold rules that form a *superset* of the requested
-/// query predicate, so SME will not introduce false negatives.
-///
-/// Returns `None` when no safe restriction can be derived from the available rules
-/// (caller should fall back to a full scan for that predicate).
-pub fn candidate_row_ranges_for_value_comparison(
-    query: NumericScalar,
-    comparison: ValueComparison,
-    rules: &[NumericCorrelationRule],
-) -> Option<smallvec::SmallVec<[RowRange; 64]>> {
-    match query {
-        NumericScalar::Signed(q) => candidate_row_ranges_for_value_comparison_i128(q, comparison, rules),
-        NumericScalar::Unsigned(q) => candidate_row_ranges_for_value_comparison_u128(q, comparison, rules),
-        NumericScalar::Float(q) => candidate_row_ranges_for_value_comparison_f64(q, comparison, rules),
-    }
-}
-
-fn pick_best_gt_i128(
-    q: i128,
-    comparison: ValueComparison,
-    rules: &[NumericCorrelationRule],
-) -> Option<&NumericCorrelationRule> {
-    let mut best: Option<(&NumericCorrelationRule, i128)> = None;
-    for r in rules {
-        let (NumericRuleOp::GreaterThan, NumericScalar::Signed(t)) = (r.op, r.value) else { continue; };
-        let ok = match comparison {
-            ValueComparison::GreaterThan => t <= q,
-            ValueComparison::GreaterThanOrEqual => t < q,
-            ValueComparison::Equal => t < q,
-            _ => false,
-        };
-        if !ok {
-            continue;
-        }
-        best = Some(match best {
-            None => (r, t),
-            Some((best_r, best_t)) => {
-                if t > best_t { (r, t) } else { (best_r, best_t) }
-            }
-        });
-    }
-    best.map(|(r, _)| r)
-}
-
-fn pick_best_lt_i128(
-    q: i128,
-    comparison: ValueComparison,
-    rules: &[NumericCorrelationRule],
-) -> Option<&NumericCorrelationRule> {
-    let mut best: Option<(&NumericCorrelationRule, i128)> = None;
-    for r in rules {
-        let (NumericRuleOp::LessThan, NumericScalar::Signed(t)) = (r.op, r.value) else { continue; };
-        let ok = match comparison {
-            ValueComparison::LessThan => t >= q,
-            ValueComparison::LessThanOrEqual => t > q,
-            ValueComparison::Equal => t > q,
-            _ => false,
-        };
-        if !ok {
-            continue;
-        }
-        best = Some(match best {
-            None => (r, t),
-            Some((best_r, best_t)) => {
-                if t < best_t { (r, t) } else { (best_r, best_t) }
-            }
-        });
-    }
-    best.map(|(r, _)| r)
-}
-
-fn candidate_row_ranges_for_value_comparison_i128(
-    q: i128,
-    comparison: ValueComparison,
-    rules: &[NumericCorrelationRule],
-) -> Option<smallvec::SmallVec<[RowRange; 64]>> {
-    match comparison {
-        ValueComparison::LessThan | ValueComparison::LessThanOrEqual => {
-            let rule = pick_best_lt_i128(q, comparison, rules)?;
-            let mut out = smallvec::SmallVec::<[RowRange; 64]>::new();
-            out.extend_from_slice(&rule.ranges);
-            Some(merge_row_ranges(out))
-        }
-        ValueComparison::GreaterThan | ValueComparison::GreaterThanOrEqual => {
-            let rule = pick_best_gt_i128(q, comparison, rules)?;
-            let mut out = smallvec::SmallVec::<[RowRange; 64]>::new();
-            out.extend_from_slice(&rule.ranges);
-            Some(merge_row_ranges(out))
-        }
-        ValueComparison::Equal => {
-            let lo = pick_best_gt_i128(q, ValueComparison::Equal, rules);
-            let hi = pick_best_lt_i128(q, ValueComparison::Equal, rules);
-            match (lo, hi) {
-                (Some(lo), Some(hi)) => {
-                    let v = crate::core::sme_v2::rules::intersect_ranges(&lo.ranges, &hi.ranges);
-                    let mut out = smallvec::SmallVec::<[RowRange; 64]>::new();
-                    out.extend(v);
-                    Some(merge_row_ranges(out))
-                }
-                _ => None,
-            }
-        }
-    }
-}
-
-fn pick_best_gt_u128(
-    q: u128,
-    comparison: ValueComparison,
-    rules: &[NumericCorrelationRule],
-) -> Option<&NumericCorrelationRule> {
-    let mut best: Option<(&NumericCorrelationRule, u128)> = None;
-    for r in rules {
-        let (NumericRuleOp::GreaterThan, NumericScalar::Unsigned(t)) = (r.op, r.value) else { continue; };
-        let ok = match comparison {
-            ValueComparison::GreaterThan => t <= q,
-            ValueComparison::GreaterThanOrEqual => t < q,
-            ValueComparison::Equal => t < q,
-            _ => false,
-        };
-        if !ok {
-            continue;
-        }
-        best = Some(match best {
-            None => (r, t),
-            Some((best_r, best_t)) => {
-                if t > best_t { (r, t) } else { (best_r, best_t) }
-            }
-        });
-    }
-    best.map(|(r, _)| r)
-}
-
-fn pick_best_lt_u128(
-    q: u128,
-    comparison: ValueComparison,
-    rules: &[NumericCorrelationRule],
-) -> Option<&NumericCorrelationRule> {
-    let mut best: Option<(&NumericCorrelationRule, u128)> = None;
-    for r in rules {
-        let (NumericRuleOp::LessThan, NumericScalar::Unsigned(t)) = (r.op, r.value) else { continue; };
-        let ok = match comparison {
-            ValueComparison::LessThan => t >= q,
-            ValueComparison::LessThanOrEqual => t > q,
-            ValueComparison::Equal => t > q,
-            _ => false,
-        };
-        if !ok {
-            continue;
-        }
-        best = Some(match best {
-            None => (r, t),
-            Some((best_r, best_t)) => {
-                if t < best_t { (r, t) } else { (best_r, best_t) }
-            }
-        });
-    }
-    best.map(|(r, _)| r)
-}
-
-fn candidate_row_ranges_for_value_comparison_u128(
-    q: u128,
-    comparison: ValueComparison,
-    rules: &[NumericCorrelationRule],
-) -> Option<smallvec::SmallVec<[RowRange; 64]>> {
-    match comparison {
-        ValueComparison::LessThan | ValueComparison::LessThanOrEqual => {
-            let rule = pick_best_lt_u128(q, comparison, rules)?;
-            let mut out = smallvec::SmallVec::<[RowRange; 64]>::new();
-            out.extend_from_slice(&rule.ranges);
-            Some(merge_row_ranges(out))
-        }
-        ValueComparison::GreaterThan | ValueComparison::GreaterThanOrEqual => {
-            let rule = pick_best_gt_u128(q, comparison, rules)?;
-            let mut out = smallvec::SmallVec::<[RowRange; 64]>::new();
-            out.extend_from_slice(&rule.ranges);
-            Some(merge_row_ranges(out))
-        }
-        ValueComparison::Equal => {
-            let lo = pick_best_gt_u128(q, ValueComparison::Equal, rules);
-            let hi = pick_best_lt_u128(q, ValueComparison::Equal, rules);
-            match (lo, hi) {
-                (Some(lo), Some(hi)) => {
-                    let v = crate::core::sme_v2::rules::intersect_ranges(&lo.ranges, &hi.ranges);
-                    let mut out = smallvec::SmallVec::<[RowRange; 64]>::new();
-                    out.extend(v);
-                    Some(merge_row_ranges(out))
-                }
-                _ => None,
-            }
-        }
-    }
-}
-
-fn pick_best_gt_f64(
-    q: f64,
-    comparison: ValueComparison,
-    rules: &[NumericCorrelationRule],
-) -> Option<&NumericCorrelationRule> {
-    if q.is_nan() {
-        return None;
-    }
-    let mut best: Option<(&NumericCorrelationRule, f64)> = None;
-    for r in rules {
-        let (NumericRuleOp::GreaterThan, NumericScalar::Float(t)) = (r.op, r.value) else { continue; };
-        if t.is_nan() {
-            continue;
-        }
-        let ok = match comparison {
-            ValueComparison::GreaterThan => t <= q,
-            ValueComparison::GreaterThanOrEqual => t < q,
-            ValueComparison::Equal => t < q,
-            _ => false,
-        };
-        if !ok {
-            continue;
-        }
-        best = Some(match best {
-            None => (r, t),
-            Some((best_r, best_t)) => {
-                if t.total_cmp(&best_t).is_gt() { (r, t) } else { (best_r, best_t) }
-            }
-        });
-    }
-    best.map(|(r, _)| r)
-}
-
-fn pick_best_lt_f64(
-    q: f64,
-    comparison: ValueComparison,
-    rules: &[NumericCorrelationRule],
-) -> Option<&NumericCorrelationRule> {
-    if q.is_nan() {
-        return None;
-    }
-    let mut best: Option<(&NumericCorrelationRule, f64)> = None;
-    for r in rules {
-        let (NumericRuleOp::LessThan, NumericScalar::Float(t)) = (r.op, r.value) else { continue; };
-        if t.is_nan() {
-            continue;
-        }
-        let ok = match comparison {
-            ValueComparison::LessThan => t >= q,
-            ValueComparison::LessThanOrEqual => t > q,
-            ValueComparison::Equal => t > q,
-            _ => false,
-        };
-        if !ok {
-            continue;
-        }
-        best = Some(match best {
-            None => (r, t),
-            Some((best_r, best_t)) => {
-                if t.total_cmp(&best_t).is_lt() { (r, t) } else { (best_r, best_t) }
-            }
-        });
-    }
-    best.map(|(r, _)| r)
-}
-
-fn candidate_row_ranges_for_value_comparison_f64(
-    q: f64,
-    comparison: ValueComparison,
-    rules: &[NumericCorrelationRule],
-) -> Option<smallvec::SmallVec<[RowRange; 64]>> {
-    match comparison {
-        ValueComparison::LessThan | ValueComparison::LessThanOrEqual => {
-            let rule = pick_best_lt_f64(q, comparison, rules)?;
-            let mut out = smallvec::SmallVec::<[RowRange; 64]>::new();
-            out.extend_from_slice(&rule.ranges);
-            Some(merge_row_ranges(out))
-        }
-        ValueComparison::GreaterThan | ValueComparison::GreaterThanOrEqual => {
-            let rule = pick_best_gt_f64(q, comparison, rules)?;
-            let mut out = smallvec::SmallVec::<[RowRange; 64]>::new();
-            out.extend_from_slice(&rule.ranges);
-            Some(merge_row_ranges(out))
-        }
-        ValueComparison::Equal => {
-            let lo = pick_best_gt_f64(q, ValueComparison::Equal, rules);
-            let hi = pick_best_lt_f64(q, ValueComparison::Equal, rules);
-            match (lo, hi) {
-                (Some(lo), Some(hi)) => {
-                    let v = crate::core::sme_v2::rules::intersect_ranges(&lo.ranges, &hi.ranges);
-                    let mut out = smallvec::SmallVec::<[RowRange; 64]>::new();
-                    out.extend(v);
-                    Some(merge_row_ranges(out))
-                }
-                _ => None,
-            }
-        }
-    }
-}
-
 /// Returns merged candidate row ranges for a numeric query.
 ///
 /// The query can be one of:
@@ -317,9 +7,7 @@ fn candidate_row_ranges_for_value_comparison_f64(
 /// - `NumericScalar::Unsigned(u128)`
 /// - `NumericScalar::Float(f64)`
 ///
-/// NOTE: This function implements an older interpretation (predicate on the query value).
-/// SME v2 now prefers `candidate_row_ranges_for_value_comparison`, which matches how
-/// the scanner builds rule ranges (predicate on stored row values).
+/// Interpretation follows `NumericRuleOp` docs: this is a predicate on the query value.
 ///
 /// Note: rules are only considered when their `value` variant matches the query variant.
 pub fn candidate_row_ranges_for_query(
@@ -354,8 +42,8 @@ pub fn candidate_row_ranges_for_query(
 #[inline]
 pub fn rule_matches_query_i128(query: i128, op: NumericRuleOp, threshold: i128) -> bool {
     match op {
-        NumericRuleOp::LessThan => query < threshold,
-        NumericRuleOp::GreaterThan => query > threshold,
+        NumericRuleOp::LessThan => query <= threshold,
+        NumericRuleOp::GreaterThan => query >= threshold,
     }
 }
 
@@ -364,12 +52,12 @@ pub fn rule_matches_query(query: NumericScalar, op: NumericRuleOp, threshold: Nu
     match (query, threshold) {
         (NumericScalar::Signed(q), NumericScalar::Signed(t)) => rule_matches_query_i128(q, op, t),
         (NumericScalar::Unsigned(q), NumericScalar::Unsigned(t)) => match op {
-            NumericRuleOp::LessThan => q < t,
-            NumericRuleOp::GreaterThan => q > t,
+            NumericRuleOp::LessThan => q <= t,
+            NumericRuleOp::GreaterThan => q >= t,
         },
         (NumericScalar::Float(q), NumericScalar::Float(t)) => match op {
-            NumericRuleOp::LessThan => q < t,
-            NumericRuleOp::GreaterThan => q > t,
+            NumericRuleOp::LessThan => q <= t,
+            NumericRuleOp::GreaterThan => q >= t,
         },
         _ => false,
     }
@@ -440,6 +128,25 @@ unsafe fn avx2_u128_gt_masks(
     _mm256_or_si256(hi_gt, hi_eq_and_lo_gt)
 }
 
+/// Unsigned u128 compare (a >= b) where each u128 is represented as (hi unsigned u64, lo unsigned u64)
+/// in 64-bit lanes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn avx2_u128_ge_masks(
+    a_hi: std::arch::x86_64::__m256i,
+    a_lo: std::arch::x86_64::__m256i,
+    b_hi: std::arch::x86_64::__m256i,
+    b_lo: std::arch::x86_64::__m256i,
+) -> std::arch::x86_64::__m256i {
+    use std::arch::x86_64::*;
+
+    let gt = unsafe { avx2_u128_gt_masks(a_hi, a_lo, b_hi, b_lo) };
+    let eq_hi = _mm256_cmpeq_epi64(a_hi, b_hi);
+    let eq_lo = _mm256_cmpeq_epi64(a_lo, b_lo);
+    let eq = _mm256_and_si256(eq_hi, eq_lo);
+    _mm256_or_si256(gt, eq)
+}
+
 /// Signed i128 compare (a > b) where each i128 is represented as (hi signed i64, lo unsigned u64)
 /// in 64-bit lanes.
 #[cfg(target_arch = "x86_64")]
@@ -459,6 +166,25 @@ unsafe fn avx2_i128_gt_masks(
     let lo_gt = unsafe { avx2_cmpgt_u64(a_lo, b_lo) };
     let hi_eq_and_lo_gt = _mm256_and_si256(hi_eq, lo_gt);
     _mm256_or_si256(hi_gt, hi_eq_and_lo_gt)
+}
+
+/// Signed i128 compare (a >= b) where each i128 is represented as (hi signed i64, lo unsigned u64)
+/// in 64-bit lanes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn avx2_i128_ge_masks(
+    a_hi: std::arch::x86_64::__m256i,
+    a_lo: std::arch::x86_64::__m256i,
+    b_hi: std::arch::x86_64::__m256i,
+    b_lo: std::arch::x86_64::__m256i,
+) -> std::arch::x86_64::__m256i {
+    use std::arch::x86_64::*;
+
+    let gt = unsafe { avx2_i128_gt_masks(a_hi, a_lo, b_hi, b_lo) };
+    let eq_hi = _mm256_cmpeq_epi64(a_hi, b_hi);
+    let eq_lo = _mm256_cmpeq_epi64(a_lo, b_lo);
+    let eq = _mm256_and_si256(eq_hi, eq_lo);
+    _mm256_or_si256(gt, eq)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -502,7 +228,7 @@ unsafe fn candidate_row_ranges_for_i128_query_avx2(
     let q_hi_vec = _mm256_set1_epi64x(q_hi);
     let q_lo_vec = _mm256_set1_epi64x(q_lo as i64);
 
-    // LessThan op: match if query < threshold  <=>  threshold > query
+    // LessThan op: match if query <= threshold  <=>  threshold >= query
     {
         let mut k = 0usize;
         while k + 4 <= lt_idx.len() {
@@ -545,7 +271,7 @@ unsafe fn candidate_row_ranges_for_i128_query_avx2(
             let t_hi = _mm256_setr_epi64x(hi0, hi1, hi2, hi3);
             let t_lo = _mm256_setr_epi64x(lo0 as i64, lo1 as i64, lo2 as i64, lo3 as i64);
 
-            let gt = unsafe { avx2_i128_gt_masks(t_hi, t_lo, q_hi_vec, q_lo_vec) };
+            let gt = unsafe { avx2_i128_ge_masks(t_hi, t_lo, q_hi_vec, q_lo_vec) };
             let m = _mm256_movemask_epi8(gt);
 
             if avx2_lane_any(m, 0) {
@@ -572,7 +298,7 @@ unsafe fn candidate_row_ranges_for_i128_query_avx2(
         }
     }
 
-    // GreaterThan op: match if query > threshold
+    // GreaterThan op: match if query >= threshold
     {
         let mut k = 0usize;
         while k + 4 <= gt_idx.len() {
@@ -615,7 +341,7 @@ unsafe fn candidate_row_ranges_for_i128_query_avx2(
             let t_hi = _mm256_setr_epi64x(hi0, hi1, hi2, hi3);
             let t_lo = _mm256_setr_epi64x(lo0 as i64, lo1 as i64, lo2 as i64, lo3 as i64);
 
-            let gt = unsafe { avx2_i128_gt_masks(q_hi_vec, q_lo_vec, t_hi, t_lo) };
+            let gt = unsafe { avx2_i128_ge_masks(q_hi_vec, q_lo_vec, t_hi, t_lo) };
             let m = _mm256_movemask_epi8(gt);
 
             if avx2_lane_any(m, 0) {
@@ -686,7 +412,7 @@ unsafe fn candidate_row_ranges_for_u128_query_avx2(
     let q_hi_vec = _mm256_set1_epi64x(q_hi as i64);
     let q_lo_vec = _mm256_set1_epi64x(q_lo as i64);
 
-    // LessThan op: match if query < threshold  <=>  threshold > query
+    // LessThan op: match if query <= threshold  <=>  threshold >= query
     {
         let mut k = 0usize;
         while k + 4 <= lt_idx.len() {
@@ -729,7 +455,7 @@ unsafe fn candidate_row_ranges_for_u128_query_avx2(
             let t_hi = _mm256_setr_epi64x(hi0 as i64, hi1 as i64, hi2 as i64, hi3 as i64);
             let t_lo = _mm256_setr_epi64x(lo0 as i64, lo1 as i64, lo2 as i64, lo3 as i64);
 
-            let gt = unsafe { avx2_u128_gt_masks(t_hi, t_lo, q_hi_vec, q_lo_vec) };
+            let gt = unsafe { avx2_u128_ge_masks(t_hi, t_lo, q_hi_vec, q_lo_vec) };
             let m = _mm256_movemask_epi8(gt);
 
             if avx2_lane_any(m, 0) {
@@ -757,7 +483,7 @@ unsafe fn candidate_row_ranges_for_u128_query_avx2(
         }
     }
 
-    // GreaterThan op: match if query > threshold
+    // GreaterThan op: match if query >= threshold
     {
         let mut k = 0usize;
         while k + 4 <= gt_idx.len() {
@@ -800,7 +526,7 @@ unsafe fn candidate_row_ranges_for_u128_query_avx2(
             let t_hi = _mm256_setr_epi64x(hi0 as i64, hi1 as i64, hi2 as i64, hi3 as i64);
             let t_lo = _mm256_setr_epi64x(lo0 as i64, lo1 as i64, lo2 as i64, lo3 as i64);
 
-            let gt = unsafe { avx2_u128_gt_masks(q_hi_vec, q_lo_vec, t_hi, t_lo) };
+            let gt = unsafe { avx2_u128_ge_masks(q_hi_vec, q_lo_vec, t_hi, t_lo) };
             let m = _mm256_movemask_epi8(gt);
 
             if avx2_lane_any(m, 0) {
@@ -1257,7 +983,7 @@ mod tests {
                     });
                 }
 
-                let query = 950i128;
+                let query = 900i128;
                 let scalar = super::candidate_row_ranges_for_query(NumericScalar::Signed(query), &rules);
                 let avx2 = unsafe { super::candidate_row_ranges_for_i128_query_avx2(query, &rules) };
                 assert_eq!(scalar, avx2);
