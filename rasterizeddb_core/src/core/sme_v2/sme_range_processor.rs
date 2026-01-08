@@ -1,5 +1,315 @@
 use crate::core::sme_v2::rules::{NumericCorrelationRule, NumericRuleOp, NumericScalar, RowRange};
 
+/// Query predicate over row values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueComparison {
+    LessThan,
+    LessThanOrEqual,
+    GreaterThan,
+    GreaterThanOrEqual,
+    Equal,
+}
+
+/// Selects candidate row ranges for a query predicate over row values.
+///
+/// IMPORTANT: scanner-built `NumericCorrelationRule` ranges represent rows where
+/// the *row value* satisfies the rule predicate:
+/// - `LessThan`: `value < threshold`
+/// - `GreaterThan`: `value > threshold`
+///
+/// This function chooses threshold rules that form a *superset* of the requested
+/// query predicate, so SME will not introduce false negatives.
+///
+/// Returns `None` when no safe restriction can be derived from the available rules
+/// (caller should fall back to a full scan for that predicate).
+pub fn candidate_row_ranges_for_value_comparison(
+    query: NumericScalar,
+    comparison: ValueComparison,
+    rules: &[NumericCorrelationRule],
+) -> Option<smallvec::SmallVec<[RowRange; 64]>> {
+    match query {
+        NumericScalar::Signed(q) => candidate_row_ranges_for_value_comparison_i128(q, comparison, rules),
+        NumericScalar::Unsigned(q) => candidate_row_ranges_for_value_comparison_u128(q, comparison, rules),
+        NumericScalar::Float(q) => candidate_row_ranges_for_value_comparison_f64(q, comparison, rules),
+    }
+}
+
+fn pick_best_gt_i128(
+    q: i128,
+    comparison: ValueComparison,
+    rules: &[NumericCorrelationRule],
+) -> Option<&NumericCorrelationRule> {
+    let mut best: Option<(&NumericCorrelationRule, i128)> = None;
+    for r in rules {
+        let (NumericRuleOp::GreaterThan, NumericScalar::Signed(t)) = (r.op, r.value) else { continue; };
+        let ok = match comparison {
+            ValueComparison::GreaterThan => t <= q,
+            ValueComparison::GreaterThanOrEqual => t < q,
+            ValueComparison::Equal => t < q,
+            _ => false,
+        };
+        if !ok {
+            continue;
+        }
+        best = Some(match best {
+            None => (r, t),
+            Some((best_r, best_t)) => {
+                if t > best_t { (r, t) } else { (best_r, best_t) }
+            }
+        });
+    }
+    best.map(|(r, _)| r)
+}
+
+fn pick_best_lt_i128(
+    q: i128,
+    comparison: ValueComparison,
+    rules: &[NumericCorrelationRule],
+) -> Option<&NumericCorrelationRule> {
+    let mut best: Option<(&NumericCorrelationRule, i128)> = None;
+    for r in rules {
+        let (NumericRuleOp::LessThan, NumericScalar::Signed(t)) = (r.op, r.value) else { continue; };
+        let ok = match comparison {
+            ValueComparison::LessThan => t >= q,
+            ValueComparison::LessThanOrEqual => t > q,
+            ValueComparison::Equal => t > q,
+            _ => false,
+        };
+        if !ok {
+            continue;
+        }
+        best = Some(match best {
+            None => (r, t),
+            Some((best_r, best_t)) => {
+                if t < best_t { (r, t) } else { (best_r, best_t) }
+            }
+        });
+    }
+    best.map(|(r, _)| r)
+}
+
+fn candidate_row_ranges_for_value_comparison_i128(
+    q: i128,
+    comparison: ValueComparison,
+    rules: &[NumericCorrelationRule],
+) -> Option<smallvec::SmallVec<[RowRange; 64]>> {
+    match comparison {
+        ValueComparison::LessThan | ValueComparison::LessThanOrEqual => {
+            let rule = pick_best_lt_i128(q, comparison, rules)?;
+            let mut out = smallvec::SmallVec::<[RowRange; 64]>::new();
+            out.extend_from_slice(&rule.ranges);
+            Some(merge_row_ranges(out))
+        }
+        ValueComparison::GreaterThan | ValueComparison::GreaterThanOrEqual => {
+            let rule = pick_best_gt_i128(q, comparison, rules)?;
+            let mut out = smallvec::SmallVec::<[RowRange; 64]>::new();
+            out.extend_from_slice(&rule.ranges);
+            Some(merge_row_ranges(out))
+        }
+        ValueComparison::Equal => {
+            let lo = pick_best_gt_i128(q, ValueComparison::Equal, rules);
+            let hi = pick_best_lt_i128(q, ValueComparison::Equal, rules);
+            match (lo, hi) {
+                (Some(lo), Some(hi)) => {
+                    let v = crate::core::sme_v2::rules::intersect_ranges(&lo.ranges, &hi.ranges);
+                    let mut out = smallvec::SmallVec::<[RowRange; 64]>::new();
+                    out.extend(v);
+                    Some(merge_row_ranges(out))
+                }
+                _ => None,
+            }
+        }
+    }
+}
+
+fn pick_best_gt_u128(
+    q: u128,
+    comparison: ValueComparison,
+    rules: &[NumericCorrelationRule],
+) -> Option<&NumericCorrelationRule> {
+    let mut best: Option<(&NumericCorrelationRule, u128)> = None;
+    for r in rules {
+        let (NumericRuleOp::GreaterThan, NumericScalar::Unsigned(t)) = (r.op, r.value) else { continue; };
+        let ok = match comparison {
+            ValueComparison::GreaterThan => t <= q,
+            ValueComparison::GreaterThanOrEqual => t < q,
+            ValueComparison::Equal => t < q,
+            _ => false,
+        };
+        if !ok {
+            continue;
+        }
+        best = Some(match best {
+            None => (r, t),
+            Some((best_r, best_t)) => {
+                if t > best_t { (r, t) } else { (best_r, best_t) }
+            }
+        });
+    }
+    best.map(|(r, _)| r)
+}
+
+fn pick_best_lt_u128(
+    q: u128,
+    comparison: ValueComparison,
+    rules: &[NumericCorrelationRule],
+) -> Option<&NumericCorrelationRule> {
+    let mut best: Option<(&NumericCorrelationRule, u128)> = None;
+    for r in rules {
+        let (NumericRuleOp::LessThan, NumericScalar::Unsigned(t)) = (r.op, r.value) else { continue; };
+        let ok = match comparison {
+            ValueComparison::LessThan => t >= q,
+            ValueComparison::LessThanOrEqual => t > q,
+            ValueComparison::Equal => t > q,
+            _ => false,
+        };
+        if !ok {
+            continue;
+        }
+        best = Some(match best {
+            None => (r, t),
+            Some((best_r, best_t)) => {
+                if t < best_t { (r, t) } else { (best_r, best_t) }
+            }
+        });
+    }
+    best.map(|(r, _)| r)
+}
+
+fn candidate_row_ranges_for_value_comparison_u128(
+    q: u128,
+    comparison: ValueComparison,
+    rules: &[NumericCorrelationRule],
+) -> Option<smallvec::SmallVec<[RowRange; 64]>> {
+    match comparison {
+        ValueComparison::LessThan | ValueComparison::LessThanOrEqual => {
+            let rule = pick_best_lt_u128(q, comparison, rules)?;
+            let mut out = smallvec::SmallVec::<[RowRange; 64]>::new();
+            out.extend_from_slice(&rule.ranges);
+            Some(merge_row_ranges(out))
+        }
+        ValueComparison::GreaterThan | ValueComparison::GreaterThanOrEqual => {
+            let rule = pick_best_gt_u128(q, comparison, rules)?;
+            let mut out = smallvec::SmallVec::<[RowRange; 64]>::new();
+            out.extend_from_slice(&rule.ranges);
+            Some(merge_row_ranges(out))
+        }
+        ValueComparison::Equal => {
+            let lo = pick_best_gt_u128(q, ValueComparison::Equal, rules);
+            let hi = pick_best_lt_u128(q, ValueComparison::Equal, rules);
+            match (lo, hi) {
+                (Some(lo), Some(hi)) => {
+                    let v = crate::core::sme_v2::rules::intersect_ranges(&lo.ranges, &hi.ranges);
+                    let mut out = smallvec::SmallVec::<[RowRange; 64]>::new();
+                    out.extend(v);
+                    Some(merge_row_ranges(out))
+                }
+                _ => None,
+            }
+        }
+    }
+}
+
+fn pick_best_gt_f64(
+    q: f64,
+    comparison: ValueComparison,
+    rules: &[NumericCorrelationRule],
+) -> Option<&NumericCorrelationRule> {
+    if q.is_nan() {
+        return None;
+    }
+    let mut best: Option<(&NumericCorrelationRule, f64)> = None;
+    for r in rules {
+        let (NumericRuleOp::GreaterThan, NumericScalar::Float(t)) = (r.op, r.value) else { continue; };
+        if t.is_nan() {
+            continue;
+        }
+        let ok = match comparison {
+            ValueComparison::GreaterThan => t <= q,
+            ValueComparison::GreaterThanOrEqual => t < q,
+            ValueComparison::Equal => t < q,
+            _ => false,
+        };
+        if !ok {
+            continue;
+        }
+        best = Some(match best {
+            None => (r, t),
+            Some((best_r, best_t)) => {
+                if t.total_cmp(&best_t).is_gt() { (r, t) } else { (best_r, best_t) }
+            }
+        });
+    }
+    best.map(|(r, _)| r)
+}
+
+fn pick_best_lt_f64(
+    q: f64,
+    comparison: ValueComparison,
+    rules: &[NumericCorrelationRule],
+) -> Option<&NumericCorrelationRule> {
+    if q.is_nan() {
+        return None;
+    }
+    let mut best: Option<(&NumericCorrelationRule, f64)> = None;
+    for r in rules {
+        let (NumericRuleOp::LessThan, NumericScalar::Float(t)) = (r.op, r.value) else { continue; };
+        if t.is_nan() {
+            continue;
+        }
+        let ok = match comparison {
+            ValueComparison::LessThan => t >= q,
+            ValueComparison::LessThanOrEqual => t > q,
+            ValueComparison::Equal => t > q,
+            _ => false,
+        };
+        if !ok {
+            continue;
+        }
+        best = Some(match best {
+            None => (r, t),
+            Some((best_r, best_t)) => {
+                if t.total_cmp(&best_t).is_lt() { (r, t) } else { (best_r, best_t) }
+            }
+        });
+    }
+    best.map(|(r, _)| r)
+}
+
+fn candidate_row_ranges_for_value_comparison_f64(
+    q: f64,
+    comparison: ValueComparison,
+    rules: &[NumericCorrelationRule],
+) -> Option<smallvec::SmallVec<[RowRange; 64]>> {
+    match comparison {
+        ValueComparison::LessThan | ValueComparison::LessThanOrEqual => {
+            let rule = pick_best_lt_f64(q, comparison, rules)?;
+            let mut out = smallvec::SmallVec::<[RowRange; 64]>::new();
+            out.extend_from_slice(&rule.ranges);
+            Some(merge_row_ranges(out))
+        }
+        ValueComparison::GreaterThan | ValueComparison::GreaterThanOrEqual => {
+            let rule = pick_best_gt_f64(q, comparison, rules)?;
+            let mut out = smallvec::SmallVec::<[RowRange; 64]>::new();
+            out.extend_from_slice(&rule.ranges);
+            Some(merge_row_ranges(out))
+        }
+        ValueComparison::Equal => {
+            let lo = pick_best_gt_f64(q, ValueComparison::Equal, rules);
+            let hi = pick_best_lt_f64(q, ValueComparison::Equal, rules);
+            match (lo, hi) {
+                (Some(lo), Some(hi)) => {
+                    let v = crate::core::sme_v2::rules::intersect_ranges(&lo.ranges, &hi.ranges);
+                    let mut out = smallvec::SmallVec::<[RowRange; 64]>::new();
+                    out.extend(v);
+                    Some(merge_row_ranges(out))
+                }
+                _ => None,
+            }
+        }
+    }
+}
+
 /// Returns merged candidate row ranges for a numeric query.
 ///
 /// The query can be one of:
@@ -7,7 +317,9 @@ use crate::core::sme_v2::rules::{NumericCorrelationRule, NumericRuleOp, NumericS
 /// - `NumericScalar::Unsigned(u128)`
 /// - `NumericScalar::Float(f64)`
 ///
-/// Interpretation follows `NumericRuleOp` docs: this is a predicate on the query value.
+/// NOTE: This function implements an older interpretation (predicate on the query value).
+/// SME v2 now prefers `candidate_row_ranges_for_value_comparison`, which matches how
+/// the scanner builds rule ranges (predicate on stored row values).
 ///
 /// Note: rules are only considered when their `value` variant matches the query variant.
 pub fn candidate_row_ranges_for_query(

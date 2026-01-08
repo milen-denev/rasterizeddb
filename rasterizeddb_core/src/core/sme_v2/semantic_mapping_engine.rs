@@ -3,15 +3,12 @@ use std::sync::OnceLock;
 use dashmap::DashMap;
 use rclite::Arc;
 
-use crate::core::{
-    db_type::DbType,
-    storage_providers::traits::StorageIO,
-};
+use crate::core::{db_type::DbType, storage_providers::traits::StorageIO};
 
 use super::{
     rule_store::{CorrelationRuleStore, RulesFileHeaderV2},
     rules::{
-        intersect_ranges, normalize_ranges, NumericCorrelationRule, NumericRuleOp, NumericScalar,
+        intersect_ranges, normalize_ranges, NumericCorrelationRule, NumericScalar,
         RowRange,
     },
     sme_range_processor,
@@ -217,34 +214,8 @@ impl SemanticMappingEngineV2 {
             Err(_) => return None,
         };
 
-        // If a LIMIT is provided, we can stop collecting candidates early.
-        // Since SME candidates are "superset" of matches, returning strictly 'limit' candidates
-        // might yield fewer than 'limit' actual rows if false positives exist.
-        // However, correlation rules usually provide range-based filtering where all rows in range MIGHT match.
-        // If the predicates are exact (e.g. integer range), and the block contains only matching rows...
-        // Safest approach: apply a multiplier to the limit to account for potential gaps/false positives,
-        // or just rely on the processor to stop.
-        // But the user requested "LIMIT should be taken into account", implying performance concern.
-        // We'll use a conservative multiplier (e.g. 2x) or just exact limit if it's large enough?
-        // Let's stick to exact limit for now as per user request, assuming high rule effectiveness.
-        // Any inaccuracy will be fixed by the user refining their query or understanding SME behavior.
-        // Actually, returning incomplete candidates is bad.
-        // BUT, if we scan row pointers in order, and return the first N pointers that match the Rules.
-        // Then the Executor reads those N pointers.
-        // If all N match the query, we get N. (Done).
-        // If only K < N match, we get K. (Incomplete result).
-        // To strictly respect LIMIT in the DB sense, we must find N *matching* rows.
-        // SME doesn't check rows.
-        // So we can only support LIMIT if we are confident.
-        // Compromise: We fetch limit * 2 candidates.
-        let target_count = limit.map(|l| l.saturating_mul(2)).unwrap_or(u64::MAX);
-
         let mut out: Vec<RowPointer> = Vec::new();
         loop {
-            if out.len() as u64 >= target_count {
-                break;
-            }
-
             let batch = match it.next_row_pointers().await {
                 Ok(b) => b,
                 Err(_) => return None,
@@ -256,9 +227,6 @@ impl SemanticMappingEngineV2 {
                 if p.deleted { continue; }
                 if id_in_intervals(p.id, &intervals) {
                     out.push(p);
-                    if out.len() as u64 >= target_count {
-                        break;
-                    }
                 }
             }
         }
@@ -360,27 +328,19 @@ impl SemanticMappingEngineV2 {
             Err(_) => return Ok(None),
         };
 
-        // Split by operation to avoid checking op inside the SIMD selection loop.
-        let mut lt_rules = Vec::new();
-        let mut gt_rules = Vec::new();
-        for r in rules.iter() {
-            match r.op {
-                NumericRuleOp::LessThan => lt_rules.push(r.clone()),
-                NumericRuleOp::GreaterThan => gt_rules.push(r.clone()),
-            }
-        }
-
-        let lt = sme_range_processor::candidate_row_ranges_for_query(query, &lt_rules).to_vec();
-        let gt = sme_range_processor::candidate_row_ranges_for_query(query, &gt_rules).to_vec();
-
-        let result = match (lt.is_empty(), gt.is_empty()) {
-            (true, true) => return Ok(None),
-            (false, true) => lt,
-            (true, false) => gt,
-            (false, false) => intersect_ranges(&lt, &gt),
+        let Some(ranges) = sme_range_processor::candidate_row_ranges_for_value_comparison(
+            query,
+            sme_range_processor::ValueComparison::Equal,
+            rules.as_slice(),
+        ) else {
+            return Ok(None);
         };
 
-        Ok(Some(normalize_ranges(result)))
+        if ranges.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(ranges.to_vec()))
     }
 
     /// Builds candidate row ranges for range queries (>, >=, <, <=).
@@ -416,41 +376,20 @@ impl SemanticMappingEngineV2 {
             Err(_) => return Ok(None),
         };
 
-        let mut lt_rules = Vec::new();
-        let mut gt_rules = Vec::new();
-        for r in rules.iter() {
-            match r.op {
-                NumericRuleOp::LessThan => lt_rules.push(r.clone()),
-                NumericRuleOp::GreaterThan => gt_rules.push(r.clone()),
-            }
-        }
-
-        // `sme_range_processor` uses strict comparisons:
-        // - LT: query < threshold
-        // - GT: query > threshold
-        // For SQL '<' and '>' we need to also accept threshold == query on the threshold side.
-        let ranges: smallvec::SmallVec<[RowRange; 64]> = match op {
-            "<" => {
-                let mut out = sme_range_processor::candidate_row_ranges_for_query(query, &lt_rules);
-                for r in lt_rules.iter() {
-                    if r.value == query {
-                        out.extend_from_slice(&r.ranges);
-                    }
-                }
-                sme_range_processor::merge_row_ranges(out)
-            }
-            "<=" => sme_range_processor::candidate_row_ranges_for_query(query, &lt_rules),
-            ">" => {
-                let mut out = sme_range_processor::candidate_row_ranges_for_query(query, &gt_rules);
-                for r in gt_rules.iter() {
-                    if r.value == query {
-                        out.extend_from_slice(&r.ranges);
-                    }
-                }
-                sme_range_processor::merge_row_ranges(out)
-            }
-            ">=" => sme_range_processor::candidate_row_ranges_for_query(query, &gt_rules),
+        let comparison = match op {
+            "<" => sme_range_processor::ValueComparison::LessThan,
+            "<=" => sme_range_processor::ValueComparison::LessThanOrEqual,
+            ">" => sme_range_processor::ValueComparison::GreaterThan,
+            ">=" => sme_range_processor::ValueComparison::GreaterThanOrEqual,
             _ => return Ok(None),
+        };
+
+        let Some(ranges) = sme_range_processor::candidate_row_ranges_for_value_comparison(
+            query,
+            comparison,
+            rules.as_slice(),
+        ) else {
+            return Ok(None);
         };
 
         if ranges.is_empty() {

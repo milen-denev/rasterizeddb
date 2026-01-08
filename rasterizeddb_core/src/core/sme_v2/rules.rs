@@ -2,9 +2,12 @@ use crate::core::db_type::DbType;
 
 /// Numeric correlation rule operation.
 ///
-/// Interpreted as a *predicate on the query value* when selecting candidate rules:
-/// - `LessThan`: match if `query < threshold`.
-/// - `GreaterThan`: match if `query > threshold`.
+/// Interpreted as a *predicate on the stored row value* when building rule ranges:
+/// - `LessThan`: rows where `value < threshold`.
+/// - `GreaterThan`: rows where `value > threshold`.
+///
+/// Query-time candidate selection should choose thresholds such that the selected
+/// rule range sets are a superset of the query predicate (to avoid false negatives).
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NumericRuleOp {
