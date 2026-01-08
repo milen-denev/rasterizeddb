@@ -37,6 +37,7 @@ kanal = "0.1"
 rclite = "0.4.1"
 opool = "0.2.0"
 cacheguard = "0.1.0"
+xutex = "0.2.1"
 
 # pgwire TLS
 rustls = "0.23"

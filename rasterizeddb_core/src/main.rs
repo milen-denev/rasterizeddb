@@ -58,6 +58,10 @@ struct Args {
     #[arg(long = "enable-semantics", alias = "enable_semantics", value_name = "BOOL")]
     enable_semantics: Option<bool>,
 
+    /// Run an in-memory database (no files are created).
+    #[arg(long = "in-memory", alias = "in_memory", default_value_t = false)]
+    in_memory: bool,
+
     /// Server protocol to use: rastcp or pgwire (default: rastcp)
     #[arg(long, value_enum, default_value_t = Protocol::Rastcp)]
     protocol: Protocol,
@@ -139,12 +143,23 @@ fn main() -> std::io::Result<()> {
             .init();
 
         #[cfg(debug_assertions)]
-        let db_location = config.location.as_deref().unwrap_or("G:/Databases/Production_2/");
-        
+        let db_location = if args.in_memory {
+            ""
+        } else {
+            config.location.as_deref().unwrap_or("G:/Databases/Production_2/")
+        };
+
         #[cfg(not(debug_assertions))]
-        let db_location = config.location.as_deref().expect("Database location must be provided with --location <path>");
-        
-        let database = Database::new(db_location).await;
+        let db_location = if args.in_memory {
+            ""
+        } else {
+            config
+                .location
+                .as_deref()
+                .expect("Database location must be provided with --location <path> unless --in-memory is set")
+        };
+
+        let database = Database::new_with_backend(db_location, args.in_memory).await;
         let arc_database = Arc::new(database);
 
         match args.protocol {

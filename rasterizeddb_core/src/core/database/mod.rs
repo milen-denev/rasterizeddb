@@ -17,7 +17,7 @@ use crate::{
             row_pointer::{RowPointer, RowPointerIterator},
             schema::{SchemaCalculator, SchemaField, TableSchema},
             table::Table,
-        }, rql::{executor::execute, lexer_ct::CreateTable, lexer_s1::recognize_query_purpose}, storage_providers::{file_sync::LocalStorageProvider, traits::StorageIO}
+        }, rql::{executor::execute, lexer_ct::CreateTable, lexer_s1::recognize_query_purpose}, storage_providers::{backend::DbStorageProvider, traits::StorageIO}
     }, memory_pool::MEMORY_POOL, SERVER_PORT
 };
 
@@ -34,28 +34,43 @@ static TCP_SERVER: async_lazy::Lazy<Arc<TcpServer>> = async_lazy::Lazy::new(|| {
 });
 
 pub struct Database {
-    pub tables: DashMap<String, Arc<Table<LocalStorageProvider>>, ahash::RandomState>,
-    pub db_io_pointers: Arc<LocalStorageProvider>,
-    pub db_io_rows: Arc<LocalStorageProvider>,
-    pub db_io_schema: Arc<LocalStorageProvider>,
+    pub tables: DashMap<String, Arc<Table<DbStorageProvider>>, ahash::RandomState>,
+    pub db_io_pointers: Arc<DbStorageProvider>,
+    pub db_io_rows: Arc<DbStorageProvider>,
+    pub db_io_schema: Arc<DbStorageProvider>,
 }
 
 impl Database {
     pub async fn new(location: &str) -> Self {
-        let dir_exists = tokio::fs::metadata(location).await.is_ok();
+        Self::new_with_backend(location, false).await
+    }
 
-        if !dir_exists {
-            tokio::fs::create_dir_all(location).await.unwrap();
+    pub async fn new_with_backend(location: &str, in_memory: bool) -> Self {
+        if !in_memory {
+            let dir_exists = tokio::fs::metadata(location).await.is_ok();
+
+            if !dir_exists {
+                tokio::fs::create_dir_all(location).await.unwrap();
+            }
         }
 
-        let io_pointers =
-            Arc::new(LocalStorageProvider::new(location, Some("db_data_pointers.db")).await);
+        let io_pointers = if in_memory {
+            Arc::new(DbStorageProvider::new_memory("db_data_pointers.db"))
+        } else {
+            Arc::new(DbStorageProvider::new_file(location, Some("db_data_pointers.db")).await)
+        };
 
-        let io_rows = 
-            Arc::new(LocalStorageProvider::new(location, Some("db_data_rows.db")).await);
+        let io_rows = if in_memory {
+            Arc::new(DbStorageProvider::new_memory("db_data_rows.db"))
+        } else {
+            Arc::new(DbStorageProvider::new_file(location, Some("db_data_rows.db")).await)
+        };
 
-        let io_schema =
-            Arc::new(LocalStorageProvider::new(location, Some("db_data_schema.db")).await);
+        let io_schema = if in_memory {
+            Arc::new(DbStorageProvider::new_memory("db_data_schema.db"))
+        } else {
+            Arc::new(DbStorageProvider::new_file(location, Some("db_data_schema.db")).await)
+        };
 
         let io_pointers_clone = io_pointers.clone();
         let io_rows_clone = io_rows.clone();

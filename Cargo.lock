@@ -1514,6 +1514,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-rustls",
+ "xutex",
 ]
 
 [[package]]
@@ -2425,6 +2426,16 @@ dependencies = [
  "rusticata-macros",
  "thiserror",
  "time",
+]
+
+[[package]]
+name = "xutex"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e179a55fe12a8d75c182e1ea63814a4b2b6262b1291d9016e3e1c7f59a1be94"
+dependencies = [
+ "branches",
+ "crossbeam-queue",
 ]
 
 [[package]]

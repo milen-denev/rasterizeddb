@@ -1,9 +1,8 @@
 pub mod file_sync;
+pub mod backend;
 pub mod memory;
 pub mod traits;
-
 pub mod mock_file_sync;
-
 pub mod helpers;
 
 #[cfg(unix)]
