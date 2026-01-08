@@ -9,5 +9,9 @@ pub mod support_types;
 pub mod tokenizer;
 pub mod processor;
 pub mod rql;
+
+#[cfg(not(feature = "sme_v2"))]
 pub mod sme;
+
+#[cfg(feature = "sme_v2")]
 pub mod sme_v2;

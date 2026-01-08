@@ -142,6 +142,7 @@ impl ConcurrentProcessor {
         schema: &Arc<SmallVec<[SchemaField; 20]>>,
         io_rows: &Arc<S>,
         iterator: &RowPointerIterator<S>,
+        _limit: Option<u64>,
     ) -> Option<(Arc<Vec<RowPointer>>, usize)> {
         if !semantics_enabled() {
             return None;
