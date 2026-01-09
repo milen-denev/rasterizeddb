@@ -2,11 +2,11 @@
 
 # Sets the main thread stack size to 32 MB for Linux
 [target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "link-arg=-Wl,-zstack-size=33554432"] # 32 * 1024 * 1024 bytes
+rustflags = ["-C", "link-arg=-Wl,-zstack-size=33554432", "-C", "target-cpu=x86-64-v3"] # 32 * 1024 * 1024 bytes
 
 # Sets the main thread stack size to 32 MB for macOS
-[target.x86_64-apple-darwin]
-rustflags = ["-C", "link-args=-Wl,-stack_size,0x2000000"] # 32 MB in hexadecimal
+# [target.x86_64-apple-darwin]
+# rustflags = ["-C", "link-args=-Wl,-stack_size,0x2000000"] # 32 MB in hexadecimal
 
 # Sets the main thread stack size to 32 MB for Windows
 [target.x86_64-pc-windows-msvc]
