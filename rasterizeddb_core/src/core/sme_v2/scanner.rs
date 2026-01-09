@@ -15,7 +15,7 @@ use log::warn;
 use log::error;
 use smallvec::SmallVec;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap, HashSet},
     cmp::Ordering as CmpOrdering,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -80,12 +80,20 @@ const MAX_RULE_COVERAGE_PERCENT: u64 = 10;
 #[allow(dead_code)]
 const STRING_SAMPLE_CAP: usize = 4096;
 
-const STRING_PREFIX_SUFFIX_LENS: [usize; 7] = [1, 2, 4, 6, 8, 12, 16];
+const STRING_PREFIX_SUFFIX_LENS: [usize; 11] = [1, 2, 3, 4, 5, 6, 8, 12, 16, 24, 32];
 const STRING_PREFIX_CANDIDATES: usize = 24;
 const STRING_SUFFIX_CANDIDATES: usize = 24;
 const STRING_CONTAINS_BYTE_CANDIDATES: usize = 12;
+const STRING_CONTAINS_BIGRAM_CANDIDATES: usize = 16;
+const STRING_CONTAINS_TRIGRAM_CANDIDATES: usize = 12;
 const STRING_CONTAINS_COUNTS: [u8; 3] = [0, 1, 2];
+const STRING_CONTAINS_NGRAM_COUNTS: [u8; 2] = [1, 2];
 const STRING_FINAL_RULES_MAX: usize = 48;
+
+const STRING_RULE_CANDIDATE_CAP: usize = 512;
+const STRING_FEATURE_MAP_MAX: usize = 4096;
+const STRING_OVERLAP_PENALTY_WEIGHT: u64 = 4;
+const STRING_LOCAL_SEARCH_PASSES: usize = 6;
 
 /// Spawns a background task that rebuilds SME v2 correlation rules on-demand.
 ///
@@ -743,8 +751,10 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
     #[derive(Clone)]
     struct StringStats {
         seen: u64,
-        prefix_counts: std::collections::HashMap<Vec<u8>, u32>,
-        suffix_counts: std::collections::HashMap<Vec<u8>, u32>,
+        prefix_counts: HashMap<Vec<u8>, u32>,
+        suffix_counts: HashMap<Vec<u8>, u32>,
+        bigram_counts: HashMap<[u8; 2], u32>,
+        trigram_counts: HashMap<[u8; 3], u32>,
         byte_freq: [u32; 256],
     }
 
@@ -752,9 +762,44 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
         fn new() -> Self {
             Self {
                 seen: 0,
-                prefix_counts: std::collections::HashMap::new(),
-                suffix_counts: std::collections::HashMap::new(),
+                prefix_counts: HashMap::new(),
+                suffix_counts: HashMap::new(),
+                bigram_counts: HashMap::new(),
+                trigram_counts: HashMap::new(),
                 byte_freq: [0u32; 256],
+            }
+        }
+
+        #[inline]
+        fn bump_bytes_map(map: &mut HashMap<Vec<u8>, u32>, key: Vec<u8>) {
+            if let Some(v) = map.get_mut(&key) {
+                *v = v.saturating_add(1);
+                return;
+            }
+            if map.len() < STRING_FEATURE_MAP_MAX {
+                map.insert(key, 1);
+            }
+        }
+
+        #[inline]
+        fn bump_2(map: &mut HashMap<[u8; 2], u32>, key: [u8; 2]) {
+            if let Some(v) = map.get_mut(&key) {
+                *v = v.saturating_add(1);
+                return;
+            }
+            if map.len() < STRING_FEATURE_MAP_MAX {
+                map.insert(key, 1);
+            }
+        }
+
+        #[inline]
+        fn bump_3(map: &mut HashMap<[u8; 3], u32>, key: [u8; 3]) {
+            if let Some(v) = map.get_mut(&key) {
+                *v = v.saturating_add(1);
+                return;
+            }
+            if map.len() < STRING_FEATURE_MAP_MAX {
+                map.insert(key, 1);
             }
         }
 
@@ -764,6 +809,14 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
                 return;
             }
 
+            // Sample after a certain point to avoid pathological feature-map growth.
+            if self.seen > STRING_SAMPLE_CAP as u64 {
+                let j = fastrand::u64(..self.seen);
+                if j >= STRING_SAMPLE_CAP as u64 {
+                    return;
+                }
+            }
+
             for &b in bytes.iter() {
                 self.byte_freq[b as usize] = self.byte_freq[b as usize].saturating_add(1);
             }
@@ -771,12 +824,30 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
             for &len in STRING_PREFIX_SUFFIX_LENS.iter() {
                 if let Some(p) = utf8_safe_prefix(bytes, len) {
                     if !p.is_empty() {
-                        *self.prefix_counts.entry(p).or_insert(0) += 1;
+                        Self::bump_bytes_map(&mut self.prefix_counts, p);
                     }
                 }
                 if let Some(s) = utf8_safe_suffix(bytes, len) {
                     if !s.is_empty() {
-                        *self.suffix_counts.entry(s).or_insert(0) += 1;
+                        Self::bump_bytes_map(&mut self.suffix_counts, s);
+                    }
+                }
+            }
+
+            // Lightweight n-gram mapping (ASCII-printable only) to seed better CONTAINS rules.
+            // Keeping this small and sampled avoids blowing up the scan cost.
+            let max_scan = std::cmp::min(bytes.len(), 256);
+            if max_scan >= 2 {
+                for w in bytes[..max_scan].windows(2) {
+                    if w[0].is_ascii_graphic() && w[1].is_ascii_graphic() {
+                        Self::bump_2(&mut self.bigram_counts, [w[0], w[1]]);
+                    }
+                }
+            }
+            if max_scan >= 3 {
+                for w in bytes[..max_scan].windows(3) {
+                    if w[0].is_ascii_graphic() && w[1].is_ascii_graphic() && w[2].is_ascii_graphic() {
+                        Self::bump_3(&mut self.trigram_counts, [w[0], w[1], w[2]]);
                     }
                 }
             }
@@ -789,6 +860,12 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
             }
             for (k, v) in other.suffix_counts.into_iter() {
                 *self.suffix_counts.entry(k).or_insert(0) += v;
+            }
+            for (k, v) in other.bigram_counts.into_iter() {
+                *self.bigram_counts.entry(k).or_insert(0) += v;
+            }
+            for (k, v) in other.trigram_counts.into_iter() {
+                *self.trigram_counts.entry(k).or_insert(0) += v;
             }
             for i in 0..256 {
                 self.byte_freq[i] = self.byte_freq[i].saturating_add(other.byte_freq[i]);
@@ -1072,15 +1149,76 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
         let db_type = f.db_type.clone();
         let st = &string_stats[i];
 
-        // Pick top prefixes
-        let mut prefixes: Vec<(Vec<u8>, u32)> = st.prefix_counts.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        let mut seen_rules: HashSet<(u8, u8, Vec<u8>)> = HashSet::new();
+        let mut rules: Vec<StringCorrelationRule> = Vec::new();
+
+        // Pick top prefixes and expand around them (shorter/longer) for trial-and-error.
+        let mut prefixes: Vec<(Vec<u8>, u32)> = st
+            .prefix_counts
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
         prefixes.sort_by(|a, b| b.1.cmp(&a.1));
         prefixes.truncate(STRING_PREFIX_CANDIDATES);
 
-        // Pick top suffixes
-        let mut suffixes: Vec<(Vec<u8>, u32)> = st.suffix_counts.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        let mut prefix_set: HashSet<Vec<u8>> = prefixes.iter().map(|(k, _)| k.clone()).collect();
+        for (p, _) in prefixes.iter() {
+            // Add shorter variants.
+            for &len in STRING_PREFIX_SUFFIX_LENS.iter() {
+                if len < p.len() {
+                    if let Some(shorter) = utf8_safe_prefix(p, len) {
+                        if !shorter.is_empty() {
+                            prefix_set.insert(shorter);
+                        }
+                    }
+                }
+            }
+            // Add a few longer variants that extend the base prefix.
+            let mut ext: Vec<(Vec<u8>, u32)> = st
+                .prefix_counts
+                .iter()
+                .filter(|(k, _v)| k.len() > p.len() && k.starts_with(p.as_slice()))
+                .map(|(k, v)| (k.clone(), *v))
+                .collect();
+            ext.sort_by(|a, b| b.1.cmp(&a.1));
+            ext.truncate(4);
+            for (k, _) in ext.into_iter() {
+                prefix_set.insert(k);
+            }
+        }
+
+        // Pick top suffixes and expand around them (shorter/longer) for trial-and-error.
+        let mut suffixes: Vec<(Vec<u8>, u32)> = st
+            .suffix_counts
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
         suffixes.sort_by(|a, b| b.1.cmp(&a.1));
         suffixes.truncate(STRING_SUFFIX_CANDIDATES);
+
+        let mut suffix_set: HashSet<Vec<u8>> = suffixes.iter().map(|(k, _)| k.clone()).collect();
+        for (s, _) in suffixes.iter() {
+            for &len in STRING_PREFIX_SUFFIX_LENS.iter() {
+                if len < s.len() {
+                    if let Some(shorter) = utf8_safe_suffix(s, len) {
+                        if !shorter.is_empty() {
+                            suffix_set.insert(shorter);
+                        }
+                    }
+                }
+            }
+            let mut ext: Vec<(Vec<u8>, u32)> = st
+                .suffix_counts
+                .iter()
+                .filter(|(k, _v)| k.len() > s.len() && k.ends_with(s.as_slice()))
+                .map(|(k, v)| (k.clone(), *v))
+                .collect();
+            ext.sort_by(|a, b| b.1.cmp(&a.1));
+            ext.truncate(4);
+            for (k, _) in ext.into_iter() {
+                suffix_set.insert(k);
+            }
+        }
 
         // Pick top ASCII bytes for contains
         let mut bytes: Vec<(u8, u32)> = (0u8..=255u8)
@@ -1090,53 +1228,109 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
         bytes.sort_by(|a, b| b.1.cmp(&a.1));
         bytes.truncate(STRING_CONTAINS_BYTE_CANDIDATES);
 
-        let mut rules: Vec<StringCorrelationRule> = Vec::new();
+        // Pick contains n-grams (ASCII) to seed stronger CONTAINS/count rules.
+        let mut bigrams: Vec<([u8; 2], u32)> = st.bigram_counts.iter().map(|(k, v)| (*k, *v)).collect();
+        bigrams.sort_by(|a, b| b.1.cmp(&a.1));
+        bigrams.truncate(STRING_CONTAINS_BIGRAM_CANDIDATES);
 
-        for (p, _) in prefixes.into_iter() {
-            let Some(s) = std::str::from_utf8(&p).ok().map(|s| s.to_string()) else {
-                continue;
-            };
-            rules.push(StringCorrelationRule {
-                column_schema_id: schema_id,
-                column_type: db_type.clone(),
-                op: StringRuleOp::StartsWith,
-                count: 1,
-                value: s,
-                ranges: RangeVec::new(),
-            });
+        let mut trigrams: Vec<([u8; 3], u32)> = st.trigram_counts.iter().map(|(k, v)| (*k, *v)).collect();
+        trigrams.sort_by(|a, b| b.1.cmp(&a.1));
+        trigrams.truncate(STRING_CONTAINS_TRIGRAM_CANDIDATES);
+
+        // Emit STARTS_WITH/ENDS_WITH candidates.
+        for p in prefix_set.into_iter() {
+            push_string_candidate_rule(
+                &mut rules,
+                &mut seen_rules,
+                schema_id,
+                &db_type,
+                StringRuleOp::StartsWith,
+                1,
+                &p,
+            );
+            if rules.len() >= STRING_RULE_CANDIDATE_CAP {
+                break;
+            }
         }
 
-        for (p, _) in suffixes.into_iter() {
-            let Some(s) = std::str::from_utf8(&p).ok().map(|s| s.to_string()) else {
-                continue;
-            };
-            rules.push(StringCorrelationRule {
-                column_schema_id: schema_id,
-                column_type: db_type.clone(),
-                op: StringRuleOp::EndsWith,
-                count: 1,
-                value: s,
-                ranges: RangeVec::new(),
-            });
+        for s in suffix_set.into_iter() {
+            push_string_candidate_rule(
+                &mut rules,
+                &mut seen_rules,
+                schema_id,
+                &db_type,
+                StringRuleOp::EndsWith,
+                1,
+                &s,
+            );
+            if rules.len() >= STRING_RULE_CANDIDATE_CAP {
+                break;
+            }
         }
 
         for (b, _) in bytes.into_iter() {
-            let token = (b as char).to_string();
             for &count in STRING_CONTAINS_COUNTS.iter() {
-                rules.push(StringCorrelationRule {
-                    column_schema_id: schema_id,
-                    column_type: db_type.clone(),
-                    op: StringRuleOp::Contains,
+                push_string_candidate_rule(
+                    &mut rules,
+                    &mut seen_rules,
+                    schema_id,
+                    &db_type,
+                    StringRuleOp::Contains,
                     count,
-                    value: token.clone(),
-                    ranges: RangeVec::new(),
-                });
+                    &[b],
+                );
+                if rules.len() >= STRING_RULE_CANDIDATE_CAP {
+                    break;
+                }
+            }
+            if rules.len() >= STRING_RULE_CANDIDATE_CAP {
+                break;
+            }
+        }
+
+        for (bg, _) in bigrams.into_iter() {
+            for &count in STRING_CONTAINS_NGRAM_COUNTS.iter() {
+                push_string_candidate_rule(
+                    &mut rules,
+                    &mut seen_rules,
+                    schema_id,
+                    &db_type,
+                    StringRuleOp::Contains,
+                    count,
+                    &bg,
+                );
+                if rules.len() >= STRING_RULE_CANDIDATE_CAP {
+                    break;
+                }
+            }
+            if rules.len() >= STRING_RULE_CANDIDATE_CAP {
+                break;
+            }
+        }
+
+        for (tg, _) in trigrams.into_iter() {
+            for &count in STRING_CONTAINS_NGRAM_COUNTS.iter() {
+                push_string_candidate_rule(
+                    &mut rules,
+                    &mut seen_rules,
+                    schema_id,
+                    &db_type,
+                    StringRuleOp::Contains,
+                    count,
+                    &tg,
+                );
+                if rules.len() >= STRING_RULE_CANDIDATE_CAP {
+                    break;
+                }
+            }
+            if rules.len() >= STRING_RULE_CANDIDATE_CAP {
+                break;
             }
         }
 
         // Keep a hard cap to avoid pathological candidate explosion.
-        if rules.len() > 256 {
-            rules.truncate(256);
+        if rules.len() > STRING_RULE_CANDIDATE_CAP {
+            rules.truncate(STRING_RULE_CANDIDATE_CAP);
         }
         if !rules.is_empty() {
             string_candidate_rules_by_col.push((schema_id, rules));
@@ -1551,39 +1745,12 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
     log::info!("scan_whole_table_build_rules: Plan optimization done in {:.2?}", opt_start.elapsed());
     log::info!("scan_whole_table_build_rules: completed total in {:.2?}", total_start.elapsed());
 
-    // Select best string rules per column (trial-and-error scoring of candidates).
+    // Select best string rules per column (trial-and-error optimization of candidates).
     let mut final_string_rules_by_col: Vec<(u64, Vec<StringCorrelationRule>)> = Vec::new();
+    use crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN;
+    let total_rows = pointers_io.get_len().await / (ROW_POINTER_RECORD_LEN as u64);
     for (schema_id, rules) in string_rules_by_col_with_ranges.into_iter() {
-        let mut scored: Vec<(u64, StringCorrelationRule)> = rules
-            .into_iter()
-            .map(|r| {
-                let score = score_rule_ranges(&r.ranges, SCORE_RANGE_COUNT_WEIGHT_INT, SCORE_CANDIDATE_ROWS_WEIGHT_INT);
-                (score, r)
-            })
-            .collect();
-        scored.sort_by_key(|(s, _)| *s);
-
-        let mut out = Vec::new();
-        for (_s, r) in scored.into_iter() {
-            out.push(r);
-            if out.len() >= STRING_FINAL_RULES_MAX {
-                break;
-            }
-        }
-
-        // Apply broad-rule filter like numeric rules.
-        if !out.is_empty() {
-            use crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN;
-            let total_rows = pointers_io
-                .get_len()
-                .await
-                / (ROW_POINTER_RECORD_LEN as u64);
-
-            if total_rows > 0 {
-                let threshold = (total_rows as u128 * MAX_RULE_COVERAGE_PERCENT as u128 / 100) as u64;
-                out.retain(|r| ranges_candidate_rows(&r.ranges) <= threshold);
-            }
-        }
+        let out = select_string_rules_trial_and_error(rules, total_rows);
 
         if !out.is_empty() {
             final_string_rules_by_col.push((schema_id, out));
@@ -1607,6 +1774,298 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
 }
 
 fn rules_by_col_ref_mut_hack<T>(v: &mut Vec<T>) -> &mut Vec<T> { v }
+
+fn string_rule_op_id(op: StringRuleOp) -> u8 {
+    match op {
+        StringRuleOp::StartsWith => 0,
+        StringRuleOp::EndsWith => 1,
+        StringRuleOp::Contains => 2,
+    }
+}
+
+fn push_string_candidate_rule(
+    rules: &mut Vec<StringCorrelationRule>,
+    seen_rules: &mut HashSet<(u8, u8, Vec<u8>)>,
+    schema_id: u64,
+    db_type: &DbType,
+    op: StringRuleOp,
+    count: u8,
+    bytes: &[u8],
+) {
+    if bytes.is_empty() {
+        return;
+    }
+    // Only accept UTF-8 rule values.
+    if std::str::from_utf8(bytes).is_err() {
+        return;
+    }
+
+    let key = (string_rule_op_id(op), count, bytes.to_vec());
+    if !seen_rules.insert(key) {
+        return;
+    }
+
+    let value = unsafe { std::str::from_utf8_unchecked(bytes) }.to_string();
+    rules.push(StringCorrelationRule {
+        column_schema_id: schema_id,
+        column_type: db_type.clone(),
+        op,
+        count,
+        value,
+        ranges: RangeVec::new(),
+    });
+}
+
+fn row_ranges_intersection_count(a: &[RowRange], b: &[RowRange]) -> u64 {
+    if a.is_empty() || b.is_empty() {
+        return 0;
+    }
+    use crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN;
+    let len = ROW_POINTER_RECORD_LEN as u64;
+
+    let mut i = 0usize;
+    let mut j = 0usize;
+    let mut total = 0u64;
+
+    while i < a.len() && j < b.len() {
+        let a_start = a[i].start_pointer_pos;
+        let a_end = a[i].end_pointer_pos_exclusive();
+        let b_start = b[j].start_pointer_pos;
+        let b_end = b[j].end_pointer_pos_exclusive();
+
+        let start = a_start.max(b_start);
+        let end = a_end.min(b_end);
+        if end > start {
+            total = total.saturating_add((end - start) / len);
+        }
+
+        if a_end < b_end {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+
+    total
+}
+
+fn string_rules_neighbor(a: &StringCorrelationRule, b: &StringCorrelationRule) -> bool {
+    if a.op != b.op {
+        return false;
+    }
+
+    let ab = a.value.as_bytes();
+    let bb = b.value.as_bytes();
+    if ab.is_empty() || bb.is_empty() {
+        return false;
+    }
+
+    match a.op {
+        StringRuleOp::StartsWith => {
+            let diff = ab.len().abs_diff(bb.len());
+            diff <= 8 && (ab.starts_with(bb) || bb.starts_with(ab))
+        }
+        StringRuleOp::EndsWith => {
+            let diff = ab.len().abs_diff(bb.len());
+            diff <= 8 && (ab.ends_with(bb) || bb.ends_with(ab))
+        }
+        StringRuleOp::Contains => {
+            if a.value == b.value {
+                return a.count != b.count;
+            }
+            let diff = ab.len().abs_diff(bb.len());
+            diff <= 1 && (ab.starts_with(bb) || ab.ends_with(bb) || bb.starts_with(ab) || bb.ends_with(ab))
+        }
+    }
+}
+
+fn select_string_rules_trial_and_error(
+    rules: Vec<StringCorrelationRule>,
+    total_rows: u64,
+) -> Vec<StringCorrelationRule> {
+    if rules.is_empty() {
+        return Vec::new();
+    }
+
+    let broad_threshold = if total_rows > 0 {
+        (total_rows as u128 * MAX_RULE_COVERAGE_PERCENT as u128 / 100) as u64
+    } else {
+        u64::MAX
+    };
+
+    #[derive(Clone)]
+    struct Cand {
+        score: u64,
+        covered: u64,
+        rule: StringCorrelationRule,
+    }
+
+    // De-dup and pre-filter.
+    let mut best: HashMap<(u8, u8, String), Cand> = HashMap::new();
+    for r in rules.into_iter() {
+        let covered = ranges_candidate_rows(&r.ranges);
+        if covered == 0 {
+            continue;
+        }
+        if covered > broad_threshold {
+            continue;
+        }
+        let score = score_rule_ranges(
+            &r.ranges,
+            SCORE_RANGE_COUNT_WEIGHT_INT,
+            SCORE_CANDIDATE_ROWS_WEIGHT_INT,
+        );
+        let key = (string_rule_op_id(r.op), r.count, r.value.clone());
+        let cand = Cand {
+            score,
+            covered,
+            rule: r,
+        };
+        match best.get(&key) {
+            None => {
+                best.insert(key, cand);
+            }
+            Some(prev) => {
+                // Prefer strictly lower score; then prefer more selective.
+                let better = cand.score < prev.score
+                    || (cand.score == prev.score && cand.covered < prev.covered);
+                if better {
+                    best.insert(key, cand);
+                }
+            }
+        }
+    }
+
+    let mut cands: Vec<Cand> = best.into_values().collect();
+    if cands.is_empty() {
+        return Vec::new();
+    }
+
+    // Keep a bounded candidate pool for the optimizer.
+    cands.sort_by(|a, b| {
+        a.score
+            .cmp(&b.score)
+            .then_with(|| a.covered.cmp(&b.covered))
+            .then_with(|| b.rule.value.len().cmp(&a.rule.value.len()))
+    });
+    if cands.len() > STRING_RULE_CANDIDATE_CAP {
+        cands.truncate(STRING_RULE_CANDIDATE_CAP);
+    }
+
+    let max_out = std::cmp::min(STRING_FINAL_RULES_MAX, cands.len());
+
+    let mut selected: Vec<usize> = Vec::new();
+    let mut selected_set: HashSet<usize> = HashSet::new();
+
+    // Greedy with overlap penalty (encourages a balanced rule set rather than many near-duplicates).
+    for _ in 0..max_out {
+        let mut best_idx: Option<usize> = None;
+        let mut best_cost = u64::MAX;
+
+        for idx in 0..cands.len() {
+            if selected_set.contains(&idx) {
+                continue;
+            }
+
+            let mut overlap = 0u64;
+            for &sidx in selected.iter() {
+                overlap = overlap.saturating_add(row_ranges_intersection_count(
+                    &cands[sidx].rule.ranges,
+                    &cands[idx].rule.ranges,
+                ));
+            }
+            let cost = cands[idx]
+                .score
+                .saturating_add(overlap.saturating_mul(STRING_OVERLAP_PENALTY_WEIGHT));
+
+            if cost < best_cost {
+                best_cost = cost;
+                best_idx = Some(idx);
+            }
+        }
+
+        let Some(chosen) = best_idx else { break; };
+        selected_set.insert(chosen);
+        selected.push(chosen);
+    }
+
+    if selected.is_empty() {
+        return Vec::new();
+    }
+
+    let objective = |sel: &[usize]| -> u64 {
+        let mut sum = 0u64;
+        for &i in sel.iter() {
+            sum = sum.saturating_add(cands[i].score);
+        }
+        for i in 0..sel.len() {
+            for j in (i + 1)..sel.len() {
+                let ov = row_ranges_intersection_count(&cands[sel[i]].rule.ranges, &cands[sel[j]].rule.ranges);
+                sum = sum.saturating_add(ov.saturating_mul(STRING_OVERLAP_PENALTY_WEIGHT));
+            }
+        }
+        sum
+    };
+
+    // Local search: try swapping in neighbor rules (shorter/longer prefixes/suffixes, different contains counts)
+    // when it improves the global objective.
+    for _pass in 0..STRING_LOCAL_SEARCH_PASSES {
+        let mut improved = false;
+        let cur_obj = objective(&selected);
+
+        'outer: for pos in 0..selected.len() {
+            let cur_idx = selected[pos];
+            let cur_rule = &cands[cur_idx].rule;
+
+            let mut best_swap: Option<usize> = None;
+            let mut best_obj = cur_obj;
+
+            for idx in 0..cands.len() {
+                if selected_set.contains(&idx) {
+                    continue;
+                }
+                let cand_rule = &cands[idx].rule;
+                if !string_rules_neighbor(cur_rule, cand_rule) {
+                    continue;
+                }
+
+                let mut trial = selected.clone();
+                trial[pos] = idx;
+                let obj = objective(&trial);
+                if obj < best_obj {
+                    best_obj = obj;
+                    best_swap = Some(idx);
+                }
+            }
+
+            if let Some(new_idx) = best_swap {
+                selected_set.remove(&cur_idx);
+                selected_set.insert(new_idx);
+                selected[pos] = new_idx;
+                improved = true;
+                break 'outer;
+            }
+        }
+
+        if !improved {
+            break;
+        }
+    }
+
+    // Stable-ish ordering for output.
+    selected.sort_by(|&a, &b| {
+        string_rule_op_id(cands[a].rule.op)
+            .cmp(&string_rule_op_id(cands[b].rule.op))
+            .then_with(|| cands[a].score.cmp(&cands[b].score))
+            .then_with(|| cands[b].rule.value.len().cmp(&cands[a].rule.value.len()))
+            .then_with(|| cands[a].rule.value.cmp(&cands[b].rule.value))
+    });
+
+    selected
+        .into_iter()
+        .map(|idx| cands[idx].rule.clone())
+        .collect()
+}
 
 #[cfg(debug_assertions)]
 #[derive(Debug, Serialize)]
