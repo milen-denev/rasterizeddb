@@ -63,7 +63,7 @@ struct Args {
     in_memory: bool,
 
     /// Server protocol to use: rastcp or pgwire (default: rastcp)
-    #[arg(long, value_enum, default_value_t = Protocol::Rastcp)]
+    #[arg(long, value_enum, default_value_t = Protocol::Pgwire)]
     protocol: Protocol,
 
     /// pgwire listen address (default: 127.0.0.1)
@@ -126,7 +126,7 @@ fn main() -> std::io::Result<()> {
         });
     }
 
-    let enable_semantics = args.enable_semantics.unwrap_or(false);
+    let enable_semantics = args.enable_semantics.unwrap_or(true);
     ENABLE_SEMANTICS.get_or_init(|| enable_semantics);
 
     let rt = Builder::new_multi_thread()
@@ -137,7 +137,9 @@ fn main() -> std::io::Result<()> {
 
     rt.block_on(async {
         unsafe { env::set_var("RUST_BACKTRACE", "full"); }
-        let level = args.log_level.unwrap_or(LevelFilter::Trace);
+
+        let level = args.log_level.unwrap_or(LevelFilter::Info);
+
         env_logger::Builder::new()
             .filter_level(level)
             .init();
