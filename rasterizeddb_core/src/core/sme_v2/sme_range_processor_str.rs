@@ -208,7 +208,7 @@ unsafe fn candidate_row_ranges_for_query_avx2(
 ) -> smallvec::SmallVec<[RowRange; 64]> {
 	use std::arch::x86_64::*;
 
-use crate::core::sme_v2::sme_range_processor_common::merge_row_ranges;
+	use crate::core::sme_v2::sme_range_processor_common::merge_row_ranges;
 
 	let q_bytes = query.as_bytes();
 
