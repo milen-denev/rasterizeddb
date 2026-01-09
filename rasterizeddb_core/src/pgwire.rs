@@ -732,7 +732,7 @@ where
         send_row_description(stream, &[("version", DbType::STRING)], &[]).await?;
         send_data_row(
             stream,
-            &[Some(b"rasterizeddb (pgwire) 0.1.6-ascii-fallback")],
+            &[Some(b"rasterizeddb (pgwire) 0.2.0")],
         )
         .await?;
         send_command_complete(stream, "SELECT 1").await?;
