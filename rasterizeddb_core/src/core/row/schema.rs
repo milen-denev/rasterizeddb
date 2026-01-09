@@ -821,7 +821,7 @@ impl<S: StorageIO> TableSchemaIterator<S> {
 mod tests {
     use super::*;
     use crate::core::{db_type::DbType, storage_providers::file_sync::LocalStorageProvider};
-    use std::io;
+    use std::{fs, io, path::Path};
 
     // Helper function to create a schema field and return it
     fn create_test_schema_field(
@@ -852,13 +852,26 @@ mod tests {
         field.save_field(storage).await
     }
 
+    fn clean_storage(temp_loc: &Path, table_name: &str) {
+        let main_path = temp_loc.join(table_name);
+        let _ = fs::remove_file(&main_path);
+        let tmp_path = temp_loc.join(format!("{}.tmp", table_name));
+        let _ = fs::remove_file(tmp_path);
+    }
+
+    async fn make_clean_provider(temp_loc: &Path, table_name: &str) -> LocalStorageProvider {
+        clean_storage(temp_loc, table_name);
+        LocalStorageProvider::new(temp_loc.to_str().unwrap(), Some(table_name)).await
+    }
+
     #[tokio::test]
     async fn test_schema_field_iterator_empty() {
         let temp_loc = std::env::temp_dir().join("test_schema_field_iterator_empty");
 
-        let mut mock_io = LocalStorageProvider::new(
-            temp_loc.to_str().unwrap(),
-            Some("test_schema_field_iterator_empty")).await;
+        let mut mock_io = make_clean_provider(
+            temp_loc.as_path(),
+            "test_schema_field_iterator_empty",
+        ).await;
 
         let mut iterator = SchemaFieldIterator::new(&mut mock_io).await.unwrap();
 
@@ -873,9 +886,10 @@ mod tests {
 
         let temp_loc = std::env::temp_dir().join("test_schema_field_iterator_single_field");
 
-        let mut mock_io = LocalStorageProvider::new(
-            temp_loc.to_str().unwrap(), 
-            Some("test_schema_field_iterator_single_field")).await;
+        let mut mock_io = make_clean_provider(
+            temp_loc.as_path(),
+            "test_schema_field_iterator_single_field",
+        ).await;
 
         save_schema_field(&schema_field, &mut mock_io)
             .await
@@ -913,9 +927,10 @@ mod tests {
 
         let temp_loc = std::env::temp_dir().join("test_schema_field_iterator_2_fields");
 
-        let mut mock_io = LocalStorageProvider::new(
-            temp_loc.to_str().unwrap(),
-            Some("test_schema_field_iterator_2_fields")).await;
+        let mut mock_io = make_clean_provider(
+            temp_loc.as_path(),
+            "test_schema_field_iterator_2_fields",
+        ).await;
 
         save_schema_field(&schema_field1, &mut mock_io)
             .await
@@ -966,9 +981,10 @@ mod tests {
 
         let temp_loc = std::env::temp_dir().join("test_schema_field_iterator_3_fields");
 
-        let mut mock_io = LocalStorageProvider::new(
-            temp_loc.to_str().unwrap(),
-            Some("test_schema_field_iterator_3_fields")).await;
+        let mut mock_io = make_clean_provider(
+            temp_loc.as_path(),
+            "test_schema_field_iterator_3_fields",
+        ).await;
 
         save_schema_field(&schema_field1, &mut mock_io)
             .await
@@ -1031,9 +1047,10 @@ mod tests {
     async fn test_schema_field_iterator_batch_retrieval() {
         let temp_loc = std::env::temp_dir().join("test_schema_field_iterator_batch_retrieval");
 
-        let mut mock_io = LocalStorageProvider::new(
-            temp_loc.to_str().unwrap(),
-            Some("test_schema_field_iterator_batch_retrieval")).await;
+        let mut mock_io = make_clean_provider(
+            temp_loc.as_path(),
+            "test_schema_field_iterator_batch_retrieval",
+        ).await;
 
         // Create and save multiple schema fields (more than BATCH_SIZE)
         for i in 0..BATCH_SIZE + 10 {
@@ -1078,9 +1095,10 @@ mod tests {
     async fn test_schema_field_iterator_reset() {
         let temp_loc = std::env::temp_dir().join("test_schema_field_iterator_reset");
 
-        let mut mock_io = LocalStorageProvider::new(
-            temp_loc.to_str().unwrap(),
-            Some("test_schema_field_iterator_reset")).await;
+        let mut mock_io = make_clean_provider(
+            temp_loc.as_path(),
+            "test_schema_field_iterator_reset",
+        ).await;
 
         // Create and save schema fields
         let schema_field1 = create_test_schema_field("id", DbType::I32, 0, 1, true);
@@ -1330,9 +1348,10 @@ mod tests {
     async fn test_table_schema_iterator_empty() {
         let temp_loc = std::env::temp_dir().join("test_table_schema_iterator_empty");
 
-        let mock_io = LocalStorageProvider::new(
-            temp_loc.to_str().unwrap(),
-            Some("test_table_schema_iterator_empty")).await;
+        let mock_io = make_clean_provider(
+            temp_loc.as_path(),
+            "test_table_schema_iterator_empty",
+        ).await;
 
         let mock_io = Arc::new(mock_io);
 
@@ -1349,9 +1368,10 @@ mod tests {
 
         let temp_loc = std::env::temp_dir().join("test_table_schema_iterator_single_schema");
 
-        let mock_io = LocalStorageProvider::new(
-            temp_loc.to_str().unwrap(),
-            Some("test_table_schema_iterator_single_schema")).await;
+        let mock_io = make_clean_provider(
+            temp_loc.as_path(),
+            "test_table_schema_iterator_single_schema",
+        ).await;
 
         let mock_io = Arc::new(mock_io);
 
@@ -1380,9 +1400,10 @@ mod tests {
 
         let temp_loc = std::env::temp_dir().join("test_table_schema_iterator_multiple_schemas");
 
-        let mock_io = LocalStorageProvider::new(
-            temp_loc.to_str().unwrap(),
-            Some("test_table_schema_iterator_multiple_schemas")).await;
+        let mock_io = make_clean_provider(
+            temp_loc.as_path(),
+            "test_table_schema_iterator_multiple_schemas",
+        ).await;
 
         let mock_io = Arc::new(mock_io);
 
@@ -1417,9 +1438,10 @@ mod tests {
     async fn test_table_schema_iterator_reset() {
         let temp_loc = std::env::temp_dir().join("test_table_schema_iterator_reset");
 
-        let mock_io = LocalStorageProvider::new(
-            temp_loc.to_str().unwrap(),
-            Some("test_table_schema_iterator_reset")).await;
+        let mock_io = make_clean_provider(
+            temp_loc.as_path(),
+            "test_table_schema_iterator_reset",
+        ).await;
 
         let mock_io = Arc::new(mock_io);
 
@@ -1457,9 +1479,10 @@ mod tests {
         // Create multiple schemas
         let temp_loc = std::env::temp_dir().join("test_table_schema_save_and_iterator");
 
-        let mock_io = LocalStorageProvider::new(
-            temp_loc.to_str().unwrap(),
-            Some("test_table_schema_save_and_iterator")).await;
+        let mock_io = make_clean_provider(
+            temp_loc.as_path(),
+            "test_table_schema_save_and_iterator",
+        ).await;
 
         let mock_io = Arc::new(mock_io);
 
@@ -1507,9 +1530,10 @@ mod tests {
 
         let temp_loc = std::env::temp_dir().join("test_table_schema_long_names");
 
-        let mock_io = LocalStorageProvider::new(
-            temp_loc.to_str().unwrap(),
-            Some("test_table_schema_long_names")).await;
+        let mock_io = make_clean_provider(
+            temp_loc.as_path(),
+            "test_table_schema_long_names",
+        ).await;
 
         let mock_io = Arc::new(mock_io);
 
@@ -1534,17 +1558,20 @@ mod tests {
     async fn test_table_schema_complete_set() {
         let temp_loc = std::env::temp_dir().join("test_table_schema_complete_set");
 
-        let _mock_io_fields = LocalStorageProvider::new(
-            temp_loc.to_str().unwrap(),
-            Some("test_table_schema_complete_set_FIELDS.db")).await;
+        let _mock_io_fields = make_clean_provider(
+            temp_loc.as_path(),
+            "test_table_schema_complete_set_FIELDS.db",
+        ).await;
 
-        let _mock_io_fields_tmp = LocalStorageProvider::new(
-            temp_loc.to_str().unwrap(),
-            Some("test_table_schema_complete_set_FIELDS.db.tmp")).await;
+        let _mock_io_fields_tmp = make_clean_provider(
+            temp_loc.as_path(),
+            "test_table_schema_complete_set_FIELDS.db.tmp",
+        ).await;
 
-        let mock_io = LocalStorageProvider::new(
-            temp_loc.to_str().unwrap(),
-            Some("test_table_schema_complete_set")).await;
+        let mock_io = make_clean_provider(
+            temp_loc.as_path(),
+            "test_table_schema_complete_set",
+        ).await;
 
         let mock_io = Arc::new(mock_io);
 
