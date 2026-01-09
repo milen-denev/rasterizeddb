@@ -10,9 +10,7 @@
 use rclite::Arc;
 
 use cacheguard::CacheGuard;
-#[cfg(debug_assertions)]
-use log::warn;
-use log::error;
+use log::{error, info};
 use smallvec::SmallVec;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -52,54 +50,73 @@ use super::{
 #[cfg(debug_assertions)]
 use serde::Serialize;
 
-const RULES_SIZE_VARIABLE: usize = 64;
+// Numeric rule budget (higher = more candidate thresholds).
+const RULES_SIZE_VARIABLE: usize = 48;
 
-const SAMPLE_CAP: usize = 1024 * 4 * RULES_SIZE_VARIABLE;
-const THRESHOLD_COUNT: usize = 8 * RULES_SIZE_VARIABLE;
+// Reservoir sample cap and thresholds scale with the rule budget.
+const SAMPLE_CAP: usize = 1024 * 2 * RULES_SIZE_VARIABLE / 8;
+const THRESHOLD_COUNT: usize = 4 * RULES_SIZE_VARIABLE; // 192 thresholds → 384 rules per numeric column.
+
+// Numeric sampling stride: larger divisors create fewer percentile anchors.
+const NUMERIC_STEP_DIVISOR: usize = 96;
+
+// Cost model weights for numeric candidate scoring (lower prefers more ranges, higher prefers fewer rows).
+const NUMERIC_RANGE_WEIGHT: u64 = 24;
+const NUMERIC_CANDIDATE_ROWS_WEIGHT: u64 = 24;
+
+// Maximum sampled coverage (0.0-1.0) allowed before a candidate is considered too broad.
+const NUMERIC_SAMPLE_BAD_COVERAGE_FRAC: f64 = 0.35;
+
+// How many numeric candidates to keep after scoring (per column, across both LT/GT variants).
+const NUMERIC_KEEP_CANDIDATES: usize = 32;
 
 // Candidate search breadth around the base percentile indices.
 // Kept intentionally small because this runs during full-table scans.
-//const CANDIDATE_STEPS: [isize; 11] = [-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5];
-const CANDIDATE_STEPS: [isize; 3] = [-1, 0, 1];
+const CANDIDATE_STEPS: [isize; 11] = [-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5];
 
 // Scoring weights for choosing thresholds.
 // For integer-like columns, we heavily penalize a high number of disjoint ranges.
 // For float columns, we penalize huge candidate-row sets more strongly (otherwise
 // the optimizer may pick thresholds that match "almost everything" in one big range).
-const SCORE_RANGE_COUNT_WEIGHT_INT: u64 = 512;
-const SCORE_CANDIDATE_ROWS_WEIGHT_INT: u64 = 64;
+const SCORE_RANGE_COUNT_WEIGHT_INT: u64 = 256;
+const SCORE_CANDIDATE_ROWS_WEIGHT_INT: u64 = 1;
 
-const SCORE_RANGE_COUNT_WEIGHT_FLOAT: u64 = 512;
-const SCORE_CANDIDATE_ROWS_WEIGHT_FLOAT: u64 = 64;
+// const SCORE_RANGE_COUNT_WEIGHT_FLOAT: u64 = 64;
+// const SCORE_CANDIDATE_ROWS_WEIGHT_FLOAT: u64 = 64;
 
-const FLOAT_COARSEN_MAX_CANDIDATE_MULTIPLIER: u64 = 128;
+const FLOAT_COARSEN_MAX_CANDIDATE_MULTIPLIER: u64 = 64;
 const FLOAT_COARSEN_TARGET_MAX_RANGES: usize = 256;
 
 // Max percentage of the total rows a single rule is allowed to cover (1-100).
 // Rules covering more than this are discarded as being "too broad" (essentially full-table scans).
-const MAX_RULE_COVERAGE_PERCENT: u64 = 10;
+const MAX_RULE_COVERAGE_PERCENT: u64 = 12;
 
 // For small tables, a strict percentage cap can discard everything.
 // This floor keeps the rule set non-empty while still avoiding "matches everything" rules on large tables.
 const MIN_RULE_COVERAGE_ROWS: u64 = 32;
 
-#[allow(dead_code)]
-const STRING_SAMPLE_CAP: usize = 4096;
+// String histogram/scan sizing and n-gram lengths (kept together for easy tuning).
+const STRING_BYTE_FREQ_BINS: usize = 256;
+const STRING_NGRAM_MAX_SCAN: usize = STRING_BYTE_FREQ_BINS;
+const STRING_BIGRAM_LEN: usize = 2;
+const STRING_TRIGRAM_LEN: usize = 3;
 
-const STRING_PREFIX_SUFFIX_LENS: [usize; 11] = [1, 2, 3, 4, 5, 6, 8, 12, 16, 24, 32];
-const STRING_PREFIX_CANDIDATES: usize = 24;
-const STRING_SUFFIX_CANDIDATES: usize = 24;
-const STRING_CONTAINS_BYTE_CANDIDATES: usize = 12;
-const STRING_CONTAINS_BIGRAM_CANDIDATES: usize = 16;
-const STRING_CONTAINS_TRIGRAM_CANDIDATES: usize = 12;
-const STRING_CONTAINS_COUNTS: [u8; 7] = [0, 1, 2, 3, 4, 5, 6];
+const STRING_SAMPLE_CAP: usize = 1024 * RULES_SIZE_VARIABLE / 16;
+
+const STRING_PREFIX_SUFFIX_LENS: [usize; 7] = [1, 2, 3, 4, 6, 8, 12];
+const STRING_PREFIX_CANDIDATES: usize = 12;
+const STRING_SUFFIX_CANDIDATES: usize = 12;
+const STRING_CONTAINS_BYTE_CANDIDATES: usize = 8;
+const STRING_CONTAINS_BIGRAM_CANDIDATES: usize = 8;
+const STRING_CONTAINS_TRIGRAM_CANDIDATES: usize = 6;
+const STRING_CONTAINS_COUNTS: [u8; 5] = [0, 1, 2, 3, 4];
 const STRING_CONTAINS_NGRAM_COUNTS: [u8; 2] = [1, 2];
-const STRING_FINAL_RULES_MAX: usize = 128 * RULES_SIZE_VARIABLE;
+const STRING_FINAL_RULES_MAX: usize = 32 * RULES_SIZE_VARIABLE;
 
-const STRING_RULE_CANDIDATE_CAP: usize = 512;
+const STRING_RULE_CANDIDATE_CAP: usize = 128;
 const STRING_FEATURE_MAP_MAX: usize = 4096;
 const STRING_OVERLAP_PENALTY_WEIGHT: u64 = 4;
-const STRING_LOCAL_SEARCH_PASSES: usize = 12;
+const STRING_LOCAL_SEARCH_PASSES: usize = 4;
 
 /// Spawns a background task that rebuilds SME v2 correlation rules on-demand.
 ///
@@ -238,19 +255,19 @@ enum NumericStats {
         min: i128,
         max: i128,
         seen: u64,
-        samples: Vec<i128>,
+        samples: Vec<(u64, i128)>,
     },
     Unsigned {
         min: u128,
         max: u128,
         seen: u64,
-        samples: Vec<u128>,
+        samples: Vec<(u64, u128)>,
     },
     Float {
         min: f64,
         max: f64,
         seen: u64,
-        samples: Vec<f64>,
+        samples: Vec<(u64, f64)>,
     },
 }
 
@@ -287,41 +304,41 @@ impl NumericStats {
         }
     }
 
-    fn push_sample_i128(samples: &mut Vec<i128>, seen: u64, v: i128) {
+    fn push_sample_i128(samples: &mut Vec<(u64, i128)>, seen: u64, pos: u64, v: i128) {
         if samples.len() < SAMPLE_CAP {
-            samples.push(v);
+            samples.push((pos, v));
             return;
         }
         // Reservoir sampling.
         let j = fastrand::u64(..seen);
         if (j as usize) < samples.len() {
-            samples[j as usize] = v;
+            samples[j as usize] = (pos, v);
         }
     }
 
-    fn push_sample_u128(samples: &mut Vec<u128>, seen: u64, v: u128) {
+    fn push_sample_u128(samples: &mut Vec<(u64, u128)>, seen: u64, pos: u64, v: u128) {
         if samples.len() < SAMPLE_CAP {
-            samples.push(v);
+            samples.push((pos, v));
             return;
         }
         let j = fastrand::u64(..seen);
         if (j as usize) < samples.len() {
-            samples[j as usize] = v;
+            samples[j as usize] = (pos, v);
         }
     }
 
-    fn push_sample_f64(samples: &mut Vec<f64>, seen: u64, v: f64) {
+    fn push_sample_f64(samples: &mut Vec<(u64, f64)>, seen: u64, pos: u64, v: f64) {
         if samples.len() < SAMPLE_CAP {
-            samples.push(v);
+            samples.push((pos, v));
             return;
         }
         let j = fastrand::u64(..seen);
         if (j as usize) < samples.len() {
-            samples[j as usize] = v;
+            samples[j as usize] = (pos, v);
         }
     }
 
-    fn update(&mut self, v: NumericScalar) {
+    fn update(&mut self, pos: u64, v: NumericScalar) {
         match (self, v) {
             (
                 NumericStats::Signed {
@@ -335,7 +352,7 @@ impl NumericStats {
                 *seen += 1;
                 *min = (*min).min(x);
                 *max = (*max).max(x);
-                Self::push_sample_i128(samples, *seen, x);
+                Self::push_sample_i128(samples, *seen, pos, x);
             }
             (
                 NumericStats::Unsigned {
@@ -349,7 +366,7 @@ impl NumericStats {
                 *seen += 1;
                 *min = (*min).min(x);
                 *max = (*max).max(x);
-                Self::push_sample_u128(samples, *seen, x);
+                Self::push_sample_u128(samples, *seen, pos, x);
             }
             (
                 NumericStats::Float {
@@ -366,19 +383,19 @@ impl NumericStats {
                 *seen += 1;
                 *min = (*min).min(x);
                 *max = (*max).max(x);
-                Self::push_sample_f64(samples, *seen, x);
+                Self::push_sample_f64(samples, *seen, pos, x);
             }
             _ => {}
         }
     }
 
-    fn sorted_unique_samples(&self) -> Vec<NumericScalar> {
+    fn sorted_unique_sample_values(&self) -> Vec<NumericScalar> {
         match self {
             NumericStats::Signed { samples, .. } => {
                 if samples.is_empty() {
                     return Vec::new();
                 }
-                let mut v = samples.clone();
+                let mut v: Vec<i128> = samples.iter().map(|(_, val)| *val).collect();
                 v.sort();
                 v.dedup();
                 v.into_iter().map(NumericScalar::Signed).collect()
@@ -387,7 +404,7 @@ impl NumericStats {
                 if samples.is_empty() {
                     return Vec::new();
                 }
-                let mut v = samples.clone();
+                let mut v: Vec<u128> = samples.iter().map(|(_, val)| *val).collect();
                 v.sort();
                 v.dedup();
                 v.into_iter().map(NumericScalar::Unsigned).collect()
@@ -396,12 +413,32 @@ impl NumericStats {
                 if samples.is_empty() {
                     return Vec::new();
                 }
-                let mut v = samples.clone();
+                let mut v: Vec<f64> = samples.iter().map(|(_, val)| *val).collect();
                 v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                 v.dedup_by(|a, b| a.to_bits() == b.to_bits());
                 v.into_iter().map(NumericScalar::Float).collect()
             }
         }
+    }
+
+    fn get_sorted_samples_with_pos(&self) -> Vec<(u64, NumericScalar)> {
+         match self {
+            NumericStats::Signed { samples, .. } => {
+                let mut v = samples.clone();
+                v.sort_by_key(|(pos, _)| *pos);
+                v.into_iter().map(|(p, v)| (p, NumericScalar::Signed(v))).collect()
+            }
+            NumericStats::Unsigned { samples, .. } => {
+                let mut v = samples.clone();
+                v.sort_by_key(|(pos, _)| *pos);
+                v.into_iter().map(|(p, v)| (p, NumericScalar::Unsigned(v))).collect()
+            }
+            NumericStats::Float { samples, .. } => {
+                let mut v = samples.clone();
+                v.sort_by_key(|(pos, _)| *pos);
+                v.into_iter().map(|(p, v)| (p, NumericScalar::Float(v))).collect()
+            }
+         }
     }
 }
 
@@ -549,7 +586,7 @@ fn optimize_ranges_dynamic(
     // If we still have too many ranges, or just to fine-tune, we try to merge the *smallest* gaps first.
     // We allow this to run even if we have many ranges (up to the target max), but we apply aggressive
     // squashing if the count is high to force convergence.
-    if best_ranges.len() > 1 && best_ranges.len() <= FLOAT_COARSEN_TARGET_MAX_RANGES {
+    if best_ranges.len() > 1 {
          let mut clustered = best_ranges.clone();
          // Attempt multiple passes of "merge smallest gap"
          let mut improved = true;
@@ -659,6 +696,8 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
     let concurrency = *crate::MAX_PERMITS_THREADS.get().unwrap_or(&16);
     let concurrency = concurrency.max(1);
 
+    info!("Scanner's concurrency: {}", concurrency);
+
     #[derive(Clone)]
     struct FieldInfo {
         schema_id: u64,
@@ -759,7 +798,7 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
         suffix_counts: HashMap<Vec<u8>, u32>,
         bigram_counts: HashMap<[u8; 2], u32>,
         trigram_counts: HashMap<[u8; 3], u32>,
-        byte_freq: [u32; 256],
+        byte_freq: [u32; STRING_BYTE_FREQ_BINS],
     }
 
     impl StringStats {
@@ -770,7 +809,7 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
                 suffix_counts: HashMap::new(),
                 bigram_counts: HashMap::new(),
                 trigram_counts: HashMap::new(),
-                byte_freq: [0u32; 256],
+                byte_freq: [0u32; STRING_BYTE_FREQ_BINS],
             }
         }
 
@@ -840,16 +879,16 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
 
             // Lightweight n-gram mapping (ASCII-printable only) to seed better CONTAINS rules.
             // Keeping this small and sampled avoids blowing up the scan cost.
-            let max_scan = std::cmp::min(bytes.len(), 256);
-            if max_scan >= 2 {
-                for w in bytes[..max_scan].windows(2) {
+            let max_scan = std::cmp::min(bytes.len(), STRING_NGRAM_MAX_SCAN);
+            if max_scan >= STRING_BIGRAM_LEN {
+                for w in bytes[..max_scan].windows(STRING_BIGRAM_LEN) {
                     if w[0].is_ascii_graphic() && w[1].is_ascii_graphic() {
                         Self::bump_2(&mut self.bigram_counts, [w[0], w[1]]);
                     }
                 }
             }
-            if max_scan >= 3 {
-                for w in bytes[..max_scan].windows(3) {
+            if max_scan >= STRING_TRIGRAM_LEN {
+                for w in bytes[..max_scan].windows(STRING_TRIGRAM_LEN) {
                     if w[0].is_ascii_graphic() && w[1].is_ascii_graphic() && w[2].is_ascii_graphic() {
                         Self::bump_3(&mut self.trigram_counts, [w[0], w[1], w[2]]);
                     }
@@ -871,7 +910,7 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
             for (k, v) in other.trigram_counts.into_iter() {
                 *self.trigram_counts.entry(k).or_insert(0) += v;
             }
-            for i in 0..256 {
+            for i in 0..STRING_BYTE_FREQ_BINS {
                 self.byte_freq[i] = self.byte_freq[i].saturating_add(other.byte_freq[i]);
             }
         }
@@ -953,7 +992,7 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
                                         let col = &row_num.columns[f.fetch_idx];
                                         let db_type = &f.db_type;
                                         if let Some(v) = decode_numeric_value(db_type, col.data.into_slice()) {
-                                            stats[i].update(v);
+                                            stats[i].update(_pos, v);
                                         }
                                     }
                                 }
@@ -1092,28 +1131,25 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
     for (i, f) in numeric_fields.iter().enumerate() {
         let schema_id = &f.schema_id;
         let db_type = &f.db_type;
-        let sorted_samples = stats[i].sorted_unique_samples();
+        let sorted_samples = stats[i].sorted_unique_sample_values();
         if sorted_samples.is_empty() {
             log::trace!("scan_whole_table_build_rules: col {} has no samples, skipping", schema_id);
             continue;
         }
 
+        let full_samples_with_pos = stats[i].get_sorted_samples_with_pos();
         let n = sorted_samples.len();
-        let is_float = matches!(db_type, DbType::F32 | DbType::F64);
-        let step = if is_float {
-            std::cmp::max(1usize, n / 256)
-        } else {
-            std::cmp::max(1usize, n / 32)
-        };
+        
+        // Determine step size to spread candidates.
+        let step = std::cmp::max(1usize, n / NUMERIC_STEP_DIVISOR);
 
-        let (range_weight, candidate_rows_weight) = if is_float {
-            (SCORE_RANGE_COUNT_WEIGHT_FLOAT, SCORE_CANDIDATE_ROWS_WEIGHT_FLOAT)
-        } else {
-            (SCORE_RANGE_COUNT_WEIGHT_INT, SCORE_CANDIDATE_ROWS_WEIGHT_INT)
-        };
+        // Balanced weights: allow more candidates but still prefer tighter ranges.
+        let range_weight = NUMERIC_RANGE_WEIGHT;
+        let candidate_rows_weight = NUMERIC_CANDIDATE_ROWS_WEIGHT;
 
         let mut slot_keys: Vec<Vec<[u8; 16]>> = Vec::with_capacity(THRESHOLD_COUNT);
-        let mut all_keys: BTreeMap<[u8; 16], NumericScalar> = BTreeMap::new();
+        let mut key_to_scalar: BTreeMap<[u8; 16], NumericScalar> = BTreeMap::new();
+        let mut raw_candidates: HashSet<[u8; 16]> = HashSet::new();
 
         for k in 1..=THRESHOLD_COUNT {
             let p = (k as f64) / ((THRESHOLD_COUNT + 1) as f64);
@@ -1125,28 +1161,78 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
                 let idx = idx.clamp(0, (n as isize) - 1) as usize;
                 let scalar = sorted_samples[idx];
                 let key = scalar_key(scalar);
-                all_keys.entry(key).or_insert(scalar);
+                key_to_scalar.insert(key, scalar);
                 keys_for_slot.push(key);
+                raw_candidates.insert(key);
             }
-            keys_for_slot.sort();
-            keys_for_slot.dedup();
             slot_keys.push(keys_for_slot);
         }
 
-        let mut rules: Vec<NumericCorrelationRule> = Vec::with_capacity(all_keys.len() * 2);
-        for (_key, scalar) in all_keys.iter() {
+        // Filter candidates using sample-based scoring to select promising ones for Pass 2.
+        let mut scored_candidates: Vec<([u8; 16], u64)> = Vec::with_capacity(raw_candidates.len());
+        
+        for key in raw_candidates {
+             let val = key_to_scalar[&key];
+             let mut score_sum = 0u64;
+             
+             for op in [NumericRuleOp::LessThan, NumericRuleOp::GreaterThan] {
+                 let mut range_count = 0u64;
+                 let mut row_count = 0u64;
+                 let mut in_range = false;
+
+                 for (_pos, s_val) in full_samples_with_pos.iter() {
+                     if value_satisfies_rule(*s_val, op, val) {
+                         row_count += 1;
+                         if !in_range {
+                             range_count += 1;
+                             in_range = true;
+                         }
+                     } else {
+                         in_range = false;
+                     }
+                 }
+                 
+                  // If coverage > threshold (sampled), mark as low-quality.
+                  if row_count > 0
+                     && (row_count as f64) < (full_samples_with_pos.len() as f64 * NUMERIC_SAMPLE_BAD_COVERAGE_FRAC)
+                  {
+                      let s = range_count * range_weight + row_count * candidate_rows_weight;
+                      score_sum += s;
+                 } else {
+                      score_sum += u64::MAX / 4; 
+                 }
+             }
+             scored_candidates.push((key, score_sum));
+        }
+        
+           // Pick best candidates (larger keep count for more aggressive rule generation).
+           scored_candidates.sort_by_key(|(_, s)| *s);
+           let keep_count = std::cmp::min(scored_candidates.len(), NUMERIC_KEEP_CANDIDATES);
+           let kept_keys: HashSet<[u8; 16]> = scored_candidates.iter().take(keep_count).map(|(k, _)| *k).collect();
+
+        for slot in slot_keys.iter_mut() {
+            slot.retain(|k| kept_keys.contains(k));
+        }
+        
+        // Sort keys to allow binary search optimization in Pass 2
+        let mut sorted_kept_keys: Vec<[u8; 16]> = kept_keys.into_iter().collect();
+        sorted_kept_keys.sort();
+
+        let mut rules: Vec<NumericCorrelationRule> = Vec::with_capacity(sorted_kept_keys.len() * 2);
+        for key in sorted_kept_keys.iter() {
+            let scalar = key_to_scalar[key];
             rules.push(NumericCorrelationRule {
                 column_schema_id: *schema_id,
                 column_type: db_type.clone(),
                 op: NumericRuleOp::LessThan,
-                value: *scalar,
+                value: scalar,
                 ranges: RangeVec::new(),
             });
-            rules.push(NumericCorrelationRule {
+             rules.push(NumericCorrelationRule {
                 column_schema_id: *schema_id,
                 column_type: db_type.clone(),
                 op: NumericRuleOp::GreaterThan,
-                value: *scalar,
+                value: scalar,
                 ranges: RangeVec::new(),
             });
         }
@@ -1361,7 +1447,7 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
         plans.len(),
         string_candidate_rules_by_col.len()
     );
-    let scan_id: u64 = fastrand::u64(..);
+    
     let rules_by_col = Arc::new(rules_by_col);
     let string_rules_by_col = Arc::new(string_candidate_rules_by_col);
 
@@ -1400,7 +1486,7 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
 
     let mut handles_2 = Vec::with_capacity(concurrency);
 
-    for worker_id in 0..concurrency {
+    for _worker_id in 0..concurrency {
         let rx2 = rx2.clone();
         let rows_io = rows_io.clone();
         let numeric_row_fetch = numeric_row_fetch.clone();
@@ -1409,10 +1495,7 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
         let string_rules_by_col = string_rules_by_col.clone();
         let numeric_schema_id_to_fetch = numeric_schema_id_to_fetch.clone();
         let string_schema_id_to_fetch = string_schema_id_to_fetch.clone();
-        let base_io = base_io.clone();
-        let table_name = table_name.to_string();
-        let scan_id = scan_id;
-        
+
         handles_2.push(tokio::spawn(async move {
             // Per-worker in-memory range lists per rule.
             let mut numeric_ranges: Vec<Vec<Vec<RowRange>>> = rules_by_col
@@ -1434,8 +1517,52 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
                 .map(|(_, rules)| vec![None; rules.len()])
                 .collect();
 
+            // Precompute thresholds per numeric column for fast bound searches.
+            let numeric_thresholds: Vec<Vec<NumericScalar>> = rules_by_col
+                .iter()
+                .map(|(_, rules)| {
+                    let mut v = Vec::with_capacity(rules.len() / 2);
+                    for pair in rules.chunks_exact(2) {
+                        v.push(pair[0].value);
+                    }
+                    v
+                })
+                .collect();
+
+            let mut prev_lower: Vec<usize> = numeric_thresholds.iter().map(|_| 0usize).collect();
+            let mut prev_upper: Vec<usize> = numeric_thresholds.iter().map(|_| 0usize).collect();
+
             let mut row_num = crate::core::row::row::Row::default();
             let mut row_str = crate::core::row::row::Row::default();
+
+            use crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN;
+            let row_len = ROW_POINTER_RECORD_LEN as u64;
+
+            #[inline]
+            fn close_range(open: &mut Option<RowRange>, dst: &mut Vec<RowRange>) {
+                if let Some(r) = open.take() {
+                    dst.push(r);
+                }
+            }
+
+            #[inline]
+            fn append_point(open: &mut Option<RowRange>, dst: &mut Vec<RowRange>, pos: u64, row_len: u64) {
+                if let Some(r) = open {
+                    let expected_next = r.start_pointer_pos.saturating_add(r.row_count.saturating_mul(row_len));
+                    if pos == expected_next {
+                        r.row_count = r.row_count.saturating_add(1);
+                        return;
+                    }
+                }
+
+                if let Some(r) = open.take() {
+                    dst.push(r);
+                }
+                *open = Some(RowRange {
+                    start_pointer_pos: pos,
+                    row_count: 1,
+                });
+            }
             
             loop {
                 let chunk_opt = {
@@ -1443,9 +1570,6 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
                     lock.recv().await
                 };
                 let Some(chunk) = chunk_opt else { break; };
-
-                use crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN;
-                let len = ROW_POINTER_RECORD_LEN as u64;
 
                 for (pointer_pos, p) in chunk {
                     if p.deleted { continue; }
@@ -1456,39 +1580,72 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
                             .await
                             .is_ok()
                         {
-                            for (col_rules_idx, (schema_id, rules)) in rules_by_col.iter().enumerate() {
+                            for (col_rules_idx, (schema_id, _rules)) in rules_by_col.iter().enumerate() {
                                 let Some((fetch_idx, db_type)) = numeric_schema_id_to_fetch.get(schema_id).cloned() else { continue; };
                                 let col = &row_num.columns[fetch_idx];
                                 let Some(v) = decode_numeric_value(&db_type, col.data.into_slice()) else { continue; };
 
-                                for (rule_idx, rule) in rules.iter().enumerate() {
-                                    let is_match = value_satisfies_rule(v, rule.op, rule.value);
-                                    if is_match {
-                                        match &mut open_numeric[col_rules_idx][rule_idx] {
-                                            None => {
-                                                open_numeric[col_rules_idx][rule_idx] = Some(RowRange {
-                                                    start_pointer_pos: pointer_pos,
-                                                    row_count: 1,
-                                                });
-                                            }
-                                            Some(r) => {
-                                                let expected_next = r.start_pointer_pos
-                                                    .saturating_add(r.row_count.saturating_mul(len));
-                                                if pointer_pos == expected_next {
-                                                    r.row_count = r.row_count.saturating_add(1);
-                                                } else {
-                                                    numeric_ranges[col_rules_idx][rule_idx].push(*r);
-                                                    *r = RowRange {
-                                                        start_pointer_pos: pointer_pos,
-                                                        row_count: 1,
-                                                    };
-                                                }
-                                            }
-                                        }
-                                    } else if let Some(r) = open_numeric[col_rules_idx][rule_idx].take() {
-                                        numeric_ranges[col_rules_idx][rule_idx].push(r);
+                                let thresholds = &numeric_thresholds[col_rules_idx];
+                                if thresholds.is_empty() {
+                                    continue;
+                                }
+
+                                // lower: first index >= v (for GT)
+                                // upper: first index > v (for LT)
+                                let search = |val: NumericScalar| thresholds.binary_search_by(|t| cmp_scalar(*t, val));
+                                let lower = match search(v) {
+                                    Ok(idx) => idx,
+                                    Err(idx) => idx,
+                                };
+                                let upper = match search(v) {
+                                    Ok(idx) => idx.saturating_add(1),
+                                    Err(idx) => idx,
+                                };
+
+                                let num_pairs = thresholds.len();
+                                let prev_lo = prev_lower[col_rules_idx];
+                                let prev_up = prev_upper[col_rules_idx];
+
+                                // GT transitions: active set [0, lower)
+                                if lower > prev_lo {
+                                    for i in prev_lo..lower {
+                                        let idx = i * 2 + 1;
+                                        close_range(&mut open_numeric[col_rules_idx][idx], &mut numeric_ranges[col_rules_idx][idx]);
                                     }
                                 }
+
+                                // LT transitions: active set [upper, num_pairs)
+                                if upper > prev_up {
+                                    for i in prev_up..upper {
+                                        let idx = i * 2;
+                                        close_range(&mut open_numeric[col_rules_idx][idx], &mut numeric_ranges[col_rules_idx][idx]);
+                                    }
+                                }
+
+                                // Extend currently active GT rules.
+                                for i in 0..lower {
+                                    let idx = i * 2 + 1;
+                                    append_point(
+                                        &mut open_numeric[col_rules_idx][idx],
+                                        &mut numeric_ranges[col_rules_idx][idx],
+                                        pointer_pos,
+                                        row_len,
+                                    );
+                                }
+
+                                // Extend currently active LT rules.
+                                for i in upper..num_pairs {
+                                    let idx = i * 2;
+                                    append_point(
+                                        &mut open_numeric[col_rules_idx][idx],
+                                        &mut numeric_ranges[col_rules_idx][idx],
+                                        pointer_pos,
+                                        row_len,
+                                    );
+                                }
+
+                                prev_lower[col_rules_idx] = lower;
+                                prev_upper[col_rules_idx] = upper;
                             }
                         }
                     }
@@ -1520,7 +1677,7 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
                                             }
                                             Some(r) => {
                                                 let expected_next = r.start_pointer_pos
-                                                    .saturating_add(r.row_count.saturating_mul(len));
+                                                    .saturating_add(r.row_count.saturating_mul(row_len));
                                                 if pointer_pos == expected_next {
                                                     r.row_count = r.row_count.saturating_add(1);
                                                 } else {
