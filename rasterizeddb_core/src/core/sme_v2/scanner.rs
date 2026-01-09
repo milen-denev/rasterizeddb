@@ -47,9 +47,6 @@ use super::{
     },
 };
 
-#[cfg(debug_assertions)]
-use serde::Serialize;
-
 // Numeric rule budget (higher = more candidate thresholds).
 const RULES_SIZE_VARIABLE: usize = 48;
 
@@ -2344,90 +2341,6 @@ fn string_rules_neighbor(a: &StringCorrelationRule, b: &StringCorrelationRule) -
             diff <= 1 && (ab.starts_with(bb) || ab.ends_with(bb) || bb.starts_with(ab) || bb.ends_with(ab))
         }
     }
-}
-
-#[cfg(debug_assertions)]
-#[derive(Debug, Serialize)]
-struct RulesJsonFile<'a> {
-    table: &'a str,
-    columns: Vec<RulesJsonColumn>,
-}
-
-#[cfg(debug_assertions)]
-#[derive(Debug, Serialize)]
-struct RulesJsonColumn {
-    column_schema_id: u64,
-    column_type: String,
-    rules: Vec<RulesJsonRule>,
-}
-
-#[cfg(debug_assertions)]
-#[derive(Debug, Serialize)]
-struct RulesJsonRule {
-    op: String,
-    value: RulesJsonScalar,
-    ranges: Vec<(u64, u64)>,
-}
-
-#[cfg(debug_assertions)]
-#[derive(Debug, Serialize)]
-#[serde(tag = "kind", content = "value")]
-enum RulesJsonScalar {
-    Signed(i128),
-    Unsigned(u128),
-    Float(f64),
-}
-
-#[cfg(debug_assertions)]
-async fn save_rules_json_atomic<S: StorageIO>(
-    json_io: S,
-    table_name: &str,
-    rules_by_col: &[(u64, Vec<NumericCorrelationRule>)],
-) -> std::io::Result<()> {
-    let mut columns: Vec<RulesJsonColumn> = Vec::with_capacity(rules_by_col.len());
-
-    for (schema_id, rules) in rules_by_col.iter() {
-        let mut col_type: Option<String> = None;
-        let mut jr: Vec<RulesJsonRule> = Vec::with_capacity(rules.len());
-        for r in rules.iter() {
-            col_type.get_or_insert_with(|| r.column_type.to_string());
-
-            let value = match r.value {
-                NumericScalar::Signed(v) => RulesJsonScalar::Signed(v),
-                NumericScalar::Unsigned(v) => RulesJsonScalar::Unsigned(v),
-                NumericScalar::Float(v) => RulesJsonScalar::Float(v),
-            };
-
-            jr.push(RulesJsonRule {
-                op: format!("{:?}", r.op),
-                value,
-                ranges: r
-                    .ranges
-                    .iter()
-                    .map(|rr| (rr.start_pointer_pos, rr.row_count))
-                    .collect(),
-            });
-        }
-
-        columns.push(RulesJsonColumn {
-            column_schema_id: *schema_id,
-            column_type: col_type.unwrap_or_else(|| "UNKNOWN".to_string()),
-            rules: jr,
-        });
-    }
-
-    let dump = RulesJsonFile {
-        table: table_name,
-        columns,
-    };
-
-    let bytes = serde_json::to_vec_pretty(&dump)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("serde_json: {}", e)))?;
-
-    let mut temp = json_io.create_temp().await;
-    temp.write_data(0, &bytes).await;
-    json_io.swap_temp(&mut temp).await;
-    Ok(())
 }
 
 fn decode_numeric_value(db_type: &DbType, bytes: &[u8]) -> Option<NumericScalar> {
