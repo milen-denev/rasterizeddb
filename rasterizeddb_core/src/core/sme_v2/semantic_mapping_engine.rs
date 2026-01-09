@@ -1,4 +1,4 @@
-use std::sync::OnceLock;
+use std::sync::{OnceLock, atomic::{AtomicU64, Ordering}};
 
 use dashmap::DashMap;
 use opool::{Pool, PoolAllocator};
@@ -6,6 +6,7 @@ use rclite::Arc;
 use smallvec::SmallVec;
 
 use crate::core::{db_type::DbType, sme_v2::sme_range_processor_comp, storage_providers::traits::StorageIO};
+use cacheguard::CacheGuard;
 
 use super::{
     in_memory_rules,
@@ -52,6 +53,8 @@ pub struct SemanticMappingEngineV2 {
     rules: DashMap<(String, u64), Arc<Vec<NumericCorrelationRule>>, ahash::RandomState>,
     // Cache for fully loaded per-column string rules.
     string_rules: DashMap<(String, u64), Arc<Vec<StringCorrelationRule>>, ahash::RandomState>,
+    // Cached row counts per table (exact rows derived from pointer file length).
+    row_counts: DashMap<String, CacheGuard<AtomicU64>, ahash::RandomState>,
 }
 
 impl SemanticMappingEngineV2 {
@@ -60,7 +63,28 @@ impl SemanticMappingEngineV2 {
             headers: DashMap::with_hasher(ahash::RandomState::new()),
             rules: DashMap::with_hasher(ahash::RandomState::new()),
             string_rules: DashMap::with_hasher(ahash::RandomState::new()),
+            row_counts: DashMap::with_hasher(ahash::RandomState::new()),
         }
+    }
+
+    async fn get_total_rows<S: StorageIO>(&self, pointers_io: Arc<S>, table_name: &str) -> std::io::Result<u64> {
+        use crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN;
+        let rec_len = ROW_POINTER_RECORD_LEN as u64;
+        let bytes = pointers_io.get_len().await;
+        let rows = bytes / rec_len;
+
+        // Update cached count if changed.
+        if let Some(entry) = self.row_counts.get(table_name) {
+            let cached = entry.load(Ordering::Acquire);
+            if cached != rows {
+                entry.store(rows, Ordering::Release);
+            }
+        } else {
+            self.row_counts
+                .insert(table_name.to_string(), AtomicU64::new(rows).into());
+        }
+
+        Ok(rows)
     }
 
     /// Attempt to build candidate row pointers for a simple WHERE clause by
@@ -99,6 +123,14 @@ impl SemanticMappingEngineV2 {
             log::trace!("SME v2: empty tokens, skipping");
             return None;
         }
+
+        let total_rows = match self.get_total_rows(pointers_io.clone(), table_name).await {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("SME v2: failed to load row count: table={} err={:?}", table_name, e);
+                return None;
+            }
+        };
 
         for t in tokens.iter() {
             if matches!(t, Token::LPar | Token::RPar) {
@@ -181,6 +213,7 @@ impl SemanticMappingEngineV2 {
             let owned_string = q_string_lit.clone();
             let owned_numeric = q_numeric_scalar;
             let owned_string_op = string_query_op;
+            let total_rows = total_rows;
             
             // We use Box::pin to store different Futures in the same Vec
             let check_future = async move {
@@ -196,19 +229,19 @@ impl SemanticMappingEngineV2 {
                         if owned_col_type == DbType::STRING {
                             let Some(s) = owned_string else { return Ok(None); };
                             return self
-                                .candidates_for_string_predicate(io_clone, &owned_table, col_schema_id, &s, None)
+                                .candidates_for_string_predicate(io_clone, &owned_table, col_schema_id, &s, None, total_rows)
                                 .await;
                         }
 
                         let Some(q_scalar) = owned_numeric else { return Ok(None); };
                         self
-                            .candidates_for_numeric_equals(io_clone, &owned_table, col_schema_id, q_scalar)
+                            .candidates_for_numeric_equals(io_clone, &owned_table, col_schema_id, q_scalar, total_rows)
                             .await
                     }
                     ">" | ">=" | "<" | "<=" => {
                         let Some(q_scalar) = owned_numeric else { return Ok(None); };
                         self
-                            .candidates_for_numeric_range(io_clone, &owned_table, col_schema_id, &owned_op, q_scalar)
+                            .candidates_for_numeric_range(io_clone, &owned_table, col_schema_id, &owned_op, q_scalar, total_rows)
                             .await
                     }
                     "CONTAINS" | "STARTSWITH" | "ENDSWITH" => {
@@ -218,7 +251,7 @@ impl SemanticMappingEngineV2 {
                         let Some(s) = owned_string else { return Ok(None); };
                         let Some(op) = owned_string_op else { return Ok(None); };
                         self
-                            .candidates_for_string_predicate(io_clone, &owned_table, col_schema_id, &s, Some(op))
+                            .candidates_for_string_predicate(io_clone, &owned_table, col_schema_id, &s, Some(op), total_rows)
                             .await
                     }
                     _ => Ok(None),
@@ -586,6 +619,7 @@ impl SemanticMappingEngineV2 {
         column_schema_id: u64,
         query: &str,
         query_op: Option<StringRuleOp>,
+        _total_rows: u64,
     ) -> std::io::Result<Option<Vec<RowRange>>> {
         use std::time::Instant;
         let total_start = Instant::now();
@@ -609,7 +643,9 @@ impl SemanticMappingEngineV2 {
             query,
             query_op,
             rules.as_slice(),
+            None,
         );
+        
         if ranges.is_empty() {
             return Ok(None);
         }
@@ -642,6 +678,7 @@ impl SemanticMappingEngineV2 {
         table_name: &str,
         column_schema_id: u64,
         query: NumericScalar,
+        _total_rows: u64,
     ) -> std::io::Result<Option<Vec<RowRange>>> {
         use std::time::Instant;
         let total_start = Instant::now();
@@ -713,6 +750,7 @@ impl SemanticMappingEngineV2 {
         let ranges = sme_range_processor::candidate_row_ranges_for_query(
             query,
             rules.as_slice(),
+            None,
         );
 
         log::info!(
@@ -746,6 +784,7 @@ impl SemanticMappingEngineV2 {
         column_schema_id: u64,
         op: &str,
         query: NumericScalar,
+        _total_rows: u64,
     ) -> std::io::Result<Option<Vec<RowRange>>> {
         use std::time::Instant;
         let total_start = Instant::now();
@@ -833,7 +872,8 @@ impl SemanticMappingEngineV2 {
             sme_range_processor_comp::candidate_row_ranges_for_comparison_query(
             query,
             comparison,
-            rules.as_slice());
+            rules.as_slice(),
+            None);
 
         log::info!(
             "SME v2: candidates_for_numeric_range: table={} col={} op={} step=compute_ranges t_ms={} dt_ms={} ranges={}",

@@ -1,6 +1,7 @@
 #[cfg(target_arch = "x86_64")]
 use crate::core::sme_v2::rules::STRING_RULE_VALUE_MAX_BYTES;
-use crate::core::{sme_v2::{rules::{RowRange, StringCorrelationRule, StringRuleOp}, sme_range_processor_common::merge_row_ranges}};
+use crate::core::sme_v2::{rules::{RowRange, StringCorrelationRule, StringRuleOp}, sme_range_processor_common::{merge_row_ranges, merge_row_ranges_clamped, uncovered_row_ranges_from_merged}};
+
 
 /// Returns merged candidate row ranges for a string query.
 ///
@@ -23,21 +24,22 @@ pub fn candidate_row_ranges_for_query_string(
 	query: &str,
 	query_op: Option<StringRuleOp>,
 	rules: &[StringCorrelationRule],
+	total_rows: Option<u64>,
 ) -> smallvec::SmallVec<[RowRange; 64]> {
 	// For small rule counts, scalar is typically fastest.
 	if rules.len() < 16 {
-		return candidate_row_ranges_for_query_scalar(query, query_op, rules);
+		return candidate_row_ranges_for_query_scalar(query, query_op, rules, total_rows);
 	}
 
 	#[cfg(target_arch = "x86_64")]
 	{
 		if std::is_x86_feature_detected!("avx2") {
 			// SAFETY: guarded by runtime feature detection.
-			return unsafe { candidate_row_ranges_for_query_avx2(query, query_op, rules) };
+			return unsafe { candidate_row_ranges_for_query_avx2(query, query_op, rules, total_rows) };
 		}
 	}
 
-	candidate_row_ranges_for_query_scalar(query, query_op, rules)
+	candidate_row_ranges_for_query_scalar(query, query_op, rules, total_rows)
 }
 
 #[inline]
@@ -146,9 +148,12 @@ pub fn candidate_row_ranges_for_query_scalar(
 	query: &str,
 	query_op: Option<StringRuleOp>,
 	rules: &[StringCorrelationRule],
+	total_rows: Option<u64>,
 ) -> smallvec::SmallVec<[RowRange; 64]> {
 	let mut out = smallvec::SmallVec::<[RowRange; 64]>::new();
+	let mut coverage = smallvec::SmallVec::<[RowRange; 64]>::new();
 	for rule in rules {
+		coverage.extend_from_slice(&rule.ranges);
 		match query_op {
 			None => {
 				if rule_matches_query(query, rule) {
@@ -162,7 +167,25 @@ pub fn candidate_row_ranges_for_query_scalar(
 			}
 		}
 	}
-	merge_row_ranges(out)
+	finalize_string_candidates(out, coverage, total_rows)
+}
+
+#[inline]
+fn finalize_string_candidates(
+	matched: smallvec::SmallVec<[RowRange; 64]>,
+	coverage: smallvec::SmallVec<[RowRange; 64]>,
+	total_rows: Option<u64>,
+) -> smallvec::SmallVec<[RowRange; 64]> {
+	match total_rows {
+		Some(total) => {
+			let merged_coverage = merge_row_ranges_clamped(total, &coverage);
+			let mut out = merge_row_ranges_clamped(total, &matched);
+			let unknown = uncovered_row_ranges_from_merged(total, &merged_coverage);
+			out.extend_from_slice(&unknown);
+			merge_row_ranges(out)
+		}
+		None => merge_row_ranges(matched),
+	}
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -205,10 +228,9 @@ unsafe fn candidate_row_ranges_for_query_avx2(
 	query: &str,
 	query_op: Option<StringRuleOp>,
 	rules: &[StringCorrelationRule],
+	total_rows: Option<u64>,
 ) -> smallvec::SmallVec<[RowRange; 64]> {
 	use std::arch::x86_64::*;
-
-	use crate::core::sme_v2::sme_range_processor_common::merge_row_ranges;
 
 	let q_bytes = query.as_bytes();
 
@@ -217,8 +239,10 @@ unsafe fn candidate_row_ranges_for_query_avx2(
 	let mut sw_by_len: [smallvec::SmallVec<[usize; 64]>; 17] = std::array::from_fn(|_| smallvec::SmallVec::new());
 	let mut ew_by_len: [smallvec::SmallVec<[usize; 64]>; 17] = std::array::from_fn(|_| smallvec::SmallVec::new());
 	let mut scalar_fallback = smallvec::SmallVec::<[usize; 64]>::new();
+	let mut coverage = smallvec::SmallVec::<[RowRange; 64]>::new();
 
 	for (i, r) in rules.iter().enumerate() {
+		coverage.extend_from_slice(&r.ranges);
 		let len = r.value.as_bytes().len();
 		if len > STRING_RULE_VALUE_MAX_BYTES {
 			scalar_fallback.push(i);
@@ -519,15 +543,15 @@ unsafe fn candidate_row_ranges_for_query_avx2(
 		}
 	}
 
-	merge_row_ranges(out)
+	finalize_string_candidates(out, coverage, total_rows)
 }
 
 #[cfg(test)]
 mod tests {
 	use crate::core::{db_type::DbType, row::row_pointer::ROW_POINTER_RECORD_LEN};
-	use super::*;
 
-	#[test]
+	use super::*;
+#[test]
 	fn candidate_ranges_string_avx2_matches_scalar_when_available() {
 		let rules = vec![
 			StringCorrelationRule {
@@ -566,12 +590,13 @@ mod tests {
 		];
 
 		let query = "abc__a__xyz";
-		let scalar = candidate_row_ranges_for_query_scalar(query, None, &rules);
+		let total_rows = 400u64;
+		let scalar = candidate_row_ranges_for_query_scalar(query, None, &rules, Some(total_rows));
 
 		#[cfg(target_arch = "x86_64")]
 		{
 			if std::is_x86_feature_detected!("avx2") {
-				let simd = unsafe { candidate_row_ranges_for_query_avx2(query, None, &rules) };
+				let simd = unsafe { candidate_row_ranges_for_query_avx2(query, None, &rules, Some(total_rows)) };
 				assert_eq!(simd, scalar);
 			}
 		}
@@ -579,6 +604,7 @@ mod tests {
 
 	#[test]
 	fn candidate_ranges_startswith_compatibility_includes_contains_rules() {
+		let total_rows = 25u64;
 		let rules = vec![
 			StringCorrelationRule {
 				column_schema_id: 1,
@@ -605,8 +631,12 @@ mod tests {
 		];
 
 		let query = "abc";
-		let out = candidate_row_ranges_for_query_string(query, Some(StringRuleOp::StartsWith), &rules);
+		let out = candidate_row_ranges_for_query_string(query, Some(StringRuleOp::StartsWith), &rules, Some(total_rows));
 		// CONTAINS("a",1) is compatible with STARTSWITH("abc"), but STARTSWITH("zzz") is not.
-		assert_eq!(out.as_slice(), &[RowRange::from_row_id_range_inclusive(1, 2)]);
+		let expected: smallvec::SmallVec<[RowRange; 64]> = smallvec::smallvec![
+			RowRange::from_row_id_range_inclusive(0, 9),
+			RowRange::from_row_id_range_inclusive(21, 24),
+		];
+		assert_eq!(out, expected);
 	}
 }

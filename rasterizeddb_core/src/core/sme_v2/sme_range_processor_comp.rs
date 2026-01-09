@@ -1,4 +1,4 @@
-use crate::core::{row::row_pointer::ROW_POINTER_RECORD_LEN, sme_v2::{rules::{NumericCorrelationRule, NumericRuleOp, NumericScalar, RowRange}, sme_range_processor_common::{any_overlap_scalar, merge_row_ranges}}};
+use crate::core::{row::row_pointer::ROW_POINTER_RECORD_LEN, sme_v2::{rules::{NumericCorrelationRule, NumericRuleOp, NumericScalar, RowRange}, sme_range_processor_common::{merge_row_ranges, merge_row_ranges_clamped, uncovered_row_ranges_from_merged}}};
 
 /// Query-time comparison selector.
 ///
@@ -11,6 +11,7 @@ pub enum ComparisonType {
     GreaterThan,
     GreaterThanOrEqual,
 }
+
 /// Returns merged candidate row ranges for a numeric comparison query.
 ///
 /// The query is the scalar value to compare *row values* against.
@@ -27,8 +28,114 @@ pub fn candidate_row_ranges_for_comparison_query(
     query: NumericScalar,
     comparison: ComparisonType,
     rules: &[NumericCorrelationRule],
+    total_rows: Option<u64>,
 ) -> smallvec::SmallVec<[RowRange; 64]> {
-    candidate_row_ranges_for_comparison_query_scalar(query, comparison, rules)
+    let mut coverage = smallvec::SmallVec::<[RowRange; 64]>::new();
+    let matched = candidate_row_ranges_for_comparison_query_scalar(query, comparison, rules, &mut coverage);
+    let baseline = finalize_numeric_candidates(matched, coverage.clone(), total_rows);
+
+    // Heuristic: pick the tightest single-rule superset for the predicate side to shrink candidates.
+    // This never under-covers because we only accept rules whose predicate is a superset of the query.
+    let best_superset = best_bound_superset(query, comparison, rules);
+
+    match best_superset {
+        None => baseline,
+        Some(mut best) => {
+            // Merge for stable sizing/overlap checks.
+            best = merge_row_ranges(best);
+            let base_rows = total_row_estimate(&baseline);
+            let best_rows = total_row_estimate(&best);
+            if best_rows < base_rows {
+                best
+            } else {
+                baseline
+            }
+        }
+    }
+}
+
+#[inline]
+fn total_row_estimate(ranges: &[RowRange]) -> u64 {
+    ranges.iter().map(|r| r.row_count).sum()
+}
+
+#[inline]
+fn best_bound_superset(
+    query: NumericScalar,
+    comparison: ComparisonType,
+    rules: &[NumericCorrelationRule],
+) -> Option<smallvec::SmallVec<[RowRange; 64]>> {
+    let mut best: Option<(u64, smallvec::SmallVec<[RowRange; 64]>)> = None;
+
+    for r in rules {
+        if !rule_superset_of_query(query, comparison, r) {
+            continue;
+        }
+        let mut ranges = smallvec::SmallVec::<[RowRange; 64]>::new();
+        ranges.extend_from_slice(&r.ranges);
+        let rows = total_row_estimate(&ranges);
+        match &mut best {
+            None => best = Some((rows, ranges)),
+            Some((best_rows, _)) if rows < *best_rows => best = Some((rows, ranges)),
+            _ => {}
+        }
+    }
+
+    best.map(|(_, ranges)| ranges)
+}
+
+#[inline]
+fn rule_superset_of_query(query: NumericScalar, comparison: ComparisonType, rule: &NumericCorrelationRule) -> bool {
+    match (query, rule.value) {
+        (NumericScalar::Signed(q), NumericScalar::Signed(t)) => match rule.op {
+            NumericRuleOp::LessThan => comparison.allows_le() && q <= t,
+            NumericRuleOp::GreaterThan => comparison.allows_ge() && q >= t,
+        },
+        (NumericScalar::Unsigned(q), NumericScalar::Unsigned(t)) => match rule.op {
+            NumericRuleOp::LessThan => comparison.allows_le() && q <= t,
+            NumericRuleOp::GreaterThan => comparison.allows_ge() && q >= t,
+        },
+        (NumericScalar::Float(q), NumericScalar::Float(t)) => {
+            if q.is_nan() || t.is_nan() {
+                return false;
+            }
+            match rule.op {
+                NumericRuleOp::LessThan => comparison.allows_le() && q <= t,
+                NumericRuleOp::GreaterThan => comparison.allows_ge() && q >= t,
+            }
+        }
+        _ => false,
+    }
+}
+
+impl ComparisonType {
+    #[inline]
+    fn allows_le(self) -> bool {
+        matches!(self, ComparisonType::LessThan | ComparisonType::LessThanOrEqual)
+    }
+
+    #[inline]
+    fn allows_ge(self) -> bool {
+        matches!(self, ComparisonType::GreaterThan | ComparisonType::GreaterThanOrEqual)
+    }
+}
+
+#[inline]
+fn finalize_numeric_candidates(
+    matched: smallvec::SmallVec<[RowRange; 64]>,
+    coverage: smallvec::SmallVec<[RowRange; 64]>,
+    total_rows: Option<u64>,
+) -> smallvec::SmallVec<[RowRange; 64]> {
+    match total_rows {
+        Some(total) => {
+            let merged_coverage = merge_row_ranges_clamped(total, &coverage);
+            let mut out = merge_row_ranges_clamped(total, &matched);
+            let unknown = uncovered_row_ranges_from_merged(total, &merged_coverage);
+            out.extend_from_slice(&unknown);
+            merge_row_ranges(out)
+        }
+        None => merge_row_ranges(matched),
+    }
 }
 
 #[inline]
@@ -335,11 +442,12 @@ pub fn candidate_row_ranges_for_comparison_query_scalar(
     query: NumericScalar,
     comparison: ComparisonType,
     rules: &[NumericCorrelationRule],
+    coverage: &mut smallvec::SmallVec<[RowRange; 64]>,
 ) -> smallvec::SmallVec<[RowRange; 64]> {
     match query {
-        NumericScalar::Signed(q) => candidate_row_ranges_for_i128_comparison_query_sweep(q, comparison, rules),
-        NumericScalar::Unsigned(q) => candidate_row_ranges_for_u128_comparison_query_sweep(q, comparison, rules),
-        NumericScalar::Float(q) => candidate_row_ranges_for_f64_comparison_query_sweep(q, comparison, rules),
+        NumericScalar::Signed(q) => candidate_row_ranges_for_i128_comparison_query_sweep(q, comparison, rules, coverage),
+        NumericScalar::Unsigned(q) => candidate_row_ranges_for_u128_comparison_query_sweep(q, comparison, rules, coverage),
+        NumericScalar::Float(q) => candidate_row_ranges_for_f64_comparison_query_sweep(q, comparison, rules, coverage),
     }
 }
 
@@ -347,6 +455,7 @@ fn candidate_row_ranges_for_i128_comparison_query_sweep(
     query: i128,
     comparison: ComparisonType,
     rules: &[NumericCorrelationRule],
+    coverage: &mut smallvec::SmallVec<[RowRange; 64]>,
 ) -> smallvec::SmallVec<[RowRange; 64]> {
     let mut events: Vec<I128Event> = Vec::new();
 
@@ -354,6 +463,7 @@ fn candidate_row_ranges_for_i128_comparison_query_sweep(
     debug_assert!(rec > 0);
 
     for rule in rules {
+        coverage.extend_from_slice(&rule.ranges);
         let threshold = match rule.value {
             NumericScalar::Signed(v) => v,
             _ => continue,
@@ -469,6 +579,7 @@ fn candidate_row_ranges_for_u128_comparison_query_sweep(
     query: u128,
     comparison: ComparisonType,
     rules: &[NumericCorrelationRule],
+    coverage: &mut smallvec::SmallVec<[RowRange; 64]>,
 ) -> smallvec::SmallVec<[RowRange; 64]> {
     let mut events: Vec<U128Event> = Vec::new();
 
@@ -476,6 +587,7 @@ fn candidate_row_ranges_for_u128_comparison_query_sweep(
     debug_assert!(rec > 0);
 
     for rule in rules {
+        coverage.extend_from_slice(&rule.ranges);
         let threshold = match rule.value {
             NumericScalar::Unsigned(v) => v,
             _ => continue,
@@ -585,6 +697,7 @@ fn candidate_row_ranges_for_f64_comparison_query_sweep(
     query: f64,
     comparison: ComparisonType,
     rules: &[NumericCorrelationRule],
+    coverage: &mut smallvec::SmallVec<[RowRange; 64]>,
 ) -> smallvec::SmallVec<[RowRange; 64]> {
     let mut events: Vec<F64Event> = Vec::new();
 
@@ -592,6 +705,7 @@ fn candidate_row_ranges_for_f64_comparison_query_sweep(
     debug_assert!(rec > 0);
 
     for rule in rules {
+        coverage.extend_from_slice(&rule.ranges);
         let threshold = match rule.value {
             NumericScalar::Float(v) => v,
             _ => continue,
@@ -699,121 +813,9 @@ fn candidate_row_ranges_for_f64_comparison_query_sweep(
     merge_row_ranges(out)
 }
 
-/// AVX2 overlap check between two vectors of row ranges.
-///
-/// - On non-x86_64 targets, or if AVX2 isn't available at runtime, this falls back to scalar.
-/// - For correctness with full `u64` range, comparisons are performed as unsigned.
-#[inline]
-pub fn any_overlap_avx2(a: &[RowRange], b: &[RowRange]) -> bool {
-    // Small inputs are typically faster scalar (less overhead).
-    if a.is_empty() || b.is_empty() {
-        return false;
-    }
-
-    #[cfg(all(target_arch = "x86_64"))]
-    {
-        if std::is_x86_feature_detected!("avx2") {
-            // SAFETY: guarded by runtime feature detection.
-            return unsafe { any_overlap_avx2_with_ranges(a, b) };
-        }
-    }
-
-    any_overlap_scalar(a, b)
-}
-
-#[cfg(all(target_arch = "x86_64"))]
-#[target_feature(enable = "avx2")]
-unsafe fn any_overlap_avx2_with_ranges(a: &[RowRange], b: &[RowRange]) -> bool {
-    use std::arch::x86_64::*;
-
-    let n = b.len();
-    if n == 0 {
-        return false;
-    }
-
-    let sign = _mm256_set1_epi64x(i64::MIN);
-    let ones = _mm256_set1_epi64x(-1);
-
-    // Helper: unsigned (a > b) per lane mask, using signed compare after XOR with sign bit.
-    #[inline(always)]
-    unsafe fn cmpgt_u64(a: __m256i, b: __m256i, sign: __m256i) -> __m256i {
-        let ax = unsafe { _mm256_xor_si256(a, sign) };
-        let bx = unsafe { _mm256_xor_si256(b, sign) };
-        unsafe { _mm256_cmpgt_epi64(ax, bx) }
-    }
-
-    // Helper: unsigned (a <= b) per lane mask.
-    #[inline(always)]
-    unsafe fn cmple_u64(a: __m256i, b: __m256i, sign: __m256i, ones: __m256i) -> __m256i {
-        let gt = unsafe { cmpgt_u64(a, b, sign) };
-        unsafe { _mm256_andnot_si256(gt, ones) }
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct Bounds {
-        start: u64,
-        end: u64,
-    }
-
-    let mut b_bounds: Vec<Bounds> = Vec::with_capacity(b.len());
-    for rb in b {
-        if rb.is_empty() {
-            continue;
-        }
-        b_bounds.push(Bounds {
-            start: rb.start_pointer_pos,
-            end: rb.end_pointer_pos_inclusive(),
-        });
-    }
-    if b_bounds.is_empty() {
-        return false;
-    }
-
-    for ra in a {
-        if ra.is_empty() {
-            continue;
-        }
-        let a_start_u = ra.start_pointer_pos;
-        let a_end_u = ra.end_pointer_pos_inclusive();
-        let a_start = _mm256_set1_epi64x(a_start_u as i64);
-        let a_end = _mm256_set1_epi64x(a_end_u as i64);
-
-        let mut i = 0usize;
-        // Load 2 ranges at a time (32 bytes): [s0,e0,s1,e1] in 64-bit lanes.
-        let n2 = b_bounds.len();
-        while i + 2 <= n2 {
-            let v = unsafe { _mm256_loadu_si256(b_bounds.as_ptr().add(i) as *const __m256i) };
-            // starts = [s0,s1,s0,s1], ends = [e0,e1,e0,e1]
-            let b_start = _mm256_permute4x64_epi64(v, 0x88);
-            let b_end = _mm256_permute4x64_epi64(v, 0xDD);
-
-            // overlap = (a_start <= b_end) && (b_start <= a_end)
-            let c1 = unsafe { cmple_u64(a_start, b_end, sign, ones) };
-            let c2 = unsafe { cmple_u64(b_start, a_end, sign, ones) };
-            let both = _mm256_and_si256(c1, c2);
-
-            if _mm256_movemask_epi8(both) != 0 {
-                return true;
-            }
-            i += 2;
-        }
-
-        // Tail.
-        for j in i..n2 {
-            let rb = b_bounds[j];
-            if a_start_u <= rb.end && rb.start <= a_end_u {
-                return true;
-            }
-        }
-    }
-
-    false
-}
-
 #[cfg(test)]
 mod tests {
-    use crate::core::{db_type::DbType, sme_v2::sme_range_processor_common::merge_row_ranges_sorted_in_place_unchecked};
+    use crate::core::{db_type::DbType, sme_v2::sme_range_processor_common::{any_overlap_avx2, any_overlap_scalar, merge_row_ranges_sorted_in_place_unchecked}};
 
     use super::*;
 
@@ -841,6 +843,7 @@ mod tests {
         // - [100..150] has values < 500
         // - [110..150] has values > 6
         // Query: value <= 5 => the subrange [110..150] is impossible and must be excluded.
+        let total_rows = 200u64;
         let rules = vec![
             NumericCorrelationRule {
                 column_schema_id: 1,
@@ -862,9 +865,12 @@ mod tests {
             NumericScalar::Signed(5),
             ComparisonType::LessThanOrEqual,
             &rules,
+            Some(total_rows),
         );
-        let expected: smallvec::SmallVec<[RowRange; 64]> =
-            smallvec::smallvec![RowRange::from_row_id_range_inclusive(100, 109)];
+        let expected: smallvec::SmallVec<[RowRange; 64]> = smallvec::smallvec![
+            RowRange::from_row_id_range_inclusive(0, 109),
+            RowRange::from_row_id_range_inclusive(151, 199),
+        ];
         assert_eq!(got, expected);
 
         // Query: value >= 5 => both segments remain possible, so it merges to [100..150].
@@ -872,16 +878,17 @@ mod tests {
             NumericScalar::Signed(5),
             ComparisonType::GreaterThanOrEqual,
             &rules,
+            Some(total_rows),
         );
         let expected2: smallvec::SmallVec<[RowRange; 64]> =
-            smallvec::smallvec![RowRange::from_row_id_range_inclusive(100, 150)];
+            smallvec::smallvec![RowRange::from_row_id_range_inclusive(0, 199)];
         assert_eq!(got2, expected2);
     }
 
     #[test]
     fn comparison_candidate_ranges_do_not_include_uncovered_gaps() {
-        // If no rules apply to a row-id segment, that segment should NOT be returned.
-        // Otherwise, uncovered gaps can get merged into huge ranges.
+        // With total-row knowledge, uncovered gaps are treated as unknown and included.
+        let total_rows = 100u64;
         let rules = vec![
             NumericCorrelationRule {
                 column_schema_id: 1,
@@ -903,12 +910,11 @@ mod tests {
             NumericScalar::Signed(10),
             ComparisonType::LessThanOrEqual,
             &rules,
+            Some(total_rows),
         );
 
-        let expected: smallvec::SmallVec<[RowRange; 64]> = smallvec::smallvec![
-            RowRange::from_row_id_range_inclusive(10, 20),
-            RowRange::from_row_id_range_inclusive(40, 50),
-        ];
+        let expected: smallvec::SmallVec<[RowRange; 64]> =
+            smallvec::smallvec![RowRange::from_row_id_range_inclusive(0, 99)];
         assert_eq!(got, expected);
     }
 

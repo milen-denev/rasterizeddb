@@ -58,8 +58,9 @@ const THRESHOLD_COUNT: usize = 4 * RULES_SIZE_VARIABLE; // 192 thresholds → 38
 const NUMERIC_STEP_DIVISOR: usize = 96;
 
 // Cost model weights for numeric candidate scoring (lower prefers more ranges, higher prefers fewer rows).
+// Bias selection to favor ranges that exclude more rows (higher row cost).
 const NUMERIC_RANGE_WEIGHT: u64 = 24;
-const NUMERIC_CANDIDATE_ROWS_WEIGHT: u64 = 24;
+const NUMERIC_CANDIDATE_ROWS_WEIGHT: u64 = 64;
 
 // Maximum sampled coverage (0.0-1.0) allowed before a candidate is considered too broad.
 const NUMERIC_SAMPLE_BAD_COVERAGE_FRAC: f64 = 0.35;
@@ -85,12 +86,12 @@ const FLOAT_COARSEN_MAX_CANDIDATE_MULTIPLIER: u64 = 64;
 const FLOAT_COARSEN_TARGET_MAX_RANGES: usize = 256;
 
 // Max percentage of the total rows a single rule is allowed to cover (1-100).
-// Rules covering more than this are discarded as being "too broad" (essentially full-table scans).
-const MAX_RULE_COVERAGE_PERCENT: u64 = 12;
+// Lowered to bias toward exclusionary, high-precision rules.
+const MAX_RULE_COVERAGE_PERCENT: u64 = 5;
 
 // For small tables, a strict percentage cap can discard everything.
 // This floor keeps the rule set non-empty while still avoiding "matches everything" rules on large tables.
-const MIN_RULE_COVERAGE_ROWS: u64 = 32;
+const MIN_RULE_COVERAGE_ROWS: u64 = 16;
 
 // String histogram/scan sizing and n-gram lengths (kept together for easy tuning).
 const STRING_BYTE_FREQ_BINS: usize = 256;
@@ -114,6 +115,8 @@ const STRING_RULE_CANDIDATE_CAP: usize = 128;
 const STRING_FEATURE_MAP_MAX: usize = 4096;
 const STRING_OVERLAP_PENALTY_WEIGHT: u64 = 4;
 const STRING_LOCAL_SEARCH_PASSES: usize = 4;
+
+const POINTERS_FINGERPRINT_CHUNK: usize = 16 * 1024;
 
 /// Spawns a background task that rebuilds SME v2 correlation rules on-demand.
 ///
@@ -218,8 +221,6 @@ impl TableRulesScannerHandleV2 {
         self.notify.notify_one();
     }
 }
-
-const POINTERS_FINGERPRINT_CHUNK: usize = 16 * 1024;
 
 async fn compute_pointers_fingerprint<S: StorageIO>(pointers_io: Arc<S>) -> std::io::Result<u64> {
     use std::hash::Hasher;
@@ -449,6 +450,60 @@ fn ranges_candidate_rows(ranges: &[RowRange]) -> u64 {
     ranges.iter().map(|r| r.row_count).sum()
 }
 
+fn build_uncovered_ranges(total_rows: u64, ranges: &[RowRange]) -> Vec<RowRange> {
+    if total_rows == 0 {
+        return Vec::new();
+    }
+
+    use crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN;
+    let row_len = ROW_POINTER_RECORD_LEN as u64;
+
+    // Merge and sort existing ranges to compute gaps.
+    let mut merged = if ranges.is_empty() {
+        Vec::new()
+    } else {
+        normalize_ranges_smallvec(ranges.to_vec()).into_vec()
+    };
+
+    if merged.is_empty() {
+        return vec![RowRange {
+            start_pointer_pos: 0,
+            row_count: total_rows,
+        }];
+    }
+
+    merged.sort_by_key(|r| r.start_pointer_pos);
+
+    let mut uncovered: Vec<RowRange> = Vec::new();
+    let mut cursor = 0u64;
+    let table_bytes = total_rows.saturating_mul(row_len);
+
+    for r in merged.into_iter() {
+        if r.start_pointer_pos > cursor {
+            let gap_rows = (r.start_pointer_pos - cursor) / row_len;
+            if gap_rows > 0 {
+                uncovered.push(RowRange {
+                    start_pointer_pos: cursor,
+                    row_count: gap_rows,
+                });
+            }
+        }
+        cursor = r.end_pointer_pos_exclusive().max(cursor);
+    }
+
+    if cursor < table_bytes {
+        let gap_rows = (table_bytes - cursor) / row_len;
+        if gap_rows > 0 {
+            uncovered.push(RowRange {
+                start_pointer_pos: cursor,
+                row_count: gap_rows,
+            });
+        }
+    }
+
+    uncovered
+}
+
 fn cmp_scalar(a: NumericScalar, b: NumericScalar) -> CmpOrdering {
     match (a, b) {
         (NumericScalar::Signed(x), NumericScalar::Signed(y)) => x.cmp(&y),
@@ -458,6 +513,19 @@ fn cmp_scalar(a: NumericScalar, b: NumericScalar) -> CmpOrdering {
             .unwrap_or(std::cmp::Ordering::Equal),
         // Different kinds shouldn't happen within a single numeric column.
         _ => std::cmp::Ordering::Equal,
+    }
+}
+
+fn numeric_catchall_scalar(db_type: &DbType) -> NumericScalar {
+    match db_type {
+        DbType::F32 | DbType::F64 => NumericScalar::Float(f64::INFINITY),
+        DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::I128 => {
+            NumericScalar::Signed(i128::MAX)
+        }
+        DbType::U8 | DbType::U16 | DbType::U32 | DbType::U64 | DbType::U128 => {
+            NumericScalar::Unsigned(u128::MAX)
+        }
+        _ => NumericScalar::Signed(i128::MAX),
     }
 }
 
@@ -1935,28 +2003,46 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
             });
         }
         
-        // Post-processing: Filter out rules that cover too much of the dataset.
-        if !out_rules.is_empty() {
+        // Post-processing: Filter, deduplicate, and backfill coverage gaps.
+        {
             use crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN;
-            let total_rows = pointers_io
-                .get_len()
-                .await
-                / (ROW_POINTER_RECORD_LEN as u64);
+            let total_rows = pointers_io.get_len().await / (ROW_POINTER_RECORD_LEN as u64);
 
-            if total_rows > 0 {
+            if total_rows > 0 && !out_rules.is_empty() {
                 // For small tables, integer division can yield 0 and would discard all rules.
                 let threshold = ((total_rows as u128 * MAX_RULE_COVERAGE_PERCENT as u128) / 100) as u64;
                 let threshold = threshold.max(MIN_RULE_COVERAGE_ROWS).max(1);
                 out_rules.retain(|r| ranges_candidate_rows(&r.ranges) <= threshold);
             }
-             
-             let mut seen_coverage = std::collections::HashSet::new();
-             out_rules.retain(|r| {
-                 let covered = ranges_candidate_rows(&r.ranges);
-                 let op_byte = r.op as u8;
-                 let key = (op_byte, covered);
-                 seen_coverage.insert(key)
-             });
+
+            if !out_rules.is_empty() {
+                let mut seen_coverage = std::collections::HashSet::new();
+                out_rules.retain(|r| {
+                    let covered = ranges_candidate_rows(&r.ranges);
+                    let op_byte = r.op as u8;
+                    let key = (op_byte, covered);
+                    seen_coverage.insert(key)
+                });
+            }
+
+            if total_rows > 0 {
+                let mut merged: Vec<RowRange> = Vec::new();
+                for r in out_rules.iter() {
+                    merged.extend_from_slice(&r.ranges);
+                }
+
+                let uncovered = build_uncovered_ranges(total_rows, &merged);
+                if !uncovered.is_empty() {
+                    let sentinel = numeric_catchall_scalar(&plan.db_type);
+                    out_rules.push(NumericCorrelationRule {
+                        column_schema_id: plan.schema_id,
+                        column_type: plan.db_type.clone(),
+                        op: NumericRuleOp::LessThan,
+                        value: sentinel,
+                        ranges: SmallVec::<[RowRange; 64]>::from_vec(uncovered),
+                    });
+                }
+            }
         }
 
         final_chosen_rules_by_col.push((plan.schema_id, out_rules));
@@ -2212,6 +2298,31 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
                 value: cand.value.clone(),
                 ranges,
             });
+        }
+
+        // Add a catch-all rule to guarantee full coverage even if optimized rules leave gaps.
+        if total_rows > 0 {
+            let mut merged: Vec<RowRange> = Vec::new();
+            for r in out_rules.iter() {
+                merged.extend_from_slice(&r.ranges);
+            }
+
+            let uncovered = build_uncovered_ranges(total_rows, &merged);
+            if !uncovered.is_empty() {
+                let column_type = rules
+                    .get(0)
+                    .map(|r| r.column_type.clone())
+                    .unwrap_or(DbType::STRING);
+
+                out_rules.push(StringCorrelationRule {
+                    column_schema_id: *schema_id,
+                    column_type,
+                    op: StringRuleOp::StartsWith,
+                    count: 1,
+                    value: String::new(),
+                    ranges: RangeVec::from_vec(uncovered),
+                });
+            }
         }
 
         if !out_rules.is_empty() {

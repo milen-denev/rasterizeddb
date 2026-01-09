@@ -1,4 +1,5 @@
-use crate::core::{sme_v2::{rules::{NumericCorrelationRule, NumericRuleOp, NumericScalar, RowRange}, sme_range_processor_common::merge_row_ranges}};
+use crate::core::sme_v2::{rules::{NumericCorrelationRule, NumericRuleOp, NumericScalar, RowRange}, sme_range_processor_common::{merge_row_ranges, merge_row_ranges_clamped, uncovered_row_ranges_from_merged}};
+
 
 /// Returns merged candidate row ranges for a numeric query.
 ///
@@ -13,10 +14,11 @@ use crate::core::{sme_v2::{rules::{NumericCorrelationRule, NumericRuleOp, Numeri
 pub fn candidate_row_ranges_for_query(
     query: NumericScalar,
     rules: &[NumericCorrelationRule],
+    total_rows: Option<u64>,
 ) -> smallvec::SmallVec<[RowRange; 64]> {
     // For small rule counts, scalar is typically fastest.
     if rules.len() < 16 {
-        return candidate_row_ranges_for_query_scalar(query, rules);
+        return candidate_row_ranges_for_query_scalar(query, rules, total_rows);
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -25,18 +27,18 @@ pub fn candidate_row_ranges_for_query(
             match query {
                 NumericScalar::Signed(q) => {
                     // SAFETY: guarded by runtime feature detection.
-                    return unsafe { candidate_row_ranges_for_i128_query_avx2(q, rules) };
+                    return unsafe { candidate_row_ranges_for_i128_query_avx2(q, rules, total_rows) };
                 }
                 NumericScalar::Unsigned(q) => {
                     // SAFETY: guarded by runtime feature detection.
-                    return unsafe { candidate_row_ranges_for_u128_query_avx2(q, rules) };
+                    return unsafe { candidate_row_ranges_for_u128_query_avx2(q, rules, total_rows) };
                 }
                 NumericScalar::Float(_) => {}
             }
         }
     }
 
-    candidate_row_ranges_for_query_scalar(query, rules)
+    candidate_row_ranges_for_query_scalar(query, rules, total_rows)
 }
 
 #[inline]
@@ -77,17 +79,38 @@ pub fn rule_matches_typed_query(query: NumericScalar, rule: &NumericCorrelationR
 }
 
 #[inline]
+fn finalize_numeric_candidates(
+    matched: smallvec::SmallVec<[RowRange; 64]>,
+    coverage: smallvec::SmallVec<[RowRange; 64]>,
+    total_rows: Option<u64>,
+) -> smallvec::SmallVec<[RowRange; 64]> {
+    match total_rows {
+        Some(total) => {
+            let merged_coverage = merge_row_ranges_clamped(total, &coverage);
+            let mut out = merge_row_ranges_clamped(total, &matched);
+            let unknown = uncovered_row_ranges_from_merged(total, &merged_coverage);
+            out.extend_from_slice(&unknown);
+            merge_row_ranges(out)
+        }
+        None => merge_row_ranges(matched),
+    }
+}
+
+#[inline]
 pub fn candidate_row_ranges_for_query_scalar(
     query: NumericScalar,
     rules: &[NumericCorrelationRule],
+    total_rows: Option<u64>,
 ) -> smallvec::SmallVec<[RowRange; 64]> {
     let mut out = smallvec::SmallVec::<[RowRange; 64]>::new();
+    let mut coverage = smallvec::SmallVec::<[RowRange; 64]>::new();
     for rule in rules {
+        coverage.extend_from_slice(&rule.ranges);
         if rule_matches_typed_query(query, rule) {
             out.extend_from_slice(&rule.ranges);
         }
     }
-    merge_row_ranges(out)
+    finalize_numeric_candidates(out, coverage, total_rows)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -192,18 +215,19 @@ unsafe fn avx2_i128_ge_masks(
 unsafe fn candidate_row_ranges_for_i128_query_avx2(
     query: i128,
     rules: &[NumericCorrelationRule],
+    total_rows: Option<u64>,
 ) -> smallvec::SmallVec<[RowRange; 64]> {
     use std::arch::x86_64::*;
-
-    use crate::core::sme_v2::sme_range_processor_common::merge_row_ranges;
 
     // Only accelerates Signed(i128) rules; others fall back to scalar per rule.
     // Split indices by op so each SIMD loop does one comparison direction.
     let mut lt_idx = smallvec::SmallVec::<[usize; 64]>::new();
     let mut gt_idx = smallvec::SmallVec::<[usize; 64]>::new();
     let mut scalar_fallback = smallvec::SmallVec::<[usize; 64]>::new();
+    let mut coverage = smallvec::SmallVec::<[RowRange; 64]>::new();
 
     for (i, r) in rules.iter().enumerate() {
+        coverage.extend_from_slice(&r.ranges);
         match (r.op, r.value) {
             (NumericRuleOp::LessThan, NumericScalar::Signed(_)) => lt_idx.push(i),
             (NumericRuleOp::GreaterThan, NumericScalar::Signed(_)) => gt_idx.push(i),
@@ -371,7 +395,7 @@ unsafe fn candidate_row_ranges_for_i128_query_avx2(
         }
     }
 
-    merge_row_ranges(out)
+    finalize_numeric_candidates(out, coverage, total_rows)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -379,18 +403,19 @@ unsafe fn candidate_row_ranges_for_i128_query_avx2(
 unsafe fn candidate_row_ranges_for_u128_query_avx2(
     query: u128,
     rules: &[NumericCorrelationRule],
+    total_rows: Option<u64>,
 ) -> smallvec::SmallVec<[RowRange; 64]> {
     use std::arch::x86_64::*;
-
-    use crate::core::sme_v2::sme_range_processor_common::merge_row_ranges;
 
     // Only accelerates Unsigned(u128) rules; others fall back to scalar per rule.
     // Split indices by op so each SIMD loop does one comparison direction.
     let mut lt_idx = smallvec::SmallVec::<[usize; 64]>::new();
     let mut gt_idx = smallvec::SmallVec::<[usize; 64]>::new();
     let mut scalar_fallback = smallvec::SmallVec::<[usize; 64]>::new();
+    let mut coverage = smallvec::SmallVec::<[RowRange; 64]>::new();
 
     for (i, r) in rules.iter().enumerate() {
+        coverage.extend_from_slice(&r.ranges);
         match (r.op, r.value) {
             (NumericRuleOp::LessThan, NumericScalar::Unsigned(_)) => lt_idx.push(i),
             (NumericRuleOp::GreaterThan, NumericScalar::Unsigned(_)) => gt_idx.push(i),
@@ -558,15 +583,14 @@ unsafe fn candidate_row_ranges_for_u128_query_avx2(
         }
     }
 
-    merge_row_ranges(out)
+    finalize_numeric_candidates(out, coverage, total_rows)
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::core::{db_type::DbType, sme_v2::sme_range_processor_common::{any_overlap_avx2, any_overlap_scalar, merge_row_ranges_sorted_in_place_unchecked}};
-
     use super::*;
-
+    use crate::core::{db_type::DbType, sme_v2::sme_range_processor_common::{any_overlap_avx2, any_overlap_scalar, merge_row_ranges_sorted_in_place_unchecked}};
+    
     fn lcg_next(state: &mut u64) -> u64 {
         *state = state
             .wrapping_mul(6364136223846793005)
@@ -587,6 +611,7 @@ mod tests {
 
     #[test]
     fn candidate_ranges_example_query_850() {
+        let total_rows = 500u64;
         let rules = vec![
             NumericCorrelationRule {
                 column_schema_id: 1,
@@ -623,12 +648,136 @@ mod tests {
             },
         ];
 
-        let got = candidate_row_ranges_for_query(NumericScalar::Signed(850), &rules);
+        let got = candidate_row_ranges_for_query(NumericScalar::Signed(850), &rules, Some(total_rows));
         let expected: smallvec::SmallVec<[RowRange; 64]> = smallvec::smallvec![
-            RowRange::from_row_id_range_inclusive(10, 20),
+            RowRange::from_row_id_range_inclusive(0, 39),
             RowRange::from_row_id_range_inclusive(70, 140),
             RowRange::from_row_id_range_inclusive(220, 420),
+            RowRange::from_row_id_range_inclusive(451, 499),
         ];
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn candidate_ranges_exclude_impossible_and_add_uncovered_tail_for_value_6() {
+        let total_rows = 600u64;
+        let rules = vec![
+            // Rule 1: > 5 in [100, 200]
+            NumericCorrelationRule {
+                column_schema_id: 1,
+                column_type: DbType::I128,
+                op: NumericRuleOp::GreaterThan,
+                value: NumericScalar::Signed(5),
+                ranges: smallvec::smallvec![RowRange::from_row_id_range_inclusive(100, 200)],
+            },
+            // Rule 2: < 7 in [150, 250]
+            NumericCorrelationRule {
+                column_schema_id: 1,
+                column_type: DbType::I128,
+                op: NumericRuleOp::LessThan,
+                value: NumericScalar::Signed(7),
+                ranges: smallvec::smallvec![RowRange::from_row_id_range_inclusive(150, 250)],
+            },
+            // Rule 3: < 10 in [0, 100]
+            NumericCorrelationRule {
+                column_schema_id: 1,
+                column_type: DbType::I128,
+                op: NumericRuleOp::LessThan,
+                value: NumericScalar::Signed(10),
+                ranges: smallvec::smallvec![RowRange::from_row_id_range_inclusive(0, 100)],
+            },
+            // Rule 4: > 7 in [300, 500] (excludes value 6)
+            NumericCorrelationRule {
+                column_schema_id: 1,
+                column_type: DbType::I128,
+                op: NumericRuleOp::GreaterThan,
+                value: NumericScalar::Signed(7),
+                ranges: smallvec::smallvec![RowRange::from_row_id_range_inclusive(300, 500)],
+            },
+            // Rule 5: > 3 in [200, 300]
+            NumericCorrelationRule {
+                column_schema_id: 1,
+                column_type: DbType::I128,
+                op: NumericRuleOp::GreaterThan,
+                value: NumericScalar::Signed(3),
+                ranges: smallvec::smallvec![RowRange::from_row_id_range_inclusive(200, 300)],
+            },
+        ];
+
+        let got = candidate_row_ranges_for_query(
+            NumericScalar::Signed(6),
+            &rules,
+            Some(total_rows),
+        );
+
+        // Expect merge of feasible ranges (0-300) plus uncovered tail (501-599).
+        let expected: smallvec::SmallVec<[RowRange; 64]> = smallvec::smallvec![
+            RowRange::from_row_id_range_inclusive(0, 300),
+            RowRange::from_row_id_range_inclusive(501, 599),
+        ];
+
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn candidate_ranges_exclude_impossible_and_add_uncovered_tail_for_value_4() {
+        let total_rows = 600u64;
+        let rules = vec![
+            // Rule 1: > 5 in [100, 200] (excludes value 4)
+            NumericCorrelationRule {
+                column_schema_id: 1,
+                column_type: DbType::I128,
+                op: NumericRuleOp::GreaterThan,
+                value: NumericScalar::Signed(5),
+                ranges: smallvec::smallvec![RowRange::from_row_id_range_inclusive(100, 200)],
+            },
+            // Rule 2: < 7 in [150, 250]
+            NumericCorrelationRule {
+                column_schema_id: 1,
+                column_type: DbType::I128,
+                op: NumericRuleOp::LessThan,
+                value: NumericScalar::Signed(7),
+                ranges: smallvec::smallvec![RowRange::from_row_id_range_inclusive(150, 250)],
+            },
+            // Rule 3: < 10 in [0, 100]
+            NumericCorrelationRule {
+                column_schema_id: 1,
+                column_type: DbType::I128,
+                op: NumericRuleOp::LessThan,
+                value: NumericScalar::Signed(10),
+                ranges: smallvec::smallvec![RowRange::from_row_id_range_inclusive(0, 100)],
+            },
+            // Rule 4: > 7 in [300, 500] (excludes value 4)
+            NumericCorrelationRule {
+                column_schema_id: 1,
+                column_type: DbType::I128,
+                op: NumericRuleOp::GreaterThan,
+                value: NumericScalar::Signed(7),
+                ranges: smallvec::smallvec![RowRange::from_row_id_range_inclusive(300, 500)],
+            },
+            // Rule 5: > 3 in [200, 300]
+            NumericCorrelationRule {
+                column_schema_id: 1,
+                column_type: DbType::I128,
+                op: NumericRuleOp::GreaterThan,
+                value: NumericScalar::Signed(3),
+                ranges: smallvec::smallvec![RowRange::from_row_id_range_inclusive(200, 300)],
+            },
+        ];
+
+        let got = candidate_row_ranges_for_query(
+            NumericScalar::Signed(4),
+            &rules,
+            Some(total_rows),
+        );
+
+        // Expect feasible merge: [0-100] + [150-300], plus uncovered tail [501-599].
+        let expected: smallvec::SmallVec<[RowRange; 64]> = smallvec::smallvec![
+            RowRange::from_row_id_range_inclusive(0, 100),
+            RowRange::from_row_id_range_inclusive(150, 300),
+            RowRange::from_row_id_range_inclusive(501, 599),
+        ];
+
         assert_eq!(got, expected);
     }
 
@@ -745,12 +894,13 @@ mod tests {
                 }
 
                 let query = 900i128;
-                let scalar = super::candidate_row_ranges_for_query(NumericScalar::Signed(query), &rules);
-                let avx2 = unsafe { super::candidate_row_ranges_for_i128_query_avx2(query, &rules) };
+                let total_rows = 1000u64;
+                let scalar = super::candidate_row_ranges_for_query(NumericScalar::Signed(query), &rules, Some(total_rows));
+                let avx2 = unsafe { super::candidate_row_ranges_for_i128_query_avx2(query, &rules, Some(total_rows)) };
                 assert_eq!(scalar, avx2);
 
                 // Also check the public entry point (which may select AVX2).
-                let public = candidate_row_ranges_for_query(NumericScalar::Signed(query), &rules);
+                let public = candidate_row_ranges_for_query(NumericScalar::Signed(query), &rules, Some(total_rows));
                 assert_eq!(scalar, public);
             }
         }

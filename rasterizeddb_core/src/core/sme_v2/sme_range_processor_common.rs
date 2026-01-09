@@ -1,6 +1,5 @@
 use crate::core::{row::row_pointer::ROW_POINTER_RECORD_LEN, sme_v2::rules::RowRange};
 
-
 /// Sorts by `start_pointer_pos`, then merges overlapping or directly-adjacent ranges.
 pub fn merge_row_ranges(
 	mut ranges: smallvec::SmallVec<[RowRange; 64]>,
@@ -65,6 +64,104 @@ pub unsafe fn merge_row_ranges_sorted_in_place_unchecked(
 	write += 1;
 
 	unsafe { ranges.set_len(write) };
+}
+
+/// Clamps a `RowRange` to the inclusive pointer bounds implied by `total_rows`.
+///
+/// Returns `None` if the range lies completely outside `[0, total_rows)` or if `total_rows == 0`.
+#[inline]
+pub fn clamp_row_range_to_total_rows(range: RowRange, total_rows: u64) -> Option<RowRange> {
+    if total_rows == 0 || range.is_empty() {
+        return None;
+    }
+
+    let rec = ROW_POINTER_RECORD_LEN as u64;
+    debug_assert!(rec > 0);
+
+    let total_end = total_rows
+        .saturating_sub(1)
+        .saturating_mul(rec);
+
+    if range.start_pointer_pos > total_end {
+        return None;
+    }
+
+    let mut end = range.end_pointer_pos_inclusive();
+    if end > total_end {
+        end = total_end;
+    }
+
+    Some(RowRange::from_pointer_bounds_inclusive(
+        range.start_pointer_pos,
+        end,
+    ))
+}
+
+/// Clamps and merges a slice of `RowRange`s to `[0, total_rows)`.
+#[inline]
+pub fn merge_row_ranges_clamped(
+    total_rows: u64,
+    ranges: &[RowRange],
+) -> smallvec::SmallVec<[RowRange; 64]> {
+    let mut tmp = smallvec::SmallVec::<[RowRange; 64]>::new();
+    for &r in ranges {
+        if let Some(clamped) = clamp_row_range_to_total_rows(r, total_rows) {
+            tmp.push(clamped);
+        }
+    }
+    merge_row_ranges(tmp)
+}
+
+/// Computes the uncovered row ranges within `[0, total_rows)` given an already merged
+/// (sorted, non-overlapping) coverage list.
+#[inline]
+pub fn uncovered_row_ranges_from_merged(
+    total_rows: u64,
+    merged_covered: &[RowRange],
+) -> smallvec::SmallVec<[RowRange; 64]> {
+    let mut out = smallvec::SmallVec::<[RowRange; 64]>::new();
+    if total_rows == 0 {
+        return out;
+    }
+
+    let rec = ROW_POINTER_RECORD_LEN as u64;
+    debug_assert!(rec > 0);
+
+    let total_end = total_rows
+        .saturating_sub(1)
+        .saturating_mul(rec);
+
+    let mut cur = 0u64;
+    for &r in merged_covered {
+        if r.is_empty() {
+            continue;
+        }
+
+        let start = r.start_pointer_pos.min(total_end.saturating_add(rec));
+        if start > total_end {
+            break;
+        }
+
+        if cur < start {
+            let gap_end = start.saturating_sub(rec);
+            if cur <= gap_end {
+                out.push(RowRange::from_pointer_bounds_inclusive(cur, gap_end));
+            }
+        }
+
+        let end = r.end_pointer_pos_inclusive().min(total_end);
+        cur = end.saturating_add(rec);
+        if cur > total_end {
+            // If we've reached or passed the end, we're done.
+            return out;
+        }
+    }
+
+    if cur <= total_end {
+        out.push(RowRange::from_pointer_bounds_inclusive(cur, total_end));
+    }
+
+    out
 }
 
 #[inline]
