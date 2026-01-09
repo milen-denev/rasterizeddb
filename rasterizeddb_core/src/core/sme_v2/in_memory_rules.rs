@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::sync::{OnceLock, RwLock};
+use std::sync::OnceLock;
+use parking_lot::RwLock;
 
 use rclite::Arc;
 
@@ -11,14 +12,14 @@ use super::rules::{NumericCorrelationRule, StringCorrelationRule};
 #[derive(Clone)]
 pub struct TableRulesV2 {
     pub header: Arc<RulesFileHeaderV2>,
-    pub numeric_by_col: HashMap<u64, Arc<Vec<NumericCorrelationRule>>>,
-    pub string_by_col: HashMap<u64, Arc<Vec<StringCorrelationRule>>>,
+    pub numeric_by_col: HashMap<u64, Arc<Vec<NumericCorrelationRule>>, ahash::RandomState>,
+    pub string_by_col: HashMap<u64, Arc<Vec<StringCorrelationRule>>, ahash::RandomState>,
 }
 
-static IN_MEMORY_RULES_V2: OnceLock<RwLock<HashMap<String, Arc<TableRulesV2>>>> = OnceLock::new();
+static IN_MEMORY_RULES_V2: OnceLock<Arc<RwLock<HashMap<String, Arc<TableRulesV2>, ahash::RandomState>>>> = OnceLock::new();
 
-fn store() -> &'static RwLock<HashMap<String, Arc<TableRulesV2>>> {
-    IN_MEMORY_RULES_V2.get_or_init(|| RwLock::new(HashMap::new()))
+fn store() -> &'static RwLock<HashMap<String, Arc<TableRulesV2>, ahash::RandomState>> {
+    IN_MEMORY_RULES_V2.get_or_init(|| Arc::new(RwLock::new(HashMap::with_hasher(Default::default()))))
 }
 
 pub fn set_table_rules(
@@ -26,12 +27,12 @@ pub fn set_table_rules(
     numeric_rules_by_col: Vec<(u64, Vec<NumericCorrelationRule>)>,
     string_rules_by_col: Vec<(u64, Vec<StringCorrelationRule>)>,
 ) {
-    let mut numeric_by_col: HashMap<u64, Arc<Vec<NumericCorrelationRule>>> = HashMap::new();
+    let mut numeric_by_col: HashMap<u64, Arc<Vec<NumericCorrelationRule>>, ahash::RandomState> = HashMap::with_hasher(Default::default());
     for (col, rules) in numeric_rules_by_col.into_iter() {
         numeric_by_col.insert(col, Arc::new(rules));
     }
 
-    let mut string_by_col: HashMap<u64, Arc<Vec<StringCorrelationRule>>> = HashMap::new();
+    let mut string_by_col: HashMap<u64, Arc<Vec<StringCorrelationRule>>, ahash::RandomState> = HashMap::with_hasher(Default::default());
     for (col, rules) in string_rules_by_col.into_iter() {
         string_by_col.insert(col, Arc::new(rules));
     }
@@ -107,12 +108,12 @@ pub fn set_table_rules(
         string_by_col,
     });
 
-    let mut guard = store().write().unwrap();
+    let mut guard = store().write();
     guard.insert(table_name.to_string(), table_rules);
 }
 
 pub fn get_table_rules(table_name: &str) -> Option<Arc<TableRulesV2>> {
-    let guard = store().read().unwrap();
+    let guard = store().read();
     guard.get(table_name).cloned()
 }
 
