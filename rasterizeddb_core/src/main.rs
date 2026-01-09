@@ -148,7 +148,7 @@ fn main() -> std::io::Result<()> {
         let db_location = if args.in_memory {
             ""
         } else {
-            config.location.as_deref().unwrap_or("G:/Databases/Production_2/")
+            config.location.as_deref().unwrap_or("G:/Databases/Production/")
         };
 
         #[cfg(not(debug_assertions))]
