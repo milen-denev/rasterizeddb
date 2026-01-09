@@ -1,6 +1,6 @@
 #[cfg(target_arch = "x86_64")]
 use crate::core::sme_v2::rules::STRING_RULE_VALUE_MAX_BYTES;
-use crate::core::{row::row_pointer::ROW_POINTER_RECORD_LEN, sme_v2::{rules::{RowRange, StringCorrelationRule, StringRuleOp}, sme_range_processor_common::merge_row_ranges}};
+use crate::core::{sme_v2::{rules::{RowRange, StringCorrelationRule, StringRuleOp}, sme_range_processor_common::merge_row_ranges}};
 
 /// Returns merged candidate row ranges for a string query.
 ///
