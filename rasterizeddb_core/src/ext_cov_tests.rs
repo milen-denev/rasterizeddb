@@ -697,8 +697,6 @@ async fn run_rowcount_case(rows_to_insert: usize) {
         .expect("tiny_counts table should exist after CREATE TABLE")
         .clone();
 
-    let schema = &table.schema.fields;
-
     let q_all = format!(
         r##"SELECT id, age FROM tiny_counts WHERE id >= 1 AND id <= {}"##,
         (rows_to_insert as u64) + 5
