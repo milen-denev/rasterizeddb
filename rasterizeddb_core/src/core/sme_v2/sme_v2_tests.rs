@@ -183,7 +183,7 @@ async fn writes_header_and_loads_numeric_rules_for_column() {
             column_type: crate::core::db_type::DbType::I64,
             op: NumericRuleOp::LessThan,
             value: NumericScalar::Signed(25),
-            ranges: vec![
+            ranges: smallvec::smallvec![
                 RowRange::from_row_id_range_inclusive(200, 500),
                 RowRange::from_row_id_range_inclusive(800, 1200),
             ],
@@ -193,7 +193,7 @@ async fn writes_header_and_loads_numeric_rules_for_column() {
             column_type: crate::core::db_type::DbType::I64,
             op: NumericRuleOp::GreaterThan,
             value: NumericScalar::Signed(20),
-            ranges: vec![
+            ranges: smallvec::smallvec![
                 RowRange::from_row_id_range_inclusive(150, 250),
                 RowRange::from_row_id_range_inclusive(2300, 3200),
             ],
@@ -206,7 +206,7 @@ async fn writes_header_and_loads_numeric_rules_for_column() {
         column_type: crate::core::db_type::DbType::U64,
         op: NumericRuleOp::LessThan,
         value: NumericScalar::Unsigned(123),
-        ranges: vec![RowRange::from_row_id_range_inclusive(1, 2)],
+        ranges: smallvec::smallvec![RowRange::from_row_id_range_inclusive(1, 2)],
     }];
 
     CorrelationRuleStore::save_numeric_rules_atomic::<_>(

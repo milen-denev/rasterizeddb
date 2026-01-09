@@ -1,4 +1,4 @@
-use crate::core::{row::row_pointer::ROW_POINTER_RECORD_LEN, sme_v2::rules::{NumericCorrelationRule, NumericRuleOp, NumericScalar, RowRange}};
+use crate::core::{row::row_pointer::ROW_POINTER_RECORD_LEN, sme_v2::{rules::{NumericCorrelationRule, NumericRuleOp, NumericScalar, RowRange}, sme_range_processor_common::{any_overlap_scalar, merge_row_ranges}}};
 
 /// Query-time comparison selector.
 ///
@@ -699,105 +699,6 @@ fn candidate_row_ranges_for_f64_comparison_query_sweep(
     merge_row_ranges(out)
 }
 
-#[inline]
-pub fn row_ranges_overlap(a: RowRange, b: RowRange) -> bool {
-    if a.is_empty() || b.is_empty() {
-        return false;
-    }
-    // Inclusive overlap in pointer space: [a.start, a.end] intersects [b.start, b.end]
-    let a_start = a.start_pointer_pos;
-    let a_end = a.end_pointer_pos_inclusive();
-    let b_start = b.start_pointer_pos;
-    let b_end = b.end_pointer_pos_inclusive();
-    a_start <= b_end && b_start <= a_end
-}
-
-/// Sorts by `start_pointer_pos`, then merges overlapping or directly-adjacent ranges.
-pub fn merge_row_ranges(mut ranges: smallvec::SmallVec<[RowRange; 64]>) -> smallvec::SmallVec<[RowRange; 64]> {
-    ranges.retain(|r| !r.is_empty());
-    if ranges.len() <= 1 {
-        return ranges;
-    }
-
-    ranges.sort_unstable_by(|a, b| {
-        a.start_pointer_pos
-            .cmp(&b.start_pointer_pos)
-            .then_with(|| a.end_pointer_pos_inclusive().cmp(&b.end_pointer_pos_inclusive()))
-    });
-
-    // SAFETY: we just sorted by start/end, and RowRange is Copy (no drop hazards).
-    unsafe { merge_row_ranges_sorted_in_place_unchecked(&mut ranges) };
-    ranges
-}
-
-/// Merges overlapping or directly-adjacent ranges **in-place**.
-///
-/// This is the fast merge step, without sorting. It can be *much* faster than `merge_row_ranges`
-/// if your input is already sorted (e.g. if you maintain per-rule ranges sorted/merged).
-///
-/// # Safety
-/// Caller must guarantee:
-/// - `ranges` is sorted by `(start_pointer_pos, end_pointer_pos_inclusive)` ascending.
-/// - every element has `row_count > 0`.
-///
-/// If these invariants are violated, the result may be incorrect.
-pub unsafe fn merge_row_ranges_sorted_in_place_unchecked(
-    ranges: &mut smallvec::SmallVec<[RowRange; 64]>,
-) {
-    let len = ranges.len();
-    if len <= 1 {
-        return;
-    }
-
-    // In-place compaction: write merged ranges back into the same buffer.
-    let ptr = ranges.as_mut_ptr();
-    let mut write = 0usize;
-    let first = unsafe { *ptr };
-    debug_assert!(!first.is_empty());
-    let rec = ROW_POINTER_RECORD_LEN as u64;
-    debug_assert!(rec > 0);
-
-    let mut cur_start = first.start_pointer_pos;
-    let mut cur_end = first.end_pointer_pos_inclusive();
-
-    for read in 1..len {
-        let r = unsafe { *ptr.add(read) };
-        debug_assert!(!r.is_empty());
-        let r_start = r.start_pointer_pos;
-        let r_end = r.end_pointer_pos_inclusive();
-        let cur_end_plus_rec = cur_end.saturating_add(rec);
-        if r_start <= cur_end_plus_rec {
-            cur_end = cur_end.max(r_end);
-        } else {
-            unsafe { *ptr.add(write) = RowRange::from_pointer_bounds_inclusive(cur_start, cur_end) };
-            write += 1;
-            cur_start = r_start;
-            cur_end = r_end;
-        }
-    }
-
-    unsafe { *ptr.add(write) = RowRange::from_pointer_bounds_inclusive(cur_start, cur_end) };
-    write += 1;
-
-    // SAFETY: write <= len always holds.
-    unsafe { ranges.set_len(write) };
-}
-
-/// Scalar overlap check between two vectors of row ranges.
-///
-/// Returns true if any range in `a` overlaps any range in `b`.
-#[inline]
-pub fn any_overlap_scalar(a: &[RowRange], b: &[RowRange]) -> bool {
-    for &ra in a {
-        for &rb in b {
-            if row_ranges_overlap(ra, rb) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 /// AVX2 overlap check between two vectors of row ranges.
 ///
 /// - On non-x86_64 targets, or if AVX2 isn't available at runtime, this falls back to scalar.
@@ -912,7 +813,7 @@ unsafe fn any_overlap_avx2_with_ranges(a: &[RowRange], b: &[RowRange]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::core::db_type::DbType;
+    use crate::core::{db_type::DbType, sme_v2::sme_range_processor_common::merge_row_ranges_sorted_in_place_unchecked};
 
     use super::*;
 
@@ -946,14 +847,14 @@ mod tests {
                 column_type: DbType::I128,
                 op: NumericRuleOp::LessThan,
                 value: NumericScalar::Signed(500),
-                ranges: vec![RowRange::from_row_id_range_inclusive(100, 150)],
+                ranges: smallvec::smallvec![RowRange::from_row_id_range_inclusive(100, 150)],
             },
             NumericCorrelationRule {
                 column_schema_id: 1,
                 column_type: DbType::I128,
                 op: NumericRuleOp::GreaterThan,
                 value: NumericScalar::Signed(6),
-                ranges: vec![RowRange::from_row_id_range_inclusive(110, 150)],
+                ranges: smallvec::smallvec![RowRange::from_row_id_range_inclusive(110, 150)],
             },
         ];
 
@@ -987,14 +888,14 @@ mod tests {
                 column_type: DbType::I128,
                 op: NumericRuleOp::LessThan,
                 value: NumericScalar::Signed(100),
-                ranges: vec![RowRange::from_row_id_range_inclusive(10, 20)],
+                ranges: smallvec::smallvec![RowRange::from_row_id_range_inclusive(10, 20)],
             },
             NumericCorrelationRule {
                 column_schema_id: 1,
                 column_type: DbType::I128,
                 op: NumericRuleOp::GreaterThan,
                 value: NumericScalar::Signed(0),
-                ranges: vec![RowRange::from_row_id_range_inclusive(40, 50)],
+                ranges: smallvec::smallvec![RowRange::from_row_id_range_inclusive(40, 50)],
             },
         ];
 

@@ -1,6 +1,6 @@
 #[cfg(target_arch = "x86_64")]
 use crate::core::sme_v2::rules::STRING_RULE_VALUE_MAX_BYTES;
-use crate::core::{row::row_pointer::ROW_POINTER_RECORD_LEN, sme_v2::rules::{RowRange, StringCorrelationRule, StringRuleOp}};
+use crate::core::{row::row_pointer::ROW_POINTER_RECORD_LEN, sme_v2::{rules::{RowRange, StringCorrelationRule, StringRuleOp}, sme_range_processor_common::merge_row_ranges}};
 
 /// Returns merged candidate row ranges for a string query.
 ///
@@ -207,6 +207,8 @@ unsafe fn candidate_row_ranges_for_query_avx2(
 	rules: &[StringCorrelationRule],
 ) -> smallvec::SmallVec<[RowRange; 64]> {
 	use std::arch::x86_64::*;
+
+use crate::core::sme_v2::sme_range_processor_common::merge_row_ranges;
 
 	let q_bytes = query.as_bytes();
 
@@ -520,72 +522,6 @@ unsafe fn candidate_row_ranges_for_query_avx2(
 	merge_row_ranges(out)
 }
 
-/// Sorts by `start_pointer_pos`, then merges overlapping or directly-adjacent ranges.
-pub fn merge_row_ranges(
-	mut ranges: smallvec::SmallVec<[RowRange; 64]>,
-) -> smallvec::SmallVec<[RowRange; 64]> {
-	ranges.retain(|r| !r.is_empty());
-	if ranges.len() <= 1 {
-		return ranges;
-	}
-
-	ranges.sort_unstable_by(|a, b| {
-		a.start_pointer_pos
-			.cmp(&b.start_pointer_pos)
-			.then_with(|| a.end_pointer_pos_inclusive().cmp(&b.end_pointer_pos_inclusive()))
-	});
-
-	// SAFETY: we just sorted by start/end, and RowRange is Copy.
-	unsafe { merge_row_ranges_sorted_in_place_unchecked(&mut ranges) };
-	ranges
-}
-
-/// Merges overlapping or directly-adjacent ranges **in-place**.
-///
-/// # Safety
-/// Caller must guarantee:
-/// - `ranges` is sorted by `(start_pointer_pos, end_pointer_pos_inclusive)` ascending.
-/// - every element has `row_count > 0`.
-pub unsafe fn merge_row_ranges_sorted_in_place_unchecked(
-	ranges: &mut smallvec::SmallVec<[RowRange; 64]>,
-) {
-	let len = ranges.len();
-	if len <= 1 {
-		return;
-	}
-
-	let ptr = ranges.as_mut_ptr();
-	let mut write = 0usize;
-	let first = unsafe { *ptr };
-	debug_assert!(!first.is_empty());
-	let rec = ROW_POINTER_RECORD_LEN as u64;
-	debug_assert!(rec > 0);
-
-	let mut cur_start = first.start_pointer_pos;
-	let mut cur_end = first.end_pointer_pos_inclusive();
-
-	for read in 1..len {
-		let r = unsafe { *ptr.add(read) };
-		debug_assert!(!r.is_empty());
-		let r_start = r.start_pointer_pos;
-		let r_end = r.end_pointer_pos_inclusive();
-		let cur_end_plus_rec = cur_end.saturating_add(rec);
-		if r_start <= cur_end_plus_rec {
-			cur_end = cur_end.max(r_end);
-		} else {
-			unsafe { *ptr.add(write) = RowRange::from_pointer_bounds_inclusive(cur_start, cur_end) };
-			write += 1;
-			cur_start = r_start;
-			cur_end = r_end;
-		}
-	}
-
-	unsafe { *ptr.add(write) = RowRange::from_pointer_bounds_inclusive(cur_start, cur_end) };
-	write += 1;
-
-	unsafe { ranges.set_len(write) };
-}
-
 #[cfg(test)]
 mod tests {
 	use crate::core::{db_type::DbType, row::row_pointer::ROW_POINTER_RECORD_LEN};
@@ -600,7 +536,7 @@ mod tests {
 				op: StringRuleOp::StartsWith,
 				count: 0,
 				value: "abc".to_string(),
-				ranges: vec![RowRange {
+				ranges: smallvec::smallvec![RowRange {
 					start_pointer_pos: 10 * ROW_POINTER_RECORD_LEN as u64,
 					row_count: 11,
 				}],
@@ -611,7 +547,7 @@ mod tests {
 				op: StringRuleOp::EndsWith,
 				count: 0,
 				value: "xyz".to_string(),
-				ranges: vec![RowRange {
+				ranges: smallvec::smallvec![RowRange {
 					start_pointer_pos: 100 * ROW_POINTER_RECORD_LEN as u64,
 					row_count: 21,
 				}],
@@ -622,7 +558,7 @@ mod tests {
 				op: StringRuleOp::Contains,
 				count: 2,
 				value: "a".to_string(),
-				ranges: vec![RowRange {
+				ranges: smallvec::smallvec![RowRange {
 					start_pointer_pos: 200 * ROW_POINTER_RECORD_LEN as u64,
 					row_count: 21,
 				}],
@@ -650,7 +586,7 @@ mod tests {
 				op: StringRuleOp::Contains,
 				count: 1,
 				value: "a".to_string(),
-				ranges: vec![RowRange {
+				ranges: smallvec::smallvec![RowRange {
 					start_pointer_pos: 1 * ROW_POINTER_RECORD_LEN as u64,
 					row_count: 2,
 				}],
@@ -661,7 +597,7 @@ mod tests {
 				op: StringRuleOp::StartsWith,
 				count: 0,
 				value: "zzz".to_string(),
-				ranges: vec![RowRange {
+				ranges: smallvec::smallvec![RowRange {
 					start_pointer_pos: 10 * ROW_POINTER_RECORD_LEN as u64,
 					row_count: 11,
 				}],

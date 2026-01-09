@@ -36,7 +36,8 @@ use crate::core::{
 use super::{
     rule_store::CorrelationRuleStore,
     rules::{
-        normalize_ranges,
+        normalize_ranges_smallvec,
+        RangeVec,
         NumericCorrelationRule,
         NumericRuleOp,
         NumericScalar,
@@ -49,7 +50,7 @@ use super::{
 #[cfg(debug_assertions)]
 use serde::Serialize;
 
-const RULES_SIZE_VARIABLE: usize = 32;
+const RULES_SIZE_VARIABLE: usize = 64;
 
 const SAMPLE_CAP: usize = 1024 * 4 * RULES_SIZE_VARIABLE;
 const THRESHOLD_COUNT: usize = 8 * RULES_SIZE_VARIABLE;
@@ -57,7 +58,7 @@ const THRESHOLD_COUNT: usize = 8 * RULES_SIZE_VARIABLE;
 // Candidate search breadth around the base percentile indices.
 // Kept intentionally small because this runs during full-table scans.
 //const CANDIDATE_STEPS: [isize; 11] = [-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5];
-const CANDIDATE_STEPS: [isize; 5] = [-2, -1, 0, 1, 2];
+const CANDIDATE_STEPS: [isize; 3] = [-1, 0, 1];
 
 // Scoring weights for choosing thresholds.
 // For integer-like columns, we heavily penalize a high number of disjoint ranges.
@@ -1043,14 +1044,14 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
                 column_type: db_type.clone(),
                 op: NumericRuleOp::LessThan,
                 value: *scalar,
-                ranges: Vec::new(),
+                ranges: RangeVec::new(),
             });
             rules.push(NumericCorrelationRule {
                 column_schema_id: *schema_id,
                 column_type: db_type.clone(),
                 op: NumericRuleOp::GreaterThan,
                 value: *scalar,
-                ranges: Vec::new(),
+                ranges: RangeVec::new(),
             });
         }
 
@@ -1101,7 +1102,7 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
                 op: StringRuleOp::StartsWith,
                 count: 1,
                 value: s,
-                ranges: Vec::new(),
+                ranges: RangeVec::new(),
             });
         }
 
@@ -1115,7 +1116,7 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
                 op: StringRuleOp::EndsWith,
                 count: 1,
                 value: s,
-                ranges: Vec::new(),
+                ranges: RangeVec::new(),
             });
         }
 
@@ -1128,7 +1129,7 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
                     op: StringRuleOp::Contains,
                     count,
                     value: token.clone(),
-                    ranges: Vec::new(),
+                    ranges: RangeVec::new(),
                 });
             }
         }
@@ -1369,7 +1370,7 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
         for (rule_idx, rule) in rules.iter().enumerate() {
             let raw_ranges = std::mem::take(&mut merged_ranges_numeric[col_idx][rule_idx]);
             // This normalize handles sorting and merging touching ranges
-            let ranges = normalize_ranges(raw_ranges);
+            let ranges = normalize_ranges_smallvec(raw_ranges);
             
             new_rules.push(NumericCorrelationRule {
                 column_schema_id: rule.column_schema_id,
@@ -1391,7 +1392,7 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
         let mut new_rules = Vec::with_capacity(rules.len());
         for (rule_idx, rule) in rules.iter().enumerate() {
             let raw_ranges = std::mem::take(&mut merged_ranges_string[col_idx][rule_idx]);
-            let ranges = normalize_ranges(raw_ranges);
+            let ranges = normalize_ranges_smallvec(raw_ranges);
             new_rules.push(StringCorrelationRule {
                 column_schema_id: rule.column_schema_id,
                 column_type: rule.column_type.clone(),
@@ -1421,8 +1422,8 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
         #[derive(Clone)]
         struct CandidatePacked {
             scalar: NumericScalar,
-            lt: Vec<RowRange>,
-            gt: Vec<RowRange>,
+            lt: RangeVec,
+            gt: RangeVec,
             score: u64,
         }
 
@@ -1431,8 +1432,8 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
             let key = scalar_key(r.value);
             let entry = candidates.entry(key).or_insert_with(|| CandidatePacked {
                 scalar: r.value,
-                lt: Vec::new(),
-                gt: Vec::new(),
+                lt: RangeVec::new(),
+                gt: RangeVec::new(),
                 score: u64::MAX,
             });
             match r.op {
@@ -1503,23 +1504,23 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
 
         let mut out_rules: Vec<NumericCorrelationRule> = Vec::with_capacity(chosen.len() * 2);
         for c in chosen.into_iter() {
-            let (mut lt, mut gt) = (c.lt, c.gt);
-            lt = optimize_ranges_dynamic(lt, plan.range_weight, plan.candidate_rows_weight);
-            gt = optimize_ranges_dynamic(gt, plan.range_weight, plan.candidate_rows_weight);
+            let (lt, gt) = (c.lt.into_vec(), c.gt.into_vec());
+            let lt = optimize_ranges_dynamic(lt, plan.range_weight, plan.candidate_rows_weight);
+            let gt = optimize_ranges_dynamic(gt, plan.range_weight, plan.candidate_rows_weight);
 
             out_rules.push(NumericCorrelationRule {
                 column_schema_id: plan.schema_id,
                 column_type: plan.db_type.clone(),
                 op: NumericRuleOp::LessThan,
                 value: c.scalar,
-                ranges: lt,
+                ranges: SmallVec::<[RowRange; 64]>::from_vec(lt),
             });
             out_rules.push(NumericCorrelationRule {
                 column_schema_id: plan.schema_id,
                 column_type: plan.db_type.clone(),
                 op: NumericRuleOp::GreaterThan,
                 value: c.scalar,
-                ranges: gt,
+                ranges: SmallVec::<[RowRange; 64]>::from_vec(gt),
             });
         }
         

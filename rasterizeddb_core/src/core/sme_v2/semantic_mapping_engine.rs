@@ -1,19 +1,44 @@
 use std::sync::OnceLock;
 
 use dashmap::DashMap;
+use opool::{Pool, PoolAllocator};
 use rclite::Arc;
+use smallvec::SmallVec;
 
 use crate::core::{db_type::DbType, sme_v2::sme_range_processor_comp, storage_providers::traits::StorageIO};
 
 use super::{
     rule_store::{CorrelationRuleStore, RulesFileHeaderV2},
     rules::{
-        intersect_ranges, normalize_ranges, NumericCorrelationRule, NumericScalar, RowRange,
+        intersect_ranges, normalize_ranges_smallvec, NumericCorrelationRule, NumericScalar, RowRange,
         StringCorrelationRule, StringRuleOp,
     },
+    sme_range_processor_common::merge_row_ranges,
     sme_range_processor,
     sme_range_processor_str,
 };
+
+struct SmeByteVecAllocator;
+
+impl PoolAllocator<Vec<u8>> for SmeByteVecAllocator {
+    #[inline]
+    fn allocate(&self) -> Vec<u8> {
+        // Keep this modest: SME reads in bounded chunks (READ_CHUNK_POINTERS).
+        Vec::with_capacity(1024 * 1024)
+    }
+
+    #[inline]
+    fn reset(&self, obj: &mut Vec<u8>) {
+        obj.clear();
+    }
+}
+
+static SME_BYTE_VEC_POOL: OnceLock<Pool<SmeByteVecAllocator, Vec<u8>>> = OnceLock::new();
+
+#[inline]
+fn sme_byte_vec_pool() -> &'static Pool<SmeByteVecAllocator, Vec<u8>> {
+    SME_BYTE_VEC_POOL.get_or_init(|| Pool::new(64, SmeByteVecAllocator))
+}
 
 /// Global singleton instance for SME v2.
 pub static SME_V2: OnceLock<Arc<SemanticMappingEngineV2>> = OnceLock::new();
@@ -208,13 +233,13 @@ impl SemanticMappingEngineV2 {
         let results = futures::future::join_all(checks).await;
         log_step(table_name, "execute_predicates", total_start, step_start);
 
-        let mut accumulated: Option<Vec<RowRange>> = None;
+        let mut accumulated: Option<SmallVec<[RowRange; 64]>> = None;
         let mut any_restriction_found = false;
 
         let step_start = Instant::now();
         for res in results {
             let ranges = match res {
-                Ok(Some(v)) => normalize_ranges(v),
+                Ok(Some(v)) => normalize_ranges_smallvec(v),
                 Ok(None) => continue, // No restriction
                 Err(_) => return None, // Error - abort optimization
             };
@@ -223,9 +248,8 @@ impl SemanticMappingEngineV2 {
             accumulated = Some(match accumulated {
                 None => ranges,
                 Some(prev) => {
-                    let mut out = intersect_ranges(&prev, &ranges);
-                    out = normalize_ranges(out);
-                    out
+                    let out = intersect_ranges(&prev, &ranges);
+                    merge_row_ranges(out)
                 }
             });
         }
@@ -237,7 +261,7 @@ impl SemanticMappingEngineV2 {
              return None;
         }
 
-        let final_ranges = accumulated.unwrap_or_default();
+        let final_ranges: SmallVec<[RowRange; 64]> = accumulated.unwrap_or_default();
         if final_ranges.is_empty() {
              // Proven empty intersection -> return empty candidates
             return Some(Arc::new(Vec::new()));
@@ -275,13 +299,23 @@ impl SemanticMappingEngineV2 {
             while remaining > 0 {
                 let take = remaining.min(READ_CHUNK_POINTERS);
                 let span_bytes = take.saturating_mul(rec_len);
-                let mut buf = vec![0u8; span_bytes as usize];
+                let mut buf = sme_byte_vec_pool().get();
+                let want = span_bytes as usize;
+                let cap = buf.capacity();
+                if cap < want {
+                    buf.reserve(want - cap);
+                }
+                buf.resize(want, 0u8);
                 let mut read_pos = pos;
-                if pointers_io.read_data_into_buffer(&mut read_pos, &mut buf).await.is_err() {
+                if pointers_io
+                    .read_data_into_buffer(&mut read_pos, &mut buf[..])
+                    .await
+                    .is_err()
+                {
                     return None;
                 }
 
-                for chunk in buf.chunks_exact(ROW_POINTER_RECORD_LEN) {
+                for chunk in buf[..].chunks_exact(ROW_POINTER_RECORD_LEN) {
                     let p = RowPointer::from_slice_unknown(chunk);
                     if p.deleted {
                         continue;
@@ -509,8 +543,8 @@ impl SemanticMappingEngineV2 {
             return Ok(None);
         }
 
-        // Convert to Vec and normalize defensively.
-        let ranges = normalize_ranges(ranges.into_iter().collect());
+        // The range processor already returns merged ranges.
+        let ranges = ranges.into_vec();
         if ranges.is_empty() {
             return Ok(None);
         }

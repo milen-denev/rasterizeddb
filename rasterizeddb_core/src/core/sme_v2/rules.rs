@@ -1,5 +1,7 @@
 use crate::core::{db_type::DbType, row::row_pointer::ROW_POINTER_RECORD_LEN};
 
+pub type RangeVec = smallvec::SmallVec<[RowRange; 64]>;
+
 /// Numeric correlation rule operation.
 ///
 /// Interpreted as a *predicate on the stored row value* when building rule ranges:
@@ -140,7 +142,7 @@ pub struct NumericCorrelationRule {
     pub column_type: DbType,
     pub op: NumericRuleOp,
     pub value: NumericScalar,
-    pub ranges: Vec<RowRange>,
+    pub ranges: RangeVec,
 }
 
 /// String correlation rule operation.
@@ -180,7 +182,7 @@ pub struct StringCorrelationRule {
     pub op: StringRuleOp,
     pub count: u8,
     pub value: String,
-    pub ranges: Vec<RowRange>,
+    pub ranges: RangeVec,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -355,45 +357,36 @@ pub fn encode_string_rule_value(value: &str) -> Option<(u8, [u8; 16])> {
 }
 
 #[inline]
-pub fn normalize_ranges(mut ranges: Vec<RowRange>) -> Vec<RowRange> {
-    if ranges.len() <= 1 {
-        return ranges;
-    }
+pub fn normalize_ranges(ranges: Vec<RowRange>) -> Vec<RowRange> {
+    use crate::core::sme_v2::sme_range_processor_common::merge_row_ranges;
+    use smallvec::SmallVec;
 
-    use crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN;
-    let len = ROW_POINTER_RECORD_LEN as u64;
-
-    ranges.sort_by_key(|r| r.start_pointer_pos);
-    let mut out = Vec::with_capacity(ranges.len());
-
-    let mut cur = ranges[0];
-    for r in ranges.into_iter().skip(1) {
-        if cur.row_count == 0 {
-            cur = r;
-            continue;
-        }
-
-        let cur_end_excl = cur.end_pointer_pos_exclusive();
-        // Merge overlapping or directly-adjacent byte spans.
-        if r.start_pointer_pos <= cur_end_excl {
-            let new_end_excl = cur_end_excl.max(r.end_pointer_pos_exclusive());
-            let new_count = (new_end_excl.saturating_sub(cur.start_pointer_pos)) / len;
-            cur.row_count = new_count;
-        } else {
-            out.push(cur);
-            cur = r;
-        }
-    }
-    out.push(cur);
-    out
+    // Delegate to the shared merging implementation used by the SME range processors.
+    // This also drops any empty ranges.
+    merge_row_ranges(SmallVec::<[RowRange; 64]>::from_vec(ranges)).into_vec()
 }
 
 #[inline]
-pub fn intersect_ranges(a: &[RowRange], b: &[RowRange]) -> Vec<RowRange> {
+pub fn normalize_ranges_smallvec(ranges: Vec<RowRange>) -> smallvec::SmallVec<[RowRange; 64]> {
+    use crate::core::sme_v2::sme_range_processor_common::merge_row_ranges;
+    use smallvec::SmallVec;
+
+    merge_row_ranges(SmallVec::<[RowRange; 64]>::from_vec(ranges))
+}
+
+#[inline]
+pub fn normalize_range_vec(ranges: RangeVec) -> RangeVec {
+    use crate::core::sme_v2::sme_range_processor_common::merge_row_ranges;
+    merge_row_ranges(ranges)
+}
+
+#[inline]
+pub fn intersect_ranges(a: &[RowRange], b: &[RowRange]) -> RangeVec {
     use crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN;
+    use smallvec::SmallVec;
     let len = ROW_POINTER_RECORD_LEN as u64;
 
-    let mut out = Vec::new();
+    let mut out: RangeVec = SmallVec::new();
     let mut i = 0usize;
     let mut j = 0usize;
     while i < a.len() && j < b.len() {

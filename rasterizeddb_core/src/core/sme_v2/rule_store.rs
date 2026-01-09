@@ -5,7 +5,8 @@ use rclite::Arc;
 use crate::core::storage_providers::traits::StorageIO;
 
 use super::rules::{
-    normalize_ranges, 
+    normalize_range_vec,
+    RangeVec,
     NumericCorrelationRule, 
     NumericRuleOp, 
     NumericRuleRecordDisk,
@@ -411,7 +412,7 @@ impl CorrelationRuleStore {
         let mut out = Vec::with_capacity(total);
 
         for rec in idx.lt.iter().copied() {
-            let ranges = Self::load_ranges_for_rule(rules_io.clone(), rec).await?;
+            let ranges = RangeVec::from_vec(Self::load_ranges_for_rule(rules_io.clone(), rec).await?);
             out.push(NumericCorrelationRule {
                 column_schema_id,
                 column_type: column_type.clone(),
@@ -422,7 +423,7 @@ impl CorrelationRuleStore {
         }
 
         for rec in idx.gt.iter().copied() {
-            let ranges = Self::load_ranges_for_rule(rules_io.clone(), rec).await?;
+            let ranges = RangeVec::from_vec(Self::load_ranges_for_rule(rules_io.clone(), rec).await?);
             out.push(NumericCorrelationRule {
                 column_schema_id,
                 column_type: column_type.clone(),
@@ -536,7 +537,9 @@ impl CorrelationRuleStore {
         let column_type = idx.column_type.clone();
 
         for rec in idx.startswith.iter().copied() {
-            let ranges = Self::load_ranges_for_offset_count(rules_io.clone(), rec.ranges_offset, rec.ranges_count).await?;
+            let ranges = RangeVec::from_vec(
+                Self::load_ranges_for_offset_count(rules_io.clone(), rec.ranges_offset, rec.ranges_count).await?,
+            );
             let value = rec.decoded_value().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "Invalid UTF-8 in string rule value")
             })?;
@@ -551,7 +554,9 @@ impl CorrelationRuleStore {
         }
 
         for rec in idx.endswith.iter().copied() {
-            let ranges = Self::load_ranges_for_offset_count(rules_io.clone(), rec.ranges_offset, rec.ranges_count).await?;
+            let ranges = RangeVec::from_vec(
+                Self::load_ranges_for_offset_count(rules_io.clone(), rec.ranges_offset, rec.ranges_count).await?,
+            );
             let value = rec.decoded_value().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "Invalid UTF-8 in string rule value")
             })?;
@@ -566,7 +571,9 @@ impl CorrelationRuleStore {
         }
 
         for rec in idx.contains.iter().copied() {
-            let ranges = Self::load_ranges_for_offset_count(rules_io.clone(), rec.ranges_offset, rec.ranges_count).await?;
+            let ranges = RangeVec::from_vec(
+                Self::load_ranges_for_offset_count(rules_io.clone(), rec.ranges_offset, rec.ranges_count).await?,
+            );
             let value = rec.decoded_value().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "Invalid UTF-8 in string rule value")
             })?;
@@ -715,7 +722,7 @@ impl CorrelationRuleStore {
             let mut range_pool: Vec<u8> = Vec::new();
 
             for r in lt_rules.into_iter().chain(gt_rules.into_iter()) {
-                let ranges = normalize_ranges(r.ranges.clone());
+                let ranges = normalize_range_vec(r.ranges.clone());
                 let ranges_count: u32 = ranges
                     .len()
                     .try_into()
@@ -826,7 +833,7 @@ impl CorrelationRuleStore {
                         )
                     })?;
 
-                    let ranges = normalize_ranges(r.ranges.clone());
+                    let ranges = normalize_range_vec(r.ranges.clone());
                     let ranges_count: u32 = ranges
                         .len()
                         .try_into()
