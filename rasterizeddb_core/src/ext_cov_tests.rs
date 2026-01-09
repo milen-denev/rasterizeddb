@@ -691,7 +691,7 @@ async fn run_rowcount_case(rows_to_insert: usize) {
         assert_ok(&res, "INSERT tiny_counts");
     }
 
-    let table = database
+    let _table = database
         .tables
         .get("tiny_counts")
         .expect("tiny_counts table should exist after CREATE TABLE")
