@@ -652,3 +652,91 @@ async fn ext_cov_employees_end_to_end_queries() {
     // Ensure we used the executor path the user wanted (not the network client).
     let _ = QueryPurpose::CreateTable(String::new());
 }
+
+async fn run_rowcount_case(rows_to_insert: usize) {
+    let _ = crate::MAX_PERMITS_THREADS.get_or_init(|| 8);
+    let _ = crate::BATCH_SIZE.get_or_init(|| 1024 * 8);
+    let _ = crate::ENABLE_SEMANTICS.get_or_init(|| true);
+    let _ = concurrent_processor::ENABLE_CACHE.get_or_init(|| false);
+
+    let db_dir = tempfile::Builder::new()
+        .prefix("rastdb_rowcount_")
+        .tempdir()
+        .expect("tempdir")
+        .keep();
+
+    let db_dir_str = db_dir
+        .to_str()
+        .expect("db path should be valid UTF-8")
+        .to_string();
+
+    let database = Arc::new(Database::new(&db_dir_str).await);
+
+    let create_sql = r##"CREATE TABLE tiny_counts (
+            id UBIGINT,
+            age INTEGER
+        );"##;
+
+    let res = exec(&database, create_sql).await;
+    assert_ok(&res, "CREATE TABLE tiny_counts");
+
+    for i in 0..rows_to_insert {
+        let id = (i as u64) + 1;
+        let age = (i % 97) as i32;
+        let insert_sql = format!(
+            r##"INSERT INTO tiny_counts (id, age) VALUES ({}, {});"##,
+            id, age
+        );
+        let res = exec(&database, &insert_sql).await;
+        assert_ok(&res, "INSERT tiny_counts");
+    }
+
+    let table = database
+        .tables
+        .get("tiny_counts")
+        .expect("tiny_counts table should exist after CREATE TABLE")
+        .clone();
+
+    let schema = &table.schema.fields;
+
+    let q_all = format!(
+        r##"SELECT id, age FROM tiny_counts WHERE id >= 1 AND id <= {}"##,
+        (rows_to_insert as u64) + 5
+    );
+    let res = exec(&database, &q_all).await;
+    let rows = assert_rows(&res, "rowcount full scan");
+    assert_eq!(
+        rows.len(),
+        rows_to_insert,
+        "rowcount={} full scan length",
+        rows_to_insert
+    );
+
+    let subset_threshold = std::cmp::max(1, rows_to_insert / 2);
+    let q_subset = format!(
+        r##"SELECT id FROM tiny_counts WHERE id > {}"##,
+        subset_threshold
+    );
+    let res = exec(&database, &q_subset).await;
+    let subset_rows = assert_rows(&res, "rowcount subset");
+    let expected_subset = rows_to_insert - subset_threshold;
+    assert_eq!(
+        subset_rows.len(),
+        expected_subset,
+        "rowcount={} subset length",
+        rows_to_insert
+    );
+
+    let q_order = r##"SELECT id FROM tiny_counts WHERE id >= 1 ORDER BY id LIMIT 5"##;
+    let res = exec(&database, q_order).await;
+    let ordered_rows = assert_rows(&res, "rowcount order by limit");
+    let expected_order_len = std::cmp::min(5, rows_to_insert);
+    assert_eq!(ordered_rows.len(), expected_order_len);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ext_cov_rowcount_varied_sizes() {
+    for rows_to_insert in [100usize, 200, 256, 300, 1000, 5000, 10_000] {
+        run_rowcount_case(rows_to_insert).await;
+    }
+}
