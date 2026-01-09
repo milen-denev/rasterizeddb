@@ -8,6 +8,7 @@ use smallvec::SmallVec;
 use crate::core::{db_type::DbType, sme_v2::sme_range_processor_comp, storage_providers::traits::StorageIO};
 
 use super::{
+    in_memory_rules,
     rule_store::{CorrelationRuleStore, RulesFileHeaderV2},
     rules::{
         intersect_ranges, normalize_ranges_smallvec, NumericCorrelationRule, NumericScalar, RowRange,
@@ -369,6 +370,13 @@ impl SemanticMappingEngineV2 {
             return Ok(Some(Arc::clone(h.value())));
         }
 
+        // RAM-only fast path.
+        if let Some(header) = in_memory_rules::get_header(table_name) {
+            self.headers
+                .insert(table_name.to_string(), Arc::clone(&header));
+            return Ok(Some(header));
+        }
+
         let rules_io = CorrelationRuleStore::open_rules_io(base_io, table_name).await;
         let Some(header) = CorrelationRuleStore::try_load_header_v2(rules_io).await? else {
             log::info!(
@@ -411,6 +419,20 @@ impl SemanticMappingEngineV2 {
                 start.elapsed().as_millis()
             );
             return Ok(Some(Arc::clone(rules.value())));
+        }
+
+        // RAM-only fast path.
+        if let Some(rules) = in_memory_rules::get_numeric_rules(table_name, column_schema_id) {
+            if rules.is_empty() {
+                return Ok(None);
+            }
+            self.rules
+                .insert((table_name.to_string(), column_schema_id), Arc::clone(&rules));
+            // Ensure header cache exists too.
+            if let Some(h) = in_memory_rules::get_header(table_name) {
+                self.headers.insert(table_name.to_string(), h);
+            }
+            return Ok(Some(rules));
         }
 
         let header = self.get_or_load_header(base_io.clone(), table_name).await?;
@@ -476,6 +498,19 @@ impl SemanticMappingEngineV2 {
                 start.elapsed().as_millis()
             );
             return Ok(Some(Arc::clone(rules.value())));
+        }
+
+        // RAM-only fast path.
+        if let Some(rules) = in_memory_rules::get_string_rules(table_name, column_schema_id) {
+            if rules.is_empty() {
+                return Ok(None);
+            }
+            self.string_rules
+                .insert((table_name.to_string(), column_schema_id), Arc::clone(&rules));
+            if let Some(h) = in_memory_rules::get_header(table_name) {
+                self.headers.insert(table_name.to_string(), h);
+            }
+            return Ok(Some(rules));
         }
 
         let header = self.get_or_load_header(base_io.clone(), table_name).await?;

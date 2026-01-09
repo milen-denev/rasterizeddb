@@ -1176,6 +1176,8 @@ impl StorageIO for LocalStorageProvider {
     }
 
     fn drop_io(&self) {
+        // Best-effort cleanup. These files are temporary staging artifacts and
+        // may already be gone (or still open on Windows). Do not panic.
         let delimiter = if cfg!(unix) {
             "/"
         } else if cfg!(windows) {
@@ -1185,10 +1187,10 @@ impl StorageIO for LocalStorageProvider {
         };
 
         let file_str = format!("{}{}{}", self.location, delimiter, self.table_name);
+        let _ = remove_file(Path::new(&file_str));
 
-        let path = Path::new(&file_str);
-
-        remove_file(&path).unwrap();
+        // Also remove the companion temp staging file created by this provider.
+        let _ = remove_file(Path::new(&self.temp_file_str));
     }
 
     fn get_hash(&self) -> u32 {
