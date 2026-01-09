@@ -11,7 +11,7 @@ use super::{
     in_memory_rules,
     rule_store::{CorrelationRuleStore, RulesFileHeaderV2},
     rules::{
-        intersect_ranges, normalize_ranges_smallvec, NumericCorrelationRule, NumericScalar, RowRange,
+        normalize_ranges_smallvec, NumericCorrelationRule, NumericScalar, RowRange,
         StringCorrelationRule, StringRuleOp,
     },
     sme_range_processor_common::merge_row_ranges,
@@ -25,7 +25,7 @@ impl PoolAllocator<Vec<u8>> for SmeByteVecAllocator {
     #[inline]
     fn allocate(&self) -> Vec<u8> {
         // Keep this modest: SME reads in bounded chunks (READ_CHUNK_POINTERS).
-        Vec::with_capacity(1024 * 1024)
+        vec![0; 1024 * 1024]
     }
 
     #[inline]
@@ -234,25 +234,49 @@ impl SemanticMappingEngineV2 {
         let results = futures::future::join_all(checks).await;
         log_step(table_name, "execute_predicates", total_start, step_start);
 
+        // println!("Total predicates checked: {}", results.len());
+
+        // for res in results.iter() {
+        //     match res {
+        //         Ok(Some(ranges)) => {
+        //             println!("  Ranges found: {}", ranges.len());
+        //             // for rr in ranges.iter() {
+        //             //     println!("    Range: start={}, count={}", rr.start_pointer_pos, rr.row_count);
+        //             // }
+        //         }
+        //         Ok(None) => {
+        //             println!("  No ranges found for this predicate");
+        //         }
+        //         Err(e) => {
+        //             println!("  Error during predicate processing: {}", e);
+        //         }
+        //     }
+        // }
+
         let mut accumulated: Option<SmallVec<[RowRange; 64]>> = None;
         let mut any_restriction_found = false;
 
         let step_start = Instant::now();
         for res in results {
-            let ranges = match res {
+            let mut ranges = match res {
                 Ok(Some(v)) => normalize_ranges_smallvec(v),
                 Ok(None) => continue, // No restriction
                 Err(_) => return None, // Error - abort optimization
             };
 
+            //println!("ranges after normalization: {}", ranges.len());
+
             any_restriction_found = true;
+
             accumulated = Some(match accumulated {
                 None => ranges,
-                Some(prev) => {
-                    let out = intersect_ranges(&prev, &ranges);
-                    merge_row_ranges(out)
+                Some(mut prev) => {
+                    prev.append(&mut ranges);
+                    merge_row_ranges(prev)
                 }
             });
+
+            //println!("accumulated ranges after intersection: {}", accumulated.as_ref().unwrap().len());
         }
 
         log_step(table_name, "intersect_ranges", total_start, step_start);
@@ -804,6 +828,7 @@ impl SemanticMappingEngineV2 {
         };
 
         step_start = Instant::now();
+
         let ranges = 
             sme_range_processor_comp::candidate_row_ranges_for_comparison_query(
             query,
