@@ -261,9 +261,21 @@ impl SemanticMappingEngineV2 {
              return None;
         }
 
-        let final_ranges: SmallVec<[RowRange; 64]> = accumulated.unwrap_or_default();
+        let mut final_ranges: SmallVec<[RowRange; 64]> = accumulated.unwrap_or_default();
+
+        // Ensure rows affected by recent INSERT/UPDATE/DELETE remain candidates until the next
+        // successful rule rebuild, regardless of how multiple predicates intersect.
+        {
+            let dirty = crate::core::sme_v2::dirty_row_tracker::dirty_row_tracker()
+                .dirty_ranges(table_name);
+            if !dirty.is_empty() {
+                final_ranges.extend(dirty);
+                final_ranges = merge_row_ranges(final_ranges);
+            }
+        }
+
         if final_ranges.is_empty() {
-             // Proven empty intersection -> return empty candidates
+            // Proven empty intersection -> return empty candidates
             return Some(Arc::new(Vec::new()));
         }
 

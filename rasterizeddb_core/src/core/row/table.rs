@@ -183,7 +183,7 @@ impl<S: StorageIO> Table<S> {
             }
         }
 
-        let result = RowPointer::write_row(
+        let result = RowPointer::write_row_with_pointer_record_pos(
             self.io_pointers.clone(),
             self.io_rows.clone(),
             &self.last_row_id,
@@ -206,8 +206,14 @@ impl<S: StorageIO> Table<S> {
                 io::ErrorKind::Other,
                 format!("Failed to insert row: {}", e),
             ));
-        } else if let Ok(row_pointer) = result {
+        } else if let Ok((pointer_record_pos, row_pointer)) = result {
             info!("Successfully inserted row with pointer: {:?}", row_pointer);
+
+            #[cfg(feature = "sme_v2")]
+            {
+                crate::core::sme_v2::dirty_row_tracker::dirty_row_tracker()
+                    .mark_pointer_record_pos(&self.schema.name, pointer_record_pos);
+            }
         }
 
         self.invalidate_query_caches();
@@ -316,6 +322,12 @@ impl<S: StorageIO> Table<S> {
             {
                 error!("Failed to delete row pointer {:?}: {}", pwo.pointer, e);
                 continue;
+            }
+
+            #[cfg(feature = "sme_v2")]
+            {
+                crate::core::sme_v2::dirty_row_tracker::dirty_row_tracker()
+                    .mark_pointer_record_pos(&self.schema.name, pwo.pointer_record_pos);
             }
 
             if !marked_dirty {
@@ -442,7 +454,7 @@ impl<S: StorageIO> Table<S> {
             let mut pointer = pwo.pointer.clone();
 
             let update_result = pointer
-                .update(
+                .update_with_pointer_record_pos(
                     self.io_pointers.clone(),
                     self.io_rows.clone(),
                     pwo.pointer_record_pos,
@@ -453,6 +465,18 @@ impl<S: StorageIO> Table<S> {
                 .await;
 
             if update_result.is_ok() {
+                #[cfg(feature = "sme_v2")]
+                {
+                    let (updated_pointer, new_pointer_pos) = update_result.as_ref().unwrap();
+                    let _ = updated_pointer;
+
+                    let tracker = crate::core::sme_v2::dirty_row_tracker::dirty_row_tracker();
+                    tracker.mark_pointer_record_pos(&self.schema.name, pwo.pointer_record_pos);
+                    if let Some(pos) = *new_pointer_pos {
+                        tracker.mark_pointer_record_pos(&self.schema.name, pos);
+                    }
+                }
+
                 if !marked_dirty {
                     #[cfg(not(feature = "sme_v2"))]
                     {

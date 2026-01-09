@@ -7,6 +7,7 @@ pub mod sme_range_processor;
 pub mod sme_range_processor_comp;
 pub mod sme_range_processor_str;
 pub mod sme_range_processor_common;
+pub mod dirty_row_tracker;
 
 #[cfg(test)]
 mod sme_v2_tests {

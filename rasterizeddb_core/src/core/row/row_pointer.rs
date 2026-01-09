@@ -699,6 +699,39 @@ impl RowPointer {
 
         row_write: &RowWrite,
     ) -> Result<RowPointer> {
+        let (p, new_pos) = self
+            .update_with_pointer_record_pos(
+                pointers_io,
+                rows_io,
+                pointer_record_pos,
+                last_id,
+                table_length,
+                #[cfg(feature = "enable_long_row")]
+                cluster,
+                row_write,
+            )
+            .await?;
+        let _ = new_pos;
+        Ok(p)
+    }
+
+    /// Same as `update`, but returns the newly appended pointer-record position when the update
+    /// requires tombstoning and appending a fresh pointer record.
+    pub async fn update_with_pointer_record_pos<S: StorageIO>(
+        &mut self,
+        pointers_io: Arc<S>,
+        rows_io: Arc<S>,
+        pointer_record_pos: u64,
+
+        #[cfg(feature = "enable_long_row")] last_id: &AtomicU64,
+        #[cfg(not(feature = "enable_long_row"))] last_id: &AtomicU64,
+
+        table_length: &AtomicU64,
+
+        #[cfg(feature = "enable_long_row")] cluster: u32,
+
+        row_write: &RowWrite,
+    ) -> Result<(RowPointer, Option<u64>)> {
         let (new_total_bytes_u64, new_total_string_size) = Self::calculate_total_bytes(row_write);
         let old_len_u64 = self.length as u64;
 
@@ -706,7 +739,7 @@ impl RowPointer {
             // Tombstone old pointer and append a fresh row.
             self.delete(pointers_io.clone(), pointer_record_pos).await?;
 
-            let new_pointer = RowPointer::write_row(
+            let (new_pointer_record_pos, new_pointer) = RowPointer::write_row_with_pointer_record_pos(
                 pointers_io,
                 rows_io,
                 last_id,
@@ -717,7 +750,7 @@ impl RowPointer {
             )
             .await?;
 
-            return Ok(new_pointer);
+            return Ok((new_pointer, Some(new_pointer_record_pos)));
         }
 
         // Overwrite in-place.
@@ -752,7 +785,7 @@ impl RowPointer {
         }
 
         self.save_at(pointers_io, pointer_record_pos).await?;
-        Ok(self.clone())
+        Ok((self.clone(), None))
     }
 
     /// Serializes the RowPointer into a Vec<u8>
@@ -1275,6 +1308,34 @@ impl RowPointer {
 
         row_write: &RowWrite,
     ) -> Result<RowPointer> {
+        let (_pointer_record_pos, p) = RowPointer::write_row_with_pointer_record_pos(
+            pointers_io,
+            rows_io,
+            last_id,
+            table_length,
+            #[cfg(feature = "enable_long_row")]
+            cluster,
+            row_write,
+        )
+        .await?;
+        Ok(p)
+    }
+
+    /// Writes a row and returns the pointer-record byte offset where the RowPointer was appended.
+    pub async fn write_row_with_pointer_record_pos<S: StorageIO>(
+        pointers_io: Arc<S>,
+        rows_io: Arc<S>,
+
+        #[cfg(feature = "enable_long_row")] last_id: &AtomicU64,
+
+        #[cfg(not(feature = "enable_long_row"))] last_id: &AtomicU64,
+
+        table_length: &AtomicU64,
+
+        #[cfg(feature = "enable_long_row")] cluster: u32,
+
+        row_write: &RowWrite,
+    ) -> Result<(u64, RowPointer)> {
         let row_pointer = RowPointer::new(
             last_id,
             table_length,
@@ -1282,6 +1343,8 @@ impl RowPointer {
             cluster,
             row_write,
         );
+
+        let pointer_record_pos = pointers_io.get_len().await;
 
         #[cfg(feature = "enable_data_verification")]
         let io_position = row_pointer.position;
@@ -1384,7 +1447,7 @@ impl RowPointer {
             ));
         }
 
-        Ok(row_pointer)
+        Ok((pointer_record_pos, row_pointer))
     }
 }
 
