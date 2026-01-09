@@ -17,6 +17,7 @@ use smallvec::SmallVec;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     cmp::Ordering as CmpOrdering,
+    io,
     sync::{
         atomic::{AtomicU64, Ordering},
     },
@@ -64,13 +65,13 @@ const CANDIDATE_STEPS: [isize; 3] = [-1, 0, 1];
 // For integer-like columns, we heavily penalize a high number of disjoint ranges.
 // For float columns, we penalize huge candidate-row sets more strongly (otherwise
 // the optimizer may pick thresholds that match "almost everything" in one big range).
-const SCORE_RANGE_COUNT_WEIGHT_INT: u64 = 256;
-const SCORE_CANDIDATE_ROWS_WEIGHT_INT: u64 = 1;
+const SCORE_RANGE_COUNT_WEIGHT_INT: u64 = 512;
+const SCORE_CANDIDATE_ROWS_WEIGHT_INT: u64 = 64;
 
-const SCORE_RANGE_COUNT_WEIGHT_FLOAT: u64 = 64;
+const SCORE_RANGE_COUNT_WEIGHT_FLOAT: u64 = 512;
 const SCORE_CANDIDATE_ROWS_WEIGHT_FLOAT: u64 = 64;
 
-const FLOAT_COARSEN_MAX_CANDIDATE_MULTIPLIER: u64 = 64;
+const FLOAT_COARSEN_MAX_CANDIDATE_MULTIPLIER: u64 = 128;
 const FLOAT_COARSEN_TARGET_MAX_RANGES: usize = 256;
 
 // Max percentage of the total rows a single rule is allowed to cover (1-100).
@@ -86,14 +87,184 @@ const STRING_SUFFIX_CANDIDATES: usize = 24;
 const STRING_CONTAINS_BYTE_CANDIDATES: usize = 12;
 const STRING_CONTAINS_BIGRAM_CANDIDATES: usize = 16;
 const STRING_CONTAINS_TRIGRAM_CANDIDATES: usize = 12;
-const STRING_CONTAINS_COUNTS: [u8; 3] = [0, 1, 2];
+const STRING_CONTAINS_COUNTS: [u8; 7] = [0, 1, 2, 3, 4, 5, 6];
 const STRING_CONTAINS_NGRAM_COUNTS: [u8; 2] = [1, 2];
-const STRING_FINAL_RULES_MAX: usize = 48;
+const STRING_FINAL_RULES_MAX: usize = 128 * RULES_SIZE_VARIABLE;
 
 const STRING_RULE_CANDIDATE_CAP: usize = 512;
 const STRING_FEATURE_MAP_MAX: usize = 4096;
 const STRING_OVERLAP_PENALTY_WEIGHT: u64 = 4;
-const STRING_LOCAL_SEARCH_PASSES: usize = 6;
+const STRING_LOCAL_SEARCH_PASSES: usize = 12;
+
+// Disk-backed range spooling.
+// Using immediate writes avoids the LocalStorageProvider temp_mem RAM mirror.
+const RANGE_SPOOL_WRITE_BUFFER_BYTES: usize = 64 * 1024;
+const RANGE_SPOOL_READ_BUFFER_BYTES: usize = 256 * 1024;
+const RANGE_SPOOL_BUCKETS: usize = 32;
+
+const RANGE_SPOOL_RECORD_LEN: usize = 4 + 8 + 8; // rule_idx(u32) + start(u64) + row_count(u64)
+
+#[inline]
+fn encode_range_spool_record(rule_idx: u32, rr: RowRange, out: &mut [u8; RANGE_SPOOL_RECORD_LEN]) {
+    out[0..4].copy_from_slice(&rule_idx.to_le_bytes());
+    out[4..12].copy_from_slice(&rr.start_pointer_pos.to_le_bytes());
+    out[12..20].copy_from_slice(&rr.row_count.to_le_bytes());
+}
+
+#[inline]
+fn decode_range_spool_record(buf: &[u8]) -> (u32, RowRange) {
+    debug_assert!(buf.len() >= RANGE_SPOOL_RECORD_LEN);
+    let rule_idx = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+    let start_pointer_pos = u64::from_le_bytes(buf[4..12].try_into().unwrap());
+    let row_count = u64::from_le_bytes(buf[12..20].try_into().unwrap());
+    (
+        rule_idx,
+        RowRange {
+            start_pointer_pos,
+            row_count,
+        },
+    )
+}
+
+struct BufferedRangeSpoolWriter<S: StorageIO> {
+    io: S,
+    buf: Vec<u8>,
+}
+
+impl<S: StorageIO> BufferedRangeSpoolWriter<S> {
+    fn new(io: S) -> Self {
+        Self {
+            io,
+            buf: Vec::with_capacity(RANGE_SPOOL_WRITE_BUFFER_BYTES),
+        }
+    }
+
+    async fn push(&mut self, rule_idx: u32, rr: RowRange) {
+        let mut rec = [0u8; RANGE_SPOOL_RECORD_LEN];
+        encode_range_spool_record(rule_idx, rr, &mut rec);
+        self.buf.extend_from_slice(&rec);
+        if self.buf.len() >= RANGE_SPOOL_WRITE_BUFFER_BYTES {
+            self.flush().await;
+        }
+    }
+
+    async fn flush(&mut self) {
+        if self.buf.is_empty() {
+            return;
+        }
+        self.io.append_data(&self.buf, true).await;
+        self.buf.clear();
+    }
+
+    async fn finish(mut self) -> S {
+        self.flush().await;
+        self.io
+    }
+}
+
+async fn read_range_spool_file<S: StorageIO, F: FnMut(u32, RowRange)>(
+    io: &S,
+    mut on_record: F,
+) -> io::Result<()> {
+    let len = io.get_len().await;
+    if len == 0 {
+        return Ok(());
+    }
+
+    let mut pos = 0u64;
+    let mut buf = vec![0u8; RANGE_SPOOL_READ_BUFFER_BYTES];
+    let mut carry: Vec<u8> = Vec::new();
+
+    while pos < len {
+        let remaining = (len - pos) as usize;
+        let to_read = std::cmp::min(remaining, buf.len());
+        let slice = &mut buf[..to_read];
+        io.read_data_into_buffer(&mut pos, slice).await?;
+
+        if carry.is_empty() {
+            let mut i = 0usize;
+            while i + RANGE_SPOOL_RECORD_LEN <= slice.len() {
+                let (rule_idx, rr) = decode_range_spool_record(&slice[i..i + RANGE_SPOOL_RECORD_LEN]);
+                on_record(rule_idx, rr);
+                i += RANGE_SPOOL_RECORD_LEN;
+            }
+            if i < slice.len() {
+                carry.extend_from_slice(&slice[i..]);
+            }
+        } else {
+            let mut merged: Vec<u8> = Vec::with_capacity(carry.len() + slice.len());
+            merged.extend_from_slice(&carry);
+            merged.extend_from_slice(slice);
+            carry.clear();
+
+            let mut i = 0usize;
+            while i + RANGE_SPOOL_RECORD_LEN <= merged.len() {
+                let (rule_idx, rr) = decode_range_spool_record(&merged[i..i + RANGE_SPOOL_RECORD_LEN]);
+                on_record(rule_idx, rr);
+                i += RANGE_SPOOL_RECORD_LEN;
+            }
+            if i < merged.len() {
+                carry.extend_from_slice(&merged[i..]);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// Normalized range store format:
+//  - rule_idx: u32
+//  - ranges_count: u32
+//  - ranges: ranges_count * (start u64, row_count u64)
+#[derive(Clone, Copy, Debug)]
+struct RangeStoreEntry {
+    offset: u64,
+    count: u32,
+    covered: u64,
+}
+
+async fn load_ranges_from_store<S: StorageIO>(
+    store_io: &S,
+    entry: RangeStoreEntry,
+) -> io::Result<Vec<RowRange>> {
+    if entry.count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut header = [0u8; 8];
+    let mut p = entry.offset;
+    store_io.read_data_into_buffer(&mut p, &mut header).await?;
+    let _rule_idx = u32::from_le_bytes(header[0..4].try_into().unwrap());
+    let count = u32::from_le_bytes(header[4..8].try_into().unwrap());
+    if count != entry.count {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "range store corrupted (count mismatch)",
+        ));
+    }
+
+    let bytes_len = (count as usize)
+        .checked_mul(16)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "range store too large"))?;
+    let mut buf = vec![0u8; bytes_len];
+    store_io.read_data_into_buffer(&mut p, &mut buf).await?;
+
+    let mut out: Vec<RowRange> = Vec::with_capacity(count as usize);
+    let mut i = 0usize;
+    while i + 16 <= buf.len() {
+        let start_pointer_pos = u64::from_le_bytes(buf[i..i + 8].try_into().unwrap());
+        let row_count = u64::from_le_bytes(buf[i + 8..i + 16].try_into().unwrap());
+        if row_count > 0 {
+            out.push(RowRange {
+                start_pointer_pos,
+                row_count,
+            });
+        }
+        i += 16;
+    }
+
+    Ok(out)
+}
 
 /// Spawns a background task that rebuilds SME v2 correlation rules on-demand.
 ///
@@ -660,7 +831,7 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
     let total_start = std::time::Instant::now();
 
     let concurrency = *crate::MAX_PERMITS_THREADS.get().unwrap_or(&16);
-    let concurrency = concurrency.max(1);
+    //let concurrency = concurrency.max(1);
 
     #[derive(Clone)]
     struct FieldInfo {
@@ -1342,6 +1513,7 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
         plans.len(),
         string_candidate_rules_by_col.len()
     );
+    let scan_id: u64 = fastrand::u64(..);
     let rules_by_col = Arc::new(rules_by_col);
     let string_rules_by_col = Arc::new(string_candidate_rules_by_col);
 
@@ -1379,8 +1551,8 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
     });
 
     let mut handles_2 = Vec::with_capacity(concurrency);
-    
-    for _ in 0..concurrency {
+
+    for worker_id in 0..concurrency {
         let rx2 = rx2.clone();
         let rows_io = rows_io.clone();
         let row_fetch = row_fetch.clone();
@@ -1388,22 +1560,46 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
         let string_rules_by_col = string_rules_by_col.clone();
         let numeric_schema_id_to_fetch = numeric_schema_id_to_fetch.clone();
         let string_schema_id_to_fetch = string_schema_id_to_fetch.clone();
+        let base_io = base_io.clone();
+        let table_name = table_name.to_string();
+        let scan_id = scan_id;
         
         handles_2.push(tokio::spawn(async move {
-            let mut local_ranges_numeric: Vec<Vec<Vec<RowRange>>> = rules_by_col
+            // Per-worker spool files per column.
+            let mut numeric_spool_names: Vec<String> = Vec::with_capacity(rules_by_col.len());
+            let mut numeric_spools: Vec<BufferedRangeSpoolWriter<S>> = Vec::with_capacity(rules_by_col.len());
+            for (schema_id, _rules) in rules_by_col.iter() {
+                let name = format!(
+                    "{}__sme2_scan_{}__num_col_{}__worker_{}.bin",
+                    table_name, scan_id, schema_id, worker_id
+                );
+                let io = base_io.create_new(name.clone()).await;
+                numeric_spool_names.push(name);
+                numeric_spools.push(BufferedRangeSpoolWriter::new(io));
+            }
+
+            let mut string_spool_names: Vec<String> = Vec::with_capacity(string_rules_by_col.len());
+            let mut string_spools: Vec<BufferedRangeSpoolWriter<S>> = Vec::with_capacity(string_rules_by_col.len());
+            for (schema_id, _rules) in string_rules_by_col.iter() {
+                let name = format!(
+                    "{}__sme2_scan_{}__str_col_{}__worker_{}.bin",
+                    table_name, scan_id, schema_id, worker_id
+                );
+                let io = base_io.create_new(name.clone()).await;
+                string_spool_names.push(name);
+                string_spools.push(BufferedRangeSpoolWriter::new(io));
+            }
+
+            // Maintain open ranges across chunks to reduce fragmentation.
+            let mut open_numeric: Vec<Vec<Option<RowRange>>> = rules_by_col
                 .iter()
-                .map(|(_, rules)| vec![Vec::with_capacity(rules.len()); rules.len()])
+                .map(|(_, rules)| vec![None; rules.len()])
+                .collect();
+            let mut open_string: Vec<Vec<Option<RowRange>>> = string_rules_by_col
+                .iter()
+                .map(|(_, rules)| vec![None; rules.len()])
                 .collect();
 
-            let mut local_ranges_string: Vec<Vec<Vec<RowRange>>> = string_rules_by_col
-                .iter()
-                .map(|(_, rules)| vec![Vec::with_capacity(rules.len()); rules.len()])
-                .collect();
-                
-            // Temp buffering for checking "open" ranges within a chunk is useful for compression,
-            // but since we receive arbitrary chunks, we can just produce ranges and let global merge handle it.
-            // Optimization: Maintain "last open" state for the current chunk processing loop to avoid generating 1-length ranges for contiguous rows within a chunk.
-            
             let mut row = crate::core::row::row::Row::default();
             
             loop {
@@ -1412,17 +1608,6 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
                     lock.recv().await
                 };
                 let Some(chunk) = chunk_opt else { break; };
-                
-                // Per-chunk open state to compress ranges locally
-                let mut open_numeric: Vec<Vec<Option<RowRange>>> = rules_by_col
-                    .iter()
-                    .map(|(_, rules)| vec![None; rules.len()])
-                    .collect();
-
-                let mut open_string: Vec<Vec<Option<RowRange>>> = string_rules_by_col
-                    .iter()
-                    .map(|(_, rules)| vec![None; rules.len()])
-                    .collect();
 
                 use crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN;
                 let len = ROW_POINTER_RECORD_LEN as u64;
@@ -1451,7 +1636,9 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
                                         if pointer_pos == expected_next {
                                             r.row_count = r.row_count.saturating_add(1);
                                         } else {
-                                            local_ranges_numeric[col_rules_idx][rule_idx].push(*r);
+                                            numeric_spools[col_rules_idx]
+                                                .push(rule_idx as u32, *r)
+                                                .await;
                                             *r = RowRange {
                                                 start_pointer_pos: pointer_pos,
                                                 row_count: 1,
@@ -1460,7 +1647,7 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
                                     }
                                 }
                             } else if let Some(r) = open_numeric[col_rules_idx][rule_idx].take() {
-                                local_ranges_numeric[col_rules_idx][rule_idx].push(r);
+                                numeric_spools[col_rules_idx].push(rule_idx as u32, r).await;
                             }
                         }
                     }
@@ -1489,7 +1676,9 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
                                         if pointer_pos == expected_next {
                                             r.row_count = r.row_count.saturating_add(1);
                                         } else {
-                                            local_ranges_string[col_rules_idx][rule_idx].push(*r);
+                                            string_spools[col_rules_idx]
+                                                .push(rule_idx as u32, *r)
+                                                .await;
                                             *r = RowRange {
                                                 start_pointer_pos: pointer_pos,
                                                 row_count: 1,
@@ -1498,30 +1687,38 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
                                     }
                                 }
                             } else if let Some(r) = open_string[col_rules_idx][rule_idx].take() {
-                                local_ranges_string[col_rules_idx][rule_idx].push(r);
+                                string_spools[col_rules_idx].push(rule_idx as u32, r).await;
                             }
                         }
                     }
                 }
-                
-                // Flush open for this chunk
-                for (col_rules_idx, rules) in rules_by_col.iter().enumerate() {
-                    for (rule_idx, _) in rules.1.iter().enumerate() {
-                        if let Some(r) = open_numeric[col_rules_idx][rule_idx].take() {
-                            local_ranges_numeric[col_rules_idx][rule_idx].push(r);
-                        }
-                    }
-                }
+            }
 
-                for (col_rules_idx, rules) in string_rules_by_col.iter().enumerate() {
-                    for (rule_idx, _) in rules.1.iter().enumerate() {
-                        if let Some(r) = open_string[col_rules_idx][rule_idx].take() {
-                            local_ranges_string[col_rules_idx][rule_idx].push(r);
-                        }
+            // Flush any open ranges.
+            for col_rules_idx in 0..open_numeric.len() {
+                for rule_idx in 0..open_numeric[col_rules_idx].len() {
+                    if let Some(r) = open_numeric[col_rules_idx][rule_idx].take() {
+                        numeric_spools[col_rules_idx].push(rule_idx as u32, r).await;
                     }
                 }
             }
-            (local_ranges_numeric, local_ranges_string)
+            for col_rules_idx in 0..open_string.len() {
+                for rule_idx in 0..open_string[col_rules_idx].len() {
+                    if let Some(r) = open_string[col_rules_idx][rule_idx].take() {
+                        string_spools[col_rules_idx].push(rule_idx as u32, r).await;
+                    }
+                }
+            }
+
+            // Ensure data is persisted.
+            for w in numeric_spools.into_iter() {
+                let _ = w.finish().await;
+            }
+            for w in string_spools.into_iter() {
+                let _ = w.finish().await;
+            }
+
+            (numeric_spool_names, string_spool_names)
         }));
     }
 
@@ -1529,74 +1726,188 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
         return Err(e);
     }
     
-    // Collect and merge ranges
-    let mut merged_ranges_numeric: Vec<Vec<Vec<RowRange>>> = rules_by_col
-        .iter()
-        .map(|(_, rules)| vec![Vec::new(); rules.len()])
-        .collect();
-
-    let mut merged_ranges_string: Vec<Vec<Vec<RowRange>>> = string_rules_by_col
-        .iter()
-        .map(|(_, rules)| vec![Vec::new(); rules.len()])
-        .collect();
+    // Collect spool files.
+    let mut numeric_worker_spools_by_col: Vec<Vec<String>> = vec![Vec::new(); rules_by_col.len()];
+    let mut string_worker_spools_by_col: Vec<Vec<String>> = vec![Vec::new(); string_rules_by_col.len()];
 
     for h in handles_2 {
-        let (thread_numeric, thread_string) = h.await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-        for (col_idx, rules_ranges) in thread_numeric.into_iter().enumerate() {
-            for (rule_idx, ranges) in rules_ranges.into_iter().enumerate() {
-                merged_ranges_numeric[col_idx][rule_idx].extend(ranges);
-            }
+        let (num_names, str_names) = h
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        for (col_idx, name) in num_names.into_iter().enumerate() {
+            numeric_worker_spools_by_col[col_idx].push(name);
         }
-
-        for (col_idx, rules_ranges) in thread_string.into_iter().enumerate() {
-            for (rule_idx, ranges) in rules_ranges.into_iter().enumerate() {
-                merged_ranges_string[col_idx][rule_idx].extend(ranges);
-            }
+        for (col_idx, name) in str_names.into_iter().enumerate() {
+            string_worker_spools_by_col[col_idx].push(name);
         }
     }
-    
-    // Normalize global ranges
-    // Unwrapping the Arc to modify the inner rules is hard. We have to reconstruct rules structure.
-    let mut final_rules_by_col: Vec<(u64, Vec<NumericCorrelationRule>)> = Vec::new();
 
+    // Build normalized range stores per column (disk-backed) and gather lightweight stats.
+    #[derive(Clone)]
+    struct ColumnRangeStore<S: StorageIO> {
+        schema_id: u64,
+        store_io: S,
+        entries: Vec<Option<RangeStoreEntry>>, // by rule_idx
+        range_counts: Vec<u32>,
+        covered_rows: Vec<u64>,
+    }
+
+    async fn build_column_range_store<S: StorageIO>(
+        base_io: Arc<S>,
+        table_name: &str,
+        scan_id: u64,
+        kind: &str,
+        schema_id: u64,
+        rule_count: usize,
+        worker_spool_names: &[String],
+    ) -> io::Result<ColumnRangeStore<S>> {
+        // Bucketize worker spools by rule_idx % RANGE_SPOOL_BUCKETS.
+        let mut bucket_ios: Vec<S> = Vec::with_capacity(RANGE_SPOOL_BUCKETS);
+        let mut bucket_writers: Vec<BufferedRangeSpoolWriter<S>> = Vec::with_capacity(RANGE_SPOOL_BUCKETS);
+        for b in 0..RANGE_SPOOL_BUCKETS {
+            let name = format!(
+                "{}__sme2_scan_{}__{}_col_{}__bucket_{}.bin",
+                table_name, scan_id, kind, schema_id, b
+            );
+            let io = base_io.create_new(name).await;
+            bucket_ios.push(io.clone());
+            bucket_writers.push(BufferedRangeSpoolWriter::new(io));
+        }
+
+        for name in worker_spool_names.iter() {
+            let io_in = base_io.create_new(name.clone()).await;
+            read_range_spool_file(&io_in, |rule_idx, rr| {
+                let b = (rule_idx as usize) % RANGE_SPOOL_BUCKETS;
+                // Buffering happens in the writer.
+                // We cannot await here, so we just enqueue into a local Vec and flush after.
+                // Instead, we use a small workaround: push into an in-memory batch per bucket.
+                // (bounded by the read buffer size)
+                let _ = (b, rule_idx, rr);
+            })
+            .await?;
+
+            // Second pass: re-read and actually write (with async).
+            // This looks redundant, but keeps the implementation simple without async closures.
+            // The read buffer is large; in practice this is dominated by IO.
+            let io_in = base_io.create_new(name.clone()).await;
+            let mut batch: Vec<(usize, u32, RowRange)> = Vec::new();
+            read_range_spool_file(&io_in, |rule_idx, rr| {
+                let b = (rule_idx as usize) % RANGE_SPOOL_BUCKETS;
+                batch.push((b, rule_idx, rr));
+            })
+            .await?;
+            for (b, rule_idx, rr) in batch.into_iter() {
+                bucket_writers[b].push(rule_idx, rr).await;
+            }
+        }
+
+        for w in bucket_writers.into_iter() {
+            let _ = w.finish().await;
+        }
+
+        // Normalized store.
+        let store_name = format!(
+            "{}__sme2_scan_{}__{}_col_{}__ranges_store.bin",
+            table_name, scan_id, kind, schema_id
+        );
+        let store_io = base_io.create_new(store_name).await;
+
+        let mut entries: Vec<Option<RangeStoreEntry>> = vec![None; rule_count];
+        let mut range_counts: Vec<u32> = vec![0u32; rule_count];
+        let mut covered_rows: Vec<u64> = vec![0u64; rule_count];
+
+        let mut offset = 0u64;
+
+        for b in 0..RANGE_SPOOL_BUCKETS {
+            let bucket_io = &bucket_ios[b];
+            let mut by_rule: HashMap<u32, Vec<RowRange>> = HashMap::new();
+            read_range_spool_file(bucket_io, |rule_idx, rr| {
+                by_rule.entry(rule_idx).or_default().push(rr);
+            })
+            .await?;
+
+            if by_rule.is_empty() {
+                continue;
+            }
+
+            for (rule_idx, raw) in by_rule.into_iter() {
+                let rule_usize = rule_idx as usize;
+                if rule_usize >= rule_count {
+                    continue;
+                }
+
+                let norm = normalize_ranges_smallvec(raw);
+                let count: u32 = norm.len().try_into().unwrap_or(u32::MAX);
+                let covered = ranges_candidate_rows(&norm);
+
+                range_counts[rule_usize] = count;
+                covered_rows[rule_usize] = covered;
+
+                if count == 0 {
+                    continue;
+                }
+
+                // Write section: header + ranges.
+                let mut header = [0u8; 8];
+                header[0..4].copy_from_slice(&rule_idx.to_le_bytes());
+                header[4..8].copy_from_slice(&count.to_le_bytes());
+                store_io.append_data(&header, true).await;
+
+                for rr in norm.iter() {
+                    let mut rec = [0u8; 16];
+                    rec[0..8].copy_from_slice(&rr.start_pointer_pos.to_le_bytes());
+                    rec[8..16].copy_from_slice(&rr.row_count.to_le_bytes());
+                    store_io.append_data(&rec, true).await;
+                }
+
+                entries[rule_usize] = Some(RangeStoreEntry {
+                    offset,
+                    count,
+                    covered,
+                });
+                offset = offset
+                    .saturating_add(8)
+                    .saturating_add((count as u64).saturating_mul(16));
+            }
+        }
+
+        Ok(ColumnRangeStore {
+            schema_id,
+            store_io,
+            entries,
+            range_counts,
+            covered_rows,
+        })
+    }
+
+    let mut numeric_range_stores: Vec<ColumnRangeStore<S>> = Vec::with_capacity(rules_by_col.len());
     for (col_idx, (schema_id, rules)) in rules_by_col.iter().enumerate() {
-        let mut new_rules = Vec::with_capacity(rules.len());
-        for (rule_idx, rule) in rules.iter().enumerate() {
-            let raw_ranges = std::mem::take(&mut merged_ranges_numeric[col_idx][rule_idx]);
-            // This normalize handles sorting and merging touching ranges
-            let ranges = normalize_ranges_smallvec(raw_ranges);
-            
-            new_rules.push(NumericCorrelationRule {
-                column_schema_id: rule.column_schema_id,
-                column_type: rule.column_type.clone(),
-                op: rule.op,
-                value: rule.value,
-                ranges,
-            });
-        }
-        rules_by_col_ref_mut_hack(&mut final_rules_by_col).push((*schema_id, new_rules));
+        let store = build_column_range_store(
+            base_io.clone(),
+            table_name,
+            scan_id,
+            "num",
+            *schema_id,
+            rules.len(),
+            &numeric_worker_spools_by_col[col_idx],
+        )
+        .await?;
+        numeric_range_stores.push(store);
     }
-    
-    // Reassign rules by col for usage in optimization below
-    let rules_by_col = final_rules_by_col;
 
-    // Build string candidate rules with ranges.
-    let mut string_rules_by_col_with_ranges: Vec<(u64, Vec<StringCorrelationRule>)> = Vec::new();
+    let mut string_range_stores: Vec<ColumnRangeStore<S>> = Vec::with_capacity(string_rules_by_col.len());
     for (col_idx, (schema_id, rules)) in string_rules_by_col.iter().enumerate() {
-        let mut new_rules = Vec::with_capacity(rules.len());
-        for (rule_idx, rule) in rules.iter().enumerate() {
-            let raw_ranges = std::mem::take(&mut merged_ranges_string[col_idx][rule_idx]);
-            let ranges = normalize_ranges_smallvec(raw_ranges);
-            new_rules.push(StringCorrelationRule {
-                column_schema_id: rule.column_schema_id,
-                column_type: rule.column_type.clone(),
-                op: rule.op,
-                count: rule.count,
-                value: rule.value.clone(),
-                ranges,
-            });
-        }
-        string_rules_by_col_with_ranges.push((*schema_id, new_rules));
+        let store = build_column_range_store(
+            base_io.clone(),
+            table_name,
+            scan_id,
+            "str",
+            *schema_id,
+            rules.len(),
+            &string_worker_spools_by_col[col_idx],
+        )
+        .await?;
+        string_range_stores.push(store);
     }
 
     log::info!("scan_whole_table_build_rules: Pass 2 (range building) done in {:.2?}", pass2_start.elapsed());
@@ -1605,44 +1916,63 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
     let mut final_chosen_rules_by_col: Vec<(u64, Vec<NumericCorrelationRule>)> = Vec::new();
     let opt_start = std::time::Instant::now();
 
+    // Build schema_id -> numeric column index for range store access.
+    let mut numeric_schema_idx: HashMap<u64, usize> = HashMap::new();
+    for (idx, (schema_id, _)) in rules_by_col.iter().enumerate() {
+        numeric_schema_idx.insert(*schema_id, idx);
+    }
+
     for plan in plans.iter() {
-        let Some((_schema_id, candidate_rules)) = rules_by_col
-            .iter()
-            .find(|(sid, _)| *sid == plan.schema_id)
-        else {
+        let Some(&col_idx) = numeric_schema_idx.get(&plan.schema_id) else {
             continue;
         };
+        let candidate_rules = &rules_by_col[col_idx].1;
+        let store = &numeric_range_stores[col_idx];
 
         #[derive(Clone)]
         struct CandidatePacked {
             scalar: NumericScalar,
-            lt: RangeVec,
-            gt: RangeVec,
+            lt_rule_idx: Option<usize>,
+            gt_rule_idx: Option<usize>,
+            lt_score: u64,
+            gt_score: u64,
             score: u64,
         }
 
         let mut candidates: BTreeMap<[u8; 16], CandidatePacked> = BTreeMap::new();
-        for r in candidate_rules.iter() {
+        for (rule_idx, r) in candidate_rules.iter().enumerate() {
             let key = scalar_key(r.value);
             let entry = candidates.entry(key).or_insert_with(|| CandidatePacked {
                 scalar: r.value,
-                lt: RangeVec::new(),
-                gt: RangeVec::new(),
+                lt_rule_idx: None,
+                gt_rule_idx: None,
+                lt_score: u64::MAX,
+                gt_score: u64::MAX,
                 score: u64::MAX,
             });
+
+            let range_count = store.range_counts[rule_idx] as u64;
+            let covered = store.covered_rows[rule_idx];
+            let s = range_count
+                .saturating_mul(plan.range_weight)
+                .saturating_add(covered.saturating_mul(plan.candidate_rows_weight));
+
             match r.op {
-                NumericRuleOp::LessThan => entry.lt = r.ranges.clone(),
-                NumericRuleOp::GreaterThan => entry.gt = r.ranges.clone(),
+                NumericRuleOp::LessThan => {
+                    entry.lt_rule_idx = Some(rule_idx);
+                    entry.lt_score = s;
+                }
+                NumericRuleOp::GreaterThan => {
+                    entry.gt_rule_idx = Some(rule_idx);
+                    entry.gt_score = s;
+                }
             }
         }
+
         for (_k, c) in candidates.iter_mut() {
-            let s = score_rule_ranges(&c.lt, plan.range_weight, plan.candidate_rows_weight)
-                .saturating_add(score_rule_ranges(
-                    &c.gt,
-                    plan.range_weight,
-                    plan.candidate_rows_weight,
-                ));
-            c.score = s;
+            let lt = if c.lt_score == u64::MAX { 0 } else { c.lt_score };
+            let gt = if c.gt_score == u64::MAX { 0 } else { c.gt_score };
+            c.score = lt.saturating_add(gt);
         }
 
         let mut chosen_keys: Vec<[u8; 16]> = Vec::new();
@@ -1698,23 +2028,36 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
 
         let mut out_rules: Vec<NumericCorrelationRule> = Vec::with_capacity(chosen.len() * 2);
         for c in chosen.into_iter() {
-            let (lt, gt) = (c.lt.into_vec(), c.gt.into_vec());
-            let lt = optimize_ranges_dynamic(lt, plan.range_weight, plan.candidate_rows_weight);
-            let gt = optimize_ranges_dynamic(gt, plan.range_weight, plan.candidate_rows_weight);
+            let mut lt_ranges: Vec<RowRange> = Vec::new();
+            let mut gt_ranges: Vec<RowRange> = Vec::new();
+
+            if let Some(rule_idx) = c.lt_rule_idx {
+                if let Some(entry) = store.entries[rule_idx] {
+                    lt_ranges = load_ranges_from_store(&store.store_io, entry).await?;
+                }
+            }
+            if let Some(rule_idx) = c.gt_rule_idx {
+                if let Some(entry) = store.entries[rule_idx] {
+                    gt_ranges = load_ranges_from_store(&store.store_io, entry).await?;
+                }
+            }
+
+            let lt_ranges = optimize_ranges_dynamic(lt_ranges, plan.range_weight, plan.candidate_rows_weight);
+            let gt_ranges = optimize_ranges_dynamic(gt_ranges, plan.range_weight, plan.candidate_rows_weight);
 
             out_rules.push(NumericCorrelationRule {
                 column_schema_id: plan.schema_id,
                 column_type: plan.db_type.clone(),
                 op: NumericRuleOp::LessThan,
                 value: c.scalar,
-                ranges: SmallVec::<[RowRange; 64]>::from_vec(lt),
+                ranges: SmallVec::<[RowRange; 64]>::from_vec(lt_ranges),
             });
             out_rules.push(NumericCorrelationRule {
                 column_schema_id: plan.schema_id,
                 column_type: plan.db_type.clone(),
                 op: NumericRuleOp::GreaterThan,
                 value: c.scalar,
-                ranges: SmallVec::<[RowRange; 64]>::from_vec(gt),
+                ranges: SmallVec::<[RowRange; 64]>::from_vec(gt_ranges),
             });
         }
         
@@ -1745,20 +2088,270 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
     log::info!("scan_whole_table_build_rules: Plan optimization done in {:.2?}", opt_start.elapsed());
     log::info!("scan_whole_table_build_rules: completed total in {:.2?}", total_start.elapsed());
 
-    // Select best string rules per column (trial-and-error optimization of candidates).
+    // Select best string rules per column (disk-backed, RAM efficient).
     let mut final_string_rules_by_col: Vec<(u64, Vec<StringCorrelationRule>)> = Vec::new();
     use crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN;
     let total_rows = pointers_io.get_len().await / (ROW_POINTER_RECORD_LEN as u64);
-    for (schema_id, rules) in string_rules_by_col_with_ranges.into_iter() {
-        let out = select_string_rules_trial_and_error(rules, total_rows);
 
-        if !out.is_empty() {
-            final_string_rules_by_col.push((schema_id, out));
+    for (col_idx, (schema_id, rules)) in string_rules_by_col.iter().enumerate() {
+        let store = &string_range_stores[col_idx];
+        let broad_threshold = if total_rows > 0 {
+            (total_rows as u128 * MAX_RULE_COVERAGE_PERCENT as u128 / 100) as u64
+        } else {
+            u64::MAX
+        };
+
+        #[derive(Clone)]
+        struct CandMeta {
+            rule_idx: usize,
+            score: u64,
+            covered: u64,
+            op: StringRuleOp,
+            count: u8,
+            value: String,
+            column_type: DbType,
+        }
+
+        // Dedup + prefilter using store stats.
+        let mut best: HashMap<(u8, u8, String), CandMeta> = HashMap::new();
+        for (rule_idx, r) in rules.iter().enumerate() {
+            let covered = store.covered_rows[rule_idx];
+            if covered == 0 || covered > broad_threshold {
+                continue;
+            }
+            let rc = store.range_counts[rule_idx] as u64;
+            let score = rc
+                .saturating_mul(SCORE_RANGE_COUNT_WEIGHT_INT)
+                .saturating_add(covered.saturating_mul(SCORE_CANDIDATE_ROWS_WEIGHT_INT));
+
+            let key = (string_rule_op_id(r.op), r.count, r.value.clone());
+            let cand = CandMeta {
+                rule_idx,
+                score,
+                covered,
+                op: r.op,
+                count: r.count,
+                value: r.value.clone(),
+                column_type: r.column_type.clone(),
+            };
+
+            match best.get(&key) {
+                None => {
+                    best.insert(key, cand);
+                }
+                Some(prev) => {
+                    if cand.score < prev.score {
+                        best.insert(key, cand);
+                    }
+                }
+            }
+        }
+
+        let mut cands: Vec<CandMeta> = best.into_values().collect();
+        if cands.is_empty() {
+            continue;
+        }
+        cands.sort_by(|a, b| {
+            a.score
+                .cmp(&b.score)
+                .then_with(|| a.covered.cmp(&b.covered))
+                .then_with(|| b.value.len().cmp(&a.value.len()))
+        });
+        if cands.len() > STRING_RULE_CANDIDATE_CAP {
+            cands.truncate(STRING_RULE_CANDIDATE_CAP);
+        }
+        let max_out = std::cmp::min(STRING_FINAL_RULES_MAX, cands.len());
+
+        // Small cache for on-demand range loads.
+        let mut range_cache: HashMap<usize, RangeVec> = HashMap::new();
+        let mut cache_order: Vec<usize> = Vec::new();
+        let mut load_ranges = |rule_idx: usize| -> io::Result<RangeVec> {
+            if let Some(r) = range_cache.get(&rule_idx) {
+                return Ok(r.clone());
+            }
+            let Some(entry) = store.entries[rule_idx] else {
+                return Ok(RangeVec::new());
+            };
+            let v = futures::executor::block_on(load_ranges_from_store(&store.store_io, entry))?;
+            let rv = RangeVec::from_vec(v);
+            // Tiny LRU-ish cap.
+            range_cache.insert(rule_idx, rv.clone());
+            cache_order.push(rule_idx);
+            if cache_order.len() > 64 {
+                if let Some(old) = cache_order.first().copied() {
+                    range_cache.remove(&old);
+                    cache_order.remove(0);
+                }
+            }
+            Ok(rv)
+        };
+
+        // Greedy selection with overlap penalty.
+        let mut selected: Vec<usize> = Vec::new();
+        let mut selected_ranges: Vec<RangeVec> = Vec::new();
+        let mut selected_set: HashSet<usize> = HashSet::new();
+
+        for _ in 0..max_out {
+            let mut best_idx: Option<usize> = None;
+            let mut best_cost = u64::MAX;
+
+            for idx in 0..cands.len() {
+                if selected_set.contains(&idx) {
+                    continue;
+                }
+                let cand = &cands[idx];
+                let ranges = match load_ranges(cand.rule_idx) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+
+                let mut overlap = 0u64;
+                for sr in selected_ranges.iter() {
+                    overlap = overlap
+                        .saturating_add(row_ranges_intersection_count(&ranges, sr));
+                }
+                let cost = cand
+                    .score
+                    .saturating_add(overlap.saturating_mul(STRING_OVERLAP_PENALTY_WEIGHT));
+                if cost < best_cost {
+                    best_cost = cost;
+                    best_idx = Some(idx);
+                }
+            }
+
+            let Some(chosen) = best_idx else { break; };
+            selected_set.insert(chosen);
+            let rule_idx = cands[chosen].rule_idx;
+            let ranges = load_ranges(rule_idx).unwrap_or_else(|_| RangeVec::new());
+            selected.push(chosen);
+            selected_ranges.push(ranges);
+        }
+
+        if selected.is_empty() {
+            continue;
+        }
+
+        let objective = |sel: &[usize], sel_ranges: &[RangeVec]| -> u64 {
+            let mut sum = 0u64;
+            for &i in sel.iter() {
+                sum = sum.saturating_add(cands[i].score);
+            }
+            for i in 0..sel_ranges.len() {
+                for j in (i + 1)..sel_ranges.len() {
+                    let o = row_ranges_intersection_count(&sel_ranges[i], &sel_ranges[j]);
+                    sum = sum.saturating_add(o.saturating_mul(STRING_OVERLAP_PENALTY_WEIGHT));
+                }
+            }
+            sum
+        };
+
+        // Local search swaps (neighbor-based).
+        for _pass in 0..STRING_LOCAL_SEARCH_PASSES {
+            let mut improved = false;
+            let cur_obj = objective(&selected, &selected_ranges);
+
+            'outer: for pos in 0..selected.len() {
+                let cur_idx = selected[pos];
+                let cur_meta = &cands[cur_idx];
+
+                let mut best_swap: Option<usize> = None;
+                let mut best_obj = cur_obj;
+
+                for idx in 0..cands.len() {
+                    if selected_set.contains(&idx) {
+                        continue;
+                    }
+                    // Neighbor heuristic.
+                    let cand = &cands[idx];
+                    let a = StringCorrelationRule {
+                        column_schema_id: *schema_id,
+                        column_type: cur_meta.column_type.clone(),
+                        op: cur_meta.op,
+                        count: cur_meta.count,
+                        value: cur_meta.value.clone(),
+                        ranges: RangeVec::new(),
+                    };
+                    let b = StringCorrelationRule {
+                        column_schema_id: *schema_id,
+                        column_type: cand.column_type.clone(),
+                        op: cand.op,
+                        count: cand.count,
+                        value: cand.value.clone(),
+                        ranges: RangeVec::new(),
+                    };
+                    if !string_rules_neighbor(&a, &b) {
+                        continue;
+                    }
+
+                    let cand_ranges = match load_ranges(cand.rule_idx) {
+                        Ok(r) => r,
+                        Err(_) => continue,
+                    };
+
+                    let mut test_sel = selected.clone();
+                    let mut test_ranges = selected_ranges.clone();
+                    test_sel[pos] = idx;
+                    test_ranges[pos] = cand_ranges;
+                    let obj = objective(&test_sel, &test_ranges);
+                    if obj < best_obj {
+                        best_obj = obj;
+                        best_swap = Some(idx);
+                    }
+                }
+
+                if let Some(new_idx) = best_swap {
+                    selected_set.remove(&cur_idx);
+                    selected_set.insert(new_idx);
+                    selected[pos] = new_idx;
+                    let r = load_ranges(cands[new_idx].rule_idx).unwrap_or_else(|_| RangeVec::new());
+                    selected_ranges[pos] = r;
+                    improved = true;
+                    break 'outer;
+                }
+            }
+
+            if !improved {
+                break;
+            }
+        }
+
+        // Stable-ish ordering for output.
+        selected.sort_by(|&a, &b| {
+            string_rule_op_id(cands[a].op)
+                .cmp(&string_rule_op_id(cands[b].op))
+                .then_with(|| cands[a].score.cmp(&cands[b].score))
+                .then_with(|| cands[b].value.len().cmp(&cands[a].value.len()))
+                .then_with(|| cands[a].value.cmp(&cands[b].value))
+        });
+
+        let mut out_rules: Vec<StringCorrelationRule> = Vec::with_capacity(selected.len());
+        for idx in selected.into_iter() {
+            let cand = &cands[idx];
+            let ranges = match store.entries[cand.rule_idx] {
+                Some(entry) => RangeVec::from_vec(load_ranges_from_store(&store.store_io, entry).await?),
+                None => RangeVec::new(),
+            };
+
+            out_rules.push(StringCorrelationRule {
+                column_schema_id: *schema_id,
+                column_type: cand.column_type.clone(),
+                op: cand.op,
+                count: cand.count,
+                value: cand.value.clone(),
+                ranges,
+            });
+        }
+
+        if !out_rules.is_empty() {
+            final_string_rules_by_col.push((*schema_id, out_rules));
         }
     }
 
     let rules_io = CorrelationRuleStore::open_rules_io(base_io.clone(), table_name).await;
     CorrelationRuleStore::save_rules_atomic::<S>(rules_io, &final_chosen_rules_by_col, &final_string_rules_by_col).await?;
+
+    // Rules are now rebuilt successfully; clear the dirty pointer tracker for this table.
+    crate::core::sme_v2::dirty_row_tracker::dirty_row_tracker().clear_table(table_name);
 
     #[cfg(debug_assertions)]
     {
@@ -1772,8 +2365,6 @@ pub async fn scan_whole_table_build_rules<S: StorageIO>(
 
     Ok(())
 }
-
-fn rules_by_col_ref_mut_hack<T>(v: &mut Vec<T>) -> &mut Vec<T> { v }
 
 fn string_rule_op_id(op: StringRuleOp) -> u8 {
     match op {
@@ -1877,194 +2468,6 @@ fn string_rules_neighbor(a: &StringCorrelationRule, b: &StringCorrelationRule) -
             diff <= 1 && (ab.starts_with(bb) || ab.ends_with(bb) || bb.starts_with(ab) || bb.ends_with(ab))
         }
     }
-}
-
-fn select_string_rules_trial_and_error(
-    rules: Vec<StringCorrelationRule>,
-    total_rows: u64,
-) -> Vec<StringCorrelationRule> {
-    if rules.is_empty() {
-        return Vec::new();
-    }
-
-    let broad_threshold = if total_rows > 0 {
-        (total_rows as u128 * MAX_RULE_COVERAGE_PERCENT as u128 / 100) as u64
-    } else {
-        u64::MAX
-    };
-
-    #[derive(Clone)]
-    struct Cand {
-        score: u64,
-        covered: u64,
-        rule: StringCorrelationRule,
-    }
-
-    // De-dup and pre-filter.
-    let mut best: HashMap<(u8, u8, String), Cand> = HashMap::new();
-    for r in rules.into_iter() {
-        let covered = ranges_candidate_rows(&r.ranges);
-        if covered == 0 {
-            continue;
-        }
-        if covered > broad_threshold {
-            continue;
-        }
-        let score = score_rule_ranges(
-            &r.ranges,
-            SCORE_RANGE_COUNT_WEIGHT_INT,
-            SCORE_CANDIDATE_ROWS_WEIGHT_INT,
-        );
-        let key = (string_rule_op_id(r.op), r.count, r.value.clone());
-        let cand = Cand {
-            score,
-            covered,
-            rule: r,
-        };
-        match best.get(&key) {
-            None => {
-                best.insert(key, cand);
-            }
-            Some(prev) => {
-                // Prefer strictly lower score; then prefer more selective.
-                let better = cand.score < prev.score
-                    || (cand.score == prev.score && cand.covered < prev.covered);
-                if better {
-                    best.insert(key, cand);
-                }
-            }
-        }
-    }
-
-    let mut cands: Vec<Cand> = best.into_values().collect();
-    if cands.is_empty() {
-        return Vec::new();
-    }
-
-    // Keep a bounded candidate pool for the optimizer.
-    cands.sort_by(|a, b| {
-        a.score
-            .cmp(&b.score)
-            .then_with(|| a.covered.cmp(&b.covered))
-            .then_with(|| b.rule.value.len().cmp(&a.rule.value.len()))
-    });
-    if cands.len() > STRING_RULE_CANDIDATE_CAP {
-        cands.truncate(STRING_RULE_CANDIDATE_CAP);
-    }
-
-    let max_out = std::cmp::min(STRING_FINAL_RULES_MAX, cands.len());
-
-    let mut selected: Vec<usize> = Vec::new();
-    let mut selected_set: HashSet<usize> = HashSet::new();
-
-    // Greedy with overlap penalty (encourages a balanced rule set rather than many near-duplicates).
-    for _ in 0..max_out {
-        let mut best_idx: Option<usize> = None;
-        let mut best_cost = u64::MAX;
-
-        for idx in 0..cands.len() {
-            if selected_set.contains(&idx) {
-                continue;
-            }
-
-            let mut overlap = 0u64;
-            for &sidx in selected.iter() {
-                overlap = overlap.saturating_add(row_ranges_intersection_count(
-                    &cands[sidx].rule.ranges,
-                    &cands[idx].rule.ranges,
-                ));
-            }
-            let cost = cands[idx]
-                .score
-                .saturating_add(overlap.saturating_mul(STRING_OVERLAP_PENALTY_WEIGHT));
-
-            if cost < best_cost {
-                best_cost = cost;
-                best_idx = Some(idx);
-            }
-        }
-
-        let Some(chosen) = best_idx else { break; };
-        selected_set.insert(chosen);
-        selected.push(chosen);
-    }
-
-    if selected.is_empty() {
-        return Vec::new();
-    }
-
-    let objective = |sel: &[usize]| -> u64 {
-        let mut sum = 0u64;
-        for &i in sel.iter() {
-            sum = sum.saturating_add(cands[i].score);
-        }
-        for i in 0..sel.len() {
-            for j in (i + 1)..sel.len() {
-                let ov = row_ranges_intersection_count(&cands[sel[i]].rule.ranges, &cands[sel[j]].rule.ranges);
-                sum = sum.saturating_add(ov.saturating_mul(STRING_OVERLAP_PENALTY_WEIGHT));
-            }
-        }
-        sum
-    };
-
-    // Local search: try swapping in neighbor rules (shorter/longer prefixes/suffixes, different contains counts)
-    // when it improves the global objective.
-    for _pass in 0..STRING_LOCAL_SEARCH_PASSES {
-        let mut improved = false;
-        let cur_obj = objective(&selected);
-
-        'outer: for pos in 0..selected.len() {
-            let cur_idx = selected[pos];
-            let cur_rule = &cands[cur_idx].rule;
-
-            let mut best_swap: Option<usize> = None;
-            let mut best_obj = cur_obj;
-
-            for idx in 0..cands.len() {
-                if selected_set.contains(&idx) {
-                    continue;
-                }
-                let cand_rule = &cands[idx].rule;
-                if !string_rules_neighbor(cur_rule, cand_rule) {
-                    continue;
-                }
-
-                let mut trial = selected.clone();
-                trial[pos] = idx;
-                let obj = objective(&trial);
-                if obj < best_obj {
-                    best_obj = obj;
-                    best_swap = Some(idx);
-                }
-            }
-
-            if let Some(new_idx) = best_swap {
-                selected_set.remove(&cur_idx);
-                selected_set.insert(new_idx);
-                selected[pos] = new_idx;
-                improved = true;
-                break 'outer;
-            }
-        }
-
-        if !improved {
-            break;
-        }
-    }
-
-    // Stable-ish ordering for output.
-    selected.sort_by(|&a, &b| {
-        string_rule_op_id(cands[a].rule.op)
-            .cmp(&string_rule_op_id(cands[b].rule.op))
-            .then_with(|| cands[a].score.cmp(&cands[b].score))
-            .then_with(|| cands[b].rule.value.len().cmp(&cands[a].rule.value.len()))
-            .then_with(|| cands[a].rule.value.cmp(&cands[b].rule.value))
-    });
-
-    selected
-        .into_iter()
-        .map(|idx| cands[idx].rule.clone())
-        .collect()
 }
 
 #[cfg(debug_assertions)]
