@@ -1,0 +1,31 @@
+Smart Semantic Mapping
+
+Then starting the rules creation process a snapshot of the rows that have been inserted shall be 
+taken, and only after the end should be removed.
+A secondary AtomicCacheGeneric shall be tracking which rows have been updated, deleted or inserted 
+and those shall be appended to the main AtomicCacheGeneric at the end of the rules creation process.
+
+Schema 
+
+[Main AtomicCacheGeneric]  [Secondary AtomicCacheGeneric]  [AtomicBool Append_To_Secondary]
+
+~ No rules creation process running ~
+
+[ true ]                     [ false ]                       [ false ]
+
+~ Rules creation process started ~
+
+[ true ]                    [ true ]                        [ true ]
+
+-> Take Snapshot (1)
+
+~ Rules creation process ended ~
+
+[ true ]                    [ false ]                       [ false ]
+                               
+                         -> Take Snapshot (2)
+
+Compare Snapshot 1 and Snapshot 2.
+Clear Main AtomicCacheGeneric.
+Append updated, deleted, and inserted rows to Main AtomicCacheGeneric derived from the comparison.
+Clear Secondary AtomicCacheGeneric.
