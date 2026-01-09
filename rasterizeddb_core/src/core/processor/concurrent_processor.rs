@@ -21,7 +21,7 @@ use super::{
 
 use crate::{
     MAX_PERMITS_THREADS, cache::atomic_cache::AtomicGenericCache, core::{
-        processor::transformer::RowBlocks, row::{row::{Row, RowFetch}, row_pointer::{RowPointer, RowPointerIterator}, schema::SchemaField}, storage_providers::traits::StorageIO, tokenizer::{query_parser::QueryParser, query_tokenizer::tokenize}
+        processor::transformer::RowBlocks, row::{row::{Row, RowFetch}, row_pointer::{RowPointer, RowPointerIterator, ROW_POINTER_RECORD_LEN}, schema::SchemaField}, storage_providers::traits::StorageIO, tokenizer::{query_parser::QueryParser, query_tokenizer::tokenize}
     }, memory_pool::MemoryBlock
 };
 
@@ -41,6 +41,10 @@ pub static EMPTY_STR: &str = "";
 pub static ATOMIC_CACHE: OnceLock<std::sync::Arc<AtomicGenericCache<u64, Arc<Vec<RowPointer>>>>> = OnceLock::new();
 pub static ENABLE_CACHE: OnceLock<bool> = OnceLock::new();
 const CRC_64: Crc<u64> = Crc::<u64>::new(&CRC_64_ECMA_182);
+
+// SME range pre-filtering can be lossy on small tables; fall back to full scans below this.
+// Empirically, keep SME candidates disabled until tables exceed ~5K rows.
+const SME_MIN_ROWS_FOR_CANDIDATES: usize = 1024 * 5;
 
 #[derive(Debug, Clone)]
 pub struct RowPointerWithOffset {
@@ -648,11 +652,21 @@ impl ConcurrentProcessor {
             log::info!("Starting semantic processing for query: {}", where_query);
         }
 
+        // Avoid SME candidates on very small tables; rule sampling can drop matches.
+        let total_rows_estimate = {
+            let len = iterator.io().get_len().await as usize;
+            len / ROW_POINTER_RECORD_LEN
+        };
+        let should_use_sme = semantics_enabled() && total_rows_estimate >= SME_MIN_ROWS_FOR_CANDIDATES;
+
         // If SME semantics are enabled and SME can build candidates for this query/table,
         // only iterate those. Otherwise fall back to scanning all pointers.
-        let sme_candidates =
+        let sme_candidates = if should_use_sme {
             Self::maybe_build_sme_candidates(table_name, &tokens_arc, &schema_arc, &io_rows_outer, iterator, limit)
-                .await;
+                .await
+        } else {
+            None
+        };
 
         if sme_candidates.is_some() {
             log::info!(
