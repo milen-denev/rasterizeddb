@@ -231,12 +231,8 @@ impl LocalStorageProvider {
             #[cfg(test)]
             let temp_len = {
                 // If we're operating under the system temp directory (typical for tests),
-                // ensure a clean slate by truncating any previous content.
+                // ensure temp file is clean; keep main file intact to avoid nuking freshly written data.
                 let sys_tmp = std::env::temp_dir().to_string_lossy().to_string();
-
-                if final_location.starts_with(&sys_tmp) {
-                    let _ = file_read_mmap.set_len(0);
-                }
 
                 // Determine temp length; under system temp dir, truncate temp as well.
                 let temp_len = if final_location.starts_with(&sys_tmp) {
@@ -365,13 +361,8 @@ impl LocalStorageProvider {
             #[cfg(test)]
             let temp_len = {
                 // If we're operating under the system temp directory (typical for tests),
-                // ensure a clean slate by truncating any previous content.
+                // ensure temp file is clean; keep main file intact to avoid nuking freshly written data.
                 let sys_tmp = std::env::temp_dir().to_string_lossy().to_string();
-
-                if location_str.starts_with(&sys_tmp) {
-                    let _ = file_read_mmap.set_len(0);
-                    let _ = temp_file.set_len(0);
-                }
 
                 // Determine temp length; under system temp dir, truncate temp as well.
                 let temp_len = if location_str.starts_with(&sys_tmp) {
