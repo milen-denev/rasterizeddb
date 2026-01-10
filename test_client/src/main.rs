@@ -22,6 +22,8 @@ use std::{
     sync::Arc,
 };
 
+const QUERY: &str = "salary >= 249999.0";
+
 #[tokio::main(flavor = "multi_thread")]
 #[allow(unreachable_code)]
 async fn main() -> std::io::Result<()> {
@@ -488,13 +490,13 @@ async fn insert_rows(client: &Arc<DbClient>) {
 
 async fn run_queries(client: &Arc<DbClient>) {
     for _ in 0..5 {
-        let query = r##"
+        let query = format!(r##"
             SELECT id, salary, age, name FROM employees
-            WHERE id > 0 AND id <= 100
-        "##;
+            WHERE {}
+        "##, QUERY);
 
         let instant = std::time::Instant::now();
-        let select_result = client.execute_query(query).await;
+        let select_result = client.execute_query(&query).await;
         let elapsed = instant.elapsed().as_micros();
 
         println!("Query executed in {} μs", elapsed);

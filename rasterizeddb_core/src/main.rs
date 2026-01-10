@@ -106,10 +106,6 @@ fn main() -> std::io::Result<()> {
     let cache_size = args.cache_size.unwrap_or(100_000);
     let min_size = if cache_size < 1024 { 1024 } else { cache_size };
 
-    #[cfg(debug_assertions)]
-    let enable_cache = args.enable_cache.unwrap_or(false);
-
-    #[cfg(not(debug_assertions))]
     let enable_cache = args.enable_cache.unwrap_or(true);
 
     if enable_cache {
