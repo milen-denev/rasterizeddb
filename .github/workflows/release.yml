@@ -10,7 +10,7 @@ permissions:
 
 env:
   # Toggle to enable PGO+BOLT on Linux builds. Defaults off to keep CI fast/stable.
-  ENABLE_PGO_BOLT: "true"
+  ENABLE_PGO_BOLT: "false"
   # Toggle x86-64-v4 builds (some crates may not support v4).
   ENABLE_X86_64_V4: "false"
 
