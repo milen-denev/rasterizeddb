@@ -12,11 +12,10 @@ use super::{
     in_memory_rules,
     rule_store::{CorrelationRuleStore, RulesFileHeaderV2},
     rules::{
-        normalize_ranges_smallvec, NumericCorrelationRule, NumericScalar, RowRange,
-        StringCorrelationRule, StringRuleOp,
+        intersect_ranges, normalize_ranges_smallvec, NumericCorrelationRule, NumericScalar,
+        RowRange, StringCorrelationRule, StringRuleOp,
     },
     sme_range_processor_common::merge_row_ranges,
-    sme_range_processor,
     sme_range_processor_str,
 };
 
@@ -296,6 +295,11 @@ impl SemanticMappingEngineV2 {
                 Ok(None) => continue, // No restriction
                 Err(_) => return None, // Error - abort optimization
             };
+
+            // Skip predicates that produced no candidate ranges to avoid collapsing to zero.
+            if ranges.is_empty() {
+                continue;
+            }
 
             //println!("ranges after normalization: {}", ranges.len());
 
@@ -747,22 +751,63 @@ impl SemanticMappingEngineV2 {
         );
 
         step_start = Instant::now();
-        let ranges = sme_range_processor::candidate_row_ranges_for_query(
+
+        // Build upper/lower envelopes separately, then intersect to approximate equality.
+        let le_ranges = sme_range_processor_comp::candidate_row_ranges_for_comparison_query(
             query,
+            sme_range_processor_comp::ComparisonType::LessThanOrEqual,
+            rules.as_slice(),
+            None,
+        );
+        let ge_ranges = sme_range_processor_comp::candidate_row_ranges_for_comparison_query(
+            query,
+            sme_range_processor_comp::ComparisonType::GreaterThanOrEqual,
             rules.as_slice(),
             None,
         );
 
+        let le_len = le_ranges.len();
+        let ge_len = ge_ranges.len();
+
+        #[inline]
+        fn total_rows_estimate(ranges: &[RowRange]) -> u64 {
+            ranges.iter().map(|r| r.row_count).sum()
+        }
+
+        let chosen = if !le_ranges.is_empty() && !ge_ranges.is_empty() {
+            let intersection = intersect_ranges(&le_ranges, &ge_ranges);
+            if !intersection.is_empty() {
+                merge_row_ranges(intersection)
+            } else {
+                // Rules disagree (no overlap); fall back to the tighter side.
+                let le_rows = total_rows_estimate(&le_ranges);
+                let ge_rows = total_rows_estimate(&ge_ranges);
+                if le_rows <= ge_rows {
+                    le_ranges
+                } else {
+                    ge_ranges
+                }
+            }
+        } else if !le_ranges.is_empty() {
+            le_ranges
+        } else if !ge_ranges.is_empty() {
+            ge_ranges
+        } else {
+            smallvec::SmallVec::new()
+        };
+
         log::info!(
-            "SME v2: candidates_for_numeric_equals: table={} col={} step=compute_ranges t_ms={} dt_ms={} ranges={}",
+            "SME v2: candidates_for_numeric_equals: table={} col={} step=compute_ranges t_ms={} dt_ms={} le={} ge={} chosen={}",
             table_name,
             column_schema_id,
             total_start.elapsed().as_millis(),
             step_start.elapsed().as_millis(),
-            ranges.len(),
+            le_len,
+            ge_len,
+            chosen.len(),
         );
 
-        if ranges.is_empty() {
+        if chosen.is_empty() {
             return Ok(None);
         };
 
@@ -771,9 +816,9 @@ impl SemanticMappingEngineV2 {
             table_name,
             column_schema_id,
             total_start.elapsed().as_millis(),
-            ranges.len(),
+            chosen.len(),
         );
-        Ok(Some(ranges.to_vec()))
+        Ok(Some(chosen.to_vec()))
     }
 
     /// Builds candidate row ranges for range queries (>, >=, <, <=).
