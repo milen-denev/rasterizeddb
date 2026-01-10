@@ -310,8 +310,17 @@ fn make_employee_row_write(i: u64) -> RowWrite {
 }
 
 async fn generate_rows_and_pointers_to_disk() -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
     const ROWS_PATH: &str = r"G:\Databases\Production\employees.db";
+    #[cfg(target_os = "windows")]
     const POINTERS_PATH: &str = r"G:\Databases\Production\employees_pointers.db";
+
+    #[cfg(target_os = "linux")]
+    const ROWS_PATH: &str = "/home/milen-denev/Documents/db/employees.db";
+    
+    #[cfg(target_os = "linux")]
+    const POINTERS_PATH: &str = "/home/milen-denev/Documents/db/employees_pointers.db";
+
     const ROW_COUNT: u64 = 5_000_000;
 
     // Very rough capacity hints to reduce reallocations.
