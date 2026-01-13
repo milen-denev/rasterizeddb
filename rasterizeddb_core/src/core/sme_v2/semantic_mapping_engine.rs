@@ -3,9 +3,9 @@ use std::sync::{OnceLock, atomic::{AtomicU64, Ordering}};
 use dashmap::DashMap;
 use opool::{Pool, PoolAllocator};
 use rclite::Arc;
-use smallvec::SmallVec;
+use smallvec::{SmallVec, ToSmallVec};
 
-use crate::core::{db_type::DbType, sme_v2::sme_range_processor_comp, storage_providers::traits::StorageIO};
+use crate::core::{db_type::DbType, row::row::Row, sme_v2::{sme_range_merger::intersect_many, sme_range_processor_comp}, storage_providers::traits::StorageIO};
 use cacheguard::CacheGuard;
 
 use super::{
@@ -285,45 +285,33 @@ impl SemanticMappingEngineV2 {
         //     }
         // }
 
-        let mut accumulated: Option<SmallVec<[RowRange; 64]>> = None;
-        let mut any_restriction_found = false;
+        let mut ranges_1: Vec<Vec<RowRange>> = Vec::new();
+
+        println!("SME: \n {:?}", results);
 
         let step_start = Instant::now();
+        
         for res in results {
-            let mut ranges = match res {
-                Ok(Some(v)) => normalize_ranges_smallvec(v),
+            match res {
+                Ok(Some(v)) => {
+                    if !v.is_empty() {
+                        ranges_1.push(v);
+                    } else {
+                        continue;
+                    }
+                },
                 Ok(None) => continue, // No restriction
                 Err(_) => return None, // Error - abort optimization
-            };
-
-            // Skip predicates that produced no candidate ranges to avoid collapsing to zero.
-            if ranges.is_empty() {
-                continue;
             }
-
-            //println!("ranges after normalization: {}", ranges.len());
-
-            any_restriction_found = true;
-
-            accumulated = Some(match accumulated {
-                None => ranges,
-                Some(mut prev) => {
-                    prev.append(&mut ranges);
-                    merge_row_ranges(prev)
-                }
-            });
-
-            //println!("accumulated ranges after intersection: {}", accumulated.as_ref().unwrap().len());
         }
+
+        let final_vec = ranges_1.iter().map(|x| x.as_slice()).collect::<Vec<_>>();
+
+        let intersected = intersect_many(final_vec);
 
         log_step(table_name, "intersect_ranges", total_start, step_start);
 
-        if !any_restriction_found {
-             // No supported rules found for any predicate -> Fallback to full scan
-             return None;
-        }
-
-        let mut final_ranges: SmallVec<[RowRange; 64]> = accumulated.unwrap_or_default();
+        let mut final_ranges: SmallVec<[RowRange; 64]> = intersected;
 
         // Ensure rows affected by recent INSERT/UPDATE/DELETE remain candidates until the next
         // successful rule rebuild, regardless of how multiple predicates intersect.
