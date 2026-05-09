@@ -73,55 +73,54 @@ impl Row {
 
     pub fn into_vec(self) -> Vec<u8> {
         let mut vec = Vec::new();
+        self.extend_serialized(&mut vec);
+        vec
+    }
 
+    /// Append this row's wire-format bytes to `out` without allocating a fresh
+    /// `Vec` per row. Equivalent to `out.extend_from_slice(&self.into_vec())`,
+    /// but avoids the intermediate allocation and a redundant memcpy. Used by
+    /// the bytes-mode query path so workers can serialize directly into a
+    /// per-worker output buffer.
+    pub fn extend_serialized(&self, out: &mut Vec<u8>) {
         #[cfg(feature = "enable_long_row")]
-        const LEN_EMPTY_BUFFER: [u8; 8] = [0u8; 8];
-
+        const LEN_HEADER: usize = 8;
         #[cfg(not(feature = "enable_long_row"))]
-        const LEN_EMPTY_BUFFER: [u8; 4] = [0u8; 4];
+        const LEN_HEADER: usize = 4;
 
-        vec.extend_from_slice(&LEN_EMPTY_BUFFER);
+        let header_pos = out.len();
+        // Reserve the length header; we patch it in once we know the size.
+        out.extend_from_slice(&[0u8; LEN_HEADER]);
 
         let mut size: u64 = 0;
 
-        for column in self.columns {
+        for column in &self.columns {
             let column_data = column.data.into_slice();
             let column_size = column_data.len() as u64;
 
             size += 8 + 8;
 
-            vec.extend_from_slice(&column_size.to_le_bytes());
-            vec.extend_from_slice(&column.schema_id.to_le_bytes());
-
-            vec.extend_from_slice(&column_data);
+            out.extend_from_slice(&column_size.to_le_bytes());
+            out.extend_from_slice(&column.schema_id.to_le_bytes());
+            out.extend_from_slice(column_data);
 
             size += column_size;
 
-            vec.extend_from_slice(&[column.column_type.to_byte()]);
+            out.push(column.column_type.to_byte());
 
             size += 1;
         }
 
         #[cfg(feature = "enable_long_row")]
-        let len_bytes = (size as u64).to_le_bytes();
-
-        #[cfg(not(feature = "enable_long_row"))]
-        let len_bytes = (size as u32).to_le_bytes();
-
-        vec[0] = len_bytes[0];
-        vec[1] = len_bytes[1];
-        vec[2] = len_bytes[2];
-        vec[3] = len_bytes[3];
-
-        #[cfg(feature = "enable_long_row")]
         {
-            vec[4] = len_bytes[4];
-            vec[5] = len_bytes[5];
-            vec[6] = len_bytes[6];
-            vec[7] = len_bytes[7];
+            let len_bytes = (size as u64).to_le_bytes();
+            out[header_pos..header_pos + 8].copy_from_slice(&len_bytes);
         }
-
-        vec
+        #[cfg(not(feature = "enable_long_row"))]
+        {
+            let len_bytes = (size as u32).to_le_bytes();
+            out[header_pos..header_pos + 4].copy_from_slice(&len_bytes);
+        }
     }
 
     pub fn from_vec(bytes: &[u8]) -> std::io::Result<Self> {
@@ -212,9 +211,12 @@ impl Row {
 }
 
 pub fn rows_into_vec(rows: Vec<Row>) -> Vec<u8> {
-    let mut vec = Vec::new();
-    for row in rows {
-        vec.extend(row.into_vec());
+    // Rough pre-size: avoids most reallocs for the common SELECT-many case.
+    // Header (4 or 8 bytes) + per-column metadata (~17 bytes) + payload bytes.
+    let approx = rows.len() * 64;
+    let mut vec = Vec::with_capacity(approx);
+    for row in &rows {
+        row.extend_serialized(&mut vec);
     }
     vec
 }

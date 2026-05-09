@@ -18,12 +18,7 @@ use std::sync::OnceLock;
 use tokio::task::yield_now;
 
 use memmap2::{Mmap, MmapOptions};
-
-#[cfg(windows)]
-use std::os::windows::fs::FileExt;
-
-#[cfg(unix)]
-use std::os::unix::fs::FileExt;
+use smallvec::SmallVec;
 
 // Removed chunk cache; no longer need helpers::Chunk
 
@@ -685,39 +680,57 @@ impl LocalStorageProvider {
             let start_copied = overall_copied;
 
             // 1. Try mmap
-            let mmap_copied = self.read_from_mmap(*position, &mut buffer[overall_copied..overall_copied+phase1_target], main_len);
+            let mut mmap_copied = self.read_from_mmap(*position, &mut buffer[overall_copied..overall_copied+phase1_target], main_len);
             overall_copied += mmap_copied;
             *position += mmap_copied as u64;
 
-            // 2. Fallback to disk (blocking)
+            // 1b. If mmap is stale (file extended past current mmap coverage),
+            // refresh it once and retry. This avoids the very expensive
+            // spawn_blocking pread fallback below — a single remap covers
+            // millions of subsequent reads, while spawn_blocking incurs tokio
+            // scheduler + parking_lot mutex overhead on every call.
+            if overall_copied < start_copied + phase1_target {
+                let mmap_len_now = self._memory_map.load().len() as u64;
+                if main_len > mmap_len_now {
+                    self.update_memory_map();
+                    let still_needed = (start_copied + phase1_target) - overall_copied;
+                    let extra = self.read_from_mmap(
+                        *position,
+                        &mut buffer[overall_copied..overall_copied + still_needed],
+                        main_len,
+                    );
+                    overall_copied += extra;
+                    *position += extra as u64;
+                    mmap_copied += extra;
+                }
+            }
+            let _ = mmap_copied;
+
+            // 2. Fallback to synchronous pread (no spawn_blocking). pread is a
+            // single syscall that returns immediately for in-cache pages; the
+            // overhead of spawn_blocking (tokio blocking-pool mutex + condvar)
+            // dwarfs the syscall itself. Briefly blocking the worker is fine
+            // here because the only reason we get here is a true cache miss
+            // beyond mmap coverage that the remap above couldn't fix.
             while overall_copied < start_copied + phase1_target {
                 let needed = (start_copied + phase1_target) - overall_copied;
-                let file_ref = self.read_file.clone();
-                let read_pos = *position;
+                let dst = &mut buffer[overall_copied..overall_copied + needed];
 
-                let mut temp_buf = byte_vec_pool().get();
-                let cap = temp_buf.capacity();
-                if cap < needed {
-                    temp_buf.reserve(needed - cap);
-                }
-                unsafe { temp_buf.set_len(needed); }
-
-                let res = tokio::task::spawn_blocking(move || {
-                    #[cfg(unix)]
-                    let r = file_ref.read_at(&mut temp_buf, read_pos);
-                    #[cfg(windows)]
-                    let r = file_ref.seek_read(&mut temp_buf, read_pos);
-                    (r, temp_buf)
-                }).await.map_err(|e| io::Error::new(ErrorKind::Other, e))?;
-
-                let (read_res, temp_buf) = res;
-                let n = read_res?;
+                #[cfg(unix)]
+                let n = {
+                    use std::os::unix::fs::FileExt;
+                    self.read_file.read_at(dst, *position)?
+                };
+                #[cfg(windows)]
+                let n = {
+                    use std::os::windows::fs::FileExt;
+                    self.read_file.seek_read(dst, *position)?
+                };
 
                 if n == 0 {
-                     return Err(io::Error::new(ErrorKind::UnexpectedEof, "Unexpected EOF in main file"));
+                    return Err(io::Error::new(ErrorKind::UnexpectedEof, "Unexpected EOF in main file"));
                 }
 
-                buffer[overall_copied..overall_copied + n].copy_from_slice(&temp_buf[..n]);
                 overall_copied += n;
                 *position += n as u64;
             }
@@ -734,31 +747,23 @@ impl LocalStorageProvider {
                  overall_copied += copied;
                  *position += copied as u64;
 
-                 // 2. Fallback to disk (blocking)
+                 // 2. Fallback to synchronous pread (no spawn_blocking).
                  if copied < to_read {
                      let needed = to_read - copied;
                      let current_temp_pos = *position - main_len;
-                     let file_ref = self.temp_read_file.clone();
+                     let dst = &mut buffer[overall_copied..overall_copied + needed];
 
-                     let mut temp_buf = byte_vec_pool().get();
-                     let cap = temp_buf.capacity();
-                     if cap < needed {
-                         temp_buf.reserve(needed - cap);
-                     }
-                     unsafe { temp_buf.set_len(needed); }
+                     #[cfg(unix)]
+                     let n = {
+                         use std::os::unix::fs::FileExt;
+                         self.temp_read_file.read_at(dst, current_temp_pos)?
+                     };
+                     #[cfg(windows)]
+                     let n = {
+                         use std::os::windows::fs::FileExt;
+                         self.temp_read_file.seek_read(dst, current_temp_pos)?
+                     };
 
-                     let res = tokio::task::spawn_blocking(move || {
-                        #[cfg(unix)]
-                        let r = file_ref.read_at(&mut temp_buf, current_temp_pos);
-                        #[cfg(windows)]
-                        let r = file_ref.seek_read(&mut temp_buf, current_temp_pos);
-                        (r, temp_buf)
-                     }).await.map_err(|e| io::Error::new(ErrorKind::Other, e))?;
-
-                     let (read_res, temp_buf) = res;
-                     let n = read_res?;
-
-                     buffer[overall_copied..overall_copied + n].copy_from_slice(&temp_buf[..n]);
                      overall_copied += n;
                      *position += n as u64;
                  }
@@ -878,35 +883,90 @@ impl StorageIO for LocalStorageProvider {
     }
 
     async fn read_vectored(&self, reads: &mut [(u64, &mut [u8])]) -> io::Result<()> {
-        let mut pending = Vec::with_capacity(reads.len());
+        // Pending entries are rare (only when mmap can't satisfy the read fully),
+        // so a SmallVec avoids a per-call heap allocation in the common case.
+        let mut pending: SmallVec<[(usize, u64, usize); 16]> = SmallVec::new();
         let main_len = self.load_file_len();
 
-        for (i, (pos, buf)) in reads.iter_mut().enumerate() {
-            if buf.is_empty() { continue; }
+        // Hoist the TLS borrow + Arc<Mmap> resolution out of the per-entry loop.
+        // Previously each entry called `mmap_copy_region` -> `with_cached_mmap`,
+        // which performed a TLS RefCell borrow and an `ArcSwap::load` per entry.
+        self.with_cached_mmap(|mmap| {
+            let mmap_bytes: &[u8] = &mmap[..];
+            let mmap_len = mmap_bytes.len() as u64;
 
-            // Try mmap if within main file
-            if *pos < main_len {
-                let copied = self.read_from_mmap(*pos, buf, main_len);
-                if copied == buf.len() {
-                    continue; // Done
+            for (i, (pos, buf)) in reads.iter_mut().enumerate() {
+                if buf.is_empty() {
+                    continue;
                 }
-                // Partial or no mmap.
-                pending.push((i, *pos + copied as u64, copied));
-            } else {
-                // Temp file or EOF
-                pending.push((i, *pos, 0));
+
+                if *pos < main_len && *pos < mmap_len {
+                    let max_span = (mmap_len - *pos).min(main_len - *pos);
+                    let to_copy = min(buf.len(), max_span as usize);
+                    if to_copy > 0 {
+                        let start = *pos as usize;
+                        buf[..to_copy].copy_from_slice(&mmap_bytes[start..start + to_copy]);
+                    }
+                    if to_copy == buf.len() {
+                        continue;
+                    }
+                    pending.push((i, *pos + to_copy as u64, to_copy));
+                } else {
+                    pending.push((i, *pos, 0));
+                }
             }
+        });
+
+        if pending.is_empty() {
+            return Ok(());
         }
 
-        if pending.is_empty() { return Ok(()); }
-
-        // Process pending reads
+        // Process pending reads (temp file or mmap-miss fallbacks)
         for (idx, pos, offset) in pending {
             let (_, buf) = &mut reads[idx];
             let mut p = pos;
             self.read_data_into_buffer_internal(&mut p, &mut buf[offset..]).await?;
         }
         Ok(())
+    }
+
+    /// Synchronous fast path: copies every read directly out of the mmap if
+    /// possible. Returns true only when every entry was fully satisfied — the
+    /// caller can then skip the async `read_vectored` entirely (no future
+    /// poll, no waker setup, no SmallVec for pending).
+    #[inline]
+    fn try_read_vectored_sync(&self, reads: &mut [(u64, &mut [u8])]) -> bool {
+        let main_len = self.load_file_len();
+        // Hot path: do not even attempt this if there is staged temp data —
+        // some reads might land there and we would have to fall back anyway.
+        if self.temp_has_data.load(Ordering::Relaxed) {
+            return false;
+        }
+
+        // Single TLS+ArcSwap resolution, then plain memcpy per entry.
+        self.with_cached_mmap(|mmap| {
+            let mmap_bytes: &[u8] = &mmap[..];
+            let mmap_len = mmap_bytes.len() as u64;
+
+            for (pos, buf) in reads.iter_mut() {
+                if buf.is_empty() {
+                    continue;
+                }
+                let p = *pos;
+                let blen = buf.len();
+                // Need every byte to come from mmap (and within main_len).
+                if p >= main_len || p >= mmap_len {
+                    return false;
+                }
+                let avail = (mmap_len - p).min(main_len - p);
+                if (blen as u64) > avail {
+                    return false;
+                }
+                let start = p as usize;
+                buf.copy_from_slice(&mmap_bytes[start..start + blen]);
+            }
+            true
+        })
     }
 
     async fn write_data_seek(&self, seek: SeekFrom, buffer: &[u8]) {

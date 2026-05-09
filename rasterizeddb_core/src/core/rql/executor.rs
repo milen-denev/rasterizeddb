@@ -3,7 +3,7 @@ use rclite::Arc;
 use log::{debug, error, info};
 
 use crate::core::{
-    database::Database, row::row::rows_into_vec, rql::{
+    database::Database, rql::{
         lexer_ct::create_table_from_query_purpose, lexer_ir::insert_row_from_query_purpose,
         lexer_query::row_fetch_from_select_query, lexer_s1::QueryPurpose,
         lexer_ur::update_row_from_query_purpose,
@@ -292,8 +292,8 @@ pub async fn execute(query: QueryPurpose, database: Arc<Database>) -> Vec<u8> {
             let schema = &table.schema;
             // Handle insert row
             if let Ok(query_row) = row_fetch_from_select_query(&query, &schema.fields) {
-                if let Ok(rows) = table
-                    .query_row(
+                if let Ok(rows_bytes) = table
+                    .query_row_bytes(
                         &query_row.where_clause,
                         &schema.fields.to_vec(),
                         query_row.query_row_fetch,
@@ -303,12 +303,13 @@ pub async fn execute(query: QueryPurpose, database: Arc<Database>) -> Vec<u8> {
                     )
                     .await
                 {
-                    info!("Query executed successfully, returning {} rows", rows.len());
-                    let mut result: [u8; 1] = [2u8; 1];
-                    let mut final_vec = Vec::with_capacity(1 + rows.len());
-                    let mut rows_vec = rows_into_vec(rows);
-                    final_vec.extend_from_slice(&mut result);
-                    final_vec.append(&mut rows_vec);
+                    info!(
+                        "Query executed successfully, returning {} bytes",
+                        rows_bytes.len()
+                    );
+                    let mut final_vec = Vec::with_capacity(1 + rows_bytes.len());
+                    final_vec.push(2u8);
+                    final_vec.extend_from_slice(&rows_bytes);
                     return final_vec;
                 } else {
                     error!("Failed to execute query");

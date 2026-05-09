@@ -198,8 +198,11 @@ impl<S: StorageIO> RowPointerIterator<S> {
             return Ok(());
         }
 
-        // Clear the buffer and ensure capacity
-        self.buffer = MEMORY_POOL.acquire(bytes_to_read as usize);
+        // Clear the buffer and ensure capacity. Reuse existing allocation when sizes match
+        // to avoid pool churn on every chunk.
+        if self.buffer.len() != bytes_to_read as usize {
+            self.buffer = MEMORY_POOL.acquire(bytes_to_read as usize);
+        }
 
         // Track the absolute byte position of this chunk.
         self.chunk_start_position = self.position;
@@ -249,14 +252,16 @@ impl<S: StorageIO> RowPointerIterator<S> {
 
             let record_offset = self.chunk_start_position + self.buffer_index as u64;
 
-            let mut slice: [u8; TOTAL_LENGTH] = [0; TOTAL_LENGTH];
-            slice.copy_from_slice(
-                &self.buffer.into_slice()[self.buffer_index..self.buffer_index + TOTAL_LENGTH],
-            );
+            // Cast directly from the buffer slice; from_slice only reads through raw pointers
+            // so we can avoid an intermediate stack copy of TOTAL_LENGTH bytes per pointer.
+            let buf_slice = self.buffer.into_slice();
+            let arr_ref: &[u8; TOTAL_LENGTH] = unsafe {
+                &*(buf_slice.as_ptr().add(self.buffer_index) as *const [u8; TOTAL_LENGTH])
+            };
+            let row_pointer = RowPointer::from_slice(arr_ref);
 
             self.buffer_index += TOTAL_LENGTH;
 
-            let row_pointer = RowPointer::from_slice(&slice);
             if row_pointer.deleted {
                 continue;
             }
@@ -284,10 +289,42 @@ impl<S: StorageIO> RowPointerIterator<S> {
     pub async fn next_row_pointers_into(&mut self, out: &mut Vec<RowPointer>) -> Result<()> {
         out.clear();
 
-        for _ in 0..*BATCH_SIZE.get().unwrap() {
-            match self.next_row_pointer().await? {
-                Some(pointer) => out.push(pointer),
-                None => break,
+        let batch_size = *BATCH_SIZE.get().unwrap();
+        out.reserve(batch_size.saturating_sub(out.capacity()));
+
+        // Inline the synchronous fast-path of `next_row_pointer_with_offset` so we avoid
+        // creating/polling a fresh async future for every pointer. We only `.await` when
+        // we actually need to load the next chunk from storage.
+        let mut produced = 0usize;
+        while produced < batch_size {
+            if self.end_of_data {
+                break;
+            }
+
+            if self.buffer_index + TOTAL_LENGTH > self.buffer_valid_length {
+                self.load_next_chunk().await?;
+                if self.end_of_data {
+                    break;
+                }
+            }
+
+            // Drain as many records as we can from the currently loaded chunk without awaiting.
+            let buf_slice = self.buffer.into_slice();
+            let buf_ptr = buf_slice.as_ptr();
+            while produced < batch_size
+                && self.buffer_index + TOTAL_LENGTH <= self.buffer_valid_length
+            {
+                let arr_ref: &[u8; TOTAL_LENGTH] = unsafe {
+                    &*(buf_ptr.add(self.buffer_index) as *const [u8; TOTAL_LENGTH])
+                };
+                let row_pointer = RowPointer::from_slice(arr_ref);
+                self.buffer_index += TOTAL_LENGTH;
+
+                if row_pointer.deleted {
+                    continue;
+                }
+                out.push(row_pointer);
+                produced += 1;
             }
         }
 
@@ -1143,7 +1180,7 @@ impl RowPointer {
 
     pub async fn fetch_row_reuse_async<S: StorageIO>(
         &self,
-        io: Arc<S>,
+        io: &S,
         row_fetch: &RowFetch,
         row_reuse: &mut Row,
     ) -> std::io::Result<()> {
@@ -1211,7 +1248,9 @@ impl RowPointer {
         }
 
         if !first_pass_reads.is_empty() {
-            io.read_vectored(&mut first_pass_reads).await?;
+            if !io.try_read_vectored_sync(&mut first_pass_reads) {
+                io.read_vectored(&mut first_pass_reads).await?;
+            }
         }
         
         drop(first_pass_reads);
@@ -1271,7 +1310,9 @@ impl RowPointer {
             }
             
             if !second_pass_reads.is_empty() {
-                io.read_vectored(&mut second_pass_reads).await?;
+                if !io.try_read_vectored_sync(&mut second_pass_reads) {
+                    io.read_vectored(&mut second_pass_reads).await?;
+                }
             }
         }
 

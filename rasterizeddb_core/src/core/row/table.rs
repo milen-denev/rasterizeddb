@@ -190,6 +190,43 @@ impl<S: StorageIO> Table<S> {
         return Ok(rows);
     }
 
+    /// Bytes-mode counterpart of `query_row`. Workers serialize matched rows
+    /// to wire bytes inline; the result is ready for the response with no
+    /// extra `rows_into_vec` pass. Used by the SELECT executor hot path.
+    pub async fn query_row_bytes(
+        &self,
+        query: &str,
+        schema_fields: &Vec<SchemaField>,
+        query_row_fetch: RowFetch,
+        requested_row_fetch: RowFetch,
+        limit: Option<u64>,
+        order_by: Option<String>,
+    ) -> Result<Vec<u8>> {
+        info!("Querying row (bytes mode)");
+
+        let mut iterator = RowPointerIterator::new(self.io_pointers.clone())
+            .await
+            .unwrap();
+
+        let bytes = self
+            .concurrent_processor
+            .process_into_bytes(
+                &self.schema.name,
+                query,
+                query_row_fetch,
+                requested_row_fetch,
+                schema_fields,
+                self.io_rows.clone(),
+                &mut iterator,
+                limit,
+                order_by,
+            )
+            .await;
+
+        info!("Query executed, returning {} bytes", bytes.len());
+        Ok(bytes)
+    }
+
     fn build_full_row_fetch(schema_fields: &SmallVec<[SchemaField; 20]>) -> RowFetch {
         let schema_calc = SchemaCalculator::default();
         let mut columns_fetching_data = smallvec::SmallVec::new();
@@ -299,7 +336,7 @@ impl<S: StorageIO> Table<S> {
             // Load full row so we can merge updates.
             if pwo
                 .pointer
-                .fetch_row_reuse_async(self.io_rows.clone(), &full_fetch, &mut row)
+                .fetch_row_reuse_async(&*self.io_rows, &full_fetch, &mut row)
                 .await
                 .is_err()
             {

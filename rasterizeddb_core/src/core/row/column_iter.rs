@@ -105,7 +105,7 @@ impl<S: StorageIO> ColumnDataIterator<S> {
 
             // Read the requested column from the row.
             row_pointer
-                .fetch_row_reuse_async(Arc::clone(&self.rows_io), &self.row_fetch, &mut self.row_reuse)
+                .fetch_row_reuse_async(&*self.rows_io, &self.row_fetch, &mut self.row_reuse)
                 .await?;
 
             // We fetch exactly one column, so it should be at index 0.

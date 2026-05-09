@@ -30,6 +30,16 @@ pub trait StorageIO: Clone + Sync + Send + 'static {
         reads: &mut [(u64, &mut [u8])],
     ) -> impl Future<Output = Result<(), std::io::Error>> + Send + Sync;
 
+    /// Synchronous fast path for `read_vectored`. Returns `true` if every read
+    /// was fully satisfied without blocking (e.g. all data resident in mmap),
+    /// in which case callers must NOT call `read_vectored` for the same reads.
+    /// Default impl returns `false` (no fast path); the caller must fall back
+    /// to the async `read_vectored`.
+    #[inline(always)]
+    fn try_read_vectored_sync(&self, _reads: &mut [(u64, &mut [u8])]) -> bool {
+        false
+    }
+
     fn append_data(&self, buffer: &[u8], immediate: bool)
     -> impl Future<Output = ()> + Send + Sync;
 
