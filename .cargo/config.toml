@@ -1,6 +1,7 @@
 # .cargo/config.toml
 
 # Sets the main thread stack size to 32 MB for Linux
+# Add , "-C", "force-frame-pointers=yes" if you want to force frame pointers for better profiling support, but it may have a performance impact.
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "link-arg=-Wl,-zstack-size=33554432", "-C", "target-cpu=x86-64-v3"] # 32 * 1024 * 1024 bytes
 
@@ -10,4 +11,4 @@ rustflags = ["-C", "link-arg=-Wl,-zstack-size=33554432", "-C", "target-cpu=x86-6
 
 # Sets the main thread stack size to 32 MB for Windows
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "link-arg=/STACK:33554432", "-C", "target-cpu=x86-64-v3"] # 32 * 1024 * 1024 bytes
+rustflags = ["-C", "link-arg=/STACK:33554432", "-C", "target-cpu=x86-64-v3", "-C"] # 32 * 1024 * 1024 bytes

@@ -22,7 +22,8 @@ use std::{
     sync::Arc,
 };
 
-const QUERY: &str = "salary >= 249999.0";
+// const QUERY: &str = "salary >= 247999.0";
+const QUERY: &str = "id = 100000";
 
 #[tokio::main(flavor = "multi_thread")]
 #[allow(unreachable_code)]
@@ -35,7 +36,7 @@ async fn main() -> std::io::Result<()> {
         let choice = prompt_menu_choice();
         match choice {
             1 => {
-                let client = Arc::new(DbClient::new(Some("127.0.0.1")).await.unwrap());
+                let client = Arc::new(DbClient::with_pool_settings(Some("127.0.0.1"), 10, 100).await.unwrap());
 
                 let create_result = create_table(&client).await;
                 println!("Create result: {:?}", create_result);
@@ -45,7 +46,7 @@ async fn main() -> std::io::Result<()> {
                 run_queries(&client).await;
             }
             2 => {
-                let client = Arc::new(DbClient::new(Some("127.0.0.1")).await.unwrap());
+                let client = Arc::new(DbClient::with_pool_settings(Some("127.0.0.1"), 10, 100).await.unwrap());
 
                 pause("Press any key to continue...");
                 insert_rows(&client).await;
@@ -53,13 +54,13 @@ async fn main() -> std::io::Result<()> {
                 run_queries(&client).await;
             }
             3 => {
-                let client = Arc::new(DbClient::new(Some("127.0.0.1")).await.unwrap());
+                let client = Arc::new(DbClient::with_pool_settings(Some("127.0.0.1"), 1, 100).await.unwrap());
 
                 pause("Press any key to continue...");
                 run_queries(&client).await;
             }
             4 => {
-                pause("Press any key to start generating 5,000,000 rows...");
+                pause("Press any key to start generating 500,000 rows...");
                 generate_rows_and_pointers_to_disk().await?;
             }
             _ => unreachable!(),
@@ -79,7 +80,7 @@ fn prompt_menu_choice() -> u8 {
 1. Create Table, Add rows and query\n\
 2. Add rows and Query\n\
 3. Query only\n\
-4. Generate 5,000,000 rows + pointers to disk (in-memory build)\n"
+4. Generate 500,000 rows + pointers to disk (in-memory build)\n"
     );
 
     loop {
@@ -318,12 +319,12 @@ async fn generate_rows_and_pointers_to_disk() -> std::io::Result<()> {
     const POINTERS_PATH: &str = r"G:\Databases\Production\employees_pointers.db";
 
     #[cfg(target_os = "linux")]
-    const ROWS_PATH: &str = "/home/milen-denev/Documents/db/employees.db";
+    const ROWS_PATH: &str = "/home/milend/test_db/employees.db";
     
     #[cfg(target_os = "linux")]
-    const POINTERS_PATH: &str = "/home/milen-denev/Documents/db/employees_pointers.db";
+    const POINTERS_PATH: &str = "/home/milend/test_db/employees_pointers.db";
 
-    const ROW_COUNT: u64 = 5_000_000;
+    const ROW_COUNT: u64 = 500_000;
 
     // Very rough capacity hints to reduce reallocations.
     // If you increase average string sizes, memory usage will grow significantly.
@@ -433,7 +434,7 @@ async fn create_table(client: &Arc<DbClient>) -> Result<QueryExecutionResult, st
 }
 
 async fn insert_rows(client: &Arc<DbClient>) {
-    for _i in 0..50 {
+    for _i in 0..1 {
         let mut features = vec![];
 
         let semaphore = Arc::new(tokio::sync::Semaphore::new(16));
