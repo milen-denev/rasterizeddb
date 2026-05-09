@@ -162,6 +162,11 @@ impl TcpClient {
                 None => TcpStream::connect(&self.addr).await?,
             };
 
+            // Disable Nagle's algorithm: small request/response RPCs over a
+            // long-lived connection otherwise hit Linux's ~40 ms
+            // delayed-ACK timer between turns.
+            let _ = stream.set_nodelay(true);
+
             info!("Connected to {}", self.addr);
 
             let tls_stream = self

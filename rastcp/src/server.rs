@@ -302,15 +302,15 @@ impl TcpServer {
         }
     }
 
-    // New method that accepts a mutable reference to a context through Arc<Mutex<>>
+    // New method that accepts a mutable reference to a context through Arc<xutex::AsyncMutex<>>
     pub async fn run_with_shared_context<A, F, Fut>(
         &self,
-        context: Arc<tokio::sync::Mutex<A>>,
+        context: Arc<xutex::AsyncMutex<A>>,
         handler: F,
     ) -> Result<(), RastcpError>
     where
         A: Send + Sync + 'static,
-        F: Fn(Arc<tokio::sync::Mutex<A>>, Vec<u8>) -> Fut + Send + Sync + Clone + 'static,
+        F: Fn(Arc<xutex::AsyncMutex<A>>, Vec<u8>) -> Fut + Send + Sync + Clone + 'static,
         Fut: Future<Output = Vec<u8>> + Send + 'static,
     {
         let acceptor = self.acceptor.clone();
@@ -392,6 +392,12 @@ impl TcpServer {
         F: Fn(Vec<u8>) -> Fut + Send + Sync,
         Fut: Future<Output = Vec<u8>> + Send,
     {
+        // Disable Nagle's algorithm on the accepted connection. Linux does
+        // NOT inherit TCP_NODELAY from the listener, so without this an
+        // idle reused connection waits ~40 ms for the delayed-ACK timer
+        // before the server's response is flushed.
+        let _ = stream.set_nodelay(true);
+
         let peer_addr = match stream.peer_addr() {
             Ok(addr) => addr,
             Err(e) => {
@@ -486,6 +492,7 @@ impl TcpServer {
         F: Fn(A, Vec<u8>) -> Fut + Send + Sync,
         Fut: Future<Output = Vec<u8>> + Send,
     {
+        let _ = stream.set_nodelay(true);
         let peer_addr = stream.peer_addr()?;
         debug!("Accepting TLS connection from {}", peer_addr);
 
@@ -564,14 +571,15 @@ impl TcpServer {
     async fn handle_connection_with_shared_context<A, F, Fut>(
         stream: TcpStream,
         acceptor: TlsAcceptor,
-        context: Arc<tokio::sync::Mutex<A>>,
+        context: Arc<xutex::AsyncMutex<A>>,
         handler: F,
     ) -> Result<(), RastcpError>
     where
         A: Send + Sync,
-        F: Fn(Arc<tokio::sync::Mutex<A>>, Vec<u8>) -> Fut + Send + Sync,
+        F: Fn(Arc<xutex::AsyncMutex<A>>, Vec<u8>) -> Fut + Send + Sync,
         Fut: Future<Output = Vec<u8>> + Send,
     {
+        let _ = stream.set_nodelay(true);
         let peer_addr = stream.peer_addr()?;
         debug!("Accepting TLS connection from {}", peer_addr);
 
