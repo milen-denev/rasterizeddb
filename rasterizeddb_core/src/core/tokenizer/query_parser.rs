@@ -47,7 +47,7 @@ impl<'a, 'b> QueryParser<'a, 'b> {
     /// Build the transformer plan on the first call; fast path is now a no-op.
     pub fn execute<'c>(
         &mut self,
-        cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
+        cols: &SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
     ) -> Result<(), String> {
         if self.first_iteration {
             self.first_iteration = false;
@@ -81,7 +81,7 @@ impl<'a, 'b> QueryParser<'a, 'b> {
     /// This will parse/build on first call and then run the processor in zero-copy mode.
     pub fn evaluate_row<'c>(
         &mut self,
-        cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
+        cols: &SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
         comparison_results: &mut SmallVec<[(bool, Option<Next>); 20]>,
     ) -> Result<bool, String> {
         // Ensure the plan is built
@@ -150,7 +150,7 @@ impl<'a, 'b> QueryParser<'a, 'b> {
 
     fn parse_or<'c>(
         &mut self,
-        cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
+        cols: &SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
     ) -> Result<(), String> {
         self.parse_and(cols)?;
         while let Some(Next::Or) = self.peek_logic() {
@@ -163,7 +163,7 @@ impl<'a, 'b> QueryParser<'a, 'b> {
 
     fn parse_and<'c>(
         &mut self,
-        cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
+        cols: &SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
     ) -> Result<(), String> {
         self.parse_comp_or_group(cols)?;
         while let Some(Next::And) = self.peek_logic() {
@@ -183,7 +183,7 @@ impl<'a, 'b> QueryParser<'a, 'b> {
 
     fn parse_comp_or_group<'c>(
         &mut self,
-        cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
+        cols: &SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
     ) -> Result<(), String> {
         if let Some(Token::LPar) = self.toks.get(self.pos) {
             if self.is_boolean_group(self.pos) {
@@ -262,7 +262,7 @@ impl<'a, 'b> QueryParser<'a, 'b> {
 
     fn parse_comparison<'c>(
         &mut self,
-        cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
+        cols: &SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
     ) -> Result<(), String> {
         let (left_op, left_type) = self.parse_expr(cols)?;
         let op_token = self
@@ -310,7 +310,7 @@ impl<'a, 'b> QueryParser<'a, 'b> {
 
     fn parse_expr<'c>(
         &mut self,
-        cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
+        cols: &SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
     ) -> Result<(ComparisonOperand, DbType), String> {
         let (mut lhs_op, lhs_type) = self.parse_term(cols)?;
         while let Some(op_str) = self.peek_op(&["+", "-"]) {
@@ -331,7 +331,7 @@ impl<'a, 'b> QueryParser<'a, 'b> {
 
     fn parse_term<'c>(
         &mut self,
-        cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
+        cols: &SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
     ) -> Result<(ComparisonOperand, DbType), String> {
         let (mut lhs_op, lhs_type) = self.parse_factor(cols)?;
         while let Some(op_str) = self.peek_op(&["*", "/"]) {
@@ -352,7 +352,7 @@ impl<'a, 'b> QueryParser<'a, 'b> {
 
     fn parse_factor<'c>(
         &mut self,
-        cols: &'c SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
+        cols: &SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
     ) -> Result<(ComparisonOperand, DbType), String> {
         let token = self
             .next()

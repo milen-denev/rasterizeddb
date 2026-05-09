@@ -339,6 +339,12 @@ impl From<usize> for ComparisonOperand {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct TransformerPlan {
+    transformers: SmallVec<[ColumnTransformer; 36]>,
+    max_result_store_index: usize,
+}
+
 impl ComparisonOperand {
     pub fn get_memory_block(&self) -> &MemoryBlock {
         match self {
@@ -391,6 +397,21 @@ impl<'a> TransformerProcessor<'a> {
         if idx > self.max_result_store_index {
             self.max_result_store_index = idx;
         }
+    }
+
+    pub fn snapshot_plan(&self) -> TransformerPlan {
+        TransformerPlan {
+            transformers: self.transformers.clone(),
+            max_result_store_index: self.max_result_store_index,
+        }
+    }
+
+    pub fn load_plan(&mut self, plan: &TransformerPlan) {
+        self.transformers.clear();
+        self.transformers.extend(plan.transformers.iter().cloned());
+        self.intermediate_results.clear();
+        self.max_result_store_index = plan.max_result_store_index;
+        self.ensure_intermediate_capacity();
     }
 
     pub fn add_math_operation(
@@ -979,6 +1000,43 @@ mod tests {
 
         let mut bool_buf: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
         let res = proc.execute_row(&row, &mut bool_buf);
+        assert!(res);
+    }
+
+    #[test]
+    fn test_processor_plan_snapshot_round_trip() {
+        let lhs = create_memory_block_from_i32(40);
+        let rhs = create_memory_block_from_i32(2);
+        let row = [lhs.clone(), rhs.clone()];
+
+        let mut transformers: SmallVec<[ColumnTransformer; 36]> = SmallVec::new();
+        let mut inter: SmallVec<[MemoryBlock; 20]> = SmallVec::new();
+        let mut proc = TransformerProcessor::new(&mut transformers, &mut inter);
+
+        let add_idx = proc.add_math_operation(
+            DbType::I32,
+            ComparisonOperand::DirectWithIndex(lhs.clone(), 0),
+            ComparisonOperand::DirectWithIndex(rhs.clone(), 1),
+            MathOperation::Add,
+        );
+        proc.add_comparison(
+            DbType::I32,
+            ComparisonOperand::Intermediate(add_idx),
+            create_memory_block_from_i32(42),
+            ComparerOperation::Equals,
+            None,
+        );
+
+        let plan = proc.snapshot_plan();
+
+        let mut cloned_transformers: SmallVec<[ColumnTransformer; 36]> = SmallVec::new();
+        let mut cloned_inter: SmallVec<[MemoryBlock; 20]> = SmallVec::new();
+        let mut cloned_proc =
+            TransformerProcessor::new(&mut cloned_transformers, &mut cloned_inter);
+        cloned_proc.load_plan(&plan);
+
+        let mut bool_buf: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
+        let res = cloned_proc.execute_row(&row, &mut bool_buf);
         assert!(res);
     }
 

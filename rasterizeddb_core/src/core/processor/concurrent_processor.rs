@@ -16,7 +16,7 @@ use tokio::{
 };
 
 use super::{
-    transformer::{ColumnTransformer, Next, TransformerProcessor},
+    transformer::{ColumnTransformer, Next, TransformerPlan, TransformerProcessor},
 };
 
 use crate::{
@@ -141,6 +141,54 @@ impl ConcurrentProcessor {
         (no_filter, schema_arc, tokens_arc)
     }
 
+    #[inline]
+    fn build_plan_columns<'a>(
+        schema: &'a [SchemaField],
+    ) -> SmallVec<[(Cow<'a, str>, MemoryBlock); 20]> {
+        let max_write_order = schema
+            .iter()
+            .map(|field| field.write_order as usize)
+            .max()
+            .unwrap_or(0);
+
+        let mut columns = SmallVec::new();
+        columns.resize_with(max_write_order.saturating_add(1), || {
+            (Cow::Borrowed(EMPTY_STR), MemoryBlock::default())
+        });
+
+        for field in schema {
+            columns[field.write_order as usize] = (
+                Cow::Borrowed(field.name.as_str()),
+                MemoryBlock::default(),
+            );
+        }
+
+        columns
+    }
+
+    fn compile_query_plan(
+        schema_arc: &Arc<SmallVec<[SchemaField; 20]>>,
+        tokens_arc: &Arc<SmallVec<[Token; 36]>>,
+    ) -> TransformerPlan {
+        let plan_columns = Self::build_plan_columns(schema_arc.as_slice());
+        let mut transformers: SmallVec<[ColumnTransformer; 36]> = SmallVec::new();
+        let mut intermediate_results: SmallVec<[MemoryBlock; 20]> = SmallVec::new();
+        let processor_cell = UnsafeCell::new(TransformerProcessor::new(
+            &mut transformers,
+            &mut intermediate_results,
+        ));
+
+        {
+            let processor_mut = unsafe { &mut *processor_cell.get() };
+            let mut parser = QueryParser::new(tokens_arc.as_ref(), processor_mut);
+            if let Err(e) = parser.execute(&plan_columns) {
+                panic!("Error compiling query plan: {:?}", e);
+            }
+        }
+
+        unsafe { &*processor_cell.get() }.snapshot_plan()
+    }
+
     /// Long-lived worker pool design.
     ///
     /// Spawns `MAX_PERMITS_THREADS` worker tasks ONCE up front. Each worker
@@ -159,7 +207,7 @@ impl ConcurrentProcessor {
         iterator: &mut RowPointerIterator<S>,
         shared_tuple: Arc<(RowFetch, RowFetch)>,
         schema_arc: Arc<SmallVec<[SchemaField; 20]>>,
-        tokens_arc: Arc<SmallVec<[Token; 36]>>,
+        compiled_plan: Option<Arc<TransformerPlan>>,
         io_rows_outer: Arc<S>,
         // Exactly ONE of `tx_rows` / `tx_bytes` should be Some, depending on
         // whether the caller wants `Vec<Row>` (e.g. for ORDER BY or row-level
@@ -196,7 +244,7 @@ impl ConcurrentProcessor {
             let bytes_mode = tx_bytes_clone.is_some();
             let tx_rp_clone = tx_rp.as_ref().map(|s| s.clone());
             let schema_ref = Arc::clone(&schema_arc);
-            let tokens_ref = Arc::clone(&tokens_arc);
+            let compiled_plan_ref = compiled_plan.as_ref().map(Arc::clone);
             let io_rows_batch = Arc::clone(&io_rows_outer);
             let limit_counter_ref = Arc::clone(&limit_counter);
             let stop_ref = Arc::clone(&stop_processing);
@@ -224,12 +272,15 @@ impl ConcurrentProcessor {
                     &mut buffer.intermediate_results,
                 ));
                 let processor_mut = unsafe { &mut *processor_cell.get() };
-                let parser_cell =
-                    UnsafeCell::new(QueryParser::new(&tokens_ref, processor_mut));
+                if !no_filter {
+                    let plan = compiled_plan_ref
+                        .as_ref()
+                        .expect("compiled plan required for filtered query");
+                    processor_mut.load_plan(plan.as_ref());
+                }
 
-                // Plan-build state lives across batches: same tokens + schema
-                // produce the same plan for every batch this worker handles.
-                let mut plan_built = false;
+                // Row layout for fetched WHERE columns is stable within a query.
+                let mut row_layout_built = false;
 
                 // Per-worker result accumulators. Sent ONCE at the end of
                 // this worker's lifetime to avoid per-batch channel sends
@@ -353,59 +404,13 @@ impl ConcurrentProcessor {
                                 continue;
                             }
 
-                            if !plan_built {
-                                let tmp_vec =
-                                    unsafe { &mut *buffer.hashtable_buffer.get() };
-                                tmp_vec.clear();
-
-                                {
-                                    let columns = &buffer.row.columns;
-                                    let schema = &*schema_ref;
-
-                                    tmp_vec.resize(
-                                        schema.len(),
-                                        (
-                                            Cow::Borrowed(EMPTY_STR),
-                                            MemoryBlock::default(),
-                                        ),
-                                    );
-
-                                    for column in columns.iter() {
-                                        let schema_field =
-                                            &schema[column.schema_id as usize];
-                                        let write_order =
-                                            schema_field.write_order as usize;
-                                        if let Some(entry) =
-                                            tmp_vec.get_mut(write_order)
-                                        {
-                                            *entry = (
-                                                Cow::Borrowed(
-                                                    schema_field.name.as_str(),
-                                                ),
-                                                column.data.clone(),
-                                            );
-                                        }
-                                    }
-                                }
-
-                                let parser_mut = unsafe { &mut *parser_cell.get() };
-                                if let Err(e) = parser_mut.execute(tmp_vec) {
-                                    panic!(
-                                        "Error executing query parser while building plan: {:?}",
-                                        e
-                                    );
-                                }
-
-                                unsafe { &mut *processor_cell.get() }
-                                    .replace_row_inputs(&[]);
-
+                            if !row_layout_built {
                                 build_write_order_map(
                                     &mut buffer.write_order_to_col,
                                     &buffer.row,
                                     schema_ref.as_slice(),
                                 );
-
-                                plan_built = true;
+                                row_layout_built = true;
                             }
 
                             let result = {
@@ -707,6 +712,11 @@ impl ConcurrentProcessor {
         let io_rows_outer = Arc::clone(&io_rows);
 
         let (no_filter, schema_arc, tokens_arc) = Self::prepare_query(where_query, &table_schema);
+        let compiled_plan = if no_filter {
+            None
+        } else {
+            Some(Arc::new(Self::compile_query_plan(&schema_arc, &tokens_arc)))
+        };
 
         // If the WHERE-evaluation columns already cover the SELECT columns, we can
         // skip the second (requested) fetch for matched rows and emit the WHERE buffer
@@ -730,7 +740,7 @@ impl ConcurrentProcessor {
             iterator,
             Arc::clone(&shared_tuple),
             Arc::clone(&schema_arc),
-            Arc::clone(&tokens_arc),
+            compiled_plan.clone(),
             io_rows_outer.clone(),
             Some(tx.clone()),
             None,
@@ -880,6 +890,11 @@ impl ConcurrentProcessor {
 
         let (no_filter, schema_arc, tokens_arc) =
             Self::prepare_query(where_query, &table_schema_sv);
+        let compiled_plan = if no_filter {
+            None
+        } else {
+            Some(Arc::new(Self::compile_query_plan(&schema_arc, &tokens_arc)))
+        };
 
         let query_covers_requested = {
             let q = &shared_tuple.0.columns_fetching_data;
@@ -899,7 +914,7 @@ impl ConcurrentProcessor {
             iterator,
             Arc::clone(&shared_tuple),
             Arc::clone(&schema_arc),
-            Arc::clone(&tokens_arc),
+            compiled_plan.clone(),
             io_rows_outer.clone(),
             None,
             Some(tx_b.clone()),
