@@ -38,6 +38,7 @@ rclite = "0.4.1"
 opool = "0.2.0"
 cacheguard = "0.1.0"
 xutex = "0.2.1"
+branches = "0.4.4"
 
 # pgwire TLS
 rustls = "0.23"
@@ -75,6 +76,10 @@ harness = false
 
 [[bench]]
 name = "file_sync_benchmarks"
+harness = false
+
+[[bench]]
+name = "server_cache_repeated_query_benchmarks"
 harness = false
 
 [features]

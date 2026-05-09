@@ -1,5 +1,6 @@
 use std::{borrow::Cow, cell::UnsafeCell, sync::{OnceLock, atomic::{AtomicBool, AtomicU64}}};
 
+use branches::{likely, unlikely};
 use cacheguard::CacheGuard;
 use log::error;
 use rclite::Arc;
@@ -81,6 +82,48 @@ impl ConcurrentProcessor {
         }
 
         Some((crc64_hash, collected_rows))
+    }
+
+    /// Bytes-mode cache fast-path. Serializes matched rows directly into a
+    /// `Vec<u8>` at the wire format, skipping the `Vec<Row>` intermediate
+    /// and the `Row::clone_row` per pointer. This is the cache-hit
+    /// counterpart of the worker bytes-mode change in Phase 8.
+    async fn try_collect_cached_bytes<S: StorageIO>(
+        table_name: &str,
+        where_query: &str,
+        requested_row_fetch: &RowFetch,
+        io_rows: &Arc<S>,
+    ) -> Option<Vec<u8>> {
+        let cache_enabled = *ENABLE_CACHE.get().unwrap();
+        if !cache_enabled {
+            return None;
+        }
+
+        let crc64_hash = CRC_64.checksum(table_name.as_bytes()) ^ CRC_64.checksum(where_query.as_bytes());
+        let cache = ATOMIC_CACHE.get().unwrap();
+        let entries = cache.get(&crc64_hash)?;
+
+        // Conservative initial guess; extend_serialized will grow as needed.
+        let mut out: Vec<u8> = Vec::with_capacity(entries.len().saturating_mul(64));
+        let mut row = Row::default();
+
+        for pointer in entries.iter() {
+            if pointer.deleted {
+                continue;
+            }
+
+            if pointer
+                .fetch_row_reuse_async(&**io_rows, requested_row_fetch, &mut row)
+                .await
+                .is_err()
+            {
+                continue;
+            }
+
+            row.extend_serialized(&mut out);
+        }
+
+        Some(out)
     }
 
     #[inline]
@@ -212,14 +255,14 @@ impl ConcurrentProcessor {
                         }
 
                         for pointer in pointers.iter() {
-                            if stop_ref.load(std::sync::atomic::Ordering::Relaxed) {
+                            if unlikely(stop_ref.load(std::sync::atomic::Ordering::Relaxed)) {
                                 break;
                             }
-                            if pointer.deleted {
+                            if unlikely(pointer.deleted) {
                                 continue;
                             }
 
-                            if enforce_limit_early {
+                            if unlikely(enforce_limit_early) {
                                 if let Some(limit_val) = limit_opt {
                                     if limit_counter_ref
                                         .load(std::sync::atomic::Ordering::Relaxed)
@@ -236,25 +279,25 @@ impl ConcurrentProcessor {
 
                             let (_, requested_row_fetch) = &*tuple_clone;
 
-                            if pointer
+                            if unlikely(pointer
                                 .fetch_row_reuse_async(
                                     io_rows_ref,
                                     requested_row_fetch,
                                     &mut buffer.row,
                                 )
                                 .await
-                                .is_err()
+                                .is_err())
                             {
                                 continue;
                             }
 
-                            if enforce_limit_early {
+                            if unlikely(enforce_limit_early) {
                                 if let Some(limit_val) = limit_opt {
                                     let prev = limit_counter_ref.fetch_add(
                                         1,
                                         std::sync::atomic::Ordering::Relaxed,
                                     );
-                                    if prev + 1 >= limit_val {
+                                    if unlikely(prev + 1 >= limit_val) {
                                         stop_ref.store(
                                             true,
                                             std::sync::atomic::Ordering::Relaxed,
@@ -266,7 +309,7 @@ impl ConcurrentProcessor {
                                     // emitted past LIMIT (the row-mode path
                                     // papers over this with a final truncate;
                                     // the bytes-mode path cannot).
-                                    if prev >= limit_val {
+                                    if unlikely(prev >= limit_val) {
                                         break;
                                     }
                                 }
@@ -275,7 +318,7 @@ impl ConcurrentProcessor {
                             if tx_rp_clone.is_some() {
                                 acc_ptrs.push(pointer.clone());
                             }
-                            if bytes_mode {
+                            if likely(bytes_mode) {
                                 buffer.row.extend_serialized(&mut acc_bytes);
                             } else {
                                 acc_rows.push(std::mem::take(&mut buffer.row));
@@ -287,21 +330,21 @@ impl ConcurrentProcessor {
                             &*tuple_clone;
 
                         for pointer in pointers.iter() {
-                            if stop_ref.load(std::sync::atomic::Ordering::Relaxed) {
+                            if unlikely(stop_ref.load(std::sync::atomic::Ordering::Relaxed)) {
                                 break;
                             }
-                            if pointer.deleted {
+                            if unlikely(pointer.deleted) {
                                 continue;
                             }
 
-                            if pointer
+                            if unlikely(pointer
                                 .fetch_row_reuse_async(
                                     io_rows_ref,
                                     query_row_fetch,
                                     &mut buffer.row,
                                 )
                                 .await
-                                .is_err()
+                                .is_err())
                             {
                                 error!(
                                     "Failed to fetch query row for pointer {:?}",
@@ -397,19 +440,19 @@ impl ConcurrentProcessor {
                                     }
                                 }
 
-                                if enforce_limit_early {
+                                if unlikely(enforce_limit_early) {
                                     if let Some(limit_val) = limit_opt {
                                         let prev = limit_counter_ref.fetch_add(
                                             1,
                                             std::sync::atomic::Ordering::Relaxed,
                                         );
-                                        if prev + 1 >= limit_val {
+                                        if unlikely(prev + 1 >= limit_val) {
                                             stop_ref.store(
                                                 true,
                                                 std::sync::atomic::Ordering::Relaxed,
                                             );
                                         }
-                                        if prev >= limit_val {
+                                        if unlikely(prev >= limit_val) {
                                             break;
                                         }
                                     }
@@ -418,7 +461,7 @@ impl ConcurrentProcessor {
                                 if tx_rp_clone.is_some() {
                                     acc_ptrs.push(pointer.clone());
                                 }
-                                if bytes_mode {
+                                if likely(bytes_mode) {
                                     buffer.row.extend_serialized(&mut acc_bytes);
                                 } else {
                                     acc_rows.push(std::mem::take(&mut buffer.row));
@@ -790,9 +833,9 @@ impl ConcurrentProcessor {
             where_query
         );
 
-        // Cache fast-path (if enabled): produces Vec<Row> from cached
-        // pointers; serialize once at the boundary.
-        if let Some((_hash, rows)) = Self::try_collect_cached_rows(
+        // Cache fast-path (if enabled): serialize directly to wire bytes
+        // without materializing a `Vec<Row>` or cloning rows.
+        if let Some(bytes) = Self::try_collect_cached_bytes(
             table_name,
             where_query,
             &requested_row_fetch,
@@ -800,7 +843,7 @@ impl ConcurrentProcessor {
         )
         .await
         {
-            return crate::core::row::row::rows_into_vec(rows);
+            return bytes;
         }
 
         let (tx_b, rx_b) = kanal::unbounded_async::<Vec<u8>>();

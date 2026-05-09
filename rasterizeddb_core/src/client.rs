@@ -4,7 +4,9 @@ use std::io;
 use rclite::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+// xutex::AsyncMutex: lower-overhead async mutex than tokio's; lock() returns
+// a future ergonomically usable in the same way as tokio::sync::Mutex::lock().
+use xutex::AsyncMutex as Mutex;
 
 use crate::core::support_types::QueryExecutionResult;
 use crate::SERVER_PORT;
