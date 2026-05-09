@@ -4,7 +4,6 @@ use itertools::Itertools;
 use smallvec::SmallVec;
 use std::io::Result;
 use std::{
-    io,
     sync::atomic::{AtomicBool, AtomicU64},
 };
 
@@ -15,17 +14,6 @@ use crate::core::processor::concurrent_processor::ConcurrentProcessor;
 use crate::core::rql::lexer_ct::CreateColumnData;
 use crate::core::processor::concurrent_processor::{ATOMIC_CACHE, ENABLE_CACHE};
 
-#[cfg(not(feature = "sme_v2"))]
-use crate::core::sme::scanner::{spawn_table_rules_scanner, TableRulesScannerHandle};
-
-#[cfg(feature = "sme_v2")]
-use crate::core::sme_v2::scanner::{
-    spawn_table_rules_scanner_v2 as spawn_table_rules_scanner,
-    TableRulesScannerHandleV2 as TableRulesScannerHandle,
-};
-
-#[cfg(not(feature = "sme_v2"))]
-use crate::core::sme::semantic_mapping_engine::SME;
 use crate::core::{
     row::{
         row::{Row, RowFetch, RowWrite},
@@ -38,8 +26,6 @@ use crate::core::{
 use crate::core::row::row::{ColumnFetchingData, ColumnWritePayload};
 use crate::core::row::schema::SchemaCalculator;
 
-use std::time::Duration;
-
 pub struct Table<S: StorageIO> {
     pub schema: TableSchema,
     pub io_pointers: Arc<S>,
@@ -48,9 +34,7 @@ pub struct Table<S: StorageIO> {
     pub hard_locked: CacheGuard<AtomicBool>,
     pub len: CacheGuard<AtomicU64>,
     pub last_row_id: CacheGuard<AtomicU64>,
-    pub concurrent_processor: ConcurrentProcessor,
-
-    sme_scanner: Option<TableRulesScannerHandle>,
+    pub concurrent_processor: ConcurrentProcessor
 }
 
 unsafe impl<S: StorageIO> Send for Table<S> {}
@@ -65,14 +49,6 @@ impl<S: StorageIO> Table<S> {
         if ENABLE_CACHE.get().copied().unwrap_or(false) {
             if let Some(cache) = ATOMIC_CACHE.get() {
                 _ = cache.clear();
-            }
-        }
-
-        // SME v1 candidate cache can also go stale across mutations.
-        #[cfg(not(feature = "sme_v2"))]
-        {
-            if let Some(engine) = SME.get() {
-                _ = engine.clear_candidates();
             }
         }
     }
@@ -124,18 +100,6 @@ impl<S: StorageIO> Table<S> {
 
         info!("Loaded schema: {:?}", schema);
 
-        // SME: scan table and emit semantic rules to `TABLENAME_rules.db`.
-        // Scans are on-demand (triggered by INSERT/UPDATE/DELETE), not periodic.
-        let sme_scanner = spawn_table_rules_scanner(
-            initial_io.clone(),
-            table_name.to_string(),
-            schema.fields.clone(),
-            io_pointers.clone(),
-            io_rows.clone(),
-            Duration::from_millis(0),
-            true,
-        );
-
         let mut pointer_iterator = RowPointerIterator::new(io_pointers.clone()).await.unwrap();
 
         let (atomic_last_id, atomic_table_length) =
@@ -162,7 +126,6 @@ impl<S: StorageIO> Table<S> {
             len: atomic_table_length.into(),
             last_row_id: atomic_last_id.into(),
             concurrent_processor: ConcurrentProcessor::new(),
-            sme_scanner: Some(sme_scanner),
         }
     }
 
@@ -174,16 +137,7 @@ impl<S: StorageIO> Table<S> {
             row_write.columns_writing_data.len()
         );
 
-        // Ensure SME v1 never uses stale rules across mutations.
-        #[cfg(not(feature = "sme_v2"))]
-        {
-            if let Some(engine) = SME.get() {
-                engine.mark_table_rules_dirty(&self.schema.name);
-                _ = engine.remove_table_rules_for_table(&self.schema.name);
-            }
-        }
-
-        let result = RowPointer::write_row_with_pointer_record_pos(
+        let _result = RowPointer::write_row_with_pointer_record_pos(
             self.io_pointers.clone(),
             self.io_rows.clone(),
             &self.last_row_id,
@@ -194,34 +148,7 @@ impl<S: StorageIO> Table<S> {
         )
         .await;
 
-        if let Err(e) = result {
-            error!("Failed to insert row: {}", e);
-            #[cfg(not(feature = "sme_v2"))]
-            {
-                if let Some(engine) = SME.get() {
-                    engine.clear_table_rules_dirty(&self.schema.name);
-                }
-            }
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("Failed to insert row: {}", e),
-            ));
-        } else if let Ok((pointer_record_pos, row_pointer)) = result {
-            info!("Successfully inserted row with pointer: {:?}", row_pointer);
-
-            #[cfg(feature = "sme_v2")]
-            {
-                crate::core::sme_v2::dirty_row_tracker::dirty_row_tracker()
-                    .mark_pointer_record_pos(&self.schema.name, pointer_record_pos);
-            }
-        }
-
         self.invalidate_query_caches();
-
-        // Trigger an async rules rebuild for this table.
-        if let Some(handle) = &self.sme_scanner {
-            handle.request_scan();
-        }
 
         return Ok(());
     }
@@ -309,7 +236,6 @@ impl<S: StorageIO> Table<S> {
             .await;
 
         let mut deleted_count: u64 = 0;
-        let mut marked_dirty = false;
         for mut pwo in matches.into_iter() {
             if pwo.pointer.deleted {
                 continue;
@@ -324,32 +250,11 @@ impl<S: StorageIO> Table<S> {
                 continue;
             }
 
-            #[cfg(feature = "sme_v2")]
-            {
-                crate::core::sme_v2::dirty_row_tracker::dirty_row_tracker()
-                    .mark_pointer_record_pos(&self.schema.name, pwo.pointer_record_pos);
-            }
-
-            if !marked_dirty {
-                #[cfg(not(feature = "sme_v2"))]
-                {
-                    if let Some(engine) = SME.get() {
-                        engine.mark_table_rules_dirty(&self.schema.name);
-                        _ = engine.remove_table_rules_for_table(&self.schema.name);
-                    }
-                }
-                marked_dirty = true;
-            }
-
             deleted_count = deleted_count.saturating_add(1);
         }
 
         if deleted_count > 0 {
             self.invalidate_query_caches();
-
-            if let Some(handle) = &self.sme_scanner {
-                handle.request_scan();
-            }
         }
 
         Ok(deleted_count)
@@ -385,8 +290,6 @@ impl<S: StorageIO> Table<S> {
 
         let mut updated_count: u64 = 0;
         let mut row = Row::default();
-
-        let mut marked_dirty = false;
 
         for pwo in matches.into_iter() {
             if pwo.pointer.deleted {
@@ -465,38 +368,12 @@ impl<S: StorageIO> Table<S> {
                 .await;
 
             if update_result.is_ok() {
-                #[cfg(feature = "sme_v2")]
-                {
-                    let (updated_pointer, new_pointer_pos) = update_result.as_ref().unwrap();
-                    let _ = updated_pointer;
-
-                    let tracker = crate::core::sme_v2::dirty_row_tracker::dirty_row_tracker();
-                    tracker.mark_pointer_record_pos(&self.schema.name, pwo.pointer_record_pos);
-                    if let Some(pos) = *new_pointer_pos {
-                        tracker.mark_pointer_record_pos(&self.schema.name, pos);
-                    }
-                }
-
-                if !marked_dirty {
-                    #[cfg(not(feature = "sme_v2"))]
-                    {
-                        if let Some(engine) = SME.get() {
-                            engine.mark_table_rules_dirty(&self.schema.name);
-                            _ = engine.remove_table_rules_for_table(&self.schema.name);
-                        }
-                    }
-                    marked_dirty = true;
-                }
                 updated_count = updated_count.saturating_add(1);
             }
         }
 
         if updated_count > 0 {
             self.invalidate_query_caches();
-
-            if let Some(handle) = &self.sme_scanner {
-                handle.request_scan();
-            }
         }
 
         Ok(updated_count)

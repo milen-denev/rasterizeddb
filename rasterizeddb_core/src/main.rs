@@ -4,7 +4,7 @@ use rclite::Arc;
 use clap::Parser;
 
 use log::LevelFilter;
-use rasterizeddb_core::{BATCH_SIZE, ENABLE_SEMANTICS, MAX_PERMITS_THREADS, cache::atomic_cache::AtomicGenericCache, core::{database::Database, processor::concurrent_processor::{ATOMIC_CACHE, ENABLE_CACHE}, row::row_pointer::RowPointer}};
+use rasterizeddb_core::{BATCH_SIZE, MAX_PERMITS_THREADS, cache::atomic_cache::AtomicGenericCache, core::{database::Database, processor::concurrent_processor::{ATOMIC_CACHE, ENABLE_CACHE}, row::row_pointer::RowPointer}};
 use tokio::runtime::Builder;
 
 use rasterizeddb_core::configuration::Configuration;
@@ -34,7 +34,7 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     location: Option<String>,
 
-    /// Batch size for processing (default: 65536)
+    /// Batch size for processing (default: 10_000)
     #[arg(long = "batch-size", alias = "batch_size", value_name = "N")]
     batch_size: Option<usize>,
 
@@ -50,11 +50,11 @@ struct Args {
     #[arg(long = "cache-size", alias = "cache_size", value_name = "N")]
     cache_size: Option<usize>,
 
-    /// Enable or disable cache (default: true)
+    /// Enable or disable cache (default: false)
     #[arg(long = "enable-cache", alias = "enable_cache", value_name = "BOOL")]
     enable_cache: Option<bool>,
 
-    /// Enable or disable SME semantics (default: true)
+    /// Enable or disable SME semantics (default: false)
     #[arg(long = "enable-semantics", alias = "enable_semantics", value_name = "BOOL")]
     enable_semantics: Option<bool>,
 
@@ -63,7 +63,7 @@ struct Args {
     in_memory: bool,
 
     /// Server protocol to use: rastcp or pgwire (default: rastcp)
-    #[arg(long, value_enum, default_value_t = Protocol::Pgwire)]
+    #[arg(long, value_enum, default_value_t = Protocol::Rastcp)]
     protocol: Protocol,
 
     /// pgwire listen address (default: 127.0.0.1)
@@ -101,12 +101,12 @@ fn main() -> std::io::Result<()> {
     };
 
     MAX_PERMITS_THREADS.set(config.concurrent_threads.unwrap_or(16)).unwrap();
-    BATCH_SIZE.set(config.batch_size.unwrap_or(1024 * 64)).unwrap();
+    BATCH_SIZE.set(config.batch_size.unwrap_or(10_000)).unwrap();
 
     let cache_size = args.cache_size.unwrap_or(100_000);
     let min_size = if cache_size < 1024 { 1024 } else { cache_size };
 
-    let enable_cache = args.enable_cache.unwrap_or(true);
+    let enable_cache = args.enable_cache.unwrap_or(false);
 
     if enable_cache {
         ATOMIC_CACHE.get_or_init(|| {
@@ -122,9 +122,6 @@ fn main() -> std::io::Result<()> {
         });
     }
 
-    let enable_semantics = args.enable_semantics.unwrap_or(true);
-    ENABLE_SEMANTICS.get_or_init(|| enable_semantics);
-
     let rt = Builder::new_multi_thread()
         .worker_threads(config.concurrent_threads.unwrap_or(*MAX_PERMITS_THREADS.get().unwrap()))
         .thread_stack_size(STACK_SIZE)
@@ -134,7 +131,7 @@ fn main() -> std::io::Result<()> {
     rt.block_on(async {
         unsafe { env::set_var("RUST_BACKTRACE", "full"); }
 
-        let level = args.log_level.unwrap_or(LevelFilter::Info);
+        let level = args.log_level.unwrap_or(LevelFilter::Error);
 
         env_logger::Builder::new()
             .filter_level(level)
@@ -144,7 +141,7 @@ fn main() -> std::io::Result<()> {
         let db_location = if args.in_memory {
             ""
         } else {
-            config.location.as_deref().unwrap_or("G:/Databases/Production/")
+            config.location.as_deref().unwrap_or("/home/milend/test_db")
         };
 
         #[cfg(not(debug_assertions))]

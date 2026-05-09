@@ -121,7 +121,6 @@ async fn ext_cov_employees_end_to_end_queries() {
     // Tests run the engine directly, so set sane defaults here.
     let _ = crate::MAX_PERMITS_THREADS.get_or_init(|| 8);
     let _ = crate::BATCH_SIZE.get_or_init(|| 1024 * 8);
-    let _ = crate::ENABLE_SEMANTICS.get_or_init(|| false);
     let _ = concurrent_processor::ENABLE_CACHE.get_or_init(|| false);
 
     // Keep the directory around (Windows file-locks can make auto-cleanup flaky).
@@ -656,7 +655,6 @@ async fn ext_cov_employees_end_to_end_queries() {
 async fn run_rowcount_case(rows_to_insert: usize) {
     let _ = crate::MAX_PERMITS_THREADS.get_or_init(|| 8);
     let _ = crate::BATCH_SIZE.get_or_init(|| 1024 * 8);
-    let _ = crate::ENABLE_SEMANTICS.get_or_init(|| false);
     let _ = concurrent_processor::ENABLE_CACHE.get_or_init(|| false);
 
     let db_dir = tempfile::Builder::new()

@@ -7,7 +7,7 @@ use rclite::Arc;
 use opool::{Pool, PoolAllocator};
 
 use crc::{CRC_64_ECMA_182, Crc};
-use futures::future::join_all;
+use futures::{future::join_all};
 use smallvec::SmallVec;
 
 use tokio::{
@@ -21,19 +21,11 @@ use super::{
 
 use crate::{
     MAX_PERMITS_THREADS, cache::atomic_cache::AtomicGenericCache, core::{
-        processor::transformer::RowBlocks, row::{row::{Row, RowFetch}, row_pointer::{RowPointer, RowPointerIterator, ROW_POINTER_RECORD_LEN}, schema::SchemaField}, storage_providers::traits::StorageIO, tokenizer::{query_parser::QueryParser, query_tokenizer::tokenize}
+        processor::transformer::RowBlocks, row::{row::{Row, RowFetch}, row_pointer::{RowPointer, RowPointerIterator}, schema::SchemaField}, storage_providers::traits::StorageIO, tokenizer::{query_parser::QueryParser, query_tokenizer::tokenize}
     }, memory_pool::MemoryBlock
 };
 
-use crate::{BATCH_SIZE, semantics_enabled};
-
-#[cfg(not(feature = "sme_v2"))]
-use crate::core::sme::semantic_mapping_engine::{SME, SemanticMappingEngine};
-
-#[cfg(feature = "sme_v2")]
-use crate::core::sme_v2::{
-    semantic_mapping_engine::{SemanticMappingEngineV2, SME_V2},
-};
+use crate::BATCH_SIZE;
 
 use crate::core::tokenizer::query_tokenizer::Token;
 
@@ -41,10 +33,6 @@ pub static EMPTY_STR: &str = "";
 pub static ATOMIC_CACHE: OnceLock<std::sync::Arc<AtomicGenericCache<u64, Arc<Vec<RowPointer>>>>> = OnceLock::new();
 pub static ENABLE_CACHE: OnceLock<bool> = OnceLock::new();
 const CRC_64: Crc<u64> = Crc::<u64>::new(&CRC_64_ECMA_182);
-
-// SME range pre-filtering can be lossy on small tables; fall back to full scans below this.
-// Empirically, keep SME candidates disabled until tables exceed ~5K rows.
-const SME_MIN_ROWS_FOR_CANDIDATES: usize = 1024 * 5;
 
 #[derive(Debug, Clone)]
 pub struct RowPointerWithOffset {
@@ -139,62 +127,8 @@ impl ConcurrentProcessor {
         (no_filter, schema_arc, tokens_arc)
     }
 
-    #[cfg(not(feature = "sme_v2"))]
-    async fn maybe_build_sme_candidates<S: StorageIO>(
-        table_name: &str,
-        tokens: &Arc<SmallVec<[Token; 36]>>,
-        schema: &Arc<SmallVec<[SchemaField; 20]>>,
-        io_rows: &Arc<S>,
-        iterator: &RowPointerIterator<S>,
-        _limit: Option<u64>,
-    ) -> Option<(Arc<Vec<RowPointer>>, usize)> {
-        if !semantics_enabled() {
-            return None;
-        }
-
-        let pointers_io = iterator.io();
-        let sme = SME.get_or_init(|| rclite::Arc::new(SemanticMappingEngine::new()));
-        sme.get_or_build_candidates_for_table_tokens(
-            table_name,
-            &*tokens,
-            schema.as_slice(),
-            Arc::clone(io_rows),
-            pointers_io,
-        )
-        .await
-        .map(|arc| (arc, 0usize))
-    }
-
-    #[cfg(feature = "sme_v2")]
-    async fn maybe_build_sme_candidates<S: StorageIO>(
-        table_name: &str,
-        tokens: &Arc<SmallVec<[Token; 36]>>,
-        schema: &Arc<SmallVec<[SchemaField; 20]>>,
-        io_rows: &Arc<S>,
-        iterator: &RowPointerIterator<S>,
-        limit: Option<u64>,
-    ) -> Option<(Arc<Vec<RowPointer>>, usize)> {
-        if !semantics_enabled() { return None; }
-
-        let engine = SME_V2.get_or_init(|| rclite::Arc::new(SemanticMappingEngineV2::new()));
-        let pointers_io = iterator.io();
-
-        engine
-            .get_or_build_candidates_for_table_tokens(
-                table_name,
-                &*tokens,
-                schema.as_slice(),
-                Arc::clone(io_rows),
-                pointers_io,
-                limit,
-            )
-            .await
-            .map(|arc| (arc, 0usize))
-    }
-
     async fn spawn_batch_tasks<S: StorageIO>(
         iterator: &mut RowPointerIterator<S>,
-        mut sme_candidates: Option<(Arc<Vec<RowPointer>>, usize)>,
         shared_tuple: Arc<(Semaphore, RowFetch, RowFetch)>,
         schema_arc: Arc<SmallVec<[SchemaField; 20]>>,
         tokens_arc: Arc<SmallVec<[Token; 36]>>,
@@ -221,17 +155,8 @@ impl ConcurrentProcessor {
 
             let mut pointers = row_pointer_vec_pool().get();
 
-            if let Some((cands, idx)) = &mut sme_candidates {
-                let batch_size = *BATCH_SIZE.get().unwrap();
-                if *idx < cands.len() {
-                    let end = std::cmp::min(*idx + batch_size, cands.len());
-                    pointers.extend(cands[*idx..end].iter().cloned());
-                    *idx = end;
-                }
-            } else {
-                if iterator.next_row_pointers_into(&mut *pointers).await.is_err() {
-                    pointers.clear();
-                }
+            if iterator.next_row_pointers_into(&mut *pointers).await.is_err() {
+                pointers.clear();
             }
 
             if pointers.is_empty() {
@@ -647,54 +572,10 @@ impl ConcurrentProcessor {
             prep_stopwatch.elapsed()
         );
 
-        let semantic_stopwatch = std::time::Instant::now();
-        if semantics_enabled() {
-            log::info!("Starting semantic processing for query: {}", where_query);
-        }
-
-        // Avoid SME candidates on very small tables; rule sampling can drop matches.
-        let total_rows_estimate = {
-            let len = iterator.io().get_len().await as usize;
-            len / ROW_POINTER_RECORD_LEN
-        };
-        let should_use_sme = semantics_enabled() && total_rows_estimate >= SME_MIN_ROWS_FOR_CANDIDATES;
-
-        // If SME semantics are enabled and SME can build candidates for this query/table,
-        // only iterate those. Otherwise fall back to scanning all pointers.
-        let sme_candidates = if should_use_sme {
-            Self::maybe_build_sme_candidates(table_name, &tokens_arc, &schema_arc, &io_rows_outer, iterator, limit)
-                .await
-        } else {
-            None
-        };
-
-        if sme_candidates.is_some() {
-            log::info!(
-                "Semantic processing will use candidate row pointers, with {} candidates for query: {}",
-                sme_candidates.as_ref().unwrap().0.len(),
-                where_query
-            );
-        } else {
-            if semantics_enabled() {
-                log::info!(
-                    "Semantic processing will scan all row pointers for query: {}",
-                    where_query
-                );
-            }
-        }
-
-        if semantics_enabled() {
-            log::info!(
-                "Semantic processing setup completed in {:.2?}",
-                semantic_stopwatch.elapsed()
-            );
-        }
-        
         let reading_time_total: Arc<CacheGuard<AtomicU64>> = Arc::new(AtomicU64::new(0).into());
 
         let batch_handles = Self::spawn_batch_tasks(
             iterator,
-            sme_candidates,
             Arc::clone(&shared_tuple),
             Arc::clone(&schema_arc),
             Arc::clone(&tokens_arc),
@@ -802,16 +683,6 @@ impl ConcurrentProcessor {
             "Preperation for pointer query completed in {:.2?}",
             prep_stopwatch.elapsed()
         );
-
-        if semantics_enabled() {
-            // NOTE: SME candidates currently don't carry pointer-record offsets.
-            // For correctness of UPDATE/DELETE (which must write pointer records), we conservatively
-            // fall back to scanning all pointers here.
-            log::info!(
-                "Semantic processing is enabled, but pointer-record offsets are required; scanning all row pointers for query: {}",
-                where_query
-            );
-        }
 
         let reading_time_total = Arc::new(AtomicU64::new(0));
 
