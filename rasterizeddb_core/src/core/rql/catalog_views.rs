@@ -1,0 +1,1255 @@
+//! PostgreSQL catalogue relations, built only when a statement names one.
+//!
+//! [`crate::core::introspect`] explains why the catalogue is not stored as
+//! tables here: the schema lives in a per-table sidecar, the sizes live in the
+//! filesystem, and materialising all three into rows costs the whole price of a
+//! catalogue to answer questions that are a field read each.
+//!
+//! That argument is against keeping them. It is not an argument against
+//! *producing* them when someone asks: an application written for PostgreSQL
+//! reads `pg_stat_user_tables` rather than `SHOW TABLES`, and rewriting the
+//! application is not always the caller's option. So a statement naming one of
+//! these gets a temporary table built from the same field reads `SHOW` would
+//! have made, and nothing is built for a statement that names none.
+//!
+//! The rows are a snapshot taken when the statement runs, which is what
+//! PostgreSQL's statistics views are too.
+
+use rclite::Arc;
+
+use crate::core::database::Database;
+use crate::core::storage_providers::traits::StorageIO;
+use crate::core::rql::cte::Materialized;
+use crate::core::db_type::DbType;
+use crate::core::row::schema::SchemaField;
+use smallvec::SmallVec;
+
+/// The catalogue relations this module can produce.
+const VIEWS: [&str; 9] = [
+    "pg_stat_user_tables",
+    "pg_class",
+    "pg_namespace",
+    "pg_inherits",
+    "pg_replication_slots",
+    "pg_index",
+    "pg_database",
+    "columns",
+    "tables",
+];
+
+/// The columns each view is built with, in order.
+///
+/// The extended query protocol asks what a statement returns *before* running
+/// it, and a catalogue view does not exist until it is materialised — so the
+/// describe path cannot look its columns up the way it does for a real
+/// relation. Answering from here lets it describe one without building it,
+/// which matters because materialising at describe time would give `Describe`
+/// side effects.
+///
+/// Without this every catalogue view answered `Describe` with `NoData` and then
+/// sent `DataRow`s from `Execute` anyway. Drivers read that as a protocol
+/// violation; sqlx surfaced it as rows whose columns could not be read by name,
+/// so `SELECT * FROM information_schema.columns` returned the right values under
+/// no names at all and any schema introspection failed.
+///
+/// `catalogue_columns_match_what_is_built` holds this list to what `build`
+/// actually creates, so the two cannot drift.
+pub fn columns_of(view: &str) -> Option<&'static [(&'static str, DbType)]> {
+    use DbType::{BOOL, I64, STRING};
+    Some(match view {
+        "pg_namespace" => &[("oid", I64), ("nspname", STRING)],
+        "pg_class" => &[
+            ("oid", I64),
+            ("relname", STRING),
+            ("relnamespace", I64),
+            ("relkind", STRING),
+            ("relsize", I64),
+            ("reltuples", I64),
+        ],
+        "columns" => &[
+            ("table_catalog", STRING),
+            ("table_schema", STRING),
+            ("table_name", STRING),
+            ("column_name", STRING),
+            ("ordinal_position", I64),
+            ("data_type", STRING),
+            ("is_nullable", STRING),
+        ],
+        "pg_stat_user_tables" => &[
+            ("relid", I64),
+            ("schemaname", STRING),
+            ("relname", STRING),
+            ("n_live_tup", I64),
+            ("n_dead_tup", I64),
+        ],
+        "pg_replication_slots" => &[
+            ("slot_name", STRING),
+            ("plugin", STRING),
+            ("slot_type", STRING),
+            ("datoid", I64),
+            ("database", STRING),
+            ("temporary", BOOL),
+            ("active", BOOL),
+            ("active_pid", I64),
+            ("xmin", I64),
+            ("catalog_xmin", I64),
+            ("restart_lsn", I64),
+            ("confirmed_flush_lsn", I64),
+        ],
+        "pg_index" => &[
+            ("indexrelid", I64),
+            ("indrelid", I64),
+            ("indnatts", I64),
+            ("indisunique", BOOL),
+            ("indisprimary", BOOL),
+            ("indisvalid", BOOL),
+            ("indisready", BOOL),
+            ("indislive", BOOL),
+            ("indpred", STRING),
+            ("indexprs", STRING),
+        ],
+        "pg_database" => &[
+            ("oid", I64),
+            ("datname", STRING),
+            ("datdba", I64),
+            ("encoding", I64),
+            ("datcollate", STRING),
+            ("datctype", STRING),
+            ("datistemplate", BOOL),
+            ("datallowconn", BOOL),
+            ("datconnlimit", I64),
+        ],
+        "tables" => &[
+            ("table_catalog", STRING),
+            ("table_schema", STRING),
+            ("table_name", STRING),
+            ("table_type", STRING),
+        ],
+        "pg_inherits" => &[("inhrelid", I64), ("inhparent", I64), ("inhseqno", I64)],
+        _ => return None,
+    })
+}
+
+/// The catalogue view a statement reads, if it reads one.
+///
+/// The same test [`materialize`] applies, so a statement that merely contains
+/// the word does not match.
+pub fn view_of_statement(sql: &str) -> Option<&'static str> {
+    VIEWS.iter().copied().find(|view| names_relation(sql, view))
+}
+
+/// A schema equivalent to the one the materialised view will have, for
+/// describing a statement without building it.
+pub fn synthetic_schema(view: &str) -> Option<SmallVec<[SchemaField; 20]>> {
+    let columns = columns_of(view)?;
+    let mut fields: SmallVec<[SchemaField; 20]> = SmallVec::new();
+    let mut offset = 0u64;
+    for (order, (name, ty)) in columns.iter().enumerate() {
+        let size = ty.get_size();
+        fields.push(SchemaField::new(
+            name.to_string(),
+            ty.clone(),
+            size,
+            offset,
+            order as u64,
+            false,
+        ));
+        offset += size as u64;
+    }
+    Some(fields)
+}
+
+/// The one schema this engine has.
+const SCHEMA: &str = "public";
+
+/// Catalogue relations that are only recognised when they are qualified.
+///
+/// `columns` is `information_schema.columns`, and the bare word is far too
+/// common to claim: it is a keyword in `SHOW COLUMNS FROM t`, and it is a
+/// perfectly ordinary table name. Claiming it rewrote the keyword — `SHOW
+/// COLUMNS FROM "rdb_roles"` became `SHOW __cat_columns_… FROM "rdb_roles"`,
+/// which returned one empty column and left every client that asks a table for
+/// its columns believing it had none.
+const QUALIFIED_ONLY: [&str; 2] = ["columns", "tables"];
+
+/// Whether `view` may only be matched with its schema in front of it.
+fn needs_qualifier(view: &str) -> bool {
+    QUALIFIED_ONLY.iter().any(|v| v.eq_ignore_ascii_case(view))
+}
+
+/// True when `name` is a catalogue relation, with or without a `pg_catalog.`
+/// qualifier.
+pub fn is_catalog_view(name: &str) -> bool {
+    let trimmed = name.trim().trim_matches('"');
+    let qualified = trimmed.contains('.');
+    let bare = trimmed.rsplit('.').next().unwrap_or(trimmed).trim_matches('"');
+    VIEWS
+        .iter()
+        .any(|v| v.eq_ignore_ascii_case(bare) && (qualified || !needs_qualifier(v)))
+}
+
+/// Builds every catalogue relation the statement names and points it at them.
+///
+/// Returns `None` when the statement names none, which is the ordinary case and
+/// costs one scan of the text.
+pub async fn materialize(
+    sql: &str,
+    database: &Arc<Database>,
+    tx: crate::core::mvcc::transaction::TxId,
+    // Only `pg_database` needs it, and only a session has one: a `Database`
+    // is owned by the catalogue and holds no way back up to it. `None` builds
+    // the view with the current database as its only row, which is the truth
+    // for a process serving one.
+    catalog: Option<&Arc<crate::core::database::catalog::DatabaseCatalog>>,
+) -> Result<Option<Materialized>, String> {
+    let mut wanted: Vec<String> = Vec::new();
+    for view in VIEWS {
+        if names_relation(sql, view) {
+            wanted.push(view.to_string());
+        }
+    }
+    if wanted.is_empty() {
+        return Ok(None);
+    }
+
+    let mut temps: Vec<String> = Vec::new();
+    let mut rewritten = sql.to_string();
+
+    // `pg_total_relation_size(c.oid)` becomes `c.relsize`: the figure is read
+    // when `pg_class` is built, where the storage layer is reachable, rather
+    // than by a function the row evaluator has no way to answer.
+    if wanted.iter().any(|v| v == "pg_class") {
+        rewritten = rewrite_size_calls(&rewritten);
+    }
+
+    // Same treatment for the WAL position functions: `pg_current_wal_lsn()`
+    // becomes the engine's own commit LSN as a literal, and
+    // `pg_wal_lsn_diff(a, b)` becomes the subtraction it is. The row evaluator
+    // has no way to reach the WAL, and a monitor's `SELECT` should not fail on
+    // a function that is one field read away.
+    if wanted.iter().any(|v| v == "pg_replication_slots") {
+        rewritten = rewrite_wal_calls(&rewritten, database);
+    }
+
+    // `pg_get_expr(indpred, indrelid)` renders an index's partial predicate.
+    // No index here has one, so the answer is always the empty predicate, and
+    // a client filtering on it — `pg_get_expr(...) ILIKE '%<uuid>%'`, looking
+    // for the partial index covering one value — correctly matches nothing.
+    // Left alone the whole statement failed instead, which reads as "the index
+    // could not be checked" rather than "there is no such index".
+    if wanted.iter().any(|v| v == "pg_index") {
+        rewritten = rewrite_get_expr(&rewritten);
+    }
+
+    for view in &wanted {
+        match build(view, database, tx, catalog).await {
+            Ok(temp) => {
+                rewritten = replace_relation(&rewritten, view, &temp);
+                temps.push(temp);
+            }
+            Err(e) => {
+                // Whatever was built before the failure is dropped: the caller
+                // is handed nothing by an `Err` and cannot clean up.
+                crate::core::rql::cte::drop_temps(database, &temps, tx).await;
+                return Err(e);
+            }
+        }
+    }
+
+    Ok(Some(Materialized { rewritten, temps }))
+}
+
+/// Whether `sql` uses `view` as a relation, rather than merely containing the
+/// word.
+fn names_relation(sql: &str, view: &str) -> bool {
+    if needs_qualifier(view) {
+        // Matched only as `information_schema.columns`, never as the bare word.
+        return names_relation(sql, &format!("information_schema.{}", view))
+            || names_relation(sql, &format!("pg_catalog.{}", view));
+    }
+    let lower = sql.to_ascii_lowercase();
+    let mut from = 0usize;
+    while let Some(at) = lower[from..].find(view) {
+        let start = from + at;
+        let end = start + view.len();
+        let before_ok = start == 0 || {
+            let b = lower.as_bytes()[start - 1];
+            // A `pg_catalog.` qualifier is part of the name, not a different one.
+            !(b.is_ascii_alphanumeric() || b == b'_')
+        };
+        let after_ok = end >= lower.len() || {
+            let b = lower.as_bytes()[end];
+            !(b.is_ascii_alphanumeric() || b == b'_')
+        };
+        if before_ok && after_ok {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
+/// Points every reference to `view` at `temp`, qualifier included.
+///
+/// Skips string literals: `WHERE relname = 'pg_class'` compares against the
+/// *name* `pg_class`, and rewriting it would silently change what the statement
+/// asks for.
+fn replace_relation(sql: &str, view: &str, temp: &str) -> String {
+    let bytes = sql.as_bytes();
+    let lower = sql.to_ascii_lowercase();
+    // Both schemas a catalogue relation is written under. The qualifier is
+    // part of the name being replaced, not a separate token — leaving it behind
+    // produced `information_schema.__cat_columns_…`, which names nothing.
+    let qualified: [String; 2] = [
+        format!("pg_catalog.{}", view),
+        format!("information_schema.{}", view),
+    ];
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        // A quoted literal is data; copy it through untouched.
+        if bytes[i] == b'\'' {
+            let start = i;
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\'' {
+                    if bytes.get(i + 1) == Some(&b'\'') {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+
+        let matched = qualified
+            .iter()
+            .find(|q| lower[i..].starts_with(q.as_str()))
+            .map(|q| q.len())
+            .or_else(|| {
+                // A qualifier-only view is never matched bare. See
+                // `QUALIFIED_ONLY`.
+                (!needs_qualifier(view) && lower[i..].starts_with(view))
+                    .then(|| view.len())
+            });
+
+        if let Some(len) = matched {
+            let end = i + len;
+            let before_ok = i == 0 || {
+                let b = bytes[i - 1];
+                !(b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
+            };
+            let after_ok = end >= bytes.len() || {
+                let b = bytes[end];
+                !(b.is_ascii_alphanumeric() || b == b'_')
+            };
+            if before_ok && after_ok {
+                out.push_str(temp);
+                i = end;
+                continue;
+            }
+        }
+
+        let ch = sql[i..].chars().next().expect("in bounds");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Turns `pg_total_relation_size(x.oid)` into `x.relsize`.
+///
+/// Only the `<alias>.oid` form is rewritten. Any other argument is left alone
+/// and fails as an unsupported function, rather than being answered with a size
+/// for a relation nobody named.
+fn rewrite_size_calls(sql: &str) -> String {
+    let mut out = sql.to_string();
+    for func in ["pg_total_relation_size", "pg_relation_size"] {
+        loop {
+            let lower = out.to_ascii_lowercase();
+            let Some(at) = lower.find(func) else { break };
+            let after = &out[at + func.len()..];
+            let Some(open) = after.find('(') else { break };
+            if !after[..open].trim().is_empty() {
+                break;
+            }
+            let Some(close) = after.find(')') else { break };
+            let arg = after[open + 1..close].trim();
+            let Some(alias) = arg.strip_suffix(".oid").or_else(|| {
+                arg.strip_suffix(".OID")
+            }) else {
+                break;
+            };
+            out = format!(
+                "{}{}.relsize{}",
+                &out[..at],
+                alias.trim(),
+                &after[close + 1..]
+            );
+        }
+    }
+    out
+}
+
+/// Replaces the WAL position functions with values the evaluator can read.
+///
+/// `pg_current_wal_lsn()` becomes the engine's commit LSN — a real, monotonic
+/// position, not a placeholder — and `pg_wal_lsn_diff(a, b)` becomes `(a - b)`.
+/// Replaces every `pg_get_expr(...)` call with the empty string.
+///
+/// Empty rather than `NULL`: the row evaluator rejects a `NULL` literal in a
+/// `WHERE`, and the two behave the same under the `LIKE`/`ILIKE` these calls
+/// are almost always compared with — neither matches a pattern with anything
+/// in it. Arguments are skipped by balancing parentheses, so a nested call
+/// does not end the span early.
+fn rewrite_get_expr(sql: &str) -> String {
+    const NAME: &str = "pg_get_expr";
+    let mut out = sql.to_string();
+    let mut from = 0usize;
+
+    loop {
+        let lower = out.to_ascii_lowercase();
+        let Some(at) = lower[from..].find(NAME).map(|i| i + from) else { break };
+
+        // Only a call, and only a whole word: `my_pg_get_expr` is a column.
+        let before_ok = at == 0 || !is_ident_byte(out.as_bytes()[at - 1]);
+        let after = &out[at + NAME.len()..];
+        let open_rel = after.find('(').filter(|o| after[..*o].trim().is_empty());
+
+        let (Some(open_rel), true) = (open_rel, before_ok) else {
+            from = at + NAME.len();
+            continue;
+        };
+
+        let start = at + NAME.len() + open_rel;
+        let Some(end) = matching_paren(&out, start) else {
+            from = at + NAME.len();
+            continue;
+        };
+
+        out = format!("{}''{}", &out[..at], &out[end + 1..]);
+        from = at + 2;
+    }
+
+    out
+}
+
+/// The index of the `)` closing the `(` at `open`, or `None` if unbalanced.
+///
+/// String literals are skipped so a parenthesis inside one cannot close the
+/// call.
+fn matching_paren(sql: &str, open: usize) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    let mut depth = 0usize;
+    let mut i = open;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    None
+}
+
+/// A byte that can appear inside an identifier.
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn rewrite_wal_calls(sql: &str, database: &Arc<Database>) -> String {
+    let lsn = database
+        .location
+        .as_deref()
+        .and_then(crate::core::wal::wal_for)
+        .map(|w| w.commit_lsn())
+        .unwrap_or(0);
+
+    let mut out = sql.to_string();
+
+    // The nullary one first, so the diff below sees a literal where its
+    // argument was.
+    loop {
+        let lower = out.to_ascii_lowercase();
+        let Some(at) = lower.find("pg_current_wal_lsn") else { break };
+        let after = &out[at + "pg_current_wal_lsn".len()..];
+        let Some(open) = after.find('(') else { break };
+        if !after[..open].trim().is_empty() {
+            break;
+        }
+        let Some(close) = after[open..].find(')') else { break };
+        out = format!("{}{}{}", &out[..at], lsn, &after[open + close + 1..]);
+    }
+
+    loop {
+        let lower = out.to_ascii_lowercase();
+        let Some(at) = lower.find("pg_wal_lsn_diff") else { break };
+        let after = &out[at + "pg_wal_lsn_diff".len()..];
+        let Some(open) = after.find('(') else { break };
+        if !after[..open].trim().is_empty() {
+            break;
+        }
+        let Some(close) = matching_paren_from(after, open) else { break };
+        let args = &after[open + 1..close];
+        let Some(comma) = top_level_comma(args) else { break };
+        out = format!(
+            "{}({} - {}){}",
+            &out[..at],
+            args[..comma].trim(),
+            args[comma + 1..].trim(),
+            &after[close + 1..]
+        );
+    }
+
+    out
+}
+
+/// Index of the parenthesis matching the one at `open`, ignoring quoted text.
+fn matching_paren_from(text: &str, open: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut quote: Option<u8> = None;
+    for (i, b) in bytes.iter().enumerate().skip(open) {
+        match quote {
+            Some(q) => {
+                if *b == q {
+                    quote = None;
+                }
+            }
+            None => match b {
+                b'\'' | b'"' => quote = Some(*b),
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+    None
+}
+
+/// Index of the first comma at nesting depth zero.
+fn top_level_comma(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0i32;
+    let mut quote: Option<u8> = None;
+    for (i, b) in bytes.iter().enumerate() {
+        match quote {
+            Some(q) => {
+                if *b == q {
+                    quote = None;
+                }
+            }
+            None => match b {
+                b'\'' | b'"' => quote = Some(*b),
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                b',' if depth == 0 => return Some(i),
+                _ => {}
+            },
+        }
+    }
+    None
+}
+
+/// Merges single-row `INSERT`s that share a target into multi-row ones.
+///
+/// Every row of a catalogue relation is generated as its own statement, which
+/// keeps the builders simple. Executing them that way does not scale: the cost
+/// is per statement, and a relation describing every column of every table has
+/// thousands. Statements that agree up to `VALUES` are joined; anything that
+/// does not fit the shape is passed through untouched, so a builder that emits
+/// something unusual still works.
+fn batch_inserts(inserts: &[String], per_statement: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut prefix: Option<&str> = None;
+    let mut tuples: Vec<&str> = Vec::new();
+
+    let flush = |out: &mut Vec<String>, prefix: Option<&str>, tuples: &mut Vec<&str>| {
+        if let (Some(prefix), false) = (prefix, tuples.is_empty()) {
+            out.push(format!("{}{}", prefix, tuples.join(", ")));
+        }
+        tuples.clear();
+    };
+
+    for insert in inserts {
+        let split = insert.find(" VALUES ").map(|at| at + " VALUES ".len());
+        let Some(at) = split else {
+            flush(&mut out, prefix, &mut tuples);
+            prefix = None;
+            out.push(insert.clone());
+            continue;
+        };
+        let (head, tail) = insert.split_at(at);
+        if prefix != Some(head) || tuples.len() >= per_statement {
+            flush(&mut out, prefix, &mut tuples);
+            prefix = Some(head);
+        }
+        tuples.push(tail.trim());
+    }
+    flush(&mut out, prefix, &mut tuples);
+    out
+}
+
+/// PostgreSQL's `information_schema` spelling of a column's type.
+fn sql_type_name(db_type: &crate::core::db_type::DbType) -> &'static str {
+    use crate::core::db_type::DbType;
+    match db_type {
+        DbType::BOOL => "boolean",
+        DbType::I8 | DbType::I16 => "smallint",
+        DbType::I32 => "integer",
+        DbType::I64 | DbType::U8 | DbType::U16 | DbType::U32 | DbType::U64 => "bigint",
+        DbType::F32 => "real",
+        DbType::F64 => "double precision",
+        DbType::DATETIME => "timestamp with time zone",
+        DbType::UUID => "uuid",
+        DbType::INET => "inet",
+        DbType::DECIMAL => "numeric",
+        DbType::BYTEA => "bytea",
+        DbType::ARRAY => "ARRAY",
+        DbType::JSON | DbType::JSONB => "jsonb",
+        _ => "text",
+    }
+}
+
+/// A temporary table name for one view, unique to this statement.
+fn temp_name(view: &str, database: &Arc<Database>) -> String {
+    // The address of the database is stable for its lifetime and different for
+    // two of them, so two statements in flight against different databases
+    // cannot collide on a name.
+    format!(
+        "__cat_{}_{:x}",
+        view,
+        Arc::as_ptr(database) as usize as u64 ^ fastrand::u64(..)
+    )
+}
+
+/// Builds one catalogue relation as a temporary table and returns its name.
+async fn build(
+    view: &str,
+    database: &Arc<Database>,
+    tx: crate::core::mvcc::transaction::TxId,
+    catalog: Option<&Arc<crate::core::database::catalog::DatabaseCatalog>>,
+) -> Result<String, String> {
+    let temp = temp_name(view, database);
+
+    // Names are collected first so no map guard is held across an await.
+    let tables: Vec<String> = database
+        .tables
+        .iter()
+        .map(|entry| entry.key().clone())
+        .filter(|name| !is_internal(name))
+        .collect();
+
+    let (create, inserts) = match view {
+        "pg_namespace" => (
+            format!("CREATE TABLE {} (oid BIGINT, nspname TEXT)", temp),
+            vec![format!(
+                "INSERT INTO {} (oid, nspname) VALUES ({}, '{}')",
+                temp,
+                oid_of(SCHEMA),
+                SCHEMA
+            )],
+        ),
+        "pg_class" => {
+            let mut rows = Vec::with_capacity(tables.len());
+            for name in &tables {
+                // The size is read here, where the storage layer is reachable.
+                // `pg_total_relation_size(c.oid)` is rewritten into a reference
+                // to this column, so the figure comes from a `stat` rather than
+                // from a function the row evaluator could not answer.
+                let (bytes, tuples) = relation_size(database, name).await;
+                rows.push(format!(
+                    "INSERT INTO {} (oid, relname, relnamespace, relkind, relsize, reltuples) \
+                     VALUES ({}, '{}', {}, 'r', {}, {})",
+                    temp,
+                    oid_of(name),
+                    escape(name),
+                    oid_of(SCHEMA),
+                    bytes,
+                    tuples
+                ));
+            }
+            (
+                format!(
+                    "CREATE TABLE {} (oid BIGINT, relname TEXT, relnamespace BIGINT, \
+                     relkind TEXT, relsize BIGINT, reltuples BIGINT)",
+                    temp
+                ),
+                rows,
+            )
+        }
+        // `information_schema.columns`, which is how an application asks
+        // whether a column exists before using it. Named `columns` here because
+        // the qualifier is stripped before the lookup.
+        "columns" => {
+            let mut rows = Vec::new();
+            for name in &tables {
+                let Some(table) = database.tables.get(name) else { continue };
+                let mut fields: Vec<_> = table
+                    .schema
+                    .fields
+                    .iter()
+                    .filter(|f| {
+                        !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name)
+                    })
+                    .cloned()
+                    .collect();
+                fields.sort_by_key(|f| f.write_order);
+                for (position, field) in fields.iter().enumerate() {
+                    // A column is nullable exactly when it has a companion
+                    // recording that, which is the same test the writer uses.
+                    let nullable = table.schema.fields.iter().any(|f| {
+                        !f.is_deleted
+                            && f.name.eq_ignore_ascii_case(
+                                &crate::core::rql::nullable::flag_column_name(&field.name),
+                            )
+                    });
+                    rows.push(format!(
+                        "INSERT INTO {} (table_catalog, table_schema, table_name, column_name, \
+                         ordinal_position, data_type, is_nullable) \
+                         VALUES ('{}', '{}', '{}', '{}', {}, '{}', '{}')",
+                        temp,
+                        SCHEMA,
+                        SCHEMA,
+                        escape(name),
+                        escape(&field.name),
+                        position + 1,
+                        sql_type_name(&field.db_type),
+                        if nullable { "YES" } else { "NO" }
+                    ));
+                }
+            }
+            (
+                format!(
+                    "CREATE TABLE {} (table_catalog TEXT, table_schema TEXT, table_name TEXT, \
+                     column_name TEXT, ordinal_position BIGINT, data_type TEXT, \
+                     is_nullable TEXT)",
+                    temp
+                ),
+                rows,
+            )
+        }
+        // The four columns schema introspection actually reads —
+        // `sea-orm-cli`, Diesel's `print-schema` and JDBC's `getTables` all
+        // select them by name. The standard's remaining columns
+        // (`self_referencing_column_name`, `is_insertable_into` and the rest)
+        // are omitted rather than filled with plausible constants: a tool that
+        // needs one should fail on its absence instead of reading an invented
+        // answer.
+        "tables" => {
+            let mut rows = Vec::with_capacity(tables.len());
+            for name in &tables {
+                rows.push(format!(
+                    "INSERT INTO {} (table_catalog, table_schema, table_name, table_type) \
+                     VALUES ('{}', '{}', '{}', 'BASE TABLE')",
+                    temp,
+                    SCHEMA,
+                    SCHEMA,
+                    escape(name)
+                ));
+            }
+            (
+                format!(
+                    "CREATE TABLE {} (table_catalog TEXT, table_schema TEXT, \
+                     table_name TEXT, table_type TEXT)",
+                    temp
+                ),
+                rows,
+            )
+        }
+        "pg_stat_user_tables" => {
+            let mut rows = Vec::with_capacity(tables.len());
+            for name in &tables {
+                let (live, dead) = tuple_counts(database, name).await;
+                rows.push(format!(
+                    "INSERT INTO {} (relid, schemaname, relname, n_live_tup, n_dead_tup) \
+                     VALUES ({}, '{}', '{}', {}, {})",
+                    temp,
+                    oid_of(name),
+                    SCHEMA,
+                    escape(name),
+                    live,
+                    dead
+                ));
+            }
+            (
+                format!(
+                    "CREATE TABLE {} (relid BIGINT, schemaname TEXT, relname TEXT, \
+                     n_live_tup BIGINT, n_dead_tup BIGINT)",
+                    temp
+                ),
+                rows,
+            )
+        }
+        // Table inheritance and declarative partitioning do not exist here, so
+        // nothing inherits from anything. The relation is produced empty rather
+        // than refused: a query that joins or anti-joins against it — which is
+        // how a caller excludes partitions — then gets the right answer instead
+        // of an error about a relation it only mentions in passing.
+        // Empty, and honestly so: this engine replicates statements between
+        // its own nodes and has no PostgreSQL replication slots to report.
+        // A monitor asking after one gets "there is no such slot" instead of
+        // "relation does not exist", which is the true answer to its question.
+        // The columns are PostgreSQL's, so a query that selects any of them
+        // parses.
+        "pg_replication_slots" => (
+            format!(
+                "CREATE TABLE {} (slot_name TEXT, plugin TEXT, slot_type TEXT, \
+                 datoid BIGINT, database TEXT, temporary BOOL, active BOOL, \
+                 active_pid BIGINT, xmin BIGINT, catalog_xmin BIGINT, \
+                 restart_lsn BIGINT, confirmed_flush_lsn BIGINT)",
+                temp
+            ),
+            Vec::new(),
+        ),
+        // One row per uniqueness constraint. This engine maintains its own
+        // access paths and has no user-visible indexes, so the only entries are
+        // the ones a client can reason about: what is unique, and what is the
+        // key.
+        "pg_index" => {
+            let mut rows = Vec::new();
+            for name in &tables {
+                let Some(table) = database.tables.get(name) else { continue };
+                let relid = oid_of(name);
+
+                let mut keys: Vec<(String, bool, bool)> = Vec::new();
+                if let Some(primary) = table.schema.primary_key.as_deref() {
+                    keys.push((primary.to_string(), true, true));
+                }
+                for field in table.schema.fields.iter() {
+                    if field.is_unique
+                        && !field.is_deleted
+                        && !keys.iter().any(|(n, _, _)| n.eq_ignore_ascii_case(&field.name))
+                    {
+                        keys.push((field.name.clone(), true, false));
+                    }
+                }
+                for key in table.schema.unique_keys.iter().filter(|k| !k.is_deleted) {
+                    if key.columns.len() == 1
+                        && !keys.iter().any(|(n, _, _)| n.eq_ignore_ascii_case(&key.columns[0]))
+                    {
+                        keys.push((key.columns[0].clone(), true, false));
+                    }
+                }
+
+                for (column, unique, primary) in keys {
+                    // The index has an identity of its own, distinct from the
+                    // table's, so a client joining `pg_index` to `pg_class`
+                    // does not find the table where it expects the index.
+                    let indexrelid = oid_of(&format!("{}.{}", name, column));
+                    rows.push(format!(
+                        "INSERT INTO {} (indexrelid, indrelid, indnatts, indisunique, \
+                         indisprimary, indisvalid, indisready, indislive, \
+                         indpred, indexprs) \
+                         VALUES ({}, {}, 1, {}, {}, 't', 't', 't', '', '')",
+                        temp,
+                        indexrelid,
+                        relid,
+                        if unique { "'t'" } else { "'f'" },
+                        if primary { "'t'" } else { "'f'" },
+                    ));
+                }
+            }
+            (
+                format!(
+                    // `indpred` and `indexprs` are always empty: every index
+                    // here is one plain column, never partial and never over an
+                    // expression. They exist so a client that reads them finds
+                    // the answer rather than an error.
+                    "CREATE TABLE {} (indexrelid BIGINT, indrelid BIGINT, indnatts BIGINT, \
+                     indisunique BOOL, indisprimary BOOL, indisvalid BOOL, indisready BOOL, \
+                     indislive BOOL, indpred TEXT, indexprs TEXT)",
+                    temp
+                ),
+                rows,
+            )
+        }
+        "pg_database" => {
+            // `datallowconn` and `datistemplate` are constants: every database
+            // here accepts connections and none is a template.
+            let names: Vec<String> = match catalog {
+                Some(catalog) => catalog.names(),
+                None => vec![database.name.clone()],
+            };
+            let rows = names
+                .iter()
+                .map(|name| {
+                    format!(
+                        "INSERT INTO {} (oid, datname, datdba, encoding, datcollate, \
+                         datctype, datistemplate, datallowconn, datconnlimit) \
+                         VALUES ({}, '{}', 10, 6, 'en_US.UTF-8', 'en_US.UTF-8', 'f', 't', -1)",
+                        temp,
+                        oid_of(name),
+                        escape(name)
+                    )
+                })
+                .collect();
+            (
+                format!(
+                    "CREATE TABLE {} (oid BIGINT, datname TEXT, datdba BIGINT, \
+                     encoding BIGINT, datcollate TEXT, datctype TEXT, \
+                     datistemplate BOOL, datallowconn BOOL, datconnlimit BIGINT)",
+                    temp
+                ),
+                rows,
+            )
+        }
+        "pg_inherits" => (
+            format!(
+                "CREATE TABLE {} (inhrelid BIGINT, inhparent BIGINT, inhseqno BIGINT)",
+                temp
+            ),
+            Vec::new(),
+        ),
+        other => return Err(format!("'{}' is not a catalogue relation", other)),
+    };
+
+    crate::core::rql::executor::run_statement(&create, database, tx)
+        .await
+        .map_err(|e| format!("could not build {}: {}", view, e))?;
+    // Filled in batches. A catalogue relation is one row per column of every
+    // table — thousands for a real schema — and running one statement each cost
+    // about a second and a half per thousand: `SELECT … FROM
+    // information_schema.columns` took four and a half seconds, which a client
+    // polling it feels as the whole database being slow. The rows are known and
+    // identical in shape, so they go in a few statements instead of thousands.
+    for statement in batch_inserts(&inserts, 200) {
+        crate::core::rql::executor::run_statement(&statement, database, tx)
+            .await
+            .map_err(|e| format!("could not fill {}: {}", view, e))?;
+    }
+    Ok(temp)
+}
+
+/// Bytes one relation occupies, and its estimated tuple count.
+///
+/// Every file the table owns is counted — rows, pointers, schema sidecar,
+/// filter checkpoint and sequence — which is what `pg_total_relation_size`
+/// means: the relation and everything stored with it.
+async fn relation_size(database: &Arc<Database>, name: &str) -> (u64, i64) {
+    let ios = {
+        let Some(table) = database.tables.get(name) else {
+            return (0, 0);
+        };
+        [
+            table.io_rows.clone(),
+            table.io_pointers.clone(),
+            table.io_schema.clone(),
+            table.io_filters.clone(),
+            table.io_sequence.clone(),
+        ]
+    };
+    let mut total = 0u64;
+    for io in ios {
+        total += io.get_len().await;
+    }
+    let (live, _) = tuple_counts(database, name).await;
+    (total, live)
+}
+
+/// Live and dead tuple counts for one table.
+///
+/// Both are **estimates**, which is what PostgreSQL's are too — its own
+/// documentation says these columns are approximate. The pointer file gives the
+/// number of slots ever written, which bounds the live rows from above because
+/// a deleted or relocated row keeps its slot until a vacuum reclaims it. The
+/// reclamation service tracks dead space in bytes, so it is converted to rows
+/// by the width the schema declares, and the live count is what remains.
+///
+/// Counting exactly would mean a scan per table on every catalogue query. The
+/// caller that needs an exact figure runs `SELECT COUNT(*)`, as it would
+/// against PostgreSQL.
+async fn tuple_counts(database: &Arc<Database>, name: &str) -> (i64, i64) {
+    let (pointers_io, dead_bytes, row_width) = {
+        let Some(table) = database.tables.get(name) else {
+            return (0, 0);
+        };
+        let width: u64 = table
+            .schema
+            .fields
+            .iter()
+            .filter(|f| !f.is_deleted)
+            .map(|f| f.size as u64)
+            .sum();
+        (
+            table.io_pointers.clone(),
+            table
+                .vacuum_stats()
+                .last_dead_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            width,
+        )
+    };
+
+    let slots = (pointers_io.get_len().await
+        / crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN as u64) as i64;
+    let dead = if row_width == 0 {
+        0
+    } else {
+        (dead_bytes / row_width) as i64
+    };
+    (slots.saturating_sub(dead).max(0), dead.min(slots))
+}
+
+/// A stable identifier for a name, standing in for PostgreSQL's OID.
+///
+/// Derived from the name so it is the same across statements and across
+/// restarts — a client that reads an oid from one query and joins on it in the
+/// next gets the relation it asked for.
+fn oid_of(name: &str) -> i64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in name.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    // Kept positive and inside i32 range: `oid` is a 32-bit unsigned type in
+    // PostgreSQL and a client may decode it as one.
+    ((hash % 2_000_000_000) + 16_384) as i64
+}
+
+/// Tables the engine keeps for itself, which PostgreSQL's catalogue would not
+/// list as user tables.
+fn is_internal(name: &str) -> bool {
+    name.starts_with("__")
+        || name.starts_with(crate::core::rql::json_map::SHADOW_TABLE_PREFIX)
+}
+
+fn escape(text: &str) -> String {
+    text.replace('\'', "''")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The call is replaced wherever it appears, arguments and all, so a
+    /// client filtering on a partial-index predicate gets "no such index"
+    /// rather than a failed statement.
+    #[test]
+    fn pg_get_expr_becomes_an_empty_predicate() {
+        assert_eq!(
+            rewrite_get_expr("SELECT pg_get_expr(i.indpred, i.indrelid) FROM pg_index i"),
+            "SELECT '' FROM pg_index i"
+        );
+        // The shape the application actually sends.
+        assert_eq!(
+            rewrite_get_expr(
+                "SELECT 1 FROM pg_index i \
+                 WHERE pg_get_expr(i.indpred, i.indrelid) ILIKE '%4806fcdf%'"
+            ),
+            "SELECT 1 FROM pg_index i WHERE '' ILIKE '%4806fcdf%'"
+        );
+    }
+
+    /// A nested call must not end the span at the inner `)`, and a column that
+    /// merely contains the name is not a call at all.
+    #[test]
+    fn the_rewrite_reads_the_whole_call_and_only_a_call() {
+        assert_eq!(
+            rewrite_get_expr("SELECT pg_get_expr(coalesce(a, b), c) FROM t"),
+            "SELECT '' FROM t"
+        );
+        assert_eq!(
+            rewrite_get_expr("SELECT my_pg_get_expr FROM t"),
+            "SELECT my_pg_get_expr FROM t"
+        );
+        // Two of them, so the scan continues past the first.
+        assert_eq!(
+            rewrite_get_expr("SELECT pg_get_expr(a, b), pg_get_expr(c, d) FROM t"),
+            "SELECT '', '' FROM t"
+        );
+    }
+
+    #[test]
+    fn only_a_statement_naming_a_view_is_recognised() {
+        assert!(names_relation("SELECT * FROM pg_class", "pg_class"));
+        assert!(names_relation("SELECT * FROM pg_catalog.pg_class c", "pg_class"));
+        // A longer name that merely contains it is a different relation.
+        assert!(!names_relation("SELECT * FROM pg_classroom", "pg_class"));
+        assert!(!names_relation("SELECT * FROM my_pg_class", "pg_class"));
+        assert!(!names_relation("SELECT * FROM users", "pg_class"));
+    }
+
+    #[test]
+    fn a_reference_is_repointed_qualifier_and_all() {
+        let out = replace_relation(
+            "SELECT c.relname FROM pg_catalog.pg_class c WHERE c.relname = 'pg_class'",
+            "pg_class",
+            "__cat_1",
+        );
+        assert!(out.starts_with("SELECT c.relname FROM __cat_1 c"), "{}", out);
+        // The string literal is data, not a relation, so it stays as written.
+        assert!(out.ends_with("'pg_class'"), "{}", out);
+    }
+
+    #[test]
+    fn a_name_that_merely_contains_the_view_is_left_alone() {
+        let out = replace_relation("SELECT * FROM pg_classroom", "pg_class", "__cat_1");
+        assert_eq!(out, "SELECT * FROM pg_classroom");
+    }
+
+    #[test]
+    fn a_size_call_becomes_a_column_reference() {
+        // The size is read when pg_class is built, where the storage layer is
+        // reachable; the row evaluator could not answer the function.
+        assert_eq!(
+            rewrite_size_calls("SELECT pg_total_relation_size(c.oid) FROM pg_class c"),
+            "SELECT c.relsize FROM pg_class c"
+        );
+        assert_eq!(
+            rewrite_size_calls("SELECT SUM(pg_relation_size(x.oid)) FROM pg_class x"),
+            "SELECT SUM(x.relsize) FROM pg_class x"
+        );
+    }
+
+    #[test]
+    fn a_size_call_on_something_else_is_left_to_fail() {
+        // Answering it would mean reporting a size for a relation nobody named.
+        let sql = "SELECT pg_total_relation_size('users') FROM pg_class c";
+        assert_eq!(rewrite_size_calls(sql), sql);
+    }
+
+    #[test]
+    fn an_oid_is_stable_and_in_range() {
+        // A client may decode `oid` as a 32-bit unsigned value, and a join
+        // across two statements needs the same answer both times.
+        assert_eq!(oid_of("users"), oid_of("users"));
+        assert_ne!(oid_of("users"), oid_of("orders"));
+        for name in ["users", "orders", "a", "", "user_table_row_archive_manifest"] {
+            let oid = oid_of(name);
+            assert!(oid > 0 && oid < u32::MAX as i64, "{} -> {}", name, oid);
+        }
+    }
+
+    #[test]
+    fn the_engines_own_tables_are_not_user_tables() {
+        assert!(is_internal("__cte_x_0_ab"));
+        assert!(is_internal("__json_users_doc_1234"));
+        assert!(!is_internal("users"));
+    }
+
+    #[test]
+    fn every_listed_view_is_recognised_with_or_without_a_qualifier() {
+        for view in VIEWS {
+            // A qualifier-only view is deliberately *not* recognised bare:
+            // `columns` is a keyword in `SHOW COLUMNS FROM t` and an ordinary
+            // table name besides. See `QUALIFIED_ONLY`.
+            assert_eq!(is_catalog_view(view), !needs_qualifier(view), "{}", view);
+            assert!(is_catalog_view(&format!("pg_catalog.{}", view)), "{}", view);
+            assert_eq!(
+                is_catalog_view(&format!("\"{}\"", view)),
+                !needs_qualifier(view),
+                "{}",
+                view
+            );
+        }
+        assert!(!is_catalog_view("users"));
+    }
+}
+
+#[cfg(test)]
+mod batching_tests {
+    use super::batch_inserts;
+
+    #[test]
+    fn statements_sharing_a_target_become_one() {
+        let inserts = vec![
+            "INSERT INTO t (a, b) VALUES (1, 'x')".to_string(),
+            "INSERT INTO t (a, b) VALUES (2, 'y')".to_string(),
+            "INSERT INTO t (a, b) VALUES (3, 'z')".to_string(),
+        ];
+        let out = batch_inserts(&inserts, 200);
+        assert_eq!(out, vec!["INSERT INTO t (a, b) VALUES (1, 'x'), (2, 'y'), (3, 'z')"]);
+    }
+
+    #[test]
+    fn a_batch_is_capped() {
+        let inserts: Vec<String> = (0..5)
+            .map(|i| format!("INSERT INTO t (a) VALUES ({})", i))
+            .collect();
+        assert_eq!(batch_inserts(&inserts, 2).len(), 3);
+    }
+
+    #[test]
+    fn different_targets_are_not_merged() {
+        let inserts = vec![
+            "INSERT INTO a (x) VALUES (1)".to_string(),
+            "INSERT INTO b (x) VALUES (2)".to_string(),
+        ];
+        assert_eq!(batch_inserts(&inserts, 200).len(), 2);
+    }
+
+    #[test]
+    fn a_statement_of_another_shape_passes_through() {
+        // A builder that emits something without a `VALUES` must still run.
+        let inserts = vec!["INSERT INTO t SELECT * FROM other".to_string()];
+        assert_eq!(batch_inserts(&inserts, 200), inserts);
+    }
+
+    #[test]
+    fn nothing_in_nothing_out() {
+        assert!(batch_inserts(&[], 200).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod qualified_only_tests {
+    use super::*;
+
+    #[test]
+    fn a_bare_columns_is_not_the_catalogue_relation() {
+        // `SHOW COLUMNS FROM t` is the case that broke: the keyword was
+        // rewritten to the temporary table's name, so the statement returned
+        // one empty column and every client asking a table for its columns was
+        // told it had none.
+        assert!(!names_relation("SHOW COLUMNS FROM \"rdb_roles\"", "columns"));
+        assert!(!names_relation("SELECT * FROM columns", "columns"));
+        assert!(!is_catalog_view("columns"));
+    }
+
+    #[test]
+    fn a_qualified_columns_still_is() {
+        assert!(names_relation(
+            "SELECT 1 FROM information_schema.columns WHERE table_name = 't'",
+            "columns"
+        ));
+        assert!(is_catalog_view("information_schema.columns"));
+    }
+
+    #[test]
+    fn the_keyword_survives_the_rewrite() {
+        let sql = "SHOW COLUMNS FROM \"rdb_roles\"";
+        assert_eq!(replace_relation(sql, "columns", "__cat_columns_1"), sql);
+    }
+}

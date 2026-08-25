@@ -28,4 +28,31 @@ pub mod lexer_dr;
 /// Query Rows
 pub mod lexer_query;
 
+/// `ORDER BY` clause parsing, shared by the single-table and join planners.
+pub mod order_by;
+
+pub mod aggregate;
+pub mod join;
+pub mod json_map;
+pub mod path_index;
+pub mod column_default;
+pub mod cte;
+pub mod expr;
+pub mod foreign_key;
+
+/// Table-level and composite `UNIQUE` constraints.
+pub mod unique_key;
+pub mod lexer_alter;
+pub mod nullable;
+pub mod catalog_views;
+pub mod row_lock;
+pub mod type_modifier;
+pub mod window;
+pub mod subquery;
 pub mod executor;
+
+/// `BACKUP`, `RESTORE` and `SHOW BACKUPS`, behind the `s3_backup` feature.
+#[cfg(feature = "s3_backup")]
+pub mod lexer_backup;
+#[cfg(feature = "s3_backup")]
+pub mod backup_exec;
