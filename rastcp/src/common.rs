@@ -2,6 +2,8 @@ use crate::error::RastcpError;
 use opool::{Pool, PoolAllocator};
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
+
 /// Allocator for pooled coalesce buffers used by `write_message`.
 struct CoalesceBufAllocator;
 impl PoolAllocator<Vec<u8>> for CoalesceBufAllocator {
@@ -27,6 +29,16 @@ pub async fn read_message<S>(stream: &mut S) -> Result<Vec<u8>, RastcpError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    read_message_limited(stream, DEFAULT_MAX_MESSAGE_SIZE).await
+}
+
+pub async fn read_message_limited<S>(
+    stream: &mut S,
+    max_message_size: usize,
+) -> Result<Vec<u8>, RastcpError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + ?Sized,
+{
     // Read the message length (4 bytes)
     let mut len_bytes = [0u8; 4];
     stream.read_exact(&mut len_bytes).await.map_err(|e| {
@@ -38,7 +50,18 @@ where
     })?;
 
     let len = u32::from_le_bytes(len_bytes) as usize;
-    let mut buffer = vec![0u8; len];
+    if len > max_message_size {
+        return Err(RastcpError::MessageTooLarge {
+            len,
+            max: max_message_size,
+        });
+    }
+
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(len)
+        .map_err(|err| RastcpError::ProtocolError(err.to_string()))?;
+    buffer.resize(len, 0);
     stream.read_exact(&mut buffer).await.map_err(|e| {
         if e.kind() == io::ErrorKind::UnexpectedEof {
             RastcpError::ConnectionClosed
@@ -53,7 +76,7 @@ where
 // Write a length-prefixed message - generic over any AsyncRead + AsyncWrite stream
 pub async fn write_message<S>(stream: &mut S, data: &[u8]) -> Result<(), RastcpError>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + ?Sized,
 {
     let len = data.len() as u32;
     let len_bytes = len.to_le_bytes();
@@ -81,6 +104,25 @@ where
     Ok(())
 }
 
+/// Reads a message with both a size cap and a timeout.
+///
+/// What an exchange that has not authenticated anyone yet gets: the default
+/// cap would let an unauthenticated caller ask the server to reserve 8 MiB per
+/// connection, and no timeout would let it hold the slot by staying silent.
+pub async fn read_message_limited_timeout<S>(
+    stream: &mut S,
+    max_message_size: usize,
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>, RastcpError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + ?Sized,
+{
+    match tokio::time::timeout(timeout, read_message_limited(stream, max_message_size)).await {
+        Ok(result) => result,
+        Err(_) => Err(RastcpError::ConnectionTimeout),
+    }
+}
+
 // Read a message with a timeout
 pub async fn read_message_timeout<S>(
     stream: &mut S,
@@ -102,7 +144,7 @@ pub async fn write_message_timeout<S>(
     timeout: std::time::Duration,
 ) -> Result<(), RastcpError>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + ?Sized,
 {
     match tokio::time::timeout(timeout, write_message(stream, data)).await {
         Ok(result) => result,

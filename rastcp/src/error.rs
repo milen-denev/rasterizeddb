@@ -20,6 +20,9 @@ pub enum RastcpError {
     #[error("Invalid message format")]
     InvalidMessageFormat,
 
+    #[error("Message too large: {len} bytes exceeds limit of {max} bytes")]
+    MessageTooLarge { len: usize, max: usize },
+
     #[error("Connection limit reached")]
     ConnectionLimitReached,
 

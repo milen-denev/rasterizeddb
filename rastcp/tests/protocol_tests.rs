@@ -1,8 +1,10 @@
 use rastcp::{
     client::TcpClientBuilder,
-    common::{read_message, write_message},
+    common::{DEFAULT_MAX_MESSAGE_SIZE, read_message, write_message},
+    error::RastcpError,
     server::TcpServerBuilder,
 };
+use tokio::io::duplex;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -220,4 +222,106 @@ async fn test_custom_protocol_implementation() {
     tokio::time::timeout(Duration::from_millis(100), server_handle)
         .await
         .ok();
+}
+
+#[tokio::test]
+async fn test_read_message_rejects_oversized_frame() {
+    let (mut writer, mut reader) = duplex(64);
+    let oversized_len = (DEFAULT_MAX_MESSAGE_SIZE as u32).saturating_add(1);
+
+    tokio::spawn(async move {
+        writer.write_all(&oversized_len.to_le_bytes()).await.unwrap();
+    });
+
+    let result = read_message(&mut reader).await;
+
+    match result {
+        Err(RastcpError::MessageTooLarge { len, max }) => {
+            assert_eq!(len, oversized_len as usize);
+            assert_eq!(max, DEFAULT_MAX_MESSAGE_SIZE);
+        }
+        other => panic!("expected oversized frame rejection, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_client_send_returns_timeout_instead_of_panicking() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let server = TcpServerBuilder::new("127.0.0.1", 8100)
+        .request_timeout(Duration::from_secs(1))
+        .build()
+        .await
+        .unwrap();
+
+    let server_handle = tokio::spawn(async move {
+        server
+            .run(|data| async move {
+                sleep(Duration::from_millis(250)).await;
+                data
+            })
+            .await
+            .unwrap();
+    });
+
+    sleep(Duration::from_millis(100)).await;
+
+    let mut client = TcpClientBuilder::new("127.0.0.1:8100")
+        .timeout(Duration::from_millis(50))
+        .build()
+        .await
+        .unwrap();
+
+    let result = client.send(b"slow request".to_vec()).await;
+
+    assert!(matches!(result, Err(RastcpError::ConnectionTimeout)));
+    assert!(!client.is_connected());
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_graceful_shutdown_drains_and_frees_the_port() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let server = Arc::new(
+        TcpServerBuilder::new("127.0.0.1", 8101)
+            .shutdown_grace(Duration::from_secs(5))
+            .build()
+            .await
+            .unwrap(),
+    );
+
+    let shutdown = server.shutdown_handle();
+    let running = server.clone();
+
+    let server_handle = tokio::spawn(async move { running.run(|data| async move { data }).await });
+
+    sleep(Duration::from_millis(100)).await;
+
+    let mut client = TcpClientBuilder::new("127.0.0.1:8101").build().await.unwrap();
+    let echoed = client.send(b"ping".to_vec()).await.unwrap();
+    assert_eq!(echoed, b"ping".to_vec());
+
+    // The connection is now idle but still open; a shutdown has to close it
+    // rather than wait out the whole grace period.
+    shutdown.shutdown();
+
+    let stopped = tokio::time::timeout(Duration::from_secs(5), server_handle).await;
+
+    assert!(
+        matches!(stopped, Ok(Ok(Ok(())))),
+        "server did not stop cleanly: {:?}",
+        stopped.map(|joined| joined.map(|run| run.is_ok()))
+    );
+    assert_eq!(server.active_connections(), 0);
+
+    // Once the listener is dropped the port takes a new bind straight away,
+    // which is what a restart right after Ctrl+C does.
+    drop(server);
+
+    TcpServerBuilder::new("127.0.0.1", 8101)
+        .build()
+        .await
+        .expect("port should be free immediately after a graceful shutdown");
 }
