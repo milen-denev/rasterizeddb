@@ -23,19 +23,24 @@ fn extract_where_columns(where_clause: &str, schema: &SmallVec<[SchemaField; 20]
     }
 
     let where_bytes = where_clause.as_bytes();
-    for field in schema.iter() {
+    // As in `lexer_query::extract_where_columns`: an underscore is part of an
+    // identifier, so `foo` must not match inside `foo_id`, and a dropped column
+    // cannot be referenced at all.
+    let is_word_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    for field in schema.iter().filter(|f| !f.is_deleted) {
         let field_bytes = field.name.as_bytes();
-        for i in 0..where_bytes.len().saturating_sub(field_bytes.len()) {
-            if i + field_bytes.len() <= where_bytes.len() {
-                let slice = &where_bytes[i..i + field_bytes.len()];
-                if simd_compare_strings(slice, field_bytes, &ComparerOperation::Equals) {
-                    let start_ok = i == 0 || !where_bytes[i - 1].is_ascii_alphanumeric();
-                    let end_ok = i + field_bytes.len() == where_bytes.len()
-                        || !where_bytes[i + field_bytes.len()].is_ascii_alphanumeric();
-                    if start_ok && end_ok {
-                        where_columns.insert(field.name.clone());
-                        break;
-                    }
+        if field_bytes.len() > where_bytes.len() {
+            continue;
+        }
+        for i in 0..=where_bytes.len() - field_bytes.len() {
+            let slice = &where_bytes[i..i + field_bytes.len()];
+            if simd_compare_strings(slice, field_bytes, &ComparerOperation::Equals) {
+                let start_ok = i == 0 || !is_word_byte(where_bytes[i - 1]);
+                let end_ok = i + field_bytes.len() == where_bytes.len()
+                    || !is_word_byte(where_bytes[i + field_bytes.len()]);
+                if start_ok && end_ok {
+                    where_columns.insert(field.name.clone());
+                    break;
                 }
             }
         }
@@ -46,9 +51,34 @@ fn extract_where_columns(where_clause: &str, schema: &SmallVec<[SchemaField; 20]
 
 /// Attempts to parse a QueryPurpose::DeleteRow variant into a DeleteRow struct.
 /// Returns None if the QueryPurpose is not DeleteRow or parsing fails.
+/// Parses a `DELETE`, discarding why it was rejected.
 pub fn delete_row_from_query_purpose(
     qp: &QueryPurpose,
     schema: &SmallVec<[SchemaField; 20]>,
+) -> Option<DeleteRow> {
+    delete_row_with_reason(qp, schema).0
+}
+
+/// Parses a `DELETE`, also returning why it was rejected.
+///
+/// The reason matters: without it an unsupported `WHERE` clause reached the
+/// client as "Cannot parse DELETE query", which names neither the clause nor
+/// the feature. `SELECT` with the same predicate reports the real cause, so the
+/// two disagreed about the same statement. Mirrors `create_table_with_reason`,
+/// which exists for exactly this reason.
+pub fn delete_row_with_reason(
+    qp: &QueryPurpose,
+    schema: &SmallVec<[SchemaField; 20]>,
+) -> (Option<DeleteRow>, Option<String>) {
+    let mut rejection: Option<String> = None;
+    let parsed = parse_delete_row(qp, schema, &mut rejection);
+    (parsed, rejection)
+}
+
+fn parse_delete_row(
+    qp: &QueryPurpose,
+    schema: &SmallVec<[SchemaField; 20]>,
+    rejection: &mut Option<String>,
 ) -> Option<DeleteRow> {
     if let QueryPurpose::DeleteRow(sql) = qp {
         let sql = sql.as_str();
@@ -57,12 +87,38 @@ pub fn delete_row_from_query_purpose(
             return None;
         }
         // DELETE FROM table_name WHERE ...
+        // Split before parsing, for the same reason as `UPDATE`.
+        let sql = match crate::core::rql::lexer_ir::returning_split(sql) {
+            Some((head, _)) => head,
+            None => sql,
+        };
+        let sql_upper = sql.to_ascii_uppercase();
+
+        // `DELETE … USING other WHERE t.k = other.k` deletes only the rows the
+        // join matches. Nothing here implements it, and the clause used to be
+        // *ignored*: the predicate then referenced a relation the scan did not
+        // have, matched every row, and the statement emptied the table.
+        //
+        // That is not a missing feature failing safely — it is a targeted
+        // delete silently becoming `DELETE FROM t`. It destroyed 13,585 rows of
+        // a real table. Refused until it is implemented, because an error the
+        // caller can see is the only acceptable answer to a statement this
+        // engine cannot carry out.
+        if crate::core::rql::join::find_keyword(sql, "USING", 0).is_some() {
+            return None;
+        }
+
         let mut parts = sql.split_whitespace();
         parts.next(); // DELETE
         parts.next(); // FROM
         let table_name = parts.next()?.trim_matches('"');
-        // Find WHERE
-        let where_idx = sql_upper.find("WHERE");
+        // Matched as a whole word, not as a substring. `find("WHERE")` hit the
+        // first occurrence anywhere — including inside a relation name, so
+        // `DELETE FROM "wherehouse" WHERE id = 1` took `house" WHERE id = 1`
+        // for its predicate and the statement failed with an error about a
+        // clause nobody wrote.
+        let where_idx = crate::core::rql::join::find_keyword(sql, "WHERE", 0);
+        let _ = &sql_upper;
         let where_clause = if let Some(idx) = where_idx {
             let clause = sql[idx + 5..].trim();
             // Remove leading "WHERE" if present (case-insensitive)
@@ -79,17 +135,32 @@ pub fn delete_row_from_query_purpose(
             return None;
         }
 
+        // Desugared for the same reasons as `UPDATE`: quoted and qualified
+        // names, the sugar predicate forms, and the guards that stop a `NULL`
+        // row satisfying a comparison — which for a `DELETE` decides whether a
+        // row is destroyed.
+        let where_clause = match crate::core::tokenizer::predicate_rewrite::rewrite_where(
+            &where_clause,
+            schema,
+        ) {
+            Ok(clause) => clause,
+            Err(reason) => {
+                rejection.replace(reason);
+                return None;
+            }
+        };
+
         let where_columns = extract_where_columns(&where_clause, schema);
         let schema_calc = SchemaCalculator::default();
         let mut query_columns_fetching_data = SmallVec::new();
         for col_name in &where_columns {
             let field = schema
                 .iter()
-                .find(|f| f.name.eq_ignore_ascii_case(col_name.as_str()))?;
+                .find(|f| f.name.eq_ignore_ascii_case(col_name.as_str()) && !f.is_deleted)?;
             let offset = schema_calc.calculate_schema_offset(&field.name, schema);
             query_columns_fetching_data.push(ColumnFetchingData {
                 column_offset: offset.0,
-                column_type: field.db_type.clone(),
+                column_type: field.db_type.physical(),
                 size: field.size,
                 schema_id: offset.1,
             });
