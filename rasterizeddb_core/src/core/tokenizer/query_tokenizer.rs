@@ -9,12 +9,30 @@ use crate::{core::db_type::DbType, memory_pool::MemoryBlock};
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
     Ident((String, DbType, u64)),
+    /// `doc->>'k'` — a value inside a document column, not a column of its own.
+    ///
+    /// Carries the *document's* `write_order`, because that is the column a row
+    /// has to fetch; the steps are walked against its bytes per row. Keeping it
+    /// a distinct token rather than a synthetic `Ident` is deliberate: an
+    /// `Ident` is a promise that a physical column of that name and type
+    /// exists, and the filter index believes that promise.
+    JsonPath {
+        write_order: u64,
+        steps: Vec<crate::core::jsonb::Step>,
+        as_text: bool,
+    },
     Number(NumericValue),
     StringLit(String),
     Op(String),
     Next(String),
     LPar,
     RPar,
+    /// `::bigint` applied to the operand before it.
+    ///
+    /// Kept as a token rather than resolved where it is read, because what it
+    /// applies to may be a parenthesised group whose extent the parser knows
+    /// and the tokenizer does not.
+    Cast(DbType),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -33,9 +51,6 @@ pub enum NumericValue {
     F64(f64),
 }
 
-static mut CHAR_CLASS_TABLE: [u8; 256] = [0; 256];
-static mut INIT_DONE: bool = false;
-
 const CHAR_WHITESPACE: u8 = 1;
 const CHAR_DIGIT: u8 = 2;
 const CHAR_ALPHA: u8 = 4;
@@ -44,49 +59,53 @@ const CHAR_OPERATOR: u8 = 16;
 const CHAR_QUOTE: u8 = 32;
 const CHAR_PAREN: u8 = 64;
 
-#[cold]
-fn init_char_table() {
-    unsafe {
-        if INIT_DONE {
-            return;
-        }
-
-        for i in 0..256 {
-            let c = i as u8 as char;
-            let mut class = 0u8;
-
-            if c.is_whitespace() {
-                class |= CHAR_WHITESPACE;
-            }
-            if c.is_ascii_digit() {
-                class |= CHAR_DIGIT;
-            }
-            if c.is_alphabetic() {
-                class |= CHAR_ALPHA;
-            }
-            if c == '_' {
-                class |= CHAR_UNDERSCORE;
-            }
-            if matches!(c, '<' | '>' | '!' | '=' | '+' | '-' | '*' | '/') {
-                class |= CHAR_OPERATOR;
-            }
-            if c == '\'' {
-                class |= CHAR_QUOTE;
-            }
-            if matches!(c, '(' | ')') {
-                class |= CHAR_PAREN;
-            }
-
-            CHAR_CLASS_TABLE[i] = class;
-        }
-
-        INIT_DONE = true;
+// Built at compile time so the per-byte lookup needs no init check and no
+// synchronisation. The byte is classified as the Latin-1 character it names,
+// which is what `(i as u8 as char).is_whitespace()` / `.is_alphabetic()` do;
+// `char_class_table_matches_char_methods` pins the two in agreement.
+const fn char_class_of(b: u8) -> u8 {
+    let mut class = 0u8;
+    // Unicode White_Space within U+0000..=U+00FF.
+    if matches!(b, 0x09..=0x0D | 0x20 | 0x85 | 0xA0) {
+        class |= CHAR_WHITESPACE;
     }
+    if b.is_ascii_digit() {
+        class |= CHAR_DIGIT;
+    }
+    // Unicode Alphabetic within U+0000..=U+00FF.
+    if b.is_ascii_alphabetic()
+        || matches!(b, 0xAA | 0xB5 | 0xBA | 0xC0..=0xD6 | 0xD8..=0xF6 | 0xF8..=0xFF)
+    {
+        class |= CHAR_ALPHA;
+    }
+    if b == b'_' {
+        class |= CHAR_UNDERSCORE;
+    }
+    if matches!(b, b'<' | b'>' | b'!' | b'=' | b'+' | b'-' | b'*' | b'/') {
+        class |= CHAR_OPERATOR;
+    }
+    if b == b'\'' {
+        class |= CHAR_QUOTE;
+    }
+    if matches!(b, b'(' | b')') {
+        class |= CHAR_PAREN;
+    }
+    class
 }
+
+const CHAR_CLASS_TABLE: [u8; 256] = {
+    let mut table = [0u8; 256];
+    let mut i = 0;
+    while i < 256 {
+        table[i] = char_class_of(i as u8);
+        i += 1;
+    }
+    table
+};
 
 #[inline(always)]
 fn get_char_class(c: u8) -> u8 {
-    unsafe { CHAR_CLASS_TABLE[c as usize] }
+    CHAR_CLASS_TABLE[c as usize]
 }
 
 #[inline(always)]
@@ -286,6 +305,17 @@ impl<'a> FieldLookup<'a> {
         string_ops.insert("contains".to_string(), "CONTAINS".to_string());
         string_ops.insert("startswith".to_string(), "STARTSWITH".to_string());
         string_ops.insert("endswith".to_string(), "ENDSWITH".to_string());
+        // The case-insensitive counterparts that `ILIKE` lowers to. Without
+        // these the tokenizer would treat them as unknown identifiers, which it
+        // panics on.
+        string_ops.insert("icontains".to_string(), "ICONTAINS".to_string());
+        string_ops.insert("istartswith".to_string(), "ISTARTSWITH".to_string());
+        string_ops.insert("iendswith".to_string(), "IENDSWITH".to_string());
+        string_ops.insert("iequals".to_string(), "IEQUALS".to_string());
+        // `LIKE`/`ILIKE` reach the tokenizer only for patterns the rewrite could
+        // not reduce to one of the above — an interior `%`, or a `_`.
+        string_ops.insert("like".to_string(), "LIKE".to_string());
+        string_ops.insert("ilike".to_string(), "ILIKE".to_string());
 
         Self {
             map,
@@ -296,9 +326,98 @@ impl<'a> FieldLookup<'a> {
 }
 
 #[inline(always)]
-pub fn tokenize<'a>(s: &str, schema: &'a SmallVec<[SchemaField; 20]>) -> SmallVec<[Token; 36]> {
-    init_char_table();
+/// Tokenizes a predicate, or says why it cannot.
+///
+/// Returns an error rather than panicking. A predicate naming something that is
+/// not a column is an ordinary client mistake — a keyword the clause splitter
+/// left behind, a function the engine does not have — and it used to take down
+/// the worker thread, which dropped the client's connection with no message at
+/// all. Four separate parser bugs surfaced that way in one day, each appearing
+/// as a lost connection rather than as the error it was.
+pub fn try_tokenize<'a>(
+    s: &str,
+    schema: &'a SmallVec<[SchemaField; 20]>,
+) -> Result<SmallVec<[Token; 36]>, String> {
+    tokenize_inner(s, schema)
+}
 
+/// Panicking wrapper, for callers that have already validated their input.
+///
+/// Prefer [`try_tokenize`]: anything reachable from a client should report the
+/// error rather than die.
+pub fn tokenize<'a>(s: &str, schema: &'a SmallVec<[SchemaField; 20]>) -> SmallVec<[Token; 36]> {
+    match tokenize_inner(s, schema) {
+        Ok(tokens) => tokens,
+        Err(e) => panic!("{}", e),
+    }
+}
+
+/// Where a JSON path following a column name ends, or `None` when none does.
+///
+/// Only the extent is decided here; what the steps *are* is
+/// `jsonb::parse_path_expression`'s answer, so there is one definition of what
+/// a path means rather than two that can disagree.
+fn json_path_extent(bytes: &[u8], from: usize) -> Option<usize> {
+    let mut i = from;
+    let mut end = None;
+    loop {
+        let mut j = i;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        // Longest first: `->>` before `->`, `#>>` before `#>`.
+        let after_op = if bytes[j..].starts_with(b"->>") || bytes[j..].starts_with(b"#>>") {
+            j + 3
+        } else if bytes[j..].starts_with(b"->") || bytes[j..].starts_with(b"#>") {
+            j + 2
+        } else {
+            return end;
+        };
+
+        let mut k = after_op;
+        while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+            k += 1;
+        }
+        if k >= bytes.len() {
+            return end;
+        }
+        if bytes[k] == b'\'' {
+            // A quoted key, in which `''` is one quote and not the end.
+            k += 1;
+            loop {
+                if k >= bytes.len() {
+                    return end;
+                }
+                if bytes[k] == b'\'' {
+                    if bytes.get(k + 1) == Some(&b'\'') {
+                        k += 2;
+                        continue;
+                    }
+                    k += 1;
+                    break;
+                }
+                k += 1;
+            }
+        } else {
+            let digits_at = if bytes[k] == b'-' { k + 1 } else { k };
+            let mut d = digits_at;
+            while d < bytes.len() && bytes[d].is_ascii_digit() {
+                d += 1;
+            }
+            if d == digits_at {
+                return end;
+            }
+            k = d;
+        }
+        end = Some(k);
+        i = k;
+    }
+}
+
+fn tokenize_inner<'a>(
+    s: &str,
+    schema: &'a SmallVec<[SchemaField; 20]>,
+) -> Result<SmallVec<[Token; 36]>, String> {
     let mut out = SmallVec::new();
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -341,18 +460,28 @@ pub fn tokenize<'a>(s: &str, schema: &'a SmallVec<[SchemaField; 20]>) -> SmallVe
 
         match c {
             b'\'' => {
-                // Handle string literals
-                let start = i + 1;
-                let mut j = start;
-                while j < bytes.len() && bytes[j] != b'\'' {
-                    j += 1;
+                // A string literal. `''` inside one is an escaped quote, not
+                // the end: `'O''Brien'` is one literal, and reading it as two
+                // left `Brien` to be reported as an unknown identifier.
+                let mut lit = String::new();
+                let mut segment = i + 1;
+                let mut j = segment;
+                loop {
+                    while j < bytes.len() && bytes[j] != b'\'' {
+                        j += 1;
+                    }
+                    if j >= bytes.len() {
+                        return Err(format!("unclosed string literal starting at position {}", i));
+                    }
+                    lit.push_str(&s[segment..j]);
+                    if bytes.get(j + 1) == Some(&b'\'') {
+                        lit.push('\'');
+                        j += 2;
+                        segment = j;
+                        continue;
+                    }
+                    break;
                 }
-                if j >= bytes.len() {
-                    panic!("Unclosed string literal starting at position {}", i);
-                }
-
-                // SAFETY: We know this is valid UTF-8 since it came from a &str
-                let lit = unsafe { std::str::from_utf8_unchecked(&bytes[start..j]).to_string() };
                 out.push(Token::StringLit(lit));
                 i = j + 1;
 
@@ -373,7 +502,7 @@ pub fn tokenize<'a>(s: &str, schema: &'a SmallVec<[SchemaField; 20]>) -> SmallVe
                 let num_str = unsafe { std::str::from_utf8_unchecked(&bytes[start..i]) };
 
                 let numeric_value =
-                    parse_numeric_value(num_str, &current_field_context, &expression_type_context);
+                    parse_numeric_value(num_str, &current_field_context, &expression_type_context)?;
 
                 let num_type = numeric_value_to_db_type(&numeric_value);
                 if expression_type_context.is_none() {
@@ -397,7 +526,7 @@ pub fn tokenize<'a>(s: &str, schema: &'a SmallVec<[SchemaField; 20]>) -> SmallVe
                 let num_str = unsafe { std::str::from_utf8_unchecked(&bytes[start..i]) };
 
                 let numeric_value =
-                    parse_numeric_value(num_str, &current_field_context, &expression_type_context);
+                    parse_numeric_value(num_str, &current_field_context, &expression_type_context)?;
 
                 let num_type = numeric_value_to_db_type(&numeric_value);
                 if expression_type_context.is_none() {
@@ -420,7 +549,15 @@ pub fn tokenize<'a>(s: &str, schema: &'a SmallVec<[SchemaField; 20]>) -> SmallVe
                 if let Some(normalized) = field_lookup.string_ops.get(&id_lower) {
                     // For string operations, we need to determine the type from context or schema
                     // Since these are operators, we might want to use the current expression type
-                    let op_type = expression_type_context.clone().unwrap();
+                    // A string operator with nothing before it — `WHERE like 'x'`,
+                    // or a column that happens to share an operator's name —
+                    // has no operand type to take; refused rather than unwrapped.
+                    let Some(op_type) = expression_type_context.clone() else {
+                        return Err(format!(
+                            "operator {} has no left-hand operand",
+                            normalized
+                        ));
+                    };
                     out.push(Token::Ident((normalized.clone(), op_type, 0)));
                     continue;
                 }
@@ -451,6 +588,32 @@ pub fn tokenize<'a>(s: &str, schema: &'a SmallVec<[SchemaField; 20]>) -> SmallVe
                         }
                     }
 
+                    // A path following the name — `doc->>'k'` — makes this a
+                    // reach into a document rather than a column reference.
+                    // The extent is found here and handed to the one path
+                    // parser, so the tokenizer cannot drift from what `SELECT`
+                    // and a future index resolve the same text to.
+                    if let Some(end) = json_path_extent(bytes, i) {
+                        let text = unsafe { std::str::from_utf8_unchecked(&bytes[start..end]) };
+                        if let Some(path) = crate::core::jsonb::parse_path_expression(text) {
+                            i = end;
+                            // `->>` is text; `->` yields a document.
+                            let result_type = if path.as_text {
+                                DbType::STRING
+                            } else {
+                                DbType::JSONB
+                            };
+                            expression_type_context = Some(result_type.clone());
+                            current_field_context = None;
+                            out.push(Token::JsonPath {
+                                write_order: *write_order,
+                                steps: path.steps,
+                                as_text: path.as_text,
+                            });
+                            continue;
+                        }
+                    }
+
                     out.push(Token::Ident((
                         canonical_name.to_string(),
                         field_type.clone(),
@@ -472,7 +635,7 @@ pub fn tokenize<'a>(s: &str, schema: &'a SmallVec<[SchemaField; 20]>) -> SmallVe
                                 || (next_i + 8 <= bytes.len()
                                     && &bytes[next_i..next_i + 8] == b"ENDSWITH")
                             {
-                                panic!("Unknown column: '{}' is not defined in the schema", id);
+                                return Err(format!("unknown column '{}' is not defined in the schema", id));
                             }
                         }
                     }
@@ -480,7 +643,7 @@ pub fn tokenize<'a>(s: &str, schema: &'a SmallVec<[SchemaField; 20]>) -> SmallVe
                     // For identifiers not found in schema, this should probably be an error
                     // since all valid fields should be in the schema
                     // But if you want to allow unknown identifiers, you could use a default type
-                    panic!("Unknown identifier: '{}' is not defined in the schema", id);
+                    return Err(format!("unknown identifier '{}' is not defined in the schema", id));
                 }
             }
 
@@ -547,11 +710,31 @@ pub fn tokenize<'a>(s: &str, schema: &'a SmallVec<[SchemaField; 20]>) -> SmallVe
                 expression_type_context = None;
             }
 
-            _ => panic!("unexpected character: '{}'", c as char),
+            // `::bigint` — a cast applied to whatever precedes it. The parser
+            // decides what that is; here it only has to become a token.
+            b':' if bytes.get(i + 1) == Some(&b':') => {
+                let mut k = i + 2;
+                while k < bytes.len() && (bytes[k] as char).is_whitespace() {
+                    k += 1;
+                }
+                let name_start = k;
+                while k < bytes.len() && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_') {
+                    k += 1;
+                }
+                let name = unsafe { std::str::from_utf8_unchecked(&bytes[name_start..k]) };
+                let Some(db_type) = crate::core::rql::expr::db_type_of_cast(name) else {
+                    return Err(format!("unknown type '{}' in a cast", name));
+                };
+                expression_type_context = Some(db_type.clone());
+                out.push(Token::Cast(db_type));
+                i = k;
+            }
+
+            _ => return Err(format!("unexpected character '{}'", c as char)),
         }
     }
 
-    out
+    Ok(out)
 }
 
 // Rest of the helper functions remain the same but with optimized implementations
@@ -561,7 +744,7 @@ fn parse_numeric_value<'a>(
     value_str: &str,
     field_context: &Option<(Cow<'a, String>, DbType, u64)>,
     expression_context: &Option<DbType>,
-) -> NumericValue {
+) -> Result<NumericValue, String> {
     if let Some(db_type) = expression_context {
         return parse_by_db_type(value_str, db_type);
     }
@@ -573,35 +756,48 @@ fn parse_numeric_value<'a>(
     parse_default(value_str)
 }
 
+/// Parses the literal as the type of the column it is compared with.
+///
+/// A literal the type cannot hold is an error, as it is in PostgreSQL. It
+/// used to parse as the type's default: `WHERE age > 300` on a `U8` column
+/// became `age > 0` and returned every row, and `WHERE id = 100000` on an
+/// `I16` column matched the rows whose id is 0 — a wrong answer reported as
+/// success, with nothing in the statement to show for it.
 #[inline(always)]
-fn parse_by_db_type(value_str: &str, db_type: &DbType) -> NumericValue {
-    match db_type {
-        DbType::I8 => NumericValue::I8(value_str.parse().unwrap_or_default()),
-        DbType::I16 => NumericValue::I16(value_str.parse().unwrap_or_default()),
-        DbType::I32 => NumericValue::I32(value_str.parse().unwrap_or_default()),
-        DbType::I64 => NumericValue::I64(value_str.parse().unwrap_or_default()),
-        DbType::I128 => NumericValue::I128(value_str.parse().unwrap_or_default()),
-        DbType::U8 => NumericValue::U8(value_str.parse().unwrap_or_default()),
-        DbType::U16 => NumericValue::U16(value_str.parse().unwrap_or_default()),
-        DbType::U32 => NumericValue::U32(value_str.parse().unwrap_or_default()),
-        DbType::U64 => NumericValue::U64(value_str.parse().unwrap_or_default()),
-        DbType::U128 => NumericValue::U128(value_str.parse().unwrap_or_default()),
-        DbType::F32 => NumericValue::F32(value_str.parse().unwrap_or_default()),
-        DbType::F64 => NumericValue::F64(value_str.parse().unwrap_or_default()),
-        _ => parse_default(value_str),
+fn parse_by_db_type(value_str: &str, db_type: &DbType) -> Result<NumericValue, String> {
+    fn parse<T: std::str::FromStr>(value_str: &str, db_type: &DbType) -> Result<T, String> {
+        value_str
+            .parse()
+            .map_err(|_| format!("value {} is out of range for type {:?}", value_str, db_type))
     }
+    Ok(match db_type {
+        DbType::I8 => NumericValue::I8(parse(value_str, db_type)?),
+        DbType::I16 => NumericValue::I16(parse(value_str, db_type)?),
+        DbType::I32 => NumericValue::I32(parse(value_str, db_type)?),
+        DbType::I64 => NumericValue::I64(parse(value_str, db_type)?),
+        DbType::I128 => NumericValue::I128(parse(value_str, db_type)?),
+        DbType::U8 => NumericValue::U8(parse(value_str, db_type)?),
+        DbType::U16 => NumericValue::U16(parse(value_str, db_type)?),
+        DbType::U32 => NumericValue::U32(parse(value_str, db_type)?),
+        DbType::U64 => NumericValue::U64(parse(value_str, db_type)?),
+        DbType::U128 => NumericValue::U128(parse(value_str, db_type)?),
+        DbType::F32 => NumericValue::F32(parse(value_str, db_type)?),
+        DbType::F64 => NumericValue::F64(parse(value_str, db_type)?),
+        _ => return parse_default(value_str),
+    })
 }
 
 #[inline(always)]
-fn parse_default(value_str: &str) -> NumericValue {
+fn parse_default(value_str: &str) -> Result<NumericValue, String> {
+    let out_of_range = || format!("numeric literal {} is out of range", value_str);
     if value_str.contains('.') {
-        NumericValue::F64(value_str.parse().unwrap_or_default())
+        Ok(NumericValue::F64(value_str.parse().map_err(|_| out_of_range())?))
     } else {
-        let parsed_num: i64 = value_str.parse().unwrap_or_default();
+        let parsed_num: i64 = value_str.parse().map_err(|_| out_of_range())?;
         if parsed_num >= i32::MIN as i64 && parsed_num <= i32::MAX as i64 {
-            NumericValue::I32(parsed_num as i32)
+            Ok(NumericValue::I32(parsed_num as i32))
         } else {
-            NumericValue::I64(parsed_num)
+            Ok(NumericValue::I64(parsed_num))
         }
     }
 }
@@ -680,6 +876,66 @@ pub fn numeric_type_to_db_type(nv: &NumericValue) -> DbType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn char_class_table_matches_char_methods() {
+        for i in 0..256usize {
+            let c = i as u8 as char;
+            let mut expected = 0u8;
+            if c.is_whitespace() {
+                expected |= CHAR_WHITESPACE;
+            }
+            if c.is_ascii_digit() {
+                expected |= CHAR_DIGIT;
+            }
+            if c.is_alphabetic() {
+                expected |= CHAR_ALPHA;
+            }
+            if c == '_' {
+                expected |= CHAR_UNDERSCORE;
+            }
+            if matches!(c, '<' | '>' | '!' | '=' | '+' | '-' | '*' | '/') {
+                expected |= CHAR_OPERATOR;
+            }
+            if c == '\'' {
+                expected |= CHAR_QUOTE;
+            }
+            if matches!(c, '(' | ')') {
+                expected |= CHAR_PAREN;
+            }
+            assert_eq!(
+                CHAR_CLASS_TABLE[i], expected,
+                "byte 0x{i:02X} ({c:?}) classified differently from the char methods"
+            );
+        }
+    }
+
+    #[test]
+    fn a_doubled_quote_is_an_escaped_quote_inside_a_literal() {
+        let schema = create_schema_2();
+        let toks = tokenize_inner("name = 'O''Brien'", &schema).expect("one literal");
+        assert!(
+            toks.iter().any(|t| matches!(t, Token::StringLit(s) if s == "O'Brien")),
+            "got {:?}",
+            toks
+        );
+        let toks = tokenize_inner("name = ''''", &schema).expect("a lone quote");
+        assert!(toks.iter().any(|t| matches!(t, Token::StringLit(s) if s == "'")));
+        let toks = tokenize_inner("name = ''", &schema).expect("empty");
+        assert!(toks.iter().any(|t| matches!(t, Token::StringLit(s) if s.is_empty())));
+    }
+
+    /// A literal the column's type cannot hold used to parse as that type's
+    /// default, so `age > 300` on a `U8` column returned every row.
+    #[test]
+    fn an_out_of_range_literal_is_refused_rather_than_read_as_zero() {
+        let schema = create_schema_2();
+        let err = tokenize_inner("age > 300", &schema).expect_err("300 does not fit a U8");
+        assert!(err.contains("out of range"), "{err}");
+        let err = tokenize_inner("age = -1", &schema).expect_err("-1 does not fit a U8");
+        assert!(err.contains("out of range"), "{err}");
+        assert!(tokenize_inner("age > 200", &schema).is_ok());
+    }
 
     fn create_schema_2() -> SmallVec<[SchemaField; 20]> {
         smallvec::smallvec![

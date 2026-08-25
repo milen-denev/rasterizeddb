@@ -7,7 +7,7 @@ use super::query_tokenizer::{Token, numeric_to_mb, numeric_value_to_db_type, str
 use crate::core::db_type::DbType;
 use crate::core::processor::transformer::{ComparerOperation, ComparisonOperand, MathOperation, Next, TransformerProcessor};
 use crate::core::row::schema::SchemaField;
-use crate::memory_pool::MemoryBlock;
+use crate::memory_pool::{MemoryBlock, MEMORY_POOL};
 
 pub struct QueryParser<'a, 'b> {
     toks: &'a SmallVec<[Token; 36]>,
@@ -55,6 +55,17 @@ impl<'a, 'b> QueryParser<'a, 'b> {
             self.used_column_indices.clear();
 
             self.parse_or(cols)?;
+
+            // `parse_or` stops at the first token that is not a connective.
+            // Anything left is a predicate the clause asked for and the plan
+            // does not contain — returned rows would be a superset, reported
+            // as the answer.
+            if self.pos < self.toks.len() {
+                return Err(format!(
+                    "unexpected {:?} after the end of the expression",
+                    self.toks[self.pos]
+                ));
+            }
 
             if !self.used_column_indices.is_empty() {
                 self.used_column_indices.sort_unstable();
@@ -121,7 +132,8 @@ impl<'a, 'b> QueryParser<'a, 'b> {
         // Execute on the aligned slice
         let res = self
             .query_transformer
-            .execute_row(&aligned[..], comparison_results);
+            .execute_row(&aligned[..], comparison_results)
+            .map_err(|e| e.as_str().to_string())?;
         Ok(res)
     }
 
@@ -188,7 +200,12 @@ impl<'a, 'b> QueryParser<'a, 'b> {
         if let Some(Token::LPar) = self.toks.get(self.pos) {
             if self.is_boolean_group(self.pos) {
                 self.pos += 1; // consume '('
-                self.parse_or(cols)?;
+                // The bracketing is recorded so the evaluator can honour it;
+                // the result chain alone cannot express grouping.
+                self.query_transformer.open_group();
+                let inner = self.parse_or(cols);
+                self.query_transformer.close_group();
+                inner?;
                 match self.next() {
                     Some(Token::RPar) => return Ok(()),
                     _ => return Err("expected closing parenthesis".to_string()),
@@ -204,9 +221,13 @@ impl<'a, 'b> QueryParser<'a, 'b> {
         let mut has_comp = false;
         let mut has_logic = false;
 
-        const CMP_OPS: [&str; 6] = ["=", "!=", ">", ">=", "<", "<="];
+        const CMP_OPS: [&str; 7] = ["=", "!=", "<>", ">", ">=", "<", "<="];
         const LOGIC_KWS: [&str; 2] = ["AND", "OR"];
-        const TEXT_CMPS: [&str; 3] = ["CONTAINS", "STARTSWITH", "ENDSWITH"];
+        const TEXT_CMPS: [&str; 9] = [
+            "CONTAINS", "STARTSWITH", "ENDSWITH",
+            "ICONTAINS", "ISTARTSWITH", "IENDSWITH", "IEQUALS",
+            "LIKE", "ILIKE",
+        ];
 
         let toks_len = self.toks.len();
         while i < toks_len {
@@ -277,9 +298,22 @@ impl<'a, 'b> QueryParser<'a, 'b> {
 
         let (right_op, right_type) = self.parse_expr(cols)?;
 
+        // A literal's type comes from how it was written, not from what it is
+        // compared against: `200` is an `i32` and `'1111-…'` is text, even when
+        // the column is a `DECIMAL` or a `UUID`. The evaluator does no
+        // coercion, so without this the pair would fail as an operand-size
+        // mismatch. Coercing the *literal* to the column's type, rather than
+        // the other way round, keeps the column's bytes untouched — which is
+        // what lets the filter index recognise the predicate.
+        let (left_op, right_op, left_type, right_type) =
+            Self::reconcile_operand_types(left_op, right_op, left_type, right_type)?;
+
         let cmp = match op_str {
             "=" => ComparerOperation::Equals,
-            "!=" => ComparerOperation::NotEquals,
+            // `<>` is standard SQL for not-equal and is what most clients and
+            // ORMs emit; `!=` is the PostgreSQL-accepted alias. Both map to the
+            // same comparison.
+            "!=" | "<>" => ComparerOperation::NotEquals,
             ">" => ComparerOperation::Greater,
             ">=" => ComparerOperation::GreaterOrEquals,
             "<" => ComparerOperation::Less,
@@ -287,13 +321,23 @@ impl<'a, 'b> QueryParser<'a, 'b> {
             "CONTAINS" => ComparerOperation::Contains,
             "STARTSWITH" => ComparerOperation::StartsWith,
             "ENDSWITH" => ComparerOperation::EndsWith,
+            "IEQUALS" => ComparerOperation::EqualsCaseInsensitive,
+            "ICONTAINS" => ComparerOperation::ContainsCaseInsensitive,
+            "ISTARTSWITH" => ComparerOperation::StartsWithCaseInsensitive,
+            "IENDSWITH" => ComparerOperation::EndsWithCaseInsensitive,
+            "LIKE" => ComparerOperation::Like,
+            "ILIKE" => ComparerOperation::LikeCaseInsensitive,
             _ => return Err(format!("unknown comparison operator: {}", op_str)),
         };
 
         let comparison_type = match cmp {
             ComparerOperation::Contains
             | ComparerOperation::StartsWith
-            | ComparerOperation::EndsWith => {
+            | ComparerOperation::EndsWith
+            | ComparerOperation::EqualsCaseInsensitive
+            | ComparerOperation::ContainsCaseInsensitive
+            | ComparerOperation::StartsWithCaseInsensitive
+            | ComparerOperation::EndsWithCaseInsensitive => {
                 if left_type == DbType::STRING || right_type == DbType::STRING {
                     DbType::STRING
                 } else {
@@ -306,6 +350,83 @@ impl<'a, 'b> QueryParser<'a, 'b> {
         self.query_transformer
             .add_comparison(comparison_type, left_op, right_op, cmp, None);
         Ok(())
+    }
+
+    /// Rewrites a literal operand to the type of the column it is compared
+    /// against, so both sides reach the evaluator at the same width.
+    ///
+    /// Only a bare literal (`Direct`) is rewritten, and only when the other
+    /// side is a column reference (`DirectWithIndex`). Two columns, or two
+    /// literals, are left alone: there is no column type to adopt. Handling
+    /// both orders means `1990 < id` behaves like `id > 1990`.
+    fn reconcile_operand_types(
+        left_op: ComparisonOperand,
+        right_op: ComparisonOperand,
+        left_type: DbType,
+        right_type: DbType,
+    ) -> Result<(ComparisonOperand, ComparisonOperand, DbType, DbType), String> {
+        fn coerce(
+            literal: &MemoryBlock,
+            from: &DbType,
+            to: &DbType,
+        ) -> Result<MemoryBlock, String> {
+            let bytes = crate::core::value_codec::coerce_literal(literal.into_slice(), from, to)
+                .ok_or_else(|| {
+                    format!(
+                        "literal cannot be compared against a {} column",
+                        to
+                    )
+                })?;
+            let mut mb = MEMORY_POOL.acquire(bytes.len());
+            mb.into_slice_mut().copy_from_slice(&bytes);
+            Ok(mb)
+        }
+
+        match (&left_op, &right_op) {
+            (ComparisonOperand::Direct(lit), ComparisonOperand::DirectWithIndex(_, _))
+                if left_type != right_type =>
+            {
+                let mb = coerce(lit, &left_type, &right_type)?;
+                let t = right_type.clone();
+                Ok((ComparisonOperand::Direct(mb), right_op, t.clone(), t))
+            }
+            (ComparisonOperand::DirectWithIndex(_, _), ComparisonOperand::Direct(lit))
+                if left_type != right_type =>
+            {
+                let mb = coerce(lit, &right_type, &left_type)?;
+                let t = left_type.clone();
+                Ok((left_op, ComparisonOperand::Direct(mb), t.clone(), t))
+            }
+            // A literal meeting a *path* needs the same reconciliation.
+            //
+            // Only column operands were handled, so `(doc->>'code')::bigint = 3`
+            // put an eight-byte value against a literal written as a narrower
+            // int and the evaluator refused the pair outright — "operand size
+            // does not match the column type being evaluated" — for a
+            // comparison that is perfectly well formed. The cast is precisely
+            // what says which type to compare in, so the literal is re-encoded
+            // in it exactly as it would be for a column of that type.
+            //
+            // Only when a cast set the type. An *uncast* path keeps the older
+            // behaviour of comparing raw bytes, which is what `data->'k' <> ''`
+            // relies on — coercing the empty string into JSONB there fails, and
+            // that pair is how key-existence is answered.
+            (ComparisonOperand::Direct(lit), ComparisonOperand::PathWithIndex(_, _, path))
+                if left_type != right_type && path.cast.is_some() =>
+            {
+                let mb = coerce(lit, &left_type, &right_type)?;
+                let t = right_type.clone();
+                Ok((ComparisonOperand::Direct(mb), right_op, t.clone(), t))
+            }
+            (ComparisonOperand::PathWithIndex(_, _, path), ComparisonOperand::Direct(lit))
+                if left_type != right_type && path.cast.is_some() =>
+            {
+                let mb = coerce(lit, &right_type, &left_type)?;
+                let t = left_type.clone();
+                Ok((left_op, ComparisonOperand::Direct(mb), t.clone(), t))
+            }
+            _ => Ok((left_op, right_op, left_type, right_type)),
+        }
     }
 
     fn parse_expr<'c>(
@@ -386,14 +507,96 @@ impl<'a, 'b> QueryParser<'a, 'b> {
 
                 Ok((ComparisonOperand::DirectWithIndex(mb, idx), db_type))
             }
+            // A path into a document. The index is the *document* column's —
+            // that is what the row has to fetch — and the transformer takes the
+            // path from its bytes each row.
+            Token::JsonPath { write_order, steps, as_text } => {
+                let idx = write_order as usize;
+                if idx >= cols.len() {
+                    return Err(format!(
+                        "Column index {} out of bounds (max: {})",
+                        idx,
+                        cols.len() - 1
+                    ));
+                }
+                if self.first_iteration {
+                    self.used_column_indices.push(idx);
+                }
+                // A cast written on the path belongs to it: `doc->>'n'::int`
+                // and `(doc->>'n')::int` both mean "read that value as an
+                // int", and the comparison then happens in that type.
+                let cast = match self.peek_cast() {
+                    Some(t) => {
+                        self.pos += 1;
+                        Some(t)
+                    }
+                    None => None,
+                };
+                let path = crate::core::processor::transformer::JsonPathRef {
+                    steps: std::sync::Arc::new(steps),
+                    as_text,
+                    cast: cast.clone(),
+                };
+                // Resolved once here so the first comparison has a value of the
+                // right width; every row after it goes through
+                // `update_column_data_by_index`.
+                let mb = path.extract(cols[idx].1.into_slice());
+                let db_type = match cast {
+                    Some(t) => t,
+                    None if as_text => DbType::STRING,
+                    None => DbType::JSONB,
+                };
+                Ok((ComparisonOperand::PathWithIndex(mb, idx, path), db_type))
+            }
             Token::LPar => {
                 let (inner_op, inner_type) = self.parse_expr(cols)?;
                 match self.next() {
-                    Some(Token::RPar) => Ok((inner_op, inner_type)),
+                    Some(Token::RPar) => {
+                        // `(doc->>'n')::bigint` — the cast follows the group and
+                        // applies to what the group produced. Only a path can
+                        // carry one, because only a path re-reads its bytes;
+                        // over anything else it is refused rather than
+                        // silently ignored, which would compare a value in the
+                        // wrong type and match nothing.
+                        match self.peek_cast() {
+                            None => Ok((inner_op, inner_type)),
+                            Some(target) => {
+                                self.pos += 1;
+                                match inner_op {
+                                    ComparisonOperand::PathWithIndex(_, idx, path) => {
+                                        let recast =
+                                            crate::core::processor::transformer::JsonPathRef {
+                                                steps: path.steps.clone(),
+                                                as_text: path.as_text,
+                                                cast: Some(target.clone()),
+                                            };
+                                        let mb = recast.extract(cols[idx].1.into_slice());
+                                        Ok((
+                                            ComparisonOperand::PathWithIndex(mb, idx, recast),
+                                            target,
+                                        ))
+                                    }
+                                    _ => Err(
+                                        "a `::` cast over this expression is not supported yet"
+                                            .to_string(),
+                                    ),
+                                }
+                            }
+                        }
+                    }
                     _ => Err("expected closing parenthesis after grouped expression".to_string()),
                 }
             }
             t => Err(format!("unexpected factor: {:?}", t)),
+        }
+    }
+
+    /// A cast token sitting at the current position, if there is one.
+    #[inline(always)]
+    fn peek_cast(&self) -> Option<DbType> {
+        match self.toks.get(self.pos) {
+            Some(Token::Cast(t)) => Some(t.clone()),
+            _ => None,
         }
     }
 
