@@ -22,8 +22,25 @@ use std::{
     sync::Arc,
 };
 
+#[cfg(target_os = "windows")]
+const ROWS_PATH: &str = r"G:\Databases\Production\employees.db";
+#[cfg(target_os = "windows")]
+const POINTERS_PATH: &str = r"G:\Databases\Production\employees_pointers.db";
+
+#[cfg(target_os = "linux")]
+//const ROWS_PATH: &str = "/mnt/Volume4/test_db/employees.db";
+const ROWS_PATH: &str = "/test_db/employees.db";
+
+#[cfg(target_os = "linux")]
+//const POINTERS_PATH: &str = "/mnt/Volume4/test_db/employees_pointers.db";
+const POINTERS_PATH: &str = "/test_db/employees_pointers.db";
+
+const ROW_COUNT: u64 = 1_000_000;
+
 // const QUERY: &str = "salary >= 247999.0";
-const QUERY: &str = "id = 100000";
+const QUERY: &str = r##"
+id >= 99995 AND id <= 99999
+"##;
 
 #[tokio::main(flavor = "multi_thread")]
 #[allow(unreachable_code)]
@@ -60,7 +77,7 @@ async fn main() -> std::io::Result<()> {
                 run_queries(&client).await;
             }
             4 => {
-                pause("Press any key to start generating 500,000 rows...");
+                pause(&format!("Press any key to start generating {} rows...", ROW_COUNT));
                 generate_rows_and_pointers_to_disk().await?;
             }
             _ => unreachable!(),
@@ -80,7 +97,7 @@ fn prompt_menu_choice() -> u8 {
 1. Create Table, Add rows and query\n\
 2. Add rows and Query\n\
 3. Query only\n\
-4. Generate 500,000 rows + pointers to disk (in-memory build)\n"
+4. Generate {ROW_COUNT} rows + pointers to disk (in-memory build)\n"
     );
 
     loop {
@@ -170,6 +187,18 @@ impl StorageIO for InMemoryVecStorage {
     async fn append_data(&self, buffer: &[u8], _immediate: bool) {
         let mut guard = self.data.lock().unwrap();
         guard.extend_from_slice(buffer);
+    }
+
+    async fn append_data_returning_offset(&self, buffer: &[u8], _immediate: bool) -> u64 {
+        // The offset must be determined atomically with the append: reading the
+        // length and extending under the *same* lock guard is what makes two
+        // concurrent callers get distinct offsets that each match where their
+        // own bytes actually landed. Pairing get_len() with append_data() would
+        // compile but hand back another caller's offset under contention.
+        let mut guard = self.data.lock().unwrap();
+        let offset = guard.len() as u64;
+        guard.extend_from_slice(buffer);
+        offset
     }
 
     async fn get_len(&self) -> u64 {
@@ -313,19 +342,6 @@ fn make_employee_row_write(i: u64) -> RowWrite {
 }
 
 async fn generate_rows_and_pointers_to_disk() -> std::io::Result<()> {
-    #[cfg(target_os = "windows")]
-    const ROWS_PATH: &str = r"G:\Databases\Production\employees.db";
-    #[cfg(target_os = "windows")]
-    const POINTERS_PATH: &str = r"G:\Databases\Production\employees_pointers.db";
-
-    #[cfg(target_os = "linux")]
-    const ROWS_PATH: &str = "/home/milend/test_db/employees.db";
-    
-    #[cfg(target_os = "linux")]
-    const POINTERS_PATH: &str = "/home/milend/test_db/employees_pointers.db";
-
-    const ROW_COUNT: u64 = 500_000;
-
     // Very rough capacity hints to reduce reallocations.
     // If you increase average string sizes, memory usage will grow significantly.
     let rows_io = rclite::Arc::new(InMemoryVecStorage::new("employees_rows", 512 * 1024 * 1024));
@@ -381,11 +397,13 @@ async fn generate_rows_and_pointers_to_disk() -> std::io::Result<()> {
 
     {
         use std::io::Write;
+        let _ = std::fs::remove_file(ROWS_PATH);
         let mut f = std::fs::File::create(ROWS_PATH)?;
         f.write_all(&rows_bytes)?;
     }
     {
         use std::io::Write;
+        let _ = std::fs::remove_file(POINTERS_PATH);
         let mut f = std::fs::File::create(POINTERS_PATH)?;
         f.write_all(&pointers_bytes)?;
     }
@@ -439,7 +457,7 @@ async fn insert_rows(client: &Arc<DbClient>) {
 
         let semaphore = Arc::new(tokio::sync::Semaphore::new(16));
 
-        for i in 0..100_000 {
+        for i in 0..ROW_COUNT {
             let person = generate_person();
             let query = format!(
                 r##"
@@ -453,7 +471,7 @@ async fn insert_rows(client: &Arc<DbClient>) {
                     '{}', '{}', '{}', {}, {}, {}, {}, {}
                 );
                 "##,
-                (i + 1) + (_i * 100_000),
+                (i + 1) + (_i * ROW_COUNT),
                 person.name,
                 person.job_title,
                 person.salary,

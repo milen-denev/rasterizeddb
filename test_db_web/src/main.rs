@@ -1,57 +1,187 @@
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::Duration;
+use std::{fmt::Write, io};
 
 use axum::Router;
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::Path;
-use axum::http::header;
+use axum::http::{StatusCode, header};
 use axum::{response::Response, routing::get};
+use once_cell::sync::Lazy;
 
 use rand::Rng;
 
 use rasterizeddb_core::client::DbClient;
 use rasterizeddb_core::core::db_type::DbType;
 use rasterizeddb_core::core::row::row::ReturnResult;
+use tokio::sync::OnceCell;
 
 static CLIENT: async_lazy::Lazy<Arc<DbClient>> = async_lazy::Lazy::new(|| {
     Box::pin(async {
-        let client = DbClient::with_pool_settings(Some("127.0.0.1"), 10, 5000)
+        let client = DbClient::with_pool_settings_and_timeouts(
+            Some("127.0.0.1"),
+            64,
+            128,
+            Duration::from_secs(2),
+            Duration::from_millis(250),
+        )
             .await
             .unwrap();
 
-        // let _query = r##"
-        //     CREATE TABLE employees (
-        //         id UBIGINT,
-        //         name VARCHAR,
-        //         job_title VARCHAR,
-        //         salary REAL,
-        //         department VARCHAR,
-        //         age INTEGER,
-        //         manager VARCHAR,
-        //         location VARCHAR,
-        //         hire_date UBIGINT,
-        //         degree VARCHAR,
-        //         skills VARCHAR,
-        //         current_project VARCHAR,
-        //         performance_score REAL,
-        //         is_active BOOLEAN,
-        //         created_at UBIGINT,
-        //         updated_at UBIGINT,
-        //         is_fired BOOLEAN
-        //     );
-        // "##;
+        let _query = r##"
+            CREATE TABLE employees (
+                id UBIGINT,
+                name VARCHAR,
+                job_title VARCHAR,
+                salary REAL,
+                department VARCHAR,
+                age INTEGER,
+                manager VARCHAR,
+                location VARCHAR,
+                hire_date UBIGINT,
+                degree VARCHAR,
+                skills VARCHAR,
+                current_project VARCHAR,
+                performance_score REAL,
+                is_active BOOLEAN,
+                created_at UBIGINT,
+                updated_at UBIGINT,
+                is_fired BOOLEAN
+            );
+        "##;
 
-        // client
-        //     .execute_query(_query)
-        //     .await
-        //     .unwrap();
+        client
+            .execute_query(_query)
+            .await
+            .unwrap();
 
         _ = client.connect().await;
 
         Arc::new(client)
     })
 });
+
+static RESPONSE_CACHE: Lazy<Mutex<HashMap<u64, Arc<OnceCell<Bytes>>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Debug)]
+struct HttpResponseError {
+    status: StatusCode,
+    message: String,
+}
+
+fn response_cache_cell(id: u64) -> Arc<OnceCell<Bytes>> {
+    let mut cache = RESPONSE_CACHE.lock().expect("response cache mutex poisoned");
+    cache.entry(id)
+        .or_insert_with(|| Arc::new(OnceCell::new()))
+        .clone()
+}
+
+fn text_response(status: StatusCode, body: impl Into<Body>) -> Response {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/plain; charset=UTF-8")
+        .body(body.into())
+        .unwrap()
+}
+
+fn build_query(id: u64) -> String {
+    let mut query = String::with_capacity(96);
+    let _ = write!(
+        &mut query,
+        "SELECT id, salary, job_title, location, current_project FROM employees WHERE id = {}",
+        id
+    );
+    query
+}
+
+fn render_rows(result: ReturnResult) -> Result<Bytes, io::Error> {
+    let mut output = String::new();
+
+    match result {
+        ReturnResult::Rows(rows) => {
+            for row in &rows {
+                for (index, col) in row.columns.iter().enumerate() {
+                    match (index, col.column_type.clone()) {
+                        (0, DbType::U64) => {
+                            let value = u64::from_le_bytes(
+                                col.data
+                                    .into_slice()
+                                    .try_into()
+                                    .expect("Failed to convert bytes to u64"),
+                            );
+                            let _ = write!(&mut output, "id: {}\t", value);
+                        }
+                        (1, DbType::F64) => {
+                            let value = f64::from_le_bytes(
+                                col.data
+                                    .into_slice()
+                                    .try_into()
+                                    .expect("Failed to convert bytes to f64"),
+                            );
+                            let _ = write!(&mut output, "salary: {}\t", value);
+                        }
+                        (2, DbType::STRING) => {
+                            let _ = write!(
+                                &mut output,
+                                "job title: {}\t",
+                                String::from_utf8_lossy(&col.data.into_slice())
+                            );
+                        }
+                        (3, DbType::STRING) => {
+                            let _ = write!(
+                                &mut output,
+                                "location: {}\t",
+                                String::from_utf8_lossy(&col.data.into_slice())
+                            );
+                        }
+                        (4, DbType::STRING) => {
+                            let _ = write!(
+                                &mut output,
+                                "project: {}\t",
+                                String::from_utf8_lossy(&col.data.into_slice())
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        _ => output.push_str("No rows returned."),
+    }
+
+    Ok(Bytes::from(output))
+}
+
+async fn fetch_response_body(id: u64) -> Result<Bytes, HttpResponseError> {
+    let query = build_query(id);
+    let client = CLIENT.force().await;
+
+    let db_response = client.execute_query(&query).await.map_err(|err| HttpResponseError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        message: format!("db unavailable: {err}"),
+    })?;
+
+    let result = match DbClient::extract_rows(db_response) {
+        Ok(Some(result)) => result,
+        Ok(None) => ReturnResult::Rows(Vec::new()),
+        Err(err) => {
+            return Err(HttpResponseError {
+                status: StatusCode::BAD_GATEWAY,
+                message: format!("invalid db response: {err}"),
+            });
+        }
+    };
+
+    render_rows(result).map_err(|err| HttpResponseError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("failed to render response: {err}"),
+    })
+}
 
 #[tokio::main]
 async fn main() {
@@ -65,56 +195,15 @@ async fn main() {
 
 // get id from query param
 async fn query(Path(id): Path<u64>) -> Response {
-    //let x = rand::random_range(0..10_000 as i32);
-    let query_evaluation = &format!(
-    r#"
-        SELECT id, salary, job_title FROM employees
-        WHERE id = {id}
-    "#);
+    let cache_cell = response_cache_cell(id);
 
-    let client = CLIENT.force().await;
-
-    let db_response2 = client.execute_query(&query_evaluation).await.unwrap();
-    let result = DbClient::extract_rows(db_response2).unwrap().unwrap();
-
-    let mut output = String::new();
-
-    match result {
-        ReturnResult::Rows(rows) => {
-            for row in rows.iter() {
-                for col in row.columns.iter() {
-                    if col.column_type == DbType::STRING {
-                        output.push_str(&format!(
-                            "job title: {}\t",
-                            String::from_utf8_lossy(&col.data.into_slice())
-                        ));
-                    } else if col.column_type == DbType::U64 {
-                        let int_value = u64::from_le_bytes(
-                            col.data.into_slice()
-                                .try_into()
-                                .expect("Failed to convert bytes to u64"),
-                        );
-                        output.push_str(&format!("id: {}\t", int_value));
-                    } else if col.column_type == DbType::F64 {
-                        let float_value = f64::from_le_bytes(
-                            col.data.into_slice()
-                                .try_into()
-                                .expect("Failed to convert bytes to f64"),
-                        );
-                        output.push_str(&format!("salary: {}\t", float_value));
-                    }
-                }
-            }
-        }
-        _ => {
-            output.push_str("No rows returned.");
-        }
+    match cache_cell
+        .get_or_try_init(|| async move { fetch_response_body(id).await })
+        .await
+    {
+        Ok(body) => text_response(StatusCode::OK, Body::from(body.clone())),
+        Err(err) => text_response(err.status, Body::from(err.message.clone())),
     }
-
-    Response::builder()
-        .header(header::CONTENT_TYPE, "text/html; charset=UTF-8")
-        .body(Body::new(output))
-        .unwrap()
 }
 
 
