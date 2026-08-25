@@ -3,7 +3,7 @@ use itertools::Either;
 use smallvec::SmallVec;
 
 use crate::{
-    core::{db_type::DbType, helpers::smallvec_extensions::SmallVecExtensions, row::{logical::perform_comparison_operation, math::perform_math_operation}},
+    core::{db_type::DbType, helpers::smallvec_extensions::SmallVecExtensions, row::{error::EvalError, logical::perform_comparison_operation, math::perform_math_operation}},
     memory_pool::MemoryBlock,
 };
 
@@ -21,6 +21,27 @@ pub struct ColumnTransformer {
 
     pub column_1_index: Option<usize>,
     pub column_2_index: Option<usize>,
+
+    /// Set when the operand is a path into a document rather than the column
+    /// itself. The index still names the *document* column — that is what the
+    /// row fetches — and the path is taken from its bytes each row.
+    pub column_1_path: Option<JsonPathRef>,
+    pub column_2_path: Option<JsonPathRef>,
+
+    /// Parentheses opening immediately before this comparison, and closing
+    /// immediately after it.
+    ///
+    /// The boolean results arrive as a flat chain, which is enough to evaluate
+    /// an unparenthesised expression by precedence but loses the grouping.
+    /// Without it, `A AND (B OR C)` flattens to `(A AND B) OR C` — a wrong
+    /// answer rather than a slow one, and exactly the shape `x IN (…)`
+    /// desugars into.
+    ///
+    /// Counts rather than a nesting depth, because depth cannot tell sibling
+    /// groups apart: `(A AND B) AND (C OR D)` and `(A AND B AND C OR D)` have
+    /// identical depths at every position.
+    pub group_opens: u8,
+    pub group_closes: u8,
 }
 
 impl Clone for ColumnTransformer {
@@ -36,6 +57,10 @@ impl Clone for ColumnTransformer {
             result_index_2: self.result_index_2,
             column_1_index: self.column_1_index,
             column_2_index: self.column_2_index,
+            column_1_path: self.column_1_path.clone(),
+            column_2_path: self.column_2_path.clone(),
+            group_opens: self.group_opens,
+            group_closes: self.group_closes,
         }
     }
 }
@@ -57,6 +82,23 @@ pub enum ComparerOperation {
     GreaterOrEquals,
     Less,
     LessOrEquals,
+    /// Case-insensitive counterparts, which `ILIKE` lowers to.
+    ///
+    /// They are separate operators rather than a flag on the existing ones on
+    /// purpose: the fingerprint index hashes raw bytes, so `'ACME'` and
+    /// `'acme'` hash differently. Making `Equals` itself case-insensitive would
+    /// silently drop rows from filtered queries, whereas a distinct operator is
+    /// simply not recognised by the index and falls back to a full scan.
+    EqualsCaseInsensitive,
+    ContainsCaseInsensitive,
+    /// SQL `LIKE` with a pattern the prefix/suffix/substring operators cannot
+    /// express — an interior `%`, or any `_`. Carries the pattern as its
+    /// operand, wildcards intact.
+    Like,
+    /// `ILIKE` for the same shapes.
+    LikeCaseInsensitive,
+    StartsWithCaseInsensitive,
+    EndsWithCaseInsensitive,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -132,8 +174,12 @@ impl ColumnTransformer {
             result_store_index: None,
             result_index_1: None,
             result_index_2: None,
+            column_1_path: None,
+            column_2_path: None,
             column_1_index: None,
             column_2_index: None,
+            group_opens: 0,
+            group_closes: 0,
         }
     }
 
@@ -171,27 +217,84 @@ impl ColumnTransformer {
         &self,
         row: &R,
         inter: &[MemoryBlock],
-    ) -> Either<MemoryBlock, (bool, Option<Next>)> {
+    ) -> Result<Either<MemoryBlock, (bool, Option<Next>)>, EvalError> {
         let (left_mb, right_mb) = self.resolve_inputs(row, inter);
-        let input1 = left_mb.into_slice();
-        let input2 = right_mb.into_slice();
+
+        // A path operand's bytes are the *document*; what the comparison wants
+        // is the value inside it. Resolved here rather than in either
+        // `update_column_*`, because the hot path never calls those:
+        // `resolve_inputs` borrows straight out of the row, so this is the only
+        // point where a value that has to be *computed* can live long enough to
+        // be compared.
+        let left_owned;
+        let input1 = match &self.column_1_path {
+            Some(path) => {
+                left_owned = path.extract(left_mb.into_slice());
+                left_owned.into_slice()
+            }
+            None => left_mb.into_slice(),
+        };
+        let right_owned;
+        let input2 = match &self.column_2_path {
+            Some(path) => {
+                right_owned = path.extract(right_mb.into_slice());
+                right_owned.into_slice()
+            }
+            None => right_mb.into_slice(),
+        };
 
         match self.transformer_type {
             ColumnTransformerType::MathOperation(ref operation) => {
                 if self.next.is_some() {
                     panic!("Next operation is not supported for MathOperation");
                 }
-                Either::Left(perform_math_operation(
+                Ok(Either::Left(perform_math_operation(
                     input1,
                     input2,
                     &self.column_type,
                     operation,
-                ))
+                )?))
             }
-            ColumnTransformerType::ComparerOperation(ref operation) => Either::Right((
-                perform_comparison_operation(input1, input2, &self.column_type, operation),
-                self.next.clone(),
-            )),
+            ColumnTransformerType::ComparerOperation(ref operation) => {
+                // A cast path with nothing to read is SQL NULL, and a
+                // comparison with NULL is false.
+                //
+                // `(doc->>'code')::bigint = 3` has to answer *something* for a
+                // row whose `code` is absent, or is JSON `null`, or holds text
+                // that is not a number. The extract has no value to give, so it
+                // yields empty bytes — and a fixed-width comparison refuses a
+                // zero-length operand outright, failing the whole statement
+                // with "operand size does not match the column type being
+                // evaluated". One unreadable row killed a query that every
+                // other row answered fine.
+                //
+                // PostgreSQL's answer for the first two is NULL, and a
+                // comparison against NULL is false — the row simply does not
+                // match. It errors only on the third, which is a narrower
+                // divergence than failing all three, and far narrower than the
+                // alternative of substituting the type's zeroes: an absent key
+                // would then *match* `= 0`, quietly pulling rows into a result
+                // they have nothing to do with.
+                //
+                // Only for a **cast** path. An uncast one compares its bytes as
+                // they are, and empty is a meaningful value there — it is how
+                // `data->'k' <> ''` answers key existence.
+                let unreadable = self
+                    .column_1_path
+                    .as_ref()
+                    .is_some_and(|p| p.cast.is_some() && input1.is_empty())
+                    || self
+                        .column_2_path
+                        .as_ref()
+                        .is_some_and(|p| p.cast.is_some() && input2.is_empty());
+                if unreadable {
+                    return Ok(Either::Right((false, self.next.clone())));
+                }
+                Ok(Either::Right((
+                    perform_comparison_operation(input1, input2, &self.column_type, operation)?,
+                    self.next.clone(),
+                )))
+            }
         }
     }
 
@@ -219,18 +322,24 @@ impl ColumnTransformer {
     pub fn update_column_data_by_index(&mut self, new_columns: &[MemoryBlock]) {
         if let Some(idx1) = self.column_1_index {
             if self.result_index_1.is_none() {
-                self.column_1 = new_columns
+                let document = new_columns
                     .get(idx1)
-                    .unwrap_or_else(|| panic!("Column index {} out of bounds", idx1))
-                    .clone();
+                    .unwrap_or_else(|| panic!("Column index {} out of bounds", idx1));
+                self.column_1 = match &self.column_1_path {
+                    Some(path) => path.extract(document.into_slice()),
+                    None => document.clone(),
+                };
             }
         }
         if let Some(idx2) = self.column_2_index {
             if self.result_index_2.is_none() {
-                let mb = new_columns
+                let document = new_columns
                     .get(idx2)
-                    .unwrap_or_else(|| panic!("Column index {} out of bounds", idx2))
-                    .clone();
+                    .unwrap_or_else(|| panic!("Column index {} out of bounds", idx2));
+                let mb = match &self.column_2_path {
+                    Some(path) => path.extract(document.into_slice()),
+                    None => document.clone(),
+                };
                 self.column_2 = Some(mb);
             }
         }
@@ -276,12 +385,24 @@ impl ColumnTransformer {
             || (self.column_2_index == Some(column_index) && self.result_index_2.is_none())
     }
 
+    /// The hot path's per-row update.
+    ///
+    /// `new_data` is the column's own bytes. When the operand is a path into a
+    /// document, those bytes are the *document* and the value compared is what
+    /// the path reaches inside it — resolved here, per row, because that is
+    /// where the row's bytes arrive.
     pub fn update_column_by_index(&mut self, column_index: usize, new_data: MemoryBlock) {
         if self.column_1_index == Some(column_index) && self.result_index_1.is_none() {
-            self.column_1 = new_data.clone();
+            self.column_1 = match &self.column_1_path {
+                Some(path) => path.extract(new_data.into_slice()),
+                None => new_data.clone(),
+            };
         }
         if self.column_2_index == Some(column_index) && self.result_index_2.is_none() {
-            self.column_2 = Some(new_data);
+            self.column_2 = Some(match &self.column_2_path {
+                Some(path) => path.extract(new_data.into_slice()),
+                None => new_data,
+            });
         }
     }
 
@@ -325,7 +446,75 @@ impl ColumnTransformer {
 pub enum ComparisonOperand {
     Direct(MemoryBlock),
     DirectWithIndex(MemoryBlock, usize),
+    /// A path into the document column at this index — `doc->>'k'`. The index
+    /// is the document's, and the path is taken from its bytes per row.
+    PathWithIndex(MemoryBlock, usize, JsonPathRef),
     Intermediate(usize),
+}
+
+/// A path taken from a document column, resolved per row.
+///
+/// Shared rather than cloned per row: the steps are fixed by the query and a
+/// predicate is evaluated once per row over a whole scan.
+#[derive(Debug, Clone)]
+pub struct JsonPathRef {
+    pub steps: std::sync::Arc<Vec<crate::core::jsonb::Step>>,
+    pub as_text: bool,
+    /// A `::` cast applied to what the path reaches.
+    ///
+    /// `(data->>'code')::bigint = 3` extracts text and asks for it to be
+    /// compared as a number. Without this the text `"3"` was compared against
+    /// the number `3` and matched nothing, so the type has to travel with the
+    /// operand and be applied to the bytes before the comparison sees them.
+    pub cast: Option<crate::core::db_type::DbType>,
+}
+
+impl JsonPathRef {
+    /// The value this path reaches in `document`, as the bytes a comparison
+    /// should use.
+    ///
+    /// An absent path gives empty bytes, which is what a NULL column gives —
+    /// so `doc->>'missing' = 'x'` is false rather than an error, as it is in
+    /// PostgreSQL.
+    pub fn extract(&self, document: &[u8]) -> MemoryBlock {
+        let Some(found) = crate::core::jsonb::get_path(document, &self.steps) else {
+            return MemoryBlock::default();
+        };
+        let bytes: Vec<u8> = if self.as_text {
+            match crate::core::jsonb::as_text(found) {
+                Some(text) => text.into_bytes(),
+                None => return MemoryBlock::default(),
+            }
+        } else {
+            found.to_vec()
+        };
+        // Re-read as the cast's type, so the comparison happens in it.
+        //
+        // An unreadable value gives empty bytes, which is what an absent path
+        // gives — `(doc->>'k')::bigint = 3` on a `k` that is not a number is
+        // then false rather than an error, matching how the uncast path treats
+        // a missing key.
+        let bytes = match &self.cast {
+            None => bytes,
+            Some(target) => {
+                let value = crate::core::rql::expr::Value::Data {
+                    bytes,
+                    db_type: crate::core::db_type::DbType::STRING,
+                };
+                match crate::core::rql::expr::coerce_to_public(value, target) {
+                    crate::core::rql::expr::Value::Data { bytes, db_type }
+                        if db_type == *target =>
+                    {
+                        bytes
+                    }
+                    _ => return MemoryBlock::default(),
+                }
+            }
+        };
+        let mut mb = crate::memory_pool::MEMORY_POOL.acquire(bytes.len());
+        mb.into_slice_mut().copy_from_slice(&bytes);
+        mb
+    }
 }
 
 impl From<MemoryBlock> for ComparisonOperand {
@@ -336,6 +525,46 @@ impl From<MemoryBlock> for ComparisonOperand {
 impl From<usize> for ComparisonOperand {
     fn from(idx: usize) -> Self {
         ComparisonOperand::Intermediate(idx)
+    }
+}
+
+impl ComparisonOperand {
+    /// Writes this operand into a transformer's first slot.
+    ///
+    /// One place per side rather than one arm per *pairing*: the pairings were
+    /// a cartesian product, and a new operand shape had to be added to every
+    /// one of them or it would silently take a wildcard.
+    fn apply_left(&self, transformer: &mut ColumnTransformer) {
+        match self {
+            ComparisonOperand::Direct(mb) => transformer.column_1 = mb.clone(),
+            ComparisonOperand::DirectWithIndex(mb, index) => {
+                transformer.column_1 = mb.clone();
+                transformer.set_column_1_index(*index);
+            }
+            ComparisonOperand::PathWithIndex(mb, index, path) => {
+                transformer.column_1 = mb.clone();
+                transformer.set_column_1_index(*index);
+                transformer.column_1_path = Some(path.clone());
+            }
+            ComparisonOperand::Intermediate(idx) => transformer.result_index_1 = Some(*idx),
+        }
+    }
+
+    /// The same for the second slot.
+    fn apply_right(&self, transformer: &mut ColumnTransformer) {
+        match self {
+            ComparisonOperand::Direct(mb) => transformer.setup_column_2(mb.clone()),
+            ComparisonOperand::DirectWithIndex(mb, index) => {
+                transformer.setup_column_2(mb.clone());
+                transformer.set_column_2_index(*index);
+            }
+            ComparisonOperand::PathWithIndex(mb, index, path) => {
+                transformer.setup_column_2(mb.clone());
+                transformer.set_column_2_index(*index);
+                transformer.column_2_path = Some(path.clone());
+            }
+            ComparisonOperand::Intermediate(idx) => transformer.result_index_2 = Some(*idx),
+        }
     }
 }
 
@@ -350,6 +579,7 @@ impl ComparisonOperand {
         match self {
             ComparisonOperand::Direct(mb) => mb,
             ComparisonOperand::DirectWithIndex(mb, _) => mb,
+            ComparisonOperand::PathWithIndex(mb, _, _) => mb,
             ComparisonOperand::Intermediate(_) => {
                 panic!("Intermediate has no direct memory block")
             }
@@ -358,6 +588,7 @@ impl ComparisonOperand {
     pub fn get_column_index(&self) -> Option<usize> {
         match self {
             ComparisonOperand::DirectWithIndex(_, i) => Some(*i),
+            ComparisonOperand::PathWithIndex(_, i, _) => Some(*i),
             _ => None,
         }
     }
@@ -376,6 +607,24 @@ pub struct TransformerProcessor<'a> {
 
     // New: cache maximum result index once (set when building plan)
     max_result_store_index: usize,
+
+    /// The `WHERE` clause's boolean structure, compiled to postfix once with
+    /// the plan so the per-row path is a stack walk with no allocation.
+    ///
+    /// Empty when the clause has no parentheses, where the flat sum-of-products
+    /// walk is already correct and cheaper.
+    comparison_program: SmallVec<[EvalOp; 24]>,
+    /// Parentheses opening before the next comparison to be added.
+    pending_opens: u8,
+}
+
+/// One step of the compiled boolean program, in postfix order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvalOp {
+    /// Push the comparison result at this index.
+    Value(u16),
+    And,
+    Or,
 }
 
 impl<'a> TransformerProcessor<'a> {
@@ -389,6 +638,8 @@ impl<'a> TransformerProcessor<'a> {
             transformers,
             intermediate_results,
             max_result_store_index: 0,
+            comparison_program: SmallVec::new(),
+            pending_opens: 0,
         }
     }
 
@@ -411,6 +662,9 @@ impl<'a> TransformerProcessor<'a> {
         self.transformers.extend(plan.transformers.iter().cloned());
         self.intermediate_results.clear();
         self.max_result_store_index = plan.max_result_store_index;
+        // A worker reusing a compiled plan must recompile the boolean program
+        // with it, or its evaluation silently falls back to the flat form.
+        self.refresh_comparison_program();
         self.ensure_intermediate_capacity();
     }
 
@@ -435,24 +689,8 @@ impl<'a> TransformerProcessor<'a> {
         );
         transformer.setup_column_2(placeholder);
 
-        match left_op {
-            ComparisonOperand::Direct(mem) => transformer.column_1 = mem,
-            ComparisonOperand::DirectWithIndex(mem, index) => {
-                transformer.column_1 = mem;
-                transformer.set_column_1_index(index);
-            }
-            ComparisonOperand::Intermediate(idx) => {
-                transformer.result_index_1 = Some(idx);
-            }
-        }
-        match right_op {
-            ComparisonOperand::Direct(mem) => transformer.setup_column_2(mem),
-            ComparisonOperand::DirectWithIndex(mem, index) => {
-                transformer.setup_column_2(mem);
-                transformer.set_column_2_index(index);
-            }
-            ComparisonOperand::Intermediate(idx) => transformer.result_index_2 = Some(idx),
-        }
+        left_op.apply_left(&mut transformer);
+        right_op.apply_right(&mut transformer);
 
         transformer.result_store_index = Some(result_store_idx);
 
@@ -461,6 +699,120 @@ impl<'a> TransformerProcessor<'a> {
         self.update_max_result_index(result_store_idx);
 
         result_store_idx
+    }
+
+    /// Notes that a boolean group opens before the next comparison.
+    pub fn open_group(&mut self) {
+        self.pending_opens = self.pending_opens.saturating_add(1);
+    }
+
+    /// Notes that the boolean group closes after the comparison just added.
+    pub fn close_group(&mut self) {
+        // An opening that never got a comparison cancels out rather than
+        // leaving the program unbalanced.
+        if self.pending_opens > 0 {
+            self.pending_opens -= 1;
+            return;
+        }
+        for t in self.transformers.iter_mut().rev() {
+            if matches!(t.transformer_type, ColumnTransformerType::ComparerOperation(_)) {
+                t.group_closes = t.group_closes.saturating_add(1);
+                break;
+            }
+        }
+        self.refresh_comparison_program();
+    }
+
+    /// Compiles the boolean structure to postfix by shunting-yard, so the
+    /// per-row evaluation is a stack walk rather than a re-parse.
+    ///
+    /// Rebuilt whenever the plan changes, so it can never fall out of step with
+    /// the results it indexes.
+    fn refresh_comparison_program(&mut self) {
+        self.comparison_program.clear();
+
+        let comparisons: SmallVec<[(u8, u8, Option<Next>); 24]> = self
+            .transformers
+            .iter()
+            .filter(|t| matches!(t.transformer_type, ColumnTransformerType::ComparerOperation(_)))
+            .map(|t| (t.group_opens, t.group_closes, t.next.clone()))
+            .collect();
+
+        // With no parentheses the flat walk is already correct, and skipping
+        // the program avoids the stack entirely on the common path.
+        if comparisons.iter().all(|(o, c, _)| *o == 0 && *c == 0) {
+            return;
+        }
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum StackOp {
+            LParen,
+            And,
+            Or,
+        }
+
+        fn precedence(op: StackOp) -> u8 {
+            match op {
+                // AND binds tighter than OR, as in SQL.
+                StackOp::And => 2,
+                StackOp::Or => 1,
+                StackOp::LParen => 0,
+            }
+        }
+
+        let mut ops: SmallVec<[StackOp; 16]> = SmallVec::new();
+        let mut out: SmallVec<[EvalOp; 24]> = SmallVec::new();
+
+        for (index, (opens, closes, next)) in comparisons.iter().enumerate() {
+            for _ in 0..*opens {
+                ops.push(StackOp::LParen);
+            }
+
+            out.push(EvalOp::Value(index as u16));
+
+            for _ in 0..*closes {
+                while let Some(top) = ops.pop() {
+                    match top {
+                        StackOp::LParen => break,
+                        StackOp::And => out.push(EvalOp::And),
+                        StackOp::Or => out.push(EvalOp::Or),
+                    }
+                }
+            }
+
+            let Some(connective) = next else { continue };
+            let incoming = match connective {
+                Next::And => StackOp::And,
+                Next::Or => StackOp::Or,
+            };
+            while let Some(top) = ops.last().copied() {
+                if top == StackOp::LParen || precedence(top) < precedence(incoming) {
+                    break;
+                }
+                ops.pop();
+                out.push(match top {
+                    StackOp::And => EvalOp::And,
+                    StackOp::Or => EvalOp::Or,
+                    StackOp::LParen => unreachable!("guarded above"),
+                });
+            }
+            ops.push(incoming);
+        }
+
+        while let Some(top) = ops.pop() {
+            match top {
+                // Unbalanced input: the parser rejects it before here, so
+                // rather than guess, fall back to the flat walk.
+                StackOp::LParen => {
+                    self.comparison_program.clear();
+                    return;
+                }
+                StackOp::And => out.push(EvalOp::And),
+                StackOp::Or => out.push(EvalOp::Or),
+            }
+        }
+
+        self.comparison_program = out;
     }
 
     pub fn add_comparison(
@@ -483,55 +835,13 @@ impl<'a> TransformerProcessor<'a> {
         );
         transformer.setup_column_2(placeholder);
 
-        match (&left_operand, &right_operand) {
-            (ComparisonOperand::Direct(m1), ComparisonOperand::Direct(m2)) => {
-                transformer.column_1 = m1.clone();
-                transformer.setup_column_2(m2.clone());
-            }
-            (ComparisonOperand::DirectWithIndex(m1, i1), ComparisonOperand::Direct(m2)) => {
-                transformer.column_1 = m1.clone();
-                transformer.setup_column_2(m2.clone());
-                transformer.set_column_1_index(*i1);
-            }
-            (ComparisonOperand::Direct(m1), ComparisonOperand::DirectWithIndex(m2, i2)) => {
-                transformer.column_1 = m1.clone();
-                transformer.setup_column_2(m2.clone());
-                transformer.set_column_2_index(*i2);
-            }
-            (
-                ComparisonOperand::DirectWithIndex(m1, i1),
-                ComparisonOperand::DirectWithIndex(m2, i2),
-            ) => {
-                transformer.column_1 = m1.clone();
-                transformer.setup_column_2(m2.clone());
-                transformer.set_column_1_index(*i1);
-                transformer.set_column_2_index(*i2);
-            }
-            (ComparisonOperand::Intermediate(i1), ComparisonOperand::Intermediate(i2)) => {
-                transformer.result_index_1 = Some(*i1);
-                transformer.result_index_2 = Some(*i2);
-            }
-            (ComparisonOperand::Direct(m1), ComparisonOperand::Intermediate(i2)) => {
-                transformer.column_1 = m1.clone();
-                transformer.result_index_2 = Some(*i2);
-            }
-            (ComparisonOperand::DirectWithIndex(m1, i1), ComparisonOperand::Intermediate(i2)) => {
-                transformer.column_1 = m1.clone();
-                transformer.set_column_1_index(*i1);
-                transformer.result_index_2 = Some(*i2);
-            }
-            (ComparisonOperand::Intermediate(i1), ComparisonOperand::Direct(m2)) => {
-                transformer.result_index_1 = Some(*i1);
-                transformer.setup_column_2(m2.clone());
-            }
-            (ComparisonOperand::Intermediate(i1), ComparisonOperand::DirectWithIndex(m2, i2)) => {
-                transformer.result_index_1 = Some(*i1);
-                transformer.setup_column_2(m2.clone());
-                transformer.set_column_2_index(*i2);
-            }
-        }
+        left_operand.apply_left(&mut transformer);
+        right_operand.apply_right(&mut transformer);
 
+        transformer.group_opens = self.pending_opens;
+        self.pending_opens = 0;
         self.transformers.push_back(transformer);
+        self.refresh_comparison_program();
     }
 
     // New: Ensure intermediate_results has enough capacity once (no per-row scans).
@@ -554,12 +864,12 @@ impl<'a> TransformerProcessor<'a> {
         &mut self,
         row: &R,
         comparison_results: &mut SmallVec<[(bool, Option<Next>); 20]>,
-    ) -> bool {
+    ) -> Result<bool, EvalError> {
         comparison_results.clear();
         self.ensure_intermediate_capacity();
 
         for t in self.transformers.iter() {
-            match t.transform_on_row(row, &self.intermediate_results) {
+            match t.transform_on_row(row, &self.intermediate_results)? {
                 Either::Left(result) => {
                     if let Some(store_idx) = t.result_store_index {
                         if store_idx >= self.intermediate_results.len() {
@@ -575,7 +885,7 @@ impl<'a> TransformerProcessor<'a> {
             }
         }
 
-        self.evaluate_comparison_results(comparison_results)
+        Ok(self.evaluate_comparison_results(comparison_results))
     }
 
     fn evaluate_comparison_results(&self, results: &[(bool, Option<Next>)]) -> bool {
@@ -583,6 +893,42 @@ impl<'a> TransformerProcessor<'a> {
             return false;
         }
 
+        // No program means no parentheses, where the flat walk is correct.
+        if self.comparison_program.is_empty() {
+            return Self::evaluate_flat(results);
+        }
+
+        let mut stack: SmallVec<[bool; 16]> = SmallVec::new();
+        for op in self.comparison_program.iter() {
+            match op {
+                EvalOp::Value(i) => match results.get(*i as usize) {
+                    Some((v, _)) => stack.push(*v),
+                    // The program indexes a result that was not produced. That
+                    // means plan and results disagree, so the safe answer is
+                    // the flat walk rather than a guess.
+                    None => return Self::evaluate_flat(results),
+                },
+                EvalOp::And => {
+                    let (Some(b), Some(a)) = (stack.pop(), stack.pop()) else {
+                        return Self::evaluate_flat(results);
+                    };
+                    stack.push(a && b);
+                }
+                EvalOp::Or => {
+                    let (Some(b), Some(a)) = (stack.pop(), stack.pop()) else {
+                        return Self::evaluate_flat(results);
+                    };
+                    stack.push(a || b);
+                }
+            }
+        }
+
+        stack.pop().unwrap_or(false)
+    }
+
+    /// Sum-of-products over the chain, correct when no parentheses are present:
+    /// `A AND B OR C` is `(A AND B) OR C` in SQL too.
+    fn evaluate_flat(results: &[(bool, Option<Next>)]) -> bool {
         let mut current_and = true;
 
         for (value, next) in results.iter() {
@@ -758,7 +1104,7 @@ mod tests {
 
         let row = TestRow([i32_data_1.clone(), i32_data_2.clone()]);
         let empty_inter = [];
-        match transformer.transform_on_row(&row, &empty_inter) {
+        match transformer.transform_on_row(&row, &empty_inter).unwrap() {
             Either::Left(result) => {
                 let result_slice = result.into_slice();
                 let result_value = i32::from_le_bytes(result_slice.try_into().unwrap());
@@ -783,7 +1129,7 @@ mod tests {
 
         let row = TestRow([i32_data_1.clone(), i32_data_2.clone()]);
         let empty_inter = [];
-        match transformer.transform_on_row(&row, &empty_inter) {
+        match transformer.transform_on_row(&row, &empty_inter).unwrap() {
             Either::Right(result) => {
                 assert!(result.0);
             }
@@ -806,7 +1152,7 @@ mod tests {
 
         let row = TestRow([i32_data_1.clone(), i32_data_2.clone()]);
         let empty_inter = [];
-        match transformer.transform_on_row(&row, &empty_inter) {
+        match transformer.transform_on_row(&row, &empty_inter).unwrap() {
             Either::Right(result) => {
                 assert!(result.0);
             }
@@ -830,7 +1176,7 @@ mod tests {
 
         let row = TestRow([i32_data_1.clone(), i32_data_2.clone()]);
         let empty_inter = [];
-        transformer.transform_on_row(&row, &empty_inter);
+        let _ = transformer.transform_on_row(&row, &empty_inter);
     }
 
     #[test]
@@ -848,7 +1194,7 @@ mod tests {
 
         let row = TestRow([string_data_1.clone(), string_data_2.clone()]);
         let empty_inter = [];
-        match transformer.transform_on_row(&row, &empty_inter) {
+        match transformer.transform_on_row(&row, &empty_inter).unwrap() {
             Either::Right(result) => {
                 assert!(result.0);
             }
@@ -871,7 +1217,7 @@ mod tests {
 
         let row = TestRow([string_data_1.clone(), string_data_2.clone()]);
         let empty_inter = [];
-        match transformer.transform_on_row(&row, &empty_inter) {
+        match transformer.transform_on_row(&row, &empty_inter).unwrap() {
             Either::Right(result) => assert!(!result.0),
             _ => panic!("Expected bool result"),
         }
@@ -948,7 +1294,7 @@ mod tests {
         );
 
         let mut bool_buf: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
-        let res = proc.execute_row(&row, &mut bool_buf);
+        let res = proc.execute_row(&row, &mut bool_buf).unwrap();
         assert!(res);
     }
 
@@ -999,7 +1345,7 @@ mod tests {
         );
 
         let mut bool_buf: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
-        let res = proc.execute_row(&row, &mut bool_buf);
+        let res = proc.execute_row(&row, &mut bool_buf).unwrap();
         assert!(res);
     }
 
@@ -1036,7 +1382,7 @@ mod tests {
         cloned_proc.load_plan(&plan);
 
         let mut bool_buf: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
-        let res = cloned_proc.execute_row(&row, &mut bool_buf);
+        let res = cloned_proc.execute_row(&row, &mut bool_buf).unwrap();
         assert!(res);
     }
 
@@ -1090,7 +1436,7 @@ mod tests {
         );
 
         let mut bool_buf: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
-        let res = proc.execute_row(&row, &mut bool_buf);
+        let res = proc.execute_row(&row, &mut bool_buf).unwrap();
         assert!(!res);
     }
 
@@ -1141,7 +1487,7 @@ mod tests {
         );
 
         let mut bool_buf: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
-        let res = proc.execute_row(&row, &mut bool_buf);
+        let res = proc.execute_row(&row, &mut bool_buf).unwrap();
         assert!(res);
     }
 
@@ -1199,7 +1545,7 @@ mod tests {
         );
 
         let mut bool_buf: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
-        let _ = proc.execute_row(&row, &mut bool_buf);
+        let _ = proc.execute_row(&row, &mut bool_buf).unwrap();
 
         let used = proc.get_used_column_indices();
         assert!(used.contains(&0));
