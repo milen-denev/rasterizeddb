@@ -10,11 +10,26 @@ use xutex::AsyncMutex;
 
 use super::traits::StorageIO;
 
+/// The named buffers one in-memory database is made of.
+///
+/// `create_new` is how every caller opens a sibling file, and for the file
+/// backend two handles to the same name see the same bytes. The in-memory
+/// backend has to match that, or a write through one handle is invisible to
+/// another — which is what silently discarded every schema change, since
+/// `TableSchema::add_field` writes through a handle it opens itself.
+///
+/// The registry is per family rather than global: a provider created by
+/// `new` starts a fresh one and every handle derived from it shares it, so two
+/// in-memory databases in one process stay isolated even when their tables have
+/// the same names.
+type BufferRegistry = Arc<dashmap::DashMap<String, Arc<AsyncMutex<Vec<u8>>>>>;
+
 pub struct MemoryStorageProvider {
     buf: Arc<AsyncMutex<Vec<u8>>>,
     dropped: Arc<AtomicBool>,
     random_u32: u32,
     name: String,
+    registry: BufferRegistry,
 }
 
 impl Clone for MemoryStorageProvider {
@@ -24,17 +39,23 @@ impl Clone for MemoryStorageProvider {
             dropped: self.dropped.clone(),
             random_u32: self.random_u32,
             name: self.name.clone(),
+            registry: self.registry.clone(),
         }
     }
 }
 
 impl MemoryStorageProvider {
     pub fn new(name: &str) -> MemoryStorageProvider {
+        let buf = Arc::new(AsyncMutex::new(Vec::new()));
+        let registry: BufferRegistry = Arc::new(dashmap::DashMap::new());
+        registry.insert(name.to_string(), buf.clone());
+
         MemoryStorageProvider {
-            buf: Arc::new(AsyncMutex::new(Vec::new())),
+            buf,
             dropped: Arc::new(AtomicBool::new(false)),
             random_u32: rand::rng().next_u32(),
             name: name.to_string(),
+            registry,
         }
     }
 
@@ -126,14 +147,41 @@ impl StorageIO for MemoryStorageProvider {
         Ok(())
     }
 
-    async fn append_data(&self, buffer: &[u8], _immediate: bool) {
-        if buffer.is_empty() {
-            return;
-        }
+    async fn append_data(&self, buffer: &[u8], immediate: bool) {
+        let _ = self.append_data_returning_offset(buffer, immediate).await;
+    }
 
+    async fn append_data_returning_offset(&self, buffer: &[u8], _immediate: bool) -> u64 {
         let mut buf_guard = self.buf.lock_sync();
         self.maybe_clear_dropped(&mut buf_guard);
+
+        // Offset is read under the same lock that performs the append, so
+        // concurrent appenders get distinct, accurate offsets.
+        let offset = buf_guard.len() as u64;
+
+        if buffer.is_empty() {
+            return offset;
+        }
+
         buf_guard.extend_from_slice(buffer);
+        offset
+    }
+
+    async fn truncate(&self, len: u64) -> Result<(), std::io::Error> {
+        let mut buf_guard = self.buf.lock_sync();
+        self.maybe_clear_dropped(&mut buf_guard);
+        let current = buf_guard.len() as u64;
+        if len > current {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                format!("truncate to {} would grow a {}-byte buffer", len, current),
+            ));
+        }
+        buf_guard.truncate(len as usize);
+        // Hand the pages back rather than keeping a buffer sized to the table's
+        // high-water mark for the life of the process.
+        buf_guard.shrink_to_fit();
+        Ok(())
     }
 
     async fn get_len(&self) -> u64 {
@@ -165,11 +213,14 @@ impl StorageIO for MemoryStorageProvider {
     }
 
     async fn create_temp(&self) -> Self {
+        // Deliberately unregistered: a scratch buffer is not a named file, and
+        // registering it would let a later `create_new("temp")` find it.
         Self {
             buf: Arc::new(AsyncMutex::new(Vec::new())),
             dropped: Arc::new(AtomicBool::new(false)),
             random_u32: rand::rng().next_u32(),
             name: "temp".to_string(),
+            registry: self.registry.clone(),
         }
     }
 
@@ -204,11 +255,20 @@ impl StorageIO for MemoryStorageProvider {
 
     #[allow(refining_impl_trait)]
     async fn create_new(&self, name: String) -> Self {
+        // Reopening the same name returns a handle onto the same bytes, the way
+        // reopening a file does.
+        let buf = self
+            .registry
+            .entry(name.clone())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(Vec::new())))
+            .clone();
+
         MemoryStorageProvider {
-            buf: Arc::new(AsyncMutex::new(Vec::new())),
+            buf,
             dropped: Arc::new(AtomicBool::new(false)),
             random_u32: rand::rng().next_u32(),
-            name: name,
+            name,
+            registry: self.registry.clone(),
         }
     }
 
@@ -216,6 +276,9 @@ impl StorageIO for MemoryStorageProvider {
         // Sync method in the trait: avoid blocking on an async mutex.
         // Mark as dropped and lazily clear on the next operation that acquires the lock.
         self.dropped.store(true, Ordering::Release);
+        // Forget the name too, so reopening it later starts empty rather than
+        // finding the dropped buffer — which is what deleting a file does.
+        self.registry.remove(&self.name);
     }
 
     fn get_hash(&self) -> u32 {

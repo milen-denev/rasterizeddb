@@ -87,6 +87,40 @@ impl StorageIO for MockStorageProvider {
         self.inner.append_data(buffer, immediate).await
     }
 
+    async fn append_data_returning_offset(&self, buffer: &[u8], immediate: bool) -> u64 {
+        self.inner
+            .append_data_returning_offset(buffer, immediate)
+            .await
+    }
+
+    fn begin_txn(&self) -> u64 {
+        self.inner.begin_txn()
+    }
+
+    async fn append_data_txn(&self, txn: u64, buffer: &[u8]) -> (u64, u64) {
+        self.inner.append_data_txn(txn, buffer).await
+    }
+
+    async fn write_data_txn(&self, txn: u64, position: u64, buffer: &[u8]) -> u64 {
+        self.inner.write_data_txn(txn, position, buffer).await
+    }
+
+    async fn commit_durable(&self, token: u64) -> super::traits::IOResult<()> {
+        self.inner.commit_durable(token).await
+    }
+
+    async fn truncate(&self, len: u64) -> super::traits::IOResult<()> {
+        self.inner.truncate(len).await
+    }
+
+    fn try_borrow_range(
+        &self,
+        position: u64,
+        len: usize,
+    ) -> Option<super::traits::BorrowedBytes> {
+        self.inner.try_borrow_range(position, len)
+    }
+
     async fn get_len(&self) -> u64 {
         self.inner.get_len().await
     }

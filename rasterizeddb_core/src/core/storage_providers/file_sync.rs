@@ -11,7 +11,7 @@ use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use arc_swap::ArcSwap;
 use cacheguard::CacheGuard;
 use log::error;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rclite::Arc as RcArc;
 use opool::{Pool, PoolAllocator};
 use std::sync::OnceLock;
@@ -28,6 +28,110 @@ pub enum FastPathResult {
     Done,              // fully satisfied
     EofPartial(usize), // partial bytes copied (usize) then EOF
     EofNone,           // position at/after EOF before copying
+}
+
+/// Lets one flush make several concurrent appends durable.
+///
+/// Every immediate append used to issue its own `fsync`, so N clients inserting
+/// at once paid N device flushes even though a single flush persists everything
+/// written before it. This tracks which appends are already covered so waiters
+/// can share one.
+#[derive(Default)]
+struct CommitState {
+    /// Appends whose `write` has completed. Bumped under the append lock, so it
+    /// can never run ahead of the bytes it stands for.
+    ///
+    /// Not padded. Splitting these two onto separate cache lines was tried and
+    /// measured *worse* — `insert_shape_100_rows` went from -2.0% to +2.3%
+    /// against the same baseline (p = 0.00 both ways). The waiters that poll
+    /// `durable` are already serialised behind `gate`, so the false sharing the
+    /// padding was meant to remove was not there to remove, and the cost of
+    /// filling a second line on every append was.
+    issued: AtomicU64,
+    /// Highest `issued` value known to be on stable storage.
+    durable: AtomicU64,
+    /// Serializes the flush itself.
+    gate: Mutex<()>,
+    /// Flush handle, opened on first use. Deliberately *not* `append_file`: a
+    /// flush must not hold the append lock, or the next appender would block on
+    /// it and there would be no group left to commit.
+    handle: OnceLock<std::fs::File>,
+    /// The first flush failure, after which nothing here is durable again.
+    ///
+    /// Permanent for the reason the log's poisoning is: Linux drops the dirty
+    /// pages an `fdatasync` reported as failed, so a later flush that succeeds
+    /// does not cover them. The failure used to be discarded and the sequence
+    /// published as durable anyway, which on the no-log path is the only
+    /// durability mechanism reporting a success it did not have.
+    poisoned: OnceLock<String>,
+}
+
+impl CommitState {
+    /// Records a completed append. Call with the append lock held.
+    #[inline]
+    fn issue(&self) -> u64 {
+        self.issued.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Returns once every append up to `seq` is on stable storage, or the
+    /// error that means it never will be.
+    fn flush_through(&self, seq: u64, path: &str) -> io::Result<()> {
+        if let Some(why) = self.poisoned.get() {
+            return Err(Self::poisoned_error(why));
+        }
+        if self.durable.load(Ordering::Acquire) >= seq {
+            return Ok(()); // an earlier flush already covered us
+        }
+
+        let _gate = self.gate.lock();
+
+        if self.durable.load(Ordering::Acquire) >= seq {
+            return Ok(()); // covered while we waited for the gate
+        }
+
+        // Read the counter *before* flushing. The flush also persists every
+        // append issued after ours, so publishing the highest sequence written
+        // so far — not just our own — is what collapses a burst of concurrent
+        // appends into a single device flush.
+        let covered = self.issued.load(Ordering::Acquire);
+
+        if self.handle.get().is_none() {
+            match std::fs::File::options().read(true).write(true).open(path) {
+                Ok(file) => {
+                    let _ = self.handle.set(file);
+                }
+                Err(e) => return Err(self.poison(format!("open {} for flush: {}", path, e))),
+            }
+        }
+        let file = self.handle.get().expect("set just above");
+
+        // `sync_data` (fdatasync) rather than `sync_all` (fsync): an append only
+        // needs its bytes and the new file size durable to be readable after a
+        // crash. Forcing out mtime/ctime costs an extra journal transaction and
+        // buys nothing here.
+        if let Err(e) = file.sync_data() {
+            return Err(self.poison(format!("fdatasync {}: {}", path, e)));
+        }
+
+        self.durable.fetch_max(covered, Ordering::AcqRel);
+        Ok(())
+    }
+
+    /// Records the first failure and returns it as the permanent kind.
+    fn poison(&self, why: String) -> io::Error {
+        error!("flush failed; file is no longer durable: {}", why);
+        let why = self.poisoned.get_or_init(|| why);
+        Self::poisoned_error(why)
+    }
+
+    fn poisoned_error(why: &str) -> io::Error {
+        io::Error::other(format!("{}: {}", super::traits::POISONED_LOG, why))
+    }
+
+    /// The failure that stopped this file being durable, if one happened.
+    fn poison_error(&self) -> Option<io::Error> {
+        self.poisoned.get().map(|why| Self::poisoned_error(why))
+    }
 }
 
 pub struct LocalStorageProvider {
@@ -47,7 +151,41 @@ pub struct LocalStorageProvider {
     pub(super) temp_mem_len: CacheGuard<AtomicU64>,
     // length of staged temp file bytes, maintained atomically (no metadata in read paths)
     pub(super) temp_file_len: CacheGuard<AtomicU64>,
+    /// Logical file length — and, for `append_data_txn`, the **allocator**:
+    /// each append takes its offset from `file_len.fetch_add(len)`.
+    ///
+    /// It therefore *leads* the on-disk length by construction. **Never refresh
+    /// it from `metadata()`.** Doing so is not a correction but a race against
+    /// the allocator: an append that has written its bytes but not yet claimed
+    /// its offset leaves the file momentarily longer than `file_len`, so a
+    /// metadata-derived `fetch_max` raises it and the append's own `fetch_add`
+    /// then double-counts — the length ends one record too long and that append
+    /// takes an offset that overlaps its predecessor.
+    ///
+    /// That is a real bug that has been in this file, not a hypothetical. It
+    /// reproduced at 2 runs in 12 in release, isolated, which is exactly the
+    /// rate that gets written off as flake. The trap is that the *staged*
+    /// append path (`append_data(.., immediate = false)`, writing to the `.tmp`
+    /// sidecar) genuinely does let the on-disk length lag, so the two append
+    /// paths look interchangeable at the call site and disagree about whether
+    /// the disk is authoritative. It is not, here.
+    ///
+    /// To make an in-place write's extension visible, use [`Self::inplace_end`],
+    /// which derives the target from the write rather than from the file.
     pub file_len: CacheGuard<AtomicU64>,
+    /// Highest end offset (`position + len`) an in-place write in flight needs
+    /// the file to reach, raised at commit once the bytes are actually applied.
+    ///
+    /// The apply in `commit_txn` writes by path and bypasses this provider, so
+    /// `file_len` would otherwise never learn that an in-place write extended
+    /// the file. Deriving the target from the *write* rather than from
+    /// `metadata()` is what keeps it safe: `append_data_txn` treats `file_len`
+    /// as the allocator — it hands out each append's offset from `fetch_add` —
+    /// so a value read back off disk can race an append that has written its
+    /// bytes but not yet claimed its offset, and double-count. A write's own
+    /// `position + len` cannot outrun the allocator, because a provider that
+    /// appends only ever overwrites *within* the length it already handed out.
+    pub(super) inplace_end: CacheGuard<AtomicU64>,
     // Memory map published with ArcSwap and owned by Arc to allow thread-local caches to own a handle safely.
     pub(crate) _memory_map: Arc<ArcSwap<Mmap>>,
     // Monotonic generation counter; bumped whenever the mmap is refreshed.
@@ -58,7 +196,9 @@ pub struct LocalStorageProvider {
     // true when there is data in temp_file waiting to be flushed
     temp_has_data: CacheGuard<AtomicBool>,
     // used to temporarily block appends during flush
-    append_blocked: CacheGuard<AtomicBool>
+    append_blocked: CacheGuard<AtomicBool>,
+    /// Shared across clones so all handles to a file commit as one group.
+    commit: Arc<CommitState>,
 }
 
 unsafe impl Sync for LocalStorageProvider {}
@@ -99,12 +239,14 @@ impl Clone for LocalStorageProvider {
             temp_mem_len: AtomicU64::new(self.temp_mem_len.load(Ordering::Acquire)).into(),
             temp_file_len: AtomicU64::new(self.temp_file_len.load(Ordering::Acquire)).into(),
             file_len: AtomicU64::new(self.file_len.load(std::sync::atomic::Ordering::SeqCst)).into(),
+            inplace_end: AtomicU64::new(self.inplace_end.load(std::sync::atomic::Ordering::SeqCst)).into(),
             _memory_map: Arc::new(arc_swap::ArcSwap::new(map)),
             mmap_gen: AtomicU64::new(1).into(),
             hash: CRC.checksum(format!("{}+++{}", self.location, self.table_name).as_bytes()),
             _locked: AtomicBool::new(false).into(),
             temp_has_data: AtomicBool::new(self.temp_has_data.load(Ordering::Relaxed)).into(),
-            append_blocked: AtomicBool::new(false).into()
+            append_blocked: AtomicBool::new(false).into(),
+            commit: self.commit.clone(),
         }
     }
 }
@@ -160,11 +302,11 @@ impl LocalStorageProvider {
                 _ = std::fs::create_dir_all(location_path);
             }
 
-            let final_location = if location.ends_with(delimiter) {
-                location[location.len() - 1..].replace(delimiter, "")
-            } else {
-                format!("{}", location)
-            };
+            // Trim any trailing separators. The previous form sliced off the
+            // last character and stripped it, which turned "/data/db/" into an
+            // empty string — so files were created at the filesystem root and
+            // the constructor panicked.
+            let final_location = location.trim_end_matches(delimiter).to_string();
 
             let file_str = format!("{}{}{}", final_location, delimiter, table_name);
 
@@ -172,6 +314,11 @@ impl LocalStorageProvider {
 
             if !file_path.exists() && !file_path.is_file() {
                 _ = std::fs::File::create(&file_str).unwrap();
+                let _ = crate::core::wal::sync_parent_dir(std::path::Path::new(&file_str));
+                // Creating a file writes a directory entry, which is only
+                // durable once the directory itself is flushed. Without this a
+                // crash can lose the file even though its contents were synced.
+                let _ = crate::core::wal::sync_parent_dir(file_path);
             }
 
             let file_append = std::fs::File::options()
@@ -204,6 +351,7 @@ impl LocalStorageProvider {
 
             if !Path::new(&temp_file_str).exists() {
                 _ = std::fs::File::create(&temp_file_str).unwrap();
+                let _ = crate::core::wal::sync_parent_dir(std::path::Path::new(&temp_file_str));
             }
 
             let temp_file = std::fs::File::options()
@@ -265,13 +413,15 @@ impl LocalStorageProvider {
                 temp_mem: RwLock::new(Vec::new()),
                 temp_mem_len: AtomicU64::new(0).into(),
                 file_len: AtomicU64::new(file_len).into(),
+                inplace_end: AtomicU64::new(0).into(),
                 _memory_map: map,
                 mmap_gen: AtomicU64::new(1).into(),
                 hash: CRC.checksum(format!("{}+++{}", final_location, table_name).as_bytes()),
                 _locked: AtomicBool::new(false).into(),
                 temp_file_len: AtomicU64::new(temp_len).into(),
                 temp_has_data: AtomicBool::new(false).into(),
-                append_blocked: AtomicBool::new(false).into()
+                append_blocked: AtomicBool::new(false).into(),
+                commit: Default::default(),
             };
 
             // If there are staged bytes in temp file, flush them into the main file.
@@ -281,6 +431,7 @@ impl LocalStorageProvider {
                 let _ = local_storage_provider.flush_temp_to_main().await;
             }
 
+            local_storage_provider.register_with_wal();
             local_storage_provider
         } else {
             let delimiter = if cfg!(unix) {
@@ -291,11 +442,8 @@ impl LocalStorageProvider {
                 panic!("OS not supported");
             };
 
-            let location_str = if location.ends_with(delimiter) {
-                location[location.len() - 1..].replace(delimiter, "")
-            } else {
-                format!("{}", location)
-            };
+            // Same trailing-separator fix as above.
+            let location_str = location.trim_end_matches(delimiter).to_string();
 
             let location_path = Path::new(&location_str);
 
@@ -306,6 +454,7 @@ impl LocalStorageProvider {
             let file_str = format!("{}{}{}", location_str, delimiter, "CONFIG_TABLE.db");
 
             _ = std::fs::File::create(&file_str).unwrap();
+            let _ = crate::core::wal::sync_parent_dir(std::path::Path::new(&file_str));
 
             let file_append = std::fs::File::options()
                 .read(true)
@@ -336,6 +485,7 @@ impl LocalStorageProvider {
             let temp_file_str = format!("{}.tmp", file_str);
             if !Path::new(&temp_file_str).exists() {
                 _ = std::fs::File::create(&temp_file_str).unwrap();
+                let _ = crate::core::wal::sync_parent_dir(std::path::Path::new(&temp_file_str));
             }
             let temp_file = std::fs::File::options()
                 .create(true)
@@ -395,19 +545,22 @@ impl LocalStorageProvider {
                 temp_mem: RwLock::new(Vec::new()),
                 temp_mem_len: AtomicU64::new(0).into(),
                 file_len: AtomicU64::new(file_len).into(),
+                inplace_end: AtomicU64::new(0).into(),
                 _memory_map: map,
                 mmap_gen: AtomicU64::new(1).into(),
                 hash: CRC.checksum(format!("{}+++{}", location_str, "CONFIG_TABLE.db").as_bytes()),
                 _locked: AtomicBool::new(false).into(),
                 temp_file_len: AtomicU64::new(temp_len).into(),
                 temp_has_data: AtomicBool::new(false).into(),
-                append_blocked: AtomicBool::new(false).into()
+                append_blocked: AtomicBool::new(false).into(),
+                commit: Default::default(),
             };
 
             if temp_len > 0 {
                 let _ = local_storage_provider.flush_temp_to_main().await;
             }
 
+            local_storage_provider.register_with_wal();
             local_storage_provider
         }
     }
@@ -457,8 +610,19 @@ impl LocalStorageProvider {
 
         let _reset = Reset(&self.append_blocked);
 
-        // Snapshot temp length from atomic.
-        let len = self.temp_file_len.swap(0, Ordering::AcqRel) as usize;
+        // Read the staged length; it is NOT cleared here. Clearing it up
+        // front made the logical length — `file_len + temp_file_len`, which is
+        // what `get_len` reports and what a scan turns into a slot count —
+        // DIP for the whole duration of the write and its fsync below: the
+        // staged rows had stopped counting while the main file had not yet
+        // grown. A scan in that window saw fewer slots than exist and simply
+        // did not reach the newest version of a row, so a reader could miss a
+        // row that was merely being updated, and a writer could land on the
+        // older version and report a serialization conflict against a
+        // transaction that had already finished. Appends are blocked for the
+        // whole of this function, so nothing can add to the staged length
+        // while it is being published.
+        let len = self.temp_file_len.load(Ordering::Acquire) as usize;
 
         if len == 0 {
             // nothing to do
@@ -469,14 +633,16 @@ impl LocalStorageProvider {
         // Prefer writing from the in-memory staging buffer (if it fully covers the staged range).
         let mut wrote_from_mem = false;
         if self.temp_mem_len.load(Ordering::Acquire) == len as u64 {
-            let mut mem = self.temp_mem.write();
+            let mem = self.temp_mem.write();
             if mem.len() == len {
                 let mut main = self.append_file.write();
                 main.write_all(&mem)?;
                 main.flush()?;
                 let _ = main.sync_all();
-                mem.clear();
-                self.temp_mem_len.store(0, Ordering::Release);
+                // The mirror is deliberately NOT cleared yet. Until the length
+                // is published below, a read of these offsets is still served
+                // from the staged copy; dropping it here would leave the bytes
+                // reachable from neither place.
                 wrote_from_mem = true;
             }
         }
@@ -502,22 +668,34 @@ impl LocalStorageProvider {
             main.flush()?;
             let _ = main.sync_all();
 
-            // We flushed staged bytes; drop any in-memory mirror.
-            self.temp_mem.write().clear();
-            self.temp_mem_len.store(0, Ordering::Release);
+            // As above: the mirror is dropped after the length is published,
+            // not before.
         }
 
-        // Truncate temp file back to zero for next round
+        // The map has to cover the bytes before the length that describes them
+        // is published, or a scan is told about slots the map cannot serve.
+        self.update_memory_map();
+
+        // Publish. The two counters move together under the append lock, which
+        // `get_len` also takes, so no reader can observe the instant between
+        // them — one order would dip and the other would overshoot, and both
+        // are wrong for a scan that turns the number into a slot count.
+        {
+            let _publish = self.append_file.write();
+            self.file_len.fetch_add(len as u64, Ordering::Release);
+            self.temp_file_len.fetch_sub(len as u64, Ordering::Release);
+        }
+
+        // Only now is the staged copy redundant: these offsets are served from
+        // the main file, and the length says so.
+        self.temp_mem.write().clear();
+        self.temp_mem_len.store(0, Ordering::Release);
         {
             let mut temp = self.temp_file.write();
             temp.seek(SeekFrom::Start(0))?;
             temp.set_len(0)?;
             let _ = temp.flush();
         }
-
-        // Publish new file_len and refresh mmap
-        self.file_len.fetch_add(len as u64, Ordering::Release);
-        self.update_memory_map();
 
         // Clear pending flag
         self.temp_has_data.store(false, Ordering::Release);
@@ -564,6 +742,30 @@ impl LocalStorageProvider {
             let mmap_arc = state.2.as_ref().unwrap();
             f(&*mmap_arc)
         })
+    }
+
+    /// This file's id within its database directory, as the log records it.
+    #[inline]
+    fn wal_file_id(&self) -> u64 {
+        crate::core::wal::file_id_for_name(&self.table_name)
+    }
+
+    /// Makes a write durable without a log: flush this file, group-committed.
+    ///
+    /// The failure is recorded rather than returned — the append paths that
+    /// call this cannot report one — and surfaces from `commit_durable`, which
+    /// every statement runs before it reports success.
+    #[inline]
+    fn flush_self(&self, seq: u64) {
+        let _ = self.commit.flush_through(seq, &self.file_str);
+    }
+
+    /// Publishes this file so a replay can find it by path.
+    #[inline]
+    fn register_with_wal(&self) {
+        if let Some(w) = crate::core::wal::wal_for(&self.location) {
+            w.register_file(self.wal_file_id(), &self.file_str);
+        }
     }
 
     #[inline(always)]
@@ -653,15 +855,29 @@ impl LocalStorageProvider {
             return Ok(());
         }
 
-        // Snapshot lengths
-        let main_len = self.load_file_len();
-        // Avoid `await` in the hot read path; if a flush is in progress, do a short spin.
-        // Flushes are expected to be rare relative to reads.
+        // Avoid `await` in the hot read path; if a flush is in progress, do a
+        // short spin. Flushes are expected to be rare relative to reads.
         while self.append_blocked.load(Ordering::Acquire) {
             std::hint::spin_loop();
         }
 
-        let temp_len = self.temp_file_len.load(Ordering::Acquire);
+        // BOTH lengths after the spin, and both under the publish lock.
+        // Reading the main length *before* waiting for the flush and the
+        // staged length *after* it meant a flush landing in between was
+        // counted in neither: the main length was the one from before it
+        // published and the staged length had already been cleared. The
+        // logical end then came out short, and this returned `UnexpectedEof`
+        // for a position that is well inside the file — which a scan reads as
+        // the end of the table, so it stops early and the rows past that point
+        // simply do not appear. A reader could miss a row that exists while
+        // another connection was updating it.
+        let (main_len, temp_len) = {
+            let _publish = self.append_file.read();
+            (
+                self.load_file_len(),
+                self.temp_file_len.load(Ordering::Acquire),
+            )
+        };
         let file_len = main_len + temp_len; // logical length
 
         // Immediate EOF if the requested position is beyond the logical end.
@@ -795,31 +1011,263 @@ impl StorageIO for LocalStorageProvider {
     }
 
     async fn write_data(&self, position: u64, buffer: &[u8]) {
-        let mut file = self.write_file.write();
-        file.seek(SeekFrom::Start(position)).unwrap();
+        let txn = self.begin_txn();
+        let token = self.write_data_txn(txn, position, buffer).await;
+        // `write_data` has no way to report this; callers that need to know use
+        // the transactional form and commit it themselves.
+        if let Err(e) = self.commit_durable(token).await {
+            error!("in-place write to {} is not durable: {}", self.file_str, e);
+        }
+    }
+
+    fn begin_txn(&self) -> u64 {
+        match crate::core::wal::wal_for(&self.location) {
+            Some(w) => w.begin(),
+            None => 0,
+        }
+    }
+
+    async fn write_data_txn(&self, txn: u64, position: u64, buffer: &[u8]) -> u64 {
+        // Recorded now, applied to `file_len` at commit — see `inplace_end`.
+        // Raising the length here instead would publish a length whose bytes
+        // are not in the file yet, since the apply is deferred to commit.
+        self.inplace_end
+            .fetch_max(position + buffer.len() as u64, Ordering::AcqRel);
+        if let Some(w) = crate::core::wal::wal_for(&self.location) {
+            match w.log_in_place(txn, self.wal_file_id(), position, buffer) {
+                // The data file is deliberately untouched here; `commit_durable`
+                // applies it once the record is durable. Overwriting first would
+                // destroy the old bytes with no undo record to restore them.
+                Ok(_) => return txn,
+                Err(e) => error!(
+                    "WAL in-place log failed ({}); writing {} directly",
+                    e, self.file_str
+                ),
+            }
+        }
+
+        {
+            let mut file = self.write_file.write();
+            file.seek(SeekFrom::Start(position)).unwrap();
+            file.write_all(buffer).unwrap();
+            file.flush().unwrap();
+        }
+        self.flush_self(self.commit.issue());
+        0
+    }
+
+    async fn append_data_txn(&self, txn: u64, buffer: &[u8]) -> (u64, u64) {
+        let mut file = self.append_file.write();
         file.write_all(buffer).unwrap();
         file.flush().unwrap();
-        file.sync_all().unwrap();
+        let offset = self
+            .file_len
+            .fetch_add(buffer.len() as u64, Ordering::Release);
+        let seq = self.commit.issue();
+        let new_len = offset + buffer.len() as u64;
+
+        // Release the append lock before any flush. Holding it across the flush
+        // would serialize appends behind the device and leave nothing for the
+        // shared commit to batch.
+        drop(file);
+
+        // A directory being bulk-loaded takes neither a log record nor a flush:
+        // the loader syncs every file once at the end, and a load that dies
+        // before then is discarded whole. See `core::bulk_load`.
+        let token = if crate::core::bulk_load::is_active(&self.location) {
+            0
+        } else {
+            match crate::core::wal::wal_for(&self.location) {
+            Some(w) => match w.log(txn, self.wal_file_id(), offset, buffer) {
+                Ok(_) => txn,
+                Err(e) => {
+                    error!("WAL append failed ({}); flushing {} directly", e, self.file_str);
+                    self.flush_self(seq);
+                    0
+                }
+            },
+            None => {
+                self.flush_self(seq);
+                0
+            }
+            }
+        };
+
+        let mmap_len = self._memory_map.load().len() as u64;
+        if new_len > mmap_len + REMAP_GROWTH_THRESHOLD {
+            self.update_memory_map();
+        }
+
+        (offset, token)
+    }
+
+    async fn commit_durable(&self, token: u64) -> io::Result<()> {
+        // Checked for every token, including the no-log path's `0`: a flush
+        // that failed after an append is this file's failure to report, and
+        // this is the one call every writer makes before reporting success.
+        if let Some(e) = self.commit.poison_error() {
+            return Err(e);
+        }
+        if token == 0 {
+            return Ok(());
+        }
+        let Some(w) = crate::core::wal::wal_for(&self.location) else {
+            return Ok(());
+        };
+        // Deferred: this is a row or pointer write, and the statement that
+        // asked for it takes one sync for all of them before reporting success.
+        if let Err(e) = w.commit_txn_deferred(token) {
+            // Logged as well as returned. The error goes to the caller so it can
+            // stop reporting success; the log line stays because it is what
+            // surfaced this from a live server, and an operator watching logs
+            // should not have to also be reading the client's errors.
+            error!("WAL commit failed: {}", e);
+            // Poisoning is permanent by design, so it has to arrive at the
+            // caller as something other than "try again".
+            if w.is_poisoned() {
+                return Err(io::Error::other(format!(
+                    "{}: {}",
+                    super::traits::POISONED_LOG,
+                    e
+                )));
+            }
+            return Err(e);
+        }
+
+        // The apply inside `commit_txn` writes to the data file *by path*, with
+        // its own handle — this provider is bypassed entirely, so its cached
+        // `file_len` and its mmap never learn that their own file grew. Without
+        // this refresh a provider cannot read back an in-place write it just
+        // made: the bytes are on disk and durable, and its next read still EOFs.
+        //
+        // `fetch_max` rather than `store`, because appends maintain `file_len`
+        // themselves and stage through a temp file — the on-disk length can
+        // legitimately lag the logical one, and a length must never go
+        // backwards.
+
+        // The apply inside `commit_txn` wrote by path, bypassing this provider,
+        // so its cached length and mmap have not seen the bytes. Raise them to
+        // what the in-place writes required. Without this a provider cannot
+        // read back an in-place write it just made: the bytes are durably on
+        // disk and its own next read still EOFs.
+        //
+        // `fetch_max`, never `store` — a length must not go backwards past a
+        // concurrent append.
+        let need = self.inplace_end.load(Ordering::Acquire);
+        if need > 0 {
+            // The MAP is refreshed before the LENGTH that describes those
+            // bytes is published, never after. The other order left a window
+            // in which `get_len` already reported the longer file while the
+            // map still covered less of it — and a read past the end of the
+            // mapped region does not fail, it copies **zero bytes** (see the
+            // `pos >= mmap_len` guard in the mmap read path). A scan turns the
+            // length into a slot count, so in that window it walked slots the
+            // map could not serve, read them as empty, and skipped the rows
+            // living there: a reader could miss a row that exists while
+            // another connection was merely updating it in place, and a writer
+            // that missed the current version could then collide with the
+            // older one and report a serialization conflict against a
+            // transaction that had already finished.
+            //
+            // Mapping first is safe and costs nothing: `update_memory_map`
+            // maps the file at its real on-disk size, and these bytes are
+            // already written and synced by the time this runs — so the map
+            // covers `need` before anything is told to look there.
+            if need > self.file_len.load(Ordering::Acquire) {
+                self.update_memory_map();
+            }
+            self.file_len.fetch_max(need, Ordering::AcqRel);
+        }
+
+        if w.bytes_since_checkpoint() >= crate::wal_checkpoint_bytes() {
+            // Off the caller's thread: a checkpoint fsyncs every data file, and
+            // making whichever writer happened to cross the threshold wait for
+            // all of that would show up as an unpredictable latency spike.
+            // `Wal::checkpoint` already ensures only one runs at a time.
+            let w = w.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = w.checkpoint() {
+                    error!("WAL checkpoint failed: {}", e);
+                }
+            });
+        }
+        Ok(())
+    }
+
+    async fn truncate(&self, len: u64) -> io::Result<()> {
+        // Staged appends live past the current end, so they are exactly the
+        // bytes a truncation would drop. Land them first and let the caller see
+        // a length that accounts for them, rather than silently discarding
+        // writes someone has already been told succeeded.
+        let _ = self.flush_temp_to_main().await;
+
+        let current = self.load_file_len();
+        if len > current {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                format!("truncate to {} would grow a {}-byte file", len, current),
+            ));
+        }
+        if len == current {
+            return Ok(());
+        }
+
+        // Appends must not land past the new end while we shorten the file.
+        while self
+            .append_blocked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            yield_now().await;
+        }
+        struct Unblock<'a>(&'a AtomicBool);
+        impl Drop for Unblock<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _unblock = Unblock(&self.append_blocked);
+
+        {
+            let file = self.write_file.write();
+            file.set_len(len)?;
+            file.sync_all()?;
+        }
+        let _ = crate::core::wal::sync_parent_dir(Path::new(&self.file_str));
+
+        self.file_len.store(len, Ordering::Release);
+
+        // `inplace_end` is a high-water claim about where in-place writes have
+        // reached, and `commit_durable` raises `file_len` to it. Truncation
+        // makes any claim past the new end false, so leaving it would have the
+        // *next* in-place commit restore the pre-truncation length: the provider
+        // then reports a file longer than it is, and `RowPointerIterator` walks
+        // records that do not exist. Measured — truncate to 1024 with a mark at
+        // 4096, and the next commit reported 4096 against 1024 bytes on disk.
+        //
+        // `fetch_min` rather than `store`, for the same reason the other
+        // direction uses `fetch_max`: a length claim must only ever move the way
+        // the operation making it can justify.
+        self.inplace_end.fetch_min(len, Ordering::AcqRel);
+        // The old mapping still spans the discarded range; reading through it
+        // after the file shrank is a SIGBUS, not a short read.
+        self.update_memory_map();
+
+        Ok(())
     }
 
     async fn append_data(&self, buffer: &[u8], immediate: bool) {
+        let _ = self.append_data_returning_offset(buffer, immediate).await;
+    }
+
+    async fn append_data_returning_offset(&self, buffer: &[u8], immediate: bool) -> u64 {
         if immediate {
-            // Bypass staging: write directly to the main file and publish length
-            let mut file = self.append_file.write();
-            file.write_all(buffer).unwrap();
-            file.flush().unwrap();
-            // Ensure file length and data are durable for any new handles
-            let _ = file.sync_all();
-            // Update file length atomically and refresh mmap only if it is far behind.
-            let new_len = self
-                .file_len
-                .fetch_add(buffer.len() as u64, Ordering::Release)
-                + buffer.len() as u64;
-            let mmap_len = self._memory_map.load().len() as u64;
-            if new_len > mmap_len + REMAP_GROWTH_THRESHOLD {
-                self.update_memory_map();
+            let txn = self.begin_txn();
+            let (offset, token) = self.append_data_txn(txn, buffer).await;
+            if let Err(e) = self.commit_durable(token).await {
+                error!("append to {} is not durable: {}", self.file_str, e);
             }
-            return;
+            return offset;
         }
 
         // If a flush is ongoing, wait briefly until it completes to keep ordering simple.
@@ -827,32 +1275,78 @@ impl StorageIO for LocalStorageProvider {
             yield_now().await;
         }
 
-        // Stage data into the temp file
-        {
-            let mut tf = self.temp_file.write();
-            // Ensure writes go to the end
-            tf.seek(SeekFrom::End(0)).unwrap();
-            tf.write_all(buffer).unwrap();
-            let _ = tf.flush();
-        }
+        // Stage the file write, the in-memory mirror and the published length in
+        // one critical section. Taking these separately let two concurrent
+        // stagers land in one order in the temp file and the opposite order in
+        // `temp_mem`, leaving the mirror disagreeing with the file it mirrors.
+        //
+        // Lock order is `temp_mem` then `temp_file`, matching the flush path
+        // (which nests `temp_mem` -> `append_file` and never takes `temp_file`
+        // while holding `temp_mem`).
+        let mut mem = self.temp_mem.write();
+        let mut tf = self.temp_file.write();
+
+        // Ensure writes go to the end
+        tf.seek(SeekFrom::End(0)).unwrap();
+        tf.write_all(buffer).unwrap();
+        let _ = tf.flush();
 
         // Mirror staged bytes in memory for faster read-back.
-        {
-            let mut mem = self.temp_mem.write();
-            mem.extend_from_slice(buffer);
-        }
+        mem.extend_from_slice(buffer);
+
+        let staged_before = self
+            .temp_file_len
+            .fetch_add(buffer.len() as u64, Ordering::Release);
         self.temp_mem_len
             .fetch_add(buffer.len() as u64, Ordering::Release);
 
         // Mark that we have staged data
         self.temp_has_data.store(true, Ordering::Release);
-        self.temp_file_len
-            .fetch_add(buffer.len() as u64, Ordering::Release);
+
+        drop(tf);
+        drop(mem);
+
+        // Logical offset = persisted main file + staged bytes ahead of us.
+        self.file_len.load(Ordering::Acquire) + staged_before
+    }
+
+    fn try_borrow_range(&self, position: u64, len: usize) -> Option<super::traits::BorrowedBytes> {
+        if len == 0 {
+            return None;
+        }
+
+        // Staged writes live outside the mapping, so part of the range might
+        // not be visible through it. Decline and let the caller copy.
+        if self.temp_has_data.load(Ordering::Relaxed) {
+            return None;
+        }
+
+        let main_len = self.load_file_len();
+        let end = position.checked_add(len as u64)?;
+        if end > main_len {
+            return None;
+        }
+
+        // Hold our own handle to the mapping. If a concurrent append re-maps
+        // the file, this Arc keeps the region we handed out alive.
+        let map: std::sync::Arc<Mmap> = std::sync::Arc::clone(&*self._memory_map.load());
+        if end > map.len() as u64 {
+            return None;
+        }
+
+        let ptr = unsafe { map.as_ptr().add(position as usize) };
+        // SAFETY: the range was just bounds-checked against the mapping, and
+        // `map` keeps it mapped for as long as the guard lives.
+        Some(unsafe { super::traits::BorrowedBytes::new(map, ptr, len) })
     }
 
     async fn get_len(&self) -> u64 {
         // Logical length = main persisted on disk + staged temp
         // Re-read filesystem metadata to avoid stale length on freshly opened handles.
+        // Both counters under the publish lock: `flush_temp_to_main` moves a
+        // run of bytes from the staged file to the main one, and the sum is
+        // only meaningful either side of that move, never inside it.
+        let _publish = self.append_file.read();
         let main = self.load_file_len();
         let temp = self.temp_file_len.load(Ordering::Acquire);
         main + temp
@@ -1000,6 +1494,7 @@ impl StorageIO for LocalStorageProvider {
         let file_str = format!("{}{}{}", final_location, delimiter, "temp.db");
 
         _ = std::fs::File::create(&file_str).unwrap();
+        let _ = crate::core::wal::sync_parent_dir(std::path::Path::new(&file_str));
 
         let file_append = std::fs::File::options()
             .read(true)
@@ -1033,6 +1528,7 @@ impl StorageIO for LocalStorageProvider {
         let temp_file_str = format!("{}.tmp", file_str);
         if !Path::new(&temp_file_str).exists() {
             _ = std::fs::File::create(&temp_file_str).unwrap();
+            let _ = crate::core::wal::sync_parent_dir(std::path::Path::new(&temp_file_str));
         }
         let temp_file = std::fs::File::options()
             .create(true)
@@ -1076,6 +1572,7 @@ impl StorageIO for LocalStorageProvider {
             temp_mem_len: AtomicU64::new(0).into(),
             temp_file_len: AtomicU64::new(staged_len).into(),
             file_len: AtomicU64::new(file_len).into(),
+            inplace_end: AtomicU64::new(0).into(),
             _memory_map: Arc::new(ArcSwap::new(Arc::new(unsafe {
                 MmapOptions::new().map(&file_read_mmap).unwrap()
             }))),
@@ -1084,12 +1581,14 @@ impl StorageIO for LocalStorageProvider {
             _locked: AtomicBool::new(false).into(),
             temp_has_data: AtomicBool::new(false).into(),
             append_blocked: AtomicBool::new(false).into(),
+            commit: Default::default(),
         };
 
         if staged_len > 0 {
             let _ = local_storage_provider.flush_temp_to_main().await;
         }
 
+        local_storage_provider.register_with_wal();
         local_storage_provider
     }
 
@@ -1119,6 +1618,16 @@ impl StorageIO for LocalStorageProvider {
     }
 
     #[allow(refining_impl_trait)]
+    async fn create_new_at(&self, location: &str, name: String) -> Self {
+        // `new` and `create_new` build the same thing from the same inputs; the
+        // only difference is which directory the name is resolved against, and
+        // `new` takes that as an argument. Duplicating the body here to avoid
+        // one `Option` would be a second copy of the opening sequence to keep
+        // in step.
+        Self::new(location, Some(&name)).await
+    }
+
+    #[allow(refining_impl_trait)]
     async fn create_new(&self, name: String) -> Self {
         let delimiter = if cfg!(unix) {
             "/"
@@ -1144,6 +1653,7 @@ impl StorageIO for LocalStorageProvider {
 
         if !file_path.exists() {
             _ = std::fs::File::create(&file_path).unwrap();
+            let _ = crate::core::wal::sync_parent_dir(file_path);
         }
 
         let file_append = std::fs::File::options()
@@ -1175,6 +1685,7 @@ impl StorageIO for LocalStorageProvider {
 
         if !Path::new(&temp_file_str).exists() {
             _ = std::fs::File::create(&temp_file_str).unwrap();
+            let _ = crate::core::wal::sync_parent_dir(std::path::Path::new(&temp_file_str));
         }
 
         let temp_file = std::fs::File::options()
@@ -1209,6 +1720,7 @@ impl StorageIO for LocalStorageProvider {
             temp_mem_len: AtomicU64::new(0).into(),
             temp_file_len: AtomicU64::new(staged_len).into(),
             file_len: AtomicU64::new(file_len).into(),
+            inplace_end: AtomicU64::new(0).into(),
             _memory_map: Arc::new(ArcSwap::new(Arc::new(unsafe {
                 MmapOptions::new().map(&file_read_mmap).unwrap()
             }))),
@@ -1216,13 +1728,15 @@ impl StorageIO for LocalStorageProvider {
             hash: CRC.checksum(format!("{}+++{}", final_location, name).as_bytes()),
             _locked: AtomicBool::new(false).into(),
             temp_has_data: AtomicBool::new(false).into(),
-            append_blocked: AtomicBool::new(false).into()
+            append_blocked: AtomicBool::new(false).into(),
+            commit: Default::default(),
         };
 
         if staged_len > 0 {
             let _ = local_storage_provider.flush_temp_to_main().await;
         }
 
+        local_storage_provider.register_with_wal();
         local_storage_provider
     }
 
@@ -1571,6 +2085,52 @@ mod test {
             consumed += delta;
         }
         assert_eq!(pos2, (init + total) as u64);
+    }
+
+    #[tokio::test]
+    async fn an_in_place_write_is_visible_through_the_provider_that_made_it() {
+        // With a log installed, `write_data_txn` defers the bytes and
+        // `commit_txn` applies them by opening the target *by path* — bypassing
+        // the provider entirely. The provider's cached `file_len` and its mmap
+        // therefore never learn that their own file grew.
+        //
+        // The failure shape is nasty: the write succeeds, is durable, and is on
+        // disk, while the writer's own next read reports EOF. Nothing hits it
+        // today by luck rather than design — the filter writes its checkpoint
+        // and never re-reads it in-process — but that is one refactor from
+        // being wrong, so it is pinned here.
+        let dir = tempfile::tempdir().unwrap();
+        let location = dir.path().to_str().unwrap().to_string();
+
+        let wal = std::sync::Arc::new(
+            crate::core::wal::Wal::open(&dir.path().join("rastdb.wal")).unwrap(),
+        );
+        crate::core::wal::install_for(&location, wal);
+
+        let provider = LocalStorageProvider::new(&location, Some("inplace_vis.db")).await;
+        assert_eq!(provider.get_len().await, 0, "fresh file should be empty");
+
+        let payload = vec![7u8; 512];
+        provider.write_data(0, &payload).await;
+
+        let on_disk = std::fs::metadata(dir.path().join("inplace_vis.db"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert_eq!(on_disk, 512, "the bytes must reach disk");
+
+        assert_eq!(
+            provider.get_len().await,
+            512,
+            "the provider that issued the write must see its own file grow"
+        );
+
+        let mut buf = vec![0u8; 512];
+        let mut pos = 0u64;
+        provider
+            .read_data_into_buffer(&mut pos, &mut buf)
+            .await
+            .expect("the writer must be able to read back what it just wrote");
+        assert_eq!(buf, payload);
     }
 
     #[tokio::test]

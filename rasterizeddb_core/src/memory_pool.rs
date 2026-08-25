@@ -4,13 +4,7 @@ use std::{
 };
 
 #[cfg(feature = "memory_pool_reuse")]
-use std::{
-    sync::{Arc, OnceLock},
-    sync::atomic::{AtomicUsize, Ordering},
-};
-
-#[cfg(feature = "memory_pool_reuse")]
-use crate::cache::atomic_cache::AtomicGenericCache;
+use std::cell::UnsafeCell;
 
 use crate::instructions::{copy_ptr_to_ptr, copy_vec_to_ptr};
 
@@ -19,21 +13,30 @@ pub static MEMORY_POOL: MemoryPool = MemoryPool::new();
 use libmimalloc_sys::{mi_free, mi_malloc};
 
 #[cfg(feature = "memory_pool_reuse")]
-#[derive(Clone)]
-struct ReuseSlot(Arc<AtomicUsize>);
-
-#[cfg(feature = "memory_pool_reuse")]
-impl Default for ReuseSlot {
-    fn default() -> Self {
-        Self(Arc::new(AtomicUsize::new(0)))
-    }
-}
-
-#[cfg(feature = "memory_pool_reuse")]
-static HEAP_REUSE: OnceLock<Arc<AtomicGenericCache<usize, ReuseSlot>>> = OnceLock::new();
-
-#[cfg(feature = "memory_pool_reuse")]
 const MAX_REUSE_BYTES: usize = 1024 * 128; // 128 KiB
+
+/// Smallest heap size class. `INLINE_CAPACITY` bytes and below never reach the
+/// heap, so the first class is the next power of two above it.
+#[cfg(feature = "memory_pool_reuse")]
+const MIN_CLASS_SHIFT: u32 = 5; // 32 bytes
+#[cfg(feature = "memory_pool_reuse")]
+const MAX_CLASS_SHIFT: u32 = 17; // 128 KiB
+#[cfg(feature = "memory_pool_reuse")]
+const N_CLASSES: usize = (MAX_CLASS_SHIFT - MIN_CLASS_SHIFT + 1) as usize;
+
+/// Blocks cached per size class. Deep enough that a row holding several columns
+/// of the same class is fully served from cache, shallow enough for the large
+/// classes that the retained footprint stays small.
+#[cfg(feature = "memory_pool_reuse")]
+const MAX_DEPTH: usize = 8;
+
+#[cfg(feature = "memory_pool_reuse")]
+#[inline(always)]
+const fn class_depth(shift: u32) -> usize {
+    // <= 4 KiB: keep 8. Above that, keep 2 — worst-case retained bytes per
+    // thread stay under ~600 KiB.
+    if shift <= 12 { MAX_DEPTH } else { 2 }
+}
 
 #[cfg(feature = "memory_pool_reuse")]
 #[inline(always)]
@@ -43,23 +46,110 @@ fn heap_size_class(size: usize) -> usize {
     size.next_power_of_two()
 }
 
+/// Per-thread free lists, indexed directly by size class.
+///
+/// This replaces a global `AtomicGenericCache<usize, ReuseSlot>` lookup. That
+/// design hashed the size and then linear-scanned 64 cache-line-padded entries
+/// (~20 KiB of loads) on *every* heap acquire and *every* release, cloned an
+/// `Arc` per probe, and funnelled every thread through one atomic per class.
+/// Here the class index is a shift, the lookup is an array index, and no thread
+/// touches another thread's list — so there is no shared atomic at all.
+#[cfg(feature = "memory_pool_reuse")]
+struct ThreadFreeLists {
+    slots: [[*mut u8; MAX_DEPTH]; N_CLASSES],
+    len: [u8; N_CLASSES],
+}
+
+#[cfg(feature = "memory_pool_reuse")]
+impl ThreadFreeLists {
+    const fn new() -> Self {
+        Self {
+            slots: [[std::ptr::null_mut(); MAX_DEPTH]; N_CLASSES],
+            len: [0; N_CLASSES],
+        }
+    }
+}
+
+#[cfg(feature = "memory_pool_reuse")]
+impl Drop for ThreadFreeLists {
+    fn drop(&mut self) {
+        // Hand everything still parked here back to the allocator rather than
+        // leaking it when the thread goes away.
+        for class in 0..N_CLASSES {
+            for i in 0..self.len[class] as usize {
+                let ptr = self.slots[class][i];
+                if !ptr.is_null() {
+                    unsafe { mi_free(ptr as *mut _) };
+                }
+            }
+            self.len[class] = 0;
+        }
+    }
+}
+
+#[cfg(feature = "memory_pool_reuse")]
+thread_local! {
+    static FREE_LISTS: UnsafeCell<ThreadFreeLists> =
+        const { UnsafeCell::new(ThreadFreeLists::new()) };
+}
+
+/// Class index for an already-rounded size class, or `None` if the size is
+/// outside the reusable range.
 #[cfg(feature = "memory_pool_reuse")]
 #[inline(always)]
-fn heap_reuse_cache() -> &'static AtomicGenericCache<usize, ReuseSlot> {
-    HEAP_REUSE
-        .get_or_init(|| {
-            // Small, bounded number of buckets: 128..=1 MiB => 14 entries.
-            let cache = AtomicGenericCache::new(64, 1024);
+fn class_index(alloc_size: usize) -> Option<usize> {
+    if alloc_size < (1 << MIN_CLASS_SHIFT) || alloc_size > MAX_REUSE_BYTES {
+        return None;
+    }
+    let shift = alloc_size.trailing_zeros();
+    debug_assert_eq!(1usize << shift, alloc_size, "size class must be a power of two");
+    Some((shift - MIN_CLASS_SHIFT) as usize)
+}
 
-            let mut sz = (INLINE_CAPACITY + 1).next_power_of_two();
-            while sz <= MAX_REUSE_BYTES {
-                let _ = cache.insert(sz, ReuseSlot::default());
-                sz <<= 1;
+/// Pops a cached block of `alloc_size` bytes from this thread's free list.
+#[cfg(feature = "memory_pool_reuse")]
+#[inline(always)]
+fn reuse_pop(alloc_size: usize) -> *mut u8 {
+    let Some(class) = class_index(alloc_size) else {
+        return std::ptr::null_mut();
+    };
+
+    // `try_with` matters: a `MemoryBlock` can be dropped while TLS is being torn
+    // down, after this key's destructor has already run.
+    FREE_LISTS
+        .try_with(|cell| {
+            let lists = unsafe { &mut *cell.get() };
+            let n = lists.len[class] as usize;
+            if n == 0 {
+                return std::ptr::null_mut();
             }
-
-            cache
+            lists.len[class] = (n - 1) as u8;
+            std::mem::replace(&mut lists.slots[class][n - 1], std::ptr::null_mut())
         })
-        .as_ref()
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// Parks a block on this thread's free list. Returns `false` if the list for
+/// that class is full and the caller should free the block outright.
+#[cfg(feature = "memory_pool_reuse")]
+#[inline(always)]
+fn reuse_push(ptr: *mut u8, alloc_size: usize) -> bool {
+    let Some(class) = class_index(alloc_size) else {
+        return false;
+    };
+
+    FREE_LISTS
+        .try_with(|cell| {
+            let lists = unsafe { &mut *cell.get() };
+            let n = lists.len[class] as usize;
+            if n >= class_depth(alloc_size.trailing_zeros()) {
+                return false;
+            }
+            lists.slots[class][n] = ptr;
+            lists.len[class] = (n + 1) as u8;
+            true
+        })
+        .unwrap_or(false)
 }
 
 // Define the maximum size for inline allocation
@@ -95,47 +185,55 @@ impl MemoryPool {
                 is_heap: false,
             }
         } else {
-            // Allocate on the heap (optionally reusing an existing block of the same size class)
-            #[cfg(feature = "memory_pool_reuse")]
-            let alloc_size = if size <= MAX_REUSE_BYTES {
-                heap_size_class(size)
-            } else {
-                size
-            };
+            self.acquire_heap(size)
+        }
+    }
 
-            #[cfg(not(feature = "memory_pool_reuse"))]
-            let alloc_size = size;
+    /// Heap half of `acquire`.
+    ///
+    /// Split out purely for readability — `acquire` is `#[inline(always)]` and
+    /// most of its callers are small fixed-width columns that take the inline
+    /// branch, so this half is the rarer one at most call sites.
+    #[inline(always)]
+    fn acquire_heap(&self, size: usize) -> MemoryBlock {
+        // Allocate on the heap (optionally reusing an existing block of the same size class)
+        #[cfg(feature = "memory_pool_reuse")]
+        let alloc_size = if size <= MAX_REUSE_BYTES {
+            heap_size_class(size)
+        } else {
+            size
+        };
 
-            #[cfg(feature = "memory_pool_reuse")]
-            if alloc_size <= MAX_REUSE_BYTES {
-                if let Some(slot) = heap_reuse_cache().get(&alloc_size) {
-                    let ptr_usize = slot.0.swap(0, Ordering::AcqRel);
-                    if ptr_usize != 0 {
-                        return MemoryBlock {
-                            data: MemoryBlockData {
-                                heap_data: (ptr_usize as *mut u8, alloc_size),
-                            },
-                            len: size,
-                            is_heap: true,
-                        };
-                    }
-                }
+        #[cfg(not(feature = "memory_pool_reuse"))]
+        let alloc_size = size;
+
+        #[cfg(feature = "memory_pool_reuse")]
+        {
+            let reused = reuse_pop(alloc_size);
+            if !reused.is_null() {
+                return MemoryBlock {
+                    data: MemoryBlockData {
+                        heap_data: (reused, alloc_size),
+                    },
+                    len: size,
+                    is_heap: true,
+                };
             }
+        }
 
-            let ptr = unsafe { mi_malloc(alloc_size) as *mut u8 };
+        let ptr = unsafe { mi_malloc(alloc_size) as *mut u8 };
 
-            if ptr.is_null() {
-                panic!("Allocation failed (likely OOM).");
-            }
+        if ptr.is_null() {
+            panic!("Allocation failed (likely OOM).");
+        }
 
-            MemoryBlock {
-                //hash: 0, // Default hash value
-                data: MemoryBlockData {
-                    heap_data: (ptr, alloc_size),
-                },
-                len: size, // len is the logical size; allocation may be larger
-                is_heap: true,
-            }
+        MemoryBlock {
+            //hash: 0, // Default hash value
+            data: MemoryBlockData {
+                heap_data: (ptr, alloc_size),
+            },
+            len: size, // len is the logical size; allocation may be larger
+            is_heap: true,
         }
     }
 
@@ -157,18 +255,10 @@ impl MemoryPool {
             panic!("Invalid operation, releasing null pointer.");
         }
 
-        if allocated_size <= MAX_REUSE_BYTES {
-            if let Some(slot) = heap_reuse_cache().get(&allocated_size) {
-                // Keep at most one cached block per size class.
-                // If already occupied, free immediately (bounded memory usage).
-                if slot
-                    .0
-                    .compare_exchange(0, ptr as usize, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-                {
-                    return;
-                }
-            }
+        // Park it on this thread's free list; if that class is already full,
+        // give it straight back to the allocator so memory stays bounded.
+        if reuse_push(ptr, allocated_size) {
+            return;
         }
 
         self.release(ptr);
@@ -249,6 +339,8 @@ impl Drop for MemoryBlock {
     #[track_caller]
     fn drop(&mut self) {
         if self.is_heap {
+            // `allocated_size` is only consulted by the recycling path.
+            #[cfg_attr(not(feature = "memory_pool_reuse"), allow(unused_variables))]
             let (ptr, allocated_size) = unsafe { self.data.heap_data };
 
             #[cfg(feature = "memory_pool_reuse")]
@@ -274,24 +366,33 @@ impl Clone for MemoryBlock {
         // Important: this must be a deep clone.
         // A shallow clone of a heap pointer would double-free on Drop and would also
         // cause aliasing where one block mutation corrupts the other.
+
+        // Inline blocks own no heap memory, so cloning one is just a copy of the
+        // fixed-size inline buffer. Copying all INLINE_CAPACITY bytes compiles to
+        // a pair of moves instead of the `acquire` + variable-length
+        // `copy_from_slice` the general path would emit — and this is the case
+        // every numeric column takes.
+        if !self.is_heap {
+            return MemoryBlock {
+                data: MemoryBlockData {
+                    inline_data: unsafe { self.data.inline_data },
+                },
+                len: self.len,
+                is_heap: false,
+            };
+        }
+
         if self.len == 0 {
             return MEMORY_POOL.acquire(0);
         }
 
-        let mut new_block = MEMORY_POOL.acquire(self.len);
+        let new_block = MEMORY_POOL.acquire(self.len);
 
-        if self.is_heap {
-            debug_assert!(new_block.is_heap, "heap clone must allocate on heap");
-            let src_ptr = unsafe { self.data.heap_data.0 };
-            let dst_ptr = unsafe { new_block.data.heap_data.0 };
-            unsafe {
-                copy_ptr_to_ptr(src_ptr, dst_ptr, self.len);
-            }
-        } else {
-            debug_assert!(!new_block.is_heap, "inline clone must allocate inline");
-            let src = self.into_slice();
-            let dst = unsafe { &mut new_block.data.inline_data[..self.len] };
-            dst.copy_from_slice(src);
+        debug_assert!(new_block.is_heap, "heap clone must allocate on heap");
+        let src_ptr = unsafe { self.data.heap_data.0 };
+        let dst_ptr = unsafe { new_block.data.heap_data.0 };
+        unsafe {
+            copy_ptr_to_ptr(src_ptr, dst_ptr, self.len);
         }
 
         new_block
@@ -385,13 +486,14 @@ impl MemoryBlock {
             }
             new_block
         } else {
-            // Allocate inline
-            let mut new_block = MEMORY_POOL.acquire(self.len);
-            // Only copy the used portion of inline_data
-            let dst = unsafe { &mut new_block.data.inline_data[..self.len] };
-            let src = self.into_slice();
-            dst.copy_from_slice(src);
-            new_block
+            // Inline: a straight copy of the fixed-size buffer, same as `clone`.
+            MemoryBlock {
+                data: MemoryBlockData {
+                    inline_data: unsafe { self.data.inline_data },
+                },
+                len: self.len,
+                is_heap: false,
+            }
         }
     }
 }
