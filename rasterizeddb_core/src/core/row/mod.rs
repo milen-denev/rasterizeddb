@@ -7,3 +7,5 @@ pub mod row_pointer;
 pub mod schema;
 pub mod table;
 pub mod column_iter;
+#[cfg(test)]
+mod write_path_tests;

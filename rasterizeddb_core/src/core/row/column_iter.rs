@@ -70,7 +70,7 @@ impl<S: StorageIO> ColumnDataIterator<S> {
         let row_fetch = RowFetch {
             columns_fetching_data: smallvec::smallvec![ColumnFetchingData {
                 column_offset: offset,
-                column_type: field.db_type.clone(),
+                column_type: field.db_type.physical(),
                 size: field.size,
                 schema_id,
             }],

@@ -172,8 +172,68 @@ pub fn simd_compare_strings(input1: &[u8], input2: &[u8], operation: &ComparerOp
         ComparerOperation::StartsWith => unsafe { simd_starts_with(input1, input2) },
         ComparerOperation::EndsWith => unsafe { simd_ends_with(input1, input2) },
         ComparerOperation::GreaterOrEquals => unsafe { simd_greater_or_equal(input1, input2) },
-        _ => panic!("Unsupported operation for string types: {:?}", operation),
+        // `simd_greater_or_equal` is a total lexicographic `>=`, so the other
+        // three orderings follow from it exactly by negating or swapping the
+        // operands. Deriving them costs one call each and reuses the tested
+        // comparison rather than adding three more SIMD paths to keep in
+        // agreement.
+        //
+        // These used to panic. `WHERE name < 'abc'` is ordinary SQL that any
+        // ORM emits, and reaching it took down a query worker.
+        ComparerOperation::Less => !unsafe { simd_greater_or_equal(input1, input2) },
+        // a > b  <=>  !(a <= b)  <=>  !(b >= a)
+        ComparerOperation::Greater => !unsafe { simd_greater_or_equal(input2, input1) },
+        // a <= b  <=>  b >= a
+        ComparerOperation::LessOrEquals => unsafe { simd_greater_or_equal(input2, input1) },
+        ComparerOperation::EqualsCaseInsensitive => ci_equals(input1, input2),
+        ComparerOperation::ContainsCaseInsensitive => ci_contains(input1, input2),
+        ComparerOperation::StartsWithCaseInsensitive => ci_starts_with(input1, input2),
+        ComparerOperation::EndsWithCaseInsensitive => ci_ends_with(input1, input2),
+        ComparerOperation::Like => like_match(input1, input2, false),
+        ComparerOperation::LikeCaseInsensitive => like_match(input1, input2, true),
     }
+}
+
+// Case-insensitive comparisons, backing `ILIKE`.
+//
+// Folding is ASCII-only. Postgres folds according to the database collation,
+// so a non-ASCII letter compares case-sensitively here where Postgres would
+// match it. Handling the general case needs a Unicode case table, and these are
+// scalar rather than SIMD because `ILIKE` is not on the hot path — the aim is a
+// correct answer, not a fast wrong one.
+
+#[inline]
+fn ci_equals(input1: &[u8], input2: &[u8]) -> bool {
+    input1.len() == input2.len()
+        && input1
+            .iter()
+            .zip(input2.iter())
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
+#[inline]
+fn ci_starts_with(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.len() >= needle.len() && ci_equals(&haystack[..needle.len()], needle)
+}
+
+#[inline]
+fn ci_ends_with(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.len() >= needle.len() && ci_equals(&haystack[haystack.len() - needle.len()..], needle)
+}
+
+#[inline]
+fn ci_contains(haystack: &[u8], needle: &[u8]) -> bool {
+    // The empty needle is contained in everything, matching `simd_contains`
+    // and SQL's `x ILIKE '%%'`.
+    if needle.is_empty() {
+        return true;
+    }
+    if needle.len() > haystack.len() {
+        return false;
+    }
+    haystack
+        .windows(needle.len())
+        .any(|window| ci_equals(window, needle))
 }
 
 #[inline(always)]
@@ -294,52 +354,92 @@ unsafe fn simd_equals(input1: &[u8], input2: &[u8]) -> bool {
     compare_large(ptr1, ptr2, len)
 }
 
+/// Equality for 0..=16 byte values — the length most string columns actually
+/// hold (a name, a department, a status code).
+///
+/// Uses two overlapping loads per side instead of a byte-at-a-time loop, so the
+/// whole comparison is a constant handful of instructions regardless of length.
+/// The loop this replaced made a 16-byte compare measurably *slower* than a
+/// 32-byte one, which took the SSE path.
+///
+/// Overlapping is what keeps it branch-light: for any length in a size class,
+/// the head load and the tail load together cover every byte, with the middle
+/// bytes simply compared twice.
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn compare_small(ptr1: *const u8, ptr2: *const u8, len: usize) -> bool {
-    // For very small strings, byte by byte comparison is often faster
-    // than the SIMD setup overhead
-    let mut i = 0;
-    while i < len {
-        if *ptr1.add(i) != *ptr2.add(i) {
-            return false;
-        }
-        i += 1;
+    #[inline(always)]
+    unsafe fn load_u64(p: *const u8) -> u64 {
+        (p as *const u64).read_unaligned()
     }
+    #[inline(always)]
+    unsafe fn load_u32(p: *const u8) -> u32 {
+        (p as *const u32).read_unaligned()
+    }
+
+    if len >= 8 {
+        // 8..=16 bytes: head and tail 8-byte words cover everything.
+        let a1 = load_u64(ptr1);
+        let b1 = load_u64(ptr2);
+        let a2 = load_u64(ptr1.add(len - 8));
+        let b2 = load_u64(ptr2.add(len - 8));
+        return ((a1 ^ b1) | (a2 ^ b2)) == 0;
+    }
+
+    if len >= 4 {
+        // 4..=7 bytes.
+        let a1 = load_u32(ptr1);
+        let b1 = load_u32(ptr2);
+        let a2 = load_u32(ptr1.add(len - 4));
+        let b2 = load_u32(ptr2.add(len - 4));
+        return ((a1 ^ b1) | (a2 ^ b2)) == 0;
+    }
+
+    if len >= 2 {
+        // 2..=3 bytes.
+        let a1 = (ptr1 as *const u16).read_unaligned();
+        let b1 = (ptr2 as *const u16).read_unaligned();
+        let a2 = (ptr1.add(len - 2) as *const u16).read_unaligned();
+        let b2 = (ptr2.add(len - 2) as *const u16).read_unaligned();
+        return ((a1 ^ b1) | (a2 ^ b2)) == 0;
+    }
+
+    if len == 1 {
+        // Kept as a single byte compare; folding it into the 2..=3 case cost
+        // more than it saved for single-character values.
+        return *ptr1 == *ptr2;
+    }
+
     true
 }
 
+/// Equality for 17..=64 byte values.
+///
+/// Same overlapping-load idea as `compare_small`, one size class up: a pair of
+/// vector loads per side covers the whole value, so there is no loop and no
+/// scalar tail to clean up.
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn compare_medium(ptr1: *const u8, ptr2: *const u8, len: usize) -> bool {
-    let mut i = 0;
+    if len <= 32 {
+        // 17..=32 bytes: two overlapping 16-byte loads per side.
+        let a1 = _mm_loadu_si128(ptr1 as *const __m128i);
+        let b1 = _mm_loadu_si128(ptr2 as *const __m128i);
+        let a2 = _mm_loadu_si128(ptr1.add(len - 16) as *const __m128i);
+        let b2 = _mm_loadu_si128(ptr2.add(len - 16) as *const __m128i);
 
-    // Process 16 bytes at a time using SSE
-    while i + 16 <= len {
-        let a = _mm_loadu_si128(ptr1.add(i) as *const __m128i);
-        let b = _mm_loadu_si128(ptr2.add(i) as *const __m128i);
-
-        // Compare for equality
-        let cmp = _mm_cmpeq_epi8(a, b);
-        let mask = _mm_movemask_epi8(cmp);
-
-        // If mask is not all 1s (0xFFFF), there's a difference
-        if mask != 0xFFFF {
-            return false;
-        }
-
-        i += 16;
+        let diff = _mm_or_si128(_mm_xor_si128(a1, b1), _mm_xor_si128(a2, b2));
+        return _mm_testz_si128(diff, diff) != 0;
     }
 
-    // Handle remaining bytes
-    while i < len {
-        if *ptr1.add(i) != *ptr2.add(i) {
-            return false;
-        }
-        i += 1;
-    }
+    // 33..=64 bytes: two overlapping 32-byte loads per side.
+    let a1 = _mm256_loadu_si256(ptr1 as *const __m256i);
+    let b1 = _mm256_loadu_si256(ptr2 as *const __m256i);
+    let a2 = _mm256_loadu_si256(ptr1.add(len - 32) as *const __m256i);
+    let b2 = _mm256_loadu_si256(ptr2.add(len - 32) as *const __m256i);
 
-    true
+    let diff = _mm256_or_si256(_mm256_xor_si256(a1, b1), _mm256_xor_si256(a2, b2));
+    _mm256_testz_si256(diff, diff) != 0
 }
 
 #[inline(always)]
@@ -419,8 +519,7 @@ unsafe fn simd_contains(haystack: &[u8], needle: &[u8]) -> bool {
     match m {
         1 => contains_single_byte(haystack, needle[0]),
         2..=8 => contains_small(haystack, needle),
-        9..=32 => contains_medium(haystack, needle),
-        _ => contains_large(haystack, needle),
+        _ => contains_big(haystack, needle),
     }
 }
 
@@ -464,36 +563,112 @@ unsafe fn contains_single_byte(haystack: &[u8], needle_byte: u8) -> bool {
     false
 }
 
-/// Optimized search for small needles (2-8 bytes)
+/// Compares the interior bytes (`1..m-1`) of a candidate match.
+///
+/// The first and last bytes are already known to match when this is called, and
+/// `m <= 8` here, so this is at most six byte compares.
+///
+/// # Safety
+/// `h` must point at `m` readable bytes and `n` at the `m`-byte needle.
+#[inline(always)]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn middle_matches(h: *const u8, n: *const u8, m: usize) -> bool {
+    let mut j = 1;
+    while j + 1 < m {
+        if *h.add(j) != *n.add(j) {
+            return false;
+        }
+        j += 1;
+    }
+    true
+}
+
+/// Optimized search for small needles (2-8 bytes).
+///
+/// Scans 32 candidate positions per iteration by testing the needle's first and
+/// last byte simultaneously: one vector compare against the block starting at
+/// `i` and another against the block starting at `i + m - 1`, ANDed together.
+/// Only positions where *both* bytes line up reach the interior comparison,
+/// which for a 2-byte needle is already an exact answer.
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn contains_small(haystack: &[u8], needle: &[u8]) -> bool {
     let n = haystack.len();
     let m = needle.len();
+    // Callers guarantee `0 < m <= n`.
     let n_minus_m = n - m;
 
-    let first_byte = needle[0];
-    let last_byte = needle[m - 1];
+    let hp = haystack.as_ptr();
+    let np = needle.as_ptr();
 
-    // For small needles, we can use a faster comparison approach
-    let mut i = 0;
-    while i <= n_minus_m {
-        // Check first byte
-        if haystack[i] == first_byte {
-            // Check last byte before doing full comparison
-            if haystack[i + m - 1] == last_byte {
-                // For small needles, direct comparison might be faster
-                let mut match_found = true;
-                for j in 1..m - 1 {
-                    if haystack[i + j] != needle[j] {
-                        match_found = false;
-                        break;
-                    }
-                }
-                if match_found {
+    let first_byte = *np;
+    let last_byte = *np.add(m - 1);
+
+    let mut i = 0usize;
+
+    // AVX2: 32 candidate start positions per iteration.
+    // The guard `i + 31 <= n_minus_m` keeps both 32-byte loads (the one at `i`
+    // and the one at `i + m - 1`) fully inside the haystack.
+    if n_minus_m >= 31 {
+        let v_first = _mm256_set1_epi8(first_byte as i8);
+        let v_last = _mm256_set1_epi8(last_byte as i8);
+
+        while i + 31 <= n_minus_m {
+            let block_first = _mm256_loadu_si256(hp.add(i) as *const __m256i);
+            let block_last = _mm256_loadu_si256(hp.add(i + m - 1) as *const __m256i);
+
+            let eq = _mm256_and_si256(
+                _mm256_cmpeq_epi8(block_first, v_first),
+                _mm256_cmpeq_epi8(block_last, v_last),
+            );
+
+            let mut mask = _mm256_movemask_epi8(eq) as u32;
+            while mask != 0 {
+                let offset = mask.trailing_zeros() as usize;
+                if middle_matches(hp.add(i + offset), np, m) {
                     return true;
                 }
+                mask &= mask.wrapping_sub(1);
             }
+
+            i += 32;
+        }
+    }
+
+    // SSE2: 16 candidate start positions per iteration.
+    if i + 15 <= n_minus_m {
+        let v_first = _mm_set1_epi8(first_byte as i8);
+        let v_last = _mm_set1_epi8(last_byte as i8);
+
+        while i + 15 <= n_minus_m {
+            let block_first = _mm_loadu_si128(hp.add(i) as *const __m128i);
+            let block_last = _mm_loadu_si128(hp.add(i + m - 1) as *const __m128i);
+
+            let eq = _mm_and_si128(
+                _mm_cmpeq_epi8(block_first, v_first),
+                _mm_cmpeq_epi8(block_last, v_last),
+            );
+
+            let mut mask = _mm_movemask_epi8(eq) as u32;
+            while mask != 0 {
+                let offset = mask.trailing_zeros() as usize;
+                if middle_matches(hp.add(i + offset), np, m) {
+                    return true;
+                }
+                mask &= mask.wrapping_sub(1);
+            }
+
+            i += 16;
+        }
+    }
+
+    // Scalar tail for the last (< 16) candidate positions.
+    while i <= n_minus_m {
+        if *hp.add(i) == first_byte
+            && *hp.add(i + m - 1) == last_byte
+            && middle_matches(hp.add(i), np, m)
+        {
+            return true;
         }
         i += 1;
     }
@@ -501,143 +676,104 @@ unsafe fn contains_small(haystack: &[u8], needle: &[u8]) -> bool {
     false
 }
 
-/// Optimized search for medium needles (9-32 bytes)
+/// Substring search for needles of 9 bytes or more.
+///
+/// Filters candidate positions on the needle's first *and* last byte at once,
+/// the same way `contains_small` does. Filtering on the first byte alone (what
+/// this replaced) sends every position whose first byte matches into a full
+/// comparison — on text where that byte is common, most of that work is thrown
+/// away. Requiring both bytes cuts survivors by roughly another factor of 256.
+///
+/// Both size classes share this: the only thing that differed between the old
+/// medium and large versions was the vector width of the first-byte scan, and
+/// this walks 32 positions at a time for both.
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn contains_medium(haystack: &[u8], needle: &[u8]) -> bool {
+unsafe fn contains_big(haystack: &[u8], needle: &[u8]) -> bool {
     let n = haystack.len();
     let m = needle.len();
+    // Callers guarantee `0 < m <= n`.
     let n_minus_m = n - m;
 
-    let first_byte = needle[0];
-    let last_byte = needle[m - 1];
-    let v_first_byte = _mm_set1_epi8(first_byte as i8);
+    let hp = haystack.as_ptr();
+    let first_byte = *needle.get_unchecked(0);
+    let last_byte = *needle.get_unchecked(m - 1);
 
-    let mut i = 0;
-    // Use SSE (128-bit) for medium needles
-    while i + 16 <= n {
-        if i > n_minus_m {
-            break;
-        }
+    let mut i = 0usize;
 
-        let chunk = _mm_loadu_si128(haystack.as_ptr().add(i) as *const __m128i);
-        let cmp = _mm_cmpeq_epi8(chunk, v_first_byte);
-        let mut mask = _mm_movemask_epi8(cmp);
+    // AVX2: 32 candidate start positions per iteration. The guard keeps both
+    // loads (at `i` and at `i + m - 1`) inside the haystack.
+    if n_minus_m >= 31 {
+        let v_first = _mm256_set1_epi8(first_byte as i8);
+        let v_last = _mm256_set1_epi8(last_byte as i8);
 
-        while mask != 0 {
-            let offset = mask.trailing_zeros() as usize;
-            let pos = i + offset;
-            if pos <= n_minus_m {
-                if haystack[pos + m - 1] == last_byte {
-                    // For medium needles, use memcmp/direct compare
-                    if compare_bytes(&haystack[pos..pos + m], needle) {
-                        return true;
-                    }
+        while i + 31 <= n_minus_m {
+            let block_first = _mm256_loadu_si256(hp.add(i) as *const __m256i);
+            let block_last = _mm256_loadu_si256(hp.add(i + m - 1) as *const __m256i);
+
+            let eq = _mm256_and_si256(
+                _mm256_cmpeq_epi8(block_first, v_first),
+                _mm256_cmpeq_epi8(block_last, v_last),
+            );
+
+            let mut mask = _mm256_movemask_epi8(eq) as u32;
+            while mask != 0 {
+                let pos = i + mask.trailing_zeros() as usize;
+                if simd_equals(
+                    std::slice::from_raw_parts(hp.add(pos), m),
+                    needle,
+                ) {
+                    return true;
                 }
+                mask &= mask.wrapping_sub(1);
             }
 
-            mask &= mask.wrapping_sub(1); // Clear LSB safely, even when mask == 0
-        }
-
-        i += 16;
-    }
-
-    // Tail fallback
-    for k in i..=n_minus_m {
-        if haystack[k] == first_byte && haystack[k + m - 1] == last_byte {
-            if compare_bytes(&haystack[k..k + m], needle) {
-                return true;
-            }
+            i += 32;
         }
     }
 
-    false
-}
+    // SSE2: 16 candidate start positions per iteration.
+    if i + 15 <= n_minus_m {
+        let v_first = _mm_set1_epi8(first_byte as i8);
+        let v_last = _mm_set1_epi8(last_byte as i8);
 
-/// Optimized search for large needles (>32 bytes)
-#[inline(always)]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn contains_large(haystack: &[u8], needle: &[u8]) -> bool {
-    let n = haystack.len();
-    let m = needle.len();
-    let n_minus_m = n - m;
+        while i + 15 <= n_minus_m {
+            let block_first = _mm_loadu_si128(hp.add(i) as *const __m128i);
+            let block_last = _mm_loadu_si128(hp.add(i + m - 1) as *const __m128i);
 
-    let first_byte = needle[0];
-    let last_byte = needle[m - 1];
-    let v_first_byte = _mm256_set1_epi8(first_byte as i8);
+            let eq = _mm_and_si128(
+                _mm_cmpeq_epi8(block_first, v_first),
+                _mm_cmpeq_epi8(block_last, v_last),
+            );
 
-    let mut i = 0;
-    while i + 32 <= n {
-        if i > n_minus_m {
-            break;
-        }
-
-        let chunk = _mm256_loadu_si256(haystack.as_ptr().add(i) as *const __m256i);
-        let cmp = _mm256_cmpeq_epi8(chunk, v_first_byte);
-        let mut mask = _mm256_movemask_epi8(cmp);
-
-        while mask != 0 {
-            let offset = mask.trailing_zeros() as usize;
-            let pos = i + offset;
-            if pos <= n_minus_m {
-                if haystack[pos + m - 1] == last_byte {
-                    // For large needles, use full simd_equals
-                    if simd_equals(&haystack[pos..pos + m], needle) {
-                        return true;
-                    }
+            let mut mask = _mm_movemask_epi8(eq) as u32;
+            while mask != 0 {
+                let pos = i + mask.trailing_zeros() as usize;
+                if simd_equals(
+                    std::slice::from_raw_parts(hp.add(pos), m),
+                    needle,
+                ) {
+                    return true;
                 }
+                mask &= mask.wrapping_sub(1);
             }
-            mask &= mask.wrapping_sub(1); // Clear LSB safely
-        }
 
-        i += 32;
-    }
-
-    // Tail fallback
-    for k in i..=n_minus_m {
-        if haystack[k] == first_byte && haystack[k + m - 1] == last_byte {
-            if simd_equals(&haystack[k..k + m], needle) {
-                return true;
-            }
+            i += 16;
         }
     }
 
-    false
-}
-
-/// Helper function for medium needle comparison
-/// More efficient than simd_equals for medium-sized needles
-#[inline(always)]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn compare_bytes(a: &[u8], b: &[u8]) -> bool {
-    debug_assert!(a.len() == b.len());
-    let len = a.len();
-
-    // Use 16-byte chunks for medium needles
-    let mut i = 0;
-    while i + 16 <= len {
-        let chunk_a = _mm_loadu_si128(a.as_ptr().add(i) as *const __m128i);
-        let chunk_b = _mm_loadu_si128(b.as_ptr().add(i) as *const __m128i);
-
-        let cmp = _mm_cmpeq_epi8(chunk_a, chunk_b);
-        let mask = _mm_movemask_epi8(cmp);
-
-        if mask != 0xFFFF {
-            return false;
-        }
-
-        i += 16;
-    }
-
-    // Handle remaining bytes
-    while i < len {
-        if a[i] != b[i] {
-            return false;
+    // Scalar tail for the last (< 16) candidate positions.
+    while i <= n_minus_m {
+        if *hp.add(i) == first_byte
+            && *hp.add(i + m - 1) == last_byte
+            && simd_equals(std::slice::from_raw_parts(hp.add(i), m), needle)
+        {
+            return true;
         }
         i += 1;
     }
 
-    true
+    false
 }
 
 /// SIMD-based implementation to check if `input1` starts with `input2`.
@@ -757,13 +893,26 @@ mod tests {
         ));
     }
 
+    /// Every `ComparerOperation` is now handled for strings. This used to
+    /// assert that the ordered ones panicked, which made `WHERE name < 'abc'`
+    /// a way to kill a query worker from ordinary SQL.
     #[test]
-    #[should_panic(expected = "Unsupported operation for string types")]
-    fn test_simd_compare_strings_unsupported_operation() {
-        let input1 = "hello".as_bytes();
-        let input2 = "world".as_bytes();
+    fn test_simd_compare_strings_handles_every_operation() {
+        let a = "hello".as_bytes();
+        let b = "world".as_bytes();
 
-        simd_compare_strings(input1, input2, &ComparerOperation::Greater);
+        assert!(!simd_compare_strings(a, b, &ComparerOperation::Greater));
+        assert!(simd_compare_strings(b, a, &ComparerOperation::Greater));
+        assert!(simd_compare_strings(a, b, &ComparerOperation::Less));
+        assert!(!simd_compare_strings(b, a, &ComparerOperation::Less));
+        assert!(simd_compare_strings(a, b, &ComparerOperation::LessOrEquals));
+        assert!(simd_compare_strings(a, a, &ComparerOperation::LessOrEquals));
+        assert!(simd_compare_strings(a, a, &ComparerOperation::GreaterOrEquals));
+        assert!(simd_compare_strings(a, a, &ComparerOperation::Equals));
+        assert!(simd_compare_strings(a, b, &ComparerOperation::NotEquals));
+        assert!(simd_compare_strings(a, "ell".as_bytes(), &ComparerOperation::Contains));
+        assert!(simd_compare_strings(a, "he".as_bytes(), &ComparerOperation::StartsWith));
+        assert!(simd_compare_strings(a, "lo".as_bytes(), &ComparerOperation::EndsWith));
     }
 
     #[test]
@@ -1566,5 +1715,249 @@ mod tests {
             prefix_long_avx.as_bytes(),
             &ComparerOperation::GreaterOrEquals
         ));
+    }
+
+    /// Cross-check every ordering against Rust's own `[u8]` ordering over
+    /// inputs that actually reach the vector paths.
+    ///
+    /// The existing cases are 5-byte ASCII, which leaves two things unproven.
+    /// First, a difference found *inside* a 32- or 16-byte vector never
+    /// happens, so the `movemask`/`trailing_zeros` first-difference logic is
+    /// never exercised. Second, and more subtly, every byte stays under 0x80,
+    /// so the `XOR 0x80` that turns a signed `cmpgt` into an unsigned
+    /// comparison is never load-bearing — a string column holding any accented
+    /// or CJK character would order wrongly and nothing here would notice.
+    ///
+    /// Rust's slice ordering is lexicographic with length as the tiebreak,
+    /// which is exactly what `simd_greater_or_equal` implements, so it is a
+    /// valid oracle rather than an approximation.
+    #[test]
+    fn simd_string_ordering_matches_rust_ordering_across_widths() {
+        // Deterministic LCG: a fixed seed keeps failures reproducible.
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+
+        // Drawing from a small alphabet makes shared prefixes common, so the
+        // comparison usually has to walk past whole equal vectors before it
+        // finds a difference. A wide alphabet would differ in byte 0 nearly
+        // every time and never leave the first block.
+        const ALPHABET: [u8; 6] = [0x00, b'a', b'b', 0x7F, 0x80, 0xFF];
+
+        for _ in 0..4000 {
+            // 0..=80 spans every path: scalar-only, one SSE block, one AVX2
+            // block, and AVX2 followed by SSE and scalar remainders.
+            let len_a = (next() % 81) as usize;
+            let len_b = (next() % 81) as usize;
+
+            let mut a = vec![0u8; len_a];
+            let mut b = vec![0u8; len_b];
+            for byte in a.iter_mut() {
+                *byte = ALPHABET[(next() % ALPHABET.len() as u32) as usize];
+            }
+            // Copy a prefix of `a` into `b` most of the time, then perturb it,
+            // so the first difference lands at a varied offset instead of
+            // always at index 0.
+            let shared = (next() as usize) % (len_a.min(len_b) + 1);
+            for (i, byte) in b.iter_mut().enumerate() {
+                *byte = if i < shared {
+                    a[i]
+                } else {
+                    ALPHABET[(next() % ALPHABET.len() as u32) as usize]
+                };
+            }
+
+            let (a, b) = (&a[..], &b[..]);
+            let lt = simd_compare_strings(a, b, &ComparerOperation::Less);
+            let gt = simd_compare_strings(a, b, &ComparerOperation::Greater);
+            let le = simd_compare_strings(a, b, &ComparerOperation::LessOrEquals);
+            let ge = simd_compare_strings(a, b, &ComparerOperation::GreaterOrEquals);
+            let eq = simd_compare_strings(a, b, &ComparerOperation::Equals);
+
+            assert_eq!(lt, a < b, "Less {:?} vs {:?}", a, b);
+            assert_eq!(gt, a > b, "Greater {:?} vs {:?}", a, b);
+            assert_eq!(le, a <= b, "LessOrEquals {:?} vs {:?}", a, b);
+            assert_eq!(ge, a >= b, "GreaterOrEquals {:?} vs {:?}", a, b);
+            assert_eq!(eq, a == b, "Equals {:?} vs {:?}", a, b);
+        }
+    }
+
+    /// The three derived orderings are defined in terms of
+    /// `simd_greater_or_equal`, so they must stay consistent with each other
+    /// as a matter of algebra, independent of what the comparison decides.
+    ///
+    /// This holds even if the underlying comparison were wrong, which is the
+    /// point: it isolates a desync between the four from a fault in the one
+    /// they are built on.
+    #[test]
+    fn derived_string_orderings_stay_algebraically_consistent() {
+        let cases: [&[u8]; 8] = [
+            b"",
+            b"a",
+            b"ab",
+            b"\xFF",
+            b"\x80\x00",
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",  // 33: past one AVX2 block
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",  // differs in the tail
+            b"aaaaaaaaaaaaaaaab",                  // differs inside an SSE block
+        ];
+
+        for a in cases {
+            for b in cases {
+                let lt = simd_compare_strings(a, b, &ComparerOperation::Less);
+                let gt = simd_compare_strings(a, b, &ComparerOperation::Greater);
+                let le = simd_compare_strings(a, b, &ComparerOperation::LessOrEquals);
+                let ge = simd_compare_strings(a, b, &ComparerOperation::GreaterOrEquals);
+                let eq = simd_compare_strings(a, b, &ComparerOperation::Equals);
+
+                // Exactly one of <, ==, > holds: a total order, no incomparables.
+                assert_eq!(
+                    [lt, eq, gt].iter().filter(|x| **x).count(),
+                    1,
+                    "trichotomy broken for {:?} vs {:?}",
+                    a,
+                    b
+                );
+                assert_eq!(le, lt || eq, "<= != (< or ==) for {:?} vs {:?}", a, b);
+                assert_eq!(ge, gt || eq, ">= != (> or ==) for {:?} vs {:?}", a, b);
+                // Antisymmetry across a swap of the operands.
+                assert_eq!(
+                    lt,
+                    simd_compare_strings(b, a, &ComparerOperation::Greater),
+                    "a<b != b>a for {:?} vs {:?}",
+                    a,
+                    b
+                );
+            }
+        }
+    }
+}
+
+/// Matches `value` against a SQL `LIKE` pattern.
+///
+/// `%` matches any run of characters including none; `_` matches exactly one.
+/// `fold` lowercases ASCII on both sides, which is what `ILIKE` needs.
+///
+/// Exists because a pattern with an *interior* wildcard — `'a%b'` — cannot be
+/// expressed as any conjunction of the prefix/suffix/substring operators.
+/// `STARTSWITH 'a' AND CONTAINS 'b'` over-matches: it does not require `b` to
+/// follow `a`, and with three or more segments it loses the ordering entirely.
+/// Returning rows PostgreSQL would not is worse than refusing, which is why the
+/// rewrite refused these until there was a real matcher behind them.
+///
+/// Iterative with backtracking rather than recursive: the pattern comes from a
+/// client, and `%a%a%a%…` against a long value is a stack-overflow shaped input
+/// for the naive recursion. This is O(n·m) worst case and O(n) on the patterns
+/// anyone actually writes, with no stack growth.
+pub fn like_match(value: &[u8], pattern: &[u8], fold: bool) -> bool {
+    let norm = |b: u8| if fold { b.to_ascii_lowercase() } else { b };
+
+    let (mut v, mut p) = (0usize, 0usize);
+    // Where to resume if the current `%` guess turns out to be wrong.
+    let (mut star_p, mut star_v) = (usize::MAX, 0usize);
+
+    while v < value.len() {
+        if p < pattern.len() && pattern[p] == b'_' {
+            v += 1;
+            p += 1;
+        } else if p < pattern.len() && pattern[p] == b'%' {
+            // Remember this `%` and try matching it against nothing first.
+            star_p = p;
+            star_v = v;
+            p += 1;
+        } else if p < pattern.len() && norm(pattern[p]) == norm(value[v]) {
+            v += 1;
+            p += 1;
+        } else if star_p != usize::MAX {
+            // Backtrack: let the last `%` swallow one more character.
+            star_v += 1;
+            v = star_v;
+            p = star_p + 1;
+        } else {
+            return false;
+        }
+    }
+
+    // Trailing `%`s can match the empty remainder; anything else cannot.
+    while p < pattern.len() && pattern[p] == b'%' {
+        p += 1;
+    }
+    p == pattern.len()
+}
+
+#[cfg(test)]
+mod like_tests {
+    use super::like_match;
+
+    fn m(value: &str, pattern: &str) -> bool {
+        like_match(value.as_bytes(), pattern.as_bytes(), false)
+    }
+
+    /// The shape that motivated this: a wildcard between two literal segments.
+    #[test]
+    fn an_interior_wildcard_requires_the_segments_in_order() {
+        assert!(m("UserTable:42:read", "UserTable:%:%"));
+        assert!(m("UserTable::", "UserTable:%:%"));
+        assert!(!m("UserTable:42", "UserTable:%:%"), "only one colon");
+        assert!(!m("Other:42:read", "UserTable:%:%"));
+
+        // Order matters — the reason `STARTSWITH … AND CONTAINS …` is wrong.
+        assert!(m("axxb", "a%b"));
+        assert!(!m("bxxa", "a%b"), "segments matched but in the wrong order");
+    }
+
+    #[test]
+    fn the_familiar_shapes_still_behave() {
+        assert!(m("abc", "abc"));
+        assert!(!m("abcd", "abc"));
+        assert!(m("abcd", "abc%"));
+        assert!(m("xabc", "%abc"));
+        assert!(m("xabcy", "%abc%"));
+        assert!(m("anything", "%"));
+        assert!(m("", "%"));
+        assert!(m("", ""));
+        assert!(!m("a", ""));
+    }
+
+    #[test]
+    fn underscore_matches_exactly_one_character() {
+        assert!(m("abc", "a_c"));
+        assert!(!m("ac", "a_c"), "underscore is not optional");
+        assert!(!m("abbc", "a_c"), "underscore is not greedy");
+        assert!(m("abc", "___"));
+        assert!(m("a_c", "a_c"), "a literal underscore in the value still matches");
+    }
+
+    /// Consecutive and trailing wildcards are common in generated SQL.
+    #[test]
+    fn repeated_and_trailing_wildcards_collapse() {
+        assert!(m("abc", "a%%c"));
+        assert!(m("abc", "abc%%%"));
+        assert!(m("abc", "%%%abc"));
+        assert!(m("abc", "%a%b%c%"));
+    }
+
+    /// Backtracking must find a match that a greedy first guess would miss.
+    #[test]
+    fn backtracking_finds_a_late_match() {
+        assert!(m("aaaab", "%ab"));
+        assert!(m("aaa", "%a"));
+        assert!(!m("aaab", "%ac"));
+    }
+
+    /// A pattern built to blow a recursive matcher's stack must merely be slow.
+    #[test]
+    fn a_pathological_pattern_does_not_recurse() {
+        let value = "a".repeat(2_000);
+        let pattern = format!("{}b", "%a".repeat(40));
+        assert!(!like_match(value.as_bytes(), pattern.as_bytes(), false));
+    }
+
+    #[test]
+    fn folding_is_applied_to_both_sides() {
+        assert!(like_match(b"UserTable:X", b"usertable:%", true));
+        assert!(!like_match(b"UserTable:X", b"usertable:%", false));
     }
 }

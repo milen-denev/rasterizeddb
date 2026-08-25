@@ -1,9 +1,14 @@
 use std::fmt::Debug;
 
-use crate::core::{db_type::DbType, processor::transformer::ComparerOperation};
+use crate::core::{
+    db_type::DbType,
+    processor::transformer::ComparerOperation,
+    value_codec::{INET_LEN, UUID_LEN},
+};
 
 use super::{
-    common::{FromLeBytes, FromLeBytesUnsafe, simd_compare_strings}
+    common::{FromLeBytes, FromLeBytesUnsafe, simd_compare_strings},
+    error::EvalError,
 };
 
 #[inline(always)]
@@ -12,7 +17,7 @@ pub fn perform_comparison_operation(
     input2: &[u8],
     db_type: &DbType,
     operation: &ComparerOperation,
-) -> bool {
+) -> std::result::Result<bool, EvalError> {
     match db_type {
         DbType::I8 => generic_comparison::<i8>(input1, input2, operation),
         DbType::U8 => generic_comparison::<u8>(input1, input2, operation),
@@ -26,26 +31,91 @@ pub fn perform_comparison_operation(
         DbType::U128 => generic_comparison::<u128>(input1, input2, operation),
         DbType::F32 => generic_comparison::<f32>(input1, input2, operation),
         DbType::F64 => generic_comparison::<f64>(input1, input2, operation),
-        DbType::STRING => string_comparison(input1, input2, operation),
-        _ => panic!(
-            "Unsupported data type for comparison operation: {:?}",
-            db_type
-        ),
+        DbType::STRING => Ok(string_comparison(input1, input2, operation)),
+        // Stored as microseconds since the Unix epoch, so an instant comparison
+        // is an `i64` comparison. Note this must NOT be a byte compare: the
+        // value is little-endian, and pre-1970 instants are negative.
+        DbType::DATETIME => generic_comparison::<i64>(input1, input2, operation),
+        DbType::BOOL => generic_comparison::<u8>(input1, input2, operation),
+        DbType::CHAR => generic_comparison::<u32>(input1, input2, operation),
+        // Unscaled units at one fixed scale, so the integer order is the
+        // numeric order and equal values are bitwise identical.
+        DbType::DECIMAL => generic_comparison::<i128>(input1, input2, operation),
+        // Fixed-width and big-endian by construction, so `memcmp` gives both
+        // equality and the canonical ordering with no decoding step.
+        DbType::UUID => bytes_comparison(input1, input2, UUID_LEN, operation),
+        DbType::INET => bytes_comparison(input1, input2, INET_LEN, operation),
+        // Encoding a document is canonical — keys sorted, duplicates resolved
+        // — so two documents that are equal encode identically and a byte
+        // compare decides equality correctly. The *ordering* it yields is
+        // stable but is not the one PostgreSQL defines for `jsonb`.
+        DbType::JSONB => Ok(string_comparison(input1, input2, operation)),
+        // NULL / START / END / UNKNOWN are markers, not values. Returning an
+        // error rather than panicking keeps a malformed query from taking a
+        // worker down with it.
+        _ => Err(EvalError::UnsupportedType),
     }
 }
 
+/// Ordered comparison of two fixed-width values by their raw bytes.
+///
+/// Only correct for types stored big-endian, which is why it is not offered
+/// generically — a little-endian value compared this way would order by its
+/// least significant byte.
 #[inline(always)]
-fn generic_comparison<T>(input1: &[u8], input2: &[u8], operation: &ComparerOperation) -> bool
+fn bytes_comparison(
+    input1: &[u8],
+    input2: &[u8],
+    width: usize,
+    operation: &ComparerOperation,
+) -> std::result::Result<bool, EvalError> {
+    if input1.len() != width || input2.len() != width {
+        return Err(EvalError::OperandSizeMismatch);
+    }
+
+    Ok(match operation {
+        ComparerOperation::Equals => input1 == input2,
+        ComparerOperation::NotEquals => input1 != input2,
+        ComparerOperation::Greater => input1 > input2,
+        ComparerOperation::GreaterOrEquals => input1 >= input2,
+        ComparerOperation::Less => input1 < input2,
+        ComparerOperation::LessOrEquals => input1 <= input2,
+        // Substring and case-folding operations have no meaning for an identity
+        // or an address.
+        ComparerOperation::Contains
+        | ComparerOperation::StartsWith
+        | ComparerOperation::EndsWith
+        | ComparerOperation::EqualsCaseInsensitive
+        | ComparerOperation::ContainsCaseInsensitive
+        | ComparerOperation::StartsWithCaseInsensitive
+        | ComparerOperation::EndsWithCaseInsensitive
+        | ComparerOperation::Like
+        | ComparerOperation::LikeCaseInsensitive => return Err(EvalError::UnsupportedType),
+    })
+}
+
+#[inline(always)]
+fn generic_comparison<T>(
+    input1: &[u8],
+    input2: &[u8],
+    operation: &ComparerOperation,
+) -> std::result::Result<bool, EvalError>
 where
     T: Copy + Default + PartialEq + PartialOrd + FromLeBytes + FromLeBytesUnsafe + Debug,
 {
-    debug_assert_eq!(input1.len(), std::mem::size_of::<T>());
-    debug_assert_eq!(input2.len(), std::mem::size_of::<T>());
+    // `from_le_bytes_unchecked` does a raw `read_unaligned` of `size_of::<T>()`
+    // bytes. Guarding that with `debug_assert` meant release builds read past
+    // the end of a short slice — undefined behaviour, not merely a wrong answer.
+    let size = std::mem::size_of::<T>();
+    if input1.len() != size || input2.len() != size {
+        return Err(EvalError::OperandSizeMismatch);
+    }
 
+    // SAFETY: both slices were just verified to be exactly `size_of::<T>()` bytes.
     let num1 = unsafe { T::from_le_bytes_unchecked(input1) };
     let num2 = unsafe { T::from_le_bytes_unchecked(input2) };
 
-    match operation {
+    Ok(match operation {
         ComparerOperation::Equals => num1 == num2,
         ComparerOperation::NotEquals => num1 != num2,
         ComparerOperation::Greater => num1 > num2,
@@ -54,10 +124,19 @@ where
         ComparerOperation::LessOrEquals => num1 <= num2,
         ComparerOperation::Contains
         | ComparerOperation::StartsWith
-        | ComparerOperation::EndsWith => {
-            panic!("Unsupported operation for numeric types: {:?}", operation)
+        | ComparerOperation::EndsWith
+        | ComparerOperation::EqualsCaseInsensitive
+        | ComparerOperation::ContainsCaseInsensitive
+        | ComparerOperation::StartsWithCaseInsensitive
+        | ComparerOperation::EndsWithCaseInsensitive
+        | ComparerOperation::Like
+        | ComparerOperation::LikeCaseInsensitive => {
+            // Substring, pattern and case-folding operations are string-shaped.
+            // A query reaching this with a numeric column is malformed, not
+            // fatal.
+            return Err(EvalError::UnsupportedType);
         }
-    }
+    })
 }
 
 #[inline(always)]
@@ -81,37 +160,37 @@ mod tests {
             &input1,
             &DbType::I32,
             &ComparerOperation::Equals
-        ));
+        ).unwrap());
         assert!(!perform_comparison_operation(
             &input1,
             &input2,
             &DbType::I32,
             &ComparerOperation::Equals
-        ));
+        ).unwrap());
         assert!(perform_comparison_operation(
             &input2,
             &input1,
             &DbType::I32,
             &ComparerOperation::Less
-        ));
+        ).unwrap());
         assert!(perform_comparison_operation(
             &input1,
             &input2,
             &DbType::I32,
             &ComparerOperation::Greater
-        ));
+        ).unwrap());
         assert!(perform_comparison_operation(
             &input1,
             &input1,
             &DbType::I32,
             &ComparerOperation::GreaterOrEquals
-        ));
+        ).unwrap());
         assert!(perform_comparison_operation(
             &input2,
             &input1,
             &DbType::I32,
             &ComparerOperation::LessOrEquals
-        ));
+        ).unwrap());
     }
 
     #[test]
@@ -125,47 +204,305 @@ mod tests {
             input3,
             &DbType::STRING,
             &ComparerOperation::Equals
-        ));
+        ).unwrap());
         assert!(!perform_comparison_operation(
             input1,
             input2,
             &DbType::STRING,
             &ComparerOperation::Equals
-        ));
+        ).unwrap());
         assert!(perform_comparison_operation(
             input1,
             input2,
             &DbType::STRING,
             &ComparerOperation::NotEquals
-        ));
+        ).unwrap());
+    }
+
+    /// Instants are microseconds since the Unix epoch, held little-endian. A
+    /// byte compare would order them by their least significant byte, so this
+    /// checks the ordering itself and not merely that the call returns.
+    #[test]
+    fn datetime_compares_as_a_signed_instant() {
+        let earlier = 1_000_000i64.to_le_bytes();
+        let later = 2_000_000i64.to_le_bytes();
+        // 0x0100 vs 0x00FF: little-endian byte order disagrees with numeric order.
+        let low_byte_trap = 256i64.to_le_bytes();
+        let high_low_byte = 255i64.to_le_bytes();
+        let before_epoch = (-1_000_000i64).to_le_bytes();
+
+        let lt = |a: &[u8], b: &[u8]| {
+            perform_comparison_operation(a, b, &DbType::DATETIME, &ComparerOperation::Less).unwrap()
+        };
+
+        assert!(lt(&earlier, &later));
+        assert!(!lt(&later, &earlier));
+        assert!(lt(&high_low_byte, &low_byte_trap), "must not compare byte-wise");
+        assert!(lt(&before_epoch, &earlier), "pre-1970 instants sort first");
+        assert!(
+            perform_comparison_operation(&earlier, &earlier, &DbType::DATETIME, &ComparerOperation::Equals)
+                .unwrap()
+        );
+    }
+
+    /// `WHERE name < 'abc'` is ordinary SQL. These three operators used to
+    /// panic the worker evaluating them, so this checks the ordering itself
+    /// rather than merely that the call returns.
+    #[test]
+    fn strings_order_lexicographically_instead_of_panicking() {
+        let cmp = |a: &str, b: &str, op: ComparerOperation| {
+            perform_comparison_operation(a.as_bytes(), b.as_bytes(), &DbType::STRING, &op).unwrap()
+        };
+
+        assert!(cmp("abc", "abd", ComparerOperation::Less));
+        assert!(!cmp("abd", "abc", ComparerOperation::Less));
+        assert!(cmp("abd", "abc", ComparerOperation::Greater));
+        assert!(!cmp("abc", "abd", ComparerOperation::Greater));
+
+        // Equal values are neither less nor greater, but satisfy both
+        // "or equals" forms.
+        assert!(!cmp("abc", "abc", ComparerOperation::Less));
+        assert!(!cmp("abc", "abc", ComparerOperation::Greater));
+        assert!(cmp("abc", "abc", ComparerOperation::LessOrEquals));
+        assert!(cmp("abc", "abc", ComparerOperation::GreaterOrEquals));
+    }
+
+    /// A prefix sorts before the string that extends it, and length only
+    /// decides once every shared byte is equal.
+    #[test]
+    fn a_prefix_sorts_before_its_extension() {
+        let cmp = |a: &str, b: &str, op: ComparerOperation| {
+            perform_comparison_operation(a.as_bytes(), b.as_bytes(), &DbType::STRING, &op).unwrap()
+        };
+
+        assert!(cmp("ab", "abc", ComparerOperation::Less));
+        assert!(cmp("abc", "ab", ComparerOperation::Greater));
+        assert!(cmp("", "a", ComparerOperation::Less));
+        assert!(cmp("", "", ComparerOperation::LessOrEquals));
+        // A longer string that differs early still loses on the first byte.
+        assert!(cmp("b", "abcdef", ComparerOperation::Greater));
+    }
+
+    /// The four orderings must stay mutually consistent, since three of them
+    /// are derived from the fourth.
+    #[test]
+    fn string_orderings_agree_with_each_other() {
+        let cases = ["", "a", "ab", "abc", "abd", "b", "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"];
+        for a in cases {
+            for b in cases {
+                let c = |op: ComparerOperation| {
+                    perform_comparison_operation(a.as_bytes(), b.as_bytes(), &DbType::STRING, &op)
+                        .unwrap()
+                };
+                let (lt, gt, le, ge, eq) = (
+                    c(ComparerOperation::Less),
+                    c(ComparerOperation::Greater),
+                    c(ComparerOperation::LessOrEquals),
+                    c(ComparerOperation::GreaterOrEquals),
+                    c(ComparerOperation::Equals),
+                );
+
+                assert_eq!(lt, a < b, "{:?} < {:?}", a, b);
+                assert_eq!(gt, a > b, "{:?} > {:?}", a, b);
+                assert_eq!(le, a <= b, "{:?} <= {:?}", a, b);
+                assert_eq!(ge, a >= b, "{:?} >= {:?}", a, b);
+                assert_eq!(eq, a == b, "{:?} == {:?}", a, b);
+                assert!(!(lt && gt), "{:?} and {:?} cannot be both", a, b);
+                assert_eq!(le, lt || eq);
+                assert_eq!(ge, gt || eq);
+            }
+        }
     }
 
     #[test]
-    #[should_panic(expected = "Unsupported data type for comparison operation: DATETIME")]
-    fn test_unsupported_db_type() {
-        let input1 = [0u8; 4];
-        let input2 = [0u8; 4];
-        perform_comparison_operation(
-            &input1,
-            &input2,
-            &DbType::DATETIME,
-            &ComparerOperation::Equals,
+    fn bool_and_char_compare_instead_of_panicking() {
+        let t = [1u8];
+        let f = [0u8];
+        assert!(
+            perform_comparison_operation(&t, &t, &DbType::BOOL, &ComparerOperation::Equals).unwrap()
+        );
+        assert!(
+            perform_comparison_operation(&t, &f, &DbType::BOOL, &ComparerOperation::NotEquals).unwrap()
+        );
+
+        let a = ('a' as u32).to_le_bytes();
+        let b = ('b' as u32).to_le_bytes();
+        assert!(perform_comparison_operation(&a, &b, &DbType::CHAR, &ComparerOperation::Less).unwrap());
+    }
+
+    #[test]
+    fn decimal_compares_as_scaled_units() {
+        let one_five = crate::core::value_codec::parse_decimal("1.5").unwrap().to_le_bytes();
+        let one_five_padded = crate::core::value_codec::parse_decimal("1.500").unwrap().to_le_bytes();
+        let two = crate::core::value_codec::parse_decimal("2").unwrap().to_le_bytes();
+        let negative = crate::core::value_codec::parse_decimal("-1").unwrap().to_le_bytes();
+
+        assert!(
+            perform_comparison_operation(&one_five, &one_five_padded, &DbType::DECIMAL, &ComparerOperation::Equals)
+                .unwrap(),
+            "trailing zeroes must not change the stored units"
+        );
+        assert!(
+            perform_comparison_operation(&one_five, &two, &DbType::DECIMAL, &ComparerOperation::Less).unwrap()
+        );
+        assert!(
+            perform_comparison_operation(&negative, &one_five, &DbType::DECIMAL, &ComparerOperation::Less)
+                .unwrap()
         );
     }
 
     #[test]
-    #[should_panic(expected = "Unsupported operation for numeric types")]
-    fn test_unsupported_operation_numeric() {
-        let input1 = 5i32.to_le_bytes();
-        let input2 = 10i32.to_le_bytes();
-        perform_comparison_operation(&input1, &input2, &DbType::I32, &ComparerOperation::Contains);
+    fn uuid_compares_bytewise_in_canonical_order() {
+        use crate::core::value_codec::parse_uuid;
+        let low = parse_uuid("00000000-0000-0000-0000-000000000001").unwrap();
+        let high = parse_uuid("ffffffff-0000-0000-0000-000000000000").unwrap();
+
+        assert!(
+            perform_comparison_operation(&low, &low, &DbType::UUID, &ComparerOperation::Equals).unwrap()
+        );
+        assert!(
+            perform_comparison_operation(&low, &high, &DbType::UUID, &ComparerOperation::Less).unwrap()
+        );
+        assert!(
+            perform_comparison_operation(&high, &low, &DbType::UUID, &ComparerOperation::Greater).unwrap()
+        );
     }
 
     #[test]
-    #[should_panic(expected = "Unsupported operation for string types")]
-    fn test_unsupported_operation_string() {
-        let input1 = "hello".as_bytes();
-        let input2 = "world".as_bytes();
-        perform_comparison_operation(input1, input2, &DbType::STRING, &ComparerOperation::Greater);
+    fn inet_compares_by_family_then_address() {
+        use crate::core::value_codec::parse_inet;
+        let v4_low = parse_inet("10.0.0.1").unwrap();
+        let v4_high = parse_inet("10.0.0.2").unwrap();
+        let v6 = parse_inet("::1").unwrap();
+
+        assert!(
+            perform_comparison_operation(&v4_low, &v4_high, &DbType::INET, &ComparerOperation::Less).unwrap()
+        );
+        assert!(
+            perform_comparison_operation(&v4_high, &v6, &DbType::INET, &ComparerOperation::Less).unwrap(),
+            "IPv4 sorts before IPv6"
+        );
+        assert!(
+            perform_comparison_operation(&v4_low, &v4_low, &DbType::INET, &ComparerOperation::Equals).unwrap()
+        );
+    }
+
+    /// A width that does not match the column type must fail cleanly rather
+    /// than reading past the end of the slice.
+    #[test]
+    fn mismatched_operand_width_is_an_error() {
+        use crate::core::row::error::EvalError;
+        let short = [0u8; 4];
+        let full = [0u8; 16];
+        assert_eq!(
+            perform_comparison_operation(&short, &full, &DbType::UUID, &ComparerOperation::Equals),
+            Err(EvalError::OperandSizeMismatch)
+        );
+        assert_eq!(
+            perform_comparison_operation(&short, &short, &DbType::DATETIME, &ComparerOperation::Equals),
+            Err(EvalError::OperandSizeMismatch)
+        );
+    }
+
+    /// Marker types carry no value. They must report an error rather than take
+    /// the worker down, since a query can reach them from user input.
+    #[test]
+    fn marker_types_report_an_error_instead_of_panicking() {
+        use crate::core::row::error::EvalError;
+        for ty in [DbType::NULL, DbType::START, DbType::END, DbType::UNKNOWN] {
+            assert_eq!(
+                perform_comparison_operation(&[0u8], &[0u8], &ty, &ComparerOperation::Equals),
+                Err(EvalError::UnsupportedType),
+                "{:?}",
+                ty
+            );
+        }
+    }
+
+    #[test]
+    fn substring_operations_are_rejected_for_identity_types() {
+        use crate::core::row::error::EvalError;
+        let a = [0u8; 16];
+        assert_eq!(
+            perform_comparison_operation(&a, &a, &DbType::UUID, &ComparerOperation::Contains),
+            Err(EvalError::UnsupportedType)
+        );
+    }
+
+    /// A substring or case-folding operator against a numeric column is a
+    /// malformed query, not a fatal one. This used to panic, so `WHERE age
+    /// CONTAINS 5` could take a query worker down.
+    #[test]
+    fn string_shaped_operators_on_numbers_are_an_error_not_a_panic() {
+        use crate::core::row::error::EvalError;
+        let a = 5i32.to_le_bytes();
+        let b = 10i32.to_le_bytes();
+
+        for op in [
+            ComparerOperation::Contains,
+            ComparerOperation::StartsWith,
+            ComparerOperation::EndsWith,
+            ComparerOperation::EqualsCaseInsensitive,
+            ComparerOperation::ContainsCaseInsensitive,
+            ComparerOperation::StartsWithCaseInsensitive,
+            ComparerOperation::EndsWithCaseInsensitive,
+        ] {
+            assert_eq!(
+                perform_comparison_operation(&a, &b, &DbType::I32, &op),
+                Err(EvalError::UnsupportedType),
+                "{:?}",
+                op
+            );
+        }
+    }
+
+    #[test]
+    fn case_insensitive_string_operators_ignore_ascii_case() {
+        let cmp = |a: &str, b: &str, op: ComparerOperation| {
+            perform_comparison_operation(a.as_bytes(), b.as_bytes(), &DbType::STRING, &op).unwrap()
+        };
+
+        assert!(cmp("Acme", "ACME", ComparerOperation::EqualsCaseInsensitive));
+        assert!(!cmp("Acme", "Acme Ltd", ComparerOperation::EqualsCaseInsensitive));
+        assert!(cmp("alice@ACME.test", "acme", ComparerOperation::ContainsCaseInsensitive));
+        assert!(cmp("Alice", "AL", ComparerOperation::StartsWithCaseInsensitive));
+        assert!(cmp("Alice", "CE", ComparerOperation::EndsWithCaseInsensitive));
+        assert!(!cmp("Alice", "zz", ComparerOperation::ContainsCaseInsensitive));
+
+        // The case-sensitive operators must be unaffected.
+        assert!(!cmp("Acme", "ACME", ComparerOperation::Equals));
+    }
+
+    /// Folding is ASCII-only, and the boundary bytes around the alphabet must
+    /// not be swept into it — `'_'` (0x5F) sits just below `'a'`-0x20, and
+    /// `'{'` (0x7B) just above `'z'`-0x20.
+    #[test]
+    fn case_folding_does_not_reach_beyond_the_ascii_alphabet() {
+        let cmp = |a: &[u8], b: &[u8]| {
+            perform_comparison_operation(a, b, &DbType::STRING, &ComparerOperation::EqualsCaseInsensitive)
+                .unwrap()
+        };
+
+        assert!(!cmp(b"_", b"?"), "0x5F must not fold onto 0x3F");
+        assert!(!cmp(b"{", b"["), "0x7B must not fold onto 0x5B");
+        assert!(cmp(b"[", b"["));
+        // Non-ASCII bytes compare as themselves rather than being folded.
+        assert!(cmp("\u{00c9}".as_bytes(), "\u{00c9}".as_bytes()));
+        assert!(!cmp("\u{00c9}".as_bytes(), "\u{00e9}".as_bytes()));
+    }
+
+    /// Substring operations are meaningful for strings and meaningless for the
+    /// fixed-width identity types, which is the split this checks.
+    #[test]
+    fn substring_operations_are_accepted_for_strings() {
+        assert!(
+            perform_comparison_operation(
+                "hello".as_bytes(),
+                "ell".as_bytes(),
+                &DbType::STRING,
+                &ComparerOperation::Contains
+            )
+            .unwrap()
+        );
     }
 }

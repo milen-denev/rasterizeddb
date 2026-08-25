@@ -152,8 +152,11 @@ pub async fn consolidated_read_data_function(schema: TableSchema, _id: u64) {
             &mut iterator,
             None,
             None,
+            None,
+            crate::core::mvcc::Visibility::All,
         )
-        .await;
+        .await
+        .expect("mock table query failed");
 
     stopwatch.stop();
 

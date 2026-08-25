@@ -10,12 +10,15 @@ use crate::{
 
 use super::schema::SchemaField;
 
-#[derive(Debug)]
+/// `Clone` because a scan may be retried under a wider slot ceiling, and this
+/// is a small descriptor of *which* columns to read — offsets, types and sizes,
+/// no row data — so copying it costs nothing next to the scan it configures.
+#[derive(Debug, Clone)]
 pub struct RowFetch {
     pub columns_fetching_data: SmallVec<[ColumnFetchingData; 32]>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ColumnFetchingData {
     pub column_offset: u32,
     pub column_type: DbType,
@@ -60,9 +63,22 @@ impl Row {
         schema: &SmallVec<[SchemaField; 20]>,
     ) -> Option<MemoryBlock> {
         let result = self.columns.iter().find_map(|col| {
-            if schema[col.schema_id as usize].name == *column_name {
-                let data = col.data.clone();
-                return Some(data);
+            // `schema_id` is a `write_order`, not a position: `calculate_schema_offset`
+            // returns `field.write_order`. Indexing the slice with it holds only
+            // while the two happen to coincide, and they stop coinciding as soon
+            // as a caller passes a *projection* rather than the whole field list —
+            // which is what a SELECT of some columns does. The same raw index in
+            // pgwire panicked a worker with "len is 22 but the index is 22" and
+            // dropped the connection.
+            //
+            // Positional lookup stays as a fallback so a caller that really did
+            // pass indices keeps working.
+            let field = schema
+                .iter()
+                .find(|f| f.write_order == col.schema_id)
+                .or_else(|| schema.get(col.schema_id as usize))?;
+            if field.name == *column_name {
+                Some(col.data.clone())
             } else {
                 None
             }
@@ -88,38 +104,64 @@ impl Row {
         #[cfg(not(feature = "enable_long_row"))]
         const LEN_HEADER: usize = 4;
 
-        let header_pos = out.len();
-        // Reserve the length header; we patch it in once we know the size.
-        out.extend_from_slice(&[0u8; LEN_HEADER]);
+        // Per column: an 8-byte size, an 8-byte schema id, the data, and a
+        // 1-byte type tag.
+        const COLUMN_OVERHEAD: usize = 8 + 8 + 1;
 
-        let mut size: u64 = 0;
+        // Size the whole row up front. The previous version issued four
+        // separately capacity-checked writes per column and then patched the
+        // header afterwards; one `reserve` plus straight-line stores replaces
+        // roughly 4N bounds/growth checks with one.
+        let payload: usize = self.columns.len() * COLUMN_OVERHEAD
+            + self
+                .columns
+                .iter()
+                .map(|column| column.data.len())
+                .sum::<usize>();
 
-        for column in &self.columns {
-            let column_data = column.data.into_slice();
-            let column_size = column_data.len() as u64;
+        let start = out.len();
+        out.reserve(LEN_HEADER + payload);
 
-            size += 8 + 8;
+        // SAFETY: `reserve` guarantees `LEN_HEADER + payload` writable bytes
+        // past `start`, and the loop below writes exactly that many before
+        // `set_len` makes them visible.
+        unsafe {
+            let mut p = out.as_mut_ptr().add(start);
 
-            out.extend_from_slice(&column_size.to_le_bytes());
-            out.extend_from_slice(&column.schema_id.to_le_bytes());
-            out.extend_from_slice(column_data);
+            #[cfg(feature = "enable_long_row")]
+            let header = (payload as u64).to_le_bytes();
+            #[cfg(not(feature = "enable_long_row"))]
+            let header = (payload as u32).to_le_bytes();
 
-            size += column_size;
+            std::ptr::copy_nonoverlapping(header.as_ptr(), p, LEN_HEADER);
+            p = p.add(LEN_HEADER);
 
-            out.push(column.column_type.to_byte());
+            for column in &self.columns {
+                let column_data = column.data.into_slice();
+                let column_size = column_data.len();
 
-            size += 1;
-        }
+                std::ptr::copy_nonoverlapping((column_size as u64).to_le_bytes().as_ptr(), p, 8);
+                p = p.add(8);
 
-        #[cfg(feature = "enable_long_row")]
-        {
-            let len_bytes = (size as u64).to_le_bytes();
-            out[header_pos..header_pos + 8].copy_from_slice(&len_bytes);
-        }
-        #[cfg(not(feature = "enable_long_row"))]
-        {
-            let len_bytes = (size as u32).to_le_bytes();
-            out[header_pos..header_pos + 4].copy_from_slice(&len_bytes);
+                std::ptr::copy_nonoverlapping(column.schema_id.to_le_bytes().as_ptr(), p, 8);
+                p = p.add(8);
+
+                if column_size > 0 {
+                    std::ptr::copy_nonoverlapping(column_data.as_ptr(), p, column_size);
+                    p = p.add(column_size);
+                }
+
+                *p = column.column_type.to_byte();
+                p = p.add(1);
+            }
+
+            debug_assert_eq!(
+                p as usize - out.as_mut_ptr().add(start) as usize,
+                LEN_HEADER + payload,
+                "serialized byte count must match the reserved size"
+            );
+
+            out.set_len(start + LEN_HEADER + payload);
         }
     }
 
@@ -262,10 +304,21 @@ pub fn column_vec_into_vec<'a>(
     schema: &'a SmallVec<[SchemaField; 20]>,
 ) {
     for column in columns {
-        row_mut.push((
-            Cow::Borrowed(schema[column.schema_id as usize].name.as_str()),
-            column.data.clone(),
-        ));
+        // Same `write_order`-is-not-an-index hazard as `Row::get_column`, but it
+        // fails differently here: this names the output columns, so a mismatch
+        // that lands in range returns the right values under the *wrong names*
+        // rather than panicking — wrong answers with nothing reporting it.
+        //
+        // A column that matches nothing still has to be emitted: dropping it
+        // would change the result's arity, which is worse than an honest
+        // placeholder and much harder to trace back to here.
+        let name = schema
+            .iter()
+            .find(|f| f.write_order == column.schema_id)
+            .or_else(|| schema.get(column.schema_id as usize))
+            .map(|f| Cow::Borrowed(f.name.as_str()))
+            .unwrap_or_else(|| Cow::Owned(format!("column_{}", column.schema_id)));
+        row_mut.push((name, column.data.clone()));
     }
 }
 
@@ -297,17 +350,20 @@ mod row_tests {
         }
     }
 
+    /// Width of `Row::length`, which is the only thing `enable_long_row` changes
+    /// about a row. `columns` is a `SmallVec` either way — the long-row variant
+    /// of this helper used to ask for a `Vec`, which is why every caller failed
+    /// to compile under that feature.
     #[cfg(feature = "enable_long_row")]
-    fn make_test_row(position: u64, columns: Vec<Column>, length: u64) -> Row {
-        Row {
-            position,
-            columns,
-            length,
-        }
-    }
-
+    type TestRowLen = u64;
     #[cfg(not(feature = "enable_long_row"))]
-    fn make_test_row(position: u64, columns: SmallVec<[Column; 32]>, length: u32) -> Row {
+    type TestRowLen = u32;
+
+    fn make_test_row(
+        position: u64,
+        columns: SmallVec<[Column; 32]>,
+        length: TestRowLen,
+    ) -> Row {
         Row {
             position,
             columns,

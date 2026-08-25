@@ -4,6 +4,54 @@ use crate::{
 };
 
 use super::common::{FromF64, FromLeBytes, IntoF64};
+use super::error::EvalError;
+
+/// Add/subtract/multiply that reports leaving the type's range instead of
+/// wrapping.
+///
+/// The release profile sets `overflow-checks = false`, so plain `+`/`-`/`*` on
+/// integers wrapped silently there — `WHERE salary * 1000000 > x` quietly
+/// produced a wrong answer instead of an error. Integers are checked here;
+/// floats keep IEEE semantics (saturating to infinity), which is what callers
+/// expect from floating point.
+pub trait CheckedArith: Sized {
+    fn arith_add(self, rhs: Self) -> Option<Self>;
+    fn arith_sub(self, rhs: Self) -> Option<Self>;
+    fn arith_mul(self, rhs: Self) -> Option<Self>;
+}
+
+macro_rules! impl_checked_arith_int {
+    ($($type:ty),*) => {
+        $(
+            impl CheckedArith for $type {
+                #[inline(always)]
+                fn arith_add(self, rhs: Self) -> Option<Self> { self.checked_add(rhs) }
+                #[inline(always)]
+                fn arith_sub(self, rhs: Self) -> Option<Self> { self.checked_sub(rhs) }
+                #[inline(always)]
+                fn arith_mul(self, rhs: Self) -> Option<Self> { self.checked_mul(rhs) }
+            }
+        )*
+    };
+}
+
+macro_rules! impl_checked_arith_float {
+    ($($type:ty),*) => {
+        $(
+            impl CheckedArith for $type {
+                #[inline(always)]
+                fn arith_add(self, rhs: Self) -> Option<Self> { Some(self + rhs) }
+                #[inline(always)]
+                fn arith_sub(self, rhs: Self) -> Option<Self> { Some(self - rhs) }
+                #[inline(always)]
+                fn arith_mul(self, rhs: Self) -> Option<Self> { Some(self * rhs) }
+            }
+        )*
+    };
+}
+
+impl_checked_arith_int!(i8, u8, i16, u16, i32, u32, i64, u64, i128, u128);
+impl_checked_arith_float!(f32, f64);
 
 /// Function to perform a mathematical operation on two byte slices
 /// each representing a numeric type. The numeric type is determined by the `db_type` parameter.
@@ -17,12 +65,12 @@ pub fn perform_math_operation(
     input2: &[u8],
     db_type: &DbType,
     operation: &MathOperation,
-) -> MemoryBlock {
-    debug_assert_eq!(
-        input1.len(),
-        input2.len(),
-        "Input slices must have the same length"
-    );
+) -> std::result::Result<MemoryBlock, EvalError> {
+    // Checked, not `debug_assert`ed: release builds compile assertions out, and
+    // the mismatch then reaches `from_le_bytes`, which panics on a short slice.
+    if input1.len() != input2.len() {
+        return Err(EvalError::OperandSizeMismatch);
+    }
 
     match db_type {
         DbType::I8 => generic_operation::<i8>(input1, input2, operation),
@@ -37,19 +85,23 @@ pub fn perform_math_operation(
         DbType::U128 => generic_operation::<u128>(input1, input2, operation),
         DbType::F32 => generic_operation::<f32>(input1, input2, operation),
         DbType::F64 => generic_operation::<f64>(input1, input2, operation),
-        _ => panic!("Unsupported data type for math operation: {:?}", db_type),
+        // Reported, not panicked: the type comes from a client's query, and a
+        // panic here takes down the worker thread evaluating the row.
+        _ => Err(EvalError::UnsupportedType),
     }
 }
 
 #[inline(always)]
-fn generic_operation<T>(input1: &[u8], input2: &[u8], operation: &MathOperation) -> MemoryBlock
+fn generic_operation<T>(
+    input1: &[u8],
+    input2: &[u8],
+    operation: &MathOperation,
+) -> std::result::Result<MemoryBlock, EvalError>
 where
     T: Copy
         + Default
-        + std::ops::Add<Output = T>
-        + std::ops::Sub<Output = T>
-        + std::ops::Mul<Output = T>
         + std::ops::Div<Output = T>
+        + CheckedArith
         + PartialEq
         + FromLeBytes
         + FromF64
@@ -57,23 +109,26 @@ where
 {
     let size = std::mem::size_of::<T>();
 
-    debug_assert!(
-        input1.len() % size == 0,
-        "Input slices must be divisible by the size of the target type"
-    );
-
-    let mut block = MEMORY_POOL.acquire(input1.len());
-    let result = block.into_slice_mut();
+    // `from_le_bytes` panics on a slice that isn't exactly `size` bytes, so this
+    // has to be a real check rather than a debug assertion.
+    if input1.len() != size || input2.len() != size {
+        return Err(EvalError::OperandSizeMismatch);
+    }
 
     let num1 = T::from_le_bytes(input1);
     let num2 = T::from_le_bytes(input2);
 
     let res = match operation {
-        MathOperation::Add => num1 + num2,
-        MathOperation::Subtract => num1 - num2,
-        MathOperation::Multiply => num1 * num2,
+        MathOperation::Add => num1.arith_add(num2).ok_or(EvalError::ArithmeticOverflow)?,
+        MathOperation::Subtract => num1.arith_sub(num2).ok_or(EvalError::ArithmeticOverflow)?,
+        MathOperation::Multiply => num1.arith_mul(num2).ok_or(EvalError::ArithmeticOverflow)?,
         MathOperation::Divide => {
-            debug_assert!(num2 != T::default(), "Division by zero is not allowed");
+            // Integer division by zero panics in every build profile — a
+            // `debug_assert` here left release builds crashing the worker
+            // thread on any row where the divisor happened to be 0.
+            if num2 == T::default() {
+                return Err(EvalError::DivisionByZero);
+            }
             num1 / num2
         }
         MathOperation::Exponent => {
@@ -84,14 +139,18 @@ where
         MathOperation::Root => {
             let value: f64 = num1.into_f64();
             let root: f64 = num2.into_f64();
-            debug_assert!(root != 0.0, "Root by zero is not allowed");
+            if root == 0.0 {
+                return Err(EvalError::RootByZero);
+            }
             T::from_f64(value.powf(1.0 / root))
         }
     };
 
+    let mut block = MEMORY_POOL.acquire(input1.len());
+    let result = block.into_slice_mut();
     result.copy_from_slice(res.to_le_bytes().into_slice());
 
-    block
+    Ok(block)
 }
 
 #[cfg(test)]
@@ -124,7 +183,7 @@ mod tests {
             &DbType::I32,
             &MathOperation::Add,
         );
-        assert_eq!(from_memory_block::<i32>(result), 8);
+        assert_eq!(from_memory_block::<i32>(result.unwrap()), 8);
 
         // Unsigned integer addition
         let result = perform_math_operation(
@@ -133,7 +192,7 @@ mod tests {
             &DbType::U64,
             &MathOperation::Add,
         );
-        assert_eq!(from_memory_block::<u64>(result), 8);
+        assert_eq!(from_memory_block::<u64>(result.unwrap()), 8);
 
         // Floating point addition
         let result = perform_math_operation(
@@ -142,7 +201,7 @@ mod tests {
             &DbType::F32,
             &MathOperation::Add,
         );
-        assert!((from_memory_block::<f32>(result) - 8.7).abs() < 0.001);
+        assert!((from_memory_block::<f32>(result.unwrap()) - 8.7).abs() < 0.001);
 
         let result = perform_math_operation(
             to_le_bytes(5.5f64).into_slice(),
@@ -150,7 +209,7 @@ mod tests {
             &DbType::F64,
             &MathOperation::Add,
         );
-        assert!((from_memory_block::<f64>(result) - 8.7).abs() < 0.001);
+        assert!((from_memory_block::<f64>(result.unwrap()) - 8.7).abs() < 0.001);
     }
 
     #[test]
@@ -162,7 +221,7 @@ mod tests {
             &DbType::I32,
             &MathOperation::Subtract,
         );
-        assert_eq!(from_memory_block::<i32>(result), 2);
+        assert_eq!(from_memory_block::<i32>(result.unwrap()), 2);
 
         // Unsigned integer subtraction
         let result = perform_math_operation(
@@ -171,7 +230,7 @@ mod tests {
             &DbType::U64,
             &MathOperation::Subtract,
         );
-        assert_eq!(from_memory_block::<u64>(result), 2);
+        assert_eq!(from_memory_block::<u64>(result.unwrap()), 2);
 
         // Floating point subtraction
         let result = perform_math_operation(
@@ -180,7 +239,7 @@ mod tests {
             &DbType::F32,
             &MathOperation::Subtract,
         );
-        assert!((from_memory_block::<f32>(result) - 2.3).abs() < 0.001);
+        assert!((from_memory_block::<f32>(result.unwrap()) - 2.3).abs() < 0.001);
 
         let result = perform_math_operation(
             to_le_bytes(5.5f64).into_slice(),
@@ -188,7 +247,7 @@ mod tests {
             &DbType::F64,
             &MathOperation::Subtract,
         );
-        assert!((from_memory_block::<f64>(result) - 2.3).abs() < 0.001);
+        assert!((from_memory_block::<f64>(result.unwrap()) - 2.3).abs() < 0.001);
     }
 
     #[test]
@@ -200,7 +259,7 @@ mod tests {
             &DbType::I32,
             &MathOperation::Multiply,
         );
-        assert_eq!(from_memory_block::<i32>(result), 15);
+        assert_eq!(from_memory_block::<i32>(result.unwrap()), 15);
 
         // Unsigned integer multiplication
         let result = perform_math_operation(
@@ -209,7 +268,7 @@ mod tests {
             &DbType::U64,
             &MathOperation::Multiply,
         );
-        assert_eq!(from_memory_block::<u64>(result), 15);
+        assert_eq!(from_memory_block::<u64>(result.unwrap()), 15);
 
         // Floating point multiplication
         let result = perform_math_operation(
@@ -218,7 +277,7 @@ mod tests {
             &DbType::F32,
             &MathOperation::Multiply,
         );
-        assert!((from_memory_block::<f32>(result) - 16.5).abs() < 0.001);
+        assert!((from_memory_block::<f32>(result.unwrap()) - 16.5).abs() < 0.001);
 
         let result = perform_math_operation(
             to_le_bytes(5.5f64).into_slice(),
@@ -226,7 +285,7 @@ mod tests {
             &DbType::F64,
             &MathOperation::Multiply,
         );
-        assert!((from_memory_block::<f64>(result) - 16.5).abs() < 0.001);
+        assert!((from_memory_block::<f64>(result.unwrap()) - 16.5).abs() < 0.001);
     }
 
     #[test]
@@ -238,7 +297,7 @@ mod tests {
             &DbType::I32,
             &MathOperation::Divide,
         );
-        assert_eq!(from_memory_block::<i32>(result), 5);
+        assert_eq!(from_memory_block::<i32>(result.unwrap()), 5);
 
         // Unsigned integer division
         let result = perform_math_operation(
@@ -247,7 +306,7 @@ mod tests {
             &DbType::U64,
             &MathOperation::Divide,
         );
-        assert_eq!(from_memory_block::<u64>(result), 5);
+        assert_eq!(from_memory_block::<u64>(result.unwrap()), 5);
 
         // Floating point division
         let result = perform_math_operation(
@@ -256,7 +315,7 @@ mod tests {
             &DbType::F32,
             &MathOperation::Divide,
         );
-        assert!((from_memory_block::<f32>(result) - 5.5).abs() < 0.001);
+        assert!((from_memory_block::<f32>(result.unwrap()) - 5.5).abs() < 0.001);
 
         let result = perform_math_operation(
             to_le_bytes(16.5f64).into_slice(),
@@ -264,7 +323,7 @@ mod tests {
             &DbType::F64,
             &MathOperation::Divide,
         );
-        assert!((from_memory_block::<f64>(result) - 5.5).abs() < 0.001);
+        assert!((from_memory_block::<f64>(result.unwrap()) - 5.5).abs() < 0.001);
     }
 
     #[test]
@@ -276,7 +335,7 @@ mod tests {
             &DbType::I32,
             &MathOperation::Exponent,
         );
-        assert_eq!(from_memory_block::<i32>(result), 8);
+        assert_eq!(from_memory_block::<i32>(result.unwrap()), 8);
 
         // Unsigned integer exponentiation
         let result = perform_math_operation(
@@ -285,7 +344,7 @@ mod tests {
             &DbType::U64,
             &MathOperation::Exponent,
         );
-        assert_eq!(from_memory_block::<u64>(result), 8);
+        assert_eq!(from_memory_block::<u64>(result.unwrap()), 8);
 
         // Floating point exponentiation
         let result = perform_math_operation(
@@ -294,7 +353,7 @@ mod tests {
             &DbType::F32,
             &MathOperation::Exponent,
         );
-        assert!((from_memory_block::<f32>(result) - 2.83).abs() < 0.01);
+        assert!((from_memory_block::<f32>(result.unwrap()) - 2.83).abs() < 0.01);
 
         let result = perform_math_operation(
             to_le_bytes(2.0f64).into_slice(),
@@ -302,7 +361,7 @@ mod tests {
             &DbType::F64,
             &MathOperation::Exponent,
         );
-        assert!((from_memory_block::<f64>(result) - 2.83).abs() < 0.01);
+        assert!((from_memory_block::<f64>(result.unwrap()) - 2.83).abs() < 0.01);
     }
 
     #[test]
@@ -314,7 +373,7 @@ mod tests {
             &DbType::I32,
             &MathOperation::Root,
         );
-        assert_eq!(from_memory_block::<i32>(result), 2);
+        assert_eq!(from_memory_block::<i32>(result.unwrap()), 2);
 
         // Unsigned integer root
         let result = perform_math_operation(
@@ -323,7 +382,7 @@ mod tests {
             &DbType::U64,
             &MathOperation::Root,
         );
-        assert_eq!(from_memory_block::<u64>(result), 2);
+        assert_eq!(from_memory_block::<u64>(result.unwrap()), 2);
 
         // Floating point root
         let result = perform_math_operation(
@@ -332,7 +391,7 @@ mod tests {
             &DbType::F32,
             &MathOperation::Root,
         );
-        assert!((from_memory_block::<f32>(result) - 3.0).abs() < 0.001);
+        assert!((from_memory_block::<f32>(result.unwrap()) - 3.0).abs() < 0.001);
 
         let result = perform_math_operation(
             to_le_bytes(9.0f64).into_slice(),
@@ -340,7 +399,7 @@ mod tests {
             &DbType::F64,
             &MathOperation::Root,
         );
-        assert!((from_memory_block::<f64>(result) - 3.0).abs() < 0.001);
+        assert!((from_memory_block::<f64>(result.unwrap()) - 3.0).abs() < 0.001);
     }
 
     #[test]
@@ -352,7 +411,7 @@ mod tests {
             &DbType::I8,
             &MathOperation::Add,
         );
-        assert_eq!(from_memory_block::<i8>(result), 8);
+        assert_eq!(from_memory_block::<i8>(result.unwrap()), 8);
 
         // Test u8
         let result = perform_math_operation(
@@ -361,7 +420,7 @@ mod tests {
             &DbType::U8,
             &MathOperation::Add,
         );
-        assert_eq!(from_memory_block::<u8>(result), 8);
+        assert_eq!(from_memory_block::<u8>(result.unwrap()), 8);
 
         // Test i16
         let result = perform_math_operation(
@@ -370,7 +429,7 @@ mod tests {
             &DbType::I16,
             &MathOperation::Add,
         );
-        assert_eq!(from_memory_block::<i16>(result), 8);
+        assert_eq!(from_memory_block::<i16>(result.unwrap()), 8);
 
         // Test u16
         let result = perform_math_operation(
@@ -379,7 +438,7 @@ mod tests {
             &DbType::U16,
             &MathOperation::Add,
         );
-        assert_eq!(from_memory_block::<u16>(result), 8);
+        assert_eq!(from_memory_block::<u16>(result.unwrap()), 8);
 
         // Test i128
         let result = perform_math_operation(
@@ -388,7 +447,7 @@ mod tests {
             &DbType::I128,
             &MathOperation::Add,
         );
-        assert_eq!(from_memory_block::<i128>(result), 8);
+        assert_eq!(from_memory_block::<i128>(result.unwrap()), 8);
 
         // Test u128
         let result = perform_math_operation(
@@ -397,61 +456,115 @@ mod tests {
             &DbType::U128,
             &MathOperation::Add,
         );
-        assert_eq!(from_memory_block::<u128>(result), 8);
+        assert_eq!(from_memory_block::<u128>(result.unwrap()), 8);
     }
 
     #[test]
-    #[should_panic(expected = "Division by zero is not allowed")]
     fn test_divide_by_zero() {
-        perform_math_operation(
+        // Must be reported, not panicked on: this used to be a `debug_assert`,
+        // so release builds fell through to a real divide and crashed the
+        // worker thread evaluating the row.
+        let err = perform_math_operation(
             to_le_bytes(5i32).into_slice(),
             to_le_bytes(0i32).into_slice(),
             &DbType::I32,
             &MathOperation::Divide,
-        );
+        )
+        .unwrap_err();
+        assert_eq!(err, EvalError::DivisionByZero);
     }
 
     #[test]
-    #[should_panic(expected = "Root by zero is not allowed")]
+    fn test_divide_by_zero_float() {
+        let err = perform_math_operation(
+            to_le_bytes(5f64).into_slice(),
+            to_le_bytes(0f64).into_slice(),
+            &DbType::F64,
+            &MathOperation::Divide,
+        )
+        .unwrap_err();
+        assert_eq!(err, EvalError::DivisionByZero);
+    }
+
+    #[test]
     fn test_root_by_zero() {
-        perform_math_operation(
+        let err = perform_math_operation(
             to_le_bytes(5i32).into_slice(),
             to_le_bytes(0i32).into_slice(),
             &DbType::I32,
             &MathOperation::Root,
-        );
+        )
+        .unwrap_err();
+        assert_eq!(err, EvalError::RootByZero);
     }
 
     #[test]
-    #[should_panic(expected = "attempt to add with overflow")]
     fn test_edge_cases() {
-        // Test with minimum and maximum values
-        let _result = perform_math_operation(
+        // Overflow is reported in every build profile. The release profile sets
+        // `overflow-checks = false`, so before this was checked explicitly the
+        // same expression wrapped silently and returned a wrong answer.
+        let err = perform_math_operation(
             to_le_bytes(i32::MAX).into_slice(),
             to_le_bytes(1i32).into_slice(),
             &DbType::I32,
             &MathOperation::Add,
-        );
-    }
+        )
+        .unwrap_err();
+        assert_eq!(err, EvalError::ArithmeticOverflow);
 
-    #[test]
-    #[should_panic(expected = "Input slices must have the same length")]
-    fn test_unequal_length_inputs() {
-        let input1_block =  to_le_bytes(5i32);
-        let input2_block =  to_le_bytes(3i16);
-        let input1 = input1_block.into_slice();
-        let input2 = input2_block.into_slice();
-        perform_math_operation(input1, input2, &DbType::I32, &MathOperation::Add);
-    }
+        let err = perform_math_operation(
+            to_le_bytes(i32::MIN).into_slice(),
+            to_le_bytes(1i32).into_slice(),
+            &DbType::I32,
+            &MathOperation::Subtract,
+        )
+        .unwrap_err();
+        assert_eq!(err, EvalError::ArithmeticOverflow);
 
-    #[test]
-    #[should_panic(expected = "Unsupported data type for math operation")]
-    fn test_unsupported_type() {
-        perform_math_operation(
-            to_le_bytes(5i32).into_slice(),
-            to_le_bytes(3i32).into_slice(),
-            &DbType::STRING,
+        let err = perform_math_operation(
+            to_le_bytes(u8::MAX).into_slice(),
+            to_le_bytes(2u8).into_slice(),
+            &DbType::U8,
+            &MathOperation::Multiply,
+        )
+        .unwrap_err();
+        assert_eq!(err, EvalError::ArithmeticOverflow);
+
+        // Floats keep IEEE semantics rather than erroring.
+        let ok = perform_math_operation(
+            to_le_bytes(f64::MAX).into_slice(),
+            to_le_bytes(f64::MAX).into_slice(),
+            &DbType::F64,
             &MathOperation::Add,
         );
+        assert!(ok.is_ok());
+    }
+
+    #[test]
+    fn test_unequal_length_inputs() {
+        let input1_block = to_le_bytes(5i32);
+        let input2_block = to_le_bytes(3i16);
+        let input1 = input1_block.into_slice();
+        let input2 = input2_block.into_slice();
+        let err = perform_math_operation(input1, input2, &DbType::I32, &MathOperation::Add)
+            .unwrap_err();
+        assert_eq!(err, EvalError::OperandSizeMismatch);
+    }
+
+    /// Arithmetic on a type that has none must be reported, not panicked: the
+    /// type comes from a client's query, and a panic here takes down the worker
+    /// thread evaluating the row.
+    #[test]
+    fn test_unsupported_type() {
+        for db_type in [DbType::STRING, DbType::UUID, DbType::NULL, DbType::END] {
+            let err = perform_math_operation(
+                to_le_bytes(5i32).into_slice(),
+                to_le_bytes(3i32).into_slice(),
+                &db_type,
+                &MathOperation::Add,
+            )
+            .unwrap_err();
+            assert_eq!(err, EvalError::UnsupportedType, "for {:?}", db_type);
+        }
     }
 }

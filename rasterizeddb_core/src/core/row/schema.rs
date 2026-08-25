@@ -351,16 +351,36 @@ impl<'a, S: StorageIO> SchemaFieldIterator<'a, S> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TableSchema {
     pub name: String,
     pub fields: SmallVec<[SchemaField; 20]>,
     pub primary_key: Option<String>,
     pub indexes: SmallVec<[TableIndex; 4]>,
     pub is_immutable: bool,
+    /// Foreign keys this table declares, loaded from its sidecar.
+    pub foreign_keys: SmallVec<[crate::core::rql::foreign_key::ForeignKey; 4]>,
+    /// `DEFAULT` expressions, loaded from their sidecar.
+    pub defaults: SmallVec<[crate::core::rql::column_default::ColumnDefault; 8]>,
+    /// Columns declared `JSON`/`JSONB`, each backed by its own table.
+    pub json_columns: SmallVec<[crate::core::rql::json_map::JsonColumn; 4]>,
+    /// Indexes declared over a path into a document column.
+    ///
+    /// Read from a sidecar like the other declarations. Unlike them it changes
+    /// no row layout — it says which paths the filter index should carry, and
+    /// nothing else about the table depends on it.
+    pub path_indexes: SmallVec<[crate::core::rql::path_index::PathIndex; 4]>,
+    /// Table-level `UNIQUE` constraints, composite ones included, loaded from
+    /// their sidecar. A single-column `UNIQUE` written inline on a column is
+    /// recorded on the field instead, as `SchemaField::is_unique`.
+    pub unique_keys: SmallVec<[crate::core::rql::unique_key::UniqueKey; 4]>,
+    /// Declared precision and scale per column — the `(p, s)` of
+    /// `NUMERIC(p, s)`, loaded from their sidecar. A column with no entry keeps
+    /// the engine's default scale, which is what its rows were written with.
+    pub type_modifiers: SmallVec<[crate::core::rql::type_modifier::TypeModifier; 8]>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TableIndex {
     pub name: String,
     pub fields: Vec<String>,
@@ -375,6 +395,12 @@ impl TableSchema {
             primary_key: None,
             indexes: SmallVec::new(),
             is_immutable,
+            foreign_keys: SmallVec::new(),
+            defaults: SmallVec::new(),
+            json_columns: SmallVec::new(),
+            path_indexes: SmallVec::new(),
+            unique_keys: SmallVec::new(),
+            type_modifiers: SmallVec::new(),
         }
     }
 
@@ -416,20 +442,61 @@ impl TableSchema {
             all_fields.append(&mut fields);
         }
 
-        // Deduplicate by field name, keeping the earliest occurrence (lowest write_order)
-        // and preserving original order based on write_order ascending.
-        let mut seen = std::collections::HashSet::new();
-        let mut deduped: SmallVec<[SchemaField; 20]> = SmallVec::new();
-        // Sort by write_order to ensure deterministic order
-        let mut sorted: Vec<SchemaField> = all_fields.into_iter().collect();
-        sorted.sort_by_key(|f| f.write_order);
-        for f in sorted.into_iter() {
-            if seen.insert(f.name.clone()) {
-                deduped.push(f);
+        // Deduplicate by field name. The tie-break is load-bearing, and it used
+        // to be backwards.
+        //
+        // A name can be held by both a tombstone and a live field: `RENAME
+        // COLUMN` is allowed to rename *onto* a dropped column's name, which is
+        // what makes the standard retype dance work (add `_tmp`, copy, drop the
+        // original, rename `_tmp` back). That leaves two records with the same
+        // name — one dead at the old offset with the old type and width, one
+        // live at the new one.
+        //
+        // Keeping the earliest occurrence kept the *lowest* write_order, and the
+        // lowest is the oldest, which for this collision is always the dead one.
+        // So the table loaded its own pre-migration ancestor and every by-name
+        // lookup — 25+ of them across the query path, none filtering
+        // `is_deleted` — resolved to a field at the wrong offset with the wrong
+        // type. Reads returned the migrated-away value; the first write after
+        // that would put bytes at the wrong offset with the wrong width. Two
+        // tables in the live deployment were in this state.
+        //
+        // So: prefer a live record over a tombstone, and the newest among
+        // equals. Fixing it here repairs schemas already written that way, which
+        // is why it is worth doing even though `RENAME COLUMN` no longer creates
+        // the collision.
+        let mut best: std::collections::HashMap<String, SchemaField> =
+            std::collections::HashMap::new();
+        for f in all_fields.into_iter() {
+            match best.get(&f.name) {
+                // `false < true`, so a live record outranks a tombstone, and a
+                // higher write_order outranks a lower one within the same kind.
+                Some(existing)
+                    if (!f.is_deleted, f.write_order)
+                        <= (!existing.is_deleted, existing.write_order) => {}
+                _ => {
+                    best.insert(f.name.clone(), f);
+                }
             }
         }
+        // Ordered by write_order as before: callers index this by position in
+        // places that have not been taught otherwise.
+        let mut deduped: SmallVec<[SchemaField; 20]> = best.into_values().collect();
+        deduped.sort_by_key(|f| f.write_order);
 
         table_schema.fields = deduped;
+        table_schema.foreign_keys =
+            crate::core::rql::foreign_key::load(schema_io.clone()).await;
+        table_schema.defaults =
+            crate::core::rql::column_default::load(schema_io.clone()).await;
+        table_schema.json_columns =
+            crate::core::rql::json_map::load(schema_io.clone()).await;
+        table_schema.path_indexes =
+            crate::core::rql::path_index::load(schema_io.clone()).await;
+        table_schema.unique_keys =
+            crate::core::rql::unique_key::load(schema_io.clone()).await;
+        table_schema.type_modifiers =
+            crate::core::rql::type_modifier::load(schema_io.clone()).await;
 
         Ok(table_schema)
     }
@@ -508,6 +575,14 @@ impl TableSchema {
             primary_key,
             indexes: SmallVec::new(), // Indexes are stored separately,
             is_immutable: immutable,
+            // Foreign keys and defaults live in their own sidecars; `load`
+            // fills them in.
+            foreign_keys: SmallVec::new(),
+            defaults: SmallVec::new(),
+            json_columns: SmallVec::new(),
+            path_indexes: SmallVec::new(),
+            unique_keys: SmallVec::new(),
+            type_modifiers: SmallVec::new(),
         })
     }
 
@@ -516,6 +591,19 @@ impl TableSchema {
         // Schema is small and critical; persist immediately so CREATE TABLE is durable
         // even if the process crashes before any background flush runs.
         schema_io.append_data(&data, true).await;
+        Ok(())
+    }
+
+    /// Overwrites the header record without appending a second one.
+    ///
+    /// [`save`](Self::save) appends, which is right the first time and wrong
+    /// every time after: the file is a `TABLE_SIZE` header followed by field
+    /// records, so a second append would be read back as a malformed field. The
+    /// header is fixed-width and lives at offset zero, so writing over it is
+    /// exact.
+    pub async fn rewrite_header<S: StorageIO>(&self, schema_io: Arc<S>) -> io::Result<()> {
+        let data = self.into_vec();
+        schema_io.write_data(0, &data).await;
         Ok(())
     }
 
@@ -534,37 +622,27 @@ impl TableSchema {
             ))
             .await;
 
-        let mut field_iterator = SchemaFieldIterator::new(&mut field_io).await.unwrap();
-
-        let mut all_fields: SmallVec<[SchemaField; 20]> = SmallVec::new();
-
-        while let Ok(mut fields) = field_iterator.next_schema_fields().await {
-            if fields.is_empty() {
-                break;
-            }
-            all_fields.append(&mut fields);
+        // `self.fields` is the authority for what this schema already holds:
+        // `load` populates it from storage, and each `add_field` appends to it.
+        // Re-reading the field file here instead would depend on the append
+        // being visible through a freshly opened handle, which the in-memory
+        // backend does not guarantee — and when that read came back empty every
+        // column was assigned `write_order` 0 and `offset` 0. Identical write
+        // orders then made `schema_id` useless: two different columns compared
+        // equal, so a SELECT could be served the WHERE clause's columns instead
+        // of the ones it asked for.
+        if self.fields.iter().any(|f| f.name == field_name) {
+            return;
         }
 
-        // Check if field from the table schema already exists
-        for field in all_fields.iter() {
-            if field_name == field.name {
-                return;
-            }
-        }
-
-        // Add fields to the all_fields if they are not already present
-        // for field in  self.fields.iter() {
-        //     if all_fields.iter().any(|f| f.name != field.name) {
-        //         all_fields.push(field.clone());
-        //     }
-        // }
-
-        let offset: u64 = all_fields.iter().map(|f| f.db_type.get_size() as u64).sum();
-        let write_order: u64 = if all_fields.len() > 0 {
-            all_fields.iter().map(|f| f.write_order).max().unwrap_or(0) + 1
-        } else {
-            0
-        };
+        let offset: u64 = self.fields.iter().map(|f| f.size as u64).sum();
+        let write_order: u64 = self
+            .fields
+            .iter()
+            .map(|f| f.write_order)
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0);
 
         let field = SchemaField::new(
             field_name,
@@ -579,12 +657,128 @@ impl TableSchema {
         self.fields.push(field);
     }
 
+    /// Renames a field in the schema and in its persisted record.
+    ///
+    /// Nothing in a row moves: the layout is keyed by `write_order`, and the
+    /// name is metadata. The record is rewritten in place at its own offset,
+    /// so the file keeps its fixed-stride shape.
+    pub async fn rename_field<S: StorageIO>(
+        &mut self,
+        from: &str,
+        to: &str,
+        schema_io: Arc<S>,
+    ) -> Result<(), String> {
+        let filtered: String = to
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if filtered != to {
+            return Err(format!(
+                "column name '{}' contains characters that cannot be stored",
+                to
+            ));
+        }
+        if to.len() > 128 {
+            return Err("column names are limited to 128 characters".to_string());
+        }
+
+        let mut field_io = schema_io
+            .create_new(format!(
+                "{}_{}",
+                schema_io.get_name().replace(".db", ""),
+                "FIELDS.db"
+            ))
+            .await;
+
+        let mut position = 0u64;
+        let mut found = false;
+        let mut all_fields: SmallVec<[SchemaField; 20]> = SmallVec::new();
+        {
+            let mut iterator = SchemaFieldIterator::new(&mut field_io)
+                .await
+                .map_err(|e| e.to_string())?;
+            while let Ok(mut fields) = iterator.next_schema_fields().await {
+                if fields.is_empty() {
+                    break;
+                }
+                all_fields.append(&mut fields);
+            }
+        }
+
+        for field in all_fields.iter_mut() {
+            if field.name.eq_ignore_ascii_case(from) {
+                field.name = to.to_string();
+                let mut vec = field.into_vec();
+                field_io
+                    .write_data_seek(io::SeekFrom::Start(position), &mut vec)
+                    .await;
+                found = true;
+                break;
+            }
+            position += SCHEMA_FIELD_SIZE;
+        }
+
+        if !found {
+            return Err(format!("column '{}' does not exist", from));
+        }
+
+        for field in self.fields.iter_mut() {
+            if field.name.eq_ignore_ascii_case(from) {
+                field.name = to.to_string();
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn set_primary_key(&mut self, primary_key: String) {
         self.primary_key = Some(primary_key);
     }
 
     pub fn add_index(&mut self, index: TableIndex) {
         self.indexes.push(index);
+    }
+
+    /// Clears a column's `UNIQUE` flag, persisting it the way
+    /// `mark_field_as_deleted` persists a drop.
+    ///
+    /// A column declared `UNIQUE` inline carries the constraint as this flag
+    /// rather than as a named sidecar, so dropping it by name needs a way to
+    /// turn it off.
+    pub async fn set_field_unique<S: StorageIO>(
+        &mut self,
+        field_name: &str,
+        unique: bool,
+        schema_io: Arc<S>,
+    ) {
+        let mut field_io = schema_io
+            .create_new(format!(
+                "{}_{}",
+                schema_io.get_name().replace(".db", ""),
+                "FIELDS.db"
+            ))
+            .await;
+        let mut field_iterator = SchemaFieldIterator::new(&mut field_io).await.unwrap();
+        let mut all_fields: SmallVec<[SchemaField; 20]> = SmallVec::new();
+        while let Ok(mut fields) = field_iterator.next_schema_fields().await {
+            if fields.is_empty() {
+                break;
+            }
+            all_fields.append(&mut fields);
+        }
+        let mut position = 0;
+        for field in all_fields.iter_mut() {
+            if field.name.eq_ignore_ascii_case(field_name) {
+                field.is_unique = unique;
+                let mut vec = field.into_vec();
+                field_io
+                    .write_data_seek(io::SeekFrom::Start(position), &mut vec)
+                    .await;
+                break;
+            }
+            position += SCHEMA_FIELD_SIZE;
+        }
+        self.fields = all_fields;
     }
 
     pub async fn mark_field_as_deleted<S: StorageIO>(
@@ -1739,5 +1933,73 @@ mod tests {
         assert_eq!(read_schema1.fields[3].write_order, 3);
         assert_eq!(read_schema1.fields[3].size, 8 + 4);
         assert_eq!(read_schema1.fields[3].is_deleted, true);
+    }
+    /// The retype dance that damaged two tables in the live deployment.
+    ///
+    /// `ALTER TABLE` has no `ALTER COLUMN TYPE` that rewrites in place, so the
+    /// standard way to change a column's type is: add `<name>_tmp` with the new
+    /// type, copy the values across, drop the original, rename `_tmp` back. That
+    /// last step renames *onto* a tombstoned name, which is deliberately allowed
+    /// — and leaves two field records sharing a name.
+    ///
+    /// The load then has to pick one. Picking the lowest `write_order` picked
+    /// the tombstone every time: old offset, old type, old width. A `SELECT`
+    /// returned the value the migration had moved *away from*, reporting
+    /// success, and it survived restarts because every load made the same wrong
+    /// choice.
+    #[tokio::test]
+    async fn a_rename_onto_a_tombstoned_name_loads_the_live_field() {
+        let temp_loc = std::env::temp_dir().join("schema_rename_onto_tombstone");
+        _ = std::fs::remove_dir_all(&temp_loc);
+        let mock_io = Arc::new(
+            LocalStorageProvider::new(
+                temp_loc.to_str().unwrap(),
+                Some("schema_rename_onto_tombstone"),
+            )
+            .await,
+        );
+
+        let mut schema = create_test_table_schema("retype", Some("id"));
+        schema.save(mock_io.clone()).await.unwrap();
+        schema
+            .add_field(mock_io.clone(), "payload_format".into(), DbType::STRING, false)
+            .await;
+        let dead_order = schema
+            .fields
+            .iter()
+            .find(|f| f.name == "payload_format")
+            .expect("added")
+            .write_order;
+
+        schema
+            .add_field(mock_io.clone(), "payload_format_tmp".into(), DbType::I16, false)
+            .await;
+        schema.mark_field_as_deleted("payload_format", mock_io.clone()).await;
+        schema
+            .rename_field("payload_format_tmp", "payload_format", mock_io.clone())
+            .await
+            .expect("rename onto the tombstoned name");
+
+        let loaded = TableSchema::load(mock_io.clone()).await.expect("load");
+        let field = loaded
+            .fields
+            .iter()
+            .find(|f| f.name == "payload_format")
+            .expect("the renamed column is gone entirely");
+
+        assert!(
+            !field.is_deleted,
+            "the load resolved `payload_format` to the tombstone, so every by-name \
+             lookup reads the pre-migration column at its old offset"
+        );
+        assert_eq!(
+            field.db_type,
+            DbType::I16,
+            "the load kept the old column's type, so values are read at the wrong width"
+        );
+        assert!(
+            field.write_order > dead_order,
+            "the load kept the older record; the live one is always the newer"
+        );
     }
 }
