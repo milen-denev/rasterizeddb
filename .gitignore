@@ -1,2 +1,8 @@
 /target
 /old_code/
+test-cred.txt
+deploy_database.sh
+s3_reset.py
+s3_reset.sh
+deploy.sh
+/__pycache__

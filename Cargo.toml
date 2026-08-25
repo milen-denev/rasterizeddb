@@ -1,5 +1,5 @@
 [workspace]
-members = [ "rastcp","rasterizeddb_core", "test_client", "test_db_web"]
+members = [ "rastcp","rasterizeddb_core", "rasterizeddb_compat", "rasterizeddb_filter_tests", "test_client", "test_db_web", "rdb_studio"]
 resolver = "3"
 
 [profile.release]

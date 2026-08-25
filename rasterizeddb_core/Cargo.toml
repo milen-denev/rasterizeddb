@@ -32,6 +32,7 @@ smallvec = { version = "1.15", features = ["union", "write"]}
 arc-swap = "1.8"
 fastrand = "2.3"
 parking_lot = "0.12"
+libc = "0.2"
 clap = { version = "4.5", features = ["derive"] }
 kanal = "0.1"
 rclite = "0.4.1"
@@ -45,10 +46,28 @@ rustls = "0.23"
 tokio-rustls = "0.26"
 rustls-pemfile = "2.2"
 
+# pgwire authentication: SCRAM-SHA-256, and MD5 for older clients.
+sha2 = "0.10"
+hmac = "0.12"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+md-5 = "0.10"
+base64 = "0.22"
+subtle = "2.6"
+
 # NOTE: Cargo does not support `cfg(debug_assertions)` for platform-specific dependencies.
 # These are always available, but only used behind `#[cfg(debug_assertions)]` in code.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# --- s3_backup feature only ---
+# zstd carries the whole snapshot and every archived log segment. It is the
+# only new code pulled in: the S3 client is built on rustls/tokio-rustls/sha2/
+# hmac/base64, which the pgwire listener already required.
+zstd = { version = "0.13", optional = true, features = ["zstdmt"] }
+# Root certificates for the *client* side of TLS. `rustls` ships none, and
+# rustls-native-certs would add a platform dependency for a store the server
+# has no other use for.
+webpki-roots = { version = "1", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.8" }
@@ -82,10 +101,68 @@ harness = false
 name = "server_cache_repeated_query_benchmarks"
 harness = false
 
+[[bench]]
+name = "hotspot_benchmarks"
+harness = false
+
+[[bench]]
+name = "row_path_benchmarks"
+harness = false
+
+[[bench]]
+name = "filter_benchmarks"
+harness = false
+
+[[bench]]
+name = "mmap_scan_benchmarks"
+harness = false
+
+[[bench]]
+name = "append_benchmarks"
+harness = false
+
+[[bench]]
+name = "vacuum_benchmarks"
+harness = false
+
 [features]
-default = ["memory_pool_reuse"]
+default = ["memory_pool_reuse", "replication_compression", "s3_backup", "pg_import", "storage_pools"]
 enable_long_row = []
 enable_data_verification = []
 memory_pool_reuse = []
-sme_v1 = []
-sme_v2 = []
+
+# Compressed transaction exchange between replicating instances.
+#
+# On by default. Turning it off drops the codec, and a node built without it
+# still interoperates with one that has it — the handshake only ever picks a
+# codec both ends advertise, so the link falls back to uncompressed.
+replication_compression = ["dep:zstd"]
+
+# One-way import of a live PostgreSQL database: schema, then data.
+#
+# Off by default. It is the only feature that makes this process a *client* of
+# another database, and a build that never migrates should not carry a second
+# wire protocol. It adds no crate of its own — the PostgreSQL frontend protocol
+# is spoken over the `rustls`/`tokio` the pgwire listener already needs, and the
+# SCRAM exchange reuses `auth::ScramClient` — except the root certificates that
+# `sslmode=verify-full` checks a server against, which `s3_backup` also pulls.
+pg_import = ["dep:webpki-roots"]
+
+# Several storage directories for one database, with a policy that decides
+# which of them a new table's files are created in, and mirrored backup
+# locations.
+#
+# Off by default. A database that only ever writes into one directory should not
+# carry the placement machinery, the mirroring provider, or the extra match arm
+# on every storage call — and with the feature off the pool type collapses to
+# `()` and all of it compiles away. It adds no crate of its own: free space
+# comes from `statvfs` through the `libc` already in the tree, and the pool file
+# is tab-separated text rather than a serialisation format.
+storage_pools = []
+
+# Snapshot + point-in-time backup to any S3-compatible object store.
+#
+# Off by default: it is the only feature that opens an outbound network
+# connection, and a build that never backs up should not carry a compressor,
+# a root certificate bundle, or the code that signs requests.
+s3_backup = ["dep:zstd", "dep:webpki-roots"]
