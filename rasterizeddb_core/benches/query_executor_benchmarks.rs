@@ -10,28 +10,34 @@ use std::borrow::Cow;
 use std::hint::black_box;
 use std::sync::LazyLock;
 
+/// NOTE: `write_order` is what the query plan uses to index into a row — it is
+/// not decorative. Every field here previously passed `write_order = 0`, so the
+/// compiled plan resolved *every* column reference to slot 0 and the benchmarks
+/// silently measured "compare the `id` column against each literal" rather than
+/// the query they name. The values below match the column order in
+/// `setup_test_columns`, which is what makes the plan resolve correctly.
 fn create_benchmark_schema() -> SmallVec<[SchemaField; 20]> {
     smallvec::smallvec![
         SchemaField::new("id".to_string(), DbType::I32, 4, 0, 0, false),
-        SchemaField::new("age".to_string(), DbType::U8, 1, 0, 0, false),
-        SchemaField::new("salary".to_string(), DbType::I32, 4, 0, 0, false),
-        SchemaField::new("name".to_string(), DbType::STRING, 4 + 8, 0, 0, false),
-        SchemaField::new("department".to_string(), DbType::STRING, 4 + 8, 0, 0, false),
-        SchemaField::new("bank_balance".to_string(), DbType::F64, 8, 0, 0, false),
-        SchemaField::new("is_active".to_string(), DbType::U8, 1, 0, 0, false),
-        SchemaField::new("score".to_string(), DbType::F32, 4, 0, 0, false),
-        SchemaField::new("notes".to_string(), DbType::STRING, 4 + 8, 0, 0, false),
-        SchemaField::new("created_at".to_string(), DbType::U64, 8, 0, 0, false),
+        SchemaField::new("age".to_string(), DbType::U8, 1, 0, 1, false),
+        SchemaField::new("salary".to_string(), DbType::I32, 4, 0, 2, false),
+        SchemaField::new("name".to_string(), DbType::STRING, 4 + 8, 0, 3, false),
+        SchemaField::new("department".to_string(), DbType::STRING, 4 + 8, 0, 4, false),
+        SchemaField::new("bank_balance".to_string(), DbType::F64, 8, 0, 5, false),
+        SchemaField::new("is_active".to_string(), DbType::U8, 1, 0, 6, false),
+        SchemaField::new("score".to_string(), DbType::F32, 4, 0, 7, false),
+        SchemaField::new("notes".to_string(), DbType::STRING, 4 + 8, 0, 8, false),
+        SchemaField::new("created_at".to_string(), DbType::U64, 8, 0, 9, false),
         // For execute benchmarks
-        SchemaField::new("earth_position".to_string(), DbType::I8, 1, 0, 0, false),
-        SchemaField::new("test_1".to_string(), DbType::U32, 4, 0, 0, false),
-        SchemaField::new("test_2".to_string(), DbType::U16, 2, 0, 0, false),
-        SchemaField::new("test_3".to_string(), DbType::I128, 16, 0, 0, false),
-        SchemaField::new("test_4".to_string(), DbType::U128, 16, 0, 0, false),
-        SchemaField::new("test_5".to_string(), DbType::I16, 2, 0, 0, false),
-        SchemaField::new("test_6".to_string(), DbType::U64, 8, 0, 0, false),
-        SchemaField::new("credit_balance".to_string(), DbType::F32, 4, 0, 0, false),
-        SchemaField::new("net_assets".to_string(), DbType::I64, 8, 0, 0, false),
+        SchemaField::new("credit_balance".to_string(), DbType::F32, 4, 0, 10, false),
+        SchemaField::new("net_assets".to_string(), DbType::I64, 8, 0, 11, false),
+        SchemaField::new("earth_position".to_string(), DbType::I8, 1, 0, 12, false),
+        SchemaField::new("test_1".to_string(), DbType::U32, 4, 0, 13, false),
+        SchemaField::new("test_2".to_string(), DbType::U16, 2, 0, 14, false),
+        SchemaField::new("test_3".to_string(), DbType::I128, 16, 0, 15, false),
+        SchemaField::new("test_4".to_string(), DbType::U128, 16, 0, 16, false),
+        SchemaField::new("test_5".to_string(), DbType::I16, 2, 0, 17, false),
+        SchemaField::new("test_6".to_string(), DbType::U64, 8, 0, 18, false),
     ]
 }
 
@@ -233,7 +239,11 @@ fn benchmark_execute_query(c: &mut Criterion) {
         c.bench_function(name, move |b| {
             b.iter(|| {
                 let mut bool_buffer_local: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
-                let res = processor_leaked.execute_row(&**columns, &mut bool_buffer_local);
+                // Unwrap so an evaluation failure is a loud benchmark failure
+                // rather than a short-circuit that looks like a speedup.
+                let res = processor_leaked
+                    .execute_row(&**columns, &mut bool_buffer_local)
+                    .expect("WHERE evaluation failed");
                 black_box(res)
             });
         });

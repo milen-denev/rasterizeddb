@@ -17,7 +17,6 @@ use rasterizeddb_core::{
         processor::concurrent_processor::{ATOMIC_CACHE, ENABLE_CACHE},
         row::{
             row::{ColumnWritePayload, RowWrite},
-            row_pointer::RowPointer,
         },
         rql::{
             executor::execute,
@@ -27,6 +26,7 @@ use rasterizeddb_core::{
     },
     memory_pool::{MEMORY_POOL, MemoryBlock},
 };
+use rasterizeddb_core::cache::query_cache::QueryCacheEntry;
 use rclite::Arc;
 use smallvec::smallvec;
 use tempfile::TempDir;
@@ -56,7 +56,10 @@ fn build_context() -> BenchContext {
     MAX_PERMITS_THREADS.get_or_init(|| 16);
     BATCH_SIZE.get_or_init(|| 3_000);
     ATOMIC_CACHE.get_or_init(|| {
-        AtomicGenericCache::<u64, Arc<Vec<RowPointer>>>::new(1024, 10240)
+        // The cache now stores a `QueryCacheEntry`, which carries the table,
+        // the clause and the generation alongside the pointers so a stale
+        // entry is detectable rather than merely unlikely.
+        AtomicGenericCache::<u64, Arc<QueryCacheEntry>>::new(1024, 10240)
     });
     
     ENABLE_CACHE.get_or_init(|| true);
@@ -208,6 +211,14 @@ async fn create_employees_table(database: &Arc<Database>) {
                 },
             ],
             is_immutable: false,
+            foreign_keys: Vec::new(),
+            defaults: Vec::new(),
+            json_columns: Vec::new(),
+            unique_columns: Vec::new(),
+            unique_keys: Vec::new(),
+            type_modifiers: Vec::new(),
+            primary_key: None,
+            if_not_exists: false,
         })
         .await
         .expect("failed to create employees table for benchmark");

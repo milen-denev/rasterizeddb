@@ -27,6 +27,15 @@ use cacheguard::CacheGuard;
 /// Each entry stores a value along with metadata including state, version,
 /// key hash, timestamp, and sequence number. The entry uses atomic operations
 /// for thread-safe access without locks.
+/// The entry is padded to a cache line as a *whole*, which is the granularity
+/// false sharing actually happens at here: two threads working on two entries
+/// must not collide, but the five words of one entry are always touched
+/// together by whichever thread owns it.
+///
+/// Wrapping each field in a `CacheGuard` instead — which is `align(128)` on
+/// x86_64 — put every one of them on its own line: 640 bytes per entry, 84 MB
+/// for an empty cache at the default sizing, and five line fills for a lookup
+/// that needs one.
 #[repr(C, align(64))]
 struct AtomicEntry<K, T>
 where
@@ -34,15 +43,15 @@ where
     K: Hash + Eq + Send + Sync + 'static,
 {
     /// Combined state (lower 32 bits) and version (upper 32 bits)
-    state_version: CacheGuard<AtomicU64>,
+    state_version: AtomicU64,
     /// Hash of the key for this entry
-    key_hash: CacheGuard<AtomicU64>,
+    key_hash: AtomicU64,
     /// Storage for values using ArcSwap
     value_storage: ArcSwap<T>,
     /// UTC timestamp in nanoseconds when the entry was last modified
-    timestamp_nanos: CacheGuard<AtomicU64>,
+    timestamp_nanos: AtomicU64,
     /// Monotonic sequence number for ordering operations
-    sequence: CacheGuard<AtomicU64>,
+    sequence: AtomicU64,
     phantom_key_type: std::marker::PhantomData<K>,
 }
 
@@ -60,6 +69,16 @@ where
     T: Clone + Send + Sync + 'static,
 {
 }
+
+/// Number of consecutive slots examined for a given key.
+///
+/// Entries are placed at `hash & capacity_mask` and probed forward from there,
+/// so every point operation (`get`, `remove`, key-update) touches at most this
+/// many slots instead of walking the whole table. With the cache kept at a sane
+/// load factor a window of 16 makes displacement beyond the window vanishingly
+/// rare; when it does happen the insert evicts the oldest entry in the window
+/// rather than spilling outside it, which keeps lookups correct by construction.
+const PROBE_LIMIT: usize = 16;
 
 /// Entry states for atomic state machine
 const STATE_EMPTY: u32 = 0; // Entry is empty and available
@@ -116,12 +135,24 @@ where
     /// the size and alignment requirements of type T.
     #[inline]
     fn new() -> Self {
+        Self::with_placeholder(Arc::new(T::default()))
+    }
+
+    /// Builds an empty entry whose value slot points at `placeholder`.
+    ///
+    /// Every slot needs *some* value to start with, and the table builds a
+    /// quarter of a million of them. Handing them all the same placeholder
+    /// makes that a refcount bump each rather than an allocation each — the
+    /// contents are unreachable either way, since a slot is only ever read in
+    /// `STATE_WRITTEN` and reaching that state overwrites the value first.
+    #[inline]
+    fn with_placeholder(placeholder: Arc<T>) -> Self {
         Self {
-            key_hash: AtomicU64::new(0).into(),
-            value_storage: ArcSwap::from_pointee(T::default()),
-            timestamp_nanos: AtomicU64::new(0).into(),
-            sequence: AtomicU64::new(0).into(),
-            state_version: AtomicU64::new(pack_state_version(STATE_EMPTY, 0)).into(),
+            key_hash: AtomicU64::new(0),
+            value_storage: ArcSwap::new(placeholder),
+            timestamp_nanos: AtomicU64::new(0),
+            sequence: AtomicU64::new(0),
+            state_version: AtomicU64::new(pack_state_version(STATE_EMPTY, 0)),
             phantom_key_type: std::marker::PhantomData,
         }
     }
@@ -237,8 +268,9 @@ where
 {
     /// Array of cache entries, sized to a power of 2
     entries: Box<[AtomicEntry<K, T>]>,
-    /// Monotonic write index for ring buffer behavior
-    write_index: CacheGuard<AtomicUsize>,
+    /// Live count of `STATE_WRITTEN` entries, so `len()` is O(1) instead of a
+    /// full table scan (it is consulted on every `insert`).
+    entry_count: CacheGuard<AtomicUsize>,
     /// Bit mask for fast modulo operations (capacity - 1)
     capacity_mask: usize,
     max_capacity: usize,
@@ -282,14 +314,15 @@ where
     pub fn new(capacity: usize, max_capacity: usize) -> Arc<Self> {
         let capacity = capacity.next_power_of_two().max(64);
 
+        let placeholder = Arc::new(T::default());
         let mut entries = Vec::with_capacity(capacity);
         for _ in 0..capacity {
-            entries.push(AtomicEntry::new());
+            entries.push(AtomicEntry::with_placeholder(Arc::clone(&placeholder)));
         }
 
         Arc::new(Self {
             entries: entries.into_boxed_slice(),
-            write_index: AtomicUsize::new(0).into(),
+            entry_count: AtomicUsize::new(0).into(),
             capacity_mask: capacity - 1,
             max_capacity,
             // Start from 1 so tests asserting non-zero sequence pass
@@ -313,7 +346,39 @@ where
         let mut h = self.hasher.build_hasher();
         key.hash(&mut h);
         let hash = h.finish();
-        hash | 1
+        // 0 is the "no key" sentinel stored in empty slots, so it is the only
+        // value that must be remapped. Forcing a bit (the previous `hash | 1`)
+        // would pin every home slot to an odd index and waste half the table.
+        if hash == 0 { 1 } else { hash }
+    }
+
+    /// Slot a key hashes to. Entries live at this index or in the
+    /// `PROBE_LIMIT` slots following it.
+    #[inline(always)]
+    fn home_index(&self, key_hash: u64) -> usize {
+        (key_hash as usize) & self.capacity_mask
+    }
+
+    /// Iterator over the probe window for `key_hash`, in probe order.
+    #[inline(always)]
+    fn probe_window(&self, key_hash: u64) -> impl Iterator<Item = &AtomicEntry<K, T>> {
+        let home = self.home_index(key_hash);
+        let mask = self.capacity_mask;
+        let window = PROBE_LIMIT.min(mask + 1);
+        (0..window).map(move |i| &self.entries[(home + i) & mask])
+    }
+
+    /// Finds the live slot holding `key_hash`, if any.
+    #[inline]
+    fn find_slot(&self, key_hash: u64) -> Option<&AtomicEntry<K, T>> {
+        for slot in self.probe_window(key_hash) {
+            if slot.get_state() == STATE_WRITTEN
+                && slot.key_hash.load(Ordering::Relaxed) == key_hash
+            {
+                return Some(slot);
+            }
+        }
+        None
     }
 
     /// Gets the current UTC timestamp in nanoseconds.
@@ -351,27 +416,55 @@ where
         let key_hash = self.hash_key(&key);
         let now = Self::get_timestamp_nanos();
 
-        // Try to update existing entry first
-        if self.try_update_existing(key_hash, &value, now)? {
-            return Ok(true);
-        }
+        self.place(key_hash, &value, now)
+    }
 
-        // Look for available slot using ring buffer approach
-        let max_attempts = self.capacity_mask + 1;
+    /// Places `value` into the probe window for `key_hash`.
+    ///
+    /// Order of preference: update the slot already holding this key, then any
+    /// free/tombstoned slot in the window, then evict the oldest live entry in
+    /// the window. The final step is what keeps the cache a *cache* — a key can
+    /// always be stored, it just costs whichever neighbour was least recently
+    /// written.
+    fn place(&self, key_hash: u64, value: &T, now: u64) -> Result<bool, std::io::Error> {
+        // A handful of rounds absorbs losing a CAS race to a concurrent writer.
+        for round in 0..4 {
+            if self.try_update_existing(key_hash, value, now)? {
+                return Ok(true);
+            }
 
-        for attempt in 0..max_attempts {
-            let write_pos = self.write_index.fetch_add(1, Ordering::Relaxed);
-            let index = write_pos & self.capacity_mask;
-            let slot = &self.entries[index];
+            for slot in self.probe_window(key_hash) {
+                let state = slot.get_state();
+                if state == STATE_EMPTY || state == STATE_TOMBSTONE {
+                    if self.try_acquire_slot(slot, key_hash, value, now)? {
+                        return Ok(true);
+                    }
+                }
+            }
 
-            if let Ok(res) = self.try_acquire_slot(slot, key_hash, &value, now) {
-                if res {
+            // Window is full of live entries: evict the oldest one in it.
+            let mut victim: Option<(&AtomicEntry<K, T>, u64)> = None;
+            for slot in self.probe_window(key_hash) {
+                if slot.get_state() == STATE_WRITTEN {
+                    let seq = slot.sequence.load(Ordering::Relaxed);
+                    if victim.is_none_or(|(_, best)| seq < best) {
+                        victim = Some((slot, seq));
+                    }
+                }
+            }
+
+            if let Some((slot, _)) = victim {
+                if slot
+                    .compare_exchange_state(STATE_WRITTEN, STATE_WRITING)
+                    .is_ok()
+                {
+                    self.write_entry_data(slot, key_hash, value.clone(), now)?;
+                    slot.set_state(STATE_WRITTEN);
                     return Ok(true);
                 }
             }
 
-            // Yield periodically to avoid busy spinning
-            if attempt & 7 == 7 {
+            if round > 0 {
                 std::thread::yield_now();
             }
         }
@@ -414,29 +507,8 @@ where
         let key_hash = self.hash_key(&key);
         let now = Self::get_timestamp_nanos();
 
-        // Try to update existing entry first
-        if self.try_update_existing(key_hash, &value, now)? {
+        if self.place(key_hash, &value, now)? {
             return Ok((true, removed_entries));
-        }
-
-        // Look for available slot using ring buffer approach
-        let max_attempts = self.capacity_mask + 1;
-
-        for attempt in 0..max_attempts {
-            let write_pos = self.write_index.fetch_add(1, Ordering::Relaxed);
-            let index = write_pos & self.capacity_mask;
-            let slot = &self.entries[index];
-
-            if let Ok(res) = self.try_acquire_slot(slot, key_hash, &value, now) {
-                if res {
-                    return Ok((true, removed_entries));
-                }
-            }
-
-            // Yield periodically to avoid busy spinning
-            if attempt & 7 == 7 {
-                std::thread::yield_now();
-            }
         }
 
         // If we still can't insert after removing oldest entries,
@@ -446,21 +518,8 @@ where
             let additional_removed = self.remove_oldest(3);
             removed_entries.extend(additional_removed);
 
-            // Retry insertion one more time
-            for attempt in 0..max_attempts {
-                let write_pos = self.write_index.fetch_add(1, Ordering::Relaxed);
-                let index = write_pos & self.capacity_mask;
-                let slot = &self.entries[index];
-
-                if let Ok(res) = self.try_acquire_slot(slot, key_hash, &value, now) {
-                    if res {
-                        return Ok((true, removed_entries));
-                    }
-                }
-
-                if attempt & 7 == 7 {
-                    std::thread::yield_now();
-                }
+            if self.place(key_hash, &value, now)? {
+                return Ok((true, removed_entries));
             }
         }
 
@@ -498,6 +557,13 @@ where
                     .is_ok()
                 {
                     self.write_entry_data(slot, key_hash, value.clone(), timestamp)?;
+                    // Counted before the slot is published: `clear` and
+                    // `retain` decrement for every WRITTEN slot they tombstone,
+                    // and one that was published first and counted second could
+                    // be decremented for an increment that never happened —
+                    // wrapping the count to `usize::MAX`, after which `insert`
+                    // refuses everything and `force_insert` evicts the table.
+                    self.entry_count.fetch_add(1, Ordering::Relaxed);
                     slot.set_state(STATE_WRITTEN);
                     Ok(true)
                 } else {
@@ -537,7 +603,7 @@ where
         value: &T,
         timestamp: u64,
     ) -> Result<bool, std::io::Error> {
-        for slot in self.entries.iter() {
+        for slot in self.probe_window(key_hash) {
             if slot.get_state() == STATE_WRITTEN
                 && slot.key_hash.load(Ordering::Relaxed) == key_hash
                 && slot
@@ -596,7 +662,7 @@ where
     pub fn get(&self, key: &K) -> Option<T> {
         let key_hash = self.hash_key(key);
 
-        for slot in self.entries.iter() {
+        for slot in self.probe_window(key_hash) {
             if slot.get_state() == STATE_WRITTEN
                 && slot.key_hash.load(Ordering::Relaxed) == key_hash
             {
@@ -629,7 +695,7 @@ where
     pub fn get_with_metadata(&self, key: &K) -> Option<(T, u64, u64)> {
         let key_hash = self.hash_key(key);
 
-        for slot in self.entries.iter() {
+        for slot in self.probe_window(key_hash) {
             if slot.get_state() == STATE_WRITTEN
                 && slot.key_hash.load(Ordering::Relaxed) == key_hash
             {
@@ -673,7 +739,9 @@ where
     /// `true` if the key exists, `false` otherwise
     #[inline]
     pub fn contains_key(&self, key: &K) -> bool {
-        self.get(key).is_some()
+        // Probe for the slot without materializing the value: an existence
+        // check does not need the ArcSwap load and `T::clone` that `get` pays.
+        self.find_slot(self.hash_key(key)).is_some()
     }
 
     /// Checks if the cache contains any of the specified keys.
@@ -711,7 +779,7 @@ where
     pub fn remove(&self, key: &K) -> Option<T> {
         let key_hash = self.hash_key(key);
 
-        for slot in self.entries.iter() {
+        for slot in self.probe_window(key_hash) {
             if slot.get_state() == STATE_WRITTEN
                 && slot.key_hash.load(Ordering::Relaxed) == key_hash
             {
@@ -720,9 +788,11 @@ where
                 if slot
                     .compare_exchange_state(STATE_WRITTEN, STATE_TOMBSTONE)
                     .is_ok()
-                    && slot.key_hash.load(Ordering::Relaxed) == key_hash
                 {
-                    return Some(value);
+                    self.entry_count.fetch_sub(1, Ordering::Relaxed);
+                    if slot.key_hash.load(Ordering::Relaxed) == key_hash {
+                        return Some(value);
+                    }
                 }
             }
         }
@@ -760,6 +830,8 @@ where
                 cleared += 1;
             }
         }
+
+        self.entry_count.fetch_sub(cleared, Ordering::Relaxed);
 
         cleared
     }
@@ -828,6 +900,7 @@ where
                 .compare_exchange_state(STATE_WRITTEN, STATE_TOMBSTONE)
                 .is_ok()
             {
+                self.entry_count.fetch_sub(1, Ordering::Relaxed);
                 // Double-check that this is still the same entry (sequence hasn't changed)
                 let current_sequence = slot.sequence.load(Ordering::Relaxed);
                 if current_sequence == sequence {
@@ -850,10 +923,7 @@ where
     /// Number of entries with STATE_WRITTEN
     #[inline]
     pub fn len(&self) -> usize {
-        self.entries
-            .iter()
-            .filter(|slot| slot.get_state() == STATE_WRITTEN)
-            .count()
+        self.entry_count.load(Ordering::Relaxed)
     }
 
     /// Returns all entries as key-value pairs.
@@ -895,6 +965,7 @@ where
                         .compare_exchange_state(STATE_WRITTEN, STATE_EMPTY)
                         .is_ok()
                 {
+                    self.entry_count.fetch_sub(1, Ordering::Relaxed);
                     results.push((key, value, timestamp, sequence));
                 }
             }
@@ -911,10 +982,7 @@ where
     /// `true` if no entries have STATE_WRITTEN, `false` otherwise
     #[inline]
     pub fn is_empty(&self) -> bool {
-        !self
-            .entries
-            .iter()
-            .any(|slot| slot.get_state() == STATE_WRITTEN)
+        self.len() == 0
     }
 
     /// Returns the total capacity of the cache.
@@ -994,6 +1062,8 @@ where
                 }
             }
         }
+
+        self.entry_count.fetch_sub(removed_count, Ordering::Relaxed);
 
         removed_count
     }
