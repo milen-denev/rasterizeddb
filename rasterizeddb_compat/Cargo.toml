@@ -1,0 +1,43 @@
+[package]
+name = "rasterizeddb_compat"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "PostgreSQL feature-compatibility harness for RasterizedDB: sea-orm entities and raw-SQL probes modelled on a real application schema."
+
+[dependencies]
+rasterizeddb_core = { path = "../rasterizeddb_core" }
+rclite = "0.4.1"
+tokio = { version = "1", features = ["full"] }
+
+sea-orm = { version = "2.0", default-features = false, features = [
+    "sqlx-postgres",
+    "runtime-tokio-rustls",
+    "macros",
+    "with-chrono",
+    "with-uuid",
+    "with-rust_decimal",
+] }
+sqlx = { version = "0.8", default-features = false, features = [
+    "postgres",
+    "runtime-tokio-rustls",
+    "chrono",
+    "uuid",
+    "rust_decimal",
+    # `jsonb` is decoded as a document rather than as text: its binary wire form
+    # carries a one-byte format version, so reading it as a string leaves that
+    # byte on the front of the JSON.
+    "json",
+] }
+
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+rust_decimal = { version = "1", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+env_logger = "0.11"
+
+[[bin]]
+name = "capabilities"
+path = "src/bin/capabilities.rs"
