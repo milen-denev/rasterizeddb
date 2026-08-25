@@ -1,0 +1,20 @@
+[package]
+name = "rasterizeddb_filter_tests"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Exhaustive black-box test suite for the RasterizedDB bit-level filter index."
+
+[dependencies]
+rasterizeddb_core = { path = "../rasterizeddb_core" }
+smallvec = { version = "1.15", features = ["union", "write"] }
+rclite = "0.4.1"
+tokio = { version = "1", features = ["full"] }
+fastrand = "2.3"
+tempfile = "3"
+
+[features]
+# Mirrors the core flag so the whole suite can be run against the long-row
+# pointer layout, which changes ROW_POINTER_RECORD_LEN and therefore the
+# slot arithmetic every test depends on.
+enable_long_row = ["rasterizeddb_core/enable_long_row"]
