@@ -4,6 +4,7 @@
 //! database the name in its connection string reaches, and that two of them do
 //! not leak into each other.
 
+use sqlx::AssertSqlSafe;
 use rasterizeddb_compat::TestServer;
 use rasterizeddb_core::auth::AuthMethod;
 use rasterizeddb_core::core::database::DEFAULT_DATABASE_NAME;
@@ -69,7 +70,7 @@ async fn two_databases_do_not_share_tables() {
             .execute(pool)
             .await
             .expect("each database should take its own CREATE TABLE");
-        sqlx::query(&format!("INSERT INTO items (id) VALUES ({})", value))
+        sqlx::query(AssertSqlSafe(format!("INSERT INTO items (id) VALUES ({})", value)))
             .execute(pool)
             .await
             .expect("insert should succeed");
@@ -128,7 +129,7 @@ async fn the_default_database_cannot_be_dropped() {
     let server = TestServer::start().await.expect("server should start");
     let pool = connect(&server.url()).await.expect("default should accept");
 
-    sqlx::query(&format!("DROP DATABASE {}", DEFAULT_DATABASE_NAME))
+    sqlx::query(AssertSqlSafe(format!("DROP DATABASE {}", DEFAULT_DATABASE_NAME)))
         .execute(&pool)
         .await
         .expect_err("the default database must not be droppable");

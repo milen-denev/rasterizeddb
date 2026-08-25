@@ -13,7 +13,7 @@ use axum::http::{StatusCode, header};
 use axum::{response::Response, routing::get};
 use once_cell::sync::Lazy;
 
-use rand::Rng;
+use rand::RngExt;
 
 use rasterizeddb_core::client::DbClient;
 use rasterizeddb_core::core::db_type::DbType;

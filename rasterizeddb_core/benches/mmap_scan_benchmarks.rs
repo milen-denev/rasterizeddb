@@ -13,7 +13,7 @@ use std::hint::black_box;
 use std::io::Write;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use rand::{RngCore, SeedableRng, rngs::StdRng};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 use tempfile::TempDir;
 
 use rasterizeddb_core::core::row::row_pointer::{ROW_POINTER_RECORD_LEN, RowPointer, RowPointerIterator};

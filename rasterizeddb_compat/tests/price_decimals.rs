@@ -4,6 +4,7 @@
 //! back wrong is not a rounding curiosity: `0.02` read as `0.20` is a tenfold
 //! overcharge, and a rate that reads as `0` skips the charge silently.
 
+use sqlx::AssertSqlSafe;
 use rasterizeddb_compat::TestServer;
 use sqlx::{Executor, Row};
 use sqlx::types::Decimal;
@@ -37,10 +38,10 @@ async fn every_seeded_price_round_trips() {
 
     // Inserted as literals, the way the seed migration writes them.
     for (i, (name, price)) in SEED.iter().enumerate() {
-        pool.execute(sqlx::raw_sql(&format!(
+        pool.execute(sqlx::raw_sql(AssertSqlSafe(format!(
             "INSERT INTO prices (id, price, \"group\", name) VALUES ({}, {}, 'general', '{}')",
             i, price, name
-        )))
+        ))))
         .await
         .unwrap_or_else(|e| panic!("insert {}: {}", name, e));
     }

@@ -5,6 +5,7 @@
 //! failed outright rather than returning something wrong. That is the right
 //! failure mode, and these are the tests that make them work.
 
+use sqlx::AssertSqlSafe;
 use rasterizeddb_compat::TestServer;
 use sqlx::Row;
 
@@ -15,7 +16,7 @@ async fn server() -> (TestServer, sqlx::PgPool) {
 }
 
 async fn run(pool: &sqlx::PgPool, sql: &str) -> Result<(), String> {
-    sqlx::query(sql)
+    sqlx::query(AssertSqlSafe(sql))
         .execute(pool)
         .await
         .map(|_| ())

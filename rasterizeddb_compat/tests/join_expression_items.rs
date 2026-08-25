@@ -9,6 +9,7 @@
 //!
 //! From production, in the auto-tier worker.
 
+use sqlx::AssertSqlSafe;
 use rasterizeddb_compat::TestServer;
 use sqlx::{Executor, Row};
 
@@ -50,7 +51,7 @@ async fn setup(pool: &sqlx::PgPool) {
 }
 
 async fn probe(pool: &sqlx::PgPool, label: &str, sql: &str) -> Result<String, String> {
-    match sqlx::query(sql).fetch_all(pool).await {
+    match sqlx::query(AssertSqlSafe(sql)).fetch_all(pool).await {
         Ok(rows) => {
             let out = rows
                 .iter()

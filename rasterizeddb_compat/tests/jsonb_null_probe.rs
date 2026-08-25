@@ -1,3 +1,4 @@
+use sqlx::AssertSqlSafe;
 use rasterizeddb_compat::TestServer;
 use sqlx::Executor;
 
@@ -25,7 +26,7 @@ async fn isolate_null_into_jsonb() {
     // And the bound forms.
     for (label, cast) in [("bound NULL, no cast", ""), ("bound NULL with cast", "::jsonb")] {
         let sql = format!("INSERT INTO p (id, j) VALUES ($1, $2{})", cast);
-        let r = sqlx::query(&sql)
+        let r = sqlx::query(AssertSqlSafe(&*sql))
             .bind(if cast.is_empty() { 10i32 } else { 11i32 })
             .bind(Option::<String>::None)
             .execute(&pool)

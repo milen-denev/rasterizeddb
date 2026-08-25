@@ -5,6 +5,7 @@
 //! are real: a rollback undoes, a transaction sees its own work and nobody
 //! else's, and a failure inside a block does not commit half of it.
 
+use sqlx::AssertSqlSafe;
 use rasterizeddb_compat::TestServer;
 use sqlx::Row;
 
@@ -15,7 +16,7 @@ async fn server() -> (TestServer, sqlx::PgPool) {
 }
 
 async fn run(pool: &sqlx::PgPool, sql: &str) -> Result<(), String> {
-    sqlx::query(sql)
+    sqlx::query(AssertSqlSafe(sql))
         .execute(pool)
         .await
         .map(|_| ())
@@ -23,7 +24,7 @@ async fn run(pool: &sqlx::PgPool, sql: &str) -> Result<(), String> {
 }
 
 async fn count(pool: &sqlx::PgPool, sql: &str) -> usize {
-    sqlx::query(sql).fetch_all(pool).await.expect("select should succeed").len()
+    sqlx::query(AssertSqlSafe(sql)).fetch_all(pool).await.expect("select should succeed").len()
 }
 
 /// One connection, so `BEGIN` and the statements after it share a session.
@@ -35,7 +36,7 @@ async fn conn(server: &TestServer) -> sqlx::PgConnection {
 }
 
 async fn exec(c: &mut sqlx::PgConnection, sql: &str) -> Result<(), String> {
-    sqlx::query(sql)
+    sqlx::query(AssertSqlSafe(sql))
         .execute(&mut *c)
         .await
         .map(|_| ())
@@ -43,7 +44,7 @@ async fn exec(c: &mut sqlx::PgConnection, sql: &str) -> Result<(), String> {
 }
 
 async fn rows(c: &mut sqlx::PgConnection, sql: &str) -> usize {
-    sqlx::query(sql).fetch_all(&mut *c).await.expect("select").len()
+    sqlx::query(AssertSqlSafe(sql)).fetch_all(&mut *c).await.expect("select").len()
 }
 
 async fn table(pool: &sqlx::PgPool) {
@@ -970,7 +971,7 @@ async fn a_join_does_not_see_another_transactions_uncommitted_writes() {
 }
 
 async fn show(c: &mut sqlx::PgConnection, parameter: &str) -> String {
-    let row = sqlx::query(&format!("SHOW {}", parameter))
+    let row = sqlx::query(AssertSqlSafe(format!("SHOW {}", parameter)))
         .fetch_one(&mut *c)
         .await
         .expect("SHOW answers");
@@ -978,7 +979,7 @@ async fn show(c: &mut sqlx::PgConnection, parameter: &str) -> String {
 }
 
 async fn sqlstate(c: &mut sqlx::PgConnection, sql: &str) -> Option<String> {
-    match sqlx::query(sql).execute(&mut *c).await {
+    match sqlx::query(AssertSqlSafe(sql)).execute(&mut *c).await {
         Ok(_) => None,
         Err(e) => e.as_database_error().and_then(|d| d.code().map(|c| c.to_string())),
     }

@@ -7,6 +7,7 @@
 //! subquery 'SELECT ...'", the ellipsis being literal English from the
 //! comment. The worker failed every cycle.
 
+use sqlx::AssertSqlSafe;
 use rasterizeddb_compat::TestServer;
 use sqlx::{Executor, Row};
 
@@ -17,14 +18,14 @@ async fn server() -> (TestServer, sqlx::PgPool) {
 }
 
 async fn run(pool: &sqlx::PgPool, sql: &str) -> Result<(), String> {
-    pool.execute(sqlx::raw_sql(sql))
+    pool.execute(sqlx::raw_sql(AssertSqlSafe(sql)))
         .await
         .map(|_| ())
         .map_err(|e| e.to_string().lines().next().unwrap_or("").to_string())
 }
 
 async fn count(pool: &sqlx::PgPool, sql: &str) -> i64 {
-    pool.fetch_one(sqlx::raw_sql(sql))
+    pool.fetch_one(sqlx::raw_sql(AssertSqlSafe(sql)))
         .await
         .expect("count")
         .try_get::<i64, _>(0)

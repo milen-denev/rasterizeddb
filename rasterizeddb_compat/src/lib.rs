@@ -12,6 +12,16 @@
 //!
 //! JSON columns and index DDL are deliberately absent: RasterizedDB has its own
 //! leaf-structure indexing and no JSON type is planned.
+//!
+//! # Why `AssertSqlSafe` is everywhere here
+//!
+//! sqlx 0.9 accepts only `&'static str` in `query()`, so any statement built at
+//! runtime has to be wrapped and thereby audited. Sending statements built at
+//! runtime is precisely what this crate is *for*: a probe is a SQL string, and
+//! a sweep generates one per case. Every wrapped statement is composed inside
+//! this crate from its own fixtures — no value crosses in from a user, a
+//! network peer, or a file — so the assertion is sound, and it is a harness
+//! rather than a server in any case.
 
 pub mod entities;
 pub mod probes;

@@ -12,6 +12,7 @@
 //! NULL is now its own key with its own length marker, and a NULL key is
 //! emitted as a NULL rather than as empty bytes.
 
+use sqlx::AssertSqlSafe;
 use rasterizeddb_compat::TestServer;
 use sqlx::Row;
 
@@ -22,7 +23,7 @@ async fn server() -> (TestServer, sqlx::PgPool) {
 }
 
 async fn run(pool: &sqlx::PgPool, sql: &str) {
-    sqlx::query(sql)
+    sqlx::query(AssertSqlSafe(sql))
         .execute(pool)
         .await
         .unwrap_or_else(|e| panic!("{} failed: {}", sql, e));

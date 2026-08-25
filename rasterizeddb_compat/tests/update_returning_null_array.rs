@@ -11,6 +11,7 @@
 //! same column is correct. It is the RETURNING projection on an UPDATE that
 //! emits length 0.
 
+use sqlx::AssertSqlSafe;
 use rasterizeddb_compat::TestServer;
 use sqlx::{Executor, Row};
 
@@ -59,12 +60,12 @@ async fn update_setting_every_column_returns_the_null_array() {
     let (_s, pool) = server().await;
     setup(&pool).await;
 
-    let row = sqlx::query(&format!(
+    let row = sqlx::query(AssertSqlSafe(format!(
         "UPDATE field SET case_id = $1, step_id = $2, label = $3, content_string = $4, \
          content_string_vec = $5, content_attachment = $6, content_number = $7, \
          content_bool = $8 WHERE id = $9 RETURNING {}",
         ALL
-    ))
+    )))
     .bind(7i32)
     .bind(3i32)
     .bind("Notes")
@@ -90,12 +91,12 @@ async fn update_returning_inside_a_transaction() {
     setup(&pool).await;
 
     let mut tx = pool.begin().await.expect("begin");
-    let row = sqlx::query(&format!(
+    let row = sqlx::query(AssertSqlSafe(format!(
         "UPDATE field SET case_id = $1, step_id = $2, label = $3, content_string = $4, \
          content_string_vec = $5, content_attachment = $6, content_number = $7, \
          content_bool = $8 WHERE id = $9 RETURNING {}",
         ALL
-    ))
+    )))
     .bind(7i32)
     .bind(3i32)
     .bind("Notes")
@@ -145,7 +146,7 @@ async fn setting_the_array_to_null_returns_null() {
 async fn delete_returning_reports_the_null_array() {
     let (_s, pool) = server().await;
     setup(&pool).await;
-    let row = sqlx::query(&format!("DELETE FROM field WHERE id = $1 RETURNING {}", ALL))
+    let row = sqlx::query(AssertSqlSafe(format!("DELETE FROM field WHERE id = $1 RETURNING {}", ALL)))
         .bind(1i32)
         .fetch_one(&pool)
         .await

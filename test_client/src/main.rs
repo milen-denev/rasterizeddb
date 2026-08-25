@@ -3,7 +3,7 @@
 
 use futures::future::join_all;
 use log::LevelFilter;
-use rand::Rng;
+use rand::RngExt;
 use rasterizeddb_core::{
     client::DbClient,
     core::{

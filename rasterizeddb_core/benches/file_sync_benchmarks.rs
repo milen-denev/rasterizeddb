@@ -3,7 +3,7 @@ use std::io::Write;
 use std::sync::atomic::Ordering;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use rand::{RngCore, SeedableRng, rngs::StdRng};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 use tempfile::TempDir;
 
 use rasterizeddb_core::core::storage_providers::file_sync::LocalStorageProvider;

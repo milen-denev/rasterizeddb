@@ -11,6 +11,7 @@
 //!
 //! Verbatim from production, inserting user-table rows through the API.
 
+use sqlx::AssertSqlSafe;
 use rasterizeddb_compat::TestServer;
 use sqlx::{Executor, Row};
 
@@ -108,10 +109,10 @@ async fn scalars_objects_and_arrays_share_a_column() {
     ];
 
     for (id, literal, _) in &cases {
-        pool.execute(sqlx::raw_sql(&format!(
+        pool.execute(sqlx::raw_sql(AssertSqlSafe(format!(
             "INSERT INTO utrn_mix (row_id, c_v) VALUES ({}, {})",
             id, literal
-        )))
+        ))))
         .await
         .unwrap_or_else(|e| panic!("insert {}: {}", literal, e));
     }

@@ -6,6 +6,7 @@
 //! its references are sound when they are not, so these tests assert that a
 //! violation is *refused* rather than recorded.
 
+use sqlx::AssertSqlSafe;
 use rasterizeddb_compat::{TestServer, probes};
 
 async fn server() -> (TestServer, sqlx::PgPool) {
@@ -16,7 +17,7 @@ async fn server() -> (TestServer, sqlx::PgPool) {
 }
 
 async fn run(pool: &sqlx::PgPool, sql: &str) -> Result<(), String> {
-    sqlx::query(sql)
+    sqlx::query(AssertSqlSafe(sql))
         .execute(pool)
         .await
         .map(|_| ())
@@ -24,7 +25,7 @@ async fn run(pool: &sqlx::PgPool, sql: &str) -> Result<(), String> {
 }
 
 async fn count(pool: &sqlx::PgPool, sql: &str) -> usize {
-    sqlx::query(sql).fetch_all(pool).await.expect("select should succeed").len()
+    sqlx::query(AssertSqlSafe(sql)).fetch_all(pool).await.expect("select should succeed").len()
 }
 
 /// Builds a parent and a child related by `action`.

@@ -8,6 +8,7 @@
 //! slot with no value, is how a zero-length payload reaches a client under a
 //! fixed-width type.
 
+use sqlx::AssertSqlSafe;
 use rasterizeddb_compat::TestServer;
 use sqlx::{Executor, Row};
 
@@ -62,10 +63,10 @@ async fn columns_added_by_migration_then_returned() {
     }
 
     // The pre-migration row, read through RETURNING on an update.
-    let row = sqlx::query(&format!(
+    let row = sqlx::query(AssertSqlSafe(format!(
         "UPDATE \"field\" SET \"content_string\" = $1 WHERE \"id\" = $2 RETURNING {}",
         RET
-    ))
+    )))
     .bind("typed")
     .bind(1i32)
     .fetch_one(&pool)
@@ -75,10 +76,10 @@ async fn columns_added_by_migration_then_returned() {
     assert_eq!(row.get::<Option<Vec<String>>, _>("content_string_vec"), None);
 
     // A row inserted after the migration.
-    let row = sqlx::query(&format!(
+    let row = sqlx::query(AssertSqlSafe(format!(
         "INSERT INTO \"field\" (\"id\", \"case_id\", \"label\") VALUES ($1, $2, $3) RETURNING {}",
         RET
-    ))
+    )))
     .bind(2i32)
     .bind(7i32)
     .bind("Notes")
@@ -89,7 +90,7 @@ async fn columns_added_by_migration_then_returned() {
 
     // And a plain read of both.
     for id in [1i32, 2] {
-        let row = sqlx::query(&format!("SELECT {} FROM \"field\" WHERE \"id\" = $1", RET))
+        let row = sqlx::query(AssertSqlSafe(format!("SELECT {} FROM \"field\" WHERE \"id\" = $1", RET)))
             .bind(id)
             .fetch_one(&pool)
             .await

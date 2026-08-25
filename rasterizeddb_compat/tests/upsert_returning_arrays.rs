@@ -7,6 +7,7 @@
 //! zero-length payload under a real array type panics sqlx's decoder — five
 //! `i32` headers are read before any element — rather than erroring.
 
+use sqlx::AssertSqlSafe;
 use rasterizeddb_compat::TestServer;
 use sqlx::{Executor, Row};
 
@@ -53,13 +54,13 @@ async fn upsert_insert_branch_returning_nulls() {
     let (_s, pool) = server().await;
     create(&pool).await;
 
-    let row = sqlx::query(&format!(
+    let row = sqlx::query(AssertSqlSafe(format!(
         "INSERT INTO \"field\" (\"id\", \"case_id\", \"step_id\", \"label\", \"content_string\") \
          VALUES ($1, $2, $3, $4, $5) \
          ON CONFLICT (\"id\") DO UPDATE SET \"content_string\" = $5 \
          RETURNING {}",
         RETURNING
-    ))
+    )))
     .bind(1i32)
     .bind(7i32)
     .bind(3i32)
@@ -80,13 +81,13 @@ async fn upsert_conflict_branch_returning_nulls() {
     create(&pool).await;
 
     for (n, text) in [(1, "t"), (2, "ty"), (3, "typ"), (4, "type")] {
-        let row = sqlx::query(&format!(
+        let row = sqlx::query(AssertSqlSafe(format!(
             "INSERT INTO \"field\" (\"id\", \"case_id\", \"step_id\", \"label\", \"content_string\") \
              VALUES ($1, $2, $3, $4, $5) \
              ON CONFLICT (\"id\") DO UPDATE SET \"content_string\" = $5 \
              RETURNING {}",
             RETURNING
-        ))
+        )))
         .bind(1i32)
         .bind(7i32)
         .bind(3i32)
@@ -127,11 +128,11 @@ async fn upsert_do_nothing_returning() {
         .await
         .expect("seed");
 
-    let rows = sqlx::query(&format!(
+    let rows = sqlx::query(AssertSqlSafe(format!(
         "INSERT INTO \"field\" (\"id\", \"case_id\", \"step_id\", \"label\") \
          VALUES ($1, $2, $3, $4) ON CONFLICT (\"id\") DO NOTHING RETURNING {}",
         RETURNING
-    ))
+    )))
     .bind(1i32)
     .bind(7i32)
     .bind(3i32)

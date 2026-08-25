@@ -9,6 +9,7 @@
 //! The constraint still has to hold when the statement *does* write to it,
 //! which is the other half of this file.
 
+use sqlx::AssertSqlSafe;
 use rasterizeddb_compat::TestServer;
 use sqlx::Row;
 
@@ -19,7 +20,7 @@ async fn server() -> (TestServer, sqlx::PgPool) {
 }
 
 async fn run(pool: &sqlx::PgPool, sql: &str) -> Result<(), String> {
-    sqlx::query(sql)
+    sqlx::query(AssertSqlSafe(sql))
         .execute(pool)
         .await
         .map(|_| ())

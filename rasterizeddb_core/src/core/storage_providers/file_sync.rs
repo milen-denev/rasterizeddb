@@ -1796,7 +1796,7 @@ mod test {
         sync::atomic::Ordering,
     };
 
-    use rand::{RngCore, SeedableRng, rngs::StdRng};
+    use rand::{Rng, SeedableRng, rngs::StdRng};
 
     use crate::core::storage_providers::{file_sync::LocalStorageProvider, traits::StorageIO};
 
@@ -2210,7 +2210,7 @@ mod test {
 
     #[tokio::test]
     async fn test_append_immediate_then_read_back() {
-        use rand::{RngCore, SeedableRng, rngs::StdRng};
+        use rand::{Rng, SeedableRng, rngs::StdRng};
 
         let init = 4096usize;
         let (provider, initial_data, _extra) = create_provider(init, 0).await;
@@ -2247,7 +2247,7 @@ mod test {
 
     #[tokio::test]
     async fn test_append_immediate_then_staged_then_read_across_both() {
-        use rand::{RngCore, SeedableRng, rngs::StdRng};
+        use rand::{Rng, SeedableRng, rngs::StdRng};
 
         let init = 2048usize;
         let (provider, _initial_data, _extra) = create_provider(init, 0).await;
@@ -2285,7 +2285,7 @@ mod test {
 
     #[tokio::test]
     async fn test_many_small_appends_mixed_then_piecewise_reads() {
-        use rand::{RngCore, SeedableRng, rngs::StdRng};
+        use rand::{Rng, SeedableRng, rngs::StdRng};
 
         let init = 1024usize;
         let (provider, _initial_data, _extra) = create_provider(init, 0).await;
@@ -2335,7 +2335,7 @@ mod test {
 
     #[tokio::test]
     async fn test_service_flush_from_temp_to_main_with_length_checks() {
-        use rand::{RngCore, SeedableRng, rngs::StdRng};
+        use rand::{Rng, SeedableRng, rngs::StdRng};
         use tokio::time::{sleep, Duration};
         use std::sync::Arc;
 

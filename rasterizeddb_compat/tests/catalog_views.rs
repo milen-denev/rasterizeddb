@@ -13,6 +13,7 @@
 //! is the oracle — a shared list would agree with itself even when both are
 //! wrong.
 
+use sqlx::AssertSqlSafe;
 use rasterizeddb_compat::TestServer;
 use sqlx::{Column, Row};
 
@@ -28,7 +29,7 @@ async fn server() -> (TestServer, sqlx::PgPool) {
 
 /// The column names a `SELECT *` announces, in order.
 async fn described(pool: &sqlx::PgPool, sql: &str) -> Vec<String> {
-    let rows = sqlx::query(sql).fetch_all(pool).await.expect("query should succeed");
+    let rows = sqlx::query(AssertSqlSafe(sql)).fetch_all(pool).await.expect("query should succeed");
     let first = rows.first().expect("expected at least one row");
     first.columns().iter().map(|c| c.name().to_string()).collect()
 }

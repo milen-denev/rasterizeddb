@@ -1,5 +1,6 @@
 //! Runs a single SQL statement against a fresh server, for narrowing down a
 //! specific failure: `cargo run -p rasterizeddb_compat --example probe_one -- "<sql>"`
+use sqlx::AssertSqlSafe;
 use rasterizeddb_compat::{TestServer, probes};
 use sqlx::{Column, Row, ValueRef};
 
@@ -10,7 +11,7 @@ async fn main() -> anyhow::Result<()> {
     let pool = server.connect_sqlx().await?;
     probes::apply_schema(&pool).await?;
 
-    let rows = sqlx::query(&sql).fetch_all(&pool).await?;
+    let rows = sqlx::query(AssertSqlSafe(&*sql)).fetch_all(&pool).await?;
     println!("-- {} row(s)", rows.len());
     for r in &rows {
         let cells: Vec<String> = (0..r.columns().len())

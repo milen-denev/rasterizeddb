@@ -18,9 +18,13 @@ sea-orm = { version = "2.0", default-features = false, features = [
     "with-uuid",
     "with-rust_decimal",
 ] }
-sqlx = { version = "0.8", default-features = false, features = [
+sqlx = { version = "0.9", default-features = false, features = [
     "postgres",
-    "runtime-tokio-rustls",
+    # 0.9 split the old `runtime-tokio-rustls` into the runtime and the TLS
+    # provider. `ring` is named explicitly to match what the rest of the
+    # workspace links, so one provider is built rather than two.
+    "runtime-tokio",
+    "tls-rustls-ring",
     "chrono",
     "uuid",
     "rust_decimal",

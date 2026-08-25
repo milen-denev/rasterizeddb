@@ -1,5 +1,6 @@
 //! Runs several statements in order against one fresh server, for exercising a
 //! DDL sequence: `cargo run -p rasterizeddb_compat --example probe_many -- "stmt" "stmt" …`
+use sqlx::AssertSqlSafe;
 use rasterizeddb_compat::{TestServer, probes};
 use sqlx::{Column, Row, ValueRef};
 
@@ -12,7 +13,7 @@ async fn main() -> anyhow::Result<()> {
 
     for sql in &statements {
         print!("-- {}\n", sql);
-        match sqlx::query(sql).fetch_all(&pool).await {
+        match sqlx::query(AssertSqlSafe(&**sql)).fetch_all(&pool).await {
             Err(e) => println!("   ERROR: {}", e.to_string().lines().next().unwrap_or("")),
             Ok(rows) => {
                 println!("   ok, {} row(s)", rows.len());

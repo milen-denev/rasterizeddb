@@ -4,6 +4,7 @@
 //! field. The scan can only sort stored columns, so these keys are evaluated
 //! per row after it, and the page is cut after the sort.
 
+use sqlx::AssertSqlSafe;
 use rasterizeddb_compat::TestServer;
 use sqlx::Row;
 
@@ -14,7 +15,7 @@ async fn server() -> (TestServer, sqlx::PgPool) {
 }
 
 async fn run(pool: &sqlx::PgPool, sql: &str) -> Result<(), String> {
-    sqlx::query(sql)
+    sqlx::query(AssertSqlSafe(sql))
         .execute(pool)
         .await
         .map(|_| ())
@@ -22,7 +23,7 @@ async fn run(pool: &sqlx::PgPool, sql: &str) -> Result<(), String> {
 }
 
 async fn ids(pool: &sqlx::PgPool, sql: &str) -> Result<Vec<i32>, String> {
-    Ok(sqlx::query(sql)
+    Ok(sqlx::query(AssertSqlSafe(sql))
         .fetch_all(pool)
         .await
         .map_err(|e| e.to_string().lines().next().unwrap_or("").to_string())?

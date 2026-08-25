@@ -3,6 +3,7 @@
 //! `SELECT a.user_table_id, SUM(a.slow_calls)::bigint … FROM … a JOIN …
 //! GROUP BY a.user_table_id, …`.
 
+use sqlx::AssertSqlSafe;
 use rasterizeddb_compat::TestServer;
 use sqlx::Row;
 
@@ -13,7 +14,7 @@ async fn server() -> (TestServer, sqlx::PgPool) {
 }
 
 async fn run(pool: &sqlx::PgPool, sql: &str) -> Result<(), String> {
-    sqlx::query(sql)
+    sqlx::query(AssertSqlSafe(sql))
         .execute(pool)
         .await
         .map(|_| ())

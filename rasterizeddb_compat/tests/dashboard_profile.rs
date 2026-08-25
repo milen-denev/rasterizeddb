@@ -3,16 +3,17 @@
 //! Run explicitly:
 //!   cargo test -p rasterizeddb_compat --test dashboard_profile -- --ignored --nocapture
 
+use sqlx::AssertSqlSafe;
 use rasterizeddb_compat::TestServer;
 use sqlx::Executor;
 use std::time::Instant;
 
 async fn timed(pool: &sqlx::PgPool, label: &str, sql: &str, iters: u32) -> f64 {
     // Warm once so parse/plan caches are not charged to the first iteration.
-    let _ = pool.fetch_all(sqlx::raw_sql(sql)).await;
+    let _ = pool.fetch_all(sqlx::raw_sql(AssertSqlSafe(sql))).await;
     let start = Instant::now();
     for _ in 0..iters {
-        pool.fetch_all(sqlx::raw_sql(sql))
+        pool.fetch_all(sqlx::raw_sql(AssertSqlSafe(sql)))
             .await
             .unwrap_or_else(|e| panic!("{} failed: {}", label, e));
     }
@@ -47,10 +48,10 @@ async fn dashboard_query_shapes() {
         .await
         .expect("seed domain");
     for i in 0..50i32 {
-        pool.execute(sqlx::raw_sql(&format!(
+        pool.execute(sqlx::raw_sql(AssertSqlSafe(format!(
             "INSERT INTO case_model (id, domain_id, name) VALUES ({}, 1, 'm{}')",
             i, i
-        )))
+        ))))
         .await
         .expect("seed case_model");
     }
@@ -64,13 +65,13 @@ async fn dashboard_query_shapes() {
         )).await.expect("recreate kase");
         let seed = Instant::now();
         for i in 0..rows {
-            pool.execute(sqlx::raw_sql(&format!(
+            pool.execute(sqlx::raw_sql(AssertSqlSafe(format!(
                 "INSERT INTO kase (id, case_model_id, state, title) VALUES ({}, {}, '{}', 't{}')",
                 i,
                 i % 50,
                 if i % 3 == 0 { "active" } else { "done" },
                 i
-            )))
+            ))))
             .await
             .expect("seed kase");
         }
@@ -105,7 +106,7 @@ async fn dashboard_query_shapes() {
                     2 => "SELECT id, name FROM domain WHERE id = 1 LIMIT 1".to_string(),
                     _ => "SELECT COUNT(*) FROM case_model".to_string(),
                 };
-                pool.fetch_all(sqlx::raw_sql(&sql)).await.expect("card query");
+                pool.fetch_all(sqlx::raw_sql(AssertSqlSafe(&*sql))).await.expect("card query");
             }));
         }
         for h in handles {
@@ -121,10 +122,10 @@ async fn dashboard_query_shapes() {
     // The seeding write on the read path.
     let w = Instant::now();
     for i in 10000..10020i32 {
-        pool.execute(sqlx::raw_sql(&format!(
+        pool.execute(sqlx::raw_sql(AssertSqlSafe(format!(
             "INSERT INTO kase (id, case_model_id, state, title) VALUES ({}, 1, 'x', 't')",
             i
-        )))
+        ))))
         .await
         .expect("write");
     }

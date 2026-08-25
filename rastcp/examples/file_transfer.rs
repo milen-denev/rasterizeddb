@@ -1,10 +1,22 @@
 use rastcp::{client::TcpClientBuilder, error::RastcpError, server::TcpServerBuilder};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
+
+/// bincode 2 takes the configuration explicitly and hands back how many bytes
+/// it read alongside the value. These wrap both, so the call sites below read
+/// the way they did under 1.x's derived defaults.
+fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, bincode::error::EncodeError> {
+    bincode::serde::encode_to_vec(value, bincode::config::standard())
+}
+
+fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, bincode::error::DecodeError> {
+    bincode::serde::decode_from_slice(bytes, bincode::config::standard()).map(|(value, _)| value)
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 enum Command {
@@ -34,7 +46,7 @@ impl FileServer {
 
     async fn handle_command(&self, data: Vec<u8>) -> Vec<u8> {
         // Try to deserialize the command
-        match bincode::deserialize::<Command>(&data) {
+        match decode::<Command>(&data) {
             Ok(cmd) => match cmd {
                 Command::ListFiles => self.list_files().await,
                 Command::DownloadFile { name } => self.download_file(name).await,
@@ -44,7 +56,7 @@ impl FileServer {
                 let response = Response::Error {
                     message: "Failed to parse command".to_string(),
                 };
-                bincode::serialize(&response).unwrap()
+                encode(&response).unwrap()
             }
         }
     }
@@ -69,13 +81,13 @@ impl FileServer {
                 }
 
                 let response = Response::FileList { files };
-                bincode::serialize(&response).unwrap()
+                encode(&response).unwrap()
             }
             Err(e) => {
                 let response = Response::Error {
                     message: format!("Failed to list files: {}", e),
                 };
-                bincode::serialize(&response).unwrap()
+                encode(&response).unwrap()
             }
         }
     }
@@ -89,7 +101,7 @@ impl FileServer {
             let response = Response::Error {
                 message: "Invalid file path".to_string(),
             };
-            return bincode::serialize(&response).unwrap();
+            return encode(&response).unwrap();
         }
 
         // Read the file
@@ -100,17 +112,17 @@ impl FileServer {
                     let response = Response::Error {
                         message: format!("Failed to read file: {}", e),
                     };
-                    return bincode::serialize(&response).unwrap();
+                    return encode(&response).unwrap();
                 }
 
                 let response = Response::FileData { data };
-                bincode::serialize(&response).unwrap()
+                encode(&response).unwrap()
             }
             Err(e) => {
                 let response = Response::Error {
                     message: format!("Failed to open file: {}", e),
                 };
-                bincode::serialize(&response).unwrap()
+                encode(&response).unwrap()
             }
         }
     }
@@ -124,7 +136,7 @@ impl FileServer {
             let response = Response::Error {
                 message: "Invalid file path".to_string(),
             };
-            return bincode::serialize(&response).unwrap();
+            return encode(&response).unwrap();
         }
 
         // Write the file
@@ -134,19 +146,19 @@ impl FileServer {
                     let response = Response::Error {
                         message: format!("Failed to write file: {}", e),
                     };
-                    return bincode::serialize(&response).unwrap();
+                    return encode(&response).unwrap();
                 }
 
                 let response = Response::Success {
                     message: format!("File '{}' uploaded successfully", name),
                 };
-                bincode::serialize(&response).unwrap()
+                encode(&response).unwrap()
             }
             Err(e) => {
                 let response = Response::Error {
                     message: format!("Failed to create file: {}", e),
                 };
-                bincode::serialize(&response).unwrap()
+                encode(&response).unwrap()
             }
         }
     }
@@ -270,7 +282,7 @@ async fn run_client(args: &[String]) -> Result<(), RastcpError> {
     };
 
     // Serialize and send the command
-    let serialized_cmd = match bincode::serialize(&cmd) {
+    let serialized_cmd = match encode(&cmd) {
         Ok(data) => data,
         Err(e) => {
             println!("Error serializing command: {}", e);
@@ -281,7 +293,7 @@ async fn run_client(args: &[String]) -> Result<(), RastcpError> {
     let response_data = client.send(serialized_cmd).await?;
 
     // Process the response
-    let response: Response = match bincode::deserialize(&response_data) {
+    let response: Response = match decode(&response_data) {
         Ok(r) => r,
         Err(e) => {
             println!("Error deserializing response: {}", e);

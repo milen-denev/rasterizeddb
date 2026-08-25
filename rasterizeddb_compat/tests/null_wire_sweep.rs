@@ -9,6 +9,7 @@
 //!
 //! A panic here surfaces as a test failure naming the column and the path.
 
+use sqlx::AssertSqlSafe;
 use rasterizeddb_compat::TestServer;
 use sqlx::{Executor, Row};
 
@@ -61,17 +62,17 @@ fn decode_all(row: &sqlx::postgres::PgRow, path: &str) {
 #[tokio::test]
 async fn all_nulls_through_insert_returning() {
     let (_s, pool) = server().await;
-    pool.execute(sqlx::raw_sql(&format!(
+    pool.execute(sqlx::raw_sql(AssertSqlSafe(format!(
         "CREATE TABLE sweep (id INT PRIMARY KEY, {})",
         COLUMNS
-    )))
+    ))))
     .await
     .expect("create");
 
-    let row = sqlx::query(&format!(
+    let row = sqlx::query(AssertSqlSafe(format!(
         "INSERT INTO sweep (id) VALUES ($1) RETURNING id, {}",
         LIST
-    ))
+    )))
     .bind(1i32)
     .fetch_one(&pool)
     .await
@@ -82,10 +83,10 @@ async fn all_nulls_through_insert_returning() {
 #[tokio::test]
 async fn all_nulls_through_update_returning_and_select() {
     let (_s, pool) = server().await;
-    pool.execute(sqlx::raw_sql(&format!(
+    pool.execute(sqlx::raw_sql(AssertSqlSafe(format!(
         "CREATE TABLE sweep2 (id INT PRIMARY KEY, {})",
         COLUMNS
-    )))
+    ))))
     .await
     .expect("create");
     sqlx::query("INSERT INTO sweep2 (id) VALUES ($1)")
@@ -94,10 +95,10 @@ async fn all_nulls_through_update_returning_and_select() {
         .await
         .expect("insert");
 
-    let row = sqlx::query(&format!(
+    let row = sqlx::query(AssertSqlSafe(format!(
         "UPDATE sweep2 SET c_text = $1 WHERE id = $2 RETURNING id, {}",
         LIST
-    ))
+    )))
     .bind("set")
     .bind(1i32)
     .fetch_one(&pool)
@@ -105,14 +106,14 @@ async fn all_nulls_through_update_returning_and_select() {
     .expect("update returning");
     decode_all(&row, "UPDATE RETURNING");
 
-    let row = sqlx::query(&format!("SELECT id, {} FROM sweep2 WHERE id = $1", LIST))
+    let row = sqlx::query(AssertSqlSafe(format!("SELECT id, {} FROM sweep2 WHERE id = $1", LIST)))
         .bind(1i32)
         .fetch_one(&pool)
         .await
         .expect("select");
     decode_all(&row, "SELECT");
 
-    let row = sqlx::query(&format!("SELECT id, {} FROM sweep2", LIST))
+    let row = sqlx::query(AssertSqlSafe(format!("SELECT id, {} FROM sweep2", LIST)))
         .fetch_one(&pool)
         .await
         .expect("select all");

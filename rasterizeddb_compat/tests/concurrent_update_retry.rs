@@ -10,6 +10,7 @@
 //! The replay must never become a silent empty answer: a retry that matches
 //! nothing reports the original conflict instead.
 
+use sqlx::AssertSqlSafe;
 use rasterizeddb_compat::TestServer;
 use sqlx::{Executor, Row};
 
@@ -20,7 +21,7 @@ async fn server() -> (TestServer, sqlx::PgPool) {
 }
 
 async fn run(pool: &sqlx::PgPool, sql: &str) -> Result<(), String> {
-    pool.execute(sqlx::raw_sql(sql))
+    pool.execute(sqlx::raw_sql(AssertSqlSafe(sql)))
         .await
         .map(|_| ())
         .map_err(|e| e.to_string().lines().next().unwrap_or("").to_string())

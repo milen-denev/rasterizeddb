@@ -13,6 +13,7 @@
 //! that instead — describe still materialises nothing, which is the constraint
 //! that matters.
 
+use sqlx::AssertSqlSafe;
 use rasterizeddb_compat::TestServer;
 use sqlx::{Column, Row};
 
@@ -24,7 +25,7 @@ async fn server() -> (TestServer, sqlx::PgPool) {
 
 /// The columns a statement's rows actually carry, by name.
 async fn described(pool: &sqlx::PgPool, sql: &str) -> Vec<String> {
-    let rows = sqlx::query(sql)
+    let rows = sqlx::query(AssertSqlSafe(sql))
         .fetch_all(pool)
         .await
         .unwrap_or_else(|e| panic!("{} failed: {}", sql, e));
@@ -119,11 +120,11 @@ async fn an_aggregate_over_a_derived_table_announces_its_columns() {
         .await
         .expect("create");
     for i in 1..=3 {
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "INSERT INTO su (id, k, total_bytes) VALUES ({}, 'a', {})",
             i,
             i * 100
-        ))
+        )))
         .execute(&pool)
         .await
         .expect("insert");

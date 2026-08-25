@@ -6,6 +6,7 @@
 //! at all: the quotes and the cast become part of the data, and every later
 //! read returns `'x'::text` where the application wrote `x`.
 
+use sqlx::AssertSqlSafe;
 use rasterizeddb_compat::TestServer;
 use sqlx::{Executor, Row};
 
@@ -112,10 +113,10 @@ async fn inline_values_containing_punctuation_are_left_alone() {
         (5, "'::'", "::"),
         (6, "''", ""),
     ] {
-        pool.execute(sqlx::raw_sql(&format!(
+        pool.execute(sqlx::raw_sql(AssertSqlSafe(format!(
             "INSERT INTO punct (id, a) VALUES ({}, {})",
             id, literal
-        )))
+        ))))
         .await
         .unwrap_or_else(|e| panic!("insert {}: {}", literal, e));
 

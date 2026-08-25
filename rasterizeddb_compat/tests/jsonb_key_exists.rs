@@ -5,6 +5,7 @@
 //! it on every autosave, where it failed with
 //! `unexpected character '?' in WHERE clause`.
 
+use sqlx::AssertSqlSafe;
 use rasterizeddb_compat::TestServer;
 use sqlx::{Executor, Row};
 
@@ -23,17 +24,17 @@ async fn setup(pool: &sqlx::PgPool) {
         (2, r#"{"resource_id": "b"}"#),
         (3, r#"{"checkpoint_payload": null, "resource_id": "c"}"#),
     ] {
-        pool.execute(sqlx::raw_sql(&format!(
+        pool.execute(sqlx::raw_sql(AssertSqlSafe(format!(
             "INSERT INTO d (id, data) VALUES ({}, '{}')",
             id, doc
-        )))
+        ))))
         .await
         .unwrap_or_else(|e| panic!("seed {}: {}", id, e));
     }
 }
 
 async fn ids(pool: &sqlx::PgPool, sql: &str) -> Result<String, String> {
-    match sqlx::query(sql).fetch_all(pool).await {
+    match sqlx::query(AssertSqlSafe(sql)).fetch_all(pool).await {
         Ok(rows) => Ok(rows
             .iter()
             .map(|r| r.get::<i32, _>("id").to_string())
@@ -128,11 +129,11 @@ async fn the_audit_checkpoint_lookup_runs() {
         (2, 2, r#"{"checkpoint_payload": {"n": 2}, "checkpoint_number": "8", "resource_type_code": "3", "resource_id": "r1"}"#),
         (3, 3, r#"{"checkpoint_number": "9", "resource_type_code": "3", "resource_id": "r1"}"#),
     ] {
-        pool.execute(sqlx::raw_sql(&format!(
+        pool.execute(sqlx::raw_sql(AssertSqlSafe(format!(
             "INSERT INTO user_table_row (id, domain_id, user_table_id, entry_order, data) \
              VALUES ({}, 1, 1, {}, '{}')",
             id, order, doc
-        )))
+        ))))
         .await
         .unwrap_or_else(|e| panic!("seed {}: {}", id, e));
     }
@@ -183,10 +184,10 @@ async fn a_cast_over_a_path_compares_as_the_cast_type() {
         (2, r#"{"code": "4", "n": "9"}"#),
         (3, r#"{"code": "5", "n": "1"}"#),
     ] {
-        pool.execute(sqlx::raw_sql(&format!(
+        pool.execute(sqlx::raw_sql(AssertSqlSafe(format!(
             "INSERT INTO c (id, data) VALUES ({}, '{}')",
             id, doc
-        )))
+        ))))
         .await
         .unwrap_or_else(|e| panic!("seed {}: {}", id, e));
     }
@@ -242,10 +243,10 @@ async fn a_cast_over_an_unreadable_value_is_false_not_an_error() {
         (3, r#"{"code": null}"#),
         (4, r#"{"code": "not a number"}"#),
     ] {
-        pool.execute(sqlx::raw_sql(&format!(
+        pool.execute(sqlx::raw_sql(AssertSqlSafe(format!(
             "INSERT INTO g (id, data) VALUES ({}, '{}')",
             id, doc
-        )))
+        ))))
         .await
         .unwrap_or_else(|e| panic!("seed {}: {}", id, e));
     }
@@ -309,10 +310,10 @@ async fn null_coded_rows_do_not_disturb_the_checkpoint_lookup() {
         (5, 5, r#"{"checkpoint_number": "10", "resource_type_code": "3", "resource_id": "r1"}"#),
     ];
     for (id, order, doc) in rows {
-        pool.execute(sqlx::raw_sql(&format!(
+        pool.execute(sqlx::raw_sql(AssertSqlSafe(format!(
             "INSERT INTO user_table_row (id, domain_id, user_table_id, entry_order, data)              VALUES ({}, 1, 1, {}, '{}')",
             id, order, doc
-        )))
+        ))))
         .await
         .unwrap_or_else(|e| panic!("seed {}: {}", id, e));
     }

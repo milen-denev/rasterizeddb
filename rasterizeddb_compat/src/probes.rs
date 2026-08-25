@@ -4,6 +4,7 @@
 //! is missing rather than which ORM call broke. [`crate::probes::run_all`]
 //! executes the list against a live server and reports a pass/fail matrix.
 
+use sqlx::AssertSqlSafe;
 use sqlx::{Row, ValueRef};
 
 use crate::schema;
@@ -373,14 +374,18 @@ fn first_line(s: &str) -> String {
 
 /// Creates every table and inserts the seed rows.
 pub async fn apply_schema(pool: &sqlx::PgPool) -> anyhow::Result<()> {
+    // sqlx 0.9 accepts only `&'static str` in `query()`, so that dynamic SQL has
+    // to be audited rather than merely compiled. Both statements below are built
+    // by this crate — a fixed DDL array and the seed statements it generates —
+    // and neither interpolates anything that came from outside it.
     for ddl in schema::CREATE_TABLES {
-        sqlx::query(ddl)
+        sqlx::query(AssertSqlSafe(*ddl))
             .execute(pool)
             .await
             .map_err(|e| anyhow::anyhow!("DDL failed: {}\n{}", first_line(&e.to_string()), ddl))?;
     }
     for stmt in schema::seed_statements() {
-        sqlx::query(&stmt)
+        sqlx::query(AssertSqlSafe(stmt.as_str()))
             .execute(pool)
             .await
             .map_err(|e| anyhow::anyhow!("seed failed: {}\n{}", first_line(&e.to_string()), stmt))?;

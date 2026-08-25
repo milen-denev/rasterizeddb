@@ -5,10 +5,11 @@
 //! the hit rate for the two shapes that matter: an autocommit `UPDATE` with
 //! nothing else running, and the same statement inside an explicit transaction.
 
+use sqlx::AssertSqlSafe;
 use rasterizeddb_compat::TestServer;
 
 async fn run(pool: &sqlx::PgPool, sql: &str) {
-    sqlx::query(sql).execute(pool).await.unwrap_or_else(|e| panic!("{}: {}", sql, e));
+    sqlx::query(AssertSqlSafe(sql)).execute(pool).await.unwrap_or_else(|e| panic!("{}: {}", sql, e));
 }
 
 #[tokio::main]
@@ -36,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
         use sqlx::Connection;
         let mut c = sqlx::PgConnection::connect(&server.url()).await?;
         sqlx::query("BEGIN").execute(&mut c).await?;
-        sqlx::query(&format!("UPDATE m SET amount = {} WHERE id = {}", round, round + 1))
+        sqlx::query(AssertSqlSafe(format!("UPDATE m SET amount = {} WHERE id = {}", round, round + 1)))
             .execute(&mut c)
             .await?;
         sqlx::query("COMMIT").execute(&mut c).await?;

@@ -9,7 +9,7 @@ tokio = { version = "1", features = ["full"] }
 stopwatch = "0.0.7"
 env_logger = "0.11"
 log = "0.4"
-rand = "0.9"
+rand = "0.10"
 futures = "0.3"
 rclite = "0.4.1"
 

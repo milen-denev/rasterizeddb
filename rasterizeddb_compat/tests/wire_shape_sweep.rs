@@ -13,6 +13,7 @@
 //! finding; a plain SQL error is not — some shapes are legitimately
 //! unsupported, and this test is about the wire, not the feature.
 
+use sqlx::AssertSqlSafe;
 use rasterizeddb_compat::TestServer;
 use sqlx::Executor;
 
@@ -23,7 +24,7 @@ async fn server() -> (TestServer, sqlx::PgPool) {
 }
 
 async fn run(pool: &sqlx::PgPool, sql: &str) -> Result<(), String> {
-    pool.execute(sqlx::raw_sql(sql))
+    pool.execute(sqlx::raw_sql(AssertSqlSafe(sql)))
         .await
         .map(|_| ())
         .map_err(|e| e.to_string().lines().next().unwrap_or("").to_string())
@@ -94,11 +95,11 @@ async fn no_shape_produces_a_malformed_frame() {
     let mut errors: Vec<String> = Vec::new();
     for sql in &probes {
         // Simple protocol.
-        if let Err(e) = pool.fetch_all(sqlx::raw_sql(sql)).await {
+        if let Err(e) = pool.fetch_all(sqlx::raw_sql(AssertSqlSafe(&**sql))).await {
             errors.push(format!("[simple] {} -> {}", sql, e.to_string().lines().next().unwrap_or("")));
         }
         // Extended protocol: sqlx prepares whenever `query` is used.
-        if let Err(e) = sqlx::query(sql).fetch_all(&pool).await {
+        if let Err(e) = sqlx::query(AssertSqlSafe(&**sql)).fetch_all(&pool).await {
             errors.push(format!("[extended] {} -> {}", sql, e.to_string().lines().next().unwrap_or("")));
         }
     }

@@ -6,6 +6,7 @@
 //! outside the list starts passing — the second case is a prompt to move it in,
 //! so the baseline never silently drifts behind the implementation.
 
+use sqlx::AssertSqlSafe;
 use rasterizeddb_compat::{TestServer, probes};
 
 /// Probes known to pass. Add to this list when a feature lands.
@@ -63,7 +64,7 @@ async fn the_application_schema_applies_cleanly() {
 
     for table in rasterizeddb_compat::schema::TABLES {
         let sql = format!("SELECT * FROM {}", table);
-        sqlx::query(&sql)
+        sqlx::query(AssertSqlSafe(&*sql))
             .fetch_all(&pool)
             .await
             .unwrap_or_else(|e| panic!("{} should be queryable: {}", table, e));

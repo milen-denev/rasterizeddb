@@ -4,7 +4,7 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use rand::RngCore;
+use rand::Rng;
 use rclite::Arc;
 use xutex::AsyncMutex;
 

@@ -6,6 +6,7 @@
 //! that asked for `jsonb` gets `jsonb` — the type it is advertised as, and a
 //! value it can decode — for documents the shredded mapping could not hold.
 
+use sqlx::AssertSqlSafe;
 use rasterizeddb_compat::TestServer;
 use sqlx::Row;
 
@@ -16,7 +17,7 @@ async fn server() -> (TestServer, sqlx::PgPool) {
 }
 
 async fn run(pool: &sqlx::PgPool, sql: &str) -> Result<(), String> {
-    sqlx::query(sql)
+    sqlx::query(AssertSqlSafe(sql))
         .execute(pool)
         .await
         .map(|_| ())
@@ -30,7 +31,7 @@ async fn run(pool: &sqlx::PgPool, sql: &str) -> Result<(), String> {
 /// was asked for, so this only succeeds if the column really is `jsonb` on the
 /// wire.
 async fn document(pool: &sqlx::PgPool, id: i32) -> serde_json::Value {
-    let row = sqlx::query(&format!("SELECT doc FROM docs WHERE id = {}", id))
+    let row = sqlx::query(AssertSqlSafe(format!("SELECT doc FROM docs WHERE id = {}", id)))
         .fetch_one(pool)
         .await
         .expect("select should succeed");

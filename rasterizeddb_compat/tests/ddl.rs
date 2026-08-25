@@ -4,12 +4,13 @@
 //! DDL, so a statement the engine cannot honour has to fail loudly rather than
 //! be accepted as a no-op. The exceptions are recorded here explicitly.
 
+use sqlx::AssertSqlSafe;
 use rasterizeddb_compat::{TestServer, probes};
 use sqlx::Row;
 
 /// Rows a query returns.
 async fn count(pool: &sqlx::PgPool, sql: &str) -> usize {
-    sqlx::query(sql).fetch_all(pool).await.expect("select should succeed").len()
+    sqlx::query(AssertSqlSafe(sql)).fetch_all(pool).await.expect("select should succeed").len()
 }
 
 async fn server() -> (TestServer, sqlx::PgPool) {
@@ -20,7 +21,7 @@ async fn server() -> (TestServer, sqlx::PgPool) {
 }
 
 async fn run(pool: &sqlx::PgPool, sql: &str) -> Result<(), String> {
-    sqlx::query(sql)
+    sqlx::query(AssertSqlSafe(sql))
         .execute(pool)
         .await
         .map(|_| ())
@@ -29,13 +30,13 @@ async fn run(pool: &sqlx::PgPool, sql: &str) -> Result<(), String> {
 
 /// How many rows a query returns.
 async fn count_rows(pool: &sqlx::PgPool, sql: &str) -> usize {
-    sqlx::query(sql).fetch_all(pool).await.expect("select should succeed").len()
+    sqlx::query(AssertSqlSafe(sql)).fetch_all(pool).await.expect("select should succeed").len()
 }
 
 /// Column names visible to a client, in order.
 async fn columns(pool: &sqlx::PgPool, table: &str) -> Vec<String> {
     use sqlx::{Column, Row};
-    let rows = sqlx::query(&format!("SELECT * FROM {}", table))
+    let rows = sqlx::query(AssertSqlSafe(format!("SELECT * FROM {}", table)))
         .fetch_all(pool)
         .await
         .expect("select should succeed");
@@ -557,7 +558,7 @@ async fn a_paren_inside_a_string_literal_does_not_truncate_the_value() {
         run(&pool, &format!("INSERT INTO s (id, name) VALUES ({}, '{}')", id, value))
             .await
             .unwrap_or_else(|e| panic!("{}: {}", value, e));
-        let row = sqlx::query(&format!("SELECT name FROM s WHERE id = {}", id))
+        let row = sqlx::query(AssertSqlSafe(format!("SELECT name FROM s WHERE id = {}", id)))
             .fetch_one(&pool)
             .await
             .expect("select");
@@ -1027,10 +1028,10 @@ async fn like_never_prunes_a_matching_row() {
     }
 
     for (pattern, oracle) in expected_by_pattern {
-        let mut got: Vec<i32> = sqlx::query(&format!(
+        let mut got: Vec<i32> = sqlx::query(AssertSqlSafe(format!(
             "SELECT id FROM big WHERE name LIKE '{}'",
             pattern
-        ))
+        )))
         .fetch_all(&pool)
         .await
         .unwrap_or_else(|e| panic!("{}: {}", pattern, e))

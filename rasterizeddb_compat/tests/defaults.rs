@@ -4,6 +4,7 @@
 //! row is inserted, which is what makes `DEFAULT CURRENT_TIMESTAMP` mean the
 //! time of the insert rather than the time of the `CREATE TABLE`.
 
+use sqlx::AssertSqlSafe;
 use rasterizeddb_compat::{TestServer, probes};
 use sqlx::Row;
 
@@ -15,7 +16,7 @@ async fn server() -> (TestServer, sqlx::PgPool) {
 }
 
 async fn run(pool: &sqlx::PgPool, sql: &str) -> Result<(), String> {
-    sqlx::query(sql)
+    sqlx::query(AssertSqlSafe(sql))
         .execute(pool)
         .await
         .map(|_| ())
@@ -23,7 +24,7 @@ async fn run(pool: &sqlx::PgPool, sql: &str) -> Result<(), String> {
 }
 
 async fn text_of(pool: &sqlx::PgPool, sql: &str) -> Vec<String> {
-    sqlx::query(sql)
+    sqlx::query(AssertSqlSafe(sql))
         .fetch_all(pool)
         .await
         .expect("select should succeed")
@@ -33,7 +34,7 @@ async fn text_of(pool: &sqlx::PgPool, sql: &str) -> Vec<String> {
 }
 
 async fn ints_of(pool: &sqlx::PgPool, sql: &str) -> Vec<i32> {
-    sqlx::query(sql)
+    sqlx::query(AssertSqlSafe(sql))
         .fetch_all(pool)
         .await
         .expect("select should succeed")

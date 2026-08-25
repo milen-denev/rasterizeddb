@@ -6,6 +6,7 @@
 //! document round-trips, and that its fields are genuinely queryable as their
 //! own types.
 
+use sqlx::AssertSqlSafe;
 use rasterizeddb_compat::TestServer;
 use sqlx::Row;
 
@@ -23,7 +24,7 @@ async fn server() -> (TestServer, sqlx::PgPool) {
 }
 
 async fn run(pool: &sqlx::PgPool, sql: &str) -> Result<(), String> {
-    sqlx::query(sql)
+    sqlx::query(AssertSqlSafe(sql))
         .execute(pool)
         .await
         .map(|_| ())
@@ -32,7 +33,7 @@ async fn run(pool: &sqlx::PgPool, sql: &str) -> Result<(), String> {
 
 /// The document stored for `id`, parsed back into JSON.
 async fn document(pool: &sqlx::PgPool, table: &str, id: i32) -> serde_json::Value {
-    let row = sqlx::query(&format!("SELECT doc FROM {} WHERE id = {}", table, id))
+    let row = sqlx::query(AssertSqlSafe(format!("SELECT doc FROM {} WHERE id = {}", table, id)))
         .fetch_one(pool)
         .await
         .expect("select should succeed");
@@ -90,7 +91,7 @@ async fn the_fields_are_queryable_as_native_columns() {
     let shadow = shadow_of("docs", "doc");
 
     // A number compares as a number, not as text.
-    let names: Vec<String> = sqlx::query(&format!("SELECT name FROM {} WHERE hits > 10", shadow))
+    let names: Vec<String> = sqlx::query(AssertSqlSafe(format!("SELECT name FROM {} WHERE hits > 10", shadow)))
         .fetch_all(&pool)
         .await
         .expect("numeric predicate")
@@ -100,7 +101,7 @@ async fn the_fields_are_queryable_as_native_columns() {
     assert_eq!(names, vec!["acme"]);
 
     // A date string became a timestamp, so a range works.
-    let count = sqlx::query(&format!("SELECT name FROM {} WHERE seen > '2026-01-01'", shadow))
+    let count = sqlx::query(AssertSqlSafe(format!("SELECT name FROM {} WHERE seen > '2026-01-01'", shadow)))
         .fetch_all(&pool)
         .await
         .expect("timestamp predicate")
@@ -108,7 +109,7 @@ async fn the_fields_are_queryable_as_native_columns() {
     assert_eq!(count, 1);
 
     // An address string became an address.
-    let count = sqlx::query(&format!("SELECT name FROM {} WHERE ip = '10.0.0.1'", shadow))
+    let count = sqlx::query(AssertSqlSafe(format!("SELECT name FROM {} WHERE ip = '10.0.0.1'", shadow)))
         .fetch_all(&pool)
         .await
         .expect("inet predicate")
