@@ -2,9 +2,73 @@
 # Rasterized DB
 ## A high-performance database written from scratch in Rust — now fully rewritten.
 
+![rdb_studio connected to a RasterizedDB server](docs/images/rdb_studio.png)
+
+*[rdb_studio](#rdb_studio--the-desktop-console), the desktop console, watching a
+live server: size and row counts, reclaimable space, transaction rate, cache
+hits against scans, and where the bytes actually are.*
+
+RasterizedDB is a schema-full storage engine that speaks the PostgreSQL wire
+protocol, so `psql`, any driver and any ORM connect to it unmodified. It is
+transactional (MVCC, real `BEGIN`/`COMMIT`/`ROLLBACK`, savepoints), crash-safe
+through a write-ahead log, and it reclaims its own dead space. Rows are scanned
+through a bit-sliced SIMD filter index rather than a B-tree.
+
+### What is in it
+
+| | |
+|---|---|
+| **PostgreSQL wire protocol** | Simple and extended query protocols, bound parameters, SCRAM-SHA-256, TLS. Drivers and ORMs work as-is — see [SQL surface](#sql-surface) |
+| **Transactions** | MVCC snapshots, `READ COMMITTED` / `REPEATABLE READ`, savepoints, first-updater-wins conflicts |
+| **Durability** | Write-ahead log with checkpoints, and a `synchronous_commit` knob with the trade stated exactly |
+| **Filter index** | Bit-sliced fingerprints, 512 rows per SIMD register, plus zone maps for ranges. Adaptive and runtime-tunable |
+| **Space reclamation** | Background vacuum publishing a free list the write path allocates from; `VACUUM` and `VACUUM FULL` |
+| **JSON** | Documents stored as binary values, with path indexing |
+| **Replication** | Multi-primary, statement-shipping, HLC-ordered, over TLS 1.3 |
+| **Backup** | Snapshot and point-in-time recovery to any S3-compatible store |
+| **Storage pools** | One database across several directories, with a placement policy and mirrored backups |
+| **PostgreSQL import** | One-shot migration of a live PostgreSQL database |
+| **rdb_studio** | A desktop console that also speaks to PostgreSQL |
+
+Design notes for each subsystem live in [docs/](docs/) — they cover the
+reasoning, the alternatives that were measured and rejected, and the parts
+deliberately not built.
+
 ### Guide on how to run
 
 rasterizeddb_server-PLATFORM-x64.exe --location /your-location/bla-bla --concurrent_threads 16 --batch_size 16000
+
+*batch_size*: recommended value is 16K, but you can play around with more or less depending on your case. The lesser the number of rows, the lower the batch size must be.
+*concurrent_threads*: must equal to the number of CPU threads of lower.
+
+### Build features
+
+The heavier subsystems are Cargo features, so a build that does not want one
+does not carry its code, its dependencies, or its match arms. The current
+default set turns most of them on:
+
+```toml
+default = ["memory_pool_reuse", "replication_compression",
+           "s3_backup", "pg_import", "storage_pools"]
+```
+
+| Feature | Default | What it adds |
+|---|---|---|
+| `s3_backup` | on | Backup, restore and PITR to an object store, and the `BACKUP`/`RESTORE` statements |
+| `pg_import` | on | The PostgreSQL frontend client and `IMPORT DATABASE FROM POSTGRES` |
+| `storage_pools` | on | Multi-directory placement, mirroring, and the `STORAGE` statements |
+| `replication_compression` | on | Zstd on replication links; a node without it still interoperates, uncompressed |
+| `memory_pool_reuse` | on | Thread-local free lists in the buffer pool |
+| `enable_long_row` | off | Rows above the standard width cap |
+| `enable_data_verification` | off | Extra checksums on the read path |
+
+Replication itself needs no feature — it is compiled in and switched on with
+`--replication`. To build without the optional subsystems:
+
+```sh
+cargo build --release -p rasterizeddb_core --no-default-features \
+    --features memory_pool_reuse,replication_compression
+```
 
 ### PostgreSQL network compatibility (pgwire)
 
@@ -40,6 +104,170 @@ Every part of that string matters:
 Authentication defaults to SCRAM-SHA-256; `--pg-auth` also accepts `md5`,
 `password` and `trust`. Both the simple and the extended query protocols are
 implemented, which is what lets prepared statements and ORMs work.
+
+### SQL surface
+
+The dialect is PostgreSQL's. What is implemented:
+
+- **Projection** — `*`, column lists, `AS` aliases, qualified and quoted names,
+  case-insensitive resolution, arithmetic, `SELECT DISTINCT`.
+- **Filtering** — every comparison operator on every scalar type, `AND`/`OR`
+  with parentheses, `IN`, `NOT IN`, `BETWEEN`, `LIKE` and `ILIKE` with the full
+  pattern language.
+- **Joins** — `INNER` and `LEFT JOIN`, any number of relations, aliases, and
+  **composite keys** (`ON a.x = b.x AND a.y = b.y`), which every junction table
+  needs. Executed as a hash join over materialised rows, each relation scanned
+  once with its own share of the `WHERE` pushed down, so filter pruning still
+  applies per relation.
+- **Aggregates** — `COUNT`, `SUM`, `MIN`, `MAX`, `AVG` with `GROUP BY` and
+  `HAVING`, over a single table or a join. `SUM` and `AVG` over an exact type
+  stay exact, so a money column keeps its cents.
+- **Window functions** — `ROW_NUMBER() OVER (PARTITION BY … ORDER BY …)`. Not an
+  aggregate: every row survives and gains a column computed from the rows
+  around it.
+- **CTEs** — `WITH name AS (SELECT …)`, materialised, which gives PostgreSQL's
+  pre-12 semantics: an optimisation fence, evaluated once however many times it
+  is referenced.
+- **Subqueries** — uncorrelated `IN (SELECT …)`, folded into the outer statement
+  as a literal list so filter pruning still applies.
+- **Ordering and paging** — `ORDER BY` over several keys each with its own
+  direction, including expressions and keys that are not selected; `LIMIT`,
+  `OFFSET`, and the `FETCH FIRST … ROWS ONLY` spellings.
+- **Writes** — `INSERT` (single and multi-row), `INSERT … SELECT`, `UPDATE`,
+  `DELETE`, `DELETE … USING`, `ON CONFLICT DO UPDATE`, and `RETURNING` on all of
+  them — where a returned item may be an expression, not only a column.
+- **Expressions** — `CASE WHEN`, `COALESCE`, `NULLIF`, `LEAST`, `GREATEST`,
+  `MOD`, and `::` casts, in projections, predicates and `RETURNING`.
+- **Constraints** — `NOT NULL`, defaults (kept as text, so
+  `DEFAULT CURRENT_TIMESTAMP` means the time of the insert), primary keys,
+  single- and multi-column `UNIQUE`, and foreign keys, which are **enforced**
+  rather than merely accepted.
+- **DDL** — `CREATE`/`DROP TABLE`, `CREATE DATABASE`, `ALTER TABLE` including
+  `ADD`/`DROP`/`RENAME COLUMN` and `ALTER … TYPE … USING`.
+- **Catalogue** — PostgreSQL's catalogue relations are produced on demand when a
+  statement names one, so tools that introspect `pg_catalog` work.
+
+See [docs/postgres-compatibility.md](docs/postgres-compatibility.md) for the
+type mapping, the exact semantics, and what is not supported.
+
+### Transactions
+
+`BEGIN`, `COMMIT` and `ROLLBACK` do what they say. They used to be accepted and
+ignored — each statement committed as it ran, so an application that rolled a
+transaction back had already committed every statement in it, with no way to
+find out.
+
+The engine is MVCC: an update writes a new row version rather than overwriting
+one a reader might still be looking at, and each statement reads through a
+snapshot. Uncommitted work is invisible to other sessions, a rollback undoes
+inserts, updates and deletes alike, and two transactions updating the same row
+get a serialization failure (`40001`) rather than one silently losing.
+
+`READ COMMITTED` (the default) takes a fresh snapshot per statement;
+`REPEATABLE READ` fixes one for the transaction. `SERIALIZABLE` is accepted and
+behaves as `REPEATABLE READ` — it does **not** detect write skew, which needs
+predicate locking.
+
+Savepoints work — `SAVEPOINT`, `ROLLBACK TO SAVEPOINT`, `RELEASE` — which is
+what an ORM's nested transactions are built from. A failed statement poisons
+the block until it is closed or rolled back to a savepoint. `SELECT … FOR
+UPDATE` and `FOR SHARE` take row locks.
+
+See [docs/mvcc.md](docs/mvcc.md).
+
+### Durability
+
+Writes go through a write-ahead log. Without one, every durable write has to
+reach storage on its own: an `INSERT` appends row bytes to one file and a
+pointer record to another, paying two device flushes, and a crash between them
+leaves the row half-written with no way to tell. The log turns that into one
+sequential append plus one flush of a single file — and because a flush
+persists everything written before it, concurrent writers share it.
+
+`synchronous_commit` is PostgreSQL's knob and the same trade:
+
+```sh
+rasterizeddb_core --location <PATH> --synchronous-commit off --wal-writer-delay-ms 200
+```
+
+**On** (default), nothing is acknowledged until its records are durable, which
+costs one `fdatasync` per writing statement — on a drive without a
+power-loss-protected cache that is most of what the statement takes.
+
+**Off**, a commit returns once the bytes are in the *kernel's* page cache. The
+server process dying then loses nothing — `kill -9` and a panic are both
+survivable — and only an operating system crash or power loss costs the last
+`--wal-writer-delay-ms` of transactions. Records are appended in order and
+replay stops at the first one it cannot read whole, so what is lost is whole
+transactions off the end of the log, never half of one. It is a durability
+knob, not a consistency one.
+
+### The filter index
+
+Scans are pruned by a bit-level index rather than a B-tree. It is a positional
+shadow of the row-pointer file — bit *i* describes slot *i* — so no
+key-to-slot map is needed and the structure costs *bits* per row rather than
+bytes per entry. Values are stored as fingerprints, bit-sliced across bitplanes
+per 512-row zone, so one SIMD register tests 512 rows at once (AVX-512 where the
+CPU has it, AVX2 otherwise). Zone maps carry min/max bounds for the ranges a
+fingerprint cannot answer.
+
+The safety property is one-sided: the index may say a zone *might* match when it
+does not, and the scan then confirms. It must never say a zone cannot match when
+a matching row is there — so a predicate the extractor is not certain it models
+exactly is dropped rather than approximated.
+
+It is adaptive and tunable while the server runs:
+
+```sql
+SHOW CONFIG;                    -- every knob, and whether it is hot-reloadable
+SET CONFIG filter.max_f = 14;   -- applied live
+```
+
+```sh
+rasterizeddb_core --location <PATH> --filter true --filter-max-f 14 \
+    --filter-min-table-rows 50000 --filter-min-selectivity 0.05
+```
+
+See [docs/bit-bloom-filter-design.md](docs/bit-bloom-filter-design.md) for the
+cost model, the measured skip-versus-fetch ratio, and the tiers not built.
+
+### Space reclamation
+
+A `DELETE` tombstones a pointer record, and an `UPDATE` that outgrows its slot
+tombstones the old one and appends a replacement. Neither touches the row bytes,
+so without reclamation the rows file only ever grows: a table that deletes and
+reinserts the same working set doubles on disk every cycle even though its live
+size never changes.
+
+A background task scans the pointer file, works out which byte ranges no pointer
+refers to any more, and publishes them as a free list the write path allocates
+from before falling back to appending. Nothing moves, so no offset changes, and
+the pass can be interrupted at any point. Reclamation is snapshot-aware: an
+extent is not reused while any open query could still read it.
+
+```sql
+VACUUM;             -- reclaim into the free list
+VACUUM FULL;        -- compact in place and return space to the filesystem
+SHOW TABLE STATS users;   -- includes how much is reclaimable
+```
+
+See [docs/space-reclamation.md](docs/space-reclamation.md).
+
+### JSON documents
+
+A JSON column is stored as one binary value. It used to be *shredded* — each key
+became a column, each nested object a further table — which does not survive
+contact with real documents, for a structural reason: shredding makes the schema
+a function of the data. A document keyed by data (statistics keyed by column
+name, a row keyed by a user-defined field) has unboundedly many keys, so the
+table grows a column per distinct key.
+
+Shredding survives as a knob (`--json-shadow-tables`) for the workloads it did
+suit, but it is no longer the default. Reaching into a document from SQL, and
+indexing a particular path so a predicate over it does not parse every document,
+are both supported — the path index reuses the same filter machinery rather than
+adding a second index structure.
 
 ### Native protocol authentication
 
@@ -83,9 +311,6 @@ loopback listener accepts any caller and says so loudly at start-up: a database
 nobody can open is not a secure database. It starts requiring a password the
 moment there is one to require, and never stops again.
 
-*batch_size*: recommended value is 16K, but you can play around with more or less depending on your case. The lesser the number of rows, the lower the batch size must be.
-*concurrent_threads*: must equal to the number of CPU threads of lower.
-
 ### rdb_studio — the desktop console
 
 A pgAdmin-style console for RasterizedDB, written in [iced](https://iced.rs).
@@ -126,9 +351,64 @@ SHOW STORAGE PLACEMENTS;      -- which directory holds each table
 See [docs/introspection.md](docs/introspection.md) for what each figure means
 and why the surface is statements rather than an `information_schema`.
 
+### Multi-primary replication
+
+Every node accepts reads and writes. A transaction committed on one is shipped
+to the others and applied there, so the cluster converges without any node being
+designated the writer and without a failover step when one goes away.
+
+```sh
+# node 1
+rasterizeddb_core --location /data --replication --node-id 1 \
+    --peer 'two@10.0.0.2:61171' --peer 'three@10.0.0.3:61171'
+
+# node 2
+rasterizeddb_core --location /data --replication --node-id 2 \
+    --peer 'one@10.0.0.1:61171' --peer 'three@10.0.0.3:61171'
+```
+
+What travels is a committed transaction as the statements that made it up,
+stamped with the node that took it, its sequence number, and a hybrid logical
+clock reading. Statements rather than pages, so the nodes are not tied to one
+physical layout. The clock is what makes the ordering agreeable: wall-clock time
+alone does not give one, since two nodes a second apart disagree about which
+commit came first, and a clock that steps backwards makes a node disagree with
+itself.
+
+Links run over TLS 1.3 with mutual certificate pinning or a cluster CA, batch
+and compress (zstd, negotiated per link, falling back to uncompressed against a
+node built without it), and catch a peer up from the replication log after a
+disconnect. Conflict policy is `abort` by default, with `skip` and
+`last-writer-wins` available.
+
+From SQL, over either protocol:
+
+```sql
+REPLICATION ENABLE;
+REPLICATION ADD PEER 'berlin' ADDRESS '10.0.0.2:61171';
+REPLICATION ADD PEER 'tokyo' ADDRESS '10.0.1.7:61171' WITH (COMPRESSION = 'zstd:3');
+REPLICATION PAUSE PEER 'berlin';
+REPLICATION RESYNC PEER 'berlin' FROM 0;
+REPLICATION SET conflict = 'last-writer-wins';
+
+SHOW REPLICATION;           -- summary and a line per peer
+SHOW REPLICATION STATUS;    -- counters
+SHOW REPLICATION PEERS;
+SHOW REPLICATION SETTINGS;
+```
+
+Unlike the storage statements these are **not** persisted: a peer added with a
+statement is gone after a restart unless the flag is added too, so what a node
+comes up as is always what its command line says.
+
+See [docs/replication.md](docs/replication.md) for the wire format, the
+measured compression and batching figures, the authentication setup, and — the
+part worth reading before relying on it — what it guarantees and what it does
+not.
+
 ### Multiple storage directories
 
-Off by default. Build with `--features storage_pools`. A database that has only
+On in the default feature set (`storage_pools`). A database that has only
 ever been given one directory keeps behaving exactly as it did — the whole
 subsystem compiles away without the feature.
 
@@ -209,7 +489,7 @@ guarantee.
 
 ### S3 backup and point-in-time recovery
 
-Off by default. Build with `--features s3_backup`, then name a bucket:
+On in the default feature set (`s3_backup`). Name a bucket:
 
 ```sh
 rasterizeddb_core --location /var/lib/rasterized \
@@ -248,7 +528,7 @@ list, and what it costs in API requests.
 
 ### Importing a PostgreSQL database
 
-Off by default. Build with `--features pg_import`.
+On in the default feature set (`pg_import`).
 
 **Against a server that is already running** — the usual case, and the one that
 needs no coordination — send it a statement over either protocol:
@@ -340,8 +620,17 @@ Rasterized DB is designed to handle virtually unlimited data sizes, row counts, 
 - UUID (GUID) support [DONE]
 - Fully functional RETURN, LIMIT, and advanced SELECT capabilities [DONE]
 - Server mode with network access [DONE]
+- PostgreSQL wire protocol, drivers and ORMs [DONE]
+- Transactions with MVCC, savepoints and isolation levels [DONE]
+- Crash safety through a write-ahead log [DONE]
+- Joins, aggregates, CTEs, window functions and subqueries [DONE]
+- Foreign keys and composite unique constraints [DONE]
+- Binary JSON documents with path indexing [DONE]
+- Multi-primary replication [DONE]
+- Backup and point-in-time recovery to object storage [DONE]
+- A database spanning several disks, with a placement policy [DONE]
+- Compression for storage efficiency [PARTIALLY DONE — replication links and backups]
 - Sharding for horizontal scalability
-- Compression for storage efficiency
 - Table immutability options
 
 #### ORM & Ecosystem
