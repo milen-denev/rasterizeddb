@@ -13,7 +13,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering};
 
 use cacheguard::CacheGuard;
 
@@ -34,8 +34,178 @@ const ENTRIES_PER_BYTE: u64 = 4;
 /// Grow the file in whole pages rather than a byte at a time.
 const GROWTH_CHUNK: usize = 4096;
 
+/// Bytes per level, and how many levels there are.
+///
+/// Level `l` holds `BASE << l` bytes and starts at byte `BASE * ((1 << l) - 1)`,
+/// so 32 levels cover more of the id space than a machine could hold bitmap for
+/// — the allocation of a level fails long before the table runs out.
+const BASE: usize = GROWTH_CHUNK;
+const LEVELS: usize = 32;
+
+/// The packed outcome bits, readable without taking a lock.
+///
+/// `outcome` is asked about one or two transactions for *every row* a scan
+/// looks at, from every worker at once. Holding the log's `Mutex` to answer
+/// made a two-bit lookup a contended acquire: eight workers spent 29% of their
+/// cycles in `lock_slow`, and the scan finished no sooner than it did on one
+/// worker. See `concurrent_readers_see_a_writers_outcomes`.
+///
+/// So the bytes live in levels that are allocated once and never move. A reader
+/// needs one atomic load of the level pointer and one of the byte; a writer
+/// still holds the `Mutex`, which is what keeps the read-modify-write of a byte
+/// shared by four transactions atomic, and still guards everything else in the
+/// log. Growth only ever publishes a new level, so a pointer a reader is
+/// holding stays valid.
+struct Bitmap {
+    levels: [AtomicPtr<AtomicU8>; LEVELS],
+    /// Logical length: bytes that have been recorded into, rounded up to
+    /// [`GROWTH_CHUNK`] exactly as the old `Vec::resize` did. Deliberately not
+    /// the allocated capacity — an id past this reads as aborted, and moving
+    /// that boundary would change which unrecorded ids read as in-progress.
+    len: AtomicUsize,
+}
+
+impl Bitmap {
+    fn new() -> Self {
+        Bitmap {
+            levels: [const { AtomicPtr::new(std::ptr::null_mut()) }; LEVELS],
+            len: AtomicUsize::new(0),
+        }
+    }
+
+    /// Which level a byte lives in, and where inside it.
+    #[inline]
+    fn locate(index: usize) -> (usize, usize) {
+        let v = index / BASE + 1;
+        let level = (usize::BITS - 1 - v.leading_zeros()) as usize;
+        (level, index - BASE * ((1 << level) - 1))
+    }
+
+    #[inline]
+    fn level_len(level: usize) -> usize {
+        BASE << level
+    }
+
+    /// The byte at `index`, or `None` past the recorded length.
+    #[inline]
+    fn get(&self, index: usize) -> Option<u8> {
+        if index >= self.len.load(Ordering::Acquire) {
+            return None;
+        }
+        let (level, offset) = Self::locate(index);
+        // Within `len`, so the level is published — but a null here must read as
+        // absent rather than dereference.
+        let base = self.levels.get(level)?.load(Ordering::Acquire);
+        if base.is_null() {
+            return None;
+        }
+        // Safe: `base` points at a `[AtomicU8; level_len(level)]` that was
+        // allocated before it was published and is freed only in `Drop`, and
+        // `offset` is inside it because `index` is inside the level.
+        Some(unsafe { (*base.add(offset)).load(Ordering::Acquire) })
+    }
+
+    /// The byte at `index`, for a writer that already holds the log's `Mutex`
+    /// and has grown the map past `index`.
+    #[inline]
+    fn load_for_update(&self, index: usize) -> u8 {
+        let (level, offset) = Self::locate(index);
+        let base = self.levels[level].load(Ordering::Acquire);
+        debug_assert!(!base.is_null(), "writer must grow before it writes");
+        unsafe { (*base.add(offset)).load(Ordering::Acquire) }
+    }
+
+    /// Writes the byte at `index`. Caller holds the log's `Mutex`, so no other
+    /// writer can be mid-update of the four transactions that share this byte.
+    #[inline]
+    fn store(&self, index: usize, byte: u8) {
+        let (level, offset) = Self::locate(index);
+        let base = self.levels[level].load(Ordering::Acquire);
+        debug_assert!(!base.is_null(), "writer must grow before it writes");
+        unsafe { (*base.add(offset)).store(byte, Ordering::Release) }
+    }
+
+    /// Makes `len` bytes readable, allocating whatever levels that needs.
+    ///
+    /// The length is published last, so a reader either sees the old length —
+    /// and reads a byte that was already there — or the new one, by which point
+    /// every level under it is allocated and zeroed.
+    fn grow_to(&self, len: usize) {
+        let mut covered = 0usize;
+        for level in 0..LEVELS {
+            if covered >= len {
+                break;
+            }
+            if self.levels[level].load(Ordering::Acquire).is_null() {
+                let chunk: Box<[AtomicU8]> =
+                    (0..Self::level_len(level)).map(|_| AtomicU8::new(0)).collect();
+                // Leaked deliberately: a level outlives every reader that may
+                // be holding a pointer into it, and `Drop` takes it back.
+                self.levels[level]
+                    .store(Box::into_raw(chunk) as *mut AtomicU8, Ordering::Release);
+            }
+            covered += Self::level_len(level);
+        }
+        assert!(
+            covered >= len,
+            "transaction status bitmap exceeded {} levels ({} bytes)",
+            LEVELS,
+            covered
+        );
+        if len > self.len.load(Ordering::Acquire) {
+            self.len.store(len, Ordering::Release);
+        }
+    }
+
+    /// The recorded length.
+    #[inline]
+    fn len(&self) -> usize {
+        self.len.load(Ordering::Acquire)
+    }
+
+    /// A copy of `[low, high)`, which may span levels.
+    ///
+    /// The range goes to the log and to the file, and both want it contiguous.
+    /// The old code sliced the `Vec` and copied it for staging anyway, so this
+    /// is the same allocation moved one line earlier.
+    fn copy_range(&self, low: usize, high: usize) -> Vec<u8> {
+        (low..high).map(|i| self.get(i).unwrap_or(0)).collect()
+    }
+
+    /// Fills the map from bytes read off disk. Called before publication.
+    fn fill_from(&self, bytes: &[u8]) {
+        self.grow_to(bytes.len());
+        for (i, b) in bytes.iter().enumerate() {
+            if *b != 0 {
+                self.store(i, *b);
+            }
+        }
+    }
+}
+
+impl Drop for Bitmap {
+    fn drop(&mut self) {
+        for level in 0..LEVELS {
+            let ptr = *self.levels[level].get_mut();
+            if !ptr.is_null() {
+                // Reclaims exactly what `grow_to` leaked with `mem::forget`.
+                unsafe {
+                    drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                        ptr,
+                        Self::level_len(level),
+                    )));
+                }
+            }
+        }
+    }
+}
+
 pub struct StatusLog {
     inner: Mutex<Inner>,
+    /// The packed bits, outside the `Mutex` so a scan can read them without it.
+    /// Held in memory in full: at two bits each, a billion transactions is
+    /// 250 MB, and the working set in practice is a few pages.
+    bits: Bitmap,
     /// Width of the unflushed byte range, readable without taking the lock.
     ///
     /// A read-only transaction skips the durable flush entirely, so on a
@@ -63,9 +233,6 @@ impl std::fmt::Debug for StatusLog {
 }
 
 struct Inner {
-    /// The packed bits. Held in memory in full: at two bits each, a billion
-    /// transactions is 250 MB, and the working set in practice is a few pages.
-    bits: Vec<u8>,
     /// `None` for an in-memory log, which is what tests and `--in-memory` use.
     file: Option<File>,
     path: Option<PathBuf>,
@@ -132,9 +299,12 @@ impl StatusLog {
             }
         }
 
+        let map = Bitmap::new();
+        map.fill_from(&bits);
+
         Ok(StatusLog {
+            bits: map,
             inner: Mutex::new(Inner {
-                bits,
                 file: Some(file),
                 path: Some(path),
                 highest,
@@ -152,8 +322,8 @@ impl StatusLog {
     /// there is nothing for the record to be consulted by.
     pub fn in_memory() -> Self {
         StatusLog {
+            bits: Bitmap::new(),
             inner: Mutex::new(Inner {
-                bits: Vec::new(),
                 file: None,
                 path: None,
                 highest: 0,
@@ -173,16 +343,18 @@ impl StatusLog {
             TxOutcome::Aborted => BITS_ABORTED,
         };
 
+        // The lock still serializes writers: four transactions share a byte, so
+        // the read-modify-write below is only atomic because nobody else is in
+        // it. Readers need no lock — see [`Bitmap`].
         let mut inner = self.inner.lock();
         let index = (tx / ENTRIES_PER_BYTE) as usize;
-        if index >= inner.bits.len() {
-            let target = (index + 1).next_multiple_of(GROWTH_CHUNK);
-            inner.bits.resize(target, 0);
+        if index >= self.bits.len() {
+            self.bits.grow_to((index + 1).next_multiple_of(GROWTH_CHUNK));
         }
 
         let shift = (tx % ENTRIES_PER_BYTE) * 2;
-        let byte = &mut inner.bits[index];
-        *byte = (*byte & !(0b11 << shift)) | (bits << shift);
+        let byte = self.bits.load_for_update(index);
+        self.bits.store(index, (byte & !(0b11 << shift)) | (bits << shift));
 
         if tx > inner.highest {
             inner.highest = tx;
@@ -203,9 +375,8 @@ impl StatusLog {
     /// progress: either it was never assigned, or it was assigned by a run that
     /// crashed before recording anything. Both mean its writes must not be seen.
     pub fn outcome(&self, tx: TxId) -> TxOutcome {
-        let inner = self.inner.lock();
         let index = (tx / ENTRIES_PER_BYTE) as usize;
-        let Some(byte) = inner.bits.get(index) else {
+        let Some(byte) = self.bits.get(index) else {
             return TxOutcome::Aborted;
         };
         let shift = (tx % ENTRIES_PER_BYTE) * 2;
@@ -295,20 +466,24 @@ impl StatusLog {
             return Ok(None);
         }
 
+        // One copy of the range, because it may span levels of the bitmap and
+        // both the log and the file want it contiguous. The old code sliced a
+        // `Vec` and then copied it for staging regardless.
+        let bytes = self.bits.copy_range(low, high);
+
         // With no log the file is the only record, so it is written and synced
         // here and there is nothing to stage.
         let Some((wal, file_id)) = inner.wal.clone() else {
-            let Inner { bits, file, .. } = &mut *inner;
-            let file = file.as_mut().expect("checked above");
+            let file = inner.file.as_mut().expect("checked above");
             file.seek(SeekFrom::Start(low as u64))?;
-            file.write_all(&bits[low..high])?;
+            file.write_all(&bytes)?;
             file.sync_data()?;
             inner.dirty = None;
             self.dirty_bytes.store(0, Ordering::Relaxed);
             return Ok(None);
         };
 
-        let seq = wal.log_and_commit_deferred(file_id, low as u64, &inner.bits[low..high])?;
+        let seq = wal.log_and_commit_deferred(file_id, low as u64, &bytes)?;
 
         // The file is written too, even when logging. A checkpoint does not
         // replay records into files — it fsyncs the files their writers already
@@ -323,7 +498,6 @@ impl StatusLog {
         // the kernel is free to write its page back at any time; if that landed
         // before the log's own sync and the machine then died, the file would
         // name a transaction as committed whose rows never became durable.
-        let bytes = inner.bits[low..high].to_vec();
         inner.staged.push(Staged { seq, low, bytes });
         inner.dirty = None;
         self.dirty_bytes.store(0, Ordering::Relaxed);
@@ -395,6 +569,99 @@ impl StatusLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bitmap grows in doubling levels, so an id can land in a level that
+    /// did not exist when its neighbour was recorded. Every byte has to survive
+    /// that, including the ones at the seams.
+    #[test]
+    fn outcomes_survive_growth_across_levels() {
+        let log = StatusLog::in_memory();
+
+        // Level `l` starts at byte BASE * ((1 << l) - 1), so these ids sit on
+        // both sides of the first several seams as well as far past them.
+        let mut ids: Vec<TxId> = vec![0, 1, 2, 3, 7, 4095];
+        for level in 0..6u64 {
+            let first_byte = BASE as u64 * ((1 << level) - 1);
+            let first_id = first_byte * ENTRIES_PER_BYTE;
+            ids.extend([first_id.saturating_sub(1), first_id, first_id + 1]);
+        }
+        ids.push(4_000_000);
+        ids.sort_unstable();
+        ids.dedup();
+
+        for (n, id) in ids.iter().enumerate() {
+            log.record(*id, if n % 2 == 0 { TxOutcome::Committed } else { TxOutcome::Aborted });
+        }
+        for (n, id) in ids.iter().enumerate() {
+            let expected =
+                if n % 2 == 0 { TxOutcome::Committed } else { TxOutcome::Aborted };
+            assert_eq!(log.outcome(*id), expected, "id {}", id);
+        }
+    }
+
+    /// An id past everything recorded reads as aborted, and recording a high id
+    /// must not make the ids below it start reading as in-progress instead.
+    #[test]
+    fn ids_past_the_recorded_length_are_aborted() {
+        let log = StatusLog::in_memory();
+        assert_eq!(log.outcome(5), TxOutcome::Aborted, "nothing recorded at all");
+
+        log.record(5, TxOutcome::Committed);
+        // Same byte, never recorded: in progress, as it was before.
+        assert_eq!(log.outcome(4), TxOutcome::InProgress);
+        // Past the rounded-up length.
+        assert_eq!(log.outcome(4 * GROWTH_CHUNK as TxId), TxOutcome::Aborted);
+    }
+
+    /// Readers take no lock, so a writer's byte updates have to reach them
+    /// whole: four transactions share a byte, and a reader must never see one
+    /// of them lose its recorded outcome to a neighbour being written.
+    #[test]
+    fn concurrent_readers_see_a_writers_outcomes() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        const IDS: TxId = 20_000;
+        let log = Arc::new(StatusLog::in_memory());
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let log = log.clone();
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    // Once an id reads committed it must keep reading committed:
+                    // the only writes are of *other* ids, three of which share
+                    // its byte.
+                    let mut seen = vec![false; IDS as usize];
+                    while !stop.load(Ordering::Relaxed) {
+                        for id in 0..IDS {
+                            match log.outcome(id) {
+                                TxOutcome::Committed => seen[id as usize] = true,
+                                other => assert!(
+                                    !seen[id as usize],
+                                    "id {} was committed and now reads {:?}",
+                                    id, other
+                                ),
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for id in 0..IDS {
+            log.record(id, TxOutcome::Committed);
+        }
+        stop.store(true, Ordering::Relaxed);
+        for r in readers {
+            r.join().unwrap();
+        }
+
+        for id in 0..IDS {
+            assert_eq!(log.outcome(id), TxOutcome::Committed, "id {}", id);
+        }
+    }
 
     #[test]
     fn an_outcome_survives_being_written_and_read_back() {
