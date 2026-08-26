@@ -60,6 +60,98 @@ pub fn wal_checkpoint_bytes() -> u64 {
     *WAL_CHECKPOINT_BYTES.get().unwrap_or(&(64 * 1024 * 1024))
 }
 
+// ---------------------------------------------------------------------------
+// Allocator
+// ---------------------------------------------------------------------------
+
+/// Keeps glibc's allocator from handing large buffers back to the kernel
+/// between statements.
+///
+/// Measured 2026-08-26: a 200 000-row scan took **77 000 minor page faults per
+/// query** — about 315 MB of freshly-touched pages to return a 10.6 MB result —
+/// and 98.8% of the faults were inside the `memmove` that fills a buffer that
+/// was allocated a moment earlier. glibc was releasing every large result
+/// buffer at `free` (over the mmap threshold it is `munmap`ed; under it, the
+/// heap is trimmed back with `brk`) and the next statement faulted every page
+/// of it back in. Setting both thresholds so that neither happens took the same
+/// scan from 141 ms to 80 ms and the aggregate from 82 ms to 48 ms.
+///
+/// Both matter: raising only one of them changed nothing, because the buffer
+/// then left by the other route.
+///
+/// The cost is that freed memory stays with the process — RSS reflects the
+/// high-water mark of a workload rather than its current one, which is the
+/// usual trade for a server and the reason `MALLOC_MMAP_THRESHOLD_` and
+/// `MALLOC_TRIM_THRESHOLD_` are honoured: an operator who has set either is
+/// left alone entirely.
+///
+/// **It is a trade, not a win, and it is off by default** (`--tune-allocator
+/// true` turns it on). Measured against the same 200 000-row table:
+///
+/// | workload | off | on |
+/// |---|---|---|
+/// | one scan, on a worker thread | 117 ms | **83 ms** |
+/// | one scan, on the main thread | 143 ms | **75 ms** |
+/// | 8 clients scanning at once | **27 ms** | 31 ms |
+/// | 8 clients, aggregate | 32 ms | 30 ms |
+/// | 8 clients, point lookups | 13.5 us | 13.5 us |
+///
+/// The concurrent case loses because eight 156 MB buffers is more than a
+/// process wants to hold on to, and because a *worker* thread's arena caps its
+/// heap at 64 MiB — a buffer bigger than that is mmap'ed however the threshold
+/// is set, so the tuning cannot help the one allocation that matters and only
+/// retains the rest.
+///
+/// **The buffer is the actual bug.** A scan materialises `Vec<Row>` and `Row`
+/// is 1560 bytes whatever it holds, because `columns` is a
+/// `SmallVec<[Column; 32]>` — 32 inline columns for a five-column table. Make
+/// that buffer proportional to the data and none of this tuning is needed.
+///
+/// Idempotent, and a no-op off glibc.
+pub fn tune_allocator() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        {
+            // Both have to clear the largest buffer a statement allocates, and
+            // that is *not* the size of its result: a scan materialises a
+            // `Vec<Row>`, and `Row` is 1560 bytes whatever it holds, so 100 000
+            // result rows is a 156 MB allocation to return 10.6 MB. Anything
+            // smaller than the buffer and it leaves by the other route — 32 MB
+            // and 128 MB measured exactly the same as no tuning at all.
+            //
+            // A gigabyte covers a result of roughly 700 000 rows. Past that the
+            // faults come back, which is the sign that the fix belongs in the
+            // row buffer rather than here.
+            const MMAP_THRESHOLD: libc::c_int = 1024 * 1024 * 1024;
+            const TRIM_THRESHOLD: libc::c_int = 1024 * 1024 * 1024;
+
+            let tuned = ["MALLOC_MMAP_THRESHOLD_", "MALLOC_TRIM_THRESHOLD_"]
+                .iter()
+                .any(|k| std::env::var_os(k).is_some());
+            if tuned {
+                return;
+            }
+
+            // Setting either one also switches off glibc's dynamic adjustment
+            // of the mmap threshold, which is the mechanism that was releasing
+            // the buffers in the first place.
+            //
+            // `M_ARENA_MAX` is deliberately not touched. A worker thread gets
+            // its own arena whose heap is capped at 64 MiB, so a buffer larger
+            // than that is mmap'ed however these are set, and confining every
+            // thread to one arena does recover the rest of the win — for a
+            // single client. With eight concurrent ones it costs 3.4x on point
+            // lookups and 2.1x on inserts, because one arena is one malloc
+            // lock. Measured, not assumed.
+            unsafe {
+                libc::mallopt(libc::M_MMAP_THRESHOLD, MMAP_THRESHOLD);
+                libc::mallopt(libc::M_TRIM_THRESHOLD, TRIM_THRESHOLD);
+            }
+        }
+    });
+}
+
 /// Whether a commit waits for the log to reach the disk before reporting
 /// success. PostgreSQL's `synchronous_commit`, and the same trade.
 /// Default: **on**.

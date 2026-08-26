@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use cacheguard::CacheGuard;
 
@@ -187,6 +187,17 @@ pub struct TransactionManager {
     /// [`begin`]: TransactionManager::begin
     in_place: std::sync::Mutex<usize>,
     in_place_done: std::sync::Condvar,
+    /// How many savepoint bookkeeping entries [`TransactionManager::outcome`]
+    /// would have to walk: `parent.len() + rolled_back.len()`, republished
+    /// under the write lock by everything that touches either.
+    ///
+    /// Zero — every database that has never opened a savepoint, and every one
+    /// whose savepoints have retired — means `outcome` can go straight to the
+    /// status log rather than take `inner` for a lookup that can only miss.
+    /// It is called once or twice for **every row a scan looks at**, and a
+    /// shared `RwLock` read is a write to the lock word, so eight workers were
+    /// ping-ponging one line between them per row.
+    savepoints: AtomicUsize,
     /// Last id passed to [`TransactionManager::mark_wrote`].
     ///
     /// Marking happens per row written, not per statement, so the hot path has
@@ -307,6 +318,7 @@ impl TransactionManager {
             status,
             in_place: std::sync::Mutex::new(0),
             in_place_done: std::sync::Condvar::new(),
+            savepoints: AtomicUsize::new(0),
             last_writer: AtomicU64::new(NO_TX).into(),
         }
     }
@@ -404,6 +416,15 @@ impl TransactionManager {
         id
     }
 
+    /// Republishes the count [`TransactionManager::outcome`]'s lock-free path
+    /// tests. Call with the write lock held, after any change to `parent` or
+    /// `rolled_back` — those two are the whole of what `outcome` consults.
+    #[inline]
+    fn publish_savepoints(&self, inner: &Inner) {
+        self.savepoints
+            .store(inner.parent.len() + inner.rolled_back.len(), Ordering::Release);
+    }
+
     /// Takes `tx` and every savepoint under it out of the running set.
     ///
     /// A savepoint left running would hold `oldest_active` down for the life of
@@ -452,6 +473,7 @@ impl TransactionManager {
             }
             inner.children.remove(&id);
         }
+        self.publish_savepoints(&inner);
     }
 
     /// Opens a savepoint inside `parent` and returns the sub-transaction id that
@@ -473,6 +495,7 @@ impl TransactionManager {
         // A savepoint is as rollback-able as its parent, so it never qualifies
         // for the in-place fast path even if the parent somehow did.
         inner.statement_scoped.remove(&id);
+        self.publish_savepoints(&inner);
         id
     }
 
@@ -499,6 +522,7 @@ impl TransactionManager {
         inner.rolled_back.insert(tx);
         inner.running.remove(&tx);
         inner.pinned.remove(&tx);
+        self.publish_savepoints(&inner);
     }
 
     /// Merges `tx` into its parent: its writes now stand or fall with it.
@@ -629,6 +653,19 @@ impl TransactionManager {
             return TxOutcome::Committed;
         }
 
+        // Nothing to walk: `rolled_back` cannot contain `tx` and `parent`
+        // cannot name it, so the answer is whatever the log says.
+        //
+        // Racing with a savepoint being opened is not a new hazard. The locked
+        // version resolved the chain as it stood when it took the lock, and a
+        // reader that got there first read the same absent parent this reads.
+        // Nor can a reader reach this with a sub-transaction id it has not
+        // already seen stamped on a row — and that row was written after the
+        // savepoint was published, through storage that synchronises them.
+        if self.savepoints.load(Ordering::Acquire) == 0 {
+            return self.status.outcome(tx);
+        }
+
         // A sub-transaction has no outcome of its own: rolled back explicitly,
         // or whatever its parent turns out to be. Resolving here rather than at
         // each call site means every reader — visibility, reclamation, conflict
@@ -749,6 +786,13 @@ impl TransactionManager {
     /// nothing pointing at why.
     pub fn bookkeeping_entries(&self) -> usize {
         let inner = self.inner.read();
+        // The published count is what `outcome` trusts instead of this lock, so
+        // every test that looks at the bookkeeping also checks it did not drift.
+        debug_assert_eq!(
+            self.savepoints.load(Ordering::Acquire),
+            inner.parent.len() + inner.rolled_back.len(),
+            "savepoint count drifted from the maps it mirrors"
+        );
         inner.parent.len() + inner.children.len() + inner.rolled_back.len()
     }
 
@@ -1030,6 +1074,40 @@ mod savepoint_tests {
 
     fn resolver(m: &TransactionManager) -> impl Fn(TxId) -> TxOutcome + '_ {
         move |id| m.outcome(id)
+    }
+
+    /// `outcome` skips the lock when no savepoint bookkeeping is outstanding,
+    /// so the count it tests has to follow the maps through every step — and
+    /// come back to zero, or the fast path is lost for the life of the process.
+    ///
+    /// `bookkeeping_entries` asserts the two agree, so calling it is the check.
+    #[test]
+    fn the_published_savepoint_count_follows_the_maps() {
+        let m = TransactionManager::in_memory();
+        assert_eq!(m.savepoints.load(Ordering::Acquire), 0);
+
+        let outer = m.begin();
+        let sp = m.begin_savepoint(outer);
+        m.bookkeeping_entries();
+        assert_eq!(m.savepoints.load(Ordering::Acquire), 1, "one parent link");
+
+        let inner_sp = m.begin_savepoint(sp);
+        m.bookkeeping_entries();
+        m.rollback_savepoint(inner_sp);
+        m.bookkeeping_entries();
+        assert_eq!(
+            m.savepoints.load(Ordering::Acquire),
+            3,
+            "two parent links and one rollback"
+        );
+
+        m.commit(outer);
+        m.bookkeeping_entries();
+        assert_eq!(
+            m.savepoints.load(Ordering::Acquire),
+            0,
+            "retiring the family restores the fast path"
+        );
     }
 
     /// A savepoint's writes are visible to its own transaction, like any other

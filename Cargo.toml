@@ -19,3 +19,11 @@ codegen-units = 1
 lto = "thin"
 overflow-checks = false
 incremental = false
+
+# Release code with symbols, for `perf record` / Hotspot. Same codegen as
+# `release` — fat LTO, one codegen unit — plus DWARF line and inline tables and
+# frame pointers, so a profile names the functions release actually runs.
+[profile.profiling]
+inherits = "release"
+debug = 1
+strip = "none"
