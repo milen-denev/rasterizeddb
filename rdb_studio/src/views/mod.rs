@@ -229,6 +229,25 @@ fn sidebar(studio: &Studio) -> Element<'_, Message> {
         }));
     }
 
+    // Caption the figure once for the whole list rather than per row. Without
+    // it the number sits unlabelled beside a table name and reads as a row
+    // count, which it is not: `row_slots` counts pointer records, so a table
+    // churned by updates shows a figure hundreds of times its live row count
+    // until a `VACUUM FULL`. The wording matches the TABLES tab's column header
+    // so the two surfaces name the same thing the same way.
+    if !filtered.is_empty() {
+        tree = tree.push(
+            container(
+                row![
+                    Space::new().width(Fill),
+                    text("ROW SLOTS").size(9).font(theme::MONO).color(theme::TEXT_FAINT),
+                ]
+                .align_y(Center),
+            )
+            .padding([0, 8]),
+        );
+    }
+
     let mut list = column![].spacing(1).width(Fill);
     for table in filtered {
         let active = studio.selected_table.as_deref() == Some(table.name.as_str());
