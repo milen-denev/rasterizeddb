@@ -942,7 +942,7 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         help: "largest row fraction a predicate may match and still be indexed" },
     ConfigKey { section: "filter", key: "min_table_rows", hot: true,
         set_with: "SET CONFIG filter.min_table_rows = 10000",
-        help: "tables smaller than this are not indexed" },
+        help: "tables smaller than this are scanned without consulting the index" },
     ConfigKey { section: "filter", key: "zone_bounds", hot: true,
         set_with: "SET CONFIG filter.zone_bounds = on",
         help: "keep per-zone min/max for range pruning" },

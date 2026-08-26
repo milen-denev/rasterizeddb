@@ -24,7 +24,18 @@ pub struct FilterConfig {
     /// distinct values is 0.1 % selectivity whether the table holds a million
     /// rows or a billion.
     pub min_selectivity: f64,
-    /// Tables smaller than this are cheaper to scan outright.
+    /// Tables smaller than this are cheaper to scan outright, so a query
+    /// against one does not consult the index at all.
+    ///
+    /// Enforced in `Table::build_candidates` rather than here: the decision is
+    /// about whether a mask is worth building for a scan, not about how wide a
+    /// column's fingerprints should be. Gating it in `choose_f` instead would
+    /// take each column out of service as it crossed a zone boundary, which
+    /// makes a checkpoint's contents depend on the table's size at the moment
+    /// it was taken.
+    ///
+    /// Counted in **slots, not live rows** — the scan walks slots, so that is
+    /// the work a mask would be saving.
     pub min_table_rows: u64,
 }
 

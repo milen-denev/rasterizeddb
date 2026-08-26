@@ -1893,7 +1893,12 @@ impl<S: StorageIO> Table<S> {
     }
 
     /// Build a candidate mask for a WHERE clause, or `None` to scan normally.
-    async fn build_candidates(
+    ///
+    /// `pub(crate)` only so `write_path_tests` can assert on what it declines.
+    /// The decisions here — the size gate and the ratio test below — are
+    /// invisible in query results by design, since both fail open to a full
+    /// scan, so nothing outside this method can tell whether they ran.
+    pub(crate) async fn build_candidates(
         &self,
         where_clause: &str,
         limit: Option<u64>,
@@ -1916,6 +1921,19 @@ impl<S: StorageIO> Table<S> {
 
         let n_slots = self.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
         if n_slots == 0 {
+            return None;
+        }
+
+        // A table small enough to scan outright gains nothing from a mask: the
+        // bitmap test per record costs more than the fetches it saves, and
+        // building the mask is itself work. Scanning is the cheaper answer, so
+        // give the caller no candidates and let it read everything.
+        //
+        // This is what `min_table_rows` is for. Until it was read here the knob
+        // was settable from the CLI and `SET CONFIG` and reported by `SHOW
+        // CONFIG` while gating nothing — it accepted a value and had no effect.
+        // Slots rather than live rows, because slots are what the scan walks.
+        if n_slots < filters.config().min_table_rows {
             return None;
         }
 

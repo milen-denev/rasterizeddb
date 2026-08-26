@@ -702,6 +702,54 @@ async fn a_relocating_update_preserves_the_rows_history() {
     assert!(tombstone.deleted_at > 0);
 }
 
+/// A table small enough to scan outright must not have a candidate mask built
+/// for it, however selective that mask would be.
+///
+/// This is `filter.min_table_rows`, which was settable from the CLI and `SET
+/// CONFIG` and reported by `SHOW CONFIG` while being read by nothing at all —
+/// so the assertion that matters is not where the boundary falls but that the
+/// configured value is consulted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_small_table_is_scanned_rather_than_masked() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_table(dir.path(), "wp_size_gate").await;
+    // Over one 512-row zone, so a zone seals and the column carries
+    // fingerprints — but well under the 4096-slot default.
+    for i in 0..600u64 {
+        insert(&t, i, (i % 8) as i32, "s").await;
+    }
+    t.wait_filters_ready().await;
+
+    let filters = t.filters.as_ref().expect("filters active");
+    let n_slots = t.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
+    assert!(
+        n_slots < filters.config().min_table_rows,
+        "test table is not below the gate: {} slots",
+        n_slots
+    );
+
+    // The mask is perfectly buildable and would prune hard: `id` is unique, so
+    // this is not the ratio test declining a mask that barely prunes.
+    let toks = crate::core::tokenizer::query_tokenizer::tokenize("id = 300", &t.schema.fields);
+    let program = crate::core::filter::sarg::extract(&toks, filters)
+        .expect("a point lookup on a unique column is sargable");
+    let bm = filters.evaluate(&program, n_slots).expect("the mask builds");
+    assert!(bm.get(300), "the mask is wrong, not merely declined");
+    assert!(bm.count() < n_slots / 2, "the mask does not prune, so this proves nothing");
+
+    // And the scan declines it anyway, because the table is too small to pay
+    // for a bitmap test per record.
+    assert!(
+        t.build_candidates("id = 300", None).await.is_none(),
+        "a table under min_table_rows still had a candidate mask built"
+    );
+
+    // Declining is an optimisation, not an answer: the query is unchanged.
+    let rows = run(&t, "id = 300").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(u64_of(&rows[0], 0), 300);
+}
+
 /// The filter backfill reads rows by pointer just as a query does, and is the
 /// one such reader that is not a query. Reclaiming an extent underneath it
 /// would index another row's bytes — which does not fail, it silently builds a

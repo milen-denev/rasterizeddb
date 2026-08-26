@@ -48,7 +48,7 @@ pub const KEYS: &[Key] = &[
     Key { name: "default_f", global_only: false, help: "fingerprint bits before cardinality is known" },
     Key { name: "max_f", global_only: false, help: "ceiling on fingerprint bits (4..16)" },
     Key { name: "min_selectivity", global_only: false, help: "largest row fraction a predicate may match and still be indexed" },
-    Key { name: "min_table_rows", global_only: false, help: "tables smaller than this are not indexed" },
+    Key { name: "min_table_rows", global_only: false, help: "tables smaller than this are scanned without consulting the index" },
 ];
 
 #[derive(Debug, PartialEq)]
