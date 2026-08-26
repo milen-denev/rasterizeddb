@@ -750,6 +750,61 @@ async fn a_small_table_is_scanned_rather_than_masked() {
     assert_eq!(u64_of(&rows[0], 0), 300);
 }
 
+/// An `UPDATE` writes a new version of an existing row, so it must not draw a
+/// fresh id from the sequence.
+///
+/// `RowPointer::new` allocated one unconditionally and `inherit_metadata` then
+/// overwrote it with the previous version's, so every relocation spent a
+/// sequence number on nothing. That made `last_row_id` — which `SHOW TABLE
+/// STATS` reports as "highest id handed out" — count pointer records rather
+/// than rows: it read 472 401 against about a thousand live rows on the
+/// deployment where this was noticed, which is not a figure anything can use.
+#[tokio::test(flavor = "multi_thread")]
+async fn updates_do_not_consume_row_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_table(dir.path(), "wp_row_ids").await;
+    for i in 0..5u64 {
+        insert(&t, i, i as i32, "s").await;
+    }
+
+    let before = all_pointers(&t).await;
+    let original = before.iter().find(|p| !p.deleted).unwrap().clone();
+    let after_inserts = t.last_row_id.load(std::sync::atomic::Ordering::Relaxed);
+
+    // Each label is longer than the last, so every one of these relocates
+    // rather than overwriting the extent in place — the path that allocates.
+    for n in 0..10usize {
+        t.update_rows(
+            "id = 0",
+            full_fetch(&t.schema.fields),
+            upd(&t.schema.fields, "label", "x".repeat(8 + n).as_bytes()),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(
+        t.last_row_id.load(std::sync::atomic::Ordering::Relaxed),
+        after_inserts,
+        "ten updates drew ids from the sequence"
+    );
+
+    // The point of the id is that the row keeps answering to it, so the saving
+    // must not have come from dropping it.
+    let live: Vec<_> = all_pointers(&t).await.into_iter().filter(|p| !p.deleted).collect();
+    assert_eq!(live.len(), 5, "an update left more than one live version");
+    assert_eq!(
+        live.iter().filter(|p| p.id == original.id).count(),
+        1,
+        "the updated row did not keep the id it was inserted with"
+    );
+
+    let rows = run(&t, "id = 0").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(str_of(&rows[0], 2), "x".repeat(17));
+}
+
 /// The filter backfill reads rows by pointer just as a query does, and is the
 /// one such reader that is not a query. Reclaiming an extent underneath it
 /// would index another row's bytes — which does not fail, it silently builds a

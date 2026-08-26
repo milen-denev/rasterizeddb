@@ -769,15 +769,30 @@ impl RowPointer {
 
         row_write: &RowWrite,
 
+        // The version this one replaces, or `None` for a genuine insert. A
+        // replacement keeps the row's existing id, so it must not draw one from
+        // the sequence: `inherit_metadata` would overwrite it, and the number
+        // would be spent on nothing. That burn made `last_row_id` — reported as
+        // "highest id handed out" — count pointer records rather than rows, and
+        // it read 472 401 against ~1 000 live rows on the first deployment it
+        // was measured on, which is not a figure anything can use.
+        previous: Option<&RowPointer>,
+
         // The transaction this version belongs to. `FROZEN_TX` for a write
         // outside any transaction, which is visible to everyone immediately.
         written_by: TxId,
     ) -> Self {
         #[cfg(feature = "enable_long_row")]
-        let id = last_id.fetch_add(1, std::sync::atomic::Ordering::Acquire) as u128;
+        let id = match previous {
+            Some(previous) => previous.id,
+            None => last_id.fetch_add(1, std::sync::atomic::Ordering::Acquire) as u128,
+        };
 
         #[cfg(not(feature = "enable_long_row"))]
-        let id = last_id.fetch_add(1, std::sync::atomic::Ordering::Acquire);
+        let id = match previous {
+            Some(previous) => previous.id,
+            None => last_id.fetch_add(1, std::sync::atomic::Ordering::Acquire),
+        };
 
         #[cfg(feature = "enable_long_row")]
         let (total_bytes, total_string_size) = {
@@ -1978,9 +1993,14 @@ impl RowPointer {
             #[cfg(feature = "enable_long_row")]
             cluster,
             row_write,
+            previous,
             written_by,
         );
 
+        // `new` has already taken the id from `previous`; this carries the rest
+        // of the metadata across. Left as a separate step so `inherit_metadata`
+        // stays correct on its own terms rather than depending on `new` having
+        // done half of it.
         if let Some(previous) = previous {
             row_pointer.inherit_metadata(previous);
         }
