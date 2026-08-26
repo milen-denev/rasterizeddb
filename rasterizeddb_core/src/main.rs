@@ -89,6 +89,16 @@ struct Args {
     #[arg(long = "enable-cache", alias = "enable_cache", value_name = "BOOL")]
     enable_cache: Option<bool>,
 
+    /// Keep large buffers out of the kernel's hands between statements
+    /// (default: false).
+    ///
+    /// Worth 1.4x on a single large scan and nothing at all on point lookups;
+    /// costs about 15% when several clients run large scans at once. See
+    /// `rasterizeddb_core::tune_allocator` for why it is a trade rather than a
+    /// win, and what would remove the need for it.
+    #[arg(long = "tune-allocator", alias = "tune_allocator", value_name = "BOOL")]
+    tune_allocator: Option<bool>,
+
     /// Run an in-memory database (no files are created).
     /// Master switch for the bit-level filter index.
     #[arg(long = "filter", alias = "filter_enabled", value_name = "BOOL")]
@@ -589,6 +599,13 @@ fn main() -> std::io::Result<()> {
 
     // Parse command line arguments with clap
     let args = Args::parse();
+
+    // Before the database opens, so every buffer a statement allocates is
+    // governed by it. Off by default: see `tune_allocator` for the measurements
+    // and for which workload it costs.
+    if args.tune_allocator.unwrap_or(false) {
+        rasterizeddb_core::tune_allocator();
+    }
 
     // Before anything opens a database: this writes two files and exits, so a
     // node can be given an identity without also being started.
