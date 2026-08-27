@@ -26,7 +26,17 @@ pub struct ColumnTransformer {
     /// itself. The index still names the *document* column — that is what the
     /// row fetches — and the path is taken from its bytes each row.
     pub column_1_path: Option<JsonPathRef>,
+    /// A `::` cast applied to the left operand, as `(from, to)`.
+    ///
+    /// Kept beside the path rather than folded into it because a cast can apply
+    /// to an ordinary column — `hardware_status::text` — where there is no
+    /// document and no path. Resolved per row in the same places the path is,
+    /// which is the only point at which a computed value lives long enough to
+    /// be compared.
+    pub column_1_cast: Option<(DbType, DbType)>,
     pub column_2_path: Option<JsonPathRef>,
+    /// A `::` cast applied to the right operand — see [`Self::column_1_cast`].
+    pub column_2_cast: Option<(DbType, DbType)>,
 
     /// Parentheses opening immediately before this comparison, and closing
     /// immediately after it.
@@ -58,6 +68,8 @@ impl Clone for ColumnTransformer {
             column_1_index: self.column_1_index,
             column_2_index: self.column_2_index,
             column_1_path: self.column_1_path.clone(),
+            column_1_cast: self.column_1_cast.clone(),
+            column_2_cast: self.column_2_cast.clone(),
             column_2_path: self.column_2_path.clone(),
             group_opens: self.group_opens,
             group_closes: self.group_closes,
@@ -99,6 +111,26 @@ pub enum ComparerOperation {
     LikeCaseInsensitive,
     StartsWithCaseInsensitive,
     EndsWithCaseInsensitive,
+    /// SQL `SIMILAR TO`, carrying its pattern as the operand.
+    ///
+    /// A separate operator from `Like` rather than a flag on it: the two
+    /// pattern languages differ in more than syntax — `SIMILAR TO` has
+    /// alternation and quantifiers — and the reduction `LIKE` gets in
+    /// `predicate_rewrite`, where `'ab%'` becomes a prefix test the index can
+    /// use, is not sound for a pattern that can also say `(ab|cd)%`.
+    SimilarTo,
+    /// A PostgreSQL structural operator — `@>`, `<@`, `&&`, `<<=`, `@@` and
+    /// the rest — see [`crate::core::pg_ops`].
+    ///
+    /// These carry the **right operand's declared type** because, unlike every
+    /// operator above, they are not symmetric in it: `range @> 100` compares a
+    /// range against a bare integer, and the answer depends on knowing that the
+    /// right side is an element rather than another range. The planner knows
+    /// that when it builds the transformer; the evaluator would have to guess.
+    Pg {
+        op: crate::core::pg_ops::PgOp,
+        right_type: crate::core::db_type::DbType,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -115,6 +147,16 @@ pub enum MathOperation {
     Divide,
     Exponent,
     Root,
+    /// `timestamp - timestamp`, which yields an `INTERVAL` rather than a
+    /// number. A separate operation rather than a flag on `Subtract`, because
+    /// the two produce different *widths* — eight bytes against sixteen — and
+    /// the evaluator checks that before it does anything else.
+    IntervalBetween,
+    /// `timestamp + interval` and `timestamp - interval`, which yield a
+    /// timestamp. The months and days of the interval move the calendar, so
+    /// this cannot be integer addition on microseconds.
+    ShiftForward,
+    ShiftBackward,
 }
 
 // A small trait to view "row columns" without cloning.
@@ -175,6 +217,8 @@ impl ColumnTransformer {
             result_index_1: None,
             result_index_2: None,
             column_1_path: None,
+            column_1_cast: None,
+            column_2_cast: None,
             column_2_path: None,
             column_1_index: None,
             column_2_index: None,
@@ -227,20 +271,28 @@ impl ColumnTransformer {
         // point where a value that has to be *computed* can live long enough to
         // be compared.
         let left_owned;
-        let input1 = match &self.column_1_path {
-            Some(path) => {
+        let input1 = match (&self.column_1_path, &self.column_1_cast) {
+            (Some(path), _) => {
                 left_owned = path.extract(left_mb.into_slice());
                 left_owned.into_slice()
             }
-            None => left_mb.into_slice(),
+            (None, Some((from, to))) => {
+                left_owned = cast_block(left_mb, from, to);
+                left_owned.into_slice()
+            }
+            (None, None) => left_mb.into_slice(),
         };
         let right_owned;
-        let input2 = match &self.column_2_path {
-            Some(path) => {
+        let input2 = match (&self.column_2_path, &self.column_2_cast) {
+            (Some(path), _) => {
                 right_owned = path.extract(right_mb.into_slice());
                 right_owned.into_slice()
             }
-            None => right_mb.into_slice(),
+            (None, Some((from, to))) => {
+                right_owned = cast_block(right_mb, from, to);
+                right_owned.into_slice()
+            }
+            (None, None) => right_mb.into_slice(),
         };
 
         match self.transformer_type {
@@ -325,9 +377,10 @@ impl ColumnTransformer {
                 let document = new_columns
                     .get(idx1)
                     .unwrap_or_else(|| panic!("Column index {} out of bounds", idx1));
-                self.column_1 = match &self.column_1_path {
-                    Some(path) => path.extract(document.into_slice()),
-                    None => document.clone(),
+                self.column_1 = match (&self.column_1_path, &self.column_1_cast) {
+                    (Some(path), _) => path.extract(document.into_slice()),
+                    (None, Some((from, to))) => cast_block(document, from, to),
+                    (None, None) => document.clone(),
                 };
             }
         }
@@ -393,15 +446,17 @@ impl ColumnTransformer {
     /// where the row's bytes arrive.
     pub fn update_column_by_index(&mut self, column_index: usize, new_data: MemoryBlock) {
         if self.column_1_index == Some(column_index) && self.result_index_1.is_none() {
-            self.column_1 = match &self.column_1_path {
-                Some(path) => path.extract(new_data.into_slice()),
-                None => new_data.clone(),
+            self.column_1 = match (&self.column_1_path, &self.column_1_cast) {
+                (Some(path), _) => path.extract(new_data.into_slice()),
+                (None, Some((from, to))) => cast_block(&new_data, from, to),
+                (None, None) => new_data.clone(),
             };
         }
         if self.column_2_index == Some(column_index) && self.result_index_2.is_none() {
-            self.column_2 = Some(match &self.column_2_path {
-                Some(path) => path.extract(new_data.into_slice()),
-                None => new_data,
+            self.column_2 = Some(match (&self.column_2_path, &self.column_2_cast) {
+                (Some(path), _) => path.extract(new_data.into_slice()),
+                (None, Some((from, to))) => cast_block(&new_data, from, to),
+                (None, None) => new_data,
             });
         }
     }
@@ -449,6 +504,13 @@ pub enum ComparisonOperand {
     /// A path into the document column at this index — `doc->>'k'`. The index
     /// is the document's, and the path is taken from its bytes per row.
     PathWithIndex(MemoryBlock, usize, JsonPathRef),
+    /// A `::` cast over the column at this index, as `(from, to)`.
+    ///
+    /// `a::text = 'x'` compares what the column *renders as*, which for every
+    /// type but `STRING` is not its stored bytes. Without this the cast was
+    /// refused outright — "a `::` cast over this expression is not supported
+    /// yet" — for a comparison that is ordinary SQL.
+    CastWithIndex(MemoryBlock, usize, DbType, DbType),
     Intermediate(usize),
 }
 
@@ -546,6 +608,11 @@ impl ComparisonOperand {
                 transformer.set_column_1_index(*index);
                 transformer.column_1_path = Some(path.clone());
             }
+            ComparisonOperand::CastWithIndex(mb, index, from, to) => {
+                transformer.column_1 = mb.clone();
+                transformer.set_column_1_index(*index);
+                transformer.column_1_cast = Some((from.clone(), to.clone()));
+            }
             ComparisonOperand::Intermediate(idx) => transformer.result_index_1 = Some(*idx),
         }
     }
@@ -563,8 +630,43 @@ impl ComparisonOperand {
                 transformer.set_column_2_index(*index);
                 transformer.column_2_path = Some(path.clone());
             }
+            ComparisonOperand::CastWithIndex(mb, index, from, to) => {
+                transformer.setup_column_2(mb.clone());
+                transformer.set_column_2_index(*index);
+                transformer.column_2_cast = Some((from.clone(), to.clone()));
+            }
             ComparisonOperand::Intermediate(idx) => transformer.result_index_2 = Some(*idx),
         }
+    }
+}
+
+/// Converts a column's bytes to the type a `::` cast names.
+///
+/// A cast the codec cannot honour yields the bytes unchanged. That is
+/// deliberate: the comparison then fails on a width or a value mismatch and
+/// answers `false` for that row, where returning an error would fail a whole
+/// scan over one unconvertible value.
+fn cast_block(source: &MemoryBlock, from: &DbType, to: &DbType) -> MemoryBlock {
+    if from == to {
+        return source.clone();
+    }
+    let bytes = source.into_slice();
+    // A cast to text renders the value the way the client would see it, which
+    // for the types stored in PostgreSQL's own layout is not their bytes.
+    let converted = if matches!(to, DbType::STRING) {
+        crate::core::rql::subquery::value_to_literal(from, bytes).map(|literal| {
+            crate::core::value_codec::unquote_sql(&literal).to_string().into_bytes()
+        })
+    } else {
+        crate::core::value_codec::coerce_literal(bytes, from, to)
+    };
+    match converted {
+        Some(converted) => {
+            let mut mb = crate::memory_pool::MEMORY_POOL.acquire(converted.len());
+            mb.into_slice_mut().copy_from_slice(&converted);
+            mb
+        }
+        None => source.clone(),
     }
 }
 
@@ -580,6 +682,7 @@ impl ComparisonOperand {
             ComparisonOperand::Direct(mb) => mb,
             ComparisonOperand::DirectWithIndex(mb, _) => mb,
             ComparisonOperand::PathWithIndex(mb, _, _) => mb,
+            ComparisonOperand::CastWithIndex(mb, _, _, _) => mb,
             ComparisonOperand::Intermediate(_) => {
                 panic!("Intermediate has no direct memory block")
             }
@@ -589,6 +692,7 @@ impl ComparisonOperand {
         match self {
             ComparisonOperand::DirectWithIndex(_, i) => Some(*i),
             ComparisonOperand::PathWithIndex(_, i, _) => Some(*i),
+            ComparisonOperand::CastWithIndex(_, i, _, _) => Some(*i),
             _ => None,
         }
     }

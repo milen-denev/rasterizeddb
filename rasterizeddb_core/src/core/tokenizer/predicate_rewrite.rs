@@ -42,6 +42,19 @@ fn guard_null(column: &str, fragment: &str, schema: &SmallVec<[SchemaField; 20]>
     }
 }
 
+/// PostgreSQL's structural operator symbols, **longest first**.
+///
+/// The order is load-bearing: a prefix match runs down this list and stops at
+/// the first hit, so `<<=` has to precede `<<` or the `=` would be left behind
+/// and `client_ip <<= inet '…'` would silently become the strict `<<`, which
+/// excludes the network itself.
+///
+/// `<->` is here too even though it yields a distance rather than a boolean:
+/// lexing it is what lets the planner report it as an unsupported *operator*
+/// rather than as an unexpected character.
+pub const PG_OPERATORS: &[&str] =
+    &["<<=", ">>=", "<->", "@>", "<@", "&&", "<<", ">>", "@@"];
+
 #[derive(Debug, Clone, PartialEq)]
 enum Tok {
     /// A bare word: column name, keyword, or unquoted literal.
@@ -164,6 +177,25 @@ fn lex(clause: &str) -> Result<Vec<Tok>, String> {
                 let start = i;
                 i += if bytes.get(i + 2) == Some(&b'>') { 3 } else { 2 };
                 out.push(Tok::Sym(clause[start..i].to_string()));
+            }
+            // PostgreSQL's structural operators. Taken before the ordered
+            // comparisons below, which would otherwise cut them in half: `<@`
+            // would lex as `<` followed by a stray `@`, which is where
+            // "unexpected character '@' in WHERE clause" came from.
+            //
+            // Longest first — `<<=` before `<<`, `>>=` before `>>` — or a
+            // network containment test would lose its `=` and silently become
+            // the strict operator.
+            _ if PG_OPERATORS
+                .iter()
+                .any(|sym| clause[i..].starts_with(*sym)) =>
+            {
+                let symbol = PG_OPERATORS
+                    .iter()
+                    .find(|sym| clause[i..].starts_with(**sym))
+                    .expect("the guard just found one");
+                out.push(Tok::Sym((*symbol).to_string()));
+                i += symbol.len();
             }
             b'=' | b'<' | b'>' | b'!' => {
                 let start = i;
@@ -605,9 +637,31 @@ pub fn rewrite_where(
     let toks = lex(clause)?;
     let mut out: Vec<String> = Vec::with_capacity(toks.len());
     let mut i = 0usize;
+    // Where the comparison currently being read began, as an index into `out`.
+    //
+    // A nullable column that turns up *inside* an arithmetic operand —
+    // `subtotal + tax_amount > 100` — cannot guard itself by taking back the
+    // two tokens before it, the way a column on the right of a comparison does:
+    // the `+` is not the comparison, and popping it left the rest of the
+    // comparison outside the guard's parentheses. The whole term has to be
+    // wrapped, and this is where it starts.
+    let mut term_start = 0usize;
 
     while i < toks.len() {
         let tok = &toks[i];
+
+        // A term begins after each connective, and after a parenthesis that
+        // opens a *boolean* group.
+        //
+        // The distinction matters: `(a = 1 OR b = 2)` is a group of terms and a
+        // guard belongs inside it, while `(x - y) > z` is an operand and a
+        // guard inserted inside it would turn the operand into a boolean group
+        // — which is exactly what the planner then refused.
+        if tok.is_keyword("and") || tok.is_keyword("or") {
+            term_start = out.len() + 1;
+        } else if matches!(tok, Tok::LPar) && opens_boolean_group(&toks, i) {
+            term_start = out.len() + 1;
+        }
 
         // A word that names a column may start one of the sugar forms.
         if let Tok::Word(raw) = tok {
@@ -774,6 +828,46 @@ pub fn rewrite_where(
                     continue;
                 }
 
+                // A `::` cast between the column and its operator —
+                // `hardware_status::text SIMILAR TO '101%'`. The cast travels
+                // with the column into the emitted text; the parser applies it
+                // per row.
+                let (kw_at, col) = match toks.get(kw_at) {
+                    Some(Tok::Sym(sym)) if sym.starts_with("::") => {
+                        (kw_at + 1, format!("{}{}", col, sym))
+                    }
+                    _ => (kw_at, col),
+                };
+
+                // `col [NOT] SIMILAR TO 'pattern'`. Two words, so it is
+                // folded into the one-word operator the tokenizer's string-op
+                // table can carry — the same trick `IS NULL` uses to become a
+                // comparison against the nullability companion.
+                if toks.get(kw_at).map(|t| t.is_keyword("similar")).unwrap_or(false)
+                    && toks.get(kw_at + 1).map(|t| t.is_keyword("to")).unwrap_or(false)
+                {
+                    let pattern = toks
+                        .get(kw_at + 2)
+                        .ok_or("SIMILAR TO is missing its pattern")?;
+                    let Tok::Str(literal) = pattern else {
+                        return Err("SIMILAR TO needs a quoted pattern".to_string());
+                    };
+                    if negated {
+                        return Err("NOT SIMILAR TO is not supported yet".to_string());
+                    }
+                    // `Tok::Str` keeps the quotes it was written with, so the
+                    // literal is emitted as-is. Adding a pair around it made
+                    // `''101%''`, which the tokenizer read as an empty string
+                    // followed by a bare `101%`.
+                    out.push(guard_null(
+                        &col,
+                        &format!("{} SIMILARTO {}", col, literal),
+                        schema,
+                    ));
+                    i = kw_at + 3;
+                    continue;
+                }
+
                 // `col [NOT] LIKE 'pattern'` / `ILIKE`
                 let case_insensitive =
                     toks.get(kw_at).map(|t| t.is_keyword("ilike")).unwrap_or(false);
@@ -787,6 +881,27 @@ pub fn rewrite_where(
                     }
                     out.push(guard_null(&col, &format!("{} {} {}", col, op, literal), schema));
                     i = kw_at + 2;
+                    continue;
+                }
+
+                // A nullable column inside an arithmetic operand. The guard
+                // is inserted in front of the whole term rather than wrapped
+                // around it, which reads the same — `AND` binds tighter than
+                // `OR`, so a term inside an `OR` chain is still guarded as a
+                // unit — and needs nothing taken back.
+                let preceded_by_arithmetic = i > 0
+                    && matches!(toks.get(i - 1), Some(Tok::Sym(sym)) if is_arithmetic(sym));
+                if preceded_by_arithmetic {
+                    if nullable::is_nullable(&col, schema) {
+                        if let Some(flag) =
+                            nullable::flag_field(&col, schema)
+                        {
+                            let at = term_start.min(out.len());
+                            out.insert(at, format!("{} = 0 AND", flag.name));
+                        }
+                    }
+                    out.push(col);
+                    i += 1;
                     continue;
                 }
 
@@ -859,6 +974,36 @@ pub fn rewrite_where(
                 // value outside the parentheses.
                 if nullable::is_nullable(&col, schema) {
                     let end = comparison_end(&toks, i + 1);
+
+                    // Unless the run that was consumed holds no comparison at
+                    // all. That happens when the column is an *operand* inside
+                    // parentheses — `(fulfilled_at - created_at) > duration` —
+                    // where `comparison_end` stops at the closing bracket and
+                    // the comparison itself is outside it. Wrapping that run
+                    // produced `( … AND fulfilled_at - created_at ) > duration`:
+                    // a boolean group where an operand belongs, and the planner
+                    // refused the statement.
+                    //
+                    // The guard goes in front of the term instead, which reads
+                    // the same — `AND` binds tighter than `OR` — and leaves the
+                    // parentheses holding what they held.
+                    let holds_comparison = toks[i + 1..end].iter().any(|t| {
+                        matches!(t, Tok::Sym(sym) if !is_arithmetic(sym))
+                            || t.is_keyword("contains")
+                            || t.is_keyword("startswith")
+                            || t.is_keyword("endswith")
+                            || t.is_keyword("similarto")
+                    });
+                    if !holds_comparison {
+                        if let Some(flag) = nullable::flag_field(&col, schema) {
+                            let at = term_start.min(out.len());
+                            out.insert(at, format!("{} = 0 AND", flag.name));
+                        }
+                        out.push(col);
+                        i += 1;
+                        continue;
+                    }
+
                     let mut fragment = vec![col.clone()];
                     for tok in &toks[i + 1..end] {
                         fragment.push(match tok {
@@ -902,8 +1047,8 @@ pub fn rewrite_where(
             }
 
             // Words that are part of the grammar the evaluator understands.
-            const PASS_THROUGH: [&str; 11] = [
-                "AND", "OR", "LIKE", "ILIKE",
+            const PASS_THROUGH: [&str; 12] = [
+                "AND", "OR", "LIKE", "ILIKE", "SIMILARTO",
                 "CONTAINS", "STARTSWITH", "ENDSWITH", "ICONTAINS", "ISTARTSWITH",
                 "IENDSWITH", "IEQUALS",
             ];
@@ -949,6 +1094,37 @@ pub fn rewrite_where(
 /// at a parenthesis that closes a group opened before it, or at the end.
 ///
 /// The result is the index just past the comparison's last token.
+/// Whether the parenthesis at `at` opens a group of boolean terms rather than
+/// a parenthesised operand.
+///
+/// Decided by what the group holds at its own top level: a comparison operator
+/// or an `AND`/`OR` makes it boolean, and arithmetic alone does not.
+fn opens_boolean_group(toks: &[Tok], at: usize) -> bool {
+    let mut depth = 0usize;
+    for tok in &toks[at..] {
+        match tok {
+            Tok::LPar => depth += 1,
+            Tok::RPar => {
+                depth -= 1;
+                if depth == 0 {
+                    return false;
+                }
+            }
+            Tok::Sym(sym) if depth == 1 && !is_arithmetic(sym) && !sym.starts_with("::") => {
+                return true;
+            }
+            t if depth == 1 && (t.is_keyword("and") || t.is_keyword("or")) => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether a symbol is an arithmetic operator rather than a comparison.
+fn is_arithmetic(symbol: &str) -> bool {
+    matches!(symbol, "+" | "-" | "*" | "/" | "%" | "^")
+}
+
 fn comparison_end(toks: &[Tok], start: usize) -> usize {
     let mut depth = 0usize;
     let mut i = start;

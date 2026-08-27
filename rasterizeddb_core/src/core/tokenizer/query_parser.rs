@@ -16,6 +16,13 @@ pub struct QueryParser<'a, 'b> {
     first_iteration: bool,
     // Keep sorted & unique on first parse
     used_column_indices: SmallVec<[usize; 16]>,
+    /// The declared scale of each `NUMERIC(p, s)` column, by write order.
+    ///
+    /// A `DECIMAL` is stored as an `i128` of units scaled by the column's own
+    /// `s`, while a literal is encoded at the engine default. Comparing the two
+    /// without reconciling the scales is off by a power of ten — and answers,
+    /// rather than failing. See [`Self::rescale_decimal_literal`].
+    decimal_scales: SmallVec<[(usize, u32); 8]>,
 }
 
 impl<'a, 'b> QueryParser<'a, 'b> {
@@ -29,7 +36,62 @@ impl<'a, 'b> QueryParser<'a, 'b> {
             query_transformer,
             first_iteration: true,
             used_column_indices: SmallVec::new(),
+            decimal_scales: SmallVec::new(),
         }
+    }
+
+    /// Tells the parser what scale each `NUMERIC(p, s)` column stores in.
+    ///
+    /// Without this every predicate over such a column is answered from a value
+    /// a power of ten away from the stored one: `WHERE price > 50` over a
+    /// `NUMERIC(10,2)` column returned no rows at all, and reported no error.
+    /// A parser given no scales behaves as before, which is correct for a
+    /// schema whose decimals all use the engine default.
+    pub fn with_scales(mut self, schema: &[crate::core::row::schema::SchemaField]) -> Self {
+        for field in schema {
+            if field.db_type != DbType::DECIMAL {
+                continue;
+            }
+            if let Some(scale) = field.scale {
+                if scale != crate::core::value_codec::DECIMAL_SCALE {
+                    self.decimal_scales.push((field.write_order as usize, scale));
+                }
+            }
+        }
+        self
+    }
+
+    /// The declared scale of the column an operand names, when it differs from
+    /// the engine default.
+    fn scale_of(&self, operand: &ComparisonOperand) -> Option<u32> {
+        let index = operand.get_column_index()?;
+        self.decimal_scales
+            .iter()
+            .find(|(at, _)| *at == index)
+            .map(|(_, scale)| *scale)
+    }
+
+    /// Re-encodes a literal at the scale the column it is compared against
+    /// stores in.
+    ///
+    /// The literal is rendered back to text and parsed again rather than
+    /// rescaled arithmetically, so one decimal reader decides what the text
+    /// means — the same one the insert path uses.
+    fn rescale_decimal_literal(
+        literal: &ComparisonOperand,
+        from: &DbType,
+        scale: u32,
+    ) -> Option<ComparisonOperand> {
+        let ComparisonOperand::Direct(mb) = literal else {
+            return None;
+        };
+        let text = crate::core::rql::subquery::value_to_literal(from, mb.into_slice())?;
+        let text = crate::core::value_codec::unquote_sql(&text);
+        let unscaled = crate::core::value_codec::parse_decimal_scaled(&text, scale)?;
+        let bytes = unscaled.to_le_bytes();
+        let mut out = MEMORY_POOL.acquire(bytes.len());
+        out.into_slice_mut().copy_from_slice(&bytes);
+        Some(ComparisonOperand::Direct(out))
     }
 
     #[inline]
@@ -223,10 +285,10 @@ impl<'a, 'b> QueryParser<'a, 'b> {
 
         const CMP_OPS: [&str; 7] = ["=", "!=", "<>", ">", ">=", "<", "<="];
         const LOGIC_KWS: [&str; 2] = ["AND", "OR"];
-        const TEXT_CMPS: [&str; 9] = [
+        const TEXT_CMPS: [&str; 10] = [
             "CONTAINS", "STARTSWITH", "ENDSWITH",
             "ICONTAINS", "ISTARTSWITH", "IENDSWITH", "IEQUALS",
-            "LIKE", "ILIKE",
+            "LIKE", "ILIKE", "SIMILARTO",
         ];
 
         let toks_len = self.toks.len();
@@ -305,6 +367,88 @@ impl<'a, 'b> QueryParser<'a, 'b> {
         // mismatch. Coercing the *literal* to the column's type, rather than
         // the other way round, keeps the column's bytes untouched — which is
         // what lets the filter index recognise the predicate.
+        // A `NUMERIC(p, s)` column and a literal have to meet at the column's
+        // scale, not the engine's default. Done before everything below,
+        // because the ordinary reconciliation would otherwise encode the
+        // literal at the default and the two would never compare equal.
+        let (left_op, right_op, left_type, right_type) = {
+            let left_scale = self.scale_of(&left_op);
+            let right_scale = self.scale_of(&right_op);
+            match (left_scale, right_scale) {
+                (Some(scale), None) if right_type != DbType::DECIMAL || true => {
+                    match Self::rescale_decimal_literal(&right_op, &right_type, scale) {
+                        Some(rescaled) => (left_op, rescaled, left_type, DbType::DECIMAL),
+                        None => (left_op, right_op, left_type, right_type),
+                    }
+                }
+                (None, Some(scale)) => {
+                    match Self::rescale_decimal_literal(&left_op, &left_type, scale) {
+                        Some(rescaled) => (rescaled, right_op, DbType::DECIMAL, right_type),
+                        None => (left_op, right_op, left_type, right_type),
+                    }
+                }
+                // Two columns of the same declared scale need no work; two of
+                // *different* scales cannot be compared byte-for-byte, and are
+                // left to the reconciliation below to refuse.
+                _ => (left_op, right_op, left_type, right_type),
+            }
+        };
+
+        // A structural operator is not reconciled and not coerced. The two
+        // sides are *meant* to differ: `sample_frequencies @> 100` compares an
+        // `int4range` against an `int4`, and coercing the literal to the
+        // column's type — which is what reconciliation does for every ordered
+        // comparison — would turn the integer into a malformed range.
+        if let Some(op) = crate::core::pg_ops::PgOp::from_symbol(op_str) {
+            if !op.applies_to(&left_type) {
+                return Err(format!(
+                    "operator {} does not apply to a {} value",
+                    op.symbol(),
+                    left_type
+                ));
+            }
+            // A literal written as text is re-encoded at the left operand's
+            // type — `tags @> '{gift}'` is an array, `raw_payload @> '{"a":1}'`
+            // is a document — because these operators compare *values*, and
+            // comparing an array against the eight characters of its text form
+            // answers nothing. When the text does not encode at that type the
+            // literal is left alone, which is what keeps `range @> '2026-01-01'`
+            // reaching the element reader.
+            let (right_op, right_type) = match (&right_op, &right_type) {
+                (ComparisonOperand::Direct(literal), DbType::STRING)
+                    if left_type != DbType::STRING =>
+                {
+                    match std::str::from_utf8(literal.into_slice())
+                        .ok()
+                        .and_then(|text| {
+                            crate::core::value_codec::encode_literal(&left_type, text)
+                        }) {
+                        Some(bytes) => {
+                            let mut mb = MEMORY_POOL.acquire(bytes.len());
+                            mb.into_slice_mut().copy_from_slice(&bytes);
+                            (ComparisonOperand::Direct(mb), left_type.clone())
+                        }
+                        None => (right_op, right_type),
+                    }
+                }
+                _ => (right_op, right_type),
+            };
+
+            return self.push_comparison(
+                left_op,
+                right_op,
+                left_type,
+                crate::core::processor::transformer::ComparerOperation::Pg { op, right_type },
+            );
+        }
+
+        // A literal's type comes from how it was written, not from what it is
+        // compared against: `200` is an `i32` and `'1111-…'` is text, even when
+        // the column is a `DECIMAL` or a `UUID`. The evaluator does no
+        // coercion, so without this the pair would fail as an operand-size
+        // mismatch. Coercing the *literal* to the column's type, rather than
+        // the other way round, keeps the column's bytes untouched — which is
+        // what lets the filter index recognise the predicate.
         let (left_op, right_op, left_type, right_type) =
             Self::reconcile_operand_types(left_op, right_op, left_type, right_type)?;
 
@@ -327,6 +471,7 @@ impl<'a, 'b> QueryParser<'a, 'b> {
             "IENDSWITH" => ComparerOperation::EndsWithCaseInsensitive,
             "LIKE" => ComparerOperation::Like,
             "ILIKE" => ComparerOperation::LikeCaseInsensitive,
+            "SIMILARTO" => ComparerOperation::SimilarTo,
             _ => return Err(format!("unknown comparison operator: {}", op_str)),
         };
 
@@ -337,7 +482,8 @@ impl<'a, 'b> QueryParser<'a, 'b> {
             | ComparerOperation::EqualsCaseInsensitive
             | ComparerOperation::ContainsCaseInsensitive
             | ComparerOperation::StartsWithCaseInsensitive
-            | ComparerOperation::EndsWithCaseInsensitive => {
+            | ComparerOperation::EndsWithCaseInsensitive
+            | ComparerOperation::SimilarTo => {
                 if left_type == DbType::STRING || right_type == DbType::STRING {
                     DbType::STRING
                 } else {
@@ -349,6 +495,23 @@ impl<'a, 'b> QueryParser<'a, 'b> {
 
         self.query_transformer
             .add_comparison(comparison_type, left_op, right_op, cmp, None);
+        Ok(())
+    }
+
+    /// Records one comparison, with the left operand's type deciding how the
+    /// bytes are read.
+    ///
+    /// Split out so the structural-operator branch above shares the emit step
+    /// rather than reimplementing it.
+    fn push_comparison(
+        &mut self,
+        left_op: ComparisonOperand,
+        right_op: ComparisonOperand,
+        left_type: DbType,
+        cmp: ComparerOperation,
+    ) -> Result<(), String> {
+        self.query_transformer
+            .add_comparison(left_type, left_op, right_op, cmp, None);
         Ok(())
     }
 
@@ -433,19 +596,40 @@ impl<'a, 'b> QueryParser<'a, 'b> {
         &mut self,
         cols: &SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
     ) -> Result<(ComparisonOperand, DbType), String> {
-        let (mut lhs_op, lhs_type) = self.parse_term(cols)?;
+        let (mut lhs_op, mut lhs_type) = self.parse_term(cols)?;
         while let Some(op_str) = self.peek_op(&["+", "-"]) {
             self.next(); // consume op
-            let (rhs_op, _) = self.parse_term(cols)?;
-            let math = if op_str == "+" {
-                MathOperation::Add
-            } else {
-                MathOperation::Subtract
+            let (rhs_op, rhs_type) = self.parse_term(cols)?;
+            let adding = op_str == "+";
+
+            // Temporal arithmetic is not arithmetic on the operands' bytes:
+            // `timestamp - timestamp` is a span and `timestamp ± interval`
+            // moves the calendar. Deciding it here, where both operand types
+            // are known, is what lets the evaluator see one operation per
+            // meaning rather than guess from a single type.
+            let (math, result_type) = match (&lhs_type, &rhs_type) {
+                (DbType::DATETIME, DbType::DATETIME) if !adding => {
+                    (MathOperation::IntervalBetween, DbType::INTERVAL)
+                }
+                (DbType::DATETIME, DbType::INTERVAL) => (
+                    if adding {
+                        MathOperation::ShiftForward
+                    } else {
+                        MathOperation::ShiftBackward
+                    },
+                    DbType::DATETIME,
+                ),
+                _ => (
+                    if adding { MathOperation::Add } else { MathOperation::Subtract },
+                    lhs_type.clone(),
+                ),
             };
+
             let idx =
                 self.query_transformer
                     .add_math_operation(lhs_type.clone(), lhs_op, rhs_op, math);
             lhs_op = ComparisonOperand::Intermediate(idx);
+            lhs_type = result_type;
         }
         Ok((lhs_op, lhs_type))
     }
@@ -486,8 +670,33 @@ impl<'a, 'b> QueryParser<'a, 'b> {
                 Ok((ComparisonOperand::Direct(mb), db_type))
             }
             Token::StringLit(s) => {
-                let mb = str_to_mb(&s);
-                Ok((ComparisonOperand::Direct(mb), DbType::STRING))
+                // `'…'::type`, and the typed-literal form `TYPE '…'` the
+                // tokenizer compiles to it. The literal is encoded at that type
+                // here, where the text is still in hand — a `POINT` compared as
+                // the seven characters of `'(5,5)'` would answer nothing.
+                //
+                // A cast the encoder cannot honour leaves the literal as text
+                // rather than failing, because the ordered comparisons below
+                // reconcile a text literal against the column themselves, and
+                // that path already handles the types this one does not.
+                match self.peek_cast() {
+                    Some(target) if target != DbType::STRING => {
+                        self.pos += 1;
+                        match crate::core::value_codec::encode_literal(&target, &s) {
+                            Some(bytes) => {
+                                let mut mb = MEMORY_POOL.acquire(bytes.len());
+                                mb.into_slice_mut().copy_from_slice(&bytes);
+                                Ok((ComparisonOperand::Direct(mb), target))
+                            }
+                            None => Ok((ComparisonOperand::Direct(str_to_mb(&s)), DbType::STRING)),
+                        }
+                    }
+                    Some(_) => {
+                        self.pos += 1;
+                        Ok((ComparisonOperand::Direct(str_to_mb(&s)), DbType::STRING))
+                    }
+                    None => Ok((ComparisonOperand::Direct(str_to_mb(&s)), DbType::STRING)),
+                }
             }
             Token::Ident((_name, db_type, write_order)) => {
                 let idx = write_order as usize;
@@ -505,7 +714,23 @@ impl<'a, 'b> QueryParser<'a, 'b> {
                     self.used_column_indices.push(idx);
                 }
 
-                Ok((ComparisonOperand::DirectWithIndex(mb, idx), db_type))
+                // `hardware_status::text` — a cast over the column itself. The
+                // conversion is per row, so it travels with the operand rather
+                // than being applied here to the first row's bytes.
+                match self.peek_cast() {
+                    Some(target) if target != db_type => {
+                        self.pos += 1;
+                        Ok((
+                            ComparisonOperand::CastWithIndex(mb, idx, db_type, target.clone()),
+                            target,
+                        ))
+                    }
+                    Some(_) => {
+                        self.pos += 1;
+                        Ok((ComparisonOperand::DirectWithIndex(mb, idx), db_type))
+                    }
+                    None => Ok((ComparisonOperand::DirectWithIndex(mb, idx), db_type)),
+                }
             }
             // A path into a document. The index is the *document* column's —
             // that is what the row has to fetch — and the transformer takes the

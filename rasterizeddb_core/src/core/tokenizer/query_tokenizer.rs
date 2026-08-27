@@ -316,6 +316,9 @@ impl<'a> FieldLookup<'a> {
         // not reduce to one of the above — an interior `%`, or a `_`.
         string_ops.insert("like".to_string(), "LIKE".to_string());
         string_ops.insert("ilike".to_string(), "ILIKE".to_string());
+        // `SIMILAR TO`, folded to one word by `predicate_rewrite` so it fits
+        // this table — the tokenizer reads one identifier at a time.
+        string_ops.insert("similarto".to_string(), "SIMILARTO".to_string());
 
         Self {
             map,
@@ -619,6 +622,43 @@ fn tokenize_inner<'a>(
                         field_type.clone(),
                         write_order.clone(),
                     )));
+                } else if let Some(db_type) = typed_literal_type(&id, bytes, i) {
+                    // `POINT '(1,2)'`, `inet '10.0.0.0/8'`, `INTERVAL '1 day'`
+                    // — PostgreSQL's typed-literal syntax, which is defined to
+                    // mean exactly what `'…'::type` means.
+                    //
+                    // So it is lexed as exactly that: the string, then a cast.
+                    // Compiling it to the form the parser already handles is
+                    // what keeps one implementation of what a cast does, rather
+                    // than a second that could disagree with it.
+                    let mut j = unsafe { skip_whitespace_simd(bytes, i) };
+                    let mut lit = String::new();
+                    let mut segment = j + 1;
+                    j += 1;
+                    loop {
+                        while j < bytes.len() && bytes[j] != b'\'' {
+                            j += 1;
+                        }
+                        if j >= bytes.len() {
+                            return Err(format!(
+                                "unclosed string literal after the type name '{}'",
+                                id
+                            ));
+                        }
+                        lit.push_str(&s[segment..j]);
+                        if bytes.get(j + 1) == Some(&b'\'') {
+                            lit.push('\'');
+                            j += 2;
+                            segment = j;
+                            continue;
+                        }
+                        break;
+                    }
+                    out.push(Token::StringLit(lit));
+                    out.push(Token::Cast(db_type.clone()));
+                    i = j + 1;
+                    expression_type_context = Some(db_type);
+                    current_field_context = None;
                 } else {
                     // Validate field reference
                     if i < bytes.len() {
@@ -673,6 +713,22 @@ fn tokenize_inner<'a>(
                     }
                     in_parentheses -= 1;
                 }
+            }
+
+            // PostgreSQL's structural operators, matched before the ordered
+            // comparisons below so `<@` is not cut into `<` and a stray `@`.
+            // The list is longest-first, which is what keeps `<<=` whole.
+            _ if crate::core::tokenizer::predicate_rewrite::PG_OPERATORS
+                .iter()
+                .any(|sym| bytes[i..].starts_with(sym.as_bytes())) =>
+            {
+                let symbol = crate::core::tokenizer::predicate_rewrite::PG_OPERATORS
+                    .iter()
+                    .find(|sym| bytes[i..].starts_with(sym.as_bytes()))
+                    .expect("the guard just found one");
+                out.push(Token::Op((*symbol).to_string()));
+                i += symbol.len();
+                current_field_context = None;
             }
 
             b'<' | b'>' | b'!' | b'=' => {
@@ -735,6 +791,23 @@ fn tokenize_inner<'a>(
     }
 
     Ok(out)
+}
+
+/// The type of a `TYPE 'literal'` at this position, or `None` when the
+/// identifier is not a type name or is not followed by a string.
+///
+/// Both conditions matter. A column may legitimately be called `path` or
+/// `line`, and treating the name as a type wherever it appeared would take a
+/// column reference away from a schema that has one — so the schema is
+/// consulted first (this runs in the `else` of that lookup) and a quote must
+/// follow.
+fn typed_literal_type(id: &str, bytes: &[u8], at: usize) -> Option<DbType> {
+    let db_type = crate::core::rql::expr::db_type_of_cast(id)?;
+    let mut j = at;
+    while j < bytes.len() && (bytes[j] as char).is_whitespace() {
+        j += 1;
+    }
+    if bytes.get(j) == Some(&b'\'') { Some(db_type) } else { None }
 }
 
 // Rest of the helper functions remain the same but with optimized implementations
@@ -1040,6 +1113,7 @@ mod tests {
             offset: 0,
             write_order: 5,
             is_unique: false,
+            scale: None,
         });
         schema.push(SchemaField {
             name: "field2".to_string(),
@@ -1049,6 +1123,7 @@ mod tests {
             offset: 0,
             write_order: 10,
             is_unique: false,
+            scale: None,
         });
         let tokens = tokenize("field1 + field2", &schema);
         assert_eq!(tokens.len(), 3);
