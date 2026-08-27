@@ -60,12 +60,60 @@ impl_checked_arith_float!(f32, f64);
 /// The function uses a generic approach to handle different numeric types.
 /// `&[u8]` must be in little-endian format.
 #[inline(always)]
+/// An eight-byte little-endian instant, or `None` when the operand is not one.
+fn le_i64(bytes: &[u8]) -> Option<i64> {
+    Some(i64::from_le_bytes(bytes.get(0..8)?.try_into().ok()?))
+}
+
+/// Copies bytes into a pooled block.
+fn block_of(bytes: &[u8]) -> MemoryBlock {
+    let mut mb = crate::memory_pool::MEMORY_POOL.acquire(bytes.len());
+    mb.into_slice_mut().copy_from_slice(bytes);
+    mb
+}
+
 pub fn perform_math_operation(
     input1: &[u8],
     input2: &[u8],
     db_type: &DbType,
     operation: &MathOperation,
 ) -> std::result::Result<MemoryBlock, EvalError> {
+    // The temporal operations pair operands of *different* widths on purpose —
+    // an eight-byte instant against a sixteen-byte span — so they are answered
+    // before the equal-width check below.
+    match operation {
+        MathOperation::IntervalBetween => {
+            let (Some(a), Some(b)) = (le_i64(input1), le_i64(input2)) else {
+                return Err(EvalError::OperandSizeMismatch);
+            };
+            let span = crate::core::pg_types::Interval {
+                months: 0,
+                days: 0,
+                micros: a.checked_sub(b).ok_or(EvalError::UnsupportedType)?,
+            };
+            return Ok(block_of(&crate::core::pg_types::encode_interval(span)));
+        }
+        MathOperation::ShiftForward | MathOperation::ShiftBackward => {
+            let Some(instant) = le_i64(input1) else {
+                return Err(EvalError::OperandSizeMismatch);
+            };
+            let Some(mut span) = crate::core::pg_types::decode_interval(input2) else {
+                return Err(EvalError::OperandSizeMismatch);
+            };
+            if matches!(operation, MathOperation::ShiftBackward) {
+                span = crate::core::pg_types::Interval {
+                    months: -span.months,
+                    days: -span.days,
+                    micros: -span.micros,
+                };
+            }
+            let shifted = crate::core::pg_types::shift_timestamp(instant, span)
+                .ok_or(EvalError::UnsupportedType)?;
+            return Ok(block_of(&shifted.to_le_bytes()));
+        }
+        _ => {}
+    }
+
     // Checked, not `debug_assert`ed: release builds compile assertions out, and
     // the mismatch then reaches `from_le_bytes`, which panics on a short slice.
     if input1.len() != input2.len() {
@@ -131,6 +179,11 @@ where
             }
             num1 / num2
         }
+        // Answered before the type dispatch, so reaching them here means the
+        // planner paired a temporal operation with a numeric column.
+        MathOperation::IntervalBetween
+        | MathOperation::ShiftForward
+        | MathOperation::ShiftBackward => return Err(EvalError::UnsupportedType),
         MathOperation::Exponent => {
             let base: f64 = num1.into_f64();
             let exp: f64 = num2.into_f64();

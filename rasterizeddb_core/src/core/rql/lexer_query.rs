@@ -2276,7 +2276,8 @@ mod tests {
                 offset: 0,
                 write_order: 0,
                 is_unique: true,
-                is_deleted: false
+                is_deleted: false,
+                scale: None,
             },
             SchemaField {
                 name: "name".to_string(),
@@ -2285,7 +2286,8 @@ mod tests {
                 offset: 8,
                 write_order: 1,
                 is_unique: false,
-                is_deleted: false
+                is_deleted: false,
+                scale: None,
             },
             SchemaField {
                 name: "age".to_string(),
@@ -2294,7 +2296,8 @@ mod tests {
                 offset: 40,
                 write_order: 2,
                 is_unique: false,
-                is_deleted: false
+                is_deleted: false,
+                scale: None,
             },
             SchemaField {
                 name: "email".to_string(),
@@ -2303,7 +2306,8 @@ mod tests {
                 offset: 41,
                 write_order: 3,
                 is_unique: false,
-                is_deleted: false
+                is_deleted: false,
+                scale: None,
             },
         ]
     }

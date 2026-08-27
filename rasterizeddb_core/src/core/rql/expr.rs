@@ -130,6 +130,46 @@ pub enum TextFunc {
     Upper,
     /// `date_trunc('minute', ts)` — an instant floored to a unit.
     DateTrunc,
+    /// `to_tsvector(config, document)` — a document reduced to its lexemes.
+    ToTsVector,
+    /// `to_tsquery(config, query)` — a boolean query over lexemes.
+    ToTsQuery,
+    /// `plainto_tsquery(config, text)` — every word of the text, `AND`ed.
+    PlainToTsQuery,
+    /// `array_length(array, dimension)` — how many elements it holds.
+    ArrayLength,
+    /// `array_ndims(array)` — how many dimensions it has.
+    ArrayNdims,
+}
+
+/// How many elements an array's text form `{a,b,"c,d"}` holds.
+///
+/// Counted from the text rather than the binary header because that is the
+/// form `format_array` yields, and a comma inside a quoted element is not a
+/// separator — `{"a,b"}` holds one element, not two.
+fn array_element_count(text: &str) -> usize {
+    let trimmed = text.trim();
+    let body = trimmed
+        .strip_prefix('{')
+        .and_then(|t| t.strip_suffix('}'))
+        .unwrap_or(trimmed);
+    if body.trim().is_empty() {
+        return 0;
+    }
+    let mut count = 1usize;
+    let mut in_quotes = false;
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            '\\' if in_quotes => {
+                chars.next();
+            }
+            ',' if !in_quotes => count += 1,
+            _ => {}
+        }
+    }
+    count
 }
 
 /// A binary arithmetic operator.
@@ -263,6 +303,29 @@ fn cast_target(name: &str) -> Option<DbType> {
         // `real` IS float4 — mapping it to F64 made the described type float8,
         // and a client decoding the column as f32 then refused the row.
         "REAL" | "FLOAT4" => DbType::F32,
+        "JSON" | "JSONB" => DbType::JSONB,
+        "BYTEA" => DbType::BYTEA,
+        "INET" | "CIDR" => DbType::INET,
+        "INTERVAL" => DbType::INTERVAL,
+        "MACADDR" => DbType::MACADDR,
+        "MACADDR8" => DbType::MACADDR8,
+        "BIT" => DbType::BIT,
+        "VARBIT" | "BIT VARYING" => DbType::VARBIT,
+        "TIME" => DbType::TIME,
+        "TIMETZ" | "TIME WITH TIME ZONE" => DbType::TIMETZ,
+        "POINT" => DbType::POINT,
+        "LINE" => DbType::LINE,
+        "LSEG" => DbType::LSEG,
+        "BOX" => DbType::BOX,
+        "PATH" => DbType::PATH,
+        "POLYGON" => DbType::POLYGON,
+        "CIRCLE" => DbType::CIRCLE,
+        "INT4RANGE" => DbType::INT4RANGE,
+        "INT8RANGE" => DbType::INT8RANGE,
+        "NUMRANGE" => DbType::NUMRANGE,
+        "TSRANGE" => DbType::TSRANGE,
+        "TSTZRANGE" => DbType::TSTZRANGE,
+        "DATERANGE" => DbType::DATERANGE,
         _ => return None,
     })
 }
@@ -415,16 +478,32 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
         return Ok(Expr::Literal { bytes: v.to_le_bytes().to_vec(), db_type: DbType::F64 });
     }
 
-    // `INTERVAL '1 day'`. Represented as a count of microseconds, which is the
-    // unit a DATETIME is stored in, so adding one to a timestamp is ordinary
-    // integer arithmetic.
+    // `INTERVAL '1 day'`, as a real `INTERVAL` value.
+    //
+    // It used to be a count of microseconds typed `I64`, which read the same
+    // for a day or an hour and could not represent a month at all — a month is
+    // not a fixed number of microseconds, so `INTERVAL '1 month'` was refused.
+    // Keeping the three fields apart is what lets the arithmetic move the
+    // calendar; see `pg_types::shift_timestamp`.
     if upper.starts_with("INTERVAL") {
         let rest = text["INTERVAL".len()..].trim();
         if rest.starts_with('\'') && rest.ends_with('\'') && rest.len() >= 2 {
-            let micros = interval_micros(&rest[1..rest.len() - 1])?;
+            let body = &rest[1..rest.len() - 1];
+            if let Some(span) = crate::core::pg_types::parse_interval(body) {
+                return Ok(Expr::Literal {
+                    bytes: crate::core::pg_types::encode_interval(span),
+                    db_type: DbType::INTERVAL,
+                });
+            }
+            // The older reader, kept as the fallback so a spelling it accepted
+            // and the new one does not is still understood rather than newly
+            // refused.
+            let micros = interval_micros(body)?;
             return Ok(Expr::Literal {
-                bytes: micros.to_le_bytes().to_vec(),
-                db_type: DbType::I64,
+                bytes: crate::core::pg_types::encode_interval(
+                    crate::core::pg_types::Interval { months: 0, days: 0, micros },
+                ),
+                db_type: DbType::INTERVAL,
             });
         }
         return Err(format!("INTERVAL needs a quoted value, as in `INTERVAL '1 day'`; got '{}'", text));
@@ -556,6 +635,40 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                         return Err("replace takes three arguments".to_string());
                     }
                     Ok(Expr::Call(TextFunc::Replace, args))
+                }
+                // Full-text search. The configuration argument is required
+                // here, where PostgreSQL also offers a one-argument form that
+                // reads `default_text_search_config` — a setting this server
+                // does not have, so asking for it explicitly is the honest
+                // spelling rather than one that silently assumes English.
+                "TO_TSVECTOR" | "TO_TSQUERY" | "PLAINTO_TSQUERY" => {
+                    if args.len() != 2 {
+                        return Err(format!(
+                            "{} takes a configuration and a text argument, as in                              {}('english', notes)",
+                            upper_name.to_ascii_lowercase(),
+                            upper_name.to_ascii_lowercase()
+                        ));
+                    }
+                    let func = match upper_name.as_str() {
+                        "TO_TSVECTOR" => TextFunc::ToTsVector,
+                        "TO_TSQUERY" => TextFunc::ToTsQuery,
+                        _ => TextFunc::PlainToTsQuery,
+                    };
+                    Ok(Expr::Call(func, args))
+                }
+                "ARRAY_LENGTH" => {
+                    if args.len() != 2 {
+                        return Err(
+                            "array_length takes an array and a dimension".to_string()
+                        );
+                    }
+                    Ok(Expr::Call(TextFunc::ArrayLength, args))
+                }
+                "ARRAY_NDIMS" => {
+                    if args.len() != 1 {
+                        return Err("array_ndims takes exactly one argument".to_string());
+                    }
+                    Ok(Expr::Call(TextFunc::ArrayNdims, args))
                 }
                 "PG_COLUMN_SIZE" => {
                     if args.len() != 1 {
@@ -1079,9 +1192,14 @@ pub fn static_type(expr: &Expr) -> DbType {
                 }
             };
             if timestamp(lhs) && timestamp(rhs) && matches!(op, ArithOp::Sub) {
-                DbType::I64
+                // The difference of two instants is a span, not a bigint. It
+                // was described as `int8` before the type existed, and a client
+                // asking to decode a duration refused the column.
+                DbType::INTERVAL
             } else if timestamp(lhs) || timestamp(rhs) {
                 DbType::DATETIME
+            } else if matches!(ty(lhs), DbType::INTERVAL) && matches!(ty(rhs), DbType::INTERVAL) {
+                DbType::INTERVAL
             } else if matches!(ty(lhs), DbType::DECIMAL) || matches!(ty(rhs), DbType::DECIMAL) {
                 DbType::DECIMAL
             } else if matches!(ty(lhs), DbType::F32 | DbType::F64)
@@ -1114,14 +1232,70 @@ fn arith(a: &Value, op: ArithOp, b: &Value) -> Result<Value, String> {
         matches!(v, Value::Data { db_type: DbType::F32 | DbType::F64, .. })
     };
     let is_timestamp = |v: &Value| matches!(v, Value::Data { db_type: DbType::DATETIME, .. });
+    let is_interval = |v: &Value| matches!(v, Value::Data { db_type: DbType::INTERVAL, .. });
 
-    // A timestamp plus an interval is a timestamp. Both are microseconds here,
-    // so the arithmetic is the integer kind — only the resulting *type* differs,
-    // and getting that wrong would hand a DATETIME column a bare integer.
+    // Interval ± interval is an interval, with the three fields kept apart —
+    // a month is not thirty days, and collapsing them here would make
+    // `INTERVAL '1 month' + INTERVAL '1 day'` print as 31 days.
+    if is_interval(a) && is_interval(b) {
+        if !matches!(op, ArithOp::Add | ArithOp::Sub) {
+            return Err(format!("'{}' is not defined for two intervals", op.symbol()));
+        }
+        let (Value::Data { bytes: x, .. }, Value::Data { bytes: y, .. }) = (a, b) else {
+            return Err("an interval has no value".to_string());
+        };
+        let (Some(x), Some(y)) = (
+            crate::core::pg_types::decode_interval(x),
+            crate::core::pg_types::decode_interval(y),
+        ) else {
+            return Err("an interval could not be read".to_string());
+        };
+        let sign = if matches!(op, ArithOp::Add) { 1 } else { -1 };
+        let sum = crate::core::pg_types::Interval {
+            months: x.months + sign * y.months,
+            days: x.days + sign * y.days,
+            micros: x.micros + sign as i64 * y.micros,
+        };
+        return Ok(Value::Data {
+            bytes: crate::core::pg_types::encode_interval(sum),
+            db_type: DbType::INTERVAL,
+        });
+    }
+
+    // A timestamp plus an interval is a timestamp; the difference of two
+    // timestamps is an interval. Getting the resulting *type* wrong would hand
+    // a DATETIME column a bare integer, or describe a duration as a bigint.
     if is_timestamp(a) || is_timestamp(b) {
         if !matches!(op, ArithOp::Add | ArithOp::Sub) {
             return Err(format!("'{}' is not defined for a timestamp", op.symbol()));
         }
+
+        // An interval operand may be a real `INTERVAL` value or the plain
+        // microsecond count an `INTERVAL '…'` literal parses to. Only the
+        // former can carry months and days, which shift the calendar rather
+        // than a fixed number of microseconds.
+        if is_timestamp(a) && is_interval(b) {
+            let (Some(instant), Value::Data { bytes, .. }) = (as_i64(a), b) else {
+                return Err("a timestamp can only be offset by an interval".to_string());
+            };
+            let Some(mut span) = crate::core::pg_types::decode_interval(bytes) else {
+                return Err("an interval could not be read".to_string());
+            };
+            if matches!(op, ArithOp::Sub) {
+                span = crate::core::pg_types::Interval {
+                    months: -span.months,
+                    days: -span.days,
+                    micros: -span.micros,
+                };
+            }
+            let shifted = crate::core::pg_types::shift_timestamp(instant, span)
+                .ok_or_else(|| "timestamp arithmetic overflowed".to_string())?;
+            return Ok(Value::Data {
+                bytes: shifted.to_le_bytes().to_vec(),
+                db_type: DbType::DATETIME,
+            });
+        }
+
         let (Some(x), Some(y)) = (as_i64(a), as_i64(b)) else {
             return Err("a timestamp can only be offset by an interval".to_string());
         };
@@ -1130,14 +1304,22 @@ fn arith(a: &Value, op: ArithOp, b: &Value) -> Result<Value, String> {
             _ => x.checked_sub(y),
         }
         .ok_or_else(|| "timestamp arithmetic overflowed".to_string())?;
+
         // Subtracting one timestamp from another leaves an interval, not a
-        // point in time.
-        let db_type = if is_timestamp(a) && is_timestamp(b) && matches!(op, ArithOp::Sub) {
-            DbType::I64
-        } else {
-            DbType::DATETIME
-        };
-        return Ok(Value::Data { bytes: value.to_le_bytes().to_vec(), db_type });
+        // point in time — and not a bigint either, which is what it used to
+        // report before the type existed.
+        if is_timestamp(a) && is_timestamp(b) && matches!(op, ArithOp::Sub) {
+            return Ok(Value::Data {
+                bytes: crate::core::pg_types::encode_interval(
+                    crate::core::pg_types::Interval { months: 0, days: 0, micros: value },
+                ),
+                db_type: DbType::INTERVAL,
+            });
+        }
+        return Ok(Value::Data {
+            bytes: value.to_le_bytes().to_vec(),
+            db_type: DbType::DATETIME,
+        });
     }
 
     if float_operand(a) || float_operand(b) {
@@ -1285,6 +1467,65 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
         }
         TextFunc::Lower => string(as_text(&args[0]).to_lowercase()),
         TextFunc::Upper => string(as_text(&args[0]).to_uppercase()),
+
+        // Full-text search. Both sides carry their canonical text form — see
+        // `crate::core::text_search` for why that rather than a packed layout —
+        // so a `tsvector` and a `tsquery` are strings here, and `@@` compares
+        // them.
+        TextFunc::ToTsVector => string(crate::core::text_search::to_tsvector(
+            &as_text(&args[0]),
+            &as_text(&args[1]),
+        )),
+        TextFunc::ToTsQuery => {
+            match crate::core::text_search::to_tsquery(&as_text(&args[0]), &as_text(&args[1]))
+            {
+                Ok(query) => string(query),
+                // A malformed query is reported rather than silently matching
+                // nothing, which is what PostgreSQL does too.
+                Err(reason) => return Err(reason),
+            }
+        }
+        TextFunc::PlainToTsQuery => string(crate::core::text_search::plainto_tsquery(
+            &as_text(&args[0]),
+            &as_text(&args[1]),
+        )),
+
+        // `array_length(a, 1)` is NULL for an empty array, as in PostgreSQL —
+        // not zero, which is the guess that makes an emptiness test read the
+        // wrong way round.
+        TextFunc::ArrayLength => {
+            let Value::Data { bytes, .. } = &args[0] else {
+                return Ok(Value::Null);
+            };
+            let dimension = as_text(&args[1]).trim().parse::<i32>().unwrap_or(1);
+            if dimension != 1 {
+                // One storage type covers every element type, and it records
+                // one dimension. A higher dimension is unknown rather than
+                // zero.
+                return Ok(Value::Null);
+            }
+            let Some(text) = crate::core::value_codec::format_array(bytes) else {
+                return Ok(Value::Null);
+            };
+            let count = array_element_count(&text);
+            if count == 0 {
+                return Ok(Value::Null);
+            }
+            Value::Data { bytes: (count as i32).to_le_bytes().to_vec(), db_type: DbType::I32 }
+        }
+        // Always one: the array storage carries a flat element list, so a
+        // multi-dimensional array declared `DOUBLE PRECISION[][]` is stored and
+        // reported as one-dimensional. Stated here rather than left to be
+        // discovered — PostgreSQL would answer 2.
+        TextFunc::ArrayNdims => {
+            let Value::Data { bytes, .. } = &args[0] else {
+                return Ok(Value::Null);
+            };
+            if bytes.is_empty() {
+                return Ok(Value::Null);
+            }
+            Value::Data { bytes: 1i32.to_le_bytes().to_vec(), db_type: DbType::I32 }
+        }
         // `pg_column_size(v)` is the stored width of one value. Given a whole
         // row — `pg_column_size(t)`, which is how a size query is written — the
         // argument names a relation rather than a column and resolves to
@@ -2040,13 +2281,29 @@ mod tests {
 
     #[test]
     fn interval_literals_parse_in_both_spellings() {
+        use crate::core::pg_types::{decode_interval, Interval};
         let s = schema();
         let r = row_with(Some(1), "");
-        let day = eval(&parse("INTERVAL '1 day'", &s).unwrap(), &r, &s).unwrap();
-        assert_eq!(as_i64(&day), Some(86_400_000_000));
+
+        // An interval keeps its months, days and microseconds apart, so a day
+        // is one *day* rather than 86,400,000,000 microseconds — the two behave
+        // differently across a daylight-saving boundary.
+        let bytes = |text: &str| match eval(&parse(text, &s).unwrap(), &r, &s).unwrap() {
+            Value::Data { bytes, db_type } => {
+                assert_eq!(db_type, DbType::INTERVAL, "{}", text);
+                bytes
+            }
+            Value::Null => panic!("{} evaluated to NULL", text),
+        };
+        assert_eq!(
+            decode_interval(&bytes("INTERVAL '1 day'")),
+            Some(Interval { months: 0, days: 1, micros: 0 })
+        );
         // Several units in one literal add up rather than the last one winning.
-        let combined = eval(&parse("INTERVAL '1 day 6 hours'", &s).unwrap(), &r, &s).unwrap();
-        assert_eq!(as_i64(&combined), Some(86_400_000_000 + 6 * 3_600_000_000));
+        assert_eq!(
+            decode_interval(&bytes("INTERVAL '1 day 6 hours'")),
+            Some(Interval { months: 0, days: 1, micros: 6 * 3_600_000_000 })
+        );
         // Subtraction moves backwards.
         let before = eval(&parse("now() - INTERVAL '1 day'", &s).unwrap(), &r, &s).unwrap();
         let now = eval(&parse("now()", &s).unwrap(), &r, &s).unwrap();
@@ -2109,13 +2366,29 @@ mod tests {
     }
 
     #[test]
-    fn months_and_years_are_refused_rather_than_approximated() {
+    fn months_and_years_are_kept_as_months_rather_than_flattened() {
+        use crate::core::pg_types::{decode_interval, Interval};
         let s = schema();
-        // Their length depends on the date, so a fixed number of days would be
-        // wrong for most of them — and wrong without saying so.
-        assert!(parse("INTERVAL '1 month'", &s).is_err());
-        assert!(parse("INTERVAL '1 year'", &s).is_err());
-        assert!(parse("make_interval(months => 1)", &s).is_err());
+        let r = row_with(Some(1), "");
+
+        // These used to be refused, because a month expressed as a fixed number
+        // of days is wrong for most months and wrong without saying so. They
+        // are accepted now that the months are carried as months and applied to
+        // the calendar — see `pg_types::shift_timestamp`.
+        let bytes = |text: &str| match eval(&parse(text, &s).unwrap(), &r, &s).unwrap() {
+            Value::Data { bytes, .. } => bytes,
+            Value::Null => panic!("{} evaluated to NULL", text),
+        };
+        assert_eq!(
+            decode_interval(&bytes("INTERVAL '1 month'")),
+            Some(Interval { months: 1, days: 0, micros: 0 })
+        );
+        assert_eq!(
+            decode_interval(&bytes("INTERVAL '1 year'")),
+            Some(Interval { months: 12, days: 0, micros: 0 })
+        );
+
+        // A unit that means nothing is still refused rather than guessed at.
         assert!(parse("INTERVAL '5 fortnights'", &s).is_err());
     }
 
