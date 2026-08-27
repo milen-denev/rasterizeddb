@@ -19,6 +19,7 @@ through a bit-sliced SIMD filter index rather than a B-tree.
 | | |
 |---|---|
 | **PostgreSQL wire protocol** | Simple and extended query protocols, bound parameters, SCRAM-SHA-256, TLS. Drivers and ORMs work as-is — see [SQL surface](#sql-surface) |
+| **Type system** | 40 PostgreSQL types, including intervals, MAC and bit strings, the seven geometric types and the six ranges — each with its real wire OID |
 | **Transactions** | MVCC snapshots, `READ COMMITTED` / `REPEATABLE READ`, savepoints, first-updater-wins conflicts |
 | **Durability** | Write-ahead log with checkpoints, and a `synchronous_commit` knob with the trade stated exactly |
 | **Filter index** | Bit-sliced fingerprints, 512 rows per SIMD register, plus zone maps for ranges. Adaptive and runtime-tunable |
@@ -27,6 +28,7 @@ through a bit-sliced SIMD filter index rather than a B-tree.
 | **Replication** | Multi-primary, statement-shipping, HLC-ordered, over TLS 1.3 |
 | **Backup** | Snapshot and point-in-time recovery to any S3-compatible store |
 | **Storage pools** | One database across several directories, with a placement policy and mirrored backups |
+| **Key/value storage** | A database kept in an object store instead of files, per table, alongside file and in-memory tables |
 | **PostgreSQL import** | One-shot migration of a live PostgreSQL database |
 | **rdb_studio** | A desktop console that also speaks to PostgreSQL |
 
@@ -57,6 +59,8 @@ default = ["memory_pool_reuse", "replication_compression",
 | `s3_backup` | on | Backup, restore and PITR to an object store, and the `BACKUP`/`RESTORE` statements |
 | `pg_import` | on | The PostgreSQL frontend client and `IMPORT DATABASE FROM POSTGRES` |
 | `storage_pools` | on | Multi-directory placement, mirroring, and the `STORAGE` statements |
+| `kv_storage` | off | A table kept in a key/value store rather than in files, and the `kv:` placement spec |
+| `kv_storage_s3` | off | The S3 backing store for `kv_storage`. Implies `kv_storage` and `s3_backup` |
 | `replication_compression` | on | Zstd on replication links; a node without it still interoperates, uncompressed |
 | `memory_pool_reuse` | on | Thread-local free lists in the buffer pool |
 | `enable_long_row` | off | Rows above the standard width cap |
@@ -113,7 +117,12 @@ The dialect is PostgreSQL's. What is implemented:
   case-insensitive resolution, arithmetic, `SELECT DISTINCT`.
 - **Filtering** — every comparison operator on every scalar type, `AND`/`OR`
   with parentheses, `IN`, `NOT IN`, `BETWEEN`, `LIKE` and `ILIKE` with the full
-  pattern language.
+  pattern language, and `SIMILAR TO` with alternation, grouping, quantifiers
+  and bracket expressions.
+- **Structural operators** — `@>`, `<@` and `&&` over documents, arrays, ranges
+  and geometry; `<<`, `<<=`, `>>` and `>>=` over networks; `@@` for text search.
+  An operator with no meaning for its operands is an **error**, not `false` —
+  answering `false` would drop every row and look like an empty table.
 - **Joins** — `INNER` and `LEFT JOIN`, any number of relations, aliases, and
   **composite keys** (`ON a.x = b.x AND a.y = b.y`), which every junction table
   needs. Executed as a hash join over materialised rows, each relation scanned
@@ -122,9 +131,16 @@ The dialect is PostgreSQL's. What is implemented:
 - **Aggregates** — `COUNT`, `SUM`, `MIN`, `MAX`, `AVG` with `GROUP BY` and
   `HAVING`, over a single table or a join. `SUM` and `AVG` over an exact type
   stay exact, so a money column keeps its cents.
-- **Window functions** — `ROW_NUMBER() OVER (PARTITION BY … ORDER BY …)`. Not an
-  aggregate: every row survives and gains a column computed from the rows
-  around it.
+- **Window functions** — the ranking calls (`ROW_NUMBER`, `RANK`, `DENSE_RANK`,
+  `PERCENT_RANK`, `CUME_DIST`), the value calls (`LAG`, `LEAD`, `FIRST_VALUE`,
+  `LAST_VALUE`, `NTH_VALUE`) and the aggregates over a window, with `ROWS` and
+  `RANGE` frames. Not an aggregate: every row survives and gains a column
+  computed from the rows around it. The default frame follows PostgreSQL's, so
+  `SUM(x) OVER (ORDER BY t)` is a running total and `SUM(x) OVER ()` is the
+  partition total.
+- **Full-text search** — `to_tsvector`, `to_tsquery`, `plainto_tsquery` and
+  `@@`, with PostgreSQL's `english` stop-word list and a Porter stemmer, so a
+  query for `runs` finds a document that said `running`.
 - **CTEs** — `WITH name AS (SELECT …)`, materialised, which gives PostgreSQL's
   pre-12 semantics: an optimisation fence, evaluated once however many times it
   is referenced.
@@ -137,15 +153,39 @@ The dialect is PostgreSQL's. What is implemented:
   `DELETE`, `DELETE … USING`, `ON CONFLICT DO UPDATE`, and `RETURNING` on all of
   them — where a returned item may be an expression, not only a column.
 - **Expressions** — `CASE WHEN`, `COALESCE`, `NULLIF`, `LEAST`, `GREATEST`,
-  `MOD`, and `::` casts, in projections, predicates and `RETURNING`.
+  `MOD`, `array_length`, `array_ndims`, and `::` casts — over a column as well
+  as a literal — in projections, predicates and `RETURNING`.
+- **Interval arithmetic** — `timestamp - timestamp` is an `interval`, and
+  `timestamp ± interval` moves the **calendar**: 31 January plus a month is
+  28 February, not 3 March.
 - **Constraints** — `NOT NULL`, defaults (kept as text, so
-  `DEFAULT CURRENT_TIMESTAMP` means the time of the insert), primary keys,
-  single- and multi-column `UNIQUE`, and foreign keys, which are **enforced**
-  rather than merely accepted.
+  `DEFAULT CURRENT_TIMESTAMP` means the time of the insert, and likewise
+  `clock_timestamp()`, `CURRENT_DATE` and `CURRENT_TIME`), primary keys,
+  single- and multi-column `UNIQUE`, foreign keys, and `CHECK` — all
+  **enforced** rather than merely accepted. A `CHECK` that evaluates to NULL
+  passes, which is PostgreSQL's rule and the opposite of a `WHERE` clause.
+- **Generated columns** — `GENERATED ALWAYS AS (…) STORED`, computed from the
+  row as it will be stored, so it sees the values defaults filled in. A
+  client-supplied value for one is refused, as PostgreSQL refuses it.
+- **Serial columns** — `SERIAL`, `SMALLSERIAL` and `BIGSERIAL`, expanded to
+  what PostgreSQL expands them to: an integer column, `NOT NULL`, defaulting to
+  the next value of a sequence made with the table.
 - **DDL** — `CREATE`/`DROP TABLE`, `CREATE DATABASE`, `ALTER TABLE` including
   `ADD`/`DROP`/`RENAME COLUMN` and `ALTER … TYPE … USING`.
 - **Catalogue** — PostgreSQL's catalogue relations are produced on demand when a
   statement names one, so tools that introspect `pg_catalog` work.
+
+The notable gaps, each pinned by a test in `rasterizeddb_compat` that names it
+rather than being left to be discovered:
+
+- `LATERAL` set-returning functions in `FROM`, and `WITH ORDINALITY`.
+- Function calls inside a `WHERE` clause. The scan's comparison path takes
+  column bytes and literals and has nowhere to evaluate an expression per row —
+  which is why `to_tsvector(…)` works in a select list but not in a predicate.
+- A join `ON` that is an `OR` of predicates.
+- The `jsonb_path_query` family, and multi-dimensional array subscripts.
+
+`cargo test -p rasterizeddb_compat -- --ignored` runs them as a work list.
 
 See [docs/postgres-compatibility.md](docs/postgres-compatibility.md) for the
 type mapping, the exact semantics, and what is not supported.
@@ -486,6 +526,31 @@ PostgreSQL has no placement policy to change.
 See [docs/storage-pools.md](docs/storage-pools.md) for the on-disk format, what
 a crash leaves behind at each step, and what a mirrored backup does and does not
 guarantee.
+
+### Key/value storage
+
+Off by default (`kv_storage`, and `kv_storage_s3` for the S3 backing store). A
+whole second storage backend — chunked objects, a delta log, a page cache and a
+compactor — so a build that only ever writes files does not carry it or the
+extra match arm on every storage call.
+
+Placement is **per table**, so one database can hold file, in-memory and
+object-store tables side by side. A table's spec in `db_storage.cfg` widens
+from a directory path to a backend:
+
+```sql
+STORAGE PLACE TABLE events AT 'kv:archive';
+STORAGE PLACE TABLE scratch AT 'memory:';
+STORAGE PLACE TABLE orders  AT '/mnt/nvme1';
+```
+
+A non-file table gets **no file-based features**: no backup, no relocation, no
+WAL, and the free-space policy skips it. Those are guards rather than
+omissions — a snapshot logs what it excluded instead of quietly leaving it out.
+
+See [docs/kv-storage.md](docs/kv-storage.md) for the object layout, the
+compactor, and the two limits stated rather than left implicit: one writer per
+store prefix, and no local disk cache tier.
 
 ### S3 backup and point-in-time recovery
 
