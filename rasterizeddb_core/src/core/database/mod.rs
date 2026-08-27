@@ -218,6 +218,48 @@ pub type StoragePool = StdArc<crate::core::storage::StorageManager>;
 #[cfg(not(feature = "storage_pools"))]
 pub type StoragePool = ();
 
+/// The key/value stores a database's tables may be placed on, or `()` in a
+/// build without `kv_storage`.
+#[cfg(all(feature = "kv_storage", feature = "storage_pools"))]
+pub type KvStores = StdArc<crate::core::storage::kv_registry::KvRegistry>;
+/// The key/value stores a database's tables may be placed on, or `()` in a
+/// build without `kv_storage`.
+///
+/// Also `()` without `storage_pools`: the registry lives inside `core::storage`,
+/// and without a placement map there is nothing to place on it. The driver
+/// itself is unaffected — it is a provider, and needs neither feature.
+#[cfg(not(all(feature = "kv_storage", feature = "storage_pools")))]
+pub type KvStores = ();
+
+#[cfg(all(feature = "kv_storage", feature = "storage_pools"))]
+fn open_kv_stores(location: &str, in_memory: bool) -> KvStores {
+    StdArc::new(if in_memory {
+        crate::core::storage::kv_registry::KvRegistry::inert()
+    } else {
+        crate::core::storage::kv_registry::KvRegistry::open(location)
+    })
+}
+
+#[cfg(not(all(feature = "kv_storage", feature = "storage_pools")))]
+fn open_kv_stores(_location: &str, _in_memory: bool) -> KvStores {}
+
+/// The seed provider each non-directory table is opened from, keyed by the
+/// backend spec *and* the table name.
+///
+/// Cached because these backends have identity: an in-memory table's buffers
+/// live in the registry its seed created, and a key/value table's length and
+/// page cache live in its family. Building a fresh seed on the second call
+/// would not reopen the table — it would make a second, empty one.
+///
+/// The spec is part of the key rather than only the name, because a name can
+/// outlive the backend it was cached against: drop a table on `kv:archive`, pin
+/// the same name to `memory:`, recreate it, and a name-keyed entry would hand
+/// back the old key/value seed. The table would then be built on the store the
+/// placement no longer names — silently, and correctly as far as every later
+/// read is concerned. Keying on the spec makes that a miss instead of relying on
+/// every site that changes a placement to remember to invalidate this.
+type SeedCache = DashMap<(String, String), Arc<DbStorageProvider>, ahash::RandomState>;
+
 #[cfg(feature = "storage_pools")]
 fn open_pool(location: &str, in_memory: bool) -> StoragePool {
     StdArc::new(if in_memory {
@@ -257,12 +299,135 @@ async fn open_root_file(location: &str, _backups: &[String], name: &str) -> DbSt
 /// The database's own provider when the table has no recorded placement, which
 /// is every table in a single-directory database — so this call is free there
 /// and the code paths do not fork.
+/// Resolves a table onto a backend that is not a directory, if it is on one.
+///
+/// Separate from the directory path so that a build without `storage_pools` —
+/// which has no placement map at all — still compiles, and so the common case
+/// stays one map lookup.
+async fn seed_on_other_backend(
+    _io_pointers: &Arc<DbStorageProvider>,
+    _pool: &StoragePool,
+    _kv: &KvStores,
+    _seeds: &SeedCache,
+    _table_name: &str,
+) -> Option<Arc<DbStorageProvider>> {
+    #[cfg(feature = "storage_pools")]
+    {
+        use crate::core::storage::TableBackend;
+        let backend = _pool.backend_of(_table_name)?;
+        if backend.is_file_based() {
+            return None;
+        }
+        let key = (backend.as_spec(), _table_name.to_string());
+        if let Some(existing) = _seeds.get(&key) {
+            return Some(existing.clone());
+        }
+        let seed: Arc<DbStorageProvider> = match &backend {
+            TableBackend::Memory => {
+                Arc::new(DbStorageProvider::new_memory(&format!("{_table_name}_pointers.db")))
+            }
+            #[cfg(feature = "kv_storage")]
+            TableBackend::KeyValue(store) => match _kv.family(store).await {
+                Ok(family) => match DbStorageProvider::new_key_value(
+                    family,
+                    &format!("{_table_name}_pointers.db"),
+                )
+                .await
+                {
+                    Ok(provider) => Arc::new(provider),
+                    Err(e) => {
+                        error!("table {_table_name}: key/value store '{store}' failed: {e}");
+                        return Some(fallback_seed(_table_name));
+                    }
+                },
+                Err(e) => {
+                    error!("table {_table_name}: key/value store '{store}' failed: {e}");
+                    return Some(fallback_seed(_table_name));
+                }
+            },
+            other => {
+                error!(
+                    "table {_table_name} is placed on a {} backend this build cannot open",
+                    other.kind()
+                );
+                return Some(fallback_seed(_table_name));
+            }
+        };
+        _seeds.insert(key, seed.clone());
+        return Some(seed);
+    }
+    #[cfg(not(feature = "storage_pools"))]
+    None
+}
+
+/// Whether `table_name`'s recorded backend is one this server can actually open.
+///
+/// Reports what is wrong and where, because the operator's fix — restore the
+/// store's entry in `db_kv.cfg`, or rebuild this server with the feature — is
+/// not guessable from "table does not exist".
+fn backend_is_openable(_pool: &StoragePool, _kv: &KvStores, _table_name: &str) -> bool {
+    #[cfg(feature = "storage_pools")]
+    {
+        use crate::core::storage::TableBackend;
+        match _pool.backend_of(_table_name) {
+            Some(TableBackend::KeyValue(store)) => {
+                #[cfg(all(feature = "kv_storage", feature = "storage_pools"))]
+                {
+                    if _kv.has(&store) {
+                        return true;
+                    }
+                    error!(
+                        "table {_table_name} is placed on key/value store '{store}', which \
+                         {} does not configure; the table is unavailable until it is restored",
+                        crate::core::storage::kv_registry::KV_FILE
+                    );
+                    return false;
+                }
+                #[cfg(not(all(feature = "kv_storage", feature = "storage_pools")))]
+                {
+                    error!(
+                        "table {_table_name} is placed on key/value store '{store}', and this \
+                         server was built without the kv_storage feature; the table is \
+                         unavailable"
+                    );
+                    return false;
+                }
+            }
+            _ => true,
+        }
+    }
+    #[cfg(not(feature = "storage_pools"))]
+    true
+}
+
+/// What a table gets when its backend cannot be opened.
+///
+/// In memory, deliberately. The database refuses to open when a placement names
+/// a store that is not configured, so reaching this means the configuration
+/// changed under a running server. Falling back to the database *directory*
+/// would scatter that table's files where a later, correct run would find them
+/// as orphans; this way the damage cannot outlive the process.
+fn fallback_seed(table_name: &str) -> Arc<DbStorageProvider> {
+    Arc::new(DbStorageProvider::new_memory(&format!("{table_name}_pointers.db")))
+}
+
 #[cfg(feature = "storage_pools")]
 async fn seed_in(
     io_pointers: &Arc<DbStorageProvider>,
     pool: &StoragePool,
+    kv: &KvStores,
+    seeds: &SeedCache,
     table_name: &str,
 ) -> Arc<DbStorageProvider> {
+    // Boxed, so opening a key/value store does not enlarge this frame for the
+    // tables that will never take that branch. `seed_in` is on `add_table`'s
+    // await chain, which already sits close to a test thread's 2 MiB stack, and
+    // an inlined future here would be paid for by every table.
+    if let Some(seed) =
+        Box::pin(seed_on_other_backend(io_pointers, pool, kv, seeds, table_name)).await
+    {
+        return seed;
+    }
     let Some(root) = pool.root() else {
         return io_pointers.clone(); // in memory: one place, and it is not a directory
     };
@@ -306,6 +471,8 @@ async fn seed_at(
 async fn seed_in(
     io_pointers: &Arc<DbStorageProvider>,
     _pool: &StoragePool,
+    _kv: &KvStores,
+    _seeds: &SeedCache,
     _table_name: &str,
 ) -> Arc<DbStorageProvider> {
     io_pointers.clone()
@@ -335,8 +502,11 @@ fn pool_rename(pool: &StoragePool, old_name: &str, new_name: &str) {
     // Recorded before the copy rather than after it, so that a crash midway
     // leaves the new name pointing at the directory its half-written files are
     // actually in. The other order strands them somewhere nothing looks.
-    if let Some(path) = pool.location_of(old_name) {
-        let _ = pool.pin(new_name, &path);
+    // The spec, not the directory: a table on another backend has no directory,
+    // and losing its placement here would have the renamed table resolve to the
+    // database directory and open empty.
+    if let Some(spec) = pool.spec_of(old_name) {
+        let _ = pool.pin_backend(new_name, &crate::core::storage::TableBackend::parse(&spec));
     }
 }
 
@@ -408,6 +578,20 @@ pub struct Database {
     /// directory, so the placement call sites need no branch — the same shape
     /// `replication` uses. See [`crate::core::storage`].
     pub storage: StoragePool,
+
+    /// The key/value stores this database's tables may be placed on.
+    ///
+    /// Read from `db_kv.cfg` at open and empty for a database that has none, so
+    /// the call sites need no branch. See
+    /// [`crate::core::storage::kv_registry`].
+    pub kv: KvStores,
+
+    /// The seed provider each table on a non-directory backend was opened from.
+    ///
+    /// Not a cache in the usual sense — it is identity. Two lookups of the same
+    /// in-memory table have to reach the same buffers, and two lookups of the
+    /// same key/value table the same family. See [`SeedCache`].
+    seeds: SeedCache,
 }
 
 impl Database {
@@ -460,6 +644,8 @@ impl Database {
         // for this database, recovers their logs, and says whether the
         // catalogue itself is mirrored.
         let storage = open_pool(location, in_memory);
+        let kv_stores = open_kv_stores(location, in_memory);
+        let seeds: SeedCache = DashMap::default();
         let backups = pool_mirrors(&storage);
 
         // The catalogue, the row store and the schema are mirrored along with
@@ -501,7 +687,7 @@ impl Database {
 
         // Before the table list, because what it resolves is which names that
         // list should contain.
-        recover_interrupted_rename(&io_pointers, &io_rows, &io_schema, &storage).await;
+        recover_interrupted_rename(&io_pointers, &io_rows, &io_schema, &storage, &kv_stores, &seeds).await;
 
         let tables_names: Vec<(String, u64)> =
             load_db_tables(&schema, &mut iterator, io_rows.clone()).await;
@@ -551,11 +737,18 @@ impl Database {
         let id = next_database_id();
 
         for (table_name, _) in tables_names {
+            // A table whose backend is not configured is left out of the live
+            // map entirely, so a query for it says the table does not exist.
+            // Opening it anyway would answer that query with no rows, which is
+            // the same shape as an empty table and reads as data loss.
+            if !backend_is_openable(&storage, &kv_stores, &table_name) {
+                continue;
+            }
             // A table placed on a second disk is opened from a seed rooted
             // there. `seed_in` returns the database's own provider when the
             // table has no placement, so a single-directory database opens
             // exactly as it did before.
-            let seed = seed_in(&io_pointers, &storage, &table_name).await;
+            let seed = seed_in(&io_pointers, &storage, &kv_stores, &seeds, &table_name).await;
 
             let mut table = Table::new(&table_name, seed, vec![]).await;
             table.scope_cache_to_database(id);
@@ -576,7 +769,20 @@ impl Database {
             replication: StdArc::new(crate::replication::Replication::new()),
             location: (!in_memory).then(|| location.to_string()),
             storage,
+            kv: kv_stores,
+            seeds,
         }
+    }
+
+    /// Releases the cached seed for a table that is gone.
+    ///
+    /// Correctness does not depend on this — the spec is part of the cache key,
+    /// so a stale entry can never be served for a different backend. It is here
+    /// so that dropping an in-memory table also drops its buffers, and dropping
+    /// a key/value table releases its open file, rather than holding both for
+    /// the life of the process.
+    fn forget_seed(&self, table_name: &str) {
+        self.seeds.retain(|(_, name), _| name != table_name);
     }
 
     /// Ends `tx` successfully, on this node.
@@ -844,7 +1050,7 @@ impl Database {
         // that is not there, which is also what makes it usable for cleaning up
         // a rename that never finished.
         discard_files(
-            &seed_in(&self.db_io_pointers, &self.storage, table_name).await,
+            &seed_in(&self.db_io_pointers, &self.storage, &self.kv, &self.seeds, table_name).await,
             table_name,
         )
         .await;
@@ -853,6 +1059,7 @@ impl Database {
         // the sweep above to the database directory, where it would find
         // nothing and report a clean drop over a table still on disk.
         pool_forget(&self.storage, table_name);
+        self.forget_seed(table_name);
 
         // A shadow table is storage the engine created to back a JSON column,
         // owned by the parent's column rather than by the user. Nothing will
@@ -1065,8 +1272,8 @@ impl Database {
         // directory — but they are resolved separately rather than assumed
         // equal, because that assumption is only true while `pool_rename` runs
         // before this does.
-        let from = seed_in(&self.db_io_pointers, &self.storage, old_name).await;
-        let to = seed_in(&self.db_io_pointers, &self.storage, new_name).await;
+        let from = seed_in(&self.db_io_pointers, &self.storage, &self.kv, &self.seeds, old_name).await;
+        let to = seed_in(&self.db_io_pointers, &self.storage, &self.kv, &self.seeds, new_name).await;
 
         for suffix in RENAMED_SUFFIXES {
             let source = from
@@ -1123,7 +1330,7 @@ impl Database {
     /// frees the most space for the fewest copies.
     #[cfg(feature = "storage_pools")]
     pub async fn table_bytes(&self, table_name: &str) -> u64 {
-        let seed = seed_in(&self.db_io_pointers, &self.storage, table_name).await;
+        let seed = seed_in(&self.db_io_pointers, &self.storage, &self.kv, &self.seeds, table_name).await;
         let mut total = 0u64;
         for suffix in RENAMED_SUFFIXES {
             let io = seed.create_new(format!("{}{}", table_name, suffix)).await;
@@ -1198,7 +1405,7 @@ impl Database {
         // `rename_table`.
         let table = self.tables.remove(table_name).map(|(_, t)| t);
 
-        let from = seed_in(&self.db_io_pointers, &self.storage, table_name).await;
+        let from = seed_in(&self.db_io_pointers, &self.storage, &self.kv, &self.seeds, table_name).await;
         // Built for the destination directly rather than from this database's
         // own provider: whether a file is mirrored is settled when it is
         // opened, and the catalogue's provider may predate the backup location.
@@ -1258,7 +1465,7 @@ impl Database {
     /// Used both to clean up a failed copy and to drop the original once the
     /// rename has committed, so it must tolerate files that are not there.
     async fn discard_table_files(&self, name: &str) {
-        discard_files(&seed_in(&self.db_io_pointers, &self.storage, name).await, name).await
+        discard_files(&seed_in(&self.db_io_pointers, &self.storage, &self.kv, &self.seeds, name).await, name).await
     }
 
     /// Rewrites the table name embedded in a schema record's header.
@@ -1271,7 +1478,7 @@ impl Database {
     /// a cache namespace.
     async fn rewrite_schema_name(&self, new_name: &str) -> io::Result<()> {
         let schema_io = Arc::new(
-            seed_in(&self.db_io_pointers, &self.storage, new_name)
+            seed_in(&self.db_io_pointers, &self.storage, &self.kv, &self.seeds, new_name)
                 .await
                 .create_new(format!("{}_schema.db", new_name))
                 .await,
@@ -1293,7 +1500,7 @@ impl Database {
 
     /// Opens the renamed table and puts it in the live map under its new name.
     async fn open_renamed_table(&self, new_name: &str) {
-        let seed = seed_in(&self.db_io_pointers, &self.storage, new_name).await;
+        let seed = seed_in(&self.db_io_pointers, &self.storage, &self.kv, &self.seeds, new_name).await;
         let mut table = Table::new(new_name, seed, Vec::new()).await;
         table.scope_cache_to_database(self.id);
         table.enable_versioning(self.transactions.clone());
@@ -1489,7 +1696,7 @@ impl Database {
         // a half-written table, which the next `CREATE TABLE` of that name
         // reuses; the other order leaves the files somewhere nothing looks.
         pool_place(&self.storage, table_name);
-        let seed = seed_in(&self.db_io_pointers, &self.storage, table_name).await;
+        let seed = seed_in(&self.db_io_pointers, &self.storage, &self.kv, &self.seeds, table_name).await;
 
         let mut table = Table::new_with_constraints(
             &table_name,
@@ -1579,6 +1786,39 @@ impl Database {
                 return Err(e);
             }
             table.schema.type_modifiers.push(entry.clone());
+            // Onto the field as well as into the sidecar. A table created in
+            // this process is never re-read from disk, so `TableSchema::load`'s
+            // copy of this never runs for it — and a planner that did not know
+            // the column's scale compared every literal against it a power of
+            // ten away, silently.
+            if let Some(field) = table
+                .schema
+                .fields
+                .iter_mut()
+                .find(|f| f.name.eq_ignore_ascii_case(&entry.column))
+            {
+                field.scale = Some(entry.scale as u32);
+            }
+        }
+
+        for entry in &create_table.generated {
+            if let Err(e) =
+                crate::core::rql::generated::append(table.io_schema.clone(), entry).await
+            {
+                error!("Failed to persist generated column {}: {}", entry.column, e);
+                return Err(e);
+            }
+            table.schema.generated.push(entry.clone());
+        }
+
+        for entry in &create_table.checks {
+            if let Err(e) =
+                crate::core::rql::check::append(table.io_schema.clone(), entry).await
+            {
+                error!("Failed to persist check constraint {}: {}", entry.name, e);
+                return Err(e);
+            }
+            table.schema.checks.push(entry.clone());
         }
 
         for entry in &create_table.json_columns {
@@ -1764,7 +2004,7 @@ impl Database {
         // The previous handle is dropped first so its maintenance task stops
         // before a second one starts on the same files.
         self.tables.remove(table_name);
-        let seed = seed_in(&self.db_io_pointers, &self.storage, table_name).await;
+        let seed = seed_in(&self.db_io_pointers, &self.storage, &self.kv, &self.seeds, table_name).await;
         let mut table = Table::new(table_name, seed, Vec::new()).await;
         table.scope_cache_to_database(self.id);
         table.enable_versioning(self.transactions.clone());
@@ -1840,6 +2080,8 @@ async fn recover_interrupted_rename(
     io_rows: &Arc<DbStorageProvider>,
     io_schema: &Arc<DbStorageProvider>,
     pool: &StoragePool,
+    kv: &KvStores,
+    seeds: &SeedCache,
 ) {
     let io = io_pointers.create_new(RENAME_INTENT_FILE.to_string()).await;
     let len = io.get_len().await;
@@ -1878,13 +2120,13 @@ async fn recover_interrupted_rename(
                 old_name, new_name
             );
             if tombstone_catalogue_row(io_pointers, io_rows, io_schema, old_name).await.is_ok() {
-                discard_files(&seed_in(io_pointers, pool, old_name).await, old_name).await;
+                discard_files(&seed_in(io_pointers, pool, kv, seeds, old_name).await, old_name).await;
                 clear_intent(io_pointers).await;
             }
         }
         (false, true) => {
             // Committed and tombstoned; only the old files remain.
-            discard_files(&seed_in(io_pointers, pool, old_name).await, old_name).await;
+            discard_files(&seed_in(io_pointers, pool, kv, seeds, old_name).await, old_name).await;
             clear_intent(io_pointers).await;
         }
         // Never committed: the catalogue still names only the original, so
@@ -1894,7 +2136,7 @@ async fn recover_interrupted_rename(
                 "Abandoning an interrupted rename of {} to {}: it never reached the catalogue",
                 old_name, new_name
             );
-            discard_files(&seed_in(io_pointers, pool, new_name).await, new_name).await;
+            discard_files(&seed_in(io_pointers, pool, kv, seeds, new_name).await, new_name).await;
             clear_intent(io_pointers).await;
         }
         // Neither: nothing to reconcile against, so the safest act is none.
