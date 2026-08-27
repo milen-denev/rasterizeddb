@@ -227,14 +227,40 @@ pub async fn run_all(pool: &sqlx::PgPool) -> anyhow::Result<Vec<ProbeResult>> {
 }
 
 async fn run_one(pool: &sqlx::PgPool, probe: &Probe) -> anyhow::Result<()> {
-    if matches!(probe.expect, Expect::Fails) {
-        return match sqlx::query(probe.sql).fetch_all(pool).await {
-            Err(_) => Ok(()),
-            Ok(_) => anyhow::bail!("the statement was accepted, but it must be refused"),
-        };
-    }
+    // One connection, held for this probe and cleaned before it goes back.
+    //
+    // Running straight against the pool made the probes share state: `BEGIN`,
+    // `START TRANSACTION` and `BEGIN ISOLATION LEVEL …` each leave their
+    // connection inside an open block, sqlx returns it to the pool as it is,
+    // and a later probe handed that connection inherits the block. So
+    // `SAVEPOINT probe_sp`, which must be refused *outside* a transaction, was
+    // sometimes correctly accepted — the engine right both times and the probe
+    // red on a coin toss. With one connection it reproduces every run.
+    //
+    // The `ROLLBACK` is what makes the claim above this list — that each probe
+    // runs on its own connection — actually true. Outside a block it is a
+    // no-op, and its own failure is not this probe's result.
+    let mut connection = pool.acquire().await?;
 
-    let rows = sqlx::query(probe.sql).fetch_all(pool).await?;
+    let outcome = if matches!(probe.expect, Expect::Fails) {
+        match sqlx::query(probe.sql).fetch_all(&mut *connection).await {
+            Err(_) => Ok(Vec::new()),
+            Ok(_) => Err(anyhow::anyhow!(
+                "the statement was accepted, but it must be refused"
+            )),
+        }
+    } else {
+        sqlx::query(probe.sql)
+            .fetch_all(&mut *connection)
+            .await
+            .map_err(anyhow::Error::from)
+    };
+    let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+
+    let rows = outcome?;
+    if matches!(probe.expect, Expect::Fails) {
+        return Ok(());
+    }
 
     match &probe.expect {
         Expect::Succeeds => Ok(()),
