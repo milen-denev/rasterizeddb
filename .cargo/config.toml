@@ -1,5 +1,24 @@
 # .cargo/config.toml
 
+# Test threads get Rust's 2 MiB default, which nobody chose — while the product
+# runs every one of these futures on 32 MB, both on its main thread (the
+# rustflags below) and on its Tokio workers (`STACK_SIZE` in `main.rs`). So the
+# suite was exercising the engine on a sixteenth of the stack it ships with.
+#
+# Measured before this was set: the lib suite passed at 2048 KB and aborted at
+# 2016 KB, so the headroom was under 32 KB — about 1.5%. `execute_with_context`
+# is one match over every statement kind, so its future is the sum of every
+# arm's locals, and a few hundred bytes added to `TableSchema` was enough to
+# tip it. It surfaces as a bare SIGABRT: the summary line reports the abort
+# rather than a failure count, and the only clue is one line reading
+# "has overflowed its stack".
+#
+# This aligns the test threads with production rather than papering over a bug.
+# A frame that genuinely needs shrinking is a separate question, and one this
+# does not answer either way.
+[env]
+RUST_MIN_STACK = "33554432" # 32 * 1024 * 1024 bytes, matching the below
+
 # Sets the main thread stack size to 32 MB for Linux
 # Add , "-C", "force-frame-pointers=yes" if you want to force frame pointers for better profiling support, but it may have a performance impact.
 [target.x86_64-unknown-linux-gnu]
