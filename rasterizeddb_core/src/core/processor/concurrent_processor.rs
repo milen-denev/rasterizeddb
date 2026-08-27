@@ -274,7 +274,8 @@ impl ConcurrentProcessor {
 
         {
             let processor_mut = unsafe { &mut *processor_cell.get() };
-            let mut parser = QueryParser::new(tokens_arc.as_ref(), processor_mut);
+            let mut parser = QueryParser::new(tokens_arc.as_ref(), processor_mut)
+                .with_scales(schema_arc.as_slice());
             if let Err(e) = parser.execute(&plan_columns) {
                 return Err(format!("could not compile the query plan: {}", e));
             }
@@ -1579,7 +1580,10 @@ impl ConcurrentProcessor {
                     &mut buffer.intermediate_results,
                 ));
                 let processor_mut = unsafe { &mut *processor_cell.get() };
-                let parser_cell = UnsafeCell::new(QueryParser::new(&tokens_ref, processor_mut));
+                let parser_cell = UnsafeCell::new(
+                    QueryParser::new(&tokens_ref, processor_mut)
+                        .with_scales(schema_ref.as_slice()),
+                );
                 let mut plan_built = false;
 
                 for pwo in pointers.into_iter() {
@@ -1828,6 +1832,61 @@ pub(crate) fn compare_bytes_as_type(db_type: crate::core::db_type::DbType, a: &[
             av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal)
         }
         DbType::NULL => std::cmp::Ordering::Equal,
+
+        // The types stored in PostgreSQL's own wire layout. Their bytes are
+        // big-endian, which memcmp orders correctly for the unsigned parts but
+        // not across a sign, so each one that has a meaningful order decodes
+        // rather than compares raw.
+        DbType::INTERVAL => {
+            let key = |b: &[u8]| {
+                crate::core::pg_types::decode_interval(b)
+                    .map(crate::core::pg_types::interval_sort_key)
+                    .unwrap_or(i128::MIN)
+            };
+            key(a).cmp(&key(b))
+        }
+        // Fixed-width octet strings with no sign: byte order is address order.
+        DbType::MACADDR | DbType::MACADDR8 => a.cmp(b),
+        DbType::DATE => read_num::<4, i32>(a, b, i32::from_be_bytes),
+        DbType::TIME => read_num::<8, i64>(a, b, i64::from_be_bytes),
+        // PostgreSQL orders `timetz` by the UTC-normalised time, then by the
+        // offset, so two spellings of the same instant sort together and still
+        // compare distinct.
+        DbType::TIMETZ => {
+            let key = |x: &[u8]| crate::core::pg_types::timetz_sort_key(x).unwrap_or((i64::MIN, 0));
+            key(a).cmp(&key(b))
+        }
+        // Geometric values have no ordering PostgreSQL defines either, so a
+        // byte compare is used for the same reason it is used for an array: it
+        // is stable, which is all a sort or a join key needs.
+        // A bit string orders by its bytes, which is its bit order: the length
+        // prefix is big-endian and the bits are packed most-significant-first,
+        // so the byte compare is the lexicographic bit compare PostgreSQL
+        // defines — for two strings of equal length. Different lengths compare
+        // by length first here, where PostgreSQL compares the bits first.
+        DbType::BIT | DbType::VARBIT => a.cmp(b),
+        DbType::POINT
+        | DbType::LINE
+        | DbType::LSEG
+        | DbType::BOX
+        | DbType::PATH
+        | DbType::POLYGON
+        | DbType::CIRCLE => a.cmp(b),
+        // A range orders by its lower bound then its upper, which is what
+        // PostgreSQL does. An undecodable or empty range sorts first.
+        DbType::INT4RANGE
+        | DbType::INT8RANGE
+        | DbType::NUMRANGE
+        | DbType::TSRANGE
+        | DbType::TSTZRANGE
+        | DbType::DATERANGE => {
+            let key = |x: &[u8]| {
+                crate::core::pg_types::range_bounds_key(&db_type, x)
+                    .map(|(lo, hi, _, _)| (lo, hi))
+                    .unwrap_or((i128::MIN, i128::MIN))
+            };
+            key(a).cmp(&key(b))
+        }
     }
 }
 

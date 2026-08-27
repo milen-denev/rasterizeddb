@@ -191,6 +191,28 @@ pub fn simd_compare_strings(input1: &[u8], input2: &[u8], operation: &ComparerOp
         ComparerOperation::EndsWithCaseInsensitive => ci_ends_with(input1, input2),
         ComparerOperation::Like => like_match(input1, input2, false),
         ComparerOperation::LikeCaseInsensitive => like_match(input1, input2, true),
+        // `SIMILAR TO`: a pattern language of its own, matched in
+        // `crate::core::similar_to`. A malformed pattern matches nothing here
+        // — it was already reported when the predicate was parsed.
+        ComparerOperation::SimilarTo => {
+            match (std::str::from_utf8(input1), std::str::from_utf8(input2)) {
+                (Ok(text), Ok(pattern)) => {
+                    crate::core::similar_to::matches_default(text, pattern).unwrap_or(false)
+                }
+                _ => false,
+            }
+        }
+        // A structural operator is not a string comparison. `@@` is the one
+        // that can reach here — a `tsvector` is text — and it is answered by
+        // the text-search matcher rather than by a byte compare.
+        ComparerOperation::Pg { op, right_type } => crate::core::pg_ops::evaluate(
+            *op,
+            &crate::core::db_type::DbType::STRING,
+            input1,
+            right_type,
+            input2,
+        )
+        .unwrap_or(false),
     }
 }
 

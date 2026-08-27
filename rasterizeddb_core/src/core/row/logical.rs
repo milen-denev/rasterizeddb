@@ -18,6 +18,20 @@ pub fn perform_comparison_operation(
     db_type: &DbType,
     operation: &ComparerOperation,
 ) -> std::result::Result<bool, EvalError> {
+    // The structural operators — `@>`, `<@`, `&&`, the network family, `@@` —
+    // ask a question about the value's shape rather than its order, so they are
+    // answered by type in `pg_ops` rather than by the ordered comparisons
+    // below. Handled first, before the dispatch, so no arm has to grow a case
+    // that does not apply to it.
+    //
+    // `None` from `pg_ops` is an operator that has no meaning for these
+    // operands, and becomes an error rather than `false`: answering `false`
+    // would drop every row and look exactly like an empty table.
+    if let ComparerOperation::Pg { op, right_type } = operation {
+        return crate::core::pg_ops::evaluate(*op, db_type, input1, right_type, input2)
+            .ok_or(EvalError::UnsupportedType);
+    }
+
     match db_type {
         DbType::I8 => generic_comparison::<i8>(input1, input2, operation),
         DbType::U8 => generic_comparison::<u8>(input1, input2, operation),
@@ -50,11 +64,71 @@ pub fn perform_comparison_operation(
         // compare decides equality correctly. The *ordering* it yields is
         // stable but is not the one PostgreSQL defines for `jsonb`.
         DbType::JSONB => Ok(string_comparison(input1, input2, operation)),
+        // The types stored in PostgreSQL's own wire layout. Their ordering is
+        // defined once, in `compare_bytes_as_type`, and reused here rather than
+        // written a second time — the sort path and the filter path disagreeing
+        // about which of two values is larger is not a failure that announces
+        // itself.
+        //
+        // Without these arms a `DATE`, `TIME` or `INTERVAL` column could not be
+        // compared at all: splitting them out of `DATETIME` gave them the right
+        // wire type and took away every predicate over them.
+        DbType::INTERVAL
+        | DbType::MACADDR
+        | DbType::MACADDR8
+        | DbType::BIT
+        | DbType::VARBIT
+        | DbType::DATE
+        | DbType::TIME
+        | DbType::TIMETZ
+        | DbType::POINT
+        | DbType::LINE
+        | DbType::LSEG
+        | DbType::BOX
+        | DbType::PATH
+        | DbType::POLYGON
+        | DbType::CIRCLE
+        | DbType::INT4RANGE
+        | DbType::INT8RANGE
+        | DbType::NUMRANGE
+        | DbType::TSRANGE
+        | DbType::TSTZRANGE
+        | DbType::DATERANGE => ordered_comparison(input1, input2, db_type, operation),
         // NULL / START / END / UNKNOWN are markers, not values. Returning an
         // error rather than panicking keeps a malformed query from taking a
         // worker down with it.
         _ => Err(EvalError::UnsupportedType),
     }
+}
+
+/// Comparison by the type's own ordering, for the types whose bytes are not
+/// directly comparable.
+///
+/// The substring and case-folding operators have no meaning for any of them, so
+/// they are refused rather than answered — a `false` there would silently drop
+/// every row.
+#[inline]
+fn ordered_comparison(
+    input1: &[u8],
+    input2: &[u8],
+    db_type: &DbType,
+    operation: &ComparerOperation,
+) -> std::result::Result<bool, EvalError> {
+    use std::cmp::Ordering;
+    let ordering = crate::core::processor::concurrent_processor::compare_bytes_as_type(
+        db_type.clone(),
+        input1,
+        input2,
+    );
+    Ok(match operation {
+        ComparerOperation::Equals => ordering == Ordering::Equal,
+        ComparerOperation::NotEquals => ordering != Ordering::Equal,
+        ComparerOperation::Greater => ordering == Ordering::Greater,
+        ComparerOperation::GreaterOrEquals => ordering != Ordering::Less,
+        ComparerOperation::Less => ordering == Ordering::Less,
+        ComparerOperation::LessOrEquals => ordering != Ordering::Greater,
+        _ => return Err(EvalError::UnsupportedType),
+    })
 }
 
 /// Ordered comparison of two fixed-width values by their raw bytes.
@@ -90,7 +164,14 @@ fn bytes_comparison(
         | ComparerOperation::StartsWithCaseInsensitive
         | ComparerOperation::EndsWithCaseInsensitive
         | ComparerOperation::Like
-        | ComparerOperation::LikeCaseInsensitive => return Err(EvalError::UnsupportedType),
+        | ComparerOperation::LikeCaseInsensitive
+        // A pattern match over an identity or an address is not a question
+        // with an answer; the string path is where `SIMILAR TO` belongs.
+        | ComparerOperation::SimilarTo => return Err(EvalError::UnsupportedType),
+        // Taken by `perform_comparison_operation` before the type dispatch, so
+        // this is unreachable in practice; it is spelled out rather than left
+        // to a catch-all so a later operator cannot land here silently.
+        ComparerOperation::Pg { .. } => return Err(EvalError::UnsupportedType),
     })
 }
 
@@ -136,6 +217,10 @@ where
             // fatal.
             return Err(EvalError::UnsupportedType);
         }
+        // As for the other pattern operators above: string-shaped.
+        ComparerOperation::SimilarTo => return Err(EvalError::UnsupportedType),
+        // As above: routed out before the dispatch.
+        ComparerOperation::Pg { .. } => return Err(EvalError::UnsupportedType),
     })
 }
 

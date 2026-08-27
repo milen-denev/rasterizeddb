@@ -869,6 +869,44 @@ pub fn value_to_literal(db_type: &DbType, bytes: &[u8]) -> Option<String> {
                 value_codec::quote_sql(&crate::core::jsonb::decode(bytes).ok()?.to_string())
             }
         }
+        // The types stored in PostgreSQL's own wire layout. Their literal form
+        // is their text form quoted — which is exactly what a client would have
+        // written to put the value there, so the round trip is closed.
+        //
+        // Reaching here matters for more than subqueries: `value_to_literal` is
+        // also what renders a `::text` cast, and without these arms
+        // `hardware_status::text` failed with "BIT cannot be rendered as text"
+        // rather than yielding the bits.
+        DbType::INTERVAL => {
+            value_codec::quote_sql(&crate::core::pg_types::format_interval(bytes)?)
+        }
+        DbType::MACADDR | DbType::MACADDR8 => {
+            value_codec::quote_sql(&crate::core::pg_types::format_macaddr(bytes))
+        }
+        DbType::BIT | DbType::VARBIT => {
+            value_codec::quote_sql(&crate::core::pg_types::format_bit_string(bytes)?)
+        }
+        DbType::DATE => value_codec::quote_sql(&crate::core::pg_types::format_date(bytes)?),
+        DbType::TIME => value_codec::quote_sql(&crate::core::pg_types::format_time(bytes)?),
+        DbType::TIMETZ => value_codec::quote_sql(&crate::core::pg_types::format_timetz(bytes)?),
+        DbType::POINT => value_codec::quote_sql(&crate::core::pg_types::format_point(bytes)?),
+        DbType::LINE => value_codec::quote_sql(&crate::core::pg_types::format_line(bytes)?),
+        DbType::LSEG => value_codec::quote_sql(&crate::core::pg_types::format_lseg(bytes)?),
+        DbType::BOX => value_codec::quote_sql(&crate::core::pg_types::format_box(bytes)?),
+        DbType::PATH => value_codec::quote_sql(&crate::core::pg_types::format_path(bytes)?),
+        DbType::POLYGON => value_codec::quote_sql(&crate::core::pg_types::format_polygon(bytes)?),
+        DbType::CIRCLE => value_codec::quote_sql(&crate::core::pg_types::format_circle(bytes)?),
+        DbType::INT4RANGE
+        | DbType::INT8RANGE
+        | DbType::NUMRANGE
+        | DbType::TSRANGE
+        | DbType::TSTZRANGE
+        | DbType::DATERANGE => {
+            value_codec::quote_sql(&crate::core::pg_types::format_range(db_type, bytes)?)
+        }
+        // Variable-width types whose literal is their own text syntax.
+        DbType::BYTEA => value_codec::quote_sql(&value_codec::format_bytea(bytes)),
+        DbType::ARRAY => value_codec::quote_sql(&value_codec::format_array(bytes)?),
         // An empty value is how a NULL arrives for a variable-width column.
         // Anything else of an unknown type has no faithful literal, and
         // inventing one would store a value nobody wrote.

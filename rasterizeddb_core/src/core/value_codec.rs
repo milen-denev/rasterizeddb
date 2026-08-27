@@ -784,6 +784,7 @@ pub fn coerce_literal(
             DbType::STRING => Some(bytes.to_vec()),
             DbType::UUID | DbType::INET | DbType::DATETIME | DbType::DECIMAL
             | DbType::JSONB => encode_literal(to, text),
+            _ if has_text_literal(to) => encode_literal(to, text),
             DbType::BOOL => match text.trim().to_ascii_lowercase().as_str() {
                 "true" | "t" | "yes" | "y" | "on" | "1" => Some(vec![1]),
                 "false" | "f" | "no" | "n" | "off" | "0" => Some(vec![0]),
@@ -971,9 +972,39 @@ pub fn strip_quotes(s: &str) -> &str {
 /// A literal that does not parse is rejected rather than coerced: silently
 /// storing a zero for `'not-a-uuid'` would make the value indistinguishable
 /// from a legitimately zero UUID.
+/// Drops a leading type name from `TYPE 'literal'`, leaving the quoted part.
+///
+/// Only when what follows really is a quoted string — so a bare word, or a
+/// literal that merely begins with letters, is returned untouched.
+pub fn strip_type_prefix(literal: &str) -> &str {
+    let trimmed = literal.trim();
+    let bytes = trimmed.as_bytes();
+    if bytes.first().is_none_or(|b| !b.is_ascii_alphabetic()) {
+        return literal;
+    }
+    let mut i = 0usize;
+    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+        i += 1;
+    }
+    let rest = trimmed[i..].trim_start();
+    if rest.starts_with('\'') && rest.ends_with('\'') && rest.len() >= 2 {
+        return rest;
+    }
+    literal
+}
+
 pub fn encode_literal(db_type: &crate::core::db_type::DbType, literal: &str) -> Option<Vec<u8>> {
     use crate::core::db_type::DbType;
 
+    // `INTERVAL '1 day'`, `POINT '(1,2)'` — PostgreSQL's typed-literal form,
+    // which reaches an `INSERT` with the type name still attached because the
+    // value parser hands the literal over as written.
+    //
+    // Stripped here rather than in each type's parser: without it,
+    // `INTERVAL '1 hour'` was handed to the interval reader as the whole
+    // string, parsed as nothing, and stored as a zero interval. The insert
+    // succeeded and the column read `00:00:00`.
+    let literal = strip_type_prefix(literal);
     let text = strip_quotes(literal);
     match db_type {
         DbType::UUID => parse_uuid(text).map(|b| b.to_vec()),
@@ -987,8 +1018,75 @@ pub fn encode_literal(db_type: &crate::core::db_type::DbType, literal: &str) -> 
         DbType::JSONB => serde_json::from_str::<serde_json::Value>(text)
             .ok()
             .map(|document| crate::core::jsonb::encode(&document)),
+
+        // Everything below stores the bytes PostgreSQL puts on the wire, so
+        // each of these is a text parser and the binary result path is a copy.
+        // See `crate::core::pg_types` for why that choice differs from the one
+        // the types above make.
+        DbType::INTERVAL => {
+            crate::core::pg_types::parse_interval(text).map(crate::core::pg_types::encode_interval)
+        }
+        DbType::MACADDR => {
+            crate::core::pg_types::parse_macaddr::<6>(text).map(|b| b.to_vec())
+        }
+        DbType::MACADDR8 => {
+            crate::core::pg_types::parse_macaddr::<8>(text).map(|b| b.to_vec())
+        }
+        // A `BIT(n)` literal PostgreSQL accepts is already `n` bits long — it
+        // rejects any other length — so no declared width has to reach here.
+        DbType::BIT | DbType::VARBIT => crate::core::pg_types::parse_bit_string(text, None),
+        DbType::DATE => crate::core::pg_types::parse_date(text).map(|d| d.to_be_bytes().to_vec()),
+        DbType::TIME => crate::core::pg_types::parse_time(text).map(|t| t.to_be_bytes().to_vec()),
+        DbType::TIMETZ => crate::core::pg_types::parse_timetz(text),
+        DbType::POINT => crate::core::pg_types::parse_point(text),
+        DbType::LINE => crate::core::pg_types::parse_line(text),
+        DbType::LSEG => crate::core::pg_types::parse_lseg(text),
+        DbType::BOX => crate::core::pg_types::parse_box(text),
+        DbType::PATH => crate::core::pg_types::parse_path(text),
+        DbType::POLYGON => crate::core::pg_types::parse_polygon(text),
+        DbType::CIRCLE => crate::core::pg_types::parse_circle(text),
+        DbType::INT4RANGE
+        | DbType::INT8RANGE
+        | DbType::NUMRANGE
+        | DbType::TSRANGE
+        | DbType::TSTZRANGE
+        | DbType::DATERANGE => crate::core::pg_types::parse_range(db_type, text),
+
         _ => None,
     }
+}
+
+/// Whether a type's literal form is text that [`encode_literal`] parses.
+///
+/// The insert and update paths both branch on this rather than listing the
+/// types twice, which is what stops the two from drifting apart on which
+/// literals they accept — they already had, once, over doubled quotes.
+pub fn has_text_literal(db_type: &crate::core::db_type::DbType) -> bool {
+    use crate::core::db_type::DbType;
+    matches!(
+        db_type,
+        DbType::INTERVAL
+            | DbType::MACADDR
+            | DbType::MACADDR8
+            | DbType::BIT
+            | DbType::VARBIT
+            | DbType::DATE
+            | DbType::TIME
+            | DbType::TIMETZ
+            | DbType::POINT
+            | DbType::LINE
+            | DbType::LSEG
+            | DbType::BOX
+            | DbType::PATH
+            | DbType::POLYGON
+            | DbType::CIRCLE
+            | DbType::INT4RANGE
+            | DbType::INT8RANGE
+            | DbType::NUMRANGE
+            | DbType::TSRANGE
+            | DbType::TSTZRANGE
+            | DbType::DATERANGE
+    )
 }
 
 #[cfg(test)]

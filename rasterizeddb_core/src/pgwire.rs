@@ -4269,6 +4269,32 @@ fn format_column_binary(db_type: DbType, bytes: &[u8], scale: Option<u32>) -> Op
                 Some(bytes.to_vec())
             }
         }
+        // Stored in PostgreSQL's binary layout already, so the binary result is
+        // the stored bytes. Falling through to the catch-all below would have
+        // sent the *text* rendering to a client that asked for binary — the
+        // shape of bug that makes a value arrive wrong rather than make the
+        // query fail.
+        DbType::INTERVAL
+        | DbType::MACADDR
+        | DbType::MACADDR8
+        | DbType::BIT
+        | DbType::VARBIT
+        | DbType::DATE
+        | DbType::TIME
+        | DbType::TIMETZ
+        | DbType::POINT
+        | DbType::LINE
+        | DbType::LSEG
+        | DbType::BOX
+        | DbType::PATH
+        | DbType::POLYGON
+        | DbType::CIRCLE
+        | DbType::INT4RANGE
+        | DbType::INT8RANGE
+        | DbType::NUMRANGE
+        | DbType::TSRANGE
+        | DbType::TSTZRANGE
+        | DbType::DATERANGE => Some(bytes.to_vec()),
         _ => format_column_text(db_type, bytes).map(|s| s.into_bytes())
     }
 }
@@ -4709,6 +4735,70 @@ fn format_column_text_inner(db_type: DbType, bytes: &[u8]) -> Option<String> {
                 return None;
             }
         }
+
+        // Stored in PostgreSQL's own wire layout, so the text form is derived
+        // from the same bytes the binary path sends unchanged. Deriving both
+        // from one source is the point: a `NUMERIC` once reached a client
+        // multiplied by a power of ten because the two paths each worked the
+        // value out separately.
+        DbType::INTERVAL => match crate::core::pg_types::format_interval(bytes) {
+            Some(s) => s,
+            None => return None,
+        },
+        DbType::MACADDR | DbType::MACADDR8 => crate::core::pg_types::format_macaddr(bytes),
+        DbType::BIT | DbType::VARBIT => match crate::core::pg_types::format_bit_string(bytes) {
+            Some(s) => s,
+            None => return None,
+        },
+        DbType::DATE => match crate::core::pg_types::format_date(bytes) {
+            Some(s) => s,
+            None => return None,
+        },
+        DbType::TIME => match crate::core::pg_types::format_time(bytes) {
+            Some(s) => s,
+            None => return None,
+        },
+        DbType::TIMETZ => match crate::core::pg_types::format_timetz(bytes) {
+            Some(s) => s,
+            None => return None,
+        },
+        DbType::POINT => match crate::core::pg_types::format_point(bytes) {
+            Some(s) => s,
+            None => return None,
+        },
+        DbType::LINE => match crate::core::pg_types::format_line(bytes) {
+            Some(s) => s,
+            None => return None,
+        },
+        DbType::LSEG => match crate::core::pg_types::format_lseg(bytes) {
+            Some(s) => s,
+            None => return None,
+        },
+        DbType::BOX => match crate::core::pg_types::format_box(bytes) {
+            Some(s) => s,
+            None => return None,
+        },
+        DbType::PATH => match crate::core::pg_types::format_path(bytes) {
+            Some(s) => s,
+            None => return None,
+        },
+        DbType::POLYGON => match crate::core::pg_types::format_polygon(bytes) {
+            Some(s) => s,
+            None => return None,
+        },
+        DbType::CIRCLE => match crate::core::pg_types::format_circle(bytes) {
+            Some(s) => s,
+            None => return None,
+        },
+        DbType::INT4RANGE
+        | DbType::INT8RANGE
+        | DbType::NUMRANGE
+        | DbType::TSRANGE
+        | DbType::TSTZRANGE
+        | DbType::DATERANGE => match crate::core::pg_types::format_range(&db_type, bytes) {
+            Some(s) => s,
+            None => return None,
+        },
 
         DbType::START | DbType::END | DbType::NULL => {
             // Already handled at top, but keep arm to satisfy match exhaustiveness.

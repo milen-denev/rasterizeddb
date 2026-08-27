@@ -62,6 +62,58 @@ pub enum DbType {
     /// storage: a column declared `JSONB` holds its document rather than a
     /// reference to a table the document was taken apart into.
     JSONB,
+    /// A span of time, stored as PostgreSQL's binary layout: `i64` microseconds,
+    /// `i32` days, `i32` months, big-endian. The three are kept apart because a
+    /// month is not a fixed number of days; see [`crate::core::pg_types`].
+    INTERVAL,
+    /// A six-octet MAC address.
+    MACADDR,
+    /// An eight-octet (EUI-64) MAC address. Distinct from [`DbType::MACADDR`]
+    /// rather than a width flag on it, because a column advertises one type OID
+    /// and the two have different ones.
+    MACADDR8,
+    /// A fixed-width bit string, `BIT(n)`.
+    BIT,
+    /// A varying bit string, `BIT VARYING(n)`.
+    VARBIT,
+    /// A calendar date, `i32` days from 2000-01-01, big-endian.
+    ///
+    /// Split out of [`DbType::DATETIME`] rather than folded into it: a `DATE`
+    /// column that advertised `timestamptz` was decoded by a client into a
+    /// timestamp type, and a driver asking for a `NaiveDate` refused the column
+    /// outright.
+    DATE,
+    /// A time of day, `i64` microseconds since midnight, big-endian.
+    TIME,
+    /// A time of day with a UTC offset: microseconds then an `i32` offset in
+    /// seconds west of Greenwich, both big-endian.
+    TIMETZ,
+    /// Geometric point, two `f64`.
+    POINT,
+    /// Geometric line, the coefficients of `Ax + By + C = 0`.
+    LINE,
+    /// Geometric line segment, two endpoints.
+    LSEG,
+    /// Geometric box, two corners normalised so the first is the upper right.
+    BOX,
+    /// Geometric path, open or closed, of any number of points.
+    PATH,
+    /// Geometric polygon.
+    POLYGON,
+    /// Geometric circle: centre and radius.
+    CIRCLE,
+    /// `int4range`.
+    INT4RANGE,
+    /// `int8range`.
+    INT8RANGE,
+    /// `numrange`.
+    NUMRANGE,
+    /// `tsrange`.
+    TSRANGE,
+    /// `tstzrange`.
+    TSTZRANGE,
+    /// `daterange`.
+    DATERANGE,
     /// Sentinel / UNKNOWN type. Used for forward-compat and internal meta records.
     UNKNOWN,
     NULL,
@@ -87,7 +139,24 @@ impl DbType {
     #[inline]
     pub fn physical(&self) -> DbType {
         match self {
-            DbType::BYTEA | DbType::ARRAY | DbType::JSONB => DbType::STRING,
+            // Variable-width and carried by the same pointer-and-length
+            // mechanism as a string. A bit string, a path, a polygon and every
+            // range vary in length for the same reason an array does, so they
+            // reach storage the same way and only the declared type tells them
+            // apart on the wire.
+            DbType::BYTEA
+            | DbType::ARRAY
+            | DbType::JSONB
+            | DbType::BIT
+            | DbType::VARBIT
+            | DbType::PATH
+            | DbType::POLYGON
+            | DbType::INT4RANGE
+            | DbType::INT8RANGE
+            | DbType::NUMRANGE
+            | DbType::TSRANGE
+            | DbType::TSTZRANGE
+            | DbType::DATERANGE => DbType::STRING,
             other => other.clone(),
         }
     }
@@ -95,7 +164,23 @@ impl DbType {
     /// Whether values of this type vary in length.
     #[inline]
     pub fn is_variable_width(&self) -> bool {
-        matches!(self, DbType::STRING | DbType::BYTEA | DbType::ARRAY | DbType::JSONB)
+        matches!(
+            self,
+            DbType::STRING
+                | DbType::BYTEA
+                | DbType::ARRAY
+                | DbType::JSONB
+                | DbType::BIT
+                | DbType::VARBIT
+                | DbType::PATH
+                | DbType::POLYGON
+                | DbType::INT4RANGE
+                | DbType::INT8RANGE
+                | DbType::NUMRANGE
+                | DbType::TSRANGE
+                | DbType::TSTZRANGE
+                | DbType::DATERANGE
+        )
     }
 
     #[inline(always)]
@@ -123,6 +208,27 @@ impl DbType {
             DbType::BYTEA => 20,
             DbType::ARRAY => 21,
             DbType::JSONB => 22,
+            DbType::INTERVAL => 24,
+            DbType::MACADDR => 25,
+            DbType::MACADDR8 => 26,
+            DbType::BIT => 27,
+            DbType::VARBIT => 28,
+            DbType::DATE => 29,
+            DbType::TIME => 30,
+            DbType::TIMETZ => 31,
+            DbType::POINT => 32,
+            DbType::LINE => 33,
+            DbType::LSEG => 34,
+            DbType::BOX => 35,
+            DbType::PATH => 36,
+            DbType::POLYGON => 37,
+            DbType::CIRCLE => 38,
+            DbType::INT4RANGE => 39,
+            DbType::INT8RANGE => 40,
+            DbType::NUMRANGE => 41,
+            DbType::TSRANGE => 42,
+            DbType::TSTZRANGE => 43,
+            DbType::DATERANGE => 44,
             DbType::UNKNOWN => 252,
             // Never written to disk: it exists only so the wire layer can say
             // `jsonb`, and so a rebuilt document keeps its JSON-ness while it
@@ -167,6 +273,27 @@ impl DbType {
             20 => DbType::BYTEA,
             21 => DbType::ARRAY,
             22 => DbType::JSONB,
+            24 => DbType::INTERVAL,
+            25 => DbType::MACADDR,
+            26 => DbType::MACADDR8,
+            27 => DbType::BIT,
+            28 => DbType::VARBIT,
+            29 => DbType::DATE,
+            30 => DbType::TIME,
+            31 => DbType::TIMETZ,
+            32 => DbType::POINT,
+            33 => DbType::LINE,
+            34 => DbType::LSEG,
+            35 => DbType::BOX,
+            36 => DbType::PATH,
+            37 => DbType::POLYGON,
+            38 => DbType::CIRCLE,
+            39 => DbType::INT4RANGE,
+            40 => DbType::INT8RANGE,
+            41 => DbType::NUMRANGE,
+            42 => DbType::TSRANGE,
+            43 => DbType::TSTZRANGE,
+            44 => DbType::DATERANGE,
             23 => DbType::JSON,
             252 => DbType::UNKNOWN,
             253 => DbType::NULL,
@@ -200,7 +327,28 @@ impl DbType {
             DbType::DECIMAL => 16,
             // Variable-width, like STRING: an 8-byte pointer and a 4-byte
             // length live in the row, and the bytes themselves follow it.
-            DbType::BYTEA | DbType::ARRAY | DbType::JSONB => 4 + 8,
+            DbType::BYTEA
+            | DbType::ARRAY
+            | DbType::JSONB
+            | DbType::BIT
+            | DbType::VARBIT
+            | DbType::PATH
+            | DbType::POLYGON
+            | DbType::INT4RANGE
+            | DbType::INT8RANGE
+            | DbType::NUMRANGE
+            | DbType::TSRANGE
+            | DbType::TSTZRANGE
+            | DbType::DATERANGE => 4 + 8,
+            DbType::INTERVAL => crate::core::pg_types::INTERVAL_LEN as u32,
+            DbType::MACADDR => crate::core::pg_types::MACADDR_LEN as u32,
+            DbType::MACADDR8 => crate::core::pg_types::MACADDR8_LEN as u32,
+            DbType::DATE => crate::core::pg_types::DATE_LEN as u32,
+            DbType::TIME => crate::core::pg_types::TIME_LEN as u32,
+            DbType::TIMETZ => crate::core::pg_types::TIMETZ_LEN as u32,
+            DbType::POINT => crate::core::pg_types::POINT_LEN as u32,
+            DbType::LSEG | DbType::BOX => crate::core::pg_types::LSEG_LEN as u32,
+            DbType::LINE | DbType::CIRCLE => crate::core::pg_types::LINE_LEN as u32,
             DbType::UNKNOWN => 0,
             // Nothing stores it; a JSON column's slot is its UUID reference.
             DbType::JSON => crate::core::value_codec::UUID_LEN as u32,
@@ -237,6 +385,27 @@ impl DbType {
             // `text[]`. The element type is in the value, but a column has to
             // advertise one OID, and text is what the schema declares.
             DbType::ARRAY => 1009,
+            DbType::INTERVAL => 1186,
+            DbType::MACADDR => 829,
+            DbType::MACADDR8 => 774,
+            DbType::BIT => 1560,
+            DbType::VARBIT => 1562,
+            DbType::DATE => 1082,
+            DbType::TIME => 1083,
+            DbType::TIMETZ => 1266,
+            DbType::POINT => 600,
+            DbType::LINE => 628,
+            DbType::LSEG => 601,
+            DbType::BOX => 603,
+            DbType::PATH => 602,
+            DbType::POLYGON => 604,
+            DbType::CIRCLE => 718,
+            DbType::INT4RANGE => 3904,
+            DbType::NUMRANGE => 3906,
+            DbType::TSRANGE => 3908,
+            DbType::TSTZRANGE => 3910,
+            DbType::DATERANGE => 3912,
+            DbType::INT8RANGE => 3926,
             _ => 25, // fallback TEXT
         }
     }
@@ -263,6 +432,15 @@ impl DbType {
             DbType::INET => -1,
             DbType::DECIMAL => -1,
             DbType::BYTEA | DbType::ARRAY => -1,
+            DbType::INTERVAL => crate::core::pg_types::INTERVAL_LEN as i16,
+            DbType::MACADDR => crate::core::pg_types::MACADDR_LEN as i16,
+            DbType::MACADDR8 => crate::core::pg_types::MACADDR8_LEN as i16,
+            DbType::DATE => crate::core::pg_types::DATE_LEN as i16,
+            DbType::TIME => crate::core::pg_types::TIME_LEN as i16,
+            DbType::TIMETZ => crate::core::pg_types::TIMETZ_LEN as i16,
+            DbType::POINT => crate::core::pg_types::POINT_LEN as i16,
+            DbType::LSEG | DbType::BOX => crate::core::pg_types::LSEG_LEN as i16,
+            DbType::LINE | DbType::CIRCLE => crate::core::pg_types::LINE_LEN as i16,
             _ => -1,
         }
     }
