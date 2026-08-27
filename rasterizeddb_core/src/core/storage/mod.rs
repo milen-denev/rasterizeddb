@@ -59,10 +59,14 @@
 //! unchanged.
 
 pub mod mirror;
+#[cfg(feature = "kv_storage")]
+pub mod kv_registry;
 pub mod relocate;
 pub mod sql;
 #[cfg(test)]
 mod placement_tests;
+#[cfg(all(test, feature = "kv_storage"))]
+mod backend_tests;
 #[cfg(test)]
 mod tests;
 
@@ -185,6 +189,90 @@ pub struct LocationReport {
     /// rather than as zero, which would read as "full".
     pub available_bytes: Option<u64>,
     pub total_bytes: Option<u64>,
+}
+
+/// What holds a table's files.
+///
+/// A placement used to be a directory and nothing else. It is now a *backend*,
+/// of which a directory is one kind — which is how one database can hold a
+/// file-backed table, a scratch table that lives only in memory, and a table
+/// kept in an object store, side by side.
+///
+/// The spec is what `db_storage.cfg` stores. Anything without a recognised
+/// scheme is a directory, so every file written before this existed still parses
+/// as what it meant, and a Windows path is not mistaken for a scheme.
+///
+/// **A table that is not file-backed does not get the file-backed features.**
+/// It is not in a backup, it cannot be moved between disks, it has no
+/// write-ahead log, and the free-space policy does not consider it. Those
+/// features are about files, and inventing an equivalent for each backend would
+/// mean three half-working versions of each instead of one that works.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TableBackend {
+    /// Files in a directory. The only backend before this existed.
+    Directory(String),
+    /// Buffers in this process. Gone when the server stops.
+    Memory,
+    /// Objects in a named key/value store — see `db_kv.cfg`.
+    KeyValue(String),
+}
+
+/// Spec prefix for an in-memory table.
+pub const MEMORY_SPEC: &str = "memory:";
+/// Spec prefix for a key/value table, followed by the store's name.
+pub const KV_SPEC_PREFIX: &str = "kv:";
+
+impl TableBackend {
+    /// Reads a placement spec. Anything unrecognised is a directory.
+    pub fn parse(spec: &str) -> Self {
+        let trimmed = spec.trim();
+        if trimmed.eq_ignore_ascii_case(MEMORY_SPEC) || trimmed.eq_ignore_ascii_case("memory") {
+            return TableBackend::Memory;
+        }
+        // Case-insensitive on the scheme but not on the store's name, which is
+        // an identifier the operator chose.
+        if trimmed.len() > KV_SPEC_PREFIX.len()
+            && trimmed[..KV_SPEC_PREFIX.len()].eq_ignore_ascii_case(KV_SPEC_PREFIX)
+        {
+            let name = trimmed[KV_SPEC_PREFIX.len()..].trim();
+            if !name.is_empty() {
+                return TableBackend::KeyValue(name.to_string());
+            }
+        }
+        TableBackend::Directory(normalize(trimmed))
+    }
+
+    /// How this is written to `db_storage.cfg`.
+    pub fn as_spec(&self) -> String {
+        match self {
+            TableBackend::Directory(path) => path.clone(),
+            TableBackend::Memory => MEMORY_SPEC.to_string(),
+            TableBackend::KeyValue(name) => format!("{KV_SPEC_PREFIX}{name}"),
+        }
+    }
+
+    /// The directory, for the backend that has one.
+    pub fn directory(&self) -> Option<&str> {
+        match self {
+            TableBackend::Directory(path) => Some(path),
+            _ => None,
+        }
+    }
+
+    /// Whether the file-backed features apply: backup, relocation, the log, and
+    /// the free-space policy.
+    pub fn is_file_based(&self) -> bool {
+        matches!(self, TableBackend::Directory(_))
+    }
+
+    /// A short name for error messages.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            TableBackend::Directory(_) => "directory",
+            TableBackend::Memory => "in-memory",
+            TableBackend::KeyValue(_) => "key/value",
+        }
+    }
 }
 
 /// The mutable half of a pool, behind one lock.
@@ -389,8 +477,42 @@ impl StorageManager {
     }
 
     /// Where `table_name`'s files are, or `None` for the database directory.
+    ///
+    /// Directory placements only. A table on another backend has no directory,
+    /// and handing its spec back here would have every caller that treats this
+    /// as a path build one out of `kv:main`.
     pub fn location_of(&self, table_name: &str) -> Option<String> {
+        self.backend_of(table_name)?.directory().map(str::to_string)
+    }
+
+    /// What holds `table_name`, or `None` when nothing is recorded — which
+    /// means the database directory.
+    pub fn backend_of(&self, table_name: &str) -> Option<TableBackend> {
+        self.state.read().placements.get(table_name).map(|spec| TableBackend::parse(spec))
+    }
+
+    /// The recorded spec verbatim, for the paths that carry it around rather
+    /// than act on it.
+    pub fn spec_of(&self, table_name: &str) -> Option<String> {
         self.state.read().placements.get(table_name).cloned()
+    }
+
+    /// Records a backend for a table without consulting the policy.
+    ///
+    /// The counterpart of [`StorageManager::pin`] for the backends that are not
+    /// directories. A key/value store's name is not validated here — the pool
+    /// does not own `db_kv.cfg` — so the caller checks it exists first, or the
+    /// table opens against a store that is not configured.
+    pub fn pin_backend(&self, table_name: &str, backend: &TableBackend) -> Result<(), String> {
+        if let TableBackend::Directory(path) = backend {
+            return self.pin(table_name, path);
+        }
+        if self.root.is_none() {
+            return Err("this database is in memory".to_string());
+        }
+        self.state.write().placements.insert(table_name.to_string(), backend.as_spec());
+        self.persist();
+        Ok(())
     }
 
     /// Decides where a table about to be created goes, records it, and returns
@@ -406,7 +528,9 @@ impl StorageManager {
         let chosen = {
             let mut state = self.state.write();
             if let Some(existing) = state.placements.get(table_name) {
-                return Some(existing.clone());
+                // A table already pinned to another backend has no directory to
+                // report, and choosing one for it would overwrite the pin.
+                return TableBackend::parse(existing).directory().map(str::to_string);
             }
             let chosen = choose(&state, root);
             // Recorded even when it is the database's own directory. The
@@ -607,7 +731,9 @@ impl StorageManager {
         {
             let state = self.state.read();
             if role == LocationRole::Backup
-                && state.placements.values().any(|at| *at == normalized)
+                && state.placements.values().any(|spec| {
+                    TableBackend::parse(spec).directory() == Some(normalized.as_str())
+                })
             {
                 return Err(format!(
                     "{} still holds tables; a backup location is written by mirroring \
@@ -668,7 +794,13 @@ impl StorageManager {
                 // floor, which `SHOW STORAGE` corrects against the live table
                 // list, the only thing that knows about those.
                 let tables =
-                    state.placements.values().filter(|at| **at == location.path).count() as u64;
+                    state
+                        .placements
+                        .values()
+                        .filter(|spec| {
+                            TableBackend::parse(spec).directory() == Some(location.path.as_str())
+                        })
+                        .count() as u64;
                 LocationReport {
                     location: location.clone(),
                     is_root: location.path == root,
@@ -1035,7 +1167,7 @@ fn parse_into(text: &str, root: &str, state: &mut PoolState) -> Result<(), Strin
                 if name.is_empty() {
                     return Err(at("table"));
                 }
-                placements.insert(name, normalize(at_path));
+                placements.insert(name, TableBackend::parse(at_path).as_spec());
             }
             other => {
                 warn!("{}: ignoring unknown storage pool directive {:?}", POOL_FILE, other);
@@ -1051,8 +1183,12 @@ fn parse_into(text: &str, root: &str, state: &mut PoolState) -> Result<(), Strin
     // inconsistency that loses data quietly, so it is reported and the table is
     // left pointing where it says. Dropping the placement would make the table
     // resolve to the root, where it would open as empty.
-    for (table, path) in placements.iter() {
-        if !locations.iter().any(|l| l.path == *path) {
+    for (table, spec) in placements.iter() {
+        let Some(path) = TableBackend::parse(spec).directory().map(str::to_string) else {
+            // Not a directory, so no location is expected to list it.
+            continue;
+        };
+        if !locations.iter().any(|l| l.path == path) {
             warn!(
                 "{} places table {} in {}, which is not a storage location; \
                  add it back before using that table",

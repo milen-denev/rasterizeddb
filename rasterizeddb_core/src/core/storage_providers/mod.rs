@@ -4,6 +4,8 @@ pub mod memory;
 pub mod traits;
 pub mod mock_file_sync;
 pub mod helpers;
+#[cfg(feature = "kv_storage")]
+pub mod kv;
 
 use crc::{CRC_32_ISO_HDLC, Crc};
 

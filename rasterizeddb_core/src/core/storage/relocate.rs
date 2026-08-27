@@ -52,6 +52,20 @@ pub async fn move_table(
 ) -> Result<String, String> {
     let pool = &database.storage;
     let root = pool.root().ok_or("this database is in memory")?.to_string();
+
+    // Relocation is a file-based feature, and a table that is not file-based
+    // does not get it. There is no file to copy, and doing this by rows would be
+    // a different operation with different guarantees wearing the same name.
+    if let Some(backend) = pool.backend_of(table)
+        && !backend.is_file_based()
+    {
+        return Err(format!(
+            "{} is an {} table, so it has no files to move between directories",
+            table,
+            backend.kind()
+        ));
+    }
+
     let current = pool.location_of(table).unwrap_or(root);
 
     if current == destination {
@@ -137,7 +151,16 @@ async fn plan(database: &Arc<Database>, pool: &StorageManager) -> Vec<Move> {
     let mut tables: Vec<(String, String, u64)> = Vec::new();
     for entry in database.tables.iter() {
         let name = entry.key().clone();
-        let at = placements.get(&name).cloned().unwrap_or_else(|| root.clone());
+        let at = match placements.get(&name) {
+            // Only a directory placement is a rebalance candidate: the others
+            // occupy no disk the policy is balancing and cannot be moved onto
+            // one.
+            Some(spec) => match super::TableBackend::parse(spec).directory() {
+                Some(path) => path.to_string(),
+                None => continue,
+            },
+            None => root.clone(),
+        };
         let bytes = database.table_bytes(&name).await;
         tables.push((name, at, bytes));
     }

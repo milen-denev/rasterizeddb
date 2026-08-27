@@ -524,6 +524,12 @@ impl BackupService {
     /// Takes a full snapshot and makes it restorable.
     pub async fn snapshot_now(self: &Arc<Self>) -> io::Result<SnapshotReport> {
         let _one_at_a_time = self.snapshot_lock.lock().await;
+        // A snapshot is a copy of a directory, so a table that is not in one is
+        // not in the snapshot. That is the intended behaviour — a table on
+        // another backend does not get the file-backed features — but it must be
+        // said out loud every time rather than discovered at a restore, which is
+        // the worst possible moment to learn what a backup does not contain.
+        self.warn_about_excluded_tables();
         let started = std::time::Instant::now();
         let started_at = timeutil::now_unix();
 
@@ -877,6 +883,39 @@ impl BackupService {
     /// succeeded over what remained. A restore came back with the default
     /// database and nothing else, which is the worst way to discover it.
     ///
+    /// Reports the tables this snapshot cannot contain.
+    ///
+    /// Read from `db_storage.cfg` rather than from a live `Database`, so the
+    /// backup service keeps having no dependency on the catalogue.
+    #[cfg(feature = "storage_pools")]
+    fn warn_about_excluded_tables(&self) {
+        use crate::core::storage::{StorageManager, TableBackend};
+        let pool = StorageManager::open(&self.location);
+        let mut excluded: Vec<String> = pool
+            .placements()
+            .into_iter()
+            .filter_map(|(table, spec)| {
+                let backend = TableBackend::parse(&spec);
+                (!backend.is_file_based())
+                    .then(|| format!("{table} ({})", backend.kind()))
+            })
+            .collect();
+        if excluded.is_empty() {
+            return;
+        }
+        excluded.sort_unstable();
+        warn!(
+            "snapshot of {} does not include {} table(s) that are not file-backed: {}. \
+             A restore will not bring them back.",
+            self.location,
+            excluded.len(),
+            excluded.join(", ")
+        );
+    }
+
+    #[cfg(not(feature = "storage_pools"))]
+    fn warn_about_excluded_tables(&self) {}
+
     /// Names are relative paths with `/` separators, so a restore rebuilds the
     /// same shape.
     fn snapshot_file_list(&self) -> io::Result<Vec<(String, PathBuf)>> {

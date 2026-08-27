@@ -160,6 +160,22 @@ pg_import = ["dep:webpki-roots"]
 # is tab-separated text rather than a serialisation format.
 storage_pools = []
 
+# A database kept in a key/value store instead of in files.
+#
+# Off by default. It is a whole second storage backend — chunked objects, a
+# delta log, a page cache and a compactor — and a build that only ever writes
+# files should not carry it or the extra match arm on every storage call. It
+# adds no crate of its own: the backing store is a trait, and the two
+# implementations it ships with (a map, a directory) need nothing new.
+kv_storage = []
+
+# The S3 backing store for `kv_storage`.
+#
+# Separate from `kv_storage` because that feature is useful without a network —
+# it is how the driver is tested — and because this one pulls the SigV4 client
+# and root certificates that `s3_backup` owns.
+kv_storage_s3 = ["kv_storage", "s3_backup"]
+
 # Snapshot + point-in-time backup to any S3-compatible object store.
 #
 # Off by default: it is the only feature that opens an outbound network

@@ -275,6 +275,90 @@ impl S3Client {
         Ok(response.body)
     }
 
+    /// Fetches a whole object, or `None` if there is no such key.
+    ///
+    /// A missing object is an ordinary answer for a store used as a filesystem:
+    /// a sparse file's unwritten chunks are simply absent.
+    pub async fn get_object_opt(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
+        let response = self.send("GET", key, &[], &[], &[], None).await?;
+        if response.status == 404 {
+            return Ok(None);
+        }
+        expect_ok(&response, "GET", key)?;
+        Ok(Some(response.body))
+    }
+
+    /// Fetches `len` bytes from `offset`, or `None` if there is no such key.
+    ///
+    /// Returns fewer bytes than asked for when the object ends first, and an
+    /// empty vector when `offset` is already past the end — the same answers a
+    /// `pread` gives, which is what the caller is emulating.
+    pub async fn get_object_range(
+        &self,
+        key: &str,
+        offset: u64,
+        len: usize,
+    ) -> io::Result<Option<Vec<u8>>> {
+        if len == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        let last = offset + len as u64 - 1;
+        let range = format!("bytes={offset}-{last}");
+        let response = self
+            .send("GET", key, &[], &[("range", range.as_str())], &[], None)
+            .await?;
+        match response.status {
+            404 => Ok(None),
+            // The range starts past the end of the object.
+            416 => Ok(Some(Vec::new())),
+            206 => Ok(Some(response.body)),
+            200 => {
+                // The store ignored the range and sent the whole object. Slicing
+                // client-side is right rather than an error: the answer is still
+                // correct, only more expensive, and some S3-compatible stores do
+                // this for small objects.
+                let start = (offset as usize).min(response.body.len());
+                let end = start.saturating_add(len).min(response.body.len());
+                Ok(Some(response.body[start..end].to_vec()))
+            }
+            _ => Err(s3_error("GET range", key, response.status, &response.body)),
+        }
+    }
+
+    /// Every key under `prefix`, with its size, following continuations.
+    pub async fn list_prefix(&self, prefix: &str) -> io::Result<Vec<(String, u64)>> {
+        let mut out = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let mut query: Vec<(&str, &str)> = vec![("list-type", "2"), ("prefix", prefix)];
+            if let Some(t) = token.as_deref() {
+                query.push(("continuation-token", t));
+            }
+            let response = self.send("GET", "", &query, &[], &[], None).await?;
+            expect_ok(&response, "GET ?list-type=2", prefix)?;
+
+            let text = String::from_utf8_lossy(&response.body);
+            for chunk in text.split("<Contents>").skip(1) {
+                let Some(entry) = chunk.split("</Contents>").next() else {
+                    continue;
+                };
+                let Some(key) = xml_tag(entry, "Key") else { continue };
+                let size = xml_tag(entry, "Size").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                out.push((xml_unescape(key), size));
+            }
+
+            let truncated = xml_tag(&text, "IsTruncated").is_some_and(|v| v.trim() == "true");
+            // MinIO has been seen to echo a prefix back and return nothing on
+            // other listing APIs, so the continuation is trusted only when the
+            // listing says it is truncated *and* names a token.
+            match (truncated, xml_tag(&text, "NextContinuationToken")) {
+                (true, Some(next)) => token = Some(xml_unescape(next)),
+                _ => break,
+            }
+        }
+        Ok(out)
+    }
+
     /// Fetches an object, handing each chunk to `sink` as it arrives.
     ///
     /// Nothing is buffered whole, so a snapshot larger than memory restores

@@ -394,8 +394,9 @@ fn set(tokens: &[String], database: &Arc<Database>) -> Result<Vec<String>, Strin
 
 /// `STORAGE PLACE TABLE <name> AT '<path>'`
 fn place_table(tokens: &[String], database: &Arc<Database>) -> Result<Vec<String>, String> {
-    let (table, path) = table_and_path(tokens, "AT")?;
+    let (table, target) = table_and_path(tokens, "AT")?;
     let pool = pool(database)?;
+    let backend = super::TableBackend::parse(&target);
 
     if database.tables.contains_key(&table) {
         return Err(format!(
@@ -404,16 +405,60 @@ fn place_table(tokens: &[String], database: &Arc<Database>) -> Result<Vec<String
             table,
             pool.location_of(&table).unwrap_or_else(|| pool.root().unwrap_or("").to_string()),
             table,
-            path
+            target
         ));
     }
 
-    pool.pin(&table, &path)?;
-    Ok(vec![format!(
-        "{} will be created in {} when it is created",
-        table,
-        normalize(&path)
-    )])
+    // Checked here rather than when the table is created, because that is where
+    // the operator can still do something about it. A pin to a store that does
+    // not exist would otherwise surface as a table that will not open.
+    if let super::TableBackend::KeyValue(store) = &backend {
+        check_kv_store(database, store)?;
+    }
+
+    pool.pin_backend(&table, &backend)?;
+    Ok(vec![match &backend {
+        super::TableBackend::Directory(path) => {
+            format!("{table} will be created in {path} when it is created")
+        }
+        super::TableBackend::Memory => format!(
+            "{table} will be created in memory when it is created, and will not survive a \
+             restart, a backup or a relocation"
+        ),
+        super::TableBackend::KeyValue(store) => format!(
+            "{table} will be created in key/value store '{store}' when it is created, and is \
+             not covered by backups or relocation"
+        ),
+    }])
+}
+
+/// Refuses a key/value store this server cannot open.
+#[cfg(feature = "kv_storage")]
+fn check_kv_store(database: &Arc<Database>, store: &str) -> Result<(), String> {
+    if database.kv.has(store) {
+        return Ok(());
+    }
+    let known = database.kv.names();
+    Err(if known.is_empty() {
+        format!(
+            "no key/value store named '{store}': {} configures none",
+            crate::core::storage::kv_registry::KV_FILE
+        )
+    } else {
+        format!(
+            "no key/value store named '{store}'. {} configures: {}",
+            crate::core::storage::kv_registry::KV_FILE,
+            known.join(", ")
+        )
+    })
+}
+
+#[cfg(not(feature = "kv_storage"))]
+fn check_kv_store(_database: &Arc<Database>, store: &str) -> Result<(), String> {
+    Err(format!(
+        "cannot place a table on key/value store '{store}': this server was built without \
+         the kv_storage feature"
+    ))
 }
 
 /// `STORAGE MOVE TABLE <name> TO '<path>'`

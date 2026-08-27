@@ -6,6 +6,9 @@ use super::{
     traits::StorageIO,
 };
 
+#[cfg(feature = "kv_storage")]
+use super::kv::KvStorageProvider;
+
 #[derive(Clone)]
 pub enum DbStorageProvider {
     File(LocalStorageProvider),
@@ -16,6 +19,12 @@ pub enum DbStorageProvider {
     /// one pays nothing for this variant beyond a match arm.
     #[cfg(feature = "storage_pools")]
     Mirror(crate::core::storage::mirror::MirrorStorageProvider),
+    /// A database kept in a key/value store rather than in files — see
+    /// [`crate::core::storage_providers::kv`]. The whole database shares one
+    /// backing store and one page cache, held by the family the provider was
+    /// opened from.
+    #[cfg(feature = "kv_storage")]
+    KeyValue(KvStorageProvider),
 }
 
 impl DbStorageProvider {
@@ -25,6 +34,19 @@ impl DbStorageProvider {
 
     pub fn new_memory(name: &str) -> Self {
         Self::Memory(MemoryStorageProvider::new(name))
+    }
+
+    /// Opens `name` in an already-configured key/value family.
+    ///
+    /// The family is what carries the backing store, the chunk geometry and the
+    /// shared page budget, so every file of one database must come from the
+    /// same one.
+    #[cfg(feature = "kv_storage")]
+    pub async fn new_key_value(
+        family: std::sync::Arc<super::kv::KvFamily>,
+        name: &str,
+    ) -> std::io::Result<Self> {
+        Ok(Self::KeyValue(KvStorageProvider::open(family, name).await?))
     }
 
     /// Opens `name` in `location` and in every directory in `backups`.
@@ -72,6 +94,8 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => p.verify_data(position, buffer).await,
             Self::Memory(p) => p.verify_data(position, buffer).await,
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.verify_data(position, buffer).await,
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => p.verify_data(position, buffer).await,
         }
@@ -81,6 +105,8 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => p.write_data(position, buffer).await,
             Self::Memory(p) => p.write_data(position, buffer).await,
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.write_data(position, buffer).await,
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => p.write_data(position, buffer).await,
         }
@@ -90,6 +116,8 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => p.write_data_seek(seek, buffer).await,
             Self::Memory(p) => p.write_data_seek(seek, buffer).await,
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.write_data_seek(seek, buffer).await,
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => p.write_data_seek(seek, buffer).await,
         }
@@ -103,6 +131,8 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => p.read_data_into_buffer(position, buffer).await,
             Self::Memory(p) => p.read_data_into_buffer(position, buffer).await,
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.read_data_into_buffer(position, buffer).await,
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => p.read_data_into_buffer(position, buffer).await,
         }
@@ -112,6 +142,8 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => p.read_vectored(reads).await,
             Self::Memory(p) => p.read_vectored(reads).await,
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.read_vectored(reads).await,
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => p.read_vectored(reads).await,
         }
@@ -121,6 +153,8 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => p.append_data(buffer, immediate).await,
             Self::Memory(p) => p.append_data(buffer, immediate).await,
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.append_data(buffer, immediate).await,
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => p.append_data(buffer, immediate).await,
         }
@@ -130,6 +164,8 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => p.append_data_returning_offset(buffer, immediate).await,
             Self::Memory(p) => p.append_data_returning_offset(buffer, immediate).await,
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.append_data_returning_offset(buffer, immediate).await,
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => p.append_data_returning_offset(buffer, immediate).await,
         }
@@ -139,6 +175,8 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => p.begin_txn(),
             Self::Memory(p) => p.begin_txn(),
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.begin_txn(),
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => p.begin_txn(),
         }
@@ -148,6 +186,8 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => p.append_data_txn(txn, buffer).await,
             Self::Memory(p) => p.append_data_txn(txn, buffer).await,
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.append_data_txn(txn, buffer).await,
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => p.append_data_txn(txn, buffer).await,
         }
@@ -157,6 +197,8 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => p.write_data_txn(txn, position, buffer).await,
             Self::Memory(p) => p.write_data_txn(txn, position, buffer).await,
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.write_data_txn(txn, position, buffer).await,
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => p.write_data_txn(txn, position, buffer).await,
         }
@@ -166,6 +208,8 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => p.commit_durable(token).await,
             Self::Memory(p) => p.commit_durable(token).await,
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.commit_durable(token).await,
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => p.commit_durable(token).await,
         }
@@ -179,6 +223,8 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => p.try_borrow_range(position, len),
             Self::Memory(p) => p.try_borrow_range(position, len),
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.try_borrow_range(position, len),
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => p.try_borrow_range(position, len),
         }
@@ -188,6 +234,8 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => p.truncate(len).await,
             Self::Memory(p) => p.truncate(len).await,
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.truncate(len).await,
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => p.truncate(len).await,
         }
@@ -197,6 +245,8 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => p.get_len().await,
             Self::Memory(p) => p.get_len().await,
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.get_len().await,
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => p.get_len().await,
         }
@@ -211,6 +261,8 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => Self::File(p.create_temp().await),
             Self::Memory(p) => Self::Memory(p.create_temp().await),
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => Self::KeyValue(p.create_temp().await),
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => Self::Mirror(p.create_temp().await),
         }
@@ -220,6 +272,8 @@ impl StorageIO for DbStorageProvider {
         match (self, temp_io_sync) {
             (Self::File(p), Self::File(tmp)) => p.swap_temp(tmp).await,
             (Self::Memory(p), Self::Memory(tmp)) => p.swap_temp(tmp).await,
+            #[cfg(feature = "kv_storage")]
+            (Self::KeyValue(p), Self::KeyValue(tmp)) => p.swap_temp(tmp).await,
             #[cfg(feature = "storage_pools")]
             (Self::Mirror(p), Self::Mirror(tmp)) => p.swap_temp(tmp).await,
             _ => {
@@ -232,6 +286,8 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => p.get_location(),
             Self::Memory(p) => p.get_location(),
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.get_location(),
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => p.get_location(),
         }
@@ -242,6 +298,8 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => Self::File(p.create_new_at(location, name).await),
             Self::Memory(p) => Self::Memory(p.create_new_at(location, name).await),
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => Self::KeyValue(p.create_new_at(location, name).await),
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => Self::Mirror(p.create_new_at(location, name).await),
         }
@@ -252,6 +310,8 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => Self::File(p.create_new(name).await),
             Self::Memory(p) => Self::Memory(p.create_new(name).await),
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => Self::KeyValue(p.create_new(name).await),
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => Self::Mirror(p.create_new(name).await),
         }
@@ -261,6 +321,8 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => p.drop_io(),
             Self::Memory(p) => p.drop_io(),
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.drop_io(),
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => p.drop_io(),
         }
@@ -270,6 +332,8 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => p.get_hash(),
             Self::Memory(p) => p.get_hash(),
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.get_hash(),
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => p.get_hash(),
         }
@@ -279,6 +343,8 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => p.start_service().await,
             Self::Memory(p) => p.start_service().await,
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.start_service().await,
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => p.start_service().await,
         }
@@ -288,6 +354,8 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => p.get_name(),
             Self::Memory(p) => p.get_name(),
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.get_name(),
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => p.get_name(),
         }
