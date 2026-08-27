@@ -718,6 +718,8 @@ async fn rewrite_table_with_columns(
         unique_columns,
         unique_keys,
         type_modifiers,
+        generated,
+        checks,
         old_field_names,
         rows,
     ) = {
@@ -769,6 +771,13 @@ async fn rewrite_table_with_columns(
             unique_columns,
             table.schema.unique_keys.clone(),
             table.schema.type_modifiers.clone(),
+            // Carried across for the same reason the type modifiers are: a
+            // rewrite drops the table, and a generation expression lost here
+            // would leave the column present and permanently NULL.
+            table.schema.generated.clone(),
+            // Carried for the same reason: a rewrite drops the table, and a
+            // constraint lost here stops being enforced with nothing said.
+            table.schema.checks.clone(),
             old_field_names,
             rows,
         )
@@ -822,6 +831,8 @@ async fn rewrite_table_with_columns(
             // Carried across the rewrite. Losing a column's declared scale here
             // would silently reinterpret every decimal it holds.
             type_modifiers: type_modifiers.into_iter().collect(),
+            generated: generated.into_iter().collect(),
+            checks: checks.into_iter().collect(),
             unique_columns,
             unique_keys: unique_keys.into_iter().collect(),
                     // A shadow table for a JSON document has no declared key.
@@ -3562,15 +3573,366 @@ async fn supply_insert_column_list(
     row_data: &crate::core::rql::lexer_s1::InsertRowData,
     database: &Arc<Database>,
 ) -> Option<Result<QueryPurpose, String>> {
-    let fields = database
+    let (fields, generated) = database
         .tables
         .get(&row_data.table_name)
-        .map(|entry| entry.value().schema.fields.clone())?;
+        .map(|entry| {
+            let schema = &entry.value().schema;
+            (schema.fields.clone(), schema.generated.clone())
+        })?;
+    // A generated column takes no value from the client, so it is not one of
+    // the positions `INSERT INTO t VALUES (…)` fills — PostgreSQL maps the
+    // tuple across the columns that *can* be written. Leaving it in the list
+    // shifted every value after it by one.
+    let fields: smallvec::SmallVec<[crate::core::row::schema::SchemaField; 20]> = fields
+        .into_iter()
+        .filter(|f| {
+            crate::core::rql::generated::expression_for(&f.name, &generated).is_none()
+        })
+        .collect();
     let rewritten = crate::core::rql::lexer_ir::supply_column_list(&row_data.query, &fields)?;
     Some(
         recognize_query_purpose(&rewritten)
             .ok_or_else(|| "could not parse the statement after supplying its column list".to_string()),
     )
+}
+
+/// Computes a table's `GENERATED ALWAYS AS (…) STORED` columns for one row and
+/// rewrites the statement to carry them.
+///
+/// `None` when the table declares none, which is the common case and costs one
+/// map lookup. Otherwise the statement comes back with each generated column
+/// appended to its column list and the computed literal to its `VALUES` tuple.
+///
+/// The rewritten statement replaces the original **in place** rather than being
+/// re-dispatched through `execute_with_context`. A re-dispatch would reach this
+/// function again, find the generated column now present in the statement, and
+/// report it as a client-supplied value — the check below firing on this
+/// function's own output. Substituting locally means that check sees only what
+/// the client actually wrote.
+///
+/// # How the expression is evaluated
+///
+/// By substituting each referenced column's literal into the expression text
+/// and folding what remains. That is done rather than building a synthetic row
+/// and evaluating against it, because building one means re-implementing how a
+/// literal becomes bytes — and a second implementation of that is exactly how
+/// an `UPDATE` once stored `{"has ''quote''"}` where the source said
+/// `{"has 'quote'"}`. Here there is no second encoder: the literal the client
+/// wrote reaches the same encoder it always would, having been through an
+/// arithmetic fold in between.
+async fn supply_generated_values(
+    row_data: &crate::core::rql::lexer_s1::InsertRowData,
+    database: &Arc<Database>,
+) -> Option<Result<crate::core::rql::lexer_s1::InsertRowData, String>> {
+    let (fields, generated, defaults) = {
+        let entry = database.tables.get(&row_data.table_name)?;
+        let schema = &entry.value().schema;
+        if schema.generated.is_empty() {
+            return None;
+        }
+        (
+            schema.fields.clone(),
+            schema.generated.clone(),
+            schema.defaults.clone(),
+        )
+    };
+
+    let assignments = crate::core::rql::lexer_ir::assignments_of_insert(&row_data.query)?;
+
+    // A value the client supplied for a generated column is an error in
+    // PostgreSQL, and reporting it matters more than accepting it: a client
+    // that believed it had set the column would otherwise be silently
+    // overruled. `DEFAULT` is the one spelling PostgreSQL allows, and it means
+    // "compute it", so it is dropped rather than refused.
+    let mut assignments = assignments;
+    for g in &generated {
+        let Some(position) = assignments
+            .iter()
+            .position(|(name, _)| name.eq_ignore_ascii_case(&g.column))
+        else {
+            continue;
+        };
+        if !assignments[position].1.trim().eq_ignore_ascii_case("DEFAULT") {
+            return Some(Err(format!(
+                "cannot insert a non-DEFAULT value into column \"{}\": it is a generated column",
+                g.column
+            )));
+        }
+        assignments.remove(position);
+    }
+
+    // What each column holds for this row: the literal written, or its default.
+    let mut values: Vec<(String, String)> = assignments.clone();
+    for field in fields.iter().filter(|f| !f.is_deleted) {
+        if values.iter().any(|(name, _)| name.eq_ignore_ascii_case(&field.name)) {
+            continue;
+        }
+        let literal = crate::core::rql::column_default::expression_for(&field.name, &defaults)
+            .and_then(|e| crate::core::rql::column_default::evaluate(e, &field.db_type).ok())
+            .unwrap_or_else(|| "NULL".to_string());
+        values.push((field.name.clone(), literal));
+    }
+
+    let mut computed: Vec<(String, String)> = Vec::with_capacity(generated.len());
+    for g in &generated {
+        let substituted = match substitute_columns(&g.expression, &values) {
+            Ok(text) => text,
+            Err(reason) => return Some(Err(reason)),
+        };
+        let field_type = fields
+            .iter()
+            .find(|f| f.name.eq_ignore_ascii_case(&g.column))
+            .map(|f| f.db_type.clone())
+            .unwrap_or(crate::core::db_type::DbType::STRING);
+
+        // Folded against an empty row: every column reference is gone, so what
+        // is left is a constant.
+        let literal = match crate::core::rql::expr::parse(&substituted, &[]).and_then(|expr| {
+            crate::core::rql::expr::eval(
+                &expr,
+                &crate::core::row::row::Row::default(),
+                &[],
+            )
+        }) {
+            Ok(crate::core::rql::expr::Value::Null) => "NULL".to_string(),
+            Ok(crate::core::rql::expr::Value::Data { bytes, db_type }) => {
+                // Rendered at the *column's* type, not the arithmetic's: a sum
+                // of decimals folds to a decimal, and the column may be
+                // narrower or wider than the fold's intermediate.
+                let coerced = crate::core::rql::expr::coerce_to_public(
+                    crate::core::rql::expr::Value::Data {
+                        bytes: bytes.clone(),
+                        db_type: db_type.clone(),
+                    },
+                    &field_type,
+                );
+                let (bytes, db_type) = match coerced {
+                    crate::core::rql::expr::Value::Data { bytes, db_type } => (bytes, db_type),
+                    crate::core::rql::expr::Value::Null => (bytes, db_type),
+                };
+                match crate::core::rql::subquery::value_to_literal(&db_type, &bytes) {
+                    Some(literal) => literal,
+                    None => "NULL".to_string(),
+                }
+            }
+            Err(reason) => {
+                return Some(Err(format!(
+                    "the generated column \"{}\" could not be computed: {}",
+                    g.column, reason
+                )));
+            }
+        };
+        computed.push((g.column.clone(), literal));
+    }
+
+    let rewritten = match append_insert_values(&row_data.query, &computed) {
+        Some(sql) => sql,
+        None => {
+            return Some(Err(format!(
+                "the statement's shape could not carry the generated column of '{}'",
+                row_data.table_name
+            )));
+        }
+    };
+    Some(Ok(crate::core::rql::lexer_s1::InsertRowData {
+        table_name: row_data.table_name.clone(),
+        query: rewritten,
+        on_conflict_do_nothing: row_data.on_conflict_do_nothing,
+        on_conflict_update: row_data.on_conflict_update.clone(),
+    }))
+}
+
+/// Why an `UPDATE` cannot be run against a table with generated columns, if it
+/// cannot.
+///
+/// `None` when the statement touches no input of any generated column, which is
+/// every `UPDATE` on a table that has none and most on a table that has.
+fn generated_update_conflict(
+    query: &QueryPurpose,
+    schema: &crate::core::row::schema::TableSchema,
+) -> Option<String> {
+    if schema.generated.is_empty() {
+        return None;
+    }
+    let QueryPurpose::UpdateRow(sql) = query else {
+        return None;
+    };
+    let assignments = crate::core::rql::lexer_ur::assignments_of_update(sql)?;
+
+    for g in &schema.generated {
+        // Assigning the generated column itself is an error in PostgreSQL too.
+        if assignments
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case(&g.column))
+        {
+            return Some(format!(
+                "column \"{}\" can only be updated to DEFAULT: it is a generated column",
+                g.column
+            ));
+        }
+        let inputs = expression_columns(&g.expression, &schema.fields);
+        for (name, _) in &assignments {
+            if inputs.iter().any(|input| input.eq_ignore_ascii_case(name)) {
+                return Some(format!(
+                    "updating \"{}\" would leave the generated column \"{}\" stale, and                      recomputing it in an UPDATE is not supported yet; rewrite the row with                      DELETE and INSERT",
+                    name, g.column
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// The schema columns an expression names.
+///
+/// Whole words only, and only names the schema has — so `subtotal + 30` names
+/// one column, and a table with both `tax` and `tax_amount` does not have the
+/// shorter name found inside the longer one.
+fn expression_columns(
+    expression: &str,
+    fields: &smallvec::SmallVec<[crate::core::row::schema::SchemaField; 20]>,
+) -> Vec<String> {
+    fn is_word_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_'
+    }
+    let bytes = expression.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if !is_word_byte(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && is_word_byte(bytes[i]) {
+            i += 1;
+        }
+        let word = &expression[start..i];
+        if fields
+            .iter()
+            .any(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(word))
+            && !out.iter().any(|existing| existing.eq_ignore_ascii_case(word))
+        {
+            out.push(word.to_string());
+        }
+    }
+    out
+}
+
+/// Replaces each column name in an expression with the literal that row holds.
+///
+/// Matching is on whole words. Without that, a table with columns `tax` and
+/// `tax_amount` had the shorter name substituted inside the longer one, leaving
+/// arithmetic over a fragment — the same prefix-matching mistake that once
+/// deleted a column and a predicate elsewhere in this parser.
+fn substitute_columns(expression: &str, values: &[(String, String)]) -> Result<String, String> {
+    fn is_word_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_'
+    }
+
+    let bytes = expression.as_bytes();
+    let mut out = String::with_capacity(expression.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        // A quoted literal in the expression is copied through untouched.
+        if bytes[i] == b'\'' {
+            let start = i;
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\'' {
+                    if bytes.get(i + 1) == Some(&b'\'') {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.push_str(&expression[start..i]);
+            continue;
+        }
+        if !is_word_byte(bytes[i]) {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && is_word_byte(bytes[i]) {
+            i += 1;
+        }
+        let word = &expression[start..i];
+        match values
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(word))
+        {
+            // A NULL input makes the whole expression NULL, as it does in
+            // PostgreSQL — and saying so here beats folding `NULL + 5` into
+            // something that looks like a number.
+            Some((_, literal)) if literal.trim().eq_ignore_ascii_case("NULL") => {
+                return Ok("NULL".to_string());
+            }
+            Some((_, literal)) => {
+                out.push('(');
+                out.push_str(literal.trim());
+                out.push(')');
+            }
+            None => out.push_str(word),
+        }
+    }
+    Ok(out)
+}
+
+/// Appends `(column, literal)` pairs to an `INSERT`'s column list and its
+/// single `VALUES` tuple.
+///
+/// `None` when the statement is not the one-tuple, explicit-column-list shape
+/// this understands — which is the shape every insert has by the time it
+/// reaches here, the column list having been supplied and the tuples split.
+fn append_insert_values(sql: &str, extra: &[(String, String)]) -> Option<String> {
+    if extra.is_empty() {
+        return Some(sql.to_string());
+    }
+    // A RETURNING clause is set aside so its parentheses are not mistaken for
+    // the value tuple's.
+    let (head, returning) = match crate::core::rql::lexer_ir::returning_split(sql) {
+        Some((head, tail)) => (head.to_string(), Some(tail.to_string())),
+        None => (sql.to_string(), None),
+    };
+
+    let values_at = crate::core::rql::join::find_keyword(&head, "VALUES", 0)?;
+    let columns_close = head[..values_at].rfind(')')?;
+    let tuple_open = head[values_at..].find('(')? + values_at;
+    let tuple_close = head.rfind(')')?;
+    if tuple_close <= tuple_open {
+        return None;
+    }
+
+    let names = extra
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let literals = extra
+        .iter()
+        .map(|(_, literal)| literal.clone())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut out = String::with_capacity(head.len() + names.len() + literals.len() + 8);
+    out.push_str(&head[..columns_close]);
+    out.push_str(", ");
+    out.push_str(&names);
+    out.push_str(&head[columns_close..tuple_close]);
+    out.push_str(", ");
+    out.push_str(&literals);
+    out.push_str(&head[tuple_close..]);
+    if let Some(returning) = returning {
+        out.push(' ');
+        out.push_str(&returning);
+    }
+    Some(out)
 }
 
 async fn insert_values_batch(
@@ -4296,6 +4658,285 @@ async fn execute_drop_table(sql: &str, database: &Arc<Database>) -> Vec<u8> {
 /// table, so `ALTER TABLE … ADD CONSTRAINT … UNIQUE` has to look before it
 /// agrees — PostgreSQL reports "key is duplicated" for the same reason. One
 /// scan, at DDL time.
+/// Refuses a row that a `CHECK` constraint rejects.
+///
+/// Evaluated against the row **as it will be stored**, built from the payload
+/// about to be written — so it sees the defaults that were filled in and the
+/// generated columns that were computed, exactly as a later reader would.
+/// Checking the statement's literals instead would miss both.
+///
+/// `Ok(())` when every constraint holds, or when the table declares none,
+/// which is the common case and costs one `is_empty`.
+#[inline(never)]
+fn check_constraints_hold(
+    table_name: &str,
+    schema: &crate::core::row::schema::TableSchema,
+    payloads: &[crate::core::row::row::ColumnWritePayload],
+) -> Result<(), String> {
+    if schema.checks.is_empty() {
+        return Ok(());
+    }
+
+    let mut row = crate::core::row::row::Row::default();
+    for payload in payloads {
+        row.columns.push(crate::core::row::row::Column {
+            schema_id: payload.write_order as u64,
+            data: payload.data.clone(),
+            column_type: payload.column_type.clone(),
+        });
+    }
+    let row = &row;
+
+    // The schema without the nullability companions. Handing the rewriter the
+    // full schema makes it wrap every reference in `__null_x = 0 AND …`, which
+    // turns "this column is NULL" into "the check failed" — the opposite of
+    // what a check does with NULL.
+    let visible: Vec<crate::core::row::schema::SchemaField> =
+        crate::core::rql::nullable::visible_fields(&schema.fields);
+    let visible_sv: smallvec::SmallVec<[crate::core::row::schema::SchemaField; 20]> =
+        visible.iter().cloned().collect();
+
+    for constraint in &schema.checks {
+        if constraint.is_deleted {
+            continue;
+        }
+
+        // `BETWEEN`, `IN` and the rest are sugar the condition evaluator does
+        // not read; the predicate rewriter lowers them to the comparisons it
+        // does. A check it cannot lower is logged and skipped rather than
+        // failing every insert into the table.
+        let lowered = match crate::core::tokenizer::predicate_rewrite::rewrite_where(
+            &constraint.expression,
+            &visible_sv,
+        ) {
+            Ok(text) => text,
+            Err(reason) => {
+                log::error!(
+                    "check constraint '{}' on '{}' could not be compiled and is not being                      enforced: {}",
+                    constraint.name,
+                    table_name,
+                    reason
+                );
+                continue;
+            }
+        };
+
+        let condition = match crate::core::rql::expr::parse_cond(&lowered, &visible) {
+            Ok(condition) => condition,
+            Err(reason) => {
+                log::error!(
+                    "check constraint '{}' on '{}' could not be compiled and is not being                      enforced: {}",
+                    constraint.name,
+                    table_name,
+                    reason
+                );
+                continue;
+            }
+        };
+
+        // A check whose inputs include a NULL passes without being evaluated —
+        // PostgreSQL rejects a row only when a check is *false*, and a
+        // comparison against NULL is NULL rather than false. Unless the check
+        // tests for NULL itself, in which case that test is the point.
+        let upper = constraint.expression.to_ascii_uppercase();
+        let tests_null = upper.contains("IS NULL") || upper.contains("IS NOT NULL");
+        if !tests_null && condition_reads_a_null(&condition, &schema.fields, row) {
+            continue;
+        }
+
+        match crate::core::rql::expr::eval_cond(&condition, row, &visible) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(format!(
+                    "new row for relation \"{}\" violates check constraint \"{}\"",
+                    table_name, constraint.name
+                ));
+            }
+            Err(reason) => {
+                log::error!(
+                    "check constraint '{}' on '{}' could not be evaluated and is not being                      enforced for this row: {}",
+                    constraint.name,
+                    table_name,
+                    reason
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuses an `UPDATE` whose assignments violate a `CHECK`.
+///
+/// Only the constraints whose every column the statement assigns can be judged:
+/// `UPDATE t SET status = 99` supplies everything `CHECK (status BETWEEN 1 AND
+/// 10)` reads, while `UPDATE t SET lo = 5` supplies half of
+/// `CHECK (lo < hi)` and the other half is in a row this has not read.
+///
+/// **The rest are not enforced on update.** An `UPDATE` can therefore leave a
+/// row that violates a multi-column check. That is stated rather than hidden,
+/// and it is the narrower half of the choice: evaluating a check against a
+/// value it does not have would reject rows that are perfectly valid.
+#[inline(never)]
+fn check_constraints_hold_for_update(
+    table_name: &str,
+    schema: &crate::core::row::schema::TableSchema,
+    plan: &crate::core::rql::lexer_ur::UpdateRow,
+) -> Result<(), String> {
+    if schema.checks.is_empty() {
+        return Ok(());
+    }
+
+    let assigned: std::collections::HashSet<u64> =
+        plan.updates.iter().map(|p| p.write_order as u64).collect();
+
+    let mut candidate = crate::core::row::row::Row::default();
+    for payload in &plan.updates {
+        candidate.columns.push(crate::core::row::row::Column {
+            schema_id: payload.write_order as u64,
+            data: payload.data.clone(),
+            column_type: payload.column_type.clone(),
+        });
+    }
+
+    let visible: Vec<crate::core::row::schema::SchemaField> =
+        crate::core::rql::nullable::visible_fields(&schema.fields);
+    let visible_sv: smallvec::SmallVec<[crate::core::row::schema::SchemaField; 20]> =
+        visible.iter().cloned().collect();
+
+    for constraint in schema.checks.iter().filter(|c| !c.is_deleted) {
+        let Ok(lowered) = crate::core::tokenizer::predicate_rewrite::rewrite_where(
+            &constraint.expression,
+            &visible_sv,
+        ) else {
+            continue;
+        };
+        let Ok(condition) = crate::core::rql::expr::parse_cond(&lowered, &visible) else {
+            continue;
+        };
+
+        // Every column the check reads has to be one this statement assigns,
+        // or the row it would be judged against is incomplete.
+        let mut columns = Vec::new();
+        collect_condition_columns(&condition, &mut columns);
+        if columns.is_empty() || !columns.iter().all(|f| assigned.contains(&f.write_order)) {
+            continue;
+        }
+
+        if let Ok(false) = crate::core::rql::expr::eval_cond(&condition, &candidate, &visible) {
+            return Err(format!(
+                "new row for relation \"{}\" violates check constraint \"{}\"",
+                table_name, constraint.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Every column a condition tree reads.
+fn collect_condition_columns(
+    condition: &crate::core::rql::expr::Cond,
+    out: &mut Vec<crate::core::row::schema::SchemaField>,
+) {
+    match condition {
+        crate::core::rql::expr::Cond::Cmp(c) => {
+            out.extend(crate::core::rql::expr::condition_columns(c));
+        }
+        crate::core::rql::expr::Cond::And(parts) | crate::core::rql::expr::Cond::Or(parts) => {
+            for part in parts {
+                collect_condition_columns(part, out);
+            }
+        }
+    }
+}
+
+/// Whether any column a condition reads holds NULL in this row.
+fn condition_reads_a_null(
+    condition: &crate::core::rql::expr::Cond,
+    schema: &smallvec::SmallVec<[crate::core::row::schema::SchemaField; 20]>,
+    row: &crate::core::row::row::Row,
+) -> bool {
+    let mut columns = Vec::new();
+    collect_condition_columns(condition, &mut columns);
+
+    columns.iter().any(|field| {
+        let Some(flag) = crate::core::rql::nullable::flag_field(&field.name, schema) else {
+            return false;
+        };
+        row.columns
+            .iter()
+            .find(|c| c.schema_id == flag.write_order)
+            .is_some_and(|c| crate::core::rql::nullable::flag_is_set(c.data.into_slice()))
+    })
+}
+
+/// Works out where each of a table's sequences resumes, once per process.
+///
+/// A `SERIAL` column's counter lives in memory (see
+/// [`crate::core::rql::sequence`]), so a reopened database has to learn what is
+/// already stored before it hands out a value — otherwise the first insert
+/// after a restart reissues key 1 and collides with the row that has it.
+///
+/// Costs one scan of the table, and only on the first insert into it in this
+/// process, and only for a table that actually declares a serial column. A
+/// table with none returns before reading anything.
+async fn seed_sequences(database: &Arc<Database>, table_name: &str) {
+    let table = {
+        let Some(entry) = database.tables.get(table_name) else {
+            return;
+        };
+        entry.value().clone()
+    };
+
+    // Which columns are serial, and which of their sequences still need a seed.
+    let mut wanted: Vec<(String, crate::core::row::schema::SchemaField)> = Vec::new();
+    for field in table.schema.fields.iter().filter(|f| !f.is_deleted) {
+        let Some(expression) = crate::core::rql::column_default::expression_for(
+            &field.name,
+            &table.schema.defaults,
+        ) else {
+            continue;
+        };
+        let Some(name) = crate::core::rql::sequence::parse_nextval(expression) else {
+            continue;
+        };
+        if !crate::core::rql::sequence::is_seeded(&name) {
+            wanted.push((name, field.clone()));
+        }
+    }
+    if wanted.is_empty() {
+        return;
+    }
+
+    let schema = &table.schema.fields;
+    let fetch_fields: Vec<crate::core::row::schema::SchemaField> =
+        wanted.iter().map(|(_, f)| f.clone()).collect();
+    let fetch = crate::core::rql::join::fetch_for(&fetch_fields, schema);
+    let empty = crate::core::rql::join::fetch_for(&[], schema);
+    let rows = match table
+        .query_row("", &schema.to_vec(), empty, fetch, None, None)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            // Seeding at zero would hand out a key the table may already hold,
+            // so the failure is reported rather than papered over. The insert
+            // itself then fails on the duplicate, which names the real problem.
+            log::error!("could not read '{}' to seed its sequences: {}", table_name, e);
+            return;
+        }
+    };
+
+    for (name, field) in wanted {
+        let last = crate::core::rql::sequence::max_of_column(
+            &rows,
+            field.write_order,
+            &field.db_type,
+        )
+        .unwrap_or(0);
+        crate::core::rql::sequence::seed(&name, last);
+    }
+}
+
 async fn existing_rows_break_unique(
     database: &Arc<Database>,
     table_name: &str,
@@ -6365,6 +7006,12 @@ pub async fn execute_with_context(
         QueryPurpose::DropTable(sql) => {
             let response = Box::pin(execute_drop_table(sql, &database)).await;
             if response.first() != Some(&3) {
+                // The sequences go with the table. Without this a table dropped
+                // and recreated under the same name kept counting from where
+                // the old one stopped, so its first row got a key well above 1.
+                if let Ok((name, _)) = crate::core::rql::lexer_alter::parse_drop_table(sql) {
+                    crate::core::rql::sequence::forget_table(&name);
+                }
                 note_write(&database, tx, depth, sql, None);
             }
             response
@@ -6379,6 +7026,12 @@ pub async fn execute_with_context(
             response
         }
         QueryPurpose::InsertRow(row_data) => {
+            // Before anything reads a default: a `SERIAL` column's counter is
+            // in memory and a reopened database has not yet learned what the
+            // table already holds. Returns immediately for a table with no
+            // serial column, and after the first insert for one that has.
+            Box::pin(seed_sequences(&database, &row_data.table_name)).await;
+
             // `INSERT INTO t VALUES (…)` names no columns, so the list is
             // supplied from the schema and the statement re-dispatched in the
             // one shape every parser below understands. First, so that the
@@ -6422,6 +7075,29 @@ pub async fn execute_with_context(
                 Some(response) => return response,
                 None => {}
             }
+
+            // Generated columns, computed now that the statement is one tuple
+            // with an explicit column list. After the batch split, so each row
+            // of a multi-row insert is computed from its own values.
+            //
+            // The rewritten statement is substituted for the original here
+            // rather than re-dispatched — see `supply_generated_values`.
+            //
+            // Both `row_data` and `query` are shadowed. The row parser below
+            // reads the whole `QueryPurpose`, not the `row_data` beside it, so
+            // rebinding only one of them left the computed value in a statement
+            // nothing went on to parse — the column stayed NULL and the insert
+            // still reported success.
+            let generated_rewrite =
+                match Box::pin(supply_generated_values(row_data, &database)).await {
+                    Some(Ok(data)) => Some(QueryPurpose::InsertRow(data)),
+                    Some(Err(e)) => return ddl_error(&e),
+                    None => None,
+                };
+            let (row_data, query) = match &generated_rewrite {
+                Some(purpose @ QueryPurpose::InsertRow(data)) => (data, purpose),
+                _ => (row_data, &query),
+            };
 
             let table_name = &row_data.table_name;
             debug!("Insert row into table: {}", table_name);
@@ -6538,6 +7214,23 @@ pub async fn execute_with_context(
                 &schema.defaults,
                 &schema.type_modifiers,
             ) {
+                // Every `CHECK` the table declares, evaluated against the row
+                // as it will be stored. Before the write, so a violation
+                // leaves nothing behind to undo.
+                //
+                // The row it judges is built inside the helper, not here. This
+                // arm's locals are the ones that overflowed a worker's stack
+                // once already, and a `Row` plus a loop in it was enough to do
+                // so again.
+                if let Err(e) = check_constraints_hold(
+                    table_name,
+                    &table.schema,
+                    &insert_row.columns_writing_data,
+                ) {
+                    error!("{}", e);
+                    return ddl_error(&e);
+                }
+
                 // The returned row is built from the payload about to be
                 // written, so it reflects exactly what was stored without
                 // reading the row back off disk.
@@ -6811,6 +7504,25 @@ pub async fn execute_with_context(
                 entry.value().clone()
             };
 
+            // A generated column is computed from the row, so an `UPDATE` to
+            // one of its inputs has to recompute it. This engine's `UPDATE`
+            // applies one value per column across the matched set and has no
+            // per-row evaluation to hang the recomputation on, so the statement
+            // is **refused** rather than allowed to leave a stale number
+            // behind.
+            //
+            // Refusing is the deliberate choice. The alternative — accept the
+            // update and let the generated column keep the value it had — is a
+            // wrong number that reports success, which is the failure this
+            // engine is most often bitten by. A loud limitation can be worked
+            // around; a quiet one is found in a report months later.
+            if let Some(reason) =
+                generated_update_conflict(&query, &table.schema)
+            {
+                error!("{}", reason);
+                return ddl_error(&reason);
+            }
+
             // A JSON document assigned by an UPDATE is stored in the table
             // backing its column and the statement rewritten to carry the
             // reference, exactly as an INSERT does.
@@ -6873,6 +7585,16 @@ pub async fn execute_with_context(
                     return ddl_error(&message);
                 }
             };
+
+            // A `CHECK` the assignments can be judged against on their own.
+            // The values are the ones the plan already encoded, so this reads
+            // exactly what the write will store.
+            if let Err(e) =
+                check_constraints_hold_for_update(&table_name, &table.schema, &update_plan)
+            {
+                error!("{}", e);
+                return ddl_error(&e);
+            }
 
             if let Some(assignments) =
                 crate::core::rql::lexer_ur::assignments_of_update(&query_sql(&query))
@@ -7791,10 +8513,23 @@ pub async fn execute_with_context(
                                         for (position, spec) in &window_slots {
                                             let values =
                                                 crate::core::rql::window::assign(&kept, spec);
+                                            // The type the window produces, not
+                                            // `I64`: an `AVG` is a decimal and
+                                            // a `LAG(created_at)` is a
+                                            // timestamp, and describing either
+                                            // as a bigint sends the client
+                                            // eight bytes it decodes as the
+                                            // wrong thing.
+                                            let column_type = spec.result_type();
                                             for (row, value) in
                                                 kept.iter_mut().zip(values.into_iter())
                                             {
-                                                let bytes = value.to_le_bytes();
+                                                // A NULL window value — no
+                                                // preceding row for a `LAG`, an
+                                                // empty frame for an `AVG` —
+                                                // is an empty block, which is
+                                                // how a NULL travels here.
+                                                let bytes = value.unwrap_or_default();
                                                 let mut mb =
                                                     crate::memory_pool::MEMORY_POOL
                                                         .acquire(bytes.len());
@@ -7805,8 +8540,7 @@ pub async fn execute_with_context(
                                                     crate::core::row::row::Column {
                                                         schema_id: *position as u64,
                                                         data: mb,
-                                                        column_type:
-                                                            crate::core::db_type::DbType::I64,
+                                                        column_type: column_type.clone(),
                                                     },
                                                 );
                                             }

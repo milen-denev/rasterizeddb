@@ -186,18 +186,61 @@ pub fn evaluate(expression: &str, db_type: &DbType) -> Result<String, String> {
 
     // Time of the insert, not of the declaration, which is why the expression
     // is stored as text and evaluated here.
+    //
+    // `clock_timestamp()`, `statement_timestamp()` and `transaction_timestamp()`
+    // differ in PostgreSQL by *when in the transaction* they are taken.
+    // Evaluated here they are all the time of the insert, which is what
+    // `clock_timestamp()` means and is within a statement of the other two.
+    // They are accepted rather than refused because a schema that asks for a
+    // wall clock should not fail to create over the distinction.
     if matches!(
         upper.as_str(),
-        "CURRENT_TIMESTAMP" | "NOW()" | "CURRENT_TIMESTAMP()" | "LOCALTIMESTAMP"
+        "CURRENT_TIMESTAMP"
+            | "NOW()"
+            | "CURRENT_TIMESTAMP()"
+            | "LOCALTIMESTAMP"
+            | "LOCALTIMESTAMP()"
+            | "CLOCK_TIMESTAMP()"
+            | "STATEMENT_TIMESTAMP()"
+            | "TRANSACTION_TIMESTAMP()"
     ) {
-        let micros = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_micros() as i64)
-            .unwrap_or(0);
-        return Ok(format!(
-            "'{}'",
-            crate::core::value_codec::format_timestamp_us(micros)
-        ));
+        let micros = now_micros();
+        // A wall clock defaulting a `DATE` or a `TIME` column is that instant's
+        // date or time of day, not the whole timestamp: the column's encoder
+        // would refuse the full text, and `DEFAULT now()` on a date column is
+        // ordinary enough that refusing it would be the wrong answer.
+        return Ok(match db_type {
+            DbType::DATE => format!("'{}'", format_date_of(micros)),
+            DbType::TIME | DbType::TIMETZ => format!("'{}'", format_time_of(micros, db_type)),
+            _ => format!("'{}'", crate::core::value_codec::format_timestamp_us(micros)),
+        });
+    }
+
+    // The date and time of day on their own.
+    if matches!(upper.as_str(), "CURRENT_DATE" | "CURRENT_DATE()") {
+        let micros = now_micros();
+        return Ok(match db_type {
+            // A date default on a timestamp column is that date at midnight,
+            // which is what PostgreSQL's own cast does.
+            DbType::DATETIME => {
+                format!("'{} 00:00:00'", format_date_of(micros))
+            }
+            _ => format!("'{}'", format_date_of(micros)),
+        });
+    }
+    if matches!(
+        upper.as_str(),
+        "CURRENT_TIME" | "CURRENT_TIME()" | "LOCALTIME" | "LOCALTIME()"
+    ) {
+        let micros = now_micros();
+        return Ok(format!("'{}'", format_time_of(micros, db_type)));
+    }
+
+    // `SERIAL`'s default. The counter lives in
+    // `crate::core::rql::sequence`; this is the point at which a row consumes
+    // from it, so a row that is never written never takes a value.
+    if let Some(name) = crate::core::rql::sequence::parse_nextval(text) {
+        return Ok(crate::core::rql::sequence::next(&name).to_string());
     }
 
     if matches!(upper.as_str(), "GEN_RANDOM_UUID()" | "UUID_GENERATE_V4()") {
@@ -235,10 +278,45 @@ pub fn evaluate(expression: &str, db_type: &DbType) -> Result<String, String> {
     }
 
     Err(format!(
-        "DEFAULT {} is not supported: only literals, TRUE/FALSE, NULL, CURRENT_TIMESTAMP and \
-         gen_random_uuid() are understood",
+        "DEFAULT {} is not supported: literals, TRUE/FALSE, NULL, CURRENT_TIMESTAMP, now(), \
+         clock_timestamp(), CURRENT_DATE, CURRENT_TIME and gen_random_uuid() are understood",
         text
     ))
+}
+
+/// Microseconds since the Unix epoch, now.
+fn now_micros() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0)
+}
+
+/// The `YYYY-MM-DD` of an instant.
+fn format_date_of(micros: i64) -> String {
+    // Floor division, so an instant before 1970 lands on the day it belongs to
+    // rather than the one after it.
+    let days = micros.div_euclid(86_400_000_000);
+    let (year, month, day) = crate::core::value_codec::civil_from_days(days);
+    format!("{:04}-{:02}-{:02}", year, month, day)
+}
+
+/// The time of day of an instant, with the UTC offset when the column keeps
+/// one. The server reports `TimeZone=UTC`, so the offset is always `+00`.
+fn format_time_of(micros: i64, db_type: &DbType) -> String {
+    let of_day = micros.rem_euclid(86_400_000_000);
+    let hours = of_day / 3_600_000_000;
+    let minutes = (of_day % 3_600_000_000) / 60_000_000;
+    let seconds = (of_day % 60_000_000) / 1_000_000;
+    let frac = of_day % 1_000_000;
+    let mut out = format!("{:02}:{:02}:{:02}", hours, minutes, seconds);
+    if frac != 0 {
+        out.push_str(format!(".{:06}", frac).trim_end_matches('0'));
+    }
+    if matches!(db_type, DbType::TIMETZ) {
+        out.push_str("+00");
+    }
+    out
 }
 
 /// Reads the `DEFAULT …` clause out of a column definition, and returns the

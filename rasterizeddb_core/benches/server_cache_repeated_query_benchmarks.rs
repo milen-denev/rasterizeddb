@@ -217,6 +217,8 @@ async fn create_employees_table(database: &Arc<Database>) {
             unique_columns: Vec::new(),
             unique_keys: Vec::new(),
             type_modifiers: Vec::new(),
+            generated: Vec::new(),
+            checks: Vec::new(),
             primary_key: None,
             if_not_exists: false,
         })

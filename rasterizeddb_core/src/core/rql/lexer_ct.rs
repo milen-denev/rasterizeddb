@@ -23,13 +23,16 @@ struct ColumnConstraints {
     primary_key: bool,
 }
 
-fn parse_constraints(tokens: &[&str]) -> ColumnConstraints {
+fn parse_constraints(tokens: &[&str], is_serial: bool) -> ColumnConstraints {
     let upper: Vec<String> = tokens.iter().map(|t| t.to_ascii_uppercase()).collect();
     let joined = upper.join(" ");
 
     // Postgres defaults a column to nullable; `NOT NULL` and `PRIMARY KEY` are
-    // what make it not.
-    let not_null = joined.contains("NOT NULL") || joined.contains("PRIMARY KEY");
+    // what make it not. A `SERIAL` is `NOT NULL` by definition — the clause is
+    // part of what the word expands to — and without this a `BIGSERIAL PRIMARY
+    // KEY` column got a nullability companion whose presence made the insert
+    // path treat the omitted column as NULL rather than as wanting its default.
+    let not_null = is_serial || joined.contains("NOT NULL") || joined.contains("PRIMARY KEY");
     // A `PRIMARY KEY` is a `UNIQUE NOT NULL`, so both imply uniqueness. A
     // `REFERENCES … UNIQUE` would too, but the substring test is enough: the
     // word only appears in a column definition as a constraint on that column.
@@ -70,6 +73,10 @@ pub struct CreateTable {
     pub primary_key: Option<String>,
     /// `CREATE TABLE IF NOT EXISTS`: an existing table is success, not an error.
     pub if_not_exists: bool,
+    /// `GENERATED ALWAYS AS (…) STORED` expressions.
+    pub generated: Vec<crate::core::rql::generated::GeneratedColumn>,
+    /// `CHECK` constraints, both the column-level and the table-level kind.
+    pub checks: Vec<crate::core::rql::check::CheckConstraint>,
 }
 
 /// Attempts to parse a QueryPurpose::CreateTable variant into a CreateTable struct.
@@ -174,6 +181,8 @@ fn parse_create_table(
         let mut unique_columns: Vec<String> = Vec::new();
         let mut unique_keys: Vec<crate::core::rql::unique_key::UniqueKey> = Vec::new();
         let mut primary_key: Option<String> = None;
+        let mut generated: Vec<crate::core::rql::generated::GeneratedColumn> = Vec::new();
+        let mut checks: Vec<crate::core::rql::check::CheckConstraint> = Vec::new();
         for col_def in split_definitions(columns_str) {
             let col_def = col_def.trim();
             if col_def.is_empty() {
@@ -185,6 +194,22 @@ fn parse_create_table(
             // parsed as one — but a foreign key among them is captured rather
             // than discarded.
             if is_table_constraint(col_def) {
+                // A table-level `CHECK (…)`, which may name several columns.
+                let (_, table_check) = crate::core::rql::check::split_clause(col_def);
+                if let Some(expression) = table_check {
+                    checks.push(crate::core::rql::check::CheckConstraint {
+                        name: constraint_name(col_def).unwrap_or_else(|| {
+                            crate::core::rql::check::derived_name(
+                                &table_name,
+                                None,
+                                checks.len() + 1,
+                            )
+                        }),
+                        expression,
+                        is_deleted: false,
+                    });
+                    continue;
+                }
                 if let Some(fk_clause) = foreign_key_clause(col_def) {
                     match crate::core::rql::foreign_key::parse_clause(
                         fk_clause,
@@ -220,6 +245,25 @@ fn parse_create_table(
                 continue;
             }
 
+            // A column-level `CHECK (…)` comes out before anything else reads
+            // the definition: its expression is a parenthesised group that the
+            // type reader, the DEFAULT reader and the constraint reader would
+            // each take a piece of.
+            let (col_def_owned, check_expression) =
+                crate::core::rql::check::split_clause(col_def);
+            let col_def = col_def_owned.as_str();
+
+            // `GENERATED ALWAYS AS (…) STORED` comes out first, because its
+            // expression is a parenthesised group that the DEFAULT and
+            // constraint readers would both take pieces of.
+            //
+            // It used to be left in and recognised only as a constraint
+            // keyword, so the column was created and never given a value: every
+            // row read NULL for it and no statement failed.
+            let (col_def_owned, generated_expression) =
+                crate::core::rql::generated::split_clause(col_def);
+            let col_def = col_def_owned.as_str();
+
             // The DEFAULT clause is taken out before the type and constraints
             // are read, so its expression cannot be mistaken for either.
             let (col_def_owned, default_expression) =
@@ -244,7 +288,12 @@ fn parse_create_table(
                 return None;
             }
             let (type_phrase, tokens_used) = parse_type_phrase(&tokens[1..])?;
-            let constraints = parse_constraints(&tokens[1 + tokens_used..]);
+            // `SERIAL` is not a type but a shorthand: an integer column, `NOT
+            // NULL`, defaulting to the next value of a sequence made with the
+            // table. It is expanded here so everything downstream sees an
+            // ordinary column with an ordinary default.
+            let serial = crate::core::rql::sequence::serial_type(&type_phrase);
+            let constraints = parse_constraints(&tokens[1 + tokens_used..], serial.is_some());
 
             // Map SQL type to DbType (Postgres-friendly mapping; extend as needed)
             // A JSON column holds a reference to the row of a table built from
@@ -341,6 +390,52 @@ fn parse_create_table(
                     expression,
                     is_deleted: false,
                 });
+            } else if serial.is_some() {
+                // An explicit `DEFAULT` written alongside `SERIAL` wins, which
+                // is why this is the `else`: PostgreSQL lets one override the
+                // implicit `nextval`.
+                defaults.push(crate::core::rql::column_default::ColumnDefault {
+                    column: name.clone(),
+                    expression: format!(
+                        "nextval('{}')",
+                        crate::core::rql::sequence::sequence_name(&table_name, &name)
+                    ),
+                    is_deleted: false,
+                });
+            }
+
+            if let Some(expression) = check_expression {
+                if expression.len() > crate::core::rql::check::MAX_EXPRESSION_LEN {
+                    rejection.replace(format!(
+                        "a check expression may be at most {} characters",
+                        crate::core::rql::check::MAX_EXPRESSION_LEN
+                    ));
+                    return None;
+                }
+                checks.push(crate::core::rql::check::CheckConstraint {
+                    name: crate::core::rql::check::derived_name(
+                        &table_name,
+                        Some(&name),
+                        checks.len() + 1,
+                    ),
+                    expression,
+                    is_deleted: false,
+                });
+            }
+
+            if let Some(expression) = generated_expression {
+                if expression.len() > crate::core::rql::generated::MAX_EXPRESSION_LEN {
+                    rejection.replace(format!(
+                        "a generation expression may be at most {} characters",
+                        crate::core::rql::generated::MAX_EXPRESSION_LEN
+                    ));
+                    return None;
+                }
+                generated.push(crate::core::rql::generated::GeneratedColumn {
+                    column: name.clone(),
+                    expression,
+                    is_deleted: false,
+                });
             }
 
             if constraints.nullable {
@@ -376,6 +471,8 @@ fn parse_create_table(
             unique_keys,
             primary_key,
             if_not_exists,
+            generated,
+            checks,
         })
     } else {
         None
@@ -478,16 +575,16 @@ fn is_table_constraint(def: &str) -> bool {
     })
 }
 
-fn strip_parens(token: &str) -> &str {
-    token.split('(').next().unwrap_or(token)
-}
-
-fn eq_token(token: &str, expected_upper: &str) -> bool {
-    strip_parens(token).eq_ignore_ascii_case(expected_upper)
-}
-
+/// A type token, uppercased, **with its modifier left on**.
+///
+/// The modifier used to be stripped here, which cost `CHAR(5)` its width: the
+/// phrase reached `parse_column_type` as a bare `CHAR`, was read as the
+/// engine's one-codepoint type, and stored only the first character of every
+/// value. Keeping the parentheses is what lets that parser tell `CHAR` from
+/// `CHAR(5)`. Nothing downstream is troubled by them — every reader of a type
+/// name already cuts at the first `(`.
 fn normalize_token_upper(token: &str) -> String {
-    strip_parens(token).to_ascii_uppercase()
+    token.to_ascii_uppercase()
 }
 
 /// Parses a SQL type phrase from a token stream that begins at the type.
@@ -497,32 +594,55 @@ fn parse_type_phrase(tokens: &[&str]) -> Option<(String, usize)> {
         return None;
     }
 
-    // DOUBLE PRECISION
-    if tokens.len() >= 2 && eq_token(tokens[0], "DOUBLE") && eq_token(tokens[1], "PRECISION") {
-        return Some(("DOUBLE PRECISION".to_string(), 2));
+    /// A token's type name with its modifier and array brackets removed, so
+    /// `PRECISION[][]` matches `PRECISION` and `VARYING(32)` matches `VARYING`.
+    ///
+    /// Without this, `DOUBLE PRECISION[][]` failed the two-word test, fell back
+    /// to the one-word `DOUBLE`, and left `PRECISION[][]` to be read as a
+    /// *constraint*. The column became a scalar `F64` and the create still
+    /// succeeded — the array-ness was lost with nothing reported.
+    fn base(token: &str) -> String {
+        token
+            .split(['(', '['])
+            .next()
+            .unwrap_or(token)
+            .trim_matches(',')
+            .to_ascii_uppercase()
     }
 
-    // CHARACTER VARYING
-    if tokens.len() >= 2 && eq_token(tokens[0], "CHARACTER") && eq_token(tokens[1], "VARYING") {
-        return Some(("CHARACTER VARYING".to_string(), 2));
+    /// Whether a token carries array brackets.
+    fn has_brackets(token: &str) -> bool {
+        token.contains('[')
     }
 
-    // TIMESTAMP WITH TIME ZONE
-    if tokens.len() >= 4
-        && eq_token(tokens[0], "TIMESTAMP")
-        && eq_token(tokens[1], "WITH")
-        && eq_token(tokens[2], "TIME")
-        && eq_token(tokens[3], "ZONE")
-    {
-        return Some(("TIMESTAMP WITH TIME ZONE".to_string(), 4));
+    // Multi-word type names, longest first. Each entry is the words it is
+    // spelled with and the canonical phrase they mean.
+    const PHRASES: &[(&[&str], &str)] = &[
+        (&["TIMESTAMP", "WITH", "TIME", "ZONE"], "TIMESTAMP WITH TIME ZONE"),
+        (&["TIMESTAMP", "WITHOUT", "TIME", "ZONE"], "TIMESTAMP WITHOUT TIME ZONE"),
+        (&["TIME", "WITH", "TIME", "ZONE"], "TIME WITH TIME ZONE"),
+        (&["TIME", "WITHOUT", "TIME", "ZONE"], "TIME WITHOUT TIME ZONE"),
+        (&["DOUBLE", "PRECISION"], "DOUBLE PRECISION"),
+        (&["CHARACTER", "VARYING"], "CHARACTER VARYING"),
+        (&["BIT", "VARYING"], "BIT VARYING"),
+    ];
+
+    for (words, canonical) in PHRASES {
+        if tokens.len() < words.len() {
+            continue;
+        }
+        if words.iter().enumerate().all(|(i, w)| base(tokens[i]) == *w) {
+            // The brackets may sit on any word of the phrase, and are carried
+            // onto the canonical form so the caller sees an array.
+            let array = tokens[..words.len()].iter().any(|t| has_brackets(t));
+            let phrase =
+                if array { format!("{}[]", canonical) } else { canonical.to_string() };
+            return Some((phrase, words.len()));
+        }
     }
 
-    // TIMESTAMPTZ is a Postgres alias
-    if eq_token(tokens[0], "TIMESTAMPTZ") {
-        return Some(("TIMESTAMPTZ".to_string(), 1));
-    }
-
-    Some((normalize_token_upper(tokens[0]), 1))
+    let token = normalize_token_upper(tokens[0]);
+    Some((token, 1))
 }
 
 #[cfg(test)]

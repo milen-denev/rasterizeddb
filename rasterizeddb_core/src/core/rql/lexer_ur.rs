@@ -176,7 +176,16 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> Option<MemoryBlock> {
 	}
 
 	Some(match db_type {
-		DbType::BYTEA | DbType::ARRAY => {
+		// Every type whose literal is text with a syntax of its own. Listed
+		// alongside `BYTEA` and `ARRAY` rather than given an arm each, because
+		// they all reach the same encoder — see `lexer_ir`'s matching arm.
+		DbType::BYTEA | DbType::ARRAY | DbType::INTERVAL | DbType::MACADDR
+		| DbType::MACADDR8 | DbType::BIT | DbType::VARBIT | DbType::DATE
+		| DbType::TIME | DbType::TIMETZ | DbType::POINT | DbType::LINE
+		| DbType::LSEG | DbType::BOX | DbType::PATH | DbType::POLYGON
+		| DbType::CIRCLE | DbType::INT4RANGE | DbType::INT8RANGE
+		| DbType::NUMRANGE | DbType::TSRANGE | DbType::TSTZRANGE
+		| DbType::DATERANGE => {
 			// Doubled quotes are collapsed here, exactly as they are for
 			// `STRING` below and in the `INSERT` path: a quote inside the
 			// literal is written doubled, and `encode_literal` only strips the
@@ -657,7 +666,8 @@ mod tests {
 				write_order: 0,
 				is_unique: true,
 				is_deleted: false,
-			},
+				scale: None,
+},
 			SchemaField {
 				name: "name".to_string(),
 				db_type: DbType::STRING,
@@ -666,7 +676,8 @@ mod tests {
 				write_order: 1,
 				is_unique: false,
 				is_deleted: false,
-			},
+				scale: None,
+},
 		]
 	}
 

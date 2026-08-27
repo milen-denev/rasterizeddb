@@ -194,6 +194,7 @@ mod tests {
                 write_order: 0,
                 is_unique: true,
                 is_deleted: false,
+                scale: None,
             },
             SchemaField {
                 name: "name".to_string(),
@@ -203,6 +204,7 @@ mod tests {
                 write_order: 1,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
             },
         ]
     }

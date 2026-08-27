@@ -98,6 +98,8 @@ async fn setup(dir: &str, table: &str) -> Arc<Database> {
             unique_columns: Vec::new(),
         unique_keys: Vec::new(),
             type_modifiers: Vec::new(),
+            generated: Vec::new(),
+            checks: Vec::new(),
             if_not_exists: false,
         })
         .await
@@ -315,6 +317,8 @@ async fn entries_are_not_shared_across_tables_or_clauses() {
         unique_columns: Vec::new(),
         unique_keys: Vec::new(),
             type_modifiers: Vec::new(),
+            generated: Vec::new(),
+            checks: Vec::new(),
         if_not_exists: false,
     })
     .await

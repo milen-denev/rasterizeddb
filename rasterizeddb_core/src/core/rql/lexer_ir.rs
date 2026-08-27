@@ -256,7 +256,16 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> Option<MemoryBlock> {
         }
         // Variable-width values with a syntax of their own: `\xdeadbeef` and
         // `{a,b,NULL}`. Both share the STRING storage mechanism.
-        DbType::BYTEA | DbType::ARRAY => {
+        // Every type whose literal is text with a syntax of its own, sharing
+        // one encoder so the `INSERT` and `UPDATE` paths cannot disagree about
+        // what they accept.
+        DbType::BYTEA | DbType::ARRAY | DbType::INTERVAL | DbType::MACADDR
+        | DbType::MACADDR8 | DbType::BIT | DbType::VARBIT | DbType::DATE
+        | DbType::TIME | DbType::TIMETZ | DbType::POINT | DbType::LINE
+        | DbType::LSEG | DbType::BOX | DbType::PATH | DbType::POLYGON
+        | DbType::CIRCLE | DbType::INT4RANGE | DbType::INT8RANGE
+        | DbType::NUMRANGE | DbType::TSRANGE | DbType::TSTZRANGE
+        | DbType::DATERANGE => {
             // `unquote_sql`, exactly as `STRING` above uses it, and for the
             // same reason: a quote inside the literal is written doubled and
             // has to be collapsed back to one. Merely stripping the outer pair
@@ -1293,6 +1302,7 @@ mod tests {
                 write_order: 0,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
             },
             SchemaField {
                 name: "name".to_string(),
@@ -1302,6 +1312,7 @@ mod tests {
                 write_order: 1,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
             },
         ];
         let sql = r#"INSERT INTO users (id, name) VALUES (1, "Alice")"#;
@@ -1333,6 +1344,7 @@ mod tests {
             write_order: 0,
             is_unique: false,
             is_deleted: false,
+            scale: None,
         }];
         let sql = r#"INSERT INTO users (id, name) VALUES (1, "Alice")"#;
         let qp = QueryPurpose::InsertRow(InsertRowData {
@@ -1355,6 +1367,7 @@ mod tests {
                 write_order: 0,
                 is_unique: true,
                 is_deleted: false,
+                scale: None,
             },
             SchemaField {
                 name: "name".to_string(),
@@ -1364,6 +1377,7 @@ mod tests {
                 write_order: 1,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
             },
             SchemaField {
                 name: "age".to_string(),
@@ -1373,6 +1387,7 @@ mod tests {
                 write_order: 2,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
             },
             SchemaField {
                 name: "email".to_string(),
@@ -1382,6 +1397,7 @@ mod tests {
                 write_order: 3,
                 is_unique: true,
                 is_deleted: false,
+                scale: None,
             },
             SchemaField {
                 name: "active".to_string(),
@@ -1391,6 +1407,7 @@ mod tests {
                 write_order: 4,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
             },
             SchemaField {
                 name: "score".to_string(),
@@ -1400,6 +1417,7 @@ mod tests {
                 write_order: 5,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
             },
             SchemaField {
                 name: "created_at".to_string(),
@@ -1409,6 +1427,7 @@ mod tests {
                 write_order: 6,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
             },
             SchemaField {
                 name: "notes".to_string(),
@@ -1418,6 +1437,7 @@ mod tests {
                 write_order: 7,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
             },
         ];
 
@@ -1492,6 +1512,7 @@ mod tests {
                 write_order: 0,
                 is_unique: true,
                 is_deleted: false,
+                scale: None,
             },
             SchemaField {
                 name: "name".to_string(),
@@ -1501,6 +1522,7 @@ mod tests {
                 write_order: 1,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
             },
             SchemaField {
                 name: "age".to_string(),
@@ -1510,6 +1532,7 @@ mod tests {
                 write_order: 2,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
             },
         ];
         let sql = r#"INSERT INTO users (age, id, name) VALUES (30, 100, "Charlie")"#;
@@ -1560,6 +1583,7 @@ mod tests {
                 write_order: 0,
                 is_unique: true,
                 is_deleted: false,
+                scale: None,
             },
             SchemaField {
                 name: "flag".to_string(),
@@ -1569,6 +1593,7 @@ mod tests {
                 write_order: 1,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
             },
             SchemaField {
                 name: "desc".to_string(),
@@ -1578,6 +1603,7 @@ mod tests {
                 write_order: 2,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
             },
         ];
         let sql = r#"INSERT INTO users (id, flag, desc) VALUES (0, 255, "Edge")"#;
@@ -1608,6 +1634,7 @@ mod tests {
                 write_order: 0,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
             },
             SchemaField {
                 name: "grade".to_string(),
@@ -1617,6 +1644,7 @@ mod tests {
                 write_order: 1,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
             },
         ];
         let sql = r#"INSERT INTO results (score, grade) VALUES (3.14, "A")"#;
@@ -1646,6 +1674,7 @@ mod tests {
                 write_order: 0,
                 is_unique: true,
                 is_deleted: false,
+                scale: None,
             },
             SchemaField {
                 name: "name".to_string(),
@@ -1655,6 +1684,7 @@ mod tests {
                 write_order: 1,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
             },
         ];
         // Leading/trailing whitespace, tabs, newlines, and semicolon termination
@@ -1698,6 +1728,7 @@ mod tests {
                 write_order: 0,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
             },
             SchemaField {
                 name: "flag".to_string(),
@@ -1707,6 +1738,7 @@ mod tests {
                 write_order: 1,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
             },
         ];
 
@@ -1752,6 +1784,7 @@ mod tests {
                 write_order: 0,
                 is_unique: true,
                 is_deleted: false,
+                scale: None,
             },
             SchemaField {
                 name: "name".to_string(),
@@ -1761,6 +1794,7 @@ mod tests {
                 write_order: 1,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
             },
             SchemaField {
                 name: "job_title".to_string(),
@@ -1770,6 +1804,7 @@ mod tests {
                 write_order: 2,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
             },
             SchemaField {
                 name: "salary".to_string(),
@@ -1779,6 +1814,7 @@ mod tests {
                 write_order: 3,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
             },
             SchemaField {
                 name: "department".to_string(),
@@ -1788,6 +1824,7 @@ mod tests {
                 write_order: 4,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
             },
             SchemaField {
                 name: "age".to_string(),
@@ -1797,6 +1834,7 @@ mod tests {
                 write_order: 5,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
             },
             SchemaField {
                 name: "manager".to_string(),
@@ -1806,6 +1844,7 @@ mod tests {
                 write_order: 6,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
             },
             SchemaField {
                 name: "location".to_string(),
@@ -1815,6 +1854,7 @@ mod tests {
                 write_order: 7,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
             },
             SchemaField {
                 name: "hire_date".to_string(),
@@ -1824,6 +1864,7 @@ mod tests {
                 write_order: 8,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
             },
             SchemaField {
                 name: "degree".to_string(),
@@ -1833,6 +1874,7 @@ mod tests {
                 write_order: 9,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
             },
             SchemaField {
                 name: "skills".to_string(),
@@ -1842,6 +1884,7 @@ mod tests {
                 write_order: 10,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
             },
             SchemaField {
                 name: "current_project".to_string(),
@@ -1851,6 +1894,7 @@ mod tests {
                 write_order: 11,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
             },
             SchemaField {
                 name: "performance_score".to_string(),
@@ -1860,6 +1904,7 @@ mod tests {
                 write_order: 12,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
             },
             SchemaField {
                 name: "is_active".to_string(),
@@ -1869,6 +1914,7 @@ mod tests {
                 write_order: 13,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
             },
             SchemaField {
                 name: "created_at".to_string(),
@@ -1878,6 +1924,7 @@ mod tests {
                 write_order: 14,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
             },
             SchemaField {
                 name: "updated_at".to_string(),
@@ -1887,6 +1934,7 @@ mod tests {
                 write_order: 15,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
             },
             SchemaField {
                 name: "is_fired".to_string(),
@@ -1896,6 +1944,7 @@ mod tests {
                 write_order: 16,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
             },
         ];
 

@@ -109,6 +109,8 @@ async fn a_column_added_after_a_drop_does_not_take_the_previous_column_s_bytes_b
         unique_columns: Vec::new(),
         unique_keys: Vec::new(),
         type_modifiers: Vec::new(),
+        generated: Vec::new(),
+        checks: Vec::new(),
         if_not_exists: false,
     })
     .await

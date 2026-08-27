@@ -374,7 +374,19 @@ pub fn parse_column_type(tokens: &[&str]) -> Result<(DbType, usize), String> {
         return Err("column has no type".to_string());
     }
 
-    let norm = |t: &str| t.split('(').next().unwrap_or(t).trim_matches(',').to_ascii_uppercase();
+    let norm = |t: &str| {
+        t.split(['(', '['])
+            .next()
+            .unwrap_or(t)
+            .trim_matches(',')
+            .to_ascii_uppercase()
+    };
+
+    // An array is written as brackets after the element type — `TEXT[]`,
+    // `REAL[]`, `DOUBLE PRECISION[][]` — and the brackets may sit on any word
+    // of a multi-word type name. One storage type serves every element type and
+    // every dimension count, so all that is needed here is to notice them.
+    let is_array = |count: usize| tokens[..count.min(tokens.len())].iter().any(|t| t.contains('['));
 
     // Multi-word type names, longest first.
     let two = if tokens.len() >= 2 {
@@ -394,20 +406,36 @@ pub fn parse_column_type(tokens: &[&str]) -> Result<(DbType, usize), String> {
         String::new()
     };
 
-    if four == "TIMESTAMP WITH TIME ZONE" {
-        return Ok((DbType::DATETIME, 4));
+    if four == "TIMESTAMP WITH TIME ZONE" || four == "TIMESTAMP WITHOUT TIME ZONE" {
+        return Ok((if is_array(4) { DbType::ARRAY } else { DbType::DATETIME }, 4));
     }
-    if four == "TIMESTAMP WITHOUT TIME ZONE" {
-        return Ok((DbType::DATETIME, 4));
+    // `TIME WITH TIME ZONE` is `timetz` and `TIME WITHOUT TIME ZONE` is `time`.
+    // They were both reaching the one-word arm as `TIME`, so a column declared
+    // with an offset lost it.
+    if four == "TIME WITH TIME ZONE" {
+        return Ok((if is_array(4) { DbType::ARRAY } else { DbType::TIMETZ }, 4));
+    }
+    if four == "TIME WITHOUT TIME ZONE" {
+        return Ok((if is_array(4) { DbType::ARRAY } else { DbType::TIME }, 4));
     }
     if two == "DOUBLE PRECISION" {
-        return Ok((DbType::F64, 2));
+        return Ok((if is_array(2) { DbType::ARRAY } else { DbType::F64 }, 2));
     }
     if two == "CHARACTER VARYING" {
-        return Ok((DbType::STRING, 2));
+        return Ok((if is_array(2) { DbType::ARRAY } else { DbType::STRING }, 2));
+    }
+    if two == "BIT VARYING" {
+        return Ok((if is_array(2) { DbType::ARRAY } else { DbType::VARBIT }, 2));
     }
 
     let one = norm(tokens[0]);
+    // `CHAR(n)` for n above one is `bpchar`, a *string* of that width. Mapping
+    // it to the engine's `CHAR` — a single codepoint — stored only the first
+    // character and reported success: `'ABCDE'` in a `CHAR(5)` column came back
+    // as `'ABCD'`. Only a bare `CHAR`, which Postgres reads as `CHAR(1)`, is
+    // the one-character type.
+    let char_width = declared_width(tokens[0]);
+
     let db_type = match one.as_str() {
         // Postgres spellings first, then the engine's own aliases. Unsigned
         // types and the explicit bit widths are not Postgres-native; they are
@@ -427,15 +455,42 @@ pub fn parse_column_type(tokens: &[&str]) -> Result<(DbType, usize), String> {
         "FLOAT8" | "FLOAT" | "DOUBLE" => DbType::F64,
         "TEXT" | "VARCHAR" | "STRING" | "NAME" | "CITEXT" => DbType::STRING,
         "CHARACTER" | "BPCHAR" => DbType::STRING,
-        "CHAR" => DbType::CHAR,
+        "CHAR" => match char_width {
+            Some(n) if n > 1 => DbType::STRING,
+            _ => DbType::CHAR,
+        },
         "NUMERIC" | "DECIMAL" | "MONEY" => DbType::DECIMAL,
         "BOOL" | "BOOLEAN" => DbType::BOOL,
         "UUID" => DbType::UUID,
         "INET" | "CIDR" => DbType::INET,
-        "TIMESTAMP" | "TIMESTAMPTZ" | "DATETIME" | "DATE" | "TIME" | "TIMETZ" => DbType::DATETIME,
+        // `DATE`, `TIME` and `TIMETZ` were all `DATETIME`, so each advertised
+        // `timestamptz` on the wire and a client asking to decode a date or a
+        // time of day refused the column. They are their own types now, stored
+        // in the layout Postgres sends them in.
+        "TIMESTAMP" | "TIMESTAMPTZ" | "DATETIME" => DbType::DATETIME,
+        "DATE" => DbType::DATE,
+        "TIME" => DbType::TIME,
+        "TIMETZ" => DbType::TIMETZ,
+        "INTERVAL" => DbType::INTERVAL,
+        "MACADDR" => DbType::MACADDR,
+        "MACADDR8" => DbType::MACADDR8,
+        "BIT" => DbType::BIT,
+        "VARBIT" => DbType::VARBIT,
+        "POINT" => DbType::POINT,
+        "LINE" => DbType::LINE,
+        "LSEG" => DbType::LSEG,
+        "BOX" => DbType::BOX,
+        "PATH" => DbType::PATH,
+        "POLYGON" => DbType::POLYGON,
+        "CIRCLE" => DbType::CIRCLE,
+        "INT4RANGE" => DbType::INT4RANGE,
+        "INT8RANGE" => DbType::INT8RANGE,
+        "NUMRANGE" => DbType::NUMRANGE,
+        "TSRANGE" => DbType::TSRANGE,
+        "TSTZRANGE" => DbType::TSTZRANGE,
+        "DATERANGE" => DbType::DATERANGE,
         "BYTEA" => DbType::BYTEA,
         "ARRAY" => DbType::ARRAY,
-        other if other.ends_with("[]") => DbType::ARRAY,
         // A stored document. When `json_shadow_tables` is on, `CREATE TABLE`
         // and `ADD COLUMN` intercept the declaration before it reaches here and
         // build the shredded form instead, so this arm is the stored one.
@@ -443,7 +498,23 @@ pub fn parse_column_type(tokens: &[&str]) -> Result<(DbType, usize), String> {
         other => return Err(format!("column type '{}' is not supported yet", other)),
     };
 
+    // The brackets turn any of the above into an array of it.
+    if is_array(1) && db_type != DbType::ARRAY {
+        return Ok((DbType::ARRAY, 1));
+    }
+
     Ok((db_type, 1))
+}
+
+/// The `n` of a `TYPE(n)` or `TYPE(n, m)` declaration.
+///
+/// Only the first number is read: the callers here want a width, and the two
+/// numbers of a `NUMERIC(p, s)` are parsed by
+/// [`crate::core::rql::type_modifier::parse_numeric_modifier`] instead.
+pub fn declared_width(token: &str) -> Option<u32> {
+    let open = token.find('(')?;
+    let close = token[open..].find(')')? + open;
+    token[open + 1..close].split(',').next()?.trim().parse().ok()
 }
 
 /// The relation a `DROP TABLE` names, or `None` when the statement is malformed.

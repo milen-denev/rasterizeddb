@@ -35,6 +35,20 @@ pub struct SchemaField {
     pub write_order: u64,
     pub is_unique: bool,
     pub is_deleted: bool,
+    /// The `s` of a `NUMERIC(p, s)` declaration, when the column has one.
+    ///
+    /// A `DECIMAL` is stored as an `i128` of units scaled by this many decimal
+    /// places, so a comparison against a literal is only meaningful once both
+    /// sides are at the same scale. It lives on the field rather than only in
+    /// the type-modifier sidecar because the query planner has the schema and
+    /// not the sidecar — and without it every predicate over a
+    /// `NUMERIC(p, s)` column with `s` other than the engine default answered
+    /// from a value a power of ten away from the stored one. `WHERE price > 50`
+    /// over a `NUMERIC(10,2)` column returned no rows, and no error.
+    ///
+    /// `None` means the engine default,
+    /// [`crate::core::value_codec::DECIMAL_SCALE`].
+    pub scale: Option<u32>,
 }
 
 impl SchemaField {
@@ -53,6 +67,7 @@ impl SchemaField {
             offset,
             write_order,
             is_unique,
+            scale: None,
             is_deleted: false,
         }
     }
@@ -149,6 +164,9 @@ impl SchemaField {
             write_order,
             is_unique,
             is_deleted,
+            // Not part of the persisted record. `TableSchema::load` fills it in
+            // from the type-modifier sidecar once every field has been read.
+            scale: None,
         })
     }
 
@@ -378,6 +396,13 @@ pub struct TableSchema {
     /// `NUMERIC(p, s)`, loaded from their sidecar. A column with no entry keeps
     /// the engine's default scale, which is what its rows were written with.
     pub type_modifiers: SmallVec<[crate::core::rql::type_modifier::TypeModifier; 8]>,
+    /// `CHECK` constraints, loaded from their sidecar.
+    pub checks: SmallVec<[crate::core::rql::check::CheckConstraint; 4]>,
+    /// `GENERATED ALWAYS AS (…) STORED` expressions, loaded from their sidecar.
+    ///
+    /// Separate from `defaults` because the two differ in when they apply — see
+    /// [`crate::core::rql::generated`].
+    pub generated: SmallVec<[crate::core::rql::generated::GeneratedColumn; 4]>,
 }
 
 #[derive(Debug, Clone)]
@@ -401,6 +426,8 @@ impl TableSchema {
             path_indexes: SmallVec::new(),
             unique_keys: SmallVec::new(),
             type_modifiers: SmallVec::new(),
+            generated: SmallVec::new(),
+            checks: SmallVec::new(),
         }
     }
 
@@ -497,6 +524,18 @@ impl TableSchema {
             crate::core::rql::unique_key::load(schema_io.clone()).await;
         table_schema.type_modifiers =
             crate::core::rql::type_modifier::load(schema_io.clone()).await;
+        // Copied onto the fields, because the planner is handed the schema and
+        // never sees the sidecar. See `SchemaField::scale`.
+        for field in table_schema.fields.iter_mut() {
+            field.scale = table_schema
+                .type_modifiers
+                .iter()
+                .find(|m| m.column.eq_ignore_ascii_case(&field.name) && !m.is_deleted)
+                .map(|m| m.scale as u32);
+        }
+        table_schema.generated =
+            crate::core::rql::generated::load(schema_io.clone()).await;
+        table_schema.checks = crate::core::rql::check::load(schema_io.clone()).await;
 
         Ok(table_schema)
     }
@@ -583,6 +622,8 @@ impl TableSchema {
             path_indexes: SmallVec::new(),
             unique_keys: SmallVec::new(),
             type_modifiers: SmallVec::new(),
+            generated: SmallVec::new(),
+            checks: SmallVec::new(),
         })
     }
 
