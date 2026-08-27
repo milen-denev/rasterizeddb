@@ -26,6 +26,7 @@
 pub mod entities;
 pub mod probes;
 pub mod schema;
+pub mod wide_types;
 pub mod server;
 
 pub use server::TestServer;
