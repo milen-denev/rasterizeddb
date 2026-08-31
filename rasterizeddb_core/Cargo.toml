@@ -126,7 +126,7 @@ name = "vacuum_benchmarks"
 harness = false
 
 [features]
-default = ["memory_pool_reuse", "replication_compression", "s3_backup", "pg_import", "storage_pools"]
+default = ["memory_pool_reuse", "replication_compression", "s3_backup", "pg_import", "storage_pools", "kv_storage", "kv_storage_s3"]
 enable_long_row = []
 enable_data_verification = []
 memory_pool_reuse = []
