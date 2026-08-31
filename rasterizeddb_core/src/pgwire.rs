@@ -1724,6 +1724,26 @@ async fn describe_resolved(
                 true,
             )));
         }
+        // `SHOW BACKUPS` and `RESTORE` build their columns from the statement,
+        // exactly as the three families above do. `BACKUP DATABASE`/`WAL`/
+        // `PRUNE` report a count rather than rows, and `result_fields` answers
+        // `None` for them — which falls through to `NoData`, which is what they
+        // should get.
+        #[cfg(feature = "s3_backup")]
+        QueryPurpose::Backup(statement) => {
+            return Ok(crate::core::rql::backup_exec::result_fields(statement).map(|fields| {
+                (
+                    fields
+                        .into_iter()
+                        .map(|(name, ty)| {
+                            let leaked: &'static str = Box::leak(name.into_boxed_str());
+                            (leaked, ty)
+                        })
+                        .collect(),
+                    true,
+                )
+            }));
+        }
         QueryPurpose::QueryRows(qr) => {
             if crate::core::rql::join::statement_has_join(&qr.query) {
                 // A catalogue view has no entry in `database.tables` — it is
@@ -5659,6 +5679,112 @@ mod setting_tests {
             "set transaction isolation level serializable",
         ] {
             assert_eq!(strip_setting(stmt, "synchronous_commit"), None, "claimed: {}", stmt);
+        }
+    }
+}
+
+/// Statement families whose rows belong to no relation must be describable.
+///
+/// The failure this guards is silent and one-sided: `Execute` sends the rows
+/// whatever happens, so the row *count* is right and only the field list is
+/// missing. `psql` never sees it — the simple query path serialises the columns
+/// from the same `Rows` — while every extended-protocol client (sqlx, sea-orm,
+/// and so any Rust client) reads `column_names()` as `[]` and fails every
+/// `try_get`. It reached a user as "rows=2, first_cols=Some([])".
+#[cfg(test)]
+mod describe_rowless_family_tests {
+    use super::describe_query;
+    use crate::core::database::Database;
+    use rclite::Arc;
+
+    async fn open() -> (tempfile::TempDir, Arc<Database>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(
+            Database::new_named(&dir.path().to_string_lossy(), false, "describetests").await,
+        );
+        (dir, db)
+    }
+
+    #[cfg(feature = "s3_backup")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn show_backups_describes_its_columns() {
+        let (_dir, db) = open().await;
+
+        let (fields, is_select) = describe_query(&db, "SHOW BACKUPS")
+            .await
+            .expect("describe failed")
+            .expect("SHOW BACKUPS described as returning no columns");
+
+        assert!(is_select, "SHOW BACKUPS returns rows, so it must describe as a select");
+        let names: Vec<&str> = fields.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "kind",
+                "id",
+                "created_at",
+                "start_lsn",
+                "end_lsn",
+                "uncompressed_bytes",
+                "compressed_bytes",
+                "detail",
+            ],
+            "the described columns must be the ones the executor emits"
+        );
+    }
+
+    #[cfg(feature = "s3_backup")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restore_describes_its_columns() {
+        let (_dir, db) = open().await;
+
+        let (fields, is_select) =
+            describe_query(&db, "RESTORE DATABASE FROM S3 TO '/tmp/describe-only'")
+                .await
+                .expect("describe failed")
+                .expect("RESTORE described as returning no columns");
+
+        assert!(is_select);
+        assert_eq!(fields.first().map(|(name, _)| *name), Some("snapshot_id"));
+    }
+
+    /// A counted statement is *correctly* undescribable — it reports a count,
+    /// not rows, and `NoData` is the honest answer. Pinned so that a future fix
+    /// to the two above does not "fix" these into claiming columns they never
+    /// send.
+    #[cfg(feature = "s3_backup")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_counted_backup_statements_describe_as_no_rows() {
+        let (_dir, db) = open().await;
+
+        for sql in ["BACKUP DATABASE", "BACKUP WAL", "BACKUP PRUNE"] {
+            let described = describe_query(&db, sql).await.expect("describe failed");
+            assert!(
+                described.is_none() || !described.unwrap().1,
+                "{sql} reports a count, so it must not describe as returning rows"
+            );
+        }
+    }
+
+    /// The sibling families, which were fixed when this bug class was first
+    /// found. Here so that the next one to grow a statement surface is caught
+    /// by a test that already names the trap.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_other_rowless_families_still_describe() {
+        let (_dir, db) = open().await;
+
+        let mut cases: Vec<&str> = vec!["SHOW REPLICATION"];
+        if cfg!(feature = "storage_pools") {
+            cases.push("SHOW STORAGE");
+        }
+
+        for sql in cases {
+            let (fields, is_select) = describe_query(&db, sql)
+                .await
+                .expect("describe failed")
+                .unwrap_or_else(|| panic!("{sql} described as returning no columns"));
+            assert!(is_select, "{sql}");
+            assert!(!fields.is_empty(), "{sql} described with an empty column list");
         }
     }
 }
