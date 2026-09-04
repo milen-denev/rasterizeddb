@@ -4098,17 +4098,83 @@ async fn insert_values_batch(
     let mut returned: Vec<u8> = Vec::new();
     let mut any_returning = false;
     for stmt in statements {
-        let Some(purpose) = recognize_query_purpose(&stmt) else {
-            return Some(ddl_error("could not re-parse a row of the VALUES clause"));
+        // A tuple that loses a uniqueness race is replayed *here*, rather than
+        // by re-running the whole statement upstream, because only here is
+        // "applied nothing" actually true: by the time tuple 200 conflicts,
+        // tuples 1..=199 are already written, and a whole-statement replay
+        // would meet its own rows.
+        //
+        // This is the path a migration takes, and it is how the conflict
+        // reached a client after the autocommit retry was in place: PMS pages
+        // its tier copy as a multi-row `INSERT … ON CONFLICT DO NOTHING`
+        // inside an explicit `BEGIN`, and an explicit block does not go
+        // through `execute_with_sync` at all. It aborted a demote that had
+        // already copied 165,000 rows.
+        let mut attempt = 0usize;
+        let response = loop {
+            let Some(mut purpose) = recognize_query_purpose(&stmt) else {
+                return Some(ddl_error("could not re-parse a row of the VALUES clause"));
+            };
+            // `ON CONFLICT` was split off the statement before the tuples were, so
+            // `row_data.query` — the text these rows were cut from — no longer
+            // carries it, and re-parsing a row yields `on_conflict_do_nothing:
+            // false`. Restoring the parsed clause is what makes a multi-row upsert
+            // behave like the single-row one.
+            //
+            // Without this, `INSERT … VALUES (…), (…) ON CONFLICT (k) DO NOTHING`
+            // *raised* a duplicate-key error the moment any tuple conflicted — and
+            // because the loop below returns on the first error, the tuples that
+            // did not conflict were never inserted either. A statement whose whole
+            // point is "insert what fits and skip the rest" instead inserted
+            // nothing and failed. It stalled PMS's Ultra→Cold migration on
+            // 192.168.1.7, which pages exactly this shape.
+            //
+            // Restored as parsed values rather than re-appended as text: the tail
+            // the splitter carries onto each row already holds `RETURNING`, and
+            // `ON CONFLICT` has to precede it.
+            if let QueryPurpose::InsertRow(ref mut data) = purpose {
+                data.on_conflict_do_nothing = row_data.on_conflict_do_nothing;
+                data.on_conflict_update = row_data.on_conflict_update.clone();
+            }
+            let response =
+                Box::pin(execute_with_context(purpose, database.clone(), depth, tx)).await;
+            if !is_retryable_conflict(&response) || attempt >= MAX_CONFLICT_RETRIES {
+                break response;
+            }
+            attempt += 1;
+            // The transaction that won has to get to run for this to clear, so
+            // backing off beats spinning on it.
+            tokio::time::sleep(conflict_backoff(attempt)).await;
         };
-        let response = Box::pin(execute_with_context(purpose, database.clone(), depth, tx)).await;
         match response.first() {
-            Some(3) => return Some(response),
+            // Having applied nothing, the statement as a whole is still safe
+            // for the caller to replay, so the marker is left on. Once a tuple
+            // has landed it is not safe, and the conflict surfaces as itself
+            // rather than inviting a replay that would re-insert those rows.
+            Some(3) => {
+                return Some(if inserted > 0 || any_returning {
+                    strip_conflict_marker(response)
+                } else {
+                    response
+                });
+            }
             Some(2) => {
-                // RETURNING: concatenated so the batch reports every row.
+                // RETURNING: concatenated so the batch reports every row. The
+                // count comes from the rows themselves downstream, so nothing
+                // is added here.
                 any_returning = true;
                 returned.extend_from_slice(&response[1..]);
-                inserted += 1;
+            }
+            // A row-count reply carries the count as a `u64`, and it is not
+            // always one: `ON CONFLICT … DO NOTHING` answers zero for a tuple
+            // it skipped. Counting statements instead of rows reported
+            // `INSERT 0 2` for a two-tuple statement that inserted one row and
+            // skipped the other — the number a client uses to decide whether
+            // its write landed.
+            Some(0) if response.len() >= 9 => {
+                let mut n = [0u8; 8];
+                n.copy_from_slice(&response[1..9]);
+                inserted += u64::from_le_bytes(n);
             }
             _ => inserted += 1,
         }
@@ -6775,10 +6841,26 @@ pub async fn execute_with_sync(
     // transaction and its snapshot, so a conflict is genuinely its business,
     // and replaying one statement of a block would break its atomicity.
     let retry_sql = query_sql(&query);
+    // `InsertRow` joins the two write statements that were already replayed.
+    // The safety argument is the same one stated above and is *stronger* for an
+    // insert: the uniqueness check runs before the row is written, so a
+    // statement it rejects has applied nothing at all. The conflict it raises
+    // means "another transaction is writing this value and has not finished" —
+    // a question with no answer yet, which a replay resolves once that
+    // transaction commits or aborts.
     let retryable = matches!(
         query,
-        QueryPurpose::UpdateRow(_) | QueryPurpose::DeleteRow(_)
+        QueryPurpose::UpdateRow(_) | QueryPurpose::DeleteRow(_) | QueryPurpose::InsertRow(_)
     ) && !retry_sql.is_empty();
+    // The conflict clause is parsed off the statement before `retry_sql` is
+    // taken, so a re-parse loses it — the same way the multi-row split did,
+    // where it turned `ON CONFLICT DO NOTHING` into a duplicate-key error.
+    let insert_conflict = match &query {
+        QueryPurpose::InsertRow(data) => {
+            Some((data.on_conflict_do_nothing, data.on_conflict_update.clone()))
+        }
+        _ => None,
+    };
     let mut pending: Option<QueryPurpose> = Some(query);
     // The first conflict seen, kept so a later attempt that matches nothing can
     // report it rather than a misleading empty success.
@@ -6792,7 +6874,15 @@ pub async fn execute_with_sync(
         // text is non-empty and was recognised once.
         let purpose = match pending.take() {
             Some(p) => Some(p),
-            None => recognize_query_purpose(&retry_sql),
+            None => recognize_query_purpose(&retry_sql).map(|mut reparsed| {
+                if let Some((do_nothing, update)) = insert_conflict.clone() {
+                    if let QueryPurpose::InsertRow(data) = &mut reparsed {
+                        data.on_conflict_do_nothing = do_nothing;
+                        data.on_conflict_update = update;
+                    }
+                }
+                reparsed
+            }),
         };
         let Some(purpose) = purpose else {
             break (
@@ -7008,10 +7098,23 @@ fn is_retryable_conflict(response: &[u8]) -> bool {
 /// error, which is what that level is supposed to do.
 pub async fn execute_in_txn(query: QueryPurpose, database: Arc<Database>, tx: TxId) -> Vec<u8> {
     let retry_sql = query_sql(&query);
+    // `InsertRow` for the same reason the autocommit path replays it: the
+    // uniqueness check runs before the row is written, so a statement it
+    // rejects has applied nothing. A multi-row insert is the exception, and it
+    // arrives here with its marker already stripped once a tuple has landed —
+    // `insert_values_batch` retries at the tuple instead.
     let retryable = matches!(
         query,
-        QueryPurpose::UpdateRow(_) | QueryPurpose::DeleteRow(_)
+        QueryPurpose::UpdateRow(_) | QueryPurpose::DeleteRow(_) | QueryPurpose::InsertRow(_)
     ) && !retry_sql.is_empty();
+    // `retry_sql` has the conflict clause already parsed off it, so a re-parse
+    // would turn `ON CONFLICT DO NOTHING` back into a duplicate-key error.
+    let insert_conflict = match &query {
+        QueryPurpose::InsertRow(data) => {
+            Some((data.on_conflict_do_nothing, data.on_conflict_update.clone()))
+        }
+        _ => None,
+    };
 
     let mut query = query;
     let mut attempt = 0usize;
@@ -7025,7 +7128,15 @@ pub async fn execute_in_txn(query: QueryPurpose, database: Arc<Database>, tx: Tx
         // that has to run, so backing off beats spinning.
         tokio::time::sleep(conflict_backoff(attempt)).await;
         query = match recognize_query_purpose(&retry_sql) {
-            Some(q) => q,
+            Some(mut reparsed) => {
+                if let Some((do_nothing, update)) = insert_conflict.clone() {
+                    if let QueryPurpose::InsertRow(data) = &mut reparsed {
+                        data.on_conflict_do_nothing = do_nothing;
+                        data.on_conflict_update = update;
+                    }
+                }
+                reparsed
+            }
             None => return strip_conflict_marker(response),
         };
     }
@@ -7578,7 +7689,23 @@ pub async fn execute_with_context(
                         .err()
                         .map(|e| e.to_string())
                         .unwrap_or_else(|| "the row could not be inserted".to_string());
-                    error!("Failed to insert row: {}", message);
+                    // A retryable conflict is not a failure yet — the caller
+                    // above replays the statement, and either it succeeds or it
+                    // exhausts its attempts and is reported then, once. Logged
+                    // at `error!` it was neither: one deploy produced 593 ERROR
+                    // lines in a minute for statements that all went on to
+                    // succeed, and nothing in the log said so. Volume like that
+                    // teaches an operator to skim exactly the level a real
+                    // failure arrives at.
+                    if message.ends_with(
+                        <crate::core::row::table::Table<
+                            crate::core::storage_providers::backend::DbStorageProvider,
+                        >>::CONFLICT_RETRYABLE,
+                    ) {
+                        log::debug!("insert conflicted and will be replayed: {}", message);
+                    } else {
+                        error!("Failed to insert row: {}", message);
+                    }
                     let mut result = vec![3u8];
                     result.extend_from_slice(message.as_bytes());
                     return result;

@@ -1359,6 +1359,10 @@ impl<S: StorageIO> Table<S> {
         row_write: &RowWrite,
         exclude_id: Option<u64>,
         visibility: &Visibility,
+        // Whose write this is, so a value another transaction is still writing
+        // is told apart from one that is committed. See the in-flight branch in
+        // `find_row_with_value`.
+        written_by: TxId,
         // Which columns the statement actually assigns, by `write_order`, or
         // `None` for an insert — where every column is new.
         //
@@ -1406,10 +1410,32 @@ impl<S: StorageIO> Table<S> {
                 continue;
             }
 
-            if let Some(existing) = self
-                .find_row_with_value(field, value, exclude_id, visibility)
+            if let Some((existing, in_flight)) = self
+                .find_row_with_value(field, value, exclude_id, visibility, written_by)
                 .await?
             {
+                if in_flight {
+                    // Another transaction is writing this value and has not
+                    // finished. Whether that is a duplicate depends on whether
+                    // it commits, and this engine has no lock manager to wait
+                    // on it — so the statement is replayed instead, which is
+                    // sound here for the reason the autocommit retry already
+                    // relies on: the check runs *before* the write, so a
+                    // statement rejected by it has applied nothing.
+                    //
+                    // Reporting `AlreadyExists` instead would be a guess, and
+                    // the wrong one whenever the other transaction aborts —
+                    // under `ON CONFLICT DO NOTHING` that guess is a silently
+                    // skipped row rather than an error anyone would see.
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        format!(
+                            "UNIQUE column {:?} is being written by another transaction{}",
+                            field.name,
+                            Self::CONFLICT_RETRYABLE
+                        ),
+                    ));
+                }
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::AlreadyExists,
                     format!(
@@ -1625,7 +1651,12 @@ impl<S: StorageIO> Table<S> {
         // deleting transaction has committed is gone, even though reclamation
         // has not yet reached it and its `deleted` flag is still clear.
         visibility: &Visibility,
-    ) -> Result<Option<u64>> {
+        // The transaction doing the writing, so a row *it* wrote is told apart
+        // from one a concurrent transaction wrote. `NO_TX` disables the
+        // in-flight rule and leaves the plain snapshot test, which is what a
+        // database with no transaction manager wants.
+        written_by: TxId,
+    ) -> Result<Option<(u64, bool)>> {
         use crate::core::filter::sarg::{MaskExpr, SargPredicate, SargProgram};
         use crate::core::filter::zonemap::SargOp;
 
@@ -1673,9 +1704,43 @@ impl<S: StorageIO> Table<S> {
             if Some(pointer.row_id()) == exclude_id {
                 continue;
             }
-            if !visibility.visible(pointer.deleted, pointer.xmin, pointer.xmax) {
-                continue;
-            }
+            // A uniqueness check is not a query, and a snapshot is the wrong
+            // rule for it. A row another transaction has written but not yet
+            // committed is invisible to every snapshot, so two concurrent
+            // inserts of one key each looked, each found nothing, and each
+            // wrote — the constraint did not hold, silently. The write lock
+            // around the check cannot help: it serialises the writers, not what
+            // they are permitted to see.
+            //
+            // So a row *occupies* the value when its creator has not aborted
+            // and no committed transaction has deleted it. Deliberately a local
+            // rule rather than a new `Visibility`: nothing outside this check
+            // may adopt it, because seeing uncommitted rows is exactly wrong for
+            // a scan, the query cache and reclamation.
+            let manager = self.versions.load_full();
+            let in_flight = match (&manager, written_by) {
+                (Some(manager), writer) if writer != crate::core::mvcc::transaction::NO_TX => {
+                    use crate::core::mvcc::transaction::{NO_TX, TxOutcome};
+                    let creator = manager.outcome(pointer.xmin);
+                    let occupied = !pointer.deleted
+                        && creator != TxOutcome::Aborted
+                        && (pointer.xmax == NO_TX
+                            || manager.outcome(pointer.xmax) != TxOutcome::Committed);
+                    if !occupied {
+                        continue;
+                    }
+                    // Our own uncommitted row is a real duplicate, not a race:
+                    // retrying would find it again. Only another transaction's
+                    // unfinished write is worth waiting out.
+                    creator == TxOutcome::InProgress && pointer.xmin != writer
+                }
+                _ => {
+                    if !visibility.visible(pointer.deleted, pointer.xmin, pointer.xmax) {
+                        continue;
+                    }
+                    false
+                }
+            };
             if pointer
                 .fetch_row_reuse_async(&*self.io_rows, &fetch, &mut row)
                 .await
@@ -1688,7 +1753,7 @@ impl<S: StorageIO> Table<S> {
                 .first()
                 .is_some_and(|column| column.data.into_slice() == value)
             {
-                return Ok(Some(pointer.row_id()));
+                return Ok(Some((pointer.row_id(), in_flight)));
             }
         }
 
@@ -2009,8 +2074,14 @@ impl<S: StorageIO> Table<S> {
         } else {
             None
         };
-        self.check_unique(&row_write, None, &self.visibility_for(written_by), None)
-            .await?;
+        self.check_unique(
+            &row_write,
+            None,
+            &self.visibility_for(written_by),
+            written_by,
+            None,
+        )
+        .await?;
 
         // The id this row is about to take must already be covered by the
         // reservation on disk, or a crash could hand it out again.
@@ -2801,6 +2872,7 @@ impl<S: StorageIO> Table<S> {
                     &row_write,
                     Some(row_id),
                     &self.visibility_for(written_by),
+                    written_by,
                     Some(&assigned),
                 )
                 .await
@@ -2814,8 +2886,38 @@ impl<S: StorageIO> Table<S> {
                 if updated_count > 0 {
                     self.invalidate_query_caches();
                 }
+                // The marker survives only while nothing has been applied,
+                // the same rule `check_write_conflict` above follows. Unlike
+                // the insert check, this one is reached once per matched row,
+                // with earlier rows already written — so *if* partial work
+                // ever became visible to a replay, a non-idempotent assignment
+                // like `n = n + 1` would count twice.
+                //
+                // That case could not be produced. A conflicting multi-row
+                // UPDATE currently applies nothing at all — whichever matched
+                // row conflicts, and whether or not the caller has its own
+                // transaction — because the failed statement's writes never
+                // become visible. Pinned by `a_conflicting_update_applies_
+                // nothing`. So this is a guard on an invariant the function
+                // already keeps, not a fix for a reachable bug; it is here so
+                // that a change which starts committing partial work does not
+                // silently gain a double-apply.
+                //
+                // A conflict that *is* replayable is not an error anyone needs
+                // to see, for the same reason the executor logs one at `debug!`
+                // — it is about to be waited out and retried.
+                let retryable =
+                    updated_count == 0 && e.to_string().ends_with(Self::CONFLICT_RETRYABLE);
+                if retryable {
+                    log::debug!("UPDATE replayed for row {}: {}", row_id, e);
+                    return Err(e);
+                }
                 error!("UPDATE rejected for row {}: {}", row_id, e);
-                return Err(e);
+                let text = e.to_string();
+                return Err(match text.strip_suffix(Self::CONFLICT_RETRYABLE) {
+                    Some(trimmed) => std::io::Error::new(e.kind(), trimmed.to_string()),
+                    None => e,
+                });
             }
 
             // Fast path: when every assigned column is fixed-width, the row's
