@@ -396,11 +396,11 @@ fn parse_select_items(
         let aggregate_filter = match &filter_text {
             None => None,
             Some(text) => {
-                let condition = crate::core::rql::expr::parse_condition(text, schema)?;
+                let condition = crate::core::rql::expr::parse_cond(text, schema)?;
                 // The condition's columns, plus their NULL companions: the fold
                 // has no schema of its own to tell a NULL from a zero.
                 let mut fields: Vec<SchemaField> = Vec::new();
-                for field in crate::core::rql::expr::condition_columns(&condition) {
+                for field in crate::core::rql::expr::cond_columns(&condition) {
                     if let Some(flag) = crate::core::rql::nullable::flag_field(&field.name, schema)
                     {
                         if !fields.iter().any(|f| f.name == flag.name) {
@@ -518,6 +518,7 @@ fn parse_select_items(
                 .ok_or_else(|| format!("unterminated function call in '{}'", item))?;
             let arg_text = expr[open + 1..close].trim();
 
+            let mut argument_expression: Option<crate::core::rql::aggregate::ArgExpression> = None;
             let arg = if arg_text == "*" {
                 if func != AggFunc::Count {
                     return Err(format!("{}(*) is not valid", func_name.to_uppercase()));
@@ -529,11 +530,36 @@ fn parse_select_items(
                     .next()
                     .unwrap_or(arg_text)
                     .trim_matches('"');
-                let field = schema
+                match schema
                     .iter()
                     .find(|f| f.name.eq_ignore_ascii_case(name) && !f.is_deleted)
-                    .ok_or_else(|| format!("Column '{}' not found in schema", arg_text))?;
-                Some(field.clone())
+                {
+                    Some(field) => Some(field.clone()),
+                    // An argument that is computed rather than read:
+                    // `SUM(CAST(NULLIF(data ->> 'y', '') AS NUMERIC))`, which is
+                    // how an aggregate over a document field is written. Its
+                    // type is known right here — the schema is in hand — so the
+                    // result type is decided the same way a column's is, with
+                    // no placeholder to be filled in later.
+                    None => {
+                        let parsed = crate::core::rql::expr::parse(arg_text, schema)
+                            .map_err(|_| format!("Column '{}' not found in schema", arg_text))?;
+                        let db_type = crate::core::rql::expr::static_type(&parsed);
+                        let reads = expr_reads(&parsed, schema);
+                        argument_expression = Some(crate::core::rql::aggregate::ArgExpression {
+                            expr: parsed,
+                            schema: reads,
+                        });
+                        Some(SchemaField::new(
+                            arg_text.to_string(),
+                            db_type.clone(),
+                            db_type.get_size(),
+                            0,
+                            u64::MAX,
+                            false,
+                        ))
+                    }
+                }
             };
 
             out.push(SelectItem::Aggregate {
@@ -541,6 +567,7 @@ fn parse_select_items(
                 arg,
                 label: alias.unwrap_or_else(|| func.name().to_string()),
                 filter: aggregate_filter,
+                arg_expr: argument_expression,
             });
             continue;
         }
@@ -1368,7 +1395,7 @@ pub fn row_fetch_from_select_query(
     // ORDER BY: every sort key, in the order written. Resolution is deferred,
     // because an aggregate query may order by a function result — `ORDER BY
     // COUNT(*)` names nothing in the schema.
-    let order_terms: Vec<crate::core::rql::order_by::SortTerm> = match order_pos {
+    let mut order_terms: Vec<crate::core::rql::order_by::SortTerm> = match order_pos {
         None => Vec::new(),
         Some(op) => {
             let start = after_phrase(after_from, op, &["ORDER", "BY"]);
@@ -1462,6 +1489,17 @@ pub fn row_fetch_from_select_query(
     };
 
     let select_items = parse_select_items(columns_part, schema)?;
+
+    // `ORDER BY 2` names the second select item. Resolved before anything below
+    // looks at a sort key, so every path sees an ordinary one.
+    crate::core::rql::order_by::resolve_ordinals(
+        &mut order_terms,
+        &select_items
+            .iter()
+            .map(|i| i.label().to_string())
+            .collect::<Vec<_>>(),
+    )?;
+    let order_terms = order_terms;
     // A computed item folds aggregates too, so it takes the aggregate path —
     // otherwise its expression would be evaluated against raw scanned rows,
     // before there is any aggregate result for it to read.
@@ -1747,10 +1785,28 @@ pub fn row_fetch_from_select_query(
         }
         for item in &select_items {
             match item {
-                SelectItem::Aggregate { arg, filter, .. } => {
-                    if let Some(f) = arg {
-                        if !cols.iter().any(|c| c == &f.name) {
-                            cols.push(f.name.clone());
+                SelectItem::Aggregate {
+                    arg,
+                    filter,
+                    arg_expr,
+                    ..
+                } => {
+                    match arg_expr {
+                        // A computed argument's `arg` names the expression, not
+                        // a column — what has to be fetched is what it reads.
+                        Some(argument) => {
+                            for f in &argument.schema {
+                                if !cols.iter().any(|c| c == &f.name) {
+                                    cols.push(f.name.clone());
+                                }
+                            }
+                        }
+                        None => {
+                            if let Some(f) = arg {
+                                if !cols.iter().any(|c| c == &f.name) {
+                                    cols.push(f.name.clone());
+                                }
+                            }
                         }
                     }
                     // `FILTER (WHERE status = …)` reads a column the aggregate

@@ -26,6 +26,38 @@ pub struct SortTerm {
     pub nulls_first: Option<bool>,
 }
 
+/// Rewrites `ORDER BY 2` into the select item that position names.
+///
+/// SQL lets a sort key be an ordinal into the select list, and it is how a
+/// hand-written query or a migration script usually spells "sort by the second
+/// column". Resolved here, once, into the item's own label, so every consumer
+/// below — the scan's byte sort, the expression sort, the join, the aggregate
+/// fold — sees an ordinary key and none of them needs to know ordinals exist.
+///
+/// Only a bare integer is one. `ORDER BY 1 + 1` is an expression whose value
+/// happens to be a number, and PostgreSQL treats it as such.
+pub fn resolve_ordinals(terms: &mut [SortTerm], labels: &[String]) -> Result<(), String> {
+    for term in terms.iter_mut() {
+        let trimmed = term.token.trim();
+        if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let position: usize = trimmed
+            .parse()
+            .map_err(|_| format!("ORDER BY position '{}' is not a number", trimmed))?;
+        // One-based, and zero is not a position at all.
+        if position == 0 || position > labels.len() {
+            return Err(format!(
+                "ORDER BY position {} is not in the select list, which has {} item(s)",
+                position,
+                labels.len()
+            ));
+        }
+        term.token = labels[position - 1].clone();
+    }
+    Ok(())
+}
+
 /// Splits a comma-separated list on the commas that sit outside parentheses and
 /// quotes, so `COUNT(a, b)` stays one term.
 fn split_terms(clause: &str) -> Vec<String> {

@@ -6200,8 +6200,6 @@ fn sort_rows_by_expressions(
     keys: &[(crate::core::rql::expr::Expr, bool, Option<bool>)],
     schema: &[crate::core::row::schema::SchemaField],
 ) -> Result<Vec<crate::core::row::row::Row>, String> {
-    use std::cmp::Ordering;
-
     // Every key is evaluated once per row, up front — a comparator must not
     // error, and re-evaluating inside one would be quadratic anyway.
     let mut keyed: Vec<(
@@ -6216,40 +6214,11 @@ fn sort_rows_by_expressions(
         keyed.push((values, row));
     }
 
-    keyed.sort_by(|a, b| {
-        for (i, (_, descending, nulls_first)) in keys.iter().enumerate() {
-            let av = &a.0[i];
-            let bv = &b.0[i];
-            let nulls_come_first = nulls_first.unwrap_or(*descending);
-            let ord = match (av.is_null(), bv.is_null()) {
-                (true, true) => Ordering::Equal,
-                (true, false) => {
-                    if nulls_come_first {
-                        Ordering::Less
-                    } else {
-                        Ordering::Greater
-                    }
-                }
-                (false, true) => {
-                    if nulls_come_first {
-                        Ordering::Greater
-                    } else {
-                        Ordering::Less
-                    }
-                }
-                (false, false) => {
-                    // Incomparable values keep their scan order rather than
-                    // panicking the comparator.
-                    let ord = crate::core::rql::expr::compare(av, bv).unwrap_or(Ordering::Equal);
-                    if *descending { ord.reverse() } else { ord }
-                }
-            };
-            if ord != Ordering::Equal {
-                return ord;
-            }
-        }
-        Ordering::Equal
-    });
+    let directions: Vec<(bool, Option<bool>)> = keys
+        .iter()
+        .map(|(_, descending, nulls)| (*descending, *nulls))
+        .collect();
+    keyed.sort_by(|a, b| crate::core::rql::expr::compare_key_values(&a.0, &b.0, &directions));
 
     Ok(keyed.into_iter().map(|(_, row)| row).collect())
 }

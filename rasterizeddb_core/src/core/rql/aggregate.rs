@@ -73,10 +73,26 @@ impl AggFunc {
     }
 }
 
+/// An aggregate argument evaluated per row.
+#[derive(Debug, Clone)]
+pub struct ArgExpression {
+    pub expr: crate::core::rql::expr::Expr,
+    /// The columns it reads, so the scan fetches them and the evaluator has a
+    /// schema to tell a NULL from a zero.
+    pub schema: Vec<SchemaField>,
+}
+
 /// The `FILTER (WHERE …)` attached to one aggregate.
 #[derive(Debug, Clone)]
 pub struct AggregateFilter {
-    pub condition: crate::core::rql::expr::Condition,
+    /// A whole boolean tree, not one comparison.
+    ///
+    /// `FILTER (WHERE a IS NOT NULL AND a >= b)` is the ordinary shape, and a
+    /// single-comparison parser refused it outright — while an `OR` parsed as
+    /// one comparison whose right-hand side was the rest of the clause, and
+    /// counted **nothing**. The second is the dangerous one: a number, silently
+    /// wrong.
+    pub condition: crate::core::rql::expr::Cond,
     /// The fields the condition reads, with their NULL companions. Carried
     /// because the evaluator needs a schema to tell a NULL from a zero, and the
     /// fold has no other access to one.
@@ -99,6 +115,14 @@ pub enum SelectItem {
         /// `COUNT(*), COUNT(*) FILTER (WHERE status = 'failed')` — so the test
         /// belongs to the item rather than to the statement's `WHERE`.
         filter: Option<AggregateFilter>,
+        /// An argument that is computed rather than read:
+        /// `SUM(CAST(NULLIF(data ->> 'y', '') AS NUMERIC))`.
+        ///
+        /// Evaluated per row instead of reading `arg`'s column. `arg` is still
+        /// present and carries the *type* the expression yields, so the result
+        /// type is decided the same way for both — and unlike the join planner,
+        /// that type is known here at parse time, because the schema is.
+        arg_expr: Option<ArgExpression>,
     },
     /// A constant: `SELECT 1`, or the value a scalar subquery resolved to. It
     /// reads no column, and is the same in every row.
@@ -757,12 +781,17 @@ pub fn fold(plan: &AggregatePlan, rows: &[Row]) -> Result<Vec<Row>, String> {
 
         for (i, item) in plan.items.iter().enumerate() {
             match item {
-                SelectItem::Aggregate { arg, filter, .. } => {
+                SelectItem::Aggregate {
+                    arg,
+                    filter,
+                    arg_expr,
+                    ..
+                } => {
                     // A row the filter rejects is not counted by *this*
                     // aggregate, while still counting for every other item of
                     // the same statement.
                     if let Some(filter) = filter {
-                        let keep = crate::core::rql::expr::eval_condition(
+                        let keep = crate::core::rql::expr::eval_cond(
                             &filter.condition,
                             row,
                             &filter.schema,
@@ -772,13 +801,52 @@ pub fn fold(plan: &AggregatePlan, rows: &[Row]) -> Result<Vec<Row>, String> {
                             continue;
                         }
                     }
-                    let (bytes, ty) = match arg {
+                    let computed;
+                    let (bytes, ty) = match (arg, arg_expr) {
+                        // Computed per row. A NULL result accumulates as an
+                        // absent value, which is what makes `SUM` skip it
+                        // rather than adding a zero.
+                        (Some(f), Some(argument)) => {
+                            computed =
+                                crate::core::rql::expr::eval(&argument.expr, row, &argument.schema)
+                                    .map_err(|e| {
+                                        // Never swallowed into a NULL. A failed
+                                        // evaluation that becomes "no value" makes SUM
+                                        // report 0 and AVG report nothing — a number
+                                        // that looks like an answer. Reported here so
+                                        // the cause is visible even though the fold has
+                                        // no way to fail the statement.
+                                        log::error!("aggregate argument failed to evaluate: {}", e);
+                                        e
+                                    })
+                                    .ok()
+                                    // Coerced to the type this argument was *declared*
+                                    // as, which is what the accumulator reads the bytes
+                                    // by. `column_order + 1` evaluates to four bytes
+                                    // while its static type is eight, and accumulating
+                                    // the narrow value under the wide type summed to
+                                    // **zero** — a wrong number, not an error.
+                                    .and_then(|value| {
+                                        if value.db_type() == Some(&f.db_type) {
+                                            Some(value)
+                                        } else {
+                                            crate::core::rql::expr::cast(value, &f.db_type).ok()
+                                        }
+                                    })
+                                    .and_then(|value| match value {
+                                        crate::core::rql::expr::Value::Data { bytes, .. } => {
+                                            Some(bytes)
+                                        }
+                                        crate::core::rql::expr::Value::Null => None,
+                                    });
+                            (computed.as_deref(), Some(&f.db_type))
+                        }
                         // `bytes` is `None` for a NULL or an absent column, and `ty`
                         // is `None` only for `COUNT(*)`. Keeping those separate is
                         // what lets `COUNT(col)` skip a NULL without also skipping
                         // the empty string.
-                        Some(f) => (column_bytes(row, f.write_order), Some(&f.db_type)),
-                        None => (None, None),
+                        (Some(f), None) => (column_bytes(row, f.write_order), Some(&f.db_type)),
+                        _ => (None, None),
                     };
                     entry.1[i].accumulate(bytes, ty);
                 }
@@ -1130,6 +1198,7 @@ mod tests {
             arg,
             label: func.name().to_string(),
             filter: None,
+            arg_expr: None,
         }
     }
 
