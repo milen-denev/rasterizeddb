@@ -3719,3 +3719,70 @@ fn a_row_view_returns_absent_for_a_column_the_fetch_skipped() {
         "an out-of-range lookup was not absent"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A schema that cannot be read
+// ---------------------------------------------------------------------------
+
+/// Opening a table whose stored schema will not load must not fabricate an
+/// empty one.
+///
+/// The fabricated schema has no columns, so `SELECT *` succeeds and returns
+/// rows with no fields — which reads as "this table has no columns" rather than
+/// as a failure. Worse, the fallback used to *save* it, replacing the only copy
+/// of the real schema on disk. Found via a KV-backed table that came back from
+/// a clean restart with its rows intact and no columns.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_table_whose_schema_will_not_load_is_flagged_rather_than_emptied() {
+    init();
+    let dir = tempfile::tempdir().unwrap();
+    let name = "wreck";
+
+    // A real table, with columns and a row.
+    {
+        let t = open_unique_table(dir.path(), name).await;
+        insert(&t, 1, 7, "kept").await;
+        assert_eq!(t.schema.fields.len(), 3);
+        assert!(
+            !t.schema_unreadable,
+            "a table that opened cleanly is not flagged"
+        );
+    }
+
+    // Truncate the schema, the way a recovery that never stored it leaves it.
+    let schema_path = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| {
+            let f = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            f == format!("{name}_schema.db")
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "no schema file for '{name}' in {:?}",
+                std::fs::read_dir(dir.path())
+                    .unwrap()
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name())
+                    .collect::<Vec<_>>()
+            )
+        });
+    std::fs::write(&schema_path, b"").unwrap();
+
+    // Reopened the way the database opens an existing table: no columns.
+    let io = Arc::new(LocalStorageProvider::new(dir.path().to_str().unwrap(), Some(name)).await);
+    let reopened = Table::new(name, io, vec![]).await;
+    assert!(
+        reopened.schema_unreadable,
+        "a schema that did not load must be reported, not replaced with an empty one"
+    );
+
+    // And the truncated file was not overwritten with a fabricated schema —
+    // whatever is still on disk is the only copy there is.
+    assert_eq!(
+        std::fs::metadata(&schema_path).unwrap().len(),
+        0,
+        "the failed load must not have written a schema of its own"
+    );
+}

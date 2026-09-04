@@ -774,6 +774,17 @@ impl Database {
             let seed = seed_in(&io_pointers, &storage, &kv_stores, &seeds, &table_name).await;
 
             let mut table = Table::new(&table_name, seed, vec![]).await;
+            // Its schema did not load, so every column is missing. Left out of
+            // the live map for the same reason an unopenable backend is: a
+            // query then says the table does not exist, where opening it would
+            // answer `SELECT *` with rows carrying no fields.
+            if table.schema_unreadable {
+                error!(
+                    "table '{}' is left unopened: its schema could not be read",
+                    table_name
+                );
+                continue;
+            }
             table.scope_cache_to_database(id);
             table.enable_versioning(transactions.clone());
             tables.insert(table_name, Arc::new(table));
@@ -1594,6 +1605,13 @@ impl Database {
         )
         .await;
         let mut table = Table::new(new_name, seed, Vec::new()).await;
+        if table.schema_unreadable {
+            error!(
+                "renamed table '{}' is left unopened: its schema could not be read",
+                new_name
+            );
+            return;
+        }
         table.scope_cache_to_database(self.id);
         table.enable_versioning(self.transactions.clone());
         self.tables.insert(new_name.to_string(), Arc::new(table));
@@ -2111,6 +2129,15 @@ impl Database {
         )
         .await;
         let mut table = Table::new(table_name, seed, Vec::new()).await;
+        if table.schema_unreadable {
+            // The old handle has already been removed, so the table is now
+            // absent rather than stale. That is the safe end of this: a query
+            // says it does not exist, instead of reading it with no columns.
+            return Err(io::Error::other(format!(
+                "table '{}' could not be reopened: its schema could not be read",
+                table_name
+            )));
+        }
         table.scope_cache_to_database(self.id);
         table.enable_versioning(self.transactions.clone());
         self.tables.insert(table_name.to_string(), Arc::new(table));

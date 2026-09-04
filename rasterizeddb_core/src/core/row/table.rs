@@ -47,6 +47,17 @@ const ID_RESERVATION_CHUNK: u64 = 1024;
 
 pub struct Table<S: StorageIO> {
     pub schema: TableSchema,
+    /// Set when this table was *opened* and its stored schema could not be
+    /// read, so `schema` above is a fabricated empty one rather than the
+    /// table's own.
+    ///
+    /// A caller must not put such a table into the live map: every column is
+    /// missing, so `SELECT *` succeeds and returns rows with no fields, which
+    /// reads as "this table has no columns" rather than as a failure. The
+    /// database already refuses to open a table whose *backend* is missing, for
+    /// the same reason and with the same remedy — leave it out, and let the
+    /// query say the table does not exist.
+    pub schema_unreadable: bool,
     pub io_pointers: Arc<S>,
     pub io_rows: Arc<S>,
     pub io_schema: Arc<S>,
@@ -462,9 +473,26 @@ impl<S: StorageIO> Table<S> {
             }
         });
 
+        // An open passes no columns; only `CREATE TABLE` passes them. So a
+        // failed load with no columns to build from is a table whose schema
+        // should have been there and was not — a recovery failure, not a new
+        // table — and fabricating one both answers every later query wrongly
+        // and *overwrites* whatever was still on disk.
+        let mut schema_unreadable = false;
         let schema = {
             if let Ok(schema) = TableSchema::load(io_schema.clone()).await {
                 schema
+            } else if columns.is_empty() {
+                error!(
+                    "table '{}' was opened but its schema could not be read; it is left \
+                     unusable rather than answering queries with no columns",
+                    table_name
+                );
+                schema_unreadable = true;
+                // Deliberately not saved: the bytes on disk are the only copy
+                // of the real schema, and a recovery that could not read them
+                // must not replace them with an empty one.
+                TableSchema::new(table_name.to_string(), false)
             } else {
                 let mut schema = TableSchema::new(table_name.to_string(), false);
 
@@ -669,6 +697,7 @@ impl<S: StorageIO> Table<S> {
 
         Self {
             schema,
+            schema_unreadable,
             io_pointers,
             io_rows,
             io_schema,
