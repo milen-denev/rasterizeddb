@@ -4171,7 +4171,9 @@ fn join_output_columns(
         let Some(item) = plan.items.get(position) else {
             return fallback;
         };
-        if item.scalar.is_some() || item.literal.is_some() {
+        // An expression's type is the expression's own, worked out when it was
+        // parsed; there is no source column to advertise it as.
+        if item.scalar.is_some() || item.literal.is_some() || item.expr.is_some() {
             return fallback;
         }
         let Some(relation) = plan.relations.get(item.rel) else {

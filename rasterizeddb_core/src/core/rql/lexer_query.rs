@@ -168,7 +168,7 @@ fn parse_computed_item(
 /// The clause restricts which rows *this* aggregate sees, so it cannot be
 /// folded into the statement's `WHERE` — a statement usually pairs a filtered
 /// aggregate with an unfiltered one, and moving the test would change both.
-fn split_aggregate_filter(item: &str) -> (Option<String>, Option<String>) {
+pub(crate) fn split_aggregate_filter(item: &str) -> (Option<String>, Option<String>) {
     let upper = item.to_ascii_uppercase();
     let mut from = 0usize;
     while let Some(at) = upper[from..].find("FILTER") {

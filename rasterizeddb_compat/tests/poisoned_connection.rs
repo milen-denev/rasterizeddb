@@ -50,8 +50,13 @@ async fn setup(pool: &sqlx::PgPool) {
     .expect("seed");
 }
 
-/// The demote query, verbatim in shape. It fails today; what matters is what
-/// the connection does afterwards.
+/// The demote query, verbatim in shape.
+///
+/// It used to fail — `ORDER BY COALESCE(...)` over a join was unsupported —
+/// and this file used it as its convenient failing statement. It works now, so
+/// it is kept as an assertion that it does, and the poisoning is provoked by
+/// [`POISONING`] instead. What this file is really about is what the connection
+/// does after *any* failed prepare, not about this statement.
 const DEMOTE: &str = "SELECT t.id AS id, t.domain_id AS domain_id \
      FROM user_table t \
      LEFT JOIN user_table_query_stat s ON s.user_table_id = t.id \
@@ -59,6 +64,11 @@ const DEMOTE: &str = "SELECT t.id AS id, t.domain_id AS domain_id \
        AND COALESCE(s.last_queried_at, t.updated_at) < $1 \
      ORDER BY COALESCE(s.last_queried_at, t.updated_at) ASC \
      LIMIT $2";
+
+/// A statement that fails while being prepared, and will keep failing: it names
+/// a column that does not exist. Carries a parameter, because the bug is in the
+/// `ParameterDescription` the failed prepare leaves behind.
+const POISONING: &str = "SELECT t.no_such_column FROM user_table t WHERE t.id = $1";
 
 #[tokio::test]
 async fn a_failed_prepare_does_not_poison_the_connection() {
@@ -70,13 +80,11 @@ async fn a_failed_prepare_does_not_poison_the_connection() {
     let mut conn = pool.acquire().await.expect("acquire");
 
     for round in 1..=3 {
-        // The hourly worker statement. It is expected to fail.
-        let failed = sqlx::query(DEMOTE)
-            .bind(chrono::NaiveDateTime::parse_from_str("2025-01-01 00:00:00", "%Y-%m-%d %H:%M:%S").unwrap())
-            .bind(10i64)
+        let failed = sqlx::query(POISONING)
+            .bind(1i32)
             .fetch_all(&mut *conn)
             .await;
-        assert!(failed.is_err(), "round {}: the demote query is expected to fail", round);
+        assert!(failed.is_err(), "round {}: this statement is expected to fail", round);
 
         // Now the connection must still work. Parameters matter: this is the
         // path that reads a ParameterDescription.
@@ -108,11 +116,7 @@ async fn a_pool_survives_a_repeatedly_failing_statement() {
     setup(&pool).await;
 
     for round in 1..=5 {
-        let _ = sqlx::query(DEMOTE)
-            .bind(chrono::NaiveDateTime::parse_from_str("2025-01-01 00:00:00", "%Y-%m-%d %H:%M:%S").unwrap())
-            .bind(10i64)
-            .fetch_all(&pool)
-            .await;
+        let _ = sqlx::query(POISONING).bind(1i32).fetch_all(&pool).await;
 
         let row = sqlx::query("SELECT id, domain_id FROM user_table WHERE id = $1")
             .bind(1i32)
@@ -121,4 +125,29 @@ async fn a_pool_survives_a_repeatedly_failing_statement() {
             .unwrap_or_else(|e| panic!("round {}: pool query failed after the error: {}", round, e));
         assert_eq!(row.get::<i32, _>("domain_id"), 9);
     }
+}
+
+/// The demote query itself, which this file used to rely on failing.
+///
+/// `ORDER BY COALESCE(s.a, t.b)` over a `LEFT JOIN` is evaluated over the
+/// combined row now, so the statement runs. Asserted here so that if it ever
+/// regresses to an error, the failure names the query rather than showing up as
+/// a connection-poisoning test that mysteriously passes for the wrong reason.
+#[tokio::test]
+async fn the_demote_query_runs() {
+    let (_s, pool) = server().await;
+    setup(&pool).await;
+
+    let rows = sqlx::query(DEMOTE)
+        .bind(
+            chrono::NaiveDateTime::parse_from_str("2025-01-01 00:00:00", "%Y-%m-%d %H:%M:%S")
+                .unwrap(),
+        )
+        .bind(10i64)
+        .fetch_all(&pool)
+        .await
+        .expect("the demote query should run");
+    // The one seeded row has updated_at 2024-01-01, before the bound cutoff,
+    // and no stat row — so it falls through to `t.updated_at` and qualifies.
+    assert_eq!(rows.len(), 1, "the unmatched row must fall through and qualify");
 }

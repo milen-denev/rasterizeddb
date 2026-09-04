@@ -98,7 +98,7 @@ pub struct PostJoinFilter {
     ///
     /// Kept apart rather than folded into `where_clause` because the two are
     /// evaluated by different machinery; both must hold for a row to survive.
-    pub expr_terms: Vec<crate::core::rql::expr::Condition>,
+    pub expr_terms: Vec<crate::core::rql::expr::Cond>,
 }
 
 /// One output column: which relation it comes from, and what it is called.
@@ -114,6 +114,23 @@ pub struct JoinSelectItem {
     /// A constant occupying this output position: `SELECT a.id, 0, NULL FROM …`.
     /// Like `scalar`, it reads no column.
     pub literal: Option<Vec<u8>>,
+    /// An expression over the *combined* row — `COALESCE(s.a, t.b) AS eff`.
+    ///
+    /// Evaluated per joined tuple, the way the post-join predicate is, because
+    /// that is the first thing that has columns from both sides. `rel` is a
+    /// placeholder when set, and `field.db_type` carries the type the row
+    /// description advertises, so the value and its declared type come from one
+    /// place — a description that disagrees with the payload corrupts the value
+    /// rather than merely mislabelling it.
+    pub expr: Option<crate::core::rql::expr::Expr>,
+    /// This item is a select-list call whose expression has not been parsed
+    /// yet — it cannot be, until the relations' fetch lists are settled.
+    ///
+    /// Marked rather than tracked by position: the aggregate stage rewrites
+    /// `items`, so an index recorded before it runs no longer names the same
+    /// item afterwards. Removing by a stale index deleted a real column and
+    /// returned it as NULL.
+    pub pending_expression: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -122,7 +139,21 @@ pub struct JoinPlan {
     pub items: Vec<JoinSelectItem>,
     /// Sort keys as `(relation, column, descending)`, in the order written.
     /// Later keys only break the ties the earlier ones left.
+    ///
+    /// Empty when `order_exprs` is used instead.
     pub order_by: Vec<(usize, SchemaField, bool)>,
+    /// `ORDER BY` evaluated over the combined row: `(expression, descending,
+    /// nulls_first)`.
+    ///
+    /// Used when *any* term is more than a projected column — an expression
+    /// like `COALESCE(s.a, t.b)`, or a key that is not in the SELECT list. When
+    /// it is used it carries **every** term, including the plain columns:
+    /// splitting an ORDER BY across two comparators is how the two come to
+    /// disagree about NULL placement and produce wrong rows.
+    pub order_exprs: Vec<(crate::core::rql::expr::Expr, bool, Option<bool>)>,
+    /// How to build the combined row that `order_exprs` **and** any select-list
+    /// expression are evaluated against. Present when either needs one.
+    pub order_layout: Option<CombinedLayout>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
     /// `WHERE` terms that reference more than one relation, evaluated after the
@@ -397,62 +428,7 @@ fn apply_post_join(
         SmallVec::new();
 
     for tuple in combined {
-        // One row carrying every fetched column of every relation, in the
-        // synthetic write order.
-        let mut columns: SmallVec<[Column; 32]> = SmallVec::new();
-        for (rel, mapping) in filter.columns.iter().enumerate() {
-            for (i, write_order) in mapping.iter().enumerate() {
-                let field = &plan.relations[rel].fetch_columns[i];
-                let source = tuple.get(rel).and_then(|r| r.as_ref()).and_then(|row| {
-                    row.columns
-                        .iter()
-                        .find(|c| c.schema_id == field.write_order)
-                });
-                let data = source.map(|c| c.data.clone()).unwrap_or_default();
-
-                // A NULL carries through the join as a NULL. The evaluator
-                // reads a cell's *type* to decide that, so the flag the
-                // companion holds has to become one here or it is lost: the
-                // combined row is rebuilt from declared types and would
-                // otherwise present every NULL as a value holding zeroes.
-                let is_null = plan.relations[rel]
-                    .fetch_columns
-                    .iter()
-                    .find(|f| {
-                        crate::core::rql::nullable::is_hidden(&f.name)
-                            && f.name.len() > crate::core::rql::nullable::NULL_FLAG_PREFIX.len()
-                            && f.name[crate::core::rql::nullable::NULL_FLAG_PREFIX.len()..]
-                                .eq_ignore_ascii_case(&field.name)
-                    })
-                    .and_then(|flag| {
-                        tuple.get(rel).and_then(|r| r.as_ref()).and_then(|row| {
-                            row.columns
-                                .iter()
-                                .find(|c| c.schema_id == flag.write_order)
-                                .map(|c| {
-                                    crate::core::rql::nullable::flag_is_set(c.data.into_slice())
-                                })
-                        })
-                    })
-                    .unwrap_or(false);
-
-                columns.push(Column {
-                    schema_id: *write_order,
-                    data,
-                    column_type: if is_null {
-                        crate::core::db_type::DbType::NULL
-                    } else {
-                        field.db_type.clone()
-                    },
-                });
-            }
-        }
-
-        let row = Row {
-            position: 0,
-            length: 0,
-            columns,
-        };
+        let row = combined_row(plan, &filter.columns, tuple);
         let mut map: SmallVec<[u8; 32]> = SmallVec::new();
         map.resize(filter.schema.len(), u8::MAX);
         for (pos, column) in row.columns.iter().enumerate() {
@@ -474,7 +450,7 @@ fn apply_post_join(
         // which is exactly how the evaluator looks a column up.
         if matched {
             for condition in &filter.expr_terms {
-                if !crate::core::rql::expr::eval_condition(condition, &row, &filter.schema)? {
+                if !crate::core::rql::expr::eval_cond(condition, &row, &filter.schema)? {
                     matched = false;
                     break;
                 }
@@ -490,9 +466,72 @@ fn apply_post_join(
 pub fn project(plan: &JoinPlan, combined: Vec<Combined>) -> Vec<Row> {
     let mut out: Vec<Row> = Vec::with_capacity(combined.len());
 
+    // Built once per tuple, and only when something needs it: an expression in
+    // the select list is evaluated against the combined row, which is the first
+    // thing that has columns from both sides.
+    let wants_combined = plan.items.iter().any(|i| i.expr.is_some());
+    let mut expression_failure: Option<String> = None;
+
     for tuple in &combined {
+        let synthetic = match (wants_combined, plan.order_layout.as_ref()) {
+            (true, Some(layout)) => Some(combined_row(plan, &layout.columns, tuple)),
+            _ => None,
+        };
         let mut columns: SmallVec<[Column; 32]> = SmallVec::new();
         for (i, item) in plan.items.iter().enumerate() {
+            // An expression fills the position it was written in, and carries
+            // its own type: a NULL result has to leave as a NULL rather than as
+            // the declared type's zeroes.
+            if let Some(expr) = item.expr.as_ref() {
+                let (bytes, column_type) = match (synthetic.as_ref(), plan.order_layout.as_ref()) {
+                    (Some(row), Some(layout)) => {
+                        match crate::core::rql::expr::eval(expr, row, &layout.schema) {
+                            // Coerced to the type this item was *described* as.
+                            // The row description is sent before any row, and a
+                            // payload of a different width than the type it was
+                            // announced under is read as NULL — the value is
+                            // not mislabelled, it is lost. `t.b + 1` widened to
+                            // `int8` while the description still said `int4`,
+                            // and the column arrived empty.
+                            Ok(value) => {
+                                let declared = item.field.db_type.clone();
+                                let coerced = if value.db_type() == Some(&declared) {
+                                    Ok(value)
+                                } else {
+                                    crate::core::rql::expr::cast(value, &declared)
+                                };
+                                match coerced {
+                                    Ok(crate::core::rql::expr::Value::Data { bytes, db_type }) => {
+                                        (bytes, db_type)
+                                    }
+                                    Ok(crate::core::rql::expr::Value::Null) => {
+                                        (Vec::new(), crate::core::db_type::DbType::NULL)
+                                    }
+                                    Err(e) => {
+                                        expression_failure.get_or_insert(e);
+                                        (Vec::new(), crate::core::db_type::DbType::NULL)
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                expression_failure.get_or_insert(e);
+                                (Vec::new(), crate::core::db_type::DbType::NULL)
+                            }
+                        }
+                    }
+                    _ => (Vec::new(), crate::core::db_type::DbType::NULL),
+                };
+                let mut mb = crate::memory_pool::MEMORY_POOL.acquire(bytes.len());
+                if !bytes.is_empty() {
+                    mb.into_slice_mut().copy_from_slice(&bytes);
+                }
+                columns.push(Column {
+                    schema_id: i as u64,
+                    data: mb,
+                    column_type,
+                });
+                continue;
+            }
             let data = if let Some(bytes) = item.literal.as_ref() {
                 let mut mb = crate::memory_pool::MEMORY_POOL.acquire(bytes.len());
                 if !bytes.is_empty() {
@@ -580,6 +619,12 @@ pub fn project(plan: &JoinPlan, combined: Vec<Combined>) -> Vec<Row> {
         });
     }
 
+    if let Some(e) = expression_failure {
+        // Reported once. The column is NULL in every row it failed for, which
+        // is visible; saying nothing would leave a NULL that looks like data.
+        log::error!("join SELECT list expression failed: {}", e);
+    }
+
     // Sorting runs here rather than in the scan, because the order is over the
     // combined rows and a per-relation sort would not survive the join.
     //
@@ -597,7 +642,45 @@ pub fn project(plan: &JoinPlan, combined: Vec<Combined>) -> Vec<Row> {
         })
         .collect();
 
-    if !sort_keys.is_empty() {
+    if !plan.order_exprs.is_empty() {
+        if let Some(layout) = plan.order_layout.as_ref() {
+            let directions: Vec<(bool, Option<bool>)> = plan
+                .order_exprs
+                .iter()
+                .map(|(_, descending, nulls)| (*descending, *nulls))
+                .collect();
+            // Evaluated once per row up front: a comparator must not fail, and
+            // re-evaluating inside one would be quadratic anyway.
+            let mut failure: Option<String> = None;
+            let mut keyed: Vec<(Vec<crate::core::rql::expr::Value>, Row)> =
+                Vec::with_capacity(out.len());
+            for (index, row) in out.into_iter().enumerate() {
+                let synthetic = combined_row(plan, &layout.columns, &combined[index]);
+                let mut values = Vec::with_capacity(plan.order_exprs.len());
+                for (expr, _, _) in plan.order_exprs.iter() {
+                    match crate::core::rql::expr::eval(expr, &synthetic, &layout.schema) {
+                        Ok(value) => values.push(value),
+                        Err(e) => {
+                            // Sorts as NULL so the comparator stays total, and
+                            // reported once: an ORDER BY that silently gave up
+                            // would return the rows in scan order and look
+                            // ordered.
+                            failure.get_or_insert(e);
+                            values.push(crate::core::rql::expr::Value::Null);
+                        }
+                    }
+                }
+                keyed.push((values, row));
+            }
+            if let Some(e) = failure {
+                log::error!("join ORDER BY expression failed: {}", e);
+            }
+            keyed.sort_by(|a, b| {
+                crate::core::rql::expr::compare_key_values(&a.0, &b.0, &directions)
+            });
+            out = keyed.into_iter().map(|(_, row)| row).collect();
+        }
+    } else if !sort_keys.is_empty() {
         out.sort_by(|a, b| {
             for (idx, descending, ty) in sort_keys.iter() {
                 let av = a
@@ -1437,6 +1520,9 @@ pub fn plan(
     // Function calls are collected separately: they name columns to fetch, but
     // the output column they produce belongs to the fold, not to the join.
     let mut aggregate_calls: Vec<String> = Vec::new();
+    // `(position in `items`, the item as written)` for each select-list call
+    // that turns out not to be an aggregate.
+    let mut expression_items: Vec<(usize, String)> = Vec::new();
     let mut items: Vec<JoinSelectItem> = Vec::new();
     if select_list.trim() == "*" {
         for (i, s) in schemas.iter().enumerate() {
@@ -1449,6 +1535,8 @@ pub fn plan(
                     label: f.name.clone(),
                     scalar: None,
                     literal: None,
+                    expr: None,
+                    pending_expression: false,
                 });
             }
         }
@@ -1493,12 +1581,32 @@ pub fn plan(
                             label: alias.unwrap_or_else(|| name.to_ascii_lowercase()),
                             scalar: Some(func),
                             literal: None,
+                            expr: None,
+                            pending_expression: false,
                         });
                         continue;
                     }
                 }
-                // Handled by the aggregate branch below; a non-aggregate call
-                // is still refused there by name.
+                // Set aside for the aggregate stage, which is where a call
+                // becomes an output column when the list holds a real
+                // aggregate. When it does not, the call is an ordinary
+                // expression over the combined row and is filled in below.
+                //
+                // A placeholder goes into `items` now, at the position the item
+                // was written, because that position is otherwise lost: the
+                // stage only sees the calls it claimed, and appending the
+                // expression afterwards would move it to the end of the select
+                // list.
+                // Only the position is recorded. Nothing goes into `items`
+                // yet: the aggregate stage reads `items` to decide whether it
+                // forms — an item not in the GROUP BY makes it decline — so a
+                // placeholder put here stopped a grouped join from grouping,
+                // and its aggregate came back NULL.
+                //
+                // `items.len()` is the index this item was written at, because
+                // `items` is filled in select-list order and nothing else
+                // inserts into it.
+                expression_items.push((items.len(), item.to_string()));
                 aggregate_calls.push(item.to_string());
                 continue;
             }
@@ -1523,6 +1631,8 @@ pub fn plan(
                     label: "?column?".to_string(),
                     scalar: None,
                     literal: Some(bytes),
+                    expr: None,
+                    pending_expression: false,
                 });
                 continue;
             }
@@ -1544,6 +1654,8 @@ pub fn plan(
                 label,
                 scalar: None,
                 literal: None,
+                expr: None,
+                pending_expression: false,
             });
         }
     }
@@ -1759,7 +1871,8 @@ pub fn plan(
     // field whose `write_order` is that column's index in `items`. Building it
     // here — before the per-relation fetch is computed — means any column the
     // fold needs is added to `items` in time to be fetched.
-    let aggregate = build_aggregate_stage(
+    let mut expr_arguments: Vec<String> = Vec::new();
+    let mut aggregate = build_aggregate_stage(
         select_list,
         group_by_clause,
         having_clause,
@@ -1768,6 +1881,7 @@ pub fn plan(
         offset,
         &mut items,
         &resolve,
+        &mut expr_arguments,
     )?;
 
     // A select item this cannot produce is refused, not dropped.
@@ -1784,12 +1898,45 @@ pub fn plan(
     // Evaluating these over a join is a real feature — the value has to be
     // computed per combined row, the way a post-join predicate already is —
     // and until it exists, saying so is the only honest answer.
-    if aggregate.is_none() {
-        if let Some(orphan) = aggregate_calls.first() {
-            return Err(format!(
-                "an expression in the SELECT list of a join is not supported yet: '{}'.                  Compute it in the client, or select the columns it reads and combine them there.",
-                orphan.trim()
-            ));
+    // With a real aggregate the fold owns every call, including these, so the
+    // placeholders must not also appear as projected columns.
+    // With a real aggregate the fold owns every call, so the placeholders are
+    // never created. Without one, each is an ordinary expression over the
+    // combined row and takes the output position it was written at.
+    if aggregate.is_some() {
+        // The fold owns every call, so no select-list placeholder is created.
+        // What may be pending instead are the aggregate's own expression
+        // arguments, already in `items` at the positions their aggregates
+        // point at.
+        expression_items = expr_arguments
+            .iter()
+            .map(|text| (0usize, text.clone()))
+            .collect();
+    } else {
+        for (offset, (position, text)) in expression_items.iter().enumerate() {
+            let (expr_text, alias) = split_expr_alias(text);
+            let label = alias.unwrap_or_else(|| expr_text.trim().to_string());
+            let at = (position + offset).min(items.len());
+            items.insert(
+                at,
+                JoinSelectItem {
+                    rel: 0,
+                    field: SchemaField::new(
+                        label.clone(),
+                        DbType::STRING,
+                        DbType::STRING.get_size(),
+                        0,
+                        0,
+                        false,
+                    ),
+                    label,
+                    scalar: None,
+                    literal: None,
+                    // Parsed once the relations' fetch lists are settled.
+                    expr: None,
+                    pending_expression: true,
+                },
+            );
         }
     }
 
@@ -1802,38 +1949,75 @@ pub fn plan(
     };
 
     // --- ORDER BY --------------------------------------------------------
-    let mut order_keys: Vec<(usize, SchemaField, bool)> = Vec::with_capacity(order_by.len());
-    for term in &order_by {
-        // The join's sort compares projected bytes and cannot place NULLs, so
-        // a placement it cannot honour is refused rather than quietly dropped.
-        if term.nulls_first.is_some() {
-            return Err("ORDER BY ... NULLS FIRST/LAST is not supported in a join yet".to_string());
-        }
-        // An output label wins over a column name, matching how a single-table
-        // query resolves it.
-        if let Some(item) = items
-            .iter()
-            .find(|i| i.label.eq_ignore_ascii_case(&term.token))
-        {
-            order_keys.push((item.rel, item.field.clone(), term.descending));
+    // `ORDER BY 2` names the second item of the select list *as written*.
+    //
+    // Resolved against the written list rather than against `items`: a call is
+    // set aside for the aggregate stage and never reaches `items`, so counting
+    // projected columns would shift every position after it and silently sort
+    // by the wrong one. `SELECT *` has no written list to count, so its
+    // expanded columns are the positions.
+    let mut order_by = order_by;
+    {
+        let labels: Vec<String> = if select_list.trim() == "*" {
+            items.iter().map(|i| i.label.clone()).collect()
         } else {
-            let (rel, field) = resolve(&term.token)?;
-            // The sort reads the key out of the *projected* row, so a key that
-            // is not in the SELECT list has nothing to read. Refusing says so,
-            // where returning the rows unsorted would not.
-            if !items
-                .iter()
-                .any(|i| i.rel == rel && i.field.write_order == field.write_order)
+            split_top_level_commas(select_list)
+                .into_iter()
+                .map(|raw| {
+                    let item = raw.trim();
+                    let (expr, alias) = split_expr_alias(item);
+                    alias.unwrap_or_else(|| expr.trim().to_string())
+                })
+                .collect()
+        };
+        crate::core::rql::order_by::resolve_ordinals(&mut order_by, &labels)?;
+    }
+
+    // The fast path compares *projected* bytes, so it can only serve a key that
+    // is a column already in the SELECT list and carries no NULLS placement.
+    // Anything else — an expression such as `COALESCE(s.a, t.b)`, an unselected
+    // column, an explicit placement — needs the combined row, and then **every**
+    // term goes that way: two comparators over one ORDER BY would disagree about
+    // NULL placement and return the wrong rows rather than slow ones.
+    let mut order_keys: Vec<(usize, SchemaField, bool)> = Vec::with_capacity(order_by.len());
+    let mut needs_expressions = false;
+    for term in &order_by {
+        if term.nulls_first.is_some() {
+            needs_expressions = true;
+            break;
+        }
+        if let Some(item) = items.iter().find(|i| {
+            i.label.eq_ignore_ascii_case(&term.token) && i.scalar.is_none() && i.literal.is_none()
+        }) {
+            order_keys.push((item.rel, item.field.clone(), term.descending));
+            continue;
+        }
+        match resolve(&term.token) {
+            Ok((rel, field))
+                if items
+                    .iter()
+                    .any(|i| i.rel == rel && i.field.write_order == field.write_order) =>
             {
-                return Err(format!(
-                    "ORDER BY term '{}' must appear in the SELECT list of a join",
-                    term.token
-                ));
+                order_keys.push((rel, field, term.descending));
             }
-            order_keys.push((rel, field, term.descending));
+            _ => {
+                needs_expressions = true;
+                break;
+            }
         }
     }
-    let order_by = order_keys;
+    // Kept as written so the columns they read can be fetched below, and parsed
+    // once the relations' fetch lists are settled.
+    let order_expr_terms: Vec<crate::core::rql::order_by::SortTerm> = if needs_expressions {
+        order_by.clone()
+    } else {
+        Vec::new()
+    };
+    let order_by = if needs_expressions {
+        Vec::new()
+    } else {
+        order_keys
+    };
 
     // --- what each relation must fetch -----------------------------------
     let mut out_relations: Vec<Relation> = Vec::with_capacity(relations.len());
@@ -1885,6 +2069,25 @@ pub fn plan(
         for conjunct in &cross_relation {
             for field in schemas[i].iter() {
                 if term_names_column(conjunct, &r.label, &r.table, &field.name) {
+                    push(field, &mut fetch);
+                }
+            }
+        }
+        // The same for a key sorted by expression: it is evaluated against the
+        // combined row, so anything it reads has to be in it — and unlike a
+        // projected key, it need not appear in the SELECT list at all.
+        for term in &order_expr_terms {
+            for field in schemas[i].iter() {
+                if term_names_column(&term.token, &r.label, &r.table, &field.name) {
+                    push(field, &mut fetch);
+                }
+            }
+        }
+        // And for a select-list expression, which reads columns the projection
+        // has no other reason to fetch.
+        for (_, text) in &expression_items {
+            for field in schemas[i].iter() {
+                if term_names_column(text, &r.label, &r.table, &field.name) {
                     push(field, &mut fetch);
                 }
             }
@@ -1945,10 +2148,101 @@ pub fn plan(
         Some(build_post_join_filter(&cross_relation, &out_relations)?)
     };
 
+    // Parsed here, not with the rest of the ORDER BY: the combined row's schema
+    // is built from each relation's *fetch* list, which is only settled above.
+    let mut order_exprs: Vec<(crate::core::rql::expr::Expr, bool, Option<bool>)> = Vec::new();
+    let mut order_layout: Option<CombinedLayout> = None;
+    if !order_expr_terms.is_empty() || !expression_items.is_empty() {
+        let layout = combined_layout(&out_relations);
+
+        // A select-list expression, filled into the placeholder holding its
+        // position. Paired in order rather than by a recorded index: both lists
+        // are in select-list order, and an index taken before the aggregate
+        // stage ran no longer names the same item — removing by one of those
+        // deleted a real column and returned it as NULL.
+        let pending: Vec<usize> = items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| item.pending_expression)
+            .map(|(at, _)| at)
+            .collect();
+        for (position, (_, text)) in pending.iter().zip(expression_items.iter()) {
+            let (written, _) = split_expr_alias(text);
+            let mut rewritten = written.trim().to_string();
+            for (from, to) in &layout.renames {
+                rewritten = replace_qualified(&rewritten, from, to);
+            }
+            let parsed =
+                crate::core::rql::expr::parse(&rewritten, &layout.schema).map_err(|e| {
+                    format!(
+                        "the SELECT list item '{}' could not be read as an expression \
+                         over this join: {}",
+                        text.trim(),
+                        e
+                    )
+                })?;
+            // The declared type comes from the expression itself, so the row
+            // description and the bytes that follow it agree.
+            let db_type = crate::core::rql::expr::static_type(&parsed);
+            if let Some(item) = items.get_mut(*position) {
+                item.field.db_type = db_type.clone();
+                item.field.size = db_type.get_size();
+                item.expr = Some(parsed);
+                item.pending_expression = false;
+            }
+            // An aggregate pointing at this position was built before the type
+            // was known — `AVG` of an integer and `AVG` of a double do not
+            // report the same type, and the fold reads the argument's to decide.
+            if let Some(plan) = aggregate.as_mut() {
+                for fold_item in plan.items.iter_mut() {
+                    if let crate::core::rql::aggregate::SelectItem::Aggregate {
+                        arg: Some(field),
+                        ..
+                    } = fold_item
+                    {
+                        if field.write_order as usize == *position {
+                            field.db_type = db_type.clone();
+                            field.size = db_type.get_size();
+                        }
+                    }
+                }
+            }
+        }
+
+        for term in &order_expr_terms {
+            // A select-list label first, as the fast path resolves it — turned
+            // into the qualified column it stands for so the rename below
+            // reaches it like any other reference.
+            let written = match items.iter().find(|i| {
+                i.label.eq_ignore_ascii_case(&term.token)
+                    && i.scalar.is_none()
+                    && i.literal.is_none()
+            }) {
+                Some(item) => format!("{}.{}", out_relations[item.rel].label, item.field.name),
+                None => term.token.clone(),
+            };
+            let mut rewritten = written;
+            for (from, to) in &layout.renames {
+                rewritten = replace_qualified(&rewritten, from, to);
+            }
+            let expr = crate::core::rql::expr::parse(&rewritten, &layout.schema).map_err(|e| {
+                format!(
+                    "ORDER BY term '{}' is not a column of this join and could not be read \
+                     as an expression: {}",
+                    term.token, e
+                )
+            })?;
+            order_exprs.push((expr, term.descending, term.nulls_first));
+        }
+        order_layout = Some(layout);
+    }
+
     Ok(JoinPlan {
         relations: out_relations,
         items,
         order_by,
+        order_exprs,
+        order_layout,
         limit,
         offset,
         aggregate,
@@ -2011,10 +2305,30 @@ fn term_names_column(term: &str, label: &str, table: &str, column: &str) -> bool
 /// Names become `<label>__<column>` so two relations that both have `id` stay
 /// distinct — the reason the combined row needs a schema of its own rather than
 /// reusing either side's.
-fn build_post_join_filter(
-    terms: &[String],
-    relations: &[Relation],
-) -> Result<PostJoinFilter, String> {
+/// The synthetic schema a combined row is laid out to, and how to reach it.
+///
+/// Shared by the post-join predicate and the join's `ORDER BY` expressions:
+/// both evaluate against the same flattened row, and building it twice by two
+/// slightly different rules is how the two would come to disagree about which
+/// column a name means.
+#[derive(Debug, Clone)]
+pub struct CombinedLayout {
+    /// The synthetic schema, in write order.
+    pub schema: Vec<SchemaField>,
+    /// `columns[relation][i]` is the synthetic write order of that relation's
+    /// `fetch_columns[i]`.
+    pub columns: Vec<Vec<u64>>,
+    /// `t.col` -> `t__col`, longest first so `a.bc` is not partly rewritten by
+    /// a rule for `a.b`.
+    pub renames: Vec<(String, String)>,
+}
+
+/// Flattens every relation's fetched columns into one synthetic schema.
+///
+/// Names become `<label>__<column>` so two relations that both have `id` stay
+/// distinct — the reason the combined row needs a schema of its own rather than
+/// reusing either side's.
+pub fn combined_layout(relations: &[Relation]) -> CombinedLayout {
     let mut schema: Vec<SchemaField> = Vec::new();
     let mut columns: Vec<Vec<u64>> = Vec::with_capacity(relations.len());
     let mut renames: Vec<(String, String)> = Vec::new();
@@ -2038,8 +2352,94 @@ fn build_post_join_filter(
         columns.push(mapping);
     }
 
-    // Longest first, so `a.bc` is not partly rewritten by a rule for `a.b`.
     renames.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
+    CombinedLayout {
+        schema,
+        columns,
+        renames,
+    }
+}
+
+/// Flattens one combined tuple into a row laid out to [`CombinedLayout::schema`].
+///
+/// A relation left unmatched by an outer join contributes empty values, which
+/// is how a NULL is stored.
+///
+/// **A NULL has to carry through as a NULL.** The evaluator reads a cell's
+/// *type* to decide that, and this row is rebuilt from declared types — so the
+/// companion's flag is turned into `DbType::NULL` here, or every NULL arrives
+/// as a value holding zeroes and comparisons against it quietly succeed.
+pub fn combined_row(plan: &JoinPlan, columns_map: &[Vec<u64>], tuple: &Combined) -> Row {
+    let mut columns: SmallVec<[Column; 32]> = SmallVec::new();
+    for (rel, mapping) in columns_map.iter().enumerate() {
+        for (i, write_order) in mapping.iter().enumerate() {
+            let field = &plan.relations[rel].fetch_columns[i];
+            let source = tuple.get(rel).and_then(|r| r.as_ref()).and_then(|row| {
+                row.columns
+                    .iter()
+                    .find(|c| c.schema_id == field.write_order)
+            });
+            let data = source.map(|c| c.data.clone()).unwrap_or_default();
+
+            // An outer join that matched nothing contributes no row at all, and
+            // every column it would have supplied is NULL by definition. Typed
+            // NULL here rather than left as the declared type holding no bytes:
+            // the evaluator decides nullness from the *type*, so an untyped
+            // empty value is a present value — `COALESCE(s.a, t.b)` returned
+            // that emptiness instead of falling through to `t.b`, and it then
+            // compared as incomparable, which a sort reads as "equal" and
+            // leaves in scan order while reporting the rows as ordered.
+            let unmatched = tuple.get(rel).and_then(|r| r.as_ref()).is_none();
+            let is_null = unmatched
+                || plan.relations[rel]
+                    .fetch_columns
+                    .iter()
+                    .find(|f| {
+                        crate::core::rql::nullable::is_hidden(&f.name)
+                            && f.name.len() > crate::core::rql::nullable::NULL_FLAG_PREFIX.len()
+                            && f.name[crate::core::rql::nullable::NULL_FLAG_PREFIX.len()..]
+                                .eq_ignore_ascii_case(&field.name)
+                    })
+                    .and_then(|flag| {
+                        tuple.get(rel).and_then(|r| r.as_ref()).and_then(|row| {
+                            row.columns
+                                .iter()
+                                .find(|c| c.schema_id == flag.write_order)
+                                .map(|c| {
+                                    crate::core::rql::nullable::flag_is_set(c.data.into_slice())
+                                })
+                        })
+                    })
+                    .unwrap_or(false);
+
+            columns.push(Column {
+                schema_id: *write_order,
+                data,
+                column_type: if is_null {
+                    crate::core::db_type::DbType::NULL
+                } else {
+                    field.db_type.clone()
+                },
+            });
+        }
+    }
+    Row {
+        position: 0,
+        length: 0,
+        columns,
+    }
+}
+
+/// Rewrites the cross-relation terms against the combined layout.
+fn build_post_join_filter(
+    terms: &[String],
+    relations: &[Relation],
+) -> Result<PostJoinFilter, String> {
+    let CombinedLayout {
+        schema,
+        columns,
+        renames,
+    } = combined_layout(relations);
 
     let schema_sv: smallvec::SmallVec<[SchemaField; 20]> = schema.iter().cloned().collect();
 
@@ -2048,12 +2448,39 @@ fn build_post_join_filter(
     // rather than per statement keeps the fast path for everything ordinary:
     // one term needing `||` does not push the rest onto the slower evaluator.
     let mut tokenizer_terms: Vec<String> = Vec::new();
-    let mut expr_terms: Vec<crate::core::rql::expr::Condition> = Vec::new();
+    let mut expr_terms: Vec<crate::core::rql::expr::Cond> = Vec::new();
+
+    // Relations that may contribute no row at all: the right side of a LEFT
+    // JOIN. Their columns arrive *empty* in the combined row when nothing
+    // matched, and the predicate tokenizer compares fixed-width operands by
+    // size — eight bytes of timestamp against nothing is `OperandSizeMismatch`,
+    // reported bare, with no hint that an outer join is involved.
+    //
+    // The expression evaluator reads the cell's *type*, which `combined_row`
+    // sets to NULL for exactly those cells, so it answers "unknown" as SQL
+    // says it should. A term that can see one is therefore sent there, even
+    // though the tokenizer would happily compile it.
+    let optional: Vec<bool> = relations
+        .iter()
+        .map(|r| matches!(r.join.as_ref().map(|j| j.kind), Some(JoinKind::Left)))
+        .collect();
 
     for term in terms {
+        let touches_optional = relations.iter().enumerate().any(|(at, relation)| {
+            optional[at]
+                && relation.fetch_columns.iter().any(|field| {
+                    term_names_column(term, &relation.label, &relation.table, &field.name)
+                })
+        });
+
         let mut rewritten = term.clone();
         for (from, to) in &renames {
             rewritten = replace_qualified(&rewritten, from, to);
+        }
+
+        if touches_optional {
+            expr_terms.push(crate::core::rql::expr::parse_cond(&rewritten, &schema)?);
+            continue;
         }
 
         match crate::core::tokenizer::predicate_rewrite::rewrite_where(&rewritten, &schema_sv) {
@@ -2066,9 +2493,7 @@ fn build_post_join_filter(
             _ => {
                 // Refused rather than dropped if this fails too: a join term
                 // silently ignored would widen the result set.
-                expr_terms.push(crate::core::rql::expr::parse_condition(
-                    &rewritten, &schema,
-                )?);
+                expr_terms.push(crate::core::rql::expr::parse_cond(&rewritten, &schema)?);
             }
         }
     }
@@ -2080,6 +2505,53 @@ fn build_post_join_filter(
         columns,
         expr_terms,
     })
+}
+
+/// The `a.b` and bare `b` identifiers a predicate mentions, in order.
+///
+/// Deliberately generous: a keyword or a function name may come back, and the
+/// caller discards whatever does not resolve to a column. Anything inside a
+/// string literal is skipped, so `WHERE status = 'a.b'` names nothing.
+fn column_references(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'\'' {
+            quote = Some(c);
+            i += 1;
+            continue;
+        }
+        if c.is_ascii_alphabetic() || c == b'_' || c == b'"' {
+            let start = i;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric()
+                    || bytes[i] == b'_'
+                    || bytes[i] == b'.'
+                    || bytes[i] == b'"')
+            {
+                i += 1;
+            }
+            let word = text[start..i].trim_end_matches('.');
+            // A call, not a column: the name is followed by `(`.
+            let is_call = bytes.get(i) == Some(&b'(');
+            if !word.is_empty() && !is_call && !out.iter().any(|w| w == word) {
+                out.push(word.to_string());
+            }
+            continue;
+        }
+        i += 1;
+    }
+    out
 }
 
 /// Replaces a qualified name with another, matching whole identifiers only and
@@ -2135,6 +2607,10 @@ fn build_aggregate_stage(
     offset: Option<u64>,
     items: &mut Vec<JoinSelectItem>,
     resolve: &dyn Fn(&str) -> Result<(usize, SchemaField), String>,
+    // Aggregate arguments that are expressions, in the order their placeholder
+    // items were pushed. The caller parses them once the fetch lists are
+    // settled and fills in both the item and the aggregate's argument type.
+    expr_arguments: &mut Vec<String>,
 ) -> Result<Option<crate::core::rql::aggregate::AggregatePlan>, String> {
     use crate::core::rql::aggregate::{AggFunc, Having, SelectItem};
 
@@ -2147,22 +2623,6 @@ fn build_aggregate_stage(
     // recognised as aggregating at all: it fell through to the projection,
     // which has no aggregate to project, and the statement answered one row of
     // NULL instead of the sum.
-    // Named rather than left to fail deeper as "'__agg_0 FILTER (WHERE …)' is
-    // neither a column nor a value", which describes the internal name this
-    // path substituted rather than anything the author wrote. The
-    // single-relation path carries the clause; a join does not yet.
-    for item in split_top_level(select_list) {
-        let upper = item.to_ascii_uppercase();
-        if let Some(at) = upper.find("FILTER") {
-            let before_ok = at == 0 || !upper.as_bytes()[at - 1].is_ascii_alphanumeric();
-            if before_ok && item[at + "FILTER".len()..].trim_start().starts_with('(') {
-                return Err(
-                    "an aggregate FILTER (WHERE …) is not supported over a join yet".to_string(),
-                );
-            }
-        }
-    }
-
     let has_call = select_list.trim() != "*"
         && split_top_level(select_list).iter().any(|item| {
             let (expr, _) = split_expr_alias(item.trim());
@@ -2202,6 +2662,8 @@ fn build_aggregate_stage(
                     label: field.name.clone(),
                     scalar: None,
                     literal: None,
+                    expr: None,
+                    pending_expression: false,
                 });
                 items.len() - 1
             }
@@ -2228,12 +2690,109 @@ fn build_aggregate_stage(
         }
     }
 
+    // The predicate of one `FILTER (WHERE …)`, resolved against the *projected*
+    // row the fold sees.
+    //
+    // The clause names columns by relation — `c.closed_at` — and the fold has
+    // only the projected row, so each referenced column is added to the
+    // projection (if it is not there already) and the predicate is rewritten to
+    // address it by position. Names become `<label>__<column>` for the same
+    // reason the post-join filter does it: two relations may both have `id`.
+    let filter_over_join = |text: &str,
+                            items: &mut Vec<JoinSelectItem>|
+     -> Result<crate::core::rql::aggregate::AggregateFilter, String> {
+        let mut schema: Vec<SchemaField> = Vec::new();
+        let mut renames: Vec<(String, String)> = Vec::new();
+        for name in column_references(text) {
+            // Not every identifier is a column — `WHERE status = 'queued'`
+            // holds one of each — so anything that does not resolve is left
+            // alone for `parse_condition` to judge.
+            let Ok((rel, field)) = resolve(&name) else {
+                continue;
+            };
+            let positioned = positional(rel, field.clone(), items);
+            // Qualified references get a unique synthetic name, because two
+            // relations may both have `id`. An unqualified one already had to
+            // be unambiguous for `resolve` to accept it.
+            let unique = match name.split_once('.') {
+                Some((qualifier, column)) => {
+                    let unique = format!("{}__{}", qualifier, column);
+                    renames.push((name.clone(), unique.clone()));
+                    unique
+                }
+                None => field.name.clone(),
+            };
+            let mut synthetic = positioned;
+            synthetic.name = unique;
+            if !schema
+                .iter()
+                .any(|f: &SchemaField| f.name == synthetic.name)
+            {
+                schema.push(synthetic);
+            }
+        }
+        // Longest first, so `a.bc` is not partly rewritten by a rule for `a.b`.
+        renames.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
+        let mut rewritten = text.to_string();
+        for (from, to) in &renames {
+            rewritten = replace_qualified(&rewritten, from, to);
+        }
+        let condition = crate::core::rql::expr::parse_cond(&rewritten, &schema)?;
+        // No NULL companions here, unlike the single-relation path: `project`
+        // already types an absent or unmatched value as `NULL`, so the row the
+        // fold reads carries its own nullness.
+        Ok(crate::core::rql::aggregate::AggregateFilter { condition, schema })
+    };
+
     let mut fold_items: Vec<SelectItem> = Vec::new();
     for raw in split_top_level(select_list) {
         let entry = raw.trim();
         if entry.is_empty() {
             continue;
         }
+        // Peeled before anything reads the item as a call, exactly as the
+        // single-relation path does: a cast usually follows the clause, and
+        // leaving it attached sends the item down the wrapped-aggregate path.
+        let (rebuilt, filter_text) = crate::core::rql::lexer_query::split_aggregate_filter(entry);
+        // A cast around a filtered aggregate — `(AVG(x) FILTER (…))::float8`,
+        // which is how sea-orm writes one — would otherwise make the item an
+        // expression *around* a call and take the wrapped-aggregate path, which
+        // carries no filter. Dropped for the same reason the single-relation
+        // path drops it: it is a no-op on a count, and on an average it only
+        // widens what the argument already produces.
+        let rebuilt = rebuilt.map(|text| {
+            let (head, alias) = split_expr_alias(&text);
+            // sea-orm writes a filtered aggregate as
+            // `(AVG(x) FILTER (…))::float8`, so removing the clause leaves
+            // `(AVG(x))::float8` — a cast around a parenthesised call. Both
+            // wrappers have to come off, in whichever order they appear, or the
+            // "function name" before the first `(` is the empty string.
+            //
+            // The cast is dropped rather than applied: it is a no-op on a count,
+            // and on an average it only widens what the argument already
+            // produces. Parentheses are peeled only when the pair encloses the
+            // *whole* expression, so `(a + b) * 2` is untouched.
+            let mut call = head.trim();
+            loop {
+                let before = call;
+                if call.starts_with('(')
+                    && crate::core::rql::expr::matching_paren(call, 0) == Some(call.len() - 1)
+                {
+                    call = call[1..call.len() - 1].trim();
+                }
+                if let Some((inner, _)) = crate::core::rql::expr::trailing_cast(call) {
+                    call = inner.trim();
+                }
+                if call == before {
+                    break;
+                }
+            }
+            match alias {
+                Some(alias) => format!("{} AS {}", call, alias),
+                None => call.to_string(),
+            }
+        });
+        let entry = rebuilt.as_deref().unwrap_or(entry);
         let (expr, alias) = split_expr_alias(entry);
 
         // An expression *around* an aggregate — `COALESCE(SUM(x), 0)`,
@@ -2265,6 +2824,12 @@ fn build_aggregate_stage(
                     }
                     None
                 } else {
+                    // An aggregate wrapped in an expression addresses its
+                    // argument through a synthetic `__agg_N` slot whose type is
+                    // fixed when the slot is made, so an argument whose type is
+                    // only known later cannot be carried here yet. Refused, and
+                    // loudly: filling it in with a placeholder type produced a
+                    // silently NULL column instead of an error.
                     let (rel, field) = resolve(arg_text)?;
                     Some(positional(rel, field, items))
                 };
@@ -2312,18 +2877,59 @@ fn build_aggregate_stage(
                     return Err(format!("{}(*) is not valid", func_name.to_uppercase()));
                 }
                 None
-            } else {
-                let (rel, field) = resolve(arg_text)?;
+            } else if let Ok((rel, field)) = resolve(arg_text) {
                 Some(positional(rel, field, items))
+            } else {
+                // `AVG(EXTRACT(EPOCH FROM (a - b)))` — the argument is computed,
+                // not read. The fold addresses an argument as a column of the
+                // projected row, so the value is projected as one and the
+                // aggregate points at that position.
+                //
+                // Its type is not known yet: the expression can only be parsed
+                // once the relations' fetch lists are settled, and an
+                // aggregate's result type depends on its argument's. Both are
+                // filled in afterwards, and `expr_arguments` is what says which
+                // item to fill.
+                let position = items.len();
+                items.push(JoinSelectItem {
+                    rel: 0,
+                    field: SchemaField::new(
+                        arg_text.to_string(),
+                        DbType::F64,
+                        DbType::F64.get_size(),
+                        0,
+                        0,
+                        false,
+                    ),
+                    label: arg_text.to_string(),
+                    scalar: None,
+                    literal: None,
+                    expr: None,
+                    pending_expression: true,
+                });
+                expr_arguments.push(arg_text.to_string());
+                Some(SchemaField::new(
+                    arg_text.to_string(),
+                    DbType::F64,
+                    DbType::F64.get_size(),
+                    0,
+                    position as u64,
+                    false,
+                ))
             };
 
+            let filter = match &filter_text {
+                Some(text) => Some(filter_over_join(text, items)?),
+                None => None,
+            };
             fold_items.push(SelectItem::Aggregate {
                 func,
                 arg,
                 label: alias.unwrap_or_else(|| func.name().to_string()),
-                // A join does not carry an aggregate FILTER through the fold
-                // yet; the single-relation path parses it.
-                filter: None,
+                filter,
+                // The join projects a computed argument as a column instead, so
+                // the fold reads it positionally like any other.
+                arg_expr: None,
             });
         } else {
             let (rel, field) = resolve(expr)?;
@@ -2442,17 +3048,36 @@ fn split_expr_alias(entry: &str) -> (&str, Option<String>) {
         return (entry.trim_end(), None);
     }
 
+    // A cast after the last `)` belongs to the *expression*, not to the alias:
+    // `(AVG(x))::float8 AS avg` has the tail `::float8 AS avg`, whose first
+    // word is neither `AS` nor a name. Without this it fell through to the
+    // whitespace split below, which cut the item at its first space — inside
+    // `EXTRACT(EPOCH FROM …)` that produced `(AVG(EXTRACT(EPOCH` with the alias
+    // `FROM`.
+    let leading = tail.len() - tail.trim_start().len();
+    let trimmed_tail = tail.trim_start();
+    let (expr_end, tail) = if trimmed_tail.starts_with("::") {
+        let cast_len = trimmed_tail
+            .find(char::is_whitespace)
+            .unwrap_or(trimmed_tail.len());
+        (tail_start + leading + cast_len, &trimmed_tail[cast_len..])
+    } else {
+        (tail_start, tail)
+    };
+
     let mut words = tail.split_whitespace();
 
     match (words.next(), words.next()) {
         (Some(first), Some(second)) if first.eq_ignore_ascii_case("AS") => (
-            entry[..tail_start].trim_end(),
+            entry[..expr_end].trim_end(),
             Some(second.trim_matches('"').to_string()),
         ),
         (Some(first), None) if tail_start > 0 => (
-            entry[..tail_start].trim_end(),
+            entry[..expr_end].trim_end(),
             Some(first.trim_matches('"').to_string()),
         ),
+        // A cast and nothing after it: the whole item is the expression.
+        (None, _) if expr_end > tail_start => (entry[..expr_end].trim_end(), None),
         _ => {
             let mut parts = entry.split_whitespace();
             let head = parts.next().unwrap_or(entry);
@@ -2870,6 +3495,8 @@ mod tests {
                     label: "name".into(),
                     scalar: None,
                     literal: None,
+                    expr: None,
+                    pending_expression: false,
                 },
                 JoinSelectItem {
                     rel: 1,
@@ -2877,9 +3504,13 @@ mod tests {
                     label: "domain".into(),
                     scalar: None,
                     literal: None,
+                    expr: None,
+                    pending_expression: false,
                 },
             ],
             order_by: Vec::new(),
+            order_exprs: Vec::new(),
+            order_layout: None,
             limit: None,
             offset: None,
             aggregate: None,
