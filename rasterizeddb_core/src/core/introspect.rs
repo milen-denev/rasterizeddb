@@ -6,6 +6,9 @@
 //! SHOW TABLES                  -- a row per table, with its sizes
 //! SHOW TABLE STATS <table>     -- one metric per row, for one table
 //! SHOW COLUMNS FROM <table>    -- a row per column  (also: DESCRIBE <table>)
+//! SHOW QUERIES [n]             -- the last n statements, newest first
+//! SHOW QUERY STATS             -- one row per statement shape, with its totals
+//! RESET QUERY STATS            -- forget both
 //! SHOW SCHEMA MAP              -- a row per relationship, for drawing a graph
 //! SHOW CONFIG                  -- every runtime knob, its value and how to change it
 //! SHOW CONFIG KEYS             -- what SET CONFIG accepts
@@ -57,9 +60,19 @@ pub enum Introspect {
     Columns(String),
     SchemaMap,
     BackupStatus,
+    /// The last `n` statements this server answered, newest first. `None`
+    /// takes whatever the ring holds.
+    RecentQueries(Option<u64>),
+    /// Every statement shape and what it has cost in total.
+    QueryStats,
+    /// Empties both of the above.
+    ResetQueryStats,
     Config,
     ConfigKeys,
-    SetConfig { key: String, value: String },
+    SetConfig {
+        key: String,
+        value: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -96,6 +109,15 @@ pub fn parse(sql: &str) -> Option<Result<Introspect, String>> {
             }
             Some(_) => Some(Err(format!("{} takes one table name", words[0]))),
             None => Some(Err(format!("{} names no table", words[0]))),
+        };
+    }
+
+    // `RESET QUERY STATS`. The only `RESET` this surface owns; every other one
+    // is a runtime parameter the wire protocol answers for itself.
+    if words.first().copied() == Some("RESET") && words.get(1).copied() == Some("QUERY") {
+        return match (words.get(2).copied(), words.len()) {
+            (Some("STATS"), 3) => Some(Ok(Introspect::ResetQueryStats)),
+            _ => Some(Err("the statement is `RESET QUERY STATS`".to_string())),
         };
     }
 
@@ -184,6 +206,29 @@ pub fn parse(sql: &str) -> Option<Result<Introspect, String>> {
             }
             Some(Ok(Introspect::BackupStatus))
         }
+        // `SHOW QUERIES` and `SHOW QUERIES 50`. The count is a cap on what is
+        // returned, not on what is kept — the ring's size is
+        // `SET CONFIG query_stats.recent`.
+        Some("QUERIES") => match original.get(2) {
+            None => Some(Ok(Introspect::RecentQueries(None))),
+            Some(count) if original.len() == 3 => match count.parse::<u64>() {
+                Ok(n) => Some(Ok(Introspect::RecentQueries(Some(n)))),
+                Err(_) => Some(Err(format!(
+                    "SHOW QUERIES takes a row count, and `{}` is not one",
+                    count
+                ))),
+            },
+            Some(_) => Some(Err("SHOW QUERIES takes at most a row count".to_string())),
+        },
+        Some("QUERY") if words.get(2).copied() == Some("STATS") => {
+            if words.len() > 3 {
+                return Some(Err(format!(
+                    "SHOW QUERY STATS takes no arguments; unexpected {:?}",
+                    original[3]
+                )));
+            }
+            Some(Ok(Introspect::QueryStats))
+        }
         Some("SCHEMA") if words.get(2).copied() == Some("MAP") => {
             if words.len() > 3 {
                 return Some(Err(format!(
@@ -231,6 +276,8 @@ pub fn result_fields(statement: &Introspect) -> Option<Vec<(String, DbType)>> {
     let text = |name: &str| (name.to_string(), DbType::STRING);
     let number = |name: &str| (name.to_string(), DbType::U64);
     let flag = |name: &str| (name.to_string(), DbType::BOOL);
+    let real = |name: &str| (name.to_string(), DbType::F64);
+    let signed = |name: &str| (name.to_string(), DbType::I64);
 
     Some(match statement {
         // A metric per row rather than a column per metric: the set of metrics
@@ -271,6 +318,44 @@ pub fn result_fields(statement: &Introspect) -> Option<Vec<(String, DbType)>> {
             text("json_table"),
             flag("is_dropped"),
         ],
+        // What ran, what it cost, and how much of the table it had to read.
+        // `rows_scanned` against `rows` is the ratio that says why a statement
+        // is slow *when it is scan-bound*; `materialised` is the other cost
+        // centre, and a statement can be expensive for either reason or both.
+        // They are separate columns rather than one because they are different
+        // kinds of number — `rows_scanned` means something against `rows` as a
+        // ratio, a materialisation count means something on its own and has no
+        // denominator. See `core::query_stats` for what is and is not counted.
+        Introspect::RecentQueries(_) => vec![
+            text("started_at"),
+            real("duration_ms"),
+            number("rows"),
+            number("rows_scanned"),
+            number("materialised"),
+            real("materialised_ms"),
+            text("status"),
+            text("database"),
+            text("username"),
+            text("statement"),
+            text("error"),
+        ],
+        Introspect::QueryStats => vec![
+            signed("queryid"),
+            number("calls"),
+            real("total_ms"),
+            real("mean_ms"),
+            real("min_ms"),
+            real("max_ms"),
+            real("stddev_ms"),
+            number("rows"),
+            number("rows_scanned"),
+            number("materialised"),
+            real("materialised_ms"),
+            number("errors"),
+            text("last_seen"),
+            text("statement"),
+        ],
+        Introspect::ResetQueryStats => vec![text("result")],
         Introspect::SchemaMap => vec![
             text("kind"),
             text("from_table"),
@@ -311,6 +396,18 @@ pub async fn execute(statement: &Introspect, database: &Arc<Database>) -> Vec<u8
             Err(e) => failure(&e),
         },
         Introspect::SchemaMap => rows(schema_map(database)),
+        Introspect::RecentQueries(limit) => match recent_queries(*limit) {
+            Ok(r) => rows(r),
+            Err(e) => failure(&e),
+        },
+        Introspect::QueryStats => match query_stats() {
+            Ok(r) => rows(r),
+            Err(e) => failure(&e),
+        },
+        Introspect::ResetQueryStats => match reset_query_stats() {
+            Ok(message) => rows(vec![row(&[Cell::Text(message)])]),
+            Err(e) => failure(&e),
+        },
         Introspect::BackupStatus => rows(backup_status(database).await),
         Introspect::Config => rows(config(database)),
         Introspect::ConfigKeys => rows(config_keys()),
@@ -1531,6 +1628,20 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         help: "how long a sender waits for more records",
     },
     ConfigKey {
+        section: "query_stats",
+        key: "enabled",
+        hot: true,
+        set_with: "SET CONFIG query_stats.enabled = off",
+        help: "record what each statement cost, for SHOW QUERIES and pg_stat_statements",
+    },
+    ConfigKey {
+        section: "query_stats",
+        key: "recent",
+        hot: true,
+        set_with: "SET CONFIG query_stats.recent = 256",
+        help: "statements kept for SHOW QUERIES; the per-shape totals are kept regardless",
+    },
+    ConfigKey {
         section: "vacuum",
         key: "enabled",
         hot: true,
@@ -1600,6 +1711,17 @@ fn config(database: &Arc<Database>) -> Vec<Row> {
             // Reclamation is per table, and the whole point of reporting it
             // here is that a console can turn it off for a database. It reads
             // as on unless every table has it off.
+            #[cfg(feature = "query_stats")]
+            ("query_stats", "enabled") => if crate::core::query_stats::enabled() {
+                "on"
+            } else {
+                "off"
+            }
+            .to_string(),
+            #[cfg(feature = "query_stats")]
+            ("query_stats", "recent") => crate::core::query_stats::capacity().to_string(),
+            #[cfg(not(feature = "query_stats"))]
+            ("query_stats", _) => "not built".to_string(),
             ("vacuum", "enabled") => "per table".to_string(),
             _ => String::new(),
         }
@@ -1708,6 +1830,49 @@ async fn set_config(database: &Arc<Database>, key: &str, value: &str) -> Result<
             .await?;
             Ok(lines.join("; "))
         }
+        "query_stats" => {
+            #[cfg(not(feature = "query_stats"))]
+            {
+                let _ = value;
+                Err(NO_QUERY_STATS.to_string())
+            }
+            #[cfg(feature = "query_stats")]
+            match name {
+                "enabled" => {
+                    let on = parse_bool(value)?;
+                    crate::core::query_stats::set_enabled(on);
+                    // Turning it off is not the same as forgetting: what was
+                    // recorded stays readable, which is what someone turning it
+                    // off *because* of what they just saw would expect.
+                    Ok(format!(
+                        "statement statistics are now {}{}",
+                        if on { "on" } else { "off" },
+                        if on {
+                            ""
+                        } else {
+                            "; what was already recorded is still readable"
+                        }
+                    ))
+                }
+                "recent" => {
+                    let n: usize = value
+                        .trim()
+                        .parse()
+                        .map_err(|_| format!("`{}` is not a number of statements", value))?;
+                    crate::core::query_stats::set_capacity(n);
+                    Ok(format!(
+                        "SHOW QUERIES now keeps {} statement{}",
+                        crate::core::query_stats::capacity(),
+                        if crate::core::query_stats::capacity() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        }
+                    ))
+                }
+                _ => Err(format!("`{}` has no live setter", key)),
+            }
+        }
         "vacuum" => {
             let enabled = parse_bool(value)?;
             let mut touched = 0usize;
@@ -1785,10 +1950,126 @@ fn action_name(action: &crate::core::rql::foreign_key::ReferentialAction) -> &'s
     }
 }
 
+// ---------------------------------------------------------------------------
+// Query statistics
+// ---------------------------------------------------------------------------
+
+/// Why there is nothing to report, when the binary cannot report it.
+///
+/// An error rather than an empty result set, for the same reason `SHOW BACKUP
+/// STATUS` says so: "nothing has run yet" and "this build does not record what
+/// runs" want two different things done about them.
+#[cfg(not(feature = "query_stats"))]
+const NO_QUERY_STATS: &str = "this server was built without the `query_stats` feature, so it records nothing about      what it runs; rebuild with `--features query_stats`";
+
+#[cfg(not(feature = "query_stats"))]
+fn recent_queries(_limit: Option<u64>) -> Result<Vec<Row>, String> {
+    Err(NO_QUERY_STATS.to_string())
+}
+
+#[cfg(not(feature = "query_stats"))]
+fn query_stats() -> Result<Vec<Row>, String> {
+    Err(NO_QUERY_STATS.to_string())
+}
+
+#[cfg(not(feature = "query_stats"))]
+fn reset_query_stats() -> Result<String, String> {
+    Err(NO_QUERY_STATS.to_string())
+}
+
+/// The last statements this server answered, newest first.
+///
+/// The text is what the client sent, minus comments and minus anything after a
+/// `PASSWORD` keyword. It is **not** filtered by who is asking: any session
+/// that can run this sees every session's statements, which is the same
+/// exposure `SHOW CONFIG` already carries and the reason
+/// [`crate::core::query_stats`] redacts before storing rather than before
+/// printing.
+#[cfg(feature = "query_stats")]
+fn recent_queries(limit: Option<u64>) -> Result<Vec<Row>, String> {
+    let limit = limit.map(|n| n as usize).unwrap_or(usize::MAX);
+    Ok(crate::core::query_stats::recent(limit)
+        .into_iter()
+        .map(|record| {
+            let status = if record.error.is_some() {
+                "error"
+            } else {
+                "ok"
+            };
+            row(&[
+                Cell::Text(crate::pg_params::format_timestamp_us(
+                    record.started_unix_us,
+                )),
+                Cell::Real(record.duration_us as f64 / 1_000.0),
+                Cell::Number(record.rows),
+                Cell::Number(record.rows_scanned),
+                Cell::Number(record.materialised),
+                Cell::Real(record.materialised_us as f64 / 1_000.0),
+                Cell::Text(status.to_string()),
+                Cell::Text(record.database),
+                Cell::Text(record.username),
+                Cell::Text(record.sql),
+                Cell::Text(record.error.unwrap_or_default()),
+            ])
+        })
+        .collect())
+}
+
+/// One row per statement shape, the most expensive in total first.
+#[cfg(feature = "query_stats")]
+fn query_stats() -> Result<Vec<Row>, String> {
+    Ok(crate::core::query_stats::aggregated()
+        .into_iter()
+        .map(|agg| {
+            row(&[
+                // The hash uses the whole 64-bit range, so it is reported
+                // signed — as PostgreSQL reports `queryid` — rather than as a
+                // count that happens to be enormous.
+                Cell::Signed(agg.queryid as i64),
+                Cell::Number(agg.calls),
+                Cell::Real(agg.total_us as f64 / 1_000.0),
+                Cell::Real(agg.mean_us() / 1_000.0),
+                Cell::Real(agg.min_us as f64 / 1_000.0),
+                Cell::Real(agg.max_us as f64 / 1_000.0),
+                Cell::Real(agg.stddev_us() / 1_000.0),
+                Cell::Number(agg.rows),
+                Cell::Number(agg.rows_scanned),
+                Cell::Number(agg.materialised),
+                Cell::Real(agg.materialised_us as f64 / 1_000.0),
+                Cell::Number(agg.errors),
+                Cell::Text(crate::pg_params::format_timestamp_us(agg.last_seen_unix_us)),
+                Cell::Text(agg.query),
+            ])
+        })
+        .collect())
+}
+
+#[cfg(feature = "query_stats")]
+fn reset_query_stats() -> Result<String, String> {
+    let (recent, shapes) = crate::core::query_stats::reset();
+    Ok(format!(
+        "forgot {} recent statement{} and {} statement shape{}",
+        recent,
+        if recent == 1 { "" } else { "s" },
+        shapes,
+        if shapes == 1 { "" } else { "s" }
+    ))
+}
+
+/// Two of these are only ever constructed by the statement-statistics rows, so
+/// a build without that feature has them declared and unused.
+#[cfg_attr(not(feature = "query_stats"), allow(dead_code))]
 enum Cell {
     Text(String),
     Number(u64),
     Flag(bool),
+    /// A duration in milliseconds. Rendered rather than rounded to whole
+    /// microseconds: a statement that took 340 µs reads as `0.34`, and a
+    /// console that only ever saw `0` could not tell it from an instant one.
+    Real(f64),
+    /// A signed 64-bit integer, for the one figure here that is a hash rather
+    /// than a count and so uses the whole range including the negative half.
+    Signed(i64),
 }
 
 fn row(cells: &[Cell]) -> Row {
@@ -1798,6 +2079,8 @@ fn row(cells: &[Cell]) -> Row {
             Cell::Text(text) => (text.as_bytes().to_vec(), DbType::STRING),
             Cell::Number(n) => (n.to_le_bytes().to_vec(), DbType::U64),
             Cell::Flag(b) => (vec![u8::from(*b)], DbType::BOOL),
+            Cell::Real(v) => (v.to_le_bytes().to_vec(), DbType::F64),
+            Cell::Signed(v) => (v.to_le_bytes().to_vec(), DbType::I64),
         };
         let mut block = MEMORY_POOL.acquire(bytes.len());
         block.into_slice_mut().copy_from_slice(&bytes);
@@ -1874,6 +2157,29 @@ mod tests {
         );
         assert_eq!(ok("DESCRIBE users"), Introspect::Columns("users".into()));
         assert_eq!(ok("DESC users"), Introspect::Columns("users".into()));
+        assert_eq!(ok("SHOW QUERIES"), Introspect::RecentQueries(None));
+        assert_eq!(ok("show queries;"), Introspect::RecentQueries(None));
+        assert_eq!(ok("SHOW QUERIES 20"), Introspect::RecentQueries(Some(20)));
+        assert_eq!(ok("SHOW QUERY STATS"), Introspect::QueryStats);
+        assert_eq!(ok("RESET QUERY STATS"), Introspect::ResetQueryStats);
+        assert_eq!(ok("reset query stats;"), Introspect::ResetQueryStats);
+    }
+
+    /// A statement that starts like one of these and then goes wrong says which
+    /// clause was unusable, rather than falling through to "unsupported query"
+    /// — which would send `SHOW QUERIES x` to the engine to be parsed as SQL.
+    #[test]
+    fn the_statistics_statements_report_their_own_mistakes() {
+        let err = |sql: &str| parse(sql).expect("recognised").expect_err("rejected");
+        assert!(err("SHOW QUERIES x").contains("row count"));
+        assert!(err("SHOW QUERIES 10 20").contains("at most a row count"));
+        assert!(err("SHOW QUERY STATS extra").contains("no arguments"));
+        assert!(err("RESET QUERY").contains("RESET QUERY STATS"));
+        // `RESET` of anything else is not this surface's business: the wire
+        // protocol answers `RESET search_path` for itself, and claiming it here
+        // would turn a parameter reset into an error.
+        assert!(parse("RESET search_path").is_none());
+        assert!(parse("RESET ALL").is_none());
     }
 
     /// A console quotes and schema-qualifies every identifier, so the name
@@ -2082,6 +2388,9 @@ mod tests {
                 key: "k".into(),
                 value: "v".into(),
             },
+            Introspect::RecentQueries(None),
+            Introspect::QueryStats,
+            Introspect::ResetQueryStats,
         ] {
             let fields = result_fields(&statement).expect("described");
             assert!(!fields.is_empty(), "{:?} describes no columns", statement);

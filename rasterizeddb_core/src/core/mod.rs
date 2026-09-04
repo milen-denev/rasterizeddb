@@ -19,6 +19,9 @@ pub mod mvcc;
 pub mod pg_ops;
 pub mod pg_types;
 pub mod processor;
+/// What ran recently and what it cost, behind the `query_stats` feature.
+#[cfg(feature = "query_stats")]
+pub mod query_stats;
 /// Cutting statement text at a secret, for every surface that keeps one.
 pub mod redact;
 pub mod row;

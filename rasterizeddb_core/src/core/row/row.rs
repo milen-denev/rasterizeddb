@@ -263,6 +263,42 @@ pub fn rows_into_vec(rows: Vec<Row>) -> Vec<u8> {
     vec
 }
 
+/// How many rows a serialized result holds, without decoding any of them.
+///
+/// Each row is a length header followed by that many bytes, so counting is a
+/// walk of the headers. The statement log needs the figure for every result the
+/// native protocol returns, and decoding a million-row answer to count it would
+/// cost more than producing it did.
+///
+/// A truncated or malformed buffer stops the walk rather than failing: this
+/// answers a statistic, and a wrong count is not worth turning into an error
+/// the caller would have to handle on the way out of a statement that worked.
+pub fn count_serialized_rows(bytes: &[u8]) -> u64 {
+    #[cfg(feature = "enable_long_row")]
+    const LEN_HEADER: usize = 8;
+    #[cfg(not(feature = "enable_long_row"))]
+    const LEN_HEADER: usize = 4;
+
+    let mut position = 0usize;
+    let mut rows = 0u64;
+    while position + LEN_HEADER <= bytes.len() {
+        #[cfg(feature = "enable_long_row")]
+        let payload =
+            u64::from_le_bytes(bytes[position..position + LEN_HEADER].try_into().unwrap()) as usize;
+        #[cfg(not(feature = "enable_long_row"))]
+        let payload =
+            u32::from_le_bytes(bytes[position..position + LEN_HEADER].try_into().unwrap()) as usize;
+
+        let next = position + LEN_HEADER + payload;
+        if next > bytes.len() {
+            break;
+        }
+        position = next;
+        rows += 1;
+    }
+    rows
+}
+
 pub fn vec_into_rows(bytes: &[u8]) -> std::io::Result<Vec<Row>> {
     let mut rows = Vec::new();
     let mut cursor = std::io::Cursor::new(bytes);
@@ -512,6 +548,46 @@ mod row_tests {
         let row2 = Row::from_vec(&vec).unwrap();
         assert_eq!(row2.columns.len(), 1);
         assert_eq!(row2.columns[0].data.into_slice(), large_str.as_bytes());
+    }
+
+    /// The statement log counts a native-protocol result rather than decoding
+    /// it, so the walk of the length headers has to agree with the decoder on
+    /// every shape — including rows of different widths in one buffer, which is
+    /// what a `RETURNING` over a mixed schema produces.
+    #[test]
+    fn counting_rows_agrees_with_decoding_them() {
+        for widths in [vec![1usize], vec![1, 3, 2], vec![4, 4, 4, 4], vec![]] {
+            let mut rows = Vec::new();
+            for (i, width) in widths.iter().enumerate() {
+                let columns: SmallVec<[Column; 32]> = (0..*width)
+                    .map(|c| {
+                        make_string_column(
+                            c as u64,
+                            &format!("r{}c{}{}", i, c, "x".repeat(c * 7)),
+                            DbType::STRING,
+                        )
+                    })
+                    .collect();
+                rows.push(make_test_row(i as u64, columns, 0));
+            }
+            let bytes = rows_into_vec(rows);
+            assert_eq!(
+                count_serialized_rows(&bytes),
+                vec_into_rows(&bytes).unwrap().len() as u64,
+                "widths {:?}",
+                widths
+            );
+        }
+
+        // A buffer cut short stops the walk rather than counting a row that is
+        // not all there.
+        let bytes = rows_into_vec(vec![make_test_row(
+            0,
+            smallvec::smallvec![make_string_column(0, "whole", DbType::STRING)],
+            0,
+        )]);
+        assert_eq!(count_serialized_rows(&bytes), 1);
+        assert_eq!(count_serialized_rows(&bytes[..bytes.len() - 1]), 0);
     }
 
     #[test]

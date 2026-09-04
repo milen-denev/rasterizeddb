@@ -174,6 +174,9 @@ The dialect is PostgreSQL's. What is implemented:
   `ADD`/`DROP`/`RENAME COLUMN` and `ALTER … TYPE … USING`.
 - **Catalogue** — PostgreSQL's catalogue relations are produced on demand when a
   statement names one, so tools that introspect `pg_catalog` work.
+- **`pg_stat_statements`** — the same view PostgreSQL's extension provides,
+  built from the engine's own statement log, plus a `rows_scanned` column
+  PostgreSQL has no counterpart for.
 
 The notable gaps, each pinned by a test in `rasterizeddb_compat` that names it
 rather than being left to be discovered:
@@ -373,13 +376,17 @@ It reads the introspection statements the engine gained for it —
 
 ```sql
 SHOW DATABASE STATS;
-SHOW TABLES;
+SHOW TABLES;                  -- with a storage column: memory, file, s3, ...
 SHOW TABLE STATS users;
 SHOW COLUMNS FROM users;      -- or DESCRIBE users
 SHOW SCHEMA MAP;
 SHOW DATABASES;
 SHOW CONFIG;                  -- with a hot_reload column per setting
 SET CONFIG filter.max_f = 14; -- applied live
+SHOW QUERIES;                 -- the last statements, with time and rows scanned
+SHOW QUERIES 20;              -- just the last twenty
+SHOW QUERY STATS;             -- one row per statement shape, slowest first
+RESET QUERY STATS;            -- forget both
 SHOW BACKUP STATUS;           -- configured? healthy? how far can a restore reach?
 SHOW REPLICATION STATS;       -- node state and counters, as rows
 SHOW REPLICATION PEER STATUS; -- a row per peer

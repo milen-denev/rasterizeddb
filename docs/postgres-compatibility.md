@@ -118,6 +118,13 @@ nothing at all, and point lookups improve ~18x.
   `INSERT ... RETURNING`.
 - **Protocol** — the extended query protocol with bound parameters in text and
   binary format, which is how every driver and ORM actually talks.
+- **`pg_stat_statements`** — one row per statement shape, with `calls`,
+  `total_exec_time`, `mean_exec_time`, `stddev_exec_time` and `rows`, built from
+  the engine's own statement log rather than from an extension. It carries one
+  column PostgreSQL has no counterpart for — `rows_scanned`, the candidate rows
+  the scan read — and `SELECT pg_stat_statements_reset()` empties it. The block
+  counters are reported as zero: there is no shared buffer pool here to count.
+  See [introspection.md](introspection.md#pg_stat_statements).
 
 Predicate forms are desugared into the engine's basic `column <op> value`
 grammar before evaluation (`core/tokenizer/predicate_rewrite.rs`), so `IN`

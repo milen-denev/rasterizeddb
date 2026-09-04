@@ -25,7 +25,15 @@ use crate::core::storage_providers::traits::StorageIO;
 use smallvec::SmallVec;
 
 /// The catalogue relations this module can produce.
-const VIEWS: [&str; 9] = [
+///
+/// A slice rather than an array because `pg_stat_statements` is only one of
+/// them in a build that records what runs. Without the feature the name is not
+/// claimed at all, so a statement selecting from it fails the way PostgreSQL
+/// fails when the extension is not installed — rather than returning an empty
+/// relation, which a monitor would read as "this server has run nothing".
+const VIEWS: &[&str] = &[
+    #[cfg(feature = "query_stats")]
+    "pg_stat_statements",
     "pg_stat_user_tables",
     "pg_class",
     "pg_namespace",
@@ -55,8 +63,40 @@ const VIEWS: [&str; 9] = [
 /// `catalogue_columns_match_what_is_built` holds this list to what `build`
 /// actually creates, so the two cannot drift.
 pub fn columns_of(view: &str) -> Option<&'static [(&'static str, DbType)]> {
+    #[cfg(feature = "query_stats")]
+    use DbType::F64;
     use DbType::{BOOL, I64, STRING};
     Some(match view {
+        // `pg_stat_statements`, as its extension defines it, minus the columns
+        // this engine has no counterpart for. The block counters are the ones
+        // dashboards select unconditionally, and are reported as zero rather
+        // than omitted so that selecting them parses; `rows_scanned` and
+        // `materialised` are this engine's additions, and are the two columns
+        // that say *why* a statement is slow — one for scan-bound work and one
+        // for the relations a CTE or derived table has to build first. Kept
+        // apart rather than summed: they are different kinds of number, and a
+        // statement can be expensive for either reason or both. See
+        // `core::query_stats`.
+        #[cfg(feature = "query_stats")]
+        "pg_stat_statements" => &[
+            ("userid", I64),
+            ("dbid", I64),
+            ("toplevel", BOOL),
+            ("queryid", I64),
+            ("query", STRING),
+            ("calls", I64),
+            ("total_exec_time", F64),
+            ("min_exec_time", F64),
+            ("max_exec_time", F64),
+            ("mean_exec_time", F64),
+            ("stddev_exec_time", F64),
+            ("rows", I64),
+            ("shared_blks_hit", I64),
+            ("shared_blks_read", I64),
+            ("rows_scanned", I64),
+            ("materialised", I64),
+            ("materialised_ms", F64),
+        ],
         "pg_namespace" => &[("oid", I64), ("nspname", STRING)],
         "pg_class" => &[
             ("oid", I64),
@@ -207,7 +247,7 @@ pub async fn materialize(
     catalog: Option<&Arc<crate::core::database::catalog::DatabaseCatalog>>,
 ) -> Result<Option<Materialized>, String> {
     let mut wanted: Vec<String> = Vec::new();
-    for view in VIEWS {
+    for view in VIEWS.iter().copied() {
         if names_relation(sql, view) {
             wanted.push(view.to_string());
         }
@@ -804,6 +844,54 @@ async fn build(
                 rows,
             )
         }
+        // Times are milliseconds, which is what `pg_stat_statements` reports
+        // and what every dashboard built on it divides and sorts by. The
+        // engine keeps microseconds, so the conversion happens here rather
+        // than in the caller's arithmetic.
+        #[cfg(feature = "query_stats")]
+        "pg_stat_statements" => {
+            let stats = crate::core::query_stats::aggregated();
+            let mut rows = Vec::with_capacity(stats.len());
+            for agg in &stats {
+                rows.push(format!(
+                    "INSERT INTO {} (userid, dbid, toplevel, queryid, query, calls, \
+                     total_exec_time, min_exec_time, max_exec_time, mean_exec_time, \
+                     stddev_exec_time, rows, shared_blks_hit, shared_blks_read, rows_scanned, \
+                     materialised, materialised_ms) \
+                     VALUES (0, {}, TRUE, {}, '{}', {}, {}, {}, {}, {}, {}, {}, 0, 0, {}, {}, {})",
+                    temp,
+                    oid_of(&database.name),
+                    // The whole 64-bit hash, read as signed — `queryid` is a
+                    // `bigint` in PostgreSQL and half of them are negative
+                    // there too.
+                    agg.queryid as i64,
+                    escape(&agg.query),
+                    agg.calls,
+                    ms(agg.total_us as f64),
+                    ms(agg.min_us as f64),
+                    ms(agg.max_us as f64),
+                    ms(agg.mean_us()),
+                    ms(agg.stddev_us()),
+                    agg.rows,
+                    agg.rows_scanned,
+                    agg.materialised,
+                    ms(agg.materialised_us as f64)
+                ));
+            }
+            (
+                format!(
+                    "CREATE TABLE {} (userid BIGINT, dbid BIGINT, toplevel BOOL, \
+                     queryid BIGINT, query TEXT, calls BIGINT, \
+                     total_exec_time DOUBLE PRECISION, min_exec_time DOUBLE PRECISION, \
+                     max_exec_time DOUBLE PRECISION, mean_exec_time DOUBLE PRECISION, \
+                     stddev_exec_time DOUBLE PRECISION, rows BIGINT, \
+                     shared_blks_hit BIGINT, shared_blks_read BIGINT, rows_scanned BIGINT, \
+                     materialised BIGINT, materialised_ms DOUBLE PRECISION)",
+                    temp
+                ),
+                rows,
+            )
+        }
         "pg_stat_user_tables" => {
             let mut rows = Vec::with_capacity(tables.len());
             for name in &tables {
@@ -1092,6 +1180,17 @@ fn oid_of(name: &str) -> i64 {
 /// list as user tables.
 fn is_internal(name: &str) -> bool {
     name.starts_with("__") || name.starts_with(crate::core::rql::json_map::SHADOW_TABLE_PREFIX)
+}
+
+/// Microseconds as a millisecond literal a `DOUBLE PRECISION` column accepts.
+///
+/// Written out at fixed precision rather than through `{}`: an f64 formatted
+/// the short way can come out as `1e-5`, and the value parser reads that as an
+/// identifier rather than a number — a statement log with one sub-microsecond
+/// entry in it would have failed the whole view.
+#[cfg(feature = "query_stats")]
+fn ms(micros: f64) -> String {
+    format!("{:.6}", micros / 1_000.0)
 }
 
 fn escape(text: &str) -> String {

@@ -643,6 +643,13 @@ async fn materialize_inner(
             .map(|(name, ty)| format!("{} {}", name, ty))
             .collect();
 
+        // Timed from here rather than from the top of the loop: the body has
+        // already run, and a body containing its own derived table has already
+        // materialised that through `materialize_query`, which counts itself.
+        // Starting the clock earlier would count the nested relation twice.
+        #[cfg(feature = "query_stats")]
+        let materialising = std::time::Instant::now();
+
         let create = format!("CREATE TABLE {} ({})", temp, columns.join(", "));
         crate::core::rql::executor::run_statement(&create, database, tx)
             .await
@@ -685,6 +692,15 @@ async fn materialize_inner(
                 .await
                 .map_err(|e| format!("could not fill the WITH clause '{}': {}", def.name, e))?;
         }
+
+        // One relation built. A CTE that failed part-way is not counted — the
+        // `?` above carries the error out — which is the right answer: nothing
+        // usable was produced, and the statement is recorded as the failure it
+        // was.
+        #[cfg(feature = "query_stats")]
+        crate::core::query_stats::note_materialised(
+            materialising.elapsed().as_micros().min(u64::MAX as u128) as u64,
+        );
 
         rewritten = replace_relation_references(&rewritten, &def.name, &temp);
         published.push((def.name.clone(), temp));
@@ -762,6 +778,41 @@ fn declared_wide_types(
 }
 
 pub async fn materialize_query(
+    query: &str,
+    alias: &str,
+    statement: &str,
+    database: &Arc<Database>,
+    tx: crate::core::mvcc::transaction::TxId,
+) -> Result<String, String> {
+    // An explicit `return`, matching the same shape in `pgwire`: two cfg'd
+    // blocks in tail position depend on cfg-stripping to decide which one is
+    // the tail expression, and saying so outright costs nothing.
+    #[cfg(not(feature = "query_stats"))]
+    {
+        return materialize_query_inner(query, alias, statement, database, tx).await;
+    }
+
+    // A wrapper rather than a timer threaded through the body, because the body
+    // returns early through `?` in a dozen places and a count that a failure
+    // path could skip is a count nobody can subtract from a duration.
+    #[cfg(feature = "query_stats")]
+    {
+        let started = std::time::Instant::now();
+        let result = materialize_query_inner(query, alias, statement, database, tx).await;
+        // Only a relation that was actually built, which is the same rule the
+        // `WITH` path follows: a materialisation that failed produced nothing
+        // to have been slow *for*, and the statement carrying it is recorded as
+        // the failure it was.
+        if result.is_ok() {
+            crate::core::query_stats::note_materialised(
+                started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+            );
+        }
+        result
+    }
+}
+
+async fn materialize_query_inner(
     query: &str,
     alias: &str,
     statement: &str,

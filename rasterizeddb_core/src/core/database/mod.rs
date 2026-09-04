@@ -2955,13 +2955,77 @@ pub(crate) async fn process_incoming_queries(
         };
     }
 
-    info!("Received query from {}: {}", principal, query);
+    // Redacted before it is written: role statements are handled above, before
+    // reaching here, but the store grammar carries S3 keys and this line would
+    // otherwise put them in the server log in the clear — a file that is
+    // rotated, shipped and backed up, where the statement log at least stays in
+    // memory and bounded.
+    info!(
+        "Received query from {}: {}",
+        principal,
+        crate::core::redact::statement(&query)
+    );
 
-    if let Some(query_purpose) = recognize_query_purpose(&query) {
+    #[cfg(not(feature = "query_stats"))]
+    {
+        run_native_query(&query, context.database).await
+    }
+
+    // Recorded for `SHOW QUERIES` the same way a statement arriving over the
+    // wire protocol is. The role statements handled above are not: they return
+    // before this, and what they carry is a password.
+    #[cfg(feature = "query_stats")]
+    {
+        let Some(recording) = crate::core::query_stats::begin() else {
+            return run_native_query(&query, context.database).await;
+        };
+        let database_name = context.database.name.clone();
+        let response = crate::core::query_stats::observe(recording.probe(), async {
+            let response = run_native_query(&query, context.database).await;
+            // Counted inside the scope: outside it the statement's counters are
+            // no longer the ones this task can reach.
+            crate::core::query_stats::note_rows(rows_of(&response));
+            response
+        })
+        .await;
+        let failure = match response.first() {
+            Some(3) => Some(String::from_utf8_lossy(&response[1..]).to_string()),
+            _ => None,
+        };
+        crate::core::query_stats::finish(
+            recording,
+            &query,
+            &database_name,
+            &principal.user,
+            failure.as_deref(),
+        );
+        response
+    }
+}
+
+/// Runs one recognised statement from the native protocol.
+async fn run_native_query(query: &str, database: Arc<Database>) -> Vec<u8> {
+    if let Some(query_purpose) = recognize_query_purpose(query) {
         info!("Recognized query purpose: {:?}", query_purpose);
-        execute(query_purpose, context.database).await
+        execute(query_purpose, database).await
     } else {
         error!("Could not recognize query purpose");
         error_response("Unrecognized query")
+    }
+}
+
+/// Rows a native-protocol response reports: the count a write carries, or the
+/// rows a read returned.
+///
+/// The tags are the executor's: 0 is an acknowledgement that may carry a count,
+/// 1 is a count, 2 is a result set, 3 is a failure.
+#[cfg(feature = "query_stats")]
+fn rows_of(response: &[u8]) -> u64 {
+    match response.first() {
+        Some(0) | Some(1) if response.len() >= 9 => {
+            u64::from_le_bytes(response[1..9].try_into().unwrap_or([0; 8]))
+        }
+        Some(2) => crate::core::row::row::count_serialized_rows(&response[1..]),
+        _ => 0,
     }
 }

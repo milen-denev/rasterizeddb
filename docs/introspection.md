@@ -17,6 +17,10 @@ SHOW CONFIG                  -- every runtime knob, its value, and how to change
 SHOW CONFIG KEYS             -- what SET CONFIG accepts
 SET CONFIG <key> = <value>   -- change one, where the engine can do it live
 
+SHOW QUERIES [n]             -- the last n statements, newest first
+SHOW QUERY STATS             -- a row per statement shape, with its totals
+RESET QUERY STATS            -- forget both
+
 SHOW BACKUP STATUS           -- can this server back up, where to, and is it working
 SHOW REPLICATION STATS       -- node state and counters, as rows
 SHOW REPLICATION PEER STATUS -- a row per peer
@@ -260,3 +264,168 @@ peer is, which otherwise means reading every row and taking a maximum.
 Every value that has a spelling the parser accepts is printed in that spelling —
 `auto:zstd:1`, not `Compression { mode: Auto, codec: Zstd, ... }` — so anything
 copied out of a status result can be pasted into a `REPLICATION SET`.
+
+## `SHOW QUERIES` and `SHOW QUERY STATS`
+
+Two questions, and they are not the same one. *What has this server been doing*
+is a list in time order, which is what an operator watching a slow page wants.
+*Which statement is the expensive one* is a list in cost order, which is what
+someone with a week of traffic behind them wants. `SHOW QUERIES` answers the
+first, `SHOW QUERY STATS` the second, and both are built from one record written
+when a statement finishes.
+
+```
+started_at | duration_ms | rows | rows_scanned | materialised | materialised_ms | status | database | username | statement | error
+queryid | calls | total_ms | mean_ms | min_ms | max_ms | stddev_ms | rows | rows_scanned | materialised | materialised_ms | errors | last_seen | statement
+```
+
+### `rows_scanned` says *why* — when the statement is scan-bound
+
+`rows` is what the client received. `rows_scanned` is what the scan had to look
+at to find it, counted where every scan dispatches its work — after the filter
+index has excluded what it can, so a statement that reads a tenth of a table
+reports a tenth of it. Four readings:
+
+| `rows` vs `rows_scanned` | what it means |
+|---|---|
+| 3 of 10,000,000 | a predicate nothing indexes; the whole table was read to find three rows |
+| 10,000,000 of 10,000,000 | the statement asked for the table, and got it |
+| 3 of 0 | answered from the query cache, which read no pointers at all |
+| 3 of 0, and slow | **the cost was not scanning** — see below |
+
+That last row is the one to be careful with, because the column answers it
+honestly and uselessly. `rows_scanned` is a scan-cost proxy, and not every
+expensive statement is expensive because of a scan: a CTE or a derived table is
+materialised into a real durable relation — `CREATE TABLE __cte_…`, a multi-row
+`INSERT`, then `DROP TABLE` — so wrapping a trivial query in `WITH … AS` pays
+three durable round trips before it reads anything. Measured on a live node,
+`SELECT COUNT(*) FROM t` at 0.25 ms became 136 ms as
+`WITH s AS (SELECT id FROM t) SELECT COUNT(*) FROM s`, flat and independent of
+how much data `t` holds — while reporting almost no rows scanned.
+
+That figure is a **disk** measurement and does not reproduce from the test
+suite: the same materialisation costs about 1 ms on tmpfs against 200–695 ms on
+ext4, and `tempfile::tempdir()` puts every test on tmpfs. A reader who measures
+it there will get a millisecond and conclude this paragraph is wrong.
+
+So read a high `duration_ms` against a low `rows_scanned` as "the cost was not
+scanning", never as "this cannot be the slow one". Today that difference is
+usually materialisation, and nothing here counts it yet.
+
+A join counts every relation it scanned, because each one dispatches through the
+same place.
+
+### `materialised` is the cost `rows_scanned` cannot see
+
+A CTE and a derived table are each built as a real relation before the outer
+statement runs — `CREATE TABLE __cte_…`, a multi-row `INSERT`, `DROP TABLE`
+through the ordinary executor. No scan happens, so `rows_scanned` reports such a
+statement honestly and uselessly: the column that exists to say *why* says "it
+did no work" for what may be the most expensive shape on the server. A correct
+number that means nothing is harder to distrust than a wrong one.
+
+`materialised` counts the relations one statement built and `materialised_ms`
+says what they cost. They are separate columns rather than one summed "cost",
+because they are different kinds of number: `rows_scanned` is read against
+`rows` as a ratio, while a materialisation count means something alone and has
+no denominator. A statement can be expensive for either reason or both, and one
+column would hide the mix.
+
+Counted at the two places a relation is actually built — the `WITH` path and
+`materialize_query` — rather than at the entry points that walk them, because a
+derived table inside a CTE body goes through both and would otherwise be counted
+twice. A materialisation that *failed* is not counted: it produced nothing to
+have been slow for, so on a failed statement the figure is a floor.
+
+These relations used to be durable, at a flat ~130 ms each on a real filesystem
+regardless of row count. They are memory-backed now, since a statement-scoped
+relation has no reader that could outlive it, and that cost is gone — the
+counter is how you confirm that is still true rather than taking it on trust.
+Which matters more than usual, because no test could have caught the original
+problem: the same materialisation is ~1 ms on tmpfs, and `tempfile::tempdir()`
+puts every test there.
+
+### One shape, not one statement
+
+`WHERE id = 1` and `WHERE id = 2` are the same statement asked twice, so the
+aggregate folds them together: literals become `$1`, `$2`, whitespace collapses,
+comments go, and the `queryid` is a hash of what is left. Quoted identifiers and
+bare names are kept — `col1` is a name, not a name and a number.
+
+The hash is FNV-1a rather than the engine's usual `ahash`, which is randomly
+seeded: a `queryid` has to name the same statement after a restart, or a
+dashboard keyed on it starts a new series every time the server comes back.
+
+### `pg_stat_statements`
+
+The same aggregate under PostgreSQL's own name, produced on demand like every
+other catalogue relation:
+
+```sql
+SELECT query, calls, mean_exec_time, rows, rows_scanned
+FROM pg_stat_statements
+ORDER BY total_exec_time DESC
+LIMIT 10;
+```
+
+Times are milliseconds, as the extension reports them. `shared_blks_hit` and
+`shared_blks_read` are reported as zero rather than omitted, so a dashboard that
+selects them parses; this engine has no shared buffer pool to count. The
+`rows_scanned` column is this engine's addition. `SELECT pg_stat_statements_reset()`
+works too, and is the same thing as `RESET QUERY STATS`.
+
+Built without `--features query_stats`, the name is not claimed at all — so
+selecting from it fails the way PostgreSQL fails when the extension is not
+installed, rather than returning an empty relation a monitor would read as "this
+server has run nothing".
+
+### What is not recorded at all
+
+A statement that describes the server rather than using it is not written to
+either half of the log when it succeeds — not to `SHOW QUERIES`, not to `SHOW
+QUERY STATS`, not to `pg_stat_statements`. One that **failed** is kept: what
+the server refused and why is half of what that surface answers, and a refused
+`SHOW COLUMNS FROM …` is exactly the row somebody looks for when a console has
+gone blank. It cannot flood the log either — an introspection statement that
+fails is rare by construction. Three families count: `SHOW`/`SET`/`RESET`/`DISCARD`
+statements; anything naming `pg_catalog.…`, `information_schema.…` or a bare
+`pg_…` relation; and anything naming a `__…` internal relation. Names inside
+string literals do not count — `WHERE relname = 'pg_class'` is a query *about*
+the catalogue name, run against a table the application owns.
+
+This is not tidiness. A console refreshes its table list, its column lists and
+its statistics every few seconds, and each refresh is a statement: recorded,
+they are the overwhelming majority of what the log holds. The ring fills with
+`SHOW COLUMNS FROM …` before one statement the user typed reaches the bottom of
+it, and the costliest-shape list ranks the console's own polling above the
+application's slowest query. The log answers "what has this server been doing
+for the application", and a client asking the server about itself is not that.
+
+The filter is applied when the statement finishes rather than before it runs,
+because that is the one point where the text is known; what an ignored
+statement costs is an `Instant` and an `Arc`.
+
+### What it costs, and what it keeps
+
+A ring of 256 statements and a map of at most 5,000 shapes, both in memory and
+both lost on restart. Per statement that is one mutex acquisition; per scan it is
+one relaxed atomic add per batch of ten thousand rows, which is why the counter
+is not per row and not per worker. `SET CONFIG query_stats.enabled = off` stops
+recording without forgetting what was recorded, and `SET CONFIG
+query_stats.recent = N` resizes the ring.
+
+Two things are deliberately not stored. A statement's text is cut at the first
+keyword that means a secret follows — `PASSWORD`, and the S3 credential options
+a store carries (`ACCESS_KEY_ID`, `SECRET_ACCESS_KEY`, `SESSION_TOKEN` and their
+shorter spellings) — whatever the statement is, because this surface is readable
+by any session that can run `SHOW QUERIES` and a credential that reached the ring
+would outlive the statement that set it. Per-store keys are deliberately kept out
+of `db_kv.cfg` and written to a second file at mode 0600; recording the statement
+that set them would put them straight back into a surface anyone can read. The
+cut takes everything after the earliest match, and the bare words `SECRET` and
+`TOKEN` are included on purpose: truncating an ordinary query whose column is
+called `token` costs a log line, and not truncating one that is carrying a
+session token costs the token. And nothing is written to disk: a
+statement that cost a second statement would make the log the busiest relation
+in the database and the write path both the thing being measured and the thing
+doing the measuring.

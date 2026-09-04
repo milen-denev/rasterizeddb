@@ -695,6 +695,9 @@ fn privileged_statement(stmt: &str) -> Option<&'static str> {
         ("IMPORT", "DATABASE") => Some("IMPORT DATABASE"),
         ("SET", "CONFIG") => Some("SET CONFIG"),
         ("SET", "FILTER") | ("RESET", "FILTER") => Some("SET FILTER"),
+        // Reading what ran is not administration, and `SHOW QUERIES` is
+        // deliberately not here. Throwing it away for every other session is.
+        ("RESET", "QUERY") => Some("RESET QUERY STATS"),
         ("BACKUP", _) => Some("BACKUP"),
         ("RESTORE", _) => Some("RESTORE"),
         ("STORAGE", _) => Some("STORAGE"),
@@ -3339,6 +3342,11 @@ where
                 None
             };
 
+            // What a write reported as affected counts as this statement's
+            // rows, which is what `pg_stat_statements.rows` means too.
+            #[cfg(feature = "query_stats")]
+            crate::core::query_stats::note_rows(rows_affected.unwrap_or(0));
+
             let tag = command_tag(purpose_kind, rows_affected);
 
             send_command_complete(stream, &tag).await?;
@@ -3351,6 +3359,8 @@ where
             let mut arr = [0u8; 8];
             arr.copy_from_slice(&resp[1..9]);
             let rows = u64::from_le_bytes(arr);
+            #[cfg(feature = "query_stats")]
+            crate::core::query_stats::note_rows(rows);
             let tag = match purpose_kind {
                 PurposeKind::DeleteRow => format!("DELETE {}", rows),
                 PurposeKind::InsertRow => format!("INSERT 0 {}", rows),
@@ -4432,6 +4442,32 @@ where
             send_row_description(stream, &[("?column?", DbType::I32)], &[]).await?;
         }
         send_data_row(stream, &[Some(b"1")]).await?;
+        send_command_complete(stream, "SELECT 1").await?;
+        return Ok(true);
+    }
+
+    // The function PostgreSQL's own extension offers for this. Answered here
+    // rather than by the row evaluator, which has no way to reach the statement
+    // log — the same reason `pg_current_wal_lsn()` is rewritten before it gets
+    // there. `RESET QUERY STATS` is the engine's own spelling of it.
+    if s_lower.starts_with("select pg_stat_statements_reset(") && s_lower.ends_with(')') {
+        if !state.principal.may_administer() {
+            fail_statement(
+                state,
+                stream,
+                "42501",
+                "permission denied: pg_stat_statements_reset requires superuser",
+            )
+            .await?;
+            return Ok(true);
+        }
+        #[cfg(feature = "query_stats")]
+        crate::core::query_stats::reset();
+        if !omit_description {
+            send_row_description(stream, &[("pg_stat_statements_reset", DbType::STRING)], &[])
+                .await?;
+        }
+        send_data_row(stream, &[Some(b"")]).await?;
         send_command_complete(stream, "SELECT 1").await?;
         return Ok(true);
     }
@@ -5790,6 +5826,13 @@ async fn send_data_row<S>(stream: &mut S, values: &[Option<&[u8]>]) -> io::Resul
 where
     S: AsyncWrite + Unpin,
 {
+    // One place counts every row any statement returns — a `SELECT`, a
+    // `RETURNING`, `SHOW TABLES`, a catalogue view — because they all leave
+    // through here. Counting at each producer instead would have missed
+    // whichever one was added next.
+    #[cfg(feature = "query_stats")]
+    crate::core::query_stats::note_rows(1);
+
     let mut payload = Vec::new();
     let count: i16 = values.len().try_into().unwrap_or(i16::MAX);
     payload.extend_from_slice(&count.to_be_bytes());
