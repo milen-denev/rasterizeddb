@@ -1003,45 +1003,73 @@ async fn relation_size(database: &Arc<Database>, name: &str) -> (u64, i64) {
 /// Live and dead tuple counts for one table.
 ///
 /// Both are **estimates**, which is what PostgreSQL's are too — its own
-/// documentation says these columns are approximate. The pointer file gives the
-/// number of slots ever written, which bounds the live rows from above because
-/// a deleted or relocated row keeps its slot until a vacuum reclaims it. The
-/// reclamation service tracks dead space in bytes, so it is converted to rows
-/// by the width the schema declares, and the live count is what remains.
+/// documentation says these columns are approximate. Counting exactly would
+/// mean a scan per table on every catalogue query; a caller that needs the
+/// exact figure runs `SELECT COUNT(*)`, as it would against PostgreSQL.
 ///
-/// Counting exactly would mean a scan per table on every catalogue query. The
-/// caller that needs an exact figure runs `SELECT COUNT(*)`, as it would
-/// against PostgreSQL.
+/// ```text
+/// slots = pointer file length / record length      (exact, and free)
+/// live  = min(last_row_id, slots)                  (ids handed out, clamped)
+/// dead  = slots - live
+/// ```
+///
+/// # Why not from dead bytes
+///
+/// This used to derive `dead` as `last_dead_bytes / row_width`, and that is
+/// blind to the failure these columns exist to reveal. Incremental vacuum never
+/// reclaims pointer *slots* — the filter index refers to them as stable
+/// addresses — so a table can accumulate thousands of dead slots per live row
+/// while its dead *bytes* stay near zero. Measured on a live node: a heartbeat
+/// table with **8 live rows in 38 030 slots** reported ~37 500 live and ~550
+/// dead, a dead ratio of 1.5 % against a true 99.98 %.
+///
+/// That error ran in the reassuring direction, which is what made it serious.
+/// `n_dead_tup` is what every PostgreSQL-shaped monitoring tool reads to decide
+/// whether a table needs vacuuming, and those tools never see `SHOW TABLE
+/// STATS` — so this number was the only one they got, and it told them the
+/// table was healthy while it degraded.
+///
+/// # Why `last_row_id`
+///
+/// It is the id sequence's high-water mark, and an `UPDATE` does not draw from
+/// it — pinned by `write_path_tests::updates_do_not_consume_row_ids`. So it is
+/// at least the number of rows ever inserted, it is maintained by the write
+/// path at no cost, and it needs no vacuum sweep to have run. That is the same
+/// shape as PostgreSQL, where `n_live_tup` is maintained by the writes and
+/// merely *corrected* by `ANALYZE`.
+///
+/// It errs by counting deleted rows as live, since their ids were still handed
+/// out. That is the same direction as the old bug but bounded by the slot
+/// count, where the old one was unbounded and uncorrectable.
+///
+/// # The clamp is load-bearing
+///
+/// `min(…, slots)` is not defensive. **Any path that advances the sequence
+/// faster than it inserts rows** puts `last_row_id` above the slot count, and
+/// compaction is a permanent one: `Table::compact` ends with
+/// `last_row_id.fetch_max(…)`, which only ever raises, while the slot count
+/// drops to the compacted total. A table compacted from 1 000 sparse ids to 10
+/// slots keeps the mark at 1 000, and the clamp is what makes it report 10 —
+/// the correct post-compaction answer. Historically, updates burning ids before
+/// 2026-08-26 were another such path.
+///
+/// Without it, `live` exceeds `slots` and `dead` goes negative, which the
+/// consumers of these two columns render as a negative dead-tuple count.
 async fn tuple_counts(database: &Arc<Database>, name: &str) -> (i64, i64) {
-    let (pointers_io, dead_bytes, row_width) = {
+    let (pointers_io, ids_handed_out) = {
         let Some(table) = database.tables.get(name) else {
             return (0, 0);
         };
-        let width: u64 = table
-            .schema
-            .fields
-            .iter()
-            .filter(|f| !f.is_deleted)
-            .map(|f| f.size as u64)
-            .sum();
         (
             table.io_pointers.clone(),
-            table
-                .vacuum_stats()
-                .last_dead_bytes
-                .load(std::sync::atomic::Ordering::Relaxed),
-            width,
+            table.last_row_id.load(std::sync::atomic::Ordering::Relaxed),
         )
     };
 
     let slots = (pointers_io.get_len().await
         / crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN as u64) as i64;
-    let dead = if row_width == 0 {
-        0
-    } else {
-        (dead_bytes / row_width) as i64
-    };
-    (slots.saturating_sub(dead).max(0), dead.min(slots))
+    let live = (ids_handed_out as i64).clamp(0, slots);
+    (live, slots - live)
 }
 
 /// A stable identifier for a name, standing in for PostgreSQL's OID.

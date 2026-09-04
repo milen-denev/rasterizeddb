@@ -241,6 +241,10 @@ pub fn result_fields(statement: &Introspect) -> Option<Vec<(String, DbType)>> {
         }
         Introspect::Tables => vec![
             text("table_name"),
+            // Second, not last: it is an identity, not a measurement, and a
+            // console reading the list wants to know what a table *is* before
+            // it reads how big it is.
+            text("storage"),
             number("row_slots"),
             number("columns"),
             number("data_bytes"),
@@ -381,6 +385,10 @@ async fn tables(database: &Arc<Database>) -> Vec<Row> {
 
         out.push(row(&[
             Cell::Text(name),
+            // The backend holding the row data. Every file of a table is opened
+            // from one seed, so this is the table's answer and not just this
+            // file's — `SHOW TABLE STATS` reports where it is.
+            Cell::Text(table.io_rows.kind().to_string()),
             Cell::Number(sizes.row_slots()),
             Cell::Number(visible as u64),
             Cell::Number(sizes.data),
@@ -396,6 +404,29 @@ async fn tables(database: &Arc<Database>) -> Vec<Row> {
     out
 }
 
+/// The whole database, as one metric per row.
+///
+/// # What this deliberately does not report
+///
+/// **Settings.** `wal_enabled`, `batch_size`, `filter_min_pruning_ratio` and
+/// the rest of the knobs used to be here. They are not measurements: they say
+/// what this server was told to do, they do not change while it runs, and every
+/// one of them is already reported by `SHOW CONFIG` — which is also the only
+/// place they can be *changed*. Listed here as well they were most of the rows,
+/// which pushed the figures that actually move off the page, and a console
+/// showing a constant beside the sizes invites reading it as a statistic.
+///
+/// **Internal ids and internal relations.** The database's own id and the
+/// replication node id name this process to the engine; nothing a client can
+/// do depends on either. And the `__…` tables — a JSON column's shadow table, a
+/// CTE's temporary relation — are counted by neither `tables` nor `columns`,
+/// because `SHOW TABLES` does not list them and a front page that disagreed
+/// with the table list about how many tables exist is a front page nobody
+/// trusts.
+///
+/// The byte totals still cover **every** file the database owns, shadow tables
+/// included. That is what the disk actually holds, and a size that left them
+/// out would be wrong in the direction that matters.
 async fn database_stats(database: &Arc<Database>) -> Vec<Row> {
     let mut names: Vec<String> = database.tables.iter().map(|e| e.key().clone()).collect();
     names.sort();
@@ -412,18 +443,26 @@ async fn database_stats(database: &Arc<Database>) -> Vec<Row> {
     let mut unique_keys = 0usize;
     let mut json_columns = 0usize;
     let mut column_count = 0usize;
+    let mut table_count = 0usize;
 
     for name in &names {
         let Some(table) = database.tables.get(name).map(|t| t.value().clone()) else {
             continue;
         };
         let sizes = sizes_of(&table).await;
+        // Bytes are counted for every table; the countable *things* are counted
+        // only for the ones a client can name. See the note above the function.
         total.data += sizes.data;
         total.pointers += sizes.pointers;
         total.schema += sizes.schema;
         total.filters += sizes.filters;
         total.sequence += sizes.sequence;
         reclaimable += table.reclaimable_bytes();
+
+        if name.starts_with("__") {
+            continue;
+        }
+        table_count += 1;
         foreign_keys += table
             .schema
             .foreign_keys
@@ -477,20 +516,28 @@ async fn database_stats(database: &Arc<Database>) -> Vec<Row> {
             .unwrap_or_else(|| "(in memory)".to_string()),
         "directory holding this database's files",
     );
+    // What is under the whole database, in the same vocabulary the table list
+    // uses. `location` above is the directory it was opened with, which for a
+    // key/value database is not where the bytes are.
     push(
-        "database_id",
-        database.id.to_string(),
-        "distinguishes it from a recreated namesake",
+        "storage",
+        database.db_io_rows.kind().to_string(),
+        "memory | file | mirrored | s3 | kv-directory | kv-memory",
+    );
+    push(
+        "storage_location",
+        database.db_io_rows.location(),
+        "where those bytes actually are",
     );
     push(
         "tables",
-        names.len().to_string(),
-        "user and shadow tables the catalogue holds",
+        table_count.to_string(),
+        "tables a client can name; the same set SHOW TABLES lists",
     );
     push(
         "columns",
         column_count.to_string(),
-        "declared columns across every table",
+        "declared columns across those tables",
     );
     push(
         "row_slots",
@@ -522,7 +569,7 @@ async fn database_stats(database: &Arc<Database>) -> Vec<Row> {
     push(
         "total_bytes",
         total.total().to_string(),
-        "every file the tables own",
+        "every file the database owns",
     );
     push(
         "reclaimable_bytes",
@@ -568,70 +615,72 @@ async fn database_stats(database: &Arc<Database>) -> Vec<Row> {
         "no transaction is running",
     );
 
-    push(
-        "wal_enabled",
-        crate::wal_enabled().to_string(),
-        "durable writes go through the log",
-    );
-    push(
-        "wal_checkpoint_bytes",
-        crate::wal_checkpoint_bytes().to_string(),
-        "log bytes between checkpoints",
-    );
+    // The page cache in front of an object store, which is the difference
+    // between a scan that reads memory and one that pays for a request per
+    // chunk. Reported for the database because the cache is the family's and is
+    // shared by every table in it.
+    #[cfg(feature = "kv_storage")]
+    if let Some(family) = database.db_io_rows.kv_family() {
+        let (hits, misses, resident) = family.cache_stats();
+        push(
+            "kv_store",
+            family.store().describe(),
+            "the store behind this database",
+        );
+        push(
+            "kv_cache_hits",
+            hits.to_string(),
+            "chunks served without a request",
+        );
+        push(
+            "kv_cache_misses",
+            misses.to_string(),
+            "each one is a request to the store",
+        );
+        push(
+            "kv_cache_bytes",
+            resident.to_string(),
+            "chunks resident in memory",
+        );
+    }
+
+    #[cfg(feature = "query_stats")]
+    {
+        let (recorded, shapes) = crate::core::query_stats::counts();
+        push(
+            "statements_recorded",
+            recorded.to_string(),
+            "kept for SHOW QUERIES",
+        );
+        push(
+            "statement_shapes",
+            shapes.to_string(),
+            "distinct statements in the aggregate",
+        );
+    }
 
     let (hits, misses, entries) = crate::cache::query_cache::stats();
     push(
-        "query_cache_enabled",
-        crate::cache::query_cache::enabled().to_string(),
-        "repeated queries served from a known offset",
-    );
-    push("query_cache_hits", hits.to_string(), "");
-    push("query_cache_misses", misses.to_string(), "");
-    push("query_cache_entries", entries.to_string(), "");
-
-    let filters = crate::filter_settings();
-    push(
-        "filter_enabled",
-        filters.enabled().to_string(),
-        "bit-sliced filter index",
+        "query_cache_hits",
+        hits.to_string(),
+        "queries served from a known offset",
     );
     push(
-        "filter_min_pruning_ratio",
-        filters.min_pruning_ratio().to_string(),
-        "skip the mask when it prunes less than this",
+        "query_cache_misses",
+        misses.to_string(),
+        "queries that had to scan",
     );
     push(
-        "filter_indexed_tables",
-        filters.overridden_tables().len().to_string(),
-        "tables carrying a filter override",
+        "query_cache_entries",
+        entries.to_string(),
+        "offsets currently remembered",
     );
 
     let replication = &database.replication;
     push(
-        "replication_active",
-        replication.is_active().to_string(),
-        "shipping transactions to peers",
-    );
-    push(
         "replication_peers",
         replication.peer_count().to_string(),
-        "",
-    );
-    push(
-        "replication_node_id",
-        replication.node_id().to_string(),
-        "half of every global transaction id",
-    );
-
-    push(
-        "batch_size",
-        crate::batch_size().to_string(),
-        "row pointers fetched per batch",
-    );
-    push(
-        "concurrent_threads",
-        crate::max_permits_threads().to_string(),
-        "workers a query may use",
+        "peers this node ships transactions to",
     );
 
     out
@@ -669,6 +718,60 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
         .count();
 
     push("table", schema.name.clone(), "");
+    // What is holding this table, and where. First, because it changes how
+    // every figure below it should be read: a scan of an S3-backed table is a
+    // bill, and a memory-backed one does not survive a restart at all.
+    push(
+        "storage",
+        table.io_rows.kind().to_string(),
+        "memory | file | mirrored | s3 | kv-directory | kv-memory",
+    );
+    push(
+        "storage_location",
+        table.io_rows.location(),
+        "where those bytes actually are",
+    );
+    // The page cache in front of the store, reported here as well as on the
+    // database because a table can be placed on a key/value store while the
+    // database it belongs to is on files — `STORAGE PLACE TABLE t AT
+    // 'kv:<store>'` — and then the database-level figures do not exist. The
+    // counters are the store's, shared by every table placed on it, and the
+    // detail says so rather than letting them read as this table's own.
+    #[cfg(feature = "kv_storage")]
+    if let Some(family) = table.io_rows.kv_family() {
+        let (hits, misses, resident) = family.cache_stats();
+        push(
+            "kv_store",
+            family.store().describe(),
+            "shared by every table on this store",
+        );
+        push(
+            "kv_cache_hits",
+            hits.to_string(),
+            "chunks served without a request",
+        );
+        push(
+            "kv_cache_misses",
+            misses.to_string(),
+            "each one is a request to the store",
+        );
+        push(
+            "kv_cache_bytes",
+            resident.to_string(),
+            "chunks resident in memory",
+        );
+    }
+    #[cfg(feature = "storage_pools")]
+    {
+        let copies = table.io_rows.backup_count();
+        if copies > 0 {
+            push(
+                "backup_copies",
+                copies.to_string(),
+                "extra directories every write also goes to",
+            );
+        }
+    }
     push(
         "columns",
         visible.len().to_string(),
@@ -711,6 +814,15 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
     );
 
     push("data_bytes", sizes.data.to_string(), "row data");
+    // The measured average, where `fixed_row_width` above is the declared
+    // minimum: the difference between them is what the variable-width columns
+    // are actually costing, which is the figure capacity planning needs and the
+    // one nothing here reported.
+    push(
+        "avg_row_bytes",
+        (sizes.data / sizes.row_slots().max(1)).to_string(),
+        "row data divided by pointer records",
+    );
     push(
         "pointer_bytes",
         sizes.pointers.to_string(),
@@ -741,7 +853,21 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
         table.reclaimable_bytes().to_string(),
         "dead space a VACUUM would return",
     );
+    // The ratio rather than the two figures, because the decision it informs —
+    // is a VACUUM worth taking — is about the proportion and not the size. A
+    // gigabyte of dead space in a terabyte table is noise; the same gigabyte in
+    // a two-gigabyte table is half the disk.
+    push(
+        "dead_ratio",
+        format!("{:.1}%", percent(table.reclaimable_bytes(), sizes.data)),
+        "reclaimable against row data",
+    );
 
+    push(
+        "vacuum_enabled",
+        table.vacuum_enabled().to_string(),
+        "reclamation runs for this table; SHOW CONFIG can only say `per table`",
+    );
     push(
         "vacuum_runs",
         vacuum.runs.load(Ordering::Relaxed).to_string(),
@@ -766,6 +892,14 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
         "vacuum_last_dead_bytes",
         vacuum.last_dead_bytes.load(Ordering::Relaxed).to_string(),
         "",
+    );
+    push(
+        "vacuum_last_reclaimed_bytes",
+        vacuum
+            .last_reclaimed_bytes
+            .load(Ordering::Relaxed)
+            .to_string(),
+        "what the most recent run actually returned",
     );
     push(
         "vacuum_total_reclaimed_bytes",
@@ -805,6 +939,50 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
         "",
     );
 
+    // The declarations that cost something on every write, counted before they
+    // are listed: a table with forty checks is a table whose inserts are doing
+    // forty evaluations, and that is worth seeing without counting rows.
+    push(
+        "check_constraints",
+        schema
+            .checks
+            .iter()
+            .filter(|c| !c.is_deleted)
+            .count()
+            .to_string(),
+        "evaluated on every insert and update",
+    );
+    push(
+        "generated_columns",
+        schema
+            .generated
+            .iter()
+            .filter(|g| !g.is_deleted)
+            .count()
+            .to_string(),
+        "computed from the row as it is stored",
+    );
+    push(
+        "default_expressions",
+        schema
+            .defaults
+            .iter()
+            .filter(|d| !d.is_deleted)
+            .count()
+            .to_string(),
+        "",
+    );
+    push(
+        "path_indexes",
+        schema
+            .path_indexes
+            .iter()
+            .filter(|p| !p.is_deleted)
+            .count()
+            .to_string(),
+        "document paths carried by the filter index",
+    );
+
     for key in schema.unique_keys.iter().filter(|k| !k.is_deleted) {
         push(
             "unique_constraint",
@@ -828,6 +1006,23 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
             format!("{} -> {}", json.column, json.shadow_table),
             "document fields live in the shadow table",
         );
+    }
+    for check in schema.checks.iter().filter(|c| !c.is_deleted) {
+        push(
+            "check_constraint",
+            format!("{} : {}", check.name, check.expression),
+            "",
+        );
+    }
+    for generated in schema.generated.iter().filter(|g| !g.is_deleted) {
+        push(
+            "generated_column",
+            format!("{} = {}", generated.column, generated.expression),
+            "",
+        );
+    }
+    for index in schema.path_indexes.iter().filter(|p| !p.is_deleted) {
+        push("path_index", format!("{} : {}", index.name, index.path), "");
     }
 
     Ok(out)
@@ -1624,6 +1819,14 @@ fn row(cells: &[Cell]) -> Row {
     }
 }
 
+/// `part` as a percentage of `whole`, and zero rather than a division by it.
+fn percent(part: u64, whole: u64) -> f64 {
+    if whole == 0 {
+        return 0.0;
+    }
+    part as f64 * 100.0 / whole as f64
+}
+
 fn rows(rows: Vec<Row>) -> Vec<u8> {
     let mut out = vec![2u8];
     for row in &rows {
@@ -1759,6 +1962,107 @@ mod tests {
                 qualified
             );
         }
+    }
+
+    /// The metric names `SHOW DATABASE STATS` reports, in order.
+    async fn metrics(database: &Arc<Database>) -> Vec<String> {
+        database_stats(database)
+            .await
+            .iter()
+            .map(|row| {
+                String::from_utf8(row.columns[0].data.into_slice().to_vec())
+                    .expect("a metric name is text")
+            })
+            .collect()
+    }
+
+    /// Settings live on `SHOW CONFIG`, which is also the only place they can be
+    /// changed. Reported here as well they are most of the list, they never
+    /// move, and the two surfaces drift the moment one of them is edited.
+    ///
+    /// Written against `CONFIG_KEYS` rather than against a list of names, so a
+    /// knob added to the configuration surface tomorrow is covered without
+    /// anybody remembering this test exists. That is the point of it: adding a
+    /// setting here would be a reasonable-looking one-line change, and nothing
+    /// about the result would look wrong afterwards.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_statistics_report_no_settings_and_no_internal_ids() {
+        let _ = crate::MAX_PERMITS_THREADS.get_or_init(|| 8);
+        let _ = crate::BATCH_SIZE.get_or_init(|| 1024 * 8);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let database = Arc::new(Database::new(dir.path().to_str().expect("a UTF-8 path")).await);
+        let metrics = metrics(&database).await;
+
+        for key in CONFIG_KEYS {
+            // Both spellings a knob could take here: `wal.enabled` was
+            // `wal_enabled`, and `server.batch_size` was the bare `batch_size`.
+            for spelling in [format!("{}_{}", key.section, key.key), key.key.to_string()] {
+                assert!(
+                    !metrics.contains(&spelling),
+                    "`{}` is a SHOW CONFIG knob and is reported as a statistic",
+                    spelling
+                );
+            }
+        }
+
+        for internal in ["database_id", "replication_node_id"] {
+            assert!(
+                !metrics.contains(&internal.to_string()),
+                "`{}` names this process to the engine; no client can act on it",
+                internal
+            );
+        }
+
+        // What a console reads by name. Losing one of these silently empties a
+        // tile on the front page.
+        for kept in ["name", "tables", "columns", "row_slots", "total_bytes"] {
+            assert!(
+                metrics.contains(&kept.to_string()),
+                "`{}` went missing",
+                kept
+            );
+        }
+    }
+
+    /// The count has to be the set `SHOW TABLES` lists, or a console's front
+    /// page and its table list disagree about how many tables exist.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn internal_relations_are_not_counted_as_tables() {
+        let _ = crate::MAX_PERMITS_THREADS.get_or_init(|| 8);
+        let _ = crate::BATCH_SIZE.get_or_init(|| 1024 * 8);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let database = Arc::new(Database::new(dir.path().to_str().expect("a UTF-8 path")).await);
+
+        for sql in [
+            "CREATE TABLE orders (id INT, amount INT)",
+            // The spelling every internal relation uses: a JSON column's
+            // shadow table, a CTE's temporary one, a materialised catalogue
+            // view.
+            "CREATE TABLE __json_orders_doc (id INT, k VARCHAR)",
+        ] {
+            let purpose = crate::core::rql::lexer_s1::recognize_query_purpose(sql)
+                .unwrap_or_else(|| panic!("unrecognised: {sql}"));
+            let response = crate::core::rql::executor::execute(purpose, database.clone()).await;
+            assert_ne!(response.first(), Some(&3u8), "{sql} failed");
+        }
+
+        let stats = database_stats(&database).await;
+        let value_of = |metric: &str| -> String {
+            let index = stats
+                .iter()
+                .position(|row| row.columns[0].data.into_slice() == metric.as_bytes())
+                .unwrap_or_else(|| panic!("no `{}` row", metric));
+            String::from_utf8(stats[index].columns[1].data.into_slice().to_vec())
+                .expect("a value is text")
+        };
+
+        assert_eq!(value_of("tables"), "1", "the shadow table was counted");
+        assert!(
+            database.tables.len() >= 2,
+            "the fixture did not actually create the shadow table"
+        );
     }
 
     /// Result metadata is sent before the rows, so a mismatch is a protocol

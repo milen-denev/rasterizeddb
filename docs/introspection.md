@@ -46,6 +46,48 @@ change. A result set has column names and types the wire protocol describes, so
 a client binds to those and a new metric is an added row rather than a broken
 parser.
 
+## What is holding a table
+
+`SHOW TABLES` names the backend of every table, and `SHOW TABLE STATS` says
+where it is:
+
+```
+table_name | storage      | row_slots | ...
+customers  | file         |         2 | ...
+archive    | kv-directory |         1 | ...
+sessions   | memory       |    10_412 | ...
+```
+
+| `storage` | what it means |
+|---|---|
+| `memory` | in this process, and gone when it exits |
+| `file` | ordinary files in a directory |
+| `mirrored` | files, written to a primary directory and to backup ones |
+| `s3` | objects in an S3-compatible store |
+| `kv-directory` | the object layout, in a local directory |
+| `kv-memory` | the object layout, in a map |
+
+One database can hold tables on several of these at once — `STORAGE PLACE TABLE
+t AT 'kv:archive'` puts one table on an object store while the rest of the
+database stays on files — which is why this is a column of the table list and
+not a property of the database. `SHOW DATABASE STATS` reports the database's own
+backend under the same names.
+
+The three `kv-*` answers are one storage engine over three backing stores, and
+they are deliberately not folded into a single `object`: what an operator *does*
+about a slow table differs completely between them, since a local directory is a
+disk to look at and S3 is a request count to pay for. For the same reason the
+kind is a fixed one-word vocabulary rather than the store's description —
+`storage_location` carries the path or the bucket, and it is free to be reworded;
+`storage` is what a console groups by, and it is not.
+
+For a table on a key/value store, `SHOW TABLE STATS` also reports the page cache
+in front of it — `kv_cache_hits`, `kv_cache_misses`, `kv_cache_bytes`. Those are
+the store's rather than the table's, shared by every table placed on it, and the
+`detail` column says so. On an object store the miss count is the figure that
+matters: each one is a request, and requests are what an object store charges
+for.
+
 ## What the figures mean
 
 Every size is read from the storage layer rather than counted, so `SHOW TABLES`
@@ -57,8 +99,45 @@ had to move leaves one behind. It is an upper bound, and it is named `row_slots`
 rather than `rows` so that nothing reads it as the latter. A client that wants
 the exact figure runs `SELECT COUNT(*)`, which scans.
 
-`reclaimable_bytes` is what a `VACUUM` would return. `index_bytes` is the
+`avg_row_bytes` is the measured average — row data divided by pointer records —
+where `fixed_row_width` is the declared minimum. The gap between them is what the
+variable-width columns actually cost, which is the figure capacity planning wants
+and the one that cannot be worked out from the schema.
+
+`reclaimable_bytes` is what a `VACUUM` would return, and `dead_ratio` is that as
+a proportion of the row data. The ratio is the one to read: the decision it
+informs — is a `VACUUM` worth taking — is about the proportion and not the size,
+since a gigabyte of dead space in a terabyte table is noise and the same gigabyte
+in a two-gigabyte table is half the disk. `vacuum_enabled` says whether
+reclamation is running *for this table*, which is the question `SHOW CONFIG`
+cannot answer: the switch is per table, so all it can report there is the words
+"per table". `index_bytes` is the
 persisted bit-sliced filter checkpoint, not a B-tree.
+
+## What `SHOW DATABASE STATS` does not report
+
+Two kinds of row used to be there and are not.
+
+**Settings.** `wal_enabled`, `wal_checkpoint_bytes`, `filter_enabled`,
+`filter_min_pruning_ratio`, `query_cache_enabled`, `query_stats_enabled`,
+`replication_active`, `batch_size`, `concurrent_threads`. They are not
+measurements: they say what this server was told to do, they do not move while
+it runs, and every one of them is already reported by `SHOW CONFIG` — which is
+also the only place they can be changed. Reported in both places they were most
+of the list, which pushed the figures that actually move off the page, and a
+constant sitting beside the sizes invites being read as a statistic.
+
+**Internal ids and internal relations.** `database_id` and
+`replication_node_id` name this process to the engine and nothing a client does
+depends on either. And the `__…` relations — a JSON column's shadow table, the
+temporary relation a CTE or a catalogue view materialises into — are counted by
+neither `tables` nor `columns`, because `SHOW TABLES` does not list them and a
+console whose front page disagrees with its table list about how many tables
+exist is a console nobody trusts.
+
+The byte totals still cover **every** file the database owns, shadow tables
+included. That is what the disk holds, and a size that left them out would be
+wrong in the direction that matters.
 
 ## Configuration, and what "hot reload" means
 

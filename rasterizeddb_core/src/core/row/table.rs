@@ -1240,6 +1240,15 @@ impl<S: StorageIO> Table<S> {
         self.free_space.free_bytes()
     }
 
+    /// Whether reclamation is running for this table.
+    ///
+    /// Per table rather than per database, which is why it is reported per
+    /// table: `SHOW CONFIG` can only answer "per table" for `vacuum.enabled`,
+    /// and without this there was nowhere to find out which tables that meant.
+    pub fn vacuum_enabled(&self) -> bool {
+        self.free_space.is_enabled()
+    }
+
     /// Turns reclamation on or off for this table without restarting.
     ///
     /// Switching off drops the free list, so nothing further is handed out, and
