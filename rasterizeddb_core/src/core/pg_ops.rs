@@ -190,7 +190,11 @@ fn structural(
                 Some(bounds) => bounds,
                 // An empty range contains nothing and overlaps nothing, but is
                 // contained by everything.
-                None => return Some(op == PgOp::Contains && pg_types::range_bounds_key(t, right).is_none()),
+                None => {
+                    return Some(
+                        op == PgOp::Contains && pg_types::range_bounds_key(t, right).is_none(),
+                    );
+                }
             };
             let (lo_b, hi_b, lo_inc_b, hi_inc_b) = match pg_types::range_bounds_key(t, right) {
                 Some(bounds) => bounds,
@@ -313,9 +317,9 @@ pub fn json_contains(outer: &serde_json::Value, inner: &serde_json::Value) -> bo
         (Value::Object(a), Value::Object(b)) => b
             .iter()
             .all(|(key, value)| a.get(key).is_some_and(|found| json_contains(found, value))),
-        (Value::Array(a), Value::Array(b)) => {
-            b.iter().all(|want| a.iter().any(|have| json_contains(have, want)))
-        }
+        (Value::Array(a), Value::Array(b)) => b
+            .iter()
+            .all(|want| a.iter().any(|have| json_contains(have, want))),
         (Value::Array(a), scalar) if !scalar.is_object() => {
             a.iter().any(|have| json_contains(have, scalar))
         }
@@ -422,11 +426,23 @@ mod tests {
         let host = inet("192.168.1.10");
         let net = inet("192.168.0.0/16");
         assert_eq!(
-            evaluate(PgOp::NetContainedByOrEq, &DbType::INET, &host, &DbType::INET, &net),
+            evaluate(
+                PgOp::NetContainedByOrEq,
+                &DbType::INET,
+                &host,
+                &DbType::INET,
+                &net
+            ),
             Some(true)
         );
         assert_eq!(
-            evaluate(PgOp::NetContainsOrEq, &DbType::INET, &net, &DbType::INET, &host),
+            evaluate(
+                PgOp::NetContainsOrEq,
+                &DbType::INET,
+                &net,
+                &DbType::INET,
+                &host
+            ),
             Some(true)
         );
     }
@@ -436,7 +452,13 @@ mod tests {
         let host = inet("10.0.0.5");
         let net = inet("192.168.0.0/16");
         assert_eq!(
-            evaluate(PgOp::NetContainedByOrEq, &DbType::INET, &host, &DbType::INET, &net),
+            evaluate(
+                PgOp::NetContainedByOrEq,
+                &DbType::INET,
+                &host,
+                &DbType::INET,
+                &net
+            ),
             Some(false)
         );
     }
@@ -445,11 +467,23 @@ mod tests {
     fn a_network_does_not_strictly_contain_itself() {
         let net = inet("192.168.0.0/16");
         assert_eq!(
-            evaluate(PgOp::NetContainedBy, &DbType::INET, &net, &DbType::INET, &net),
+            evaluate(
+                PgOp::NetContainedBy,
+                &DbType::INET,
+                &net,
+                &DbType::INET,
+                &net
+            ),
             Some(false)
         );
         assert_eq!(
-            evaluate(PgOp::NetContainedByOrEq, &DbType::INET, &net, &DbType::INET, &net),
+            evaluate(
+                PgOp::NetContainedByOrEq,
+                &DbType::INET,
+                &net,
+                &DbType::INET,
+                &net
+            ),
             Some(true)
         );
     }
@@ -459,11 +493,19 @@ mod tests {
         // /12 fixes four bits of the second octet: 172.16 and 172.31 are in,
         // 172.32 is out.
         let net = inet("172.16.0.0/12");
-        for (address, expected) in
-            [("172.16.0.1", true), ("172.31.255.254", true), ("172.32.0.1", false)]
-        {
+        for (address, expected) in [
+            ("172.16.0.1", true),
+            ("172.31.255.254", true),
+            ("172.32.0.1", false),
+        ] {
             assert_eq!(
-                evaluate(PgOp::NetContainedByOrEq, &DbType::INET, &inet(address), &DbType::INET, &net),
+                evaluate(
+                    PgOp::NetContainedByOrEq,
+                    &DbType::INET,
+                    &inet(address),
+                    &DbType::INET,
+                    &net
+                ),
                 Some(expected),
                 "{}",
                 address
@@ -486,7 +528,8 @@ mod tests {
     fn a_false_value_is_contained_and_a_missing_key_is_not() {
         // The distinction the risk-flag filter rests on: `false` is a value,
         // not an absence, so a document without the key must not match.
-        let flagged: serde_json::Value = serde_json::from_str(r#"{"is_risk_flagged": false}"#).unwrap();
+        let flagged: serde_json::Value =
+            serde_json::from_str(r#"{"is_risk_flagged": false}"#).unwrap();
         let other: serde_json::Value = serde_json::from_str(r#"{"other": 1}"#).unwrap();
         let want = serde_json::json!({"is_risk_flagged": false});
         assert!(json_contains(&flagged, &want));
@@ -496,7 +539,13 @@ mod tests {
     #[test]
     fn a_range_contains_the_values_between_its_bounds() {
         let range = pg_types::parse_range(&DbType::INT4RANGE, "[50,150)").unwrap();
-        for (value, expected) in [(50i32, true), (100, true), (149, true), (150, false), (49, false)] {
+        for (value, expected) in [
+            (50i32, true),
+            (100, true),
+            (149, true),
+            (150, false),
+            (49, false),
+        ] {
             assert_eq!(
                 evaluate(
                     PgOp::Contains,
@@ -518,11 +567,23 @@ mod tests {
         let b = pg_types::parse_range(&DbType::INT4RANGE, "[100,200)").unwrap();
         let c = pg_types::parse_range(&DbType::INT4RANGE, "[200,300)").unwrap();
         assert_eq!(
-            evaluate(PgOp::Overlaps, &DbType::INT4RANGE, &a, &DbType::INT4RANGE, &b),
+            evaluate(
+                PgOp::Overlaps,
+                &DbType::INT4RANGE,
+                &a,
+                &DbType::INT4RANGE,
+                &b
+            ),
             Some(true)
         );
         assert_eq!(
-            evaluate(PgOp::Overlaps, &DbType::INT4RANGE, &a, &DbType::INT4RANGE, &c),
+            evaluate(
+                PgOp::Overlaps,
+                &DbType::INT4RANGE,
+                &a,
+                &DbType::INT4RANGE,
+                &c
+            ),
             Some(false)
         );
     }
@@ -533,7 +594,13 @@ mod tests {
         let a = pg_types::parse_range(&DbType::INT4RANGE, "[50,150)").unwrap();
         let b = pg_types::parse_range(&DbType::INT4RANGE, "[150,200)").unwrap();
         assert_eq!(
-            evaluate(PgOp::Overlaps, &DbType::INT4RANGE, &a, &DbType::INT4RANGE, &b),
+            evaluate(
+                PgOp::Overlaps,
+                &DbType::INT4RANGE,
+                &a,
+                &DbType::INT4RANGE,
+                &b
+            ),
             Some(false)
         );
     }
@@ -544,11 +611,23 @@ mod tests {
         let near = pg_types::parse_polygon("((5,5),(5,15),(15,15),(15,5),(5,5))").unwrap();
         let far = pg_types::parse_polygon("((20,20),(20,30),(30,30),(30,20),(20,20))").unwrap();
         assert_eq!(
-            evaluate(PgOp::Overlaps, &DbType::POLYGON, &square, &DbType::POLYGON, &near),
+            evaluate(
+                PgOp::Overlaps,
+                &DbType::POLYGON,
+                &square,
+                &DbType::POLYGON,
+                &near
+            ),
             Some(true)
         );
         assert_eq!(
-            evaluate(PgOp::Overlaps, &DbType::POLYGON, &square, &DbType::POLYGON, &far),
+            evaluate(
+                PgOp::Overlaps,
+                &DbType::POLYGON,
+                &square,
+                &DbType::POLYGON,
+                &far
+            ),
             Some(false)
         );
     }
@@ -558,11 +637,23 @@ mod tests {
         let small = pg_types::parse_circle("<(5,5),3>").unwrap();
         let large = pg_types::parse_circle("<(5,5),20>").unwrap();
         assert_eq!(
-            evaluate(PgOp::ContainedBy, &DbType::CIRCLE, &small, &DbType::CIRCLE, &large),
+            evaluate(
+                PgOp::ContainedBy,
+                &DbType::CIRCLE,
+                &small,
+                &DbType::CIRCLE,
+                &large
+            ),
             Some(true)
         );
         assert_eq!(
-            evaluate(PgOp::ContainedBy, &DbType::CIRCLE, &large, &DbType::CIRCLE, &small),
+            evaluate(
+                PgOp::ContainedBy,
+                &DbType::CIRCLE,
+                &large,
+                &DbType::CIRCLE,
+                &small
+            ),
             Some(false)
         );
     }
@@ -573,15 +664,33 @@ mod tests {
         let inner = crate::core::value_codec::parse_array_literal("{gift}").unwrap();
         let absent = crate::core::value_codec::parse_array_literal("{standard}").unwrap();
         assert_eq!(
-            evaluate(PgOp::Contains, &DbType::ARRAY, &outer, &DbType::ARRAY, &inner),
+            evaluate(
+                PgOp::Contains,
+                &DbType::ARRAY,
+                &outer,
+                &DbType::ARRAY,
+                &inner
+            ),
             Some(true)
         );
         assert_eq!(
-            evaluate(PgOp::Contains, &DbType::ARRAY, &outer, &DbType::ARRAY, &absent),
+            evaluate(
+                PgOp::Contains,
+                &DbType::ARRAY,
+                &outer,
+                &DbType::ARRAY,
+                &absent
+            ),
             Some(false)
         );
         assert_eq!(
-            evaluate(PgOp::Overlaps, &DbType::ARRAY, &outer, &DbType::ARRAY, &absent),
+            evaluate(
+                PgOp::Overlaps,
+                &DbType::ARRAY,
+                &outer,
+                &DbType::ARRAY,
+                &absent
+            ),
             Some(false)
         );
     }

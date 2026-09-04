@@ -46,7 +46,10 @@ fn top_level_words(sql: &str) -> Vec<Word> {
     macro_rules! flush {
         ($end:expr) => {
             if let Some(start) = word_start.take() {
-                words.push(Word { start, text: sql[start..$end].to_string() });
+                words.push(Word {
+                    start,
+                    text: sql[start..$end].to_string(),
+                });
             }
         };
     }
@@ -196,10 +199,9 @@ fn parse_page(words: &[Word]) -> Result<Page, String> {
                 i += 2;
                 // `OFFSET 10 ROWS` — the SQL:2008 spelling. The noise word is
                 // optional and carries no meaning.
-                if words
-                    .get(i)
-                    .is_some_and(|w| w.text.eq_ignore_ascii_case("ROW") || w.text.eq_ignore_ascii_case("ROWS"))
-                {
+                if words.get(i).is_some_and(|w| {
+                    w.text.eq_ignore_ascii_case("ROW") || w.text.eq_ignore_ascii_case("ROWS")
+                }) {
                     i += 1;
                 }
             }
@@ -216,7 +218,10 @@ fn parse_page(words: &[Word]) -> Result<Page, String> {
 
                 // The count is optional: `FETCH FIRST ROW ONLY` means one row.
                 let count = match words.get(i) {
-                    Some(word) if !word.text.eq_ignore_ascii_case("ROW") && !word.text.eq_ignore_ascii_case("ROWS") => {
+                    Some(word)
+                        if !word.text.eq_ignore_ascii_case("ROW")
+                            && !word.text.eq_ignore_ascii_case("ROWS") =>
+                    {
                         let n = parse_count(&word.text, "FETCH FIRST")?;
                         i += 1;
                         n
@@ -235,7 +240,7 @@ fn parse_page(words: &[Word]) -> Result<Page, String> {
                         return Err(format!(
                             "FETCH FIRST expects ROW or ROWS, found '{}'",
                             word.text
-                        ))
+                        ));
                     }
                     None => return Err("FETCH FIRST is missing ROW ONLY".to_string()),
                 }
@@ -246,10 +251,10 @@ fn parse_page(words: &[Word]) -> Result<Page, String> {
                     // the ORDER BY key, so it can return more rows than asked
                     // for. Refused rather than silently downgraded to ONLY.
                     Some(word) if word.text.eq_ignore_ascii_case("WITH") => {
-                        return Err("FETCH FIRST ... WITH TIES is not supported yet".to_string())
+                        return Err("FETCH FIRST ... WITH TIES is not supported yet".to_string());
                     }
                     Some(word) => {
-                        return Err(format!("FETCH FIRST expects ONLY, found '{}'", word.text))
+                        return Err(format!("FETCH FIRST expects ONLY, found '{}'", word.text));
                     }
                     None => return Err("FETCH FIRST is missing ONLY".to_string()),
                 }
@@ -260,7 +265,7 @@ fn parse_page(words: &[Word]) -> Result<Page, String> {
                 return Err(format!(
                     "'{}' cannot follow a LIMIT/OFFSET/FETCH clause",
                     other
-                ))
+                ));
             }
         }
     }
@@ -364,13 +369,22 @@ mod tests {
     #[test]
     fn limit_all_drops_the_cap() {
         assert_eq!(norm("SELECT id FROM t LIMIT ALL"), "SELECT id FROM t");
-        assert_eq!(norm("SELECT id FROM t LIMIT ALL OFFSET 4"), "SELECT id FROM t OFFSET 4");
+        assert_eq!(
+            norm("SELECT id FROM t LIMIT ALL OFFSET 4"),
+            "SELECT id FROM t OFFSET 4"
+        );
     }
 
     #[test]
     fn offset_accepts_the_row_noise_word() {
-        assert_eq!(norm("SELECT id FROM t OFFSET 7 ROWS"), "SELECT id FROM t OFFSET 7");
-        assert_eq!(norm("SELECT id FROM t OFFSET 1 ROW"), "SELECT id FROM t OFFSET 1");
+        assert_eq!(
+            norm("SELECT id FROM t OFFSET 7 ROWS"),
+            "SELECT id FROM t OFFSET 7"
+        );
+        assert_eq!(
+            norm("SELECT id FROM t OFFSET 1 ROW"),
+            "SELECT id FROM t OFFSET 1"
+        );
     }
 
     #[test]
@@ -388,7 +402,10 @@ mod tests {
     /// The count is optional in SQL:2008 and defaults to one row.
     #[test]
     fn fetch_first_without_a_count_means_one_row() {
-        assert_eq!(norm("SELECT id FROM t FETCH FIRST ROW ONLY"), "SELECT id FROM t LIMIT 1");
+        assert_eq!(
+            norm("SELECT id FROM t FETCH FIRST ROW ONLY"),
+            "SELECT id FROM t LIMIT 1"
+        );
     }
 
     #[test]
@@ -401,7 +418,10 @@ mod tests {
 
     #[test]
     fn take_and_skip_map_onto_limit_and_offset() {
-        assert_eq!(norm("SELECT id FROM t TAKE 10"), "SELECT id FROM t LIMIT 10");
+        assert_eq!(
+            norm("SELECT id FROM t TAKE 10"),
+            "SELECT id FROM t LIMIT 10"
+        );
         assert_eq!(norm("SELECT id FROM t SKIP 5"), "SELECT id FROM t OFFSET 5");
         assert_eq!(
             norm("SELECT id FROM t ORDER BY id SKIP 5 TAKE 10"),

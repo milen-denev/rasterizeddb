@@ -36,7 +36,10 @@ async fn read_all(provider: &KvStorageProvider) -> Vec<u8> {
     let mut out = vec![0u8; len];
     if len > 0 {
         let mut position = 0u64;
-        provider.read_data_into_buffer(&mut position, &mut out).await.unwrap();
+        provider
+            .read_data_into_buffer(&mut position, &mut out)
+            .await
+            .unwrap();
     }
     out
 }
@@ -148,8 +151,7 @@ impl KvStore for FailAfterStore {
         self.inner.get_range(key, offset, len)
     }
     fn put<'a>(&'a self, key: &'a str, body: Vec<u8>) -> BoxFuture<'a, std::io::Result<()>> {
-        if self.armed.load(Ordering::Relaxed)
-            && self.remaining.fetch_sub(1, Ordering::Relaxed) == 0
+        if self.armed.load(Ordering::Relaxed) && self.remaining.fetch_sub(1, Ordering::Relaxed) == 0
         {
             return Box::pin(async { Err(std::io::Error::other("store went away")) });
         }
@@ -206,11 +208,17 @@ async fn reading_past_the_end_reports_eof() {
 
     let mut buffer = [0u8; 8];
     let mut position = 0u64;
-    let error = io.read_data_into_buffer(&mut position, &mut buffer).await.unwrap_err();
+    let error = io
+        .read_data_into_buffer(&mut position, &mut buffer)
+        .await
+        .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::UnexpectedEof);
 
     let mut position = 99u64;
-    let error = io.read_data_into_buffer(&mut position, &mut buffer).await.unwrap_err();
+    let error = io
+        .read_data_into_buffer(&mut position, &mut buffer)
+        .await
+        .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::UnexpectedEof);
 }
 
@@ -243,7 +251,9 @@ async fn two_handles_to_one_name_are_one_file() {
     // How the engine opens a sibling: through an existing provider.
     let second = first.create_new("schema.db".to_string()).await;
 
-    second.append_data(b"written through the other handle", true).await;
+    second
+        .append_data(b"written through the other handle", true)
+        .await;
     assert_eq!(read_all(&first).await, b"written through the other handle");
 }
 
@@ -345,8 +355,14 @@ async fn a_transaction_spanning_two_files_commits_on_one_of_them() {
         pointers.commit_durable(txn).await.unwrap();
     }
     let family = open_family(store).await;
-    assert_eq!(read_all(&open(&family, "t.db").await).await, b"the row bytes");
-    assert_eq!(read_all(&open(&family, "t_pointers.db").await).await, b"the pointer");
+    assert_eq!(
+        read_all(&open(&family, "t.db").await).await,
+        b"the row bytes"
+    );
+    assert_eq!(
+        read_all(&open(&family, "t_pointers.db").await).await,
+        b"the pointer"
+    );
 }
 
 #[tokio::test]
@@ -421,7 +437,11 @@ async fn a_corrupt_delta_is_treated_as_uncommitted_not_as_an_outage() {
 
     let family = open_family(handle).await;
     let io = open(&family, "rows.db").await;
-    assert_eq!(read_all(&io).await, b"first", "the intact prefix must still open");
+    assert_eq!(
+        read_all(&io).await,
+        b"first",
+        "the intact prefix must still open"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -444,7 +464,10 @@ async fn compaction_folds_into_base_chunks_and_retires_the_deltas() {
         expected.extend_from_slice(&block);
     }
     let deltas_before = store.list("t/rows.db/d/").await.unwrap().len();
-    assert!(deltas_before >= 40, "expected a delta per commit, saw {deltas_before}");
+    assert!(
+        deltas_before >= 40,
+        "expected a delta per commit, saw {deltas_before}"
+    );
 
     io.compact_now().await.unwrap();
 
@@ -452,7 +475,11 @@ async fn compaction_folds_into_base_chunks_and_retires_the_deltas() {
     let chunks = store.list("t/rows.db/g").await.unwrap().len();
     assert!(deltas_after < deltas_before, "compaction retired nothing");
     assert!(chunks > 0, "compaction wrote no base chunks");
-    assert_eq!(read_all(&io).await, expected, "compaction changed what the file says");
+    assert_eq!(
+        read_all(&io).await,
+        expected,
+        "compaction changed what the file says"
+    );
 }
 
 #[tokio::test]
@@ -494,13 +521,19 @@ async fn compaction_leaves_an_open_transaction_alone() {
     // Visible to its own writer, and gone after a restart.
     let mut buffer = vec![0u8; 13];
     let mut position = 20_000u64;
-    io.read_data_into_buffer(&mut position, &mut buffer).await.unwrap();
+    io.read_data_into_buffer(&mut position, &mut buffer)
+        .await
+        .unwrap();
     assert_eq!(&buffer, b"not committed");
 
     drop(io);
     let family = open_family(store).await;
     let io = open(&family, "rows.db").await;
-    assert_eq!(read_all(&io).await, settled, "an open transaction became base data");
+    assert_eq!(
+        read_all(&io).await,
+        settled,
+        "an open transaction became base data"
+    );
 }
 
 #[tokio::test]
@@ -523,7 +556,9 @@ async fn repeated_writes_to_one_place_do_not_grow_the_store() {
     }
     let mut buffer = [0u8; 1];
     let mut position = 12_345u64;
-    io.read_data_into_buffer(&mut position, &mut buffer).await.unwrap();
+    io.read_data_into_buffer(&mut position, &mut buffer)
+        .await
+        .unwrap();
     assert_eq!(buffer[0], 199);
 
     let bytes = store.total_bytes();
@@ -600,13 +635,18 @@ async fn a_scan_reads_each_chunk_once() {
     let mut buffer = vec![0u8; 256];
     for block in 0..(4096 * 10 / 256) {
         let mut position = block as u64 * 256;
-        io.read_data_into_buffer(&mut position, &mut buffer).await.unwrap();
+        io.read_data_into_buffer(&mut position, &mut buffer)
+            .await
+            .unwrap();
         assert!(buffer.iter().all(|&b| b == 7));
     }
     let reads = store.reads() - before;
     // 160 reads over 10 chunks. Anything near 160 means the cache is not
     // working; anything near 10 means whole chunks are being fetched.
-    assert!(reads <= 40, "a sequential scan of 10 chunks took {reads} requests");
+    assert!(
+        reads <= 40,
+        "a sequential scan of 10 chunks took {reads} requests"
+    );
 }
 
 #[tokio::test]
@@ -624,7 +664,9 @@ async fn a_resident_batch_is_served_without_touching_the_store() {
     // Warm the pages.
     let mut warm = vec![0u8; 8192];
     let mut position = 0u64;
-    io.read_data_into_buffer(&mut position, &mut warm).await.unwrap();
+    io.read_data_into_buffer(&mut position, &mut warm)
+        .await
+        .unwrap();
 
     let before = store.reads();
     let mut buffers: Vec<Vec<u8>> = (0..4).map(|_| vec![0u8; 100]).collect();
@@ -635,7 +677,10 @@ async fn a_resident_batch_is_served_without_touching_the_store() {
             .collect();
         io.try_read_vectored_sync(&mut reads)
     };
-    assert!(served, "everything was resident and the sync path still declined");
+    assert!(
+        served,
+        "everything was resident and the sync path still declined"
+    );
     assert_eq!(store.reads(), before);
     assert_eq!(buffers[0].as_slice(), &data[10..110]);
     assert_eq!(buffers[3].as_slice(), &data[7000..7100]);
@@ -652,9 +697,13 @@ async fn a_borrowed_range_is_refused_when_an_overlay_covers_it() {
 
     let mut warm = vec![0u8; 8192];
     let mut position = 0u64;
-    io.read_data_into_buffer(&mut position, &mut warm).await.unwrap();
+    io.read_data_into_buffer(&mut position, &mut warm)
+        .await
+        .unwrap();
 
-    let borrowed = io.try_borrow_range(100, 16).expect("a clean, resident range should borrow");
+    let borrowed = io
+        .try_borrow_range(100, 16)
+        .expect("a clean, resident range should borrow");
     assert_eq!(borrowed.as_slice(), &[b'o'; 16]);
     drop(borrowed);
 
@@ -692,7 +741,11 @@ async fn a_swapped_scratch_file_becomes_the_real_one_and_survives_a_restart() {
 
     let family = open_family(store).await;
     let io = open(&family, "rows.db").await;
-    assert_eq!(io.get_len().await, 5_000, "the swapped file did not survive");
+    assert_eq!(
+        io.get_len().await,
+        5_000,
+        "the swapped file did not survive"
+    );
     assert_eq!(read_all(&io).await, vec![b'n'; 5_000]);
 }
 
@@ -743,7 +796,11 @@ async fn dropping_a_scratch_file_leaves_the_real_one_alone() {
     assert_eq!(read_all(&io).await, b"the real contents");
     let family = open_family(store).await;
     let io = open(&family, "rows.db").await;
-    assert_eq!(read_all(&io).await, b"the real contents", "dropping scratch erased the table");
+    assert_eq!(
+        read_all(&io).await,
+        b"the real contents",
+        "dropping scratch erased the table"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -818,8 +875,16 @@ async fn it_behaves_like_the_in_memory_provider() {
                 let mut pa = at;
                 let mut pb = at;
                 kv.read_data_into_buffer(&mut pa, &mut mine).await.unwrap();
-                reference.read_data_into_buffer(&mut pb, &mut theirs).await.unwrap();
-                assert_eq!(mine, theirs, "seed {seed} step {step}: bytes at {at}..{}", at + want as u64);
+                reference
+                    .read_data_into_buffer(&mut pb, &mut theirs)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    mine,
+                    theirs,
+                    "seed {seed} step {step}: bytes at {at}..{}",
+                    at + want as u64
+                );
                 assert_eq!(pa, pb, "seed {seed} step {step}: position advance");
             }
         }
@@ -840,10 +905,10 @@ mod engine {
     use smallvec::SmallVec;
     use std::sync::Arc;
 
-    use super::{KvStore, KvStorageProvider, MemoryKvStore, open_family};
+    use super::{KvStorageProvider, KvStore, MemoryKvStore, open_family};
     use crate::core::db_type::DbType;
-    use crate::core::row::row::{ColumnFetchingData, Row, RowFetch, RowWrite};
     use crate::core::row::row::ColumnWritePayload;
+    use crate::core::row::row::{ColumnFetchingData, Row, RowFetch, RowWrite};
     use crate::core::row::schema::{SchemaCalculator, SchemaField};
     use crate::core::row::table::Table;
     use crate::core::rql::lexer_ct::CreateColumnData;
@@ -859,13 +924,21 @@ mod engine {
         let mut mb = MEMORY_POOL.acquire(bytes.len());
         mb.into_slice_mut().copy_from_slice(bytes);
         let size = column_type.get_size();
-        ColumnWritePayload { data: mb, write_order, column_type, size }
+        ColumnWritePayload {
+            data: mb,
+            write_order,
+            column_type,
+            size,
+        }
     }
 
     fn full_fetch(fields: &SmallVec<[SchemaField; 20]>) -> RowFetch {
         let calc = SchemaCalculator;
         let mut cols = SmallVec::new();
-        for f in fields.iter().sorted_by(|a, b| a.write_order.cmp(&b.write_order)) {
+        for f in fields
+            .iter()
+            .sorted_by(|a, b| a.write_order.cmp(&b.write_order))
+        {
             let (column_offset, schema_id) = calc.calculate_schema_offset(&f.name, fields);
             cols.push(ColumnFetchingData {
                 column_offset,
@@ -874,7 +947,9 @@ mod engine {
                 schema_id,
             });
         }
-        RowFetch { columns_fetching_data: cols }
+        RowFetch {
+            columns_fetching_data: cols,
+        }
     }
 
     async fn open_table(store: Arc<dyn KvStore>) -> Table<KvStorageProvider> {
@@ -885,19 +960,33 @@ mod engine {
             "people",
             RcArc::new(seed),
             vec![
-                CreateColumnData { name: "id".into(), data_type: DbType::U64 },
-                CreateColumnData { name: "cat".into(), data_type: DbType::I32 },
-                CreateColumnData { name: "label".into(), data_type: DbType::STRING },
+                CreateColumnData {
+                    name: "id".into(),
+                    data_type: DbType::U64,
+                },
+                CreateColumnData {
+                    name: "cat".into(),
+                    data_type: DbType::I32,
+                },
+                CreateColumnData {
+                    name: "label".into(),
+                    data_type: DbType::STRING,
+                },
             ],
         )
         .await
     }
 
     async fn insert(table: &Table<KvStorageProvider>, id: u64, cat: i32, label: &str) {
-        let mut rw = RowWrite { columns_writing_data: SmallVec::new() };
-        rw.columns_writing_data.push(payload(&id.to_le_bytes(), 0, DbType::U64));
-        rw.columns_writing_data.push(payload(&cat.to_le_bytes(), 1, DbType::I32));
-        rw.columns_writing_data.push(payload(label.as_bytes(), 2, DbType::STRING));
+        let mut rw = RowWrite {
+            columns_writing_data: SmallVec::new(),
+        };
+        rw.columns_writing_data
+            .push(payload(&id.to_le_bytes(), 0, DbType::U64));
+        rw.columns_writing_data
+            .push(payload(&cat.to_le_bytes(), 1, DbType::I32));
+        rw.columns_writing_data
+            .push(payload(label.as_bytes(), 2, DbType::STRING));
         table.insert_row(rw).await.unwrap();
     }
 
@@ -917,12 +1006,20 @@ mod engine {
     }
 
     fn u64_of(row: &Row, schema_id: u64) -> u64 {
-        let column = row.columns.iter().find(|c| c.schema_id == schema_id).unwrap();
+        let column = row
+            .columns
+            .iter()
+            .find(|c| c.schema_id == schema_id)
+            .unwrap();
         u64::from_le_bytes(column.data.into_slice().try_into().unwrap())
     }
 
     fn str_of(row: &Row, schema_id: u64) -> String {
-        let column = row.columns.iter().find(|c| c.schema_id == schema_id).unwrap();
+        let column = row
+            .columns
+            .iter()
+            .find(|c| c.schema_id == schema_id)
+            .unwrap();
         String::from_utf8_lossy(column.data.into_slice()).to_string()
     }
 
@@ -969,6 +1066,9 @@ mod engine {
         let mut ids: Vec<u64> = rows.iter().map(|r| u64_of(r, 0)).collect();
         ids.sort_unstable();
         assert_eq!(ids, (0..120u64).collect::<Vec<_>>());
-        assert_eq!(str_of(rows.iter().find(|r| u64_of(r, 0) == 99).unwrap(), 2), "value-99");
+        assert_eq!(
+            str_of(rows.iter().find(|r| u64_of(r, 0) == 99).unwrap(), 2),
+            "value-99"
+        );
     }
 }

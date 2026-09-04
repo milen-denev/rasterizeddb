@@ -1,9 +1,4 @@
-use std::{
-    any::Any,
-    future::Future,
-    io::SeekFrom,
-    sync::Arc,
-};
+use std::{any::Any, future::Future, io::SeekFrom, sync::Arc};
 
 pub type IOError = std::io::Error;
 pub type IOResult<T> = std::result::Result<T, IOError>;
@@ -48,7 +43,11 @@ impl BorrowedBytes {
     /// held, and must not be deallocated or unmapped while this guard lives.
     #[inline]
     pub unsafe fn new(owner: Arc<dyn Any + Send + Sync>, ptr: *const u8, len: usize) -> Self {
-        Self { _owner: owner, ptr, len }
+        Self {
+            _owner: owner,
+            ptr,
+            len,
+        }
     }
 
     #[inline(always)]

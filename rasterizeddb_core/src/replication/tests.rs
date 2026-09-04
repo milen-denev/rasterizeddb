@@ -85,7 +85,11 @@ async fn users(database: &Arc<Database>) -> Option<Vec<String>> {
     let mut names: Vec<String> = rows
         .iter()
         .filter_map(|row| row.columns.get(1))
-        .map(|column| String::from_utf8_lossy(column.data.into_slice()).trim_end_matches('\0').to_string())
+        .map(|column| {
+            String::from_utf8_lossy(column.data.into_slice())
+                .trim_end_matches('\0')
+                .to_string()
+        })
         .collect();
     names.sort();
     Some(names)
@@ -160,7 +164,11 @@ async fn both_nodes_accept_writes_and_converge() {
     .await;
 
     run_ok(&one, "INSERT INTO repl_users (id, name) VALUES (1, 'ada')").await;
-    run_ok(&two, "INSERT INTO repl_users (id, name) VALUES (2, 'grace')").await;
+    run_ok(
+        &two,
+        "INSERT INTO repl_users (id, name) VALUES (2, 'grace')",
+    )
+    .await;
 
     let expected = vec!["ada".to_string(), "grace".to_string()];
     eventually("node one to hold both rows", || async {
@@ -215,7 +223,10 @@ async fn a_multi_statement_transaction_arrives_whole() {
     for (id, name) in [(1, "ada"), (2, "grace"), (3, "edsger")] {
         run_ok(
             &one,
-            &format!("INSERT INTO repl_users (id, name) VALUES ({}, '{}')", id, name),
+            &format!(
+                "INSERT INTO repl_users (id, name) VALUES ({}, '{}')",
+                id, name
+            ),
         )
         .await;
     }
@@ -233,7 +244,11 @@ async fn an_update_and_a_delete_replicate_as_well_as_an_insert() {
 
     run_ok(&one, "CREATE TABLE repl_users (id INTEGER, name VARCHAR)").await;
     run_ok(&one, "INSERT INTO repl_users (id, name) VALUES (1, 'ada')").await;
-    run_ok(&one, "INSERT INTO repl_users (id, name) VALUES (2, 'grace')").await;
+    run_ok(
+        &one,
+        "INSERT INTO repl_users (id, name) VALUES (2, 'grace')",
+    )
+    .await;
 
     eventually("both rows to reach node two", || async {
         users(&two).await.map(|rows| rows.len()) == Some(2)
@@ -261,7 +276,10 @@ async fn a_peer_that_was_paused_catches_up_when_it_resumes() {
     })
     .await;
 
-    let link = one.replication.peer("two").expect("node one knows node two");
+    let link = one
+        .replication
+        .peer("two")
+        .expect("node one knows node two");
     link.set_paused(true);
     // Let the pause take effect before writing anything behind it.
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -269,7 +287,10 @@ async fn a_peer_that_was_paused_catches_up_when_it_resumes() {
     for id in 1..=5 {
         run_ok(
             &one,
-            &format!("INSERT INTO repl_users (id, name) VALUES ({}, 'user{}')", id, id),
+            &format!(
+                "INSERT INTO repl_users (id, name) VALUES ({}, 'user{}')",
+                id, id
+            ),
         )
         .await;
     }
@@ -421,7 +442,10 @@ async fn resending_the_same_transaction_changes_nothing() {
 
     // Force the link down and back up, which replays the catch-up from the log
     // over records node two already has.
-    let link = one.replication.peer("two").expect("node one knows node two");
+    let link = one
+        .replication
+        .peer("two")
+        .expect("node one knows node two");
     link.set_paused(true);
     tokio::time::sleep(Duration::from_millis(100)).await;
     link.set_paused(false);
@@ -443,7 +467,9 @@ async fn the_status_view_reports_a_connected_peer() {
         let lines = super::sql::execute("SHOW REPLICATION PEERS", &one)
             .await
             .expect("the status view should render");
-        lines.iter().any(|line| line.contains("two") && line.contains("up"))
+        lines
+            .iter()
+            .any(|line| line.contains("two") && line.contains("up"))
     })
     .await;
 }
@@ -492,7 +518,11 @@ async fn a_cluster_can_be_built_entirely_from_sql() {
 
     let bare = |node_id: u64, port: u16| async move {
         let database = super::test_support::in_memory_database().await;
-        let mut config = ReplicationConfig { node_id, listen_port: port, ..Default::default() };
+        let mut config = ReplicationConfig {
+            node_id,
+            listen_port: port,
+            ..Default::default()
+        };
         brisk(&mut config);
         database.replication.set_config(config).unwrap();
         database
@@ -540,7 +570,11 @@ async fn a_listener_that_cannot_bind_says_so_and_stays_retryable() {
     let port = occupied.local_addr().expect("a bound address").port();
 
     let database = super::test_support::in_memory_database().await;
-    let mut config = ReplicationConfig { node_id: 1, listen_port: port, ..Default::default() };
+    let mut config = ReplicationConfig {
+        node_id: 1,
+        listen_port: port,
+        ..Default::default()
+    };
     brisk(&mut config);
     database.replication.set_config(config).unwrap();
 
@@ -576,25 +610,42 @@ async fn a_resync_pulls_every_batch_and_not_just_the_first() {
         listen_port: port_puller,
         // Two records per answer, so ten records take several rounds.
         batch_max_records: 2,
-        peers: vec![PeerConfig::new("source", format!("127.0.0.1:{}", port_source))],
+        peers: vec![PeerConfig::new(
+            "source",
+            format!("127.0.0.1:{}", port_source),
+        )],
         ..Default::default()
     };
     brisk(&mut config);
     puller.replication.set_config(config).unwrap();
     Database::start_replication(puller.clone()).unwrap();
 
-    run_ok(&source, "CREATE TABLE repl_users (id INTEGER, name VARCHAR)").await;
+    run_ok(
+        &source,
+        "CREATE TABLE repl_users (id INTEGER, name VARCHAR)",
+    )
+    .await;
     for id in 1..=9 {
         run_ok(
             &source,
-            &format!("INSERT INTO repl_users (id, name) VALUES ({}, 'user{}')", id, id),
+            &format!(
+                "INSERT INTO repl_users (id, name) VALUES ({}, 'user{}')",
+                id, id
+            ),
         )
         .await;
     }
-    assert_eq!(source.replication.local_seq(), 10, "one CREATE plus nine INSERTs");
+    assert_eq!(
+        source.replication.local_seq(),
+        10,
+        "one CREATE plus nine INSERTs"
+    );
 
     // Nothing should have arrived on its own.
-    assert!(users(&puller).await.is_none(), "the source has no peers, so it pushes nothing");
+    assert!(
+        users(&puller).await.is_none(),
+        "the source has no peers, so it pushes nothing"
+    );
 
     // Wait for the link so the peer's node id is known, which RESYNC needs.
     eventually("the puller's link to the source", || async {
@@ -626,7 +677,12 @@ async fn a_chain_carries_a_transaction_to_a_node_the_origin_cannot_see() {
     let (port_a, port_b, port_c) = (free_port(), free_port(), free_port());
 
     // A ── B ── C, and A has never heard of C.
-    let a = node(1, port_a, vec![PeerConfig::new("b", format!("127.0.0.1:{}", port_b))]).await;
+    let a = node(
+        1,
+        port_a,
+        vec![PeerConfig::new("b", format!("127.0.0.1:{}", port_b))],
+    )
+    .await;
 
     let b = super::test_support::in_memory_database().await;
     let mut config = ReplicationConfig {
@@ -643,7 +699,12 @@ async fn a_chain_carries_a_transaction_to_a_node_the_origin_cannot_see() {
     b.replication.set_config(config).unwrap();
     Database::start_replication(b.clone()).unwrap();
 
-    let c = node(3, port_c, vec![PeerConfig::new("b", format!("127.0.0.1:{}", port_b))]).await;
+    let c = node(
+        3,
+        port_c,
+        vec![PeerConfig::new("b", format!("127.0.0.1:{}", port_b))],
+    )
+    .await;
 
     // Let every link finish its handshake before anything is written, so the
     // relay knows which peer is which.
@@ -663,9 +724,21 @@ async fn a_chain_carries_a_transaction_to_a_node_the_origin_cannot_see() {
     // And the relay must not have sent it back where it came from and had it
     // applied twice.
     tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(users(&a).await.map(|rows| rows.len()), Some(1), "the origin");
-    assert_eq!(users(&b).await.map(|rows| rows.len()), Some(1), "the middle");
-    assert_eq!(users(&c).await.map(|rows| rows.len()), Some(1), "the far end");
+    assert_eq!(
+        users(&a).await.map(|rows| rows.len()),
+        Some(1),
+        "the origin"
+    );
+    assert_eq!(
+        users(&b).await.map(|rows| rows.len()),
+        Some(1),
+        "the middle"
+    );
+    assert_eq!(
+        users(&c).await.map(|rows| rows.len()),
+        Some(1),
+        "the far end"
+    );
     assert_eq!(
         c.replication.applied().high_water(1),
         2,
@@ -690,10 +763,18 @@ async fn a_synchronous_commit_waits_for_the_peer() {
     one.replication.set_config(config).unwrap();
     Database::start_replication(one.clone()).unwrap();
 
-    let two = node(2, port_two, vec![PeerConfig::new("one", format!("127.0.0.1:{}", port_one))]).await;
+    let two = node(
+        2,
+        port_two,
+        vec![PeerConfig::new("one", format!("127.0.0.1:{}", port_one))],
+    )
+    .await;
 
     eventually("the link to come up", || async {
-        one.replication.peer("two").map(|p| p.is_connected()).unwrap_or(false)
+        one.replication
+            .peer("two")
+            .map(|p| p.is_connected())
+            .unwrap_or(false)
     })
     .await;
 
@@ -708,7 +789,10 @@ async fn a_synchronous_commit_waits_for_the_peer() {
         "a synchronous commit must not return before the peer has the record"
     );
     assert_eq!(
-        one.replication.stats().ack_timeouts.load(std::sync::atomic::Ordering::Relaxed),
+        one.replication
+            .stats()
+            .ack_timeouts
+            .load(std::sync::atomic::Ordering::Relaxed),
         0,
         "nothing should have timed out"
     );
@@ -750,7 +834,11 @@ async fn a_synchronous_commit_gives_up_on_a_peer_that_is_not_there() {
         "the local write stands regardless of what the peer did"
     );
     assert!(
-        one.replication.stats().ack_timeouts.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        one.replication
+            .stats()
+            .ack_timeouts
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0,
         "and the give-up should be visible in the statistics"
     );
 }
@@ -766,22 +854,28 @@ async fn a_synchronous_commit_gives_up_on_a_peer_that_is_not_there() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn committing_publishes_nothing_until_the_outcome_is_durable() {
     let database = super::test_support::in_memory_database().await;
-    let mut config =
-        ReplicationConfig { node_id: 1, listen_port: free_port(), ..Default::default() };
+    let mut config = ReplicationConfig {
+        node_id: 1,
+        listen_port: free_port(),
+        ..Default::default()
+    };
     brisk(&mut config);
     database.replication.set_config(config).unwrap();
     database.replication.open_storage(None).unwrap();
     database.replication.set_active(true);
 
-    run_ok(&database, "CREATE TABLE repl_users (id INTEGER, name VARCHAR)").await;
+    run_ok(
+        &database,
+        "CREATE TABLE repl_users (id INTEGER, name VARCHAR)",
+    )
+    .await;
     let published_before = database.replication.local_seq();
 
     // A write in a transaction the caller owns, as an explicit block does.
     let tx = database.transactions.begin();
     let purpose =
         recognize_query_purpose("INSERT INTO repl_users (id, name) VALUES (1, 'ada')").unwrap();
-    let response =
-        crate::core::rql::executor::execute_in_txn(purpose, database.clone(), tx).await;
+    let response = crate::core::rql::executor::execute_in_txn(purpose, database.clone(), tx).await;
     assert_ne!(response.first(), Some(&3), "the insert should have worked");
 
     let family = database.commit_transaction(tx);
@@ -804,14 +898,21 @@ async fn committing_publishes_nothing_until_the_outcome_is_durable() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_aborted_transaction_is_never_published() {
     let database = super::test_support::in_memory_database().await;
-    let mut config =
-        ReplicationConfig { node_id: 1, listen_port: free_port(), ..Default::default() };
+    let mut config = ReplicationConfig {
+        node_id: 1,
+        listen_port: free_port(),
+        ..Default::default()
+    };
     brisk(&mut config);
     database.replication.set_config(config).unwrap();
     database.replication.open_storage(None).unwrap();
     database.replication.set_active(true);
 
-    run_ok(&database, "CREATE TABLE repl_users (id INTEGER, name VARCHAR)").await;
+    run_ok(
+        &database,
+        "CREATE TABLE repl_users (id INTEGER, name VARCHAR)",
+    )
+    .await;
     let published_before = database.replication.local_seq();
 
     let tx = database.transactions.begin();
@@ -829,7 +930,11 @@ async fn an_aborted_transaction_is_never_published() {
         published_before,
         "an aborted transaction must leave nothing for the peers, even if publish is called"
     );
-    assert_eq!(database.replication.open_captures(), 0, "and no buffer behind");
+    assert_eq!(
+        database.replication.open_captures(),
+        0,
+        "and no buffer behind"
+    );
 }
 
 /// A block with savepoints is several transaction ids, and all of them have to
@@ -845,17 +950,20 @@ async fn writes_inside_a_savepoint_replicate_with_the_block() {
     let (one, two) = pair().await;
 
     run_ok(&one, "CREATE TABLE repl_users (id INTEGER, name VARCHAR)").await;
-    eventually("the table to reach node two", || async { users(&two).await.is_some() }).await;
+    eventually("the table to reach node two", || async {
+        users(&two).await.is_some()
+    })
+    .await;
 
     // A block that writes, opens a savepoint, writes inside it, and commits.
     let tx = one.transactions.begin();
-    let outer = recognize_query_purpose("INSERT INTO repl_users (id, name) VALUES (1, 'outer')")
-        .unwrap();
+    let outer =
+        recognize_query_purpose("INSERT INTO repl_users (id, name) VALUES (1, 'outer')").unwrap();
     crate::core::rql::executor::execute_in_txn(outer, one.clone(), tx).await;
 
     let sub = one.transactions.begin_savepoint(tx);
-    let inner = recognize_query_purpose("INSERT INTO repl_users (id, name) VALUES (2, 'inner')")
-        .unwrap();
+    let inner =
+        recognize_query_purpose("INSERT INTO repl_users (id, name) VALUES (2, 'inner')").unwrap();
     crate::core::rql::executor::execute_in_txn(inner, one.clone(), sub).await;
     one.transactions.release_savepoint(sub);
 
@@ -864,9 +972,10 @@ async fn writes_inside_a_savepoint_replicate_with_the_block() {
     one.publish_transaction(family).await;
 
     let expected = vec!["inner".to_string(), "outer".to_string()];
-    eventually("both the outer and the savepoint write to reach node two", || async {
-        users(&two).await.as_ref() == Some(&expected)
-    })
+    eventually(
+        "both the outer and the savepoint write to reach node two",
+        || async { users(&two).await.as_ref() == Some(&expected) },
+    )
     .await;
 }
 
@@ -876,11 +985,14 @@ async fn writes_rolled_back_to_a_savepoint_are_not_replicated() {
     let (one, two) = pair().await;
 
     run_ok(&one, "CREATE TABLE repl_users (id INTEGER, name VARCHAR)").await;
-    eventually("the table to reach node two", || async { users(&two).await.is_some() }).await;
+    eventually("the table to reach node two", || async {
+        users(&two).await.is_some()
+    })
+    .await;
 
     let tx = one.transactions.begin();
-    let kept = recognize_query_purpose("INSERT INTO repl_users (id, name) VALUES (1, 'kept')")
-        .unwrap();
+    let kept =
+        recognize_query_purpose("INSERT INTO repl_users (id, name) VALUES (1, 'kept')").unwrap();
     crate::core::rql::executor::execute_in_txn(kept, one.clone(), tx).await;
 
     let sub = one.transactions.begin_savepoint(tx);
@@ -912,5 +1024,9 @@ async fn writes_rolled_back_to_a_savepoint_are_not_replicated() {
         Some(&expected),
         "and it is not on the origin either"
     );
-    assert_eq!(one.replication.open_captures(), 0, "no capture buffer should be left behind");
+    assert_eq!(
+        one.replication.open_captures(),
+        0,
+        "no capture buffer should be left behind"
+    );
 }

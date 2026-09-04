@@ -10,12 +10,14 @@
 use std::sync::Arc as StdArc;
 use std::time::Duration;
 
-use rasterizeddb_core::auth::{AuthMethod, ensure_role_catalogue, execute_role_statement, parse_role_statement};
-use rasterizeddb_core::core::database::Database;
-use rasterizeddb_core::native_auth::{PasswordAuthenticator, RoleAuthenticator};
 use rastcp::client::TcpClientBuilder;
 use rastcp::server::TcpServerBuilder;
 use rastcp::session::{ClientAuthenticator, ServerAuthenticator};
+use rasterizeddb_core::auth::{
+    AuthMethod, ensure_role_catalogue, execute_role_statement, parse_role_statement,
+};
+use rasterizeddb_core::core::database::Database;
+use rasterizeddb_core::native_auth::{PasswordAuthenticator, RoleAuthenticator};
 use rclite::Arc;
 
 /// A port nothing is listening on.
@@ -81,9 +83,8 @@ async fn login(port: u16, credentials: Option<(&str, &str)>) -> Result<String, S
         TcpClientBuilder::new(&format!("127.0.0.1:{}", port)).timeout(Duration::from_secs(5));
 
     if let Some((user, password)) = credentials {
-        builder = builder.authenticator(
-            StdArc::new(PasswordAuthenticator::new(user, password)) as StdArc<dyn ClientAuthenticator>
-        );
+        builder = builder.authenticator(StdArc::new(PasswordAuthenticator::new(user, password))
+            as StdArc<dyn ClientAuthenticator>);
     }
 
     let mut client = builder.build().await.map_err(|e| e.to_string())?;
@@ -98,7 +99,12 @@ async fn login(port: u16, credentials: Option<(&str, &str)>) -> Result<String, S
 #[tokio::test]
 async fn the_right_password_gets_in_as_the_right_user() {
     let port = free_port();
-    serve(port, database_with_roles(&[]).await, AuthMethod::ScramSha256).await;
+    serve(
+        port,
+        database_with_roles(&[]).await,
+        AuthMethod::ScramSha256,
+    )
+    .await;
 
     assert_eq!(
         login(port, Some(("alice", "hunter2"))).await.unwrap(),
@@ -111,7 +117,12 @@ async fn the_right_password_gets_in_as_the_right_user() {
 #[tokio::test]
 async fn a_wrong_password_is_refused() {
     let port = free_port();
-    serve(port, database_with_roles(&[]).await, AuthMethod::ScramSha256).await;
+    serve(
+        port,
+        database_with_roles(&[]).await,
+        AuthMethod::ScramSha256,
+    )
+    .await;
 
     let err = login(port, Some(("alice", "not hunter2")))
         .await
@@ -122,7 +133,12 @@ async fn a_wrong_password_is_refused() {
 #[tokio::test]
 async fn an_unknown_user_is_refused_and_looks_the_same_as_a_wrong_password() {
     let port = free_port();
-    serve(port, database_with_roles(&[]).await, AuthMethod::ScramSha256).await;
+    serve(
+        port,
+        database_with_roles(&[]).await,
+        AuthMethod::ScramSha256,
+    )
+    .await;
 
     let unknown = login(port, Some(("nobody", "hunter2")))
         .await
@@ -141,7 +157,12 @@ async fn an_unknown_user_is_refused_and_looks_the_same_as_a_wrong_password() {
 #[tokio::test]
 async fn a_caller_that_presents_nothing_is_refused() {
     let port = free_port();
-    serve(port, database_with_roles(&[]).await, AuthMethod::ScramSha256).await;
+    serve(
+        port,
+        database_with_roles(&[]).await,
+        AuthMethod::ScramSha256,
+    )
+    .await;
 
     assert!(
         login(port, None).await.is_err(),
@@ -193,9 +214,10 @@ async fn trust_accepts_any_password_but_still_reports_the_user() {
 
     let mut client = TcpClientBuilder::new(&format!("127.0.0.1:{}", port))
         .timeout(Duration::from_secs(5))
-        .authenticator(StdArc::new(
-            PasswordAuthenticator::new("alice", "whatever").allow_trust(),
-        ) as StdArc<dyn ClientAuthenticator>)
+        .authenticator(
+            StdArc::new(PasswordAuthenticator::new("alice", "whatever").allow_trust())
+                as StdArc<dyn ClientAuthenticator>,
+        )
         .build()
         .await
         .expect("the client should build");
@@ -223,7 +245,12 @@ async fn a_client_with_a_password_refuses_a_server_that_never_challenges_it() {
 #[tokio::test]
 async fn a_reconnected_client_authenticates_again() {
     let port = free_port();
-    serve(port, database_with_roles(&[]).await, AuthMethod::ScramSha256).await;
+    serve(
+        port,
+        database_with_roles(&[]).await,
+        AuthMethod::ScramSha256,
+    )
+    .await;
 
     let mut client = TcpClientBuilder::new(&format!("127.0.0.1:{}", port))
         .timeout(Duration::from_secs(5))
@@ -238,7 +265,10 @@ async fn a_reconnected_client_authenticates_again() {
         "alice:true"
     );
 
-    client.reconnect().await.expect("the reconnect should authenticate");
+    client
+        .reconnect()
+        .await
+        .expect("the reconnect should authenticate");
 
     assert_eq!(
         String::from_utf8_lossy(&client.send(b"SELECT 1".to_vec()).await.unwrap()),

@@ -246,7 +246,10 @@ pub fn map_column(column: &SourceColumn, json: JsonMapping) -> Mapping {
             declared: "NUMERIC".to_string(),
             conversion: Conversion::Decimal,
             select_cast: Some("::numeric"),
-            note: Some("money became NUMERIC, read as an exact amount without its currency symbol".to_string()),
+            note: Some(
+                "money became NUMERIC, read as an exact amount without its currency symbol"
+                    .to_string(),
+            ),
             decimal_scale: None,
         },
 
@@ -345,9 +348,9 @@ pub fn map_column(column: &SourceColumn, json: JsonMapping) -> Mapping {
         // Types with a faithful text rendering and no counterpart here. Listed
         // rather than left to the fallback so that the report says what they
         // were instead of calling them unrecognised.
-        "time" | "timetz" | "interval" | "macaddr" | "macaddr8" | "bit" | "varbit"
-        | "tsvector" | "tsquery" | "point" | "line" | "lseg" | "box" | "path" | "polygon"
-        | "circle" | "pg_lsn" | "txid_snapshot" => Mapping::noted(
+        "time" | "timetz" | "interval" | "macaddr" | "macaddr8" | "bit" | "varbit" | "tsvector"
+        | "tsquery" | "point" | "line" | "lseg" | "box" | "path" | "polygon" | "circle"
+        | "pg_lsn" | "txid_snapshot" => Mapping::noted(
             DbType::STRING,
             "TEXT",
             Conversion::Text,
@@ -456,7 +459,9 @@ pub fn literal(mapping: &Mapping, value: Option<&str>) -> Result<String, String>
             }
         }
 
-        Conversion::Uuid => checked(mapping, value).map_err(|_| format!("{:?} is not a UUID", value)),
+        Conversion::Uuid => {
+            checked(mapping, value).map_err(|_| format!("{:?} is not a UUID", value))
+        }
 
         Conversion::Inet => checked(mapping, value)
             .map_err(|_| format!("{:?} is not an IP address or network", value)),
@@ -557,7 +562,10 @@ pub fn identifier(name: &str) -> String {
 /// reliably reads one.
 pub fn is_plain_identifier(name: &str) -> bool {
     !name.is_empty()
-        && name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
@@ -702,7 +710,10 @@ mod tests {
         assert_eq!(lit("int2", "32767").unwrap(), "32767");
         assert_eq!(lit("int2", "-32768").unwrap(), "-32768");
         assert!(lit("int2", "32768").unwrap_err().contains("does not fit"));
-        assert_eq!(lit("int8", "9223372036854775807").unwrap(), "9223372036854775807");
+        assert_eq!(
+            lit("int8", "9223372036854775807").unwrap(),
+            "9223372036854775807"
+        );
         assert!(lit("int4", "notanumber").is_err());
     }
 
@@ -710,7 +721,10 @@ mod tests {
     /// zero by the insert path, which then reports success.
     #[test]
     fn values_the_engine_would_silently_zero_are_refused() {
-        assert!(lit("numeric", "0.1234567891").is_err(), "ten decimal places");
+        assert!(
+            lit("numeric", "0.1234567891").is_err(),
+            "ten decimal places"
+        );
         assert!(lit("numeric", "NaN").is_err());
         assert!(lit("numeric", "1e40").is_err(), "past the DECIMAL range");
         assert!(lit("uuid", "not-a-uuid").is_err());
@@ -750,7 +764,11 @@ mod tests {
     fn bytea_has_to_be_hex() {
         assert_eq!(lit("bytea", "\\x48656c6c6f").unwrap(), "'\\x48656c6c6f'");
         assert_eq!(lit("bytea", "\\x").unwrap(), "'\\x'");
-        assert!(lit("bytea", "Hello").unwrap_err().contains("rather than hex"));
+        assert!(
+            lit("bytea", "Hello")
+                .unwrap_err()
+                .contains("rather than hex")
+        );
     }
 
     #[test]

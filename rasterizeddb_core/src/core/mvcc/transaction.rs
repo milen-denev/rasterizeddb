@@ -77,7 +77,12 @@ impl Snapshot {
         if own != NO_TX {
             family.insert(own);
         }
-        Snapshot { xmax, running: Arc::new(running), own, family: Arc::new(family) }
+        Snapshot {
+            xmax,
+            running: Arc::new(running),
+            own,
+            family: Arc::new(family),
+        }
     }
 
     /// Same, with every id the reading transaction owns.
@@ -87,7 +92,12 @@ impl Snapshot {
         own: TxId,
         family: BTreeSet<TxId>,
     ) -> Self {
-        Snapshot { xmax, running: Arc::new(running), own, family: Arc::new(family) }
+        Snapshot {
+            xmax,
+            running: Arc::new(running),
+            own,
+            family: Arc::new(family),
+        }
     }
 
     /// Whether `tx` is this transaction or one of its savepoints.
@@ -242,7 +252,9 @@ impl std::fmt::Debug for InPlaceGuard {
 /// carrying on.
 #[inline]
 fn lock(mutex: &std::sync::Mutex<usize>) -> std::sync::MutexGuard<'_, usize> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[derive(Debug, Default)]
@@ -421,8 +433,10 @@ impl TransactionManager {
     /// `rolled_back` — those two are the whole of what `outcome` consults.
     #[inline]
     fn publish_savepoints(&self, inner: &Inner) {
-        self.savepoints
-            .store(inner.parent.len() + inner.rolled_back.len(), Ordering::Release);
+        self.savepoints.store(
+            inner.parent.len() + inner.rolled_back.len(),
+            Ordering::Release,
+        );
     }
 
     /// Takes `tx` and every savepoint under it out of the running set.
@@ -741,8 +755,12 @@ impl TransactionManager {
                 }
             }
         }
-        let running: BTreeSet<TxId> =
-            inner.running.iter().copied().filter(|id| !family.contains(id)).collect();
+        let running: BTreeSet<TxId> = inner
+            .running
+            .iter()
+            .copied()
+            .filter(|id| !family.contains(id))
+            .collect();
         Snapshot::at_with_family(inner.next_id, running, own, family)
     }
 
@@ -770,7 +788,12 @@ impl TransactionManager {
     /// taken — which is what makes it safe to reclaim.
     pub fn oldest_active(&self) -> TxId {
         let inner = self.inner.read();
-        inner.running.iter().next().copied().unwrap_or(inner.next_id)
+        inner
+            .running
+            .iter()
+            .next()
+            .copied()
+            .unwrap_or(inner.next_id)
     }
 
     /// One past the highest id assigned so far.
@@ -862,7 +885,10 @@ mod tests {
     fn a_transaction_that_wrote_nothing_is_not_a_writer() {
         let m = TransactionManager::in_memory();
         let reader = m.begin_autocommit();
-        assert!(!m.wrote_family(reader), "a transaction that wrote nothing counted as a writer");
+        assert!(
+            !m.wrote_family(reader),
+            "a transaction that wrote nothing counted as a writer"
+        );
     }
 
     #[test]
@@ -891,7 +917,10 @@ mod tests {
 
         assert!(m.wrote_family(a));
         assert!(m.wrote_family(b));
-        assert!(!m.wrote_family(c), "a transaction that never wrote counted as a writer");
+        assert!(
+            !m.wrote_family(c),
+            "a transaction that never wrote counted as a writer"
+        );
     }
 
     /// Writes made inside a `SAVEPOINT` carry the sub-transaction's id, so a
@@ -906,7 +935,10 @@ mod tests {
 
         m.mark_wrote(sub);
 
-        assert!(m.wrote_family(parent), "the parent of a writing savepoint read as read-only");
+        assert!(
+            m.wrote_family(parent),
+            "the parent of a writing savepoint read as read-only"
+        );
     }
 
     /// The neither-real ids are never retired, so an entry for one would never
@@ -930,7 +962,10 @@ mod tests {
         assert!(m.wrote_family(writer));
 
         m.commit(writer);
-        assert!(!m.wrote_family(writer), "the entry outlived the transaction");
+        assert!(
+            !m.wrote_family(writer),
+            "the entry outlived the transaction"
+        );
     }
 
     #[test]
@@ -963,8 +998,14 @@ mod tests {
         let me = m.begin();
         let s = m.snapshot(me);
 
-        assert!(s.sees(me, NO_TX, &resolver(&m)), "an INSERT must be visible to the SELECT after it");
-        assert!(!s.sees(me, me, &resolver(&m)), "and a row it then deleted must not be");
+        assert!(
+            s.sees(me, NO_TX, &resolver(&m)),
+            "an INSERT must be visible to the SELECT after it"
+        );
+        assert!(
+            !s.sees(me, me, &resolver(&m)),
+            "and a row it then deleted must not be"
+        );
     }
 
     #[test]
@@ -1029,7 +1070,10 @@ mod tests {
         assert!(m.snapshot(NO_TX).sees_everything());
 
         let running = m.begin();
-        assert!(!m.snapshot(NO_TX).sees_everything(), "someone else is mid-write");
+        assert!(
+            !m.snapshot(NO_TX).sees_everything(),
+            "someone else is mid-write"
+        );
         // A transaction does not block its own fast path.
         assert!(m.snapshot(running).sees_everything());
 
@@ -1061,7 +1105,11 @@ mod tests {
         assert_eq!(m.oldest_active(), first);
 
         m.commit(first);
-        assert_eq!(m.oldest_active(), second, "the bound advances as the oldest ends");
+        assert_eq!(
+            m.oldest_active(),
+            second,
+            "the bound advances as the oldest ends"
+        );
 
         m.commit(second);
         assert_eq!(m.oldest_active(), m.next_id());
@@ -1120,7 +1168,10 @@ mod savepoint_tests {
 
         let s = m.snapshot(sp);
         assert!(s.sees(sp, NO_TX, &resolver(&m)), "its own write");
-        assert!(s.sees(outer, NO_TX, &resolver(&m)), "and one made before the savepoint");
+        assert!(
+            s.sees(outer, NO_TX, &resolver(&m)),
+            "and one made before the savepoint"
+        );
     }
 
     /// The point of the whole thing: rolling back to a savepoint discards what
@@ -1133,8 +1184,14 @@ mod savepoint_tests {
         m.rollback_savepoint(sp);
 
         let s = m.snapshot(outer);
-        assert!(!s.sees(sp, NO_TX, &resolver(&m)), "the savepoint's write is gone");
-        assert!(s.sees(outer, NO_TX, &resolver(&m)), "the earlier write is not");
+        assert!(
+            !s.sees(sp, NO_TX, &resolver(&m)),
+            "the savepoint's write is gone"
+        );
+        assert!(
+            s.sees(outer, NO_TX, &resolver(&m)),
+            "the earlier write is not"
+        );
     }
 
     /// A delete made inside a rolled-back savepoint did not happen, so the row
@@ -1163,7 +1220,10 @@ mod savepoint_tests {
 
         let s = m.snapshot(outer);
         assert!(!s.sees(first, NO_TX, &resolver(&m)));
-        assert!(!s.sees(second, NO_TX, &resolver(&m)), "the nested one went with it");
+        assert!(
+            !s.sees(second, NO_TX, &resolver(&m)),
+            "the nested one went with it"
+        );
         assert!(s.sees(outer, NO_TX, &resolver(&m)));
     }
 
@@ -1180,7 +1240,10 @@ mod savepoint_tests {
         assert!(!m.snapshot(NO_TX).sees(sp, NO_TX, &resolver(&m)));
 
         m.commit(outer);
-        assert!(m.snapshot(NO_TX).sees(sp, NO_TX, &resolver(&m)), "released work commits with it");
+        assert!(
+            m.snapshot(NO_TX).sees(sp, NO_TX, &resolver(&m)),
+            "released work commits with it"
+        );
     }
 
     /// And it aborts with its parent, released or not.
@@ -1222,7 +1285,11 @@ mod savepoint_tests {
         m.commit(other);
 
         let sp = m.begin_savepoint(outer);
-        assert_eq!(m.snapshot(sp).xmax, before, "the savepoint widened the view");
+        assert_eq!(
+            m.snapshot(sp).xmax,
+            before,
+            "the savepoint widened the view"
+        );
         assert!(!m.snapshot(sp).sees(other, NO_TX, &resolver(&m)));
     }
 
@@ -1267,7 +1334,11 @@ mod savepoint_leaks {
             }
 
             assert!(m.quiescent(), "savepoints outlived their transaction");
-            assert_eq!(m.oldest_active(), m.next_id(), "the reclamation bound is stuck");
+            assert_eq!(
+                m.oldest_active(),
+                m.next_id(),
+                "the reclamation bound is stuck"
+            );
         }
     }
 

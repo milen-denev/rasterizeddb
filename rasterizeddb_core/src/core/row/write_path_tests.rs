@@ -22,13 +22,21 @@ fn payload(bytes: &[u8], write_order: u32, column_type: DbType) -> ColumnWritePa
     let mut mb = MEMORY_POOL.acquire(bytes.len());
     mb.into_slice_mut().copy_from_slice(bytes);
     let size = column_type.get_size();
-    ColumnWritePayload { data: mb, write_order, column_type, size }
+    ColumnWritePayload {
+        data: mb,
+        write_order,
+        column_type,
+        size,
+    }
 }
 
 fn full_fetch(fields: &SmallVec<[SchemaField; 20]>) -> RowFetch {
     let calc = SchemaCalculator;
     let mut cols = SmallVec::new();
-    for f in fields.iter().sorted_by(|a, b| a.write_order.cmp(&b.write_order)) {
+    for f in fields
+        .iter()
+        .sorted_by(|a, b| a.write_order.cmp(&b.write_order))
+    {
         let (column_offset, schema_id) = calc.calculate_schema_offset(&f.name, fields);
         cols.push(ColumnFetchingData {
             column_offset,
@@ -37,7 +45,9 @@ fn full_fetch(fields: &SmallVec<[SchemaField; 20]>) -> RowFetch {
             schema_id,
         });
     }
-    RowFetch { columns_fetching_data: cols }
+    RowFetch {
+        columns_fetching_data: cols,
+    }
 }
 
 async fn open_table(dir: &std::path::Path, name: &str) -> Table<LocalStorageProvider> {
@@ -47,19 +57,33 @@ async fn open_table(dir: &std::path::Path, name: &str) -> Table<LocalStorageProv
         name,
         io,
         vec![
-            CreateColumnData { name: "id".into(), data_type: DbType::U64 },
-            CreateColumnData { name: "cat".into(), data_type: DbType::I32 },
-            CreateColumnData { name: "label".into(), data_type: DbType::STRING },
+            CreateColumnData {
+                name: "id".into(),
+                data_type: DbType::U64,
+            },
+            CreateColumnData {
+                name: "cat".into(),
+                data_type: DbType::I32,
+            },
+            CreateColumnData {
+                name: "label".into(),
+                data_type: DbType::STRING,
+            },
         ],
     )
     .await
 }
 
 async fn insert(t: &Table<LocalStorageProvider>, id: u64, cat: i32, label: &str) {
-    let mut rw = RowWrite { columns_writing_data: SmallVec::new() };
-    rw.columns_writing_data.push(payload(&id.to_le_bytes(), 0, DbType::U64));
-    rw.columns_writing_data.push(payload(&cat.to_le_bytes(), 1, DbType::I32));
-    rw.columns_writing_data.push(payload(label.as_bytes(), 2, DbType::STRING));
+    let mut rw = RowWrite {
+        columns_writing_data: SmallVec::new(),
+    };
+    rw.columns_writing_data
+        .push(payload(&id.to_le_bytes(), 0, DbType::U64));
+    rw.columns_writing_data
+        .push(payload(&cat.to_le_bytes(), 1, DbType::I32));
+    rw.columns_writing_data
+        .push(payload(label.as_bytes(), 2, DbType::STRING));
     t.insert_row(rw).await.unwrap();
 }
 
@@ -68,9 +92,16 @@ async fn query_all(t: &Table<LocalStorageProvider>) -> Vec<Row> {
 }
 
 async fn run(t: &Table<LocalStorageProvider>, w: &str) -> Vec<Row> {
-    t.query_row(w, &t.schema.fields.to_vec(), full_fetch(&t.schema.fields), full_fetch(&t.schema.fields), None, None)
-        .await
-        .unwrap()
+    t.query_row(
+        w,
+        &t.schema.fields.to_vec(),
+        full_fetch(&t.schema.fields),
+        full_fetch(&t.schema.fields),
+        None,
+        None,
+    )
+    .await
+    .unwrap()
 }
 
 fn u64_of(r: &Row, sid: u64) -> u64 {
@@ -82,7 +113,11 @@ fn str_of(r: &Row, sid: u64) -> String {
     String::from_utf8_lossy(c.data.into_slice()).to_string()
 }
 
-fn upd(fields: &SmallVec<[SchemaField; 20]>, name: &str, bytes: &[u8]) -> SmallVec<[ColumnWritePayload; 32]> {
+fn upd(
+    fields: &SmallVec<[SchemaField; 20]>,
+    name: &str,
+    bytes: &[u8],
+) -> SmallVec<[ColumnWritePayload; 32]> {
     let f = fields.iter().find(|f| f.name == name).unwrap();
     let mut mb = MEMORY_POOL.acquire(bytes.len());
     mb.into_slice_mut().copy_from_slice(bytes);
@@ -111,7 +146,12 @@ async fn update_growing_string_keeps_row_intact() {
     assert_eq!(before.len(), 1);
 
     let n = t
-        .update_rows("id = 2", full_fetch(&t.schema.fields), upd(&t.schema.fields, "label", b"a-much-longer-label"), None)
+        .update_rows(
+            "id = 2",
+            full_fetch(&t.schema.fields),
+            upd(&t.schema.fields, "label", b"a-much-longer-label"),
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(n, 1, "one row updated");
@@ -140,7 +180,12 @@ async fn update_shrinking_string_in_place() {
     t.wait_filters_ready().await;
 
     let n = t
-        .update_rows("id = 3", full_fetch(&t.schema.fields), upd(&t.schema.fields, "label", b"x"), None)
+        .update_rows(
+            "id = 3",
+            full_fetch(&t.schema.fields),
+            upd(&t.schema.fields, "label", b"x"),
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(n, 1);
@@ -166,7 +211,12 @@ async fn repeated_growing_updates() {
     for k in 1..6 {
         let label = "y".repeat(k * 5);
         let n = t
-            .update_rows("id = 1", full_fetch(&t.schema.fields), upd(&t.schema.fields, "label", label.as_bytes()), None)
+            .update_rows(
+                "id = 1",
+                full_fetch(&t.schema.fields),
+                upd(&t.schema.fields, "label", label.as_bytes()),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(n, 1, "iteration {}", k);
@@ -187,7 +237,10 @@ async fn delete_survives_reopen() {
             insert(&t, i, i as i32, "s").await;
         }
         t.wait_filters_ready().await;
-        let n = t.delete_rows("id = 4", full_fetch(&t.schema.fields), None).await.unwrap();
+        let n = t
+            .delete_rows("id = 4", full_fetch(&t.schema.fields), None)
+            .await
+            .unwrap();
         assert_eq!(n, 1);
         assert_eq!(run(&t, "").await.len(), 9);
     }
@@ -208,19 +261,31 @@ async fn relocating_update_survives_reopen_and_next_insert() {
             insert(&t, i, i as i32, "s").await;
         }
         t.wait_filters_ready().await;
-        t.update_rows("id = 0", full_fetch(&t.schema.fields), upd(&t.schema.fields, "label", b"grown-a-lot-here"), None)
-            .await
-            .unwrap();
+        t.update_rows(
+            "id = 0",
+            full_fetch(&t.schema.fields),
+            upd(&t.schema.fields, "label", b"grown-a-lot-here"),
+            None,
+        )
+        .await
+        .unwrap();
     }
     let t2 = open_table(dir.path(), "wp_reloc").await;
     t2.wait_filters_ready().await;
-    assert_eq!(run(&t2, "").await.len(), 5, "duplicate or lost row after reopen");
+    assert_eq!(
+        run(&t2, "").await.len(),
+        5,
+        "duplicate or lost row after reopen"
+    );
     assert_eq!(str_of(&run(&t2, "id = 0").await[0], 2), "grown-a-lot-here");
 
     insert(&t2, 99, 99, "new-row-after-reopen").await;
     let all = run(&t2, "").await;
     assert_eq!(all.len(), 6);
-    assert_eq!(str_of(&run(&t2, "id = 99").await[0], 2), "new-row-after-reopen");
+    assert_eq!(
+        str_of(&run(&t2, "id = 99").await[0], 2),
+        "new-row-after-reopen"
+    );
     // And the relocated row must still read back correctly.
     assert_eq!(str_of(&run(&t2, "id = 0").await[0], 2), "grown-a-lot-here");
 }
@@ -236,7 +301,12 @@ async fn update_all_rows_of_a_category() {
     t.wait_filters_ready().await;
 
     let n = t
-        .update_rows("cat = 1", full_fetch(&t.schema.fields), upd(&t.schema.fields, "cat", &7i32.to_le_bytes()), None)
+        .update_rows(
+            "cat = 1",
+            full_fetch(&t.schema.fields),
+            upd(&t.schema.fields, "cat", &7i32.to_le_bytes()),
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(n, 10);
@@ -259,7 +329,10 @@ async fn all_pointers(t: &Table<LocalStorageProvider>) -> Vec<RowPointer> {
     while pos + ROW_POINTER_RECORD_LEN as u64 <= len {
         let mut buf = [0u8; ROW_POINTER_RECORD_LEN];
         let mut p = pos;
-        t.io_pointers.read_data_into_buffer(&mut p, &mut buf).await.unwrap();
+        t.io_pointers
+            .read_data_into_buffer(&mut p, &mut buf)
+            .await
+            .unwrap();
         out.push(RowPointer::from_slice(&buf));
         pos += ROW_POINTER_RECORD_LEN as u64;
     }
@@ -307,7 +380,11 @@ async fn concurrent_updates_do_not_duplicate_a_row() {
     assert!(applied >= 1, "at least one update has to win");
 
     // Exactly one live pointer per surviving row.
-    let live = all_pointers(&t).await.into_iter().filter(|p| !p.deleted).count();
+    let live = all_pointers(&t)
+        .await
+        .into_iter()
+        .filter(|p| !p.deleted)
+        .count();
     assert_eq!(live, 50);
 }
 
@@ -324,7 +401,10 @@ async fn concurrent_delete_and_update_do_not_resurrect_a_row() {
 
     let deleter = {
         let t = t.clone();
-        tokio::spawn(async move { t.delete_rows("id = 3", full_fetch(&t.schema.fields), None).await })
+        tokio::spawn(async move {
+            t.delete_rows("id = 3", full_fetch(&t.schema.fields), None)
+                .await
+        })
     };
     let updater = {
         let t = t.clone();
@@ -344,7 +424,11 @@ async fn concurrent_delete_and_update_do_not_resurrect_a_row() {
     let survivors = run(&t, "id = 3").await;
     // Whichever ran first, the row is either updated once or gone once — never
     // both, and never twice.
-    assert!(survivors.len() <= 1, "id = 3 matched {} rows", survivors.len());
+    assert!(
+        survivors.len() <= 1,
+        "id = 3 matched {} rows",
+        survivors.len()
+    );
     if deleted == 1 && updated == 0 {
         assert!(survivors.is_empty());
         assert_eq!(run(&t, "").await.len(), 29);
@@ -367,14 +451,19 @@ async fn concurrent_deletes_of_one_row_count_once() {
     for _ in 0..6 {
         let t = t.clone();
         handles.push(tokio::spawn(async move {
-            t.delete_rows("id = 11", full_fetch(&t.schema.fields), None).await
+            t.delete_rows("id = 11", full_fetch(&t.schema.fields), None)
+                .await
         }));
     }
     let mut total = 0u64;
     for h in handles {
         total += h.await.unwrap().unwrap();
     }
-    assert_eq!(total, 1, "six racing DELETEs reported {} rows affected", total);
+    assert_eq!(
+        total, 1,
+        "six racing DELETEs reported {} rows affected",
+        total
+    );
     assert_eq!(run(&t, "").await.len(), 19);
 }
 
@@ -393,7 +482,9 @@ async fn reinserting_after_a_delete_reuses_the_freed_space() {
     t.wait_filters_ready().await;
     let after_first_fill = t.io_rows.get_len().await;
 
-    t.delete_rows("id < 400", full_fetch(&t.schema.fields), None).await.unwrap();
+    t.delete_rows("id < 400", full_fetch(&t.schema.fields), None)
+        .await
+        .unwrap();
     assert!(run(&t, "").await.is_empty());
 
     let report = t.vacuum_now().await.unwrap();
@@ -432,7 +523,9 @@ async fn rows_written_into_reclaimed_extents_read_back_correctly() {
 
     // Punch holes rather than clearing the table, so live and reclaimed rows
     // are interleaved.
-    t.delete_rows("cat < 100", full_fetch(&t.schema.fields), None).await.unwrap();
+    t.delete_rows("cat < 100", full_fetch(&t.schema.fields), None)
+        .await
+        .unwrap();
     t.vacuum_now().await.unwrap();
 
     for i in 1000..1100u64 {
@@ -462,7 +555,9 @@ async fn reclaimed_rows_survive_reopen() {
             insert(&t, i, i as i32, "some-moderately-long-label-here").await;
         }
         t.wait_filters_ready().await;
-        t.delete_rows("cat < 60", full_fetch(&t.schema.fields), None).await.unwrap();
+        t.delete_rows("cat < 60", full_fetch(&t.schema.fields), None)
+            .await
+            .unwrap();
         t.vacuum_now().await.unwrap();
         for i in 1000..1060u64 {
             insert(&t, i, i as i32, "some-moderately-long-label-here").await;
@@ -481,7 +576,10 @@ async fn reclaimed_rows_survive_reopen() {
     // A fresh insert after reopening must not land on top of a live row.
     insert(&t2, 5000, 5000, "post-reopen-label").await;
     assert_eq!(run(&t2, "").await.len(), 101);
-    assert_eq!(str_of(&run(&t2, "id = 5000").await[0], 2), "post-reopen-label");
+    assert_eq!(
+        str_of(&run(&t2, "id = 5000").await[0], 2),
+        "post-reopen-label"
+    );
 }
 
 /// The slack an in-place shrinking update leaves behind is dead space too, and
@@ -496,11 +594,19 @@ async fn shrinking_updates_leave_reclaimable_slack() {
     t.wait_filters_ready().await;
 
     let baseline = t.vacuum_now().await.unwrap();
-    assert_eq!(baseline.dead_bytes, 0, "a freshly filled table has no holes");
+    assert_eq!(
+        baseline.dead_bytes, 0,
+        "a freshly filled table has no holes"
+    );
 
-    t.update_rows("cat < 50", full_fetch(&t.schema.fields), upd(&t.schema.fields, "label", b"x"), None)
-        .await
-        .unwrap();
+    t.update_rows(
+        "cat < 50",
+        full_fetch(&t.schema.fields),
+        upd(&t.schema.fields, "label", b"x"),
+        None,
+    )
+    .await
+    .unwrap();
 
     let after = t.vacuum_now().await.unwrap();
     assert_eq!(after.live_rows, 100);
@@ -520,7 +626,9 @@ async fn a_running_query_defers_publication() {
         insert(&t, i, i as i32, "label-long-enough-to-matter").await;
     }
     t.wait_filters_ready().await;
-    t.delete_rows("cat < 25", full_fetch(&t.schema.fields), None).await.unwrap();
+    t.delete_rows("cat < 25", full_fetch(&t.schema.fields), None)
+        .await
+        .unwrap();
 
     // Stand in for a query that started before the scan and has not finished.
     let ticket = t.readers.enter();
@@ -545,7 +653,10 @@ async fn a_running_query_defers_publication() {
     )
     .await
     .unwrap();
-    assert!(report.deferred, "publication ran while an older read was live");
+    assert!(
+        report.deferred,
+        "publication ran while an older read was live"
+    );
     assert_eq!(t.free_space.free_bytes(), 0);
 
     drop(ticket);
@@ -667,7 +778,11 @@ async fn a_relocating_update_preserves_the_rows_history() {
     t.wait_filters_ready().await;
 
     let before = all_pointers(&t).await;
-    let original = before.iter().find(|p| !p.deleted && p.id == 1).unwrap().clone();
+    let original = before
+        .iter()
+        .find(|p| !p.deleted && p.id == 1)
+        .unwrap()
+        .clone();
     assert!(original.created_at > 0);
 
     // Force a relocation: the new label cannot fit the old extent.
@@ -733,9 +848,14 @@ async fn a_small_table_is_scanned_rather_than_masked() {
     let toks = crate::core::tokenizer::query_tokenizer::tokenize("id = 300", &t.schema.fields);
     let program = crate::core::filter::sarg::extract(&toks, filters)
         .expect("a point lookup on a unique column is sargable");
-    let bm = filters.evaluate(&program, n_slots).expect("the mask builds");
+    let bm = filters
+        .evaluate(&program, n_slots)
+        .expect("the mask builds");
     assert!(bm.get(300), "the mask is wrong, not merely declined");
-    assert!(bm.count() < n_slots / 2, "the mask does not prune, so this proves nothing");
+    assert!(
+        bm.count() < n_slots / 2,
+        "the mask does not prune, so this proves nothing"
+    );
 
     // And the scan declines it anyway, because the table is too small to pay
     // for a bitmap test per record.
@@ -792,7 +912,11 @@ async fn updates_do_not_consume_row_ids() {
 
     // The point of the id is that the row keeps answering to it, so the saving
     // must not have come from dropping it.
-    let live: Vec<_> = all_pointers(&t).await.into_iter().filter(|p| !p.deleted).collect();
+    let live: Vec<_> = all_pointers(&t)
+        .await
+        .into_iter()
+        .filter(|p| !p.deleted)
+        .collect();
     assert_eq!(live.len(), 5, "an update left more than one live version");
     assert_eq!(
         live.iter().filter(|p| p.id == original.id).count(),
@@ -819,7 +943,9 @@ async fn a_backfill_running_against_reclamation_still_indexes_correctly() {
         }
         t.wait_filters_ready().await;
         // Leave the table with plenty of dead space for the reopen to reclaim.
-        t.delete_rows("cat < 150", full_fetch(&t.schema.fields), None).await.unwrap();
+        t.delete_rows("cat < 150", full_fetch(&t.schema.fields), None)
+            .await
+            .unwrap();
     }
 
     // Reopening kicks off a backfill over a table that has reclaimable space.
@@ -871,8 +997,11 @@ async fn insert_reports_what_it_actually_wrote() {
 
     // The conversion the propagation goes through must not flatten a storage
     // error into something a caller cannot act on.
-    let io_error: std::io::Error =
-        RowError::Io(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied")).into();
+    let io_error: std::io::Error = RowError::Io(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "denied",
+    ))
+    .into();
     assert_eq!(io_error.kind(), std::io::ErrorKind::PermissionDenied);
     let io_error: std::io::Error = RowError::NotFound("gone".into()).into();
     assert_eq!(io_error.kind(), std::io::ErrorKind::NotFound);
@@ -887,17 +1016,27 @@ async fn insert_reports_what_it_actually_wrote() {
         insert(&t, i, i as i32, "a-label-with-some-length").await;
     }
     t.wait_filters_ready().await;
-    t.delete_rows("cat < 40", full_fetch(&t.schema.fields), None).await.unwrap();
+    t.delete_rows("cat < 40", full_fetch(&t.schema.fields), None)
+        .await
+        .unwrap();
     t.vacuum_now().await.unwrap();
 
     for i in 1000..1040u64 {
-        let mut rw = RowWrite { columns_writing_data: SmallVec::new() };
-        rw.columns_writing_data.push(payload(&i.to_le_bytes(), 0, DbType::U64));
-        rw.columns_writing_data.push(payload(&(i as i32).to_le_bytes(), 1, DbType::I32));
-        rw.columns_writing_data.push(payload(b"a-label-with-some-length", 2, DbType::STRING));
+        let mut rw = RowWrite {
+            columns_writing_data: SmallVec::new(),
+        };
+        rw.columns_writing_data
+            .push(payload(&i.to_le_bytes(), 0, DbType::U64));
+        rw.columns_writing_data
+            .push(payload(&(i as i32).to_le_bytes(), 1, DbType::I32));
+        rw.columns_writing_data
+            .push(payload(b"a-label-with-some-length", 2, DbType::STRING));
         t.insert_row(rw).await.expect("insert reported failure");
     }
-    assert!(t.free_space.reused_rows() > 0, "the reclaimed path was not exercised");
+    assert!(
+        t.free_space.reused_rows() > 0,
+        "the reclaimed path was not exercised"
+    );
     assert_eq!(run(&t, "").await.len(), 50);
     assert_eq!(t.free_space.leaked_loans(), 0, "an extent was stranded");
 }
@@ -945,16 +1084,25 @@ async fn the_capped_path_never_rehands_a_reused_extent() {
         .unwrap()
     };
 
-    t.delete_rows("cat < 80", full_fetch(&t.schema.fields), None).await.unwrap();
+    t.delete_rows("cat < 80", full_fetch(&t.schema.fields), None)
+        .await
+        .unwrap();
 
     // First run publishes the freed extents; the refill claims them. The
     // tombstones that released them stay on disk.
     let first = run(&t).await;
-    assert!(first.reclaimed_bytes > 0, "capped path reclaimed nothing: {:?}", first);
+    assert!(
+        first.reclaimed_bytes > 0,
+        "capped path reclaimed nothing: {:?}",
+        first
+    );
     for i in 1000..1080u64 {
         insert(&t, i, i as i32, &format!("original-{:04}", i)).await;
     }
-    assert!(t.free_space.reused_rows() > 0, "the refill did not reuse anything");
+    assert!(
+        t.free_space.reused_rows() > 0,
+        "the refill did not reuse anything"
+    );
 
     // Second run sees exactly the same tombstones. Anything it publishes now is
     // occupied by one of the rows just written.
@@ -1032,7 +1180,10 @@ async fn compaction_shrinks_both_files() {
         "pointer file still holds tombstones"
     );
     assert_eq!(report.rows_bytes_freed, full_rows - compacted_rows);
-    assert_eq!(report.pointer_bytes_freed, full_pointers - compacted_pointers);
+    assert_eq!(
+        report.pointer_bytes_freed,
+        full_pointers - compacted_pointers
+    );
 
     // Nothing about the data changed.
     let rows = run(&t, "").await;
@@ -1053,7 +1204,9 @@ async fn point_lookups_still_work_after_compaction() {
         insert(&t, i, i as i32, &format!("label-{:04}", i)).await;
     }
     t.wait_filters_ready().await;
-    t.delete_rows("cat < 250", full_fetch(&t.schema.fields), None).await.unwrap();
+    t.delete_rows("cat < 250", full_fetch(&t.schema.fields), None)
+        .await
+        .unwrap();
 
     t.compact().await.unwrap();
     t.wait_filters_ready().await;
@@ -1064,7 +1217,11 @@ async fn point_lookups_still_work_after_compaction() {
         assert_eq!(str_of(&found[0], 2), format!("label-{:04}", id));
     }
     for id in [0u64, 100, 249] {
-        assert!(run(&t, &format!("id = {}", id)).await.is_empty(), "id = {} came back", id);
+        assert!(
+            run(&t, &format!("id = {}", id)).await.is_empty(),
+            "id = {} came back",
+            id
+        );
     }
     assert!(run(&t, "label = 'label-0300'").await.len() == 1);
 }
@@ -1079,7 +1236,9 @@ async fn a_compacted_table_reopens_and_keeps_writing() {
             insert(&t, i, i as i32, &format!("label-{:04}", i)).await;
         }
         t.wait_filters_ready().await;
-        t.delete_rows("cat < 120", full_fetch(&t.schema.fields), None).await.unwrap();
+        t.delete_rows("cat < 120", full_fetch(&t.schema.fields), None)
+            .await
+            .unwrap();
         t.compact().await.unwrap();
     }
 
@@ -1100,9 +1259,13 @@ async fn a_compacted_table_reopens_and_keeps_writing() {
     }
 
     // And it can be compacted again.
-    t.delete_rows("cat < 1020 AND cat >= 1000", full_fetch(&t.schema.fields), None)
-        .await
-        .unwrap();
+    t.delete_rows(
+        "cat < 1020 AND cat >= 1000",
+        full_fetch(&t.schema.fields),
+        None,
+    )
+    .await
+    .unwrap();
     let second = t.compact().await.unwrap();
     assert_eq!(second.live_rows, 110);
     assert_eq!(run(&t, "").await.len(), 110);
@@ -1144,12 +1307,18 @@ async fn compaction_handles_empty_and_fully_dead_tables() {
         insert(&t, i, i as i32, "label").await;
     }
     t.wait_filters_ready().await;
-    t.delete_rows("", full_fetch(&t.schema.fields), None).await.unwrap();
+    t.delete_rows("", full_fetch(&t.schema.fields), None)
+        .await
+        .unwrap();
 
     let report = t.compact().await.unwrap();
     assert_eq!(report.live_rows, 0);
     assert_eq!(report.dead_rows, 50);
-    assert_eq!(t.io_rows.get_len().await, 0, "a fully dead table kept its bytes");
+    assert_eq!(
+        t.io_rows.get_len().await,
+        0,
+        "a fully dead table kept its bytes"
+    );
     assert_eq!(t.io_pointers.get_len().await, 0);
     assert!(run(&t, "").await.is_empty());
 
@@ -1224,7 +1393,11 @@ async fn compaction_excludes_concurrent_readers_and_writers() {
     assert_eq!(rows.len(), survivors + 40);
     let mut ids: Vec<u64> = rows.iter().map(|r| u64_of(r, 0)).collect();
     ids.sort_unstable();
-    let deduped = { let mut d = ids.clone(); d.dedup(); d };
+    let deduped = {
+        let mut d = ids.clone();
+        d.dedup();
+        d
+    };
     assert_eq!(ids, deduped, "compaction duplicated a row");
     for row in &rows {
         let id = u64_of(row, 0);
@@ -1246,13 +1419,20 @@ async fn compaction_excludes_concurrent_readers_and_writers() {
 /// happened.
 #[test]
 fn a_bad_literal_is_rejected_rather_than_zeroed() {
+    use crate::core::row::schema::SchemaField;
     use crate::core::rql::lexer_ir::insert_row_from_query_purpose;
     use crate::core::rql::lexer_s1::{InsertRowData, QueryPurpose};
     use crate::core::rql::lexer_ur::update_row_from_query_purpose;
-    use crate::core::row::schema::SchemaField;
 
     let schema: SmallVec<[SchemaField; 20]> = smallvec::smallvec![
-        SchemaField::new("id".into(), DbType::U64, DbType::U64.get_size(), 0, 0, false),
+        SchemaField::new(
+            "id".into(),
+            DbType::U64,
+            DbType::U64.get_size(),
+            0,
+            0,
+            false
+        ),
         SchemaField::new("n".into(), DbType::I32, DbType::I32.get_size(), 1, 8, false),
     ];
 
@@ -1261,8 +1441,8 @@ fn a_bad_literal_is_rejected_rather_than_zeroed() {
             &QueryPurpose::InsertRow(InsertRowData {
                 table_name: "t".into(),
                 query: sql.to_string(),
-            on_conflict_do_nothing: false,
-            on_conflict_update: None,
+                on_conflict_do_nothing: false,
+                on_conflict_update: None,
             }),
             &schema,
         )
@@ -1302,22 +1482,36 @@ async fn a_malformed_row_write_is_refused_before_anything_is_written() {
     let t = open_table(dir.path(), "wp_validate").await;
 
     // A fixed-width column carrying fewer bytes than it declares.
-    let mut rw = RowWrite { columns_writing_data: SmallVec::new() };
-    rw.columns_writing_data.push(payload(&1u64.to_le_bytes(), 0, DbType::U64));
+    let mut rw = RowWrite {
+        columns_writing_data: SmallVec::new(),
+    };
+    rw.columns_writing_data
+        .push(payload(&1u64.to_le_bytes(), 0, DbType::U64));
     let mut short = payload(&[1, 2, 3], 1, DbType::I32);
     short.size = 4;
     rw.columns_writing_data.push(short);
-    rw.columns_writing_data.push(payload(b"ok", 2, DbType::STRING));
-    assert!(t.insert_row(rw).await.is_err(), "a short column was accepted");
+    rw.columns_writing_data
+        .push(payload(b"ok", 2, DbType::STRING));
+    assert!(
+        t.insert_row(rw).await.is_err(),
+        "a short column was accepted"
+    );
 
     // A STRING column declaring something other than its header width.
-    let mut rw = RowWrite { columns_writing_data: SmallVec::new() };
-    rw.columns_writing_data.push(payload(&2u64.to_le_bytes(), 0, DbType::U64));
-    rw.columns_writing_data.push(payload(&7i32.to_le_bytes(), 1, DbType::I32));
+    let mut rw = RowWrite {
+        columns_writing_data: SmallVec::new(),
+    };
+    rw.columns_writing_data
+        .push(payload(&2u64.to_le_bytes(), 0, DbType::U64));
+    rw.columns_writing_data
+        .push(payload(&7i32.to_le_bytes(), 1, DbType::I32));
     let mut wrong = payload(b"ok", 2, DbType::STRING);
     wrong.size = u32::MAX;
     rw.columns_writing_data.push(wrong);
-    assert!(t.insert_row(rw).await.is_err(), "a bogus STRING width was accepted");
+    assert!(
+        t.insert_row(rw).await.is_err(),
+        "a bogus STRING width was accepted"
+    );
 
     // Nothing was written, and the table still works.
     assert!(run(&t, "").await.is_empty());
@@ -1353,13 +1547,21 @@ async fn a_relocated_row_keeps_its_id_and_the_sequence_survives_reopen() {
         t.update_rows(
             "id = 0",
             full_fetch(&t.schema.fields),
-            upd(&t.schema.fields, "label", b"a-label-far-too-long-to-fit-in-place"),
+            upd(
+                &t.schema.fields,
+                "label",
+                b"a-label-far-too-long-to-fit-in-place",
+            ),
             None,
         )
         .await
         .unwrap();
 
-        let live: Vec<_> = all_pointers(&t).await.into_iter().filter(|p| !p.deleted).collect();
+        let live: Vec<_> = all_pointers(&t)
+            .await
+            .into_iter()
+            .filter(|p| !p.deleted)
+            .collect();
         assert!(
             live.iter().any(|p| p.id == original.id),
             "the relocated row lost its id"
@@ -1382,13 +1584,20 @@ async fn a_relocated_row_keeps_its_id_and_the_sequence_survives_reopen() {
         insert(&t, i, i as i32, "s").await;
     }
 
-    let live: Vec<_> = all_pointers(&t).await.into_iter().filter(|p| !p.deleted).collect();
+    let live: Vec<_> = all_pointers(&t)
+        .await
+        .into_iter()
+        .filter(|p| !p.deleted)
+        .collect();
     assert_eq!(live.len(), 40);
     let mut ids: Vec<u64> = live.iter().map(RowPointer::row_id).collect();
     ids.sort_unstable();
     let mut deduped = ids.clone();
     deduped.dedup();
-    assert_eq!(ids, deduped, "a reopened table reused an id that was still live");
+    assert_eq!(
+        ids, deduped,
+        "a reopened table reused an id that was still live"
+    );
     for old in &ids_before {
         assert!(ids.contains(old), "id {} was lost across the reopen", old);
     }
@@ -1444,7 +1653,10 @@ async fn an_update_follows_a_row_that_was_relocated_under_it() {
     assert_eq!(rows.len(), 1);
     assert_eq!(str_of(&rows[0], 2), "first-writer-value-long");
     let cat = rows[0].columns.iter().find(|c| c.schema_id == 1).unwrap();
-    assert_eq!(i32::from_le_bytes(cat.data.into_slice().try_into().unwrap()), 777);
+    assert_eq!(
+        i32::from_le_bytes(cat.data.into_slice().try_into().unwrap()),
+        777
+    );
     assert_eq!(run(&t, "").await.len(), 40);
 }
 
@@ -1475,16 +1687,25 @@ async fn a_delete_follows_a_row_that_was_relocated_under_it() {
     let deleter = {
         let t = t.clone();
         tokio::spawn(async move {
-            t.delete_rows("id = 13", full_fetch(&t.schema.fields), None).await.unwrap()
+            t.delete_rows("id = 13", full_fetch(&t.schema.fields), None)
+                .await
+                .unwrap()
         })
     };
     let moved = updater.await.unwrap();
     let deleted = deleter.await.unwrap();
 
     // Whatever the interleaving, the row must be gone exactly once.
-    assert!(run(&t, "id = 13").await.is_empty(), "the row survived its DELETE");
+    assert!(
+        run(&t, "id = 13").await.is_empty(),
+        "the row survived its DELETE"
+    );
     assert_eq!(run(&t, "").await.len(), 39);
-    assert_eq!(deleted, 1, "the DELETE reported {} rows (update moved: {})", deleted, moved);
+    assert_eq!(
+        deleted, 1,
+        "the DELETE reported {} rows (update moved: {})",
+        deleted, moved
+    );
 }
 
 /// A table whose queries always overlap the scan must still reclaim — one run
@@ -1497,7 +1718,9 @@ async fn a_permanently_busy_table_still_reclaims() {
         insert(&t, i, i as i32, "a-label-with-enough-length-to-matter").await;
     }
     t.wait_filters_ready().await;
-    t.delete_rows("cat < 80", full_fetch(&t.schema.fields), None).await.unwrap();
+    t.delete_rows("cat < 80", full_fetch(&t.schema.fields), None)
+        .await
+        .unwrap();
 
     let config = VacuumConfig {
         drain_timeout: std::time::Duration::from_millis(20),
@@ -1527,9 +1750,16 @@ async fn a_permanently_busy_table_still_reclaims() {
     let forever = t.readers.enter();
 
     let first = run_vacuum(&t).await;
-    assert!(first.deferred, "the first run should have timed out: {:?}", first);
+    assert!(
+        first.deferred,
+        "the first run should have timed out: {:?}",
+        first
+    );
     assert_eq!(first.reclaimed_bytes, 0, "nothing is safe on the first run");
-    assert!(t.free_space.quarantined_extents() > 0, "the batch was thrown away");
+    assert!(
+        t.free_space.quarantined_extents() > 0,
+        "the batch was thrown away"
+    );
 
     // The long-running query still holds *its* barrier, but the batch's barrier
     // was taken during the first run, and that has now been passed by everything
@@ -1538,7 +1768,11 @@ async fn a_permanently_busy_table_still_reclaims() {
     let blocking_again = t.readers.enter();
 
     let second = run_vacuum(&t).await;
-    assert!(second.deferred, "the second run should also time out: {:?}", second);
+    assert!(
+        second.deferred,
+        "the second run should also time out: {:?}",
+        second
+    );
     assert!(
         second.reclaimed_bytes > 0,
         "the held-over batch was never published: {:?}",
@@ -1549,7 +1783,10 @@ async fn a_permanently_busy_table_still_reclaims() {
     for i in 1000..1080u64 {
         insert(&t, i, i as i32, "a-label-with-enough-length-to-matter").await;
     }
-    assert!(t.free_space.reused_rows() > 0, "reclaimed space was never used");
+    assert!(
+        t.free_space.reused_rows() > 0,
+        "reclaimed space was never used"
+    );
     assert_eq!(run(&t, "").await.len(), 120);
 }
 
@@ -1564,9 +1801,18 @@ async fn open_unique_table(dir: &std::path::Path, name: &str) -> Table<LocalStor
         name,
         io,
         vec![
-            CreateColumnData { name: "id".into(), data_type: DbType::U64 },
-            CreateColumnData { name: "cat".into(), data_type: DbType::I32 },
-            CreateColumnData { name: "label".into(), data_type: DbType::STRING },
+            CreateColumnData {
+                name: "id".into(),
+                data_type: DbType::U64,
+            },
+            CreateColumnData {
+                name: "cat".into(),
+                data_type: DbType::I32,
+            },
+            CreateColumnData {
+                name: "label".into(),
+                data_type: DbType::STRING,
+            },
         ],
         &["id".to_string(), "label".to_string()],
     )
@@ -1586,18 +1832,28 @@ async fn a_duplicate_insert_into_a_unique_column_is_refused() {
     t.wait_filters_ready().await;
 
     // Duplicate in the numeric unique column.
-    let mut rw = RowWrite { columns_writing_data: SmallVec::new() };
-    rw.columns_writing_data.push(payload(&7u64.to_le_bytes(), 0, DbType::U64));
-    rw.columns_writing_data.push(payload(&99i32.to_le_bytes(), 1, DbType::I32));
-    rw.columns_writing_data.push(payload(b"a-brand-new-label", 2, DbType::STRING));
+    let mut rw = RowWrite {
+        columns_writing_data: SmallVec::new(),
+    };
+    rw.columns_writing_data
+        .push(payload(&7u64.to_le_bytes(), 0, DbType::U64));
+    rw.columns_writing_data
+        .push(payload(&99i32.to_le_bytes(), 1, DbType::I32));
+    rw.columns_writing_data
+        .push(payload(b"a-brand-new-label", 2, DbType::STRING));
     let err = t.insert_row(rw).await.unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists, "{}", err);
 
     // Duplicate in the string unique column.
-    let mut rw = RowWrite { columns_writing_data: SmallVec::new() };
-    rw.columns_writing_data.push(payload(&500u64.to_le_bytes(), 0, DbType::U64));
-    rw.columns_writing_data.push(payload(&99i32.to_le_bytes(), 1, DbType::I32));
-    rw.columns_writing_data.push(payload(b"label-3", 2, DbType::STRING));
+    let mut rw = RowWrite {
+        columns_writing_data: SmallVec::new(),
+    };
+    rw.columns_writing_data
+        .push(payload(&500u64.to_le_bytes(), 0, DbType::U64));
+    rw.columns_writing_data
+        .push(payload(&99i32.to_le_bytes(), 1, DbType::I32));
+    rw.columns_writing_data
+        .push(payload(b"label-3", 2, DbType::STRING));
     let err = t.insert_row(rw).await.unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists, "{}", err);
 
@@ -1621,7 +1877,9 @@ async fn a_deleted_rows_unique_value_can_be_reused() {
     }
     t.wait_filters_ready().await;
 
-    t.delete_rows("id = 4", full_fetch(&t.schema.fields), None).await.unwrap();
+    t.delete_rows("id = 4", full_fetch(&t.schema.fields), None)
+        .await
+        .unwrap();
     insert(&t, 4, 400, "label-4-again").await;
     assert_eq!(run(&t, "id = 4").await.len(), 1);
     assert_eq!(str_of(&run(&t, "id = 4").await[0], 2), "label-4-again");
@@ -1640,25 +1898,44 @@ async fn update_respects_uniqueness_without_colliding_with_itself() {
 
     // Rewriting a row's non-unique column leaves its unique ones untouched.
     let n = t
-        .update_rows("id = 2", full_fetch(&t.schema.fields), upd(&t.schema.fields, "cat", &42i32.to_le_bytes()), None)
+        .update_rows(
+            "id = 2",
+            full_fetch(&t.schema.fields),
+            upd(&t.schema.fields, "cat", &42i32.to_le_bytes()),
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(n, 1, "a row collided with its own unique value");
 
     // Assigning a unique column a value it already has is also fine.
     let n = t
-        .update_rows("id = 2", full_fetch(&t.schema.fields), upd(&t.schema.fields, "label", b"label-2"), None)
+        .update_rows(
+            "id = 2",
+            full_fetch(&t.schema.fields),
+            upd(&t.schema.fields, "label", b"label-2"),
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(n, 1);
 
     // But taking another row's value is not.
     let err = t
-        .update_rows("id = 2", full_fetch(&t.schema.fields), upd(&t.schema.fields, "label", b"label-5"), None)
+        .update_rows(
+            "id = 2",
+            full_fetch(&t.schema.fields),
+            upd(&t.schema.fields, "label", b"label-5"),
+            None,
+        )
         .await
         .unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists, "{}", err);
-    assert_eq!(str_of(&run(&t, "id = 2").await[0], 2), "label-2", "the rejected UPDATE still wrote");
+    assert_eq!(
+        str_of(&run(&t, "id = 2").await[0], 2),
+        "label-2",
+        "the rejected UPDATE still wrote"
+    );
     assert_eq!(run(&t, "").await.len(), 10);
 }
 
@@ -1675,11 +1952,18 @@ async fn concurrent_inserts_cannot_both_claim_a_unique_value() {
     for k in 0..8u64 {
         let t = t.clone();
         handles.push(tokio::spawn(async move {
-            let mut rw = RowWrite { columns_writing_data: SmallVec::new() };
-            rw.columns_writing_data.push(payload(&777u64.to_le_bytes(), 0, DbType::U64));
-            rw.columns_writing_data.push(payload(&(k as i32).to_le_bytes(), 1, DbType::I32));
+            let mut rw = RowWrite {
+                columns_writing_data: SmallVec::new(),
+            };
             rw.columns_writing_data
-                .push(payload(format!("racer-{}", k).as_bytes(), 2, DbType::STRING));
+                .push(payload(&777u64.to_le_bytes(), 0, DbType::U64));
+            rw.columns_writing_data
+                .push(payload(&(k as i32).to_le_bytes(), 1, DbType::I32));
+            rw.columns_writing_data.push(payload(
+                format!("racer-{}", k).as_bytes(),
+                2,
+                DbType::STRING,
+            ));
             t.insert_row(rw).await.is_ok()
         }));
     }
@@ -1690,7 +1974,11 @@ async fn concurrent_inserts_cannot_both_claim_a_unique_value() {
         }
     }
 
-    assert_eq!(winners, 1, "{} concurrent inserts claimed the same unique value", winners);
+    assert_eq!(
+        winners, 1,
+        "{} concurrent inserts claimed the same unique value",
+        winners
+    );
     assert_eq!(run(&t, "id = 777").await.len(), 1);
     assert_eq!(run(&t, "").await.len(), 2);
 }
@@ -1726,12 +2014,27 @@ fn vacuum_statements_parse() {
     assert_eq!(parse("VACUUM;"), Some((None, false)));
     assert_eq!(parse("vacuum full"), Some((None, true)));
     assert_eq!(parse("VACUUM users"), Some((Some("users".into()), false)));
-    assert_eq!(parse("VACUUM FULL users;"), Some((Some("users".into()), true)));
-    assert_eq!(parse("VACUUM \"users\""), Some((Some("users".into()), false)));
+    assert_eq!(
+        parse("VACUUM FULL users;"),
+        Some((Some("users".into()), true))
+    );
+    assert_eq!(
+        parse("VACUUM \"users\""),
+        Some((Some("users".into()), false))
+    );
     // Options this engine has nothing to act on are skipped, not rejected.
-    assert_eq!(parse("VACUUM (ANALYZE) users"), Some((Some("users".into()), false)));
-    assert_eq!(parse("VACUUM (VERBOSE, ANALYZE) users"), Some((Some("users".into()), false)));
-    assert_eq!(parse("VACUUM VERBOSE ANALYZE users"), Some((Some("users".into()), false)));
+    assert_eq!(
+        parse("VACUUM (ANALYZE) users"),
+        Some((Some("users".into()), false))
+    );
+    assert_eq!(
+        parse("VACUUM (VERBOSE, ANALYZE) users"),
+        Some((Some("users".into()), false))
+    );
+    assert_eq!(
+        parse("VACUUM VERBOSE ANALYZE users"),
+        Some((Some("users".into()), false))
+    );
     assert_eq!(parse("VACUUM FULL VERBOSE"), Some((None, true)));
 
     // And it must not swallow anything else.
@@ -1779,7 +2082,11 @@ async fn churn_reaches_a_steady_state() {
         sizes.push(t.io_rows.get_len().await);
     }
 
-    assert_eq!(run(&t, "").await.len(), 300, "churn lost or duplicated rows");
+    assert_eq!(
+        run(&t, "").await.len(),
+        300,
+        "churn lost or duplicated rows"
+    );
 
     // Once the free list covers a cycle's worth of rows, the file must stop
     // growing outright — not merely grow slowly.
@@ -1829,9 +2136,8 @@ fn create_table_carries_unique_constraints() {
     use crate::core::rql::lexer_ct::create_table_from_query_purpose;
     use crate::core::rql::lexer_s1::QueryPurpose;
 
-    let parsed = |sql: &str| {
-        create_table_from_query_purpose(&QueryPurpose::CreateTable(sql.to_string()))
-    };
+    let parsed =
+        |sql: &str| create_table_from_query_purpose(&QueryPurpose::CreateTable(sql.to_string()));
 
     // Inline constraints flag their column.
     let inline_of = |sql: &str| {
@@ -1928,27 +2234,47 @@ async fn unique_and_vacuum_work_through_sql() {
     // Status byte 3 is an error; 0 is success.
     let ok = |reply: &[u8]| reply.first() == Some(&0u8);
 
-    assert!(ok(&exec("CREATE TABLE people (id BIGINT PRIMARY KEY, email TEXT UNIQUE, note TEXT)").await));
+    assert!(ok(&exec(
+        "CREATE TABLE people (id BIGINT PRIMARY KEY, email TEXT UNIQUE, note TEXT)"
+    )
+    .await));
 
-    assert!(ok(&exec("INSERT INTO people (id, email, note) VALUES (1, 'a@x', 'first')").await));
-    assert!(ok(&exec("INSERT INTO people (id, email, note) VALUES (2, 'b@x', 'second')").await));
+    assert!(ok(&exec(
+        "INSERT INTO people (id, email, note) VALUES (1, 'a@x', 'first')"
+    )
+    .await));
+    assert!(ok(&exec(
+        "INSERT INTO people (id, email, note) VALUES (2, 'b@x', 'second')"
+    )
+    .await));
 
     // A duplicate in either unique column is refused.
     let dup_id = exec("INSERT INTO people (id, email, note) VALUES (1, 'c@x', 'dup id')").await;
     assert!(!ok(&dup_id), "duplicate PRIMARY KEY was accepted");
-    let dup_email = exec("INSERT INTO people (id, email, note) VALUES (3, 'a@x', 'dup email')").await;
+    let dup_email =
+        exec("INSERT INTO people (id, email, note) VALUES (3, 'a@x', 'dup email')").await;
     assert!(!ok(&dup_email), "duplicate UNIQUE was accepted");
 
     // A non-unique column may repeat.
-    assert!(ok(&exec("INSERT INTO people (id, email, note) VALUES (3, 'c@x', 'first')").await));
+    assert!(ok(&exec(
+        "INSERT INTO people (id, email, note) VALUES (3, 'c@x', 'first')"
+    )
+    .await));
 
     // Deleting frees the value, and VACUUM reaches the reclamation.
     assert!(ok(&exec("DELETE FROM people WHERE id = 2").await));
-    assert!(ok(&exec("INSERT INTO people (id, email, note) VALUES (4, 'b@x', 'reused')").await));
+    assert!(ok(&exec(
+        "INSERT INTO people (id, email, note) VALUES (4, 'b@x', 'reused')"
+    )
+    .await));
 
     let reply = exec("VACUUM people").await;
     assert!(ok(&reply), "VACUUM reported an error");
-    assert_eq!(reply.len(), 9, "VACUUM reply should be a status byte plus a u64");
+    assert_eq!(
+        reply.len(),
+        9,
+        "VACUUM reply should be a status byte plus a u64"
+    );
 
     let reply = exec("VACUUM FULL").await;
     assert!(ok(&reply), "VACUUM FULL reported an error");
@@ -1957,8 +2283,14 @@ async fn unique_and_vacuum_work_through_sql() {
     assert!(!ok(&exec("VACUUM no_such_table").await));
 
     // And the table still behaves after all of that.
-    assert!(ok(&exec("INSERT INTO people (id, email, note) VALUES (5, 'e@x', 'after vacuum')").await));
-    assert!(!ok(&exec("INSERT INTO people (id, email, note) VALUES (6, 'a@x', 'still dup')").await));
+    assert!(ok(&exec(
+        "INSERT INTO people (id, email, note) VALUES (5, 'e@x', 'after vacuum')"
+    )
+    .await));
+    assert!(!ok(&exec(
+        "INSERT INTO people (id, email, note) VALUES (6, 'a@x', 'still dup')"
+    )
+    .await));
 }
 
 /// An UPDATE that assigns only fixed-width columns must not rewrite the row.
@@ -1973,7 +2305,13 @@ async fn a_fixed_width_update_writes_only_the_columns_it_changes() {
     let dir = tempfile::tempdir().unwrap();
     let t = open_table(dir.path(), "wp_inplace").await;
     for i in 0..40u64 {
-        insert(&t, i, i as i32, &format!("a-string-that-must-not-move-{:04}", i)).await;
+        insert(
+            &t,
+            i,
+            i as i32,
+            &format!("a-string-that-must-not-move-{:04}", i),
+        )
+        .await;
     }
     t.wait_filters_ready().await;
 
@@ -1999,7 +2337,11 @@ async fn a_fixed_width_update_writes_only_the_columns_it_changes() {
 
     // The long-row layout stores a checksum over the whole row, which this path
     // does not have the bytes to recompute, so it declines there by design.
-    let expected_fast = if cfg!(feature = "enable_long_row") { 0 } else { 20 };
+    let expected_fast = if cfg!(feature = "enable_long_row") {
+        0
+    } else {
+        20
+    };
     assert_eq!(
         t.in_place_column_updates(),
         expected_fast,
@@ -2014,7 +2356,11 @@ async fn a_fixed_width_update_writes_only_the_columns_it_changes() {
         .map(|p| (p.row_id(), p.position, p.length as u64))
         .collect();
     assert_eq!(before, after, "a fixed-width update moved or resized rows");
-    assert_eq!(t.io_rows.get_len().await, rows_len_before, "the rows file grew");
+    assert_eq!(
+        t.io_rows.get_len().await,
+        rows_len_before,
+        "the rows file grew"
+    );
     assert_eq!(
         t.io_pointers.get_len().await,
         pointers_len_before,
@@ -2025,7 +2371,10 @@ async fn a_fixed_width_update_writes_only_the_columns_it_changes() {
     assert_eq!(run(&t, "cat = 555").await.len(), 20);
     for row in run(&t, "").await {
         let id = u64_of(&row, 0);
-        assert_eq!(str_of(&row, 2), format!("a-string-that-must-not-move-{:04}", id));
+        assert_eq!(
+            str_of(&row, 2),
+            format!("a-string-that-must-not-move-{:04}", id)
+        );
     }
     // And the filter still finds the new value by point lookup, which only
     // works if the slot was reindexed.
@@ -2049,7 +2398,11 @@ async fn a_string_update_still_takes_the_general_path() {
     t.update_rows(
         "id = 4",
         full_fetch(&t.schema.fields),
-        upd(&t.schema.fields, "label", b"a-considerably-longer-value-than-before"),
+        upd(
+            &t.schema.fields,
+            "label",
+            b"a-considerably-longer-value-than-before",
+        ),
         None,
     )
     .await
@@ -2057,7 +2410,10 @@ async fn a_string_update_still_takes_the_general_path() {
 
     let rows = run(&t, "id = 4").await;
     assert_eq!(rows.len(), 1);
-    assert_eq!(str_of(&rows[0], 2), "a-considerably-longer-value-than-before");
+    assert_eq!(
+        str_of(&rows[0], 2),
+        "a-considerably-longer-value-than-before"
+    );
     assert_eq!(run(&t, "").await.len(), 10);
 
     // Shrinking one writes in place, and must not leave the old tail readable.
@@ -2096,11 +2452,15 @@ fn the_in_place_latch_holds_begin_off() {
     let manager = StdArc::new(TransactionManager::in_memory());
 
     // Nothing running: the claim succeeds.
-    let guard = manager.try_begin_in_place().expect("quiescent manager declined");
+    let guard = manager
+        .try_begin_in_place()
+        .expect("quiescent manager declined");
 
     // A second in-place write is fine — they cannot observe each other, only
     // transactions can observe them.
-    let second = manager.try_begin_in_place().expect("declined a concurrent in-place write");
+    let second = manager
+        .try_begin_in_place()
+        .expect("declined a concurrent in-place write");
 
     // The waiter reports *when* `begin` returned, not how long it took.
     //
@@ -2213,7 +2573,12 @@ async fn a_versioned_table_declines_the_fast_path_while_a_transaction_runs() {
 
     // Quiescent: the fast path is available and taken.
     let n = t
-        .update_rows("cat < 5", full_fetch(&t.schema.fields), upd(&t.schema.fields, "cat", &111i32.to_le_bytes()), None)
+        .update_rows(
+            "cat < 5",
+            full_fetch(&t.schema.fields),
+            upd(&t.schema.fields, "cat", &111i32.to_le_bytes()),
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(n, 5);
@@ -2222,7 +2587,11 @@ async fn a_versioned_table_declines_the_fast_path_while_a_transaction_runs() {
     // from partial bytes, so it declines there by design and every count below
     // stays at zero. The *updates* must still land either way, which is what the
     // row assertions at the end check.
-    let fast: u64 = if cfg!(feature = "enable_long_row") { 0 } else { 1 };
+    let fast: u64 = if cfg!(feature = "enable_long_row") {
+        0
+    } else {
+        1
+    };
 
     let taken_while_quiescent = t.in_place_column_updates();
     assert_eq!(
@@ -2240,7 +2609,13 @@ async fn a_versioned_table_declines_the_fast_path_while_a_transaction_runs() {
     // previous version and the block can still roll back — asserted below.
     let own = manager.begin_autocommit();
     let n = t
-        .update_rows_in_txn("cat >= 5 AND cat < 8", full_fetch(&t.schema.fields), upd(&t.schema.fields, "cat", &333i32.to_le_bytes()), None, own)
+        .update_rows_in_txn(
+            "cat >= 5 AND cat < 8",
+            full_fetch(&t.schema.fields),
+            upd(&t.schema.fields, "cat", &333i32.to_le_bytes()),
+            None,
+            own,
+        )
         .await
         .unwrap();
     assert_eq!(n, 3);
@@ -2256,7 +2631,13 @@ async fn a_versioned_table_declines_the_fast_path_while_a_transaction_runs() {
     // running, and the update still lands through the versioning path.
     let block = manager.begin();
     let n = t
-        .update_rows_in_txn("cat >= 8 AND cat < 10", full_fetch(&t.schema.fields), upd(&t.schema.fields, "cat", &444i32.to_le_bytes()), None, block)
+        .update_rows_in_txn(
+            "cat >= 8 AND cat < 10",
+            full_fetch(&t.schema.fields),
+            upd(&t.schema.fields, "cat", &444i32.to_le_bytes()),
+            None,
+            block,
+        )
         .await
         .unwrap();
     assert_eq!(n, 2);
@@ -2272,10 +2653,18 @@ async fn a_versioned_table_declines_the_fast_path_while_a_transaction_runs() {
     // must still happen, through the path that writes a new version.
     let reader = manager.begin();
     let n = t
-        .update_rows("cat >= 10 AND cat < 15", full_fetch(&t.schema.fields), upd(&t.schema.fields, "cat", &222i32.to_le_bytes()), None)
+        .update_rows(
+            "cat >= 10 AND cat < 15",
+            full_fetch(&t.schema.fields),
+            upd(&t.schema.fields, "cat", &222i32.to_le_bytes()),
+            None,
+        )
         .await
         .unwrap();
-    assert_eq!(n, 5, "the update was dropped rather than taking the slow path");
+    assert_eq!(
+        n, 5,
+        "the update was dropped rather than taking the slow path"
+    );
     assert_eq!(
         t.in_place_column_updates(),
         taken_while_quiescent,
@@ -2391,7 +2780,10 @@ async fn a_versioned_table_reclaims_across_a_restart() {
     for i in 1000..1080u64 {
         insert(&t2, i, i as i32, "a-label-with-enough-length-to-reclaim").await;
     }
-    assert!(t2.free_space.reused_rows() > 0, "the refill extended the file instead");
+    assert!(
+        t2.free_space.reused_rows() > 0,
+        "the refill extended the file instead"
+    );
     assert_eq!(
         t2.io_rows.get_len().await,
         rows_len,
@@ -2432,10 +2824,9 @@ async fn a_rolled_back_update_leaves_the_old_value_readable() {
     assert_ne!(resp.first(), Some(&3), "update should succeed");
 
     let table = db.tables.get("t").expect("table").clone();
-    let mut it =
-        crate::core::row::row_pointer::RowPointerIterator::new(table.io_pointers.clone())
-            .await
-            .unwrap();
+    let mut it = crate::core::row::row_pointer::RowPointerIterator::new(table.io_pointers.clone())
+        .await
+        .unwrap();
     let mut stamps = Vec::new();
     loop {
         let batch = it.next_row_pointers().await.unwrap();
@@ -2466,7 +2857,11 @@ async fn a_rolled_back_update_leaves_the_old_value_readable() {
         stamps,
         text
     );
-    assert!(!text.contains("after"), "and must not leave the new one: {:?}", text);
+    assert!(
+        !text.contains("after"),
+        "and must not leave the new one: {:?}",
+        text
+    );
 }
 
 /// Reclamation owns clearing filter fingerprints under versioning, and must do
@@ -2533,7 +2928,11 @@ async fn reclamation_clears_filter_fingerprints_once() {
         assert_eq!(str_of(&found[0], 2), format!("label-{:04}", id));
     }
     for id in [0u64, 15, 29] {
-        assert!(run(&t, &format!("id = {}", id)).await.is_empty(), "id = {} came back", id);
+        assert!(
+            run(&t, &format!("id = {}", id)).await.is_empty(),
+            "id = {} came back",
+            id
+        );
     }
 
     // A second round of deletes gets cleared in its turn.
@@ -2557,7 +2956,9 @@ async fn an_unversioned_table_is_not_re_cleared_every_sweep() {
         insert(&t, i, i as i32, "label").await;
     }
     t.wait_filters_ready().await;
-    t.delete_rows("cat < 20", full_fetch(&t.schema.fields), None).await.unwrap();
+    t.delete_rows("cat < 20", full_fetch(&t.schema.fields), None)
+        .await
+        .unwrap();
 
     for _ in 0..3 {
         let report = t.vacuum_now().await.unwrap();
@@ -2621,11 +3022,21 @@ async fn a_provider_without_a_log_commits_successfully() {
         insert(&t, i, i as i32, "label").await;
     }
     t.wait_filters_ready().await;
-    assert_eq!(t.delete_rows("cat < 3", full_fetch(&t.schema.fields), None).await.unwrap(), 3);
     assert_eq!(
-        t.update_rows("cat >= 5", full_fetch(&t.schema.fields), upd(&t.schema.fields, "cat", &9i32.to_le_bytes()), None)
+        t.delete_rows("cat < 3", full_fetch(&t.schema.fields), None)
             .await
             .unwrap(),
+        3
+    );
+    assert_eq!(
+        t.update_rows(
+            "cat >= 5",
+            full_fetch(&t.schema.fields),
+            upd(&t.schema.fields, "cat", &9i32.to_le_bytes()),
+            None
+        )
+        .await
+        .unwrap(),
         5
     );
     t.compact().await.unwrap();
@@ -2664,7 +3075,11 @@ async fn a_filter_checkpoint_reaches_disk_with_a_log_installed() {
     };
     exec("CREATE TABLE flt (id UBIGINT, name VARCHAR);").await;
     for i in 0..200u64 {
-        exec(&format!("INSERT INTO flt (id, name) VALUES ({}, 'row-{}');", i, i)).await;
+        exec(&format!(
+            "INSERT INTO flt (id, name) VALUES ({}, 'row-{}');",
+            i, i
+        ))
+        .await;
     }
 
     {
@@ -2774,8 +3189,14 @@ async fn a_dropped_table_stays_dropped_across_a_restart() {
         exec("INSERT INTO drop_me (x) VALUES (1);").await;
 
         assert!(db.tables.contains_key("drop_me"));
-        assert!(db.drop_table("drop_me").await.unwrap(), "drop reported nothing removed");
-        assert!(!db.tables.contains_key("drop_me"), "still present in the live catalogue");
+        assert!(
+            db.drop_table("drop_me").await.unwrap(),
+            "drop reported nothing removed"
+        );
+        assert!(
+            !db.tables.contains_key("drop_me"),
+            "still present in the live catalogue"
+        );
     }
 
     let reopened = Database::new(&path).await;
@@ -2818,10 +3239,15 @@ async fn a_rolled_back_insert_gives_its_space_back() {
     // branch and would be checking nothing.
     let kept = manager.begin();
     for i in 50..60u64 {
-        let mut rw = RowWrite { columns_writing_data: SmallVec::new() };
-        rw.columns_writing_data.push(payload(&i.to_le_bytes(), 0, DbType::U64));
-        rw.columns_writing_data.push(payload(&(i as i32).to_le_bytes(), 1, DbType::I32));
-        rw.columns_writing_data.push(payload(b"committed-under-a-txn", 2, DbType::STRING));
+        let mut rw = RowWrite {
+            columns_writing_data: SmallVec::new(),
+        };
+        rw.columns_writing_data
+            .push(payload(&i.to_le_bytes(), 0, DbType::U64));
+        rw.columns_writing_data
+            .push(payload(&(i as i32).to_le_bytes(), 1, DbType::I32));
+        rw.columns_writing_data
+            .push(payload(b"committed-under-a-txn", 2, DbType::STRING));
         t.insert_row_in_txn(rw, kept).await.unwrap();
     }
     manager.commit(kept);
@@ -2830,10 +3256,15 @@ async fn a_rolled_back_insert_gives_its_space_back() {
     // commits per row — and then the transaction that stamped them aborts.
     let tx = manager.begin();
     for i in 100..120u64 {
-        let mut rw = RowWrite { columns_writing_data: SmallVec::new() };
-        rw.columns_writing_data.push(payload(&i.to_le_bytes(), 0, DbType::U64));
-        rw.columns_writing_data.push(payload(&(i as i32).to_le_bytes(), 1, DbType::I32));
-        rw.columns_writing_data.push(payload(b"rolled-back-payload", 2, DbType::STRING));
+        let mut rw = RowWrite {
+            columns_writing_data: SmallVec::new(),
+        };
+        rw.columns_writing_data
+            .push(payload(&i.to_le_bytes(), 0, DbType::U64));
+        rw.columns_writing_data
+            .push(payload(&(i as i32).to_le_bytes(), 1, DbType::I32));
+        rw.columns_writing_data
+            .push(payload(b"rolled-back-payload", 2, DbType::STRING));
         t.insert_row_in_txn(rw, tx).await.unwrap();
     }
     manager.abort(tx);
@@ -2928,7 +3359,11 @@ async fn a_rolled_back_update_frees_the_new_version_and_keeps_the_old() {
         .update_rows_in_txn(
             "cat < 5",
             full_fetch(&t.schema.fields),
-            upd(&t.schema.fields, "label", b"a-much-longer-label-forcing-relocation"),
+            upd(
+                &t.schema.fields,
+                "label",
+                b"a-much-longer-label-forcing-relocation",
+            ),
             None,
             tx,
         )
@@ -2987,17 +3422,27 @@ async fn uniqueness_sees_the_transactions_own_uncommitted_rows() {
 
     let tx = manager.begin();
 
-    let mut rw = RowWrite { columns_writing_data: SmallVec::new() };
-    rw.columns_writing_data.push(payload(&100u64.to_le_bytes(), 0, DbType::U64));
-    rw.columns_writing_data.push(payload(&1i32.to_le_bytes(), 1, DbType::I32));
-    rw.columns_writing_data.push(payload(b"claimed-inside-the-txn", 2, DbType::STRING));
+    let mut rw = RowWrite {
+        columns_writing_data: SmallVec::new(),
+    };
+    rw.columns_writing_data
+        .push(payload(&100u64.to_le_bytes(), 0, DbType::U64));
+    rw.columns_writing_data
+        .push(payload(&1i32.to_le_bytes(), 1, DbType::I32));
+    rw.columns_writing_data
+        .push(payload(b"claimed-inside-the-txn", 2, DbType::STRING));
     t.insert_row_in_txn(rw, tx).await.expect("first insert");
 
     // Same unique label, same transaction, not yet committed.
-    let mut rw = RowWrite { columns_writing_data: SmallVec::new() };
-    rw.columns_writing_data.push(payload(&101u64.to_le_bytes(), 0, DbType::U64));
-    rw.columns_writing_data.push(payload(&1i32.to_le_bytes(), 1, DbType::I32));
-    rw.columns_writing_data.push(payload(b"claimed-inside-the-txn", 2, DbType::STRING));
+    let mut rw = RowWrite {
+        columns_writing_data: SmallVec::new(),
+    };
+    rw.columns_writing_data
+        .push(payload(&101u64.to_le_bytes(), 0, DbType::U64));
+    rw.columns_writing_data
+        .push(payload(&1i32.to_le_bytes(), 1, DbType::I32));
+    rw.columns_writing_data
+        .push(payload(b"claimed-inside-the-txn", 2, DbType::STRING));
     let err = t
         .insert_row_in_txn(rw, tx)
         .await
@@ -3036,19 +3481,29 @@ async fn a_rolled_back_insert_frees_the_unique_value_it_claimed() {
     t.enable_versioning(manager.clone());
 
     let doomed = manager.begin();
-    let mut rw = RowWrite { columns_writing_data: SmallVec::new() };
-    rw.columns_writing_data.push(payload(&200u64.to_le_bytes(), 0, DbType::U64));
-    rw.columns_writing_data.push(payload(&1i32.to_le_bytes(), 1, DbType::I32));
-    rw.columns_writing_data.push(payload(b"briefly-claimed", 2, DbType::STRING));
+    let mut rw = RowWrite {
+        columns_writing_data: SmallVec::new(),
+    };
+    rw.columns_writing_data
+        .push(payload(&200u64.to_le_bytes(), 0, DbType::U64));
+    rw.columns_writing_data
+        .push(payload(&1i32.to_le_bytes(), 1, DbType::I32));
+    rw.columns_writing_data
+        .push(payload(b"briefly-claimed", 2, DbType::STRING));
     t.insert_row_in_txn(rw, doomed).await.expect("insert");
     manager.abort(doomed);
 
     // A later transaction may take the value the rollback gave up.
     let winner = manager.begin();
-    let mut rw = RowWrite { columns_writing_data: SmallVec::new() };
-    rw.columns_writing_data.push(payload(&201u64.to_le_bytes(), 0, DbType::U64));
-    rw.columns_writing_data.push(payload(&1i32.to_le_bytes(), 1, DbType::I32));
-    rw.columns_writing_data.push(payload(b"briefly-claimed", 2, DbType::STRING));
+    let mut rw = RowWrite {
+        columns_writing_data: SmallVec::new(),
+    };
+    rw.columns_writing_data
+        .push(payload(&201u64.to_le_bytes(), 0, DbType::U64));
+    rw.columns_writing_data
+        .push(payload(&1i32.to_le_bytes(), 1, DbType::I32));
+    rw.columns_writing_data
+        .push(payload(b"briefly-claimed", 2, DbType::STRING));
     t.insert_row_in_txn(rw, winner)
         .await
         .expect("a rolled-back insert kept its unique value reserved forever");
@@ -3102,7 +3557,10 @@ async fn a_scan_does_not_fetch_pointers_whose_extents_were_reclaimed() {
     // handle, and asserting it here means the test fails loudly if the delete
     // path ever starts tombstoning instead of stamping.
     let report = t.vacuum_now().await.unwrap();
-    assert!(report.reclaimed_bytes > 0, "nothing was reclaimed, so nothing is reused");
+    assert!(
+        report.reclaimed_bytes > 0,
+        "nothing was reclaimed, so nothing is reused"
+    );
 
     // Same width, so the freed extents are genuinely reusable and the stale
     // pointers now address bytes belonging to these rows.
@@ -3126,7 +3584,10 @@ async fn a_scan_does_not_fetch_pointers_whose_extents_were_reclaimed() {
         .map(|r| u64_of(r, 0))
         .collect();
     ids.sort();
-    assert_eq!(ids, expected, "the WHERE-filtered scan disagreed with the unfiltered one");
+    assert_eq!(
+        ids, expected,
+        "the WHERE-filtered scan disagreed with the unfiltered one"
+    );
 }
 
 #[test]
@@ -3142,8 +3603,22 @@ fn column_lookup_uses_write_order_not_position() {
     // out of range for exactly the reason it panicked a pgwire worker with
     // "len is 22 but the index is 22".
     let mut projected: SmallVec<[SchemaField; 20]> = SmallVec::new();
-    projected.push(SchemaField::new("late".into(), DbType::I32, 4, 0, 21, false));
-    projected.push(SchemaField::new("later".into(), DbType::I32, 4, 4, 22, false));
+    projected.push(SchemaField::new(
+        "late".into(),
+        DbType::I32,
+        4,
+        0,
+        21,
+        false,
+    ));
+    projected.push(SchemaField::new(
+        "later".into(),
+        DbType::I32,
+        4,
+        4,
+        22,
+        false,
+    ));
 
     let mut mb_a = MEMORY_POOL.acquire(4);
     mb_a.into_slice_mut().copy_from_slice(&7i32.to_le_bytes());
@@ -3151,13 +3626,31 @@ fn column_lookup_uses_write_order_not_position() {
     mb_b.into_slice_mut().copy_from_slice(&9i32.to_le_bytes());
 
     let mut columns: SmallVec<[Column; 32]> = SmallVec::new();
-    columns.push(Column { schema_id: 21, data: mb_a.clone(), column_type: DbType::I32 });
-    columns.push(Column { schema_id: 22, data: mb_b.clone(), column_type: DbType::I32 });
-    let row = Row { position: 0, length: 8, columns };
+    columns.push(Column {
+        schema_id: 21,
+        data: mb_a.clone(),
+        column_type: DbType::I32,
+    });
+    columns.push(Column {
+        schema_id: 22,
+        data: mb_b.clone(),
+        column_type: DbType::I32,
+    });
+    let row = Row {
+        position: 0,
+        length: 8,
+        columns,
+    };
 
     // Would have indexed past the end of a two-element slice.
-    assert!(row.get_column("later", &projected).is_some(), "lookup by write_order failed");
-    assert!(row.get_column("late", &projected).is_some(), "lookup by write_order failed");
+    assert!(
+        row.get_column("later", &projected).is_some(),
+        "lookup by write_order failed"
+    );
+    assert!(
+        row.get_column("late", &projected).is_some(),
+        "lookup by write_order failed"
+    );
     assert!(row.get_column("absent", &projected).is_none());
 
     // And the naming path returns the names those write_orders actually carry,
@@ -3165,7 +3658,11 @@ fn column_lookup_uses_write_order_not_position() {
     let mut out: SmallVec<[(Cow<'_, str>, MemoryBlock); 20]> = SmallVec::new();
     column_vec_into_vec(&mut out, &row.columns.to_vec(), &projected);
     let names: Vec<&str> = out.iter().map(|(n, _)| n.as_ref()).collect();
-    assert_eq!(names, vec!["late", "later"], "output columns were named by position");
+    assert_eq!(
+        names,
+        vec!["late", "later"],
+        "output columns were named by position"
+    );
 }
 
 #[test]
@@ -3190,18 +3687,35 @@ fn a_row_view_returns_absent_for_a_column_the_fetch_skipped() {
 
     // Only write_order 0 was fetched.
     let mut columns: SmallVec<[Column; 32]> = SmallVec::new();
-    columns.push(Column { schema_id: 0, data: mb, column_type: DbType::I32 });
-    let row = Row { position: 0, length: 4, columns };
+    columns.push(Column {
+        schema_id: 0,
+        data: mb,
+        column_type: DbType::I32,
+    });
+    let row = Row {
+        position: 0,
+        length: 4,
+        columns,
+    };
 
     let mut map: SmallVec<[u8; 32]> = SmallVec::new();
     build_write_order_map(&mut map, &row, schema.as_slice());
     let view = RowView::new(&row, &map);
 
     assert_eq!(view.mb_at(0).into_slice(), &5i32.to_le_bytes());
-    assert!(view.mb_at(1).into_slice().is_empty(), "an unfetched column was not absent");
-    assert!(view.mb_at(2).into_slice().is_empty(), "an unfetched column was not absent");
+    assert!(
+        view.mb_at(1).into_slice().is_empty(),
+        "an unfetched column was not absent"
+    );
+    assert!(
+        view.mb_at(2).into_slice().is_empty(),
+        "an unfetched column was not absent"
+    );
 
     // And a write_order past the end of the map — the other unchecked access,
     // reachable whenever a write_order exceeds the field count.
-    assert!(view.mb_at(99).into_slice().is_empty(), "an out-of-range lookup was not absent");
+    assert!(
+        view.mb_at(99).into_slice().is_empty(),
+        "an out-of-range lookup was not absent"
+    );
 }

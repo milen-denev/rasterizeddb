@@ -94,10 +94,7 @@ pub fn parse(sql: &str) -> Option<Result<Introspect, String>> {
             Some(name) if original.len() == 2 => {
                 Some(Ok(Introspect::Columns(normalize_name(name))))
             }
-            Some(_) => Some(Err(format!(
-                "{} takes one table name",
-                words[0]
-            ))),
+            Some(_) => Some(Err(format!("{} takes one table name", words[0]))),
             None => Some(Err(format!("{} names no table", words[0]))),
         };
     }
@@ -113,7 +110,11 @@ pub fn parse(sql: &str) -> Option<Result<Introspect, String>> {
             return Some(Err("SET CONFIG needs `key = value`".to_string()));
         };
         let key = key.trim().to_ascii_lowercase();
-        let value = value.trim().trim_matches('\'').trim_matches('"').to_string();
+        let value = value
+            .trim()
+            .trim_matches('\'')
+            .trim_matches('"')
+            .to_string();
         if key.is_empty() {
             return Some(Err("SET CONFIG names no key".to_string()));
         }
@@ -154,7 +155,11 @@ pub fn parse(sql: &str) -> Option<Result<Introspect, String>> {
         },
         Some("COLUMNS") => {
             // `SHOW COLUMNS FROM t`, and the bare `SHOW COLUMNS t`.
-            let index = if words.get(2).copied() == Some("FROM") { 3 } else { 2 };
+            let index = if words.get(2).copied() == Some("FROM") {
+                3
+            } else {
+                2
+            };
             match original.get(index) {
                 Some(name) if original.len() == index + 1 => {
                     Some(Ok(Introspect::Columns(normalize_name(name))))
@@ -395,7 +400,13 @@ async fn database_stats(database: &Arc<Database>) -> Vec<Row> {
     let mut names: Vec<String> = database.tables.iter().map(|e| e.key().clone()).collect();
     names.sort();
 
-    let mut total = TableSizes { data: 0, pointers: 0, schema: 0, filters: 0, sequence: 0 };
+    let mut total = TableSizes {
+        data: 0,
+        pointers: 0,
+        schema: 0,
+        filters: 0,
+        sequence: 0,
+    };
     let mut reclaimable = 0u64;
     let mut foreign_keys = 0usize;
     let mut unique_keys = 0usize;
@@ -413,9 +424,24 @@ async fn database_stats(database: &Arc<Database>) -> Vec<Row> {
         total.filters += sizes.filters;
         total.sequence += sizes.sequence;
         reclaimable += table.reclaimable_bytes();
-        foreign_keys += table.schema.foreign_keys.iter().filter(|f| !f.is_deleted).count();
-        unique_keys += table.schema.unique_keys.iter().filter(|k| !k.is_deleted).count();
-        json_columns += table.schema.json_columns.iter().filter(|c| !c.is_deleted).count();
+        foreign_keys += table
+            .schema
+            .foreign_keys
+            .iter()
+            .filter(|f| !f.is_deleted)
+            .count();
+        unique_keys += table
+            .schema
+            .unique_keys
+            .iter()
+            .filter(|k| !k.is_deleted)
+            .count();
+        json_columns += table
+            .schema
+            .json_columns
+            .iter()
+            .filter(|c| !c.is_deleted)
+            .count();
         column_count += table
             .schema
             .fields
@@ -433,7 +459,11 @@ async fn database_stats(database: &Arc<Database>) -> Vec<Row> {
         ]));
     };
 
-    push("name", database.name.clone(), "what clients connect to this database as");
+    push(
+        "name",
+        database.name.clone(),
+        "what clients connect to this database as",
+    );
     push(
         "server_version",
         format!("rasterizeddb {}", env!("CARGO_PKG_VERSION")),
@@ -441,60 +471,168 @@ async fn database_stats(database: &Arc<Database>) -> Vec<Row> {
     );
     push(
         "location",
-        database.location.clone().unwrap_or_else(|| "(in memory)".to_string()),
+        database
+            .location
+            .clone()
+            .unwrap_or_else(|| "(in memory)".to_string()),
         "directory holding this database's files",
     );
-    push("database_id", database.id.to_string(), "distinguishes it from a recreated namesake");
-    push("tables", names.len().to_string(), "user and shadow tables the catalogue holds");
-    push("columns", column_count.to_string(), "declared columns across every table");
-    push("row_slots", (total.pointers / ROW_POINTER_RECORD_LEN as u64).to_string(),
-         "pointer records; an upper bound on live rows");
+    push(
+        "database_id",
+        database.id.to_string(),
+        "distinguishes it from a recreated namesake",
+    );
+    push(
+        "tables",
+        names.len().to_string(),
+        "user and shadow tables the catalogue holds",
+    );
+    push(
+        "columns",
+        column_count.to_string(),
+        "declared columns across every table",
+    );
+    push(
+        "row_slots",
+        (total.pointers / ROW_POINTER_RECORD_LEN as u64).to_string(),
+        "pointer records; an upper bound on live rows",
+    );
 
     push("data_bytes", total.data.to_string(), "row data");
-    push("pointer_bytes", total.pointers.to_string(), "row pointer records");
-    push("schema_bytes", total.schema.to_string(), "schemas and their sidecars");
-    push("index_bytes", total.filters.to_string(), "persisted filter checkpoints");
-    push("sequence_bytes", total.sequence.to_string(), "row-id sequences");
-    push("total_bytes", total.total().to_string(), "every file the tables own");
-    push("reclaimable_bytes", reclaimable.to_string(), "dead space a VACUUM would return");
+    push(
+        "pointer_bytes",
+        total.pointers.to_string(),
+        "row pointer records",
+    );
+    push(
+        "schema_bytes",
+        total.schema.to_string(),
+        "schemas and their sidecars",
+    );
+    push(
+        "index_bytes",
+        total.filters.to_string(),
+        "persisted filter checkpoints",
+    );
+    push(
+        "sequence_bytes",
+        total.sequence.to_string(),
+        "row-id sequences",
+    );
+    push(
+        "total_bytes",
+        total.total().to_string(),
+        "every file the tables own",
+    );
+    push(
+        "reclaimable_bytes",
+        reclaimable.to_string(),
+        "dead space a VACUUM would return",
+    );
 
-    push("foreign_keys", foreign_keys.to_string(), "enforced references");
-    push("unique_constraints", unique_keys.to_string(), "table-level UNIQUE constraints");
-    push("json_columns", json_columns.to_string(), "columns mapped onto a shadow table");
+    push(
+        "foreign_keys",
+        foreign_keys.to_string(),
+        "enforced references",
+    );
+    push(
+        "unique_constraints",
+        unique_keys.to_string(),
+        "table-level UNIQUE constraints",
+    );
+    push(
+        "json_columns",
+        json_columns.to_string(),
+        "columns mapped onto a shadow table",
+    );
 
     let transactions = &database.transactions;
-    push("next_transaction_id", transactions.next_id().to_string(), "id the next transaction takes");
-    push("oldest_active_transaction", transactions.oldest_active().to_string(),
-         "what pins the reclamation horizon");
-    push("transaction_bookkeeping", transactions.bookkeeping_entries().to_string(),
-         "outcomes still being tracked");
-    push("quiescent", transactions.quiescent().to_string(), "no transaction is running");
+    push(
+        "next_transaction_id",
+        transactions.next_id().to_string(),
+        "id the next transaction takes",
+    );
+    push(
+        "oldest_active_transaction",
+        transactions.oldest_active().to_string(),
+        "what pins the reclamation horizon",
+    );
+    push(
+        "transaction_bookkeeping",
+        transactions.bookkeeping_entries().to_string(),
+        "outcomes still being tracked",
+    );
+    push(
+        "quiescent",
+        transactions.quiescent().to_string(),
+        "no transaction is running",
+    );
 
-    push("wal_enabled", crate::wal_enabled().to_string(), "durable writes go through the log");
-    push("wal_checkpoint_bytes", crate::wal_checkpoint_bytes().to_string(),
-         "log bytes between checkpoints");
+    push(
+        "wal_enabled",
+        crate::wal_enabled().to_string(),
+        "durable writes go through the log",
+    );
+    push(
+        "wal_checkpoint_bytes",
+        crate::wal_checkpoint_bytes().to_string(),
+        "log bytes between checkpoints",
+    );
 
     let (hits, misses, entries) = crate::cache::query_cache::stats();
-    push("query_cache_enabled", crate::cache::query_cache::enabled().to_string(),
-         "repeated queries served from a known offset");
+    push(
+        "query_cache_enabled",
+        crate::cache::query_cache::enabled().to_string(),
+        "repeated queries served from a known offset",
+    );
     push("query_cache_hits", hits.to_string(), "");
     push("query_cache_misses", misses.to_string(), "");
     push("query_cache_entries", entries.to_string(), "");
 
     let filters = crate::filter_settings();
-    push("filter_enabled", filters.enabled().to_string(), "bit-sliced filter index");
-    push("filter_min_pruning_ratio", filters.min_pruning_ratio().to_string(),
-         "skip the mask when it prunes less than this");
-    push("filter_indexed_tables", filters.overridden_tables().len().to_string(),
-         "tables carrying a filter override");
+    push(
+        "filter_enabled",
+        filters.enabled().to_string(),
+        "bit-sliced filter index",
+    );
+    push(
+        "filter_min_pruning_ratio",
+        filters.min_pruning_ratio().to_string(),
+        "skip the mask when it prunes less than this",
+    );
+    push(
+        "filter_indexed_tables",
+        filters.overridden_tables().len().to_string(),
+        "tables carrying a filter override",
+    );
 
     let replication = &database.replication;
-    push("replication_active", replication.is_active().to_string(), "shipping transactions to peers");
-    push("replication_peers", replication.peer_count().to_string(), "");
-    push("replication_node_id", replication.node_id().to_string(), "half of every global transaction id");
+    push(
+        "replication_active",
+        replication.is_active().to_string(),
+        "shipping transactions to peers",
+    );
+    push(
+        "replication_peers",
+        replication.peer_count().to_string(),
+        "",
+    );
+    push(
+        "replication_node_id",
+        replication.node_id().to_string(),
+        "half of every global transaction id",
+    );
 
-    push("batch_size", crate::batch_size().to_string(), "row pointers fetched per batch");
-    push("concurrent_threads", crate::max_permits_threads().to_string(), "workers a query may use");
+    push(
+        "batch_size",
+        crate::batch_size().to_string(),
+        "row pointers fetched per batch",
+    );
+    push(
+        "concurrent_threads",
+        crate::max_permits_threads().to_string(),
+        "workers a query may use",
+    );
 
     out
 }
@@ -531,61 +669,165 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
         .count();
 
     push("table", schema.name.clone(), "");
-    push("columns", visible.len().to_string(), "declared and not dropped");
-    push("nullable_columns", nullable.to_string(), "each carries a companion flag column");
-    push("dropped_columns", schema.fields.iter().filter(|f| f.is_deleted).count().to_string(),
-         "slots kept rather than rewritten");
-    push("fixed_row_width", visible.iter().map(|f| f.size as u64).sum::<u64>().to_string(),
-         "bytes a row occupies before variable-width columns");
+    push(
+        "columns",
+        visible.len().to_string(),
+        "declared and not dropped",
+    );
+    push(
+        "nullable_columns",
+        nullable.to_string(),
+        "each carries a companion flag column",
+    );
+    push(
+        "dropped_columns",
+        schema
+            .fields
+            .iter()
+            .filter(|f| f.is_deleted)
+            .count()
+            .to_string(),
+        "slots kept rather than rewritten",
+    );
+    push(
+        "fixed_row_width",
+        visible
+            .iter()
+            .map(|f| f.size as u64)
+            .sum::<u64>()
+            .to_string(),
+        "bytes a row occupies before variable-width columns",
+    );
 
-    push("row_slots", sizes.row_slots().to_string(),
-         "pointer records; an upper bound on live rows");
-    push("last_row_id", table.last_row_id.load(Ordering::Relaxed).to_string(),
-         "highest id handed out");
+    push(
+        "row_slots",
+        sizes.row_slots().to_string(),
+        "pointer records; an upper bound on live rows",
+    );
+    push(
+        "last_row_id",
+        table.last_row_id.load(Ordering::Relaxed).to_string(),
+        "highest id handed out",
+    );
 
     push("data_bytes", sizes.data.to_string(), "row data");
-    push("pointer_bytes", sizes.pointers.to_string(), "row pointer records");
-    push("schema_bytes", sizes.schema.to_string(), "schema and its sidecars");
-    push("index_bytes", sizes.filters.to_string(), "persisted filter checkpoint");
-    push("sequence_bytes", sizes.sequence.to_string(), "row-id sequence");
-    push("total_bytes", sizes.total().to_string(), "every file this table owns");
-    push("reclaimable_bytes", table.reclaimable_bytes().to_string(),
-         "dead space a VACUUM would return");
+    push(
+        "pointer_bytes",
+        sizes.pointers.to_string(),
+        "row pointer records",
+    );
+    push(
+        "schema_bytes",
+        sizes.schema.to_string(),
+        "schema and its sidecars",
+    );
+    push(
+        "index_bytes",
+        sizes.filters.to_string(),
+        "persisted filter checkpoint",
+    );
+    push(
+        "sequence_bytes",
+        sizes.sequence.to_string(),
+        "row-id sequence",
+    );
+    push(
+        "total_bytes",
+        sizes.total().to_string(),
+        "every file this table owns",
+    );
+    push(
+        "reclaimable_bytes",
+        table.reclaimable_bytes().to_string(),
+        "dead space a VACUUM would return",
+    );
 
-    push("vacuum_runs", vacuum.runs.load(Ordering::Relaxed).to_string(), "");
-    push("vacuum_compactions", vacuum.compactions.load(Ordering::Relaxed).to_string(),
-         "runs that actually reclaimed something");
-    push("vacuum_deferrals", vacuum.deferrals.load(Ordering::Relaxed).to_string(),
-         "runs held off by an open snapshot");
-    push("vacuum_last_live_bytes", vacuum.last_live_bytes.load(Ordering::Relaxed).to_string(), "");
-    push("vacuum_last_dead_bytes", vacuum.last_dead_bytes.load(Ordering::Relaxed).to_string(), "");
-    push("vacuum_total_reclaimed_bytes",
-         vacuum.total_reclaimed_bytes.load(Ordering::Relaxed).to_string(), "");
+    push(
+        "vacuum_runs",
+        vacuum.runs.load(Ordering::Relaxed).to_string(),
+        "",
+    );
+    push(
+        "vacuum_compactions",
+        vacuum.compactions.load(Ordering::Relaxed).to_string(),
+        "runs that actually reclaimed something",
+    );
+    push(
+        "vacuum_deferrals",
+        vacuum.deferrals.load(Ordering::Relaxed).to_string(),
+        "runs held off by an open snapshot",
+    );
+    push(
+        "vacuum_last_live_bytes",
+        vacuum.last_live_bytes.load(Ordering::Relaxed).to_string(),
+        "",
+    );
+    push(
+        "vacuum_last_dead_bytes",
+        vacuum.last_dead_bytes.load(Ordering::Relaxed).to_string(),
+        "",
+    );
+    push(
+        "vacuum_total_reclaimed_bytes",
+        vacuum
+            .total_reclaimed_bytes
+            .load(Ordering::Relaxed)
+            .to_string(),
+        "",
+    );
 
-    push("filters_ready", table.filters_ready().to_string(),
-         "the index has caught up with the rows");
-    push("filter_enabled_for_table", crate::filter_settings().table_enabled(&schema.name).to_string(),
-         "");
-    push("in_place_column_updates", table.in_place_column_updates().to_string(),
-         "updates that rewrote only the assigned columns");
-    push("hard_locked", table.hard_locked.load(Ordering::Relaxed).to_string(),
-         "a compaction holds the table");
+    push(
+        "filters_ready",
+        table.filters_ready().to_string(),
+        "the index has caught up with the rows",
+    );
+    push(
+        "filter_enabled_for_table",
+        crate::filter_settings()
+            .table_enabled(&schema.name)
+            .to_string(),
+        "",
+    );
+    push(
+        "in_place_column_updates",
+        table.in_place_column_updates().to_string(),
+        "updates that rewrote only the assigned columns",
+    );
+    push(
+        "hard_locked",
+        table.hard_locked.load(Ordering::Relaxed).to_string(),
+        "a compaction holds the table",
+    );
     push("immutable", schema.is_immutable.to_string(), "");
-    push("primary_key", schema.primary_key.clone().unwrap_or_default(), "");
+    push(
+        "primary_key",
+        schema.primary_key.clone().unwrap_or_default(),
+        "",
+    );
 
     for key in schema.unique_keys.iter().filter(|k| !k.is_deleted) {
-        push("unique_constraint", format!("{} ({})", key.name, key.columns.join(", ")), "");
+        push(
+            "unique_constraint",
+            format!("{} ({})", key.name, key.columns.join(", ")),
+            "",
+        );
     }
     for fk in schema.foreign_keys.iter().filter(|f| !f.is_deleted) {
         push(
             "foreign_key",
-            format!("{} : {} -> {}.{}", fk.name, fk.column, fk.parent_table, fk.parent_column),
+            format!(
+                "{} : {} -> {}.{}",
+                fk.name, fk.column, fk.parent_table, fk.parent_column
+            ),
             &format!("ON DELETE {}", action_name(&fk.on_delete)),
         );
     }
     for json in schema.json_columns.iter().filter(|c| !c.is_deleted) {
-        push("json_column", format!("{} -> {}", json.column, json.shadow_table),
-             "document fields live in the shadow table");
+        push(
+            "json_column",
+            format!("{} -> {}", json.column, json.shadow_table),
+            "document fields live in the shadow table",
+        );
     }
 
     Ok(out)
@@ -612,12 +854,15 @@ fn columns(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, String> {
         }
         position += 1;
 
-        let nullable = crate::core::rql::nullable::flag_field(&field.name, &schema.fields).is_some();
+        let nullable =
+            crate::core::rql::nullable::flag_field(&field.name, &schema.fields).is_some();
         let is_primary = schema.primary_key.as_deref() == Some(field.name.as_str());
-        let in_unique_key = schema
-            .unique_keys
-            .iter()
-            .any(|k| !k.is_deleted && k.columns.iter().any(|c| c.eq_ignore_ascii_case(&field.name)));
+        let in_unique_key = schema.unique_keys.iter().any(|k| {
+            !k.is_deleted
+                && k.columns
+                    .iter()
+                    .any(|c| c.eq_ignore_ascii_case(&field.name))
+        });
         let default = schema
             .defaults
             .iter()
@@ -768,7 +1013,11 @@ async fn backup_status(database: &Arc<Database>) -> Vec<Row> {
         let config = service.config();
         push("configured", "true".to_string(), "");
         push("bucket", config.bucket.clone(), "");
-        push("prefix", config.normalized_prefix(), "one database per prefix");
+        push(
+            "prefix",
+            config.normalized_prefix(),
+            "one database per prefix",
+        );
         push("region", config.region.clone(), "");
         push(
             "endpoint",
@@ -809,8 +1058,11 @@ async fn backup_status(database: &Arc<Database>) -> Vec<Row> {
                 "how far back recovery can reach between flushes"
             },
         );
-        push("wal_bundle_bytes", config.wal_bundle_bytes.to_string(),
-             "staged bytes that trigger a flush without waiting for the interval");
+        push(
+            "wal_bundle_bytes",
+            config.wal_bundle_bytes.to_string(),
+            "staged bytes that trigger a flush without waiting for the interval",
+        );
         push(
             "retain_snapshots",
             config.retain_snapshots.to_string(),
@@ -823,7 +1075,11 @@ async fn backup_status(database: &Arc<Database>) -> Vec<Row> {
 
         let staged = service.staged_bytes();
         let suspended = service.archiving_is_suspended();
-        push("staged_bytes", staged.to_string(), "written but not yet uploaded");
+        push(
+            "staged_bytes",
+            staged.to_string(),
+            "written but not yet uploaded",
+        );
         push(
             "staging_max_bytes",
             config.staging_max_bytes.to_string(),
@@ -904,75 +1160,188 @@ struct ConfigKey {
 }
 
 const CONFIG_KEYS: &[ConfigKey] = &[
-    ConfigKey { section: "server", key: "batch_size", hot: false,
-        set_with: "--batch-size N (restart)", help: "row pointers fetched per batch" },
-    ConfigKey { section: "server", key: "concurrent_threads", hot: false,
-        set_with: "--concurrent-threads N (restart)", help: "workers a query may use" },
-    ConfigKey { section: "wal", key: "enabled", hot: false,
-        set_with: "--wal BOOL (restart)", help: "route durable writes through the log" },
-    ConfigKey { section: "wal", key: "checkpoint_bytes", hot: false,
-        set_with: "--wal-checkpoint-bytes N (restart)", help: "log bytes between checkpoints" },
-    ConfigKey { section: "wal", key: "synchronous_commit", hot: true,
+    ConfigKey {
+        section: "server",
+        key: "batch_size",
+        hot: false,
+        set_with: "--batch-size N (restart)",
+        help: "row pointers fetched per batch",
+    },
+    ConfigKey {
+        section: "server",
+        key: "concurrent_threads",
+        hot: false,
+        set_with: "--concurrent-threads N (restart)",
+        help: "workers a query may use",
+    },
+    ConfigKey {
+        section: "wal",
+        key: "enabled",
+        hot: false,
+        set_with: "--wal BOOL (restart)",
+        help: "route durable writes through the log",
+    },
+    ConfigKey {
+        section: "wal",
+        key: "checkpoint_bytes",
+        hot: false,
+        set_with: "--wal-checkpoint-bytes N (restart)",
+        help: "log bytes between checkpoints",
+    },
+    ConfigKey {
+        section: "wal",
+        key: "synchronous_commit",
+        hot: true,
         set_with: "SET CONFIG wal.synchronous_commit = off",
-        help: "commits wait for their fdatasync; off risks the last writes, not the database" },
-    ConfigKey { section: "wal", key: "writer_delay_ms", hot: true,
+        help: "commits wait for their fdatasync; off risks the last writes, not the database",
+    },
+    ConfigKey {
+        section: "wal",
+        key: "writer_delay_ms",
+        hot: true,
         set_with: "SET CONFIG wal.writer_delay_ms = 200",
-        help: "how long an asynchronous commit may go unsynced" },
-    ConfigKey { section: "cache", key: "enabled", hot: false,
-        set_with: "--enable-cache BOOL (restart)", help: "serve repeated queries from a known offset" },
-    ConfigKey { section: "filter", key: "enabled", hot: true,
-        set_with: "SET CONFIG filter.enabled = on", help: "master switch for the filter index" },
-    ConfigKey { section: "filter", key: "backfill_on_open", hot: true,
-        set_with: "SET CONFIG filter.backfill_on_open = on", help: "index pre-existing rows at open" },
-    ConfigKey { section: "filter", key: "min_pruning_ratio", hot: true,
+        help: "how long an asynchronous commit may go unsynced",
+    },
+    ConfigKey {
+        section: "cache",
+        key: "enabled",
+        hot: false,
+        set_with: "--enable-cache BOOL (restart)",
+        help: "serve repeated queries from a known offset",
+    },
+    ConfigKey {
+        section: "filter",
+        key: "enabled",
+        hot: true,
+        set_with: "SET CONFIG filter.enabled = on",
+        help: "master switch for the filter index",
+    },
+    ConfigKey {
+        section: "filter",
+        key: "backfill_on_open",
+        hot: true,
+        set_with: "SET CONFIG filter.backfill_on_open = on",
+        help: "index pre-existing rows at open",
+    },
+    ConfigKey {
+        section: "filter",
+        key: "min_pruning_ratio",
+        hot: true,
         set_with: "SET CONFIG filter.min_pruning_ratio = 0.9",
-        help: "skip the mask when it prunes less than this (0..1)" },
-    ConfigKey { section: "filter", key: "checkpoint_interval_secs", hot: true,
+        help: "skip the mask when it prunes less than this (0..1)",
+    },
+    ConfigKey {
+        section: "filter",
+        key: "checkpoint_interval_secs",
+        hot: true,
         set_with: "SET CONFIG filter.checkpoint_interval_secs = 60",
-        help: "how often the maintenance task checkpoints" },
-    ConfigKey { section: "filter", key: "min_f", hot: true,
-        set_with: "SET CONFIG filter.min_f = 8", help: "floor on fingerprint bits (4..16)" },
-    ConfigKey { section: "filter", key: "default_f", hot: true,
+        help: "how often the maintenance task checkpoints",
+    },
+    ConfigKey {
+        section: "filter",
+        key: "min_f",
+        hot: true,
+        set_with: "SET CONFIG filter.min_f = 8",
+        help: "floor on fingerprint bits (4..16)",
+    },
+    ConfigKey {
+        section: "filter",
+        key: "default_f",
+        hot: true,
         set_with: "SET CONFIG filter.default_f = 12",
-        help: "fingerprint bits before cardinality is known" },
-    ConfigKey { section: "filter", key: "max_f", hot: true,
-        set_with: "SET CONFIG filter.max_f = 16", help: "ceiling on fingerprint bits (4..16)" },
-    ConfigKey { section: "filter", key: "min_selectivity", hot: true,
+        help: "fingerprint bits before cardinality is known",
+    },
+    ConfigKey {
+        section: "filter",
+        key: "max_f",
+        hot: true,
+        set_with: "SET CONFIG filter.max_f = 16",
+        help: "ceiling on fingerprint bits (4..16)",
+    },
+    ConfigKey {
+        section: "filter",
+        key: "min_selectivity",
+        hot: true,
         set_with: "SET CONFIG filter.min_selectivity = 0.1",
-        help: "largest row fraction a predicate may match and still be indexed" },
-    ConfigKey { section: "filter", key: "min_table_rows", hot: true,
+        help: "largest row fraction a predicate may match and still be indexed",
+    },
+    ConfigKey {
+        section: "filter",
+        key: "min_table_rows",
+        hot: true,
         set_with: "SET CONFIG filter.min_table_rows = 10000",
-        help: "tables smaller than this are scanned without consulting the index" },
-    ConfigKey { section: "filter", key: "zone_bounds", hot: true,
+        help: "tables smaller than this are scanned without consulting the index",
+    },
+    ConfigKey {
+        section: "filter",
+        key: "zone_bounds",
+        hot: true,
         set_with: "SET CONFIG filter.zone_bounds = on",
-        help: "keep per-zone min/max for range pruning" },
-    ConfigKey { section: "filter", key: "bloom", hot: true,
+        help: "keep per-zone min/max for range pruning",
+    },
+    ConfigKey {
+        section: "filter",
+        key: "bloom",
+        hot: true,
         set_with: "SET CONFIG filter.bloom = off",
-        help: "keep a per-superzone span summary" },
-    ConfigKey { section: "replication", key: "active", hot: true,
+        help: "keep a per-superzone span summary",
+    },
+    ConfigKey {
+        section: "replication",
+        key: "active",
+        hot: true,
         set_with: "REPLICATION ENABLE | REPLICATION DISABLE",
-        help: "ship committed transactions to the peers" },
-    ConfigKey { section: "replication", key: "compression", hot: true,
+        help: "ship committed transactions to the peers",
+    },
+    ConfigKey {
+        section: "replication",
+        key: "compression",
+        hot: true,
         set_with: "SET CONFIG replication.compression = 'auto:zstd:1'",
-        help: "none | zstd[:level] | auto[:zstd[:level]]" },
-    ConfigKey { section: "replication", key: "mode", hot: true,
+        help: "none | zstd[:level] | auto[:zstd[:level]]",
+    },
+    ConfigKey {
+        section: "replication",
+        key: "mode",
+        hot: true,
         set_with: "SET CONFIG replication.mode = 'quorum:1'",
-        help: "async | sync | quorum:N | all" },
-    ConfigKey { section: "replication", key: "conflict", hot: true,
+        help: "async | sync | quorum:N | all",
+    },
+    ConfigKey {
+        section: "replication",
+        key: "conflict",
+        hot: true,
         set_with: "SET CONFIG replication.conflict = 'last-writer-wins'",
-        help: "abort | skip | last-writer-wins" },
-    ConfigKey { section: "replication", key: "ack_timeout_ms", hot: true,
+        help: "abort | skip | last-writer-wins",
+    },
+    ConfigKey {
+        section: "replication",
+        key: "ack_timeout_ms",
+        hot: true,
         set_with: "SET CONFIG replication.ack_timeout_ms = 2000",
-        help: "how long a synchronous commit waits for peers" },
-    ConfigKey { section: "replication", key: "batch_max_records", hot: true,
+        help: "how long a synchronous commit waits for peers",
+    },
+    ConfigKey {
+        section: "replication",
+        key: "batch_max_records",
+        hot: true,
         set_with: "SET CONFIG replication.batch_max_records = 256",
-        help: "records in one outbound batch" },
-    ConfigKey { section: "replication", key: "batch_linger_us", hot: true,
+        help: "records in one outbound batch",
+    },
+    ConfigKey {
+        section: "replication",
+        key: "batch_linger_us",
+        hot: true,
         set_with: "SET CONFIG replication.batch_linger_us = 500",
-        help: "how long a sender waits for more records" },
-    ConfigKey { section: "vacuum", key: "enabled", hot: true,
+        help: "how long a sender waits for more records",
+    },
+    ConfigKey {
+        section: "vacuum",
+        key: "enabled",
+        hot: true,
         set_with: "SET CONFIG vacuum.enabled = on",
-        help: "background reclamation, for every table in this database" },
+        help: "background reclamation, for every table in this database",
+    },
 ];
 
 fn config_keys() -> Vec<Row> {
@@ -1005,15 +1374,20 @@ fn config(database: &Arc<Database>) -> Vec<Row> {
             // `on`/`off`, not `true`/`false`: it carries a PostgreSQL setting's
             // name, its help and `set_with` both spell it that way, and it is
             // what someone types back into a console's edit box.
-            ("wal", "synchronous_commit") => {
-                if crate::synchronous_commit() { "on" } else { "off" }.to_string()
+            ("wal", "synchronous_commit") => if crate::synchronous_commit() {
+                "on"
+            } else {
+                "off"
             }
+            .to_string(),
             ("wal", "writer_delay_ms") => crate::wal_writer_delay_ms().to_string(),
             ("cache", "enabled") => crate::cache::query_cache::enabled().to_string(),
             ("filter", "enabled") => filters.enabled().to_string(),
             ("filter", "backfill_on_open") => filters.backfill_on_open().to_string(),
             ("filter", "min_pruning_ratio") => filters.min_pruning_ratio().to_string(),
-            ("filter", "checkpoint_interval_secs") => filters.checkpoint_interval_secs().to_string(),
+            ("filter", "checkpoint_interval_secs") => {
+                filters.checkpoint_interval_secs().to_string()
+            }
             ("filter", "min_f") => resolved.cfg.min_f.to_string(),
             ("filter", "default_f") => resolved.cfg.default_f.to_string(),
             ("filter", "max_f") => resolved.cfg.max_f.to_string(),
@@ -1058,9 +1432,12 @@ fn config(database: &Arc<Database>) -> Vec<Row> {
 /// reimplemented. That is what keeps `SET CONFIG filter.max_f = 20` and
 /// `SET FILTER max_f = 20` from drifting into meaning different things.
 async fn set_config(database: &Arc<Database>, key: &str, value: &str) -> Result<String, String> {
-    let (section, name) = key
-        .split_once('.')
-        .ok_or_else(|| format!("`{}` is not a config key; they are `section.key`, and SHOW CONFIG KEYS lists them", key))?;
+    let (section, name) = key.split_once('.').ok_or_else(|| {
+        format!(
+            "`{}` is not a config key; they are `section.key`, and SHOW CONFIG KEYS lists them",
+            key
+        )
+    })?;
 
     let spec = CONFIG_KEYS
         .iter()
@@ -1078,7 +1455,10 @@ async fn set_config(database: &Arc<Database>, key: &str, value: &str) -> Result<
         "wal" => match name {
             "synchronous_commit" => {
                 let on = crate::parse_synchronous_commit(value).ok_or_else(|| {
-                    format!("`{}` is not a value for synchronous_commit (use on/off)", value)
+                    format!(
+                        "`{}` is not a value for synchronous_commit (use on/off)",
+                        value
+                    )
                 })?;
                 crate::set_synchronous_commit(on);
                 // Turning it back on says nothing about what was committed while
@@ -1091,7 +1471,11 @@ async fn set_config(database: &Arc<Database>, key: &str, value: &str) -> Result<
                 Ok(format!(
                     "synchronous_commit is now {}{}",
                     if on { "on" } else { "off" },
-                    if on { "; everything committed so far is durable" } else { "" }
+                    if on {
+                        "; everything committed so far is durable"
+                    } else {
+                        ""
+                    }
                 ))
             }
             "writer_delay_ms" => {
@@ -1108,12 +1492,17 @@ async fn set_config(database: &Arc<Database>, key: &str, value: &str) -> Result<
             _ => Err(format!("`{}` has no live setter", key)),
         },
         "filter" => {
-            let lines = crate::core::filter::sql::execute(&format!("SET FILTER {} = {}", name, value))?;
+            let lines =
+                crate::core::filter::sql::execute(&format!("SET FILTER {} = {}", name, value))?;
             Ok(lines.join("; "))
         }
         "replication" => {
             if name == "active" {
-                let statement = if parse_bool(value)? { "REPLICATION ENABLE" } else { "REPLICATION DISABLE" };
+                let statement = if parse_bool(value)? {
+                    "REPLICATION ENABLE"
+                } else {
+                    "REPLICATION DISABLE"
+                };
                 let lines = crate::replication::sql::execute(statement, database).await?;
                 return Ok(lines.join("; "));
             }
@@ -1146,7 +1535,10 @@ fn parse_bool(value: &str) -> Result<bool, String> {
     match value.trim().to_ascii_lowercase().as_str() {
         "true" | "on" | "yes" | "1" | "t" => Ok(true),
         "false" | "off" | "no" | "0" | "f" => Ok(false),
-        other => Err(format!("`{}` is not a boolean (use on/off, true/false, 1/0)", other)),
+        other => Err(format!(
+            "`{}` is not a boolean (use on/off, true/false, 1/0)",
+            other
+        )),
     }
 }
 
@@ -1265,9 +1657,18 @@ mod tests {
         assert_eq!(ok("SHOW CONFIG KEYS"), Introspect::ConfigKeys);
         assert_eq!(ok("SHOW BACKUP STATUS"), Introspect::BackupStatus);
         assert_eq!(ok("show backup status;"), Introspect::BackupStatus);
-        assert_eq!(ok("SHOW TABLE STATS users"), Introspect::TableStats("users".into()));
-        assert_eq!(ok("SHOW COLUMNS FROM users"), Introspect::Columns("users".into()));
-        assert_eq!(ok("SHOW COLUMNS users"), Introspect::Columns("users".into()));
+        assert_eq!(
+            ok("SHOW TABLE STATS users"),
+            Introspect::TableStats("users".into())
+        );
+        assert_eq!(
+            ok("SHOW COLUMNS FROM users"),
+            Introspect::Columns("users".into())
+        );
+        assert_eq!(
+            ok("SHOW COLUMNS users"),
+            Introspect::Columns("users".into())
+        );
         assert_eq!(ok("DESCRIBE users"), Introspect::Columns("users".into()));
         assert_eq!(ok("DESC users"), Introspect::Columns("users".into()));
     }
@@ -1276,7 +1677,10 @@ mod tests {
     /// arrives as `"public"."users"` rather than `users`.
     #[test]
     fn a_quoted_and_qualified_name_resolves_to_the_table() {
-        assert_eq!(ok("SHOW TABLE STATS \"users\""), Introspect::TableStats("users".into()));
+        assert_eq!(
+            ok("SHOW TABLE STATS \"users\""),
+            Introspect::TableStats("users".into())
+        );
         assert_eq!(
             ok("SHOW COLUMNS FROM \"public\".\"users\""),
             Introspect::Columns("users".into())
@@ -1287,11 +1691,17 @@ mod tests {
     fn set_config_keeps_the_value_case_and_strips_quotes() {
         assert_eq!(
             ok("SET CONFIG replication.mode = 'quorum:1'"),
-            Introspect::SetConfig { key: "replication.mode".into(), value: "quorum:1".into() }
+            Introspect::SetConfig {
+                key: "replication.mode".into(),
+                value: "quorum:1".into()
+            }
         );
         assert_eq!(
             ok("SET CONFIG filter.max_f = 20"),
-            Introspect::SetConfig { key: "filter.max_f".into(), value: "20".into() }
+            Introspect::SetConfig {
+                key: "filter.max_f".into(),
+                value: "20".into()
+            }
         );
     }
 
@@ -1310,7 +1720,11 @@ mod tests {
             "SELECT * FROM users",
             "SET FILTER max_f = 20",
         ] {
-            assert!(parse(sql).is_none(), "{:?} should not be an introspection statement", sql);
+            assert!(
+                parse(sql).is_none(),
+                "{:?} should not be an introspection statement",
+                sql
+            );
         }
     }
 
@@ -1339,7 +1753,11 @@ mod tests {
                 "{} is not addressable",
                 qualified
             );
-            assert!(!key.set_with.is_empty(), "{} says nothing about how to change it", qualified);
+            assert!(
+                !key.set_with.is_empty(),
+                "{} says nothing about how to change it",
+                qualified
+            );
         }
     }
 
@@ -1356,7 +1774,10 @@ mod tests {
             Introspect::BackupStatus,
             Introspect::Config,
             Introspect::ConfigKeys,
-            Introspect::SetConfig { key: "k".into(), value: "v".into() },
+            Introspect::SetConfig {
+                key: "k".into(),
+                value: "v".into(),
+            },
         ] {
             let fields = result_fields(&statement).expect("described");
             assert!(!fields.is_empty(), "{:?} describes no columns", statement);

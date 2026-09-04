@@ -43,19 +43,19 @@
 //!   by interval subtraction rather than exact match, so a partially consumed
 //!   extent contributes only its unused remainder.
 
-use std::collections::{BTreeSet, HashMap};
 use branches::likely;
 use cacheguard::CacheGuard;
-use std::sync::atomic::AtomicUsize;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use log::info;
 use parking_lot::Mutex;
 
+use crate::core::filter::TableFilters;
 use crate::core::mvcc::transaction::{FROZEN_TX, NO_TX};
 use crate::core::mvcc::visibility::Visibility;
-use crate::core::filter::TableFilters;
 use crate::core::mvcc::{TransactionManager, TxId, TxOutcome};
 use crate::core::row::row_pointer::{ROW_POINTER_RECORD_LEN, RowPointer};
 use crate::core::storage_providers::traits::StorageIO;
@@ -570,8 +570,7 @@ impl VersionHorizon {
         }
 
         if xmax != NO_TX {
-            return manager.outcome(xmax) == TxOutcome::Committed
-                && xmax < self.oldest_active;
+            return manager.outcome(xmax) == TxOutcome::Committed && xmax < self.oldest_active;
         }
 
         // No `xmax`, but marked deleted: the row predates versioning, so no
@@ -1197,12 +1196,10 @@ pub async fn run_once<S: StorageIO>(
         info!(
             "Vacuum: {} live rows exceeds the tracking limit of {}; deriving dead space from \
              tombstones, so slack from in-place updates is left in place",
-            scan.live_rows,
-            config.max_tracked_live_extents
+            scan.live_rows, config.max_tracked_live_extents
         );
         let dead = merge_overlapping(scan.dead);
-        let conflicts =
-            live_extents_overlapping(io_pointers, &dead, rows_len, horizon).await?;
+        let conflicts = live_extents_overlapping(io_pointers, &dead, rows_len, horizon).await?;
         if !conflicts.is_empty() {
             log::debug!(
                 "Vacuum: {} tombstoned extents have since been reused; withholding them",
@@ -1346,8 +1343,7 @@ impl<S: StorageIO> VacuumService<S> {
                 // pure cost — and on a large table, not a small one. Outstanding
                 // loans still force a scan: they are what retires them.
                 let mutations_now = self.mutations.load(Ordering::Acquire);
-                if mutations_now == scanned_at_mutation
-                    && self.free_space.loans_outstanding() == 0
+                if mutations_now == scanned_at_mutation && self.free_space.loans_outstanding() == 0
                 {
                     continue;
                 }
@@ -1519,7 +1515,11 @@ mod tests {
         // Only the 400 bytes past the loan come back.
         assert_eq!(fs.free_bytes(), 400);
         assert_eq!(fs.alloc(400), Some(100));
-        assert_eq!(fs.alloc(1), None, "the lent 100 bytes must not be handed out twice");
+        assert_eq!(
+            fs.alloc(1),
+            None,
+            "the lent 100 bytes must not be handed out twice"
+        );
     }
 
     #[test]
@@ -1548,7 +1548,10 @@ mod tests {
 
     #[test]
     fn merging_absorbs_a_contained_extent() {
-        assert_eq!(merge_overlapping(vec![e(0, 100), e(20, 10)]), vec![e(0, 100)]);
+        assert_eq!(
+            merge_overlapping(vec![e(0, 100), e(20, 10)]),
+            vec![e(0, 100)]
+        );
     }
 
     #[test]
@@ -1573,7 +1576,14 @@ mod tests {
 
     #[test]
     fn a_saturating_end_cannot_wrap_into_live_data() {
-        assert_eq!(Extent { start: u64::MAX - 5, len: 100 }.end(), u64::MAX);
+        assert_eq!(
+            Extent {
+                start: u64::MAX - 5,
+                len: 100
+            }
+            .end(),
+            u64::MAX
+        );
     }
 
     #[test]
@@ -1660,7 +1670,12 @@ mod tests {
         // Every claim is a distinct ROW-sized slice of the one extent.
         assert_eq!(handed_out as u64, EXTENT / ROW);
         for pair in starts.windows(2) {
-            assert!(pair[1] - pair[0] >= ROW, "claims at {} and {} overlap", pair[0], pair[1]);
+            assert!(
+                pair[1] - pair[0] >= ROW,
+                "claims at {} and {} overlap",
+                pair[0],
+                pair[1]
+            );
         }
         assert_eq!(exhausted.load(Ordering::Relaxed), THREADS);
     }
@@ -1762,7 +1777,7 @@ mod tests {
 
     use crate::core::mvcc::TransactionManager;
     use crate::core::mvcc::transaction::{FROZEN_TX, NO_TX};
-use crate::core::mvcc::visibility::Visibility;
+    use crate::core::mvcc::visibility::Visibility;
 
     /// Pins the defaults, because nothing else does.
     ///

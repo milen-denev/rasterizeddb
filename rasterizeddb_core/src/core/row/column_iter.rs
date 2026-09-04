@@ -27,7 +27,7 @@ pub struct FieldInfo {
     pub schema_id: u64,
     pub db_type: DbType,
     pub fetch_idx: usize,
-    pub row_pointer: RowPointer
+    pub row_pointer: RowPointer,
 }
 
 pub type ColumnDataOwnedBatch = SmallVec<[ColumnData; 32]>;
@@ -61,9 +61,8 @@ impl<S: StorageIO> ColumnDataIterator<S> {
         rows_io: Arc<S>,
         batch_size: usize,
     ) -> Result<Self> {
-        let (offset, field) = find_offset_and_field(schema, schema_id).ok_or_else(|| {
-            RowError::InvalidColumn(format!("Unknown schema_id {}", schema_id))
-        })?;
+        let (offset, field) = find_offset_and_field(schema, schema_id)
+            .ok_or_else(|| RowError::InvalidColumn(format!("Unknown schema_id {}", schema_id)))?;
 
         let pointers = RowPointerIterator::new(Arc::clone(&pointers_io)).await?;
 
@@ -131,7 +130,10 @@ impl<S: StorageIO> ColumnDataIterator<S> {
     }
 }
 
-fn find_offset_and_field<'a>(schema: &'a [SchemaField], schema_id: u64) -> Option<(u32, &'a SchemaField)> {
+fn find_offset_and_field<'a>(
+    schema: &'a [SchemaField],
+    schema_id: u64,
+) -> Option<(u32, &'a SchemaField)> {
     let mut fields: Vec<&SchemaField> = schema.iter().collect();
     fields.sort_by_key(|f| f.write_order);
 

@@ -78,11 +78,21 @@ pub struct Record {
 
 impl Record {
     pub fn write(txn: u64, offset: u64, payload: Vec<u8>) -> Self {
-        Self { txn, kind: RecordKind::Write, offset, payload }
+        Self {
+            txn,
+            kind: RecordKind::Write,
+            offset,
+            payload,
+        }
     }
 
     pub fn truncate(txn: u64, len: u64) -> Self {
-        Self { txn, kind: RecordKind::Truncate, offset: len, payload: Vec::new() }
+        Self {
+            txn,
+            kind: RecordKind::Truncate,
+            offset: len,
+            payload: Vec::new(),
+        }
     }
 
     /// Bytes this record occupies in memory and, near enough, on the wire.
@@ -112,7 +122,11 @@ pub struct DeltaBatch {
 impl DeltaBatch {
     pub fn encode(&self) -> Vec<u8> {
         let payload_len: usize = self.committed.len() * 8
-            + self.records.iter().map(|r| 21 + r.payload.len()).sum::<usize>();
+            + self
+                .records
+                .iter()
+                .map(|r| 21 + r.payload.len())
+                .sum::<usize>();
         let mut out = Vec::with_capacity(DELTA_HEADER_LEN + payload_len);
         out.extend_from_slice(&MAGIC_DELTA.to_le_bytes());
         out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
@@ -160,7 +174,9 @@ impl DeltaBatch {
         if version != FORMAT_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("kv delta batch is format version {version}, this build writes {FORMAT_VERSION}"),
+                format!(
+                    "kv delta batch is format version {version}, this build writes {FORMAT_VERSION}"
+                ),
             ));
         }
         let seq = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
@@ -180,7 +196,9 @@ impl DeltaBatch {
             if cursor + 8 > payload.len() {
                 return Ok(None);
             }
-            committed.push(u64::from_le_bytes(payload[cursor..cursor + 8].try_into().unwrap()));
+            committed.push(u64::from_le_bytes(
+                payload[cursor..cursor + 8].try_into().unwrap(),
+            ));
             cursor += 8;
         }
 
@@ -192,7 +210,8 @@ impl DeltaBatch {
             let kind = RecordKind::from_u8(payload[cursor])?;
             let txn = u64::from_le_bytes(payload[cursor + 1..cursor + 9].try_into().unwrap());
             let offset = u64::from_le_bytes(payload[cursor + 9..cursor + 17].try_into().unwrap());
-            let len = u32::from_le_bytes(payload[cursor + 17..cursor + 21].try_into().unwrap()) as usize;
+            let len =
+                u32::from_le_bytes(payload[cursor + 17..cursor + 21].try_into().unwrap()) as usize;
             cursor += 21;
             if cursor + len > payload.len() {
                 return Ok(None);
@@ -206,7 +225,12 @@ impl DeltaBatch {
             cursor += len;
         }
 
-        Ok(Some(Self { seq, base_gen, committed, records }))
+        Ok(Some(Self {
+            seq,
+            base_gen,
+            committed,
+            records,
+        }))
     }
 }
 

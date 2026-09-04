@@ -42,7 +42,8 @@ fn a_location_and_its_placements_survive_a_reopen() {
 
     {
         let pool = StorageManager::open(&root);
-        pool.add_location(&second, LocationRole::Primary, 3, true).unwrap();
+        pool.add_location(&second, LocationRole::Primary, 3, true)
+            .unwrap();
         pool.set_policy(PlacementPolicy::RoundRobin);
         pool.set_min_free_bytes(7 * 1024 * 1024);
         pool.pin("users", &second).unwrap();
@@ -74,8 +75,10 @@ fn a_placement_is_never_recomputed_from_the_policy() {
 
     {
         let pool = StorageManager::open(&root);
-        pool.add_location(&a, LocationRole::Primary, 1, true).unwrap();
-        pool.add_location(&b, LocationRole::Primary, 1, true).unwrap();
+        pool.add_location(&a, LocationRole::Primary, 1, true)
+            .unwrap();
+        pool.add_location(&b, LocationRole::Primary, 1, true)
+            .unwrap();
         pool.pin("users", &a).unwrap();
         // A policy change after the fact must not move anything.
         pool.set_policy(PlacementPolicy::FreeSpace);
@@ -95,8 +98,10 @@ fn round_robin_fills_the_emptiest_primary() {
     let b = format!("{}_b", root);
 
     let pool = StorageManager::open(&root);
-    pool.add_location(&a, LocationRole::Primary, 1, true).unwrap();
-    pool.add_location(&b, LocationRole::Primary, 1, true).unwrap();
+    pool.add_location(&a, LocationRole::Primary, 1, true)
+        .unwrap();
+    pool.add_location(&b, LocationRole::Primary, 1, true)
+        .unwrap();
     pool.set_policy(PlacementPolicy::RoundRobin);
 
     // The root counts as empty, so it takes the first; then a, then b, then
@@ -109,7 +114,10 @@ fn round_robin_fills_the_emptiest_primary() {
     chosen.sort();
     let mut expected = vec![root.clone(), a.clone(), b.clone()];
     expected.sort();
-    assert_eq!(chosen, expected, "each primary should take one before any takes two");
+    assert_eq!(
+        chosen, expected,
+        "each primary should take one before any takes two"
+    );
 
     std::fs::remove_dir_all(&a).ok();
     std::fs::remove_dir_all(&b).ok();
@@ -121,7 +129,8 @@ fn a_backup_location_is_never_placed_into() {
     let backup = format!("{}_backup", root);
 
     let pool = StorageManager::open(&root);
-    pool.add_location(&backup, LocationRole::Backup, 1, true).unwrap();
+    pool.add_location(&backup, LocationRole::Backup, 1, true)
+        .unwrap();
     pool.set_policy(PlacementPolicy::FreeSpace);
 
     for table in ["a", "b", "c"] {
@@ -142,7 +151,8 @@ fn a_disabled_location_keeps_its_tables_and_takes_no_new_ones() {
     let second = format!("{}_second", root);
 
     let pool = StorageManager::open(&root);
-    pool.add_location(&second, LocationRole::Primary, 1, true).unwrap();
+    pool.add_location(&second, LocationRole::Primary, 1, true)
+        .unwrap();
     pool.pin("users", &second).unwrap();
     pool.set_enabled(&second, false).unwrap();
     pool.set_policy(PlacementPolicy::RoundRobin);
@@ -159,11 +169,15 @@ fn a_location_still_holding_tables_cannot_be_dropped() {
     let second = format!("{}_second", root);
 
     let pool = StorageManager::open(&root);
-    pool.add_location(&second, LocationRole::Primary, 1, true).unwrap();
+    pool.add_location(&second, LocationRole::Primary, 1, true)
+        .unwrap();
     pool.pin("users", &second).unwrap();
 
     let refused = pool.drop_location(&second).unwrap_err();
-    assert!(refused.contains("users"), "the message should name what is in the way: {refused}");
+    assert!(
+        refused.contains("users"),
+        "the message should name what is in the way: {refused}"
+    );
 
     pool.pin("users", &root).unwrap();
     pool.drop_location(&second).unwrap();
@@ -187,15 +201,19 @@ fn overlapping_locations_are_refused() {
     let inner = format!("{}/inner", outer);
 
     let pool = StorageManager::open(&root);
-    pool.add_location(&outer, LocationRole::Primary, 1, true).unwrap();
+    pool.add_location(&outer, LocationRole::Primary, 1, true)
+        .unwrap();
 
-    let refused = pool.add_location(&inner, LocationRole::Backup, 1, true).unwrap_err();
+    let refused = pool
+        .add_location(&inner, LocationRole::Backup, 1, true)
+        .unwrap_err();
     assert!(refused.contains("overlaps"), "{refused}");
 
     // A sibling whose name merely starts with the same characters is fine:
     // containment is per path component, not per byte.
     let sibling = format!("{}_outer2", root);
-    pool.add_location(&sibling, LocationRole::Primary, 1, true).unwrap();
+    pool.add_location(&sibling, LocationRole::Primary, 1, true)
+        .unwrap();
 
     std::fs::remove_dir_all(&outer).ok();
     std::fs::remove_dir_all(&sibling).ok();
@@ -205,7 +223,9 @@ fn overlapping_locations_are_refused() {
 fn a_relative_location_is_refused() {
     let root = temp_root("relative");
     let pool = StorageManager::open(&root);
-    let refused = pool.add_location("data/second", LocationRole::Primary, 1, true).unwrap_err();
+    let refused = pool
+        .add_location("data/second", LocationRole::Primary, 1, true)
+        .unwrap_err();
     assert!(refused.contains("absolute"), "{refused}");
 }
 
@@ -215,7 +235,8 @@ fn the_same_directory_written_two_ways_is_one_location() {
     let second = format!("{}_second", root);
 
     let pool = StorageManager::open(&root);
-    pool.add_location(&second, LocationRole::Primary, 1, true).unwrap();
+    pool.add_location(&second, LocationRole::Primary, 1, true)
+        .unwrap();
     // A trailing separator must not create a second entry that placements
     // recorded against the first cannot be found under.
     let refused = pool
@@ -249,12 +270,16 @@ fn a_path_with_a_space_survives_the_round_trip() {
 
     {
         let pool = StorageManager::open(&root);
-        pool.add_location(&second, LocationRole::Primary, 1, true).unwrap();
+        pool.add_location(&second, LocationRole::Primary, 1, true)
+            .unwrap();
         pool.pin("my table", &second).unwrap();
     }
 
     let pool = StorageManager::open(&root);
-    assert_eq!(pool.location_of("my table").as_deref(), Some(second.as_str()));
+    assert_eq!(
+        pool.location_of("my table").as_deref(),
+        Some(second.as_str())
+    );
 
     std::fs::remove_dir_all(&second).ok();
 }
@@ -272,10 +297,18 @@ fn sizes_parse_the_way_an_operator_writes_them() {
 #[test]
 fn policy_and_role_names_accept_what_the_documentation_promises() {
     for spelling in ["free-space", "free_space", "FREE-SPACE", "balance"] {
-        assert_eq!(PlacementPolicy::parse(spelling), Some(PlacementPolicy::FreeSpace), "{spelling}");
+        assert_eq!(
+            PlacementPolicy::parse(spelling),
+            Some(PlacementPolicy::FreeSpace),
+            "{spelling}"
+        );
     }
     for spelling in ["round-robin", "ROUND_ROBIN", "rr"] {
-        assert_eq!(PlacementPolicy::parse(spelling), Some(PlacementPolicy::RoundRobin), "{spelling}");
+        assert_eq!(
+            PlacementPolicy::parse(spelling),
+            Some(PlacementPolicy::RoundRobin),
+            "{spelling}"
+        );
     }
     assert_eq!(LocationRole::parse("BACKUP"), Some(LocationRole::Backup));
     assert_eq!(LocationRole::parse("mirror"), Some(LocationRole::Backup));
@@ -289,7 +322,10 @@ fn free_space_is_readable_for_a_directory_that_exists() {
     // Not asserting a value — this is a real filesystem — only that the probe
     // works at all, since a policy silently seeing `None` everywhere degrades
     // to picking the first location and would pass every other test here.
-    assert!(available_bytes(&root).is_some(), "statvfs should answer for {root}");
+    assert!(
+        available_bytes(&root).is_some(),
+        "statvfs should answer for {root}"
+    );
     assert!(total_bytes(&root).unwrap_or(0) > 0);
     assert!(available_bytes("/definitely/not/a/directory/here").is_none());
 }
@@ -343,10 +379,12 @@ fn two_directories_on_one_disk_are_one_filesystem() {
         filesystem_id(&b),
         "two directories under the same temp root should be on one filesystem"
     );
-    assert!(filesystem_id(&a).is_some(), "the probe should answer for a directory that exists");
+    assert!(
+        filesystem_id(&a).is_some(),
+        "the probe should answer for a directory that exists"
+    );
     assert!(filesystem_id("/definitely/not/a/directory/here").is_none());
 }
-
 
 #[test]
 fn repointing_moves_the_root_and_its_tables_to_the_restore() {
@@ -362,9 +400,15 @@ fn repointing_moves_the_root_and_its_tables_to_the_restore() {
     assert!(dropped.is_empty());
 
     let text = std::fs::read_to_string(target.join(POOL_FILE)).unwrap();
-    assert!(!text.contains("/srv/live"), "the source path must be gone:\n{text}");
+    assert!(
+        !text.contains("/srv/live"),
+        "the source path must be gone:\n{text}"
+    );
     let root = normalize(&target.to_string_lossy());
-    assert!(text.contains(&format!("location\tprimary\t1\tenabled\t{root}")), "{text}");
+    assert!(
+        text.contains(&format!("location\tprimary\t1\tenabled\t{root}")),
+        "{text}"
+    );
     assert!(text.contains(&format!("table\t{root}\torders")), "{text}");
     // Everything else is carried through untouched.
     assert!(text.contains("policy\tprimary"), "{text}");
@@ -409,7 +453,10 @@ fn an_in_place_restore_leaves_the_pool_alone() {
     let dropped = repoint_pool_config(&target, &target, Some(&root)).unwrap();
 
     assert!(dropped.is_empty());
-    assert_eq!(std::fs::read_to_string(target.join(POOL_FILE)).unwrap(), text);
+    assert_eq!(
+        std::fs::read_to_string(target.join(POOL_FILE)).unwrap(),
+        text
+    );
 }
 
 #[test]
@@ -425,13 +472,20 @@ fn without_a_recorded_root_the_first_location_stands_in() {
 
     let text = std::fs::read_to_string(target.join(POOL_FILE)).unwrap();
     assert!(!text.contains("/srv/live"), "{text}");
-    assert!(text.contains(&normalize(&target.to_string_lossy())), "{text}");
+    assert!(
+        text.contains(&normalize(&target.to_string_lossy())),
+        "{text}"
+    );
 }
 
 #[test]
 fn a_database_with_no_pool_file_needs_no_repointing() {
     let target = std::path::PathBuf::from(temp_root("repoint_absent"));
-    assert!(repoint_pool_config(&target, &target, Some("/srv/live")).unwrap().is_empty());
+    assert!(
+        repoint_pool_config(&target, &target, Some("/srv/live"))
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -451,8 +505,14 @@ fn a_restore_names_the_directory_it_will_be_published_into() {
     repoint_pool_config(&staging, &published, Some("/srv/live")).unwrap();
 
     let text = std::fs::read_to_string(staging.join(POOL_FILE)).unwrap();
-    assert!(text.contains(&normalize(&published.to_string_lossy())), "{text}");
-    assert!(!text.contains(&normalize(&staging.to_string_lossy())), "{text}");
+    assert!(
+        text.contains(&normalize(&published.to_string_lossy())),
+        "{text}"
+    );
+    assert!(
+        !text.contains(&normalize(&staging.to_string_lossy())),
+        "{text}"
+    );
 }
 
 #[test]
@@ -472,9 +532,11 @@ fn a_pool_file_copied_from_another_directory_is_still_read() {
 
     // Read, not refused: the placement is the original's, which is exactly what
     // the warning is about.
-    assert_eq!(pool.location_of("orders").as_deref(), Some("/srv/somewhere-else"));
+    assert_eq!(
+        pool.location_of("orders").as_deref(),
+        Some("/srv/somewhere-else")
+    );
 }
-
 
 #[test]
 fn concurrent_placements_leave_a_whole_configuration_on_disk() {
@@ -508,7 +570,9 @@ fn concurrent_placements_leave_a_whole_configuration_on_disk() {
     }
 
     assert!(
-        !std::path::Path::new(&root).join(format!("{}.tmp", POOL_FILE)).exists(),
+        !std::path::Path::new(&root)
+            .join(format!("{}.tmp", POOL_FILE))
+            .exists(),
         "a temporary pool file was left behind"
     );
 

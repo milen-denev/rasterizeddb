@@ -134,7 +134,11 @@ impl fmt::Display for ProtocolError {
             ProtocolError::UnknownCodec(c) => write!(f, "unknown codec {}", c),
             ProtocolError::Truncated => f.write_str("frame ended in the middle of a field"),
             ProtocolError::TooLarge(len) => {
-                write!(f, "payload of {} bytes exceeds the {} byte limit", len, MAX_PAYLOAD)
+                write!(
+                    f,
+                    "payload of {} bytes exceeds the {} byte limit",
+                    len, MAX_PAYLOAD
+                )
             }
             ProtocolError::CodecUnavailable(c) => {
                 write!(f, "this build cannot decode {} payloads", c)
@@ -317,7 +321,14 @@ impl TxnRecord {
             tables.push(reader.str()?);
         }
 
-        Ok(TxnRecord { origin, seq, commit_hlc, flags, statements, tables })
+        Ok(TxnRecord {
+            origin,
+            seq,
+            commit_hlc,
+            flags,
+            statements,
+            tables,
+        })
     }
 
     #[inline]
@@ -451,10 +462,19 @@ impl HelloAck {
         let count = reader.u32()? as usize;
         let mut applied = Vec::with_capacity(count.min(reader.remaining() / 16));
         for _ in 0..count {
-            applied.push(VectorEntry { origin: reader.u64()?, seq: reader.u64()? });
+            applied.push(VectorEntry {
+                origin: reader.u64()?,
+                seq: reader.u64()?,
+            });
         }
 
-        Ok(HelloAck { node_id, cluster_id, codec, clock, applied })
+        Ok(HelloAck {
+            node_id,
+            cluster_id,
+            codec,
+            clock,
+            applied,
+        })
     }
 }
 
@@ -559,16 +579,29 @@ impl PushAck {
             let status = ApplyStatus::from_wire(status_byte)
                 .ok_or(ProtocolError::UnknownFrame(status_byte))?;
             let message = reader.str()?;
-            outcomes.push(ApplyOutcome { origin, seq, status, message });
+            outcomes.push(ApplyOutcome {
+                origin,
+                seq,
+                status,
+                message,
+            });
         }
 
         let count = reader.u32()? as usize;
         let mut applied = Vec::with_capacity(count.min(reader.remaining() / 16));
         for _ in 0..count {
-            applied.push(VectorEntry { origin: reader.u64()?, seq: reader.u64()? });
+            applied.push(VectorEntry {
+                origin: reader.u64()?,
+                seq: reader.u64()?,
+            });
         }
 
-        Ok(PushAck { node_id, clock, outcomes, applied })
+        Ok(PushAck {
+            node_id,
+            clock,
+            outcomes,
+            applied,
+        })
     }
 }
 
@@ -634,7 +667,12 @@ pub fn parse_header(frame: &[u8]) -> Result<Header, ProtocolError> {
         return Err(ProtocolError::TooLarge(raw_len));
     }
 
-    Ok(Header { kind, codec, flags, raw_len })
+    Ok(Header {
+        kind,
+        codec,
+        flags,
+        raw_len,
+    })
 }
 
 /// Decides whether a payload of this size is worth compressing.
@@ -677,7 +715,9 @@ pub struct FrameCodec {
 
 impl fmt::Debug for FrameCodec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("FrameCodec").field("level", &self.level).finish()
+        f.debug_struct("FrameCodec")
+            .field("level", &self.level)
+            .finish()
     }
 }
 
@@ -971,7 +1011,10 @@ mod tests {
                 FrameKind::Push,
                 0,
                 payload,
-                Compression { mode: CompressionMode::Off, ..Default::default() },
+                Compression {
+                    mode: CompressionMode::Off,
+                    ..Default::default()
+                },
                 None,
                 &mut frame,
             )
@@ -982,7 +1025,10 @@ mod tests {
         let (header, body) = codec.decode_frame(&frame, &mut scratch).unwrap();
         assert_eq!(header.kind, FrameKind::Push);
         assert_eq!(body, payload);
-        assert!(scratch.is_empty(), "an uncompressed frame should not touch the scratch buffer");
+        assert!(
+            scratch.is_empty(),
+            "an uncompressed frame should not touch the scratch buffer"
+        );
     }
 
     #[test]
@@ -999,7 +1045,10 @@ mod tests {
                 FrameKind::Push,
                 0,
                 &payload,
-                Compression { mode: CompressionMode::Always, ..Default::default() },
+                Compression {
+                    mode: CompressionMode::Always,
+                    ..Default::default()
+                },
                 None,
                 &mut frame,
             )
@@ -1026,7 +1075,10 @@ mod tests {
 
     #[test]
     fn auto_mode_stops_compressing_once_it_stops_paying() {
-        let compression = Compression { mode: CompressionMode::Auto, ..Default::default() };
+        let compression = Compression {
+            mode: CompressionMode::Auto,
+            ..Default::default()
+        };
         assert!(
             !should_compress(compression, 100_000, Some(0.99)),
             "a 1% saving is not worth the CPU"
@@ -1060,7 +1112,10 @@ mod tests {
     fn an_absurd_declared_length_is_refused_before_allocating() {
         let mut frame = plain_frame(FrameKind::Push, 0, &[]);
         frame[8..12].copy_from_slice(&(MAX_PAYLOAD as u32 + 1).to_le_bytes());
-        assert!(matches!(parse_header(&frame), Err(ProtocolError::TooLarge(_))));
+        assert!(matches!(
+            parse_header(&frame),
+            Err(ProtocolError::TooLarge(_))
+        ));
     }
 
     #[test]
@@ -1111,7 +1166,12 @@ mod tests {
             node_id: 2,
             clock: 42,
             outcomes: vec![
-                ApplyOutcome { origin: 1, seq: 1, status: ApplyStatus::Applied, message: String::new() },
+                ApplyOutcome {
+                    origin: 1,
+                    seq: 1,
+                    status: ApplyStatus::Applied,
+                    message: String::new(),
+                },
                 ApplyOutcome {
                     origin: 1,
                     seq: 2,

@@ -87,8 +87,14 @@ async fn setup(dir: &str, table: &str) -> Arc<Database> {
         .add_table(CreateTable {
             table_name: table.to_string(),
             columns: vec![
-                CreateColumnData { name: "id".into(), data_type: DbType::U64 },
-                CreateColumnData { name: "age".into(), data_type: DbType::I32 },
+                CreateColumnData {
+                    name: "id".into(),
+                    data_type: DbType::U64,
+                },
+                CreateColumnData {
+                    name: "age".into(),
+                    data_type: DbType::I32,
+                },
             ],
             is_immutable: false,
             foreign_keys: Vec::new(),
@@ -96,7 +102,7 @@ async fn setup(dir: &str, table: &str) -> Arc<Database> {
             primary_key: None,
             json_columns: Vec::new(),
             unique_columns: Vec::new(),
-        unique_keys: Vec::new(),
+            unique_keys: Vec::new(),
             type_modifiers: Vec::new(),
             generated: Vec::new(),
             checks: Vec::new(),
@@ -181,7 +187,12 @@ async fn repeated_queries_are_served_from_the_cache() {
 
     // A write retires the entry, so the next read misses and re-stores.
     let resp = run(&db, "DELETE FROM t_hit WHERE id = 1").await;
-    assert_ne!(resp.first().copied(), Some(3u8), "delete failed: {:?}", resp);
+    assert_ne!(
+        resp.first().copied(),
+        Some(3u8),
+        "delete failed: {:?}",
+        resp
+    );
     assert_eq!(row_count(&run(&db, ALL).await), ROW_COUNT as usize - 1);
     let (h3, _, s3) = query_cache::stats();
     assert_eq!(h3, h2, "a stale entry must not count as a hit");
@@ -244,7 +255,10 @@ async fn order_by_survives_a_cache_hit() {
 
     clear_cache();
     let cold = column_i32(&run(&db, SORTED).await, 1);
-    assert!(cold.windows(2).all(|w| w[0] <= w[1]), "cold scan is unsorted");
+    assert!(
+        cold.windows(2).all(|w| w[0] <= w[1]),
+        "cold scan is unsorted"
+    );
 
     // Warm the entry with the unordered query, then ask for it ordered.
     clear_cache();
@@ -276,7 +290,12 @@ async fn writes_invalidate_cached_answers() {
 
     // DELETE: the removed row must not be served out of the warm entry.
     let resp = run(&db, "DELETE FROM t_write WHERE id = 7").await;
-    assert_ne!(resp.first().copied(), Some(3u8), "delete failed: {:?}", resp);
+    assert_ne!(
+        resp.first().copied(),
+        Some(3u8),
+        "delete failed: {:?}",
+        resp
+    );
     let after_delete = column_u64(&run(&db, ALL).await, 0);
     assert_eq!(after_delete.len(), ROW_COUNT as usize - 1);
     assert!(
@@ -285,7 +304,10 @@ async fn writes_invalidate_cached_answers() {
     );
 
     // INSERT: a new match must show up.
-    table.insert_row(row(ROW_COUNT + 1, 500)).await.expect("insert");
+    table
+        .insert_row(row(ROW_COUNT + 1, 500))
+        .await
+        .expect("insert");
     let after_insert = column_u64(&run(&db, ALL).await, 0);
     assert_eq!(after_insert.len(), ROW_COUNT as usize);
     assert!(
@@ -306,19 +328,25 @@ async fn entries_are_not_shared_across_tables_or_clauses() {
     db.add_table(CreateTable {
         table_name: "t_b".into(),
         columns: vec![
-            CreateColumnData { name: "id".into(), data_type: DbType::U64 },
-            CreateColumnData { name: "age".into(), data_type: DbType::I32 },
+            CreateColumnData {
+                name: "id".into(),
+                data_type: DbType::U64,
+            },
+            CreateColumnData {
+                name: "age".into(),
+                data_type: DbType::I32,
+            },
         ],
         is_immutable: false,
         foreign_keys: Vec::new(),
         defaults: Vec::new(),
-            primary_key: None,
+        primary_key: None,
         json_columns: Vec::new(),
         unique_columns: Vec::new(),
         unique_keys: Vec::new(),
-            type_modifiers: Vec::new(),
-            generated: Vec::new(),
-            checks: Vec::new(),
+        type_modifiers: Vec::new(),
+        generated: Vec::new(),
+        checks: Vec::new(),
         if_not_exists: false,
     })
     .await

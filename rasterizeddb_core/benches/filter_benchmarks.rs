@@ -2,11 +2,11 @@ use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_mai
 use std::hint::black_box;
 
 use rasterizeddb_core::core::db_type::DbType;
+use rasterizeddb_core::core::db_type::DbType as Ty;
 use rasterizeddb_core::core::filter::column::{ColumnFilter, bitmap_words};
 use rasterizeddb_core::core::filter::hash::{HashSeed, canonical_hash, fingerprint};
 use rasterizeddb_core::core::filter::kernels::*;
 use rasterizeddb_core::core::filter::{FilterConfig, SargOp, TableFilters};
-use rasterizeddb_core::core::db_type::DbType as Ty;
 use rasterizeddb_core::core::row::schema::SchemaField;
 
 /// One zone probe = 512 rows. Reported as rows/second.
@@ -15,7 +15,9 @@ fn bench_probe_kernel(c: &mut Criterion) {
     group.throughput(Throughput::Elements(ZONE_ROWS as u64));
 
     for f in [4u8, 8, 12, 16] {
-        let planes: Vec<u64> = (0..f as usize * ZONE_WORDS).map(|_| fastrand::u64(..)).collect();
+        let planes: Vec<u64> = (0..f as usize * ZONE_WORDS)
+            .map(|_| fastrand::u64(..))
+            .collect();
         let g = fingerprint(fastrand::u64(..), f);
         let mut out = [0u64; ZONE_WORDS];
 
@@ -44,7 +46,12 @@ fn bench_column_sweep(c: &mut Criterion) {
     group.throughput(Throughput::Elements(N));
 
     for f in [8u8, 16] {
-        let cfg = FilterConfig { min_f: f, default_f: f, max_f: f, ..Default::default() };
+        let cfg = FilterConfig {
+            min_f: f,
+            default_f: f,
+            max_f: f,
+            ..Default::default()
+        };
         let mut col = ColumnFilter::new(0, DbType::U64, HashSeed::default(), cfg);
         for slot in 0..N {
             col.set(slot, Some(&fastrand::u64(..).to_le_bytes()));
@@ -90,7 +97,12 @@ fn bench_insert(c: &mut Criterion) {
     group.throughput(Throughput::Elements(1));
 
     for f in [8u8, 16] {
-        let cfg = FilterConfig { min_f: f, default_f: f, max_f: f, ..Default::default() };
+        let cfg = FilterConfig {
+            min_f: f,
+            default_f: f,
+            max_f: f,
+            ..Default::default()
+        };
         group.bench_function(format!("set_slot/f{}", f), |b| {
             b.iter_batched_ref(
                 || ColumnFilter::new(0, DbType::U64, HashSeed::default(), cfg),
@@ -139,7 +151,12 @@ fn report_insert_contention(_c: &mut Criterion) {
         let mut mb = MEMORY_POOL.acquire(bytes.len().max(1));
         mb.into_slice_mut()[..bytes.len()].copy_from_slice(bytes);
         let size = column_type.get_size();
-        ColumnWritePayload { data: mb, write_order, column_type, size }
+        ColumnWritePayload {
+            data: mb,
+            write_order,
+            column_type,
+            size,
+        }
     }
 
     // Row construction is pooled allocation and would be timed as contention it
@@ -147,13 +164,17 @@ fn report_insert_contention(_c: &mut Criterion) {
     // clock sees is maintenance and nothing else.
     let prebuilt: Vec<RowWrite> = (0..64u64)
         .map(|k| {
-            let mut rw = RowWrite { columns_writing_data: SmallVec::new() };
-            rw.columns_writing_data.push(payload(&k.to_le_bytes(), 0, DbType::U64));
+            let mut rw = RowWrite {
+                columns_writing_data: SmallVec::new(),
+            };
+            rw.columns_writing_data
+                .push(payload(&k.to_le_bytes(), 0, DbType::U64));
             rw.columns_writing_data
                 .push(payload(&((k % 97) as i32).to_le_bytes(), 1, DbType::I32));
             rw.columns_writing_data
                 .push(payload(format!("l{}", k).as_bytes(), 2, DbType::STRING));
-            rw.columns_writing_data.push(payload(&(k as f64).to_le_bytes(), 3, DbType::F64));
+            rw.columns_writing_data
+                .push(payload(&(k as f64).to_le_bytes(), 3, DbType::F64));
             rw
         })
         .collect();
@@ -212,10 +233,17 @@ fn report_span_summary(_c: &mut Criterion) {
 
     const N: u64 = 1_000_000;
     let f = 8u8;
-    let cfg = FilterConfig { min_f: f, default_f: f, max_f: f, ..Default::default() };
+    let cfg = FilterConfig {
+        min_f: f,
+        default_f: f,
+        max_f: f,
+        ..Default::default()
+    };
 
-    for (label, distinct_per_span) in [("low-cardinality", 250u64), ("all-distinct", SUPERZONE_ROWS)]
-    {
+    for (label, distinct_per_span) in [
+        ("low-cardinality", 250u64),
+        ("all-distinct", SUPERZONE_ROWS),
+    ] {
         let mut built = Vec::new();
         for summary in [false, true] {
             let mut col = ColumnFilter::with_options(
@@ -273,7 +301,12 @@ fn report_span_summary(_c: &mut Criterion) {
 fn report_overhead(_c: &mut Criterion) {
     const N: u64 = 1_000_000;
     for f in [4u8, 8, 12, 16] {
-        let cfg = FilterConfig { min_f: f, default_f: f, max_f: f, ..Default::default() };
+        let cfg = FilterConfig {
+            min_f: f,
+            default_f: f,
+            max_f: f,
+            ..Default::default()
+        };
         let mut col = ColumnFilter::new(0, DbType::U64, HashSeed::default(), cfg);
         for slot in 0..N {
             col.set(slot, Some(&fastrand::u64(..).to_le_bytes()));

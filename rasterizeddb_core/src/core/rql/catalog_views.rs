@@ -18,10 +18,10 @@
 use rclite::Arc;
 
 use crate::core::database::Database;
-use crate::core::storage_providers::traits::StorageIO;
-use crate::core::rql::cte::Materialized;
 use crate::core::db_type::DbType;
 use crate::core::row::schema::SchemaField;
+use crate::core::rql::cte::Materialized;
+use crate::core::storage_providers::traits::StorageIO;
 use smallvec::SmallVec;
 
 /// The catalogue relations this module can produce.
@@ -182,7 +182,11 @@ fn needs_qualifier(view: &str) -> bool {
 pub fn is_catalog_view(name: &str) -> bool {
     let trimmed = name.trim().trim_matches('"');
     let qualified = trimmed.contains('.');
-    let bare = trimmed.rsplit('.').next().unwrap_or(trimmed).trim_matches('"');
+    let bare = trimmed
+        .rsplit('.')
+        .next()
+        .unwrap_or(trimmed)
+        .trim_matches('"');
     VIEWS
         .iter()
         .any(|v| v.eq_ignore_ascii_case(bare) && (qualified || !needs_qualifier(v)))
@@ -334,8 +338,7 @@ fn replace_relation(sql: &str, view: &str, temp: &str) -> String {
             .or_else(|| {
                 // A qualifier-only view is never matched bare. See
                 // `QUALIFIED_ONLY`.
-                (!needs_qualifier(view) && lower[i..].starts_with(view))
-                    .then(|| view.len())
+                (!needs_qualifier(view) && lower[i..].starts_with(view)).then(|| view.len())
             });
 
         if let Some(len) = matched {
@@ -380,9 +383,10 @@ fn rewrite_size_calls(sql: &str) -> String {
             }
             let Some(close) = after.find(')') else { break };
             let arg = after[open + 1..close].trim();
-            let Some(alias) = arg.strip_suffix(".oid").or_else(|| {
-                arg.strip_suffix(".OID")
-            }) else {
+            let Some(alias) = arg
+                .strip_suffix(".oid")
+                .or_else(|| arg.strip_suffix(".OID"))
+            else {
                 break;
             };
             out = format!(
@@ -414,7 +418,9 @@ fn rewrite_get_expr(sql: &str) -> String {
 
     loop {
         let lower = out.to_ascii_lowercase();
-        let Some(at) = lower[from..].find(NAME).map(|i| i + from) else { break };
+        let Some(at) = lower[from..].find(NAME).map(|i| i + from) else {
+            break;
+        };
 
         // Only a call, and only a whole word: `my_pg_get_expr` is a column.
         let before_ok = at == 0 || !is_ident_byte(out.as_bytes()[at - 1]);
@@ -497,27 +503,37 @@ fn rewrite_wal_calls(sql: &str, database: &Arc<Database>) -> String {
     // argument was.
     loop {
         let lower = out.to_ascii_lowercase();
-        let Some(at) = lower.find("pg_current_wal_lsn") else { break };
+        let Some(at) = lower.find("pg_current_wal_lsn") else {
+            break;
+        };
         let after = &out[at + "pg_current_wal_lsn".len()..];
         let Some(open) = after.find('(') else { break };
         if !after[..open].trim().is_empty() {
             break;
         }
-        let Some(close) = after[open..].find(')') else { break };
+        let Some(close) = after[open..].find(')') else {
+            break;
+        };
         out = format!("{}{}{}", &out[..at], lsn, &after[open + close + 1..]);
     }
 
     loop {
         let lower = out.to_ascii_lowercase();
-        let Some(at) = lower.find("pg_wal_lsn_diff") else { break };
+        let Some(at) = lower.find("pg_wal_lsn_diff") else {
+            break;
+        };
         let after = &out[at + "pg_wal_lsn_diff".len()..];
         let Some(open) = after.find('(') else { break };
         if !after[..open].trim().is_empty() {
             break;
         }
-        let Some(close) = matching_paren_from(after, open) else { break };
+        let Some(close) = matching_paren_from(after, open) else {
+            break;
+        };
         let args = &after[open + 1..close];
-        let Some(comma) = top_level_comma(args) else { break };
+        let Some(comma) = top_level_comma(args) else {
+            break;
+        };
         out = format!(
             "{}({} - {}){}",
             &out[..at],
@@ -715,14 +731,14 @@ async fn build(
         "columns" => {
             let mut rows = Vec::new();
             for name in &tables {
-                let Some(table) = database.tables.get(name) else { continue };
+                let Some(table) = database.tables.get(name) else {
+                    continue;
+                };
                 let mut fields: Vec<_> = table
                     .schema
                     .fields
                     .iter()
-                    .filter(|f| {
-                        !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name)
-                    })
+                    .filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name))
                     .cloned()
                     .collect();
                 fields.sort_by_key(|f| f.write_order);
@@ -840,7 +856,9 @@ async fn build(
         "pg_index" => {
             let mut rows = Vec::new();
             for name in &tables {
-                let Some(table) = database.tables.get(name) else { continue };
+                let Some(table) = database.tables.get(name) else {
+                    continue;
+                };
                 let relid = oid_of(name);
 
                 let mut keys: Vec<(String, bool, bool)> = Vec::new();
@@ -850,14 +868,18 @@ async fn build(
                 for field in table.schema.fields.iter() {
                     if field.is_unique
                         && !field.is_deleted
-                        && !keys.iter().any(|(n, _, _)| n.eq_ignore_ascii_case(&field.name))
+                        && !keys
+                            .iter()
+                            .any(|(n, _, _)| n.eq_ignore_ascii_case(&field.name))
                     {
                         keys.push((field.name.clone(), true, false));
                     }
                 }
                 for key in table.schema.unique_keys.iter().filter(|k| !k.is_deleted) {
                     if key.columns.len() == 1
-                        && !keys.iter().any(|(n, _, _)| n.eq_ignore_ascii_case(&key.columns[0]))
+                        && !keys
+                            .iter()
+                            .any(|(n, _, _)| n.eq_ignore_ascii_case(&key.columns[0]))
                     {
                         keys.push((key.columns[0].clone(), true, false));
                     }
@@ -1041,8 +1063,7 @@ fn oid_of(name: &str) -> i64 {
 /// Tables the engine keeps for itself, which PostgreSQL's catalogue would not
 /// list as user tables.
 fn is_internal(name: &str) -> bool {
-    name.starts_with("__")
-        || name.starts_with(crate::core::rql::json_map::SHADOW_TABLE_PREFIX)
+    name.starts_with("__") || name.starts_with(crate::core::rql::json_map::SHADOW_TABLE_PREFIX)
 }
 
 fn escape(text: &str) -> String {
@@ -1094,7 +1115,10 @@ mod tests {
     #[test]
     fn only_a_statement_naming_a_view_is_recognised() {
         assert!(names_relation("SELECT * FROM pg_class", "pg_class"));
-        assert!(names_relation("SELECT * FROM pg_catalog.pg_class c", "pg_class"));
+        assert!(names_relation(
+            "SELECT * FROM pg_catalog.pg_class c",
+            "pg_class"
+        ));
         // A longer name that merely contains it is a different relation.
         assert!(!names_relation("SELECT * FROM pg_classroom", "pg_class"));
         assert!(!names_relation("SELECT * FROM my_pg_class", "pg_class"));
@@ -1108,7 +1132,11 @@ mod tests {
             "pg_class",
             "__cat_1",
         );
-        assert!(out.starts_with("SELECT c.relname FROM __cat_1 c"), "{}", out);
+        assert!(
+            out.starts_with("SELECT c.relname FROM __cat_1 c"),
+            "{}",
+            out
+        );
         // The string literal is data, not a relation, so it stays as written.
         assert!(out.ends_with("'pg_class'"), "{}", out);
     }
@@ -1146,7 +1174,13 @@ mod tests {
         // across two statements needs the same answer both times.
         assert_eq!(oid_of("users"), oid_of("users"));
         assert_ne!(oid_of("users"), oid_of("orders"));
-        for name in ["users", "orders", "a", "", "user_table_row_archive_manifest"] {
+        for name in [
+            "users",
+            "orders",
+            "a",
+            "",
+            "user_table_row_archive_manifest",
+        ] {
             let oid = oid_of(name);
             assert!(oid > 0 && oid < u32::MAX as i64, "{} -> {}", name, oid);
         }
@@ -1190,7 +1224,10 @@ mod batching_tests {
             "INSERT INTO t (a, b) VALUES (3, 'z')".to_string(),
         ];
         let out = batch_inserts(&inserts, 200);
-        assert_eq!(out, vec!["INSERT INTO t (a, b) VALUES (1, 'x'), (2, 'y'), (3, 'z')"]);
+        assert_eq!(
+            out,
+            vec!["INSERT INTO t (a, b) VALUES (1, 'x'), (2, 'y'), (3, 'z')"]
+        );
     }
 
     #[test]
@@ -1233,7 +1270,10 @@ mod qualified_only_tests {
         // rewritten to the temporary table's name, so the statement returned
         // one empty column and every client asking a table for its columns was
         // told it had none.
-        assert!(!names_relation("SHOW COLUMNS FROM \"rdb_roles\"", "columns"));
+        assert!(!names_relation(
+            "SHOW COLUMNS FROM \"rdb_roles\"",
+            "columns"
+        ));
         assert!(!names_relation("SELECT * FROM columns", "columns"));
         assert!(!is_catalog_view("columns"));
     }

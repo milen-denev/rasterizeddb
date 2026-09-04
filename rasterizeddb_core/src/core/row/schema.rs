@@ -197,7 +197,7 @@ impl SchemaCalculator {
             //println!("Field: {} - Offset: {}", field.name, offset);
             offset = offset.saturating_add(field.size as u32);
         }
-        
+
         (0, 0)
     }
 }
@@ -512,16 +512,11 @@ impl TableSchema {
         deduped.sort_by_key(|f| f.write_order);
 
         table_schema.fields = deduped;
-        table_schema.foreign_keys =
-            crate::core::rql::foreign_key::load(schema_io.clone()).await;
-        table_schema.defaults =
-            crate::core::rql::column_default::load(schema_io.clone()).await;
-        table_schema.json_columns =
-            crate::core::rql::json_map::load(schema_io.clone()).await;
-        table_schema.path_indexes =
-            crate::core::rql::path_index::load(schema_io.clone()).await;
-        table_schema.unique_keys =
-            crate::core::rql::unique_key::load(schema_io.clone()).await;
+        table_schema.foreign_keys = crate::core::rql::foreign_key::load(schema_io.clone()).await;
+        table_schema.defaults = crate::core::rql::column_default::load(schema_io.clone()).await;
+        table_schema.json_columns = crate::core::rql::json_map::load(schema_io.clone()).await;
+        table_schema.path_indexes = crate::core::rql::path_index::load(schema_io.clone()).await;
+        table_schema.unique_keys = crate::core::rql::unique_key::load(schema_io.clone()).await;
         table_schema.type_modifiers =
             crate::core::rql::type_modifier::load(schema_io.clone()).await;
         // Copied onto the fields, because the planner is handed the schema and
@@ -533,8 +528,7 @@ impl TableSchema {
                 .find(|m| m.column.eq_ignore_ascii_case(&field.name) && !m.is_deleted)
                 .map(|m| m.scale as u32);
         }
-        table_schema.generated =
-            crate::core::rql::generated::load(schema_io.clone()).await;
+        table_schema.generated = crate::core::rql::generated::load(schema_io.clone()).await;
         table_schema.checks = crate::core::rql::check::load(schema_io.clone()).await;
 
         Ok(table_schema)
@@ -1021,7 +1015,9 @@ impl<S: StorageIO> TableSchemaIterator<S> {
             let _ = field_io.read_data_into_buffer(&mut pos, &mut buf).await;
             let mut idx = 0usize;
             while idx + SCHEMA_FIELD_SIZE as usize <= total_len {
-                if let Ok(field) = SchemaField::from_vec(&buf[idx..idx + SCHEMA_FIELD_SIZE as usize]) {
+                if let Ok(field) =
+                    SchemaField::from_vec(&buf[idx..idx + SCHEMA_FIELD_SIZE as usize])
+                {
                     table_schema.fields.push(field);
                 }
                 idx += SCHEMA_FIELD_SIZE as usize;
@@ -1103,10 +1099,8 @@ mod tests {
     async fn test_schema_field_iterator_empty() {
         let temp_loc = std::env::temp_dir().join("test_schema_field_iterator_empty");
 
-        let mut mock_io = make_clean_provider(
-            temp_loc.as_path(),
-            "test_schema_field_iterator_empty",
-        ).await;
+        let mut mock_io =
+            make_clean_provider(temp_loc.as_path(), "test_schema_field_iterator_empty").await;
 
         let mut iterator = SchemaFieldIterator::new(&mut mock_io).await.unwrap();
 
@@ -1124,7 +1118,8 @@ mod tests {
         let mut mock_io = make_clean_provider(
             temp_loc.as_path(),
             "test_schema_field_iterator_single_field",
-        ).await;
+        )
+        .await;
 
         save_schema_field(&schema_field, &mut mock_io)
             .await
@@ -1162,10 +1157,8 @@ mod tests {
 
         let temp_loc = std::env::temp_dir().join("test_schema_field_iterator_2_fields");
 
-        let mut mock_io = make_clean_provider(
-            temp_loc.as_path(),
-            "test_schema_field_iterator_2_fields",
-        ).await;
+        let mut mock_io =
+            make_clean_provider(temp_loc.as_path(), "test_schema_field_iterator_2_fields").await;
 
         save_schema_field(&schema_field1, &mut mock_io)
             .await
@@ -1216,10 +1209,8 @@ mod tests {
 
         let temp_loc = std::env::temp_dir().join("test_schema_field_iterator_3_fields");
 
-        let mut mock_io = make_clean_provider(
-            temp_loc.as_path(),
-            "test_schema_field_iterator_3_fields",
-        ).await;
+        let mut mock_io =
+            make_clean_provider(temp_loc.as_path(), "test_schema_field_iterator_3_fields").await;
 
         save_schema_field(&schema_field1, &mut mock_io)
             .await
@@ -1285,7 +1276,8 @@ mod tests {
         let mut mock_io = make_clean_provider(
             temp_loc.as_path(),
             "test_schema_field_iterator_batch_retrieval",
-        ).await;
+        )
+        .await;
 
         // Create and save multiple schema fields (more than BATCH_SIZE)
         for i in 0..BATCH_SIZE + 10 {
@@ -1330,10 +1322,8 @@ mod tests {
     async fn test_schema_field_iterator_reset() {
         let temp_loc = std::env::temp_dir().join("test_schema_field_iterator_reset");
 
-        let mut mock_io = make_clean_provider(
-            temp_loc.as_path(),
-            "test_schema_field_iterator_reset",
-        ).await;
+        let mut mock_io =
+            make_clean_provider(temp_loc.as_path(), "test_schema_field_iterator_reset").await;
 
         // Create and save schema fields
         let schema_field1 = create_test_schema_field("id", DbType::I32, 0, 1, true);
@@ -1480,7 +1470,9 @@ mod tests {
 
         let mock_io = LocalStorageProvider::new(
             temp_loc.to_str().unwrap(),
-            Some("test_table_schema_serialize_deserialize")).await;
+            Some("test_table_schema_serialize_deserialize"),
+        )
+        .await;
 
         let mock_io = Arc::new(mock_io);
 
@@ -1522,7 +1514,9 @@ mod tests {
 
         let mock_io = LocalStorageProvider::new(
             temp_loc.to_str().unwrap(),
-            Some("test_table_schema_mutability")).await;
+            Some("test_table_schema_mutability"),
+        )
+        .await;
 
         let mock_io = Arc::new(mock_io);
 
@@ -1545,7 +1539,9 @@ mod tests {
 
         let mock_io = LocalStorageProvider::new(
             temp_loc.to_str().unwrap(),
-            Some("test_table_schema_mutability_2")).await;
+            Some("test_table_schema_mutability_2"),
+        )
+        .await;
 
         let mock_io = Arc::new(mock_io);
 
@@ -1583,10 +1579,8 @@ mod tests {
     async fn test_table_schema_iterator_empty() {
         let temp_loc = std::env::temp_dir().join("test_table_schema_iterator_empty");
 
-        let mock_io = make_clean_provider(
-            temp_loc.as_path(),
-            "test_table_schema_iterator_empty",
-        ).await;
+        let mock_io =
+            make_clean_provider(temp_loc.as_path(), "test_table_schema_iterator_empty").await;
 
         let mock_io = Arc::new(mock_io);
 
@@ -1606,7 +1600,8 @@ mod tests {
         let mock_io = make_clean_provider(
             temp_loc.as_path(),
             "test_table_schema_iterator_single_schema",
-        ).await;
+        )
+        .await;
 
         let mock_io = Arc::new(mock_io);
 
@@ -1638,7 +1633,8 @@ mod tests {
         let mock_io = make_clean_provider(
             temp_loc.as_path(),
             "test_table_schema_iterator_multiple_schemas",
-        ).await;
+        )
+        .await;
 
         let mock_io = Arc::new(mock_io);
 
@@ -1673,10 +1669,8 @@ mod tests {
     async fn test_table_schema_iterator_reset() {
         let temp_loc = std::env::temp_dir().join("test_table_schema_iterator_reset");
 
-        let mock_io = make_clean_provider(
-            temp_loc.as_path(),
-            "test_table_schema_iterator_reset",
-        ).await;
+        let mock_io =
+            make_clean_provider(temp_loc.as_path(), "test_table_schema_iterator_reset").await;
 
         let mock_io = Arc::new(mock_io);
 
@@ -1714,10 +1708,8 @@ mod tests {
         // Create multiple schemas
         let temp_loc = std::env::temp_dir().join("test_table_schema_save_and_iterator");
 
-        let mock_io = make_clean_provider(
-            temp_loc.as_path(),
-            "test_table_schema_save_and_iterator",
-        ).await;
+        let mock_io =
+            make_clean_provider(temp_loc.as_path(), "test_table_schema_save_and_iterator").await;
 
         let mock_io = Arc::new(mock_io);
 
@@ -1765,10 +1757,7 @@ mod tests {
 
         let temp_loc = std::env::temp_dir().join("test_table_schema_long_names");
 
-        let mock_io = make_clean_provider(
-            temp_loc.as_path(),
-            "test_table_schema_long_names",
-        ).await;
+        let mock_io = make_clean_provider(temp_loc.as_path(), "test_table_schema_long_names").await;
 
         let mock_io = Arc::new(mock_io);
 
@@ -1796,17 +1785,17 @@ mod tests {
         let _mock_io_fields = make_clean_provider(
             temp_loc.as_path(),
             "test_table_schema_complete_set_FIELDS.db",
-        ).await;
+        )
+        .await;
 
         let _mock_io_fields_tmp = make_clean_provider(
             temp_loc.as_path(),
             "test_table_schema_complete_set_FIELDS.db.tmp",
-        ).await;
+        )
+        .await;
 
-        let mock_io = make_clean_provider(
-            temp_loc.as_path(),
-            "test_table_schema_complete_set",
-        ).await;
+        let mock_io =
+            make_clean_provider(temp_loc.as_path(), "test_table_schema_complete_set").await;
 
         let mock_io = Arc::new(mock_io);
 
@@ -1896,15 +1885,21 @@ mod tests {
 
         let _mock_io_fields = LocalStorageProvider::new(
             temp_loc.to_str().unwrap(),
-            Some("test_table_schema_complete_set_FIELDS.db")).await;
+            Some("test_table_schema_complete_set_FIELDS.db"),
+        )
+        .await;
 
         let _mock_io_fields_tmp = LocalStorageProvider::new(
             temp_loc.to_str().unwrap(),
-            Some("test_table_schema_complete_set_FIELDS.db.tmp")).await;
+            Some("test_table_schema_complete_set_FIELDS.db.tmp"),
+        )
+        .await;
 
         let mock_io = LocalStorageProvider::new(
             temp_loc.to_str().unwrap(),
-            Some("test_table_mark_field_as_deleted")).await;
+            Some("test_table_mark_field_as_deleted"),
+        )
+        .await;
 
         let mock_io = Arc::new(mock_io);
 
@@ -2003,7 +1998,12 @@ mod tests {
         let mut schema = create_test_table_schema("retype", Some("id"));
         schema.save(mock_io.clone()).await.unwrap();
         schema
-            .add_field(mock_io.clone(), "payload_format".into(), DbType::STRING, false)
+            .add_field(
+                mock_io.clone(),
+                "payload_format".into(),
+                DbType::STRING,
+                false,
+            )
             .await;
         let dead_order = schema
             .fields
@@ -2013,9 +2013,16 @@ mod tests {
             .write_order;
 
         schema
-            .add_field(mock_io.clone(), "payload_format_tmp".into(), DbType::I16, false)
+            .add_field(
+                mock_io.clone(),
+                "payload_format_tmp".into(),
+                DbType::I16,
+                false,
+            )
             .await;
-        schema.mark_field_as_deleted("payload_format", mock_io.clone()).await;
+        schema
+            .mark_field_as_deleted("payload_format", mock_io.clone())
+            .await;
         schema
             .rename_field("payload_format_tmp", "payload_format", mock_io.clone())
             .await

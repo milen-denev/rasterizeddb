@@ -1,4 +1,8 @@
-use std::{borrow::Cow, cell::UnsafeCell, sync::atomic::{AtomicBool, AtomicU64, AtomicU8}};
+use std::{
+    borrow::Cow,
+    cell::UnsafeCell,
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU64},
+};
 
 use branches::{likely, unlikely};
 use cacheguard::CacheGuard;
@@ -8,22 +12,27 @@ use std::sync::Arc as StdArc;
 
 use crate::core::mvcc::Visibility;
 
-use futures::{future::join_all};
+use futures::future::join_all;
 use smallvec::SmallVec;
 
-use tokio::{
-    sync::Semaphore,
-    task,
-};
+use tokio::{sync::Semaphore, task};
 
-use super::{
-    transformer::{ColumnTransformer, Next, TransformerPlan, TransformerProcessor},
-};
+use super::transformer::{ColumnTransformer, Next, TransformerPlan, TransformerProcessor};
 
 use crate::{
-    cache::query_cache, core::{
-        processor::transformer::RowBlocks, row::{error::EvalError, row::{Row, RowFetch}, row_pointer::{RowPointer, RowPointerIterator}, schema::SchemaField}, storage_providers::traits::StorageIO, tokenizer::query_parser::QueryParser
-    }, memory_pool::MemoryBlock
+    cache::query_cache,
+    core::{
+        processor::transformer::RowBlocks,
+        row::{
+            error::EvalError,
+            row::{Row, RowFetch},
+            row_pointer::{RowPointer, RowPointerIterator},
+            schema::SchemaField,
+        },
+        storage_providers::traits::StorageIO,
+        tokenizer::query_parser::QueryParser,
+    },
+    memory_pool::MemoryBlock,
 };
 
 use crate::core::tokenizer::query_tokenizer::Token;
@@ -46,7 +55,6 @@ impl ConcurrentProcessor {
     pub fn new() -> Self {
         Self {}
     }
-
 
     /// Turns a finished worker fleet into a query-level error when something
     /// went wrong.
@@ -243,10 +251,8 @@ impl ConcurrentProcessor {
         });
 
         for field in schema {
-            columns[field.write_order as usize] = (
-                Cow::Borrowed(field.name.as_str()),
-                MemoryBlock::default(),
-            );
+            columns[field.write_order as usize] =
+                (Cow::Borrowed(field.name.as_str()), MemoryBlock::default());
         }
 
         columns
@@ -354,8 +360,7 @@ impl ConcurrentProcessor {
         // Bounded MPMC channel for batch dispatch. Capacity = n_workers gives
         // natural backpressure: the iterator stops reading ahead when every
         // worker has a batch in-hand.
-        let (work_tx, work_rx) =
-            kanal::bounded_async::<Vec<RowPointer>>(n_workers);
+        let (work_tx, work_rx) = kanal::bounded_async::<Vec<RowPointer>>(n_workers);
 
         let mut worker_handles = Vec::with_capacity(n_workers);
 
@@ -478,14 +483,10 @@ impl ConcurrentProcessor {
 
                             if unlikely(enforce_limit_early) {
                                 if let Some(limit_val) = limit_opt {
-                                    if limit_counter_ref
-                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                    if limit_counter_ref.load(std::sync::atomic::Ordering::Relaxed)
                                         >= limit_val
                                     {
-                                        stop_ref.store(
-                                            true,
-                                            std::sync::atomic::Ordering::Relaxed,
-                                        );
+                                        stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
                                         break;
                                     }
                                 }
@@ -493,29 +494,25 @@ impl ConcurrentProcessor {
 
                             let (_, requested_row_fetch) = &*tuple_clone;
 
-                            if unlikely(pointer
-                                .fetch_row_reuse_async(
-                                    io_rows_ref,
-                                    requested_row_fetch,
-                                    &mut buffer.row,
-                                )
-                                .await
-                                .is_err())
-                            {
+                            if unlikely(
+                                pointer
+                                    .fetch_row_reuse_async(
+                                        io_rows_ref,
+                                        requested_row_fetch,
+                                        &mut buffer.row,
+                                    )
+                                    .await
+                                    .is_err(),
+                            ) {
                                 continue;
                             }
 
                             if unlikely(enforce_limit_early) {
                                 if let Some(limit_val) = limit_opt {
-                                    let prev = limit_counter_ref.fetch_add(
-                                        1,
-                                        std::sync::atomic::Ordering::Relaxed,
-                                    );
+                                    let prev = limit_counter_ref
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     if unlikely(prev + 1 >= limit_val) {
-                                        stop_ref.store(
-                                            true,
-                                            std::sync::atomic::Ordering::Relaxed,
-                                        );
+                                        stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
                                     }
                                     // Skip the emit if we already reached the
                                     // limit on a sibling worker. Without this
@@ -537,8 +534,7 @@ impl ConcurrentProcessor {
                         }
                     } else {
                         // WHERE-filtered path
-                        let (query_row_fetch, requested_row_fetch) =
-                            &*tuple_clone;
+                        let (query_row_fetch, requested_row_fetch) = &*tuple_clone;
 
                         for pointer in pointers.iter() {
                             if unlikely(stop_ref.load(std::sync::atomic::Ordering::Relaxed)) {
@@ -607,13 +603,9 @@ impl ConcurrentProcessor {
                             }
 
                             let result = {
-                                let processor =
-                                    unsafe { &mut *processor_cell.get() };
+                                let processor = unsafe { &mut *processor_cell.get() };
                                 processor.execute_row(
-                                    &RowView::new(
-                                        &buffer.row,
-                                        &buffer.write_order_to_col,
-                                    ),
+                                    &RowView::new(&buffer.row, &buffer.write_order_to_col),
                                     &mut buffer.bool_buffer,
                                 )
                             };
@@ -631,10 +623,7 @@ impl ConcurrentProcessor {
                                         std::sync::atomic::Ordering::AcqRel,
                                         std::sync::atomic::Ordering::Acquire,
                                     );
-                                    stop_ref.store(
-                                        true,
-                                        std::sync::atomic::Ordering::Relaxed,
-                                    );
+                                    stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
                                     break;
                                 }
                             };
@@ -681,15 +670,11 @@ impl ConcurrentProcessor {
 
                                 if unlikely(enforce_limit_early) {
                                     if let Some(limit_val) = limit_opt {
-                                        let prev = limit_counter_ref.fetch_add(
-                                            1,
-                                            std::sync::atomic::Ordering::Relaxed,
-                                        );
+                                        let prev = limit_counter_ref
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         if unlikely(prev + 1 >= limit_val) {
-                                            stop_ref.store(
-                                                true,
-                                                std::sync::atomic::Ordering::Relaxed,
-                                            );
+                                            stop_ref
+                                                .store(true, std::sync::atomic::Ordering::Relaxed);
                                         }
                                         if unlikely(prev >= limit_val) {
                                             break;
@@ -706,12 +691,8 @@ impl ConcurrentProcessor {
                         }
                     }
 
-                    let elapsed_ns =
-                        batch_read_start.elapsed().as_nanos() as u64;
-                    reading_time_ref.fetch_add(
-                        elapsed_ns,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
+                    let elapsed_ns = batch_read_start.elapsed().as_nanos() as u64;
+                    reading_time_ref.fetch_add(elapsed_ns, std::sync::atomic::Ordering::Relaxed);
                 }
 
                 // Single send per worker on exit.
@@ -751,8 +732,7 @@ impl ConcurrentProcessor {
 
             // Direct allocation; with BATCH_SIZE up to 65536 RowPointers per
             // batch, this is one alloc per ~thousands of rows — negligible.
-            let mut pointers: Vec<RowPointer> =
-                Vec::with_capacity(crate::batch_size());
+            let mut pointers: Vec<RowPointer> = Vec::with_capacity(crate::batch_size());
 
             // NOTE: a failed pointer read is silently treated as the end of
             // the table here — the batch is cleared and the `is_empty` break
@@ -914,7 +894,10 @@ impl ConcurrentProcessor {
                 // The planner resolved every key against this same schema, so
                 // this is unreachable in practice. Dropping just the one key
                 // still sorts by the rest, which beats abandoning the sort.
-                None => log::warn!("ORDER BY field '{}' not found in schema; skipping key", name),
+                None => log::warn!(
+                    "ORDER BY field '{}' not found in schema; skipping key",
+                    name
+                ),
             }
         }
 
@@ -980,10 +963,7 @@ impl ConcurrentProcessor {
     ) -> std::io::Result<Vec<Row>> {
         let prep_stopwatch = std::time::Instant::now();
 
-        log::info!(
-            "Starting concurrent processing for query: {}",
-            where_query
-        );
+        log::info!("Starting concurrent processing for query: {}", where_query);
 
         let schema_arc = Self::schema_arc(table_schema);
 
@@ -1028,22 +1008,19 @@ impl ConcurrentProcessor {
         // otherwise we only sort a prefix of the matching rows.
         let enforce_limit_early = limit.is_some() && order_by.is_none();
 
-        let shared_tuple: Arc<(RowFetch, RowFetch)> = Arc::new((
-            query_row_fetch,
-            requested_row_fetch,
-        ));
+        let shared_tuple: Arc<(RowFetch, RowFetch)> =
+            Arc::new((query_row_fetch, requested_row_fetch));
 
         let io_rows_outer = Arc::clone(&io_rows);
 
-        let (no_filter, tokens_arc) = Self::prepare_query(where_query, &schema_arc)
-            .map_err(std::io::Error::other)?;
+        let (no_filter, tokens_arc) =
+            Self::prepare_query(where_query, &schema_arc).map_err(std::io::Error::other)?;
         let compiled_plan = if no_filter {
             None
         } else {
             Some(Arc::new(
-                Self::compile_query_plan(&schema_arc, &tokens_arc).map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
-                })?,
+                Self::compile_query_plan(&schema_arc, &tokens_arc)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?,
             ))
         };
 
@@ -1124,18 +1101,11 @@ impl ConcurrentProcessor {
             // non-matching rows, which for a selective-late predicate is the
             // entire cost.
             if let Some(generation) = generation {
-                let stopped_early =
-                    stop_processing.load(std::sync::atomic::Ordering::Acquire);
+                let stopped_early = stop_processing.load(std::sync::atomic::Ordering::Acquire);
                 if stopped_early {
                     // Only a prefix, and only meaningful if we know its length.
                     if limit.is_some() {
-                        query_cache::store(
-                            table_name,
-                            where_query,
-                            generation,
-                            limit,
-                            pointers,
-                        );
+                        query_cache::store(table_name, where_query, generation, limit, pointers);
                     }
                 } else {
                     // Ran to completion: a complete match set, which answers
@@ -1241,24 +1211,21 @@ impl ConcurrentProcessor {
         let eval_error: Arc<CacheGuard<AtomicU8>> = Arc::new(AtomicU8::new(0).into());
         let enforce_limit_early = limit.is_some();
 
-        let shared_tuple: Arc<(RowFetch, RowFetch)> = Arc::new((
-            query_row_fetch,
-            requested_row_fetch,
-        ));
+        let shared_tuple: Arc<(RowFetch, RowFetch)> =
+            Arc::new((query_row_fetch, requested_row_fetch));
 
         let schema_arc = Self::schema_arc(table_schema);
 
         let io_rows_outer = Arc::clone(&io_rows);
 
-        let (no_filter, tokens_arc) = Self::prepare_query(where_query, &schema_arc)
-            .map_err(std::io::Error::other)?;
+        let (no_filter, tokens_arc) =
+            Self::prepare_query(where_query, &schema_arc).map_err(std::io::Error::other)?;
         let compiled_plan = if no_filter {
             None
         } else {
             Some(Arc::new(
-                Self::compile_query_plan(&schema_arc, &tokens_arc).map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
-                })?,
+                Self::compile_query_plan(&schema_arc, &tokens_arc)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?,
             ))
         };
 
@@ -1344,18 +1311,11 @@ impl ConcurrentProcessor {
             // See `process`: a prefix is keyed by its limit, a complete set
             // by the bare clause.
             if let Some(generation) = generation {
-                let stopped_early =
-                    stop_processing.load(std::sync::atomic::Ordering::Acquire);
+                let stopped_early = stop_processing.load(std::sync::atomic::Ordering::Acquire);
                 if stopped_early {
                     // Only a prefix, and only meaningful if we know its length.
                     if limit.is_some() {
-                        query_cache::store(
-                            table_name,
-                            where_query,
-                            generation,
-                            limit,
-                            pointers,
-                        );
+                        query_cache::store(table_name, where_query, generation, limit, pointers);
                     }
                 } else {
                     // Ran to completion: a complete match set, which answers
@@ -1581,8 +1541,7 @@ impl ConcurrentProcessor {
                 ));
                 let processor_mut = unsafe { &mut *processor_cell.get() };
                 let parser_cell = UnsafeCell::new(
-                    QueryParser::new(&tokens_ref, processor_mut)
-                        .with_scales(schema_ref.as_slice()),
+                    QueryParser::new(&tokens_ref, processor_mut).with_scales(schema_ref.as_slice()),
                 );
                 let mut plan_built = false;
 
@@ -1634,7 +1593,10 @@ impl ConcurrentProcessor {
                             for column in columns.iter() {
                                 // Here `schema_id` is write_order.
                                 let write_order = column.schema_id as usize;
-                                if let Some(schema_field) = schema.iter().find(|f| f.write_order as usize == write_order) {
+                                if let Some(schema_field) = schema
+                                    .iter()
+                                    .find(|f| f.write_order as usize == write_order)
+                                {
                                     if let Some(entry) = tmp_vec.get_mut(write_order) {
                                         *entry = (
                                             Cow::Borrowed(schema_field.name.as_str()),
@@ -1683,7 +1645,6 @@ impl ConcurrentProcessor {
                         }
                     };
 
-
                     if result {
                         if let Some(limit_val) = limit_opt {
                             if limit_counter_ref.load(std::sync::atomic::Ordering::Relaxed)
@@ -1715,10 +1676,8 @@ impl ConcurrentProcessor {
                 }
 
                 let elapsed_ns = batch_read_start.elapsed().as_nanos() as u64;
-                reading_time_total_clone.fetch_add(
-                    elapsed_ns,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                reading_time_total_clone
+                    .fetch_add(elapsed_ns, std::sync::atomic::Ordering::Relaxed);
             });
 
             batch_handles.push(batch_handle);
@@ -1787,7 +1746,11 @@ fn compare_rows_by_schema_id(
     }
 }
 
-pub(crate) fn compare_bytes_as_type(db_type: crate::core::db_type::DbType, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+pub(crate) fn compare_bytes_as_type(
+    db_type: crate::core::db_type::DbType,
+    a: &[u8],
+    b: &[u8],
+) -> std::cmp::Ordering {
     use crate::core::db_type::DbType;
 
     match db_type {
@@ -1798,8 +1761,14 @@ pub(crate) fn compare_bytes_as_type(db_type: crate::core::db_type::DbType, a: &[
         // `JSONB` compares by its encoded bytes, which is a *stable* order and
         // not the one PostgreSQL defines for `jsonb`. Enough for a sort or a
         // join key; a query that needs jsonb's own ordering does not have it.
-        DbType::STRING | DbType::BYTEA | DbType::ARRAY | DbType::UNKNOWN | DbType::START
-        | DbType::END | DbType::JSON | DbType::JSONB => a.cmp(b),
+        DbType::STRING
+        | DbType::BYTEA
+        | DbType::ARRAY
+        | DbType::UNKNOWN
+        | DbType::START
+        | DbType::END
+        | DbType::JSON
+        | DbType::JSONB => a.cmp(b),
         // Fixed-width and big-endian by construction, so a plain byte compare
         // already yields canonical UUID order and address order.
         DbType::UUID | DbType::INET => a.cmp(b),
@@ -2046,13 +2015,28 @@ mod order_limit_tests {
         let mut mb = MEMORY_POOL.acquire(bytes.len());
         mb.into_slice_mut().copy_from_slice(&bytes);
         let mut columns = SmallVec::new();
-        columns.push(Column { schema_id: 0, data: mb, column_type: DbType::I64 });
-        Row { position: v as u64, columns, length: 8 as _ }
+        columns.push(Column {
+            schema_id: 0,
+            data: mb,
+            column_type: DbType::I64,
+        });
+        Row {
+            position: v as u64,
+            columns,
+            length: 8 as _,
+        }
     }
 
     fn schema() -> Arc<SmallVec<[SchemaField; 20]>> {
         let mut f = SmallVec::new();
-        f.push(SchemaField::new("v".to_string(), DbType::I64, 8, 0, 0, false));
+        f.push(SchemaField::new(
+            "v".to_string(),
+            DbType::I64,
+            8,
+            0,
+            0,
+            false,
+        ));
         Arc::new(f)
     }
 
@@ -2071,7 +2055,9 @@ mod order_limit_tests {
         let mut state = 0x2545_F491_4F6C_DD1Du64;
         let mut vs: Vec<i64> = (0..n).collect();
         for i in (1..vs.len()).rev() {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let j = ((state >> 33) as usize) % (i + 1);
             vs.swap(i, j);
         }

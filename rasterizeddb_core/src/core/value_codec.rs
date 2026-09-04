@@ -51,7 +51,11 @@ pub fn parse_uuid(text: &str) -> Option<[u8; UUID_LEN]> {
         }
     }
 
-    if n == UUID_LEN && hi.is_none() { Some(out) } else { None }
+    if n == UUID_LEN && hi.is_none() {
+        Some(out)
+    } else {
+        None
+    }
 }
 
 /// Renders 16 octets in the canonical 8-4-4-4-12 lowercase form.
@@ -176,7 +180,10 @@ pub fn parse_timestamp_us(text: &str) -> Option<i64> {
     }
 
     // Bare integer: already an epoch value.
-    if s.chars().enumerate().all(|(i, c)| c.is_ascii_digit() || (i == 0 && c == '-')) {
+    if s.chars()
+        .enumerate()
+        .all(|(i, c)| c.is_ascii_digit() || (i == 0 && c == '-'))
+    {
         return s.parse::<i64>().ok();
     }
 
@@ -201,7 +208,10 @@ pub fn parse_timestamp_us(text: &str) -> Option<i64> {
                     // `+02`
                     1 | 2 => (digits.parse::<i64>().ok()?, 0),
                     // `+0200`
-                    4 => (digits[..2].parse::<i64>().ok()?, digits[2..].parse::<i64>().ok()?),
+                    4 => (
+                        digits[..2].parse::<i64>().ok()?,
+                        digits[2..].parse::<i64>().ok()?,
+                    ),
                     _ => return None,
                 },
             };
@@ -228,7 +238,12 @@ pub fn parse_timestamp_us(text: &str) -> Option<i64> {
     if !time_part.is_empty() {
         let mut time_iter = time_part.split(':');
         hour = time_iter.next()?.parse().ok()?;
-        minute = time_iter.next().map(str::parse::<i64>).transpose().ok()?.unwrap_or(0);
+        minute = time_iter
+            .next()
+            .map(str::parse::<i64>)
+            .transpose()
+            .ok()?
+            .unwrap_or(0);
         if let Some(sec_field) = time_iter.next() {
             match sec_field.split_once('.') {
                 Some((whole, frac)) => {
@@ -352,7 +367,8 @@ pub fn parse_decimal_scaled(text: &str, scale: u32) -> Option<i128> {
     if int_part.is_empty() && frac_part.is_empty() {
         return None;
     }
-    if !int_part.bytes().all(|b| b.is_ascii_digit()) || !frac_part.bytes().all(|b| b.is_ascii_digit())
+    if !int_part.bytes().all(|b| b.is_ascii_digit())
+        || !frac_part.bytes().all(|b| b.is_ascii_digit())
     {
         return None;
     }
@@ -376,7 +392,11 @@ pub fn parse_decimal_scaled(text: &str, scale: u32) -> Option<i128> {
         frac_len -= 1;
     }
 
-    let mut unscaled: i128 = if digits.is_empty() { 0 } else { digits.parse().ok()? };
+    let mut unscaled: i128 = if digits.is_empty() {
+        0
+    } else {
+        digits.parse().ok()?
+    };
     unscaled = unscaled.checked_mul(10i128.checked_pow(scale - frac_len)?)?;
     Some(if negative { -unscaled } else { unscaled })
 }
@@ -435,7 +455,8 @@ pub fn parse_decimal(text: &str) -> Option<i128> {
     if int_part.is_empty() && frac_part.is_empty() {
         return None;
     }
-    if !int_part.bytes().all(|b| b.is_ascii_digit()) || !frac_part.bytes().all(|b| b.is_ascii_digit())
+    if !int_part.bytes().all(|b| b.is_ascii_digit())
+        || !frac_part.bytes().all(|b| b.is_ascii_digit())
     {
         return None;
     }
@@ -458,7 +479,11 @@ pub fn parse_decimal(text: &str) -> Option<i128> {
         return None;
     }
 
-    let mut unscaled: i128 = if digits.is_empty() { 0 } else { digits.parse().ok()? };
+    let mut unscaled: i128 = if digits.is_empty() {
+        0
+    } else {
+        digits.parse().ok()?
+    };
     unscaled = unscaled.checked_mul(10i128.checked_pow(DECIMAL_SCALE - frac_len)?)?;
     Some(if negative { -unscaled } else { unscaled })
 }
@@ -537,7 +562,11 @@ pub fn encode_pg_numeric_scaled(unscaled: i128, scale: u32) -> Vec<u8> {
     }
 
     // `weight` is the base-10000 exponent of the leading digit.
-    let weight: i16 = if int_digits.is_empty() { -1 } else { int_digits.len() as i16 - 1 };
+    let weight: i16 = if int_digits.is_empty() {
+        -1
+    } else {
+        int_digits.len() as i16 - 1
+    };
 
     let mut digits = int_digits;
     digits.extend_from_slice(&frac_digits);
@@ -660,7 +689,11 @@ fn finish_array_element(raw: &str, was_quoted: bool) -> Option<String> {
     if !was_quoted && raw.trim().eq_ignore_ascii_case("NULL") {
         return None;
     }
-    Some(if was_quoted { raw.to_string() } else { raw.trim().to_string() })
+    Some(if was_quoted {
+        raw.to_string()
+    } else {
+        raw.trim().to_string()
+    })
 }
 
 /// Renders the binary array representation back to `{a,b,NULL}`.
@@ -672,9 +705,8 @@ pub fn format_array(raw: &[u8]) -> Option<String> {
         return None;
     }
 
-    let be32 = |at: usize| -> i32 {
-        i32::from_be_bytes([raw[at], raw[at + 1], raw[at + 2], raw[at + 3]])
-    };
+    let be32 =
+        |at: usize| -> i32 { i32::from_be_bytes([raw[at], raw[at + 1], raw[at + 2], raw[at + 3]]) };
 
     let ndim = be32(0);
     if ndim == 0 {
@@ -782,8 +814,9 @@ pub fn coerce_literal(
         let text = std::str::from_utf8(bytes).ok()?;
         return match to {
             DbType::STRING => Some(bytes.to_vec()),
-            DbType::UUID | DbType::INET | DbType::DATETIME | DbType::DECIMAL
-            | DbType::JSONB => encode_literal(to, text),
+            DbType::UUID | DbType::INET | DbType::DATETIME | DbType::DECIMAL | DbType::JSONB => {
+                encode_literal(to, text)
+            }
             _ if has_text_literal(to) => encode_literal(to, text),
             DbType::BOOL => match text.trim().to_ascii_lowercase().as_str() {
                 "true" | "t" | "yes" | "y" | "on" | "1" => Some(vec![1]),
@@ -824,7 +857,11 @@ pub fn coerce_literal(
         }
         return encode_float(v, to).or_else(|| {
             // An integral float compared against an integer column is exact.
-            if v.fract() == 0.0 { encode_integer(v as i128, to) } else { None }
+            if v.fract() == 0.0 {
+                encode_integer(v as i128, to)
+            } else {
+                None
+            }
         });
     }
 
@@ -1026,12 +1063,8 @@ pub fn encode_literal(db_type: &crate::core::db_type::DbType, literal: &str) -> 
         DbType::INTERVAL => {
             crate::core::pg_types::parse_interval(text).map(crate::core::pg_types::encode_interval)
         }
-        DbType::MACADDR => {
-            crate::core::pg_types::parse_macaddr::<6>(text).map(|b| b.to_vec())
-        }
-        DbType::MACADDR8 => {
-            crate::core::pg_types::parse_macaddr::<8>(text).map(|b| b.to_vec())
-        }
+        DbType::MACADDR => crate::core::pg_types::parse_macaddr::<6>(text).map(|b| b.to_vec()),
+        DbType::MACADDR8 => crate::core::pg_types::parse_macaddr::<8>(text).map(|b| b.to_vec()),
         // A `BIT(n)` literal PostgreSQL accepts is already `n` bits long — it
         // rejects any other length — so no declared width has to reach here.
         DbType::BIT | DbType::VARBIT => crate::core::pg_types::parse_bit_string(text, None),
@@ -1105,9 +1138,18 @@ mod tests {
     #[test]
     fn uuid_rejects_malformed_input() {
         assert!(parse_uuid("not-a-uuid").is_none());
-        assert!(parse_uuid("3f2504e0-4f89-11d3-9a0c-0305e82c33").is_none(), "too short");
-        assert!(parse_uuid("3f2504e0-4f89-11d3-9a0c-0305e82c330101").is_none(), "too long");
-        assert!(parse_uuid("3f2504e0-4f89-11d3-9a0c-0305e82c330").is_none(), "odd nibble count");
+        assert!(
+            parse_uuid("3f2504e0-4f89-11d3-9a0c-0305e82c33").is_none(),
+            "too short"
+        );
+        assert!(
+            parse_uuid("3f2504e0-4f89-11d3-9a0c-0305e82c330101").is_none(),
+            "too long"
+        );
+        assert!(
+            parse_uuid("3f2504e0-4f89-11d3-9a0c-0305e82c330").is_none(),
+            "odd nibble count"
+        );
     }
 
     #[test]
@@ -1136,7 +1178,10 @@ mod tests {
     #[test]
     fn inet_rejects_bad_addresses_and_prefixes() {
         assert!(parse_inet("999.1.1.1").is_none());
-        assert!(parse_inet("10.0.0.1/33").is_none(), "prefix wider than IPv4");
+        assert!(
+            parse_inet("10.0.0.1/33").is_none(),
+            "prefix wider than IPv4"
+        );
         assert!(parse_inet("::1/129").is_none(), "prefix wider than IPv6");
         assert!(parse_inet("").is_none());
     }
@@ -1152,7 +1197,10 @@ mod tests {
 
     #[test]
     fn inet_distinguishes_a_host_from_its_network() {
-        assert_ne!(parse_inet("10.0.0.0").unwrap(), parse_inet("10.0.0.0/24").unwrap());
+        assert_ne!(
+            parse_inet("10.0.0.0").unwrap(),
+            parse_inet("10.0.0.0/24").unwrap()
+        );
     }
 
     #[test]
@@ -1161,14 +1209,20 @@ mod tests {
         assert_eq!(parse_timestamp_us("2026-08-20").unwrap(), expected);
         assert_eq!(parse_timestamp_us("2026-08-20 00:00:00").unwrap(), expected);
         assert_eq!(parse_timestamp_us("2026-08-20T00:00:00").unwrap(), expected);
-        assert_eq!(parse_timestamp_us("2026-08-20T00:00:00Z").unwrap(), expected);
+        assert_eq!(
+            parse_timestamp_us("2026-08-20T00:00:00Z").unwrap(),
+            expected
+        );
         assert_eq!(parse_timestamp_us("2026-08-20 00:00").unwrap(), expected);
     }
 
     #[test]
     fn timestamp_applies_the_zone_offset() {
         let utc = parse_timestamp_us("2026-08-20 12:00:00Z").unwrap();
-        assert_eq!(parse_timestamp_us("2026-08-20 14:00:00+02:00").unwrap(), utc);
+        assert_eq!(
+            parse_timestamp_us("2026-08-20 14:00:00+02:00").unwrap(),
+            utc
+        );
         assert_eq!(parse_timestamp_us("2026-08-20 14:00:00+0200").unwrap(), utc);
         assert_eq!(parse_timestamp_us("2026-08-20 10:00:00-02").unwrap(), utc);
     }
@@ -1176,10 +1230,19 @@ mod tests {
     #[test]
     fn timestamp_keeps_sub_second_precision() {
         let base = parse_timestamp_us("2026-08-20 00:00:00").unwrap();
-        assert_eq!(parse_timestamp_us("2026-08-20 00:00:00.5").unwrap(), base + 500_000);
-        assert_eq!(parse_timestamp_us("2026-08-20 00:00:00.000001").unwrap(), base + 1);
+        assert_eq!(
+            parse_timestamp_us("2026-08-20 00:00:00.5").unwrap(),
+            base + 500_000
+        );
+        assert_eq!(
+            parse_timestamp_us("2026-08-20 00:00:00.000001").unwrap(),
+            base + 1
+        );
         // More than microsecond precision is truncated, not rejected.
-        assert_eq!(parse_timestamp_us("2026-08-20 00:00:00.1234567").unwrap(), base + 123_456);
+        assert_eq!(
+            parse_timestamp_us("2026-08-20 00:00:00.1234567").unwrap(),
+            base + 123_456
+        );
     }
 
     #[test]
@@ -1213,14 +1276,25 @@ mod tests {
     fn timestamp_rejects_nonsense() {
         assert!(parse_timestamp_us("2026-13-01").is_none(), "month 13");
         assert!(parse_timestamp_us("2026-01-32").is_none(), "day 32");
-        assert!(parse_timestamp_us("2026-01-01 25:00:00").is_none(), "hour 25");
+        assert!(
+            parse_timestamp_us("2026-01-01 25:00:00").is_none(),
+            "hour 25"
+        );
         assert!(parse_timestamp_us("not a date").is_none());
         assert!(parse_timestamp_us("2026-01").is_none(), "no day");
     }
 
     #[test]
     fn decimal_round_trips_through_text() {
-        for s in ["0", "1", "-1", "20.5", "-0.000000001", "1234567.891", "1000000.25"] {
+        for s in [
+            "0",
+            "1",
+            "-1",
+            "20.5",
+            "-0.000000001",
+            "1234567.891",
+            "1000000.25",
+        ] {
             let v = parse_decimal(s).unwrap();
             assert_eq!(format_decimal(v), s, "{}", s);
         }
@@ -1274,10 +1348,18 @@ mod tests {
     #[test]
     fn pg_numeric_reports_only_the_scale_a_value_needs() {
         let raw = encode_pg_numeric(parse_decimal("19").unwrap());
-        assert_eq!(i16::from_be_bytes([raw[6], raw[7]]), 0, "dscale for a whole number");
+        assert_eq!(
+            i16::from_be_bytes([raw[6], raw[7]]),
+            0,
+            "dscale for a whole number"
+        );
 
         let raw = encode_pg_numeric(parse_decimal("1930.50").unwrap());
-        assert_eq!(i16::from_be_bytes([raw[6], raw[7]]), 1, "trailing zeroes trimmed");
+        assert_eq!(
+            i16::from_be_bytes([raw[6], raw[7]]),
+            1,
+            "trailing zeroes trimmed"
+        );
     }
 
     #[test]
@@ -1305,11 +1387,30 @@ mod tests {
     #[test]
     fn encode_literal_covers_every_type_it_claims() {
         use crate::core::db_type::DbType;
-        assert_eq!(encode_literal(&DbType::UUID, "'00000000-0000-0000-0000-000000000000'").unwrap().len(), UUID_LEN);
-        assert_eq!(encode_literal(&DbType::INET, "'10.0.0.1'").unwrap().len(), INET_LEN);
-        assert_eq!(encode_literal(&DbType::DATETIME, "'2026-08-20'").unwrap().len(), 8);
-        assert_eq!(encode_literal(&DbType::DECIMAL, "'20.00'").unwrap().len(), 16);
-        assert!(encode_literal(&DbType::I32, "7").is_none(), "numeric types stay with their caller");
+        assert_eq!(
+            encode_literal(&DbType::UUID, "'00000000-0000-0000-0000-000000000000'")
+                .unwrap()
+                .len(),
+            UUID_LEN
+        );
+        assert_eq!(
+            encode_literal(&DbType::INET, "'10.0.0.1'").unwrap().len(),
+            INET_LEN
+        );
+        assert_eq!(
+            encode_literal(&DbType::DATETIME, "'2026-08-20'")
+                .unwrap()
+                .len(),
+            8
+        );
+        assert_eq!(
+            encode_literal(&DbType::DECIMAL, "'20.00'").unwrap().len(),
+            16
+        );
+        assert!(
+            encode_literal(&DbType::I32, "7").is_none(),
+            "numeric types stay with their caller"
+        );
         assert!(encode_literal(&DbType::UUID, "'nonsense'").is_none());
     }
 
@@ -1349,8 +1450,14 @@ mod tests {
     #[test]
     fn coercion_maps_boolean_spellings_onto_one_byte() {
         use crate::core::db_type::DbType;
-        assert_eq!(coerce_literal(b"true", &DbType::STRING, &DbType::BOOL).unwrap(), vec![1]);
-        assert_eq!(coerce_literal(b"f", &DbType::STRING, &DbType::BOOL).unwrap(), vec![0]);
+        assert_eq!(
+            coerce_literal(b"true", &DbType::STRING, &DbType::BOOL).unwrap(),
+            vec![1]
+        );
+        assert_eq!(
+            coerce_literal(b"f", &DbType::STRING, &DbType::BOOL).unwrap(),
+            vec![0]
+        );
         assert_eq!(
             coerce_literal(&1i32.to_le_bytes(), &DbType::I32, &DbType::BOOL).unwrap(),
             vec![1]
@@ -1371,16 +1478,31 @@ mod tests {
     fn coercion_is_a_no_op_when_types_already_agree() {
         use crate::core::db_type::DbType;
         let lit = 7i64.to_le_bytes();
-        assert_eq!(coerce_literal(&lit, &DbType::I64, &DbType::I64).unwrap(), lit.to_vec());
+        assert_eq!(
+            coerce_literal(&lit, &DbType::I64, &DbType::I64).unwrap(),
+            lit.to_vec()
+        );
     }
 
     #[test]
     fn coercion_result_width_always_matches_the_target() {
         use crate::core::db_type::DbType;
         for to in [
-            DbType::I8, DbType::I16, DbType::I32, DbType::I64, DbType::I128,
-            DbType::U8, DbType::U16, DbType::U32, DbType::U64, DbType::U128,
-            DbType::F32, DbType::F64, DbType::BOOL, DbType::CHAR, DbType::DECIMAL,
+            DbType::I8,
+            DbType::I16,
+            DbType::I32,
+            DbType::I64,
+            DbType::I128,
+            DbType::U8,
+            DbType::U16,
+            DbType::U32,
+            DbType::U64,
+            DbType::U128,
+            DbType::F32,
+            DbType::F64,
+            DbType::BOOL,
+            DbType::CHAR,
+            DbType::DECIMAL,
             DbType::DATETIME,
         ] {
             let out = coerce_literal(&1i32.to_le_bytes(), &DbType::I32, &to)

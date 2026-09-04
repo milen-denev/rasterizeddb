@@ -85,7 +85,10 @@ impl GeneratedColumn {
         }
 
         let read = |at: usize, len: usize| -> Result<String, String> {
-            let end = raw[at..at + len].iter().position(|&b| b == 0).unwrap_or(len - 1);
+            let end = raw[at..at + len]
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(len - 1);
             std::str::from_utf8(&raw[at..at + end])
                 .map(str::to_string)
                 .map_err(|e| format!("invalid UTF-8 in generated-column record: {}", e))
@@ -116,7 +119,11 @@ pub async fn load<S: StorageIO>(schema_io: Arc<S>) -> SmallVec<[GeneratedColumn;
     let mut buffer = vec![0u8; GENERATED_SIZE as usize];
     for i in 0..(len / GENERATED_SIZE) {
         let mut position = i * GENERATED_SIZE;
-        if io.read_data_into_buffer(&mut position, &mut buffer).await.is_err() {
+        if io
+            .read_data_into_buffer(&mut position, &mut buffer)
+            .await
+            .is_err()
+        {
             break;
         }
         match GeneratedColumn::from_vec(&buffer) {
@@ -136,10 +143,7 @@ pub async fn load<S: StorageIO>(schema_io: Arc<S>) -> SmallVec<[GeneratedColumn;
 }
 
 /// Appends a record, superseding any earlier one for the same column.
-pub async fn append<S: StorageIO>(
-    schema_io: Arc<S>,
-    entry: &GeneratedColumn,
-) -> io::Result<()> {
+pub async fn append<S: StorageIO>(schema_io: Arc<S>, entry: &GeneratedColumn) -> io::Result<()> {
     if entry.expression.len() > MAX_EXPRESSION_LEN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -155,10 +159,7 @@ pub async fn append<S: StorageIO>(
 }
 
 /// The generation expression declared for `column`, if any.
-pub fn expression_for<'a>(
-    column: &str,
-    generated: &'a [GeneratedColumn],
-) -> Option<&'a str> {
+pub fn expression_for<'a>(column: &str, generated: &'a [GeneratedColumn]) -> Option<&'a str> {
     generated
         .iter()
         .find(|g| g.column.eq_ignore_ascii_case(column) && !g.is_deleted)

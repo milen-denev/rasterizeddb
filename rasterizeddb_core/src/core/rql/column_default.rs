@@ -59,7 +59,10 @@ impl ColumnDefault {
         }
 
         let read = |at: usize, len: usize| -> Result<String, String> {
-            let end = raw[at..at + len].iter().position(|&b| b == 0).unwrap_or(len - 1);
+            let end = raw[at..at + len]
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(len - 1);
             std::str::from_utf8(&raw[at..at + end])
                 .map(str::to_string)
                 .map_err(|e| format!("invalid UTF-8 in default record: {}", e))
@@ -90,7 +93,11 @@ pub async fn load<S: StorageIO>(schema_io: Arc<S>) -> SmallVec<[ColumnDefault; 8
     let mut buffer = vec![0u8; COLUMN_DEFAULT_SIZE as usize];
     for i in 0..(len / COLUMN_DEFAULT_SIZE) {
         let mut position = i * COLUMN_DEFAULT_SIZE;
-        if io.read_data_into_buffer(&mut position, &mut buffer).await.is_err() {
+        if io
+            .read_data_into_buffer(&mut position, &mut buffer)
+            .await
+            .is_err()
+        {
             break;
         }
         match ColumnDefault::from_vec(&buffer) {
@@ -110,14 +117,14 @@ pub async fn load<S: StorageIO>(schema_io: Arc<S>) -> SmallVec<[ColumnDefault; 8
 }
 
 /// Appends a default, superseding any earlier one for the same column.
-pub async fn append<S: StorageIO>(
-    schema_io: Arc<S>,
-    entry: &ColumnDefault,
-) -> io::Result<()> {
+pub async fn append<S: StorageIO>(schema_io: Arc<S>, entry: &ColumnDefault) -> io::Result<()> {
     if entry.expression.len() > MAX_EXPRESSION_LEN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("a default expression may be at most {} characters", MAX_EXPRESSION_LEN),
+            format!(
+                "a default expression may be at most {} characters",
+                MAX_EXPRESSION_LEN
+            ),
         ));
     }
     let io = schema_io.create_new(sidecar_name(&schema_io)).await;
@@ -126,10 +133,7 @@ pub async fn append<S: StorageIO>(
 }
 
 /// The default expression declared for `column`, if any.
-pub fn expression_for<'a>(
-    column: &str,
-    defaults: &'a [ColumnDefault],
-) -> Option<&'a str> {
+pub fn expression_for<'a>(column: &str, defaults: &'a [ColumnDefault]) -> Option<&'a str> {
     defaults
         .iter()
         .find(|d| d.column.eq_ignore_ascii_case(column))
@@ -162,8 +166,8 @@ pub fn strip_redundant_cast(text: &str) -> &str {
 
     // The type name must be a bare word — `jsonb`, `smallint`, `text` — so a
     // `::` inside a string literal cannot be mistaken for a cast.
-    let is_type_name = !tail.is_empty()
-        && tail.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    let is_type_name =
+        !tail.is_empty() && tail.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
     if !is_type_name {
         return text;
     }
@@ -172,8 +176,14 @@ pub fn strip_redundant_cast(text: &str) -> &str {
     // number or keyword. Anything else — a function call, a parenthesised
     // expression — is a shape this cannot vouch for.
     let simple = (head.starts_with('\'') && head.ends_with('\'') && head.len() >= 2)
-        || head.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
-    if simple && !head.is_empty() { head } else { text }
+        || head
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
+    if simple && !head.is_empty() {
+        head
+    } else {
+        text
+    }
 }
 
 pub fn evaluate(expression: &str, db_type: &DbType) -> Result<String, String> {
@@ -212,7 +222,10 @@ pub fn evaluate(expression: &str, db_type: &DbType) -> Result<String, String> {
         return Ok(match db_type {
             DbType::DATE => format!("'{}'", format_date_of(micros)),
             DbType::TIME | DbType::TIMETZ => format!("'{}'", format_time_of(micros, db_type)),
-            _ => format!("'{}'", crate::core::value_codec::format_timestamp_us(micros)),
+            _ => format!(
+                "'{}'",
+                crate::core::value_codec::format_timestamp_us(micros)
+            ),
         });
     }
 
@@ -251,7 +264,10 @@ pub fn evaluate(expression: &str, db_type: &DbType) -> Result<String, String> {
         // Version 4, variant 1, as the function promises.
         bytes[6] = (bytes[6] & 0x0f) | 0x40;
         bytes[8] = (bytes[8] & 0x3f) | 0x80;
-        return Ok(format!("'{}'", crate::core::value_codec::format_uuid(&bytes)));
+        return Ok(format!(
+            "'{}'",
+            crate::core::value_codec::format_uuid(&bytes)
+        ));
     }
 
     if upper == "TRUE" || upper == "FALSE" {
@@ -266,15 +282,19 @@ pub fn evaluate(expression: &str, db_type: &DbType) -> Result<String, String> {
     // A bare number, which the column's own encoder will read.
     let numeric_body = text.strip_prefix(['-', '+']).unwrap_or(text);
     if !numeric_body.is_empty()
-        && numeric_body.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        && numeric_body
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b == b'.')
         && numeric_body.bytes().filter(|b| *b == b'.').count() <= 1
     {
         // A number defaulting a text column is written as text.
-        return Ok(if matches!(db_type, DbType::STRING | DbType::BYTEA | DbType::JSONB) {
-            format!("'{}'", text)
-        } else {
-            text.to_string()
-        });
+        return Ok(
+            if matches!(db_type, DbType::STRING | DbType::BYTEA | DbType::JSONB) {
+                format!("'{}'", text)
+            } else {
+                text.to_string()
+            },
+        );
     }
 
     Err(format!(
@@ -335,7 +355,13 @@ pub fn split_clause(definition: &str) -> (String, Option<String>) {
 
     // Where the expression ends: the next constraint keyword at the top level.
     const TERMINATORS: [&str; 7] = [
-        "NOT NULL", "NULL", "PRIMARY KEY", "UNIQUE", "REFERENCES", "CHECK", "GENERATED",
+        "NOT NULL",
+        "NULL",
+        "PRIMARY KEY",
+        "UNIQUE",
+        "REFERENCES",
+        "CHECK",
+        "GENERATED",
     ];
     let mut end = after.len();
     let mut depth = 0usize;
@@ -493,7 +519,12 @@ mod tests {
             // Comparing lengths would be flaky: the fractional part is trimmed
             // of trailing zeroes, so the rendering varies by the microsecond.
             let epoch_2020 = crate::core::value_codec::parse_timestamp_us("2020-01-01").unwrap();
-            assert!(parsed > epoch_2020, "{} produced {:?}", expression, rendered);
+            assert!(
+                parsed > epoch_2020,
+                "{} produced {:?}",
+                expression,
+                rendered
+            );
         }
     }
 

@@ -68,7 +68,9 @@ struct Writer {
 
 impl Writer {
     fn new() -> Self {
-        Self { buf: Vec::with_capacity(1 << 16) }
+        Self {
+            buf: Vec::with_capacity(1 << 16),
+        }
     }
     #[inline]
     fn u8(&mut self, v: u8) {
@@ -251,11 +253,7 @@ pub fn serialize(columns: &[&ColumnFilter], seed: HashSeed, n_slots: u64) -> Vec
 /// `from_zone` onward, to be appended after the base and any earlier deltas.
 ///
 /// `from_zones` is parallel to `columns`.
-pub fn serialize_delta(
-    columns: &[&ColumnFilter],
-    from_zones: &[u64],
-    n_slots: u64,
-) -> Vec<u8> {
+pub fn serialize_delta(columns: &[&ColumnFilter], from_zones: &[u64], n_slots: u64) -> Vec<u8> {
     debug_assert_eq!(columns.len(), from_zones.len());
     let mut w = Writer::new();
     w.bytes(DELTA_MAGIC);
@@ -384,7 +382,10 @@ pub enum LoadReject {
     SchemaMismatch,
     /// The checkpoint describes more slots than the pointer file now holds, so
     /// it cannot be describing this file. See `deserialize`'s `now_slots`.
-    StaleSlotCount { persisted: u64, actual: u64 },
+    StaleSlotCount {
+        persisted: u64,
+        actual: u64,
+    },
 }
 
 /// Parse a sidecar, validating everything that could make its contents lie.
@@ -426,7 +427,8 @@ pub fn deserialize(
     }
     let n_slots = r.u64().ok_or(LoadReject::Truncated)?;
     let base_len = r.u64().ok_or(LoadReject::Truncated)? as usize;
-    r.skip(SUPERBLOCK_LEN - BASE_LEN_OFFSET - 8).ok_or(LoadReject::Truncated)?;
+    r.skip(SUPERBLOCK_LEN - BASE_LEN_OFFSET - 8)
+        .ok_or(LoadReject::Truncated)?;
 
     // The base image must at least contain the superblock and must fit in what
     // we were handed. A corrupt length here would otherwise decide how much of
@@ -449,7 +451,10 @@ pub fn deserialize(
     // leaves them identical. File removal on drop is best-effort, so this is the
     // check that does not depend on it.
     if n_slots > now_slots {
-        return Err(LoadReject::StaleSlotCount { persisted: n_slots, actual: now_slots });
+        return Err(LoadReject::StaleSlotCount {
+            persisted: n_slots,
+            actual: now_slots,
+        });
     }
 
     if column_count != expected.len() {
@@ -494,7 +499,11 @@ pub fn deserialize(
                 return Err(LoadReject::Truncated);
             }
             let words = r.words(word_count).ok_or(LoadReject::Truncated)?;
-            gens.push(Generation { start_zone, f, words });
+            gens.push(Generation {
+                start_zone,
+                f,
+                words,
+            });
         }
 
         let zonemap = match r.u8().ok_or(LoadReject::Truncated)? {
@@ -562,12 +571,19 @@ pub fn deserialize(
     let mut at = base_len;
     let mut applied = 0u32;
     while applied < MAX_DELTAS {
-        let Some(rec) = read_delta(buf, &mut at, &mut columns) else { break };
+        let Some(rec) = read_delta(buf, &mut at, &mut columns) else {
+            break;
+        };
         n_slots = rec;
         applied += 1;
     }
 
-    Ok(Loaded { columns, n_slots, valid_len: at as u64, deltas: applied })
+    Ok(Loaded {
+        columns,
+        n_slots,
+        valid_len: at as u64,
+        deltas: applied,
+    })
 }
 
 /// Parse and apply one delta record at `*at`, advancing it past the record.

@@ -12,11 +12,24 @@ use crate::core::row::logical::perform_comparison_operation;
 use crate::core::row::schema::SchemaField;
 
 const INDEXABLE: &[DbType] = &[
-    DbType::I8, DbType::I16, DbType::I32, DbType::I64, DbType::I128,
-    DbType::U8, DbType::U16, DbType::U32, DbType::U64, DbType::U128,
-    DbType::F32, DbType::F64, DbType::STRING,
-    DbType::DATETIME, DbType::CHAR, DbType::DECIMAL,
-    DbType::UUID, DbType::INET,
+    DbType::I8,
+    DbType::I16,
+    DbType::I32,
+    DbType::I64,
+    DbType::I128,
+    DbType::U8,
+    DbType::U16,
+    DbType::U32,
+    DbType::U64,
+    DbType::U128,
+    DbType::F32,
+    DbType::F64,
+    DbType::STRING,
+    DbType::DATETIME,
+    DbType::CHAR,
+    DbType::DECIMAL,
+    DbType::UUID,
+    DbType::INET,
 ];
 
 /// Serialized width, taken from `DbType` itself so a new type cannot be added
@@ -62,7 +75,15 @@ fn hash_agrees_with_comparison() {
         let mut samples: Vec<Vec<u8>> = Vec::new();
 
         if *ty == DbType::STRING {
-            for s in ["", "a", "ab", "ab\0", "hello world", "hello worle", &"x".repeat(200)] {
+            for s in [
+                "",
+                "a",
+                "ab",
+                "ab\0",
+                "hello world",
+                "hello worle",
+                &"x".repeat(200),
+            ] {
                 samples.push(s.as_bytes().to_vec());
             }
         } else if *ty == DbType::INET {
@@ -133,7 +154,9 @@ fn float_zero_signs_hash_alike() {
     let pos = 0.0f32.to_le_bytes();
     let neg = (-0.0f32).to_le_bytes();
     assert_ne!(pos, neg, "bit patterns must actually differ");
-    assert!(perform_comparison_operation(&pos, &neg, &DbType::F32, &ComparerOperation::Equals).unwrap());
+    assert!(
+        perform_comparison_operation(&pos, &neg, &DbType::F32, &ComparerOperation::Equals).unwrap()
+    );
     assert_eq!(
         canonical_hash(&DbType::F32, &pos, seed),
         canonical_hash(&DbType::F32, &neg, seed)
@@ -151,7 +174,11 @@ fn float_zero_signs_hash_alike() {
 fn indexable_set_matches_policy() {
     // Sentinels are not column types.
     for t in [DbType::NULL, DbType::UNKNOWN, DbType::START, DbType::END] {
-        assert!(!is_indexable(&t), "{:?} is a sentinel, not a column type", t);
+        assert!(
+            !is_indexable(&t),
+            "{:?} is a sentinel, not a column type",
+            t
+        );
     }
 
     // BOOL is indexable but never fingerprinted. Two distinct values can never
@@ -203,8 +230,9 @@ fn fingerprint_never_uses_reserved_codes() {
 fn simd_kernels_match_scalar() {
     for f in MIN_F..=MAX_F {
         for _ in 0..200 {
-            let planes: Vec<u64> =
-                (0..f as usize * ZONE_WORDS).map(|_| fastrand::u64(..)).collect();
+            let planes: Vec<u64> = (0..f as usize * ZONE_WORDS)
+                .map(|_| fastrand::u64(..))
+                .collect();
             let g = fingerprint(fastrand::u64(..), f);
 
             let mut want = [0u64; ZONE_WORDS];
@@ -212,7 +240,13 @@ fn simd_kernels_match_scalar() {
 
             let mut got = [0u64; ZONE_WORDS];
             probe_fn()(&planes, f, g, &mut got);
-            assert_eq!(got, want, "active kernel {} disagrees at f={}", active_kernel(), f);
+            assert_eq!(
+                got,
+                want,
+                "active kernel {} disagrees at f={}",
+                active_kernel(),
+                f
+            );
         }
     }
 }
@@ -228,7 +262,13 @@ fn slot_roundtrip() {
             expect[local] = g;
         }
         for local in 0..ZONE_ROWS {
-            assert_eq!(read_slot(&planes, f, local), expect[local], "f={} slot={}", f, local);
+            assert_eq!(
+                read_slot(&planes, f, local),
+                expect[local],
+                "f={} slot={}",
+                f,
+                local
+            );
         }
     }
 }
@@ -238,14 +278,20 @@ fn probe_finds_every_written_slot() {
     // No false negatives at the kernel level.
     let f = 8u8;
     let mut planes = vec![0u64; f as usize * ZONE_WORDS];
-    let codes: Vec<u32> = (0..ZONE_ROWS).map(|_| fingerprint(fastrand::u64(..), f)).collect();
+    let codes: Vec<u32> = (0..ZONE_ROWS)
+        .map(|_| fingerprint(fastrand::u64(..), f))
+        .collect();
     for (i, g) in codes.iter().enumerate() {
         write_slot(&mut planes, f, i, *g);
     }
     let mut out = [0u64; ZONE_WORDS];
     for (i, g) in codes.iter().enumerate() {
         probe_fn()(&planes, f, *g, &mut out);
-        assert!((out[i / 64] >> (i % 64)) & 1 == 1, "slot {} lost its own code", i);
+        assert!(
+            (out[i / 64] >> (i % 64)) & 1 == 1,
+            "slot {} lost its own code",
+            i
+        );
     }
 }
 
@@ -325,7 +371,10 @@ fn delete_clears_the_slot_exactly() {
     // Unlike a Bloom filter, removal is exact.
     col.set(500, None);
     col.probe_into(&v, 1000, &mut bm);
-    assert!((bm[500 / 64] >> (500 % 64)) & 1 == 0, "cleared slot still matches");
+    assert!(
+        (bm[500 / 64] >> (500 % 64)) & 1 == 0,
+        "cleared slot still matches"
+    );
 }
 
 #[test]
@@ -387,7 +436,11 @@ fn out_of_order_inserts_never_lose_rows() {
     let mut bm = vec![0u64; bitmap_words(n)];
     for slot in 0..n {
         col.probe_into(&vals[slot as usize].to_le_bytes(), n, &mut bm);
-        assert!((bm[(slot / 64) as usize] >> (slot % 64)) & 1 == 1, "slot {} lost", slot);
+        assert!(
+            (bm[(slot / 64) as usize] >> (slot % 64)) & 1 == 1,
+            "slot {} lost",
+            slot
+        );
     }
 }
 
@@ -406,7 +459,11 @@ fn generations_keep_old_zones_readable() {
         col.set(slot, Some(&vals[slot as usize].to_le_bytes()));
     }
     // Cardinality is ~n, so the adaptive rule should have widened f.
-    assert!(col.current_f() > 4, "f should have grown, got {}", col.current_f());
+    assert!(
+        col.current_f() > 4,
+        "f should have grown, got {}",
+        col.current_f()
+    );
 
     let mut bm = vec![0u64; bitmap_words(n)];
     for slot in 0..n {
@@ -444,7 +501,13 @@ fn hll_is_roughly_right() {
         }
         let est = h.estimate() as f64;
         let err = (est - truth as f64).abs() / truth as f64;
-        assert!(err < 0.25, "HLL estimate {} for {} rows (err {:.2})", est, truth, err);
+        assert!(
+            err < 0.25,
+            "HLL estimate {} for {} rows (err {:.2})",
+            est,
+            truth,
+            err
+        );
     }
 }
 
@@ -575,7 +638,11 @@ fn table_filters_conjunction_compounds() {
     // The true match must survive.
     assert!(bm.get(1234), "true match was pruned");
     // And the conjunction should be far more selective than either half.
-    assert!(bm.count() < 20, "expected tight mask, got {} candidates", bm.count());
+    assert!(
+        bm.count() < 20,
+        "expected tight mask, got {} candidates",
+        bm.count()
+    );
 }
 
 #[test]
@@ -638,16 +705,14 @@ fn checkpoint_round_trips_without_losing_rows() {
     let (f, vals) = filled_filters(n);
     let bytes = f.checkpoint_bytes(n);
 
-    let restored = TableFilters::from_checkpoint(&bytes, &persist_schema(), FilterConfig::default(), n)
-        .expect("round trip should load");
+    let restored =
+        TableFilters::from_checkpoint(&bytes, &persist_schema(), FilterConfig::default(), n)
+            .expect("round trip should load");
 
     // Every value indexed before the checkpoint must still be findable after.
     for slot in 0..n {
-        let program = sarg::extract(
-            &toks(&format!("id = {}", vals[slot as usize])),
-            &restored,
-        )
-        .unwrap();
+        let program =
+            sarg::extract(&toks(&format!("id = {}", vals[slot as usize])), &restored).unwrap();
         let bm = restored.evaluate(&program, n).unwrap();
         assert!(bm.get(slot), "slot {} lost across a checkpoint", slot);
     }
@@ -659,13 +724,22 @@ fn checkpoint_preserves_pruning_power() {
     let (f, vals) = filled_filters(n);
     let bytes = f.checkpoint_bytes(n);
     let restored =
-        TableFilters::from_checkpoint(&bytes, &persist_schema(), FilterConfig::default(), n).unwrap();
+        TableFilters::from_checkpoint(&bytes, &persist_schema(), FilterConfig::default(), n)
+            .unwrap();
 
     let program = sarg::extract(&toks(&format!("id = {}", vals[1234])), &restored).unwrap();
     let bm = restored.evaluate(&program, n).unwrap();
     assert!(bm.get(1234));
-    assert!(bm.count() < n / 10, "restored filter barely prunes: {}", bm.count());
-    assert_eq!(restored.resume_slot(), n, "restored frontier should cover all rows");
+    assert!(
+        bm.count() < n / 10,
+        "restored filter barely prunes: {}",
+        bm.count()
+    );
+    assert_eq!(
+        restored.resume_slot(),
+        n,
+        "restored frontier should cover all rows"
+    );
 }
 
 #[test]
@@ -679,7 +753,8 @@ fn modification_after_checkpoint_pulls_the_frontier_back() {
 
     let bytes = f.checkpoint_bytes(n);
     let restored =
-        TableFilters::from_checkpoint(&bytes, &persist_schema(), FilterConfig::default(), n).unwrap();
+        TableFilters::from_checkpoint(&bytes, &persist_schema(), FilterConfig::default(), n)
+            .unwrap();
 
     // The checkpoint must not claim to cover anything at or above the modified
     // slot: its bytes for that region could be stale.
@@ -712,7 +787,11 @@ fn corrupt_or_incompatible_checkpoints_are_rejected() {
     let good = f.checkpoint_bytes(n);
     let cfg = FilterConfig::default();
 
-    let load = |b: &[u8]| TableFilters::from_checkpoint(b, &persist_schema(), cfg, n).err().unwrap();
+    let load = |b: &[u8]| {
+        TableFilters::from_checkpoint(b, &persist_schema(), cfg, n)
+            .err()
+            .unwrap()
+    };
 
     assert_eq!(load(&[]), LoadReject::Empty);
 
@@ -749,7 +828,10 @@ fn corrupt_or_incompatible_checkpoints_are_rejected() {
     for cut in [1usize, 8, 40, 63, 64, 100, good.len() / 2, good.len() - 1] {
         let err = load(&good[..cut]);
         assert!(
-            matches!(err, LoadReject::Truncated | LoadReject::SchemaMismatch | LoadReject::BadMagic),
+            matches!(
+                err,
+                LoadReject::Truncated | LoadReject::SchemaMismatch | LoadReject::BadMagic
+            ),
             "cut at {} gave {:?}",
             cut,
             err
@@ -815,7 +897,11 @@ fn checkpoint_survives_generation_boundaries() {
         let program =
             sarg::extract(&toks(&format!("id = {}", vals[slot as usize])), &restored).unwrap();
         let bm = restored.evaluate(&program, n).unwrap();
-        assert!(bm.get(slot), "slot {} lost across generations + checkpoint", slot);
+        assert!(
+            bm.get(slot),
+            "slot {} lost across generations + checkpoint",
+            slot
+        );
     }
 }
 
@@ -851,7 +937,12 @@ fn string_columns_carry_truncated_bounds() {
     // Not exact ones: `ZoneMap` is a strided array, so a string keeps only its
     // first `STRING_BOUND_PREFIX` bytes. What matters is the direction each
     // bound is allowed to move under truncation.
-    let c = ColumnFilter::new(1, DbType::STRING, HashSeed::default(), FilterConfig::default());
+    let c = ColumnFilter::new(
+        1,
+        DbType::STRING,
+        HashSeed::default(),
+        FilterConfig::default(),
+    );
     assert!(c.has_zonemap());
 }
 
@@ -981,7 +1072,11 @@ fn ordered_data_prunes_hard() {
         n
     );
     for slot in 9501..n {
-        assert!((bm[(slot / 64) as usize] >> (slot % 64)) & 1 == 1, "slot {} lost", slot);
+        assert!(
+            (bm[(slot / 64) as usize] >> (slot % 64)) & 1 == 1,
+            "slot {} lost",
+            slot
+        );
     }
 }
 
@@ -997,7 +1092,11 @@ fn equality_combines_fingerprint_and_bounds() {
     assert!((bm[7777 / 64] >> (7777 % 64)) & 1 == 1, "true match pruned");
     // Bounds alone would leave one zone (512); fingerprints cut that further.
     let survivors: u64 = bm.iter().map(|w| w.count_ones() as u64).sum();
-    assert!(survivors < 64, "expected fingerprint+bounds to compound, got {}", survivors);
+    assert!(
+        survivors < 64,
+        "expected fingerprint+bounds to compound, got {}",
+        survivors
+    );
 }
 
 #[test]
@@ -1032,7 +1131,11 @@ fn all_nan_zone_stays_a_candidate() {
     col.probe_pred_into(SargOp::Gt, &1.0f64.to_le_bytes(), 10, &mut bm);
     // No bounds were ever established, so the zone cannot be ruled out.
     for slot in 0..10u64 {
-        assert!((bm[0] >> slot) & 1 == 1, "unbounded zone pruned slot {}", slot);
+        assert!(
+            (bm[0] >> slot) & 1 == 1,
+            "unbounded zone pruned slot {}",
+            slot
+        );
     }
 }
 
@@ -1055,7 +1158,10 @@ fn bounds_widen_on_update_and_never_shrink_on_delete() {
     col.set(50, None);
     col.probe_pred_into(SargOp::Gt, &9_000i64.to_le_bytes(), n, &mut bm);
     let survivors: u64 = bm.iter().map(|w| w.count_ones() as u64).sum();
-    assert!(survivors > 0, "delete must not shrink bounds into a false negative");
+    assert!(
+        survivors > 0,
+        "delete must not shrink bounds into a false negative"
+    );
 }
 
 #[test]
@@ -1085,7 +1191,11 @@ fn zonemap_survives_checkpoint() {
     for slot in 4801..n {
         assert!(bm.get(slot), "slot {} lost across checkpoint", slot);
     }
-    assert!(bm.count() < 1200, "restored bounds lost their selectivity: {}", bm.count());
+    assert!(
+        bm.count() < 1200,
+        "restored bounds lost their selectivity: {}",
+        bm.count()
+    );
 }
 
 #[test]
@@ -1205,7 +1315,11 @@ fn masks_are_supersets_of_truth() {
             };
         }
         let (l, r) = (Box::new(build(depth - 1)), Box::new(build(depth - 1)));
-        if fastrand::bool() { Expr::And(l, r) } else { Expr::Or(l, r) }
+        if fastrand::bool() {
+            Expr::And(l, r)
+        } else {
+            Expr::Or(l, r)
+        }
     }
 
     /// Render with explicit parens around every compound subexpression, so the
@@ -1217,7 +1331,11 @@ fn masks_are_supersets_of_truth() {
             Expr::AgeGt(v) => format!("age > {}", v),
             Expr::Opaque => "age != 999".to_string(),
             Expr::And(l, r) | Expr::Or(l, r) => {
-                let op = if matches!(e, Expr::And(..)) { "AND" } else { "OR" };
+                let op = if matches!(e, Expr::And(..)) {
+                    "AND"
+                } else {
+                    "OR"
+                };
                 let inner = format!("{} {} {}", render(l, false), op, render(r, false));
                 if top { inner } else { format!("({})", inner) }
             }
@@ -1240,8 +1358,12 @@ fn masks_are_supersets_of_truth() {
         let e = build(3);
         let text = render(&e, true);
 
-        let Some(program) = sarg::extract(&toks(&text), &f) else { continue };
-        let Some(bm) = f.evaluate(&program, n) else { continue };
+        let Some(program) = sarg::extract(&toks(&text), &f) else {
+            continue;
+        };
+        let Some(bm) = f.evaluate(&program, n) else {
+            continue;
+        };
         filtered_any = true;
 
         for slot in 0..n {
@@ -1250,9 +1372,11 @@ fn masks_are_supersets_of_truth() {
             }
         }
     }
-    assert!(filtered_any, "no generated expression was filterable; test proved nothing");
+    assert!(
+        filtered_any,
+        "no generated expression was filterable; test proved nothing"
+    );
 }
-
 
 // ---------------------------------------------------------------------------
 // Guards for adding new DbTypes to the filter
@@ -1328,7 +1452,11 @@ fn ordered_width_agrees_with_db_type_size() {
 #[test]
 fn every_indexable_type_is_comparable() {
     for ty in INDEXABLE {
-        let w = if *ty == DbType::STRING { 4 } else { ty.get_size() as usize };
+        let w = if *ty == DbType::STRING {
+            4
+        } else {
+            ty.get_size() as usize
+        };
         let a = vec![0u8; w];
         let b = vec![0u8; w];
         let r = std::panic::catch_unwind(|| {
@@ -1364,14 +1492,13 @@ fn sarg_fires_on_cross_typed_and_reversed_literals() {
 
     for (q, want_op) in [
         ("id > 1990", SargOp::Gt),
-        ("1990 < id", SargOp::Gt),     // reversed: I32 literal vs U64 column
+        ("1990 < id", SargOp::Gt), // reversed: I32 literal vs U64 column
         ("1990 = id", SargOp::Eq),
-        ("amount > 200", SargOp::Gt),  // I32 literal vs DECIMAL column
+        ("amount > 200", SargOp::Gt), // I32 literal vs DECIMAL column
         ("uid = '11111111-2222-3333-4444-555555555555'", SargOp::Eq), // text vs UUID
     ] {
         let toks = crate::core::tokenizer::query_tokenizer::tokenize(q, &fields);
-        let p = sarg::extract(&toks, &f)
-            .unwrap_or_else(|| panic!("`{}` should be sargable", q));
+        let p = sarg::extract(&toks, &f).unwrap_or_else(|| panic!("`{}` should be sargable", q));
         assert_eq!(p.all_preds()[0].op, want_op, "{}", q);
     }
 }
@@ -1415,7 +1542,8 @@ fn coerced_literal_bytes_match_what_the_evaluator_compares() {
         let toks = crate::core::tokenizer::query_tokenizer::tokenize(q, &fields);
         let p = sarg::extract(&toks, &f).unwrap();
         assert_eq!(
-            &p.all_preds()[0].value, expected,
+            &p.all_preds()[0].value,
+            expected,
             "`{}`: sarg encoded the literal differently from the value codec",
             q
         );
@@ -1425,7 +1553,8 @@ fn coerced_literal_bytes_match_what_the_evaluator_compares() {
             p.all_preds()[0].value.len(),
             ty.get_size() as usize,
             "`{}`: coerced literal is the wrong width for {:?}",
-            q, ty
+            q,
+            ty
         );
     }
 }
@@ -1457,7 +1586,16 @@ fn unknown_operators_are_opaque_not_guessed() {
     let ident = Token::Ident(("name".to_string(), DbType::STRING, 1));
     let lit = Token::StringLit("acme".to_string());
 
-    for op in ["ILIKE", "LIKE", "~", "~*", "SIMILAR TO", "IS DISTINCT FROM", "@>", "!="] {
+    for op in [
+        "ILIKE",
+        "LIKE",
+        "~",
+        "~*",
+        "SIMILAR TO",
+        "IS DISTINCT FROM",
+        "@>",
+        "!=",
+    ] {
         let toks = vec![ident.clone(), Token::Op(op.to_string()), lit.clone()];
         assert!(
             sarg::extract(&toks, &f).is_none(),
@@ -1471,7 +1609,9 @@ fn unknown_operators_are_opaque_not_guessed() {
         let toks = vec![
             Token::Ident(("id".to_string(), DbType::U64, 0)),
             Token::Op(op.to_string()),
-            Token::Number(crate::core::tokenizer::query_tokenizer::NumericValue::U64(1)),
+            Token::Number(crate::core::tokenizer::query_tokenizer::NumericValue::U64(
+                1,
+            )),
         ];
         assert!(
             sarg::extract(&toks, &f).is_some(),

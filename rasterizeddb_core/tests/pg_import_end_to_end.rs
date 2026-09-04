@@ -150,7 +150,11 @@ async fn build_fixture(params: &ConnectParams, schema: &str) {
 async fn imported(
     params: &ConnectParams,
     options: ImportOptions,
-) -> (tempfile::TempDir, Arc<rasterizeddb_core::core::database::Database>, Vec<String>) {
+) -> (
+    tempfile::TempDir,
+    Arc<rasterizeddb_core::core::database::Database>,
+    Vec<String>,
+) {
     let dir = tempfile::tempdir().unwrap();
     let catalog = DatabaseCatalog::open(Some(dir.path().to_str().unwrap()), "postgres")
         .await
@@ -173,15 +177,16 @@ async fn run(database: &Arc<rasterizeddb_core::core::database::Database>, sql: &
 fn decode(response: &[u8], sql: &str) -> Vec<Row> {
     match response.first() {
         Some(2) => vec_into_rows(&response[1..]).expect("a decodable result set"),
-        Some(3) => panic!("`{}` failed: {}", sql, String::from_utf8_lossy(&response[1..])),
+        Some(3) => panic!(
+            "`{}` failed: {}",
+            sql,
+            String::from_utf8_lossy(&response[1..])
+        ),
         other => panic!("`{}` returned status {:?}, not rows", sql, other),
     }
 }
 
-async fn rows(
-    database: &Arc<rasterizeddb_core::core::database::Database>,
-    sql: &str,
-) -> Vec<Row> {
+async fn rows(database: &Arc<rasterizeddb_core::core::database::Database>, sql: &str) -> Vec<Row> {
     let response = run(database, sql).await;
     decode(&response, sql)
 }
@@ -246,7 +251,9 @@ fn elements(row: &Row, column: usize) -> Vec<Option<String>> {
             continue;
         }
         let length = length as usize;
-        out.push(Some(String::from_utf8_lossy(&raw[at..at + length]).to_string()));
+        out.push(Some(
+            String::from_utf8_lossy(&raw[at..at + length]).to_string(),
+        ));
         at += length;
     }
     out
@@ -284,7 +291,11 @@ async fn every_value_arrives_as_the_value_postgres_held() {
     assert_eq!(text(ada, 2), "Ada Lovelace");
     assert_eq!(i64_of(ada, 3), 36);
     assert_eq!(text(ada, 14), "happy", "an enum keeps its label");
-    assert_eq!(i64_of(ada, 15), 7, "a domain is imported as what it is built on");
+    assert_eq!(
+        i64_of(ada, 15),
+        7,
+        "a domain is imported as what it is built on"
+    );
     assert_eq!(
         elements(ada, 12),
         vec![Some("a".to_string()), Some("b".to_string())]
@@ -334,7 +345,10 @@ async fn every_value_arrives_as_the_value_postgres_held() {
 
     // The floats, including the two values that are not numbers.
     assert_eq!(float(ada, 5), Some(1.5));
-    assert!(float(grace, 5).is_some_and(f64::is_nan), "NaN did not survive");
+    assert!(
+        float(grace, 5).is_some_and(f64::is_nan),
+        "NaN did not survive"
+    );
     assert_eq!(float(carol, 5), Some(f64::NEG_INFINITY));
 
     // A predicate the engine evaluates itself, so the value is checked through
@@ -358,13 +372,22 @@ async fn every_row_of_every_table_comes_across() {
         ("SELECT id FROM empty_table", 0),
     ] {
         let found = rows(&database, sql).await;
-        assert_eq!(found.len(), expected, "`{}` returned the wrong number of rows", sql);
+        assert_eq!(
+            found.len(),
+            expected,
+            "`{}` returned the wrong number of rows",
+            sql
+        );
     }
 
     // A view is not a table and is not imported, so asking for it is an error
     // rather than an empty answer that could be mistaken for one.
     let response = run(&database, "SELECT id FROM active_users").await;
-    assert_eq!(response.first(), Some(&3), "a view should not have been imported");
+    assert_eq!(
+        response.first(),
+        Some(&3),
+        "a view should not have been imported"
+    );
 }
 
 #[tokio::test]
@@ -375,8 +398,16 @@ async fn the_keys_the_source_enforced_are_enforced_here() {
     let (_dir, database, _notes) = imported(&params, options(SCHEMA)).await;
 
     // Primary key.
-    let response = run(&database, "INSERT INTO users (id, email) VALUES (1, 'x@y.z')").await;
-    assert_eq!(response.first(), Some(&3), "a duplicate primary key was accepted");
+    let response = run(
+        &database,
+        "INSERT INTO users (id, email) VALUES (1, 'x@y.z')",
+    )
+    .await;
+    assert_eq!(
+        response.first(),
+        Some(&3),
+        "a duplicate primary key was accepted"
+    );
 
     // Unique constraint.
     let response = run(
@@ -392,7 +423,11 @@ async fn the_keys_the_source_enforced_are_enforced_here() {
         "INSERT INTO line_items (order_id, line_no, sku) VALUES (1, 1, 'SKU-Z')",
     )
     .await;
-    assert_eq!(response.first(), Some(&3), "a duplicate composite key was accepted");
+    assert_eq!(
+        response.first(),
+        Some(&3),
+        "a duplicate composite key was accepted"
+    );
 
     // A unique index with no constraint behind it in the source.
     let response = run(
@@ -409,7 +444,11 @@ async fn the_keys_the_source_enforced_are_enforced_here() {
          '2026-01-01 00:00:00')",
     )
     .await;
-    assert_eq!(response.first(), Some(&3), "a dangling foreign key was accepted");
+    assert_eq!(
+        response.first(),
+        Some(&3),
+        "a dangling foreign key was accepted"
+    );
 
     // And a row that breaks nothing still goes in, so the checks above are not
     // simply refusing everything.
@@ -434,14 +473,30 @@ async fn the_defaults_that_are_constants_come_across() {
     build_fixture(&params, SCHEMA).await;
     let (_dir, database, _notes) = imported(&params, options(SCHEMA)).await;
 
-    let response = run(&database, "INSERT INTO users (id, email) VALUES (700, 'd@x.y')").await;
+    let response = run(
+        &database,
+        "INSERT INTO users (id, email) VALUES (700, 'd@x.y')",
+    )
+    .await;
     assert_ne!(response.first(), Some(&3));
 
-    let found = rows(&database, "SELECT balance, is_active FROM users WHERE id = 700").await;
+    let found = rows(
+        &database,
+        "SELECT balance, is_active FROM users WHERE id = 700",
+    )
+    .await;
     assert_eq!(found.len(), 1);
-    let balance = rows(&database, "SELECT id FROM users WHERE id = 700 AND balance = 0").await;
+    let balance = rows(
+        &database,
+        "SELECT id FROM users WHERE id = 700 AND balance = 0",
+    )
+    .await;
     assert_eq!(balance.len(), 1, "DEFAULT 0 did not come across");
-    assert_eq!(found[0].columns[1].data.into_slice(), &[1u8], "DEFAULT true did not come across");
+    assert_eq!(
+        found[0].columns[1].data.into_slice(),
+        &[1u8],
+        "DEFAULT true did not come across"
+    );
 }
 
 #[tokio::test]
@@ -499,14 +554,20 @@ async fn a_dry_run_creates_nothing() {
         &catalog,
         &params,
         "shop",
-        &ImportOptions { dry_run: true, ..options(SCHEMA) },
+        &ImportOptions {
+            dry_run: true,
+            ..options(SCHEMA)
+        },
     )
     .await
     .unwrap();
 
     assert!(report.dry_run);
     assert_eq!(report.tables.len(), 4);
-    assert!(catalog.get("shop").is_none(), "a dry run created a database");
+    assert!(
+        catalog.get("shop").is_none(),
+        "a dry run created a database"
+    );
     assert!(
         report.notes.iter().any(|n| n.contains("view")),
         "the report does not mention the view it skipped: {:?}",

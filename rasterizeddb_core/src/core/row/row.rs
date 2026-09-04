@@ -330,7 +330,10 @@ pub enum ReturnResult {
 #[cfg(test)]
 mod row_tests {
     use super::*;
-    use crate::core::{db_type::DbType, tokenizer::query_tokenizer::{numeric_to_mb, str_to_mb, NumericValue}};
+    use crate::core::{
+        db_type::DbType,
+        tokenizer::query_tokenizer::{NumericValue, numeric_to_mb, str_to_mb},
+    };
 
     fn make_numeric_column(schema_id: u64, value: NumericValue, column_type: DbType) -> Column {
         let mb = numeric_to_mb(&value);
@@ -359,11 +362,7 @@ mod row_tests {
     #[cfg(not(feature = "enable_long_row"))]
     type TestRowLen = u32;
 
-    fn make_test_row(
-        position: u64,
-        columns: SmallVec<[Column; 32]>,
-        length: TestRowLen,
-    ) -> Row {
+    fn make_test_row(position: u64, columns: SmallVec<[Column; 32]>, length: TestRowLen) -> Row {
         Row {
             position,
             columns,

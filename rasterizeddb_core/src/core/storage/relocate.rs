@@ -77,7 +77,12 @@ pub async fn move_table(
         .await
         .map_err(|e| e.to_string())?;
 
-    Ok(format!("moved {} to {} ({})", table, destination, human_bytes(bytes)))
+    Ok(format!(
+        "moved {} to {} ({})",
+        table,
+        destination,
+        human_bytes(bytes)
+    ))
 }
 
 /// `STORAGE REBALANCE [DRY RUN]`.
@@ -90,7 +95,9 @@ pub async fn rebalance(database: &Arc<Database>, dry_run: bool) -> Result<Vec<St
     let plan = plan(database, pool).await;
 
     if plan.is_empty() {
-        return Ok(vec!["nothing to move: every table is where the policy would put it".to_string()]);
+        return Ok(vec![
+            "nothing to move: every table is where the policy would put it".to_string(),
+        ]);
     }
 
     let total: u64 = plan.iter().map(|m| m.bytes).sum();
@@ -134,7 +141,11 @@ pub async fn rebalance(database: &Arc<Database>, dry_run: bool) -> Result<Vec<St
         }
     }
 
-    lines.push(format!("{} table(s) moved, {}", moved, human_bytes(moved_bytes)));
+    lines.push(format!(
+        "{} table(s) moved, {}",
+        moved,
+        human_bytes(moved_bytes)
+    ));
     Ok(lines)
 }
 
@@ -186,20 +197,32 @@ async fn plan(database: &Arc<Database>, pool: &StorageManager) -> Vec<Move> {
     // not both aim at the same headroom.
     let mut free: std::collections::HashMap<String, u64> = reports
         .iter()
-        .map(|r| (r.location.path.clone(), r.available_bytes.unwrap_or(u64::MAX)))
+        .map(|r| {
+            (
+                r.location.path.clone(),
+                r.available_bytes.unwrap_or(u64::MAX),
+            )
+        })
         .collect();
     let mut counts: std::collections::HashMap<String, usize> = usable
         .iter()
         .map(|path| {
-            (path.clone(), tables.iter().filter(|(_, at, _)| at == path).count())
+            (
+                path.clone(),
+                tables.iter().filter(|(_, at, _)| at == path).count(),
+            )
         })
         .collect();
 
     let mut plan: Vec<Move> = Vec::new();
-    let mut current: std::collections::HashMap<String, String> =
-        tables.iter().map(|(name, at, _)| (name.clone(), at.clone())).collect();
-    let size: std::collections::HashMap<String, u64> =
-        tables.iter().map(|(name, _, bytes)| (name.clone(), *bytes)).collect();
+    let mut current: std::collections::HashMap<String, String> = tables
+        .iter()
+        .map(|(name, at, _)| (name.clone(), at.clone()))
+        .collect();
+    let size: std::collections::HashMap<String, u64> = tables
+        .iter()
+        .map(|(name, _, bytes)| (name.clone(), *bytes))
+        .collect();
 
     // -- 1. evacuate ------------------------------------------------------
     for (name, at, bytes) in tables.iter() {
@@ -209,13 +232,19 @@ async fn plan(database: &Arc<Database>, pool: &StorageManager) -> Vec<Move> {
         let Some(target) = roomiest(&usable, &free, *bytes, floor) else {
             continue;
         };
-        apply(&mut plan, &mut free, &mut counts, &mut current, Move {
-            table: name.clone(),
-            from: at.clone(),
-            to: target,
-            bytes: *bytes,
-            reason: "its location no longer takes tables",
-        });
+        apply(
+            &mut plan,
+            &mut free,
+            &mut counts,
+            &mut current,
+            Move {
+                table: name.clone(),
+                from: at.clone(),
+                to: target,
+                bytes: *bytes,
+                reason: "its location no longer takes tables",
+            },
+        );
     }
 
     // -- 2. policy --------------------------------------------------------
@@ -226,11 +255,15 @@ async fn plan(database: &Arc<Database>, pool: &StorageManager) -> Vec<Move> {
             // emptiest until they are within one of each other. Bounded by the
             // table count so a pathological case cannot loop.
             for _ in 0..tables.len() {
-                let Some(fullest) = usable.iter().max_by_key(|p| counts.get(*p).copied().unwrap_or(0))
+                let Some(fullest) = usable
+                    .iter()
+                    .max_by_key(|p| counts.get(*p).copied().unwrap_or(0))
                 else {
                     break;
                 };
-                let Some(emptiest) = usable.iter().min_by_key(|p| counts.get(*p).copied().unwrap_or(0))
+                let Some(emptiest) = usable
+                    .iter()
+                    .min_by_key(|p| counts.get(*p).copied().unwrap_or(0))
                 else {
                     break;
                 };
@@ -255,13 +288,19 @@ async fn plan(database: &Arc<Database>, pool: &StorageManager) -> Vec<Move> {
                 }
                 let from = fullest.clone();
                 let to = emptiest.clone();
-                apply(&mut plan, &mut free, &mut counts, &mut current, Move {
-                    table: candidate,
-                    from,
-                    to,
-                    bytes,
-                    reason: "evening out the table count",
-                });
+                apply(
+                    &mut plan,
+                    &mut free,
+                    &mut counts,
+                    &mut current,
+                    Move {
+                        table: candidate,
+                        from,
+                        to,
+                        bytes,
+                        reason: "evening out the table count",
+                    },
+                );
             }
         }
         PlacementPolicy::FreeSpace => {
@@ -286,18 +325,27 @@ async fn plan(database: &Arc<Database>, pool: &StorageManager) -> Vec<Move> {
                     break;
                 };
                 let bytes = size.get(&candidate).copied().unwrap_or(0);
-                let elsewhere: Vec<String> =
-                    usable.iter().filter(|path| **path != tight).cloned().collect();
+                let elsewhere: Vec<String> = usable
+                    .iter()
+                    .filter(|path| **path != tight)
+                    .cloned()
+                    .collect();
                 let Some(target) = roomiest(&elsewhere, &free, bytes, floor) else {
                     break;
                 };
-                apply(&mut plan, &mut free, &mut counts, &mut current, Move {
-                    table: candidate,
-                    from: tight,
-                    to: target,
-                    bytes,
-                    reason: "its location is below the free-space floor",
-                });
+                apply(
+                    &mut plan,
+                    &mut free,
+                    &mut counts,
+                    &mut current,
+                    Move {
+                        table: candidate,
+                        from: tight,
+                        to: target,
+                        bytes,
+                        reason: "its location is below the free-space floor",
+                    },
+                );
             }
         }
     }
@@ -347,12 +395,7 @@ fn roomiest(
 /// A location whose free space could not be determined is treated as roomy: the
 /// alternative is refusing every move on a platform with no `statvfs`, which
 /// would make the whole surface unusable there rather than merely unguided.
-fn fits(
-    path: &str,
-    free: &std::collections::HashMap<String, u64>,
-    bytes: u64,
-    floor: u64,
-) -> bool {
+fn fits(path: &str, free: &std::collections::HashMap<String, u64>, bytes: u64, floor: u64) -> bool {
     match free.get(path) {
         Some(&space) if space == u64::MAX => true,
         Some(&space) => space.saturating_sub(bytes) >= floor,

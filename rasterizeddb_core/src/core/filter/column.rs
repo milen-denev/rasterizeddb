@@ -86,7 +86,9 @@ pub struct Hll {
 
 impl Default for Hll {
     fn default() -> Self {
-        Self { regs: Box::new([0u8; 256]) }
+        Self {
+            regs: Box::new([0u8; 256]),
+        }
     }
 }
 
@@ -98,7 +100,9 @@ impl Hll {
 
     #[inline]
     pub fn from_regs(regs: [u8; 256]) -> Self {
-        Self { regs: Box::new(regs) }
+        Self {
+            regs: Box::new(regs),
+        }
     }
 
     #[inline]
@@ -292,7 +296,11 @@ impl ColumnFilter {
         zone_bounds: bool,
         span_summary: bool,
     ) -> Self {
-        let db_type_for_zonemap = if zone_bounds { Some(db_type.clone()) } else { None };
+        let db_type_for_zonemap = if zone_bounds {
+            Some(db_type.clone())
+        } else {
+            None
+        };
         let fingerprints = is_fingerprintable(&db_type);
         Self {
             write_order,
@@ -520,13 +528,21 @@ impl ColumnFilter {
                     last.grow_to_include(zone);
                     return self.gens.len() - 1;
                 }
-                let mut g = Generation { start_zone: next_start, f: self.next_f, words: Vec::new() };
+                let mut g = Generation {
+                    start_zone: next_start,
+                    f: self.next_f,
+                    words: Vec::new(),
+                };
                 g.grow_to_include(zone);
                 self.gens.push(g);
                 self.gens.len() - 1
             }
             None => {
-                let mut g = Generation { start_zone: 0, f: self.next_f, words: Vec::new() };
+                let mut g = Generation {
+                    start_zone: 0,
+                    f: self.next_f,
+                    words: Vec::new(),
+                };
                 g.grow_to_include(zone);
                 self.gens.push(g);
                 0
@@ -722,13 +738,7 @@ impl ColumnFilter {
         self.gated_out
     }
 
-    pub fn probe_pred_into(
-        &self,
-        op: SargOp,
-        value: &[u8],
-        n_slots: u64,
-        out: &mut [u64],
-    ) -> bool {
+    pub fn probe_pred_into(&self, op: SargOp, value: &[u8], n_slots: u64, out: &mut [u64]) -> bool {
         if self.gated_out {
             out.fill(u64::MAX);
             mask_tail(out, n_slots);
@@ -752,7 +762,10 @@ impl ColumnFilter {
         // express, or *any* predicate on a bounds-only column, where the bounds
         // are the entire index. `BOOL` is the second case — `__null_x = 1` gets
         // its pruning from zones that hold no `1` at all.
-        let usable = self.zonemap.as_ref().is_some_and(|zm| zm.probes_with(value));
+        let usable = self
+            .zonemap
+            .as_ref()
+            .is_some_and(|zm| zm.probes_with(value));
         if !usable {
             out.fill(u64::MAX);
             mask_tail(out, n_slots);
@@ -767,7 +780,9 @@ impl ColumnFilter {
 
     /// Clear every zone whose bounds rule the predicate out.
     fn intersect_zonemap(&self, op: SargOp, value: &[u8], n_slots: u64, out: &mut [u64]) {
-        let Some(zm) = self.zonemap.as_ref() else { return };
+        let Some(zm) = self.zonemap.as_ref() else {
+            return;
+        };
         let limit = zones_for(self.valid_upto.min(n_slots));
         for zone in 0..limit {
             let first = zone * ZONE_ROWS as u64;
@@ -883,7 +898,12 @@ impl ColumnFilter {
             .map(|g| {
                 let first = g.start_zone.max(from_zone);
                 let skip = (first - g.start_zone) as usize * ZONE_WORDS * g.f as usize;
-                (g.start_zone, g.f, first, g.words[skip.min(g.words.len())..].to_vec())
+                (
+                    g.start_zone,
+                    g.f,
+                    first,
+                    g.words[skip.min(g.words.len())..].to_vec(),
+                )
             })
             .collect();
 
@@ -894,10 +914,13 @@ impl ColumnFilter {
             next_f: self.next_f,
             hll: self.hll.clone(),
             gens,
-            zonemap: self
-                .zonemap
-                .as_ref()
-                .map(|z| (from_zone, z.tail_from(from_zone).to_vec(), z.valid_bits().to_vec())),
+            zonemap: self.zonemap.as_ref().map(|z| {
+                (
+                    from_zone,
+                    z.tail_from(from_zone).to_vec(),
+                    z.valid_bits().to_vec(),
+                )
+            }),
             // A superzone spans 32 zones, so the re-send point rounds *down* to
             // the superzone containing `from_zone`: sending half a block would
             // drop the keys recorded in the half left behind.
@@ -944,7 +967,11 @@ impl ColumnFilter {
                 // created after the checkpoint, so it starts at or above the
                 // first zone this delta covers.
                 None if keep == 0 => {
-                    self.gens.push(Generation { start_zone, f, words });
+                    self.gens.push(Generation {
+                        start_zone,
+                        f,
+                        words,
+                    });
                 }
                 None => return false,
             }

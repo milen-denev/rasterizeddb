@@ -40,7 +40,11 @@ pub fn probe_zone_scalar(planes: &[u64], f: u8, g: u32, out: &mut [u64; ZONE_WOR
     // A real check, not a `debug_assert`: release builds turn assertions off
     // and the reads below are raw-pointer, so a short slice was an
     // out-of-bounds read there where the scalar oracle panics.
-    assert_eq!(planes.len(), f as usize * ZONE_WORDS, "probe planes must be f * ZONE_WORDS words");
+    assert_eq!(
+        planes.len(),
+        f as usize * ZONE_WORDS,
+        "probe planes must be f * ZONE_WORDS words"
+    );
     out.fill(u64::MAX);
     for j in 0..f as usize {
         // 0 when bit j of g is set (keep plane as-is), !0 when clear (invert it).
@@ -59,7 +63,11 @@ unsafe fn probe_zone_avx2(planes: &[u64], f: u8, g: u32, out: &mut [u64; ZONE_WO
     // A real check, not a `debug_assert`: release builds turn assertions off
     // and the reads below are raw-pointer, so a short slice was an
     // out-of-bounds read there where the scalar oracle panics.
-    assert_eq!(planes.len(), f as usize * ZONE_WORDS, "probe planes must be f * ZONE_WORDS words");
+    assert_eq!(
+        planes.len(),
+        f as usize * ZONE_WORDS,
+        "probe planes must be f * ZONE_WORDS words"
+    );
     unsafe {
         let p = planes.as_ptr();
         let mut lo = _mm256_set1_epi64x(-1);
@@ -86,7 +94,11 @@ unsafe fn probe_zone_avx512(planes: &[u64], f: u8, g: u32, out: &mut [u64; ZONE_
     // A real check, not a `debug_assert`: release builds turn assertions off
     // and the reads below are raw-pointer, so a short slice was an
     // out-of-bounds read there where the scalar oracle panics.
-    assert_eq!(planes.len(), f as usize * ZONE_WORDS, "probe planes must be f * ZONE_WORDS words");
+    assert_eq!(
+        planes.len(),
+        f as usize * ZONE_WORDS,
+        "probe planes must be f * ZONE_WORDS words"
+    );
     unsafe {
         let p = planes.as_ptr();
         let mut acc = _mm512_set1_epi64(-1);
@@ -165,7 +177,11 @@ pub fn write_slot(planes: &mut [u64], f: u8, local: usize, g: u32) {
     // A real check, not a `debug_assert`: release builds turn assertions off
     // and the reads below are raw-pointer, so a short slice was an
     // out-of-bounds read there where the scalar oracle panics.
-    assert_eq!(planes.len(), f as usize * ZONE_WORDS, "probe planes must be f * ZONE_WORDS words");
+    assert_eq!(
+        planes.len(),
+        f as usize * ZONE_WORDS,
+        "probe planes must be f * ZONE_WORDS words"
+    );
     let (w, b) = (local >> 6, local & 63);
     let m = 1u64 << b;
     for j in 0..f as usize {

@@ -3,7 +3,13 @@ use itertools::Either;
 use smallvec::SmallVec;
 
 use crate::{
-    core::{db_type::DbType, helpers::smallvec_extensions::SmallVecExtensions, row::{error::EvalError, logical::perform_comparison_operation, math::perform_math_operation}},
+    core::{
+        db_type::DbType,
+        helpers::smallvec_extensions::SmallVecExtensions,
+        row::{
+            error::EvalError, logical::perform_comparison_operation, math::perform_math_operation,
+        },
+    },
     memory_pool::MemoryBlock,
 };
 
@@ -655,7 +661,9 @@ fn cast_block(source: &MemoryBlock, from: &DbType, to: &DbType) -> MemoryBlock {
     // for the types stored in PostgreSQL's own layout is not their bytes.
     let converted = if matches!(to, DbType::STRING) {
         crate::core::rql::subquery::value_to_literal(from, bytes).map(|literal| {
-            crate::core::value_codec::unquote_sql(&literal).to_string().into_bytes()
+            crate::core::value_codec::unquote_sql(&literal)
+                .to_string()
+                .into_bytes()
         })
     } else {
         crate::core::value_codec::coerce_literal(bytes, from, to)
@@ -819,7 +827,10 @@ impl<'a> TransformerProcessor<'a> {
             return;
         }
         for t in self.transformers.iter_mut().rev() {
-            if matches!(t.transformer_type, ColumnTransformerType::ComparerOperation(_)) {
+            if matches!(
+                t.transformer_type,
+                ColumnTransformerType::ComparerOperation(_)
+            ) {
                 t.group_closes = t.group_closes.saturating_add(1);
                 break;
             }
@@ -838,7 +849,12 @@ impl<'a> TransformerProcessor<'a> {
         let comparisons: SmallVec<[(u8, u8, Option<Next>); 24]> = self
             .transformers
             .iter()
-            .filter(|t| matches!(t.transformer_type, ColumnTransformerType::ComparerOperation(_)))
+            .filter(|t| {
+                matches!(
+                    t.transformer_type,
+                    ColumnTransformerType::ComparerOperation(_)
+                )
+            })
             .map(|t| (t.group_opens, t.group_closes, t.next.clone()))
             .collect();
 

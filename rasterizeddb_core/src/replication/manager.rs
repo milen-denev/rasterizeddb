@@ -27,7 +27,7 @@
 //! replication having to know anything about sessions or connections.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use cacheguard::CacheGuard;
@@ -383,7 +383,10 @@ impl Replication {
 
     pub fn set_active(&self, active: bool) {
         self.active.store(active, Ordering::Relaxed);
-        info!("Replication {}", if active { "enabled" } else { "disabled" });
+        info!(
+            "Replication {}",
+            if active { "enabled" } else { "disabled" }
+        );
     }
 
     #[inline]
@@ -476,7 +479,10 @@ impl Replication {
     }
 
     pub fn peers(&self) -> Vec<Arc<PeerHandle>> {
-        self.peers.iter().map(|entry| entry.value().clone()).collect()
+        self.peers
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect()
     }
 
     pub fn peer_count(&self) -> usize {
@@ -536,13 +542,16 @@ impl Replication {
         if record.tables.is_empty() {
             return false;
         }
-        record.tables.iter().all(|table| match self.table_stamp(table) {
-            None => false,
-            Some(stamp) => {
-                stamp.hlc > record.commit_hlc
-                    || (stamp.hlc == record.commit_hlc && stamp.node > record.origin)
-            }
-        })
+        record
+            .tables
+            .iter()
+            .all(|table| match self.table_stamp(table) {
+                None => false,
+                Some(stamp) => {
+                    stamp.hlc > record.commit_hlc
+                        || (stamp.hlc == record.commit_hlc && stamp.node > record.origin)
+                }
+            })
     }
 
     // -- the capture side ---------------------------------------------------
@@ -702,7 +711,12 @@ impl Replication {
         }
 
         self.stats.captured.fetch_add(1, Ordering::Relaxed);
-        debug!("Captured transaction {}:{} ({} statements)", origin, seq, record.statements.len());
+        debug!(
+            "Captured transaction {}:{} ({} statements)",
+            origin,
+            seq,
+            record.statements.len()
+        );
 
         Some(record)
     }
@@ -732,7 +746,10 @@ impl Replication {
         let waiter = (required > 0).then(|| AckWaiter::new(required));
 
         for peer in &eligible {
-            peer.enqueue(Outbound { record: record.clone(), ack: waiter.clone() });
+            peer.enqueue(Outbound {
+                record: record.clone(),
+                ack: waiter.clone(),
+            });
         }
         self.stats.published.fetch_add(1, Ordering::Relaxed);
 
@@ -771,7 +788,10 @@ impl Replication {
             if from_node != 0 && peer.remote_node() == from_node {
                 continue;
             }
-            peer.enqueue(Outbound { record: record.clone(), ack: None });
+            peer.enqueue(Outbound {
+                record: record.clone(),
+                ack: None,
+            });
         }
     }
 
@@ -801,7 +821,10 @@ mod tests {
     fn configured() -> Replication {
         let replication = Replication::new();
         replication
-            .set_config(ReplicationConfig { node_id: 1, ..Default::default() })
+            .set_config(ReplicationConfig {
+                node_id: 1,
+                ..Default::default()
+            })
             .unwrap();
         replication.open_storage(None).unwrap();
         replication.set_active(true);
@@ -824,7 +847,9 @@ mod tests {
         replication.note_statement(7, "INSERT INTO t (id) VALUES (2)", Some("t"));
         replication.note_statement(7, "UPDATE u SET x = 1", Some("u"));
 
-        let record = replication.commit_record(7).expect("three writes committed");
+        let record = replication
+            .commit_record(7)
+            .expect("three writes committed");
         assert_eq!(record.statements.len(), 3);
         assert_eq!(record.tables, vec!["t".to_string(), "u".to_string()]);
         assert_eq!(record.origin, 1);
@@ -856,7 +881,10 @@ mod tests {
         replication.note_statement(7, "INSERT INTO t (id) VALUES (1)", Some("t"));
         replication.leave_apply(7);
 
-        assert!(replication.commit_record(7).is_none(), "an echo would loop forever");
+        assert!(
+            replication.commit_record(7).is_none(),
+            "an echo would loop forever"
+        );
     }
 
     #[test]
@@ -891,8 +919,14 @@ mod tests {
         let first = replication.commit_record(1).unwrap();
         let second = replication.commit_record(2).unwrap();
 
-        assert_eq!(first.statements, vec!["INSERT INTO a (id) VALUES (1)".to_string()]);
-        assert_eq!(second.statements, vec!["INSERT INTO b (id) VALUES (2)".to_string()]);
+        assert_eq!(
+            first.statements,
+            vec!["INSERT INTO a (id) VALUES (1)".to_string()]
+        );
+        assert_eq!(
+            second.statements,
+            vec!["INSERT INTO b (id) VALUES (2)".to_string()]
+        );
     }
 
     #[test]
@@ -908,7 +942,11 @@ mod tests {
     #[test]
     fn a_node_without_an_id_is_rejected_rather_than_replicating_anonymously() {
         let replication = Replication::new();
-        assert!(replication.set_config(ReplicationConfig::default()).is_err());
+        assert!(
+            replication
+                .set_config(ReplicationConfig::default())
+                .is_err()
+        );
     }
 
     #[test]
@@ -930,7 +968,9 @@ mod tests {
         let replication = configured();
         replication
             .update_config(|config| {
-                config.peers.push(PeerConfig::new("berlin", "10.0.0.2:61171"));
+                config
+                    .peers
+                    .push(PeerConfig::new("berlin", "10.0.0.2:61171"));
                 Ok(())
             })
             .unwrap();
@@ -940,7 +980,10 @@ mod tests {
 
     /// The marker's index in `NONDETERMINISTIC`, for readable assertions.
     fn bit_of(marker: &str) -> u8 {
-        1 << NONDETERMINISTIC.iter().position(|m| *m == marker).expect("a known marker")
+        1 << NONDETERMINISTIC
+            .iter()
+            .position(|m| *m == marker)
+            .expect("a known marker")
     }
 
     #[test]
@@ -964,7 +1007,10 @@ mod tests {
     #[test]
     fn a_false_start_does_not_hide_the_match_after_it() {
         assert_ne!(scan_nondeterministic("nnow(") & bit_of("NOW("), 0);
-        assert_ne!(scan_nondeterministic("cucurrent_date") & bit_of("CURRENT_DATE"), 0);
+        assert_ne!(
+            scan_nondeterministic("cucurrent_date") & bit_of("CURRENT_DATE"),
+            0
+        );
         assert_ne!(scan_nondeterministic("ranrandom(") & bit_of("RANDOM("), 0);
     }
 
@@ -988,10 +1034,19 @@ mod tests {
             statements: vec!["UPDATE t SET x = 1".to_string()],
             tables: vec!["t".to_string()],
         };
-        let newer = TxnRecord { commit_hlc: 6_000, ..older.clone() };
+        let newer = TxnRecord {
+            commit_hlc: 6_000,
+            ..older.clone()
+        };
 
-        assert!(replication.is_superseded(&older), "the local write is later");
-        assert!(!replication.is_superseded(&newer), "the remote write is later");
+        assert!(
+            replication.is_superseded(&older),
+            "the local write is later"
+        );
+        assert!(
+            !replication.is_superseded(&newer),
+            "the remote write is later"
+        );
     }
 
     #[test]

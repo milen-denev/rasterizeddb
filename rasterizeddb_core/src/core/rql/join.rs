@@ -180,7 +180,9 @@ pub fn fetch_for(fields: &[SchemaField], schema: &SmallVec<[SchemaField; 20]>) -
             schema_id,
         });
     }
-    RowFetch { columns_fetching_data }
+    RowFetch {
+        columns_fetching_data,
+    }
 }
 
 /// Reads one column's bytes out of a scanned row.
@@ -401,12 +403,11 @@ fn apply_post_join(
         for (rel, mapping) in filter.columns.iter().enumerate() {
             for (i, write_order) in mapping.iter().enumerate() {
                 let field = &plan.relations[rel].fetch_columns[i];
-                let source = tuple
-                    .get(rel)
-                    .and_then(|r| r.as_ref())
-                    .and_then(|row| {
-                        row.columns.iter().find(|c| c.schema_id == field.write_order)
-                    });
+                let source = tuple.get(rel).and_then(|r| r.as_ref()).and_then(|row| {
+                    row.columns
+                        .iter()
+                        .find(|c| c.schema_id == field.write_order)
+                });
                 let data = source.map(|c| c.data.clone()).unwrap_or_default();
 
                 // A NULL carries through the join as a NULL. The evaluator
@@ -447,7 +448,11 @@ fn apply_post_join(
             }
         }
 
-        let row = Row { position: 0, length: 0, columns };
+        let row = Row {
+            position: 0,
+            length: 0,
+            columns,
+        };
         let mut map: SmallVec<[u8; 32]> = SmallVec::new();
         map.resize(filter.schema.len(), u8::MAX);
         for (pos, column) in row.columns.iter().enumerate() {
@@ -540,8 +545,7 @@ pub fn project(plan: &JoinPlan, combined: Vec<Combined>) -> Vec<Row> {
                         .iter()
                         .find(|f| {
                             crate::core::rql::nullable::is_hidden(&f.name)
-                                && f.name.len()
-                                    > crate::core::rql::nullable::NULL_FLAG_PREFIX.len()
+                                && f.name.len() > crate::core::rql::nullable::NULL_FLAG_PREFIX.len()
                                 && f.name[crate::core::rql::nullable::NULL_FLAG_PREFIX.len()..]
                                     .eq_ignore_ascii_case(&item.field.name)
                         })
@@ -569,7 +573,11 @@ pub fn project(plan: &JoinPlan, combined: Vec<Combined>) -> Vec<Row> {
                 },
             });
         }
-        out.push(Row { position: 0, columns, length: 0 });
+        out.push(Row {
+            position: 0,
+            columns,
+            length: 0,
+        });
     }
 
     // Sorting runs here rather than in the scan, because the order is over the
@@ -592,8 +600,16 @@ pub fn project(plan: &JoinPlan, combined: Vec<Combined>) -> Vec<Row> {
     if !sort_keys.is_empty() {
         out.sort_by(|a, b| {
             for (idx, descending, ty) in sort_keys.iter() {
-                let av = a.columns.get(*idx).map(|c| c.data.into_slice()).unwrap_or(&[]);
-                let bv = b.columns.get(*idx).map(|c| c.data.into_slice()).unwrap_or(&[]);
+                let av = a
+                    .columns
+                    .get(*idx)
+                    .map(|c| c.data.into_slice())
+                    .unwrap_or(&[]);
+                let bv = b
+                    .columns
+                    .get(*idx)
+                    .map(|c| c.data.into_slice())
+                    .unwrap_or(&[]);
                 let ord = compare_by_type(av, bv, ty);
                 let ord = if *descending { ord.reverse() } else { ord };
                 if ord != std::cmp::Ordering::Equal {
@@ -813,7 +829,10 @@ pub fn parse_from_clause(from_clause: &str) -> Result<Vec<RelationRef>, String> 
     let mut out: Vec<RelationRef> = Vec::new();
     for (kind, segment) in segments {
         let (relation_text, on_text) = match find_keyword(&segment, "ON", 0) {
-            Some(i) => (&segment[..i], Some(segment[i + "ON".len()..].trim().to_string())),
+            Some(i) => (
+                &segment[..i],
+                Some(segment[i + "ON".len()..].trim().to_string()),
+            ),
             None => (segment.as_str(), None),
         };
 
@@ -821,7 +840,9 @@ pub fn parse_from_clause(from_clause: &str) -> Result<Vec<RelationRef>, String> 
 
         let join = match (kind, on_text) {
             (None, None) => None,
-            (None, Some(_)) => return Err("the first relation cannot have an ON clause".to_string()),
+            (None, Some(_)) => {
+                return Err("the first relation cannot have an ON clause".to_string());
+            }
             (Some(JoinKind::Cross), None) => Some(RawJoin {
                 kind: JoinKind::Cross,
                 extra: Vec::new(),
@@ -833,7 +854,12 @@ pub fn parse_from_clause(from_clause: &str) -> Result<Vec<RelationRef>, String> 
             }
             (Some(kind), Some(on)) => {
                 let (l, r, extra) = split_on_condition(&on)?;
-                Some(RawJoin { kind, extra, left_qualified: l, right_qualified: r })
+                Some(RawJoin {
+                    kind,
+                    extra,
+                    left_qualified: l,
+                    right_qualified: r,
+                })
             }
         };
 
@@ -901,8 +927,8 @@ fn split_on_condition(on: &str) -> Result<(String, String, Vec<String>), String>
                 // quotes every identifier it emits. An unqualified `"Alice"`
                 // still fails the `rq.is_some()` test below and lands in
                 // `extra`, so dropping the double quote here costs nothing.
-                let rhs_is_literal = rhs.starts_with('\'')
-                    || rhs.chars().next().is_some_and(|c| c.is_ascii_digit());
+                let rhs_is_literal =
+                    rhs.starts_with('\'') || rhs.chars().next().is_some_and(|c| c.is_ascii_digit());
                 lq.is_some() && rq.is_some() && !rhs_is_literal
             }
             None => false,
@@ -931,7 +957,6 @@ fn split_on_condition(on: &str) -> Result<(String, String, Vec<String>), String>
     };
     Ok((left, right, extra))
 }
-
 
 /// What a `WHERE` conjunct on the null-supplying side of an outer join means.
 enum AntiJoin {
@@ -991,10 +1016,33 @@ fn is_constant_term(term: &str) -> bool {
     // be waved through as a constant — the error it raises is what tells an
     // operator they typed a name wrong.
     const OPERATOR_WORDS: &[&str] = &[
-        "and", "or", "not", "is", "null", "true", "false", "unknown", "like", "ilike",
-        "similar", "to", "between", "in", "escape", "collate", "distinct", "from",
-        "contains", "icontains", "startswith", "istartswith", "endswith", "iendswith",
-        "iequals", "any", "all",
+        "and",
+        "or",
+        "not",
+        "is",
+        "null",
+        "true",
+        "false",
+        "unknown",
+        "like",
+        "ilike",
+        "similar",
+        "to",
+        "between",
+        "in",
+        "escape",
+        "collate",
+        "distinct",
+        "from",
+        "contains",
+        "icontains",
+        "startswith",
+        "istartswith",
+        "endswith",
+        "iendswith",
+        "iequals",
+        "any",
+        "all",
     ];
 
     let mut quote: Option<char> = None;
@@ -1226,10 +1274,7 @@ pub fn split_conjuncts(where_clause: &str) -> Vec<String> {
                     depth = depth.saturating_sub(1);
                     i += 1;
                 }
-                _ if depth == 0
-                    && upper.as_bytes()[i..].starts_with(b" AND ")
-                    && i > start =>
-                {
+                _ if depth == 0 && upper.as_bytes()[i..].starts_with(b" AND ") && i > start => {
                     out.push(where_clause[start..i].trim().to_string());
                     i += " AND ".len();
                     start = i;
@@ -1281,9 +1326,10 @@ fn rewrite_relation_size(
         return item.to_string();
     }
 
-    let Some(idx) = relations.iter().position(|r| {
-        r.label.eq_ignore_ascii_case(arg) || r.table.eq_ignore_ascii_case(arg)
-    }) else {
+    let Some(idx) = relations
+        .iter()
+        .position(|r| r.label.eq_ignore_ascii_case(arg) || r.table.eq_ignore_ascii_case(arg))
+    else {
         return item.to_string();
     };
 
@@ -1340,9 +1386,9 @@ pub fn plan(
     let select_list = rewritten_select_list.as_str();
 
     let index_of_label = |label: &str| -> Option<usize> {
-        relations
-            .iter()
-            .position(|r| r.label.eq_ignore_ascii_case(label) || r.table.eq_ignore_ascii_case(label))
+        relations.iter().position(|r| {
+            r.label.eq_ignore_ascii_case(label) || r.table.eq_ignore_ascii_case(label)
+        })
     };
 
     // Resolves a possibly-qualified column to (relation, field). An unqualified
@@ -1359,14 +1405,20 @@ pub fn plan(
                     .iter()
                     .find(|f| f.name.eq_ignore_ascii_case(&column) && !f.is_deleted)
                     .ok_or_else(|| {
-                        format!("column '{}' not found in relation '{}'", column, relations[idx].label)
+                        format!(
+                            "column '{}' not found in relation '{}'",
+                            column, relations[idx].label
+                        )
                     })?;
                 Ok((idx, field.clone()))
             }
             None => {
                 let mut found: Option<(usize, SchemaField)> = None;
                 for (i, s) in schemas.iter().enumerate() {
-                    if let Some(f) = s.iter().find(|f| f.name.eq_ignore_ascii_case(&column) && !f.is_deleted) {
+                    if let Some(f) = s
+                        .iter()
+                        .find(|f| f.name.eq_ignore_ascii_case(&column) && !f.is_deleted)
+                    {
                         if found.is_some() {
                             return Err(format!(
                                 "column '{}' is ambiguous; qualify it with a relation name",
@@ -1422,9 +1474,9 @@ pub fn plan(
                     if let Some((func, db_type)) =
                         crate::core::rql::aggregate::ScalarFunc::parse(name)
                     {
-                        let close = expr.rfind(')').ok_or_else(|| {
-                            format!("unterminated function call in '{}'", item)
-                        })?;
+                        let close = expr
+                            .rfind(')')
+                            .ok_or_else(|| format!("unterminated function call in '{}'", item))?;
                         if !expr[open + 1..close].trim().is_empty() {
                             return Err(format!("{}() takes no arguments", name));
                         }
@@ -1486,7 +1538,13 @@ pub fn plan(
             let label = alias
                 .map(|a| a.trim_matches('"').to_string())
                 .unwrap_or_else(|| field.name.clone());
-            items.push(JoinSelectItem { rel, field, label, scalar: None, literal: None });
+            items.push(JoinSelectItem {
+                rel,
+                field,
+                label,
+                scalar: None,
+                literal: None,
+            });
         }
     }
     if items.is_empty() && aggregate_calls.is_empty() {
@@ -1626,7 +1684,11 @@ pub fn plan(
             }
         }
 
-        joins[i] = Some(JoinedRelation { kind: raw.kind, left_rel, keys });
+        joins[i] = Some(JoinedRelation {
+            kind: raw.kind,
+            left_rel,
+            keys,
+        });
     }
 
     // --- WHERE, split per relation --------------------------------------
@@ -1745,13 +1807,14 @@ pub fn plan(
         // The join's sort compares projected bytes and cannot place NULLs, so
         // a placement it cannot honour is refused rather than quietly dropped.
         if term.nulls_first.is_some() {
-            return Err(
-                "ORDER BY ... NULLS FIRST/LAST is not supported in a join yet".to_string(),
-            );
+            return Err("ORDER BY ... NULLS FIRST/LAST is not supported in a join yet".to_string());
         }
         // An output label wins over a column name, matching how a single-table
         // query resolves it.
-        if let Some(item) = items.iter().find(|i| i.label.eq_ignore_ascii_case(&term.token)) {
+        if let Some(item) = items
+            .iter()
+            .find(|i| i.label.eq_ignore_ascii_case(&term.token))
+        {
             order_keys.push((item.rel, item.field.clone(), term.descending));
         } else {
             let (rel, field) = resolve(&term.token)?;
@@ -1792,8 +1855,9 @@ pub fn plan(
         // the wrong rows.
         if let Some(j) = joins[i].as_ref() {
             for (_, right_name) in &j.keys {
-                if let Some(f) =
-                    schemas[i].iter().find(|f| f.name.eq_ignore_ascii_case(right_name) && !f.is_deleted)
+                if let Some(f) = schemas[i]
+                    .iter()
+                    .find(|f| f.name.eq_ignore_ascii_case(right_name) && !f.is_deleted)
                 {
                     push(f, &mut fetch);
                 }
@@ -1802,8 +1866,9 @@ pub fn plan(
         for j in joins.iter().flatten() {
             if j.left_rel == i {
                 for (left_name, _) in &j.keys {
-                    if let Some(f) =
-                        schemas[i].iter().find(|f| f.name.eq_ignore_ascii_case(left_name) && !f.is_deleted)
+                    if let Some(f) = schemas[i]
+                        .iter()
+                        .find(|f| f.name.eq_ignore_ascii_case(left_name) && !f.is_deleted)
                     {
                         push(f, &mut fetch);
                     }
@@ -1837,8 +1902,7 @@ pub fn plan(
         // Added after the loops above rather than inside them, so a companion
         // is fetched exactly once however many reasons there were to read the
         // column it tracks.
-        let schema_sv: smallvec::SmallVec<[SchemaField; 20]> =
-            schemas[i].iter().cloned().collect();
+        let schema_sv: smallvec::SmallVec<[SchemaField; 20]> = schemas[i].iter().cloned().collect();
         let tracked: Vec<String> = fetch
             .iter()
             .map(|f| f.name.clone())
@@ -1928,19 +1992,17 @@ fn term_names_column(term: &str, label: &str, table: &str, column: &str) -> bool
         }
     }
     // Bare mention as a whole word.
-    upper
-        .match_indices(&col)
-        .any(|(at, _)| {
-            let before_ok = at == 0
-                || !upper.as_bytes()[at - 1].is_ascii_alphanumeric()
-                    && upper.as_bytes()[at - 1] != b'_'
-                    && upper.as_bytes()[at - 1] != b'.';
-            let after = at + col.len();
-            let after_ok = after >= upper.len()
-                || !(upper.as_bytes()[after].is_ascii_alphanumeric()
-                    || upper.as_bytes()[after] == b'_');
-            before_ok && after_ok
-        })
+    upper.match_indices(&col).any(|(at, _)| {
+        let before_ok = at == 0
+            || !upper.as_bytes()[at - 1].is_ascii_alphanumeric()
+                && upper.as_bytes()[at - 1] != b'_'
+                && upper.as_bytes()[at - 1] != b'.';
+        let after = at + col.len();
+        let after_ok = after >= upper.len()
+            || !(upper.as_bytes()[after].is_ascii_alphanumeric()
+                || upper.as_bytes()[after] == b'_');
+        before_ok && after_ok
+    })
 }
 
 /// Flattens every relation's fetched columns into one synthetic schema and
@@ -1962,15 +2024,9 @@ fn build_post_join_filter(
         for field in &relation.fetch_columns {
             let write_order = schema.len() as u64;
             let name = format!("{}__{}", relation.label, field.name);
-            renames.push((
-                format!("{}.{}", relation.label, field.name),
-                name.clone(),
-            ));
+            renames.push((format!("{}.{}", relation.label, field.name), name.clone()));
             if !relation.table.eq_ignore_ascii_case(&relation.label) {
-                renames.push((
-                    format!("{}.{}", relation.table, field.name),
-                    name.clone(),
-                ));
+                renames.push((format!("{}.{}", relation.table, field.name), name.clone()));
             }
             let mut synthetic = field.clone();
             synthetic.name = name;
@@ -1985,8 +2041,7 @@ fn build_post_join_filter(
     // Longest first, so `a.bc` is not partly rewritten by a rule for `a.b`.
     renames.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
 
-    let schema_sv: smallvec::SmallVec<[SchemaField; 20]> =
-        schema.iter().cloned().collect();
+    let schema_sv: smallvec::SmallVec<[SchemaField; 20]> = schema.iter().cloned().collect();
 
     // Each term is tried against the predicate tokenizer first, and handed to
     // the expression evaluator only if that cannot read it. Splitting per term
@@ -2003,11 +2058,8 @@ fn build_post_join_filter(
 
         match crate::core::tokenizer::predicate_rewrite::rewrite_where(&rewritten, &schema_sv) {
             Ok(clause)
-                if crate::core::tokenizer::query_tokenizer::try_tokenize(
-                    &clause,
-                    &schema_sv,
-                )
-                .is_ok() =>
+                if crate::core::tokenizer::query_tokenizer::try_tokenize(&clause, &schema_sv)
+                    .is_ok() =>
             {
                 tokenizer_terms.push(clause);
             }
@@ -2022,7 +2074,12 @@ fn build_post_join_filter(
     }
 
     let where_clause = tokenizer_terms.join(" AND ");
-    Ok(PostJoinFilter { schema, where_clause, columns, expr_terms })
+    Ok(PostJoinFilter {
+        schema,
+        where_clause,
+        columns,
+        expr_terms,
+    })
 }
 
 /// Replaces a qualified name with another, matching whole identifiers only and
@@ -2049,8 +2106,8 @@ fn replace_qualified(sql: &str, from: &str, to: &str) -> String {
             continue;
         }
         if sql[i..].len() >= from.len() && sql[i..i + from.len()].eq_ignore_ascii_case(from) {
-            let before_ok = i == 0
-                || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+            let before_ok =
+                i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
             let after = i + from.len();
             let after_ok = after >= bytes.len()
                 || !(bytes[after].is_ascii_alphanumeric() || bytes[after] == b'_');
@@ -2132,11 +2189,7 @@ fn build_aggregate_stage(
 
     // Adds a column to the join's output if it is not already there, and
     // returns a field addressing it by position in the projected row.
-    fn positional(
-        rel: usize,
-        field: SchemaField,
-        items: &mut Vec<JoinSelectItem>,
-    ) -> SchemaField {
+    fn positional(rel: usize, field: SchemaField, items: &mut Vec<JoinSelectItem>) -> SchemaField {
         let pos = match items
             .iter()
             .position(|i| i.rel == rel && i.field.write_order == field.write_order)
@@ -2188,8 +2241,8 @@ fn build_aggregate_stage(
         // and the surrounding expression is evaluated once per emitted group,
         // exactly as the single-relation path does.
         let calls = crate::core::rql::lexer_query::find_aggregate_calls(expr);
-        let wrapped = !calls.is_empty()
-            && !(calls.len() == 1 && calls[0].0 == 0 && calls[0].1 == expr.len());
+        let wrapped =
+            !calls.is_empty() && !(calls.len() == 1 && calls[0].0 == 0 && calls[0].1 == expr.len());
         if wrapped {
             let mut inputs: Vec<crate::core::rql::aggregate::ComputedInput> = Vec::new();
             let mut synth_schema: Vec<SchemaField> = Vec::new();
@@ -2276,13 +2329,19 @@ fn build_aggregate_stage(
             let (rel, field) = resolve(expr)?;
             let label = alias.unwrap_or_else(|| field.name.clone());
             let synthetic = positional(rel, field, items);
-            if !group_by.iter().any(|g| g.write_order == synthetic.write_order) {
+            if !group_by
+                .iter()
+                .any(|g| g.write_order == synthetic.write_order)
+            {
                 return Err(format!(
                     "column '{}' must appear in GROUP BY or be used in an aggregate",
                     label
                 ));
             }
-            fold_items.push(SelectItem::Column { field: synthetic, label });
+            fold_items.push(SelectItem::Column {
+                field: synthetic,
+                label,
+            });
         }
     }
 
@@ -2297,7 +2356,12 @@ fn build_aggregate_stage(
                     Some(positional(rel, field, items))
                 }
             };
-            Some(Having { func, arg, op, literal })
+            Some(Having {
+                func,
+                arg,
+                op,
+                literal,
+            })
         }
     };
 
@@ -2311,9 +2375,7 @@ fn build_aggregate_stage(
             );
         }
         let label = crate::core::rql::aggregate::resolve_order_label(&term.token, &fold_items)
-            .ok_or_else(|| {
-                format!("ORDER BY term '{}' is not in the SELECT list", term.token)
-            })?;
+            .ok_or_else(|| format!("ORDER BY term '{}' is not in the SELECT list", term.token))?;
         fold_order.push((label, term.descending));
     }
 
@@ -2400,7 +2462,9 @@ fn split_expr_alias(entry: &str) -> (&str, Option<String>) {
                 }
                 // An operator is part of the expression, not a name for it.
                 Some(w)
-                    if w.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') =>
+                    if w.chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_') =>
                 {
                     Some(w.trim_matches('"').to_string())
                 }
@@ -2452,7 +2516,10 @@ fn split_having(
         op_end += 1;
     }
     let op = HavingOp::parse(&text[op_at..op_end]).ok_or_else(|| {
-        format!("unknown comparison operator in HAVING: '{}'", &text[op_at..op_end])
+        format!(
+            "unknown comparison operator in HAVING: '{}'",
+            &text[op_at..op_end]
+        )
     })?;
 
     let lhs = text[..op_at].trim();
@@ -2470,7 +2537,11 @@ fn split_having(
     let func = AggFunc::parse(lhs[..open].trim())
         .ok_or_else(|| format!("function '{}' is not supported yet", lhs[..open].trim()))?;
     let arg_text = lhs[open + 1..close].trim();
-    let arg = if arg_text == "*" { None } else { Some(arg_text.to_string()) };
+    let arg = if arg_text == "*" {
+        None
+    } else {
+        Some(arg_text.to_string())
+    };
 
     Ok((func, arg, op, literal))
 }
@@ -2481,7 +2552,9 @@ pub fn statement_has_join(sql: &str) -> bool {
     // Whole-word matching, or a statement formatted across lines is not seen as
     // a join at all and goes to the single-table path — which then reports
     // "JOIN is not supported yet" about a join the engine does support.
-    let Some(from) = find_keyword(sql, "FROM", 0) else { return false };
+    let Some(from) = find_keyword(sql, "FROM", 0) else {
+        return false;
+    };
     let start = from + "FROM".len();
     let end = ["WHERE", "ORDER", "LIMIT", "OFFSET", "GROUP", "HAVING"]
         .iter()
@@ -2508,10 +2581,12 @@ pub fn plan_statement(
     if !upper.trim_start().starts_with("SELECT") {
         return Err("Not a SELECT query".to_string());
     }
-    let from_at = find_keyword(sql, "FROM", 0)
-        .ok_or_else(|| "Missing FROM in SELECT query".to_string())?;
+    let from_at =
+        find_keyword(sql, "FROM", 0).ok_or_else(|| "Missing FROM in SELECT query".to_string())?;
 
-    let select_start = find_keyword(sql, "SELECT", 0).map(|i| i + "SELECT".len()).unwrap_or(0);
+    let select_start = find_keyword(sql, "SELECT", 0)
+        .map(|i| i + "SELECT".len())
+        .unwrap_or(0);
     let mut select_list = sql[select_start..from_at].trim();
     let mut distinct = false;
     if let Some(rest) = strip_keyword_prefix(select_list, "DISTINCT") {
@@ -2564,7 +2639,11 @@ pub fn plan_statement(
             .min()
             .unwrap_or(after_from.len());
         let clause = after_from[start..end].trim_start();
-        clause.strip_prefix("BY").or_else(|| clause.strip_prefix("by")).unwrap_or(clause).trim()
+        clause
+            .strip_prefix("BY")
+            .or_else(|| clause.strip_prefix("by"))
+            .unwrap_or(clause)
+            .trim()
     });
 
     let having_clause = having_at.map(|h| {
@@ -2590,7 +2669,10 @@ pub fn plan_statement(
                 .min()
                 .unwrap_or(after_from.len());
             let clause = after_from[start..end].trim_start();
-            let clause = clause.strip_prefix("BY").or_else(|| clause.strip_prefix("by")).unwrap_or(clause);
+            let clause = clause
+                .strip_prefix("BY")
+                .or_else(|| clause.strip_prefix("by"))
+                .unwrap_or(clause);
             crate::core::rql::order_by::parse(clause)?
         }
     };
@@ -2598,7 +2680,11 @@ pub fn plan_statement(
     let parse_count = |at: Option<usize>, kw: &str| -> Result<Option<u64>, String> {
         let Some(p) = at else { return Ok(None) };
         let start = p + kw.len();
-        let token = after_from[start..].trim().split_whitespace().next().unwrap_or("");
+        let token = after_from[start..]
+            .trim()
+            .split_whitespace()
+            .next()
+            .unwrap_or("");
         token
             .parse::<u64>()
             .map(Some)
@@ -2631,7 +2717,8 @@ fn relations_referenced(
 ) -> Vec<usize> {
     let mut hits: Vec<usize> = Vec::new();
 
-    for token in conjunct.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.' || c == '"'))
+    for token in
+        conjunct.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.' || c == '"'))
     {
         let token = token.trim_matches('"');
         if token.is_empty() {
@@ -2643,7 +2730,9 @@ fn relations_referenced(
                 if let Some(i) = relations.iter().position(|r| {
                     r.label.eq_ignore_ascii_case(&q) || r.table.eq_ignore_ascii_case(&q)
                 }) {
-                    if schemas[i].iter().any(|f| f.name.eq_ignore_ascii_case(&column))
+                    if schemas[i]
+                        .iter()
+                        .any(|f| f.name.eq_ignore_ascii_case(&column))
                         && !hits.contains(&i)
                     {
                         hits.push(i);
@@ -2652,7 +2741,8 @@ fn relations_referenced(
             }
             None => {
                 for (i, s) in schemas.iter().enumerate() {
-                    if s.iter().any(|f| f.name.eq_ignore_ascii_case(&column)) && !hits.contains(&i) {
+                    if s.iter().any(|f| f.name.eq_ignore_ascii_case(&column)) && !hits.contains(&i)
+                    {
                         hits.push(i);
                     }
                 }
@@ -2710,7 +2800,14 @@ mod tests {
     use crate::memory_pool::MEMORY_POOL;
 
     fn field(name: &str, ty: DbType, write_order: u64) -> SchemaField {
-        SchemaField::new(name.to_string(), ty.clone(), ty.get_size(), 0, write_order, false)
+        SchemaField::new(
+            name.to_string(),
+            ty.clone(),
+            ty.get_size(),
+            0,
+            write_order,
+            false,
+        )
     }
 
     fn mb(bytes: &[u8]) -> crate::memory_pool::MemoryBlock {
@@ -2728,7 +2825,11 @@ mod tests {
                 column_type: ty.clone(),
             });
         }
-        Row { position: 0, columns, length: 0 }
+        Row {
+            position: 0,
+            columns,
+            length: 0,
+        }
     }
 
     /// users(id, name, domain_id) joined to domain(id, name).
@@ -2763,8 +2864,20 @@ mod tests {
                 },
             ],
             items: vec![
-                JoinSelectItem { rel: 0, field: u_name, label: "name".into(), scalar: None, literal: None },
-                JoinSelectItem { rel: 1, field: d_name, label: "domain".into(), scalar: None, literal: None },
+                JoinSelectItem {
+                    rel: 0,
+                    field: u_name,
+                    label: "name".into(),
+                    scalar: None,
+                    literal: None,
+                },
+                JoinSelectItem {
+                    rel: 1,
+                    field: d_name,
+                    label: "domain".into(),
+                    scalar: None,
+                    literal: None,
+                },
             ],
             order_by: Vec::new(),
             limit: None,
@@ -2777,9 +2890,21 @@ mod tests {
 
     fn users() -> Vec<Row> {
         vec![
-            row(&[(0, DbType::STRING, b"u1"), (1, DbType::STRING, b"Alice"), (2, DbType::STRING, b"d1")]),
-            row(&[(0, DbType::STRING, b"u2"), (1, DbType::STRING, b"Bob"), (2, DbType::STRING, b"d1")]),
-            row(&[(0, DbType::STRING, b"u3"), (1, DbType::STRING, b"Carol"), (2, DbType::STRING, b"d2")]),
+            row(&[
+                (0, DbType::STRING, b"u1"),
+                (1, DbType::STRING, b"Alice"),
+                (2, DbType::STRING, b"d1"),
+            ]),
+            row(&[
+                (0, DbType::STRING, b"u2"),
+                (1, DbType::STRING, b"Bob"),
+                (2, DbType::STRING, b"d1"),
+            ]),
+            row(&[
+                (0, DbType::STRING, b"u3"),
+                (1, DbType::STRING, b"Carol"),
+                (2, DbType::STRING, b"d2"),
+            ]),
         ]
     }
 
@@ -2806,7 +2931,10 @@ mod tests {
     fn inner_join_pairs_rows_on_the_key() {
         let plan = two_relation_plan(JoinKind::Inner);
         let out = project(&plan, combine(&plan, &[users(), domains()]).expect("join"));
-        assert_eq!(rendered(&out), vec!["Alice|Acme", "Bob|Acme", "Carol|Globex"]);
+        assert_eq!(
+            rendered(&out),
+            vec!["Alice|Acme", "Bob|Acme", "Carol|Globex"]
+        );
     }
 
     #[test]
@@ -2814,7 +2942,10 @@ mod tests {
         let plan = two_relation_plan(JoinKind::Inner);
         // Only d2 exists, so Alice and Bob have nothing to join to.
         let only_globex = vec![domains()[1].clone()];
-        let out = project(&plan, combine(&plan, &[users(), only_globex]).expect("join"));
+        let out = project(
+            &plan,
+            combine(&plan, &[users(), only_globex]).expect("join"),
+        );
         assert_eq!(rendered(&out), vec!["Carol|Globex"]);
     }
 
@@ -2822,7 +2953,10 @@ mod tests {
     fn left_join_keeps_unmatched_rows_with_an_empty_right_side() {
         let plan = two_relation_plan(JoinKind::Left);
         let only_globex = vec![domains()[1].clone()];
-        let out = project(&plan, combine(&plan, &[users(), only_globex]).expect("join"));
+        let out = project(
+            &plan,
+            combine(&plan, &[users(), only_globex]).expect("join"),
+        );
         assert_eq!(rendered(&out), vec!["Alice|", "Bob|", "Carol|Globex"]);
     }
 
@@ -2833,7 +2967,10 @@ mod tests {
         let plan = two_relation_plan(JoinKind::Inner);
         let mut ds = domains();
         // A second domain sharing d1's key.
-        ds.push(row(&[(0, DbType::STRING, b"d1"), (1, DbType::STRING, b"Acme Two")]));
+        ds.push(row(&[
+            (0, DbType::STRING, b"d1"),
+            (1, DbType::STRING, b"Acme Two"),
+        ]));
         let out = project(&plan, combine(&plan, &[users(), ds]).expect("join"));
         assert_eq!(out.len(), 5, "Alice and Bob each match two rows");
     }
@@ -2844,7 +2981,10 @@ mod tests {
         let name = plan.relations[0].fetch_columns[1].clone();
         plan.order_by = vec![(0, name, true)];
         let out = project(&plan, combine(&plan, &[users(), domains()]).expect("join"));
-        assert_eq!(rendered(&out), vec!["Carol|Globex", "Bob|Acme", "Alice|Acme"]);
+        assert_eq!(
+            rendered(&out),
+            vec!["Carol|Globex", "Bob|Acme", "Alice|Acme"]
+        );
     }
 
     /// The second key decides the order within a tie on the first.
@@ -2857,7 +2997,10 @@ mod tests {
         // and Bob tie on Acme, so only the second key separates them.
         plan.order_by = vec![(1, domain, false), (0, name, true)];
         let out = project(&plan, combine(&plan, &[users(), domains()]).expect("join"));
-        assert_eq!(rendered(&out), vec!["Bob|Acme", "Alice|Acme", "Carol|Globex"]);
+        assert_eq!(
+            rendered(&out),
+            vec!["Bob|Acme", "Alice|Acme", "Carol|Globex"]
+        );
     }
 
     #[test]
@@ -2874,7 +3017,10 @@ mod tests {
     #[test]
     fn an_empty_left_side_yields_no_rows() {
         let plan = two_relation_plan(JoinKind::Inner);
-        let out = project(&plan, combine(&plan, &[Vec::new(), domains()]).expect("join"));
+        let out = project(
+            &plan,
+            combine(&plan, &[Vec::new(), domains()]).expect("join"),
+        );
         assert!(out.is_empty());
     }
 
@@ -2916,7 +3062,11 @@ mod quoted_join_keys {
             split_on_condition(r#""u"."did" = "d"."id" AND "d"."nm" = 'x'"#).expect("quoted");
         let (l2, r2, e2) = split_on_condition("u.did = d.id AND d.nm = 'x'").expect("bare");
 
-        assert_eq!(e1.len(), 1, "the literal comparison is an extra, not the key");
+        assert_eq!(
+            e1.len(),
+            1,
+            "the literal comparison is an extra, not the key"
+        );
         assert_eq!(e2.len(), 1);
         assert!(l1.contains("did") && r1.contains("id"));
         assert!(l2.contains("did") && r2.contains("id"));
@@ -2931,7 +3081,12 @@ mod quoted_join_keys {
         let (left, right, extra) =
             split_on_condition(r#""d"."nm" = 'admin' AND "u"."did" = "d"."id""#)
                 .expect("literal first");
-        assert!(left.contains("did") && right.contains("id"), "{} = {}", left, right);
+        assert!(
+            left.contains("did") && right.contains("id"),
+            "{} = {}",
+            left,
+            right
+        );
         assert_eq!(extra.len(), 1);
         assert!(extra[0].contains("'admin'"));
 
@@ -2940,7 +3095,12 @@ mod quoted_join_keys {
         // key at all, which the planner turns into a filtered cross join for an
         // inner join and refuses for an outer one.
         let (l, r, extra) = split_on_condition(r#""d"."nm" = "Alice""#).unwrap();
-        assert!(l.is_empty() && r.is_empty(), "must not become a key: {} = {}", l, r);
+        assert!(
+            l.is_empty() && r.is_empty(),
+            "must not become a key: {} = {}",
+            l,
+            r
+        );
         assert_eq!(extra.len(), 1);
     }
 }
@@ -2962,7 +3122,11 @@ mod relation_size_tests {
         }];
         let schemas = vec![smallvec::smallvec![field("id", 4, 0), field("n", 8, 1)]];
         assert_eq!(
-            rewrite_relation_size("COALESCE(SUM(pg_column_size(c)), 0) AS total_bytes", &relations, &schemas),
+            rewrite_relation_size(
+                "COALESCE(SUM(pg_column_size(c)), 0) AS total_bytes",
+                &relations,
+                &schemas
+            ),
             "COALESCE(COUNT(*) * 12, 0) AS total_bytes"
         );
     }

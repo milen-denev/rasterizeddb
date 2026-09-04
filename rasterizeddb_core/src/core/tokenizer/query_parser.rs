@@ -5,9 +5,11 @@ use std::collections::HashMap;
 use super::query_tokenizer::{Token, numeric_to_mb, numeric_value_to_db_type, str_to_mb, tokenize};
 
 use crate::core::db_type::DbType;
-use crate::core::processor::transformer::{ComparerOperation, ComparisonOperand, MathOperation, Next, TransformerProcessor};
+use crate::core::processor::transformer::{
+    ComparerOperation, ComparisonOperand, MathOperation, Next, TransformerProcessor,
+};
 use crate::core::row::schema::SchemaField;
-use crate::memory_pool::{MemoryBlock, MEMORY_POOL};
+use crate::memory_pool::{MEMORY_POOL, MemoryBlock};
 
 pub struct QueryParser<'a, 'b> {
     toks: &'a SmallVec<[Token; 36]>,
@@ -54,7 +56,8 @@ impl<'a, 'b> QueryParser<'a, 'b> {
             }
             if let Some(scale) = field.scale {
                 if scale != crate::core::value_codec::DECIMAL_SCALE {
-                    self.decimal_scales.push((field.write_order as usize, scale));
+                    self.decimal_scales
+                        .push((field.write_order as usize, scale));
                 }
             }
         }
@@ -286,9 +289,16 @@ impl<'a, 'b> QueryParser<'a, 'b> {
         const CMP_OPS: [&str; 7] = ["=", "!=", "<>", ">", ">=", "<", "<="];
         const LOGIC_KWS: [&str; 2] = ["AND", "OR"];
         const TEXT_CMPS: [&str; 10] = [
-            "CONTAINS", "STARTSWITH", "ENDSWITH",
-            "ICONTAINS", "ISTARTSWITH", "IENDSWITH", "IEQUALS",
-            "LIKE", "ILIKE", "SIMILARTO",
+            "CONTAINS",
+            "STARTSWITH",
+            "ENDSWITH",
+            "ICONTAINS",
+            "ISTARTSWITH",
+            "IENDSWITH",
+            "IEQUALS",
+            "LIKE",
+            "ILIKE",
+            "SIMILARTO",
         ];
 
         let toks_len = self.toks.len();
@@ -420,9 +430,8 @@ impl<'a, 'b> QueryParser<'a, 'b> {
                 {
                     match std::str::from_utf8(literal.into_slice())
                         .ok()
-                        .and_then(|text| {
-                            crate::core::value_codec::encode_literal(&left_type, text)
-                        }) {
+                        .and_then(|text| crate::core::value_codec::encode_literal(&left_type, text))
+                    {
                         Some(bytes) => {
                             let mut mb = MEMORY_POOL.acquire(bytes.len());
                             mb.into_slice_mut().copy_from_slice(&bytes);
@@ -534,12 +543,7 @@ impl<'a, 'b> QueryParser<'a, 'b> {
             to: &DbType,
         ) -> Result<MemoryBlock, String> {
             let bytes = crate::core::value_codec::coerce_literal(literal.into_slice(), from, to)
-                .ok_or_else(|| {
-                    format!(
-                        "literal cannot be compared against a {} column",
-                        to
-                    )
-                })?;
+                .ok_or_else(|| format!("literal cannot be compared against a {} column", to))?;
             let mut mb = MEMORY_POOL.acquire(bytes.len());
             mb.into_slice_mut().copy_from_slice(&bytes);
             Ok(mb)
@@ -620,7 +624,11 @@ impl<'a, 'b> QueryParser<'a, 'b> {
                     DbType::DATETIME,
                 ),
                 _ => (
-                    if adding { MathOperation::Add } else { MathOperation::Subtract },
+                    if adding {
+                        MathOperation::Add
+                    } else {
+                        MathOperation::Subtract
+                    },
                     lhs_type.clone(),
                 ),
             };
@@ -735,7 +743,11 @@ impl<'a, 'b> QueryParser<'a, 'b> {
             // A path into a document. The index is the *document* column's —
             // that is what the row has to fetch — and the transformer takes the
             // path from its bytes each row.
-            Token::JsonPath { write_order, steps, as_text } => {
+            Token::JsonPath {
+                write_order,
+                steps,
+                as_text,
+            } => {
                 let idx = write_order as usize;
                 if idx >= cols.len() {
                     return Err(format!(
@@ -801,10 +813,10 @@ impl<'a, 'b> QueryParser<'a, 'b> {
                                             target,
                                         ))
                                     }
-                                    _ => Err(
-                                        "a `::` cast over this expression is not supported yet"
-                                            .to_string(),
-                                    ),
+                                    _ => {
+                                        Err("a `::` cast over this expression is not supported yet"
+                                            .to_string())
+                                    }
                                 }
                             }
                         }
@@ -878,7 +890,7 @@ mod tests {
     use crate::core::processor::transformer::{ColumnTransformer, Next, TransformerProcessor};
     use crate::core::row::schema::SchemaField;
     use crate::core::tokenizer::query_parser::QueryParser;
-    use crate::core::tokenizer::query_tokenizer::{tokenize, NumericValue, Token};
+    use crate::core::tokenizer::query_tokenizer::{NumericValue, Token, tokenize};
     use crate::memory_pool::{MEMORY_POOL, MemoryBlock};
 
     // Buffer structure for tests
@@ -1575,10 +1587,7 @@ mod tests {
             _ => panic!("Expected op"),
         }
         match &tokens[2] {
-            Token::Number(n) => assert_eq!(
-                *n,
-                NumericValue::U8(30)
-            ),
+            Token::Number(n) => assert_eq!(*n, NumericValue::U8(30)),
             _ => panic!("Expected num"),
         }
         match &tokens[3] {

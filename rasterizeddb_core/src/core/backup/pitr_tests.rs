@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use crate::core::wal::{file_id_for_name, Wal, SEGMENT_SUFFIX};
+use crate::core::wal::{SEGMENT_SUFFIX, Wal, file_id_for_name};
 
 /// Applies one committed write through the log, as an append would.
 fn commit_write(wal: &Wal, file_id: u64, offset: u64, bytes: &[u8]) {
@@ -34,7 +34,10 @@ fn concatenate_staged(staging: &Path, out: &Path) -> u32 {
     let mut sink = std::fs::File::create(out).unwrap();
     for path in &staged {
         let mut bytes = Vec::new();
-        std::fs::File::open(path).unwrap().read_to_end(&mut bytes).unwrap();
+        std::fs::File::open(path)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
         sink.write_all(&bytes).unwrap();
     }
     staged.len() as u32
@@ -59,7 +62,11 @@ fn a_checkpoint_stages_the_log_instead_of_losing_it() {
     wal.checkpoint().unwrap();
 
     let staged: Vec<_> = std::fs::read_dir(&staging).unwrap().flatten().collect();
-    assert_eq!(staged.len(), 1, "the checkpoint should have cut one segment");
+    assert_eq!(
+        staged.len(),
+        1,
+        "the checkpoint should have cut one segment"
+    );
     assert!(
         staged[0].metadata().unwrap().len() > 0,
         "a staged segment must carry the records the checkpoint discarded"
@@ -81,7 +88,9 @@ fn an_empty_log_is_not_staged() {
 
     // Staging an empty segment would cost an upload and a manifest rewrite to
     // say that nothing happened.
-    let staged = std::fs::read_dir(&staging).map(|d| d.flatten().count()).unwrap_or(0);
+    let staged = std::fs::read_dir(&staging)
+        .map(|d| d.flatten().count())
+        .unwrap_or(0);
     assert_eq!(staged, 0);
 }
 
@@ -120,15 +129,21 @@ fn a_declined_checkpoint_stages_nothing_and_still_reports_success() {
     assert!(before > 0);
 
     // Reports success, and does nothing.
-    wal.checkpoint().expect("a declined checkpoint still reports Ok");
+    wal.checkpoint()
+        .expect("a declined checkpoint still reports Ok");
 
     assert_eq!(
         wal.bytes_since_checkpoint(),
         before,
         "a declined checkpoint must not have truncated the log"
     );
-    let staged = std::fs::read_dir(&staging).map(|d| d.flatten().count()).unwrap_or(0);
-    assert_eq!(staged, 0, "a declined checkpoint must not have staged a segment");
+    let staged = std::fs::read_dir(&staging)
+        .map(|d| d.flatten().count())
+        .unwrap_or(0);
+    assert_eq!(
+        staged, 0,
+        "a declined checkpoint must not have staged a segment"
+    );
 
     // Once the transaction ends, the same call does the work.
     wal.commit_txn(pending).unwrap();
@@ -168,8 +183,7 @@ fn replaying_archived_segments_reconstructs_the_file() {
     std::fs::create_dir_all(&target).unwrap();
     let resolver = resolver_for(&target, &["rows.db"]);
 
-    let stats =
-        Wal::recover_upto(&replay, |file| resolver.get(&file).cloned(), None).unwrap();
+    let stats = Wal::recover_upto(&replay, |file| resolver.get(&file).cloned(), None).unwrap();
     assert_eq!(stats.applied, 6);
 
     let restored = std::fs::read(target.join("rows.db")).unwrap();
@@ -200,8 +214,7 @@ fn recovery_stops_exactly_at_the_requested_commit() {
     std::fs::create_dir_all(&target).unwrap();
     let resolver = resolver_for(&target, &["rows.db"]);
 
-    let stats =
-        Wal::recover_upto(&replay, |file| resolver.get(&file).cloned(), Some(4)).unwrap();
+    let stats = Wal::recover_upto(&replay, |file| resolver.get(&file).cloned(), Some(4)).unwrap();
     assert_eq!(stats.applied, 4);
     assert_eq!(
         stats.rolled_back, 2,
@@ -239,8 +252,7 @@ fn a_transaction_split_across_a_checkpoint_survives_concatenation() {
     std::fs::create_dir_all(&target).unwrap();
     let resolver = resolver_for(&target, &["rows.db"]);
 
-    let stats =
-        Wal::recover_upto(&replay, |file| resolver.get(&file).cloned(), None).unwrap();
+    let stats = Wal::recover_upto(&replay, |file| resolver.get(&file).cloned(), None).unwrap();
     assert_eq!(stats.applied, 1);
     assert_eq!(std::fs::read(target.join("rows.db")).unwrap(), b"WXYZ");
 }
@@ -275,7 +287,10 @@ fn a_fuzzy_copy_is_made_consistent_by_replay() {
     for i in 1..4u8 {
         let offset = i as u64 * 8;
         commit_write(&wal, id, offset, &[i; 8]);
-        let mut data = std::fs::OpenOptions::new().write(true).open(&data_path).unwrap();
+        let mut data = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&data_path)
+            .unwrap();
         use std::io::Seek;
         data.seek(std::io::SeekFrom::Start(offset)).unwrap();
         data.write_all(&[i; 8]).unwrap();
@@ -373,7 +388,10 @@ fn the_archive_survives_a_compression_round_trip() {
 
     assert_eq!(entries.len(), 3);
     assert_eq!(std::fs::read(target.join("rows.db")).unwrap(), repetitive);
-    assert_eq!(std::fs::read(target.join("schema.db")).unwrap(), b"schema bytes");
+    assert_eq!(
+        std::fs::read(target.join("schema.db")).unwrap(),
+        b"schema bytes"
+    );
     assert_eq!(std::fs::read(target.join("empty.db")).unwrap().len(), 0);
 }
 
@@ -421,8 +439,7 @@ fn a_torn_tail_does_not_inflate_the_reported_range() {
     bytes[midpoint] ^= 0xff;
 
     let (_, last, _) = crate::core::wal::scan_commit_range(&bytes);
-    let (_, clean_last, _) =
-        crate::core::wal::scan_commit_range(&std::fs::read(&replay).unwrap());
+    let (_, clean_last, _) = crate::core::wal::scan_commit_range(&std::fs::read(&replay).unwrap());
     assert!(
         last < clean_last,
         "a corrupt record must truncate the range, got {last} against {clean_last}"

@@ -50,9 +50,9 @@ use dashmap::DashMap;
 use log::{info, warn};
 use rclite::Arc;
 
-use crate::core::database::Database;
 #[cfg(test)]
 use crate::core::database::DEFAULT_DATABASE_NAME;
+use crate::core::database::Database;
 
 /// The file every database has, used to tell a database directory apart from
 /// whatever else an operator has left in the root.
@@ -159,8 +159,7 @@ impl DatabaseCatalog {
         if let Some(root) = root {
             for name in discover_databases(root, default_name).await {
                 let path = std::path::Path::new(root).join(&name);
-                let database =
-                    Database::new_named(&path.to_string_lossy(), false, &name).await;
+                let database = Database::new_named(&path.to_string_lossy(), false, &name).await;
                 databases.insert(name, Entry::new(Arc::new(database)));
             }
         }
@@ -193,7 +192,11 @@ impl DatabaseCatalog {
         let name = database.name.clone();
         let databases = DashMap::with_hasher(ahash::RandomState::new());
         databases.insert(name.clone(), Entry::new(database));
-        Arc::new(Self { databases, root: None, default_name: name })
+        Arc::new(Self {
+            databases,
+            root: None,
+            default_name: name,
+        })
     }
 
     /// What `SHOW DATABASES` reports, ordered by name.
@@ -229,8 +232,7 @@ impl DatabaseCatalog {
 
     /// Every name, sorted, so output is stable between calls.
     pub fn names(&self) -> Vec<String> {
-        let mut names: Vec<String> =
-            self.databases.iter().map(|e| e.key().clone()).collect();
+        let mut names: Vec<String> = self.databases.iter().map(|e| e.key().clone()).collect();
         names.sort();
         names
     }
@@ -267,7 +269,9 @@ impl DatabaseCatalog {
     pub fn begin_loading(&self, name: &str) -> Option<LoadingGuard> {
         let entry = self.databases.get(name)?;
         entry.loading.store(true, Ordering::Release);
-        Some(LoadingGuard { loading: entry.loading.clone() })
+        Some(LoadingGuard {
+            loading: entry.loading.clone(),
+        })
     }
 
     /// Creates a database and opens it.
@@ -297,7 +301,6 @@ impl DatabaseCatalog {
             None => Database::new_named("", true, name).await,
         };
 
-
         let database = Arc::new(database);
 
         // Between the check above and here another connection may have created
@@ -316,12 +319,18 @@ impl DatabaseCatalog {
         // database exists and holds data either way, and reporting the create
         // as failed would be a worse description of what happened than saying
         // its accounts did not come across.
-        if let Some(default) = self.databases.get(&self.default_name).map(|e| e.database.clone()) {
+        if let Some(default) = self
+            .databases
+            .get(&self.default_name)
+            .map(|e| e.database.clone())
+        {
             if let Err(e) = crate::auth::copy_role_catalogue(&default, &database).await {
                 log::error!(
                     "Database \"{}\" was created but its roles could not be carried over from \
                      \"{}\" ({}); no account will be able to connect to it until one is created",
-                    name, self.default_name, e
+                    name,
+                    self.default_name,
+                    e
                 );
             }
         }
@@ -485,8 +494,14 @@ pub fn validate_name(name: &str) -> Result<(), String> {
 /// A parsed `CREATE DATABASE`, `DROP DATABASE` or `SHOW DATABASES` statement.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DatabaseStatement {
-    Create { name: String, if_not_exists: bool },
-    Drop { name: String, if_exists: bool },
+    Create {
+        name: String,
+        if_not_exists: bool,
+    },
+    Drop {
+        name: String,
+        if_exists: bool,
+    },
     /// Lists what the catalogue holds. It belongs here rather than with the
     /// rest of the introspection surface because the executor is handed one
     /// database and the catalogue is above it.
@@ -560,7 +575,10 @@ pub fn parse_database_statement(sql: &str) -> Option<Result<DatabaseStatement, S
                     tokens[index + 1]
                 )));
             }
-            Some(Ok(DatabaseStatement::Create { name, if_not_exists }))
+            Some(Ok(DatabaseStatement::Create {
+                name,
+                if_not_exists,
+            }))
         }
         "DROP" => {
             let if_exists = upper.contains("IF EXISTS");
@@ -608,24 +626,44 @@ mod tests {
     #[test]
     fn an_unquoted_name_folds_and_a_quoted_one_does_not() {
         assert_eq!(
-            parse_database_statement("CREATE DATABASE Analytics").unwrap().unwrap(),
-            DatabaseStatement::Create { name: "analytics".to_string(), if_not_exists: false }
+            parse_database_statement("CREATE DATABASE Analytics")
+                .unwrap()
+                .unwrap(),
+            DatabaseStatement::Create {
+                name: "analytics".to_string(),
+                if_not_exists: false
+            }
         );
         assert_eq!(
-            parse_database_statement("CREATE DATABASE \"Analytics\"").unwrap().unwrap(),
-            DatabaseStatement::Create { name: "Analytics".to_string(), if_not_exists: false }
+            parse_database_statement("CREATE DATABASE \"Analytics\"")
+                .unwrap()
+                .unwrap(),
+            DatabaseStatement::Create {
+                name: "Analytics".to_string(),
+                if_not_exists: false
+            }
         );
     }
 
     #[test]
     fn if_exists_shifts_the_name() {
         assert_eq!(
-            parse_database_statement("DROP DATABASE IF EXISTS staging").unwrap().unwrap(),
-            DatabaseStatement::Drop { name: "staging".to_string(), if_exists: true }
+            parse_database_statement("DROP DATABASE IF EXISTS staging")
+                .unwrap()
+                .unwrap(),
+            DatabaseStatement::Drop {
+                name: "staging".to_string(),
+                if_exists: true
+            }
         );
         assert_eq!(
-            parse_database_statement("CREATE DATABASE IF NOT EXISTS staging").unwrap().unwrap(),
-            DatabaseStatement::Create { name: "staging".to_string(), if_not_exists: true }
+            parse_database_statement("CREATE DATABASE IF NOT EXISTS staging")
+                .unwrap()
+                .unwrap(),
+            DatabaseStatement::Create {
+                name: "staging".to_string(),
+                if_not_exists: true
+            }
         );
     }
 
@@ -640,7 +678,12 @@ mod tests {
 
     #[test]
     fn other_statements_are_not_claimed() {
-        for sql in ["SELECT 1", "CREATE TABLE t (id INT)", "DROP TABLE t", "CREATE USER bob"] {
+        for sql in [
+            "SELECT 1",
+            "CREATE TABLE t (id INT)",
+            "DROP TABLE t",
+            "CREATE USER bob",
+        ] {
             assert!(parse_database_statement(sql).is_none(), "claimed {:?}", sql);
         }
     }
@@ -648,7 +691,9 @@ mod tests {
     #[tokio::test]
     async fn an_in_memory_catalogue_creates_and_drops() {
         init_globals();
-        let catalogue = DatabaseCatalog::open(None, DEFAULT_DATABASE_NAME).await.unwrap();
+        let catalogue = DatabaseCatalog::open(None, DEFAULT_DATABASE_NAME)
+            .await
+            .unwrap();
         assert_eq!(catalogue.names(), vec![DEFAULT_DATABASE_NAME.to_string()]);
 
         catalogue.create("analytics").await.unwrap();
@@ -665,7 +710,9 @@ mod tests {
     #[tokio::test]
     async fn the_default_database_cannot_be_dropped() {
         init_globals();
-        let catalogue = DatabaseCatalog::open(None, DEFAULT_DATABASE_NAME).await.unwrap();
+        let catalogue = DatabaseCatalog::open(None, DEFAULT_DATABASE_NAME)
+            .await
+            .unwrap();
         assert!(
             catalogue
                 .drop_database(DEFAULT_DATABASE_NAME, "other")
@@ -677,10 +724,14 @@ mod tests {
     #[tokio::test]
     async fn an_attached_session_holds_a_database_open() {
         init_globals();
-        let catalogue = DatabaseCatalog::open(None, DEFAULT_DATABASE_NAME).await.unwrap();
+        let catalogue = DatabaseCatalog::open(None, DEFAULT_DATABASE_NAME)
+            .await
+            .unwrap();
         catalogue.create("staging").await.unwrap();
 
-        let guard = catalogue.connect("staging").expect("staging should be connectable");
+        let guard = catalogue
+            .connect("staging")
+            .expect("staging should be connectable");
         let err = catalogue
             .drop_database("staging", DEFAULT_DATABASE_NAME)
             .await
@@ -738,7 +789,11 @@ mod role_seeding_tests {
 
         // A role the default does not have is still absent, so this is a copy
         // rather than a blanket accept.
-        assert!(crate::auth::lookup_role(&made, "someone_else").await.is_none());
+        assert!(
+            crate::auth::lookup_role(&made, "someone_else")
+                .await
+                .is_none()
+        );
     }
 
     /// Trust authentication keeps no catalogue, so there is nothing to carry
@@ -771,7 +826,10 @@ mod loading_tests {
             .expect("in-memory catalogue");
         catalog.create("loading_db").await.expect("create");
 
-        assert!(!catalog.is_loading("loading_db"), "not loading before it starts");
+        assert!(
+            !catalog.is_loading("loading_db"),
+            "not loading before it starts"
+        );
 
         let guard = catalog.begin_loading("loading_db").expect("guard");
         assert!(catalog.is_loading("loading_db"));

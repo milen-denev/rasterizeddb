@@ -1,7 +1,12 @@
 use std::{
-    cmp::min, fs::{self, remove_file}, path::Path, sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering}, Arc
-    }, usize
+    cmp::min,
+    fs::{self, remove_file},
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    usize,
 };
 
 use std::cell::RefCell;
@@ -11,9 +16,9 @@ use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use arc_swap::ArcSwap;
 use cacheguard::CacheGuard;
 use log::error;
+use opool::{Pool, PoolAllocator};
 use parking_lot::{Mutex, RwLock};
 use rclite::Arc as RcArc;
-use opool::{Pool, PoolAllocator};
 use std::sync::OnceLock;
 use tokio::task::yield_now;
 
@@ -238,8 +243,10 @@ impl Clone for LocalStorageProvider {
             temp_mem: RwLock::new(self.temp_mem.read().clone()),
             temp_mem_len: AtomicU64::new(self.temp_mem_len.load(Ordering::Acquire)).into(),
             temp_file_len: AtomicU64::new(self.temp_file_len.load(Ordering::Acquire)).into(),
-            file_len: AtomicU64::new(self.file_len.load(std::sync::atomic::Ordering::SeqCst)).into(),
-            inplace_end: AtomicU64::new(self.inplace_end.load(std::sync::atomic::Ordering::SeqCst)).into(),
+            file_len: AtomicU64::new(self.file_len.load(std::sync::atomic::Ordering::SeqCst))
+                .into(),
+            inplace_end: AtomicU64::new(self.inplace_end.load(std::sync::atomic::Ordering::SeqCst))
+                .into(),
             _memory_map: Arc::new(arc_swap::ArcSwap::new(map)),
             mmap_gen: AtomicU64::new(1).into(),
             hash: CRC.checksum(format!("{}+++{}", self.location, self.table_name).as_bytes()),
@@ -339,12 +346,8 @@ impl LocalStorageProvider {
                 .open(&file_str)
                 .unwrap();
 
-            let read_file = RcArc::new(
-                std::fs::File::options()
-                    .read(true)
-                    .open(&file_str)
-                    .unwrap(),
-            );
+            let read_file =
+                RcArc::new(std::fs::File::options().read(true).open(&file_str).unwrap());
 
             // Ensure temp staging file exists next to main file
             let temp_file_str = format!("{}.tmp", file_str);
@@ -367,9 +370,11 @@ impl LocalStorageProvider {
                     .open(&temp_file_str)
                     .unwrap(),
             );
-            
+
             #[cfg(not(test))]
-            let temp_len = std::fs::metadata(&temp_file_str).map(|m| m.len()).unwrap_or(0);
+            let temp_len = std::fs::metadata(&temp_file_str)
+                .map(|m| m.len())
+                .unwrap_or(0);
 
             #[cfg(test)]
             let temp_len = {
@@ -388,19 +393,21 @@ impl LocalStorageProvider {
                         });
                     0u64
                 } else {
-                    std::fs::metadata(&temp_file_str).map(|m| m.len()).unwrap_or(0)
+                    std::fs::metadata(&temp_file_str)
+                        .map(|m| m.len())
+                        .unwrap_or(0)
                 };
 
                 temp_len
             };
-            
+
             let map = Arc::new(ArcSwap::new(Arc::new(unsafe {
                 MmapOptions::new().map(&file_read_mmap).unwrap()
             })));
-            
+
             let file_len = file_read_mmap.metadata().unwrap().len();
 
-            let local_storage_provider =LocalStorageProvider {
+            let local_storage_provider = LocalStorageProvider {
                 append_file: Arc::new(RwLock::new(file_append)),
                 write_file: Arc::new(RwLock::new(file_write)),
                 read_file,
@@ -474,12 +481,8 @@ impl LocalStorageProvider {
                 .open(&file_str)
                 .unwrap();
 
-            let read_file = RcArc::new(
-                std::fs::File::options()
-                    .read(true)
-                    .open(&file_str)
-                    .unwrap(),
-            );
+            let read_file =
+                RcArc::new(std::fs::File::options().read(true).open(&file_str).unwrap());
 
             // Ensure temp staging file exists next to main file
             let temp_file_str = format!("{}.tmp", file_str);
@@ -501,8 +504,10 @@ impl LocalStorageProvider {
                     .unwrap(),
             );
             #[cfg(not(test))]
-            let temp_len = std::fs::metadata(&temp_file_str).map(|m| m.len()).unwrap_or(0);
-                
+            let temp_len = std::fs::metadata(&temp_file_str)
+                .map(|m| m.len())
+                .unwrap_or(0);
+
             #[cfg(test)]
             let temp_len = {
                 // If we're operating under the system temp directory (typical for tests),
@@ -520,7 +525,9 @@ impl LocalStorageProvider {
                         });
                     0u64
                 } else {
-                    std::fs::metadata(&temp_file_str).map(|m| m.len()).unwrap_or(0)
+                    std::fs::metadata(&temp_file_str)
+                        .map(|m| m.len())
+                        .unwrap_or(0)
                 };
 
                 temp_len
@@ -724,7 +731,7 @@ impl LocalStorageProvider {
         // it also observes the newly stored mmap.
         self.mmap_gen.fetch_add(1, Ordering::Release);
 
-    self._locked.store(false, Ordering::Release);
+        self._locked.store(false, Ordering::Release);
     }
 
     #[inline(always)]
@@ -828,12 +835,7 @@ impl LocalStorageProvider {
     }
 
     // Synchronous fast path attempt: returns bytes copied from mmap.
-    fn read_from_mmap(
-        &self,
-        position: u64,
-        buffer: &mut [u8],
-        file_len: u64,
-    ) -> usize {
+    fn read_from_mmap(&self, position: u64, buffer: &mut [u8], file_len: u64) -> usize {
         if buffer.is_empty() {
             return 0;
         }
@@ -883,7 +885,10 @@ impl LocalStorageProvider {
         // Immediate EOF if the requested position is beyond the logical end.
         // This ensures callers get UnexpectedEof and position remains unchanged.
         if *position >= file_len {
-            return Err(io::Error::new(ErrorKind::UnexpectedEof, "Position beyond file end"));
+            return Err(io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "Position beyond file end",
+            ));
         }
 
         let total_len = buffer.len();
@@ -896,7 +901,11 @@ impl LocalStorageProvider {
             let start_copied = overall_copied;
 
             // 1. Try mmap
-            let mut mmap_copied = self.read_from_mmap(*position, &mut buffer[overall_copied..overall_copied+phase1_target], main_len);
+            let mut mmap_copied = self.read_from_mmap(
+                *position,
+                &mut buffer[overall_copied..overall_copied + phase1_target],
+                main_len,
+            );
             overall_copied += mmap_copied;
             *position += mmap_copied as u64;
 
@@ -944,7 +953,10 @@ impl LocalStorageProvider {
                 };
 
                 if n == 0 {
-                    return Err(io::Error::new(ErrorKind::UnexpectedEof, "Unexpected EOF in main file"));
+                    return Err(io::Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "Unexpected EOF in main file",
+                    ));
                 }
 
                 overall_copied += n;
@@ -955,34 +967,37 @@ impl LocalStorageProvider {
         // Phase 2: if logical length extends into temp, read remaining bytes from temp.
         if overall_copied < total_len {
             if *position >= main_len {
-                 let temp_pos = *position - main_len;
-                 let to_read = min((file_len - *position) as usize, total_len - overall_copied);
+                let temp_pos = *position - main_len;
+                let to_read = min((file_len - *position) as usize, total_len - overall_copied);
 
-                 // 1. Try memory mirror
-                 let copied = self.temp_mem_copy_region(temp_pos, &mut buffer[overall_copied..overall_copied+to_read]);
-                 overall_copied += copied;
-                 *position += copied as u64;
+                // 1. Try memory mirror
+                let copied = self.temp_mem_copy_region(
+                    temp_pos,
+                    &mut buffer[overall_copied..overall_copied + to_read],
+                );
+                overall_copied += copied;
+                *position += copied as u64;
 
-                 // 2. Fallback to synchronous pread (no spawn_blocking).
-                 if copied < to_read {
-                     let needed = to_read - copied;
-                     let current_temp_pos = *position - main_len;
-                     let dst = &mut buffer[overall_copied..overall_copied + needed];
+                // 2. Fallback to synchronous pread (no spawn_blocking).
+                if copied < to_read {
+                    let needed = to_read - copied;
+                    let current_temp_pos = *position - main_len;
+                    let dst = &mut buffer[overall_copied..overall_copied + needed];
 
-                     #[cfg(unix)]
-                     let n = {
-                         use std::os::unix::fs::FileExt;
-                         self.temp_read_file.read_at(dst, current_temp_pos)?
-                     };
-                     #[cfg(windows)]
-                     let n = {
-                         use std::os::windows::fs::FileExt;
-                         self.temp_read_file.seek_read(dst, current_temp_pos)?
-                     };
+                    #[cfg(unix)]
+                    let n = {
+                        use std::os::unix::fs::FileExt;
+                        self.temp_read_file.read_at(dst, current_temp_pos)?
+                    };
+                    #[cfg(windows)]
+                    let n = {
+                        use std::os::windows::fs::FileExt;
+                        self.temp_read_file.seek_read(dst, current_temp_pos)?
+                    };
 
-                     overall_copied += n;
-                     *position += n as u64;
-                 }
+                    overall_copied += n;
+                    *position += n as u64;
+                }
             }
         }
 
@@ -991,7 +1006,10 @@ impl LocalStorageProvider {
         } else {
             Err(io::Error::new(
                 ErrorKind::UnexpectedEof,
-                format!("Requested {} bytes, got {} (reached logical EOF)", total_len, overall_copied),
+                format!(
+                    "Requested {} bytes, got {} (reached logical EOF)",
+                    total_len, overall_copied
+                ),
             ))
         }
     }
@@ -1078,18 +1096,21 @@ impl StorageIO for LocalStorageProvider {
             0
         } else {
             match crate::core::wal::wal_for(&self.location) {
-            Some(w) => match w.log(txn, self.wal_file_id(), offset, buffer) {
-                Ok(_) => txn,
-                Err(e) => {
-                    error!("WAL append failed ({}); flushing {} directly", e, self.file_str);
+                Some(w) => match w.log(txn, self.wal_file_id(), offset, buffer) {
+                    Ok(_) => txn,
+                    Err(e) => {
+                        error!(
+                            "WAL append failed ({}); flushing {} directly",
+                            e, self.file_str
+                        );
+                        self.flush_self(seq);
+                        0
+                    }
+                },
+                None => {
                     self.flush_self(seq);
                     0
                 }
-            },
-            None => {
-                self.flush_self(seq);
-                0
-            }
             }
         };
 
@@ -1419,7 +1440,8 @@ impl StorageIO for LocalStorageProvider {
         for (idx, pos, offset) in pending {
             let (_, buf) = &mut reads[idx];
             let mut p = pos;
-            self.read_data_into_buffer_internal(&mut p, &mut buf[offset..]).await?;
+            self.read_data_into_buffer_internal(&mut p, &mut buf[offset..])
+                .await?;
         }
         Ok(())
     }
@@ -1514,12 +1536,7 @@ impl StorageIO for LocalStorageProvider {
             .open(&file_str)
             .unwrap();
 
-        let read_file = RcArc::new(
-            std::fs::File::options()
-                .read(true)
-                .open(&file_str)
-                .unwrap(),
-        );
+        let read_file = RcArc::new(std::fs::File::options().read(true).open(&file_str).unwrap());
 
         // Do NOT truncate here. We may be opening an existing companion file (e.g. FIELDS.db)
         // from tests or runtime, and truncation would destroy previously appended data.
@@ -1545,7 +1562,9 @@ impl StorageIO for LocalStorageProvider {
         );
 
         // Preserve any existing staged temp bytes; tests may rely on persistence across openings.
-        let mut staged_len = std::fs::metadata(&temp_file_str).map(|m| m.len()).unwrap_or(0);
+        let mut staged_len = std::fs::metadata(&temp_file_str)
+            .map(|m| m.len())
+            .unwrap_or(0);
 
         if file_len == 0 && staged_len > 0 {
             let _ = std::fs::OpenOptions::new()
@@ -1701,8 +1720,10 @@ impl StorageIO for LocalStorageProvider {
                 .open(&temp_file_str)
                 .unwrap(),
         );
-        
-        let staged_len = std::fs::metadata(&temp_file_str).map(|m| m.len()).unwrap_or(0);
+
+        let staged_len = std::fs::metadata(&temp_file_str)
+            .map(|m| m.len())
+            .unwrap_or(0);
 
         let file_len = file_read_mmap.metadata().unwrap().len();
 
@@ -1763,7 +1784,6 @@ impl StorageIO for LocalStorageProvider {
     }
 
     async fn start_service(&self) {
-
         // Run both the legacy batch service (if used elsewhere) and the temp flush service.
         async fn flush_loop(p: &LocalStorageProvider) {
             loop {
@@ -1982,8 +2002,8 @@ mod test {
     }
 
     fn unique_name(prefix: &str) -> String {
-        use std::time::{SystemTime, UNIX_EPOCH};
         use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let count = COUNTER.fetch_add(1, Ordering::Relaxed);
         let nanos = SystemTime::now()
@@ -2007,9 +2027,12 @@ mod test {
         // Start 100 bytes before end of main, read 200 -> 100 main + 100 temp
         let mut pos = (init - 100) as u64;
         let mut buf = vec![0u8; 200];
-        provider.read_data_into_buffer(&mut pos, &mut buf).await.unwrap();
+        provider
+            .read_data_into_buffer(&mut pos, &mut buf)
+            .await
+            .unwrap();
         assert_eq!(pos, (init + 100) as u64);
-        assert_eq!(&buf[..100], &initial_data[init - 100 .. init]);
+        assert_eq!(&buf[..100], &initial_data[init - 100..init]);
         assert_eq!(&buf[100..], &staged[..100]);
     }
 
@@ -2031,7 +2054,10 @@ mod test {
         // Read back the flushed range from main
         let mut pos = init as u64;
         let mut out = vec![0u8; staged.len()];
-        provider.read_data_into_buffer(&mut pos, &mut out).await.unwrap();
+        provider
+            .read_data_into_buffer(&mut pos, &mut out)
+            .await
+            .unwrap();
         assert_eq!(pos, (init + staged.len()) as u64);
         assert_eq!(out, staged);
     }
@@ -2067,7 +2093,10 @@ mod test {
         // Single full read of all staged bytes
         let mut pos = init as u64;
         let mut out = vec![0u8; total];
-        provider.read_data_into_buffer(&mut pos, &mut out).await.unwrap();
+        provider
+            .read_data_into_buffer(&mut pos, &mut out)
+            .await
+            .unwrap();
         assert_eq!(pos, (init + total) as u64);
         assert_eq!(out, expected);
 
@@ -2136,7 +2165,7 @@ mod test {
     #[tokio::test]
     async fn test_concurrent_appends_and_reads() {
         use std::sync::Arc;
-        use tokio::time::{sleep, Duration};
+        use tokio::time::{Duration, sleep};
 
         let init = 2048usize;
         let (provider, _initial_data, _extra) = create_provider(init, 0).await;
@@ -2230,15 +2259,21 @@ mod test {
         // Verify file contents at the appended position
         let mut pos = init as u64;
         let mut out = vec![0u8; appended.len()];
-        provider.read_data_into_buffer(&mut pos, &mut out).await.unwrap();
+        provider
+            .read_data_into_buffer(&mut pos, &mut out)
+            .await
+            .unwrap();
         assert_eq!(pos, (init + appended.len()) as u64);
         assert_eq!(out, appended);
 
         // Spot-check: earlier bytes (from initial) are unchanged
         let mut pos2 = (init - 128) as u64;
         let mut head = vec![0u8; 128];
-        provider.read_data_into_buffer(&mut pos2, &mut head).await.unwrap();
-        assert_eq!(head, initial_data[init - 128 .. init]);
+        provider
+            .read_data_into_buffer(&mut pos2, &mut head)
+            .await
+            .unwrap();
+        assert_eq!(head, initial_data[init - 128..init]);
 
         // verify_data API should also pass for the appended range
         let ok = StorageIO::verify_data(&provider, init as u64, &appended).await;
@@ -2270,15 +2305,21 @@ mod test {
         // Read a buffer spanning the end of immediate part into staged part
         let mut pos = (init + a_immediate.len() - 200) as u64; // start 200 bytes before boundary
         let mut out = vec![0u8; 600]; // 200 from A + 400 from B
-        provider.read_data_into_buffer(&mut pos, &mut out).await.unwrap();
+        provider
+            .read_data_into_buffer(&mut pos, &mut out)
+            .await
+            .unwrap();
         assert_eq!(pos, (init + a_immediate.len() - 200 + 600) as u64);
-        assert_eq!(&out[..200], &a_immediate[a_immediate.len() - 200 ..]);
+        assert_eq!(&out[..200], &a_immediate[a_immediate.len() - 200..]);
         assert_eq!(&out[200..600], &b_staged[..400]);
 
         // Full read of the whole appended logical tail should also succeed
         let mut pos2 = init as u64;
         let mut all = vec![0u8; a_immediate.len() + b_staged.len()];
-        provider.read_data_into_buffer(&mut pos2, &mut all).await.unwrap();
+        provider
+            .read_data_into_buffer(&mut pos2, &mut all)
+            .await
+            .unwrap();
         assert_eq!(pos2, (init + all.len()) as u64);
         assert_eq!(all, [a_immediate.as_slice(), b_staged.as_slice()].concat());
     }
@@ -2327,7 +2368,7 @@ mod test {
             let before = pos;
             let _ = provider.read_data_into_buffer(&mut pos, &mut buf).await; // may EOF at exact logical end
             let got = (pos - before) as usize;
-            assert_eq!(&buf[..got], &combined[consumed .. consumed + got]);
+            assert_eq!(&buf[..got], &combined[consumed..consumed + got]);
             consumed += got;
         }
         assert_eq!(pos, (init + combined.len()) as u64);
@@ -2336,8 +2377,8 @@ mod test {
     #[tokio::test]
     async fn test_service_flush_from_temp_to_main_with_length_checks() {
         use rand::{Rng, SeedableRng, rngs::StdRng};
-        use tokio::time::{sleep, Duration};
         use std::sync::Arc;
+        use tokio::time::{Duration, sleep};
 
         // Initial main file content
         let init = 4096usize;
@@ -2363,15 +2404,21 @@ mod test {
         // Read across boundary BEFORE flush: last 100 of main + first 200 of temp
         let mut pos = (init - 100) as u64;
         let mut out = vec![0u8; 300];
-        provider.read_data_into_buffer(&mut pos, &mut out).await.unwrap();
+        provider
+            .read_data_into_buffer(&mut pos, &mut out)
+            .await
+            .unwrap();
         assert_eq!(pos, (init + 200) as u64);
-        assert_eq!(&out[..100], &initial_data[init - 100 .. init]);
+        assert_eq!(&out[..100], &initial_data[init - 100..init]);
         assert_eq!(&out[100..], &staged[..200]);
 
         // Read within temp BEFORE flush
         let mut pos2 = init as u64;
         let mut temp_slice = vec![0u8; 512];
-        provider.read_data_into_buffer(&mut pos2, &mut temp_slice).await.unwrap();
+        provider
+            .read_data_into_buffer(&mut pos2, &mut temp_slice)
+            .await
+            .unwrap();
         assert_eq!(&temp_slice, &staged[..512]);
 
         // Start background service which includes the flush loop
@@ -2384,12 +2431,15 @@ mod test {
         // Wait for flush to complete (temp_len -> 0 and main_len increased)
         let expected_main_after = init + staged.len();
         let mut waited = 0u64;
-        
+
         loop {
             let ml = provider.file_len.load(Ordering::Acquire) as usize;
             let tl = provider.temp_file_len.load(Ordering::Acquire) as usize;
-            if ml == expected_main_after && tl == 0 { break; }
-            if waited > 5_000 { // 5s timeout
+            if ml == expected_main_after && tl == 0 {
+                break;
+            }
+            if waited > 5_000 {
+                // 5s timeout
                 panic!("Timed out waiting for background flush: main_len={ml}, temp_len={tl}");
             }
             sleep(Duration::from_millis(10)).await;
@@ -2407,7 +2457,10 @@ mod test {
         // Read appended region AFTER flush (should be from main now)
         let mut pos3 = init as u64;
         let mut out2 = vec![0u8; staged.len()];
-        provider.read_data_into_buffer(&mut pos3, &mut out2).await.unwrap();
+        provider
+            .read_data_into_buffer(&mut pos3, &mut out2)
+            .await
+            .unwrap();
         assert_eq!(pos3, (init + staged.len()) as u64);
         assert_eq!(out2, staged);
     }
@@ -2425,12 +2478,9 @@ mod test {
         // Since &mut [u8] is not Copy, we can't easily put them in a vec and then take a slice of mutable references?
         // Wait, `read_vectored` takes `&mut [(u64, &mut [u8])]`.
         // We can create a mutable array or vec of tuples.
-        
-        let mut reads: Vec<(u64, &mut [u8])> = vec![
-            (0, &mut buf1),
-            (1000, &mut buf2),
-            (4000, &mut buf3),
-        ];
+
+        let mut reads: Vec<(u64, &mut [u8])> =
+            vec![(0, &mut buf1), (1000, &mut buf2), (4000, &mut buf3)];
 
         provider.read_vectored(&mut reads).await.unwrap();
 

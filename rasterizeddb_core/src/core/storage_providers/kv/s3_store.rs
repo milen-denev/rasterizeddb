@@ -97,7 +97,9 @@ impl S3KvStore {
                 }
             }
         }
-        self.client.complete_multipart_upload(key, &upload_id, &parts).await
+        self.client
+            .complete_multipart_upload(key, &upload_id, &parts)
+            .await
     }
 }
 
@@ -133,7 +135,10 @@ impl KvStore for S3KvStore {
     fn list<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, io::Result<Vec<ObjectInfo>>> {
         Box::pin(async move {
             let listed = self.client.list_prefix(prefix).await?;
-            Ok(listed.into_iter().map(|(key, size)| ObjectInfo { key, size }).collect())
+            Ok(listed
+                .into_iter()
+                .map(|(key, size)| ObjectInfo { key, size })
+                .collect())
         })
     }
 

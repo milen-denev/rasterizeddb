@@ -3,10 +3,7 @@ use smallvec::SmallVec;
 
 use crate::core::row::row::{ColumnWritePayload, RowWrite};
 use crate::core::row::schema::SchemaField;
-use crate::core::{
-    db_type::DbType,
-    rql::lexer_s1::QueryPurpose,
-};
+use crate::core::{db_type::DbType, rql::lexer_s1::QueryPurpose};
 
 use crate::memory_pool::{MEMORY_POOL, MemoryBlock};
 
@@ -77,7 +74,6 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> Option<MemoryBlock> {
         }
         s
     }
-
 
     /// Parses a scalar, reporting a bad literal instead of substituting a zero.
     #[inline]
@@ -259,12 +255,28 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> Option<MemoryBlock> {
         // Every type whose literal is text with a syntax of its own, sharing
         // one encoder so the `INSERT` and `UPDATE` paths cannot disagree about
         // what they accept.
-        DbType::BYTEA | DbType::ARRAY | DbType::INTERVAL | DbType::MACADDR
-        | DbType::MACADDR8 | DbType::BIT | DbType::VARBIT | DbType::DATE
-        | DbType::TIME | DbType::TIMETZ | DbType::POINT | DbType::LINE
-        | DbType::LSEG | DbType::BOX | DbType::PATH | DbType::POLYGON
-        | DbType::CIRCLE | DbType::INT4RANGE | DbType::INT8RANGE
-        | DbType::NUMRANGE | DbType::TSRANGE | DbType::TSTZRANGE
+        DbType::BYTEA
+        | DbType::ARRAY
+        | DbType::INTERVAL
+        | DbType::MACADDR
+        | DbType::MACADDR8
+        | DbType::BIT
+        | DbType::VARBIT
+        | DbType::DATE
+        | DbType::TIME
+        | DbType::TIMETZ
+        | DbType::POINT
+        | DbType::LINE
+        | DbType::LSEG
+        | DbType::BOX
+        | DbType::PATH
+        | DbType::POLYGON
+        | DbType::CIRCLE
+        | DbType::INT4RANGE
+        | DbType::INT8RANGE
+        | DbType::NUMRANGE
+        | DbType::TSRANGE
+        | DbType::TSTZRANGE
         | DbType::DATERANGE => {
             // `unquote_sql`, exactly as `STRING` above uses it, and for the
             // same reason: a quote inside the literal is written doubled and
@@ -471,7 +483,9 @@ fn split_values(list: &str) -> Vec<String> {
                 depth = depth.saturating_sub(1);
                 current.push(c);
             }
-            ',' if !quoted && depth == 0 => out.push(std::mem::take(&mut current).trim().to_string()),
+            ',' if !quoted && depth == 0 => {
+                out.push(std::mem::take(&mut current).trim().to_string())
+            }
             _ => current.push(c),
         }
     }
@@ -596,7 +610,10 @@ pub fn returning_split(sql: &str) -> Option<(&str, &str)> {
     None
 }
 
-pub fn returning_columns(sql: &str, schema: &[SchemaField]) -> Option<Result<Vec<SchemaField>, String>> {
+pub fn returning_columns(
+    sql: &str,
+    schema: &[SchemaField],
+) -> Option<Result<Vec<SchemaField>, String>> {
     // Find the keyword outside of any string literal, so a value containing the
     // word "returning" cannot be mistaken for the clause.
     let bytes = sql.as_bytes();
@@ -623,8 +640,7 @@ pub fn returning_columns(sql: &str, schema: &[SchemaField]) -> Option<Result<Vec
                 if i + KW.len() <= bytes.len()
                     && bytes[i..i + KW.len()].eq_ignore_ascii_case(KW)
                     && (i == 0 || !is_ident_byte(bytes[i - 1]))
-                    && (i + KW.len() == bytes.len()
-                        || !is_ident_byte(bytes[i + KW.len()]))
+                    && (i + KW.len() == bytes.len() || !is_ident_byte(bytes[i + KW.len()]))
                 {
                     kw_at = Some(i + KW.len());
                     break;
@@ -637,7 +653,9 @@ pub fn returning_columns(sql: &str, schema: &[SchemaField]) -> Option<Result<Vec
     let start = kw_at?;
     let list = sql[start..].trim().trim_end_matches(';').trim();
     if list.is_empty() {
-        return Some(Err("RETURNING is present but no columns were listed".to_string()));
+        return Some(Err(
+            "RETURNING is present but no columns were listed".to_string()
+        ));
     }
 
     if list == "*" {
@@ -705,7 +723,9 @@ pub fn returning_items(
     let (_, list) = returning_split(sql)?;
     let list = list.trim().trim_end_matches(';').trim();
     if list.is_empty() {
-        return Some(Err("RETURNING is present but no columns were listed".to_string()));
+        return Some(Err(
+            "RETURNING is present but no columns were listed".to_string()
+        ));
     }
     if list == "*" {
         let mut fields: Vec<SchemaField> = schema
@@ -732,11 +752,14 @@ fn parse_items(list: &str, schema: &[SchemaField]) -> Result<Vec<ReturningItem>,
         // operator — is a stored column. With an alias it becomes a computed
         // echo of itself, so the wire layer names it the way the client asked.
         let is_single_name = !expr_text.contains(|c: char| {
-            c.is_whitespace()
-                || matches!(c, '(' | ')' | '+' | '-' | '*' | '/' | '|' | ':' | ',')
+            c.is_whitespace() || matches!(c, '(' | ')' | '+' | '-' | '*' | '/' | '|' | ':' | ',')
         });
         if is_single_name {
-            let name = expr_text.rsplit('.').next().unwrap_or(expr_text).trim_matches('"');
+            let name = expr_text
+                .rsplit('.')
+                .next()
+                .unwrap_or(expr_text)
+                .trim_matches('"');
             if let Some(f) = schema.iter().find(|f| {
                 f.name.eq_ignore_ascii_case(name)
                     && !f.is_deleted
@@ -764,10 +787,7 @@ fn parse_items(list: &str, schema: &[SchemaField]) -> Result<Vec<ReturningItem>,
                     .iter()
                     .any(|f| crate::core::rql::nullable::is_hidden(&f.name))
                 {
-                    return Err(format!(
-                        "RETURNING column '{}' not found in schema",
-                        item
-                    ));
+                    return Err(format!("RETURNING column '{}' not found in schema", item));
                 }
                 let db_type = crate::core::rql::expr::static_type(&expr);
                 out.push(ReturningItem::Computed {
@@ -791,12 +811,7 @@ fn parse_items(list: &str, schema: &[SchemaField]) -> Result<Vec<ReturningItem>,
 /// `copy_from_slice`, which panics on a length mismatch. Producing a
 /// zero-filled value of the right width turns what would be a crashed worker
 /// into a stored default.
-fn fit_to_width(
-    data: MemoryBlock,
-    db_type: &DbType,
-    width: usize,
-    col_name: &str,
-) -> MemoryBlock {
+fn fit_to_width(data: MemoryBlock, db_type: &DbType, width: usize, col_name: &str) -> MemoryBlock {
     if db_type.is_variable_width() || data.into_slice().len() == width {
         return data;
     }
@@ -861,7 +876,10 @@ pub fn insert_row_with_defaults(
             sql.trim_start_matches(|c: char| c.is_whitespace() || c == '\n' || c == '\r');
         let sql_upper = sql_trimmed.to_ascii_uppercase();
         if !sql_upper.starts_with("INSERT INTO") {
-            error!("INSERT parse failed: query does not start with INSERT INTO. prefix={:?}", sql_trimmed.chars().take(80).collect::<String>());
+            error!(
+                "INSERT parse failed: query does not start with INSERT INTO. prefix={:?}",
+                sql_trimmed.chars().take(80).collect::<String>()
+            );
             return None;
         }
         let sql = sql_trimmed;
@@ -952,7 +970,10 @@ pub fn insert_row_with_defaults(
         let insert_kw = match sql_upper.find("INSERT INTO") {
             Some(v) => v,
             None => {
-                error!("INSERT parse failed: could not find INSERT INTO keyword. prefix={:?}", sql_trimmed.chars().take(120).collect::<String>());
+                error!(
+                    "INSERT parse failed: could not find INSERT INTO keyword. prefix={:?}",
+                    sql_trimmed.chars().take(120).collect::<String>()
+                );
                 return None;
             }
         };
@@ -960,14 +981,20 @@ pub fn insert_row_with_defaults(
         let table_paren_start = match sql[insert_kw..].find('(') {
             Some(v) => v + insert_kw,
             None => {
-                error!("INSERT parse failed: missing column list parentheses after INSERT INTO. prefix={:?}", sql_trimmed.chars().take(200).collect::<String>());
+                error!(
+                    "INSERT parse failed: missing column list parentheses after INSERT INTO. prefix={:?}",
+                    sql_trimmed.chars().take(200).collect::<String>()
+                );
                 return None;
             }
         };
         let (col_start, col_end) = match extract_paren_block(sql, '(', ')', table_paren_start) {
             Some(v) => v,
             None => {
-                error!("INSERT parse failed: could not extract column list parentheses block. prefix={:?}", sql_trimmed.chars().take(200).collect::<String>());
+                error!(
+                    "INSERT parse failed: could not extract column list parentheses block. prefix={:?}",
+                    sql_trimmed.chars().take(200).collect::<String>()
+                );
                 return None;
             }
         };
@@ -981,28 +1008,40 @@ pub fn insert_row_with_defaults(
         let values_kw = match find_word(&sql_upper, "VALUES", col_end) {
             Some(v) => v,
             None => {
-                error!("INSERT parse failed: missing VALUES keyword. prefix={:?}", sql_trimmed.chars().take(200).collect::<String>());
+                error!(
+                    "INSERT parse failed: missing VALUES keyword. prefix={:?}",
+                    sql_trimmed.chars().take(200).collect::<String>()
+                );
                 return None;
             }
         };
         let values_kw_real = match sql[values_kw..].to_ascii_lowercase().find("values") {
             Some(v) => values_kw + v,
             None => {
-                error!("INSERT parse failed: could not locate VALUES keyword in original query. prefix={:?}", sql_trimmed.chars().take(200).collect::<String>());
+                error!(
+                    "INSERT parse failed: could not locate VALUES keyword in original query. prefix={:?}",
+                    sql_trimmed.chars().take(200).collect::<String>()
+                );
                 return None;
             }
         };
         let values_paren_start = match sql[values_kw_real..].find('(') {
             Some(v) => v + values_kw_real,
             None => {
-                error!("INSERT parse failed: missing VALUES(...) parentheses. prefix={:?}", sql_trimmed.chars().take(220).collect::<String>());
+                error!(
+                    "INSERT parse failed: missing VALUES(...) parentheses. prefix={:?}",
+                    sql_trimmed.chars().take(220).collect::<String>()
+                );
                 return None;
             }
         };
         let (val_start, val_end) = match extract_paren_block(sql, '(', ')', values_paren_start) {
             Some(v) => v,
             None => {
-                error!("INSERT parse failed: could not extract VALUES parentheses block. prefix={:?}", sql_trimmed.chars().take(220).collect::<String>());
+                error!(
+                    "INSERT parse failed: could not extract VALUES parentheses block. prefix={:?}",
+                    sql_trimmed.chars().take(220).collect::<String>()
+                );
                 return None;
             }
         };
@@ -1039,8 +1078,7 @@ pub fn insert_row_with_defaults(
             // tombstone check an `INSERT` naming it was accepted and the value
             // written into the dead slot — reported as success, readable by
             // nothing. PostgreSQL rejects the statement, and so does this.
-            let Some(schema_field) =
-                schema.iter().find(|f| f.name == *col_name && !f.is_deleted)
+            let Some(schema_field) = schema.iter().find(|f| f.name == *col_name && !f.is_deleted)
             else {
                 error!(
                     "INSERT parse failed: column {:?} not found in schema (schema_fields={:?})",
@@ -1230,7 +1268,8 @@ mod tests {
                        SELECT c.id, c.case_model_id\n\
                        FROM context c\n\
                        WHERE c.case_model_id IS NOT NULL";
-            let (prefix, select) = insert_select_source(sql).expect("should detect INSERT … SELECT");
+            let (prefix, select) =
+                insert_select_source(sql).expect("should detect INSERT … SELECT");
             assert!(prefix.trim_end().ends_with(')'), "got {:?}", prefix);
             assert!(select.starts_with("SELECT c.id"), "got {:?}", select);
             assert!(select.contains("IS NOT NULL"));
@@ -1239,9 +1278,7 @@ mod tests {
         #[test]
         fn an_ordinary_values_insert_is_not_a_query_source() {
             assert!(insert_select_source("INSERT INTO t (a, b) VALUES (1, 2)").is_none());
-            assert!(
-                insert_select_source("INSERT INTO t (a, b) VALUES (1, 2), (3, 4)").is_none()
-            );
+            assert!(insert_select_source("INSERT INTO t (a, b) VALUES (1, 2), (3, 4)").is_none());
         }
 
         #[test]
@@ -1283,8 +1320,7 @@ mod tests {
         assert_eq!(assignments.len(), 2, "{:?}", assignments);
         assert_eq!(assignments[0], ("id".to_string(), "1".to_string()));
         assert_eq!(
-            assignments[1].1,
-            r#"'{"name":"acme","hits":42,"tags":["a","b"]}'"#,
+            assignments[1].1, r#"'{"name":"acme","hits":42,"tags":["a","b"]}'"#,
             "the document must survive as a single value"
         );
     }
@@ -1705,8 +1741,8 @@ mod tests {
                 query: sql.to_string(),
                 table_name: "users".to_string(),
                 on_conflict_do_nothing: false,
-            on_conflict_update: None,
-        });
+                on_conflict_update: None,
+            });
             let row_write =
                 insert_row_from_query_purpose(&qp, &schema).expect("Should parse successfully");
             assert_eq!(row_write.columns_writing_data[0].data.into_slice(), exp_id);
@@ -1772,8 +1808,8 @@ mod tests {
 
     #[test]
     fn test_insert_row_employees_full_schema() {
-        use crate::core::rql::lexer_s1::{InsertRowData, QueryPurpose};
         use crate::core::db_type::DbType;
+        use crate::core::rql::lexer_s1::{InsertRowData, QueryPurpose};
 
         let schema = vec![
             SchemaField {
@@ -2072,7 +2108,9 @@ pub fn split_values_tuples(sql: &str) -> Option<Result<Vec<String>, String>> {
             break;
         }
         let Some(close) = matching_paren(rest, 0) else {
-            return Some(Err("unbalanced parentheses in the VALUES clause".to_string()));
+            return Some(Err(
+                "unbalanced parentheses in the VALUES clause".to_string()
+            ));
         };
         tuples.push(&rest[..=close]);
         expecting_tuple = false;
@@ -2099,7 +2137,9 @@ pub fn split_values_tuples(sql: &str) -> Option<Result<Vec<String>, String>> {
     // consume. Reporting it is the whole point: the old parser took the first
     // tuple and discarded the rest without a word.
     if rest.starts_with('(') {
-        return Some(Err("unbalanced parentheses in the VALUES clause".to_string()));
+        return Some(Err(
+            "unbalanced parentheses in the VALUES clause".to_string()
+        ));
     }
 
     if tuples.len() <= 1 {
@@ -2142,8 +2182,7 @@ fn find_values_keyword(sql: &str, upper: &str) -> Option<usize> {
                 if upper[i..].starts_with("VALUES") {
                     let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
                     let after = i + "VALUES".len();
-                    let after_ok =
-                        after >= bytes.len() || !bytes[after].is_ascii_alphanumeric();
+                    let after_ok = after >= bytes.len() || !bytes[after].is_ascii_alphanumeric();
                     if before_ok && after_ok {
                         return Some(i);
                     }
@@ -2248,7 +2287,11 @@ mod multi_row_values {
             &schema,
         )
         .expect("clause found");
-        assert!(out.is_err(), "a companion column is not addressable: {:?}", out);
+        assert!(
+            out.is_err(),
+            "a companion column is not addressable: {:?}",
+            out
+        );
     }
 
     /// `_` is an identifier byte, so a column whose name merely ends in the
@@ -2284,9 +2327,15 @@ mod multi_row_values {
     /// Refused rather than half-executed: the whole reason this exists.
     #[test]
     fn a_clause_that_cannot_be_accounted_for_is_refused() {
-        assert!(split("INSERT INTO t (a) VALUES (1),").expect("saw a comma").is_err());
         assert!(
-            split("INSERT INTO t (a) VALUES (1), (2").expect("saw two groups").is_err(),
+            split("INSERT INTO t (a) VALUES (1),")
+                .expect("saw a comma")
+                .is_err()
+        );
+        assert!(
+            split("INSERT INTO t (a) VALUES (1), (2")
+                .expect("saw two groups")
+                .is_err(),
             "an unbalanced tuple must not be silently dropped"
         );
     }
@@ -2339,12 +2388,12 @@ mod column_list_supply {
 
     #[test]
     fn the_keyword_is_found_outside_quotes_and_on_a_boundary() {
-        let out = supply_column_list(
-            "INSERT INTO \"values\" VALUES ('values', 'x')",
-            &schema(),
-        )
-        .unwrap();
-        assert_eq!(out, "INSERT INTO \"values\" (id, name) VALUES ('values', 'x')");
+        let out =
+            supply_column_list("INSERT INTO \"values\" VALUES ('values', 'x')", &schema()).unwrap();
+        assert_eq!(
+            out,
+            "INSERT INTO \"values\" (id, name) VALUES ('values', 'x')"
+        );
         assert!(supply_column_list("INSERT INTO t VALUESX (1)", &schema()).is_none());
     }
 
@@ -2355,7 +2404,10 @@ mod column_list_supply {
             &schema(),
         )
         .unwrap();
-        assert_eq!(out, "INSERT INTO t (id, name) VALUES (1, 'a'), (2, 'b') RETURNING id");
+        assert_eq!(
+            out,
+            "INSERT INTO t (id, name) VALUES (1, 'a'), (2, 'b') RETURNING id"
+        );
     }
 
     #[test]

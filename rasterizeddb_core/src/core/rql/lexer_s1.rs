@@ -171,7 +171,11 @@ fn split_on_conflict(query: &str) -> (String, bool, Option<ConflictUpdate>) {
     (
         rebuilt,
         false,
-        Some(ConflictUpdate { arbiter, assignments, where_clause }),
+        Some(ConflictUpdate {
+            arbiter,
+            assignments,
+            where_clause,
+        }),
     )
 }
 
@@ -308,7 +312,11 @@ pub fn recognize_query_purpose(query: &str) -> Option<QueryPurpose> {
     let without_comments = strip_sql_comments(query);
     let query = without_comments.as_str();
     let query_trimmed = query.trim().trim_end_matches(';').trim_end();
-    let query_trimmed = if query_trimmed.is_empty() { query.trim() } else { query_trimmed };
+    let query_trimmed = if query_trimmed.is_empty() {
+        query.trim()
+    } else {
+        query_trimmed
+    };
     let query_upper = query_trimmed.to_ascii_uppercase();
     let query_bytes = query_upper.as_bytes();
 
@@ -483,9 +491,15 @@ mod strip_comment_tests {
 
     #[test]
     fn comments_are_still_removed() {
-        assert_eq!(strip_sql_comments("SELECT 1 -- trailing\nFROM t"), "SELECT 1 \nFROM t");
+        assert_eq!(
+            strip_sql_comments("SELECT 1 -- trailing\nFROM t"),
+            "SELECT 1 \nFROM t"
+        );
         assert_eq!(strip_sql_comments("SELECT /* mid */ 1"), "SELECT   1");
         // A `--` inside a literal is data, not a comment.
-        assert_eq!(strip_sql_comments("SELECT '-- not a comment'"), "SELECT '-- not a comment'");
+        assert_eq!(
+            strip_sql_comments("SELECT '-- not a comment'"),
+            "SELECT '-- not a comment'"
+        );
     }
 }

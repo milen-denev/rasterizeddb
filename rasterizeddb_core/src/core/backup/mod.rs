@@ -449,7 +449,10 @@ impl BackupService {
         for (key, wal) in streams {
             wal.set_archive_dir(Some(self.staging_dir_for(&key)))?;
             if !key.is_empty() {
-                debug!("Archiving the log of database {} under {}", key, self.location);
+                debug!(
+                    "Archiving the log of database {} under {}",
+                    key, self.location
+                );
             }
         }
         Ok(())
@@ -477,7 +480,11 @@ impl BackupService {
         match wal.set_archive_dir(Some(self.staging_dir_for(&key))) {
             Ok(()) => info!(
                 "Archiving the log of {} under {}",
-                if key.is_empty() { "the default database" } else { key.as_str() },
+                if key.is_empty() {
+                    "the default database"
+                } else {
+                    key.as_str()
+                },
                 self.location
             ),
             Err(e) => error!("Could not archive the log of database {}: {}", key, e),
@@ -571,7 +578,11 @@ impl BackupService {
             )));
         }
 
-        let id = format!("snap-{}-{:08x}", timeutil::format_basic(started_at), fastrand::u32(..));
+        let id = format!(
+            "snap-{}-{:08x}",
+            timeutil::format_basic(started_at),
+            fastrand::u32(..)
+        );
         let key = self.config.key(&format!("snapshots/{id}.rdba.zst"));
 
         info!(
@@ -616,7 +627,10 @@ impl BackupService {
         let mut names: Vec<String> = files.iter().map(|(name, _)| name.clone()).collect();
         for (name, _) in self.snapshot_file_list()? {
             if !names.contains(&name) {
-                debug!("{} appeared during snapshot {}; it will be rebuilt from the log", name, id);
+                debug!(
+                    "{} appeared during snapshot {}; it will be rebuilt from the log",
+                    name, id
+                );
                 names.push(name);
             }
         }
@@ -751,7 +765,9 @@ impl BackupService {
             for entry in std::fs::read_dir(dir)?.flatten() {
                 let name = entry.file_name();
                 let Some(name) = name.to_str() else { continue };
-                let Ok(file_type) = entry.file_type() else { continue };
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
 
                 // Sub-databases have sidecars of their own, and a fold racing
                 // the copy is exactly as undetectable there as at the root.
@@ -896,8 +912,7 @@ impl BackupService {
             .into_iter()
             .filter_map(|(table, spec)| {
                 let backend = TableBackend::parse(&spec);
-                (!backend.is_file_based())
-                    .then(|| format!("{table} ({})", backend.kind()))
+                (!backend.is_file_based()).then(|| format!("{table} ({})", backend.kind()))
             })
             .collect();
         if excluded.is_empty() {
@@ -919,16 +934,14 @@ impl BackupService {
     /// Names are relative paths with `/` separators, so a restore rebuilds the
     /// same shape.
     fn snapshot_file_list(&self) -> io::Result<Vec<(String, PathBuf)>> {
-        fn walk(
-            dir: &Path,
-            prefix: &str,
-            files: &mut Vec<(String, PathBuf)>,
-        ) -> io::Result<()> {
+        fn walk(dir: &Path, prefix: &str, files: &mut Vec<(String, PathBuf)>) -> io::Result<()> {
             for entry in std::fs::read_dir(dir)?.flatten() {
                 let Some(name) = entry.file_name().to_str().map(str::to_string) else {
                     continue;
                 };
-                let Ok(file_type) = entry.file_type() else { continue };
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
 
                 if file_type.is_dir() {
                     // The archive staging directory holds copies of what is
@@ -1160,7 +1173,11 @@ impl BackupService {
                 .map_err(|e| {
                     io::Error::other(format!(
                         "the log of database {} could not be cut: {e}",
-                        if key.is_empty() { "<default>" } else { key.as_str() }
+                        if key.is_empty() {
+                            "<default>"
+                        } else {
+                            key.as_str()
+                        }
                     ))
                 })?;
         }
@@ -1191,81 +1208,85 @@ impl BackupService {
         // id derived from a table name, so two databases' streams cannot be
         // told apart once concatenated. One bundle belongs to exactly one.
         for (database, paths) in staged {
-        for group in group_by_size(&paths, self.config.wal_bundle_bytes)? {
-            let mut body = Vec::new();
-            for path in &group {
-                let mut file = std::fs::File::open(path)?;
-                file.read_to_end(&mut body)?;
-            }
+            for group in group_by_size(&paths, self.config.wal_bundle_bytes)? {
+                let mut body = Vec::new();
+                for path in &group {
+                    let mut file = std::fs::File::open(path)?;
+                    file.read_to_end(&mut body)?;
+                }
 
-            let (first_lsn, last_lsn, commits) = crate::core::wal::scan_commit_range(&body);
-            let uncompressed = body.len() as u64;
+                let (first_lsn, last_lsn, commits) = crate::core::wal::scan_commit_range(&body);
+                let uncompressed = body.len() as u64;
 
-            let sequence = self.next_segment_sequence().await;
-            // The root's bundles keep the flat layout an older build wrote, so
-            // its catalogue entries and objects line up across the upgrade.
-            let key = self.config.key(&if database.is_empty() {
-                format!("wal/{sequence:016x}-{first_lsn:016x}.wseg.zst")
-            } else {
-                format!("wal/{database}/{sequence:016x}-{first_lsn:016x}.wseg.zst")
-            });
+                let sequence = self.next_segment_sequence().await;
+                // The root's bundles keep the flat layout an older build wrote, so
+                // its catalogue entries and objects line up across the upgrade.
+                let key = self.config.key(&if database.is_empty() {
+                    format!("wal/{sequence:016x}-{first_lsn:016x}.wseg.zst")
+                } else {
+                    format!("wal/{database}/{sequence:016x}-{first_lsn:016x}.wseg.zst")
+                });
 
-            let level = self.config.segment_level;
-            let threads = self.compression_threads();
-            let long_range = self.config.long_range;
-            let compressed = tokio::task::spawn_blocking(move || -> io::Result<Vec<u8>> {
-                let mut encoder = new_encoder(Vec::new(), level, threads, long_range)?;
-                encoder.write_all(&body)?;
-                encoder.finish()
-            })
-            .await
-            .map_err(|e| io::Error::other(format!("segment compressor panicked: {e}")))??;
+                let level = self.config.segment_level;
+                let threads = self.compression_threads();
+                let long_range = self.config.long_range;
+                let compressed = tokio::task::spawn_blocking(move || -> io::Result<Vec<u8>> {
+                    let mut encoder = new_encoder(Vec::new(), level, threads, long_range)?;
+                    encoder.write_all(&body)?;
+                    encoder.finish()
+                })
+                .await
+                .map_err(|e| io::Error::other(format!("segment compressor panicked: {e}")))??;
 
-            let compressed_bytes = compressed.len() as u64;
-            self.client.put_object(&key, &compressed).await?;
+                let compressed_bytes = compressed.len() as u64;
+                self.client.put_object(&key, &compressed).await?;
 
-            {
-                let mut manifest = self.manifest.lock().await;
-                manifest.record_segment(SegmentEntry {
-                    sequence,
-                    database: database.clone(),
-                    key,
-                    archived_at: timeutil::now_unix(),
+                {
+                    let mut manifest = self.manifest.lock().await;
+                    manifest.record_segment(SegmentEntry {
+                        sequence,
+                        database: database.clone(),
+                        key,
+                        archived_at: timeutil::now_unix(),
+                        first_lsn,
+                        last_lsn,
+                        compressed_bytes,
+                        uncompressed_bytes: uncompressed,
+                        segment_count: group.len() as u32,
+                    });
+                }
+
+                report.bundles += 1;
+                report.segments += group.len() as u32;
+                report.uncompressed_bytes += uncompressed;
+                report.compressed_bytes += compressed_bytes;
+                if first_lsn != 0 && (report.first_lsn == 0 || first_lsn < report.first_lsn) {
+                    report.first_lsn = first_lsn;
+                }
+                report.last_lsn = report.last_lsn.max(last_lsn);
+
+                debug!(
+                    "Archived {} segments of {} ({} commits, LSN {}..{}) as {} bytes",
+                    group.len(),
+                    if database.is_empty() {
+                        "the default database"
+                    } else {
+                        database.as_str()
+                    },
+                    commits,
                     first_lsn,
                     last_lsn,
-                    compressed_bytes,
-                    uncompressed_bytes: uncompressed,
-                    segment_count: group.len() as u32,
-                });
-            }
+                    compressed_bytes
+                );
 
-            report.bundles += 1;
-            report.segments += group.len() as u32;
-            report.uncompressed_bytes += uncompressed;
-            report.compressed_bytes += compressed_bytes;
-            if first_lsn != 0 && (report.first_lsn == 0 || first_lsn < report.first_lsn) {
-                report.first_lsn = first_lsn;
-            }
-            report.last_lsn = report.last_lsn.max(last_lsn);
-
-            debug!(
-                "Archived {} segments of {} ({} commits, LSN {}..{}) as {} bytes",
-                group.len(),
-                if database.is_empty() { "the default database" } else { database.as_str() },
-                commits,
-                first_lsn,
-                last_lsn,
-                compressed_bytes
-            );
-
-            // Only once the bundle is durably in S3. Deleting first and failing
-            // the upload would lose the records outright.
-            for path in &group {
-                if let Err(e) = std::fs::remove_file(path) {
-                    warn!("Could not remove staged segment {}: {}", path.display(), e);
+                // Only once the bundle is durably in S3. Deleting first and failing
+                // the upload would lose the records outright.
+                for path in &group {
+                    if let Err(e) = std::fs::remove_file(path) {
+                        warn!("Could not remove staged segment {}: {}", path.display(), e);
+                    }
                 }
             }
-        }
         }
 
         // Checked after every flush, successful or not: this is the only place
@@ -1329,7 +1350,9 @@ impl BackupService {
                 continue;
             }
             let name = entry.file_name();
-            let Some(name) = name.to_str().map(str::to_string) else { continue };
+            let Some(name) = name.to_str().map(str::to_string) else {
+                continue;
+            };
             streams.push((name, segments_in(&entry.path())?));
         }
         streams.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1359,10 +1382,7 @@ impl BackupService {
             // moves would otherwise leave a restore repointing a storage pool
             // at a path this installation no longer uses.
             manifest.source_location = self.location.clone();
-            (
-                self.config.key(manifest::MANIFEST_KEY),
-                manifest.encode(),
-            )
+            (self.config.key(manifest::MANIFEST_KEY), manifest.encode())
         };
         self.client.put_object(&key, &body).await?;
         Ok(())
@@ -1908,7 +1928,10 @@ mod tests {
 
         // The bug this exists for: a restart used to put the next run a whole
         // interval away, so a server restarted daily never snapshotted.
-        assert_eq!(first_delay(day, now - 3600), day - Duration::from_secs(3600));
+        assert_eq!(
+            first_delay(day, now - 3600),
+            day - Duration::from_secs(3600)
+        );
         assert_eq!(first_delay(day, now - 86_000), Duration::from_secs(400));
     }
 
@@ -1951,7 +1974,10 @@ mod tests {
         sink.finish().unwrap();
 
         let parts: Vec<Vec<u8>> = rx.into_iter().collect();
-        assert_eq!(parts.iter().map(|p| p.len()).collect::<Vec<_>>(), vec![10, 10, 5]);
+        assert_eq!(
+            parts.iter().map(|p| p.len()).collect::<Vec<_>>(),
+            vec![10, 10, 5]
+        );
     }
 
     #[test]
@@ -2094,16 +2120,28 @@ mod tests {
 
     #[test]
     fn a_log_in_the_location_itself_is_the_root_stream() {
-        assert_eq!(stream_key("/var/lib/rdb", "/var/lib/rdb"), Some(String::new()));
+        assert_eq!(
+            stream_key("/var/lib/rdb", "/var/lib/rdb"),
+            Some(String::new())
+        );
         // The location may or may not carry a trailing separator; the registry
         // key does not, and neither should the answer.
-        assert_eq!(stream_key("/var/lib/rdb", "/var/lib/rdb/"), Some(String::new()));
+        assert_eq!(
+            stream_key("/var/lib/rdb", "/var/lib/rdb/"),
+            Some(String::new())
+        );
     }
 
     #[test]
     fn a_created_database_is_a_stream_named_after_its_directory() {
-        assert_eq!(stream_key("/var/lib/rdb", "/var/lib/rdb/shop"), Some("shop".to_string()));
-        assert_eq!(stream_key("/var/lib/rdb", "/var/lib/rdb/shop/"), Some("shop".to_string()));
+        assert_eq!(
+            stream_key("/var/lib/rdb", "/var/lib/rdb/shop"),
+            Some("shop".to_string())
+        );
+        assert_eq!(
+            stream_key("/var/lib/rdb", "/var/lib/rdb/shop/"),
+            Some("shop".to_string())
+        );
     }
 
     #[test]

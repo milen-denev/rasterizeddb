@@ -1,11 +1,9 @@
 use cacheguard::CacheGuard;
-use log::{error, info};
 use itertools::Itertools;
+use log::{error, info};
 use smallvec::SmallVec;
 use std::io::Result;
-use std::{
-    sync::atomic::{AtomicBool, AtomicU64},
-};
+use std::sync::atomic::{AtomicBool, AtomicU64};
 
 use rclite::Arc;
 
@@ -25,12 +23,12 @@ use crate::core::{
 use crate::core::row::row::{ColumnFetchingData, ColumnWritePayload};
 
 use crate::core::db_type::DbType;
-use crate::core::row::schema::SchemaCalculator;
 use crate::core::filter::{CandidateBitmap, FilterConfig, TableFilters, is_indexable, sarg};
-use crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN;
 use crate::core::mvcc::TransactionManager;
 use crate::core::mvcc::Visibility;
 use crate::core::mvcc::transaction::{FROZEN_TX, NO_TX, TxId};
+use crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN;
+use crate::core::row::schema::SchemaCalculator;
 use crate::core::vacuum::{
     CompactReport, FreeSpace, ReadTicket, ReaderRegistry, VacuumConfig, VacuumReport,
     VacuumService, VacuumStats, VersionHorizon, collect_live, plan_row_moves,
@@ -492,43 +490,41 @@ impl<S: StorageIO> Table<S> {
 
         let mut pointer_iterator = RowPointerIterator::new(io_pointers.clone()).await.unwrap();
 
-        let (atomic_last_id, atomic_table_length) =
-            if let Some(row_pointer) = pointer_iterator.read_last().await {
-                // The persisted sequence is the authority. Falling back to the
-                // last record is only correct for a table written before the
-                // sequence existed, when ids still ascended with file order —
-                // and such a table has no reservation to honour, so the fallback
-                // is exact rather than merely safe.
-                let atomic_last_id =
-                    AtomicU64::new(match Self::load_id_sequence(&io_sequence).await {
-                        Some(reserved) => reserved,
-                        None => row_pointer.row_id(),
-                    });
+        let (atomic_last_id, atomic_table_length) = if let Some(row_pointer) =
+            pointer_iterator.read_last().await
+        {
+            // The persisted sequence is the authority. Falling back to the
+            // last record is only correct for a table written before the
+            // sequence existed, when ids still ascended with file order —
+            // and such a table has no reservation to honour, so the fallback
+            // is exact rather than merely safe.
+            let atomic_last_id = AtomicU64::new(match Self::load_id_sequence(&io_sequence).await {
+                Some(reserved) => reserved,
+                None => row_pointer.row_id(),
+            });
 
-                // End of the last row, not its start — the start would place the
-                // high-water mark inside a row that already exists. The rows
-                // file's own length is the floor: a row written into a
-                // reclaimed extent sits below the frontier, so the last pointer
-                // on its own no longer bounds the file.
-                let table_length = (row_pointer.position + row_pointer.length as u64)
-                    .max(io_rows.get_len().await);
-                let atomic_table_length = AtomicU64::new(table_length);
+            // End of the last row, not its start — the start would place the
+            // high-water mark inside a row that already exists. The rows
+            // file's own length is the floor: a row written into a
+            // reclaimed extent sits below the frontier, so the last pointer
+            // on its own no longer bounds the file.
+            let table_length =
+                (row_pointer.position + row_pointer.length as u64).max(io_rows.get_len().await);
+            let atomic_table_length = AtomicU64::new(table_length);
 
-                (atomic_last_id, atomic_table_length)
-            } else {
-                let atomic_last_id = AtomicU64::new(
-                    Self::load_id_sequence(&io_sequence).await.unwrap_or(0),
-                );
-                let atomic_table_length = AtomicU64::new(0);
-                (atomic_last_id, atomic_table_length)
-            };
+            (atomic_last_id, atomic_table_length)
+        } else {
+            let atomic_last_id =
+                AtomicU64::new(Self::load_id_sequence(&io_sequence).await.unwrap_or(0));
+            let atomic_table_length = AtomicU64::new(0);
+            (atomic_last_id, atomic_table_length)
+        };
 
         // Everything up to the recovered value may already be in use, so the
         // first insert reserves before it allocates.
         let id_reserved_upto = AtomicU64::new(atomic_last_id.load(AtomicOrdering::Acquire));
 
-        let existing_slots =
-            io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
+        let existing_slots = io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
 
         let filter_settings = crate::core::filter::settings::settings();
         let filters = if filter_settings.table_enabled(table_name) {
@@ -623,15 +619,13 @@ impl<S: StorageIO> Table<S> {
                 loop {
                     // Re-read each tick, so `SET FILTER checkpoint_interval_secs`
                     // takes effect without restarting the table.
-                    let secs = crate::core::filter::settings::settings()
-                        .checkpoint_interval_secs();
+                    let secs = crate::core::filter::settings::settings().checkpoint_interval_secs();
                     tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
                     if !alive.load(AtomicOrdering::Relaxed) {
                         break;
                     }
                     if filters.should_checkpoint() || filters.checkpoint_requested() {
-                        let n =
-                            io_pointers_task.get_len().await / ROW_POINTER_RECORD_LEN as u64;
+                        let n = io_pointers_task.get_len().await / ROW_POINTER_RECORD_LEN as u64;
                         filters.checkpoint(&*io_filters_task, n).await;
                     }
                 }
@@ -651,7 +645,8 @@ impl<S: StorageIO> Table<S> {
         // table-level would otherwise be checked without it.
         let has_unique = schema.fields.iter().any(|f| f.is_unique && !f.is_deleted)
             || !schema.unique_keys.is_empty();
-        let cache_generation = StdArc::new(CacheGuard::new(AtomicU64::new(next_cache_generation())));
+        let cache_generation =
+            StdArc::new(CacheGuard::new(AtomicU64::new(next_cache_generation())));
         let schema_name_for_cache = schema.name.clone();
 
         if crate::vacuum_enabled() {
@@ -720,7 +715,10 @@ impl<S: StorageIO> Table<S> {
         {
             Ok(()) => Some(u64::from_le_bytes(buffer)),
             Err(e) => {
-                error!("Could not read the id sequence ({}); recovering from the pointer file", e);
+                error!(
+                    "Could not read the id sequence ({}); recovering from the pointer file",
+                    e
+                );
                 None
             }
         }
@@ -1112,7 +1110,10 @@ impl<S: StorageIO> Table<S> {
                         report.truncation_unsupported = true;
                     }
                     Err(e) => {
-                        error!("Compaction could not checkpoint the log ({}); keeping both tails", e);
+                        error!(
+                            "Compaction could not checkpoint the log ({}); keeping both tails",
+                            e
+                        );
                         report.truncation_unsupported = true;
                     }
                 }
@@ -1121,8 +1122,9 @@ impl<S: StorageIO> Table<S> {
 
         let compacted_pointer_len = target_slot * ROW_POINTER_RECORD_LEN as u64;
         if !report.truncation_unsupported {
-            report.rows_bytes_freed =
-                self.truncate_tail(&self.io_rows, compacted_rows_len, &mut report).await;
+            report.rows_bytes_freed = self
+                .truncate_tail(&self.io_rows, compacted_rows_len, &mut report)
+                .await;
             report.pointer_bytes_freed = self
                 .truncate_tail(&self.io_pointers, compacted_pointer_len, &mut report)
                 .await;
@@ -1175,12 +1177,7 @@ impl<S: StorageIO> Table<S> {
     }
 
     /// Shortens one file, tolerating a provider that cannot.
-    async fn truncate_tail(
-        &self,
-        io: &Arc<S>,
-        new_len: u64,
-        report: &mut CompactReport,
-    ) -> u64 {
+    async fn truncate_tail(&self, io: &Arc<S>, new_len: u64, report: &mut CompactReport) -> u64 {
         let before = io.get_len().await;
         if new_len >= before {
             return 0;
@@ -1409,8 +1406,9 @@ impl<S: StorageIO> Table<S> {
                 continue;
             }
 
-            if let Some(existing) =
-                self.find_row_with_value(field, value, exclude_id, visibility).await?
+            if let Some(existing) = self
+                .find_row_with_value(field, value, exclude_id, visibility)
+                .await?
             {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::AlreadyExists,
@@ -1479,8 +1477,9 @@ impl<S: StorageIO> Table<S> {
                 continue;
             }
 
-            if let Some(existing) =
-                self.find_row_with_tuple(&tuple, exclude_id, visibility).await?
+            if let Some(existing) = self
+                .find_row_with_tuple(&tuple, exclude_id, visibility)
+                .await?
             {
                 // The value is named, not just the rows. A report of "row 634
                 // duplicates row 625" is unfalsifiable from outside: it cannot
@@ -1491,11 +1490,9 @@ impl<S: StorageIO> Table<S> {
                 let shown: Vec<String> = tuple
                     .iter()
                     .map(|(field, value)| {
-                        let rendered = crate::core::rql::subquery::value_to_literal(
-                            &field.db_type,
-                            value,
-                        )
-                        .unwrap_or_else(|| format!("{:02x?}", value));
+                        let rendered =
+                            crate::core::rql::subquery::value_to_literal(&field.db_type, value)
+                                .unwrap_or_else(|| format!("{:02x?}", value));
                         format!("{} = {}", field.name, rendered)
                     })
                     .collect();
@@ -1554,8 +1551,7 @@ impl<S: StorageIO> Table<S> {
                             value: value.to_vec(),
                         }),
                     };
-                    let n_slots =
-                        self.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
+                    let n_slots = self.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
                     if let Some(bitmap) = filters.evaluate(&program, n_slots) {
                         iterator.set_candidates(Some(Arc::new(bitmap)));
                     }
@@ -1582,7 +1578,9 @@ impl<S: StorageIO> Table<S> {
         // Kept alongside the fetch so the comparison below can match columns by
         // schema id rather than by position.
         let schema_ids: Vec<u64> = columns_fetching_data.iter().map(|c| c.schema_id).collect();
-        let fetch = RowFetch { columns_fetching_data };
+        let fetch = RowFetch {
+            columns_fetching_data,
+        };
 
         let mut row = Row::default();
         while let Ok(Some(pointer)) = iterator.next_row_pointer().await {
@@ -1768,7 +1766,11 @@ impl<S: StorageIO> Table<S> {
 
         let mut buf = vec![0u8; len as usize];
         let mut pos = 0u64;
-        if io_filters.read_data_into_buffer(&mut pos, &mut buf).await.is_err() {
+        if io_filters
+            .read_data_into_buffer(&mut pos, &mut buf)
+            .await
+            .is_err()
+        {
             return None;
         }
 
@@ -1780,7 +1782,6 @@ impl<S: StorageIO> Table<S> {
             }
         }
     }
-
 
     /// Row fetch covering only columns the filter can index.
     fn build_indexed_row_fetch(schema_fields: &SmallVec<[SchemaField; 20]>) -> RowFetch {
@@ -1799,7 +1800,9 @@ impl<S: StorageIO> Table<S> {
                 schema_id: offset.1,
             });
         }
-        RowFetch { columns_fetching_data }
+        RowFetch {
+            columns_fetching_data,
+        }
     }
 
     /// Index every pre-existing row, then start trusting the filter for them.
@@ -1833,7 +1836,9 @@ impl<S: StorageIO> Table<S> {
     /// this; call it directly when a checkpoint must be on disk before some
     /// specific point, such as a controlled shutdown.
     pub async fn checkpoint_filters(&self) {
-        let Some(filters) = self.filters.as_ref() else { return };
+        let Some(filters) = self.filters.as_ref() else {
+            return;
+        };
         let n_slots = self.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
         filters.checkpoint(&*self.io_filters, n_slots).await;
     }
@@ -2004,7 +2009,8 @@ impl<S: StorageIO> Table<S> {
         } else {
             None
         };
-        self.check_unique(&row_write, None, &self.visibility_for(written_by), None).await?;
+        self.check_unique(&row_write, None, &self.visibility_for(written_by), None)
+            .await?;
 
         // The id this row is about to take must already be covered by the
         // reservation on disk, or a crash could hand it out again.
@@ -2142,9 +2148,7 @@ impl<S: StorageIO> Table<S> {
         // after `k` rows have been collected could return slots 0–50 and
         // 1500–1650 rather than the first 200 — the right number of rows and
         // the wrong ones.
-        let mut ceiling = self
-            .monotonic_scan_ceiling(&order_by, limit, n_slots)
-            .await;
+        let mut ceiling = self.monotonic_scan_ceiling(&order_by, limit, n_slots).await;
 
         let rows = loop {
             let mut iterator = RowPointerIterator::new(self.io_pointers.clone())
@@ -2184,10 +2188,7 @@ impl<S: StorageIO> Table<S> {
             // retry rather than return a short page, which would look exactly
             // like the end of the table.
             match ceiling {
-                Some(upto)
-                    if upto < n_slots
-                        && limit.is_some_and(|k| (rows.len() as u64) < k) =>
-                {
+                Some(upto) if upto < n_slots && limit.is_some_and(|k| (rows.len() as u64) < k) => {
                     ceiling = Some(upto.saturating_mul(2).min(n_slots));
                     continue;
                 }
@@ -2330,7 +2331,8 @@ impl<S: StorageIO> Table<S> {
         query_row_fetch: RowFetch,
         limit: Option<u64>,
     ) -> Result<u64> {
-        self.delete_rows_in_txn(where_clause, query_row_fetch, limit, FROZEN_TX).await
+        self.delete_rows_in_txn(where_clause, query_row_fetch, limit, FROZEN_TX)
+            .await
     }
 
     /// Deletes the rows `deleted_by` can see, stamping rather than tombstoning.
@@ -2666,14 +2668,9 @@ impl<S: StorageIO> Table<S> {
             // statement touched it, which is what `COALESCE(c, x)` means, and
             // then overwrite the placeholder their assignment left behind.
             for (write_order, expression) in expressions.iter() {
-                let value = crate::core::rql::expr::eval(
-                    expression,
-                    &row,
-                    self.schema.fields.as_slice(),
-                )
-                .map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
-                })?;
+                let value =
+                    crate::core::rql::expr::eval(expression, &row, self.schema.fields.as_slice())
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
                 let Some(slot_index) = row_write
                     .columns_writing_data
@@ -2720,8 +2717,7 @@ impl<S: StorageIO> Table<S> {
                             .find(|c| c.write_order == flag.write_order as u32)
                         {
                             let bits = crate::core::rql::nullable::flag_bytes(is_null);
-                            let mut mb =
-                                crate::memory_pool::MEMORY_POOL.acquire(bits.len());
+                            let mut mb = crate::memory_pool::MEMORY_POOL.acquire(bits.len());
                             mb.into_slice_mut().copy_from_slice(&bits);
                             flag_payload.data = mb;
                         }
@@ -2731,10 +2727,16 @@ impl<S: StorageIO> Table<S> {
                 // value is, exactly as the constant path pads it.
                 let (width, variable) = {
                     let existing = &row_write.columns_writing_data[slot_index];
-                    (existing.size as usize, existing.column_type.is_variable_width())
+                    (
+                        existing.size as usize,
+                        existing.column_type.is_variable_width(),
+                    )
                 };
-                let mut mb = crate::memory_pool::MEMORY_POOL
-                    .acquire(if variable { bytes.len() } else { width });
+                let mut mb = crate::memory_pool::MEMORY_POOL.acquire(if variable {
+                    bytes.len()
+                } else {
+                    width
+                });
                 let slot = mb.into_slice_mut();
                 slot.fill(0);
                 let n = bytes.len().min(slot.len());
@@ -2840,9 +2842,7 @@ impl<S: StorageIO> Table<S> {
                             ));
                         }
                         // Overwritten in place: same slot, new fingerprints.
-                        None => {
-                            pending_filters.push(PendingFilterOp::Insert(old_slot, row_write))
-                        }
+                        None => pending_filters.push(PendingFilterOp::Insert(old_slot, row_write)),
                     }
                 }
             }
@@ -2967,7 +2967,10 @@ async fn backfill_into<S: StorageIO>(
     if start_slot == 0 {
         filters.clear_unindexed_prefix();
     }
-    info!("Filter backfill indexed {} rows from slot {}", indexed, start_slot);
+    info!(
+        "Filter backfill indexed {} rows from slot {}",
+        indexed, start_slot
+    );
     Ok(indexed)
 }
 

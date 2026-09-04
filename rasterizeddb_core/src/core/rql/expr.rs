@@ -24,7 +24,10 @@ use crate::core::row::schema::SchemaField;
 pub enum Value {
     /// SQL NULL — distinct from an empty string, which is a value.
     Null,
-    Data { bytes: Vec<u8>, db_type: DbType },
+    Data {
+        bytes: Vec<u8>,
+        db_type: DbType,
+    },
 }
 
 impl Value {
@@ -74,7 +77,10 @@ pub enum Expr {
     /// A column of the row being evaluated.
     Column(SchemaField),
     /// A written constant.
-    Literal { bytes: Vec<u8>, db_type: DbType },
+    Literal {
+        bytes: Vec<u8>,
+        db_type: DbType,
+    },
     Null,
     /// A nullary function — `now()`, `gen_random_uuid()` — evaluated per row.
     Scalar(crate::core::rql::aggregate::ScalarFunc),
@@ -288,46 +294,55 @@ pub fn db_type_of_cast(name: &str) -> Option<DbType> {
 
 /// The SQL type a `::` cast names.
 fn cast_target(name: &str) -> Option<DbType> {
-    Some(match name.trim().split('(').next()?.trim().to_ascii_uppercase().as_str() {
-        "BIGINT" | "INT8" | "INT64" => DbType::I64,
-        "INT" | "INTEGER" | "INT4" => DbType::I32,
-        "SMALLINT" | "INT2" => DbType::I16,
-        "TEXT" | "VARCHAR" | "CHARACTER VARYING" => DbType::STRING,
-        "BOOL" | "BOOLEAN" => DbType::BOOL,
-        "UUID" => DbType::UUID,
-        // A date is a timestamp at midnight here: day precision is what the
-        // comparisons need, and the parser accepts a date-only literal.
-        "TIMESTAMP" | "TIMESTAMPTZ" | "DATE" => DbType::DATETIME,
-        "NUMERIC" | "DECIMAL" => DbType::DECIMAL,
-        "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" => DbType::F64,
-        // `real` IS float4 — mapping it to F64 made the described type float8,
-        // and a client decoding the column as f32 then refused the row.
-        "REAL" | "FLOAT4" => DbType::F32,
-        "JSON" | "JSONB" => DbType::JSONB,
-        "BYTEA" => DbType::BYTEA,
-        "INET" | "CIDR" => DbType::INET,
-        "INTERVAL" => DbType::INTERVAL,
-        "MACADDR" => DbType::MACADDR,
-        "MACADDR8" => DbType::MACADDR8,
-        "BIT" => DbType::BIT,
-        "VARBIT" | "BIT VARYING" => DbType::VARBIT,
-        "TIME" => DbType::TIME,
-        "TIMETZ" | "TIME WITH TIME ZONE" => DbType::TIMETZ,
-        "POINT" => DbType::POINT,
-        "LINE" => DbType::LINE,
-        "LSEG" => DbType::LSEG,
-        "BOX" => DbType::BOX,
-        "PATH" => DbType::PATH,
-        "POLYGON" => DbType::POLYGON,
-        "CIRCLE" => DbType::CIRCLE,
-        "INT4RANGE" => DbType::INT4RANGE,
-        "INT8RANGE" => DbType::INT8RANGE,
-        "NUMRANGE" => DbType::NUMRANGE,
-        "TSRANGE" => DbType::TSRANGE,
-        "TSTZRANGE" => DbType::TSTZRANGE,
-        "DATERANGE" => DbType::DATERANGE,
-        _ => return None,
-    })
+    Some(
+        match name
+            .trim()
+            .split('(')
+            .next()?
+            .trim()
+            .to_ascii_uppercase()
+            .as_str()
+        {
+            "BIGINT" | "INT8" | "INT64" => DbType::I64,
+            "INT" | "INTEGER" | "INT4" => DbType::I32,
+            "SMALLINT" | "INT2" => DbType::I16,
+            "TEXT" | "VARCHAR" | "CHARACTER VARYING" => DbType::STRING,
+            "BOOL" | "BOOLEAN" => DbType::BOOL,
+            "UUID" => DbType::UUID,
+            // A date is a timestamp at midnight here: day precision is what the
+            // comparisons need, and the parser accepts a date-only literal.
+            "TIMESTAMP" | "TIMESTAMPTZ" | "DATE" => DbType::DATETIME,
+            "NUMERIC" | "DECIMAL" => DbType::DECIMAL,
+            "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" => DbType::F64,
+            // `real` IS float4 — mapping it to F64 made the described type float8,
+            // and a client decoding the column as f32 then refused the row.
+            "REAL" | "FLOAT4" => DbType::F32,
+            "JSON" | "JSONB" => DbType::JSONB,
+            "BYTEA" => DbType::BYTEA,
+            "INET" | "CIDR" => DbType::INET,
+            "INTERVAL" => DbType::INTERVAL,
+            "MACADDR" => DbType::MACADDR,
+            "MACADDR8" => DbType::MACADDR8,
+            "BIT" => DbType::BIT,
+            "VARBIT" | "BIT VARYING" => DbType::VARBIT,
+            "TIME" => DbType::TIME,
+            "TIMETZ" | "TIME WITH TIME ZONE" => DbType::TIMETZ,
+            "POINT" => DbType::POINT,
+            "LINE" => DbType::LINE,
+            "LSEG" => DbType::LSEG,
+            "BOX" => DbType::BOX,
+            "PATH" => DbType::PATH,
+            "POLYGON" => DbType::POLYGON,
+            "CIRCLE" => DbType::CIRCLE,
+            "INT4RANGE" => DbType::INT4RANGE,
+            "INT8RANGE" => DbType::INT8RANGE,
+            "NUMRANGE" => DbType::NUMRANGE,
+            "TSRANGE" => DbType::TSRANGE,
+            "TSTZRANGE" => DbType::TSTZRANGE,
+            "DATERANGE" => DbType::DATERANGE,
+            _ => return None,
+        },
+    )
 }
 
 /// Position of a top-level `::`, if the expression ends in a cast.
@@ -451,10 +466,16 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
         return Ok(Expr::Null);
     }
     if upper == "TRUE" {
-        return Ok(Expr::Literal { bytes: vec![1u8], db_type: DbType::BOOL });
+        return Ok(Expr::Literal {
+            bytes: vec![1u8],
+            db_type: DbType::BOOL,
+        });
     }
     if upper == "FALSE" {
-        return Ok(Expr::Literal { bytes: vec![0u8], db_type: DbType::BOOL });
+        return Ok(Expr::Literal {
+            bytes: vec![0u8],
+            db_type: DbType::BOOL,
+        });
     }
 
     if upper.starts_with("CASE ") || upper == "CASE" {
@@ -472,10 +493,16 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
 
     // A number.
     if let Ok(v) = text.parse::<i64>() {
-        return Ok(Expr::Literal { bytes: v.to_le_bytes().to_vec(), db_type: DbType::I64 });
+        return Ok(Expr::Literal {
+            bytes: v.to_le_bytes().to_vec(),
+            db_type: DbType::I64,
+        });
     }
     if let Ok(v) = text.parse::<f64>() {
-        return Ok(Expr::Literal { bytes: v.to_le_bytes().to_vec(), db_type: DbType::F64 });
+        return Ok(Expr::Literal {
+            bytes: v.to_le_bytes().to_vec(),
+            db_type: DbType::F64,
+        });
     }
 
     // `INTERVAL '1 day'`, as a real `INTERVAL` value.
@@ -500,13 +527,18 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
             // refused.
             let micros = interval_micros(body)?;
             return Ok(Expr::Literal {
-                bytes: crate::core::pg_types::encode_interval(
-                    crate::core::pg_types::Interval { months: 0, days: 0, micros },
-                ),
+                bytes: crate::core::pg_types::encode_interval(crate::core::pg_types::Interval {
+                    months: 0,
+                    days: 0,
+                    micros,
+                }),
                 db_type: DbType::INTERVAL,
             });
         }
-        return Err(format!("INTERVAL needs a quoted value, as in `INTERVAL '1 day'`; got '{}'", text));
+        return Err(format!(
+            "INTERVAL needs a quoted value, as in `INTERVAL '1 day'`; got '{}'",
+            text
+        ));
     }
 
     // A function call.
@@ -658,9 +690,7 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                 }
                 "ARRAY_LENGTH" => {
                     if args.len() != 2 {
-                        return Err(
-                            "array_length takes an array and a dimension".to_string()
-                        );
+                        return Err("array_length takes an array and a dimension".to_string());
                     }
                     Ok(Expr::Call(TextFunc::ArrayLength, args))
                 }
@@ -693,9 +723,7 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                     ))
                 }
                 _ => {
-                    if let Some((func, _)) =
-                        crate::core::rql::aggregate::ScalarFunc::parse(name)
-                    {
+                    if let Some((func, _)) = crate::core::rql::aggregate::ScalarFunc::parse(name) {
                         if !args_text.trim().is_empty() {
                             return Err(format!("{}() takes no arguments", name));
                         }
@@ -709,7 +737,10 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
 
     // A column reference, qualified or not.
     let bare = text.rsplit('.').next().unwrap_or(text).trim_matches('"');
-    match schema.iter().find(|f| f.name.eq_ignore_ascii_case(bare) && !f.is_deleted) {
+    match schema
+        .iter()
+        .find(|f| f.name.eq_ignore_ascii_case(bare) && !f.is_deleted)
+    {
         Some(field) => Ok(Expr::Column(field.clone())),
         None => Err(format!("'{}' is neither a column nor a value", text)),
     }
@@ -719,8 +750,7 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
 fn parse_case(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
     use crate::core::rql::join::find_keyword;
 
-    let end_at = find_keyword(text, "END", 0)
-        .ok_or_else(|| "CASE has no END".to_string())?;
+    let end_at = find_keyword(text, "END", 0).ok_or_else(|| "CASE has no END".to_string())?;
     if text[end_at + 3..].trim() != "" {
         return Err("trailing text after END".to_string());
     }
@@ -728,8 +758,7 @@ fn parse_case(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
 
     // A `CASE <expr> WHEN …` compares against a value; only the searched form
     // is supported, and the difference is worth an explicit error.
-    let first_when =
-        find_keyword(body, "WHEN", 0).ok_or_else(|| "CASE has no WHEN".to_string())?;
+    let first_when = find_keyword(body, "WHEN", 0).ok_or_else(|| "CASE has no WHEN".to_string())?;
     if !body[..first_when].trim().is_empty() {
         return Err(
             "CASE <expression> WHEN … is not supported yet; use CASE WHEN <condition> …"
@@ -874,10 +903,18 @@ pub fn parse_condition(text: &str, schema: &[SchemaField]) -> Result<Condition, 
         let tail = text[at + 2..].trim().to_ascii_uppercase();
         let left = Box::new(parse(&text[..at], schema)?);
         if tail == "NULL" {
-            return Ok(Condition { left, cmp: Cmp::IsNull, right: None });
+            return Ok(Condition {
+                left,
+                cmp: Cmp::IsNull,
+                right: None,
+            });
         }
         if tail == "NOT NULL" {
-            return Ok(Condition { left, cmp: Cmp::IsNotNull, right: None });
+            return Ok(Condition {
+                left,
+                cmp: Cmp::IsNotNull,
+                right: None,
+            });
         }
         return Err(format!("condition '{}' is not supported yet", text));
     }
@@ -895,7 +932,11 @@ pub fn parse_condition(text: &str, schema: &[SchemaField]) -> Result<Condition, 
         if let Some(at) = find_operator(text, token) {
             let left = Box::new(parse(&text[..at], schema)?);
             let right = Box::new(parse(&text[at + token.len()..], schema)?);
-            return Ok(Condition { left, cmp, right: Some(right) });
+            return Ok(Condition {
+                left,
+                cmp,
+                right: Some(right),
+            });
         }
     }
     Err(format!("condition '{}' is not a comparison", text))
@@ -958,7 +999,7 @@ fn unit_micros(unit: &str) -> Result<i64, String> {
                 "an interval in {}s is not supported: its length depends on the date it is \
                  added to, and a fixed number of days would be wrong for most of them",
                 normalised
-            ))
+            ));
         }
         _ => return Err(format!("unknown interval unit '{}'", unit)),
     })
@@ -1112,7 +1153,9 @@ fn unify_literal_types(args: &mut [Expr]) {
     let Some(target) = target else { return };
 
     for arg in args.iter_mut() {
-        let Expr::Literal { bytes, db_type } = arg else { continue };
+        let Expr::Literal { bytes, db_type } = arg else {
+            continue;
+        };
         if *db_type != DbType::STRING {
             continue;
         }
@@ -1133,7 +1176,11 @@ pub fn static_type(expr: &Expr) -> DbType {
         Expr::Column(field) => field.db_type.clone(),
         // `->>` is text by definition; `->` stays a document.
         Expr::JsonPath { as_text, .. } => {
-            if *as_text { DbType::STRING } else { DbType::JSONB }
+            if *as_text {
+                DbType::STRING
+            } else {
+                DbType::JSONB
+            }
         }
         Expr::Scalar(func) => match func {
             crate::core::rql::aggregate::ScalarFunc::Now => DbType::DATETIME,
@@ -1180,12 +1227,22 @@ pub fn static_type(expr: &Expr) -> DbType {
             // the result type either way, so taking the column's rank is both
             // Postgres-shaped and safe.
             let int_literal = |e: &Expr| {
-                matches!(e, Expr::Literal { db_type: DbType::I64, .. })
+                matches!(
+                    e,
+                    Expr::Literal {
+                        db_type: DbType::I64,
+                        ..
+                    }
+                )
             };
             let rank = |e: &Expr| -> u8 {
                 if int_literal(e) {
                     // Rank of the *other* operand, so a literal never decides.
-                    let other = if std::ptr::eq(e, &**lhs) { &**rhs } else { &**lhs };
+                    let other = if std::ptr::eq(e, &**lhs) {
+                        &**rhs
+                    } else {
+                        &**lhs
+                    };
                     if int_literal(other) { 4 } else { rank(other) }
                 } else {
                     rank(e)
@@ -1229,17 +1286,42 @@ pub fn static_type(expr: &Expr) -> DbType {
 /// wrong by a factor of the scale and report success.
 fn arith(a: &Value, op: ArithOp, b: &Value) -> Result<Value, String> {
     let float_operand = |v: &Value| {
-        matches!(v, Value::Data { db_type: DbType::F32 | DbType::F64, .. })
+        matches!(
+            v,
+            Value::Data {
+                db_type: DbType::F32 | DbType::F64,
+                ..
+            }
+        )
     };
-    let is_timestamp = |v: &Value| matches!(v, Value::Data { db_type: DbType::DATETIME, .. });
-    let is_interval = |v: &Value| matches!(v, Value::Data { db_type: DbType::INTERVAL, .. });
+    let is_timestamp = |v: &Value| {
+        matches!(
+            v,
+            Value::Data {
+                db_type: DbType::DATETIME,
+                ..
+            }
+        )
+    };
+    let is_interval = |v: &Value| {
+        matches!(
+            v,
+            Value::Data {
+                db_type: DbType::INTERVAL,
+                ..
+            }
+        )
+    };
 
     // Interval ± interval is an interval, with the three fields kept apart —
     // a month is not thirty days, and collapsing them here would make
     // `INTERVAL '1 month' + INTERVAL '1 day'` print as 31 days.
     if is_interval(a) && is_interval(b) {
         if !matches!(op, ArithOp::Add | ArithOp::Sub) {
-            return Err(format!("'{}' is not defined for two intervals", op.symbol()));
+            return Err(format!(
+                "'{}' is not defined for two intervals",
+                op.symbol()
+            ));
         }
         let (Value::Data { bytes: x, .. }, Value::Data { bytes: y, .. }) = (a, b) else {
             return Err("an interval has no value".to_string());
@@ -1310,9 +1392,11 @@ fn arith(a: &Value, op: ArithOp, b: &Value) -> Result<Value, String> {
         // report before the type existed.
         if is_timestamp(a) && is_timestamp(b) && matches!(op, ArithOp::Sub) {
             return Ok(Value::Data {
-                bytes: crate::core::pg_types::encode_interval(
-                    crate::core::pg_types::Interval { months: 0, days: 0, micros: value },
-                ),
+                bytes: crate::core::pg_types::encode_interval(crate::core::pg_types::Interval {
+                    months: 0,
+                    days: 0,
+                    micros: value,
+                }),
                 db_type: DbType::INTERVAL,
             });
         }
@@ -1343,7 +1427,10 @@ fn arith(a: &Value, op: ArithOp, b: &Value) -> Result<Value, String> {
                 x % y
             }
         };
-        return Ok(Value::Data { bytes: value.to_le_bytes().to_vec(), db_type: DbType::F64 });
+        return Ok(Value::Data {
+            bytes: value.to_le_bytes().to_vec(),
+            db_type: DbType::F64,
+        });
     }
 
     // `NUMERIC` is an integer in scaled units, so it cannot share the plain
@@ -1384,12 +1471,7 @@ fn arith(a: &Value, op: ArithOp, b: &Value) -> Result<Value, String> {
     let db_type = wider_integer(a, b);
     let bytes = match narrow_integer(value, &db_type) {
         Some(bytes) => bytes,
-        None => {
-            return Err(format!(
-                "value {} is out of range for {}",
-                value, db_type
-            ))
-        }
+        None => return Err(format!("value {} is out of range for {}", value, db_type)),
     };
     Ok(Value::Data { bytes, db_type })
 }
@@ -1411,7 +1493,10 @@ fn as_text(value: &Value) -> String {
 
 /// Applies a function to its evaluated arguments.
 fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
-    let string = |text: String| Value::Data { bytes: text.into_bytes(), db_type: DbType::STRING };
+    let string = |text: String| Value::Data {
+        bytes: text.into_bytes(),
+        db_type: DbType::STRING,
+    };
 
     Ok(match func {
         // Always `public`: this engine has one schema, and reporting anything
@@ -1422,7 +1507,10 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
             // PostgreSQL quotes only what needs it: anything that is not a
             // plain lower-case identifier.
             let plain = !raw.is_empty()
-                && raw.chars().next().is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+                && raw
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
                 && raw
                     .chars()
                     .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
@@ -1452,8 +1540,7 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
             let mut raw = [0u8; 8];
             raw.copy_from_slice(bytes);
             let us = i64::from_le_bytes(raw);
-            let Some(truncated) = crate::core::value_codec::truncate_timestamp_us(us, &unit)
-            else {
+            let Some(truncated) = crate::core::value_codec::truncate_timestamp_us(us, &unit) else {
                 return Err(format!(
                     "date_trunc does not know the unit '{}'; it takes microseconds, \
                      milliseconds, second, minute, hour, day, week, month, quarter or year",
@@ -1477,8 +1564,7 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
             &as_text(&args[1]),
         )),
         TextFunc::ToTsQuery => {
-            match crate::core::text_search::to_tsquery(&as_text(&args[0]), &as_text(&args[1]))
-            {
+            match crate::core::text_search::to_tsquery(&as_text(&args[0]), &as_text(&args[1])) {
                 Ok(query) => string(query),
                 // A malformed query is reported rather than silently matching
                 // nothing, which is what PostgreSQL does too.
@@ -1511,7 +1597,10 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
             if count == 0 {
                 return Ok(Value::Null);
             }
-            Value::Data { bytes: (count as i32).to_le_bytes().to_vec(), db_type: DbType::I32 }
+            Value::Data {
+                bytes: (count as i32).to_le_bytes().to_vec(),
+                db_type: DbType::I32,
+            }
         }
         // Always one: the array storage carries a flat element list, so a
         // multi-dimensional array declared `DOUBLE PRECISION[][]` is stored and
@@ -1524,7 +1613,10 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
             if bytes.is_empty() {
                 return Ok(Value::Null);
             }
-            Value::Data { bytes: 1i32.to_le_bytes().to_vec(), db_type: DbType::I32 }
+            Value::Data {
+                bytes: 1i32.to_le_bytes().to_vec(),
+                db_type: DbType::I32,
+            }
         }
         // `pg_column_size(v)` is the stored width of one value. Given a whole
         // row — `pg_column_size(t)`, which is how a size query is written — the
@@ -1538,7 +1630,7 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
             return Err(
                 "pg_total_relation_size is only available in a select list over pg_class"
                     .to_string(),
-            )
+            );
         }
         TextFunc::ColumnSize => {
             let size = match args.first() {
@@ -1549,7 +1641,10 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
                     .map(|c| c.data.into_slice().len() as i64)
                     .sum(),
             };
-            Value::Data { bytes: size.to_le_bytes().to_vec(), db_type: DbType::I64 }
+            Value::Data {
+                bytes: size.to_le_bytes().to_vec(),
+                db_type: DbType::I64,
+            }
         }
     })
 }
@@ -1589,7 +1684,13 @@ fn top_level_concat(text: &str) -> Option<usize> {
 
 /// True when the value is a scaled decimal.
 fn is_decimal(value: &Value) -> bool {
-    matches!(value, Value::Data { db_type: DbType::DECIMAL, .. })
+    matches!(
+        value,
+        Value::Data {
+            db_type: DbType::DECIMAL,
+            ..
+        }
+    )
 }
 
 /// Arithmetic over `NUMERIC`, which is stored as an integer scaled by
@@ -1604,9 +1705,10 @@ fn decimal_arith(a: &Value, op: ArithOp, b: &Value) -> Result<Value, String> {
 
     let scaled = |value: &Value| -> Option<i128> {
         match value {
-            Value::Data { bytes, db_type: DbType::DECIMAL } => {
-                Some(i128::from_le_bytes(bytes.as_slice().try_into().ok()?))
-            }
+            Value::Data {
+                bytes,
+                db_type: DbType::DECIMAL,
+            } => Some(i128::from_le_bytes(bytes.as_slice().try_into().ok()?)),
             // A whole number written into a decimal expression is exact, so it
             // is lifted into scaled units rather than turned into a float.
             other => as_i64(other).map(|v| v as i128 * factor),
@@ -1636,7 +1738,10 @@ fn decimal_arith(a: &Value, op: ArithOp, b: &Value) -> Result<Value, String> {
     }
     .ok_or_else(|| format!("numeric overflow in '{}'", op.symbol()))?;
 
-    Ok(Value::Data { bytes: value.to_le_bytes().to_vec(), db_type: DbType::DECIMAL })
+    Ok(Value::Data {
+        bytes: value.to_le_bytes().to_vec(),
+        db_type: DbType::DECIMAL,
+    })
 }
 
 /// The type an integer result takes: the wider of the two operands.
@@ -1668,7 +1773,9 @@ fn narrow_integer(value: i64, db_type: &DbType) -> Option<Vec<u8>> {
 }
 
 fn as_f64(value: &Value) -> Option<f64> {
-    let Value::Data { bytes, db_type } = value else { return None };
+    let Value::Data { bytes, db_type } = value else {
+        return None;
+    };
     match db_type {
         DbType::F32 => Some(f32::from_le_bytes(bytes.as_slice().try_into().ok()?) as f64),
         DbType::F64 => Some(f64::from_le_bytes(bytes.as_slice().try_into().ok()?)),
@@ -1772,7 +1879,11 @@ fn column_value(field: &SchemaField, row: &Row, schema: &[SchemaField]) -> Value
             return Value::Null;
         }
     }
-    match row.columns.iter().find(|c| c.schema_id == field.write_order) {
+    match row
+        .columns
+        .iter()
+        .find(|c| c.schema_id == field.write_order)
+    {
         // A cell carrying `NULL` as its type *is* a NULL.
         //
         // The companion lookup above finds one by name, which works while the
@@ -1798,7 +1909,9 @@ fn column_value(field: &SchemaField, row: &Row, schema: &[SchemaField]) -> Value
 }
 
 fn as_i64(value: &Value) -> Option<i64> {
-    let Value::Data { bytes, db_type } = value else { return None };
+    let Value::Data { bytes, db_type } = value else {
+        return None;
+    };
     Some(match db_type {
         DbType::I8 => i8::from_le_bytes(bytes.as_slice().try_into().ok()?) as i64,
         DbType::I16 => i16::from_le_bytes(bytes.as_slice().try_into().ok()?) as i64,
@@ -1817,7 +1930,14 @@ fn as_i64(value: &Value) -> Option<i64> {
 
 /// Orders two values of the same type, for LEAST/GREATEST and comparisons.
 pub(crate) fn compare(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
-    let (Value::Data { bytes: ab, db_type: at }, Value::Data { bytes: bb, .. }) = (a, b) else {
+    let (
+        Value::Data {
+            bytes: ab,
+            db_type: at,
+        },
+        Value::Data { bytes: bb, .. },
+    ) = (a, b)
+    else {
         return None;
     };
     if ab.is_empty() || bb.is_empty() {
@@ -1832,22 +1952,23 @@ pub(crate) fn compare(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
             None
         };
     }
-    Some(crate::core::processor::concurrent_processor::compare_bytes_as_type(
-        at.clone(),
-        ab,
-        bb,
-    ))
+    Some(crate::core::processor::concurrent_processor::compare_bytes_as_type(at.clone(), ab, bb))
 }
 
 /// Evaluates `expr` for one row.
 pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, String> {
     Ok(match expr {
         Expr::Null => Value::Null,
-        Expr::Literal { bytes, db_type } => {
-            Value::Data { bytes: bytes.clone(), db_type: db_type.clone() }
-        }
+        Expr::Literal { bytes, db_type } => Value::Data {
+            bytes: bytes.clone(),
+            db_type: db_type.clone(),
+        },
         Expr::Column(field) => column_value(field, row, schema),
-        Expr::JsonPath { column, steps, as_text } => {
+        Expr::JsonPath {
+            column,
+            steps,
+            as_text,
+        } => {
             let document = match column_value(column, row, schema) {
                 Value::Data { bytes, .. } => bytes,
                 Value::Null => return Ok(Value::Null),
@@ -1869,7 +1990,10 @@ pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, Str
             } else {
                 // `->` yields a document, so the bytes stay encoded and the
                 // value can be reached into again or rendered as JSON.
-                Value::Data { bytes: found.to_vec(), db_type: DbType::JSONB }
+                Value::Data {
+                    bytes: found.to_vec(),
+                    db_type: DbType::JSONB,
+                }
             }
         }
         Expr::Concat(lhs, rhs) => {
@@ -1882,7 +2006,10 @@ pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, Str
             } else {
                 let mut text = as_text(&a);
                 text.push_str(&as_text(&b));
-                Value::Data { bytes: text.into_bytes(), db_type: DbType::STRING }
+                Value::Data {
+                    bytes: text.into_bytes(),
+                    db_type: DbType::STRING,
+                }
             }
         }
         Expr::Call(func, args) => {
@@ -1911,7 +2038,10 @@ pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, Str
                 crate::core::rql::aggregate::ScalarFunc::GenRandomUuid => "gen_random_uuid",
             })
             .expect("known function");
-            Value::Data { bytes: func.evaluate(), db_type }
+            Value::Data {
+                bytes: func.evaluate(),
+                db_type,
+            }
         }
         Expr::Coalesce(args) => {
             for arg in args {
@@ -1963,7 +2093,10 @@ pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, Str
             if r == 0 {
                 return Err("division by zero".to_string());
             }
-            Value::Data { bytes: (l % r).to_le_bytes().to_vec(), db_type: DbType::I64 }
+            Value::Data {
+                bytes: (l % r).to_le_bytes().to_vec(),
+                db_type: DbType::I64,
+            }
         }
         Expr::Case { whens, otherwise } => {
             for (condition, result) in whens {
@@ -2021,10 +2154,11 @@ pub fn eval_condition(
     // at, which keeps the previous behaviour for anything this cannot vouch
     // for.
     let right = match (&left, &right) {
-        (
-            Value::Data { db_type: lt, .. },
-            Value::Data { db_type: rt, .. },
-        ) if lt != rt && *rt == DbType::STRING => coerce_to(right, lt),
+        (Value::Data { db_type: lt, .. }, Value::Data { db_type: rt, .. })
+            if lt != rt && *rt == DbType::STRING =>
+        {
+            coerce_to(right, lt)
+        }
         _ => right,
     };
     let Some(ordering) = compare(&left, &right) else {
@@ -2115,16 +2249,30 @@ fn cast(value: Value, target: &DbType) -> Result<Value, String> {
             rounded(text, min, max).map(|v| encode(v).to_vec())
         }
         let parsed: Option<Vec<u8>> = match target {
-            DbType::I8 => int_bytes(trimmed, i8::MIN as i128, i8::MAX as i128, |v| (v as i8).to_le_bytes()),
-            DbType::I16 => int_bytes(trimmed, i16::MIN as i128, i16::MAX as i128, |v| (v as i16).to_le_bytes()),
-            DbType::I32 => int_bytes(trimmed, i32::MIN as i128, i32::MAX as i128, |v| (v as i32).to_le_bytes()),
-            DbType::I64 => int_bytes(trimmed, i64::MIN as i128, i64::MAX as i128, |v| (v as i64).to_le_bytes()),
+            DbType::I8 => int_bytes(trimmed, i8::MIN as i128, i8::MAX as i128, |v| {
+                (v as i8).to_le_bytes()
+            }),
+            DbType::I16 => int_bytes(trimmed, i16::MIN as i128, i16::MAX as i128, |v| {
+                (v as i16).to_le_bytes()
+            }),
+            DbType::I32 => int_bytes(trimmed, i32::MIN as i128, i32::MAX as i128, |v| {
+                (v as i32).to_le_bytes()
+            }),
+            DbType::I64 => int_bytes(trimmed, i64::MIN as i128, i64::MAX as i128, |v| {
+                (v as i64).to_le_bytes()
+            }),
             DbType::U8 => int_bytes(trimmed, 0, u8::MAX as i128, |v| (v as u8).to_le_bytes()),
             DbType::U16 => int_bytes(trimmed, 0, u16::MAX as i128, |v| (v as u16).to_le_bytes()),
             DbType::U32 => int_bytes(trimmed, 0, u32::MAX as i128, |v| (v as u32).to_le_bytes()),
             DbType::U64 => int_bytes(trimmed, 0, u64::MAX as i128, |v| (v as u64).to_le_bytes()),
-            DbType::F32 => trimmed.parse::<f32>().ok().map(|v| v.to_le_bytes().to_vec()),
-            DbType::F64 => trimmed.parse::<f64>().ok().map(|v| v.to_le_bytes().to_vec()),
+            DbType::F32 => trimmed
+                .parse::<f32>()
+                .ok()
+                .map(|v| v.to_le_bytes().to_vec()),
+            DbType::F64 => trimmed
+                .parse::<f64>()
+                .ok()
+                .map(|v| v.to_le_bytes().to_vec()),
             DbType::BOOL => match trimmed.to_ascii_lowercase().as_str() {
                 "t" | "true" | "1" | "yes" | "on" => Some(vec![1u8]),
                 "f" | "false" | "0" | "no" | "off" => Some(vec![0u8]),
@@ -2133,7 +2281,10 @@ fn cast(value: Value, target: &DbType) -> Result<Value, String> {
             _ => crate::core::value_codec::encode_literal(target, &text),
         };
         return match parsed {
-            Some(encoded) => Ok(Value::Data { bytes: encoded, db_type: target.clone() }),
+            Some(encoded) => Ok(Value::Data {
+                bytes: encoded,
+                db_type: target.clone(),
+            }),
             None => Err(format!("'{}' cannot be read as {:?}", text, target)),
         };
     }
@@ -2143,11 +2294,17 @@ fn cast(value: Value, target: &DbType) -> Result<Value, String> {
         let rendered = crate::core::rql::subquery::value_to_literal(&db_type, &bytes)
             .ok_or_else(|| format!("{:?} cannot be rendered as text", db_type))?;
         let unquoted = crate::core::value_codec::unquote_sql(&rendered).to_string();
-        return Ok(Value::Data { bytes: unquoted.into_bytes(), db_type: DbType::STRING });
+        return Ok(Value::Data {
+            bytes: unquoted.into_bytes(),
+            db_type: DbType::STRING,
+        });
     }
 
     // Between numeric widths.
-    let value = Value::Data { bytes, db_type: db_type.clone() };
+    let value = Value::Data {
+        bytes,
+        db_type: db_type.clone(),
+    };
     if let Some(n) = as_i64(&value) {
         let encoded = match target {
             DbType::I8 => (n as i8).to_le_bytes().to_vec(),
@@ -2161,10 +2318,16 @@ fn cast(value: Value, target: &DbType) -> Result<Value, String> {
             DbType::F32 => (n as f32).to_le_bytes().to_vec(),
             DbType::F64 => (n as f64).to_le_bytes().to_vec(),
             _ => {
-                return Err(format!("cast from {:?} to {:?} is not supported yet", db_type, target))
+                return Err(format!(
+                    "cast from {:?} to {:?} is not supported yet",
+                    db_type, target
+                ));
             }
         };
-        return Ok(Value::Data { bytes: encoded, db_type: target.clone() });
+        return Ok(Value::Data {
+            bytes: encoded,
+            db_type: target.clone(),
+        });
     }
 
     // Everything else goes through text: rendered, then re-read as the
@@ -2175,13 +2338,19 @@ fn cast(value: Value, target: &DbType) -> Result<Value, String> {
         if let Some(rendered) = crate::core::rql::subquery::value_to_literal(&db_type, bytes) {
             let unquoted = crate::core::value_codec::unquote_sql(&rendered).to_string();
             return cast(
-                Value::Data { bytes: unquoted.into_bytes(), db_type: DbType::STRING },
+                Value::Data {
+                    bytes: unquoted.into_bytes(),
+                    db_type: DbType::STRING,
+                },
                 target,
             );
         }
     }
 
-    Err(format!("cast from {:?} to {:?} is not supported yet", db_type, target))
+    Err(format!(
+        "cast from {:?} to {:?} is not supported yet",
+        db_type, target
+    ))
 }
 
 #[cfg(test)]
@@ -2191,7 +2360,14 @@ mod tests {
     use crate::memory_pool::MEMORY_POOL;
 
     fn field(name: &str, ty: DbType, write_order: u64) -> SchemaField {
-        SchemaField::new(name.to_string(), ty.clone(), ty.get_size(), 0, write_order, false)
+        SchemaField::new(
+            name.to_string(),
+            ty.clone(),
+            ty.get_size(),
+            0,
+            write_order,
+            false,
+        )
     }
 
     fn column(schema_id: u64, ty: DbType, bytes: &[u8]) -> Column {
@@ -2199,7 +2375,11 @@ mod tests {
         if !bytes.is_empty() {
             mb.into_slice_mut().copy_from_slice(bytes);
         }
-        Column { schema_id, data: mb, column_type: ty }
+        Column {
+            schema_id,
+            data: mb,
+            column_type: ty,
+        }
     }
 
     /// `v` is I32 at write order 0; `__null_v` is its companion at 1.
@@ -2224,7 +2404,11 @@ mod tests {
             }
         }
         columns.push(column(2, DbType::STRING, t.as_bytes()));
-        Row { position: 0, length: 0, columns }
+        Row {
+            position: 0,
+            length: 0,
+            columns,
+        }
     }
 
     #[test]
@@ -2232,7 +2416,10 @@ mod tests {
         let s = schema();
         let e = parse("COALESCE(v, 7)", &s).unwrap();
         // Present: the column wins.
-        assert_eq!(as_i64(&eval(&e, &row_with(Some(3), ""), &s).unwrap()), Some(3));
+        assert_eq!(
+            as_i64(&eval(&e, &row_with(Some(3), ""), &s).unwrap()),
+            Some(3)
+        );
         // NULL: the fallback wins. The companion flag is what distinguishes
         // this from a stored zero, which is why a bare byte check is not enough.
         assert_eq!(as_i64(&eval(&e, &row_with(None, ""), &s).unwrap()), Some(7));
@@ -2265,7 +2452,13 @@ mod tests {
         // The result must still be a DATETIME. Handing a timestamp column a
         // bare integer is what produced "Cannot insert row due to schema
         // mismatch" from a statement that looked fine.
-        assert!(matches!(later, Value::Data { db_type: DbType::DATETIME, .. }));
+        assert!(matches!(
+            later,
+            Value::Data {
+                db_type: DbType::DATETIME,
+                ..
+            }
+        ));
         let (Some(a), Some(b)) = (as_i64(&now), as_i64(&later)) else {
             panic!("both should decode");
         };
@@ -2281,7 +2474,7 @@ mod tests {
 
     #[test]
     fn interval_literals_parse_in_both_spellings() {
-        use crate::core::pg_types::{decode_interval, Interval};
+        use crate::core::pg_types::{Interval, decode_interval};
         let s = schema();
         let r = row_with(Some(1), "");
 
@@ -2297,12 +2490,20 @@ mod tests {
         };
         assert_eq!(
             decode_interval(&bytes("INTERVAL '1 day'")),
-            Some(Interval { months: 0, days: 1, micros: 0 })
+            Some(Interval {
+                months: 0,
+                days: 1,
+                micros: 0
+            })
         );
         // Several units in one literal add up rather than the last one winning.
         assert_eq!(
             decode_interval(&bytes("INTERVAL '1 day 6 hours'")),
-            Some(Interval { months: 0, days: 1, micros: 6 * 3_600_000_000 })
+            Some(Interval {
+                months: 0,
+                days: 1,
+                micros: 6 * 3_600_000_000
+            })
         );
         // Subtraction moves backwards.
         let before = eval(&parse("now() - INTERVAL '1 day'", &s).unwrap(), &r, &s).unwrap();
@@ -2367,7 +2568,7 @@ mod tests {
 
     #[test]
     fn months_and_years_are_kept_as_months_rather_than_flattened() {
-        use crate::core::pg_types::{decode_interval, Interval};
+        use crate::core::pg_types::{Interval, decode_interval};
         let s = schema();
         let r = row_with(Some(1), "");
 
@@ -2381,11 +2582,19 @@ mod tests {
         };
         assert_eq!(
             decode_interval(&bytes("INTERVAL '1 month'")),
-            Some(Interval { months: 1, days: 0, micros: 0 })
+            Some(Interval {
+                months: 1,
+                days: 0,
+                micros: 0
+            })
         );
         assert_eq!(
             decode_interval(&bytes("INTERVAL '1 year'")),
-            Some(Interval { months: 12, days: 0, micros: 0 })
+            Some(Interval {
+                months: 12,
+                days: 0,
+                micros: 0
+            })
         );
 
         // A unit that means nothing is still refused rather than guessed at.
@@ -2398,15 +2607,34 @@ mod tests {
         let present = row_with(Some(5), "");
         let absent = row_with(None, "");
 
-        assert_eq!(as_i64(&eval(&parse("v + 1", &s).unwrap(), &present, &s).unwrap()), Some(6));
-        assert_eq!(as_i64(&eval(&parse("v - 2", &s).unwrap(), &present, &s).unwrap()), Some(3));
-        assert_eq!(as_i64(&eval(&parse("v * 3", &s).unwrap(), &present, &s).unwrap()), Some(15));
-        assert_eq!(as_i64(&eval(&parse("v / 2", &s).unwrap(), &present, &s).unwrap()), Some(2));
-        assert_eq!(as_i64(&eval(&parse("v % 3", &s).unwrap(), &present, &s).unwrap()), Some(2));
+        assert_eq!(
+            as_i64(&eval(&parse("v + 1", &s).unwrap(), &present, &s).unwrap()),
+            Some(6)
+        );
+        assert_eq!(
+            as_i64(&eval(&parse("v - 2", &s).unwrap(), &present, &s).unwrap()),
+            Some(3)
+        );
+        assert_eq!(
+            as_i64(&eval(&parse("v * 3", &s).unwrap(), &present, &s).unwrap()),
+            Some(15)
+        );
+        assert_eq!(
+            as_i64(&eval(&parse("v / 2", &s).unwrap(), &present, &s).unwrap()),
+            Some(2)
+        );
+        assert_eq!(
+            as_i64(&eval(&parse("v % 3", &s).unwrap(), &present, &s).unwrap()),
+            Some(2)
+        );
 
         // NULL + 1 is NULL, not 1. This is what lets `COALESCE(MAX(x), 0) + 1`
         // reach its fallback instead of adding to a zero that was never there.
-        assert!(eval(&parse("v + 1", &s).unwrap(), &absent, &s).unwrap().is_null());
+        assert!(
+            eval(&parse("v + 1", &s).unwrap(), &absent, &s)
+                .unwrap()
+                .is_null()
+        );
     }
 
     #[test]
@@ -2419,7 +2647,13 @@ mod tests {
         let r = row_with(Some(5), "");
         let v = eval(&parse("v + 1", &s).unwrap(), &r, &s).unwrap();
         // `v` is I32 and `1` parses as I64, so this is the widening case.
-        assert!(matches!(v, Value::Data { db_type: DbType::I64, .. }));
+        assert!(matches!(
+            v,
+            Value::Data {
+                db_type: DbType::I64,
+                ..
+            }
+        ));
 
         // Two I32 operands stay I32.
         let both = Expr::Arith(
@@ -2428,7 +2662,13 @@ mod tests {
             Box::new(Expr::Column(field("v", DbType::I32, 0))),
         );
         let v = eval(&both, &r, &s).unwrap();
-        assert!(matches!(v, Value::Data { db_type: DbType::I32, .. }));
+        assert!(matches!(
+            v,
+            Value::Data {
+                db_type: DbType::I32,
+                ..
+            }
+        ));
         assert_eq!(as_i64(&v), Some(10));
         assert_eq!(static_type(&both), DbType::I32);
     }
@@ -2457,9 +2697,10 @@ mod tests {
         let r = row_with(Some(1), "");
         let read = |e: &Expr| -> i128 {
             match eval(e, &r, &s).unwrap() {
-                Value::Data { bytes, db_type: DbType::DECIMAL } => {
-                    i128::from_le_bytes(bytes.as_slice().try_into().unwrap())
-                }
+                Value::Data {
+                    bytes,
+                    db_type: DbType::DECIMAL,
+                } => i128::from_le_bytes(bytes.as_slice().try_into().unwrap()),
                 other => panic!("expected a DECIMAL, got {:?}", other),
             }
         };
@@ -2468,13 +2709,21 @@ mod tests {
         let a = (3 * factor) / 2;
         let b = (9 * factor) / 4;
         assert_eq!(
-            read(&Expr::Arith(Box::new(dec(a)), ArithOp::Add, Box::new(dec(b)))),
+            read(&Expr::Arith(
+                Box::new(dec(a)),
+                ArithOp::Add,
+                Box::new(dec(b))
+            )),
             a + b
         );
         // 1.50 * 2 = 3.00 — the product is scaled twice and has to come back
         // down, or the answer is out by a factor of a billion.
         assert_eq!(
-            read(&Expr::Arith(Box::new(dec(a)), ArithOp::Mul, Box::new(dec(2 * factor)))),
+            read(&Expr::Arith(
+                Box::new(dec(a)),
+                ArithOp::Mul,
+                Box::new(dec(2 * factor))
+            )),
             3 * factor
         );
         // 3.00 / 2 = 1.50 — the numerator has to be lifted first, or the
@@ -2494,11 +2743,20 @@ mod tests {
         let s = schema();
         let r = row_with(Some(2), "");
         // `*` binds tighter than `+`: 2 + 3*4 = 14, not 20.
-        assert_eq!(as_i64(&eval(&parse("v + 3 * 4", &s).unwrap(), &r, &s).unwrap()), Some(14));
+        assert_eq!(
+            as_i64(&eval(&parse("v + 3 * 4", &s).unwrap(), &r, &s).unwrap()),
+            Some(14)
+        );
         // Parentheses override it.
-        assert_eq!(as_i64(&eval(&parse("(v + 3) * 4", &s).unwrap(), &r, &s).unwrap()), Some(20));
+        assert_eq!(
+            as_i64(&eval(&parse("(v + 3) * 4", &s).unwrap(), &r, &s).unwrap()),
+            Some(20)
+        );
         // Subtraction is left-associative: (10-3)-2 = 5, not 10-(3-2) = 9.
-        assert_eq!(as_i64(&eval(&parse("10 - 3 - 2", &s).unwrap(), &r, &s).unwrap()), Some(5));
+        assert_eq!(
+            as_i64(&eval(&parse("10 - 3 - 2", &s).unwrap(), &r, &s).unwrap()),
+            Some(5)
+        );
     }
 
     #[test]
@@ -2506,9 +2764,15 @@ mod tests {
         let s = schema();
         let r = row_with(Some(2), "");
         // The whole text is a number, so it must not be split at the `-`.
-        assert_eq!(as_i64(&eval(&parse("-5", &s).unwrap(), &r, &s).unwrap()), Some(-5));
+        assert_eq!(
+            as_i64(&eval(&parse("-5", &s).unwrap(), &r, &s).unwrap()),
+            Some(-5)
+        );
         // And a sign following an operator belongs to the literal: 2 * -3.
-        assert_eq!(as_i64(&eval(&parse("v * -3", &s).unwrap(), &r, &s).unwrap()), Some(-6));
+        assert_eq!(
+            as_i64(&eval(&parse("v * -3", &s).unwrap(), &r, &s).unwrap()),
+            Some(-6)
+        );
         // A float in exponent form keeps its `-` too, rather than becoming
         // `1e` minus `5`.
         assert!(parse("1e-5", &s).is_ok());
@@ -2542,23 +2806,39 @@ mod tests {
     fn nullif_and_least_and_greatest() {
         let s = schema();
         let r = row_with(Some(5), "");
-        assert!(eval(&parse("NULLIF(v, 5)", &s).unwrap(), &r, &s).unwrap().is_null());
-        assert_eq!(as_i64(&eval(&parse("NULLIF(v, 9)", &s).unwrap(), &r, &s).unwrap()), Some(5));
-        assert_eq!(as_i64(&eval(&parse("LEAST(v, 2)", &s).unwrap(), &r, &s).unwrap()), Some(2));
+        assert!(
+            eval(&parse("NULLIF(v, 5)", &s).unwrap(), &r, &s)
+                .unwrap()
+                .is_null()
+        );
+        assert_eq!(
+            as_i64(&eval(&parse("NULLIF(v, 9)", &s).unwrap(), &r, &s).unwrap()),
+            Some(5)
+        );
+        assert_eq!(
+            as_i64(&eval(&parse("LEAST(v, 2)", &s).unwrap(), &r, &s).unwrap()),
+            Some(2)
+        );
         assert_eq!(
             as_i64(&eval(&parse("GREATEST(v, 2)", &s).unwrap(), &r, &s).unwrap()),
             Some(5)
         );
         // NULLs are ignored rather than winning, as PostgreSQL does.
         let n = row_with(None, "");
-        assert_eq!(as_i64(&eval(&parse("LEAST(v, 4)", &s).unwrap(), &n, &s).unwrap()), Some(4));
+        assert_eq!(
+            as_i64(&eval(&parse("LEAST(v, 4)", &s).unwrap(), &n, &s).unwrap()),
+            Some(4)
+        );
     }
 
     #[test]
     fn mod_and_nested_calls() {
         let s = schema();
         let r = row_with(Some(7), "");
-        assert_eq!(as_i64(&eval(&parse("MOD(v, 2)", &s).unwrap(), &r, &s).unwrap()), Some(1));
+        assert_eq!(
+            as_i64(&eval(&parse("MOD(v, 2)", &s).unwrap(), &r, &s).unwrap()),
+            Some(1)
+        );
         assert_eq!(
             as_i64(&eval(&parse("LEAST(GREATEST(v, 1), 3)", &s).unwrap(), &r, &s).unwrap()),
             Some(3)
@@ -2570,12 +2850,25 @@ mod tests {
     fn case_when_picks_the_first_true_branch() {
         let s = schema();
         let e = parse("CASE WHEN v = 1 THEN 10 WHEN v = 2 THEN 20 ELSE 30 END", &s).unwrap();
-        assert_eq!(as_i64(&eval(&e, &row_with(Some(1), ""), &s).unwrap()), Some(10));
-        assert_eq!(as_i64(&eval(&e, &row_with(Some(2), ""), &s).unwrap()), Some(20));
-        assert_eq!(as_i64(&eval(&e, &row_with(Some(9), ""), &s).unwrap()), Some(30));
+        assert_eq!(
+            as_i64(&eval(&e, &row_with(Some(1), ""), &s).unwrap()),
+            Some(10)
+        );
+        assert_eq!(
+            as_i64(&eval(&e, &row_with(Some(2), ""), &s).unwrap()),
+            Some(20)
+        );
+        assert_eq!(
+            as_i64(&eval(&e, &row_with(Some(9), ""), &s).unwrap()),
+            Some(30)
+        );
         // No ELSE and nothing matches is NULL, not zero.
         let no_else = parse("CASE WHEN v = 1 THEN 10 END", &s).unwrap();
-        assert!(eval(&no_else, &row_with(Some(9), ""), &s).unwrap().is_null());
+        assert!(
+            eval(&no_else, &row_with(Some(9), ""), &s)
+                .unwrap()
+                .is_null()
+        );
     }
 
     #[test]
@@ -2583,7 +2876,10 @@ mod tests {
         let s = schema();
         let e = parse("CASE WHEN v IS NULL THEN 1 ELSE 0 END", &s).unwrap();
         assert_eq!(as_i64(&eval(&e, &row_with(None, ""), &s).unwrap()), Some(1));
-        assert_eq!(as_i64(&eval(&e, &row_with(Some(0), ""), &s).unwrap()), Some(0));
+        assert_eq!(
+            as_i64(&eval(&e, &row_with(Some(0), ""), &s).unwrap()),
+            Some(0)
+        );
     }
 
     #[test]
@@ -2592,7 +2888,9 @@ mod tests {
         let r = row_with(Some(300), "");
         // Narrowing writes the narrower width, not the original bytes.
         let e = parse("v::smallint", &s).unwrap();
-        let Value::Data { bytes, db_type } = eval(&e, &r, &s).unwrap() else { panic!("null") };
+        let Value::Data { bytes, db_type } = eval(&e, &r, &s).unwrap() else {
+            panic!("null")
+        };
         assert_eq!(db_type, DbType::I16);
         assert_eq!(bytes.len(), 2);
         assert_eq!(i16::from_le_bytes(bytes.try_into().unwrap()), 300);
@@ -2611,11 +2909,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(as_i64(&eval(&e, &row_with(None, ""), &s).unwrap()), Some(3));
-        assert_eq!(as_i64(&eval(&e, &row_with(Some(0), ""), &s).unwrap()), Some(3));
-        assert_eq!(as_i64(&eval(&e, &row_with(Some(2), ""), &s).unwrap()), Some(3));
-        assert_eq!(as_i64(&eval(&e, &row_with(Some(9), ""), &s).unwrap()), Some(3));
-        assert_eq!(as_i64(&eval(&e, &row_with(Some(3), ""), &s).unwrap()), Some(3), "ELSE echoes the column");
-        assert_eq!(as_i64(&eval(&e, &row_with(Some(1), ""), &s).unwrap()), Some(1), "ELSE echoes the column");
+        assert_eq!(
+            as_i64(&eval(&e, &row_with(Some(0), ""), &s).unwrap()),
+            Some(3)
+        );
+        assert_eq!(
+            as_i64(&eval(&e, &row_with(Some(2), ""), &s).unwrap()),
+            Some(3)
+        );
+        assert_eq!(
+            as_i64(&eval(&e, &row_with(Some(9), ""), &s).unwrap()),
+            Some(3)
+        );
+        assert_eq!(
+            as_i64(&eval(&e, &row_with(Some(3), ""), &s).unwrap()),
+            Some(3),
+            "ELSE echoes the column"
+        );
+        assert_eq!(
+            as_i64(&eval(&e, &row_with(Some(1), ""), &s).unwrap()),
+            Some(1),
+            "ELSE echoes the column"
+        );
 
         // AND binds tighter than OR: `a OR b AND c` is `a OR (b AND c)`.
         let e = parse(
@@ -2633,20 +2948,39 @@ mod tests {
         assert_eq!(text_of(Some(2)), "out");
 
         // Parentheses group.
-        let e = parse("CASE WHEN (v = 1 OR v = 2) AND t = 'a' THEN 1 ELSE 0 END", &s).unwrap();
-        assert_eq!(as_i64(&eval(&e, &row_with(Some(2), "a"), &s).unwrap()), Some(1));
-        assert_eq!(as_i64(&eval(&e, &row_with(Some(2), "b"), &s).unwrap()), Some(0));
+        let e = parse(
+            "CASE WHEN (v = 1 OR v = 2) AND t = 'a' THEN 1 ELSE 0 END",
+            &s,
+        )
+        .unwrap();
+        assert_eq!(
+            as_i64(&eval(&e, &row_with(Some(2), "a"), &s).unwrap()),
+            Some(1)
+        );
+        assert_eq!(
+            as_i64(&eval(&e, &row_with(Some(2), "b"), &s).unwrap()),
+            Some(0)
+        );
 
         // A function call inside the condition, verbatim shape from another
         // migration: `MOD(seq - 1, 2) = 0`.
         let e = parse("CASE WHEN MOD(v - 1, 2) = 0 THEN 1 ELSE 4 END", &s).unwrap();
-        assert_eq!(as_i64(&eval(&e, &row_with(Some(1), ""), &s).unwrap()), Some(1));
-        assert_eq!(as_i64(&eval(&e, &row_with(Some(2), ""), &s).unwrap()), Some(4));
+        assert_eq!(
+            as_i64(&eval(&e, &row_with(Some(1), ""), &s).unwrap()),
+            Some(1)
+        );
+        assert_eq!(
+            as_i64(&eval(&e, &row_with(Some(2), ""), &s).unwrap()),
+            Some(4)
+        );
 
         // NULL as a THEN result stays NULL, distinct from any value.
         let e = parse("CASE WHEN v IS NULL THEN NULL ELSE 1 END", &s).unwrap();
         assert!(eval(&e, &row_with(None, ""), &s).unwrap().is_null());
-        assert_eq!(as_i64(&eval(&e, &row_with(Some(5), ""), &s).unwrap()), Some(1));
+        assert_eq!(
+            as_i64(&eval(&e, &row_with(Some(5), ""), &s).unwrap()),
+            Some(1)
+        );
 
         // NOT is refused, not folded to two-valued logic.
         assert!(parse("CASE WHEN NOT v = 1 THEN 1 ELSE 0 END", &s).is_err());
@@ -2657,39 +2991,79 @@ mod tests {
         let s = schema();
         let r = row_with(Some(1), "");
         // A quoted literal to a numeric target — `'42'::int`.
-        let Value::Data { bytes, db_type } = eval(&parse("'42'::int", &s).unwrap(), &r, &s).unwrap() else { panic!("null") };
+        let Value::Data { bytes, db_type } =
+            eval(&parse("'42'::int", &s).unwrap(), &r, &s).unwrap()
+        else {
+            panic!("null")
+        };
         assert_eq!(db_type, DbType::I32);
         assert_eq!(i32::from_le_bytes(bytes.try_into().unwrap()), 42);
         // Out of range is an error, not a wrap.
         assert!(eval(&parse("'300'::smallint", &s).unwrap(), &r, &s).is_ok());
         assert!(eval(&parse("'70000'::smallint", &s).unwrap(), &r, &s).is_err());
         // `real` is float4, not float8.
-        let Value::Data { bytes, db_type } = eval(&parse("v::real", &s).unwrap(), &r, &s).unwrap() else { panic!("null") };
+        let Value::Data { bytes, db_type } = eval(&parse("v::real", &s).unwrap(), &r, &s).unwrap()
+        else {
+            panic!("null")
+        };
         assert_eq!(db_type, DbType::F32);
         assert_eq!(f32::from_le_bytes(bytes.try_into().unwrap()), 1.0);
         // A fractional literal reaches a float target.
-        let Value::Data { bytes, db_type } = eval(&parse("'2.5'::float8", &s).unwrap(), &r, &s).unwrap() else { panic!("null") };
+        let Value::Data { bytes, db_type } =
+            eval(&parse("'2.5'::float8", &s).unwrap(), &r, &s).unwrap()
+        else {
+            panic!("null")
+        };
         assert_eq!(db_type, DbType::F64);
         assert_eq!(f64::from_le_bytes(bytes.try_into().unwrap()), 2.5);
         // A float SOURCE reaches another width through the text fallback —
         // the path `AVG(x)::real` takes, since no direct f64→f32 arm exists.
-        let Value::Data { bytes, db_type } = eval(&parse("('2.5'::float8)::real", &s).unwrap(), &r, &s).unwrap() else { panic!("null") };
+        let Value::Data { bytes, db_type } =
+            eval(&parse("('2.5'::float8)::real", &s).unwrap(), &r, &s).unwrap()
+        else {
+            panic!("null")
+        };
         assert_eq!(db_type, DbType::F32);
         assert_eq!(f32::from_le_bytes(bytes.try_into().unwrap()), 2.5);
         // A fractional value ROUNDS into an integer target, half away from
         // zero, as PostgreSQL's numeric cast does — the billing rollup hands
         // AVG's '1092.75' to ::bigint. Range still checked after rounding.
-        let Value::Data { bytes, .. } = eval(&parse("'1092.75'::bigint", &s).unwrap(), &r, &s).unwrap() else { panic!("null") };
+        let Value::Data { bytes, .. } =
+            eval(&parse("'1092.75'::bigint", &s).unwrap(), &r, &s).unwrap()
+        else {
+            panic!("null")
+        };
         assert_eq!(i64::from_le_bytes(bytes.try_into().unwrap()), 1093);
-        let Value::Data { bytes, .. } = eval(&parse("'2.5'::int", &s).unwrap(), &r, &s).unwrap() else { panic!("null") };
-        assert_eq!(i32::from_le_bytes(bytes.try_into().unwrap()), 3, "half away from zero");
-        let Value::Data { bytes, .. } = eval(&parse("'-2.5'::int", &s).unwrap(), &r, &s).unwrap() else { panic!("null") };
-        assert_eq!(i32::from_le_bytes(bytes.try_into().unwrap()), -3, "half away from zero");
+        let Value::Data { bytes, .. } = eval(&parse("'2.5'::int", &s).unwrap(), &r, &s).unwrap()
+        else {
+            panic!("null")
+        };
+        assert_eq!(
+            i32::from_le_bytes(bytes.try_into().unwrap()),
+            3,
+            "half away from zero"
+        );
+        let Value::Data { bytes, .. } = eval(&parse("'-2.5'::int", &s).unwrap(), &r, &s).unwrap()
+        else {
+            panic!("null")
+        };
+        assert_eq!(
+            i32::from_le_bytes(bytes.try_into().unwrap()),
+            -3,
+            "half away from zero"
+        );
         assert!(eval(&parse("'32767.4'::smallint", &s).unwrap(), &r, &s).is_ok());
-        assert!(eval(&parse("'32767.6'::smallint", &s).unwrap(), &r, &s).is_err(), "rounds out of range");
+        assert!(
+            eval(&parse("'32767.6'::smallint", &s).unwrap(), &r, &s).is_err(),
+            "rounds out of range"
+        );
         // Booleans read the forms PostgreSQL accepts.
         for (text, want) in [("'t'", 1u8), ("'true'", 1), ("'0'", 0), ("'off'", 0)] {
-            let Value::Data { bytes, .. } = eval(&parse(&format!("{}::bool", text), &s).unwrap(), &r, &s).unwrap() else { panic!("null") };
+            let Value::Data { bytes, .. } =
+                eval(&parse(&format!("{}::bool", text), &s).unwrap(), &r, &s).unwrap()
+            else {
+                panic!("null")
+            };
             assert_eq!(bytes, vec![want], "{}", text);
         }
         assert!(eval(&parse("'maybe'::bool", &s).unwrap(), &r, &s).is_err());

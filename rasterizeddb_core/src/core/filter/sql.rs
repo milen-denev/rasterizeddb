@@ -37,18 +37,66 @@ pub struct Key {
 }
 
 pub const KEYS: &[Key] = &[
-    Key { name: "enabled", global_only: true, help: "master switch (bool)" },
-    Key { name: "backfill_on_open", global_only: true, help: "index pre-existing rows at open (bool)" },
-    Key { name: "min_pruning_ratio", global_only: true, help: "skip the mask if it prunes less than this (0..1); overridden when the mask lets a scan start late" },
-    Key { name: "checkpoint_interval_secs", global_only: true, help: "how often the maintenance task checkpoints" },
-    Key { name: "indexed", global_only: false, help: "index this table/column at all (bool)" },
-    Key { name: "zone_bounds", global_only: false, help: "keep per-zone min/max for range pruning (bool)" },
-    Key { name: "bloom", global_only: false, help: "keep a per-superzone span summary; cuts bytes streamed, not rows fetched (bool)" },
-    Key { name: "min_f", global_only: false, help: "floor on fingerprint bits (4..16)" },
-    Key { name: "default_f", global_only: false, help: "fingerprint bits before cardinality is known" },
-    Key { name: "max_f", global_only: false, help: "ceiling on fingerprint bits (4..16)" },
-    Key { name: "min_selectivity", global_only: false, help: "largest row fraction a predicate may match and still be indexed" },
-    Key { name: "min_table_rows", global_only: false, help: "tables smaller than this are scanned without consulting the index" },
+    Key {
+        name: "enabled",
+        global_only: true,
+        help: "master switch (bool)",
+    },
+    Key {
+        name: "backfill_on_open",
+        global_only: true,
+        help: "index pre-existing rows at open (bool)",
+    },
+    Key {
+        name: "min_pruning_ratio",
+        global_only: true,
+        help: "skip the mask if it prunes less than this (0..1); overridden when the mask lets a scan start late",
+    },
+    Key {
+        name: "checkpoint_interval_secs",
+        global_only: true,
+        help: "how often the maintenance task checkpoints",
+    },
+    Key {
+        name: "indexed",
+        global_only: false,
+        help: "index this table/column at all (bool)",
+    },
+    Key {
+        name: "zone_bounds",
+        global_only: false,
+        help: "keep per-zone min/max for range pruning (bool)",
+    },
+    Key {
+        name: "bloom",
+        global_only: false,
+        help: "keep a per-superzone span summary; cuts bytes streamed, not rows fetched (bool)",
+    },
+    Key {
+        name: "min_f",
+        global_only: false,
+        help: "floor on fingerprint bits (4..16)",
+    },
+    Key {
+        name: "default_f",
+        global_only: false,
+        help: "fingerprint bits before cardinality is known",
+    },
+    Key {
+        name: "max_f",
+        global_only: false,
+        help: "ceiling on fingerprint bits (4..16)",
+    },
+    Key {
+        name: "min_selectivity",
+        global_only: false,
+        help: "largest row fraction a predicate may match and still be indexed",
+    },
+    Key {
+        name: "min_table_rows",
+        global_only: false,
+        help: "tables smaller than this are scanned without consulting the index",
+    },
 ];
 
 #[derive(Debug, PartialEq)]
@@ -62,7 +110,10 @@ fn parse_bool(v: &str) -> Result<bool, String> {
     match v.trim().to_ascii_lowercase().as_str() {
         "true" | "on" | "yes" | "1" | "t" => Ok(true),
         "false" | "off" | "no" | "0" | "f" => Ok(false),
-        other => Err(format!("`{}` is not a boolean (use on/off, true/false, 1/0)", other)),
+        other => Err(format!(
+            "`{}` is not a boolean (use on/off, true/false, 1/0)",
+            other
+        )),
     }
 }
 
@@ -96,7 +147,10 @@ fn split_scope(rest: &str) -> Result<(String, Scope), String> {
         }
         Ok((head, Scope::Column(t.to_string(), c.to_string())))
     } else {
-        Err(format!("expected FOR TABLE or FOR COLUMN, got `FOR {}`", kind))
+        Err(format!(
+            "expected FOR TABLE or FOR COLUMN, got `FOR {}`",
+            kind
+        ))
     }
 }
 
@@ -117,7 +171,10 @@ fn apply(key: &str, value: &str, scope: &Scope) -> Result<String, String> {
         .ok_or_else(|| format!("unknown filter key `{}` (try SHOW FILTER KEYS)", key.trim()))?;
 
     if spec.global_only && *scope != Scope::Global {
-        return Err(format!("`{}` is a global setting and takes no FOR clause", spec.name));
+        return Err(format!(
+            "`{}` is a global setting and takes no FOR clause",
+            spec.name
+        ));
     }
 
     let s = settings();
@@ -125,14 +182,20 @@ fn apply(key: &str, value: &str, scope: &Scope) -> Result<String, String> {
         "enabled" => s.set_enabled(parse_bool(value)?),
         "backfill_on_open" => s.set_backfill_on_open(parse_bool(value)?),
         "min_pruning_ratio" => {
-            let v: f64 = value.trim().parse().map_err(|_| format!("`{}` is not a number", value.trim()))?;
+            let v: f64 = value
+                .trim()
+                .parse()
+                .map_err(|_| format!("`{}` is not a number", value.trim()))?;
             if !(0.0..=1.0).contains(&v) {
                 return Err("min_pruning_ratio must be between 0 and 1".to_string());
             }
             s.set_min_pruning_ratio(v);
         }
         "checkpoint_interval_secs" => {
-            let v: u64 = value.trim().parse().map_err(|_| format!("`{}` is not an integer", value.trim()))?;
+            let v: u64 = value
+                .trim()
+                .parse()
+                .map_err(|_| format!("`{}` is not an integer", value.trim()))?;
             s.set_checkpoint_interval_secs(v);
         }
         "indexed" => {
@@ -148,7 +211,10 @@ fn apply(key: &str, value: &str, scope: &Scope) -> Result<String, String> {
             set_in(scope, move |o| o.zone_bounds = Some(v));
         }
         "min_f" | "default_f" | "max_f" => {
-            let v: u8 = value.trim().parse().map_err(|_| format!("`{}` is not an integer", value.trim()))?;
+            let v: u8 = value
+                .trim()
+                .parse()
+                .map_err(|_| format!("`{}` is not an integer", value.trim()))?;
             if !(super::kernels::MIN_F..=super::kernels::MAX_F).contains(&v) {
                 return Err(format!(
                     "{} must be between {} and {}",
@@ -164,14 +230,20 @@ fn apply(key: &str, value: &str, scope: &Scope) -> Result<String, String> {
             }
         }
         "min_selectivity" => {
-            let v: f64 = value.trim().parse().map_err(|_| format!("`{}` is not a number", value.trim()))?;
+            let v: f64 = value
+                .trim()
+                .parse()
+                .map_err(|_| format!("`{}` is not a number", value.trim()))?;
             if !(v > 0.0 && v <= 1.0) {
                 return Err("min_selectivity must be greater than 0 and at most 1".to_string());
             }
             set_in(scope, move |o| o.min_selectivity = Some(v));
         }
         "min_table_rows" => {
-            let v: u64 = value.trim().parse().map_err(|_| format!("`{}` is not an integer", value.trim()))?;
+            let v: u64 = value
+                .trim()
+                .parse()
+                .map_err(|_| format!("`{}` is not an integer", value.trim()))?;
             set_in(scope, move |o| o.min_table_rows = Some(v));
         }
         _ => unreachable!("key list and match are out of step"),
@@ -189,9 +261,7 @@ pub fn is_filter_statement(sql: &str) -> bool {
     let t = sql.trim_start();
     let u = t.to_ascii_uppercase();
     let u = u.trim_end_matches(';').trim_end();
-    u.starts_with("SET FILTER")
-        || u.starts_with("SHOW FILTER")
-        || u.starts_with("RESET FILTER")
+    u.starts_with("SET FILTER") || u.starts_with("SHOW FILTER") || u.starts_with("RESET FILTER")
 }
 
 /// Run one control statement. Returns lines of output, or an error message.
@@ -212,7 +282,10 @@ pub fn execute(sql: &str) -> Result<Vec<String>, String> {
         let rest = &t[t.len() - rest.len()..];
         let (head, scope) = split_scope(rest)?;
         if !head.trim().is_empty() {
-            return Err(format!("unexpected text in RESET FILTER: `{}`", head.trim()));
+            return Err(format!(
+                "unexpected text in RESET FILTER: `{}`",
+                head.trim()
+            ));
         }
         let s = settings();
         return Ok(vec![match &scope {

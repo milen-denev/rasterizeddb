@@ -50,23 +50,74 @@ pub struct Key {
 }
 
 pub const KEYS: &[Key] = &[
-    Key { name: "node_id", help: "this node's id, unique in the cluster" },
-    Key { name: "cluster", help: "cluster name; peers must agree on it" },
-    Key { name: "token", help: "shared secret presented in the handshake" },
-    Key { name: "compression", help: "none | zstd[:level] | auto[:zstd[:level]]" },
-    Key { name: "mode", help: "async | sync | quorum:N | all" },
-    Key { name: "conflict", help: "abort | skip | last-writer-wins" },
-    Key { name: "ack_timeout_ms", help: "how long a synchronous commit waits for peers" },
-    Key { name: "batch_max_records", help: "records in one outbound batch" },
-    Key { name: "batch_max_bytes", help: "uncompressed bytes in one outbound batch" },
-    Key { name: "batch_linger_us", help: "how long a sender waits for more records" },
-    Key { name: "queue_capacity", help: "records a peer queue holds before dropping to the log" },
-    Key { name: "relay", help: "forward transactions received from one peer to the others" },
-    Key { name: "log_retention_mb", help: "history kept for peers that fall behind" },
-    Key { name: "connect_timeout_ms", help: "dial timeout for a peer" },
-    Key { name: "request_timeout_ms", help: "per-request timeout on a peer link" },
-    Key { name: "reconnect_base_ms", help: "first reconnect delay; doubles up to the maximum" },
-    Key { name: "reconnect_max_ms", help: "longest reconnect delay" },
+    Key {
+        name: "node_id",
+        help: "this node's id, unique in the cluster",
+    },
+    Key {
+        name: "cluster",
+        help: "cluster name; peers must agree on it",
+    },
+    Key {
+        name: "token",
+        help: "shared secret presented in the handshake",
+    },
+    Key {
+        name: "compression",
+        help: "none | zstd[:level] | auto[:zstd[:level]]",
+    },
+    Key {
+        name: "mode",
+        help: "async | sync | quorum:N | all",
+    },
+    Key {
+        name: "conflict",
+        help: "abort | skip | last-writer-wins",
+    },
+    Key {
+        name: "ack_timeout_ms",
+        help: "how long a synchronous commit waits for peers",
+    },
+    Key {
+        name: "batch_max_records",
+        help: "records in one outbound batch",
+    },
+    Key {
+        name: "batch_max_bytes",
+        help: "uncompressed bytes in one outbound batch",
+    },
+    Key {
+        name: "batch_linger_us",
+        help: "how long a sender waits for more records",
+    },
+    Key {
+        name: "queue_capacity",
+        help: "records a peer queue holds before dropping to the log",
+    },
+    Key {
+        name: "relay",
+        help: "forward transactions received from one peer to the others",
+    },
+    Key {
+        name: "log_retention_mb",
+        help: "history kept for peers that fall behind",
+    },
+    Key {
+        name: "connect_timeout_ms",
+        help: "dial timeout for a peer",
+    },
+    Key {
+        name: "request_timeout_ms",
+        help: "per-request timeout on a peer link",
+    },
+    Key {
+        name: "reconnect_base_ms",
+        help: "first reconnect delay; doubles up to the maximum",
+    },
+    Key {
+        name: "reconnect_max_ms",
+        help: "longest reconnect delay",
+    },
 ];
 
 /// Whether this statement belongs to the replication surface.
@@ -156,10 +207,7 @@ fn with_options(statement: &str) -> Result<Vec<(String, String)>, String> {
         let (key, value) = entry
             .split_once('=')
             .ok_or_else(|| format!("`{}` is not `key = value`", entry))?;
-        options.push((
-            key.trim().to_ascii_lowercase(),
-            unquote(value).to_string(),
-        ));
+        options.push((key.trim().to_ascii_lowercase(), unquote(value).to_string()));
     }
     Ok(options)
 }
@@ -225,7 +273,10 @@ pub async fn execute(sql: &str, database: &Arc<Database>) -> Result<Vec<String>,
     }
 
     let tokens = words(statement);
-    let keyword = tokens.get(1).map(|t| t.to_ascii_uppercase()).unwrap_or_default();
+    let keyword = tokens
+        .get(1)
+        .map(|t| t.to_ascii_uppercase())
+        .unwrap_or_default();
 
     match keyword.as_str() {
         "ADD" => add_peer(database, statement, &tokens).await,
@@ -259,7 +310,10 @@ async fn enable(database: &Arc<Database>) -> Result<Vec<String>, String> {
         config.node_id, config.cluster, config.listen_addr, config.listen_port
     )];
     for peer_config in &config.peers {
-        lines.push(format!("peer {} started at {}", peer_config.name, peer_config.address));
+        lines.push(format!(
+            "peer {} started at {}",
+            peer_config.name, peer_config.address
+        ));
     }
 
     Ok(lines)
@@ -329,7 +383,10 @@ async fn add_peer(
     // and starts with everything else on `REPLICATION ENABLE`.
     if replication.is_active() {
         replication.insert_peer(peer::spawn(replication.clone(), &peer_config));
-        Ok(vec![format!("peer {} added at {} and started", name, address)])
+        Ok(vec![format!(
+            "peer {} added at {} and started",
+            name, address
+        )])
     } else {
         Ok(vec![format!(
             "peer {} added at {}; it starts with REPLICATION ENABLE",
@@ -355,10 +412,7 @@ fn peer_name(tokens: &[String]) -> Result<String, String> {
     Ok(name.to_string())
 }
 
-fn drop_peer(
-    replication: &StdArc<Replication>,
-    tokens: &[String],
-) -> Result<Vec<String>, String> {
+fn drop_peer(replication: &StdArc<Replication>, tokens: &[String]) -> Result<Vec<String>, String> {
     let name = peer_name(tokens)?;
 
     let removed = replication.remove_peer(&name);
@@ -373,7 +427,10 @@ fn drop_peer(
     })?;
 
     if removed.is_none() {
-        return Ok(vec![format!("peer {} was not running; removed from the configuration", name)]);
+        return Ok(vec![format!(
+            "peer {} was not running; removed from the configuration",
+            name
+        )]);
     }
     Ok(vec![format!("peer {} dropped", name)])
 }
@@ -546,7 +603,11 @@ async fn set(
         }
     }
 
-    Ok(vec![format!("{} = {}", key, describe_setting(&edited, &key))])
+    Ok(vec![format!(
+        "{} = {}",
+        key,
+        describe_setting(&edited, &key)
+    )])
 }
 
 /// Writes one setting into a configuration.
@@ -608,7 +669,11 @@ fn describe_setting(config: &ReplicationConfig, key: &str) -> String {
         // Never echoed: it is a shared secret, and a status view is exactly
         // where one gets copied into a bug report.
         "token" => {
-            if config.token.is_empty() { "(unset)".to_string() } else { "(set)".to_string() }
+            if config.token.is_empty() {
+                "(unset)".to_string()
+            } else {
+                "(set)".to_string()
+            }
         }
         "compression" => config.compression.to_string(),
         "mode" | "sync_mode" => config.sync_mode.to_string(),
@@ -685,7 +750,11 @@ fn show_status(replication: &StdArc<Replication>) -> Vec<String> {
             "node {} of cluster '{}' — {}",
             config.node_id,
             config.cluster,
-            if replication.is_active() { "enabled" } else { "disabled" }
+            if replication.is_active() {
+                "enabled"
+            } else {
+                "disabled"
+            }
         ),
         format!(
             "listening on {}:{}, mode {}, conflict {}, compression {}",
@@ -824,7 +893,11 @@ enum Structured {
 }
 
 fn structured_kind(sql: &str) -> Option<Structured> {
-    let upper = sql.trim().trim_end_matches(';').trim_end().to_ascii_uppercase();
+    let upper = sql
+        .trim()
+        .trim_end_matches(';')
+        .trim_end()
+        .to_ascii_uppercase();
     let normalised = upper.split_whitespace().collect::<Vec<_>>().join(" ");
     match normalised.as_str() {
         "SHOW REPLICATION STATS" => Some(Structured::Stats),
@@ -897,39 +970,83 @@ fn stats_rows(database: &Arc<Database>) -> Vec<crate::core::row::row::Row> {
         replication.is_active().to_string(),
         "whether committed transactions are being shipped",
     );
-    push("node_id", replication.node_id().to_string(), "half of every global transaction id");
-    push("cluster", config.cluster.clone(), "peers must agree on this");
+    push(
+        "node_id",
+        replication.node_id().to_string(),
+        "half of every global transaction id",
+    );
+    push(
+        "cluster",
+        config.cluster.clone(),
+        "peers must agree on this",
+    );
     push(
         "listen",
         format!("{}:{}", config.listen_addr, config.listen_port),
         "where this node accepts peer connections",
     );
-    push("listener_started", replication.listener_started().to_string(), "");
-    push("auth", config.auth.to_string(), "how peers prove they belong to the cluster");
-    push("token_set", (!config.token.is_empty()).to_string(), "a shared secret is configured");
-    push("mode", config.sync_mode.to_string(), "how long a commit waits for its peers");
-    push("conflict", config.conflict.to_string(), "what happens to a transaction that will not apply");
+    push(
+        "listener_started",
+        replication.listener_started().to_string(),
+        "",
+    );
+    push(
+        "auth",
+        config.auth.to_string(),
+        "how peers prove they belong to the cluster",
+    );
+    push(
+        "token_set",
+        (!config.token.is_empty()).to_string(),
+        "a shared secret is configured",
+    );
+    push(
+        "mode",
+        config.sync_mode.to_string(),
+        "how long a commit waits for its peers",
+    );
+    push(
+        "conflict",
+        config.conflict.to_string(),
+        "what happens to a transaction that will not apply",
+    );
     push(
         "compression",
         config.compression.to_string(),
         "the same spelling REPLICATION SET compression accepts",
     );
-    push("relay", config.relay.to_string(), "forward what arrives from one peer to the others");
+    push(
+        "relay",
+        config.relay.to_string(),
+        "forward what arrives from one peer to the others",
+    );
 
     push("peers", peers.len().to_string(), "");
     push(
         "peers_connected",
-        peers.iter().filter(|peer| peer.is_connected()).count().to_string(),
+        peers
+            .iter()
+            .filter(|peer| peer.is_connected())
+            .count()
+            .to_string(),
         "",
     );
     push(
         "peers_paused",
-        peers.iter().filter(|peer| peer.is_paused()).count().to_string(),
+        peers
+            .iter()
+            .filter(|peer| peer.is_paused())
+            .count()
+            .to_string(),
         "",
     );
 
     let local_seq = replication.local_seq();
-    push("local_sequence", local_seq.to_string(), "the newest locally-originated transaction");
+    push(
+        "local_sequence",
+        local_seq.to_string(),
+        "the newest locally-originated transaction",
+    );
 
     // The figure an operator actually watches: the furthest any peer is behind.
     let worst_lag = peers
@@ -944,17 +1061,53 @@ fn stats_rows(database: &Arc<Database>) -> Vec<crate::core::row::row::Row> {
     );
 
     let load = |counter: &std::sync::atomic::AtomicU64| counter.load(Ordering::Relaxed).to_string();
-    push("captured", load(&stats.captured), "transactions taken from the local commit path");
-    push("published", load(&stats.published), "handed to the peer queues");
-    push("applied", load(&stats.applied), "received from peers and applied here");
-    push("duplicates", load(&stats.duplicates), "already seen, so ignored");
-    push("conflicts", load(&stats.conflicts), "would not apply; see the conflict policy");
+    push(
+        "captured",
+        load(&stats.captured),
+        "transactions taken from the local commit path",
+    );
+    push(
+        "published",
+        load(&stats.published),
+        "handed to the peer queues",
+    );
+    push(
+        "applied",
+        load(&stats.applied),
+        "received from peers and applied here",
+    );
+    push(
+        "duplicates",
+        load(&stats.duplicates),
+        "already seen, so ignored",
+    );
+    push(
+        "conflicts",
+        load(&stats.conflicts),
+        "would not apply; see the conflict policy",
+    );
     push("failures", load(&stats.failures), "");
-    push("gaps", load(&stats.gaps), "sequences missing from a peer's stream");
+    push(
+        "gaps",
+        load(&stats.gaps),
+        "sequences missing from a peer's stream",
+    );
     push("batches_sent", load(&stats.batches_sent), "");
-    push("compressed_batches", load(&stats.compressed_batches), "batches that were worth compressing");
-    push("bytes_raw", load(&stats.bytes_raw), "payload before compression");
-    push("bytes_wire", load(&stats.bytes_wire), "bytes handed to the transport");
+    push(
+        "compressed_batches",
+        load(&stats.compressed_batches),
+        "batches that were worth compressing",
+    );
+    push(
+        "bytes_raw",
+        load(&stats.bytes_raw),
+        "payload before compression",
+    );
+    push(
+        "bytes_wire",
+        load(&stats.bytes_wire),
+        "bytes handed to the transport",
+    );
     push(
         "compression_saving_percent",
         match stats.compression_saving() {
@@ -969,11 +1122,27 @@ fn stats_rows(database: &Arc<Database>) -> Vec<crate::core::row::row::Row> {
         "synchronous commits that gave up waiting for a peer",
     );
 
-    push("ack_timeout_ms", config.ack_timeout.as_millis().to_string(), "");
-    push("batch_max_records", config.batch_max_records.to_string(), "");
+    push(
+        "ack_timeout_ms",
+        config.ack_timeout.as_millis().to_string(),
+        "",
+    );
+    push(
+        "batch_max_records",
+        config.batch_max_records.to_string(),
+        "",
+    );
     push("batch_max_bytes", config.batch_max_bytes.to_string(), "");
-    push("batch_linger_us", config.batch_linger.as_micros().to_string(), "");
-    push("queue_capacity", config.queue_capacity.to_string(), "records a peer queue holds");
+    push(
+        "batch_linger_us",
+        config.batch_linger.as_micros().to_string(),
+        "",
+    );
+    push(
+        "queue_capacity",
+        config.queue_capacity.to_string(),
+        "records a peer queue holds",
+    );
     push(
         "log_retention_bytes",
         config.log_retention_bytes.to_string(),
@@ -1060,7 +1229,10 @@ fn structured_row(cells: &[SCell]) -> crate::core::row::row::Row {
 /// The column a replication result set has, for the wire protocols that need
 /// to describe a row before sending one.
 pub fn result_fields() -> Vec<(String, crate::core::db_type::DbType)> {
-    vec![("replication".to_string(), crate::core::db_type::DbType::STRING)]
+    vec![(
+        "replication".to_string(),
+        crate::core::db_type::DbType::STRING,
+    )]
 }
 
 #[cfg(test)]
@@ -1086,7 +1258,9 @@ mod tests {
     #[test]
     fn replication_statements_are_recognised_and_others_are_not() {
         assert!(is_replication_statement("REPLICATION ENABLE"));
-        assert!(is_replication_statement("  replication add peer 'a' address 'h:1'"));
+        assert!(is_replication_statement(
+            "  replication add peer 'a' address 'h:1'"
+        ));
         assert!(is_replication_statement("SHOW REPLICATION"));
         assert!(is_replication_statement("SHOW REPLICATION PEERS;"));
 
@@ -1105,17 +1279,24 @@ mod tests {
 
     #[test]
     fn with_options_are_read_as_pairs() {
-        let options =
-            with_options("REPLICATION ADD PEER 'a' ADDRESS 'h:1' WITH (COMPRESSION = 'zstd:3', PAUSED = true)")
-                .unwrap();
+        let options = with_options(
+            "REPLICATION ADD PEER 'a' ADDRESS 'h:1' WITH (COMPRESSION = 'zstd:3', PAUSED = true)",
+        )
+        .unwrap();
         assert_eq!(options.len(), 2);
-        assert_eq!(options[0], ("compression".to_string(), "zstd:3".to_string()));
+        assert_eq!(
+            options[0],
+            ("compression".to_string(), "zstd:3".to_string())
+        );
         assert_eq!(options[1], ("paused".to_string(), "true".to_string()));
     }
 
     #[test]
     fn a_malformed_with_clause_is_rejected() {
-        assert!(with_options("REPLICATION ADD PEER 'a' ADDRESS 'h:1' WITH COMPRESSION = 'zstd'").is_err());
+        assert!(
+            with_options("REPLICATION ADD PEER 'a' ADDRESS 'h:1' WITH COMPRESSION = 'zstd'")
+                .is_err()
+        );
         assert!(with_options("REPLICATION ADD PEER 'a' ADDRESS 'h:1' WITH (nonsense)").is_err());
     }
 
@@ -1132,21 +1313,29 @@ mod tests {
         assert!(added[0].contains("berlin"));
         assert_eq!(database.replication.config().peers.len(), 1);
 
-        execute("REPLICATION DROP PEER 'berlin'", &database).await.unwrap();
+        execute("REPLICATION DROP PEER 'berlin'", &database)
+            .await
+            .unwrap();
         assert_eq!(database.replication.config().peers.len(), 0);
     }
 
     #[tokio::test]
     async fn the_same_peer_cannot_be_added_twice() {
         let database = database().await;
-        execute("REPLICATION ADD PEER 'berlin' ADDRESS '10.0.0.2:61171'", &database)
-            .await
-            .unwrap();
+        execute(
+            "REPLICATION ADD PEER 'berlin' ADDRESS '10.0.0.2:61171'",
+            &database,
+        )
+        .await
+        .unwrap();
 
         assert!(
-            execute("REPLICATION ADD PEER 'berlin' ADDRESS '10.0.0.3:61171'", &database)
-                .await
-                .is_err()
+            execute(
+                "REPLICATION ADD PEER 'berlin' ADDRESS '10.0.0.3:61171'",
+                &database
+            )
+            .await
+            .is_err()
         );
     }
 
@@ -1154,9 +1343,12 @@ mod tests {
     async fn a_peer_without_a_port_is_rejected() {
         let database = database().await;
         assert!(
-            execute("REPLICATION ADD PEER 'berlin' ADDRESS '10.0.0.2'", &database)
-                .await
-                .is_err()
+            execute(
+                "REPLICATION ADD PEER 'berlin' ADDRESS '10.0.0.2'",
+                &database
+            )
+            .await
+            .is_err()
         );
     }
 
@@ -1174,16 +1366,27 @@ mod tests {
     async fn settings_round_trip_through_set_and_show() {
         let database = database().await;
 
-        execute("REPLICATION SET conflict = 'last-writer-wins'", &database).await.unwrap();
-        assert_eq!(database.replication.config().conflict, ConflictPolicy::LastWriterWins);
+        execute("REPLICATION SET conflict = 'last-writer-wins'", &database)
+            .await
+            .unwrap();
+        assert_eq!(
+            database.replication.config().conflict,
+            ConflictPolicy::LastWriterWins
+        );
 
-        execute("REPLICATION SET mode = 'quorum:2'", &database).await.unwrap();
+        execute("REPLICATION SET mode = 'quorum:2'", &database)
+            .await
+            .unwrap();
         assert_eq!(database.replication.config().sync_mode, SyncMode::Quorum(2));
 
-        execute("REPLICATION SET compression = 'none'", &database).await.unwrap();
+        execute("REPLICATION SET compression = 'none'", &database)
+            .await
+            .unwrap();
         assert_eq!(database.replication.config().compression.codec, Codec::None);
 
-        execute("REPLICATION SET batch_linger_us = 250", &database).await.unwrap();
+        execute("REPLICATION SET batch_linger_us = 250", &database)
+            .await
+            .unwrap();
         assert_eq!(
             database.replication.config().batch_linger,
             std::time::Duration::from_micros(250)
@@ -1193,7 +1396,11 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_setting_is_rejected_rather_than_ignored() {
         let database = database().await;
-        assert!(execute("REPLICATION SET nonsense = 1", &database).await.is_err());
+        assert!(
+            execute("REPLICATION SET nonsense = 1", &database)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1201,18 +1408,29 @@ mod tests {
         let database = database().await;
         let before = database.replication.config().conflict;
 
-        assert!(execute("REPLICATION SET conflict = 'whatever'", &database).await.is_err());
+        assert!(
+            execute("REPLICATION SET conflict = 'whatever'", &database)
+                .await
+                .is_err()
+        );
         assert_eq!(database.replication.config().conflict, before);
     }
 
     #[tokio::test]
     async fn the_token_is_never_echoed_back() {
         let database = database().await;
-        execute("REPLICATION SET token = 'correct-horse'", &database).await.unwrap();
+        execute("REPLICATION SET token = 'correct-horse'", &database)
+            .await
+            .unwrap();
 
-        let shown = execute("SHOW REPLICATION SETTINGS", &database).await.unwrap();
+        let shown = execute("SHOW REPLICATION SETTINGS", &database)
+            .await
+            .unwrap();
         let joined = shown.join("\n");
-        assert!(!joined.contains("correct-horse"), "a secret must not appear in a status view");
+        assert!(
+            !joined.contains("correct-horse"),
+            "a secret must not appear in a status view"
+        );
         assert!(joined.contains("(set)"));
     }
 
@@ -1221,10 +1439,16 @@ mod tests {
         let database = database().await;
         database.replication.set_active(true);
 
-        assert!(execute("REPLICATION SET node_id = 9", &database).await.is_err());
+        assert!(
+            execute("REPLICATION SET node_id = 9", &database)
+                .await
+                .is_err()
+        );
 
         database.replication.set_active(false);
-        execute("REPLICATION SET node_id = 9", &database).await.unwrap();
+        execute("REPLICATION SET node_id = 9", &database)
+            .await
+            .unwrap();
         assert_eq!(database.replication.config().node_id, 9);
     }
 
@@ -1242,9 +1466,12 @@ mod tests {
     #[tokio::test]
     async fn peers_are_listed_with_their_lag() {
         let database = database().await;
-        execute("REPLICATION ADD PEER 'berlin' ADDRESS '127.0.0.1:1'", &database)
-            .await
-            .unwrap();
+        execute(
+            "REPLICATION ADD PEER 'berlin' ADDRESS '127.0.0.1:1'",
+            &database,
+        )
+        .await
+        .unwrap();
         execute("REPLICATION ENABLE", &database).await.unwrap();
 
         let lines = execute("SHOW REPLICATION PEERS", &database).await.unwrap();
@@ -1258,15 +1485,22 @@ mod tests {
     #[tokio::test]
     async fn a_peer_can_be_paused_and_resumed() {
         let database = database().await;
-        execute("REPLICATION ADD PEER 'berlin' ADDRESS '127.0.0.1:1'", &database)
-            .await
-            .unwrap();
+        execute(
+            "REPLICATION ADD PEER 'berlin' ADDRESS '127.0.0.1:1'",
+            &database,
+        )
+        .await
+        .unwrap();
         execute("REPLICATION ENABLE", &database).await.unwrap();
 
-        execute("REPLICATION PAUSE PEER 'berlin'", &database).await.unwrap();
+        execute("REPLICATION PAUSE PEER 'berlin'", &database)
+            .await
+            .unwrap();
         assert!(database.replication.peer("berlin").unwrap().is_paused());
 
-        execute("REPLICATION RESUME PEER 'berlin'", &database).await.unwrap();
+        execute("REPLICATION RESUME PEER 'berlin'", &database)
+            .await
+            .unwrap();
         assert!(!database.replication.peer("berlin").unwrap().is_paused());
 
         execute("REPLICATION DISABLE", &database).await.unwrap();
@@ -1275,7 +1509,11 @@ mod tests {
     #[tokio::test]
     async fn pausing_a_peer_that_does_not_exist_says_so() {
         let database = database().await;
-        assert!(execute("REPLICATION PAUSE PEER 'nobody'", &database).await.is_err());
+        assert!(
+            execute("REPLICATION PAUSE PEER 'nobody'", &database)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1287,8 +1525,14 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_statement_explains_itself() {
         let database = database().await;
-        let error = execute("REPLICATION FROBNICATE", &database).await.unwrap_err();
-        assert!(error.contains("ENABLE"), "the message should list what is accepted: {}", error);
+        let error = execute("REPLICATION FROBNICATE", &database)
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("ENABLE"),
+            "the message should list what is accepted: {}",
+            error
+        );
     }
 
     #[tokio::test]

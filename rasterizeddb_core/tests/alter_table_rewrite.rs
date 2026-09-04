@@ -53,7 +53,6 @@ fn on_a_big_stack<F: std::future::Future<Output = ()> + Send + 'static>(body: F)
         .expect("the test thread panicked");
 }
 
-
 fn init_globals() {
     MAX_PERMITS_THREADS.get_or_init(|| 4);
     BATCH_SIZE.get_or_init(|| 1_000);
@@ -86,10 +85,7 @@ fn a_column_added_after_a_drop_does_not_take_the_previous_column_s_bytes() {
 
 async fn a_column_added_after_a_drop_does_not_take_the_previous_column_s_bytes_body() {
     init_globals();
-    let dir = format!(
-        "/tmp/rdb_alter_rewrite_{}",
-        std::process::id()
-    );
+    let dir = format!("/tmp/rdb_alter_rewrite_{}", std::process::id());
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("dir");
 
@@ -97,9 +93,18 @@ async fn a_column_added_after_a_drop_does_not_take_the_previous_column_s_bytes_b
     db.add_table(CreateTable {
         table_name: "wo".to_string(),
         columns: vec![
-            CreateColumnData { name: "a".into(), data_type: DbType::I32 },
-            CreateColumnData { name: "b".into(), data_type: DbType::I32 },
-            CreateColumnData { name: "c".into(), data_type: DbType::STRING },
+            CreateColumnData {
+                name: "a".into(),
+                data_type: DbType::I32,
+            },
+            CreateColumnData {
+                name: "b".into(),
+                data_type: DbType::I32,
+            },
+            CreateColumnData {
+                name: "c".into(),
+                data_type: DbType::STRING,
+            },
         ],
         is_immutable: false,
         foreign_keys: Vec::new(),
@@ -179,12 +184,18 @@ async fn an_insert_after_a_drop_still_fills_the_dropped_column_s_slot_body() {
     )
     .await;
     assert!(
-        !String::from_utf8_lossy(&created).to_lowercase().contains("error"),
+        !String::from_utf8_lossy(&created)
+            .to_lowercase()
+            .contains("error"),
         "create failed: {}",
         String::from_utf8_lossy(&created)
     );
 
-    run(&db, "INSERT INTO t (id, gone, keep, n) VALUES (1, 'gone', 'stays', 11)").await;
+    run(
+        &db,
+        "INSERT INTO t (id, gone, keep, n) VALUES (1, 'gone', 'stays', 11)",
+    )
+    .await;
     run(&db, "ALTER TABLE t DROP COLUMN gone").await;
     run(&db, "INSERT INTO t (id, keep, n) VALUES (2, 'after', 22)").await;
 

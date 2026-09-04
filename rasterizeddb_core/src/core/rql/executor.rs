@@ -5,10 +5,11 @@ use log::{debug, error, info, warn};
 use crate::core::mvcc::transaction::TxId;
 
 use crate::core::{
-    database::Database, rql::{
+    database::Database,
+    rql::{
         lexer_query::row_fetch_from_select_query, lexer_s1::QueryPurpose,
         lexer_s1::recognize_query_purpose,
-    }
+    },
 };
 
 /// Runs a joined `SELECT`: each relation is scanned once with its own share of
@@ -27,12 +28,7 @@ async fn execute_join(sql: &str, database: Arc<Database>, tx: TxId) -> Vec<u8> {
         result
     }
 
-    let schema_of = |name: &str| {
-        database
-            .tables
-            .get(name)
-            .map(|t| t.schema.fields.clone())
-    };
+    let schema_of = |name: &str| database.tables.get(name).map(|t| t.schema.fields.clone());
 
     let plan = match crate::core::rql::join::plan_statement(sql, &schema_of) {
         Ok(p) => p,
@@ -42,10 +38,15 @@ async fn execute_join(sql: &str, database: Arc<Database>, tx: TxId) -> Vec<u8> {
         }
     };
 
-    let mut scanned: Vec<Vec<crate::core::row::row::Row>> = Vec::with_capacity(plan.relations.len());
+    let mut scanned: Vec<Vec<crate::core::row::row::Row>> =
+        Vec::with_capacity(plan.relations.len());
     for relation in &plan.relations {
         // Cloned out so the map guard does not span the scan below.
-        let Some(table) = database.tables.get(&relation.table).map(|t| t.value().clone()) else {
+        let Some(table) = database
+            .tables
+            .get(&relation.table)
+            .map(|t| t.value().clone())
+        else {
             return error(&format!("relation '{}' does not exist", relation.table));
         };
 
@@ -113,14 +114,10 @@ async fn execute_join(sql: &str, database: Arc<Database>, tx: TxId) -> Vec<u8> {
         let Some(relation) = plan.relations.get(item.rel) else {
             continue;
         };
-        let Some(shadow_table) = database
-            .tables
-            .get(&relation.table)
-            .and_then(|t| {
-                crate::core::rql::json_map::shadow_for(&item.field.name, &t.schema.json_columns)
-                    .map(|s| s.to_string())
-            })
-        else {
+        let Some(shadow_table) = database.tables.get(&relation.table).and_then(|t| {
+            crate::core::rql::json_map::shadow_for(&item.field.name, &t.schema.json_columns)
+                .map(|s| s.to_string())
+        }) else {
             continue;
         };
         for row in rows.iter_mut() {
@@ -136,8 +133,14 @@ async fn execute_join(sql: &str, database: Arc<Database>, tx: TxId) -> Vec<u8> {
             let reference = crate::core::value_codec::format_uuid(cell.data.into_slice());
             // An unmatched outer-join row, or a NULL document: either way the
             // column is NULL rather than an empty object.
-            let Some(document) =
-                Box::pin(load_json_document(&database, &shadow_table, &reference, 0, tx)).await
+            let Some(document) = Box::pin(load_json_document(
+                &database,
+                &shadow_table,
+                &reference,
+                0,
+                tx,
+            ))
+            .await
             else {
                 cell.data = crate::memory_pool::MEMORY_POOL.acquire(0);
                 cell.column_type = crate::core::db_type::DbType::NULL;
@@ -243,8 +246,7 @@ pub(crate) async fn run_returning_rows(
     database: &Arc<Database>,
     tx: TxId,
 ) -> Result<Vec<crate::core::row::row::Row>, String> {
-    let purpose =
-        recognize_query_purpose(sql).ok_or_else(|| format!("cannot parse '{}'", sql))?;
+    let purpose = recognize_query_purpose(sql).ok_or_else(|| format!("cannot parse '{}'", sql))?;
     // Runs inside the caller's transaction rather than opening its own. A
     // data-modifying CTE is part of one statement, so committing it separately
     // would leave its writes behind when the outer statement fails — or when
@@ -272,8 +274,7 @@ pub(crate) async fn run_statement_affected(
     database: &Arc<Database>,
     tx: TxId,
 ) -> Result<u64, String> {
-    let purpose =
-        recognize_query_purpose(sql).ok_or_else(|| format!("cannot parse '{}'", sql))?;
+    let purpose = recognize_query_purpose(sql).ok_or_else(|| format!("cannot parse '{}'", sql))?;
     let response = Box::pin(execute_with_context(purpose, database.clone(), 0, tx)).await;
     match response.first() {
         Some(3) => Err(String::from_utf8_lossy(&response[1..]).to_string()),
@@ -297,8 +298,7 @@ pub(crate) async fn run_statement(
     database: &Arc<Database>,
     tx: TxId,
 ) -> Result<(), String> {
-    let purpose =
-        recognize_query_purpose(sql).ok_or_else(|| format!("cannot parse '{}'", sql))?;
+    let purpose = recognize_query_purpose(sql).ok_or_else(|| format!("cannot parse '{}'", sql))?;
     // Runs inside the caller's transaction. Opening a fresh one made a CTE's
     // writes a *different* transaction from the statement they belong to, which
     // then collided with it — "could not serialize access due to concurrent
@@ -330,7 +330,10 @@ fn outer_relation_names(sql: &str) -> Vec<String> {
         let mut words = segment.split_whitespace().peekable();
         while let Some(word) = words.next() {
             let upper_word = word.to_ascii_uppercase();
-            if matches!(upper_word.as_str(), "JOIN" | "INNER" | "LEFT" | "RIGHT" | "OUTER" | "ON") {
+            if matches!(
+                upper_word.as_str(),
+                "JOIN" | "INNER" | "LEFT" | "RIGHT" | "OUTER" | "ON"
+            ) {
                 continue;
             }
             if upper_word == "AS" {
@@ -436,7 +439,12 @@ pub async fn substitute_in_subqueries(
         let rows = run_subquery(&found.inner_sql, database, tx).await?;
         let list = subquery::rows_to_value_list(&rows)?;
 
-        current = format!("{}{}{}", &current[..found.start], list, &current[found.end..]);
+        current = format!(
+            "{}{}{}",
+            &current[..found.start],
+            list,
+            &current[found.end..]
+        );
     }
 
     Err(format!(
@@ -460,7 +468,7 @@ async fn check_foreign_keys(
     database: &Arc<Database>,
     table_name: &str,
     assignments: &[(String, String)],
-    tx: TxId
+    tx: TxId,
 ) -> Result<(), String> {
     let foreign_keys = {
         let entry = database.tables.get(table_name);
@@ -497,9 +505,9 @@ async fn check_foreign_keys(
             "SELECT {} FROM {} WHERE {} = {} LIMIT 1",
             fk.parent_column, fk.parent_table, fk.parent_column, literal
         );
-        let rows = run_subquery(&probe, database, tx).await.map_err(|e| {
-            format!("foreign key \"{}\" could not be checked: {}", fk.name, e)
-        })?;
+        let rows = run_subquery(&probe, database, tx)
+            .await
+            .map_err(|e| format!("foreign key \"{}\" could not be checked: {}", fk.name, e))?;
 
         if rows.is_empty() {
             return Err(format!(
@@ -546,7 +554,8 @@ fn default_literal_for(database: &Arc<Database>, table: &str, column: &str) -> S
         return "NULL".to_string();
     };
     let schema = &entry.value().schema;
-    let Some(expression) = crate::core::rql::column_default::expression_for(column, &schema.defaults)
+    let Some(expression) =
+        crate::core::rql::column_default::expression_for(column, &schema.defaults)
     else {
         return "NULL".to_string();
     };
@@ -592,9 +601,9 @@ async fn apply_on_delete(
                 "SELECT {} FROM {} WHERE {} IN ({}) LIMIT 1",
                 fk.column, child_table, fk.column, list
             );
-            let rows = run_subquery(&probe, database, tx).await.map_err(|e| {
-                format!("foreign key \"{}\" could not be checked: {}", fk.name, e)
-            })?;
+            let rows = run_subquery(&probe, database, tx)
+                .await
+                .map_err(|e| format!("foreign key \"{}\" could not be checked: {}", fk.name, e))?;
             if !rows.is_empty() {
                 return Err(format!(
                     "update or delete on table \"{}\" violates foreign key constraint \"{}\" \
@@ -607,7 +616,10 @@ async fn apply_on_delete(
 
         let statement = match fk.on_delete {
             crate::core::rql::foreign_key::ReferentialAction::Cascade => {
-                format!("DELETE FROM {} WHERE {} IN ({})", child_table, fk.column, list)
+                format!(
+                    "DELETE FROM {} WHERE {} IN ({})",
+                    child_table, fk.column, list
+                )
             }
             crate::core::rql::foreign_key::ReferentialAction::SetNull => {
                 format!(
@@ -632,8 +644,13 @@ async fn apply_on_delete(
 
         // Recursion is what makes a cascade that triggers another cascade work,
         // rather than a second mechanism.
-        let response =
-            Box::pin(execute_with_context(purpose, database.clone(), depth + 1, tx)).await;
+        let response = Box::pin(execute_with_context(
+            purpose,
+            database.clone(),
+            depth + 1,
+            tx,
+        ))
+        .await;
         if response.first() == Some(&3) {
             let message = String::from_utf8_lossy(&response[1..]).to_string();
             return Err(format!(
@@ -651,7 +668,7 @@ async fn keys_about_to_be_deleted(
     database: &Arc<Database>,
     table_name: &str,
     where_clause: &str,
-    tx: TxId
+    tx: TxId,
 ) -> Result<Vec<String>, String> {
     let columns: Vec<String> = referencing_keys(database, table_name)
         .into_iter()
@@ -664,17 +681,21 @@ async fn keys_about_to_be_deleted(
     let probe = if where_clause.trim().is_empty() {
         format!("SELECT {} FROM {}", column, table_name)
     } else {
-        format!("SELECT {} FROM {} WHERE {}", column, table_name, where_clause)
+        format!(
+            "SELECT {} FROM {} WHERE {}",
+            column, table_name, where_clause
+        )
     };
 
     let rows = run_subquery(&probe, database, tx).await?;
     let mut keys = Vec::with_capacity(rows.len());
     for row in &rows {
-        let Some(cell) = row.columns.first() else { continue };
-        let Some(literal) = crate::core::rql::subquery::value_to_literal(
-            &cell.column_type,
-            cell.data.into_slice(),
-        ) else {
+        let Some(cell) = row.columns.first() else {
+            continue;
+        };
+        let Some(literal) =
+            crate::core::rql::subquery::value_to_literal(&cell.column_type, cell.data.into_slice())
+        else {
             continue;
         };
         keys.push(literal);
@@ -729,11 +750,8 @@ async fn rewrite_table_with_columns(
         };
 
         let schema = &table.schema.fields;
-        let mut ordered: Vec<crate::core::row::schema::SchemaField> = schema
-            .iter()
-            .filter(|f| !f.is_deleted)
-            .cloned()
-            .collect();
+        let mut ordered: Vec<crate::core::row::schema::SchemaField> =
+            schema.iter().filter(|f| !f.is_deleted).cloned().collect();
         ordered.sort_by_key(|f| f.write_order);
 
         let fetch = crate::core::rql::join::fetch_for(&ordered, schema);
@@ -746,7 +764,10 @@ async fn rewrite_table_with_columns(
 
         let columns: Vec<CreateColumnData> = ordered
             .iter()
-            .map(|f| CreateColumnData { name: f.name.clone(), data_type: f.db_type.clone() })
+            .map(|f| CreateColumnData {
+                name: f.name.clone(),
+                data_type: f.db_type.clone(),
+            })
             .collect();
 
         // A rewrite drops and recreates the table, so every constraint has to be
@@ -760,8 +781,10 @@ async fn rewrite_table_with_columns(
 
         // The old numbering, so each fetched value can be named before the
         // table is dropped and renumbered.
-        let old_field_names: std::collections::HashMap<u64, String> =
-            schema.iter().map(|f| (f.write_order, f.name.clone())).collect();
+        let old_field_names: std::collections::HashMap<u64, String> = schema
+            .iter()
+            .map(|f| (f.write_order, f.name.clone()))
+            .collect();
 
         (
             columns,
@@ -835,7 +858,7 @@ async fn rewrite_table_with_columns(
             checks: checks.into_iter().collect(),
             unique_columns,
             unique_keys: unique_keys.into_iter().collect(),
-                    // A shadow table for a JSON document has no declared key.
+            // A shadow table for a JSON document has no declared key.
             primary_key: None,
         })
         .await
@@ -848,9 +871,8 @@ async fn rewrite_table_with_columns(
     let schema = table.schema.fields.clone();
 
     for values in captured {
-        let mut payloads: smallvec::SmallVec<
-            [crate::core::row::row::ColumnWritePayload; 32],
-        > = smallvec::SmallVec::new();
+        let mut payloads: smallvec::SmallVec<[crate::core::row::row::ColumnWritePayload; 32]> =
+            smallvec::SmallVec::new();
 
         for field in schema.iter().filter(|f| !f.is_deleted) {
             let stored = values
@@ -917,9 +939,9 @@ async fn rewrite_table_with_columns(
                             .iter()
                             .find(|f| f.name.eq_ignore_ascii_case(tracked))
                             .is_some_and(|f| {
-                                values.iter().any(|(name, _, _)| {
-                                    name.eq_ignore_ascii_case(&f.name)
-                                })
+                                values
+                                    .iter()
+                                    .any(|(name, _, _)| name.eq_ignore_ascii_case(&f.name))
                             });
 
                         let is_null = !tracked_present
@@ -934,8 +956,7 @@ async fn rewrite_table_with_columns(
                         mb.into_slice_mut().copy_from_slice(&bytes);
                         mb
                     } else {
-                        let mut mb =
-                            crate::memory_pool::MEMORY_POOL.acquire(field.size as usize);
+                        let mut mb = crate::memory_pool::MEMORY_POOL.acquire(field.size as usize);
                         mb.into_slice_mut().fill(0);
                         mb
                     }
@@ -969,7 +990,9 @@ async fn rewrite_table_with_columns(
 
         payloads.sort_by_key(|c| c.write_order);
         table
-            .insert_row(crate::core::row::row::RowWrite { columns_writing_data: payloads })
+            .insert_row(crate::core::row::row::RowWrite {
+                columns_writing_data: payloads,
+            })
             .await
             .map_err(|e| format!("could not rewrite a row of '{}': {}", table_name, e))?;
     }
@@ -1060,8 +1083,14 @@ async fn rewrite_json_values(
             _ => {}
         }
 
-        let reference =
-            Box::pin(store_json_document(database, shadow_table, &document, 0, tx)).await?;
+        let reference = Box::pin(store_json_document(
+            database,
+            shadow_table,
+            &document,
+            0,
+            tx,
+        ))
+        .await?;
         replacements.push((literal.clone(), reference));
     }
 
@@ -1150,7 +1179,10 @@ async fn store_json_document(
     if !database.tables.contains_key(shadow_table) {
         run_ddl(
             database,
-            &format!("CREATE TABLE {} ({} UUID NOT NULL)", shadow_table, JSON_KEY_COLUMN),
+            &format!(
+                "CREATE TABLE {} ({} UUID NOT NULL)",
+                shadow_table, JSON_KEY_COLUMN
+            ),
             tx,
         )
         .await?;
@@ -1160,10 +1192,24 @@ async fn store_json_document(
 
     match document {
         serde_json::Value::Object(_) => {
-            let assignments =
-                Box::pin(object_assignments(database, shadow_table, document, depth, tx)).await?;
-            write_shadow_row(database, shadow_table, &reference, None, None, assignments, tx)
-                .await?;
+            let assignments = Box::pin(object_assignments(
+                database,
+                shadow_table,
+                document,
+                depth,
+                tx,
+            ))
+            .await?;
+            write_shadow_row(
+                database,
+                shadow_table,
+                &reference,
+                None,
+                None,
+                assignments,
+                tx,
+            )
+            .await?;
         }
         // An array becomes one row per element, all sharing the reference and
         // ordered by `__json_idx`. Storing it as a single opaque value would
@@ -1173,8 +1219,16 @@ async fn store_json_document(
             if items.is_empty() {
                 // The container row. Without it an empty array would leave no
                 // trace and read back as `{}`.
-                write_shadow_row(database, shadow_table, &reference, Some(-1), Some("a"), Vec::new(), tx)
-                    .await?;
+                write_shadow_row(
+                    database,
+                    shadow_table,
+                    &reference,
+                    Some(-1),
+                    Some("a"),
+                    Vec::new(),
+                    tx,
+                )
+                .await?;
             }
             for (index, item) in items.iter().enumerate() {
                 let assignments = match item {
@@ -1185,10 +1239,8 @@ async fn store_json_document(
                     // An element that is itself an array becomes a document of
                     // its own, referenced by UUID.
                     serde_json::Value::Array(_) => {
-                        let nested_table = json_map::shadow_table_name(
-                            shadow_table,
-                            JSON_ELEMENT_REF_COLUMN,
-                        );
+                        let nested_table =
+                            json_map::shadow_table_name(shadow_table, JSON_ELEMENT_REF_COLUMN);
                         let reference = Box::pin(store_json_document(
                             database,
                             &nested_table,
@@ -1263,15 +1315,9 @@ async fn store_json_document(
                 json_map::Inferred::Null => Vec::new(),
                 json_map::Inferred::Scalar { db_type, literal } => {
                     let column = json_value_column(&db_type);
-                    let (column, literal) = ensure_shadow_column(
-                        database,
-                        shadow_table,
-                        &column,
-                        db_type,
-                        literal,
-                        tx,
-                    )
-                    .await?;
+                    let (column, literal) =
+                        ensure_shadow_column(database, shadow_table, &column, db_type, literal, tx)
+                            .await?;
                     vec![(column, literal)]
                 }
                 json_map::Inferred::Nested => {
@@ -1280,8 +1326,16 @@ async fn store_json_document(
                     return Err("a JSON value of this shape is not supported".to_string());
                 }
             };
-            write_shadow_row(database, shadow_table, &reference, None, Some("s"), assignments, tx)
-                .await?;
+            write_shadow_row(
+                database,
+                shadow_table,
+                &reference,
+                None,
+                Some("s"),
+                assignments,
+                tx,
+            )
+            .await?;
         }
     }
 
@@ -1333,10 +1387,7 @@ async fn object_assignments(
             //
             // A string array keeps the `TEXT[]` mapping: it round-trips exactly
             // and stays queryable, which a shadow table does not.
-            if items
-                .iter()
-                .any(|item| !item.is_string())
-            {
+            if items.iter().any(|item| !item.is_string()) {
                 let nested_table = json_map::shadow_table_name(shadow_table, &column);
                 let reference = Box::pin(store_json_document(
                     database,
@@ -1471,10 +1522,20 @@ async fn ensure_shadow_column(
         let entry = database.tables.get(shadow_table);
         let fields: Vec<crate::core::row::schema::SchemaField> = entry
             .as_ref()
-            .map(|t| t.schema.fields.iter().filter(|f| !f.is_deleted).cloned().collect())
+            .map(|t| {
+                t.schema
+                    .fields
+                    .iter()
+                    .filter(|f| !f.is_deleted)
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default();
         let exact = |name: &str| {
-            fields.iter().find(|f| f.name == name).map(|f| f.db_type.clone())
+            fields
+                .iter()
+                .find(|f| f.name == name)
+                .map(|f| f.db_type.clone())
         };
         match exact(column) {
             Some(db_type) => (column.to_string(), Some(db_type)),
@@ -1578,7 +1639,9 @@ async fn retype_column(
     for row in &rows {
         let mut values: Vec<(String, String)> = Vec::new();
         for (index, field) in fields.iter().enumerate() {
-            let Some(cell) = row.columns.get(index) else { continue };
+            let Some(cell) = row.columns.get(index) else {
+                continue;
+            };
             if cell.column_type == crate::core::db_type::DbType::NULL {
                 continue;
             }
@@ -1589,7 +1652,9 @@ async fn retype_column(
             // put through a text round trip that could not survive one — a
             // UUID read as text would come back as replacement characters.
             let literal = if field.name.eq_ignore_ascii_case(column) {
-                let Some(value) = json_value_of(&field.db_type, bytes) else { continue };
+                let Some(value) = json_value_of(&field.db_type, bytes) else {
+                    continue;
+                };
                 match literal_of_json(&value, new_type) {
                     Some(literal) => literal,
                     None => continue,
@@ -1621,8 +1686,17 @@ async fn retype_column(
     let declarations: Vec<String> = columns
         .iter()
         .map(|c| {
-            let nullability = if c.name == JSON_KEY_COLUMN { " NOT NULL" } else { "" };
-            format!("{} {}{}", c.name, json_map::sql_type_name(&c.data_type), nullability)
+            let nullability = if c.name == JSON_KEY_COLUMN {
+                " NOT NULL"
+            } else {
+                ""
+            };
+            format!(
+                "{} {}{}",
+                c.name,
+                json_map::sql_type_name(&c.data_type),
+                nullability
+            )
         })
         .collect();
 
@@ -1703,7 +1777,6 @@ fn is_uniqueness_violation(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::AlreadyExists
 }
 
-
 /// Executes a multi-tuple `INSERT … VALUES (…), (…)`, or reports why it cannot.
 ///
 /// `None` means the statement has a single tuple and the ordinary path should
@@ -1775,7 +1848,10 @@ async fn constant_select_insert(
                 .ok_or_else(|| format!("'{}' produced a value that cannot be written", item))?
         } else if item.starts_with('\'')
             || item.starts_with('"')
-            || item.chars().next().is_some_and(|c| c.is_ascii_digit() || c == '-')
+            || item
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit() || c == '-')
             || item.eq_ignore_ascii_case("NULL")
         {
             item.to_string()
@@ -1892,8 +1968,10 @@ fn implicit_unique_column(
     fields
         .iter()
         .filter(|f| f.is_unique && !f.is_deleted)
-        .find(|f| stem.ends_with(&format!("_{}", f.name.to_ascii_lowercase()))
-            || stem == f.name.to_ascii_lowercase())
+        .find(|f| {
+            stem.ends_with(&format!("_{}", f.name.to_ascii_lowercase()))
+                || stem == f.name.to_ascii_lowercase()
+        })
         .map(|f| f.name.clone())
 }
 
@@ -2216,9 +2294,9 @@ fn scalar_comparison_holds(value: &str, op: &str, literal: &str) -> Result<bool,
     // Numbers compare numerically; anything else compares as text, which is
     // what an equality against a quoted constant wants.
     let ordering = match (lhs.parse::<f64>(), rhs.parse::<f64>()) {
-        (Ok(a), Ok(b)) => a.partial_cmp(&b).ok_or_else(|| {
-            format!("cannot order '{}' against '{}'", lhs, rhs)
-        })?,
+        (Ok(a), Ok(b)) => a
+            .partial_cmp(&b)
+            .ok_or_else(|| format!("cannot order '{}' against '{}'", lhs, rhs))?,
         _ => lhs.cmp(rhs),
     };
     use std::cmp::Ordering::*;
@@ -2370,8 +2448,8 @@ async fn delete_using_join(
         return Ok(result);
     }
 
-    let returning_unqualified = returning
-        .map(|r| format!("RETURNING {}", strip_qualifier(r.trim(), target_alias)));
+    let returning_unqualified =
+        returning.map(|r| format!("RETURNING {}", strip_qualifier(r.trim(), target_alias)));
 
     // One delete per DISTINCT key: several source rows may match one target
     // row, and it can only be deleted once.
@@ -2404,8 +2482,7 @@ async fn delete_using_join(
         );
         let purpose = recognize_query_purpose(&statement)
             .ok_or_else(|| format!("could not parse the rewritten '{}'", statement))?;
-        let response =
-            Box::pin(execute_with_context(purpose, database.clone(), depth, tx)).await;
+        let response = Box::pin(execute_with_context(purpose, database.clone(), depth, tx)).await;
         if response.first() == Some(&3u8) {
             return Err(String::from_utf8_lossy(&response[1..]).to_string());
         }
@@ -2544,7 +2621,9 @@ async fn update_from_join(
                     projection.push(format!("{}.{}", target_alias, field.name));
                 }
                 let _ = slots;
-                sources.push(AssignedValue::Computed { text: stripped.clone() });
+                sources.push(AssignedValue::Computed {
+                    text: stripped.clone(),
+                });
             }
             None => {
                 sources.push(AssignedValue::Slot(projection.len()));
@@ -2575,8 +2654,8 @@ async fn update_from_join(
     // alias — so `RETURNING t.id` has to lose the `t.` or it names a relation
     // that statement never mentions.
     // `returning_split` hands back the column list without the keyword.
-    let returning_unqualified = returning
-        .map(|r| format!("RETURNING {}", strip_qualifier(r.trim(), target_alias)));
+    let returning_unqualified =
+        returning.map(|r| format!("RETURNING {}", strip_qualifier(r.trim(), target_alias)));
 
     let mut written = 0u64;
     let mut returned: Vec<u8> = Vec::new();
@@ -2655,8 +2734,7 @@ async fn update_from_join(
         );
         let purpose = recognize_query_purpose(&statement)
             .ok_or_else(|| format!("could not parse the rewritten '{}'", statement))?;
-        let response =
-            Box::pin(execute_with_context(purpose, database.clone(), depth, tx)).await;
+        let response = Box::pin(execute_with_context(purpose, database.clone(), depth, tx)).await;
         if response.first() == Some(&3u8) {
             return Err(String::from_utf8_lossy(&response[1..]).to_string());
         }
@@ -2710,8 +2788,8 @@ async fn apply_conflict_update(
     depth: usize,
     tx: TxId,
 ) -> Vec<u8> {
-    let inserted = crate::core::rql::lexer_ir::assignments_of_insert(insert_sql)
-        .unwrap_or_default();
+    let inserted =
+        crate::core::rql::lexer_ir::assignments_of_insert(insert_sql).unwrap_or_default();
     if inserted.is_empty() {
         return ddl_error("ON CONFLICT DO UPDATE needs the inserted values to resolve EXCLUDED");
     }
@@ -2762,7 +2840,9 @@ async fn apply_conflict_update(
 
     let resolve = |text: &str| -> Result<String, String> {
         let text = substitute_excluded(text, &inserted)?;
-        Ok(fold_constants_in_predicate(&strip_qualifier(&text, table_name)))
+        Ok(fold_constants_in_predicate(&strip_qualifier(
+            &text, table_name,
+        )))
     };
 
     let assignments = match resolve(&spec.assignments) {
@@ -2875,13 +2955,9 @@ async fn lock_selected_rows(
         // One attempt, then act on the answer. Waiting is a loop with a bound
         // rather than an unbounded park: a lock whose holder never finishes
         // would otherwise hang the connection with nothing to report.
-        let mut outcome = database.row_locks.acquire(
-            table_name,
-            &key,
-            tx,
-            lock.strength,
-            &live,
-        );
+        let mut outcome = database
+            .row_locks
+            .acquire(table_name, &key, tx, lock.strength, &live);
         if matches!(lock.behaviour, LockWait::Wait) {
             let deadline = std::time::Instant::now() + LOCK_WAIT_TIMEOUT;
             while let Acquired::Held(_) = outcome {
@@ -2889,13 +2965,9 @@ async fn lock_selected_rows(
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                outcome = database.row_locks.acquire(
-                    table_name,
-                    &key,
-                    tx,
-                    lock.strength,
-                    &live,
-                );
+                outcome = database
+                    .row_locks
+                    .acquire(table_name, &key, tx, lock.strength, &live);
             }
         }
 
@@ -2909,7 +2981,7 @@ async fn lock_selected_rows(
                     return Err(format!(
                         "could not obtain lock on a row of '{}': held by another transaction",
                         table_name
-                    ))
+                    ));
                 }
                 LockWait::Wait => {
                     return Err(format!(
@@ -2917,7 +2989,7 @@ async fn lock_selected_rows(
                         LOCK_WAIT_TIMEOUT.as_secs(),
                         table_name,
                         owner
-                    ))
+                    ));
                 }
             },
         }
@@ -2957,8 +3029,9 @@ async fn execute_lock_table(
             return ddl_error(&format!("relation '{}' does not exist", name));
         }
 
-        let mut outcome =
-            database.row_locks.acquire_table(name, tx, statement.mode, &live);
+        let mut outcome = database
+            .row_locks
+            .acquire_table(name, tx, statement.mode, &live);
         if !statement.nowait {
             let deadline = std::time::Instant::now() + LOCK_WAIT_TIMEOUT;
             while let Acquired::Held(_) = outcome {
@@ -2966,8 +3039,9 @@ async fn execute_lock_table(
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                outcome =
-                    database.row_locks.acquire_table(name, tx, statement.mode, &live);
+                outcome = database
+                    .row_locks
+                    .acquire_table(name, tx, statement.mode, &live);
             }
         }
 
@@ -3062,11 +3136,9 @@ fn check_not_null(
             }
             None if omitted_counts => {
                 // Omitted is NULL unless a default supplies a value.
-                let filled = crate::core::rql::column_default::expression_for(
-                    &field.name,
-                    defaults,
-                )
-                .is_some_and(|e| !e.trim().eq_ignore_ascii_case("NULL"));
+                let filled =
+                    crate::core::rql::column_default::expression_for(&field.name, defaults)
+                        .is_some_and(|e| !e.trim().eq_ignore_ascii_case("NULL"));
                 if !filled {
                     return Err(violation(&field.name));
                 }
@@ -3109,7 +3181,10 @@ async fn refuse_write_to_locked_rows(
 
     // A whole-table lock answers for every row in it, so it is checked first
     // and without needing to know which rows the statement touches.
-    if let Some(owner) = database.row_locks.table_conflict(table_name, tx, true, &live) {
+    if let Some(owner) = database
+        .row_locks
+        .table_conflict(table_name, tx, true, &live)
+    {
         return Err(format!(
             "relation '{}' is locked by transaction {}; the statement that locked it must \
              finish first",
@@ -3143,23 +3218,27 @@ async fn refuse_write_to_locked_rows(
         "SELECT {} FROM {}{}{}",
         key_field.name,
         table_name,
-        if where_clause.trim().is_empty() { "" } else { " WHERE " },
+        if where_clause.trim().is_empty() {
+            ""
+        } else {
+            " WHERE "
+        },
         where_clause.trim()
     );
     let rows = run_subquery(&select, database, tx).await?;
 
     for row in &rows {
-        let Some(cell) = row.columns.first() else { continue };
+        let Some(cell) = row.columns.first() else {
+            continue;
+        };
         let key = cell.data.into_slice();
         // Asked for, not merely inspected: this transaction is about to write
         // the row, so it should hold the lock while it does.
-        if let Acquired::Held(owner) = database.row_locks.acquire(
-            table_name,
-            key,
-            tx,
-            LockStrength::Update,
-            &live,
-        ) {
+        if let Acquired::Held(owner) =
+            database
+                .row_locks
+                .acquire(table_name, key, tx, LockStrength::Update, &live)
+        {
             let _ = &schema_fields;
             return Err(format!(
                 "row of '{}' is locked by transaction {}; the statement that locked it must \
@@ -3203,11 +3282,18 @@ pub fn fold_where_constants(sql: &str) -> String {
     let body_start = where_at + "WHERE".len();
     let body = &sql[body_start..];
 
-    let end = ["GROUP BY", "ORDER BY", "LIMIT", "OFFSET", "RETURNING", "FETCH"]
-        .iter()
-        .filter_map(|k| find_keyword(body, k, 0))
-        .min()
-        .unwrap_or(body.len());
+    let end = [
+        "GROUP BY",
+        "ORDER BY",
+        "LIMIT",
+        "OFFSET",
+        "RETURNING",
+        "FETCH",
+    ]
+    .iter()
+    .filter_map(|k| find_keyword(body, k, 0))
+    .min()
+    .unwrap_or(body.len());
 
     format!(
         "{}{}{}",
@@ -3230,11 +3316,19 @@ fn fold_on_clauses(sql: &str) -> String {
     while let Some(at) = find_keyword(&sql[cursor..], "ON", 0) {
         let start = cursor + at + "ON".len();
         let rest = &sql[start..];
-        let end = ["JOIN", "WHERE", "GROUP", "ORDER", "LIMIT", "OFFSET", "RETURNING"]
-            .iter()
-            .filter_map(|k| find_keyword(rest, k, 0))
-            .min()
-            .unwrap_or(rest.len());
+        let end = [
+            "JOIN",
+            "WHERE",
+            "GROUP",
+            "ORDER",
+            "LIMIT",
+            "OFFSET",
+            "RETURNING",
+        ]
+        .iter()
+        .filter_map(|k| find_keyword(rest, k, 0))
+        .min()
+        .unwrap_or(rest.len());
 
         out.push_str(&sql[cursor..start]);
         out.push_str(&fold_constants_in_predicate(&rest[..end]));
@@ -3396,10 +3490,7 @@ fn find_comparison(term: &str) -> Option<(usize, usize)> {
 
 /// Replaces every `EXCLUDED.<column>` with the value the insert would have
 /// written for it.
-fn substitute_excluded(
-    text: &str,
-    inserted: &[(String, String)],
-) -> Result<String, String> {
+fn substitute_excluded(text: &str, inserted: &[(String, String)]) -> Result<String, String> {
     const MARKER: &str = "EXCLUDED.";
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -3437,7 +3528,10 @@ fn strip_qualifier(text: &str, table: &str) -> String {
     loop {
         let lower_rest = rest.to_ascii_lowercase();
         let bare = format!("{}.", table.to_ascii_lowercase());
-        let candidates = [lower_rest.find(&bare), lower_rest.find(&quoted.to_ascii_lowercase())];
+        let candidates = [
+            lower_rest.find(&bare),
+            lower_rest.find(&quoted.to_ascii_lowercase()),
+        ];
         let Some(at) = candidates.iter().flatten().min().copied() else {
             out.push_str(rest);
             return out;
@@ -3573,27 +3667,23 @@ async fn supply_insert_column_list(
     row_data: &crate::core::rql::lexer_s1::InsertRowData,
     database: &Arc<Database>,
 ) -> Option<Result<QueryPurpose, String>> {
-    let (fields, generated) = database
-        .tables
-        .get(&row_data.table_name)
-        .map(|entry| {
-            let schema = &entry.value().schema;
-            (schema.fields.clone(), schema.generated.clone())
-        })?;
+    let (fields, generated) = database.tables.get(&row_data.table_name).map(|entry| {
+        let schema = &entry.value().schema;
+        (schema.fields.clone(), schema.generated.clone())
+    })?;
     // A generated column takes no value from the client, so it is not one of
     // the positions `INSERT INTO t VALUES (…)` fills — PostgreSQL maps the
     // tuple across the columns that *can* be written. Leaving it in the list
     // shifted every value after it by one.
     let fields: smallvec::SmallVec<[crate::core::row::schema::SchemaField; 20]> = fields
         .into_iter()
-        .filter(|f| {
-            crate::core::rql::generated::expression_for(&f.name, &generated).is_none()
-        })
+        .filter(|f| crate::core::rql::generated::expression_for(&f.name, &generated).is_none())
         .collect();
     let rewritten = crate::core::rql::lexer_ir::supply_column_list(&row_data.query, &fields)?;
     Some(
-        recognize_query_purpose(&rewritten)
-            .ok_or_else(|| "could not parse the statement after supplying its column list".to_string()),
+        recognize_query_purpose(&rewritten).ok_or_else(|| {
+            "could not parse the statement after supplying its column list".to_string()
+        }),
     )
 }
 
@@ -3653,7 +3743,11 @@ async fn supply_generated_values(
         else {
             continue;
         };
-        if !assignments[position].1.trim().eq_ignore_ascii_case("DEFAULT") {
+        if !assignments[position]
+            .1
+            .trim()
+            .eq_ignore_ascii_case("DEFAULT")
+        {
             return Some(Err(format!(
                 "cannot insert a non-DEFAULT value into column \"{}\": it is a generated column",
                 g.column
@@ -3665,7 +3759,10 @@ async fn supply_generated_values(
     // What each column holds for this row: the literal written, or its default.
     let mut values: Vec<(String, String)> = assignments.clone();
     for field in fields.iter().filter(|f| !f.is_deleted) {
-        if values.iter().any(|(name, _)| name.eq_ignore_ascii_case(&field.name)) {
+        if values
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case(&field.name))
+        {
             continue;
         }
         let literal = crate::core::rql::column_default::expression_for(&field.name, &defaults)
@@ -3689,11 +3786,7 @@ async fn supply_generated_values(
         // Folded against an empty row: every column reference is gone, so what
         // is left is a constant.
         let literal = match crate::core::rql::expr::parse(&substituted, &[]).and_then(|expr| {
-            crate::core::rql::expr::eval(
-                &expr,
-                &crate::core::row::row::Row::default(),
-                &[],
-            )
+            crate::core::rql::expr::eval(&expr, &crate::core::row::row::Row::default(), &[])
         }) {
             Ok(crate::core::rql::expr::Value::Null) => "NULL".to_string(),
             Ok(crate::core::rql::expr::Value::Data { bytes, db_type }) => {
@@ -3812,7 +3905,9 @@ fn expression_columns(
         if fields
             .iter()
             .any(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(word))
-            && !out.iter().any(|existing| existing.eq_ignore_ascii_case(word))
+            && !out
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(word))
         {
             out.push(word.to_string());
         }
@@ -3960,8 +4055,7 @@ async fn insert_values_batch(
         let Some(purpose) = recognize_query_purpose(&stmt) else {
             return Some(ddl_error("could not re-parse a row of the VALUES clause"));
         };
-        let response =
-            Box::pin(execute_with_context(purpose, database.clone(), depth, tx)).await;
+        let response = Box::pin(execute_with_context(purpose, database.clone(), depth, tx)).await;
         match response.first() {
             Some(3) => return Some(response),
             Some(2) => {
@@ -3983,7 +4077,6 @@ async fn insert_values_batch(
     result.extend_from_slice(&inserted.to_le_bytes());
     Some(result)
 }
-
 
 /// Whether `CREATE TABLE IF NOT EXISTS` has nothing to do.
 ///
@@ -4165,8 +4258,8 @@ fn json_default_is_an_object(expression: &str) -> Result<(), String> {
 /// and not yet committed. Run beside the transaction it would not see them,
 /// and the drop-and-recreate would discard them with nothing reporting it.
 async fn run_ddl(database: &Arc<Database>, sql: &str, tx: TxId) -> Result<(), String> {
-    let purpose = recognize_query_purpose(sql)
-        .ok_or_else(|| format!("could not parse: {}", sql))?;
+    let purpose =
+        recognize_query_purpose(sql).ok_or_else(|| format!("could not parse: {}", sql))?;
     let response = Box::pin(execute_in_txn(purpose, database.clone(), tx)).await;
     if response.first() == Some(&3) {
         // With the statement, truncated. "Schema mismatch" on a statement the
@@ -4174,7 +4267,11 @@ async fn run_ddl(database: &Arc<Database>, sql: &str, tx: TxId) -> Result<(), St
         // one the client sent is not it.
         const SHOWN: usize = 400;
         let excerpt: String = if sql.chars().count() > SHOWN {
-            format!("{}… [{} chars]", sql.chars().take(SHOWN).collect::<String>(), sql.chars().count())
+            format!(
+                "{}… [{} chars]",
+                sql.chars().take(SHOWN).collect::<String>(),
+                sql.chars().count()
+            )
         } else {
             sql.to_string()
         };
@@ -4227,9 +4324,7 @@ fn retype_nulls_from_flags(
                 .columns
                 .iter()
                 .find(|c| c.schema_id == *flag_order)
-                .is_some_and(|c| {
-                    crate::core::rql::nullable::flag_is_set(c.data.into_slice())
-                });
+                .is_some_and(|c| crate::core::rql::nullable::flag_is_set(c.data.into_slice()));
             if is_null {
                 if let Some(c) = row.columns.iter_mut().find(|c| c.schema_id == *value_order) {
                     c.column_type = crate::core::db_type::DbType::NULL;
@@ -4266,7 +4361,10 @@ async fn hydrate_json_columns(
             if cell.column_type == crate::core::db_type::DbType::NULL {
                 continue;
             }
-            let Some(field) = schema.fields.iter().find(|f| f.write_order == cell.schema_id)
+            let Some(field) = schema
+                .fields
+                .iter()
+                .find(|f| f.write_order == cell.schema_id)
             else {
                 continue;
             };
@@ -4282,8 +4380,14 @@ async fn hydrate_json_columns(
             // select path does — turns `SELECT doc` on a NULL into an empty
             // object, and beside a `GROUP BY` it silently merges the NULL
             // group with the genuinely-empty-object one.
-            let Some(document) =
-                Box::pin(load_json_document(database, &shadow_table, &reference, 0, tx)).await
+            let Some(document) = Box::pin(load_json_document(
+                database,
+                &shadow_table,
+                &reference,
+                0,
+                tx,
+            ))
+            .await
             else {
                 cell.data = crate::memory_pool::MEMORY_POOL.acquire(0);
                 cell.column_type = crate::core::db_type::DbType::NULL;
@@ -4314,7 +4418,7 @@ async fn load_json_document(
     shadow_table: &str,
     reference: &str,
     depth: usize,
-    tx: TxId
+    tx: TxId,
 ) -> Option<serde_json::Value> {
     use crate::core::db_type::DbType;
     use crate::core::rql::json_map;
@@ -4357,9 +4461,7 @@ async fn load_json_document(
     let value_columns: Vec<usize> = all_fields
         .iter()
         .enumerate()
-        .filter(|(_, f)| {
-            f.name.starts_with(JSON_VALUE_PREFIX) && f.name != JSON_ELEMENT_REF_COLUMN
-        })
+        .filter(|(_, f)| f.name.starts_with(JSON_VALUE_PREFIX) && f.name != JSON_ELEMENT_REF_COLUMN)
         .map(|(i, _)| i)
         .collect();
 
@@ -4396,7 +4498,9 @@ async fn load_json_document(
     let build_object = |row: &crate::core::row::row::Row| -> serde_json::Value {
         let mut object = serde_json::Map::new();
         for (index, field) in &doc_fields {
-            let Some(bytes) = present(row, *index) else { continue };
+            let Some(bytes) = present(row, *index) else {
+                continue;
+            };
             let value = match field.db_type {
                 DbType::UUID => {
                     // Resolved below; a nested reference needs an await, which
@@ -4431,7 +4535,9 @@ async fn load_json_document(
         let idx_at = idx_at?;
         let mut elements: Vec<(i64, serde_json::Value)> = Vec::new();
         for row in &rows {
-            let Some(bytes) = present(row, idx_at) else { continue };
+            let Some(bytes) = present(row, idx_at) else {
+                continue;
+            };
             let index = i64::from_le_bytes(bytes.as_slice().try_into().ok()?);
             // The container row of an empty array carries no element.
             if index < 0 {
@@ -4473,7 +4579,14 @@ async fn load_json_document(
         build_object(rows.first()?)
     };
 
-    Box::pin(resolve_nested_references(database, shadow_table, &mut result, depth, tx)).await;
+    Box::pin(resolve_nested_references(
+        database,
+        shadow_table,
+        &mut result,
+        depth,
+        tx,
+    ))
+    .await;
     Some(result)
 }
 
@@ -4512,14 +4625,26 @@ async fn resolve_nested_references(
                         continue;
                     }
                 }
-                Box::pin(resolve_nested_references(database, shadow_table, entry, depth, tx))
-                    .await;
+                Box::pin(resolve_nested_references(
+                    database,
+                    shadow_table,
+                    entry,
+                    depth,
+                    tx,
+                ))
+                .await;
             }
         }
         serde_json::Value::Array(items) => {
             for item in items.iter_mut() {
-                Box::pin(resolve_nested_references(database, shadow_table, item, depth, tx))
-                    .await;
+                Box::pin(resolve_nested_references(
+                    database,
+                    shadow_table,
+                    item,
+                    depth,
+                    tx,
+                ))
+                .await;
             }
         }
         _ => {}
@@ -4612,7 +4737,11 @@ fn finish_element(raw: &str, was_quoted: bool) -> Option<String> {
     if !was_quoted && raw.trim().eq_ignore_ascii_case("NULL") {
         return None;
     }
-    Some(if was_quoted { raw.to_string() } else { raw.trim().to_string() })
+    Some(if was_quoted {
+        raw.to_string()
+    } else {
+        raw.trim().to_string()
+    })
 }
 
 /// A status-3 error frame carrying `message`.
@@ -4890,10 +5019,9 @@ async fn seed_sequences(database: &Arc<Database>, table_name: &str) {
     // Which columns are serial, and which of their sequences still need a seed.
     let mut wanted: Vec<(String, crate::core::row::schema::SchemaField)> = Vec::new();
     for field in table.schema.fields.iter().filter(|f| !f.is_deleted) {
-        let Some(expression) = crate::core::rql::column_default::expression_for(
-            &field.name,
-            &table.schema.defaults,
-        ) else {
+        let Some(expression) =
+            crate::core::rql::column_default::expression_for(&field.name, &table.schema.defaults)
+        else {
             continue;
         };
         let Some(name) = crate::core::rql::sequence::parse_nextval(expression) else {
@@ -4921,18 +5049,19 @@ async fn seed_sequences(database: &Arc<Database>, table_name: &str) {
             // Seeding at zero would hand out a key the table may already hold,
             // so the failure is reported rather than papered over. The insert
             // itself then fails on the duplicate, which names the real problem.
-            log::error!("could not read '{}' to seed its sequences: {}", table_name, e);
+            log::error!(
+                "could not read '{}' to seed its sequences: {}",
+                table_name,
+                e
+            );
             return;
         }
     };
 
     for (name, field) in wanted {
-        let last = crate::core::rql::sequence::max_of_column(
-            &rows,
-            field.write_order,
-            &field.db_type,
-        )
-        .unwrap_or(0);
+        let last =
+            crate::core::rql::sequence::max_of_column(&rows, field.write_order, &field.db_type)
+                .unwrap_or(0);
         crate::core::rql::sequence::seed(&name, last);
     }
 }
@@ -4984,7 +5113,12 @@ async fn existing_rows_break_unique(
     let rows = table
         .query_row("", &schema.to_vec(), empty, fetch, None, None)
         .await
-        .map_err(|e| format!("could not read '{}' to validate the constraint: {}", table_name, e))?;
+        .map_err(|e| {
+            format!(
+                "could not read '{}' to validate the constraint: {}",
+                table_name, e
+            )
+        })?;
 
     let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
     for row in &rows {
@@ -4993,7 +5127,11 @@ async fn existing_rows_break_unique(
         let mut encoded: Vec<u8> = Vec::new();
         let mut has_null = false;
         for (index, field) in fields.iter().enumerate() {
-            let Some(column) = row.columns.iter().find(|c| c.schema_id == field.write_order) else {
+            let Some(column) = row
+                .columns
+                .iter()
+                .find(|c| c.schema_id == field.write_order)
+            else {
                 has_null = true;
                 break;
             };
@@ -5002,9 +5140,7 @@ async fn existing_rows_break_unique(
                 row.columns
                     .iter()
                     .find(|c| c.schema_id == order)
-                    .is_some_and(|c| {
-                        crate::core::rql::nullable::flag_is_set(c.data.into_slice())
-                    })
+                    .is_some_and(|c| crate::core::rql::nullable::flag_is_set(c.data.into_slice()))
             });
             let bytes = column.data.into_slice();
             if flagged_null || bytes.is_empty() {
@@ -5072,7 +5208,9 @@ async fn execute_alter_table(sql: &str, database: &Arc<Database>, tx: TxId) -> V
     let if_exists = head.next().is_some_and(|w| w.eq_ignore_ascii_case("ALTER"))
         && head.next().is_some_and(|w| w.eq_ignore_ascii_case("TABLE"))
         && head.next().is_some_and(|w| w.eq_ignore_ascii_case("IF"))
-        && head.next().is_some_and(|w| w.eq_ignore_ascii_case("EXISTS"));
+        && head
+            .next()
+            .is_some_and(|w| w.eq_ignore_ascii_case("EXISTS"));
     if if_exists {
         if let Some(first) = plans.first() {
             if database.tables.get(&first.table_name).is_none() {
@@ -5127,14 +5265,16 @@ async fn retire_tombstoned_name<S: crate::core::storage_providers::traits::Stora
         if retired.eq_ignore_ascii_case(name) {
             return Ok(());
         }
-        schema.rename_field(name, &retired, io_schema.clone()).await?;
+        schema
+            .rename_field(name, &retired, io_schema.clone())
+            .await?;
     }
 }
 
 async fn execute_alter_table_action(
     plan: crate::core::rql::lexer_alter::AlterTable,
     database: &Arc<Database>,
-    tx: TxId
+    tx: TxId,
 ) -> Vec<u8> {
     use crate::core::rql::lexer_alter::AlterAction;
     use crate::core::rql::nullable;
@@ -5159,7 +5299,10 @@ async fn execute_alter_table_action(
         // Logged rather than silent, so a migration that depended on one is
         // traceable afterwards.
         AlterAction::NoOp { reason } => {
-            info!("ALTER TABLE {}: accepted without acting ({})", plan.table_name, reason);
+            info!(
+                "ALTER TABLE {}: accepted without acting ({})",
+                plan.table_name, reason
+            );
             return ddl_ok(0);
         }
         AlterAction::AddColumn {
@@ -5292,19 +5435,13 @@ async fn execute_alter_table_action(
                 };
             }
 
-            let default = match json_default_reference(
-                &database,
-                &plan.table_name,
-                &name,
-                default,
-                json,
-                tx,
-            )
-            .await
-            {
-                Ok(d) => d,
-                Err(e) => return ddl_error(&e),
-            };
+            let default =
+                match json_default_reference(&database, &plan.table_name, &name, default, json, tx)
+                    .await
+                {
+                    Ok(d) => d,
+                    Err(e) => return ddl_error(&e),
+                };
             if let Some(expression) = default {
                 let entry = crate::core::rql::column_default::ColumnDefault {
                     column: name.clone(),
@@ -5346,8 +5483,7 @@ async fn execute_alter_table_action(
                     ),
                     is_deleted: false,
                 };
-                if let Err(e) =
-                    crate::core::rql::json_map::append(io_schema.clone(), &entry).await
+                if let Err(e) = crate::core::rql::json_map::append(io_schema.clone(), &entry).await
                 {
                     return ddl_error(&e.to_string());
                 }
@@ -5371,10 +5507,14 @@ async fn execute_alter_table_action(
             // The column keeps its slot in the row layout and is marked
             // deleted: reclaiming the bytes would move every column after it,
             // which is the same rewrite `ADD COLUMN` needs.
-            schema.mark_field_as_deleted(&field.name, io_schema.clone()).await;
+            schema
+                .mark_field_as_deleted(&field.name, io_schema.clone())
+                .await;
             if let Some(flag) = nullable::flag_field(&field.name, &schema.fields) {
                 let flag_name = flag.name.clone();
-                schema.mark_field_as_deleted(&flag_name, io_schema.clone()).await;
+                schema
+                    .mark_field_as_deleted(&flag_name, io_schema.clone())
+                    .await;
             }
         }
         AlterAction::RenameColumn { from, to } => {
@@ -5445,7 +5585,10 @@ async fn execute_alter_table_action(
                 {
                     return ddl_error(&e);
                 }
-                if let Err(e) = schema.rename_field(&old_flag, &new_flag, io_schema.clone()).await {
+                if let Err(e) = schema
+                    .rename_field(&old_flag, &new_flag, io_schema.clone())
+                    .await
+                {
                     return ddl_error(&e);
                 }
             }
@@ -5517,7 +5660,9 @@ async fn execute_alter_table_action(
                     // constraint then outlived the migration meant to replace
                     // it and rejected rows the new one allows.
                     if let Some(column) = implicit_unique_column(&name, &schema.fields) {
-                        schema.set_field_unique(&column, false, io_schema.clone()).await;
+                        schema
+                            .set_field_unique(&column, false, io_schema.clone())
+                            .await;
                         return match database.reload_table(&plan.table_name).await {
                             Ok(()) => ddl_ok(0),
                             Err(e) => ddl_error(&e.to_string()),
@@ -5551,7 +5696,11 @@ async fn execute_alter_table_action(
                     Ok(fk) => fk,
                     Err(e) => return ddl_error(&e),
                 };
-                if !schema.fields.iter().any(|f| f.name.eq_ignore_ascii_case(&fk.column)) {
+                if !schema
+                    .fields
+                    .iter()
+                    .any(|f| f.name.eq_ignore_ascii_case(&fk.column))
+                {
                     return ddl_error(&format!("column '{}' does not exist", fk.column));
                 }
                 if let Err(e) = foreign_key::append(io_schema.clone(), &fk).await {
@@ -5575,7 +5724,10 @@ async fn execute_alter_table_action(
                 let trimmed = description.trim_start();
                 let upper = trimmed.to_ascii_uppercase();
                 if upper.starts_with("IF NOT EXISTS") {
-                    (trimmed["IF NOT EXISTS".len()..].trim_start().to_string(), true)
+                    (
+                        trimmed["IF NOT EXISTS".len()..].trim_start().to_string(),
+                        true,
+                    )
                 } else {
                     (description.clone(), false)
                 }
@@ -5648,7 +5800,11 @@ async fn execute_alter_table_action(
             return ddl_ok(0);
         }
         AlterAction::SetDefault { name, expression } => {
-            if !schema.fields.iter().any(|f| f.name.eq_ignore_ascii_case(&name)) {
+            if !schema
+                .fields
+                .iter()
+                .any(|f| f.name.eq_ignore_ascii_case(&name))
+            {
                 return ddl_error(&format!("column '{}' does not exist", name));
             }
             let entry = crate::core::rql::column_default::ColumnDefault {
@@ -5796,11 +5952,16 @@ async fn execute_alter_table_action(
                 // moving the columns after it is the rewrite being avoided.
                 if let Some(flag) = nullable::flag_field(&name, &schema.fields) {
                     let flag_name = flag.name.clone();
-                    schema.mark_field_as_deleted(&flag_name, io_schema.clone()).await;
+                    schema
+                        .mark_field_as_deleted(&flag_name, io_schema.clone())
+                        .await;
                 }
                 // Falls through to the reload below.
             } else {
-                warn!("ALTER TABLE {}: ALTER COLUMN {} {} ignored", plan.table_name, name, detail);
+                warn!(
+                    "ALTER TABLE {}: ALTER COLUMN {} {} ignored",
+                    plan.table_name, name, detail
+                );
                 return ddl_ok(0);
             }
         }
@@ -5840,7 +6001,11 @@ async fn execute_create_path_index(sql: &str, database: &Arc<Database>) -> Vec<u
                 && !f.is_deleted
                 && f.db_type == crate::core::db_type::DbType::JSONB
         });
-        (table.io_schema.clone(), table.schema.path_indexes.clone(), is_document)
+        (
+            table.io_schema.clone(),
+            table.schema.path_indexes.clone(),
+            is_document,
+        )
     };
 
     if !column_is_a_document {
@@ -5857,17 +6022,20 @@ async fn execute_create_path_index(sql: &str, database: &Arc<Database>) -> Vec<u
         return if statement.if_not_exists || existing.name == statement.name {
             ddl_ok(0)
         } else {
-            ddl_error(&format!(
-                "'{}' already indexes that path",
-                existing.name
-            ))
+            ddl_error(&format!("'{}' already indexes that path", existing.name))
         };
     }
-    if declared.iter().any(|i| i.name.eq_ignore_ascii_case(&statement.name)) {
+    if declared
+        .iter()
+        .any(|i| i.name.eq_ignore_ascii_case(&statement.name))
+    {
         return if statement.if_not_exists {
             ddl_ok(0)
         } else {
-            ddl_error(&format!("an index called '{}' already exists", statement.name))
+            ddl_error(&format!(
+                "an index called '{}' already exists",
+                statement.name
+            ))
         };
     }
 
@@ -5880,7 +6048,10 @@ async fn execute_create_path_index(sql: &str, database: &Arc<Database>) -> Vec<u
         return ddl_error(&e.to_string());
     }
     if let Err(e) = database.reload_table(&statement.table).await {
-        return ddl_error(&format!("the index was recorded but the table could not be reopened: {}", e));
+        return ddl_error(&format!(
+            "the index was recorded but the table could not be reopened: {}",
+            e
+        ));
     }
     ddl_ok(0)
 }
@@ -5918,7 +6089,11 @@ async fn execute_drop_path_index(sql: &str, database: &Arc<Database>) -> Vec<u8>
     let io_schema = {
         let entry = database.tables.get(&table_name);
         let Some(table) = entry.as_ref().clone() else {
-            return if if_exists { ddl_ok(0) } else { ddl_error("relation vanished") };
+            return if if_exists {
+                ddl_ok(0)
+            } else {
+                ddl_error("relation vanished")
+            };
         };
         table.io_schema.clone()
     };
@@ -5932,7 +6107,10 @@ async fn execute_drop_path_index(sql: &str, database: &Arc<Database>) -> Vec<u8>
         return ddl_error(&e.to_string());
     }
     if let Err(e) = database.reload_table(&table_name).await {
-        return ddl_error(&format!("the index was dropped but the table could not be reopened: {}", e));
+        return ddl_error(&format!(
+            "the index was dropped but the table could not be reopened: {}",
+            e
+        ));
     }
     ddl_ok(0)
 }
@@ -5980,8 +6158,10 @@ fn sort_rows_by_expressions(
 
     // Every key is evaluated once per row, up front — a comparator must not
     // error, and re-evaluating inside one would be quadratic anyway.
-    let mut keyed: Vec<(Vec<crate::core::rql::expr::Value>, crate::core::row::row::Row)> =
-        Vec::with_capacity(rows.len());
+    let mut keyed: Vec<(
+        Vec<crate::core::rql::expr::Value>,
+        crate::core::row::row::Row,
+    )> = Vec::with_capacity(rows.len());
     for row in rows {
         let mut values = Vec::with_capacity(keys.len());
         for (expr, _, _) in keys {
@@ -5998,16 +6178,23 @@ fn sort_rows_by_expressions(
             let ord = match (av.is_null(), bv.is_null()) {
                 (true, true) => Ordering::Equal,
                 (true, false) => {
-                    if nulls_come_first { Ordering::Less } else { Ordering::Greater }
+                    if nulls_come_first {
+                        Ordering::Less
+                    } else {
+                        Ordering::Greater
+                    }
                 }
                 (false, true) => {
-                    if nulls_come_first { Ordering::Greater } else { Ordering::Less }
+                    if nulls_come_first {
+                        Ordering::Greater
+                    } else {
+                        Ordering::Less
+                    }
                 }
                 (false, false) => {
                     // Incomparable values keep their scan order rather than
                     // panicking the comparator.
-                    let ord = crate::core::rql::expr::compare(av, bv)
-                        .unwrap_or(Ordering::Equal);
+                    let ord = crate::core::rql::expr::compare(av, bv).unwrap_or(Ordering::Equal);
                     if *descending { ord.reverse() } else { ord }
                 }
             };
@@ -6046,8 +6233,7 @@ async fn hydrate_json_in_returning(
         return;
     }
     for (index, field) in fields.iter().enumerate() {
-        let Some(shadow_table) =
-            crate::core::rql::json_map::shadow_for(&field.name, json_columns)
+        let Some(shadow_table) = crate::core::rql::json_map::shadow_for(&field.name, json_columns)
         else {
             continue;
         };
@@ -6062,10 +6248,16 @@ async fn hydrate_json_in_returning(
                 continue;
             }
             let reference = crate::core::value_codec::format_uuid(cell.data.into_slice());
-            let rendered = Box::pin(load_json_document(database, shadow_table, &reference, 0, tx))
-                .await
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "{}".to_string());
+            let rendered = Box::pin(load_json_document(
+                database,
+                shadow_table,
+                &reference,
+                0,
+                tx,
+            ))
+            .await
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "{}".to_string());
             if let Some(cell) = row.columns.get_mut(index) {
                 let bytes = rendered.as_bytes();
                 let mut mb = crate::memory_pool::MEMORY_POOL.acquire(bytes.len());
@@ -6171,9 +6363,7 @@ async fn returning_rows_for_write<S: crate::core::storage_providers::traits::Sto
     let computed_exprs: Vec<crate::core::rql::expr::Expr> = items
         .iter()
         .filter_map(|item| match item {
-            crate::core::rql::lexer_ir::ReturningItem::Computed { expr, .. } => {
-                Some(expr.clone())
-            }
+            crate::core::rql::lexer_ir::ReturningItem::Computed { expr, .. } => Some(expr.clone()),
             _ => None,
         })
         .collect();
@@ -6191,8 +6381,7 @@ async fn returning_rows_for_write<S: crate::core::storage_providers::traits::Sto
                     fetch_fields.len() - 1
                 }
             };
-            if let Some(flag) =
-                crate::core::rql::nullable::flag_field(&referenced.name, &schema_sv)
+            if let Some(flag) = crate::core::rql::nullable::flag_field(&referenced.name, &schema_sv)
             {
                 if !fetch_fields.iter().any(|f| f.name == flag.name) {
                     fetch_fields.push(flag.clone());
@@ -6229,7 +6418,15 @@ async fn returning_rows_for_write<S: crate::core::storage_providers::traits::Sto
     // came back empty, and a client that expects its row back saw the statement
     // fail with the value already saved.
     let mut rows = table
-        .query_row_in_txn(where_clause, &schema.to_vec(), query_fetch, requested, None, None, tx)
+        .query_row_in_txn(
+            where_clause,
+            &schema.to_vec(),
+            query_fetch,
+            requested,
+            None,
+            None,
+            tx,
+        )
         .await
         .map_err(|e| e.to_string())?;
 
@@ -6279,14 +6476,16 @@ async fn returning_rows_for_write<S: crate::core::storage_providers::traits::Sto
                     // `int4` produced eight bytes; handed to the renderer as an
                     // `int4` those decoded to nothing and `RETURNING` came back
                     // empty while the stored value was right.
-                    let Some(target) = schema
-                        .iter()
-                        .find(|f| f.write_order as u32 == *write_order)
+                    let Some(target) = schema.iter().find(|f| f.write_order as u32 == *write_order)
                     else {
                         continue;
                     };
                     let variable = target.db_type.is_variable_width();
-                    let width = if variable { bytes.len() } else { target.size as usize };
+                    let width = if variable {
+                        bytes.len()
+                    } else {
+                        target.size as usize
+                    };
                     let mut mb = crate::memory_pool::MEMORY_POOL.acquire(width);
                     let slot = mb.into_slice_mut();
                     slot.fill(0);
@@ -6297,8 +6496,9 @@ async fn returning_rows_for_write<S: crate::core::storage_providers::traits::Sto
             }
 
             for column in row.columns.iter_mut() {
-                if let Some((_, data, db_type)) =
-                    computed.iter().find(|(order, _, _)| *order == column.schema_id)
+                if let Some((_, data, db_type)) = computed
+                    .iter()
+                    .find(|(order, _, _)| *order == column.schema_id)
                 {
                     column.data = data.clone();
                     column.column_type = db_type.clone();
@@ -6339,9 +6539,7 @@ async fn returning_rows_for_write<S: crate::core::storage_providers::traits::Sto
                         updates
                             .iter()
                             .find(|u| u64::from(u.write_order) == flag.write_order)
-                            .map(|u| {
-                                crate::core::rql::nullable::flag_is_set(u.data.into_slice())
-                            })
+                            .map(|u| crate::core::rql::nullable::flag_is_set(u.data.into_slice()))
                     })
                     .unwrap_or(false);
                     column.column_type = if assigned_null {
@@ -6382,9 +6580,7 @@ async fn returning_rows_for_write<S: crate::core::storage_providers::traits::Sto
                         }),
                     }
                 }
-                crate::core::rql::lexer_ir::ReturningItem::Computed {
-                    expr, db_type, ..
-                } => {
+                crate::core::rql::lexer_ir::ReturningItem::Computed { expr, db_type, .. } => {
                     // Re-encoded as the type this item is DESCRIBED as: the
                     // arithmetic is done in i64/f64, so `counter - 1` on an
                     // `int4` column produced eight bytes under an `int4` OID
@@ -6584,11 +6780,15 @@ pub async fn execute_with_sync(
             None => recognize_query_purpose(&retry_sql),
         };
         let Some(purpose) = purpose else {
-            break (tx, first_conflict.take().unwrap_or_else(|| ddl_error("write conflict")));
+            break (
+                tx,
+                first_conflict
+                    .take()
+                    .unwrap_or_else(|| ddl_error("write conflict")),
+            );
         };
 
-        let response =
-            Box::pin(execute_with_context(purpose, database.clone(), 0, tx)).await;
+        let response = Box::pin(execute_with_context(purpose, database.clone(), 0, tx)).await;
         let conflicted = is_retryable_conflict(&response);
 
         if !conflicted || !retryable || attempt >= MAX_CONFLICT_RETRIES {
@@ -6669,8 +6869,11 @@ pub async fn execute_with_sync(
         database.abort_transaction(tx);
         let mut failed = vec![3u8];
         failed.extend_from_slice(
-            format!("could not commit: the transaction outcome could not be made durable ({})", e)
-                .as_bytes(),
+            format!(
+                "could not commit: the transaction outcome could not be made durable ({})",
+                e
+            )
+            .as_bytes(),
         );
         return failed;
     }
@@ -6694,8 +6897,11 @@ pub async fn execute_with_sync(
             let _ = database.transactions.flush();
             let mut failed = vec![3u8];
             failed.extend_from_slice(
-                format!("could not commit: the rows written could not be made durable ({})", e)
-                    .as_bytes(),
+                format!(
+                    "could not commit: the rows written could not be made durable ({})",
+                    e
+                )
+                .as_bytes(),
             );
             return failed;
         }
@@ -6723,13 +6929,7 @@ pub async fn execute_with_sync(
 /// is recorded: a replica running it triggers the same cascades itself, and
 /// shipping both would apply them twice.
 #[inline]
-fn note_write(
-    database: &Arc<Database>,
-    tx: TxId,
-    depth: usize,
-    sql: &str,
-    table: Option<&str>,
-) {
+fn note_write(database: &Arc<Database>, tx: TxId, depth: usize, sql: &str, table: Option<&str>) {
     if depth == 0 {
         database.replication.note_statement(tx, sql, table);
     }
@@ -6756,10 +6956,11 @@ fn strip_conflict_marker(mut response: Vec<u8>) -> Vec<u8> {
         return response;
     }
     let text = String::from_utf8_lossy(&response[1..]).to_string();
-    if let Some(trimmed) = text.strip_suffix(crate::core::row::table::Table::<
-        crate::core::storage_providers::file_sync::LocalStorageProvider,
-    >::CONFLICT_RETRYABLE)
-    {
+    if let Some(trimmed) = text.strip_suffix(
+        crate::core::row::table::Table::<
+            crate::core::storage_providers::file_sync::LocalStorageProvider,
+        >::CONFLICT_RETRYABLE,
+    ) {
         response.truncate(1);
         response.extend_from_slice(trimmed.as_bytes());
     }
@@ -6933,8 +7134,7 @@ pub async fn execute_with_context(
         }
         QueryPurpose::CreateTable(_) => {
             // Handle create table
-            let (parsed, rejection) =
-                crate::core::rql::lexer_ct::create_table_with_reason(&query);
+            let (parsed, rejection) = crate::core::rql::lexer_ct::create_table_with_reason(&query);
             if let Some(reason) = rejection {
                 error!("Cannot create table: {}", reason);
                 return ddl_error(&reason);
@@ -6955,19 +7155,14 @@ pub async fn execute_with_context(
                 // A JSON column's DEFAULT is a document, and the column holds a
                 // reference. Resolved before the table is registered, so the
                 // recorded default is the reference every row will take.
-                let create_table = match Box::pin(resolve_json_defaults(
-                    &database,
-                    create_table,
-                    tx,
-                ))
-                .await
-                {
-                    Ok(ct) => ct,
-                    Err(e) => {
-                        error!("{}", e);
-                        return ddl_error(&e);
-                    }
-                };
+                let create_table =
+                    match Box::pin(resolve_json_defaults(&database, create_table, tx)).await {
+                        Ok(ct) => ct,
+                        Err(e) => {
+                            error!("{}", e);
+                            return ddl_error(&e);
+                        }
+                    };
                 if database.add_table(create_table).await.is_ok() {
                     info!("Table created successfully");
                     // No table name is attached to schema changes: the
@@ -7197,7 +7392,9 @@ pub async fn execute_with_context(
             // violation leaves nothing behind to undo.
             match crate::core::rql::lexer_ir::assignments_of_insert(&row_data.query) {
                 Some(assignments) => {
-                    if let Err(e) = check_foreign_keys(&database, table_name, &assignments, tx).await {
+                    if let Err(e) =
+                        check_foreign_keys(&database, table_name, &assignments, tx).await
+                    {
                         error!("{}", e);
                         return ddl_error(&e);
                     }
@@ -7259,14 +7456,12 @@ pub async fn execute_with_context(
                             schema
                                 .fields
                                 .iter()
-                                .find(|f| {
-                                    !f.is_deleted
-                                        && f.name.eq_ignore_ascii_case(&flag_name)
-                                })
+                                .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(&flag_name))
                                 .and_then(|flag| {
-                                    insert_row.columns_writing_data.iter().find(|c| {
-                                        c.write_order as u64 == flag.write_order
-                                    })
+                                    insert_row
+                                        .columns_writing_data
+                                        .iter()
+                                        .find(|c| c.write_order as u64 == flag.write_order)
                                 })
                                 .is_some_and(|c| {
                                     crate::core::rql::nullable::flag_is_set(c.data.into_slice())
@@ -7414,9 +7609,8 @@ pub async fn execute_with_context(
                 {
                     let entry = database.tables.get(&name);
                     if let Some(table) = entry.as_ref().clone() {
-                        let assignments =
-                            crate::core::rql::lexer_ur::assignments_of_update(sql)
-                                .unwrap_or_default();
+                        let assignments = crate::core::rql::lexer_ur::assignments_of_update(sql)
+                            .unwrap_or_default();
                         if let Err(e) = check_not_null(
                             &name,
                             &table.schema.fields,
@@ -7430,10 +7624,7 @@ pub async fn execute_with_context(
                     }
                 }
                 if let Err(e) = Box::pin(refuse_write_to_locked_rows(
-                    &database,
-                    &name,
-                    &condition,
-                    tx,
+                    &database, &name, &condition, tx,
                 ))
                 .await
                 {
@@ -7476,7 +7667,12 @@ pub async fn execute_with_context(
             // Parse UPDATE ... using schema
             // We need the table to obtain schema, so first read the table name in a lightweight way.
             let table_name = match &query {
-                QueryPurpose::UpdateRow(sql) => sql.split_whitespace().nth(1).unwrap_or("").trim_matches('"').to_string(),
+                QueryPurpose::UpdateRow(sql) => sql
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("")
+                    .trim_matches('"')
+                    .to_string(),
                 _ => String::new(),
             };
 
@@ -7516,9 +7712,7 @@ pub async fn execute_with_context(
             // wrong number that reports success, which is the failure this
             // engine is most often bitten by. A loud limitation can be worked
             // around; a quiet one is found in a report months later.
-            if let Some(reason) =
-                generated_update_conflict(&query, &table.schema)
-            {
+            if let Some(reason) = generated_update_conflict(&query, &table.schema) {
                 error!("{}", reason);
                 return ddl_error(&reason);
             }
@@ -7579,8 +7773,7 @@ pub async fn execute_with_context(
             ) {
                 (Some(plan), _) => plan,
                 (None, reason) => {
-                    let message =
-                        reason.unwrap_or_else(|| "Cannot parse UPDATE query".to_string());
+                    let message = reason.unwrap_or_else(|| "Cannot parse UPDATE query".to_string());
                     error!("Cannot parse UPDATE query: {}", message);
                     return ddl_error(&message);
                 }
@@ -7703,7 +7896,10 @@ pub async fn execute_with_context(
                 Err(e) => {
                     // The retry marker is an internal signal for `execute_in_txn`;
                     // it must never appear in a log a human reads.
-                    error!("Failed to update rows: {}", clean_conflict_text(&e.to_string()));
+                    error!(
+                        "Failed to update rows: {}",
+                        clean_conflict_text(&e.to_string())
+                    );
                     let mut result = vec![3u8];
                     result.extend_from_slice(e.to_string().as_bytes());
                     return result;
@@ -7861,27 +8057,25 @@ pub async fn execute_with_context(
             // The reason travels with the failure: an unsupported predicate
             // used to reach the client as "Cannot parse DELETE query" while
             // the same clause in a SELECT named the actual feature.
-            let delete_plan = match crate::core::rql::lexer_dr::delete_row_with_reason(
-                &query,
-                &schema_sv,
-            ) {
-                (Some(plan), _) => plan,
-                (None, reason) => {
-                    let message =
-                        reason.unwrap_or_else(|| "Cannot parse DELETE query".to_string());
-                    error!("Cannot parse DELETE query: {}", message);
-                    return ddl_error(&message);
-                }
-            };
+            let delete_plan =
+                match crate::core::rql::lexer_dr::delete_row_with_reason(&query, &schema_sv) {
+                    (Some(plan), _) => plan,
+                    (None, reason) => {
+                        let message =
+                            reason.unwrap_or_else(|| "Cannot parse DELETE query".to_string());
+                        error!("Cannot parse DELETE query: {}", message);
+                        return ddl_error(&message);
+                    }
+                };
 
             // Referencing rows are dealt with before the parent goes, so a
             // blocking action can still refuse and a cascade still has the
             // parent's key to match on.
-            match keys_about_to_be_deleted(&database, &table_name, &delete_plan.where_clause, tx).await
+            match keys_about_to_be_deleted(&database, &table_name, &delete_plan.where_clause, tx)
+                .await
             {
                 Ok(keys) => {
-                    if let Err(e) =
-                        apply_on_delete(&database, &table_name, &keys, depth, tx).await
+                    if let Err(e) = apply_on_delete(&database, &table_name, &keys, depth, tx).await
                     {
                         error!("{}", e);
                         return ddl_error(&e);
@@ -7942,7 +8136,10 @@ pub async fn execute_with_context(
                 Err(e) => {
                     // The retry marker is an internal signal for `execute_in_txn`;
                     // it must never appear in a log a human reads.
-                    error!("Failed to delete rows: {}", clean_conflict_text(&e.to_string()));
+                    error!(
+                        "Failed to delete rows: {}",
+                        clean_conflict_text(&e.to_string())
+                    );
                     let mut result = vec![3u8];
                     result.extend_from_slice(e.to_string().as_bytes());
                     return result;
@@ -7967,7 +8164,9 @@ pub async fn execute_with_context(
                     Ok(flattened) => {
                         let Some(purpose) = recognize_query_purpose(&flattened) else {
                             let mut result = vec![3u8];
-                            result.extend_from_slice(b"cannot parse the statement after subquery substitution");
+                            result.extend_from_slice(
+                                b"cannot parse the statement after subquery substitution",
+                            );
                             return result;
                         };
                         return Box::pin(execute_in_txn(purpose, database.clone(), tx)).await;
@@ -8033,8 +8232,7 @@ pub async fn execute_with_context(
                 let aggregate_fetch = {
                     let mut wanted: Vec<crate::core::row::schema::SchemaField> = Vec::new();
                     for c in &query_row.requested_row_fetch.columns_fetching_data {
-                        if let Some(f) =
-                            schema.fields.iter().find(|f| f.write_order == c.schema_id)
+                        if let Some(f) = schema.fields.iter().find(|f| f.write_order == c.schema_id)
                         {
                             wanted.push(f.clone());
                         }
@@ -8068,16 +8266,15 @@ pub async fn execute_with_context(
                     Ok(mut rows) => {
                         retype_nulls_from_flags(&schema, &mut rows);
                         hydrate_json_columns(&database, &schema, &mut rows, tx).await;
-                        let grouped =
-                            match crate::core::rql::aggregate::fold(&plan, &rows) {
-                                Ok(folded) => folded,
-                                Err(e) => {
-                                    error!("Aggregate failed: {}", e);
-                                    let mut result = vec![3u8];
-                                    result.extend_from_slice(e.as_bytes());
-                                    return result;
-                                }
-                            };
+                        let grouped = match crate::core::rql::aggregate::fold(&plan, &rows) {
+                            Ok(folded) => folded,
+                            Err(e) => {
+                                error!("Aggregate failed: {}", e);
+                                let mut result = vec![3u8];
+                                result.extend_from_slice(e.as_bytes());
+                                return result;
+                            }
+                        };
                         let mut result = vec![2u8];
                         for row in &grouped {
                             row.extend_serialized(&mut result);
@@ -8159,11 +8356,8 @@ pub async fn execute_with_context(
                             .fields
                             .iter()
                             .find(|f| f.write_order == c.schema_id)?;
-                        crate::core::rql::json_map::shadow_for(
-                            &field.name,
-                            &schema.json_columns,
-                        )
-                        .map(|t| (c.schema_id, t.to_string()))
+                        crate::core::rql::json_map::shadow_for(&field.name, &schema.json_columns)
+                            .map(|t| (c.schema_id, t.to_string()))
                     })
                     .collect()
             };
@@ -8171,20 +8365,37 @@ pub async fn execute_with_context(
             // Constants and per-row scalars both fill output positions that no
             // fetched column occupies. Merged into one ordered list so the
             // splice below stays index-correct whichever kind comes first.
-            let mut value_slots: Vec<(usize, SlotValue, crate::core::db_type::DbType)> =
-                query_row
-                    .literal_slots
-                    .iter()
-                    .map(|(position, bytes, db_type)| {
-                        (*position, SlotValue::Constant(bytes.clone()), db_type.clone())
-                    })
-                    .chain(query_row.scalar_slots.iter().map(|(position, func, db_type)| {
-                        (*position, SlotValue::Scalar(*func), db_type.clone())
-                    }))
-                    .chain(query_row.expr_slots.iter().map(|(position, expr, db_type)| {
-                        (*position, SlotValue::RowExpression(expr.clone()), db_type.clone())
-                    }))
-                    .collect();
+            let mut value_slots: Vec<(usize, SlotValue, crate::core::db_type::DbType)> = query_row
+                .literal_slots
+                .iter()
+                .map(|(position, bytes, db_type)| {
+                    (
+                        *position,
+                        SlotValue::Constant(bytes.clone()),
+                        db_type.clone(),
+                    )
+                })
+                .chain(
+                    query_row
+                        .scalar_slots
+                        .iter()
+                        .map(|(position, func, db_type)| {
+                            (*position, SlotValue::Scalar(*func), db_type.clone())
+                        }),
+                )
+                .chain(
+                    query_row
+                        .expr_slots
+                        .iter()
+                        .map(|(position, expr, db_type)| {
+                            (
+                                *position,
+                                SlotValue::RowExpression(expr.clone()),
+                                db_type.clone(),
+                            )
+                        }),
+                )
+                .collect();
             value_slots.sort_by_key(|(position, ..)| *position);
             let slot_schema = schema.fields.to_vec();
             let has_literals = !value_slots.is_empty();
@@ -8240,15 +8451,15 @@ pub async fn execute_with_context(
                                         // UUID, evaluate to NULL on every
                                         // row, and quietly not sort at all.
                                         let shadowed = order_exprs.iter().any(|(expr, ..)| {
-                                            crate::core::rql::expr::columns_of(expr)
-                                                .iter()
-                                                .any(|f| {
+                                            crate::core::rql::expr::columns_of(expr).iter().any(
+                                                |f| {
                                                     crate::core::rql::json_map::shadow_for(
                                                         &f.name,
                                                         &schema.json_columns,
                                                     )
                                                     .is_some()
-                                                })
+                                                },
+                                            )
                                         });
                                         if shadowed {
                                             let e = "ORDER BY into a JSON column stored as shadow tables is not supported; store the column as native JSONB";
@@ -8318,14 +8529,14 @@ pub async fn execute_with_context(
                                         // many the client is owed.
                                         let overfetched = row.columns.len() > visible_columns
                                             && (visible_columns > 0 || has_literals);
-                                        let mut row = if trim_sort_key || has_nullable || overfetched
-                                        {
-                                            let mut trimmed = row;
-                                            trimmed.columns.truncate(visible_columns);
-                                            trimmed
-                                        } else {
-                                            row
-                                        };
+                                        let mut row =
+                                            if trim_sort_key || has_nullable || overfetched {
+                                                let mut trimmed = row;
+                                                trimmed.columns.truncate(visible_columns);
+                                                trimmed
+                                            } else {
+                                                row
+                                            };
 
                                         // A JSON column's stored UUID is
                                         // replaced by the document it refers
@@ -8366,9 +8577,8 @@ pub async fn execute_with_context(
 
                                                 if let Some(cell) = row.columns.get_mut(index) {
                                                     let bytes = rendered.as_bytes();
-                                                    let mut mb =
-                                                        crate::memory_pool::MEMORY_POOL
-                                                            .acquire(bytes.len());
+                                                    let mut mb = crate::memory_pool::MEMORY_POOL
+                                                        .acquire(bytes.len());
                                                     mb.into_slice_mut().copy_from_slice(bytes);
                                                     cell.data = mb;
                                                     cell.column_type =
@@ -8390,8 +8600,11 @@ pub async fn execute_with_context(
                                             // write order, and inserting a slot
                                             // column shifts what those lookups
                                             // find.
-                                            let mut computed: Vec<(usize, Vec<u8>, crate::core::db_type::DbType)> =
-                                                Vec::with_capacity(value_slots.len());
+                                            let mut computed: Vec<(
+                                                usize,
+                                                Vec<u8>,
+                                                crate::core::db_type::DbType,
+                                            )> = Vec::with_capacity(value_slots.len());
                                             for (position, slot, db_type) in &value_slots {
                                                 // A scalar is evaluated *here*,
                                                 // inside the per-row loop:
@@ -8452,8 +8665,8 @@ pub async fn execute_with_context(
                                                 computed.push((*position, value, ty));
                                             }
                                             for (position, value, db_type) in &computed {
-                                                let mut mb =
-                                                    crate::memory_pool::MEMORY_POOL.acquire(value.len());
+                                                let mut mb = crate::memory_pool::MEMORY_POOL
+                                                    .acquire(value.len());
                                                 if !value.is_empty() {
                                                     mb.into_slice_mut().copy_from_slice(value);
                                                 }
@@ -8475,10 +8688,8 @@ pub async fn execute_with_context(
                                             // RowDescription, which a client
                                             // rejects as "unexpected field
                                             // count in D message".
-                                            let output_columns = query_row
-                                                .select_items
-                                                .len()
-                                                .max(value_slots.len());
+                                            let output_columns =
+                                                query_row.select_items.len().max(value_slots.len());
                                             row.columns.truncate(output_columns);
                                         }
                                         let row = row;
@@ -8530,9 +8741,8 @@ pub async fn execute_with_context(
                                                 // is an empty block, which is
                                                 // how a NULL travels here.
                                                 let bytes = value.unwrap_or_default();
-                                                let mut mb =
-                                                    crate::memory_pool::MEMORY_POOL
-                                                        .acquire(bytes.len());
+                                                let mut mb = crate::memory_pool::MEMORY_POOL
+                                                    .acquire(bytes.len());
                                                 mb.into_slice_mut().copy_from_slice(&bytes);
                                                 let at = (*position).min(row.columns.len());
                                                 row.columns.insert(
@@ -8546,9 +8756,8 @@ pub async fn execute_with_context(
                                             }
                                         }
                                         for row in kept.iter_mut() {
-                                            row.columns.truncate(
-                                                query_row.select_items.len().max(1),
-                                            );
+                                            row.columns
+                                                .truncate(query_row.select_items.len().max(1));
                                         }
                                     }
 
@@ -8569,8 +8778,7 @@ pub async fn execute_with_context(
                                             // Everything the client will see:
                                             // the page plus whatever OFFSET
                                             // discards ahead of it.
-                                            written_limit
-                                                .map(|l| l as usize + offset as usize),
+                                            written_limit.map(|l| l as usize + offset as usize),
                                             tx,
                                         ))
                                         .await
@@ -8672,7 +8880,10 @@ mod predicate_extraction_tests {
 
     #[test]
     fn a_delete_keeps_its_predicate() {
-        assert_eq!(predicate_of("DELETE FROM t WHERE a = 1 RETURNING id", None), "a = 1");
+        assert_eq!(
+            predicate_of("DELETE FROM t WHERE a = 1 RETURNING id", None),
+            "a = 1"
+        );
     }
 }
 
@@ -8692,7 +8903,11 @@ mod predicate_folding_tests {
             "ORDER BY must stay separated: {}",
             folded
         );
-        assert!(!folded.contains("NOW()"), "NOW() should have been folded: {}", folded);
+        assert!(
+            !folded.contains("NOW()"),
+            "NOW() should have been folded: {}",
+            folded
+        );
     }
 
     #[test]
@@ -8716,12 +8931,15 @@ mod predicate_folding_tests {
 
     #[test]
     fn both_sides_of_a_conjunction_are_folded() {
-        let folded = fold_where_constants(
-            "UPDATE t SET a = 1 WHERE lease_until < NOW() OR owner = 'x'",
-        );
+        let folded =
+            fold_where_constants("UPDATE t SET a = 1 WHERE lease_until < NOW() OR owner = 'x'");
         assert!(!folded.contains("NOW()"), "{}", folded);
         assert!(folded.contains("owner = 'x'"), "{}", folded);
-        assert!(folded.contains(" OR "), "the separator must survive: {}", folded);
+        assert!(
+            folded.contains(" OR "),
+            "the separator must survive: {}",
+            folded
+        );
     }
 }
 

@@ -233,8 +233,12 @@ pub fn parse_alter_table(sql: &str) -> Result<AlterTable, String> {
             // `ADD UNIQUE …` all declare constraints rather than columns.
             if matches!(
                 rest_upper.get(i).map(String::as_str),
-                Some("CONSTRAINT") | Some("FOREIGN") | Some("PRIMARY") | Some("UNIQUE")
-                    | Some("CHECK") | Some("EXCLUDE")
+                Some("CONSTRAINT")
+                    | Some("FOREIGN")
+                    | Some("PRIMARY")
+                    | Some("UNIQUE")
+                    | Some("CHECK")
+                    | Some("EXCLUDE")
             ) {
                 return Ok(AlterTable {
                     table_name,
@@ -273,9 +277,17 @@ pub fn parse_alter_table(sql: &str) -> Result<AlterTable, String> {
                 parse_column_type(&type_tokens)?
             };
             let constraints = rest_upper[i + used..].join(" ");
-            let nullable = !(constraints.contains("NOT NULL") || constraints.contains("PRIMARY KEY"));
+            let nullable =
+                !(constraints.contains("NOT NULL") || constraints.contains("PRIMARY KEY"));
 
-            AlterAction::AddColumn { name, db_type, nullable, if_not_exists, default, json }
+            AlterAction::AddColumn {
+                name,
+                db_type,
+                nullable,
+                if_not_exists,
+                default,
+                json,
+            }
         }
         "DROP" => {
             let mut i = 1usize;
@@ -309,7 +321,10 @@ pub fn parse_alter_table(sql: &str) -> Result<AlterTable, String> {
             // a column. The keyword right after RENAME is what tells them apart.
             if rest_upper.get(i).map(String::as_str) == Some("TO") {
                 let to = bare_name(rest.get(i + 1).ok_or("RENAME TO has no new name")?);
-                return Ok(AlterTable { table_name, action: AlterAction::RenameTable { to } });
+                return Ok(AlterTable {
+                    table_name,
+                    action: AlterAction::RenameTable { to },
+                });
             }
             if rest_upper.get(i).map(String::as_str) == Some("COLUMN") {
                 i += 1;
@@ -335,13 +350,19 @@ pub fn parse_alter_table(sql: &str) -> Result<AlterTable, String> {
             if default.is_some() || detail_upper.starts_with("SET") {
                 return Ok(AlterTable {
                     table_name,
-                    action: AlterAction::SetDefault { name, expression: default },
+                    action: AlterAction::SetDefault {
+                        name,
+                        expression: default,
+                    },
                 });
             }
             if detail_upper.starts_with("DROP DEFAULT") {
                 return Ok(AlterTable {
                     table_name,
-                    action: AlterAction::SetDefault { name, expression: None },
+                    action: AlterAction::SetDefault {
+                        name,
+                        expression: None,
+                    },
                 });
             }
 
@@ -386,7 +407,11 @@ pub fn parse_column_type(tokens: &[&str]) -> Result<(DbType, usize), String> {
     // `REAL[]`, `DOUBLE PRECISION[][]` — and the brackets may sit on any word
     // of a multi-word type name. One storage type serves every element type and
     // every dimension count, so all that is needed here is to notice them.
-    let is_array = |count: usize| tokens[..count.min(tokens.len())].iter().any(|t| t.contains('['));
+    let is_array = |count: usize| {
+        tokens[..count.min(tokens.len())]
+            .iter()
+            .any(|t| t.contains('['))
+    };
 
     // Multi-word type names, longest first.
     let two = if tokens.len() >= 2 {
@@ -407,25 +432,67 @@ pub fn parse_column_type(tokens: &[&str]) -> Result<(DbType, usize), String> {
     };
 
     if four == "TIMESTAMP WITH TIME ZONE" || four == "TIMESTAMP WITHOUT TIME ZONE" {
-        return Ok((if is_array(4) { DbType::ARRAY } else { DbType::DATETIME }, 4));
+        return Ok((
+            if is_array(4) {
+                DbType::ARRAY
+            } else {
+                DbType::DATETIME
+            },
+            4,
+        ));
     }
     // `TIME WITH TIME ZONE` is `timetz` and `TIME WITHOUT TIME ZONE` is `time`.
     // They were both reaching the one-word arm as `TIME`, so a column declared
     // with an offset lost it.
     if four == "TIME WITH TIME ZONE" {
-        return Ok((if is_array(4) { DbType::ARRAY } else { DbType::TIMETZ }, 4));
+        return Ok((
+            if is_array(4) {
+                DbType::ARRAY
+            } else {
+                DbType::TIMETZ
+            },
+            4,
+        ));
     }
     if four == "TIME WITHOUT TIME ZONE" {
-        return Ok((if is_array(4) { DbType::ARRAY } else { DbType::TIME }, 4));
+        return Ok((
+            if is_array(4) {
+                DbType::ARRAY
+            } else {
+                DbType::TIME
+            },
+            4,
+        ));
     }
     if two == "DOUBLE PRECISION" {
-        return Ok((if is_array(2) { DbType::ARRAY } else { DbType::F64 }, 2));
+        return Ok((
+            if is_array(2) {
+                DbType::ARRAY
+            } else {
+                DbType::F64
+            },
+            2,
+        ));
     }
     if two == "CHARACTER VARYING" {
-        return Ok((if is_array(2) { DbType::ARRAY } else { DbType::STRING }, 2));
+        return Ok((
+            if is_array(2) {
+                DbType::ARRAY
+            } else {
+                DbType::STRING
+            },
+            2,
+        ));
     }
     if two == "BIT VARYING" {
-        return Ok((if is_array(2) { DbType::ARRAY } else { DbType::VARBIT }, 2));
+        return Ok((
+            if is_array(2) {
+                DbType::ARRAY
+            } else {
+                DbType::VARBIT
+            },
+            2,
+        ));
     }
 
     let one = norm(tokens[0]);
@@ -514,7 +581,12 @@ pub fn parse_column_type(tokens: &[&str]) -> Result<(DbType, usize), String> {
 pub fn declared_width(token: &str) -> Option<u32> {
     let open = token.find('(')?;
     let close = token[open..].find(')')? + open;
-    token[open + 1..close].split(',').next()?.trim().parse().ok()
+    token[open + 1..close]
+        .split(',')
+        .next()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// The relation a `DROP TABLE` names, or `None` when the statement is malformed.
@@ -682,8 +754,7 @@ mod tests {
             "VACUUM FULL t",
         ] {
             let no_op = no_op_reason(sql).is_some();
-            let implemented =
-                crate::core::rql::lexer_s1::recognize_query_purpose(sql).is_some();
+            let implemented = crate::core::rql::lexer_s1::recognize_query_purpose(sql).is_some();
             assert!(
                 !(no_op && implemented),
                 "{sql:?} is treated as a no-op while the engine implements it"
@@ -700,7 +771,11 @@ mod tests {
              ADD CONSTRAINT fk_b FOREIGN KEY (case_model_id) REFERENCES case_model (id) ON DELETE CASCADE ON UPDATE CASCADE",
         )
         .unwrap();
-        assert_eq!(actions.len(), 2, "both constraints must be parsed, not just the first");
+        assert_eq!(
+            actions.len(),
+            2,
+            "both constraints must be parsed, not just the first"
+        );
         assert!(actions.iter().all(|a| a.table_name == "ccm"));
         for action in &actions {
             match &action.action {
@@ -708,7 +783,11 @@ mod tests {
                     assert!(!drop);
                     // The comma must not ride along into the action text; that
                     // is what made a supported CASCADE report as unsupported.
-                    assert!(!description.trim_end().ends_with(','), "got {:?}", description);
+                    assert!(
+                        !description.trim_end().ends_with(','),
+                        "got {:?}",
+                        description
+                    );
                 }
                 other => panic!("expected a constraint clause, got {:?}", other),
             }
@@ -760,11 +839,20 @@ mod tests {
     fn a_list_that_cannot_be_accounted_for_is_refused() {
         // Refusing beats applying the prefix that parsed: a partly-applied
         // ALTER reported as success is the failure mode being avoided.
-        let trailing = parse_alter_table_actions("ALTER TABLE t ADD COLUMN a INT, ADD COLUMN b INT,");
-        assert!(trailing.is_err(), "trailing comma must be refused, got {:?}", trailing);
+        let trailing =
+            parse_alter_table_actions("ALTER TABLE t ADD COLUMN a INT, ADD COLUMN b INT,");
+        assert!(
+            trailing.is_err(),
+            "trailing comma must be refused, got {:?}",
+            trailing
+        );
 
         let empty = parse_alter_table_actions("ALTER TABLE t ADD COLUMN a INT, , ADD COLUMN b INT");
-        assert!(empty.is_err(), "empty action must be refused, got {:?}", empty);
+        assert!(
+            empty.is_err(),
+            "empty action must be refused, got {:?}",
+            empty
+        );
     }
 
     #[test]
@@ -789,9 +877,17 @@ mod tests {
     fn add_column_reads_its_default() {
         let a = parse_alter_table("ALTER TABLE t ADD COLUMN n INTEGER NOT NULL DEFAULT 0").unwrap();
         match a.action {
-            AlterAction::AddColumn { default, nullable, db_type, .. } => {
+            AlterAction::AddColumn {
+                default,
+                nullable,
+                db_type,
+                ..
+            } => {
                 assert_eq!(default.as_deref(), Some("0"));
-                assert!(!nullable, "NOT NULL must survive the DEFAULT being split off");
+                assert!(
+                    !nullable,
+                    "NOT NULL must survive the DEFAULT being split off"
+                );
                 assert_eq!(db_type, DbType::I32);
             }
             other => panic!("{:?}", other),
@@ -801,12 +897,22 @@ mod tests {
     #[test]
     fn set_and_drop_default_are_recognised() {
         assert_eq!(
-            parse_alter_table("ALTER TABLE t ALTER COLUMN c SET DEFAULT 'x'").unwrap().action,
-            AlterAction::SetDefault { name: "c".into(), expression: Some("'x'".into()) }
+            parse_alter_table("ALTER TABLE t ALTER COLUMN c SET DEFAULT 'x'")
+                .unwrap()
+                .action,
+            AlterAction::SetDefault {
+                name: "c".into(),
+                expression: Some("'x'".into())
+            }
         );
         assert_eq!(
-            parse_alter_table("ALTER TABLE t ALTER COLUMN c DROP DEFAULT").unwrap().action,
-            AlterAction::SetDefault { name: "c".into(), expression: None }
+            parse_alter_table("ALTER TABLE t ALTER COLUMN c DROP DEFAULT")
+                .unwrap()
+                .action,
+            AlterAction::SetDefault {
+                name: "c".into(),
+                expression: None
+            }
         );
     }
 
@@ -814,7 +920,9 @@ mod tests {
     fn add_column_honours_not_null() {
         let a = parse_alter_table(r#"ALTER TABLE users ADD COLUMN n INTEGER NOT NULL"#).unwrap();
         match a.action {
-            AlterAction::AddColumn { nullable, db_type, .. } => {
+            AlterAction::AddColumn {
+                nullable, db_type, ..
+            } => {
                 assert!(!nullable);
                 assert_eq!(db_type, DbType::I32);
             }
@@ -825,9 +933,15 @@ mod tests {
     #[test]
     fn parses_multi_word_types() {
         for (sql, expected) in [
-            ("ALTER TABLE t ADD COLUMN c TIMESTAMP WITH TIME ZONE", DbType::DATETIME),
+            (
+                "ALTER TABLE t ADD COLUMN c TIMESTAMP WITH TIME ZONE",
+                DbType::DATETIME,
+            ),
             ("ALTER TABLE t ADD COLUMN c DOUBLE PRECISION", DbType::F64),
-            ("ALTER TABLE t ADD COLUMN c CHARACTER VARYING", DbType::STRING),
+            (
+                "ALTER TABLE t ADD COLUMN c CHARACTER VARYING",
+                DbType::STRING,
+            ),
             ("ALTER TABLE t ADD COLUMN c NUMERIC(10, 2)", DbType::DECIMAL),
             ("ALTER TABLE t ADD COLUMN c UUID", DbType::UUID),
         ] {
@@ -841,16 +955,31 @@ mod tests {
     #[test]
     fn parses_drop_and_rename_column() {
         assert_eq!(
-            parse_alter_table(r#"ALTER TABLE "t" DROP COLUMN "c""#).unwrap().action,
-            AlterAction::DropColumn { name: "c".into(), if_exists: false }
+            parse_alter_table(r#"ALTER TABLE "t" DROP COLUMN "c""#)
+                .unwrap()
+                .action,
+            AlterAction::DropColumn {
+                name: "c".into(),
+                if_exists: false
+            }
         );
         assert_eq!(
-            parse_alter_table("ALTER TABLE t DROP COLUMN IF EXISTS c").unwrap().action,
-            AlterAction::DropColumn { name: "c".into(), if_exists: true }
+            parse_alter_table("ALTER TABLE t DROP COLUMN IF EXISTS c")
+                .unwrap()
+                .action,
+            AlterAction::DropColumn {
+                name: "c".into(),
+                if_exists: true
+            }
         );
         assert_eq!(
-            parse_alter_table(r#"ALTER TABLE t RENAME COLUMN "a" TO "b""#).unwrap().action,
-            AlterAction::RenameColumn { from: "a".into(), to: "b".into() }
+            parse_alter_table(r#"ALTER TABLE t RENAME COLUMN "a" TO "b""#)
+                .unwrap()
+                .action,
+            AlterAction::RenameColumn {
+                from: "a".into(),
+                to: "b".into()
+            }
         );
     }
 
@@ -900,7 +1029,10 @@ mod tests {
 
     #[test]
     fn parses_drop_table() {
-        assert_eq!(parse_drop_table("DROP TABLE users").unwrap(), ("users".into(), false));
+        assert_eq!(
+            parse_drop_table("DROP TABLE users").unwrap(),
+            ("users".into(), false)
+        );
         assert_eq!(
             parse_drop_table(r#"DROP TABLE IF EXISTS "public"."users""#).unwrap(),
             ("users".into(), true)
@@ -967,11 +1099,8 @@ mod tests {
         // in full would reject rows PostgreSQL accepts — wrong in the other
         // direction. So it stays declared rather than becoming a lie.
         assert!(
-            unique_index_as_constraint("CREATE UNIQUE INDEX i ON t (a) WHERE b IS NULL")
-                .is_none()
+            unique_index_as_constraint("CREATE UNIQUE INDEX i ON t (a) WHERE b IS NULL").is_none()
         );
-        assert!(
-            no_op_reason("CREATE UNIQUE INDEX i ON t (a) WHERE b IS NULL").is_some()
-        );
+        assert!(no_op_reason("CREATE UNIQUE INDEX i ON t (a) WHERE b IS NULL").is_some());
     }
 }

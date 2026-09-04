@@ -119,7 +119,10 @@ impl KvConfig {
 
     fn validate(&self) -> io::Result<()> {
         if self.page_size == 0 || self.chunk_size == 0 {
-            return Err(io::Error::new(ErrorKind::InvalidInput, "kv sizes must be non-zero"));
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "kv sizes must be non-zero",
+            ));
         }
         if self.chunk_size % self.page_size != 0 {
             return Err(io::Error::new(
@@ -199,8 +202,12 @@ impl KvFamily {
         let mut meta_keys: Vec<(String, String)> = Vec::new();
         let mut delta_keys: Vec<(String, u64, String)> = Vec::new();
         for object in listed {
-            let Some(rest) = object.key.strip_prefix(&prefix) else { continue };
-            let Some((name, tail)) = rest.split_once('/') else { continue };
+            let Some(rest) = object.key.strip_prefix(&prefix) else {
+                continue;
+            };
+            let Some((name, tail)) = rest.split_once('/') else {
+                continue;
+            };
             if tail == "META" {
                 meta_keys.push((name.to_string(), object.key));
             } else if let Some(seq_text) = tail.strip_prefix("d/")
@@ -216,9 +223,9 @@ impl KvFamily {
         let mut metas: HashMap<String, Meta> = HashMap::new();
         for batch in meta_keys.chunks(width) {
             let fetched = futures::future::join_all(
-                batch.iter().map(|(name, key)| async move {
-                    (name.clone(), store_ref.get(key).await)
-                }),
+                batch
+                    .iter()
+                    .map(|(name, key)| async move { (name.clone(), store_ref.get(key).await) }),
             )
             .await;
             for (name, result) in fetched {
@@ -286,7 +293,13 @@ impl KvFamily {
             recovered.insert(name, FileRecovery { meta, batches });
         }
         for (name, meta) in metas {
-            recovered.insert(name, FileRecovery { meta, batches: Vec::new() });
+            recovered.insert(
+                name,
+                FileRecovery {
+                    meta,
+                    batches: Vec::new(),
+                },
+            );
         }
         for (name, next) in max_seq {
             if let Some(entry) = recovered.get_mut(&name) {
@@ -474,7 +487,11 @@ impl KvFile {
         // A file written with a different chunk size is readable only with that
         // size; every offset in it is derived from it. Adopting it is right, and
         // silently using the configured one would misplace every byte.
-        let chunk_size = if meta.chunk_size == 0 { config.chunk_size } else { meta.chunk_size };
+        let chunk_size = if meta.chunk_size == 0 {
+            config.chunk_size
+        } else {
+            meta.chunk_size
+        };
         let config = if chunk_size == config.chunk_size {
             config
         } else {
@@ -621,22 +638,25 @@ impl KvFile {
     /// scattered pages of a chunk fetches them as ranged reads, and a batch that
     /// wants most of one fetches the object whole. Getting this backwards is the
     /// difference between a scan costing one request per 4 MiB and one per page.
-    async fn pages(
-        &self,
-        wanted: &[u64],
-        base_len: u64,
-    ) -> io::Result<HashMap<u64, Arc<Vec<u8>>>> {
+    async fn pages(&self, wanted: &[u64], base_len: u64) -> io::Result<HashMap<u64, Arc<Vec<u8>>>> {
         let generation = self.generation.load(Ordering::Acquire);
         let mut out: HashMap<u64, Arc<Vec<u8>>> = HashMap::with_capacity(wanted.len());
         let mut missing_by_chunk: HashMap<u64, Vec<u64>> = HashMap::new();
 
         for &page in wanted {
-            let id = ChunkId { file: self.id, generation, index: page };
+            let id = ChunkId {
+                file: self.id,
+                generation,
+                index: page,
+            };
             match self.cache.get(id) {
                 Some(bytes) => {
                     out.insert(page, bytes);
                 }
-                None => missing_by_chunk.entry(self.chunk_of_page(page)).or_default().push(page),
+                None => missing_by_chunk
+                    .entry(self.chunk_of_page(page))
+                    .or_default()
+                    .push(page),
             }
         }
         if missing_by_chunk.is_empty() {
@@ -680,8 +700,10 @@ impl KvFile {
                         Fetch::Page { chunk, page } => {
                             let key = layout::chunk_key(&root, generation, chunk);
                             let within = (page - chunk * pages_per_chunk) * page_size;
-                            let bytes =
-                                self.store.get_range(&key, within, page_size as usize).await?;
+                            let bytes = self
+                                .store
+                                .get_range(&key, within, page_size as usize)
+                                .await?;
                             Ok((chunk, Some(page), bytes))
                         }
                     }
@@ -693,7 +715,14 @@ impl KvFile {
                 match page {
                     Some(page) => {
                         let bytes = Arc::new(bytes);
-                        self.cache.insert(ChunkId { file: self.id, generation, index: page }, bytes.clone());
+                        self.cache.insert(
+                            ChunkId {
+                                file: self.id,
+                                generation,
+                                index: page,
+                            },
+                            bytes.clone(),
+                        );
                         out.insert(page, bytes);
                     }
                     None => {
@@ -706,8 +735,14 @@ impl KvFile {
                                 break;
                             }
                             let bytes = Arc::new(slice.to_vec());
-                            self.cache
-                                .insert(ChunkId { file: self.id, generation, index: page }, bytes.clone());
+                            self.cache.insert(
+                                ChunkId {
+                                    file: self.id,
+                                    generation,
+                                    index: page,
+                                },
+                                bytes.clone(),
+                            );
                             out.insert(page, bytes);
                         }
                     }
@@ -725,12 +760,7 @@ impl KvFile {
     /// `note` drives read-ahead. A vectored batch has already put everything it
     /// needs in flight, so letting each of its reads also trigger a prefetch
     /// would queue the same chunks many times over.
-    async fn read_at_inner(
-        &self,
-        position: u64,
-        dst: &mut [u8],
-        note: bool,
-    ) -> io::Result<usize> {
+    async fn read_at_inner(&self, position: u64, dst: &mut [u8], note: bool) -> io::Result<usize> {
         if dst.is_empty() {
             return Ok(0);
         }
@@ -858,7 +888,11 @@ impl KvFile {
             let first = self.page_of(*position);
             let last = self.page_of(covered_end - 1);
             for page in first..=last {
-                if !self.cache.contains(ChunkId { file: self.id, generation, index: page }) {
+                if !self.cache.contains(ChunkId {
+                    file: self.id,
+                    generation,
+                    index: page,
+                }) {
                     return false;
                 }
             }
@@ -883,7 +917,11 @@ impl KvFile {
                     }
                     let dst_at = (copy_start - *position) as usize;
                     let n = (copy_end - copy_start) as usize;
-                    let id = ChunkId { file: self.id, generation, index: page };
+                    let id = ChunkId {
+                        file: self.id,
+                        generation,
+                        index: page,
+                    };
                     match self.cache.get(id) {
                         Some(bytes) => {
                             let src_at = (copy_start - page_start) as usize;
@@ -921,7 +959,9 @@ impl KvFile {
         let previous = self.read_cursor.swap(end, Ordering::Relaxed);
         // Sequential means "starts where the last read ended", with a page of
         // slack for a caller that reads a header and then a body.
-        if previous == u64::MAX || position < previous || position > previous + self.config.page_size
+        if previous == u64::MAX
+            || position < previous
+            || position > previous + self.config.page_size
         {
             return;
         }
@@ -953,18 +993,31 @@ impl KvFile {
 
         tokio::spawn(async move {
             for chunk in first_chunk..=last_chunk {
-                if cache.contains(ChunkId { file, generation, index: chunk * pages_per_chunk }) {
+                if cache.contains(ChunkId {
+                    file,
+                    generation,
+                    index: chunk * pages_per_chunk,
+                }) {
                     continue;
                 }
                 let key = layout::chunk_key(&root, generation, chunk);
-                let Ok(Some(bytes)) = store.get(&key).await else { continue };
+                let Ok(Some(bytes)) = store.get(&key).await else {
+                    continue;
+                };
                 let base = chunk * pages_per_chunk;
                 for (i, slice) in bytes.chunks(page_size as usize).enumerate() {
                     let page = base + i as u64;
                     if page * page_size >= base_len {
                         break;
                     }
-                    cache.insert(ChunkId { file, generation, index: page }, Arc::new(slice.to_vec()));
+                    cache.insert(
+                        ChunkId {
+                            file,
+                            generation,
+                            index: page,
+                        },
+                        Arc::new(slice.to_vec()),
+                    );
                 }
             }
         });
@@ -1030,10 +1083,20 @@ impl KvFile {
             let committed = std::mem::take(&mut state.committing);
             // Allocated under the flush lock, so sequence order is store order.
             let seq = self.next_seq.fetch_add(1, Ordering::AcqRel);
-            (records, committed, seq, self.generation.load(Ordering::Acquire))
+            (
+                records,
+                committed,
+                seq,
+                self.generation.load(Ordering::Acquire),
+            )
         };
 
-        let batch = DeltaBatch { seq, base_gen, committed, records };
+        let batch = DeltaBatch {
+            seq,
+            base_gen,
+            committed,
+            records,
+        };
         let key = layout::delta_key(&self.root(), seq);
         let encoded = batch.encode();
         match self.store.put(&key, encoded).await {
@@ -1179,9 +1242,18 @@ impl KvFile {
             // The pages this chunk covers now hold stale bytes.
             let pages_per_chunk = self.config.pages_per_chunk();
             for page in chunk * pages_per_chunk..(chunk + 1) * pages_per_chunk {
-                self.cache.invalidate(ChunkId { file: self.id, generation, index: page });
+                self.cache.invalidate(ChunkId {
+                    file: self.id,
+                    generation,
+                    index: page,
+                });
             }
-            self.state.lock().frozen.as_mut().expect("held").remove_range(start, chunk_end);
+            self.state
+                .lock()
+                .frozen
+                .as_mut()
+                .expect("held")
+                .remove_range(start, chunk_end);
         }
 
         // ---- publish ----
@@ -1207,7 +1279,12 @@ impl KvFile {
                 .spans_iter()
                 .map(|(start, bytes)| Record::write(0, start, bytes.to_vec()))
                 .collect();
-            let batch = DeltaBatch { seq: reserved_seq, base_gen: generation, committed: Vec::new(), records };
+            let batch = DeltaBatch {
+                seq: reserved_seq,
+                base_gen: generation,
+                committed: Vec::new(),
+                records,
+            };
             self.store
                 .put(&layout::delta_key(&root, reserved_seq), batch.encode())
                 .await?;
@@ -1228,7 +1305,9 @@ impl KvFile {
                 self.state.lock().compacted_upto
             },
         };
-        self.store.put(&layout::meta_key(&root), meta.encode()).await?;
+        self.store
+            .put(&layout::meta_key(&root), meta.encode())
+            .await?;
 
         let retired: Vec<String> = {
             let mut state = self.state.lock();
@@ -1264,7 +1343,9 @@ impl KvFile {
                 }
                 state.live = rebuilt;
             }
-            old.into_iter().map(|s| layout::delta_key(&root, s)).collect()
+            old.into_iter()
+                .map(|s| layout::delta_key(&root, s))
+                .collect()
         };
         if !retired.is_empty() {
             self.store.delete(retired).await?;
@@ -1296,13 +1377,16 @@ impl KvFile {
             if let Some(frozen) = &mut state.frozen {
                 frozen.truncate(new_len);
             }
-            state.pending.retain(|r| r.kind != RecordKind::Write || r.offset < new_len);
+            state
+                .pending
+                .retain(|r| r.kind != RecordKind::Write || r.offset < new_len);
             state.pending_bytes = state.pending.iter().map(|r| r.weight()).sum();
             state.pending.push(Record::truncate(0, new_len));
             state.pending_bytes += 21;
         }
         self.len.store(new_len, Ordering::Release);
-        self.base_len.store(base_len.min(new_len), Ordering::Release);
+        self.base_len
+            .store(base_len.min(new_len), Ordering::Release);
         self.flush(None).await?;
 
         // Objects wholly past the new end are dead. The one straddling it keeps
@@ -1312,8 +1396,9 @@ impl KvFile {
             let first_dead = new_len.div_ceil(chunk_size);
             let last = (base_len - 1) / chunk_size;
             if first_dead <= last {
-                let keys: Vec<String> =
-                    (first_dead..=last).map(|c| layout::chunk_key(&root, generation, c)).collect();
+                let keys: Vec<String> = (first_dead..=last)
+                    .map(|c| layout::chunk_key(&root, generation, c))
+                    .collect();
                 self.store.delete(keys).await?;
             }
         }
@@ -1352,14 +1437,17 @@ impl KvFile {
             base_len,
             compacted_upto: temp.state.lock().compacted_upto,
         };
-        self.store.put(&layout::meta_key(&root), meta.encode()).await?;
+        self.store
+            .put(&layout::meta_key(&root), meta.encode())
+            .await?;
 
         // Read before the swap, or this names the scratch file's deltas — the
         // ones that must survive — instead of the originals.
         let dead_deltas: Vec<u64> = self.state.lock().deltas.clone();
 
         self.generation.store(new_generation, Ordering::Release);
-        self.len.store(temp.len.load(Ordering::Acquire), Ordering::Release);
+        self.len
+            .store(temp.len.load(Ordering::Acquire), Ordering::Release);
         self.base_len.store(base_len, Ordering::Release);
         {
             let mut mine = self.state.lock();
@@ -1371,9 +1459,16 @@ impl KvFile {
 
         // The old generation is unreachable now: its chunks are dead, and so are
         // the delta batches that describe them.
-        let listed = self.store.list(&layout::generation_prefix(&root, old_generation)).await?;
+        let listed = self
+            .store
+            .list(&layout::generation_prefix(&root, old_generation))
+            .await?;
         let mut doomed: Vec<String> = listed.into_iter().map(|o| o.key).collect();
-        doomed.extend(dead_deltas.into_iter().map(|seq| layout::delta_key(&root, seq)));
+        doomed.extend(
+            dead_deltas
+                .into_iter()
+                .map(|seq| layout::delta_key(&root, seq)),
+        );
         if !doomed.is_empty() {
             self.store.delete(doomed).await?;
         }
@@ -1420,7 +1515,11 @@ pub struct KvStorageProvider {
 
 impl Clone for KvStorageProvider {
     fn clone(&self) -> Self {
-        Self { family: self.family.clone(), file: self.file.clone(), hash: self.hash }
+        Self {
+            family: self.family.clone(),
+            file: self.file.clone(),
+            hash: self.hash,
+        }
     }
 }
 
@@ -1496,23 +1595,25 @@ impl StorageIO for KvStorageProvider {
         }
     }
 
-    async fn read_data_into_buffer(
-        &self,
-        position: &mut u64,
-        buffer: &mut [u8],
-    ) -> io::Result<()> {
+    async fn read_data_into_buffer(&self, position: &mut u64, buffer: &mut [u8]) -> io::Result<()> {
         if buffer.is_empty() {
             return Ok(());
         }
         if *position >= self.file.len.load(Ordering::Acquire) {
-            return Err(io::Error::new(ErrorKind::UnexpectedEof, "Position is past end of buffer"));
+            return Err(io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "Position is past end of buffer",
+            ));
         }
         let got = self.file.read_at(*position, buffer).await?;
         *position += got as u64;
         if got == buffer.len() {
             Ok(())
         } else {
-            Err(io::Error::new(ErrorKind::UnexpectedEof, "Not enough bytes to fill buffer"))
+            Err(io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "Not enough bytes to fill buffer",
+            ))
         }
     }
 
@@ -1546,7 +1647,10 @@ impl StorageIO for KvStorageProvider {
             // they have to be. Nothing in the engine takes this path — it begins
             // a transaction first — but the contract is the contract.
             if let Err(e) = self.file.flush(None).await {
-                error!("kv: untransacted append to {} could not be stored: {e}", self.file.name);
+                error!(
+                    "kv: untransacted append to {} could not be stored: {e}",
+                    self.file.name
+                );
             }
             return (offset, 0);
         }
@@ -1558,7 +1662,10 @@ impl StorageIO for KvStorageProvider {
         self.file.write_at(txn, position, buffer);
         if txn == 0 {
             if let Err(e) = self.file.flush(None).await {
-                error!("kv: untransacted write to {} could not be stored: {e}", self.file.name);
+                error!(
+                    "kv: untransacted write to {} could not be stored: {e}",
+                    self.file.name
+                );
             }
             return 0;
         }
@@ -1600,12 +1707,20 @@ impl StorageIO for KvStorageProvider {
             if state.live.intersects(position, end) {
                 return None;
             }
-            if state.frozen.as_ref().is_some_and(|f| f.intersects(position, end)) {
+            if state
+                .frozen
+                .as_ref()
+                .is_some_and(|f| f.intersects(position, end))
+            {
                 return None;
             }
         }
         let generation = self.file.generation.load(Ordering::Acquire);
-        let bytes = self.file.cache.get(ChunkId { file: self.file.id, generation, index: page })?;
+        let bytes = self.file.cache.get(ChunkId {
+            file: self.file.id,
+            generation,
+            index: page,
+        })?;
         let at = (position - page * page_size) as usize;
         if at + len > bytes.len() {
             return None;
@@ -1681,7 +1796,11 @@ impl StorageIO for KvStorageProvider {
         });
         // Unregistered, like the in-memory provider's: scratch is not a name
         // anyone should be able to reopen.
-        Self { family: self.family.clone(), file: temp, hash: self.hash }
+        Self {
+            family: self.family.clone(),
+            file: temp,
+            hash: self.hash,
+        }
     }
 
     async fn swap_temp(&self, temp_io_sync: &mut Self) {
@@ -1692,7 +1811,10 @@ impl StorageIO for KvStorageProvider {
             // No error channel in the trait, and the alternative — swapping the
             // in-memory state anyway — would leave the live file describing
             // bytes no object holds.
-            error!("kv: could not publish the scratch generation of {}: {e}", self.file.name);
+            error!(
+                "kv: could not publish the scratch generation of {}: {e}",
+                self.file.name
+            );
         }
     }
 
@@ -1773,7 +1895,11 @@ impl StorageIO for KvStorageProvider {
                 }
                 let (has_pending, deltas, overlay_bytes) = {
                     let state = file.state.lock();
-                    (!state.pending.is_empty(), state.deltas.len(), state.live.bytes())
+                    (
+                        !state.pending.is_empty(),
+                        state.deltas.len(),
+                        state.live.bytes(),
+                    )
                 };
                 if has_pending && let Err(e) = file.flush(None).await {
                     error!("kv: periodic flush of {} failed: {e}", file.name);
@@ -1791,4 +1917,3 @@ impl StorageIO for KvStorageProvider {
         self.file.name.clone()
     }
 }
-

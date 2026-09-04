@@ -85,13 +85,20 @@ impl ImportReport {
         let mut out = Vec::new();
         out.push(format!(
             "{} {} from {} into {:?}",
-            if self.dry_run { "Would import" } else { "Imported" },
+            if self.dry_run {
+                "Would import"
+            } else {
+                "Imported"
+            },
             plural(self.tables.len() as u64, "table", "tables"),
             self.source,
             self.target
         ));
         if !self.server_version.is_empty() {
-            out.push(format!("  source server: PostgreSQL {}", self.server_version));
+            out.push(format!(
+                "  source server: PostgreSQL {}",
+                self.server_version
+            ));
         }
         for table in &self.tables {
             let count = match (table.rows, self.dry_run) {
@@ -230,7 +237,10 @@ pub async fn import(
     // The guard is held across the whole load, keys and foreign keys included,
     // and dropped before the final sync so that nothing appended after the
     // sync could be missed by it.
-    let bulk = database.location.as_deref().map(crate::core::bulk_load::begin);
+    let bulk = database
+        .location
+        .as_deref()
+        .map(crate::core::bulk_load::begin);
 
     // From here on the target exists, so every failure has to take it away
     // again: half a database that looks like a whole one is the one outcome
@@ -540,7 +550,10 @@ fn build_statement(
             statement.push_str(", ");
         }
         let literal = types::literal(&column.mapping, value.as_deref()).map_err(|e| {
-            format!("column {} ({}): {}", column.source.name, column.source.formatted_type, e)
+            format!(
+                "column {} ({}): {}",
+                column.source.name, column.source.formatted_type, e
+            )
         })?;
         statement.push_str(&literal);
     }
@@ -551,7 +564,10 @@ fn build_statement(
 /// Runs one DDL statement, failing the import if it does not work.
 async fn run_ddl(database: &Arc<Database>, sql: &str) -> Result<(), String> {
     let Some(purpose) = recognize_query_purpose(sql) else {
-        return Err(format!("this engine did not recognise the statement: {}", sql));
+        return Err(format!(
+            "this engine did not recognise the statement: {}",
+            sql
+        ));
     };
     let response = executor::execute(purpose, database.clone()).await;
     if response.first() == Some(&3) {

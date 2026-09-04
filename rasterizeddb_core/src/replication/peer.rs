@@ -281,7 +281,8 @@ async fn run(
                     peer.name, link.address, link.remote_node, link.codec
                 );
 
-                if let Err(e) = stream(&replication, &peer, &mut link, &receiver, &mut codec).await {
+                if let Err(e) = stream(&replication, &peer, &mut link, &receiver, &mut codec).await
+                {
                     warn!("Replication link to {} ended: {}", peer.name, e);
                     peer.set_error(Some(e));
                 }
@@ -405,7 +406,8 @@ async fn connect(replication: &Arc<Replication>, peer: &Arc<PeerHandle>) -> Resu
 
     replication.clock().observe(ack.clock);
     peer.remote_node.store(ack.node_id, Ordering::Relaxed);
-    peer.codec.store(ack.codec.as_wire() as u64, Ordering::Relaxed);
+    peer.codec
+        .store(ack.codec.as_wire() as u64, Ordering::Relaxed);
 
     // What the peer says it has of ours is where the next send starts.
     let ours = ack
@@ -416,7 +418,12 @@ async fn connect(replication: &Arc<Replication>, peer: &Arc<PeerHandle>) -> Resu
         .unwrap_or(0);
     peer.acked_seq.store(ours, Ordering::Relaxed);
 
-    Ok(Link { client, address, remote_node: ack.node_id, codec: ack.codec })
+    Ok(Link {
+        client,
+        address,
+        remote_node: ack.node_id,
+        codec: ack.codec,
+    })
 }
 
 /// Streams records until the link fails or the peer is stopped.
@@ -574,25 +581,42 @@ async fn push(
     }
 
     let config = replication.config();
-    let compression = peer
-        .compression_override()
-        .unwrap_or(config.compression);
+    let compression = peer.compression_override().unwrap_or(config.compression);
     codec.set_level(compression.level);
 
     // The peer only advertised what it can decode; sending it something else
     // would be a decode failure at the far end rather than here.
     let compression = if link.codec == Codec::None {
-        Compression { mode: super::config::CompressionMode::Off, codec: Codec::None, ..compression }
+        Compression {
+            mode: super::config::CompressionMode::Off,
+            codec: Codec::None,
+            ..compression
+        }
     } else {
-        Compression { codec: link.codec, ..compression }
+        Compression {
+            codec: link.codec,
+            ..compression
+        }
     };
 
     let mut payload =
         Vec::with_capacity(8 + records.iter().map(|r| r.encoded_size_hint()).sum::<usize>());
-    protocol::encode_push(config.node_id, records.iter().copied(), records.len(), &mut payload);
+    protocol::encode_push(
+        config.node_id,
+        records.iter().copied(),
+        records.len(),
+        &mut payload,
+    );
 
     let used = codec
-        .encode_frame(FrameKind::Push, 0, &payload, compression, peer.ratio(), frame)
+        .encode_frame(
+            FrameKind::Push,
+            0,
+            &payload,
+            compression,
+            peer.ratio(),
+            frame,
+        )
         .map_err(|e| format!("could not encode a batch for {}: {}", peer.name, e))?;
 
     let raw = payload.len() as u64;
@@ -873,7 +897,10 @@ mod tests {
         );
 
         for seq in 1..=100 {
-            peer.enqueue(Outbound { record: record(seq), ack: None });
+            peer.enqueue(Outbound {
+                record: record(seq),
+                ack: None,
+            });
         }
 
         assert!(
@@ -895,14 +922,24 @@ mod tests {
         peer.stop();
 
         let before = peer.dropped.load(Ordering::Relaxed);
-        peer.enqueue(Outbound { record: record(1), ack: None });
-        assert_eq!(peer.dropped.load(Ordering::Relaxed), before, "nothing should be counted");
+        peer.enqueue(Outbound {
+            record: record(1),
+            ack: None,
+        });
+        assert_eq!(
+            peer.dropped.load(Ordering::Relaxed),
+            before,
+            "nothing should be counted"
+        );
     }
 
     #[tokio::test]
     async fn a_snapshot_reports_the_lag_against_the_local_stream() {
         let replication = replication();
-        let peer = spawn(replication.clone(), &PeerConfig::new("behind", "127.0.0.1:1"));
+        let peer = spawn(
+            replication.clone(),
+            &PeerConfig::new("behind", "127.0.0.1:1"),
+        );
         peer.acked_seq.store(7, Ordering::Relaxed);
 
         let snapshot = peer.snapshot(10);
@@ -916,7 +953,10 @@ mod tests {
     #[tokio::test]
     async fn a_paused_peer_reports_itself_as_such() {
         let replication = replication();
-        let peer = spawn(replication.clone(), &PeerConfig::new("paused", "127.0.0.1:1"));
+        let peer = spawn(
+            replication.clone(),
+            &PeerConfig::new("paused", "127.0.0.1:1"),
+        );
         peer.set_paused(true);
 
         assert!(peer.snapshot(0).paused);
@@ -938,13 +978,20 @@ mod tests {
         let (sender, receiver) = kanal::bounded_async::<Outbound>(64);
         for seq in 1..=5 {
             sender
-                .send(Outbound { record: record(seq), ack: None })
+                .send(Outbound {
+                    record: record(seq),
+                    ack: None,
+                })
                 .await
                 .unwrap();
         }
 
         let batch = next_batch(&replication, &receiver).await.unwrap();
-        assert_eq!(batch.len(), 5, "all five were waiting, so all five should go together");
+        assert_eq!(
+            batch.len(),
+            5,
+            "all five were waiting, so all five should go together"
+        );
     }
 
     #[tokio::test]
@@ -962,7 +1009,10 @@ mod tests {
         let (sender, receiver) = kanal::bounded_async::<Outbound>(64);
         for seq in 1..=10 {
             sender
-                .send(Outbound { record: record(seq), ack: None })
+                .send(Outbound {
+                    record: record(seq),
+                    ack: None,
+                })
                 .await
                 .unwrap();
         }
@@ -982,8 +1032,18 @@ mod tests {
             node_id: 2,
             clock: 1,
             outcomes: vec![
-                ApplyOutcome { origin: 1, seq: 1, status: ApplyStatus::Applied, message: String::new() },
-                ApplyOutcome { origin: 1, seq: 2, status: ApplyStatus::Duplicate, message: String::new() },
+                ApplyOutcome {
+                    origin: 1,
+                    seq: 1,
+                    status: ApplyStatus::Applied,
+                    message: String::new(),
+                },
+                ApplyOutcome {
+                    origin: 1,
+                    seq: 2,
+                    status: ApplyStatus::Duplicate,
+                    message: String::new(),
+                },
                 ApplyOutcome {
                     origin: 1,
                     seq: 3,
@@ -996,7 +1056,12 @@ mod tests {
                     status: ApplyStatus::Failed,
                     message: "no such table".to_string(),
                 },
-                ApplyOutcome { origin: 1, seq: 5, status: ApplyStatus::Gap, message: String::new() },
+                ApplyOutcome {
+                    origin: 1,
+                    seq: 5,
+                    status: ApplyStatus::Gap,
+                    message: String::new(),
+                },
             ],
             applied: Vec::new(),
         };
@@ -1004,10 +1069,19 @@ mod tests {
         let settled = record_outcomes(&replication, &peer, &ack);
 
         assert!(settled.contains(&record(1)), "applied counts");
-        assert!(settled.contains(&record(2)), "the peer already having it counts");
-        assert!(!settled.contains(&record(3)), "a refused record has not reached the peer");
+        assert!(
+            settled.contains(&record(2)),
+            "the peer already having it counts"
+        );
+        assert!(
+            !settled.contains(&record(3)),
+            "a refused record has not reached the peer"
+        );
         assert!(!settled.contains(&record(4)), "nor has a failed one");
-        assert!(!settled.contains(&record(5)), "nor one that arrived over a hole");
+        assert!(
+            !settled.contains(&record(5)),
+            "nor one that arrived over a hole"
+        );
 
         peer.stop();
     }

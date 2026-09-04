@@ -204,8 +204,7 @@ pub fn inline_params(sql: &str, params: &[BoundParam]) -> Result<String, String>
                         k += 1;
                     }
                     let name_start = k;
-                    while k < bytes.len()
-                        && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_')
+                    while k < bytes.len() && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_')
                     {
                         k += 1;
                     }
@@ -312,7 +311,12 @@ fn text_param_literal(oid: i32, text: &str) -> String {
 
 fn binary_param_literal(oid: i32, raw: &[u8]) -> Result<String, String> {
     match oid {
-        OID_BOOL => Ok(if raw.first().copied().unwrap_or(0) != 0 { "1" } else { "0" }.to_string()),
+        OID_BOOL => Ok(if raw.first().copied().unwrap_or(0) != 0 {
+            "1"
+        } else {
+            "0"
+        }
+        .to_string()),
         OID_INT2 => Ok(be_i16(raw)?.to_string()),
         OID_INT4 | OID_OID => Ok(be_i32(raw)?.to_string()),
         OID_INT8 => Ok(be_i64(raw)?.to_string()),
@@ -611,7 +615,11 @@ pub fn parse_uuid(text: &str) -> Option<[u8; 16]> {
             }
         }
     }
-    if n == 16 && hi.is_none() { Some(out) } else { None }
+    if n == 16 && hi.is_none() {
+        Some(out)
+    } else {
+        None
+    }
 }
 
 /// Postgres binary `numeric`: i16 digit count, i16 weight, i16 sign,
@@ -697,18 +705,27 @@ pub fn format_timestamp_us(us: i64) -> String {
     if frac == 0 {
         base
     } else {
-        format!("{}.{:06}", base, frac).trim_end_matches('0').to_string()
+        format!("{}.{:06}", base, frac)
+            .trim_end_matches('0')
+            .to_string()
     }
 }
 
 fn format_time_us(us: i64) -> String {
     let secs = us.div_euclid(1_000_000);
     let frac = us.rem_euclid(1_000_000);
-    let base = format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60);
+    let base = format!(
+        "{:02}:{:02}:{:02}",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    );
     if frac == 0 {
         base
     } else {
-        format!("{}.{:06}", base, frac).trim_end_matches('0').to_string()
+        format!("{}.{:06}", base, frac)
+            .trim_end_matches('0')
+            .to_string()
     }
 }
 
@@ -743,13 +760,25 @@ mod tests {
     use super::*;
 
     fn text(oid: i32, s: &str) -> BoundParam {
-        BoundParam { value: Some(s.as_bytes().to_vec()), format: 0, oid }
+        BoundParam {
+            value: Some(s.as_bytes().to_vec()),
+            format: 0,
+            oid,
+        }
     }
     fn binary(oid: i32, b: Vec<u8>) -> BoundParam {
-        BoundParam { value: Some(b), format: 1, oid }
+        BoundParam {
+            value: Some(b),
+            format: 1,
+            oid,
+        }
     }
     fn null(oid: i32) -> BoundParam {
-        BoundParam { value: None, format: 1, oid }
+        BoundParam {
+            value: None,
+            format: 1,
+            oid,
+        }
     }
 
     #[test]
@@ -822,8 +851,14 @@ mod tests {
 
     #[test]
     fn decodes_binary_integers() {
-        assert_eq!(param_to_literal(&binary(OID_INT2, 300i16.to_be_bytes().to_vec())).unwrap(), "300");
-        assert_eq!(param_to_literal(&binary(OID_INT4, (-7i32).to_be_bytes().to_vec())).unwrap(), "-7");
+        assert_eq!(
+            param_to_literal(&binary(OID_INT2, 300i16.to_be_bytes().to_vec())).unwrap(),
+            "300"
+        );
+        assert_eq!(
+            param_to_literal(&binary(OID_INT4, (-7i32).to_be_bytes().to_vec())).unwrap(),
+            "-7"
+        );
         assert_eq!(
             param_to_literal(&binary(OID_INT8, 9_000_000_000i64.to_be_bytes().to_vec())).unwrap(),
             "9000000000"
@@ -832,8 +867,14 @@ mod tests {
 
     #[test]
     fn decodes_binary_floats() {
-        assert_eq!(param_to_literal(&binary(OID_FLOAT8, 1.5f64.to_be_bytes().to_vec())).unwrap(), "1.5");
-        assert_eq!(param_to_literal(&binary(OID_FLOAT4, 2.0f32.to_be_bytes().to_vec())).unwrap(), "2.0");
+        assert_eq!(
+            param_to_literal(&binary(OID_FLOAT8, 1.5f64.to_be_bytes().to_vec())).unwrap(),
+            "1.5"
+        );
+        assert_eq!(
+            param_to_literal(&binary(OID_FLOAT4, 2.0f32.to_be_bytes().to_vec())).unwrap(),
+            "2.0"
+        );
     }
 
     #[test]
@@ -895,7 +936,10 @@ mod tests {
         raw.extend_from_slice(&1234u16.to_be_bytes());
         raw.extend_from_slice(&5678u16.to_be_bytes());
         raw.extend_from_slice(&0u16.to_be_bytes());
-        assert_eq!(param_to_literal(&binary(OID_NUMERIC, raw)).unwrap(), "1234.5678");
+        assert_eq!(
+            param_to_literal(&binary(OID_NUMERIC, raw)).unwrap(),
+            "1234.5678"
+        );
     }
 
     #[test]
@@ -906,7 +950,10 @@ mod tests {
         raw.extend_from_slice(&0x4000u16.to_be_bytes());
         raw.extend_from_slice(&2i16.to_be_bytes());
         raw.extend_from_slice(&42u16.to_be_bytes());
-        assert_eq!(param_to_literal(&binary(OID_NUMERIC, raw)).unwrap(), "-42.00");
+        assert_eq!(
+            param_to_literal(&binary(OID_NUMERIC, raw)).unwrap(),
+            "-42.00"
+        );
     }
 
     #[test]
@@ -917,7 +964,13 @@ mod tests {
 
     #[test]
     fn civil_day_conversion_round_trips() {
-        for &(y, m, d) in &[(1970, 1, 1), (2000, 1, 1), (2026, 8, 20), (1999, 12, 31), (2400, 2, 29)] {
+        for &(y, m, d) in &[
+            (1970, 1, 1),
+            (2000, 1, 1),
+            (2026, 8, 20),
+            (1999, 12, 31),
+            (2400, 2, 29),
+        ] {
             let days = days_from_civil(y, m, d);
             assert_eq!(civil_from_days(days), (y, m, d), "{}-{}-{}", y, m, d);
         }
@@ -956,18 +1009,37 @@ mod binary_array_tests {
         let two = [0x22u8; 16];
         let raw = array(OID_UUID, &[Some(one.to_vec()), Some(two.to_vec())]);
         let literal = binary_param_literal(2951, &raw).expect("uuid[] decodes");
-        assert!(literal.contains("11111111-1111-1111-1111-111111111111"), "{}", literal);
-        assert!(literal.contains("22222222-2222-2222-2222-222222222222"), "{}", literal);
-        assert!(literal.starts_with('\'') && literal.ends_with('\''), "{}", literal);
+        assert!(
+            literal.contains("11111111-1111-1111-1111-111111111111"),
+            "{}",
+            literal
+        );
+        assert!(
+            literal.contains("22222222-2222-2222-2222-222222222222"),
+            "{}",
+            literal
+        );
+        assert!(
+            literal.starts_with('\'') && literal.ends_with('\''),
+            "{}",
+            literal
+        );
     }
 
     #[test]
     fn an_int_array_keeps_its_order_and_nulls() {
         let raw = array(
             OID_INT4,
-            &[Some(1i32.to_be_bytes().to_vec()), None, Some(3i32.to_be_bytes().to_vec())],
+            &[
+                Some(1i32.to_be_bytes().to_vec()),
+                None,
+                Some(3i32.to_be_bytes().to_vec()),
+            ],
         );
-        assert_eq!(binary_param_literal(1007, &raw).unwrap(), "'{\"1\",NULL,\"3\"}'");
+        assert_eq!(
+            binary_param_literal(1007, &raw).unwrap(),
+            "'{\"1\",NULL,\"3\"}'"
+        );
     }
 
     #[test]

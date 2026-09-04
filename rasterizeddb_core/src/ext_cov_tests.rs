@@ -3,11 +3,11 @@ use rclite::Arc;
 use crate::core::{
     database::Database,
     processor::concurrent_processor,
+    row::row::{Row, vec_into_rows},
     rql::{
         executor,
-        lexer_s1::{recognize_query_purpose, QueryPurpose},
+        lexer_s1::{QueryPurpose, recognize_query_purpose},
     },
-    row::row::{vec_into_rows, Row},
 };
 
 #[derive(Debug, Clone)]
@@ -42,10 +42,7 @@ fn decode_error_message(result: &[u8]) -> String {
 }
 
 fn assert_ok(result: &[u8], context: &str) {
-    assert!(
-        !result.is_empty(),
-        "{context}: expected non-empty result"
-    );
+    assert!(!result.is_empty(), "{context}: expected non-empty result");
     assert_eq!(
         result[0],
         0,
@@ -56,10 +53,7 @@ fn assert_ok(result: &[u8], context: &str) {
 }
 
 fn assert_rows(result: &[u8], context: &str) -> Vec<Row> {
-    assert!(
-        !result.is_empty(),
-        "{context}: expected non-empty result"
-    );
+    assert!(!result.is_empty(), "{context}: expected non-empty result");
     assert_eq!(
         result[0],
         2,
@@ -76,8 +70,7 @@ fn assert_error_contains(result: &[u8], needle: &str, context: &str) {
         "{context}: expected non-empty error result"
     );
     assert_eq!(
-        result[0],
-        3,
+        result[0], 3,
         "{context}: expected Error (3), got status {}",
         result[0]
     );
@@ -291,16 +284,16 @@ async fn ext_cov_employees_end_to_end_queries() {
     }
 
     for row in rows {
-        let id_mb = row
-            .get_column("id", schema)
-            .expect("row should include id");
+        let id_mb = row.get_column("id", schema).expect("row should include id");
         let id = mb_to_u64(id_mb.into_slice());
         let exp = expected_by_id.get(&id).expect("id should exist");
 
         let salary_mb = row
             .get_column("salary", schema)
             .expect("row should include salary");
-        let age_mb = row.get_column("age", schema).expect("row should include age");
+        let age_mb = row
+            .get_column("age", schema)
+            .expect("row should include age");
         let name_mb = row
             .get_column("name", schema)
             .expect("row should include name");
@@ -330,28 +323,16 @@ async fn ext_cov_employees_end_to_end_queries() {
         .filter(|e| e.department == "Engineering" && e.age >= 30)
         .collect();
 
-    assert_eq!(
-        rows.len(),
-        expected_q2.len(),
-        "filtered row count mismatch"
-    );
+    assert_eq!(rows.len(), expected_q2.len(), "filtered row count mismatch");
 
     for row in rows {
-        let id = mb_to_u64(
-            row.get_column("id", schema)
-                .expect("id")
-                .into_slice(),
-        );
+        let id = mb_to_u64(row.get_column("id", schema).expect("id").into_slice());
         let department = mb_to_string(
             row.get_column("department", schema)
                 .expect("department")
                 .into_slice(),
         );
-        let age = mb_to_i32(
-            row.get_column("age", schema)
-                .expect("age")
-                .into_slice(),
-        );
+        let age = mb_to_i32(row.get_column("age", schema).expect("age").into_slice());
         let is_active = mb_to_bool(
             row.get_column("is_active", schema)
                 .expect("is_active")
@@ -384,21 +365,13 @@ async fn ext_cov_employees_end_to_end_queries() {
     expected_sorted.sort_by(|a, b| a.salary.partial_cmp(&b.salary).unwrap());
 
     for (idx, row) in rows.iter().enumerate() {
-        let id = mb_to_u64(
-            row.get_column("id", schema)
-                .expect("id")
-                .into_slice(),
-        );
+        let id = mb_to_u64(row.get_column("id", schema).expect("id").into_slice());
         let salary = mb_to_f32(
             row.get_column("salary", schema)
                 .expect("salary")
                 .into_slice(),
         );
-        let name = mb_to_string(
-            row.get_column("name", schema)
-                .expect("name")
-                .into_slice(),
-        );
+        let name = mb_to_string(row.get_column("name", schema).expect("name").into_slice());
 
         let exp = &expected_sorted[idx];
         assert_eq!(id, exp.id, "id mismatch at sorted index {idx}");
@@ -425,11 +398,7 @@ async fn ext_cov_employees_end_to_end_queries() {
     let rows = assert_rows(&res, "LIMIT only");
     assert_eq!(rows.len(), 5);
     for row in rows {
-        let id = mb_to_u64(
-            row.get_column("id", schema)
-                .expect("id")
-                .into_slice(),
-        );
+        let id = mb_to_u64(row.get_column("id", schema).expect("id").into_slice());
         assert!(expected_by_id.contains_key(&id), "id should be known");
     }
 
@@ -440,11 +409,7 @@ async fn ext_cov_employees_end_to_end_queries() {
     assert_eq!(rows.len(), 20);
     let mut prev_age: Option<i32> = None;
     for row in rows {
-        let age = mb_to_i32(
-            row.get_column("age", schema)
-                .expect("age")
-                .into_slice(),
-        );
+        let age = mb_to_i32(row.get_column("age", schema).expect("age").into_slice());
         if let Some(prev) = prev_age {
             assert!(prev <= age, "age not non-decreasing");
         }
@@ -473,11 +438,7 @@ async fn ext_cov_employees_end_to_end_queries() {
     let rows = assert_rows(&res, "SELECT updated employee");
     assert_eq!(rows.len(), 1, "expected exactly 1 updated row for id=1");
     let row = &rows[0];
-    let id = mb_to_u64(
-        row.get_column("id", schema)
-            .expect("id")
-            .into_slice(),
-    );
+    let id = mb_to_u64(row.get_column("id", schema).expect("id").into_slice());
     assert_eq!(id, 1);
     let salary = mb_to_f32(
         row.get_column("salary", schema)
@@ -503,7 +464,8 @@ async fn ext_cov_employees_end_to_end_queries() {
     let res = exec(&database, q9).await;
     assert_ok(&res, "UPDATE employees location for Sales");
 
-    let q9_verify = r##"SELECT id, department, location FROM employees WHERE department = 'Sales'"##;
+    let q9_verify =
+        r##"SELECT id, department, location FROM employees WHERE department = 'Sales'"##;
     let res = exec(&database, q9_verify).await;
     let rows = assert_rows(&res, "SELECT updated Sales employees");
     for row in rows {
@@ -534,7 +496,11 @@ async fn ext_cov_employees_end_to_end_queries() {
     let q10_verify_count = r##"SELECT id FROM employees WHERE id > 0"##;
     let res = exec(&database, q10_verify_count).await;
     let rows = assert_rows(&res, "SELECT all employees after DELETE");
-    assert_eq!(rows.len(), rows_to_insert - 5, "row count after DELETE mismatch");
+    assert_eq!(
+        rows.len(),
+        rows_to_insert - 5,
+        "row count after DELETE mismatch"
+    );
 
     // Query 11: concurrent mixed workload (INSERT/UPDATE/DELETE/SELECT), then verify final state.
     // Keep operations on mostly-disjoint row sets to make the result deterministic.
@@ -613,7 +579,11 @@ async fn ext_cov_employees_end_to_end_queries() {
     );
     let res = exec(&database, &q11_verify_inserts).await;
     let rows = assert_rows(&res, "verify concurrent inserts");
-    assert_eq!(rows.len(), concurrent_insert_n as usize, "inserted row count mismatch");
+    assert_eq!(
+        rows.len(),
+        concurrent_insert_n as usize,
+        "inserted row count mismatch"
+    );
 
     // Verify: updates applied.
     let q11_verify_updates = format!(
@@ -635,7 +605,10 @@ async fn ext_cov_employees_end_to_end_queries() {
                 .into_slice(),
         );
         assert_eq!(manager, "CONC_MGR");
-        assert!((salary - update_salary).abs() < 0.01, "concurrent updated salary mismatch");
+        assert!(
+            (salary - update_salary).abs() < 0.01,
+            "concurrent updated salary mismatch"
+        );
     }
 
     // Verify: deletes applied.
@@ -794,11 +767,7 @@ async fn ext_cov_undefined_where_expression_reports_error() {
 
     // Zero divisor reached only via one row's data — the case that would
     // otherwise return a short result set and look successful.
-    let res = exec(
-        &database,
-        "SELECT id FROM eval_err WHERE age / divisor > 1",
-    )
-    .await;
+    let res = exec(&database, "SELECT id FROM eval_err WHERE age / divisor > 1").await;
     assert_error_contains(&res, "division by zero", "data-dependent divide by zero");
 
     // Integer overflow: release builds have `overflow-checks = false`, so this
@@ -1220,7 +1189,10 @@ async fn ext_cov_order_by_honours_every_key() {
         .iter()
         .map(|r| mb_to_string(r.columns[0].data.into_slice()))
         .collect();
-    assert_eq!(depts, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+    assert_eq!(
+        depts,
+        vec!["a".to_string(), "b".to_string(), "c".to_string()]
+    );
 
     // `NULLS LAST` rides the expression-sort path now (the scan spec still
     // refuses it — the byte sort cannot place NULLs — so the planner routes
@@ -1414,9 +1386,8 @@ async fn ext_cov_unique_treats_nulls_as_distinct() {
         .expect("tempdir")
         .keep();
 
-    let database = Arc::new(
-        Database::new(db_dir.to_str().expect("db path should be valid UTF-8")).await,
-    );
+    let database =
+        Arc::new(Database::new(db_dir.to_str().expect("db path should be valid UTF-8")).await);
 
     let create_sql = r##"CREATE TABLE invites (
             id UBIGINT,
@@ -1480,11 +1451,19 @@ async fn ext_cov_anti_join_matches_an_oracle() {
     let database = Arc::new(Database::new(&db_dir_str).await);
 
     assert_ok(
-        &exec(&database, "CREATE TABLE oj_left (id INTEGER NOT NULL, tag VARCHAR)").await,
+        &exec(
+            &database,
+            "CREATE TABLE oj_left (id INTEGER NOT NULL, tag VARCHAR)",
+        )
+        .await,
         "create left",
     );
     assert_ok(
-        &exec(&database, "CREATE TABLE oj_right (id INTEGER NOT NULL, lid INTEGER)").await,
+        &exec(
+            &database,
+            "CREATE TABLE oj_right (id INTEGER NOT NULL, lid INTEGER)",
+        )
+        .await,
         "create right",
     );
 
@@ -1505,7 +1484,10 @@ async fn ext_cov_anti_join_matches_an_oracle() {
             assert_ok(
                 &exec(
                     &database,
-                    &format!("INSERT INTO oj_right (id, lid) VALUES ({}, {id})", 1000 + id),
+                    &format!(
+                        "INSERT INTO oj_right (id, lid) VALUES ({}, {id})",
+                        1000 + id
+                    ),
                 )
                 .await,
                 "insert right",
@@ -1517,7 +1499,10 @@ async fn ext_cov_anti_join_matches_an_oracle() {
 
     // The oracle must not lean on any engine affordance beyond reading each
     // table whole, or it would inherit the very bug it is checking.
-    let left_rows = assert_rows(&exec(&database, "SELECT id FROM oj_left").await, "read left");
+    let left_rows = assert_rows(
+        &exec(&database, "SELECT id FROM oj_left").await,
+        "read left",
+    );
     let right_rows = assert_rows(
         &exec(&database, "SELECT lid FROM oj_right").await,
         "read right",
@@ -1531,7 +1516,10 @@ async fn ext_cov_anti_join_matches_an_oracle() {
         .filter_map(|r| r.columns.first().map(|c| mb_to_i32(c.data.into_slice())))
         .filter(|id| !matched.contains(id))
         .collect();
-    assert_eq!(oracle, expected, "the oracle disagrees with how the data was built");
+    assert_eq!(
+        oracle, expected,
+        "the oracle disagrees with how the data was built"
+    );
 
     // Cannot pass vacuously: an empty answer and a whole-table answer are both
     // excluded before the engine is asked anything.
@@ -1555,7 +1543,8 @@ async fn ext_cov_anti_join_matches_an_oracle() {
         .collect();
 
     assert_eq!(
-        actual, oracle,
+        actual,
+        oracle,
         "anti-join returned the wrong set: extra={:?}, missing={:?}",
         actual.difference(&oracle).collect::<Vec<_>>(),
         oracle.difference(&actual).collect::<Vec<_>>()

@@ -16,7 +16,10 @@ pub struct DeleteRow {
     pub query_row_fetch: RowFetch,
 }
 
-fn extract_where_columns(where_clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> std::collections::HashSet<String> {
+fn extract_where_columns(
+    where_clause: &str,
+    schema: &SmallVec<[SchemaField; 20]>,
+) -> std::collections::HashSet<String> {
     let mut where_columns = std::collections::HashSet::new();
     if where_clause.is_empty() {
         return where_columns;
@@ -139,16 +142,14 @@ fn parse_delete_row(
         // names, the sugar predicate forms, and the guards that stop a `NULL`
         // row satisfying a comparison — which for a `DELETE` decides whether a
         // row is destroyed.
-        let where_clause = match crate::core::tokenizer::predicate_rewrite::rewrite_where(
-            &where_clause,
-            schema,
-        ) {
-            Ok(clause) => clause,
-            Err(reason) => {
-                rejection.replace(reason);
-                return None;
-            }
-        };
+        let where_clause =
+            match crate::core::tokenizer::predicate_rewrite::rewrite_where(&where_clause, schema) {
+                Ok(clause) => clause,
+                Err(reason) => {
+                    rejection.replace(reason);
+                    return None;
+                }
+            };
 
         let where_columns = extract_where_columns(&where_clause, schema);
         let schema_calc = SchemaCalculator::default();
@@ -180,9 +181,9 @@ fn parse_delete_row(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::rql::lexer_s1::QueryPurpose;
     use crate::core::db_type::DbType;
     use crate::core::row::schema::SchemaField;
+    use crate::core::rql::lexer_s1::QueryPurpose;
 
     fn make_schema() -> SmallVec<[SchemaField; 20]> {
         smallvec::smallvec![
@@ -213,7 +214,8 @@ mod tests {
     fn test_delete_row_basic() {
         let sql = r#"DELETE FROM users WHERE id = 1"#;
         let qp = QueryPurpose::DeleteRow(sql.to_string());
-        let result = delete_row_from_query_purpose(&qp, &make_schema()).expect("Should parse successfully");
+        let result =
+            delete_row_from_query_purpose(&qp, &make_schema()).expect("Should parse successfully");
         assert_eq!(result.table_name, "users");
         assert_eq!(result.where_clause, "id = 1");
     }
@@ -222,7 +224,8 @@ mod tests {
     fn test_delete_row_with_quotes() {
         let sql = r#"DELETE FROM "my_table" WHERE name = 'Alice'"#;
         let qp = QueryPurpose::DeleteRow(sql.to_string());
-        let result = delete_row_from_query_purpose(&qp, &make_schema()).expect("Should parse successfully");
+        let result =
+            delete_row_from_query_purpose(&qp, &make_schema()).expect("Should parse successfully");
         assert_eq!(result.table_name, "my_table");
         assert_eq!(result.where_clause, "name = 'Alice'");
     }

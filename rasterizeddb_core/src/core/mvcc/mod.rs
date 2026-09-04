@@ -76,7 +76,13 @@ mod invariants {
     fn the_reserved_ids_keep_their_values() {
         assert_eq!(NO_TX, 0, "a zeroed xmax must mean 'not deleted'");
         assert_eq!(FROZEN_TX, 1);
-        assert_eq!(FIRST_TX, 2, "real ids must start above both reserved values");
-        assert!(FROZEN_TX < FIRST_TX, "frozen rows must predate every transaction");
+        assert_eq!(
+            FIRST_TX, 2,
+            "real ids must start above both reserved values"
+        );
+        assert!(
+            FROZEN_TX < FIRST_TX,
+            "frozen rows must predate every transaction"
+        );
     }
 }

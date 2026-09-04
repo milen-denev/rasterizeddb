@@ -165,10 +165,7 @@ pub async fn read_schema(
     }
 
     if tables.is_empty() {
-        return Err(format!(
-            "schema {:?} holds no tables to import",
-            schema
-        ));
+        return Err(format!("schema {:?} holds no tables to import", schema));
     }
 
     read_columns(connection, schema, &mut tables).await?;
@@ -320,12 +317,20 @@ async fn read_columns(
 
         table.columns.push(SourceColumn {
             name,
-            attnum: result.get(row, "attnum").unwrap_or("0").parse().unwrap_or(0),
+            attnum: result
+                .get(row, "attnum")
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(0),
             type_name: result.get(row, "typname").unwrap_or("unknown").to_string(),
             type_kind: first_char(result.get(row, "typtype"), 'b'),
             type_category: first_char(result.get(row, "typcategory"), 'X'),
             element_type_name: result.get(row, "elemname").map(|e| e.to_string()),
-            type_modifier: result.get(row, "typmod").unwrap_or("-1").parse().unwrap_or(-1),
+            type_modifier: result
+                .get(row, "typmod")
+                .unwrap_or("-1")
+                .parse()
+                .unwrap_or(-1),
             not_null: is_true(result.get(row, "notnull")),
             default,
             formatted_type: formatted,
@@ -447,11 +452,7 @@ fn columns_by_number(tables: &[SourceTable], relid: u32, key: &str) -> Vec<Strin
     let numbers = parse_int_array(key);
     let mut out = Vec::with_capacity(numbers.len());
     for number in numbers {
-        match table
-            .columns
-            .iter()
-            .find(|c| i64::from(c.attnum) == number)
-        {
+        match table.columns.iter().find(|c| i64::from(c.attnum) == number) {
             Some(column) => out.push(column.name.clone()),
             None => return Vec::new(),
         }
@@ -501,8 +502,7 @@ async fn read_unique_indexes(
             .map(|t| t.parse().unwrap_or(0))
             .collect();
         let partial = is_true(result.get(row, "partial"));
-        let expression =
-            is_true(result.get(row, "expression")) || numbers.iter().any(|n| *n <= 0);
+        let expression = is_true(result.get(row, "expression")) || numbers.iter().any(|n| *n <= 0);
 
         let Some(table) = tables.iter_mut().find(|t| t.oid == relid) else {
             continue;
@@ -522,7 +522,11 @@ async fn read_unique_indexes(
 
         let mut columns = Vec::with_capacity(numbers.len());
         for number in &numbers {
-            match table.columns.iter().find(|c| i64::from(c.attnum) == *number) {
+            match table
+                .columns
+                .iter()
+                .find(|c| i64::from(c.attnum) == *number)
+            {
                 Some(column) => columns.push(column.name.clone()),
                 None => {
                     columns.clear();
@@ -606,7 +610,10 @@ fn parse_int_array(text: &str) -> Vec<i64> {
 /// false, which quietly dropped `NOT NULL` from every column and let a partial
 /// unique index through as an ordinary one.
 fn is_true(text: Option<&str>) -> bool {
-    matches!(text, Some("t") | Some("true") | Some("TRUE") | Some("yes") | Some("1"))
+    matches!(
+        text,
+        Some("t") | Some("true") | Some("TRUE") | Some("yes") | Some("1")
+    )
 }
 
 fn first_char(text: Option<&str>, fallback: char) -> char {

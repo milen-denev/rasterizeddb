@@ -1,34 +1,34 @@
 #[cfg(feature = "s3_backup")]
 pub mod backup;
 pub mod bulk_load;
+pub mod database;
+pub mod db_type;
+pub mod filter;
+pub mod helpers;
+pub mod introspect;
 pub mod jsonb;
+pub mod log_writer;
 /// One-way import of a live PostgreSQL database, behind the `pg_import`
 /// feature.
 #[cfg(feature = "pg_import")]
 pub mod migrate;
-pub mod filter;
-pub mod database;
-pub mod db_type;
-pub mod introspect;
-pub mod helpers;
 pub mod mock_helpers;
 pub mod mock_table;
+pub mod mvcc;
+pub mod pg_ops;
+pub mod pg_types;
+pub mod processor;
 pub mod row;
-pub mod storage_providers;
+pub mod rql;
+pub mod similar_to;
 /// Several storage directories for one database, behind the `storage_pools`
 /// feature.
 #[cfg(feature = "storage_pools")]
 pub mod storage;
-pub mod mvcc;
-pub mod vacuum;
-pub mod wal;
-pub mod log_writer;
+pub mod storage_providers;
 pub mod support_types;
-pub mod value_codec;
-pub mod pg_types;
-pub mod pg_ops;
 pub mod text_search;
-pub mod similar_to;
 pub mod tokenizer;
-pub mod processor;
-pub mod rql;
+pub mod vacuum;
+pub mod value_codec;
+pub mod wal;

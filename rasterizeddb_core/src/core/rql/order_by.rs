@@ -161,7 +161,7 @@ pub fn parse(clause: &str) -> Result<Vec<SortTerm>, String> {
                         return Err(format!(
                             "ORDER BY '{}' has NULLS without FIRST or LAST",
                             token
-                        ))
+                        ));
                     }
                 }
             } else if direction_given {
@@ -262,7 +262,10 @@ mod tests {
     fn an_aggregate_call_survives_the_split() {
         assert_eq!(
             keys("COUNT(*) DESC, status"),
-            vec![("COUNT(*)".to_string(), true), ("status".to_string(), false)]
+            vec![
+                ("COUNT(*)".to_string(), true),
+                ("status".to_string(), false)
+            ]
         );
     }
 
@@ -277,7 +280,11 @@ mod tests {
         let t = parse("salary DESC NULLS FIRST").unwrap();
         assert_eq!(t[0].nulls_first, Some(true));
         assert!(t[0].descending);
-        assert!(parse("salary NULLS SIDEWAYS").unwrap_err().contains("FIRST or LAST"));
+        assert!(
+            parse("salary NULLS SIDEWAYS")
+                .unwrap_err()
+                .contains("FIRST or LAST")
+        );
     }
 
     #[test]
@@ -285,7 +292,11 @@ mod tests {
         assert!(parse("").unwrap_err().contains("no field"));
         assert!(parse("a, , b").unwrap_err().contains("empty sort key"));
         assert!(parse("salary UPWARDS").unwrap_err().contains("ASC or DESC"));
-        assert!(parse("salary DESC junk").unwrap_err().contains("unexpected"));
+        assert!(
+            parse("salary DESC junk")
+                .unwrap_err()
+                .contains("unexpected")
+        );
     }
 
     /// A spec that names no key must read back as no keys.

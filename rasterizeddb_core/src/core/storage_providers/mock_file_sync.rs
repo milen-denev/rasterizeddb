@@ -1,14 +1,8 @@
-use std::{
-    io::SeekFrom,
-    sync::Arc,
-};
+use std::{io::SeekFrom, sync::Arc};
 
 use temp_testdir::TempDir;
 
-use super::{
-    file_sync::LocalStorageProvider,
-    traits::StorageIO,
-};
+use super::{file_sync::LocalStorageProvider, traits::StorageIO};
 
 /// Test-only storage provider.
 ///
@@ -76,10 +70,7 @@ impl StorageIO for MockStorageProvider {
         self.inner.read_data_into_buffer(position, buffer).await
     }
 
-    async fn read_vectored(
-        &self,
-        reads: &mut [(u64, &mut [u8])],
-    ) -> Result<(), std::io::Error> {
+    async fn read_vectored(&self, reads: &mut [(u64, &mut [u8])]) -> Result<(), std::io::Error> {
         self.inner.read_vectored(reads).await
     }
 
@@ -113,11 +104,7 @@ impl StorageIO for MockStorageProvider {
         self.inner.truncate(len).await
     }
 
-    fn try_borrow_range(
-        &self,
-        position: u64,
-        len: usize,
-    ) -> Option<super::traits::BorrowedBytes> {
+    fn try_borrow_range(&self, position: u64, len: usize) -> Option<super::traits::BorrowedBytes> {
         self.inner.try_borrow_range(position, len)
     }
 

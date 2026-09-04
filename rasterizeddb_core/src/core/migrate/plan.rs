@@ -331,10 +331,7 @@ fn plan_table(table: &SourceTable, options: &ImportOptions) -> Result<TablePlan,
                 definition.push_str(&expression);
             }
             Ok(None) => {}
-            Err(reason) => notes.push(format!(
-                "{}.{}: {}",
-                table.name, column.source.name, reason
-            )),
+            Err(reason) => notes.push(format!("{}.{}: {}", table.name, column.source.name, reason)),
         }
         definitions.push(definition);
     }
@@ -551,15 +548,17 @@ fn translate_default(column: &PlannedColumn) -> Result<Option<String>, String> {
 
     let acceptable = if upper == "TRUE" || upper == "FALSE" {
         true
-    } else if matches!(upper.as_str(), "NOW()" | "CURRENT_TIMESTAMP" | "CURRENT_DATE") {
+    } else if matches!(
+        upper.as_str(),
+        "NOW()" | "CURRENT_TIMESTAMP" | "CURRENT_DATE"
+    ) {
         // Rendered in the one spelling this engine's default evaluator knows.
         return Ok(Some("CURRENT_TIMESTAMP".to_string()));
     } else if expression.starts_with('\'') && expression.ends_with('\'') && expression.len() >= 2 {
         true
     } else {
         // A bare number, with or without a sign or a decimal point.
-        !expression.is_empty()
-            && expression.parse::<f64>().is_ok()
+        !expression.is_empty() && expression.parse::<f64>().is_ok()
     };
 
     if !acceptable {
@@ -679,7 +678,10 @@ mod tests {
 
     #[test]
     fn the_keys_are_declared_then_deferred() {
-        let mut source = table("users", vec![column("id", "int8", true), column("email", "text", true)]);
+        let mut source = table(
+            "users",
+            vec![column("id", "int8", true), column("email", "text", true)],
+        );
         source.primary_key = vec!["id".to_string()];
         source.unique_keys = vec![UniqueKey {
             name: "users_email_key".to_string(),
@@ -689,7 +691,8 @@ mod tests {
 
         assert!(plan.create.contains("PRIMARY KEY (id)"), "{}", plan.create);
         assert!(
-            plan.create.contains("CONSTRAINT users_email_key UNIQUE (email)"),
+            plan.create
+                .contains("CONSTRAINT users_email_key UNIQUE (email)"),
             "{}",
             plan.create
         );
@@ -724,8 +727,14 @@ mod tests {
         );
         source.primary_key = vec!["a".to_string(), "b".to_string()];
         source.unique_keys = vec![
-            UniqueKey { name: "t_c_key".to_string(), columns: vec!["c".to_string()] },
-            UniqueKey { name: "weird-name!".to_string(), columns: vec!["b".to_string()] },
+            UniqueKey {
+                name: "t_c_key".to_string(),
+                columns: vec!["c".to_string()],
+            },
+            UniqueKey {
+                name: "weird-name!".to_string(),
+                columns: vec!["b".to_string()],
+            },
         ];
         let plan = plan_one(source);
 
@@ -733,7 +742,9 @@ mod tests {
         for drop in &plan.drop_constraints {
             let name = drop.rsplit(' ').next().unwrap();
             assert!(
-                plan.add_constraints.iter().any(|add| add.contains(&format!(" CONSTRAINT {} ", name))),
+                plan.add_constraints
+                    .iter()
+                    .any(|add| add.contains(&format!(" CONSTRAINT {} ", name))),
                 "{} is dropped and never added back",
                 name
             );
@@ -771,7 +782,10 @@ mod tests {
 
     #[test]
     fn foreign_keys_are_added_after_the_data() {
-        let mut source = table("child", vec![column("id", "int4", true), column("parent", "int8", false)]);
+        let mut source = table(
+            "child",
+            vec![column("id", "int4", true), column("parent", "int8", false)],
+        );
         source.foreign_keys = vec![ForeignKey {
             name: "child_parent_fkey".to_string(),
             columns: vec!["parent".to_string()],
@@ -807,7 +821,13 @@ mod tests {
         }];
         let plan = plan_one(source);
         assert!(plan.foreign_keys.is_empty());
-        assert!(plan.notes.iter().any(|n| n.contains("spans several columns")), "{:?}", plan.notes);
+        assert!(
+            plan.notes
+                .iter()
+                .any(|n| n.contains("spans several columns")),
+            "{:?}",
+            plan.notes
+        );
     }
 
     #[test]
@@ -826,7 +846,10 @@ mod tests {
         let mut c = column("quantity", "numeric", false);
         c.type_modifier = ((38 << 16) | 16) + 4;
         c.formatted_type = "numeric(38,16)".to_string();
-        let schema = SourceSchema { tables: vec![table("t", vec![c])], notes: Vec::new() };
+        let schema = SourceSchema {
+            tables: vec![table("t", vec![c])],
+            notes: Vec::new(),
+        };
 
         let planned = plan(&schema, &ImportOptions::default()).expect("wide numeric is a number");
         let mapping = &planned.tables[0].columns[0].mapping;
@@ -846,13 +869,19 @@ mod tests {
         let scale = crate::core::rql::type_modifier::MAX_DECIMAL_SCALE as i32 + 1;
         c.type_modifier = ((60 << 16) | scale) + 4;
         c.formatted_type = format!("numeric(60,{})", scale);
-        let schema = SourceSchema { tables: vec![table("t", vec![c.clone()])], notes: Vec::new() };
+        let schema = SourceSchema {
+            tables: vec![table("t", vec![c.clone()])],
+            notes: Vec::new(),
+        };
 
         let error = plan(&schema, &ImportOptions::default()).unwrap_err();
         assert!(error.contains("decimal places"), "{}", error);
         assert!(error.contains("--pg-import-wide-numeric text"), "{}", error);
 
-        let options = ImportOptions { wide_numeric: WideNumeric::Text, ..Default::default() };
+        let options = ImportOptions {
+            wide_numeric: WideNumeric::Text,
+            ..Default::default()
+        };
         let planned = plan(&schema, &options).unwrap();
         assert_eq!(planned.tables[0].columns[0].mapping.declared, "TEXT");
     }
@@ -879,10 +908,19 @@ mod tests {
         computed.default = Some("(a + b)".to_string());
 
         let plan = plan_one(table("t", vec![id, flag, label, at, computed]));
-        assert!(plan.create.contains("flag BOOLEAN DEFAULT true"), "{}", plan.create);
-        assert!(plan.create.contains("label TEXT DEFAULT 'none'"), "{}", plan.create);
         assert!(
-            plan.create.contains("at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+            plan.create.contains("flag BOOLEAN DEFAULT true"),
+            "{}",
+            plan.create
+        );
+        assert!(
+            plan.create.contains("label TEXT DEFAULT 'none'"),
+            "{}",
+            plan.create
+        );
+        assert!(
+            plan.create
+                .contains("at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
             "{}",
             plan.create
         );
@@ -893,12 +931,16 @@ mod tests {
         // when the catalogue is read, which is where the note naming the
         // sequence comes from in a real import.)
         assert!(
-            plan.notes.iter().any(|n| n.starts_with("t.id:") && n.contains("nextval")),
+            plan.notes
+                .iter()
+                .any(|n| n.starts_with("t.id:") && n.contains("nextval")),
             "{:?}",
             plan.notes
         );
         assert!(
-            plan.notes.iter().any(|n| n.starts_with("t.computed:") && n.contains("(a + b)")),
+            plan.notes
+                .iter()
+                .any(|n| n.starts_with("t.computed:") && n.contains("(a + b)")),
             "{:?}",
             plan.notes
         );
@@ -931,8 +973,14 @@ mod tests {
     fn skipping_constraints_leaves_the_table_bare() {
         let mut source = table("users", vec![column("id", "int8", true)]);
         source.primary_key = vec!["id".to_string()];
-        let schema = SourceSchema { tables: vec![source], notes: Vec::new() };
-        let options = ImportOptions { skip_constraints: true, ..Default::default() };
+        let schema = SourceSchema {
+            tables: vec![source],
+            notes: Vec::new(),
+        };
+        let options = ImportOptions {
+            skip_constraints: true,
+            ..Default::default()
+        };
         let plan = plan(&schema, &options).unwrap();
         assert!(!plan.tables[0].create.contains("PRIMARY KEY"));
         assert!(plan.tables[0].drop_constraints.is_empty());

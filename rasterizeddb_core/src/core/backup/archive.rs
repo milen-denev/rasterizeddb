@@ -69,19 +69,17 @@ impl<W: Write> ArchiveWriter<W> {
         self.add_reader(name, len, &mut BufReader::with_capacity(256 * 1024, file))
     }
 
-    pub fn add_reader(
-        &mut self,
-        name: &str,
-        len: u64,
-        source: &mut impl Read,
-    ) -> io::Result<u64> {
+    pub fn add_reader(&mut self, name: &str, len: u64, source: &mut impl Read) -> io::Result<u64> {
         let name_bytes = name.as_bytes();
         if name_bytes.len() > MAX_NAME_LEN {
-            return Err(io::Error::other(format!("archive entry name too long: {name}")));
+            return Err(io::Error::other(format!(
+                "archive entry name too long: {name}"
+            )));
         }
 
         // Header first, so the reader knows how much to expect.
-        self.sink.write_all(&(name_bytes.len() as u16).to_le_bytes())?;
+        self.sink
+            .write_all(&(name_bytes.len() as u16).to_le_bytes())?;
         self.sink.write_all(name_bytes)?;
         self.sink.write_all(&len.to_le_bytes())?;
 
@@ -154,7 +152,9 @@ pub fn unpack(source: &mut impl Read, target_dir: &Path) -> io::Result<Vec<Entry
         source.read_exact(&mut name_len)?;
         let name_len = u16::from_le_bytes(name_len) as usize;
         if name_len == 0 || name_len > MAX_NAME_LEN {
-            return Err(io::Error::other("snapshot archive has a malformed entry name"));
+            return Err(io::Error::other(
+                "snapshot archive has a malformed entry name",
+            ));
         }
 
         let mut name_bytes = vec![0u8; name_len];
@@ -205,7 +205,13 @@ pub fn unpack(source: &mut impl Read, target_dir: &Path) -> io::Result<Vec<Entry
             )));
         }
 
-        log::debug!("restored {} ({} bytes, entry {}/{})", name, len, index + 1, entry_count);
+        log::debug!(
+            "restored {} ({} bytes, entry {}/{})",
+            name,
+            len,
+            index + 1,
+            entry_count
+        );
         entries.push(Entry { name, len });
     }
 
@@ -236,7 +242,8 @@ fn is_safe_name(name: &str) -> bool {
     {
         return false;
     }
-    name.split('/').all(|part| !part.is_empty() && part != "." && part != "..")
+    name.split('/')
+        .all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
 #[cfg(test)]

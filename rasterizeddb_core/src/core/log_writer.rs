@@ -165,7 +165,10 @@ mod tests {
             });
         }
         assert!(
-            registry().lock().iter().any(|r| r.manager.strong_count() > 0),
+            registry()
+                .lock()
+                .iter()
+                .any(|r| r.manager.strong_count() > 0),
             "the entry was not registered"
         );
 

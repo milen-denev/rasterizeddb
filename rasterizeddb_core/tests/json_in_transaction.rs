@@ -72,7 +72,13 @@ async fn run(db: &Arc<Database>, q: &str) -> String {
 async fn run_in(db: &Arc<Database>, q: &str, tx: rasterizeddb_core::core::mvcc::TxId) -> String {
     let purpose = recognize_query_purpose(q).expect("recognized");
     let out = execute_in_txn(purpose, db.clone(), tx).await;
-    assert_ne!(out.first(), Some(&3), "{} failed: {}", q, String::from_utf8_lossy(&out[1..]));
+    assert_ne!(
+        out.first(),
+        Some(&3),
+        "{} failed: {}",
+        q,
+        String::from_utf8_lossy(&out[1..])
+    );
     String::from_utf8_lossy(&out).to_string()
 }
 
@@ -93,11 +99,20 @@ async fn documents_written_in_one_transaction_survive_a_new_key_rewrite_body() {
     let dir = fresh_db("rewrite");
     let db = Arc::new(Database::new_with_backend(&dir, false).await);
     let created = run(&db, "CREATE TABLE j (id INT NOT NULL, doc JSONB NULL)").await;
-    assert!(!created.to_lowercase().contains("error"), "create failed: {}", created);
+    assert!(
+        !created.to_lowercase().contains("error"),
+        "create failed: {}",
+        created
+    );
 
     let tx = db.transactions.begin();
     // Establishes the shadow table with one key, and the nested table with one.
-    run_in(&db, r#"INSERT INTO j (id, doc) VALUES (1, '{"k1":1,"o":{"a":1}}')"#, tx).await;
+    run_in(
+        &db,
+        r#"INSERT INTO j (id, doc) VALUES (1, '{"k1":1,"o":{"a":1}}')"#,
+        tx,
+    )
+    .await;
     // `k2` is new to the shadow table and `b` is new to the nested one: two
     // rewrites, both while row 1's shadow rows are uncommitted.
     run_in(
@@ -112,11 +127,21 @@ async fn documents_written_in_one_transaction_survive_a_new_key_rewrite_body() {
 
     let one = run(&db, "SELECT doc FROM j WHERE id = 1").await;
     for expected in ["\"k1\":1", "\"a\":1"] {
-        assert!(one.contains(expected), "row 1 lost {} across the rewrite: {}", expected, one);
+        assert!(
+            one.contains(expected),
+            "row 1 lost {} across the rewrite: {}",
+            expected,
+            one
+        );
     }
     let two = run(&db, "SELECT doc FROM j WHERE id = 2").await;
     for expected in ["\"k1\":2", "\"k2\":\"x\"", "\"a\":2", "\"b\":3"] {
-        assert!(two.contains(expected), "row 2 missing {}: {}", expected, two);
+        assert!(
+            two.contains(expected),
+            "row 2 missing {}: {}",
+            expected,
+            two
+        );
     }
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -143,7 +168,11 @@ async fn a_rolled_back_json_insert_leaves_no_shadow_rows_body() {
     // by the same transaction, not by one of its own that had already
     // committed.
     let parent = run(&db, "SELECT id FROM j").await;
-    assert!(!parent.contains('1'), "the rolled-back parent row is still visible: {}", parent);
+    assert!(
+        !parent.contains('1'),
+        "the rolled-back parent row is still visible: {}",
+        parent
+    );
     let orphans = run(&db, &format!("SELECT __json_id FROM {}", shadow)).await;
     assert!(
         !orphans.contains('-'),
@@ -154,7 +183,11 @@ async fn a_rolled_back_json_insert_leaves_no_shadow_rows_body() {
     // And a committed one is there, through the same path.
     run(&db, r#"INSERT INTO j (id, doc) VALUES (2, '{"k":2}')"#).await;
     let kept = run(&db, "SELECT doc FROM j WHERE id = 2").await;
-    assert!(kept.contains("\"k\":2"), "the committed document did not come back: {}", kept);
+    assert!(
+        kept.contains("\"k\":2"),
+        "the committed document did not come back: {}",
+        kept
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -174,15 +207,27 @@ async fn keys_differing_only_in_case_get_distinct_columns_body() {
     let db = Arc::new(Database::new_with_backend(&dir, false).await);
     run(&db, "CREATE TABLE j (id INT NOT NULL, doc JSONB NULL)").await;
 
-    run(&db, r#"INSERT INTO j (id, doc) VALUES (1, '{"date":"2026-01-01"}')"#).await;
-    let second = run(&db, r#"INSERT INTO j (id, doc) VALUES (2, '{"Date":"2026-02-02"}')"#).await;
+    run(
+        &db,
+        r#"INSERT INTO j (id, doc) VALUES (1, '{"date":"2026-01-01"}')"#,
+    )
+    .await;
+    let second = run(
+        &db,
+        r#"INSERT INTO j (id, doc) VALUES (2, '{"Date":"2026-02-02"}')"#,
+    )
+    .await;
     assert!(
         !second.to_lowercase().contains("mismatch") && !second.to_lowercase().contains("not found"),
         "a key differing only in case from an existing one was refused: {}",
         second
     );
     // Both spellings in one document: neither may overwrite the other.
-    run(&db, r#"INSERT INTO j (id, doc) VALUES (3, '{"date":"a","Date":"b"}')"#).await;
+    run(
+        &db,
+        r#"INSERT INTO j (id, doc) VALUES (3, '{"date":"a","Date":"b"}')"#,
+    )
+    .await;
 
     let one = run(&db, "SELECT doc FROM j WHERE id = 1").await;
     assert!(one.contains("2026-01-01"), "row 1: {}", one);
@@ -231,7 +276,12 @@ async fn a_key_containing_a_keyword_does_not_confuse_the_insert_parser_body() {
         "\"where\":[1,2]",
         "\"from\":1",
     ] {
-        assert!(back.contains(expected), "{} missing from the document: {}", expected, back);
+        assert!(
+            back.contains(expected),
+            "{} missing from the document: {}",
+            expected,
+            back
+        );
     }
 
     let _ = std::fs::remove_dir_all(&dir);

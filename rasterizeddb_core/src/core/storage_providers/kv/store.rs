@@ -93,7 +93,9 @@ impl Default for MemoryKvStore {
 
 impl MemoryKvStore {
     pub fn new() -> Self {
-        Self { objects: dashmap::DashMap::new() }
+        Self {
+            objects: dashmap::DashMap::new(),
+        }
     }
 
     /// Number of objects held. Tests assert on this to pin request-shape
@@ -152,7 +154,10 @@ impl KvStore for MemoryKvStore {
                 .objects
                 .iter()
                 .filter(|e| e.key().starts_with(prefix))
-                .map(|e| ObjectInfo { key: e.key().clone(), size: e.value().len() as u64 })
+                .map(|e| ObjectInfo {
+                    key: e.key().clone(),
+                    size: e.value().len() as u64,
+                })
                 .collect();
             out.sort_by(|a, b| a.key.cmp(&b.key));
             Ok(out)

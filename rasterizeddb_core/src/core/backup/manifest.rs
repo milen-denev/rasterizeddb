@@ -164,7 +164,9 @@ impl Manifest {
             RecoveryTarget::Time(unix) => s.finished_at <= *unix,
             RecoveryTarget::Snapshot(id) => &s.id == id,
         };
-        self.snapshots_newest_first().into_iter().find(|s| usable(s))
+        self.snapshots_newest_first()
+            .into_iter()
+            .find(|s| usable(s))
     }
 
     /// One log's bundles, in the order they were cut.
@@ -173,8 +175,11 @@ impl Manifest {
     /// therefore the order their records were written in. Commit sequences
     /// cannot order these: each database counts its own.
     pub fn segments_for(&self, database: &str) -> Vec<&SegmentEntry> {
-        let mut ordered: Vec<&SegmentEntry> =
-            self.segments.iter().filter(|s| s.database == database).collect();
+        let mut ordered: Vec<&SegmentEntry> = self
+            .segments
+            .iter()
+            .filter(|s| s.database == database)
+            .collect();
         ordered.sort_by_key(|s| s.sequence);
         ordered
     }
@@ -377,7 +382,11 @@ impl Manifest {
             // the fallback a catalogue whose commit sequences restarted has no
             // one snapshot that reaches furthest back. Keeping what any of them
             // might need is the direction that cannot strand a restore.
-            .partition(|s| survivors.iter().any(|snapshot| segment_needed_by(snapshot, s)));
+            .partition(|s| {
+                survivors
+                    .iter()
+                    .any(|snapshot| segment_needed_by(snapshot, s))
+            });
 
         doomed.extend(dropped.into_iter().map(|s| s.key));
 
@@ -465,7 +474,10 @@ impl RecoveryTarget {
     ) -> Option<u64> {
         // Below its window end a database's copy is not yet consistent, so a
         // target that lands earlier still has to replay that far.
-        let window_end = snapshot.window_for(database).map(|w| w.end_lsn).unwrap_or(0);
+        let window_end = snapshot
+            .window_for(database)
+            .map(|w| w.end_lsn)
+            .unwrap_or(0);
 
         match self {
             RecoveryTarget::Latest => None,
@@ -574,10 +586,7 @@ mod tests {
         let m = manifest();
         let picked = m.snapshot_for(&RecoveryTarget::Lsn(250)).unwrap();
         assert_eq!(picked.id, "s2");
-        assert_eq!(
-            RecoveryTarget::Lsn(250).resolve_lsn(&m, picked),
-            Some(250)
-        );
+        assert_eq!(RecoveryTarget::Lsn(250).resolve_lsn(&m, picked), Some(250));
     }
 
     #[test]
@@ -616,7 +625,10 @@ mod tests {
         let m = manifest();
         let plan = m.plan_retention(2);
         assert_eq!(
-            plan.snapshots.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            plan.snapshots
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>(),
             vec!["s3", "s2"]
         );
         assert!(plan.doomed.contains(&"snapshots/s1.rdba.zst".to_string()));
@@ -645,7 +657,10 @@ mod tests {
 
         let plan = m.plan_retention(2);
         assert_eq!(
-            plan.snapshots.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            plan.snapshots
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>(),
             vec!["s3", "s2"],
             "retention must keep the newest, not the oldest"
         );
@@ -758,10 +773,18 @@ mod tests {
         let plan = m.plan_retention(1);
 
         for snapshot in &plan.snapshots {
-            assert!(!plan.doomed.contains(&snapshot.key), "{} was kept and deleted", snapshot.id);
+            assert!(
+                !plan.doomed.contains(&snapshot.key),
+                "{} was kept and deleted",
+                snapshot.id
+            );
         }
         for segment in &plan.segments {
-            assert!(!plan.doomed.contains(&segment.key), "{} was kept and deleted", segment.key);
+            assert!(
+                !plan.doomed.contains(&segment.key),
+                "{} was kept and deleted",
+                segment.key
+            );
         }
     }
 
@@ -808,7 +831,10 @@ mod tests {
             "every bundle predates the surviving snapshot and should be gone"
         );
         for key in ["wal/0.zst", "wal/1.zst", "snapshots/old.rdba.zst"] {
-            assert!(plan.doomed.contains(&key.to_string()), "{key} should have been removed");
+            assert!(
+                plan.doomed.contains(&key.to_string()),
+                "{key} should have been removed"
+            );
         }
     }
 
@@ -823,7 +849,10 @@ mod tests {
         let plan = m.plan_retention(1);
 
         assert_eq!(
-            plan.segments.iter().map(|s| s.key.as_str()).collect::<Vec<_>>(),
+            plan.segments
+                .iter()
+                .map(|s| s.key.as_str())
+                .collect::<Vec<_>>(),
             vec!["wal/1.zst"]
         );
         assert!(plan.doomed.contains(&"wal/0.zst".to_string()));
@@ -854,7 +883,11 @@ mod tests {
 
         m.snapshots = plan.snapshots;
         m.segments = plan.segments;
-        assert_eq!(m.next_segment_sequence(), 2, "the counter must not repeat a sequence");
+        assert_eq!(
+            m.next_segment_sequence(),
+            2,
+            "the counter must not repeat a sequence"
+        );
     }
 
     #[test]
@@ -916,8 +949,16 @@ mod tests {
         let mut snap = snapshot("s1", 3_000, 300);
         snap.first_segment_sequence = Some(0);
         snap.windows = vec![
-            LogWindow { database: String::new(), start_lsn: 250, end_lsn: 300 },
-            LogWindow { database: "shop".to_string(), start_lsn: 4, end_lsn: 6 },
+            LogWindow {
+                database: String::new(),
+                start_lsn: 250,
+                end_lsn: 300,
+            },
+            LogWindow {
+                database: "shop".to_string(),
+                start_lsn: 4,
+                end_lsn: 6,
+            },
         ];
         m.snapshots = vec![snap];
         m.segments = vec![
@@ -962,15 +1003,24 @@ mod tests {
     fn each_database_sees_only_its_own_bundles() {
         let m = two_databases();
         assert_eq!(
-            m.segments_for("").iter().map(|s| s.key.as_str()).collect::<Vec<_>>(),
+            m.segments_for("")
+                .iter()
+                .map(|s| s.key.as_str())
+                .collect::<Vec<_>>(),
             vec!["wal/0.zst"]
         );
         assert_eq!(
-            m.segments_for("shop").iter().map(|s| s.key.as_str()).collect::<Vec<_>>(),
+            m.segments_for("shop")
+                .iter()
+                .map(|s| s.key.as_str())
+                .collect::<Vec<_>>(),
             vec!["wal/shop/1.zst", "wal/shop/2.zst"],
             "one database's bundles must come back in the order they were cut"
         );
-        assert_eq!(m.databases_with_segments(), vec!["".to_string(), "shop".to_string()]);
+        assert_eq!(
+            m.databases_with_segments(),
+            vec!["".to_string(), "shop".to_string()]
+        );
     }
 
     #[test]
@@ -989,8 +1039,13 @@ mod tests {
         let m = manifest();
         let snap = &m.snapshots[0];
         assert!(snap.windows.is_empty());
-        let window = snap.window_for("").expect("the root's window is always known");
-        assert_eq!((window.start_lsn, window.end_lsn), (snap.start_lsn, snap.end_lsn));
+        let window = snap
+            .window_for("")
+            .expect("the root's window is always known");
+        assert_eq!(
+            (window.start_lsn, window.end_lsn),
+            (snap.start_lsn, snap.end_lsn)
+        );
     }
 
     #[test]
@@ -1032,7 +1087,10 @@ mod tests {
     fn an_lsn_target_past_everything_archived_replays_the_others_whole() {
         let m = two_databases();
         let snap = &m.snapshots[0];
-        assert_eq!(RecoveryTarget::Lsn(9_999).resolve_lsn_for(&m, snap, "shop"), None);
+        assert_eq!(
+            RecoveryTarget::Lsn(9_999).resolve_lsn_for(&m, snap, "shop"),
+            None
+        );
     }
 
     #[test]
@@ -1057,7 +1115,10 @@ mod tests {
 
         let plan = m.plan_retention(1);
         assert_eq!(
-            plan.segments.iter().map(|s| s.key.as_str()).collect::<Vec<_>>(),
+            plan.segments
+                .iter()
+                .map(|s| s.key.as_str())
+                .collect::<Vec<_>>(),
             vec!["wal/shop/2.zst"]
         );
         assert!(plan.doomed.contains(&"wal/0.zst".to_string()));

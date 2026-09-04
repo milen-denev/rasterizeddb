@@ -193,12 +193,22 @@ async fn a_unique_column_holds_any_number_of_nulls_body() {
     let db = Arc::new(Database::new_with_backend(&dir, false).await);
 
     for (table, ddl) in [
-        ("inline", "CREATE TABLE inline (id INT NOT NULL, ref UUID NULL UNIQUE)"),
-        ("keyed", "CREATE TABLE keyed (id INT NOT NULL, ref UUID NULL, UNIQUE (ref))"),
+        (
+            "inline",
+            "CREATE TABLE inline (id INT NOT NULL, ref UUID NULL UNIQUE)",
+        ),
+        (
+            "keyed",
+            "CREATE TABLE keyed (id INT NOT NULL, ref UUID NULL, UNIQUE (ref))",
+        ),
     ] {
         run(&db, ddl).await;
         for id in 1..=3 {
-            let out = run(&db, &format!("INSERT INTO {} (id, ref) VALUES ({}, NULL)", table, id)).await;
+            let out = run(
+                &db,
+                &format!("INSERT INTO {} (id, ref) VALUES ({}, NULL)", table, id),
+            )
+            .await;
             assert!(
                 !out.to_lowercase().contains("duplicate"),
                 "{}: NULL number {} was refused: {}",
@@ -209,14 +219,22 @@ async fn a_unique_column_holds_any_number_of_nulls_body() {
         }
 
         // A real repeat is still a repeat.
-        run(&db, &format!(
-            "INSERT INTO {} (id, ref) VALUES (9, '11111111-1111-1111-1111-111111111111')",
-            table
-        )).await;
-        let clash = run(&db, &format!(
-            "INSERT INTO {} (id, ref) VALUES (10, '11111111-1111-1111-1111-111111111111')",
-            table
-        )).await;
+        run(
+            &db,
+            &format!(
+                "INSERT INTO {} (id, ref) VALUES (9, '11111111-1111-1111-1111-111111111111')",
+                table
+            ),
+        )
+        .await;
+        let clash = run(
+            &db,
+            &format!(
+                "INSERT INTO {} (id, ref) VALUES (10, '11111111-1111-1111-1111-111111111111')",
+                table
+            ),
+        )
+        .await;
         assert!(
             clash.to_lowercase().contains("duplicate"),
             "{}: a real duplicate was accepted: {}",

@@ -67,11 +67,7 @@ impl std::fmt::Debug for MirrorStorageProvider {
 impl MirrorStorageProvider {
     /// Opens `name` in `primary_location` and in every one of `backup_locations`,
     /// bringing any backup that has fallen behind back into step.
-    pub async fn attach(
-        primary_location: &str,
-        backup_locations: &[String],
-        name: &str,
-    ) -> Self {
+    pub async fn attach(primary_location: &str, backup_locations: &[String], name: &str) -> Self {
         let primary = LocalStorageProvider::new(primary_location, Some(name)).await;
 
         let mut backups = Vec::with_capacity(backup_locations.len());
@@ -81,7 +77,10 @@ impl MirrorStorageProvider {
             backups.push(backup);
         }
 
-        Self { primary, backups: Arc::new(backups) }
+        Self {
+            primary,
+            backups: Arc::new(backups),
+        }
     }
 
     /// The provider every read goes to.
@@ -152,7 +151,10 @@ async fn force_resync(primary: &LocalStorageProvider, backup: &LocalStorageProvi
     while position < primary_len {
         let take = ((primary_len - position) as usize).min(buffer.len());
         let mut cursor = position;
-        if let Err(e) = primary.read_data_into_buffer(&mut cursor, &mut buffer[..take]).await {
+        if let Err(e) = primary
+            .read_data_into_buffer(&mut cursor, &mut buffer[..take])
+            .await
+        {
             error!(
                 "could not read {} to rebuild its backup copy: {}. The copy is incomplete",
                 primary.get_name(),
@@ -166,10 +168,18 @@ async fn force_resync(primary: &LocalStorageProvider, backup: &LocalStorageProvi
 
     let token = backup.begin_txn();
     if let Err(e) = backup.commit_durable(token).await {
-        error!("the rebuilt backup copy at {} is not durable: {}", backup.get_name(), e);
+        error!(
+            "the rebuilt backup copy at {} is not durable: {}",
+            backup.get_name(),
+            e
+        );
         return;
     }
-    debug!("rebuilt backup copy of {} ({} bytes)", backup.get_name(), primary_len);
+    debug!(
+        "rebuilt backup copy of {} ({} bytes)",
+        backup.get_name(),
+        primary_len
+    );
 }
 
 impl StorageIO for MirrorStorageProvider {
@@ -209,7 +219,10 @@ impl StorageIO for MirrorStorageProvider {
     }
 
     async fn append_data_returning_offset(&self, buffer: &[u8], immediate: bool) -> u64 {
-        let offset = self.primary.append_data_returning_offset(buffer, immediate).await;
+        let offset = self
+            .primary
+            .append_data_returning_offset(buffer, immediate)
+            .await;
         for backup in self.backups.iter() {
             // Always the immediate path, whatever the caller asked for. The
             // deferred one stages into a per-file temp buffer that its own
@@ -279,7 +292,11 @@ impl StorageIO for MirrorStorageProvider {
         if outcome.is_ok() {
             for backup in self.backups.iter() {
                 if let Err(e) = backup.truncate(len).await {
-                    error!("could not truncate the backup copy at {}: {}", backup.get_name(), e);
+                    error!(
+                        "could not truncate the backup copy at {}: {}",
+                        backup.get_name(),
+                        e
+                    );
                 }
             }
         }
@@ -299,7 +316,10 @@ impl StorageIO for MirrorStorageProvider {
         // rebuilds the backups from the result — mirroring the scratch as well
         // would double the write cost of a compaction for a file that does not
         // outlive it.
-        Self { primary: self.primary.create_temp().await, backups: Arc::new(Vec::new()) }
+        Self {
+            primary: self.primary.create_temp().await,
+            backups: Arc::new(Vec::new()),
+        }
     }
 
     async fn swap_temp(&self, temp_io_sync: &mut Self) {
@@ -322,7 +342,10 @@ impl StorageIO for MirrorStorageProvider {
             resync(&primary, &copy, &name).await;
             backups.push(copy);
         }
-        Self { primary, backups: Arc::new(backups) }
+        Self {
+            primary,
+            backups: Arc::new(backups),
+        }
     }
 
     #[allow(refining_impl_trait)]
@@ -336,7 +359,10 @@ impl StorageIO for MirrorStorageProvider {
             resync(&primary, &copy, &name).await;
             backups.push(copy);
         }
-        Self { primary, backups: Arc::new(backups) }
+        Self {
+            primary,
+            backups: Arc::new(backups),
+        }
     }
 
     fn drop_io(&self) {
@@ -355,9 +381,8 @@ impl StorageIO for MirrorStorageProvider {
         // primary does, so each needs its own flush loop or those bytes sit in
         // a `.tmp` until the next open.
         let primary = self.primary.start_service();
-        let backups = futures::future::join_all(
-            self.backups.iter().map(|backup| backup.start_service()),
-        );
+        let backups =
+            futures::future::join_all(self.backups.iter().map(|backup| backup.start_service()));
         futures::join!(primary, backups);
     }
 

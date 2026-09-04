@@ -58,15 +58,15 @@
 //! written before this feature existed is, so an existing installation opens
 //! unchanged.
 
-pub mod mirror;
-#[cfg(feature = "kv_storage")]
-pub mod kv_registry;
-pub mod relocate;
-pub mod sql;
-#[cfg(test)]
-mod placement_tests;
 #[cfg(all(test, feature = "kv_storage"))]
 mod backend_tests;
+#[cfg(feature = "kv_storage")]
+pub mod kv_registry;
+pub mod mirror;
+#[cfg(test)]
+mod placement_tests;
+pub mod relocate;
+pub mod sql;
 #[cfg(test)]
 mod tests;
 
@@ -173,7 +173,12 @@ pub struct StorageLocation {
 
 impl StorageLocation {
     fn root(path: String) -> Self {
-        Self { path, role: LocationRole::Primary, weight: 1, enabled: true }
+        Self {
+            path,
+            role: LocationRole::Primary,
+            weight: 1,
+            enabled: true,
+        }
     }
 }
 
@@ -462,7 +467,12 @@ impl StorageManager {
     /// second disk is not durable until *that* disk's log is flushed, and the
     /// root's log knows nothing about it.
     pub fn all_paths(&self) -> Vec<String> {
-        self.state.read().locations.iter().map(|l| l.path.clone()).collect()
+        self.state
+            .read()
+            .locations
+            .iter()
+            .map(|l| l.path.clone())
+            .collect()
     }
 
     /// The enabled backup locations, which every write is mirrored to.
@@ -488,7 +498,11 @@ impl StorageManager {
     /// What holds `table_name`, or `None` when nothing is recorded — which
     /// means the database directory.
     pub fn backend_of(&self, table_name: &str) -> Option<TableBackend> {
-        self.state.read().placements.get(table_name).map(|spec| TableBackend::parse(spec))
+        self.state
+            .read()
+            .placements
+            .get(table_name)
+            .map(|spec| TableBackend::parse(spec))
     }
 
     /// The recorded spec verbatim, for the paths that carry it around rather
@@ -510,7 +524,10 @@ impl StorageManager {
         if self.root.is_none() {
             return Err("this database is in memory".to_string());
         }
-        self.state.write().placements.insert(table_name.to_string(), backend.as_spec());
+        self.state
+            .write()
+            .placements
+            .insert(table_name.to_string(), backend.as_spec());
         self.persist();
         Ok(())
     }
@@ -530,14 +547,18 @@ impl StorageManager {
             if let Some(existing) = state.placements.get(table_name) {
                 // A table already pinned to another backend has no directory to
                 // report, and choosing one for it would overwrite the pin.
-                return TableBackend::parse(existing).directory().map(str::to_string);
+                return TableBackend::parse(existing)
+                    .directory()
+                    .map(str::to_string);
             }
             let chosen = choose(&state, root);
             // Recorded even when it is the database's own directory. The
             // alternative — recording only the exceptions — makes the map an
             // undercount of the root, and `round-robin` reads those counts: the
             // root would look permanently empty and take every table.
-            state.placements.insert(table_name.to_string(), chosen.clone());
+            state
+                .placements
+                .insert(table_name.to_string(), chosen.clone());
             chosen
         };
 
@@ -559,7 +580,10 @@ impl StorageManager {
         {
             let mut state = self.state.write();
             if !state.locations.iter().any(|l| l.path == path) {
-                return Err(format!("{} is not a storage location of this database", path));
+                return Err(format!(
+                    "{} is not a storage location of this database",
+                    path
+                ));
             }
             // The root is recorded like any other location — see `place`.
             let _ = root;
@@ -618,7 +642,9 @@ impl StorageManager {
             ));
         }
         if weight == 0 {
-            return Err("weight must be at least 1; use DISABLE to take a location out".to_string());
+            return Err(
+                "weight must be at least 1; use DISABLE to take a location out".to_string(),
+            );
         }
         if path == root {
             return Err(format!(
@@ -633,7 +659,11 @@ impl StorageManager {
         {
             let state = self.state.read();
             if let Some(clash) = state.locations.iter().find(|l| l.path == path) {
-                return Err(format!("{} is already a storage location ({})", clash.path, clash.role.as_str()));
+                return Err(format!(
+                    "{} is already a storage location ({})",
+                    clash.path,
+                    clash.role.as_str()
+                ));
             }
             if let Some(clash) = state
                 .locations
@@ -658,10 +688,12 @@ impl StorageManager {
             .map_err(|e| format!("{} is not writable by this server: {}", path, e))?;
         let _ = std::fs::remove_file(&probe);
 
-        self.state
-            .write()
-            .locations
-            .push(StorageLocation { path: path.clone(), role, weight, enabled });
+        self.state.write().locations.push(StorageLocation {
+            path: path.clone(),
+            role,
+            weight,
+            enabled,
+        });
         self.persist();
         self.prepare_locations();
         Ok(path)
@@ -672,14 +704,15 @@ impl StorageManager {
         let path = normalize(path);
 
         if path == root {
-            return Err(
-                "the database's own directory cannot be removed from the pool".to_string()
-            );
+            return Err("the database's own directory cannot be removed from the pool".to_string());
         }
 
         let mut state = self.state.write();
         let Some(index) = state.locations.iter().position(|l| l.path == path) else {
-            return Err(format!("{} is not a storage location of this database", path));
+            return Err(format!(
+                "{} is not a storage location of this database",
+                path
+            ));
         };
 
         // A location still holding tables would take its files with it —
@@ -731,9 +764,10 @@ impl StorageManager {
         {
             let state = self.state.read();
             if role == LocationRole::Backup
-                && state.placements.values().any(|spec| {
-                    TableBackend::parse(spec).directory() == Some(normalized.as_str())
-                })
+                && state
+                    .placements
+                    .values()
+                    .any(|spec| TableBackend::parse(spec).directory() == Some(normalized.as_str()))
             {
                 return Err(format!(
                     "{} still holds tables; a backup location is written by mirroring \
@@ -761,7 +795,10 @@ impl StorageManager {
         {
             let mut state = self.state.write();
             let Some(location) = state.locations.iter_mut().find(|l| l.path == path) else {
-                return Err(format!("{} is not a storage location of this database", path));
+                return Err(format!(
+                    "{} is not a storage location of this database",
+                    path
+                ));
             };
             change(location);
         }
@@ -793,14 +830,13 @@ impl StorageManager {
                 // and resolves to the root — so the root's count here is a
                 // floor, which `SHOW STORAGE` corrects against the live table
                 // list, the only thing that knows about those.
-                let tables =
-                    state
-                        .placements
-                        .values()
-                        .filter(|spec| {
-                            TableBackend::parse(spec).directory() == Some(location.path.as_str())
-                        })
-                        .count() as u64;
+                let tables = state
+                    .placements
+                    .values()
+                    .filter(|spec| {
+                        TableBackend::parse(spec).directory() == Some(location.path.as_str())
+                    })
+                    .count() as u64;
                 LocationReport {
                     location: location.clone(),
                     is_root: location.path == root,
@@ -897,7 +933,9 @@ impl StorageManager {
         let state = self.state.read();
 
         let mut out = String::new();
-        out.push_str("# rasterizeddb storage pool. Rewritten by the server; edit while it is stopped.\n");
+        out.push_str(
+            "# rasterizeddb storage pool. Rewritten by the server; edit while it is stopped.\n",
+        );
         out.push_str(&format!("version\t{}\n", POOL_FORMAT_VERSION));
         out.push_str(&format!("policy\t{}\n", state.policy.as_str()));
         out.push_str(&format!("min_free_bytes\t{}\n", state.min_free_bytes));
@@ -911,7 +949,11 @@ impl StorageManager {
                 "location\t{}\t{}\t{}\t{}\n",
                 location.role.as_str(),
                 location.weight,
-                if location.enabled { "enabled" } else { "disabled" },
+                if location.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
                 location.path,
             ));
         }
@@ -1048,12 +1090,15 @@ pub fn repoint_pool_config(
 /// hand-editing one — but nothing that reads this file should have to guess
 /// afterwards why the numbers came from another directory.
 fn warn_if_written_elsewhere(text: &str, root: &str, path: &Path) {
-    let mut locations = text.lines().filter(|line| !line.starts_with('#')).filter_map(|line| {
-        match line.split('\t').collect::<Vec<_>>().as_slice() {
-            ["location", _, _, _, at] => Some(normalize(at)),
-            _ => None,
-        }
-    });
+    let mut locations = text
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(
+            |line| match line.split('\t').collect::<Vec<_>>().as_slice() {
+                ["location", _, _, _, at] => Some(normalize(at)),
+                _ => None,
+            },
+        );
 
     let mut any = false;
     let mut names_this_one = false;
@@ -1083,10 +1128,12 @@ fn warn_if_written_elsewhere(text: &str, root: &str, path: &Path) {
 fn first_location(text: &str) -> Option<String> {
     text.lines()
         .filter(|line| !line.starts_with('#'))
-        .find_map(|line| match line.split('\t').collect::<Vec<_>>().as_slice() {
-            ["location", _, _, _, path] => Some(normalize(path)),
-            _ => None,
-        })
+        .find_map(
+            |line| match line.split('\t').collect::<Vec<_>>().as_slice() {
+                ["location", _, _, _, path] => Some(normalize(path)),
+                _ => None,
+            },
+        )
 }
 
 /// Applies a rendered pool file to `state`.
@@ -1170,7 +1217,10 @@ fn parse_into(text: &str, root: &str, state: &mut PoolState) -> Result<(), Strin
                 placements.insert(name, TableBackend::parse(at_path).as_spec());
             }
             other => {
-                warn!("{}: ignoring unknown storage pool directive {:?}", POOL_FILE, other);
+                warn!(
+                    "{}: ignoring unknown storage pool directive {:?}",
+                    POOL_FILE, other
+                );
             }
         }
     }
@@ -1252,8 +1302,7 @@ fn choose(state: &PoolState, root: &str) -> String {
             // older than the file have no line and are undercounted against the
             // root; the effect is a bias towards the other locations until they
             // catch up, which is the direction an operator adding a disk wants.
-            let counted =
-                |path: &str| state.placements.values().filter(|at| *at == path).count();
+            let counted = |path: &str| state.placements.values().filter(|at| *at == path).count();
             pool.iter()
                 .min_by_key(|l| counted(&l.path))
                 .map(|l| l.path.clone())

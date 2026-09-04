@@ -38,7 +38,10 @@ fn starts_with_with(sql: &str) -> bool {
     let t = sql.trim_start();
     t.len() >= 4
         && t[..4].eq_ignore_ascii_case("WITH")
-        && t[4..].chars().next().is_some_and(|c| c.is_whitespace() || c == '(')
+        && t[4..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_whitespace() || c == '(')
 }
 
 /// Index just past the parenthesis matching the one at `open`, ignoring
@@ -89,7 +92,10 @@ pub fn split_with(sql: &str) -> Result<Option<(Vec<CteDef>, String)>, String> {
     // non-recursive CTE this would return the base case and no error.
     if after_with.len() >= 9
         && after_with[..9].eq_ignore_ascii_case("RECURSIVE")
-        && after_with[9..].chars().next().is_some_and(|c| c.is_whitespace())
+        && after_with[9..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_whitespace())
     {
         return Err(
             "WITH RECURSIVE is not supported yet; refusing rather than returning only the \
@@ -112,9 +118,7 @@ pub fn split_with(sql: &str) -> Result<Option<(Vec<CteDef>, String)>, String> {
         }
         let after_name = rest[name_end..].trim_start();
         if after_name.starts_with('(') {
-            return Err(
-                "a WITH clause that renames its columns is not supported yet".to_string()
-            );
+            return Err("a WITH clause that renames its columns is not supported yet".to_string());
         }
         if after_name.len() < 2 || !after_name[..2].eq_ignore_ascii_case("AS") {
             return Err(format!("expected AS after the WITH name '{}'", name));
@@ -162,10 +166,7 @@ fn item_label(item: &str) -> Option<String> {
             b')' => depth = depth.saturating_sub(1),
             _ => {}
         }
-        if depth == 0
-            && upper[i..].starts_with(" AS ")
-            && i + 4 <= item.len()
-        {
+        if depth == 0 && upper[i..].starts_with(" AS ") && i + 4 <= item.len() {
             let name = item[i + 4..].trim().trim_matches('"');
             if !name.is_empty() {
                 return Some(name.to_string());
@@ -220,7 +221,10 @@ fn returning_constants(body: &str) -> Option<Vec<String>> {
     for item in &items {
         let item = item.trim();
         let is_literal = item.starts_with('\'')
-            || item.chars().next().is_some_and(|c| c.is_ascii_digit() || c == '-')
+            || item
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit() || c == '-')
             || item.eq_ignore_ascii_case("NULL");
         if !is_literal {
             return None;
@@ -301,7 +305,6 @@ fn temp_name(cte: &str, statement: &str, index: usize) -> String {
         .collect();
     format!("__cte_{}_{}_{:x}", safe, index, hash)
 }
-
 
 /// Replaces references to a CTE *as a relation*, leaving same-named columns
 /// alone.
@@ -472,7 +475,10 @@ async fn materialize_inner(
         // rows. PostgreSQL runs such a CTE exactly once, which is what
         // materialising in order already gives.
         let modifies = !matches!(
-            body.trim_start().get(..6).map(|w| w.to_ascii_uppercase()).as_deref(),
+            body.trim_start()
+                .get(..6)
+                .map(|w| w.to_ascii_uppercase())
+                .as_deref(),
             Some("SELECT")
         );
 
@@ -485,36 +491,43 @@ async fn materialize_inner(
                 let affected =
                     crate::core::rql::executor::run_statement_affected(head, database, tx)
                         .await
-                        .map_err(|e| {
-                            format!("the WITH clause '{}' failed: {}", def.name, e)
-                        })?;
+                        .map_err(|e| format!("the WITH clause '{}' failed: {}", def.name, e))?;
 
-                let labels: Vec<String> =
-                    (0..literals.len()).map(|i| format!("col{}", i + 1)).collect();
+                let labels: Vec<String> = (0..literals.len())
+                    .map(|i| format!("col{}", i + 1))
+                    .collect();
                 let temp = temp_name(&def.name, sql, index);
                 let columns: Vec<String> =
                     labels.iter().map(|name| format!("{} TEXT", name)).collect();
-                crate::core::rql::executor::run_statement(&format!("CREATE TABLE {} ({})", temp, columns.join(", ")), database, tx)
+                crate::core::rql::executor::run_statement(
+                    &format!("CREATE TABLE {} ({})", temp, columns.join(", ")),
+                    database,
+                    tx,
+                )
                 .await
                 .map_err(|e| {
-                    format!("could not materialise the WITH clause '{}': {}", def.name, e)
+                    format!(
+                        "could not materialise the WITH clause '{}': {}",
+                        def.name, e
+                    )
                 })?;
                 temps.push(temp.clone());
 
                 if affected > 0 {
                     let tuple = format!("({})", literals.join(", "));
-                    let tuples: Vec<String> =
-                        (0..affected).map(|_| tuple.clone()).collect();
-                    crate::core::rql::executor::run_statement(&format!(
+                    let tuples: Vec<String> = (0..affected).map(|_| tuple.clone()).collect();
+                    crate::core::rql::executor::run_statement(
+                        &format!(
                             "INSERT INTO {} ({}) VALUES {}",
                             temp,
                             labels.join(", "),
                             tuples.join(", ")
-                        ), database, tx)
+                        ),
+                        database,
+                        tx,
+                    )
                     .await
-                    .map_err(|e| {
-                        format!("could not fill the WITH clause '{}': {}", def.name, e)
-                    })?;
+                    .map_err(|e| format!("could not fill the WITH clause '{}': {}", def.name, e))?;
                 }
 
                 rewritten = replace_relation_references(&rewritten, &def.name, &temp);
@@ -567,9 +580,8 @@ async fn materialize_inner(
                 )
             })?
         } else {
-            let list = select_list_of(&body).ok_or_else(|| {
-                format!("the WITH clause '{}' must be a SELECT", def.name)
-            })?;
+            let list = select_list_of(&body)
+                .ok_or_else(|| format!("the WITH clause '{}' must be a SELECT", def.name))?;
             crate::core::rql::lexer_ct::split_definitions(list)
                 .iter()
                 .map(|item| item_label(item))
@@ -624,7 +636,12 @@ async fn materialize_inner(
         let create = format!("CREATE TABLE {} ({})", temp, columns.join(", "));
         crate::core::rql::executor::run_statement(&create, database, tx)
             .await
-            .map_err(|e| format!("could not materialise the WITH clause '{}': {}", def.name, e))?;
+            .map_err(|e| {
+                format!(
+                    "could not materialise the WITH clause '{}': {}",
+                    def.name, e
+                )
+            })?;
         // Recorded before the insert, so a failure part-way still gets cleaned
         // up by the caller.
         temps.push(temp.clone());
@@ -656,16 +673,17 @@ async fn materialize_inner(
             );
             crate::core::rql::executor::run_statement(&insert, database, tx)
                 .await
-                .map_err(|e| {
-                    format!("could not fill the WITH clause '{}': {}", def.name, e)
-                })?;
+                .map_err(|e| format!("could not fill the WITH clause '{}': {}", def.name, e))?;
         }
 
         rewritten = replace_relation_references(&rewritten, &def.name, &temp);
         published.push((def.name.clone(), temp));
     }
 
-    Ok(Some(Materialized { rewritten, temps: std::mem::take(temps) }))
+    Ok(Some(Materialized {
+        rewritten,
+        temps: std::mem::take(temps),
+    }))
 }
 
 /// Materialises one query into a temporary table and returns its name.
@@ -772,7 +790,10 @@ pub async fn materialize_query(
                 .iter()
                 .filter_map(|row| row.columns.get(index))
                 .find_map(|c| sql_type_of(&c.column_type));
-            let widened = declared.get(index).and_then(|w| w.as_ref()).and_then(sql_type_of);
+            let widened = declared
+                .get(index)
+                .and_then(|w| w.as_ref())
+                .and_then(sql_type_of);
             match sampled {
                 // `TEXT` is what a scan reports for every variable-width type,
                 // so it is the one answer worth second-guessing.
@@ -875,7 +896,8 @@ mod tests {
         let err = split_with("WITH RECURSIVE t AS (SELECT 1) SELECT * FROM t").unwrap_err();
         assert!(err.contains("RECURSIVE"), "{}", err);
         // A CTE merely *named* something starting with "recursive" is fine.
-        let ok = split_with("WITH recursive_totals AS (SELECT a FROM b) SELECT a FROM recursive_totals");
+        let ok =
+            split_with("WITH recursive_totals AS (SELECT a FROM b) SELECT a FROM recursive_totals");
         assert!(ok.is_ok(), "{:?}", ok.err());
     }
 
@@ -888,8 +910,9 @@ mod tests {
 
     #[test]
     fn splits_one_and_several_definitions() {
-        let (defs, rest) =
-            split_with("WITH a AS (SELECT id FROM t) SELECT id FROM a").unwrap().unwrap();
+        let (defs, rest) = split_with("WITH a AS (SELECT id FROM t) SELECT id FROM a")
+            .unwrap()
+            .unwrap();
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].name, "a");
         assert_eq!(defs[0].body, "SELECT id FROM t");
@@ -932,13 +955,25 @@ mod tests {
     fn only_relation_references_are_replaced() {
         let f = replace_relation_references;
         assert_eq!(f("SELECT a FROM cte", "cte", "__t"), "SELECT a FROM __t");
-        assert_eq!(f("SELECT a FROM x JOIN cte ON 1", "cte", "__t"), "SELECT a FROM x JOIN __t ON 1");
+        assert_eq!(
+            f("SELECT a FROM x JOIN cte ON 1", "cte", "__t"),
+            "SELECT a FROM x JOIN __t ON 1"
+        );
         // Qualifying something is a relation reference too.
-        assert_eq!(f("SELECT cte.id FROM cte", "cte", "__t"), "SELECT __t.id FROM __t");
+        assert_eq!(
+            f("SELECT cte.id FROM cte", "cte", "__t"),
+            "SELECT __t.id FROM __t"
+        );
         // A longer identifier merely starting with the name is untouched.
-        assert_eq!(f("SELECT a FROM cte_extra", "cte", "__t"), "SELECT a FROM cte_extra");
+        assert_eq!(
+            f("SELECT a FROM cte_extra", "cte", "__t"),
+            "SELECT a FROM cte_extra"
+        );
         // Inside a literal it is data.
-        assert_eq!(f("SELECT 'cte' FROM cte", "cte", "__t"), "SELECT 'cte' FROM __t");
+        assert_eq!(
+            f("SELECT 'cte' FROM cte", "cte", "__t"),
+            "SELECT 'cte' FROM __t"
+        );
     }
 
     #[test]
@@ -949,9 +984,21 @@ mod tests {
         let sql = "INSERT INTO users (id, domain_id, name) \
                    SELECT domain_id.id, 'x' FROM domain_id";
         let out = replace_relation_references(sql, "domain_id", "__cte_d");
-        assert!(out.contains("(id, domain_id, name)"), "column list changed: {}", out);
-        assert!(out.contains("__cte_d.id"), "qualified ref not rewritten: {}", out);
-        assert!(out.contains("FROM __cte_d"), "relation not rewritten: {}", out);
+        assert!(
+            out.contains("(id, domain_id, name)"),
+            "column list changed: {}",
+            out
+        );
+        assert!(
+            out.contains("__cte_d.id"),
+            "qualified ref not rewritten: {}",
+            out
+        );
+        assert!(
+            out.contains("FROM __cte_d"),
+            "relation not rewritten: {}",
+            out
+        );
     }
 
     #[test]
@@ -987,7 +1034,6 @@ mod tests {
         assert!(err.contains("renames its columns"), "{}", err);
     }
 }
-
 
 /// Materialises every derived table — `FROM (SELECT …) alias` — into a
 /// temporary table and points the statement at it.
@@ -1035,20 +1081,17 @@ async fn materialize_derived_inner(
 
         let temp = materialize_query(&inner, &alias, &current, database, tx).await?;
         temps.push(temp.clone());
-        current = format!(
-            "{}{} {}{}",
-            &current[..start],
-            temp,
-            alias,
-            &current[end..]
-        );
+        current = format!("{}{} {}{}", &current[..start], temp, alias, &current[end..]);
         let _ = index;
     }
 
     if !found_any {
         return Ok(None);
     }
-    Ok(Some(Materialized { rewritten: current, temps: std::mem::take(temps) }))
+    Ok(Some(Materialized {
+        rewritten: current,
+        temps: std::mem::take(temps),
+    }))
 }
 
 /// Finds the first `FROM (SELECT …) alias` or `JOIN (SELECT …) alias`.
@@ -1100,7 +1143,11 @@ pub fn next_derived_table(sql: &str) -> Option<(usize, usize, String, String)> {
                 (first, first.len())
             };
             let alias = alias.trim_matches('"');
-            if alias.is_empty() || !alias.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            if alias.is_empty()
+                || !alias
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
             {
                 // PostgreSQL requires one, and guessing a name would make the
                 // rewritten statement refer to something the caller never wrote.
@@ -1135,8 +1182,7 @@ mod derived_tests {
 
     #[test]
     fn the_as_spelling_is_accepted() {
-        let (_, _, _, alias) =
-            next_derived_table("SELECT * FROM (SELECT 1) AS r").expect("found");
+        let (_, _, _, alias) = next_derived_table("SELECT * FROM (SELECT 1) AS r").expect("found");
         assert_eq!(alias, "r");
     }
 

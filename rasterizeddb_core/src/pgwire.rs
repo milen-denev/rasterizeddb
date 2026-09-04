@@ -19,19 +19,18 @@ use tokio::{
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::TlsAcceptor;
 
-use crate::pg_params::{inline_params, BoundParam};
 use crate::core::{
     database::Database,
     database::catalog::{DatabaseCatalog, DatabaseStatement, parse_database_statement},
     db_type::DbType,
     mvcc::transaction::TxId,
+    row::row::{Row, vec_into_rows},
     rql::{
-        lexer_query::row_fetch_from_select_query,
+        lexer_query::row_fetch_from_select_query, lexer_s1::QueryPurpose,
         lexer_s1::recognize_query_purpose,
-        lexer_s1::QueryPurpose,
     },
-    row::row::{vec_into_rows, Row},
 };
+use crate::pg_params::{BoundParam, inline_params};
 
 /// Start a minimal PostgreSQL wire-protocol server (pgwire).
 ///
@@ -337,7 +336,10 @@ async fn handle_connection(
                 other => {
                     // Unknown 8-byte request (e.g., future extensions). Deny in a
                     // libpq-compatible way: most of these expect a single-byte response.
-                    log::debug!("pgwire received unknown 8-byte startup request code {}; denying", other);
+                    log::debug!(
+                        "pgwire received unknown 8-byte startup request code {}; denying",
+                        other
+                    );
                     tcp.write_all(b"N").await?;
                     tcp.flush().await?;
                     continue;
@@ -450,7 +452,11 @@ where
 
     let principal = match authenticate(&database, stream, parameters, auth).await {
         Ok(principal) => {
-            log::debug!("authenticated {} via {}", principal.name, auth.method.name());
+            log::debug!(
+                "authenticated {} via {}",
+                principal.name,
+                auth.method.name()
+            );
             principal
         }
         Err(e) => {
@@ -553,7 +559,10 @@ where
     // than a line at the end.
     let result = run_message_loop_inner(database, &mut state, stream).await;
     if let Some(t) = state.transaction.take() {
-        log::info!("connection closed with transaction {} open; rolling it back", t.id);
+        log::info!(
+            "connection closed with transaction {} open; rolling it back",
+            t.id
+        );
         database.transactions.abort(t.id);
         flush_outcomes(database);
     }
@@ -578,7 +587,10 @@ where
 
         let len = read_i32_be(stream).await?;
         if len < 4 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid message length"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid message length",
+            ));
         }
         let mut payload = vec![0u8; (len - 4) as usize];
         stream.read_exact(&mut payload).await?;
@@ -785,7 +797,8 @@ impl TransactionModes {
                     let (level, width) = match (words.get(i + 2), words.get(i + 3)) {
                         (Some(&"serializable"), _) => (IsolationLevel::RepeatableRead, 1),
                         (Some(&"repeatable"), Some(&"read")) => (IsolationLevel::RepeatableRead, 2),
-                        (Some(&"read"), Some(&"committed")) | (Some(&"read"), Some(&"uncommitted")) => {
+                        (Some(&"read"), Some(&"committed"))
+                        | (Some(&"read"), Some(&"uncommitted")) => {
                             (IsolationLevel::ReadCommitted, 2)
                         }
                         _ => return Err("unrecognised isolation level".to_string()),
@@ -886,7 +899,8 @@ impl SessionState {
     /// otherwise — read fresh each time, so `SET CONFIG wal.synchronous_commit`
     /// reaches connections that were already open.
     fn synchronous_commit(&self) -> bool {
-        self.synchronous_commit.unwrap_or_else(crate::synchronous_commit)
+        self.synchronous_commit
+            .unwrap_or_else(crate::synchronous_commit)
     }
 
     /// Puts back what a `SET LOCAL` inside `t` changed.
@@ -927,7 +941,6 @@ impl SessionState {
                 .map(|t| t.savepoints.last().map(|sp| sp.id).unwrap_or(t.id))
         })
     }
-
 }
 
 struct StatementInfo {
@@ -1027,7 +1040,10 @@ where
         } else {
             let take = len as usize;
             if payload.len() < i + take {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid Bind parameter length"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid Bind parameter length",
+                ));
             }
             let v = payload[i..i + take].to_vec();
             i += take;
@@ -1057,7 +1073,14 @@ where
         i = next;
     }
 
-    state.portals.insert(portal, PortalInfo { stmt_name: stmt, result_formats, params });
+    state.portals.insert(
+        portal,
+        PortalInfo {
+            stmt_name: stmt,
+            result_formats,
+            params,
+        },
+    );
     // BindComplete
     send_message(stream, b'2', &[]).await
 }
@@ -1073,7 +1096,10 @@ where
 {
     // Describe payload: byte ('S'|'P'), cstring name
     if payload.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid Describe payload"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid Describe payload",
+        ));
     }
     let kind = payload[0];
     let (name, _) = read_cstring_owned(payload, 1)?;
@@ -1098,7 +1124,7 @@ where
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid Describe kind",
-            ))
+            ));
         }
     };
 
@@ -1204,7 +1230,10 @@ where
                     database
                         .schema_generation
                         .load(std::sync::atomic::Ordering::Acquire),
-                    fields.iter().map(|(n, t)| (n.to_string(), t.clone())).collect(),
+                    fields
+                        .iter()
+                        .map(|(n, t)| (n.to_string(), t.clone()))
+                        .collect(),
                 ));
             }
             send_row_description(stream, &fields, &result_formats).await?;
@@ -1244,8 +1273,11 @@ where
         )
         .await;
     };
-    let (stmt_name, result_formats, params) =
-        (info.stmt_name.clone(), info.result_formats.clone(), info.params.clone());
+    let (stmt_name, result_formats, params) = (
+        info.stmt_name.clone(),
+        info.result_formats.clone(),
+        info.params.clone(),
+    );
 
     // Owned: the shape check below needs `state` mutably, and holding a
     // borrow of the statement across it would pin the map.
@@ -1322,8 +1354,15 @@ where
         }
     };
 
-    execute_single_statement(database, state, stream, &query, &result_formats, !schema_changed)
-        .await
+    execute_single_statement(
+        database,
+        state,
+        stream,
+        &query,
+        &result_formats,
+        !schema_changed,
+    )
+    .await
 }
 
 async fn handle_close<S>(state: &mut SessionState, stream: &mut S, payload: &[u8]) -> io::Result<()>
@@ -1332,7 +1371,10 @@ where
 {
     // Close payload: byte ('S'|'P'), cstring name
     if payload.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid Close payload"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid Close payload",
+        ));
     }
     let kind = payload[0];
     let (name, _) = read_cstring_owned(payload, 1)?;
@@ -1474,12 +1516,9 @@ async fn describe_query(
     // outer statement is rewritten to name the alias as an ordinary relation.
     if let Some((start, end, inner, alias)) = crate::core::rql::cte::next_derived_table(stmt) {
         if !alias.is_empty() {
-            if let Some((columns, _)) =
-                Box::pin(describe_resolved(database, &inner, None)).await?
-            {
-                let mut fields: smallvec::SmallVec<
-                    [crate::core::row::schema::SchemaField; 20],
-                > = smallvec::SmallVec::new();
+            if let Some((columns, _)) = Box::pin(describe_resolved(database, &inner, None)).await? {
+                let mut fields: smallvec::SmallVec<[crate::core::row::schema::SchemaField; 20]> =
+                    smallvec::SmallVec::new();
                 let mut offset = 0u64;
                 for (order, (name, ty)) in columns.iter().enumerate() {
                     let size = ty.get_size();
@@ -1494,9 +1533,12 @@ async fn describe_query(
                     offset += size as u64;
                 }
                 let rewritten = format!("{}{} {}{}", &stmt[..start], alias, alias, &stmt[end..]);
-                if let Some(described) =
-                    Box::pin(describe_resolved(database, &rewritten, Some((&alias, &fields))))
-                        .await?
+                if let Some(described) = Box::pin(describe_resolved(
+                    database,
+                    &rewritten,
+                    Some((&alias, &fields)),
+                ))
+                .await?
                 {
                     return Ok(Some(described));
                 }
@@ -1537,7 +1579,11 @@ fn describe_aggregate_over_derived(stmt: &str) -> Option<Vec<(&'static str, DbTy
         let leaked: &'static str = Box::leak(label.into_boxed_str());
         fields.push((leaked, DbType::I64));
     }
-    if fields.is_empty() { None } else { Some(fields) }
+    if fields.is_empty() {
+        None
+    } else {
+        Some(fields)
+    }
 }
 
 /// Describes a statement whose CTEs and derived tables are already relations.
@@ -1560,7 +1606,10 @@ async fn describe_resolved(
     // columns were resolved from its inner query. It is not in
     // `database.tables` and must not be put there: describing must not
     // materialise anything.
-    derived: Option<(&str, &smallvec::SmallVec<[crate::core::row::schema::SchemaField; 20]>)>,
+    derived: Option<(
+        &str,
+        &smallvec::SmallVec<[crate::core::row::schema::SchemaField; 20]>,
+    )>,
 ) -> io::Result<Option<(Vec<(&'static str, DbType)>, bool)>> {
     let stmt = query.trim();
     if stmt.is_empty() {
@@ -1585,8 +1634,7 @@ async fn describe_resolved(
         let builtin = !(lower.starts_with("set ")
             || lower.starts_with("show ")
             || lower.starts_with("reset "))
-            || recognize_query_purpose(stmt).is_none()
-                && parse_database_statement(stmt).is_none();
+            || recognize_query_purpose(stmt).is_none() && parse_database_statement(stmt).is_none();
         if builtin {
             if lower == "select 1" || lower == "select 1::int" {
                 return Ok(Some((vec![("?column?", DbType::I32)], true)));
@@ -1684,18 +1732,20 @@ async fn describe_resolved(
         // so `SHOW ...` worked under `psql`'s simple query path and failed
         // under any ORM.
         QueryPurpose::Introspect(statement) => {
-            return Ok(crate::core::introspect::result_fields(statement).map(|fields| {
-                (
-                    fields
-                        .into_iter()
-                        .map(|(name, ty)| {
-                            let leaked: &'static str = Box::leak(name.into_boxed_str());
-                            (leaked, ty)
-                        })
-                        .collect(),
-                    true,
-                )
-            }));
+            return Ok(
+                crate::core::introspect::result_fields(statement).map(|fields| {
+                    (
+                        fields
+                            .into_iter()
+                            .map(|(name, ty)| {
+                                let leaked: &'static str = Box::leak(name.into_boxed_str());
+                                (leaked, ty)
+                            })
+                            .collect(),
+                        true,
+                    )
+                }),
+            );
         }
         QueryPurpose::Replication(sql) => {
             return Ok(Some((
@@ -1731,18 +1781,20 @@ async fn describe_resolved(
         // should get.
         #[cfg(feature = "s3_backup")]
         QueryPurpose::Backup(statement) => {
-            return Ok(crate::core::rql::backup_exec::result_fields(statement).map(|fields| {
-                (
-                    fields
-                        .into_iter()
-                        .map(|(name, ty)| {
-                            let leaked: &'static str = Box::leak(name.into_boxed_str());
-                            (leaked, ty)
-                        })
-                        .collect(),
-                    true,
-                )
-            }));
+            return Ok(
+                crate::core::rql::backup_exec::result_fields(statement).map(|fields| {
+                    (
+                        fields
+                            .into_iter()
+                            .map(|(name, ty)| {
+                                let leaked: &'static str = Box::leak(name.into_boxed_str());
+                                (leaked, ty)
+                            })
+                            .collect(),
+                        true,
+                    )
+                }),
+            );
         }
         QueryPurpose::QueryRows(qr) => {
             if crate::core::rql::join::statement_has_join(&qr.query) {
@@ -1765,19 +1817,21 @@ async fn describe_resolved(
                         .map(|t| t.schema.fields.clone())
                         .or_else(|| crate::core::rql::catalog_views::synthetic_schema(name))
                 };
-                return Ok(match crate::core::rql::join::plan_statement(&qr.query, &schema_of) {
-                    Ok(plan) => Some((
-                        join_output_columns(&plan, database)
-                            .into_iter()
-                            .map(|(name, ty)| {
-                                let leaked: &'static str = Box::leak(name.into_boxed_str());
-                                (leaked, ty)
-                            })
-                            .collect(),
-                        true,
-                    )),
-                    Err(_) => None,
-                });
+                return Ok(
+                    match crate::core::rql::join::plan_statement(&qr.query, &schema_of) {
+                        Ok(plan) => Some((
+                            join_output_columns(&plan, database)
+                                .into_iter()
+                                .map(|(name, ty)| {
+                                    let leaked: &'static str = Box::leak(name.into_boxed_str());
+                                    (leaked, ty)
+                                })
+                                .collect(),
+                            true,
+                        )),
+                        Err(_) => None,
+                    },
+                );
             }
 
             // Same reasoning as the join path above: a catalogue view is
@@ -1792,9 +1846,7 @@ async fn describe_resolved(
                 derived
                     .filter(|(alias, _)| qr.table_name.eq_ignore_ascii_case(alias))
                     .map(|(_, fields)| (*fields).clone())
-                    .or_else(|| {
-                        crate::core::rql::catalog_views::synthetic_schema(&qr.table_name)
-                    })
+                    .or_else(|| crate::core::rql::catalog_views::synthetic_schema(&qr.table_name))
             };
             let real_table = database.tables.get(&qr.table_name);
             let table_fields = match (&view_schema, &real_table) {
@@ -1816,12 +1868,11 @@ async fn describe_resolved(
                 // row came back under no resolvable column names.
                 Err(_) => match describe_without_predicate(&qr.query) {
                     Some(reduced) => {
-                        let purpose = QueryPurpose::QueryRows(
-                            crate::core::rql::lexer_s1::QueryRowsData {
+                        let purpose =
+                            QueryPurpose::QueryRows(crate::core::rql::lexer_s1::QueryRowsData {
                                 table_name: qr.table_name.clone(),
                                 query: reduced,
-                            },
-                        );
+                            });
                         match row_fetch_from_select_query(&purpose, &table_fields) {
                             Ok(p) => p,
                             Err(_) => return Ok(None),
@@ -1876,8 +1927,7 @@ async fn describe_resolved(
                 )
             }) {
                 for item in &parsed.select_items {
-                    let leaked: &'static str =
-                        Box::leak(item.label().to_string().into_boxed_str());
+                    let leaked: &'static str = Box::leak(item.label().to_string().into_boxed_str());
                     fields.push((leaked, advertised(item)));
                 }
                 return Ok(Some((fields, true)));
@@ -1887,8 +1937,7 @@ async fn describe_resolved(
             // are the select items, named and typed by the plan.
             if let Some(plan) = &parsed.aggregate {
                 for item in &plan.items {
-                    let leaked: &'static str =
-                        Box::leak(item.label().to_string().into_boxed_str());
+                    let leaked: &'static str = Box::leak(item.label().to_string().into_boxed_str());
                     fields.push((leaked, advertised(item)));
                 }
                 return Ok(Some((fields, true)));
@@ -1940,7 +1989,11 @@ async fn describe_resolved(
         // with no resolvable names: right values, nothing able to read them.
         QueryPurpose::UpdateRow(sql) | QueryPurpose::DeleteRow(sql) => {
             // The relation is the token after `UPDATE`, or after `DELETE FROM`.
-            let skip = if matches!(&purpose, QueryPurpose::UpdateRow(_)) { 1 } else { 2 };
+            let skip = if matches!(&purpose, QueryPurpose::UpdateRow(_)) {
+                1
+            } else {
+                2
+            };
             let name = sql
                 .split_whitespace()
                 .nth(skip)
@@ -2096,7 +2149,16 @@ where
                 .map(|line| catalog_row(&[CatalogCell::Text(line.clone())]))
                 .collect();
             let tag = format!("SELECT {}", rows.len());
-            send_query_result(stream, Some(&fields), None, &rows, &[], &tag, omit_description).await
+            send_query_result(
+                stream,
+                Some(&fields),
+                None,
+                &rows,
+                &[],
+                &tag,
+                omit_description,
+            )
+            .await
         }
         Err(e) => fail_statement(state, stream, "58000", &e).await,
     }
@@ -2121,7 +2183,10 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     match statement {
-        DatabaseStatement::Create { name, if_not_exists } => {
+        DatabaseStatement::Create {
+            name,
+            if_not_exists,
+        } => {
             if if_not_exists && state.catalog.get(&name).is_some() {
                 // PostgreSQL has no `IF NOT EXISTS` here, but every migration
                 // tool writes it; reporting the no-op the way `CREATE TABLE`
@@ -2133,7 +2198,10 @@ where
                     if let Err(e) = seed_roles(&database, &state.auth).await {
                         // The database exists but nobody can log into it, which
                         // is worse than not having created it.
-                        let _ = state.catalog.drop_database(&name, &state.database_name).await;
+                        let _ = state
+                            .catalog
+                            .drop_database(&name, &state.database_name)
+                            .await;
                         fail_statement(state, stream, "58000", &e).await
                     } else {
                         send_command_complete(stream, "CREATE DATABASE").await
@@ -2177,7 +2245,16 @@ where
                 })
                 .collect();
             let tag = format!("SELECT {}", rows.len());
-            send_query_result(stream, Some(&fields), None, &rows, &[], &tag, omit_description).await
+            send_query_result(
+                stream,
+                Some(&fields),
+                None,
+                &rows,
+                &[],
+                &tag,
+                omit_description,
+            )
+            .await
         }
         DatabaseStatement::Drop { name, if_exists } => {
             if if_exists && state.catalog.get(&name).is_none() {
@@ -2281,7 +2358,10 @@ where
     // not. PostgreSQL refuses it, and the check belongs here because only the
     // session knows whether a block is open.
     if state.transaction.is_none()
-        && stmt.trim_start().get(..4).is_some_and(|w| w.eq_ignore_ascii_case("LOCK"))
+        && stmt
+            .trim_start()
+            .get(..4)
+            .is_some_and(|w| w.eq_ignore_ascii_case("LOCK"))
         && crate::core::rql::row_lock::parse_lock_table(stmt).is_some()
     {
         fail_statement(
@@ -2319,22 +2399,17 @@ where
     // the same way a CTE does, and for the same reason: the scan reads one
     // relation at a time. Run after the CTE rewrite so a derived table inside a
     // CTE body is handled too.
-    let derived = match crate::core::rql::cte::materialize_derived(
-        after_cte,
-        database,
-        effective_tx,
-    )
-    .await
-    {
-        Ok(d) => d,
-        Err(e) => {
-            if let Some(m) = &materialized {
-                crate::core::rql::cte::drop_temps(database, &m.temps, effective_tx).await;
+    let derived =
+        match crate::core::rql::cte::materialize_derived(after_cte, database, effective_tx).await {
+            Ok(d) => d,
+            Err(e) => {
+                if let Some(m) = &materialized {
+                    crate::core::rql::cte::drop_temps(database, &m.temps, effective_tx).await;
+                }
+                fail_statement(state, stream, "0A000", &e).await?;
+                return Ok(());
             }
-            fail_statement(state, stream, "0A000", &e).await?;
-            return Ok(());
-        }
-    };
+        };
     let after_derived = derived
         .as_ref()
         .map(|d| d.rewritten.as_str())
@@ -2417,8 +2492,8 @@ where
     // of whether the statement worked — the same signal `COMMIT` reads.
     if let Some((tx, owned)) = cte_tx {
         if owned {
-            let failed = state.statement_failed
-                || state.transaction.as_ref().is_some_and(|t| t.failed);
+            let failed =
+                state.statement_failed || state.transaction.as_ref().is_some_and(|t| t.failed);
             // Asked before the commit, which retires the transaction and
             // forgets the answer. A statement whose CTEs only read leaves
             // nothing on disk carrying this id, so it needs no outcome record —
@@ -2541,7 +2616,11 @@ where
         let verb = privileged_statement(stmt).filter(|v| {
             matches!(
                 *v,
-                "CREATE ROLE" | "ALTER ROLE" | "DROP ROLE" | "CREATE DATABASE" | "DROP DATABASE"
+                "CREATE ROLE"
+                    | "ALTER ROLE"
+                    | "DROP ROLE"
+                    | "CREATE DATABASE"
+                    | "DROP DATABASE"
                     | "IMPORT DATABASE"
             )
         });
@@ -2563,7 +2642,9 @@ where
                     crate::auth::RoleStatement::AlterPassword { .. } => "ALTER ROLE",
                     crate::auth::RoleStatement::Drop { .. } => "DROP ROLE",
                 };
-                match crate::auth::execute_role_statement(database, statement, state.auth.method).await {
+                match crate::auth::execute_role_statement(database, statement, state.auth.method)
+                    .await
+                {
                     Ok(()) => send_command_complete(stream, tag).await?,
                     Err(e) => fail_statement(state, stream, "42710", &e).await?,
                 }
@@ -2602,7 +2683,15 @@ where
         || crate::core::rql::subquery::find_exists(stmt).is_some()
         || crate::core::rql::subquery::find_scalar_subquery(stmt).is_some()
     {
-        match crate::core::rql::executor::substitute_in_subqueries(stmt, database, state.current_tx().unwrap_or(crate::core::mvcc::transaction::FROZEN_TX)).await {
+        match crate::core::rql::executor::substitute_in_subqueries(
+            stmt,
+            database,
+            state
+                .current_tx()
+                .unwrap_or(crate::core::mvcc::transaction::FROZEN_TX),
+        )
+        .await
+        {
             Ok(s) => {
                 flattened = s;
                 flattened.as_str()
@@ -2703,9 +2792,7 @@ where
         ),
         // Introspection rows belong to no relation either, so their column
         // names come from the statement.
-        QueryPurpose::Introspect(statement) => {
-            crate::core::introspect::result_fields(statement)
-        }
+        QueryPurpose::Introspect(statement) => crate::core::introspect::result_fields(statement),
         QueryPurpose::QueryRows(qr) if crate::core::rql::join::statement_has_join(&qr.query) => {
             let schema_of = |name: &str| database.tables.get(name).map(|t| t.schema.fields.clone());
             match crate::core::rql::join::plan_statement(&qr.query, &schema_of) {
@@ -2724,7 +2811,10 @@ where
             // client stalls. (It does not block later readers: dashmap 6.1's
             // `try_lock_shared_fast` admits a reader unless a writer *holds* the
             // lock, so parked writers do not queue readers behind them.)
-            let table = database.tables.get(&qr.table_name).map(|t| t.value().clone());
+            let table = database
+                .tables
+                .get(&qr.table_name)
+                .map(|t| t.value().clone());
             let Some(table) = table else {
                 fail_statement(state, stream, "42P01", "relation does not exist").await?;
                 return Ok(());
@@ -2753,8 +2843,8 @@ where
                 Ok(parsed)
                     if parsed.select_items.iter().any(|i| {
                         matches!(
-                    i,
-                    crate::core::rql::aggregate::SelectItem::Literal { .. }
+                            i,
+                            crate::core::rql::aggregate::SelectItem::Literal { .. }
                         | crate::core::rql::aggregate::SelectItem::Scalar { .. }
                         // A row expression fills an output slot no fetched
                         // column occupies, so the description has to come from
@@ -2764,7 +2854,7 @@ where
                         // A window fills an output slot no fetched column
                         // occupies, so its type must come from the select list.
                         | crate::core::rql::aggregate::SelectItem::Window { .. }
-                )
+                        )
                     }) =>
                 {
                     Some(
@@ -2791,10 +2881,9 @@ where
                         .iter()
                         .take(parsed.visible_columns)
                         .filter_map(|c| {
-                            field_of(&table.schema.fields, c.schema_id)
-                                .map(|field| {
-                                    (field.name.clone(), reported_type(field, &table.schema))
-                                })
+                            field_of(&table.schema.fields, c.schema_id).map(|field| {
+                                (field.name.clone(), reported_type(field, &table.schema))
+                            })
                         })
                         .collect::<Vec<_>>(),
                 ),
@@ -2806,7 +2895,11 @@ where
         }
         QueryPurpose::UpdateRow(sql) | QueryPurpose::DeleteRow(sql) => {
             // The relation is the token after `UPDATE`, or after `DELETE FROM`.
-            let skip = if matches!(purpose, QueryPurpose::UpdateRow(_)) { 1 } else { 2 };
+            let skip = if matches!(purpose, QueryPurpose::UpdateRow(_)) {
+                1
+            } else {
+                2
+            };
             let name = sql
                 .split_whitespace()
                 .nth(skip)
@@ -2825,9 +2918,7 @@ where
                     match crate::core::rql::lexer_ir::returning_columns(sql, &fields) {
                         Some(Ok(cols)) => Some(
                             cols.iter()
-                                .map(|f| {
-                                    (f.name.clone(), reported_type_of(f, &json_columns))
-                                })
+                                .map(|f| (f.name.clone(), reported_type_of(f, &json_columns)))
                                 .collect::<Vec<_>>(),
                         ),
                         Some(Err(e)) => {
@@ -2846,8 +2937,7 @@ where
         {
             None => None,
             Some((fields, json_columns)) => {
-                match crate::core::rql::lexer_ir::returning_columns(&ir.query, &fields)
-                {
+                match crate::core::rql::lexer_ir::returning_columns(&ir.query, &fields) {
                     Some(Ok(cols)) => Some(
                         cols.iter()
                             .map(|f| (f.name.clone(), reported_type_of(f, &json_columns)))
@@ -2864,31 +2954,31 @@ where
         // `SHOW BACKUPS` and `RESTORE` return rows that belong to no table, so
         // their column names come from the statement rather than from a schema.
         #[cfg(feature = "s3_backup")]
-        QueryPurpose::Backup(statement) => {
-            crate::core::rql::backup_exec::result_fields(statement)
-        }
+        QueryPurpose::Backup(statement) => crate::core::rql::backup_exec::result_fields(statement),
         _ => None,
     };
 
     // `execute` consumes QueryPurpose, but we still want `purpose_kind`/`select_fields`.
     // Re-recognize the query to get an owned QueryPurpose to pass into the engine.
-    let purpose_exec = recognize_query_purpose(stmt).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "query purpose disappeared")
-    })?;
+    let purpose_exec = recognize_query_purpose(stmt)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "query purpose disappeared"))?;
 
     // Inside a block the statement joins the session's transaction, so it sees
     // the block's own earlier writes and its effects stay invisible to everyone
     // else until COMMIT. Outside one, `execute` opens and closes a transaction
     // of its own.
     let resp = match state.current_tx() {
-        Some(tx) => crate::core::rql::executor::execute_in_txn(purpose_exec, database.clone(), tx)
-            .await,
-        None => crate::core::rql::executor::execute_with_sync(
-            purpose_exec,
-            database.clone(),
-            state.synchronous_commit(),
-        )
-        .await,
+        Some(tx) => {
+            crate::core::rql::executor::execute_in_txn(purpose_exec, database.clone(), tx).await
+        }
+        None => {
+            crate::core::rql::executor::execute_with_sync(
+                purpose_exec,
+                database.clone(),
+                state.synchronous_commit(),
+            )
+            .await
+        }
     };
     if resp.is_empty() {
         fail_statement(state, stream, "XX000", "empty engine response").await?;
@@ -2938,8 +3028,16 @@ where
                 PurposeKind::DeleteRow => format!("DELETE {}", rows.len()),
                 _ => format!("SELECT {}", rows.len()),
             };
-            send_query_result(stream, select_fields.as_deref(), select_scales.as_deref(), &rows, result_formats, &tag, omit_description)
-                .await?;
+            send_query_result(
+                stream,
+                select_fields.as_deref(),
+                select_scales.as_deref(),
+                &rows,
+                result_formats,
+                &tag,
+                omit_description,
+            )
+            .await?;
         }
         3 => {
             let msg = String::from_utf8_lossy(&resp[1..]).to_string();
@@ -3018,14 +3116,19 @@ fn sqlstate_for(message: &str) -> &'static str {
 
 fn read_cstring_owned(bytes: &[u8], start: usize) -> io::Result<(String, usize)> {
     if start > bytes.len() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid cstring offset"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid cstring offset",
+        ));
     }
     let rel_end = bytes[start..]
         .iter()
         .position(|&b| b == 0)
         .unwrap_or(bytes.len() - start);
     let end = start + rel_end;
-    let s = std::str::from_utf8(&bytes[start..end]).unwrap_or("").to_string();
+    let s = std::str::from_utf8(&bytes[start..end])
+        .unwrap_or("")
+        .to_string();
     let next = (end + 1).min(bytes.len());
     Ok((s, next))
 }
@@ -3088,7 +3191,6 @@ fn command_tag(kind: PurposeKind, rows_affected: Option<u64>) -> String {
         _ => "OK".to_string(),
     }
 }
-
 
 async fn handle_simple_query<S>(
     database: &Arc<Database>,
@@ -3182,7 +3284,9 @@ fn split_statements(query: &str) -> Vec<String> {
     out.into_iter()
         .filter(|s| {
             // Comment-only fragments carry no statement.
-            !crate::core::rql::lexer_s1::strip_sql_comments(s).trim().is_empty()
+            !crate::core::rql::lexer_s1::strip_sql_comments(s)
+                .trim()
+                .is_empty()
         })
         .map(|s| s.trim().to_string())
         .collect()
@@ -3215,7 +3319,11 @@ fn savepoint_name(rest: &str) -> Option<String> {
     // else, but a trailing token should not silently become part of the name.
     let first = name.split_whitespace().next()?;
     let unquoted = first.trim_matches('"');
-    if unquoted.is_empty() { None } else { Some(unquoted.to_string()) }
+    if unquoted.is_empty() {
+        None
+    } else {
+        Some(unquoted.to_string())
+    }
 }
 
 /// Answers `BEGIN` / `COMMIT` / `ROLLBACK` against the transaction manager.
@@ -3258,16 +3366,25 @@ async fn handle_transaction_control<S>(
 where
     S: AsyncWrite + Unpin,
 {
-    let lower = stmt.trim().trim_end_matches(';').trim().to_ascii_lowercase();
+    let lower = stmt
+        .trim()
+        .trim_end_matches(';')
+        .trim()
+        .to_ascii_lowercase();
     let lower = lower.split_whitespace().collect::<Vec<_>>().join(" ");
 
     // `BEGIN [WORK|TRANSACTION] [modes]` / `START TRANSACTION [modes]`.
-    let begin_modes = ["begin transaction", "begin work", "begin", "start transaction"]
-        .iter()
-        .find_map(|prefix| {
-            let rest = lower.strip_prefix(prefix)?;
-            (rest.is_empty() || rest.starts_with(' ')).then(|| rest.trim().to_string())
-        });
+    let begin_modes = [
+        "begin transaction",
+        "begin work",
+        "begin",
+        "start transaction",
+    ]
+    .iter()
+    .find_map(|prefix| {
+        let rest = lower.strip_prefix(prefix)?;
+        (rest.is_empty() || rest.starts_with(' ')).then(|| rest.trim().to_string())
+    });
 
     // `COMMIT`/`ROLLBACK [WORK|TRANSACTION] [AND [NO] CHAIN]`: the block is
     // closed and, with `AND CHAIN`, a new one opened with the same
@@ -3279,14 +3396,23 @@ where
             None => (lower, false),
         },
     };
-    let is_commit = lower == "commit" || lower == "commit work" || lower == "commit transaction"
-        || lower == "end" || lower == "end work" || lower == "end transaction";
-    let is_rollback =
-        lower == "rollback" || lower == "rollback work" || lower == "rollback transaction"
-            || lower == "abort";
+    let is_commit = lower == "commit"
+        || lower == "commit work"
+        || lower == "commit transaction"
+        || lower == "end"
+        || lower == "end work"
+        || lower == "end transaction";
+    let is_rollback = lower == "rollback"
+        || lower == "rollback work"
+        || lower == "rollback transaction"
+        || lower == "abort";
     if chain && !is_commit && !is_rollback {
-        send_error_response(stream, "42601", "AND CHAIN is only valid on COMMIT or ROLLBACK")
-            .await?;
+        send_error_response(
+            stream,
+            "42601",
+            "AND CHAIN is only valid on COMMIT or ROLLBACK",
+        )
+        .await?;
         return Ok(true);
     }
 
@@ -3302,7 +3428,12 @@ where
         if state.transaction.is_some() {
             // PostgreSQL warns and carries on rather than failing: nesting is
             // not supported, but neither is losing the block already open.
-            send_notice(stream, "25001", "there is already a transaction in progress").await?;
+            send_notice(
+                stream,
+                "25001",
+                "there is already a transaction in progress",
+            )
+            .await?;
         } else {
             // Characteristics named on the BEGIN itself, else whatever the
             // session was set to, else the defaults.
@@ -3451,8 +3582,12 @@ where
         let modes = match TransactionModes::parse(rest) {
             Ok(m) => m,
             Err(e) => {
-                send_error_response(stream, "42601", &format!("syntax error in SET TRANSACTION: {}", e))
-                    .await?;
+                send_error_response(
+                    stream,
+                    "42601",
+                    &format!("syntax error in SET TRANSACTION: {}", e),
+                )
+                .await?;
                 return Ok(true);
             }
         };
@@ -3583,8 +3718,7 @@ where
                         database.transactions.rollback_savepoint(target);
                         t.savepoints.truncate(index);
 
-                        let parent =
-                            t.savepoints.last().map(|sp| sp.id).unwrap_or(t.id);
+                        let parent = t.savepoints.last().map(|sp| sp.id).unwrap_or(t.id);
                         let fresh = database.transactions.begin_savepoint(parent);
                         t.savepoints.push(Savepoint {
                             name,
@@ -3608,8 +3742,8 @@ where
         return Ok(true);
     }
 
-    if let Some(rest) = strip_keyword(&lower, "release savepoint")
-        .or_else(|| strip_keyword(&lower, "release"))
+    if let Some(rest) =
+        strip_keyword(&lower, "release savepoint").or_else(|| strip_keyword(&lower, "release"))
     {
         let Some(name) = savepoint_name(rest) else {
             send_error_response(stream, "42601", "RELEASE requires a savepoint name").await?;
@@ -3830,7 +3964,9 @@ where
     // through to the runtime-parameter branch below and came back as an empty
     // column named "databases". Same trap the comment above describes, one
     // layer up.
-    if (s_lower.starts_with("set ") || s_lower.starts_with("show ") || s_lower.starts_with("reset "))
+    if (s_lower.starts_with("set ")
+        || s_lower.starts_with("show ")
+        || s_lower.starts_with("reset "))
         && (recognize_query_purpose(s).is_some() || parse_database_statement(s).is_some())
     {
         return Ok(false);
@@ -3859,7 +3995,11 @@ where
     }
 
     if let Some(reason) = crate::core::rql::lexer_alter::no_op_reason(s) {
-        log::info!("accepted without acting: {} ({})", s.lines().next().unwrap_or(s), reason);
+        log::info!(
+            "accepted without acting: {} ({})",
+            s.lines().next().unwrap_or(s),
+            reason
+        );
         let tag = s
             .split_whitespace()
             .take(2)
@@ -3884,11 +4024,7 @@ where
         if !omit_description {
             send_row_description(stream, &[("version", DbType::STRING)], &[]).await?;
         }
-        send_data_row(
-            stream,
-            &[Some(b"rasterizeddb (pgwire) 0.2.0")],
-        )
-        .await?;
+        send_data_row(stream, &[Some(b"rasterizeddb (pgwire) 0.2.0")]).await?;
         send_command_complete(stream, "SELECT 1").await?;
         return Ok(true);
     }
@@ -4154,7 +4290,7 @@ fn format_column_binary(db_type: DbType, bytes: &[u8], scale: Option<u32>) -> Op
     if matches!(db_type, DbType::NULL | DbType::START | DbType::END) {
         return None;
     }
-    
+
     match db_type {
         // `jsonb`'s binary form is a one-byte format version followed by the
         // document text. Sent as bare text it reached the client as
@@ -4180,59 +4316,71 @@ fn format_column_binary(db_type: DbType, bytes: &[u8], scale: Option<u32>) -> Op
             Some(out)
         }
         DbType::I8 | DbType::U8 => {
-             if bytes.len() == 1 {
-                 let val = bytes[0] as i16;
-                 Some(val.to_be_bytes().to_vec())
-             } else { None }
+            if bytes.len() == 1 {
+                let val = bytes[0] as i16;
+                Some(val.to_be_bytes().to_vec())
+            } else {
+                None
+            }
         }
         DbType::I16 | DbType::U16 => {
-             if bytes.len() == 2 {
-                 let mut arr = [0u8; 2];
-                 arr.copy_from_slice(bytes);
-                 let val = u16::from_le_bytes(arr);
-                 Some(val.to_be_bytes().to_vec())
-             } else { None }
+            if bytes.len() == 2 {
+                let mut arr = [0u8; 2];
+                arr.copy_from_slice(bytes);
+                let val = u16::from_le_bytes(arr);
+                Some(val.to_be_bytes().to_vec())
+            } else {
+                None
+            }
         }
         DbType::I32 | DbType::U32 => {
-             if bytes.len() == 4 {
-                 let mut arr = [0u8; 4];
-                 arr.copy_from_slice(bytes);
-                 let val = u32::from_le_bytes(arr);
-                 Some(val.to_be_bytes().to_vec())
-             } else { None }
+            if bytes.len() == 4 {
+                let mut arr = [0u8; 4];
+                arr.copy_from_slice(bytes);
+                let val = u32::from_le_bytes(arr);
+                Some(val.to_be_bytes().to_vec())
+            } else {
+                None
+            }
         }
         DbType::I64 | DbType::U64 => {
-             if bytes.len() == 8 {
-                 let mut arr = [0u8; 8];
-                 arr.copy_from_slice(bytes);
-                 let val = u64::from_le_bytes(arr);
-                 Some(val.to_be_bytes().to_vec())
-             } else { None }
+            if bytes.len() == 8 {
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(bytes);
+                let val = u64::from_le_bytes(arr);
+                Some(val.to_be_bytes().to_vec())
+            } else {
+                None
+            }
         }
         DbType::F32 => {
-             if bytes.len() == 4 {
-                 let mut arr = [0u8; 4];
-                 arr.copy_from_slice(bytes);
-                 let val = u32::from_le_bytes(arr);
-                 Some(val.to_be_bytes().to_vec())
-             } else { None }
+            if bytes.len() == 4 {
+                let mut arr = [0u8; 4];
+                arr.copy_from_slice(bytes);
+                let val = u32::from_le_bytes(arr);
+                Some(val.to_be_bytes().to_vec())
+            } else {
+                None
+            }
         }
         DbType::F64 => {
-             if bytes.len() == 8 {
-                 let mut arr = [0u8; 8];
-                 arr.copy_from_slice(bytes);
-                 let val = u64::from_le_bytes(arr);
-                 Some(val.to_be_bytes().to_vec())
-             } else { None }
+            if bytes.len() == 8 {
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(bytes);
+                let val = u64::from_le_bytes(arr);
+                Some(val.to_be_bytes().to_vec())
+            } else {
+                None
+            }
         }
         DbType::BOOL => {
-             if !bytes.is_empty() {
-                 Some(vec![if bytes[0] != 0 { 1 } else { 0 }])
-             } else { Some(vec![0]) }
+            if !bytes.is_empty() {
+                Some(vec![if bytes[0] != 0 { 1 } else { 0 }])
+            } else {
+                Some(vec![0])
+            }
         }
-        DbType::STRING | DbType::UNKNOWN => {
-             Some(bytes.to_vec())
-        }
+        DbType::STRING | DbType::UNKNOWN => Some(bytes.to_vec()),
         // Both are stored in the representation Postgres uses on the wire, so
         // the binary form is the stored bytes unchanged.
         // Both are stored in the representation Postgres uses on the wire, so
@@ -4272,7 +4420,11 @@ fn format_column_binary(db_type: DbType, bytes: &[u8], scale: Option<u32>) -> Op
                 let mut arr = [0u8; 8];
                 arr.copy_from_slice(bytes);
                 let us = i64::from_le_bytes(arr);
-                Some((us - crate::core::value_codec::PG_EPOCH_OFFSET_US).to_be_bytes().to_vec())
+                Some(
+                    (us - crate::core::value_codec::PG_EPOCH_OFFSET_US)
+                        .to_be_bytes()
+                        .to_vec(),
+                )
             } else {
                 None
             }
@@ -4315,7 +4467,7 @@ fn format_column_binary(db_type: DbType, bytes: &[u8], scale: Option<u32>) -> Op
         | DbType::TSRANGE
         | DbType::TSTZRANGE
         | DbType::DATERANGE => Some(bytes.to_vec()),
-        _ => format_column_text(db_type, bytes).map(|s| s.into_bytes())
+        _ => format_column_text(db_type, bytes).map(|s| s.into_bytes()),
     }
 }
 
@@ -4324,11 +4476,7 @@ fn format_column_text(db_type: DbType, bytes: &[u8]) -> Option<String> {
 }
 
 /// Renders a value, honouring a column's declared decimal scale.
-fn format_column_text_scaled(
-    db_type: DbType,
-    bytes: &[u8],
-    scale: Option<u32>,
-) -> Option<String> {
+fn format_column_text_scaled(db_type: DbType, bytes: &[u8], scale: Option<u32>) -> Option<String> {
     if let (DbType::DECIMAL, Some(scale)) = (&db_type, scale) {
         if bytes.len() == 16 {
             let mut arr = [0u8; 16];
@@ -4348,7 +4496,10 @@ fn format_column_text_inner(db_type: DbType, bytes: &[u8]) -> Option<String> {
         return None;
     }
 
-    trace!("Formatting column of type {:?} with bytes: {:?}", db_type, bytes);
+    trace!(
+        "Formatting column of type {:?} with bytes: {:?}",
+        db_type, bytes
+    );
 
     // Some older/alternate paths may store fixed-width numeric types as ASCII decimal
     // bytes (optionally NUL-padded). When pgwire formats these as binary little-endian
@@ -4523,7 +4674,11 @@ fn format_column_text_inner(db_type: DbType, bytes: &[u8]) -> Option<String> {
         DbType::BOOL => {
             // Postgres canonical text is 't' or 'f'.
             let is_true = bytes.first().copied().unwrap_or(0) != 0;
-            if is_true { "t".to_string() } else { "f".to_string() }
+            if is_true {
+                "t".to_string()
+            } else {
+                "f".to_string()
+            }
         }
 
         DbType::CHAR => {
@@ -4852,7 +5007,11 @@ where
 
     if config.method == AuthMethod::Trust {
         send_auth_ok(stream).await?;
-        return Ok(Principal { name: user, superuser: false, authenticated: false });
+        return Ok(Principal {
+            name: user,
+            superuser: false,
+            authenticated: false,
+        });
     }
 
     if user.is_empty() {
@@ -4947,7 +5106,11 @@ where
     }
 
     send_auth_ok(stream).await?;
-    Ok(Principal { name: user, superuser, authenticated: true })
+    Ok(Principal {
+        name: user,
+        superuser,
+        authenticated: true,
+    })
 }
 
 /// Reads a PasswordMessage ('p') and returns its payload as text.
@@ -4963,7 +5126,10 @@ where
         ));
     }
     // The trailing NUL is present for a password but not for SASL data.
-    let end = payload.iter().position(|&b| b == 0).unwrap_or(payload.len());
+    let end = payload
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(payload.len());
     Ok(String::from_utf8_lossy(&payload[..end]).to_string())
 }
 
@@ -4990,7 +5156,10 @@ where
         ));
     }
     let end = (i + len as usize).min(payload.len());
-    Ok((mechanism, String::from_utf8_lossy(&payload[i..end]).to_string()))
+    Ok((
+        mechanism,
+        String::from_utf8_lossy(&payload[i..end]).to_string(),
+    ))
 }
 
 /// Reads one tagged protocol message.
@@ -5002,7 +5171,10 @@ where
     stream.read_exact(&mut tag).await?;
     let len = read_i32_be(stream).await?;
     if len < 4 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid message length"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid message length",
+        ));
     }
     let mut payload = vec![0u8; (len - 4) as usize];
     stream.read_exact(&mut payload).await?;
@@ -5282,14 +5454,21 @@ where
 {
     let len = read_i32_be(stream).await?;
     if len < 8 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid startup packet"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid startup packet",
+        ));
     }
     let mut buf = vec![0u8; (len - 4) as usize];
     stream.read_exact(&mut buf).await?;
     Ok((len, buf))
 }
 
-async fn send_fatal_error_response<S>(stream: &mut S, sqlstate: &str, message: &str) -> io::Result<()>
+async fn send_fatal_error_response<S>(
+    stream: &mut S,
+    sqlstate: &str,
+    message: &str,
+) -> io::Result<()>
 where
     S: AsyncWrite + Unpin,
 {
@@ -5351,7 +5530,10 @@ fn build_tls_acceptor(tls: &TlsConfig) -> io::Result<TlsAcceptor> {
     Ok(TlsAcceptor::from(StdArc::new(config)))
 }
 
-fn load_tls_from_pem(cert_path: &str, key_path: &str) -> io::Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+fn load_tls_from_pem(
+    cert_path: &str,
+    key_path: &str,
+) -> io::Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
     let cert_bytes = std::fs::read(cert_path)?;
     let key_bytes = std::fs::read(key_path)?;
 
@@ -5381,11 +5563,26 @@ mod sqlstate_tests {
     #[test]
     fn engine_failures_map_to_the_codes_drivers_branch_on() {
         for (message, code) in [
-            ("duplicate value for UNIQUE column \"email\" (row 7 already holds it)", "23505"),
-            ("insert or update on table \"orders\" violates foreign key constraint \"fk\": key (1) is not present in \"users\"", "23503"),
-            ("update or delete on table \"users\" violates foreign key constraint \"fk\" on table \"orders\"", "23503"),
-            ("null value in column \"name\" of relation \"users\" violates not-null constraint", "23502"),
-            ("could not serialize access due to concurrent update of row 3 by transaction 9", "40001"),
+            (
+                "duplicate value for UNIQUE column \"email\" (row 7 already holds it)",
+                "23505",
+            ),
+            (
+                "insert or update on table \"orders\" violates foreign key constraint \"fk\": key (1) is not present in \"users\"",
+                "23503",
+            ),
+            (
+                "update or delete on table \"users\" violates foreign key constraint \"fk\" on table \"orders\"",
+                "23503",
+            ),
+            (
+                "null value in column \"name\" of relation \"users\" violates not-null constraint",
+                "23502",
+            ),
+            (
+                "could not serialize access due to concurrent update of row 3 by transaction 9",
+                "40001",
+            ),
             ("relation 'nope' does not exist", "42P01"),
             ("Table not found", "42P01"),
             ("column 'nope' does not exist", "42703"),
@@ -5395,7 +5592,10 @@ mod sqlstate_tests {
             ("value 300 is out of range for type U8", "22003"),
             ("permission denied: CREATE ROLE requires superuser", "42501"),
             ("NOT LIKE is not supported yet", "0A000"),
-            ("unexpected Ident(\"x\") after the end of the expression", "42601"),
+            (
+                "unexpected Ident(\"x\") after the end of the expression",
+                "42601",
+            ),
             ("something nobody anticipated", "XX000"),
         ] {
             assert_eq!(sqlstate_for(message), code, "{message:?}");
@@ -5405,7 +5605,7 @@ mod sqlstate_tests {
 
 #[cfg(test)]
 mod authorization_tests {
-    use super::{privileged_statement, Principal};
+    use super::{Principal, privileged_statement};
 
     #[test]
     fn administration_is_recognised_regardless_of_case_and_spacing() {
@@ -5416,7 +5616,10 @@ mod authorization_tests {
             ("drop role r;", "DROP ROLE"),
             ("CREATE DATABASE staging", "CREATE DATABASE"),
             ("DROP DATABASE IF EXISTS staging", "DROP DATABASE"),
-            ("IMPORT DATABASE FROM POSTGRES 'postgresql://x' INTO y", "IMPORT DATABASE"),
+            (
+                "IMPORT DATABASE FROM POSTGRES 'postgresql://x' INTO y",
+                "IMPORT DATABASE",
+            ),
             ("SET CONFIG filter.max_f = 14", "SET CONFIG"),
             ("SET FILTER max_f = 14", "SET FILTER"),
             ("RESET FILTER", "SET FILTER"),
@@ -5452,9 +5655,21 @@ mod authorization_tests {
 
     #[test]
     fn only_a_proven_non_superuser_is_refused() {
-        let trusted = Principal { name: "anyone".into(), superuser: false, authenticated: false };
-        let admin = Principal { name: "root".into(), superuser: true, authenticated: true };
-        let user = Principal { name: "app".into(), superuser: false, authenticated: true };
+        let trusted = Principal {
+            name: "anyone".into(),
+            superuser: false,
+            authenticated: false,
+        };
+        let admin = Principal {
+            name: "root".into(),
+            superuser: true,
+            authenticated: true,
+        };
+        let user = Principal {
+            name: "app".into(),
+            superuser: false,
+            authenticated: true,
+        };
         assert!(trusted.may_administer(), "trust has no one to refuse");
         assert!(admin.may_administer());
         assert!(!user.may_administer());
@@ -5471,7 +5686,9 @@ mod command_tag_tests {
         // consulted that spelling before decoding the integer, so any value
         // whose bytes happen to be ASCII digits came back as text. It affects
         // the plainest values there are: 48 rendered as "0" and 57 as "9".
-        for value in [0i32, 1, 47, 48, 49, 53, 57, 58, 12336, 12337, 13616, 13625, 14649, 65536] {
+        for value in [
+            0i32, 1, 47, 48, 49, 53, 57, 58, 12336, 12337, 13616, 13625, 14649, 65536,
+        ] {
             assert_eq!(
                 format_column_text(DbType::I32, &value.to_le_bytes()),
                 Some(value.to_string()),
@@ -5488,15 +5705,24 @@ mod command_tag_tests {
             );
         }
         // A single byte holding ASCII '0' is the number 48, not the digit 0.
-        assert_eq!(format_column_text(DbType::I8, &[b'0']), Some("48".to_string()));
+        assert_eq!(
+            format_column_text(DbType::I8, &[b'0']),
+            Some("48".to_string())
+        );
     }
 
     #[test]
     fn a_value_stored_as_text_is_still_read_when_its_width_does_not_match() {
         // The ASCII path exists for values written as decimal text rather than
         // encoded; it stays reachable, just no longer ahead of the type.
-        assert_eq!(format_column_text(DbType::I32, b"123"), Some("123".to_string()));
-        assert_eq!(format_column_text(DbType::I64, b"4567"), Some("4567".to_string()));
+        assert_eq!(
+            format_column_text(DbType::I32, b"123"),
+            Some("123".to_string())
+        );
+        assert_eq!(
+            format_column_text(DbType::I64, b"4567"),
+            Some("4567".to_string())
+        );
     }
 
     use super::*;
@@ -5530,7 +5756,10 @@ mod command_tag_tests {
     /// A row count on a DDL tag would be malformed — PostgreSQL sends none.
     #[test]
     fn ddl_never_carries_a_count() {
-        assert_eq!(command_tag(PurposeKind::CreateTable, Some(3)), "CREATE TABLE");
+        assert_eq!(
+            command_tag(PurposeKind::CreateTable, Some(3)),
+            "CREATE TABLE"
+        );
         assert_eq!(command_tag(PurposeKind::AlterTable, Some(3)), "ALTER TABLE");
     }
 }
@@ -5542,7 +5771,11 @@ mod command_tag_tests {
 /// A driver handed `inf` for a `float8` rejects the row — the value was right
 /// and unreadable, which is the worst combination.
 fn format_float(value: f64) -> String {
-    match non_finite(value.is_nan(), value.is_infinite(), value.is_sign_negative()) {
+    match non_finite(
+        value.is_nan(),
+        value.is_infinite(),
+        value.is_sign_negative(),
+    ) {
         Some(text) => text.to_string(),
         None => value.to_string(),
     }
@@ -5550,7 +5783,11 @@ fn format_float(value: f64) -> String {
 
 /// The same, at single precision.
 fn format_float_32(value: f32) -> String {
-    match non_finite(value.is_nan(), value.is_infinite(), value.is_sign_negative()) {
+    match non_finite(
+        value.is_nan(),
+        value.is_infinite(),
+        value.is_sign_negative(),
+    ) {
         Some(text) => text.to_string(),
         None => value.to_string(),
     }
@@ -5654,7 +5891,10 @@ mod setting_tests {
     /// different answer from "off" and must not be confused with it.
     #[test]
     fn reset_and_default_ask_to_follow_the_server() {
-        assert_eq!(strip_setting("reset synchronous_commit", "synchronous_commit"), Some(None));
+        assert_eq!(
+            strip_setting("reset synchronous_commit", "synchronous_commit"),
+            Some(None)
+        );
         assert_eq!(
             strip_setting("set synchronous_commit = default", "synchronous_commit"),
             Some(None)
@@ -5666,8 +5906,14 @@ mod setting_tests {
     /// here and silently change durability instead.
     #[test]
     fn a_longer_key_that_starts_the_same_is_not_this_one() {
-        assert_eq!(strip_setting("set synchronous_commit_timeout = 5", "synchronous_commit"), None);
-        assert_eq!(strip_setting("reset synchronous_commit_timeout", "synchronous_commit"), None);
+        assert_eq!(
+            strip_setting("set synchronous_commit_timeout = 5", "synchronous_commit"),
+            None
+        );
+        assert_eq!(
+            strip_setting("reset synchronous_commit_timeout", "synchronous_commit"),
+            None
+        );
     }
 
     #[test]
@@ -5678,7 +5924,12 @@ mod setting_tests {
             "show synchronous_commit",
             "set transaction isolation level serializable",
         ] {
-            assert_eq!(strip_setting(stmt, "synchronous_commit"), None, "claimed: {}", stmt);
+            assert_eq!(
+                strip_setting(stmt, "synchronous_commit"),
+                None,
+                "claimed: {}",
+                stmt
+            );
         }
     }
 }
@@ -5715,7 +5966,10 @@ mod describe_rowless_family_tests {
             .expect("describe failed")
             .expect("SHOW BACKUPS described as returning no columns");
 
-        assert!(is_select, "SHOW BACKUPS returns rows, so it must describe as a select");
+        assert!(
+            is_select,
+            "SHOW BACKUPS returns rows, so it must describe as a select"
+        );
         let names: Vec<&str> = fields.iter().map(|(name, _)| *name).collect();
         assert_eq!(
             names,
@@ -5784,7 +6038,10 @@ mod describe_rowless_family_tests {
                 .expect("describe failed")
                 .unwrap_or_else(|| panic!("{sql} described as returning no columns"));
             assert!(is_select, "{sql}");
-            assert!(!fields.is_empty(), "{sql} described with an empty column list");
+            assert!(
+                !fields.is_empty(),
+                "{sql} described with an empty column list"
+            );
         }
     }
 }

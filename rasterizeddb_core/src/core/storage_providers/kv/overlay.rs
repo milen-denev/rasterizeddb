@@ -138,7 +138,10 @@ impl Overlay {
         {
             return true;
         }
-        self.spans.range(start..).next().is_some_and(|(&k, _)| k < end)
+        self.spans
+            .range(start..)
+            .next()
+            .is_some_and(|(&k, _)| k < end)
     }
 
     /// Whether one span covers all of `[start, end)`, so no base read is needed.
@@ -197,7 +200,9 @@ impl Overlay {
         }
         let keys: Vec<u64> = self.spans.range(..limit).map(|(&k, _)| k).collect();
         for k in keys {
-            let Some(span) = self.spans.remove(&k) else { continue };
+            let Some(span) = self.spans.remove(&k) else {
+                continue;
+            };
             self.bytes -= span.len() as u64;
             let end = k + span.len() as u64;
             if end <= limit {

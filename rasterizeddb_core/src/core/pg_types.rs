@@ -225,7 +225,9 @@ fn apply_unit(out: &mut Interval, value: f64, unit: &str) -> Option<()> {
             .micros
             .checked_add(((total - whole) * 86_400_000_000.0).round() as i64)?;
     } else {
-        out.micros = out.micros.checked_add((value * micros_per).round() as i64)?;
+        out.micros = out
+            .micros
+            .checked_add((value * micros_per).round() as i64)?;
     }
     Some(())
 }
@@ -343,8 +345,7 @@ pub fn shift_timestamp(micros_since_epoch: i64, span: Interval) -> Option<i64> {
     }
 
     days = days.checked_add(span.days as i64)?;
-    days
-        .checked_mul(86_400_000_000)?
+    days.checked_mul(86_400_000_000)?
         .checked_add(time_of_day)?
         .checked_add(span.micros)
 }
@@ -383,13 +384,25 @@ pub fn format_interval(bytes: &[u8]) -> Option<String> {
     let years = iv.months / 12;
     let months = iv.months % 12;
     if years != 0 {
-        parts.push(format!("{} year{}", years, if years.abs() == 1 { "" } else { "s" }));
+        parts.push(format!(
+            "{} year{}",
+            years,
+            if years.abs() == 1 { "" } else { "s" }
+        ));
     }
     if months != 0 {
-        parts.push(format!("{} mon{}", months, if months.abs() == 1 { "" } else { "s" }));
+        parts.push(format!(
+            "{} mon{}",
+            months,
+            if months.abs() == 1 { "" } else { "s" }
+        ));
     }
     if iv.days != 0 {
-        parts.push(format!("{} day{}", iv.days, if iv.days.abs() == 1 { "" } else { "s" }));
+        parts.push(format!(
+            "{} day{}",
+            iv.days,
+            if iv.days.abs() == 1 { "" } else { "s" }
+        ));
     }
 
     if iv.micros != 0 || parts.is_empty() {
@@ -456,7 +469,11 @@ pub fn parse_macaddr<const WIDTH: usize>(text: &str) -> Option<[u8; WIDTH]> {
 
 /// The canonical `08:00:2b:01:02:03` form.
 pub fn format_macaddr(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(":")
+    bytes
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 // -------------------------------------------------------------- BIT STRING
@@ -543,7 +560,11 @@ pub fn format_bit_string(bytes: &[u8]) -> Option<String> {
     let mut out = String::with_capacity(length);
     for i in 0..length {
         let byte = payload[i / 8];
-        out.push(if byte & (0x80 >> (i % 8)) != 0 { '1' } else { '0' });
+        out.push(if byte & (0x80 >> (i % 8)) != 0 {
+            '1'
+        } else {
+            '0'
+        });
     }
     Some(out)
 }
@@ -653,7 +674,11 @@ fn strip_zone(text: &str) -> (&str, Option<i32>) {
 /// indistinguishable, and PostgreSQL prints them differently.
 pub fn parse_timetz(text: &str) -> Option<Vec<u8>> {
     let text = text.trim();
-    let clock = if text.contains(' ') { text.split(' ').nth(1)? } else { text };
+    let clock = if text.contains(' ') {
+        text.split(' ').nth(1)?
+    } else {
+        text
+    };
     let (body, zone) = strip_zone(clock);
     let (micros, negative) = parse_clock(body)?;
     if negative || !(0..=86_400_000_000).contains(&micros) {
@@ -776,8 +801,16 @@ pub fn parse_box(text: &str) -> Option<Vec<u8>> {
     if c.len() != 4 {
         return None;
     }
-    let (x1, x2) = if c[0] >= c[2] { (c[0], c[2]) } else { (c[2], c[0]) };
-    let (y1, y2) = if c[1] >= c[3] { (c[1], c[3]) } else { (c[3], c[1]) };
+    let (x1, x2) = if c[0] >= c[2] {
+        (c[0], c[2])
+    } else {
+        (c[2], c[0])
+    };
+    let (y1, y2) = if c[1] >= c[3] {
+        (c[1], c[3])
+    } else {
+        (c[3], c[1])
+    };
     Some(encode_f64s(&[x1, y1, x2, y2]))
 }
 
@@ -874,7 +907,11 @@ pub fn format_path(bytes: &[u8]) -> Option<String> {
         .map(|p| format!("({},{})", format_f64(p[0]), format_f64(p[1])))
         .collect::<Vec<_>>()
         .join(",");
-    Some(if closed { format!("({})", body) } else { format!("[{}]", body) })
+    Some(if closed {
+        format!("({})", body)
+    } else {
+        format!("[{}]", body)
+    })
 }
 
 /// `POLYGON`: a point count then the points. Always closed, so it carries no
@@ -926,7 +963,13 @@ pub fn geometry_points(db_type: &DbType, bytes: &[u8]) -> Option<Vec<(f64, f64)>
         }
         _ => return None,
     };
-    Some(coords.chunks(2).filter(|c| c.len() == 2).map(|c| (c[0], c[1])).collect())
+    Some(
+        coords
+            .chunks(2)
+            .filter(|c| c.len() == 2)
+            .map(|c| (c[0], c[1]))
+            .collect(),
+    )
 }
 
 /// A circle's centre and radius.
@@ -1006,7 +1049,10 @@ pub fn range_element(db_type: &DbType) -> Option<DbType> {
 /// and `int4range(1,11,'[)')` would compare unequal and one would answer a
 /// containment test the other refused.
 fn range_is_discrete(db_type: &DbType) -> bool {
-    matches!(db_type, DbType::INT4RANGE | DbType::INT8RANGE | DbType::DATERANGE)
+    matches!(
+        db_type,
+        DbType::INT4RANGE | DbType::INT8RANGE | DbType::DATERANGE
+    )
 }
 
 /// One element of a range, in the element type's binary wire form.
@@ -1021,7 +1067,11 @@ fn encode_range_element(element: &DbType, text: &str) -> Option<Vec<u8>> {
         }
         DbType::DATETIME => {
             let us = crate::core::value_codec::parse_timestamp_us(text)?;
-            Some((us - crate::core::value_codec::PG_EPOCH_OFFSET_US).to_be_bytes().to_vec())
+            Some(
+                (us - crate::core::value_codec::PG_EPOCH_OFFSET_US)
+                    .to_be_bytes()
+                    .to_vec(),
+            )
         }
         DbType::DATE => Some(parse_date(text)?.to_be_bytes().to_vec()),
         _ => None,
@@ -1035,7 +1085,10 @@ fn format_range_element(element: &DbType, bytes: &[u8]) -> Option<String> {
         DbType::DECIMAL => decode_pg_numeric(bytes),
         DbType::DATETIME => {
             let us = be_i64(bytes, 0)? + crate::core::value_codec::PG_EPOCH_OFFSET_US;
-            Some(format!("\"{}\"", crate::core::value_codec::format_timestamp_us(us)))
+            Some(format!(
+                "\"{}\"",
+                crate::core::value_codec::format_timestamp_us(us)
+            ))
         }
         DbType::DATE => format_date(bytes),
         _ => None,
@@ -1078,7 +1131,9 @@ pub fn decode_pg_numeric(bytes: &[u8]) -> Option<String> {
 
     let mut digits = Vec::with_capacity(count as usize);
     for i in 0..count as usize {
-        digits.push(u16::from_be_bytes(bytes.get(8 + i * 2..10 + i * 2)?.try_into().ok()?));
+        digits.push(u16::from_be_bytes(
+            bytes.get(8 + i * 2..10 + i * 2)?.try_into().ok()?,
+        ));
     }
 
     // Lay the base-10000 groups out on a decimal-digit line, then cut it at the
@@ -1087,7 +1142,11 @@ pub fn decode_pg_numeric(bytes: &[u8]) -> Option<String> {
     let mut fractional = String::new();
     for (i, group) in digits.iter().enumerate() {
         let position = weight as i32 - i as i32;
-        let text = if i == 0 { group.to_string() } else { format!("{:04}", group) };
+        let text = if i == 0 {
+            group.to_string()
+        } else {
+            format!("{:04}", group)
+        };
         if position >= 0 {
             if position > 0 && i == 0 {
                 integral.push_str(&text);
@@ -1204,10 +1263,12 @@ pub fn parse_range(db_type: &DbType, text: &str) -> Option<Vec<u8>> {
     // A range whose bounds cross is empty, and PostgreSQL stores it as such
     // rather than as a range nothing satisfies.
     if let (Some(lo), Some(hi)) = (&lower, &upper) {
-        let (lo_key, hi_key) =
-            (range_element_key(&element, lo)?, range_element_key(&element, hi)?);
-        let crossed = lo_key > hi_key
-            || (lo_key == hi_key && !(lower_inclusive && upper_inclusive));
+        let (lo_key, hi_key) = (
+            range_element_key(&element, lo)?,
+            range_element_key(&element, hi)?,
+        );
+        let crossed =
+            lo_key > hi_key || (lo_key == hi_key && !(lower_inclusive && upper_inclusive));
         if crossed {
             return Some(vec![range_flags::EMPTY]);
         }
@@ -1239,9 +1300,19 @@ pub fn parse_range(db_type: &DbType, text: &str) -> Option<Vec<u8>> {
 
 fn step_element(element: &DbType, bytes: &[u8], by: i64) -> Option<Vec<u8>> {
     match element {
-        DbType::I32 => Some(be_i32(bytes, 0)?.checked_add(by as i32)?.to_be_bytes().to_vec()),
+        DbType::I32 => Some(
+            be_i32(bytes, 0)?
+                .checked_add(by as i32)?
+                .to_be_bytes()
+                .to_vec(),
+        ),
         DbType::I64 => Some(be_i64(bytes, 0)?.checked_add(by)?.to_be_bytes().to_vec()),
-        DbType::DATE => Some(be_i32(bytes, 0)?.checked_add(by as i32)?.to_be_bytes().to_vec()),
+        DbType::DATE => Some(
+            be_i32(bytes, 0)?
+                .checked_add(by as i32)?
+                .to_be_bytes()
+                .to_vec(),
+        ),
         _ => None,
     }
 }

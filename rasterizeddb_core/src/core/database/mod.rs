@@ -4,14 +4,11 @@ mod native_authz_tests;
 #[cfg(test)]
 mod rename_tests;
 
-use std::{
-    fmt, io,
-    sync::atomic::AtomicU64,
-};
+use std::{fmt, io, sync::atomic::AtomicU64};
 
+use cacheguard::CacheGuard;
 use rclite::Arc;
 use std::sync::Arc as StdArc;
-use cacheguard::CacheGuard;
 
 use crate::core::mvcc::TransactionManager;
 use crate::core::mvcc::status::StatusLog;
@@ -22,14 +19,20 @@ use rastcp::server::{TcpServer, TcpServerBuilder};
 use smallvec::{SmallVec, smallvec};
 
 use crate::{
+    SERVER_PORT,
     core::{
-        db_type::DbType, processor::concurrent_processor::ConcurrentProcessor, row::{
+        db_type::DbType,
+        processor::concurrent_processor::ConcurrentProcessor,
+        row::{
             row::{ColumnFetchingData, ColumnWritePayload, RowFetch, RowWrite},
             row_pointer::{RowPointer, RowPointerIterator},
             schema::{SchemaCalculator, SchemaField, TableSchema},
             table::Table,
-        }, rql::{executor::execute, lexer_ct::CreateTable, lexer_s1::recognize_query_purpose}, storage_providers::{backend::DbStorageProvider, traits::StorageIO}
-    }, memory_pool::MEMORY_POOL, SERVER_PORT
+        },
+        rql::{executor::execute, lexer_ct::CreateTable, lexer_s1::recognize_query_purpose},
+        storage_providers::{backend::DbStorageProvider, traits::StorageIO},
+    },
+    memory_pool::MEMORY_POOL,
 };
 
 /// Where the native listener binds.
@@ -323,9 +326,9 @@ async fn seed_on_other_backend(
             return Some(existing.clone());
         }
         let seed: Arc<DbStorageProvider> = match &backend {
-            TableBackend::Memory => {
-                Arc::new(DbStorageProvider::new_memory(&format!("{_table_name}_pointers.db")))
-            }
+            TableBackend::Memory => Arc::new(DbStorageProvider::new_memory(&format!(
+                "{_table_name}_pointers.db"
+            ))),
             #[cfg(feature = "kv_storage")]
             TableBackend::KeyValue(store) => match _kv.family(store).await {
                 Ok(family) => match DbStorageProvider::new_key_value(
@@ -408,7 +411,9 @@ fn backend_is_openable(_pool: &StoragePool, _kv: &KvStores, _table_name: &str) -
 /// would scatter that table's files where a later, correct run would find them
 /// as orphans; this way the damage cannot outlive the process.
 fn fallback_seed(table_name: &str) -> Arc<DbStorageProvider> {
-    Arc::new(DbStorageProvider::new_memory(&format!("{table_name}_pointers.db")))
+    Arc::new(DbStorageProvider::new_memory(&format!(
+        "{table_name}_pointers.db"
+    )))
 }
 
 #[cfg(feature = "storage_pools")]
@@ -423,8 +428,14 @@ async fn seed_in(
     // tables that will never take that branch. `seed_in` is on `add_table`'s
     // await chain, which already sits close to a test thread's 2 MiB stack, and
     // an inlined future here would be paid for by every table.
-    if let Some(seed) =
-        Box::pin(seed_on_other_backend(io_pointers, pool, kv, seeds, table_name)).await
+    if let Some(seed) = Box::pin(seed_on_other_backend(
+        io_pointers,
+        pool,
+        kv,
+        seeds,
+        table_name,
+    ))
+    .await
     {
         return seed;
     }
@@ -432,7 +443,9 @@ async fn seed_in(
         return io_pointers.clone(); // in memory: one place, and it is not a directory
     };
 
-    let at = pool.location_of(table_name).unwrap_or_else(|| root.to_string());
+    let at = pool
+        .location_of(table_name)
+        .unwrap_or_else(|| root.to_string());
     // Read here rather than inherited from `io_pointers`, so a backup location
     // added while the server is running applies to the next table created —
     // the catalogue's own providers were built before it existed and cannot be
@@ -452,11 +465,7 @@ async fn seed_in(
 /// argument, which is what a move needs — it has to open the destination
 /// *before* the placement says the table is there.
 #[cfg(feature = "storage_pools")]
-async fn seed_at(
-    pool: &StoragePool,
-    location: &str,
-    table_name: &str,
-) -> Arc<DbStorageProvider> {
+async fn seed_at(pool: &StoragePool, location: &str, table_name: &str) -> Arc<DbStorageProvider> {
     Arc::new(
         DbStorageProvider::new_mirrored(
             location,
@@ -652,8 +661,7 @@ impl Database {
         // everything else. A backup directory that held every table but not the
         // list of them would not open as a database, which is the one thing a
         // backup copy is for.
-        let open_root =
-            async |name: &str| open_root_file(location, &backups, name).await;
+        let open_root = async |name: &str| open_root_file(location, &backups, name).await;
 
         let io_pointers = if in_memory {
             Arc::new(DbStorageProvider::new_memory("db_data_pointers.db"))
@@ -678,16 +686,28 @@ impl Database {
         let io_schema_clone = io_schema.clone();
 
         tokio::spawn(async move {
-            tokio::join!(io_rows_clone.start_service(), io_pointers_clone.start_service(), io_schema_clone.start_service());
+            tokio::join!(
+                io_rows_clone.start_service(),
+                io_pointers_clone.start_service(),
+                io_schema_clone.start_service()
+            );
         });
-        
+
         let schema = load_db_data_schema(io_schema.clone()).await;
 
         let mut iterator = RowPointerIterator::new(io_pointers.clone()).await.unwrap();
 
         // Before the table list, because what it resolves is which names that
         // list should contain.
-        recover_interrupted_rename(&io_pointers, &io_rows, &io_schema, &storage, &kv_stores, &seeds).await;
+        recover_interrupted_rename(
+            &io_pointers,
+            &io_rows,
+            &io_schema,
+            &storage,
+            &kv_stores,
+            &seeds,
+        )
+        .await;
 
         let tables_names: Vec<(String, u64)> =
             load_db_tables(&schema, &mut iterator, io_rows.clone()).await;
@@ -712,8 +732,11 @@ impl Database {
                     // Refusing to start would be worse than running unversioned,
                     // but running versioned on a log that cannot be written
                     // would report commits that do not survive a restart.
-                    error!("Could not open the transaction status log: {}. \
-                            Transactions will not be durable.", e);
+                    error!(
+                        "Could not open the transaction status log: {}. \
+                            Transactions will not be durable.",
+                        e
+                    );
                     StatusLog::in_memory()
                 }
             }
@@ -858,7 +881,10 @@ impl Database {
         // reach the disk on its own and outlive the rows it speaks for.
         if outcome.is_ok() {
             if let Err(e) = self.transactions.apply_staged() {
-                error!("transaction outcomes could not be written to the status file: {}", e);
+                error!(
+                    "transaction outcomes could not be written to the status file: {}",
+                    e
+                );
                 outcome = Err(e);
             }
         }
@@ -1050,7 +1076,14 @@ impl Database {
         // that is not there, which is also what makes it usable for cleaning up
         // a rename that never finished.
         discard_files(
-            &seed_in(&self.db_io_pointers, &self.storage, &self.kv, &self.seeds, table_name).await,
+            &seed_in(
+                &self.db_io_pointers,
+                &self.storage,
+                &self.kv,
+                &self.seeds,
+                table_name,
+            )
+            .await,
             table_name,
         )
         .await;
@@ -1072,10 +1105,8 @@ impl Database {
                     continue;
                 }
                 // A shadow can itself hold JSON columns, so this walks the chain.
-                if let Err(e) = Box::pin(
-                    self.drop_table_to_depth(&json.shadow_table, depth + 1),
-                )
-                .await
+                if let Err(e) =
+                    Box::pin(self.drop_table_to_depth(&json.shadow_table, depth + 1)).await
                 {
                     // The parent is already gone; failing here would report a
                     // drop that did happen as one that did not.
@@ -1222,7 +1253,10 @@ impl Database {
             if let Some(table) = table {
                 self.tables.insert(old_name.to_string(), table);
             }
-            error!("Rename of {} to {}: schema rewrite failed: {}", old_name, new_name, e);
+            error!(
+                "Rename of {} to {}: schema rewrite failed: {}",
+                old_name, new_name, e
+            );
             return Err(e);
         }
 
@@ -1234,7 +1268,10 @@ impl Database {
             if let Some(table) = table {
                 self.tables.insert(old_name.to_string(), table);
             }
-            error!("Rename of {} to {}: catalogue insert failed: {}", old_name, new_name, e);
+            error!(
+                "Rename of {} to {}: catalogue insert failed: {}",
+                old_name, new_name, e
+            );
             return Err(e);
         }
 
@@ -1272,21 +1309,31 @@ impl Database {
         // directory — but they are resolved separately rather than assumed
         // equal, because that assumption is only true while `pool_rename` runs
         // before this does.
-        let from = seed_in(&self.db_io_pointers, &self.storage, &self.kv, &self.seeds, old_name).await;
-        let to = seed_in(&self.db_io_pointers, &self.storage, &self.kv, &self.seeds, new_name).await;
+        let from = seed_in(
+            &self.db_io_pointers,
+            &self.storage,
+            &self.kv,
+            &self.seeds,
+            old_name,
+        )
+        .await;
+        let to = seed_in(
+            &self.db_io_pointers,
+            &self.storage,
+            &self.kv,
+            &self.seeds,
+            new_name,
+        )
+        .await;
 
         for suffix in RENAMED_SUFFIXES {
-            let source = from
-                .create_new(format!("{}{}", old_name, suffix))
-                .await;
+            let source = from.create_new(format!("{}{}", old_name, suffix)).await;
             let len = source.get_len().await;
             if len == 0 {
                 continue;
             }
 
-            let destination = to
-                .create_new(format!("{}{}", new_name, suffix))
-                .await;
+            let destination = to.create_new(format!("{}{}", new_name, suffix)).await;
 
             // Chunked rather than one allocation: a table is not bounded by
             // memory and a rename of a large one should not be.
@@ -1330,7 +1377,14 @@ impl Database {
     /// frees the most space for the fewest copies.
     #[cfg(feature = "storage_pools")]
     pub async fn table_bytes(&self, table_name: &str) -> u64 {
-        let seed = seed_in(&self.db_io_pointers, &self.storage, &self.kv, &self.seeds, table_name).await;
+        let seed = seed_in(
+            &self.db_io_pointers,
+            &self.storage,
+            &self.kv,
+            &self.seeds,
+            table_name,
+        )
+        .await;
         let mut total = 0u64;
         for suffix in RENAMED_SUFFIXES {
             let io = seed.create_new(format!("{}{}", table_name, suffix)).await;
@@ -1390,7 +1444,10 @@ impl Database {
             }
         }
 
-        let current = self.storage.location_of(table_name).unwrap_or_else(|| root.clone());
+        let current = self
+            .storage
+            .location_of(table_name)
+            .unwrap_or_else(|| root.clone());
         if current == destination {
             return Ok(0);
         }
@@ -1405,7 +1462,14 @@ impl Database {
         // `rename_table`.
         let table = self.tables.remove(table_name).map(|(_, t)| t);
 
-        let from = seed_in(&self.db_io_pointers, &self.storage, &self.kv, &self.seeds, table_name).await;
+        let from = seed_in(
+            &self.db_io_pointers,
+            &self.storage,
+            &self.kv,
+            &self.seeds,
+            table_name,
+        )
+        .await;
         // Built for the destination directly rather than from this database's
         // own provider: whether a file is mirrored is settled when it is
         // opened, and the catalogue's provider may predate the backup location.
@@ -1451,12 +1515,16 @@ impl Database {
         let mut reopened = Table::new(table_name, to, Vec::new()).await;
         reopened.scope_cache_to_database(self.id);
         reopened.enable_versioning(self.transactions.clone());
-        self.tables.insert(table_name.to_string(), Arc::new(reopened));
+        self.tables
+            .insert(table_name.to_string(), Arc::new(reopened));
 
         // The old primary's files, and only those — see `without_backups`.
         discard_files(&Arc::new(from.without_backups()), table_name).await;
 
-        info!("Moved {} from {} to {} ({} bytes)", table_name, current, destination, copied);
+        info!(
+            "Moved {} from {} to {} ({} bytes)",
+            table_name, current, destination, copied
+        );
         Ok(copied)
     }
 
@@ -1465,7 +1533,18 @@ impl Database {
     /// Used both to clean up a failed copy and to drop the original once the
     /// rename has committed, so it must tolerate files that are not there.
     async fn discard_table_files(&self, name: &str) {
-        discard_files(&seed_in(&self.db_io_pointers, &self.storage, &self.kv, &self.seeds, name).await, name).await
+        discard_files(
+            &seed_in(
+                &self.db_io_pointers,
+                &self.storage,
+                &self.kv,
+                &self.seeds,
+                name,
+            )
+            .await,
+            name,
+        )
+        .await
     }
 
     /// Rewrites the table name embedded in a schema record's header.
@@ -1478,10 +1557,16 @@ impl Database {
     /// a cache namespace.
     async fn rewrite_schema_name(&self, new_name: &str) -> io::Result<()> {
         let schema_io = Arc::new(
-            seed_in(&self.db_io_pointers, &self.storage, &self.kv, &self.seeds, new_name)
-                .await
-                .create_new(format!("{}_schema.db", new_name))
-                .await,
+            seed_in(
+                &self.db_io_pointers,
+                &self.storage,
+                &self.kv,
+                &self.seeds,
+                new_name,
+            )
+            .await
+            .create_new(format!("{}_schema.db", new_name))
+            .await,
         );
 
         let mut schema = TableSchema::load(schema_io.clone())
@@ -1500,7 +1585,14 @@ impl Database {
 
     /// Opens the renamed table and puts it in the live map under its new name.
     async fn open_renamed_table(&self, new_name: &str) {
-        let seed = seed_in(&self.db_io_pointers, &self.storage, &self.kv, &self.seeds, new_name).await;
+        let seed = seed_in(
+            &self.db_io_pointers,
+            &self.storage,
+            &self.kv,
+            &self.seeds,
+            new_name,
+        )
+        .await;
         let mut table = Table::new(new_name, seed, Vec::new()).await;
         table.scope_cache_to_database(self.id);
         table.enable_versioning(self.transactions.clone());
@@ -1513,7 +1605,9 @@ impl Database {
     /// second thing to keep in step with the catalogue's schema.
     async fn remember_in_catalogue(&self, table_name: &str) -> io::Result<()> {
         let mut name_mb = MEMORY_POOL.acquire(table_name.len());
-        name_mb.into_slice_mut().copy_from_slice(table_name.as_bytes());
+        name_mb
+            .into_slice_mut()
+            .copy_from_slice(table_name.as_bytes());
 
         let mut clusters_mb = MEMORY_POOL.acquire(8);
         clusters_mb.into_slice_mut().copy_from_slice(&[0u8; 8]);
@@ -1580,7 +1674,10 @@ impl Database {
     }
 
     async fn record_rename_intent(&self, old_name: &str, new_name: &str) -> io::Result<()> {
-        let io = self.db_io_pointers.create_new(RENAME_INTENT_FILE.to_string()).await;
+        let io = self
+            .db_io_pointers
+            .create_new(RENAME_INTENT_FILE.to_string())
+            .await;
         io.truncate(0)
             .await
             .map_err(|e| io::Error::other(format!("{e:?}")))?;
@@ -1696,15 +1793,17 @@ impl Database {
         // a half-written table, which the next `CREATE TABLE` of that name
         // reuses; the other order leaves the files somewhere nothing looks.
         pool_place(&self.storage, table_name);
-        let seed = seed_in(&self.db_io_pointers, &self.storage, &self.kv, &self.seeds, table_name).await;
-
-        let mut table = Table::new_with_constraints(
-            &table_name,
-            seed,
-            columns,
-            &unique_columns,
+        let seed = seed_in(
+            &self.db_io_pointers,
+            &self.storage,
+            &self.kv,
+            &self.seeds,
+            table_name,
         )
         .await;
+
+        let mut table =
+            Table::new_with_constraints(&table_name, seed, columns, &unique_columns).await;
         table.scope_cache_to_database(self.id);
 
         // The declared `PRIMARY KEY`, recorded in the schema header rather than
@@ -1769,8 +1868,7 @@ impl Database {
                     ));
                 }
             }
-            if let Err(e) =
-                crate::core::rql::unique_key::append(table.io_schema.clone(), key).await
+            if let Err(e) = crate::core::rql::unique_key::append(table.io_schema.clone(), key).await
             {
                 error!("Failed to persist unique constraint {}: {}", key.name, e);
                 return Err(e);
@@ -1782,7 +1880,10 @@ impl Database {
             if let Err(e) =
                 crate::core::rql::type_modifier::append(table.io_schema.clone(), entry).await
             {
-                error!("Failed to persist type modifier for {}: {}", entry.column, e);
+                error!(
+                    "Failed to persist type modifier for {}: {}",
+                    entry.column, e
+                );
                 return Err(e);
             }
             table.schema.type_modifiers.push(entry.clone());
@@ -1812,9 +1913,7 @@ impl Database {
         }
 
         for entry in &create_table.checks {
-            if let Err(e) =
-                crate::core::rql::check::append(table.io_schema.clone(), entry).await
-            {
+            if let Err(e) = crate::core::rql::check::append(table.io_schema.clone(), entry).await {
                 error!("Failed to persist check constraint {}: {}", entry.name, e);
                 return Err(e);
             }
@@ -1822,8 +1921,7 @@ impl Database {
         }
 
         for entry in &create_table.json_columns {
-            if let Err(e) =
-                crate::core::rql::json_map::append(table.io_schema.clone(), entry).await
+            if let Err(e) = crate::core::rql::json_map::append(table.io_schema.clone(), entry).await
             {
                 error!("Failed to register JSON column {}: {}", entry.column, e);
                 return Err(e);
@@ -1931,10 +2029,10 @@ impl Database {
                 "Native protocol requires {} authentication",
                 auth.method.name()
             );
-            Some(StdArc::new(RoleAuthenticator::new(
-                database.clone(),
-                auth.method,
-            )) as StdArc<dyn rastcp::session::ServerAuthenticator>)
+            Some(
+                StdArc::new(RoleAuthenticator::new(database.clone(), auth.method))
+                    as StdArc<dyn rastcp::session::ServerAuthenticator>,
+            )
         } else {
             if auth.authenticates() {
                 warn!(
@@ -2004,7 +2102,14 @@ impl Database {
         // The previous handle is dropped first so its maintenance task stops
         // before a second one starts on the same files.
         self.tables.remove(table_name);
-        let seed = seed_in(&self.db_io_pointers, &self.storage, &self.kv, &self.seeds, table_name).await;
+        let seed = seed_in(
+            &self.db_io_pointers,
+            &self.storage,
+            &self.kv,
+            &self.seeds,
+            table_name,
+        )
+        .await;
         let mut table = Table::new(table_name, seed, Vec::new()).await;
         table.scope_cache_to_database(self.id);
         table.enable_versioning(self.transactions.clone());
@@ -2091,7 +2196,11 @@ async fn recover_interrupted_rename(
 
     let mut buffer = vec![0u8; len as usize];
     let mut position = 0u64;
-    if io.read_data_into_buffer(&mut position, &mut buffer).await.is_err() {
+    if io
+        .read_data_into_buffer(&mut position, &mut buffer)
+        .await
+        .is_err()
+    {
         warn!("A rename intent record exists but could not be read; leaving it in place");
         return;
     }
@@ -2119,14 +2228,25 @@ async fn recover_interrupted_rename(
                 "Completing an interrupted rename of {} to {}: both catalogue rows exist",
                 old_name, new_name
             );
-            if tombstone_catalogue_row(io_pointers, io_rows, io_schema, old_name).await.is_ok() {
-                discard_files(&seed_in(io_pointers, pool, kv, seeds, old_name).await, old_name).await;
+            if tombstone_catalogue_row(io_pointers, io_rows, io_schema, old_name)
+                .await
+                .is_ok()
+            {
+                discard_files(
+                    &seed_in(io_pointers, pool, kv, seeds, old_name).await,
+                    old_name,
+                )
+                .await;
                 clear_intent(io_pointers).await;
             }
         }
         (false, true) => {
             // Committed and tombstoned; only the old files remain.
-            discard_files(&seed_in(io_pointers, pool, kv, seeds, old_name).await, old_name).await;
+            discard_files(
+                &seed_in(io_pointers, pool, kv, seeds, old_name).await,
+                old_name,
+            )
+            .await;
             clear_intent(io_pointers).await;
         }
         // Never committed: the catalogue still names only the original, so
@@ -2136,7 +2256,11 @@ async fn recover_interrupted_rename(
                 "Abandoning an interrupted rename of {} to {}: it never reached the catalogue",
                 old_name, new_name
             );
-            discard_files(&seed_in(io_pointers, pool, kv, seeds, new_name).await, new_name).await;
+            discard_files(
+                &seed_in(io_pointers, pool, kv, seeds, new_name).await,
+                new_name,
+            )
+            .await;
             clear_intent(io_pointers).await;
         }
         // Neither: nothing to reconcile against, so the safest act is none.
@@ -2154,10 +2278,10 @@ async fn recover_interrupted_rename(
 }
 
 async fn tombstone_catalogue_row(
-io_pointers: &Arc<DbStorageProvider>,
-io_rows: &Arc<DbStorageProvider>,
-io_schema: &Arc<DbStorageProvider>,
-table_name: &str,
+    io_pointers: &Arc<DbStorageProvider>,
+    io_rows: &Arc<DbStorageProvider>,
+    io_schema: &Arc<DbStorageProvider>,
+    table_name: &str,
 ) -> io::Result<bool> {
     let schema = load_db_data_schema(io_schema.clone()).await;
     let fetch = create_db_data_row_fetch(&schema.fields);
@@ -2166,9 +2290,7 @@ table_name: &str,
         .await
         .map_err(|e| io::Error::other(format!("{e:?}")))?;
 
-    while let Ok(Some((record_pos, mut pointer))) =
-        iterator.next_row_pointer_with_offset().await
-    {
+    while let Ok(Some((record_pos, mut pointer))) = iterator.next_row_pointer_with_offset().await {
         let Ok(row) = pointer.fetch_row(io_rows.clone(), &fetch).await else {
             continue;
         };
@@ -2253,7 +2375,10 @@ async fn copy_between(
         // table; emptying it first is the only safe reading.
         let existing = destination.get_len().await;
         if existing > 0 {
-            warn!("{} already exists at the destination ({} bytes); replacing it", file, existing);
+            warn!(
+                "{} already exists at the destination ({} bytes); replacing it",
+                file, existing
+            );
             destination
                 .truncate(0)
                 .await
@@ -2265,7 +2390,9 @@ async fn copy_between(
         while position < len {
             let take = ((len - position) as usize).min(buffer.len());
             let mut cursor = position;
-            source.read_data_into_buffer(&mut cursor, &mut buffer[..take]).await?;
+            source
+                .read_data_into_buffer(&mut cursor, &mut buffer[..take])
+                .await?;
             destination.append_data(&buffer[..take], false).await;
             position += take as u64;
         }

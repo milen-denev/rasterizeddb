@@ -94,14 +94,18 @@ fn bench_extend_serialized(c: &mut Criterion) {
 
         // Reused buffer: models the steady state, where the accumulator has
         // already grown and only the per-column writes remain.
-        group.bench_with_input(BenchmarkId::new("into_reused_vec", label), &label, |b, _| {
-            let mut out: Vec<u8> = Vec::with_capacity(64 * 1024);
-            b.iter(|| {
-                out.clear();
-                black_box(&row).extend_serialized(&mut out);
-                black_box(out.len())
-            })
-        });
+        group.bench_with_input(
+            BenchmarkId::new("into_reused_vec", label),
+            &label,
+            |b, _| {
+                let mut out: Vec<u8> = Vec::with_capacity(64 * 1024);
+                b.iter(|| {
+                    out.clear();
+                    black_box(&row).extend_serialized(&mut out);
+                    black_box(out.len())
+                })
+            },
+        );
 
         // A whole batch of rows into one buffer — closest to what a worker does.
         group.bench_with_input(BenchmarkId::new("batch_64_rows", label), &label, |b, _| {
@@ -152,7 +156,11 @@ fn bench_string_equals(c: &mut Criterion) {
         ("len4_match", b"John".as_slice(), b"John".as_slice()),
         ("len4_diff_last", b"John".as_slice(), b"Johx".as_slice()),
         ("len8_match", b"Jonathan".as_slice(), b"Jonathan".as_slice()),
-        ("len8_diff_last", b"Jonathan".as_slice(), b"Jonathax".as_slice()),
+        (
+            "len8_diff_last",
+            b"Jonathan".as_slice(),
+            b"Jonathax".as_slice(),
+        ),
         (
             "len16_match",
             b"Engineering-Dept".as_slice(),
@@ -163,7 +171,11 @@ fn bench_string_equals(c: &mut Criterion) {
             b"Engineering-Dept".as_slice(),
             b"Engineering-Depx".as_slice(),
         ),
-        ("len12_match", b"Engineering2".as_slice(), b"Engineering2".as_slice()),
+        (
+            "len12_match",
+            b"Engineering2".as_slice(),
+            b"Engineering2".as_slice(),
+        ),
         ("len1_match", b"A".as_slice(), b"A".as_slice()),
     ];
 

@@ -214,9 +214,7 @@ pub fn find_scalar_subquery(sql: &str) -> Option<InSubquery> {
             }
             c if c.is_ascii_alphanumeric() || c == b'_' => {
                 let start = i;
-                while i < bytes.len()
-                    && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
-                {
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                     i += 1;
                 }
                 word_before_previous = std::mem::take(&mut previous_word);
@@ -286,9 +284,7 @@ pub fn is_correlated(inner_sql: &str) -> bool {
             let word = &inner_sql[start..i];
             if let Some(dot) = word.find('.') {
                 let qualifier = word[..dot].trim_matches('"');
-                if !qualifier.is_empty()
-                    && !own.iter().any(|n| n.eq_ignore_ascii_case(qualifier))
-                {
+                if !qualifier.is_empty() && !own.iter().any(|n| n.eq_ignore_ascii_case(qualifier)) {
                     return true;
                 }
             }
@@ -314,9 +310,7 @@ pub fn rows_to_scalar(rows: &[Row]) -> Result<String, String> {
         1 => {
             let row = &rows[0];
             if row.columns.len() != 1 {
-                return Err(
-                    "a subquery used as a value must select exactly one column".to_string()
-                );
+                return Err("a subquery used as a value must select exactly one column".to_string());
             }
             let column = &row.columns[0];
             value_to_literal(&column.column_type, column.data.into_slice()).ok_or_else(|| {
@@ -367,7 +361,8 @@ pub fn find_exists(sql: &str) -> Option<ExistsClause> {
         }
 
         const KW: usize = "EXISTS".len();
-        let is_word_start = i == 0 || (!bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_');
+        let is_word_start =
+            i == 0 || (!bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_');
         if is_word_start
             && i + KW <= bytes.len()
             && upper.as_bytes()[i..].starts_with(b"EXISTS")
@@ -559,10 +554,7 @@ pub(crate) const UNCORRELATED: &str = "EXISTS references no outer column";
 /// outer row: "did this return anything". PostgreSQL treats it exactly so, and
 /// `WHERE NOT EXISTS (SELECT 1 FROM t)` — insert only if nothing matched — is a
 /// common seeding idiom.
-pub fn uncorrelated_exists(
-    clause: &ExistsClause,
-    outer_relations: &[String],
-) -> Option<String> {
+pub fn uncorrelated_exists(clause: &ExistsClause, outer_relations: &[String]) -> Option<String> {
     match exists_to_in(clause, outer_relations) {
         Err(e) if e == UNCORRELATED => Some(clause.inner_sql.trim().to_string()),
         _ => None,
@@ -832,10 +824,19 @@ pub fn value_to_literal(db_type: &DbType, bytes: &[u8]) -> Option<String> {
         DbType::UUID => value_codec::quote_sql(&value_codec::format_uuid(bytes)),
         DbType::INET => value_codec::quote_sql(&value_codec::format_inet(bytes)?),
         DbType::DATETIME => {
-            value_codec::quote_sql(&value_codec::format_timestamp_us(i64::from_le_bytes(le::<8>(bytes)?)))
+            value_codec::quote_sql(&value_codec::format_timestamp_us(i64::from_le_bytes(le::<
+                8,
+            >(
+                bytes,
+            )?)))
         }
         DbType::DECIMAL => value_codec::format_decimal(i128::from_le_bytes(le::<16>(bytes)?)),
-        DbType::BOOL => if bytes.first().copied().unwrap_or(0) != 0 { "1" } else { "0" }.to_string(),
+        DbType::BOOL => if bytes.first().copied().unwrap_or(0) != 0 {
+            "1"
+        } else {
+            "0"
+        }
+        .to_string(),
         DbType::I8 => i8::from_le_bytes(le::<1>(bytes)?).to_string(),
         DbType::I16 => i16::from_le_bytes(le::<2>(bytes)?).to_string(),
         DbType::I32 => i32::from_le_bytes(le::<4>(bytes)?).to_string(),
@@ -877,9 +878,7 @@ pub fn value_to_literal(db_type: &DbType, bytes: &[u8]) -> Option<String> {
         // also what renders a `::text` cast, and without these arms
         // `hardware_status::text` failed with "BIT cannot be rendered as text"
         // rather than yielding the bits.
-        DbType::INTERVAL => {
-            value_codec::quote_sql(&crate::core::pg_types::format_interval(bytes)?)
-        }
+        DbType::INTERVAL => value_codec::quote_sql(&crate::core::pg_types::format_interval(bytes)?),
         DbType::MACADDR | DbType::MACADDR8 => {
             value_codec::quote_sql(&crate::core::pg_types::format_macaddr(bytes))
         }
@@ -932,8 +931,8 @@ pub fn rows_to_value_list(rows: &[Row]) -> Result<String, String> {
         if row.columns.len() > 1 {
             return Err("a subquery used with IN must select exactly one column".to_string());
         }
-        let literal = value_to_literal(&column.column_type, column.data.into_slice())
-            .ok_or_else(|| {
+        let literal =
+            value_to_literal(&column.column_type, column.data.into_slice()).ok_or_else(|| {
                 format!(
                     "subquery returned a {} value that cannot be compared",
                     column.column_type
@@ -961,7 +960,9 @@ mod correlation_tests {
     fn a_self_contained_subquery_is_not_correlated() {
         assert!(!is_correlated("SELECT COUNT(*) FROM t"));
         assert!(!is_correlated("SELECT COUNT(*) FROM t WHERE t.x = 1"));
-        assert!(!is_correlated("SELECT COUNT(*) FROM t bl2 WHERE bl2.x = bl2.y"));
+        assert!(!is_correlated(
+            "SELECT COUNT(*) FROM t bl2 WHERE bl2.x = bl2.y"
+        ));
         // Unqualified columns say nothing either way, so they are not evidence.
         assert!(!is_correlated("SELECT COUNT(*) FROM t WHERE x = 1"));
     }
@@ -1007,8 +1008,8 @@ mod tests {
              JOIN role_ids r ON ur.role_id = r.id WHERE r.domain_id = d.id)",
         )
         .expect("should find the EXISTS");
-        let rewritten =
-            exists_to_in(&clause, &["domain".to_string(), "d".to_string()]).expect("should rewrite");
+        let rewritten = exists_to_in(&clause, &["domain".to_string(), "d".to_string()])
+            .expect("should rewrite");
         // The whole FROM survives, and the projected column keeps its qualifier
         // — `domain_id` alone would be ambiguous across the joined relations.
         assert!(rewritten.contains("JOIN role_ids r"), "{}", rewritten);
@@ -1052,7 +1053,11 @@ mod tests {
             let bytes = v.to_le_bytes();
             let mut mb = MEMORY_POOL.acquire(bytes.len());
             mb.into_slice_mut().copy_from_slice(&bytes);
-            Column { schema_id, data: mb, column_type: DbType::I32 }
+            Column {
+                schema_id,
+                data: mb,
+                column_type: DbType::I32,
+            }
         }
         fn row(x: i32, y: i32) -> Row {
             Row {
@@ -1076,7 +1081,10 @@ mod tests {
         let two = multi_exists_predicate(&spec, &[row(1, 1), row(2, 2)]).unwrap();
         assert_eq!(two, "((a.x != 1 OR a.y != 1) AND (a.x != 2 OR a.y != 2))");
 
-        let positive = MultiCorrelatedExists { negated: false, ..spec };
+        let positive = MultiCorrelatedExists {
+            negated: false,
+            ..spec
+        };
         assert_eq!(
             multi_exists_predicate(&positive, &[row(1, 1)]).unwrap(),
             "((a.x = 1 AND a.y = 1))"

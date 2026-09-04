@@ -37,9 +37,7 @@ use crate::core::database::Database;
 use crate::core::db_type::DbType;
 use crate::core::row::row::{Column, Row};
 
-use super::{
-    LocationRole, PlacementPolicy, StorageManager, human_bytes, normalize, parse_bytes,
-};
+use super::{LocationRole, PlacementPolicy, StorageManager, human_bytes, normalize, parse_bytes};
 
 /// One tunable, for `SHOW STORAGE KEYS`.
 pub struct Key {
@@ -173,7 +171,12 @@ pub async fn execute(sql: &str, database: &Arc<Database>) -> Result<Vec<String>,
     let statement = sql.trim().trim_end_matches(';').trim_end();
     let bare = without_options(statement);
     let tokens = words(bare);
-    let keyword = |index: usize| tokens.get(index).map(|w| w.to_ascii_uppercase()).unwrap_or_default();
+    let keyword = |index: usize| {
+        tokens
+            .get(index)
+            .map(|w| w.to_ascii_uppercase())
+            .unwrap_or_default()
+    };
 
     if keyword(0) == "SHOW" {
         return show(&tokens, database);
@@ -220,8 +223,9 @@ fn add_location(
     for (key, value) in with_options(statement)? {
         match key.as_str() {
             "role" => {
-                role = LocationRole::parse(&value)
-                    .ok_or_else(|| format!("unknown ROLE {:?}: expected primary or backup", value))?
+                role = LocationRole::parse(&value).ok_or_else(|| {
+                    format!("unknown ROLE {:?}: expected primary or backup", value)
+                })?
             }
             "weight" => {
                 weight = value
@@ -229,7 +233,10 @@ fn add_location(
                     .map_err(|_| format!("WEIGHT must be a positive number, not {:?}", value))?
             }
             "enabled" => {
-                enabled = matches!(value.to_ascii_lowercase().as_str(), "true" | "yes" | "on" | "1")
+                enabled = matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "true" | "yes" | "on" | "1"
+                )
             }
             other => {
                 return Err(format!(
@@ -316,7 +323,11 @@ fn alter_location(
             let role = LocationRole::parse(value)
                 .ok_or_else(|| format!("unknown role {:?}: expected primary or backup", value))?;
             let changed = pool.set_role(&path, role)?;
-            Ok(vec![format!("{} is now a {} location", changed, role.as_str())])
+            Ok(vec![format!(
+                "{} is now a {} location",
+                changed,
+                role.as_str()
+            )])
         }
         "weight" => {
             let weight: u32 = value
@@ -365,7 +376,11 @@ fn set(tokens: &[String], database: &Arc<Database>) -> Result<Vec<String>, Strin
     match key.to_ascii_lowercase().as_str() {
         "policy" => {
             let policy = PlacementPolicy::parse(&value).ok_or_else(|| {
-                format!("unknown policy {:?}: expected one of {}", value, PlacementPolicy::names())
+                format!(
+                    "unknown policy {:?}: expected one of {}",
+                    value,
+                    PlacementPolicy::names()
+                )
             })?;
             pool.set_policy(policy);
             let next = pool.would_place().unwrap_or_default();
@@ -376,7 +391,10 @@ fn set(tokens: &[String], database: &Arc<Database>) -> Result<Vec<String>, Strin
         }
         "min_free" | "min_free_bytes" | "minfree" => {
             let bytes = parse_bytes(&value).ok_or_else(|| {
-                format!("{:?} is not a size; write it as 512MB, 2GiB or a plain byte count", value)
+                format!(
+                    "{:?} is not a size; write it as 512MB, 2GiB or a plain byte count",
+                    value
+                )
             })?;
             pool.set_min_free_bytes(bytes);
             Ok(vec![format!(
@@ -403,7 +421,8 @@ fn place_table(tokens: &[String], database: &Arc<Database>) -> Result<Vec<String
             "{} already exists and its files are in {}. Use STORAGE MOVE TABLE {} TO '{}' \
              to move them",
             table,
-            pool.location_of(&table).unwrap_or_else(|| pool.root().unwrap_or("").to_string()),
+            pool.location_of(&table)
+                .unwrap_or_else(|| pool.root().unwrap_or("").to_string()),
             table,
             target
         ));
@@ -465,7 +484,9 @@ fn check_kv_store(_database: &Arc<Database>, store: &str) -> Result<(), String> 
 async fn move_table(tokens: &[String], database: &Arc<Database>) -> Result<Vec<String>, String> {
     let (table, path) = table_and_path(tokens, "TO")?;
     let destination = normalize(&path);
-    Ok(vec![super::relocate::move_table(database, &table, &destination).await?])
+    Ok(vec![
+        super::relocate::move_table(database, &table, &destination).await?,
+    ])
 }
 
 /// `STORAGE REBALANCE [DRY RUN]`
@@ -501,9 +522,12 @@ fn table_and_path(tokens: &[String], keyword: &str) -> Result<(String, String), 
     {
         index += 1;
     }
-    let table = tokens
-        .get(index)
-        .ok_or_else(|| format!("expected a table name, as TABLE users {} '/mnt/disk2'", keyword))?;
+    let table = tokens.get(index).ok_or_else(|| {
+        format!(
+            "expected a table name, as TABLE users {} '/mnt/disk2'",
+            keyword
+        )
+    })?;
     let table = unquote(table).trim_matches('"').to_string();
 
     let at = tokens
@@ -522,7 +546,10 @@ fn table_and_path(tokens: &[String], keyword: &str) -> Result<(String, String), 
 // ---------------------------------------------------------------------------
 
 fn show(tokens: &[String], database: &Arc<Database>) -> Result<Vec<String>, String> {
-    let what = tokens.get(2).map(|w| w.to_ascii_uppercase()).unwrap_or_default();
+    let what = tokens
+        .get(2)
+        .map(|w| w.to_ascii_uppercase())
+        .unwrap_or_default();
     let pool = pool(database)?;
 
     match what.as_str() {
@@ -545,9 +572,7 @@ fn show(tokens: &[String], database: &Arc<Database>) -> Result<Vec<String>, Stri
         // `LOCATIONS` and `PLACEMENTS` return columns, not lines, and are
         // answered by `execute_structured`. Reaching here means the caller did
         // not check `is_structured` first.
-        "LOCATIONS" | "PLACEMENTS" => {
-            Err(format!("SHOW STORAGE {} returns rows, not text", what))
-        }
+        "LOCATIONS" | "PLACEMENTS" => Err(format!("SHOW STORAGE {} returns rows, not text", what)),
         other => Err(format!(
             "unknown SHOW STORAGE {:?}: try SHOW STORAGE, SHOW STORAGE LOCATIONS, \
              SHOW STORAGE PLACEMENTS, SHOW STORAGE POLICY or SHOW STORAGE KEYS",
@@ -566,13 +591,15 @@ fn table_counts(
     pool: &StorageManager,
     database: &Arc<Database>,
 ) -> std::collections::HashMap<String, u64> {
-    let placed: std::collections::HashMap<String, String> =
-        pool.placements().into_iter().collect();
+    let placed: std::collections::HashMap<String, String> = pool.placements().into_iter().collect();
     let root = pool.root().unwrap_or("").to_string();
 
     let mut counts = std::collections::HashMap::new();
     for entry in database.tables.iter() {
-        let at = placed.get(entry.key()).cloned().unwrap_or_else(|| root.clone());
+        let at = placed
+            .get(entry.key())
+            .cloned()
+            .unwrap_or_else(|| root.clone());
         *counts.entry(at).or_insert(0u64) += 1;
     }
     counts
@@ -601,12 +628,20 @@ fn summary(pool: &StorageManager, database: &Arc<Database>) -> Vec<String> {
         lines.push(format!(
             "{}{}: {}, weight {}, {} table(s), {}{}",
             report.location.path,
-            if report.is_root { " (database directory)" } else { "" },
+            if report.is_root {
+                " (database directory)"
+            } else {
+                ""
+            },
             report.location.role.as_str(),
             report.location.weight,
             tables,
             space,
-            if report.location.enabled { "" } else { ", disabled" },
+            if report.location.enabled {
+                ""
+            } else {
+                ", disabled"
+            },
         ));
     }
     lines
@@ -632,7 +667,11 @@ enum Structured {
 }
 
 fn structured_kind(sql: &str) -> Option<Structured> {
-    let upper = sql.trim().trim_end_matches(';').trim_end().to_ascii_uppercase();
+    let upper = sql
+        .trim()
+        .trim_end_matches(';')
+        .trim_end()
+        .to_ascii_uppercase();
     let normalised = upper.split_whitespace().collect::<Vec<_>>().join(" ");
     match normalised.as_str() {
         "SHOW STORAGE STATS" => Some(Structured::Stats),
@@ -734,7 +773,10 @@ fn stats_rows(pool: &StorageManager, database: &Arc<Database>) -> Vec<Row> {
     let tight = reports
         .iter()
         .filter(|r| r.location.role == LocationRole::Primary && r.location.enabled)
-        .filter(|r| r.available_bytes.is_some_and(|free| free < pool.min_free_bytes()))
+        .filter(|r| {
+            r.available_bytes
+                .is_some_and(|free| free < pool.min_free_bytes())
+        })
         .count();
 
     let mut out = Vec::new();
@@ -756,12 +798,36 @@ fn stats_rows(pool: &StorageManager, database: &Arc<Database>) -> Vec<Row> {
         pool.min_free_bytes().to_string(),
         "a location below this is not chosen for new tables",
     );
-    push("root", pool.root().unwrap_or("").to_string(), "the database's own directory");
-    push("locations", reports.len().to_string(), "directories in the pool");
-    push("primaries", primaries.to_string(), "enabled locations that hold tables");
-    push("backups", backups.to_string(), "enabled locations that receive a mirrored copy");
-    push("disabled", disabled.to_string(), "locations taking no new tables");
-    push("tables", counts.values().sum::<u64>().to_string(), "tables this database holds");
+    push(
+        "root",
+        pool.root().unwrap_or("").to_string(),
+        "the database's own directory",
+    );
+    push(
+        "locations",
+        reports.len().to_string(),
+        "directories in the pool",
+    );
+    push(
+        "primaries",
+        primaries.to_string(),
+        "enabled locations that hold tables",
+    );
+    push(
+        "backups",
+        backups.to_string(),
+        "enabled locations that receive a mirrored copy",
+    );
+    push(
+        "disabled",
+        disabled.to_string(),
+        "locations taking no new tables",
+    );
+    push(
+        "tables",
+        counts.values().sum::<u64>().to_string(),
+        "tables this database holds",
+    );
     push(
         "free_bytes",
         free.to_string(),
@@ -855,9 +921,17 @@ fn structured_row(cells: &[Cell]) -> Row {
         };
         let mut block = crate::memory_pool::MEMORY_POOL.acquire(bytes.len());
         block.into_slice_mut().copy_from_slice(&bytes);
-        columns.push(Column { schema_id: index as u64, data: block, column_type });
+        columns.push(Column {
+            schema_id: index as u64,
+            data: block,
+            column_type,
+        });
     }
-    Row { position: 0, columns, length: 0 }
+    Row {
+        position: 0,
+        columns,
+        length: 0,
+    }
 }
 
 /// Wraps text lines in the result encoding a client reads as one column.

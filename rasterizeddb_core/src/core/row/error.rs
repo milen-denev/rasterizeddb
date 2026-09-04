@@ -130,9 +130,7 @@ impl EvalError {
                 "operand size does not match the column type being evaluated"
             }
             EvalError::ArithmeticOverflow => "integer out of range",
-            EvalError::UnsupportedType => {
-                "operation is not supported for this column type"
-            }
+            EvalError::UnsupportedType => "operation is not supported for this column type",
         }
     }
 

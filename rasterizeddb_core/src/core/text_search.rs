@@ -27,23 +27,141 @@
 
 /// PostgreSQL's `english.stop`, the words dropped from both sides.
 const STOP_WORDS: &[&str] = &[
-    "i", "me", "my", "myself", "we", "our", "ours", "ourselves", "you", "your", "yours",
-    "yourself", "yourselves", "he", "him", "his", "himself", "she", "her", "hers", "herself",
-    "it", "its", "itself", "they", "them", "their", "theirs", "themselves", "what", "which",
-    "who", "whom", "this", "that", "these", "those", "am", "is", "are", "was", "were", "be",
-    "been", "being", "have", "has", "had", "having", "do", "does", "did", "doing", "a", "an",
-    "the", "and", "but", "if", "or", "because", "as", "until", "while", "of", "at", "by",
-    "for", "with", "about", "against", "between", "into", "through", "during", "before",
-    "after", "above", "below", "to", "from", "up", "down", "in", "out", "on", "off", "over",
-    "under", "again", "further", "then", "once", "here", "there", "when", "where", "why",
-    "how", "all", "any", "both", "each", "few", "more", "most", "other", "some", "such",
-    "no", "nor", "not", "only", "own", "same", "so", "than", "too", "very", "s", "t", "can",
-    "will", "just", "don", "should", "now",
+    "i",
+    "me",
+    "my",
+    "myself",
+    "we",
+    "our",
+    "ours",
+    "ourselves",
+    "you",
+    "your",
+    "yours",
+    "yourself",
+    "yourselves",
+    "he",
+    "him",
+    "his",
+    "himself",
+    "she",
+    "her",
+    "hers",
+    "herself",
+    "it",
+    "its",
+    "itself",
+    "they",
+    "them",
+    "their",
+    "theirs",
+    "themselves",
+    "what",
+    "which",
+    "who",
+    "whom",
+    "this",
+    "that",
+    "these",
+    "those",
+    "am",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "being",
+    "have",
+    "has",
+    "had",
+    "having",
+    "do",
+    "does",
+    "did",
+    "doing",
+    "a",
+    "an",
+    "the",
+    "and",
+    "but",
+    "if",
+    "or",
+    "because",
+    "as",
+    "until",
+    "while",
+    "of",
+    "at",
+    "by",
+    "for",
+    "with",
+    "about",
+    "against",
+    "between",
+    "into",
+    "through",
+    "during",
+    "before",
+    "after",
+    "above",
+    "below",
+    "to",
+    "from",
+    "up",
+    "down",
+    "in",
+    "out",
+    "on",
+    "off",
+    "over",
+    "under",
+    "again",
+    "further",
+    "then",
+    "once",
+    "here",
+    "there",
+    "when",
+    "where",
+    "why",
+    "how",
+    "all",
+    "any",
+    "both",
+    "each",
+    "few",
+    "more",
+    "most",
+    "other",
+    "some",
+    "such",
+    "no",
+    "nor",
+    "not",
+    "only",
+    "own",
+    "same",
+    "so",
+    "than",
+    "too",
+    "very",
+    "s",
+    "t",
+    "can",
+    "will",
+    "just",
+    "don",
+    "should",
+    "now",
 ];
 
 /// Whether a configuration stems. `simple` only lowercases.
 fn stems(configuration: &str) -> bool {
-    !configuration.trim().trim_matches('\'').eq_ignore_ascii_case("simple")
+    !configuration
+        .trim()
+        .trim_matches('\'')
+        .eq_ignore_ascii_case("simple")
 }
 
 /// One lexeme and the positions it occurred at, one-based as PostgreSQL counts.
@@ -71,7 +189,10 @@ pub fn to_tsvector(configuration: &str, document: &str) -> String {
         }
         match lexemes.iter_mut().find(|l| l.text == text) {
             Some(existing) => existing.positions.push(position),
-            None => lexemes.push(Lexeme { text, positions: vec![position] }),
+            None => lexemes.push(Lexeme {
+                text,
+                positions: vec![position],
+            }),
         }
     }
 
@@ -83,7 +204,11 @@ pub fn to_tsvector(configuration: &str, document: &str) -> String {
             format!(
                 "'{}':{}",
                 l.text.replace('\'', "''"),
-                l.positions.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",")
+                l.positions
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
             )
         })
         .collect::<Vec<_>>()
@@ -110,7 +235,11 @@ pub fn plainto_tsquery(configuration: &str, text: &str) -> String {
         .map(|w| if stem_it { stem(&w) } else { w })
         .filter(|w| !w.is_empty())
         .collect();
-    terms.iter().map(|t| format!("'{}'", t)).collect::<Vec<_>>().join(" & ")
+    terms
+        .iter()
+        .map(|t| format!("'{}'", t))
+        .collect::<Vec<_>>()
+        .join(" & ")
 }
 
 /// `tsvector @@ tsquery`.
@@ -159,9 +288,7 @@ fn evaluate(node: &Node, present: &[String]) -> bool {
     match node {
         Node::Term(t) => present.iter().any(|p| p == t),
         Node::Not(inner) => !evaluate(inner, present),
-        Node::And(a, b) | Node::Followed(a, b) => {
-            evaluate(a, present) && evaluate(b, present)
-        }
+        Node::And(a, b) | Node::Followed(a, b) => evaluate(a, present) && evaluate(b, present),
         Node::Or(a, b) => evaluate(a, present) || evaluate(b, present),
     }
 }
@@ -190,7 +317,11 @@ struct Parser<'a> {
 }
 
 fn parse_query(configuration: &str, query: &str) -> Result<Node, String> {
-    let mut parser = Parser { tokens: tokenize_query(query), at: 0, configuration };
+    let mut parser = Parser {
+        tokens: tokenize_query(query),
+        at: 0,
+        configuration,
+    };
     let node = parser.parse_or()?;
     if parser.at != parser.tokens.len() {
         return Err(format!("syntax error in tsquery: '{}'", query));
@@ -496,11 +627,26 @@ fn apply_rules(chars: &mut Vec<char>, rules: &[(&str, &str)], min: usize) {
 
 fn step_2(chars: &mut Vec<char>) {
     const RULES: &[(&str, &str)] = &[
-        ("ational", "ate"), ("tional", "tion"), ("enci", "ence"), ("anci", "ance"),
-        ("izer", "ize"), ("bli", "ble"), ("alli", "al"), ("entli", "ent"),
-        ("eli", "e"), ("ousli", "ous"), ("ization", "ize"), ("ation", "ate"),
-        ("ator", "ate"), ("alism", "al"), ("iveness", "ive"), ("fulness", "ful"),
-        ("ousness", "ous"), ("aliti", "al"), ("iviti", "ive"), ("biliti", "ble"),
+        ("ational", "ate"),
+        ("tional", "tion"),
+        ("enci", "ence"),
+        ("anci", "ance"),
+        ("izer", "ize"),
+        ("bli", "ble"),
+        ("alli", "al"),
+        ("entli", "ent"),
+        ("eli", "e"),
+        ("ousli", "ous"),
+        ("ization", "ize"),
+        ("ation", "ate"),
+        ("ator", "ate"),
+        ("alism", "al"),
+        ("iveness", "ive"),
+        ("fulness", "ful"),
+        ("ousness", "ous"),
+        ("aliti", "al"),
+        ("iviti", "ive"),
+        ("biliti", "ble"),
         ("logi", "log"),
     ];
     apply_rules(chars, RULES, 0);
@@ -508,16 +654,21 @@ fn step_2(chars: &mut Vec<char>) {
 
 fn step_3(chars: &mut Vec<char>) {
     const RULES: &[(&str, &str)] = &[
-        ("icate", "ic"), ("ative", ""), ("alize", "al"), ("iciti", "ic"),
-        ("ical", "ic"), ("ful", ""), ("ness", ""),
+        ("icate", "ic"),
+        ("ative", ""),
+        ("alize", "al"),
+        ("iciti", "ic"),
+        ("ical", "ic"),
+        ("ful", ""),
+        ("ness", ""),
     ];
     apply_rules(chars, RULES, 0);
 }
 
 fn step_4(chars: &mut Vec<char>) {
     const SUFFIXES: &[&str] = &[
-        "al", "ance", "ence", "er", "ic", "able", "ible", "ant", "ement", "ment", "ent",
-        "ou", "ism", "ate", "iti", "ous", "ive", "ize",
+        "al", "ance", "ence", "er", "ic", "able", "ible", "ant", "ement", "ment", "ent", "ou",
+        "ism", "ate", "iti", "ous", "ive", "ize",
     ];
     // Longest first, so `ement` is not cut as `ent`.
     let mut ordered: Vec<&&str> = SUFFIXES.iter().collect();
@@ -579,7 +730,10 @@ mod tests {
 
     #[test]
     fn the_simple_configuration_lowercases_without_stemming() {
-        assert_eq!(to_tsvector("simple", "Running Quickly"), "'quickly':2 'running':1");
+        assert_eq!(
+            to_tsvector("simple", "Running Quickly"),
+            "'quickly':2 'running':1"
+        );
     }
 
     #[test]
@@ -611,9 +765,18 @@ mod tests {
     #[test]
     fn or_and_parentheses_group_as_written() {
         let vector = to_tsvector("english", "gift wrapping");
-        assert!(matches(&vector, &to_tsquery("english", "gift | express").unwrap()));
-        assert!(!matches(&vector, &to_tsquery("english", "( express | rush ) & gift").unwrap()));
-        assert!(matches(&vector, &to_tsquery("english", "( gift | rush ) & wrapping").unwrap()));
+        assert!(matches(
+            &vector,
+            &to_tsquery("english", "gift | express").unwrap()
+        ));
+        assert!(!matches(
+            &vector,
+            &to_tsquery("english", "( express | rush ) & gift").unwrap()
+        ));
+        assert!(matches(
+            &vector,
+            &to_tsquery("english", "( gift | rush ) & wrapping").unwrap()
+        ));
     }
 
     #[test]
@@ -625,7 +788,10 @@ mod tests {
 
     #[test]
     fn plainto_ands_every_word() {
-        assert_eq!(plainto_tsquery("english", "urgent fragile"), "'urgent' & 'fragil'");
+        assert_eq!(
+            plainto_tsquery("english", "urgent fragile"),
+            "'urgent' & 'fragil'"
+        );
     }
 
     #[test]

@@ -1,10 +1,6 @@
 use std::io::{self, SeekFrom};
 
-use super::{
-    file_sync::LocalStorageProvider,
-    memory::MemoryStorageProvider,
-    traits::StorageIO,
-};
+use super::{file_sync::LocalStorageProvider, memory::MemoryStorageProvider, traits::StorageIO};
 
 #[cfg(feature = "kv_storage")]
 use super::kv::KvStorageProvider;
@@ -123,11 +119,7 @@ impl StorageIO for DbStorageProvider {
         }
     }
 
-    async fn read_data_into_buffer(
-        &self,
-        position: &mut u64,
-        buffer: &mut [u8],
-    ) -> io::Result<()> {
+    async fn read_data_into_buffer(&self, position: &mut u64, buffer: &mut [u8]) -> io::Result<()> {
         match self {
             Self::File(p) => p.read_data_into_buffer(position, buffer).await,
             Self::Memory(p) => p.read_data_into_buffer(position, buffer).await,
@@ -215,11 +207,7 @@ impl StorageIO for DbStorageProvider {
         }
     }
 
-    fn try_borrow_range(
-        &self,
-        position: u64,
-        len: usize,
-    ) -> Option<super::traits::BorrowedBytes> {
+    fn try_borrow_range(&self, position: u64, len: usize) -> Option<super::traits::BorrowedBytes> {
         match self {
             Self::File(p) => p.try_borrow_range(position, len),
             Self::Memory(p) => p.try_borrow_range(position, len),

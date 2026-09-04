@@ -116,8 +116,14 @@ mod tests {
         {
             let _guard = begin(dir);
             assert!(is_active(dir));
-            assert!(is_active("/tmp/rdb-bulk-load-test-a/"), "keyed like the log: trailing separator ignored");
-            assert!(!is_active("/tmp/rdb-bulk-load-test-b"), "scoped to the directory");
+            assert!(
+                is_active("/tmp/rdb-bulk-load-test-a/"),
+                "keyed like the log: trailing separator ignored"
+            );
+            assert!(
+                !is_active("/tmp/rdb-bulk-load-test-b"),
+                "scoped to the directory"
+            );
         }
         assert!(!is_active(dir));
     }

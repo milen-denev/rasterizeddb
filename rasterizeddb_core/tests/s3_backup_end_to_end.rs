@@ -105,8 +105,8 @@ fn manifest_key(config: &BackupConfig) -> String {
 }
 
 async fn run(database: &Arc<Database>, sql: &str) -> Vec<u8> {
-    let purpose = recognize_query_purpose(sql)
-        .unwrap_or_else(|| panic!("could not recognise {sql:?}"));
+    let purpose =
+        recognize_query_purpose(sql).unwrap_or_else(|| panic!("could not recognise {sql:?}"));
     let response = execute(purpose, database.clone()).await;
     assert_ne!(
         response.first(),
@@ -123,8 +123,8 @@ async fn run_in_txn(
     sql: &str,
     tx: rasterizeddb_core::core::mvcc::transaction::TxId,
 ) -> Vec<u8> {
-    let purpose = recognize_query_purpose(sql)
-        .unwrap_or_else(|| panic!("could not recognise {sql:?}"));
+    let purpose =
+        recognize_query_purpose(sql).unwrap_or_else(|| panic!("could not recognise {sql:?}"));
     let response =
         rasterizeddb_core::core::rql::executor::execute_in_txn(purpose, database.clone(), tx).await;
     assert_ne!(
@@ -154,7 +154,10 @@ macro_rules! e2e_test {
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn $name() {
             let Some($config) = config(stringify!($name)) else {
-                eprintln!("skipping {}: RDB_S3_TEST_ENDPOINT is not set", stringify!($name));
+                eprintln!(
+                    "skipping {}: RDB_S3_TEST_ENDPOINT is not set",
+                    stringify!($name)
+                );
                 return;
             };
             init_engine_globals();
@@ -163,38 +166,42 @@ macro_rules! e2e_test {
     };
 }
 
-e2e_test!(restores_a_database_that_can_be_opened_and_queried, config, {
-    let root = temp_testdir::TempDir::default();
-    let live = root.join("live");
-    std::fs::create_dir_all(&live).unwrap();
+e2e_test!(
+    restores_a_database_that_can_be_opened_and_queried,
+    config,
+    {
+        let root = temp_testdir::TempDir::default();
+        let live = root.join("live");
+        std::fs::create_dir_all(&live).unwrap();
 
-    let database = Arc::new(Database::new(live.to_str().unwrap()).await);
-    run(&database, "CREATE TABLE people (id INT, name STRING)").await;
-    for i in 0..50 {
-        run(
-            &database,
-            &format!("INSERT INTO people (id, name) VALUES ({i}, 'person{i}')"),
-        )
-        .await;
+        let database = Arc::new(Database::new(live.to_str().unwrap()).await);
+        run(&database, "CREATE TABLE people (id INT, name STRING)").await;
+        for i in 0..50 {
+            run(
+                &database,
+                &format!("INSERT INTO people (id, name) VALUES ({i}, 'person{i}')"),
+            )
+            .await;
+        }
+        assert_eq!(count_rows(&database, "SELECT * FROM people").await, 50);
+
+        let service = BackupService::connect(config.clone(), live.to_str().unwrap())
+            .await
+            .expect("connect");
+        service.snapshot_now().await.expect("snapshot");
+
+        let target = root.join("restored");
+        rasterizeddb_core::core::backup::restore_from(&config, &target, RecoveryTarget::Latest)
+            .await
+            .expect("restore");
+
+        assert_eq!(
+            count_in_restored(&target, "SELECT * FROM people").await,
+            50,
+            "the restored database must hold every row the original did"
+        );
     }
-    assert_eq!(count_rows(&database, "SELECT * FROM people").await, 50);
-
-    let service = BackupService::connect(config.clone(), live.to_str().unwrap())
-        .await
-        .expect("connect");
-    service.snapshot_now().await.expect("snapshot");
-
-    let target = root.join("restored");
-    rasterizeddb_core::core::backup::restore_from(&config, &target, RecoveryTarget::Latest)
-        .await
-        .expect("restore");
-
-    assert_eq!(
-        count_in_restored(&target, "SELECT * FROM people").await,
-        50,
-        "the restored database must hold every row the original did"
-    );
-});
+);
 
 e2e_test!(captures_writes_that_happened_after_the_snapshot, config, {
     // The snapshot is taken, then more rows are written, then the log is
@@ -207,7 +214,11 @@ e2e_test!(captures_writes_that_happened_after_the_snapshot, config, {
     let database = Arc::new(Database::new(live.to_str().unwrap()).await);
     run(&database, "CREATE TABLE events (id INT, note STRING)").await;
     for i in 0..20 {
-        run(&database, &format!("INSERT INTO events (id, note) VALUES ({i}, 'before')")).await;
+        run(
+            &database,
+            &format!("INSERT INTO events (id, note) VALUES ({i}, 'before')"),
+        )
+        .await;
     }
 
     let service = BackupService::connect(config.clone(), live.to_str().unwrap())
@@ -216,7 +227,11 @@ e2e_test!(captures_writes_that_happened_after_the_snapshot, config, {
     service.snapshot_now().await.expect("snapshot");
 
     for i in 20..45 {
-        run(&database, &format!("INSERT INTO events (id, note) VALUES ({i}, 'after')")).await;
+        run(
+            &database,
+            &format!("INSERT INTO events (id, note) VALUES ({i}, 'after')"),
+        )
+        .await;
     }
     service.archive_wal_now().await.expect("archive");
 
@@ -246,7 +261,11 @@ e2e_test!(recovers_to_a_point_in_time, config, {
     service.snapshot_now().await.expect("snapshot");
 
     for i in 0..30 {
-        run(&database, &format!("INSERT INTO ledger (id, note) VALUES ({i}, 'good')")).await;
+        run(
+            &database,
+            &format!("INSERT INTO ledger (id, note) VALUES ({i}, 'good')"),
+        )
+        .await;
     }
     // The barrier: everything up to here is recoverable, and the commit
     // sequence at this instant is the point a recovery can be asked for.
@@ -257,7 +276,11 @@ e2e_test!(recovers_to_a_point_in_time, config, {
 
     // Then the mistake everyone wants to undo.
     for i in 30..60 {
-        run(&database, &format!("INSERT INTO ledger (id, note) VALUES ({i}, 'oops')")).await;
+        run(
+            &database,
+            &format!("INSERT INTO ledger (id, note) VALUES ({i}, 'oops')"),
+        )
+        .await;
     }
     service.archive_wal_now().await.expect("archive");
 
@@ -284,53 +307,61 @@ e2e_test!(recovers_to_a_point_in_time, config, {
     );
 });
 
-e2e_test!(a_snapshot_taken_under_concurrent_writes_still_restores, config, {
-    // The fuzzy-copy claim, against a live engine: rows keep being inserted for
-    // the whole duration of the snapshot, so the files it copies are captured
-    // at inconsistent moments and only replay can reconcile them.
-    let root = temp_testdir::TempDir::default();
-    let live = root.join("live");
-    std::fs::create_dir_all(&live).unwrap();
+e2e_test!(
+    a_snapshot_taken_under_concurrent_writes_still_restores,
+    config,
+    {
+        // The fuzzy-copy claim, against a live engine: rows keep being inserted for
+        // the whole duration of the snapshot, so the files it copies are captured
+        // at inconsistent moments and only replay can reconcile them.
+        let root = temp_testdir::TempDir::default();
+        let live = root.join("live");
+        std::fs::create_dir_all(&live).unwrap();
 
-    let database = Arc::new(Database::new(live.to_str().unwrap()).await);
-    run(&database, "CREATE TABLE busy (id INT, payload STRING)").await;
-    for i in 0..100 {
-        run(&database, &format!("INSERT INTO busy (id, payload) VALUES ({i}, 'seed')")).await;
-    }
-
-    let service = BackupService::connect(config.clone(), live.to_str().unwrap())
-        .await
-        .expect("connect");
-
-    let writer_db = database.clone();
-    let writer = tokio::spawn(async move {
-        for i in 100..400 {
-            let sql = format!("INSERT INTO busy (id, payload) VALUES ({i}, 'concurrent')");
-            let purpose = recognize_query_purpose(&sql).expect("parses");
-            execute(purpose, writer_db.clone()).await;
+        let database = Arc::new(Database::new(live.to_str().unwrap()).await);
+        run(&database, "CREATE TABLE busy (id INT, payload STRING)").await;
+        for i in 0..100 {
+            run(
+                &database,
+                &format!("INSERT INTO busy (id, payload) VALUES ({i}, 'seed')"),
+            )
+            .await;
         }
-    });
 
-    service.snapshot_now().await.expect("snapshot");
-    writer.await.expect("writer finished");
+        let service = BackupService::connect(config.clone(), live.to_str().unwrap())
+            .await
+            .expect("connect");
 
-    // Everything the writer did, whether it landed before, during or after the
-    // copy, is now archived.
-    service.archive_wal_now().await.expect("archive");
+        let writer_db = database.clone();
+        let writer = tokio::spawn(async move {
+            for i in 100..400 {
+                let sql = format!("INSERT INTO busy (id, payload) VALUES ({i}, 'concurrent')");
+                let purpose = recognize_query_purpose(&sql).expect("parses");
+                execute(purpose, writer_db.clone()).await;
+            }
+        });
 
-    let target = root.join("restored");
-    rasterizeddb_core::core::backup::restore_from(&config, &target, RecoveryTarget::Latest)
-        .await
-        .expect("restore");
+        service.snapshot_now().await.expect("snapshot");
+        writer.await.expect("writer finished");
 
-    let restored = count_in_restored(&target, "SELECT * FROM busy").await;
-    let original = count_rows(&database, "SELECT * FROM busy").await;
-    assert_eq!(original, 400);
-    assert_eq!(
-        restored, original,
-        "a snapshot taken under concurrent writes must restore to the same row count"
-    );
-});
+        // Everything the writer did, whether it landed before, during or after the
+        // copy, is now archived.
+        service.archive_wal_now().await.expect("archive");
+
+        let target = root.join("restored");
+        rasterizeddb_core::core::backup::restore_from(&config, &target, RecoveryTarget::Latest)
+            .await
+            .expect("restore");
+
+        let restored = count_in_restored(&target, "SELECT * FROM busy").await;
+        let original = count_rows(&database, "SELECT * FROM busy").await;
+        assert_eq!(original, 400);
+        assert_eq!(
+            restored, original,
+            "a snapshot taken under concurrent writes must restore to the same row count"
+        );
+    }
+);
 
 e2e_test!(the_sql_surface_drives_the_same_operations, config, {
     // `BACKUP` / `SHOW BACKUPS` / `RESTORE` go through the ordinary statement
@@ -343,7 +374,11 @@ e2e_test!(the_sql_surface_drives_the_same_operations, config, {
     let database = Arc::new(Database::new(live.to_str().unwrap()).await);
     run(&database, "CREATE TABLE notes (id INT, body STRING)").await;
     for i in 0..10 {
-        run(&database, &format!("INSERT INTO notes (id, body) VALUES ({i}, 'n{i}')")).await;
+        run(
+            &database,
+            &format!("INSERT INTO notes (id, body) VALUES ({i}, 'n{i}')"),
+        )
+        .await;
     }
 
     // `install` rather than `connect`: the statement handler reaches the
@@ -358,7 +393,11 @@ e2e_test!(the_sql_surface_drives_the_same_operations, config, {
     assert!(uploaded > 0, "the snapshot object should not be empty");
 
     for i in 10..20 {
-        run(&database, &format!("INSERT INTO notes (id, body) VALUES ({i}, 'n{i}')")).await;
+        run(
+            &database,
+            &format!("INSERT INTO notes (id, body) VALUES ({i}, 'n{i}')"),
+        )
+        .await;
     }
     run(&database, "BACKUP WAL").await;
 
@@ -410,7 +449,10 @@ e2e_test!(a_pruned_catalogue_still_restores, config, {
         for i in 0..10 {
             run(
                 &database,
-                &format!("INSERT INTO t (id, tag) VALUES ({}, 'g{generation}')", generation * 10 + i),
+                &format!(
+                    "INSERT INTO t (id, tag) VALUES ({}, 'g{generation}')",
+                    generation * 10 + i
+                ),
             )
             .await;
         }
@@ -452,61 +494,72 @@ e2e_test!(a_pruned_catalogue_still_restores, config, {
     assert_eq!(count_in_restored(&rewound, "SELECT * FROM t").await, 30);
 });
 
-e2e_test!(a_failed_restore_leaves_nothing_behind_and_can_be_retried, config, {
-    // Without this the target directory would hold a half-unpacked database
-    // after a failure, and the emptiness check would then refuse the retry —
-    // a trap rather than a safeguard. The restore is therefore assembled in a
-    // sibling directory and moved into place only once it is complete.
-    let root = temp_testdir::TempDir::default();
-    let live = root.join("live");
-    std::fs::create_dir_all(&live).unwrap();
+e2e_test!(
+    a_failed_restore_leaves_nothing_behind_and_can_be_retried,
+    config,
+    {
+        // Without this the target directory would hold a half-unpacked database
+        // after a failure, and the emptiness check would then refuse the retry —
+        // a trap rather than a safeguard. The restore is therefore assembled in a
+        // sibling directory and moved into place only once it is complete.
+        let root = temp_testdir::TempDir::default();
+        let live = root.join("live");
+        std::fs::create_dir_all(&live).unwrap();
 
-    let database = Arc::new(Database::new(live.to_str().unwrap()).await);
-    run(&database, "CREATE TABLE t (id INT, body STRING)").await;
-    for i in 0..30 {
-        run(&database, &format!("INSERT INTO t (id, body) VALUES ({i}, 'row{i}')")).await;
+        let database = Arc::new(Database::new(live.to_str().unwrap()).await);
+        run(&database, "CREATE TABLE t (id INT, body STRING)").await;
+        for i in 0..30 {
+            run(
+                &database,
+                &format!("INSERT INTO t (id, body) VALUES ({i}, 'row{i}')"),
+            )
+            .await;
+        }
+
+        let service = BackupService::connect(config.clone(), live.to_str().unwrap())
+            .await
+            .expect("connect");
+        let good = service.snapshot_now().await.expect("snapshot");
+
+        // Corrupt the snapshot object so unpacking fails part way through, which is
+        // what a truncated upload or bit-rot would look like.
+        let client = client_for(&config);
+        let original = client.get_object(&good.key).await.expect("fetch snapshot");
+        let mut damaged = original.clone();
+        let midpoint = damaged.len() / 2;
+        damaged[midpoint] ^= 0xff;
+        client
+            .put_object(&good.key, &damaged)
+            .await
+            .expect("overwrite");
+
+        let target = root.join("restored");
+        let err =
+            rasterizeddb_core::core::backup::restore_from(&config, &target, RecoveryTarget::Latest)
+                .await
+                .expect_err("a corrupted snapshot must not restore");
+        eprintln!("corrupted restore failed as expected: {err}");
+
+        assert!(
+            !target.exists(),
+            "a failed restore must not leave a directory behind"
+        );
+        assert!(
+            !root.join(".restored.restore-partial").exists(),
+            "the staging directory must be cleaned up too"
+        );
+
+        // Put the good object back; the same target must now be usable.
+        client
+            .put_object(&good.key, &original)
+            .await
+            .expect("restore object");
+        rasterizeddb_core::core::backup::restore_from(&config, &target, RecoveryTarget::Latest)
+            .await
+            .expect("the retry must succeed");
+        assert_eq!(count_in_restored(&target, "SELECT * FROM t").await, 30);
     }
-
-    let service = BackupService::connect(config.clone(), live.to_str().unwrap())
-        .await
-        .expect("connect");
-    let good = service.snapshot_now().await.expect("snapshot");
-
-    // Corrupt the snapshot object so unpacking fails part way through, which is
-    // what a truncated upload or bit-rot would look like.
-    let client = client_for(&config);
-    let original = client.get_object(&good.key).await.expect("fetch snapshot");
-    let mut damaged = original.clone();
-    let midpoint = damaged.len() / 2;
-    damaged[midpoint] ^= 0xff;
-    client.put_object(&good.key, &damaged).await.expect("overwrite");
-
-    let target = root.join("restored");
-    let err = rasterizeddb_core::core::backup::restore_from(
-        &config,
-        &target,
-        RecoveryTarget::Latest,
-    )
-    .await
-    .expect_err("a corrupted snapshot must not restore");
-    eprintln!("corrupted restore failed as expected: {err}");
-
-    assert!(
-        !target.exists(),
-        "a failed restore must not leave a directory behind"
-    );
-    assert!(
-        !root.join(".restored.restore-partial").exists(),
-        "the staging directory must be cleaned up too"
-    );
-
-    // Put the good object back; the same target must now be usable.
-    client.put_object(&good.key, &original).await.expect("restore object");
-    rasterizeddb_core::core::backup::restore_from(&config, &target, RecoveryTarget::Latest)
-        .await
-        .expect("the retry must succeed");
-    assert_eq!(count_in_restored(&target, "SELECT * FROM t").await, 30);
-});
+);
 
 e2e_test!(the_background_task_archives_without_being_asked, config, {
     // The scheduled flush is what turns the configured interval into an actual
@@ -554,56 +607,66 @@ e2e_test!(the_background_task_archives_without_being_asked, config, {
     );
 });
 
-e2e_test!(archiving_suspends_when_staging_fills_and_resumes_when_it_drains, config, {
-    // The failure this guards against is an outage, not data loss: uploads stop
-    // working, checkpoints keep handing segments to a directory nobody drains,
-    // and the disk fills until the database stops.
-    let root = temp_testdir::TempDir::default();
-    let live = root.join("live");
-    std::fs::create_dir_all(&live).unwrap();
+e2e_test!(
+    archiving_suspends_when_staging_fills_and_resumes_when_it_drains,
+    config,
+    {
+        // The failure this guards against is an outage, not data loss: uploads stop
+        // working, checkpoints keep handing segments to a directory nobody drains,
+        // and the disk fills until the database stops.
+        let root = temp_testdir::TempDir::default();
+        let live = root.join("live");
+        std::fs::create_dir_all(&live).unwrap();
 
-    let database = Arc::new(Database::new(live.to_str().unwrap()).await);
-    run(&database, "CREATE TABLE t (id INT)").await;
+        let database = Arc::new(Database::new(live.to_str().unwrap()).await);
+        run(&database, "CREATE TABLE t (id INT)").await;
 
-    let mut config = config;
-    config.staging_max_bytes = 64 * 1024;
-    let service = BackupService::connect(config.clone(), live.to_str().unwrap())
-        .await
-        .expect("connect");
+        let mut config = config;
+        config.staging_max_bytes = 64 * 1024;
+        let service = BackupService::connect(config.clone(), live.to_str().unwrap())
+            .await
+            .expect("connect");
 
-    assert!(!service.archiving_is_suspended());
+        assert!(!service.archiving_is_suspended());
 
-    // Stand in for a backlog of segments that failed to upload.
-    let ballast = service.staging_dir().join("00000000000000ff.wseg");
-    std::fs::create_dir_all(service.staging_dir()).unwrap();
-    std::fs::write(&ballast, vec![0u8; 128 * 1024]).unwrap();
+        // Stand in for a backlog of segments that failed to upload.
+        let ballast = service.staging_dir().join("00000000000000ff.wseg");
+        std::fs::create_dir_all(service.staging_dir()).unwrap();
+        std::fs::write(&ballast, vec![0u8; 128 * 1024]).unwrap();
 
-    service.enforce_staging_ceiling();
-    assert!(
-        service.archiving_is_suspended(),
-        "archiving should suspend once staging passes its ceiling"
-    );
+        service.enforce_staging_ceiling();
+        assert!(
+            service.archiving_is_suspended(),
+            "archiving should suspend once staging passes its ceiling"
+        );
 
-    // And checkpoints must actually stop staging, or the disk keeps filling.
-    let wal = rasterizeddb_core::core::wal::wal_for(live.to_str().unwrap()).expect("wal");
-    assert!(!wal.is_archiving(), "a suspended service must detach from the log");
+        // And checkpoints must actually stop staging, or the disk keeps filling.
+        let wal = rasterizeddb_core::core::wal::wal_for(live.to_str().unwrap()).expect("wal");
+        assert!(
+            !wal.is_archiving(),
+            "a suspended service must detach from the log"
+        );
 
-    for i in 0..20 {
-        run(&database, &format!("INSERT INTO t (id) VALUES ({i})")).await;
+        for i in 0..20 {
+            run(&database, &format!("INSERT INTO t (id) VALUES ({i})")).await;
+        }
+        wal.checkpoint().expect("checkpoint");
+        assert_eq!(
+            std::fs::read_dir(service.staging_dir()).unwrap().count(),
+            1,
+            "a suspended service must not accumulate new segments"
+        );
+
+        // Drain it, and the service must come back on its own.
+        std::fs::remove_file(&ballast).unwrap();
+        service.enforce_staging_ceiling();
+        assert!(
+            !service.archiving_is_suspended(),
+            "archiving should resume once drained"
+        );
+        assert!(wal.is_archiving(), "the log must be re-attached on resume");
     }
-    wal.checkpoint().expect("checkpoint");
-    assert_eq!(
-        std::fs::read_dir(service.staging_dir()).unwrap().count(),
-        1,
-        "a suspended service must not accumulate new segments"
-    );
-
-    // Drain it, and the service must come back on its own.
-    std::fs::remove_file(&ballast).unwrap();
-    service.enforce_staging_ceiling();
-    assert!(!service.archiving_is_suspended(), "archiving should resume once drained");
-    assert!(wal.is_archiving(), "the log must be re-attached on resume");
-});
+);
 
 e2e_test!(transaction_outcomes_survive_a_restore, config, {
     // The engine is MVCC: a row's visibility depends on how its transaction
@@ -629,20 +692,39 @@ e2e_test!(transaction_outcomes_survive_a_restore, config, {
     // path that never claimed it.
     let committed = database.transactions.begin();
     for i in 0..10 {
-        run_in_txn(&database, &format!("INSERT INTO ledger (id, note) VALUES ({i}, 'kept')"), committed).await;
+        run_in_txn(
+            &database,
+            &format!("INSERT INTO ledger (id, note) VALUES ({i}, 'kept')"),
+            committed,
+        )
+        .await;
     }
     database.transactions.commit(committed);
-    database.transactions.flush().expect("the commit outcome must be durable");
+    database
+        .transactions
+        .flush()
+        .expect("the commit outcome must be durable");
 
     let rolled_back = database.transactions.begin();
     for i in 100..110 {
-        run_in_txn(&database, &format!("INSERT INTO ledger (id, note) VALUES ({i}, 'undone')"), rolled_back).await;
+        run_in_txn(
+            &database,
+            &format!("INSERT INTO ledger (id, note) VALUES ({i}, 'undone')"),
+            rolled_back,
+        )
+        .await;
     }
     database.transactions.abort(rolled_back);
-    database.transactions.flush().expect("the rollback outcome must be durable");
+    database
+        .transactions
+        .flush()
+        .expect("the rollback outcome must be durable");
 
     let live_rows = count_rows(&database, "SELECT * FROM ledger").await;
-    assert_eq!(live_rows, 10, "the rollback should have left nothing behind");
+    assert_eq!(
+        live_rows, 10,
+        "the rollback should have left nothing behind"
+    );
 
     let service = BackupService::connect(config.clone(), live.to_str().unwrap())
         .await
@@ -667,69 +749,77 @@ e2e_test!(transaction_outcomes_survive_a_restore, config, {
     );
 });
 
-e2e_test!(a_snapshot_whose_log_cannot_be_archived_is_discarded, config, {
-    // `Wal::checkpoint` returns `Ok(())` when it declines to run — and it can
-    // decline in two places, the second of them under the writer lock, after
-    // the point where staging happens. A snapshot that inferred "my window was
-    // cut" from that `Ok` would record an `end_lsn` whose records were never
-    // archived: a catalogue entry that looks healthy and a restore that stops
-    // short of consistency and says nothing.
-    //
-    // So the snapshot checks the condition instead, and discards itself if it
-    // does not hold. Losing a snapshot costs a retry; recording an
-    // unrestorable one costs whatever depended on it.
-    let root = temp_testdir::TempDir::default();
-    let live = root.join("live");
-    std::fs::create_dir_all(&live).unwrap();
+e2e_test!(
+    a_snapshot_whose_log_cannot_be_archived_is_discarded,
+    config,
+    {
+        // `Wal::checkpoint` returns `Ok(())` when it declines to run — and it can
+        // decline in two places, the second of them under the writer lock, after
+        // the point where staging happens. A snapshot that inferred "my window was
+        // cut" from that `Ok` would record an `end_lsn` whose records were never
+        // archived: a catalogue entry that looks healthy and a restore that stops
+        // short of consistency and says nothing.
+        //
+        // So the snapshot checks the condition instead, and discards itself if it
+        // does not hold. Losing a snapshot costs a retry; recording an
+        // unrestorable one costs whatever depended on it.
+        let root = temp_testdir::TempDir::default();
+        let live = root.join("live");
+        std::fs::create_dir_all(&live).unwrap();
 
-    let database = Arc::new(Database::new(live.to_str().unwrap()).await);
-    run(&database, "CREATE TABLE t (id INT)").await;
-    for i in 0..10 {
-        run(&database, &format!("INSERT INTO t (id) VALUES ({i})")).await;
+        let database = Arc::new(Database::new(live.to_str().unwrap()).await);
+        run(&database, "CREATE TABLE t (id INT)").await;
+        for i in 0..10 {
+            run(&database, &format!("INSERT INTO t (id) VALUES ({i})")).await;
+        }
+
+        let service = BackupService::connect(config.clone(), live.to_str().unwrap())
+            .await
+            .expect("connect");
+
+        // Hold a transaction with a pending in-place write open. That is exactly
+        // the condition that makes every checkpoint decline. It targets a scratch
+        // file rather than a real one, so committing it later disturbs nothing.
+        let wal = rasterizeddb_core::core::wal::wal_for(live.to_str().unwrap()).expect("wal");
+        let scratch = live.join("scratch.db");
+        std::fs::write(&scratch, vec![0u8; 64]).unwrap();
+        let scratch_id = rasterizeddb_core::core::wal::file_id_for_name("scratch.db");
+        wal.register_file(scratch_id, &scratch);
+
+        let pending = wal.begin();
+        wal.log_in_place(pending, scratch_id, 0, b"held")
+            .expect("log in place");
+
+        let err = service
+            .snapshot_now()
+            .await
+            .expect_err("a snapshot whose log cannot be archived must not be recorded");
+        assert!(
+            err.to_string().contains("could not be archived"),
+            "unexpected error: {err}"
+        );
+        eprintln!("snapshot correctly discarded: {err}");
+
+        assert!(
+            service.manifest_snapshot().await.snapshots.is_empty(),
+            "a discarded snapshot must leave no catalogue entry behind"
+        );
+
+        // With the transaction closed, checkpoints work again and the retry lands.
+        wal.commit_txn(pending).expect("commit");
+        service
+            .snapshot_now()
+            .await
+            .expect("the retry should succeed");
+        assert_eq!(service.manifest_snapshot().await.snapshots.len(), 1);
+
+        let target = root.join("restored");
+        rasterizeddb_core::core::backup::restore_from(&config, &target, RecoveryTarget::Latest)
+            .await
+            .expect("restore");
+        assert_eq!(count_in_restored(&target, "SELECT * FROM t").await, 10);
     }
-
-    let service = BackupService::connect(config.clone(), live.to_str().unwrap())
-        .await
-        .expect("connect");
-
-    // Hold a transaction with a pending in-place write open. That is exactly
-    // the condition that makes every checkpoint decline. It targets a scratch
-    // file rather than a real one, so committing it later disturbs nothing.
-    let wal = rasterizeddb_core::core::wal::wal_for(live.to_str().unwrap()).expect("wal");
-    let scratch = live.join("scratch.db");
-    std::fs::write(&scratch, vec![0u8; 64]).unwrap();
-    let scratch_id = rasterizeddb_core::core::wal::file_id_for_name("scratch.db");
-    wal.register_file(scratch_id, &scratch);
-
-    let pending = wal.begin();
-    wal.log_in_place(pending, scratch_id, 0, b"held").expect("log in place");
-
-    let err = service
-        .snapshot_now()
-        .await
-        .expect_err("a snapshot whose log cannot be archived must not be recorded");
-    assert!(
-        err.to_string().contains("could not be archived"),
-        "unexpected error: {err}"
-    );
-    eprintln!("snapshot correctly discarded: {err}");
-
-    assert!(
-        service.manifest_snapshot().await.snapshots.is_empty(),
-        "a discarded snapshot must leave no catalogue entry behind"
-    );
-
-    // With the transaction closed, checkpoints work again and the retry lands.
-    wal.commit_txn(pending).expect("commit");
-    service.snapshot_now().await.expect("the retry should succeed");
-    assert_eq!(service.manifest_snapshot().await.snapshots.len(), 1);
-
-    let target = root.join("restored");
-    rasterizeddb_core::core::backup::restore_from(&config, &target, RecoveryTarget::Latest)
-        .await
-        .expect("restore");
-    assert_eq!(count_in_restored(&target, "SELECT * FROM t").await, 10);
-});
+);
 
 e2e_test!(refuses_to_restore_over_an_existing_directory, config, {
     let root = temp_testdir::TempDir::default();
@@ -777,112 +867,126 @@ e2e_test!(a_prefix_belonging_to_another_database_is_refused, config, {
     assert!(err.to_string().contains("already holds backups"), "{err}");
 });
 
-e2e_test!(a_prefix_with_no_snapshot_gets_its_base_without_being_asked, config, {
-    // The bug this pins: the snapshot loop slept a whole interval before doing
-    // anything, so a new prefix held nothing restorable for a day — while the
-    // archive loop happily filled it with segments that had no snapshot to
-    // replay onto. Every deployment restarted inside the interval never got a
-    // base at all, and the only thing that ever produced one was somebody
-    // pressing BACKUP NOW.
-    let root = temp_testdir::TempDir::default();
-    let live = root.join("live");
-    std::fs::create_dir_all(&live).unwrap();
+e2e_test!(
+    a_prefix_with_no_snapshot_gets_its_base_without_being_asked,
+    config,
+    {
+        // The bug this pins: the snapshot loop slept a whole interval before doing
+        // anything, so a new prefix held nothing restorable for a day — while the
+        // archive loop happily filled it with segments that had no snapshot to
+        // replay onto. Every deployment restarted inside the interval never got a
+        // base at all, and the only thing that ever produced one was somebody
+        // pressing BACKUP NOW.
+        let root = temp_testdir::TempDir::default();
+        let live = root.join("live");
+        std::fs::create_dir_all(&live).unwrap();
 
-    let database = Arc::new(Database::new(live.to_str().unwrap()).await);
-    run(&database, "CREATE TABLE t (id INT)").await;
-    for i in 0..12 {
-        run(&database, &format!("INSERT INTO t (id) VALUES ({i})")).await;
-    }
-
-    let mut config = config;
-    // A day away: on the old behaviour nothing whatsoever happens in the next
-    // ten seconds.
-    config.snapshot_interval_secs = 86_400;
-    let service = BackupService::connect(config.clone(), live.to_str().unwrap())
-        .await
-        .expect("connect");
-    assert!(
-        service.manifest_snapshot().await.snapshots.is_empty(),
-        "the prefix must start empty for this to be testing anything"
-    );
-
-    // Nothing is snapshotted by hand from here on.
-    service.spawn_background();
-
-    let mut took_one = false;
-    for _ in 0..40 {
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        if !service.manifest_snapshot().await.snapshots.is_empty() {
-            took_one = true;
-            break;
+        let database = Arc::new(Database::new(live.to_str().unwrap()).await);
+        run(&database, "CREATE TABLE t (id INT)").await;
+        for i in 0..12 {
+            run(&database, &format!("INSERT INTO t (id) VALUES ({i})")).await;
         }
-    }
-    assert!(took_one, "a prefix with no snapshot must not wait out the interval");
 
-    // And it is a real one: file counts and a successful upload have both lied
-    // before, so the assertion is a restore.
-    let target = root.join("restored");
-    rasterizeddb_core::core::backup::restore_from(&config, &target, RecoveryTarget::Latest)
-        .await
-        .expect("restore");
-    assert_eq!(count_in_restored(&target, "SELECT * FROM t").await, 12);
-});
+        let mut config = config;
+        // A day away: on the old behaviour nothing whatsoever happens in the next
+        // ten seconds.
+        config.snapshot_interval_secs = 86_400;
+        let service = BackupService::connect(config.clone(), live.to_str().unwrap())
+            .await
+            .expect("connect");
+        assert!(
+            service.manifest_snapshot().await.snapshots.is_empty(),
+            "the prefix must start empty for this to be testing anything"
+        );
 
-e2e_test!(an_overdue_snapshot_is_taken_at_start_not_an_interval_later, config, {
-    // The second half of the same bug. A catalogue that already holds a
-    // snapshot used to have its next one scheduled from process start, so a
-    // server restarted more often than the interval never reached one —
-    // silently, since the loop is running and the log keeps being archived.
-    let root = temp_testdir::TempDir::default();
-    let live = root.join("live");
-    std::fs::create_dir_all(&live).unwrap();
+        // Nothing is snapshotted by hand from here on.
+        service.spawn_background();
 
-    let database = Arc::new(Database::new(live.to_str().unwrap()).await);
-    run(&database, "CREATE TABLE t (id INT)").await;
-    run(&database, "INSERT INTO t (id) VALUES (1)").await;
-
-    let mut config = config;
-    config.snapshot_interval_secs = 86_400;
-    let service = BackupService::connect(config.clone(), live.to_str().unwrap())
-        .await
-        .expect("connect");
-    service.snapshot_now().await.expect("snapshot");
-
-    // Reach past the service and age the catalogue by two days, which is what a
-    // host that has been restarting inside the interval looks like.
-    let client = client_for(&config);
-    let key = manifest_key(&config);
-    let mut manifest = rasterizeddb_core::core::backup::manifest::Manifest::decode(
-        &client.get_object(&key).await.expect("manifest"),
-    )
-    .expect("decode");
-    let two_days = 2 * 86_400;
-    for snapshot in &mut manifest.snapshots {
-        snapshot.started_at = snapshot.started_at.saturating_sub(two_days);
-        snapshot.finished_at = snapshot.finished_at.saturating_sub(two_days);
-    }
-    let before = manifest.snapshots.len();
-    client.put_object(&key, &manifest.encode()).await.expect("put manifest");
-
-    // A fresh service over the aged catalogue — a restart, in other words.
-    let restarted = BackupService::connect(config.clone(), live.to_str().unwrap())
-        .await
-        .expect("reconnect");
-    restarted.spawn_background();
-
-    let mut caught_up = false;
-    for _ in 0..40 {
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        if restarted.manifest_snapshot().await.snapshots.len() > before {
-            caught_up = true;
-            break;
+        let mut took_one = false;
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            if !service.manifest_snapshot().await.snapshots.is_empty() {
+                took_one = true;
+                break;
+            }
         }
+        assert!(
+            took_one,
+            "a prefix with no snapshot must not wait out the interval"
+        );
+
+        // And it is a real one: file counts and a successful upload have both lied
+        // before, so the assertion is a restore.
+        let target = root.join("restored");
+        rasterizeddb_core::core::backup::restore_from(&config, &target, RecoveryTarget::Latest)
+            .await
+            .expect("restore");
+        assert_eq!(count_in_restored(&target, "SELECT * FROM t").await, 12);
     }
-    assert!(
-        caught_up,
-        "a snapshot two days overdue must be taken at start, not an interval later"
-    );
-});
+);
+
+e2e_test!(
+    an_overdue_snapshot_is_taken_at_start_not_an_interval_later,
+    config,
+    {
+        // The second half of the same bug. A catalogue that already holds a
+        // snapshot used to have its next one scheduled from process start, so a
+        // server restarted more often than the interval never reached one —
+        // silently, since the loop is running and the log keeps being archived.
+        let root = temp_testdir::TempDir::default();
+        let live = root.join("live");
+        std::fs::create_dir_all(&live).unwrap();
+
+        let database = Arc::new(Database::new(live.to_str().unwrap()).await);
+        run(&database, "CREATE TABLE t (id INT)").await;
+        run(&database, "INSERT INTO t (id) VALUES (1)").await;
+
+        let mut config = config;
+        config.snapshot_interval_secs = 86_400;
+        let service = BackupService::connect(config.clone(), live.to_str().unwrap())
+            .await
+            .expect("connect");
+        service.snapshot_now().await.expect("snapshot");
+
+        // Reach past the service and age the catalogue by two days, which is what a
+        // host that has been restarting inside the interval looks like.
+        let client = client_for(&config);
+        let key = manifest_key(&config);
+        let mut manifest = rasterizeddb_core::core::backup::manifest::Manifest::decode(
+            &client.get_object(&key).await.expect("manifest"),
+        )
+        .expect("decode");
+        let two_days = 2 * 86_400;
+        for snapshot in &mut manifest.snapshots {
+            snapshot.started_at = snapshot.started_at.saturating_sub(two_days);
+            snapshot.finished_at = snapshot.finished_at.saturating_sub(two_days);
+        }
+        let before = manifest.snapshots.len();
+        client
+            .put_object(&key, &manifest.encode())
+            .await
+            .expect("put manifest");
+
+        // A fresh service over the aged catalogue — a restart, in other words.
+        let restarted = BackupService::connect(config.clone(), live.to_str().unwrap())
+            .await
+            .expect("reconnect");
+        restarted.spawn_background();
+
+        let mut caught_up = false;
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            if restarted.manifest_snapshot().await.snapshots.len() > before {
+                caught_up = true;
+                break;
+            }
+        }
+        assert!(
+            caught_up,
+            "a snapshot two days overdue must be taken at start, not an interval later"
+        );
+    }
+);
 
 e2e_test!(a_rollover_records_when_it_happened, config, {
     // A rollover leaves an ordinary snapshot behind, so without this stamp
@@ -957,7 +1061,10 @@ e2e_test!(a_rollover_removes_the_bundles_behind_it, config, {
         for i in 0..5 {
             run(
                 &database,
-                &format!("INSERT INTO t (id, tag) VALUES ({}, 'g{generation}')", generation * 5 + i),
+                &format!(
+                    "INSERT INTO t (id, tag) VALUES ({}, 'g{generation}')",
+                    generation * 5 + i
+                ),
             )
             .await;
         }
@@ -980,14 +1087,22 @@ e2e_test!(a_rollover_removes_the_bundles_behind_it, config, {
 
     // Writes the rollover's own snapshot has to carry.
     for i in 10..15 {
-        run(&database, &format!("INSERT INTO t (id, tag) VALUES ({i}, 'after')")).await;
+        run(
+            &database,
+            &format!("INSERT INTO t (id, tag) VALUES ({i}, 'after')"),
+        )
+        .await;
     }
 
     let (report, removed) = service.rollover_now().await.expect("rollover");
     assert!(removed > 0, "the rollover deleted nothing");
 
     let after = service.manifest_snapshot().await;
-    assert_eq!(after.snapshots.len(), 1, "a rollover keeps exactly one generation");
+    assert_eq!(
+        after.snapshots.len(),
+        1,
+        "a rollover keeps exactly one generation"
+    );
     assert_eq!(after.snapshots[0].key, report.key);
 
     let client = client_for(&config);
@@ -1038,7 +1153,11 @@ e2e_test!(a_created_database_is_archived_and_restored, config, {
 
     let early = catalogue.create("early").await.expect("create early");
     run(&early, "CREATE TABLE t (id INT, tag STRING)").await;
-    run(&early, "INSERT INTO t (id, tag) VALUES (1, 'before the service')").await;
+    run(
+        &early,
+        "INSERT INTO t (id, tag) VALUES (1, 'before the service')",
+    )
+    .await;
 
     let service = BackupService::connect(config.clone(), &live_str)
         .await
@@ -1049,18 +1168,34 @@ e2e_test!(a_created_database_is_archived_and_restored, config, {
     let late = catalogue.create("late").await.expect("create late");
     run(&late, "CREATE TABLE t (id INT, tag STRING)").await;
     for i in 0..5 {
-        run(&late, &format!("INSERT INTO t (id, tag) VALUES ({i}, 'before the snapshot')")).await;
+        run(
+            &late,
+            &format!("INSERT INTO t (id, tag) VALUES ({i}, 'before the snapshot')"),
+        )
+        .await;
     }
-    run(&early, "INSERT INTO t (id, tag) VALUES (2, 'before the snapshot')").await;
+    run(
+        &early,
+        "INSERT INTO t (id, tag) VALUES (2, 'before the snapshot')",
+    )
+    .await;
 
     service.snapshot_now().await.expect("snapshot");
 
     // Writes after the snapshot: these exist only in the archived log, so they
     // are what proves the log of a created database is being archived at all.
     for i in 5..10 {
-        run(&late, &format!("INSERT INTO t (id, tag) VALUES ({i}, 'after the snapshot')")).await;
+        run(
+            &late,
+            &format!("INSERT INTO t (id, tag) VALUES ({i}, 'after the snapshot')"),
+        )
+        .await;
     }
-    run(&early, "INSERT INTO t (id, tag) VALUES (3, 'after the snapshot')").await;
+    run(
+        &early,
+        "INSERT INTO t (id, tag) VALUES (3, 'after the snapshot')",
+    )
+    .await;
     run(&master, "INSERT INTO ledger (id) VALUES (2)").await;
     service.archive_wal_now().await.expect("archive");
 
@@ -1098,14 +1233,16 @@ e2e_test!(a_created_database_is_archived_and_restored, config, {
     // Each database is opened from its own directory, which is where a restore
     // has to put it for the catalogue to find it again.
     assert_eq!(count_in_restored(&target, "SELECT * FROM ledger").await, 2);
-    assert_eq!(count_in_restored(&target.join("early"), "SELECT * FROM t").await, 3);
+    assert_eq!(
+        count_in_restored(&target.join("early"), "SELECT * FROM t").await,
+        3
+    );
     assert_eq!(
         count_in_restored(&target.join("late"), "SELECT * FROM t").await,
         10,
         "the writes after the snapshot exist only in the archived log"
     );
 });
-
 
 e2e_test!(a_restored_copy_reads_its_own_directory, config, {
     // A restore that answers queries from the *source* directory is the worst
@@ -1128,7 +1265,11 @@ e2e_test!(a_restored_copy_reads_its_own_directory, config, {
     let database = Arc::new(Database::new(live.to_str().unwrap()).await);
     run(&database, "CREATE TABLE ledger (id INT, note STRING)").await;
     for i in 0..25 {
-        run(&database, &format!("INSERT INTO ledger (id, note) VALUES ({i}, 'kept')")).await;
+        run(
+            &database,
+            &format!("INSERT INTO ledger (id, note) VALUES ({i}, 'kept')"),
+        )
+        .await;
     }
 
     let service = BackupService::connect(config.clone(), live.to_str().unwrap())

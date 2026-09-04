@@ -137,12 +137,12 @@ impl Bitmap {
                 break;
             }
             if self.levels[level].load(Ordering::Acquire).is_null() {
-                let chunk: Box<[AtomicU8]> =
-                    (0..Self::level_len(level)).map(|_| AtomicU8::new(0)).collect();
+                let chunk: Box<[AtomicU8]> = (0..Self::level_len(level))
+                    .map(|_| AtomicU8::new(0))
+                    .collect();
                 // Leaked deliberately: a level outlives every reader that may
                 // be holding a pointer into it, and `Drop` takes it back.
-                self.levels[level]
-                    .store(Box::into_raw(chunk) as *mut AtomicU8, Ordering::Release);
+                self.levels[level].store(Box::into_raw(chunk) as *mut AtomicU8, Ordering::Release);
             }
             covered += Self::level_len(level);
         }
@@ -279,7 +279,11 @@ impl StatusLog {
     /// A log backed by a file, read into memory if it already exists.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let mut file = OpenOptions::new().read(true).write(true).create(true).open(&path)?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path)?;
 
         let mut bits = Vec::new();
         file.seek(SeekFrom::Start(0))?;
@@ -349,12 +353,14 @@ impl StatusLog {
         let mut inner = self.inner.lock();
         let index = (tx / ENTRIES_PER_BYTE) as usize;
         if index >= self.bits.len() {
-            self.bits.grow_to((index + 1).next_multiple_of(GROWTH_CHUNK));
+            self.bits
+                .grow_to((index + 1).next_multiple_of(GROWTH_CHUNK));
         }
 
         let shift = (tx % ENTRIES_PER_BYTE) * 2;
         let byte = self.bits.load_for_update(index);
-        self.bits.store(index, (byte & !(0b11 << shift)) | (bits << shift));
+        self.bits
+            .store(index, (byte & !(0b11 << shift)) | (bits << shift));
 
         if tx > inner.highest {
             inner.highest = tx;
@@ -525,7 +531,10 @@ impl StatusLog {
         let batch: Vec<Staged> = inner.staged.drain(..ready).collect();
         let mut rest = batch.into_iter();
         while let Some(s) = rest.next() {
-            let file = inner.file.as_mut().expect("staged only when there is a file");
+            let file = inner
+                .file
+                .as_mut()
+                .expect("staged only when there is a file");
             let written = file
                 .seek(SeekFrom::Start(s.low as u64))
                 .and_then(|_| file.write_all(&s.bytes));
@@ -590,11 +599,21 @@ mod tests {
         ids.dedup();
 
         for (n, id) in ids.iter().enumerate() {
-            log.record(*id, if n % 2 == 0 { TxOutcome::Committed } else { TxOutcome::Aborted });
+            log.record(
+                *id,
+                if n % 2 == 0 {
+                    TxOutcome::Committed
+                } else {
+                    TxOutcome::Aborted
+                },
+            );
         }
         for (n, id) in ids.iter().enumerate() {
-            let expected =
-                if n % 2 == 0 { TxOutcome::Committed } else { TxOutcome::Aborted };
+            let expected = if n % 2 == 0 {
+                TxOutcome::Committed
+            } else {
+                TxOutcome::Aborted
+            };
             assert_eq!(log.outcome(*id), expected, "id {}", id);
         }
     }
@@ -604,7 +623,11 @@ mod tests {
     #[test]
     fn ids_past_the_recorded_length_are_aborted() {
         let log = StatusLog::in_memory();
-        assert_eq!(log.outcome(5), TxOutcome::Aborted, "nothing recorded at all");
+        assert_eq!(
+            log.outcome(5),
+            TxOutcome::Aborted,
+            "nothing recorded at all"
+        );
 
         log.record(5, TxOutcome::Committed);
         // Same byte, never recorded: in progress, as it was before.
@@ -681,11 +704,21 @@ mod tests {
     fn neighbouring_ids_do_not_overwrite_each_other() {
         let log = StatusLog::in_memory();
         for id in 4..12 {
-            log.record(id, if id % 2 == 0 { TxOutcome::Committed } else { TxOutcome::Aborted });
+            log.record(
+                id,
+                if id % 2 == 0 {
+                    TxOutcome::Committed
+                } else {
+                    TxOutcome::Aborted
+                },
+            );
         }
         for id in 4..12 {
-            let expected =
-                if id % 2 == 0 { TxOutcome::Committed } else { TxOutcome::Aborted };
+            let expected = if id % 2 == 0 {
+                TxOutcome::Committed
+            } else {
+                TxOutcome::Aborted
+            };
             assert_eq!(log.outcome(id), expected, "id {}", id);
         }
     }
@@ -700,7 +733,11 @@ mod tests {
         log.record(5, TxOutcome::Committed);
 
         assert_eq!(log.outcome(5), TxOutcome::Committed);
-        assert_eq!(log.outcome(6), TxOutcome::Committed, "the neighbour is untouched");
+        assert_eq!(
+            log.outcome(6),
+            TxOutcome::Committed,
+            "the neighbour is untouched"
+        );
     }
 
     /// An id from a run that crashed before recording anything must not be read
@@ -728,7 +765,11 @@ mod tests {
         assert_eq!(log.outcome(2), TxOutcome::Committed);
         assert_eq!(log.outcome(3), TxOutcome::Aborted);
         assert_eq!(log.outcome(40), TxOutcome::Committed);
-        assert_eq!(log.highest_recorded(), 40, "ids must resume above what was used");
+        assert_eq!(
+            log.highest_recorded(),
+            40,
+            "ids must resume above what was used"
+        );
     }
 
     /// The unflushed span is what a read-only statement watches to decide when
@@ -745,7 +786,11 @@ mod tests {
 
         // Four ids to a byte, so this is a byte apiece and the span widens.
         log.record(4_000, TxOutcome::Committed);
-        assert!(log.dirty_bytes() > one, "the span did not widen: {}", log.dirty_bytes());
+        assert!(
+            log.dirty_bytes() > one,
+            "the span did not widen: {}",
+            log.dirty_bytes()
+        );
 
         log.flush().expect("flush");
         assert_eq!(log.dirty_bytes(), 0, "the flush did not clear the span");
@@ -780,7 +825,10 @@ mod tests {
         // Applying now must do nothing: the record is not durable yet.
         log.apply_staged().expect("apply with nothing durable");
         let still = std::fs::read(&path).expect("read");
-        assert!(still.get(1).copied().unwrap_or(0) == 0, "applied before the sync");
+        assert!(
+            still.get(1).copied().unwrap_or(0) == 0,
+            "applied before the sync"
+        );
 
         // The sync the caller owed, then the copy.
         wal.sync_pending().expect("sync");
@@ -810,7 +858,11 @@ mod tests {
 
         let bytes = std::fs::read(&path).expect("read");
         let expected = BITS_COMMITTED << ((7 % ENTRIES_PER_BYTE) * 2);
-        assert_eq!(bytes.get(1).copied().unwrap_or(0), expected, "flush was not durable");
+        assert_eq!(
+            bytes.get(1).copied().unwrap_or(0),
+            expected,
+            "flush was not durable"
+        );
     }
 
     /// A staged range left over from a deferred flush is not lost when a later

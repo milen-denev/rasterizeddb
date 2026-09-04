@@ -17,8 +17,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use arc_swap::ArcSwap;
 use ahash::RandomState;
+use arc_swap::ArcSwap;
 
 use cacheguard::CacheGuard;
 
@@ -221,8 +221,12 @@ where
             let new_version = current_version.wrapping_add(1);
             let new_sv = pack_state_version(new, new_version);
             // Publish with AcqRel on success; Acquire on failure to synchronize
-            self.state_version
-                .compare_exchange(current_sv, new_sv, Ordering::AcqRel, Ordering::Acquire)
+            self.state_version.compare_exchange(
+                current_sv,
+                new_sv,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
         } else {
             Err(current_sv)
         }

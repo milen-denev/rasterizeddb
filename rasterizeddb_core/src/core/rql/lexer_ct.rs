@@ -96,10 +96,7 @@ pub fn create_table_with_reason(qp: &QueryPurpose) -> (Option<CreateTable>, Opti
     (parsed, rejection)
 }
 
-fn parse_create_table(
-    qp: &QueryPurpose,
-    rejection: &mut Option<String>,
-) -> Option<CreateTable> {
+fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Option<CreateTable> {
     if let QueryPurpose::CreateTable(sql) = qp {
         let sql = sql.as_str();
         // Robustly extract table name after CREATE and TABLE, skipping arbitrary whitespace
@@ -249,8 +246,7 @@ fn parse_create_table(
             // the definition: its expression is a parenthesised group that the
             // type reader, the DEFAULT reader and the constraint reader would
             // each take a piece of.
-            let (col_def_owned, check_expression) =
-                crate::core::rql::check::split_clause(col_def);
+            let (col_def_owned, check_expression) = crate::core::rql::check::split_clause(col_def);
             let col_def = col_def_owned.as_str();
 
             // `GENERATED ALWAYS AS (…) STORED` comes out first, because its
@@ -300,7 +296,12 @@ fn parse_create_table(
             // the document, so its own storage is a UUID.
             let declared = type_phrase.split_whitespace().next().unwrap_or("");
             let is_json = matches!(
-                declared.split('(').next().unwrap_or(declared).to_ascii_uppercase().as_str(),
+                declared
+                    .split('(')
+                    .next()
+                    .unwrap_or(declared)
+                    .to_ascii_uppercase()
+                    .as_str(),
                 "JSON" | "JSONB"
             );
 
@@ -343,10 +344,7 @@ fn parse_create_table(
                 // which table the document was taken apart into.
                 json_columns.push(crate::core::rql::json_map::JsonColumn {
                     column: name.clone(),
-                    shadow_table: crate::core::rql::json_map::shadow_table_name(
-                        &table_name,
-                        &name,
-                    ),
+                    shadow_table: crate::core::rql::json_map::shadow_table_name(&table_name, &name),
                     is_deleted: false,
                 });
                 DbType::UUID
@@ -618,10 +616,19 @@ fn parse_type_phrase(tokens: &[&str]) -> Option<(String, usize)> {
     // Multi-word type names, longest first. Each entry is the words it is
     // spelled with and the canonical phrase they mean.
     const PHRASES: &[(&[&str], &str)] = &[
-        (&["TIMESTAMP", "WITH", "TIME", "ZONE"], "TIMESTAMP WITH TIME ZONE"),
-        (&["TIMESTAMP", "WITHOUT", "TIME", "ZONE"], "TIMESTAMP WITHOUT TIME ZONE"),
+        (
+            &["TIMESTAMP", "WITH", "TIME", "ZONE"],
+            "TIMESTAMP WITH TIME ZONE",
+        ),
+        (
+            &["TIMESTAMP", "WITHOUT", "TIME", "ZONE"],
+            "TIMESTAMP WITHOUT TIME ZONE",
+        ),
         (&["TIME", "WITH", "TIME", "ZONE"], "TIME WITH TIME ZONE"),
-        (&["TIME", "WITHOUT", "TIME", "ZONE"], "TIME WITHOUT TIME ZONE"),
+        (
+            &["TIME", "WITHOUT", "TIME", "ZONE"],
+            "TIME WITHOUT TIME ZONE",
+        ),
         (&["DOUBLE", "PRECISION"], "DOUBLE PRECISION"),
         (&["CHARACTER", "VARYING"], "CHARACTER VARYING"),
         (&["BIT", "VARYING"], "BIT VARYING"),
@@ -635,8 +642,11 @@ fn parse_type_phrase(tokens: &[&str]) -> Option<(String, usize)> {
             // The brackets may sit on any word of the phrase, and are carried
             // onto the canonical form so the caller sees an array.
             let array = tokens[..words.len()].iter().any(|t| has_brackets(t));
-            let phrase =
-                if array { format!("{}[]", canonical) } else { canonical.to_string() };
+            let phrase = if array {
+                format!("{}[]", canonical)
+            } else {
+                canonical.to_string()
+            };
             return Some((phrase, words.len()));
         }
     }
@@ -659,7 +669,6 @@ mod tests {
             .filter(|c| !crate::core::rql::nullable::is_hidden(&c.name))
             .collect()
     }
-
 
     #[test]
     fn test_create_table_all_types() {
@@ -864,7 +873,11 @@ mod constraint_keyword_tests {
             "excluded_at TIMESTAMP",
             "uniqueness INT",
         ] {
-            assert!(!is_table_constraint(def), "{} was taken for a constraint", def);
+            assert!(
+                !is_table_constraint(def),
+                "{} was taken for a constraint",
+                def
+            );
         }
     }
 

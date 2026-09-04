@@ -110,7 +110,11 @@ pub async fn load<S: crate::core::storage_providers::traits::StorageIO>(
     let mut buffer = vec![0u8; PATH_INDEX_SIZE as usize];
     for i in 0..(len / PATH_INDEX_SIZE) {
         let mut position = i * PATH_INDEX_SIZE;
-        if io.read_data_into_buffer(&mut position, &mut buffer).await.is_err() {
+        if io
+            .read_data_into_buffer(&mut position, &mut buffer)
+            .await
+            .is_err()
+        {
             break;
         }
         match PathIndex::from_vec(&buffer) {
@@ -306,7 +310,12 @@ pub fn parse_create(sql: &str) -> Option<Result<CreatePathIndex, String>> {
     let path = crate::core::jsonb::parse_path_expression(inner)?;
 
     Some(match indexable(&path) {
-        Ok(()) => Ok(CreatePathIndex { name, table, path, if_not_exists }),
+        Ok(()) => Ok(CreatePathIndex {
+            name,
+            table,
+            path,
+            if_not_exists,
+        }),
         Err(e) => Err(e),
     })
 }
@@ -415,7 +424,11 @@ mod statement_tests {
             "CREATE INDEX ix ON docs USING gin (doc)",
             "SELECT 1",
         ] {
-            assert!(parse_create(sql).is_none(), "{} should not be a path index", sql);
+            assert!(
+                parse_create(sql).is_none(),
+                "{} should not be a path index",
+                sql
+            );
         }
     }
 
@@ -430,9 +443,18 @@ mod statement_tests {
 
     #[test]
     fn drop_parses() {
-        assert_eq!(parse_drop("DROP INDEX ix_status"), Some(("ix_status".to_string(), false)));
-        assert_eq!(parse_drop("DROP INDEX IF EXISTS ix"), Some(("ix".to_string(), true)));
-        assert_eq!(parse_drop("drop index \"ix\";"), Some(("ix".to_string(), false)));
+        assert_eq!(
+            parse_drop("DROP INDEX ix_status"),
+            Some(("ix_status".to_string(), false))
+        );
+        assert_eq!(
+            parse_drop("DROP INDEX IF EXISTS ix"),
+            Some(("ix".to_string(), true))
+        );
+        assert_eq!(
+            parse_drop("drop index \"ix\";"),
+            Some(("ix".to_string(), false))
+        );
         assert!(parse_drop("DROP TABLE t").is_none());
     }
 }

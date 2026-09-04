@@ -112,10 +112,7 @@ impl NativeAuthConfig {
 }
 
 /// Creates the role catalogue and its bootstrap role if there is none yet.
-pub async fn seed_roles(
-    database: &Arc<Database>,
-    config: &NativeAuthConfig,
-) -> Result<(), String> {
+pub async fn seed_roles(database: &Arc<Database>, config: &NativeAuthConfig) -> Result<(), String> {
     if config.method == AuthMethod::Trust {
         return Ok(());
     }
@@ -414,7 +411,10 @@ mod tests {
         let mut hello = vec![C_HELLO, PROTOCOL_VERSION];
         hello.extend_from_slice(&(99u16).to_le_bytes());
         hello.extend_from_slice(b"alice");
-        assert!(parse_hello(&hello).is_err(), "a claimed length must be checked");
+        assert!(
+            parse_hello(&hello).is_err(),
+            "a claimed length must be checked"
+        );
 
         assert!(parse_hello(&[]).is_err());
         assert!(parse_hello(&[C_HELLO]).is_err());

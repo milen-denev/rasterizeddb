@@ -221,10 +221,12 @@ fn handle_hello(replication: &StdArc<Replication>, payload: &[u8]) -> Vec<u8> {
         use subtle::ConstantTimeEq;
         let presented = hello.token.as_bytes();
         let expected = config.token.as_bytes();
-        let matches = presented.len() == expected.len()
-            && bool::from(presented.ct_eq(expected));
+        let matches = presented.len() == expected.len() && bool::from(presented.ct_eq(expected));
         if !matches {
-            warn!("Refusing node {}: the replication token does not match", hello.node_id);
+            warn!(
+                "Refusing node {}: the replication token does not match",
+                hello.node_id
+            );
             return protocol::error_frame("authentication failed: replication token mismatch");
         }
     }
@@ -525,7 +527,10 @@ pub async fn apply_pulled(
             refused += 1;
         }
     }
-    replication.stats().applied.fetch_add(applied as u64, Ordering::Relaxed);
+    replication
+        .stats()
+        .applied
+        .fetch_add(applied as u64, Ordering::Relaxed);
     (applied, refused)
 }
 
@@ -538,7 +543,10 @@ mod tests {
         let database = crate::replication::test_support::in_memory_database().await;
         database
             .replication
-            .set_config(ReplicationConfig { node_id: 1, ..Default::default() })
+            .set_config(ReplicationConfig {
+                node_id: 1,
+                ..Default::default()
+            })
             .unwrap();
         database.replication.open_storage(None).unwrap();
         database.replication.set_active(true);
@@ -557,12 +565,9 @@ mod tests {
     }
 
     async fn create_table(database: &Arc<Database>) {
-        let purpose = recognize_query_purpose(
-            "CREATE TABLE repl_t (id INTEGER, name VARCHAR)",
-        )
-        .unwrap();
-        let response =
-            crate::core::rql::executor::execute(purpose, database.clone()).await;
+        let purpose =
+            recognize_query_purpose("CREATE TABLE repl_t (id INTEGER, name VARCHAR)").unwrap();
+        let response = crate::core::rql::executor::execute(purpose, database.clone()).await;
         assert_ne!(response.first(), Some(&3), "the fixture table must exist");
     }
 
@@ -584,7 +589,11 @@ mod tests {
         let outcome = apply_record(
             &database,
             &replication,
-            record(2, 1, vec!["INSERT INTO repl_t (id, name) VALUES (1, 'ada')"]),
+            record(
+                2,
+                1,
+                vec!["INSERT INTO repl_t (id, name) VALUES (1, 'ada')"],
+            ),
             NO_SENDER,
         )
         .await;
@@ -635,7 +644,11 @@ mod tests {
         apply_record(
             &database,
             &replication,
-            record(2, 1, vec!["INSERT INTO repl_t (id, name) VALUES (1, 'ada')"]),
+            record(
+                2,
+                1,
+                vec!["INSERT INTO repl_t (id, name) VALUES (1, 'ada')"],
+            ),
             NO_SENDER,
         )
         .await;
@@ -645,7 +658,11 @@ mod tests {
             before,
             "an applied record must not become a local one, or a mesh would loop"
         );
-        assert_eq!(replication.open_captures(), 0, "no buffer should be left behind");
+        assert_eq!(
+            replication.open_captures(),
+            0,
+            "no buffer should be left behind"
+        );
     }
 
     #[tokio::test]
@@ -657,21 +674,33 @@ mod tests {
         let first = apply_record(
             &database,
             &replication,
-            record(2, 1, vec!["INSERT INTO repl_t (id, name) VALUES (1, 'ada')"]),
+            record(
+                2,
+                1,
+                vec!["INSERT INTO repl_t (id, name) VALUES (1, 'ada')"],
+            ),
             NO_SENDER,
         )
         .await;
         let second = apply_record(
             &database,
             &replication,
-            record(2, 1, vec!["INSERT INTO repl_t (id, name) VALUES (1, 'ada')"]),
+            record(
+                2,
+                1,
+                vec!["INSERT INTO repl_t (id, name) VALUES (1, 'ada')"],
+            ),
             NO_SENDER,
         )
         .await;
 
         assert_eq!(first.status, ApplyStatus::Applied);
         assert_eq!(second.status, ApplyStatus::Duplicate);
-        assert_eq!(row_count(&database).await, 1, "a resend must not double-insert");
+        assert_eq!(
+            row_count(&database).await,
+            1,
+            "a resend must not double-insert"
+        );
     }
 
     #[tokio::test]
@@ -683,7 +712,11 @@ mod tests {
         apply_record(
             &database,
             &replication,
-            record(2, 1, vec!["INSERT INTO repl_t (id, name) VALUES (1, 'ada')"]),
+            record(
+                2,
+                1,
+                vec!["INSERT INTO repl_t (id, name) VALUES (1, 'ada')"],
+            ),
             NO_SENDER,
         )
         .await;
@@ -691,13 +724,21 @@ mod tests {
         let outcome = apply_record(
             &database,
             &replication,
-            record(2, 5, vec!["INSERT INTO repl_t (id, name) VALUES (5, 'five')"]),
+            record(
+                2,
+                5,
+                vec!["INSERT INTO repl_t (id, name) VALUES (5, 'five')"],
+            ),
             NO_SENDER,
         )
         .await;
 
         assert_eq!(outcome.status, ApplyStatus::Gap);
-        assert_eq!(row_count(&database).await, 1, "nothing may be applied over a hole");
+        assert_eq!(
+            row_count(&database).await,
+            1,
+            "nothing may be applied over a hole"
+        );
     }
 
     /// A node joining a cluster whose early history is gone adopts the stream
@@ -711,7 +752,11 @@ mod tests {
         let outcome = apply_record(
             &database,
             &replication,
-            record(2, 900, vec!["INSERT INTO repl_t (id, name) VALUES (9, 'nine')"]),
+            record(
+                2,
+                900,
+                vec!["INSERT INTO repl_t (id, name) VALUES (9, 'nine')"],
+            ),
             NO_SENDER,
         )
         .await;
@@ -729,7 +774,11 @@ mod tests {
         let outcome = apply_record(
             &database,
             &replication,
-            record(1, 1, vec!["INSERT INTO repl_t (id, name) VALUES (1, 'ada')"]),
+            record(
+                1,
+                1,
+                vec!["INSERT INTO repl_t (id, name) VALUES (1, 'ada')"],
+            ),
             NO_SENDER,
         )
         .await;
@@ -766,7 +815,11 @@ mod tests {
         .await;
 
         assert_eq!(outcome.status, ApplyStatus::Conflict);
-        assert_eq!(row_count(&database).await, 0, "an aborted apply must be all-or-nothing");
+        assert_eq!(
+            row_count(&database).await,
+            0,
+            "an aborted apply must be all-or-nothing"
+        );
         assert_eq!(
             replication.applied().high_water(2),
             0,
@@ -802,8 +855,16 @@ mod tests {
         .await;
 
         assert_eq!(outcome.status, ApplyStatus::Applied);
-        assert_eq!(row_count(&database).await, 1, "the good statement should survive");
-        assert_eq!(replication.applied().high_water(2), 1, "the stream moves on");
+        assert_eq!(
+            row_count(&database).await,
+            1,
+            "the good statement should survive"
+        );
+        assert_eq!(
+            replication.applied().high_water(2),
+            1,
+            "the stream moves on"
+        );
     }
 
     #[tokio::test]
@@ -825,7 +886,11 @@ mod tests {
         let outcome = apply_record(
             &database,
             &replication,
-            record(2, 1, vec!["INSERT INTO repl_t (id, name) VALUES (1, 'ada')"]),
+            record(
+                2,
+                1,
+                vec!["INSERT INTO repl_t (id, name) VALUES (1, 'ada')"],
+            ),
             NO_SENDER,
         )
         .await;
@@ -878,7 +943,10 @@ mod tests {
         hello.encode(&mut payload);
 
         let response = handle_hello(&replication, &payload);
-        assert_eq!(protocol::parse_header(&response).unwrap().kind, FrameKind::Error);
+        assert_eq!(
+            protocol::parse_header(&response).unwrap().kind,
+            FrameKind::Error
+        );
     }
 
     #[tokio::test]
@@ -905,7 +973,9 @@ mod tests {
         .encode(&mut payload);
 
         assert_eq!(
-            protocol::parse_header(&handle_hello(&replication, &payload)).unwrap().kind,
+            protocol::parse_header(&handle_hello(&replication, &payload))
+                .unwrap()
+                .kind,
             FrameKind::Error
         );
 
@@ -922,7 +992,9 @@ mod tests {
         .encode(&mut payload);
 
         assert_eq!(
-            protocol::parse_header(&handle_hello(&replication, &payload)).unwrap().kind,
+            protocol::parse_header(&handle_hello(&replication, &payload))
+                .unwrap()
+                .kind,
             FrameKind::HelloAck
         );
     }
@@ -957,7 +1029,10 @@ mod tests {
     async fn a_garbled_frame_is_answered_with_an_error_not_a_panic() {
         let database = database().await;
         let response = handle_frame(database, vec![0xde, 0xad, 0xbe, 0xef]).await;
-        assert_eq!(protocol::parse_header(&response).unwrap().kind, FrameKind::Error);
+        assert_eq!(
+            protocol::parse_header(&response).unwrap().kind,
+            FrameKind::Error
+        );
     }
 
     #[test]

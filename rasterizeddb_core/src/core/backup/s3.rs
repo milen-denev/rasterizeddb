@@ -107,7 +107,8 @@ impl Endpoint {
         let (host, port) = match rest.rsplit_once(':') {
             Some((h, p)) if !h.ends_with(']') && p.chars().all(|c| c.is_ascii_digit()) => (
                 h.to_string(),
-                p.parse::<u16>().map_err(|_| format!("bad port in '{url}'"))?,
+                p.parse::<u16>()
+                    .map_err(|_| format!("bad port in '{url}'"))?,
             ),
             _ => (rest.to_string(), if tls { 443 } else { 80 }),
         };
@@ -239,7 +240,11 @@ impl S3Client {
         if self.config.path_style {
             self.config.endpoint.authority()
         } else {
-            format!("{}.{}", self.config.bucket, self.config.endpoint.authority())
+            format!(
+                "{}.{}",
+                self.config.bucket,
+                self.config.endpoint.authority()
+            )
         }
     }
 
@@ -257,9 +262,7 @@ impl S3Client {
 
     /// Uploads a whole object in one request.
     pub async fn put_object(&self, key: &str, body: &[u8]) -> io::Result<String> {
-        let response = self
-            .send("PUT", key, &[], &[], body, None)
-            .await?;
+        let response = self.send("PUT", key, &[], &[], body, None).await?;
         expect_ok(&response, "PUT", key)?;
         Ok(response
             .header("etag")
@@ -342,8 +345,12 @@ impl S3Client {
                 let Some(entry) = chunk.split("</Contents>").next() else {
                     continue;
                 };
-                let Some(key) = xml_tag(entry, "Key") else { continue };
-                let size = xml_tag(entry, "Size").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                let Some(key) = xml_tag(entry, "Key") else {
+                    continue;
+                };
+                let size = xml_tag(entry, "Size")
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
                 out.push((xml_unescape(key), size));
             }
 
@@ -610,10 +617,7 @@ impl S3Client {
     ///
     /// Only the first page is read: this clears orphans at start-up, and a
     /// bucket with more than a page of them has a problem paging does not fix.
-    pub async fn list_multipart_uploads(
-        &self,
-        prefix: &str,
-    ) -> io::Result<Vec<(String, String)>> {
+    pub async fn list_multipart_uploads(&self, prefix: &str) -> io::Result<Vec<(String, String)>> {
         let response = self
             .send("GET", "", &[("uploads", "")], &[], &[], None)
             .await?;
@@ -711,7 +715,8 @@ impl S3Client {
         body: &[u8],
         content_type: Option<&str>,
     ) -> io::Result<Response> {
-        let request = self.sign_request(method, key, query, extra_headers, body.len(), content_type)?;
+        let request =
+            self.sign_request(method, key, query, extra_headers, body.len(), content_type)?;
 
         let mut stream = self.connect().await?;
         stream.write_all(&request).await?;
@@ -749,8 +754,11 @@ impl S3Client {
             }
         }
 
-        let tcp = TcpStream::connect((self.config.endpoint.host.as_str(), self.config.endpoint.port))
-            .await?;
+        let tcp = TcpStream::connect((
+            self.config.endpoint.host.as_str(),
+            self.config.endpoint.port,
+        ))
+        .await?;
         // Request framing is written in one shot, so Nagle would only add a
         // round trip of delay before the body follows.
         tcp.set_nodelay(true)?;
@@ -758,14 +766,18 @@ impl S3Client {
         match &self.tls {
             None => Ok(Stream::Plain(tcp)),
             Some(config) => {
-                let server_name = rustls::pki_types::ServerName::try_from(
-                    self.config.endpoint.host.clone(),
-                )
-                .map_err(|_| {
-                    io::Error::other(format!("invalid TLS host '{}'", self.config.endpoint.host))
-                })?;
+                let server_name =
+                    rustls::pki_types::ServerName::try_from(self.config.endpoint.host.clone())
+                        .map_err(|_| {
+                            io::Error::other(format!(
+                                "invalid TLS host '{}'",
+                                self.config.endpoint.host
+                            ))
+                        })?;
                 let connector = tokio_rustls::TlsConnector::from(config.clone());
-                Ok(Stream::Tls(Box::new(connector.connect(server_name, tcp).await?)))
+                Ok(Stream::Tls(Box::new(
+                    connector.connect(server_name, tcp).await?,
+                )))
             }
         }
     }
@@ -919,9 +931,7 @@ impl S3Client {
         request.push_str("content-length: ");
         request.push_str(&body_len.to_string());
         request.push_str("\r\n");
-        request.push_str(
-            "authorization: AWS4-HMAC-SHA256 Credential=",
-        );
+        request.push_str("authorization: AWS4-HMAC-SHA256 Credential=");
         request.push_str(&self.config.credentials.access_key);
         request.push('/');
         request.push_str(&scope);
@@ -968,7 +978,9 @@ impl ResponseReader {
                 break pos + 4;
             }
             if self.buf.len() > 256 * 1024 {
-                return Err(io::Error::other("S3 response headers are implausibly large"));
+                return Err(io::Error::other(
+                    "S3 response headers are implausibly large",
+                ));
             }
             let n = stream.read(&mut chunk).await?;
             if n == 0 {
@@ -1128,8 +1140,8 @@ impl ResponseReader {
     async fn read_line(&mut self, stream: &mut Stream) -> io::Result<String> {
         loop {
             if let Some(pos) = find_subsequence(&self.buf[self.cursor..], b"\r\n") {
-                let line = String::from_utf8_lossy(&self.buf[self.cursor..self.cursor + pos])
-                    .to_string();
+                let line =
+                    String::from_utf8_lossy(&self.buf[self.cursor..self.cursor + pos]).to_string();
                 self.cursor += pos + 2;
                 return Ok(line);
             }
@@ -1187,7 +1199,10 @@ fn s3_error(what: &str, key: &str, status: u16, body: &[u8]) -> io::Error {
     };
     io::Error::new(
         kind,
-        format!("S3 {what} {key} returned {status}: {}", truncate(detail, 400)),
+        format!(
+            "S3 {what} {key} returned {status}: {}",
+            truncate(detail, 400)
+        ),
     )
 }
 

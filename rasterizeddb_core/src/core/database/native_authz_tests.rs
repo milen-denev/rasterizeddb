@@ -41,8 +41,17 @@ async fn an_ordinary_user_cannot_create_a_role() {
     )
     .await;
 
-    assert_eq!(response.first(), Some(&3), "must be refused: {}", text_of(&response));
-    assert!(text_of(&response).contains("not a superuser"), "{}", text_of(&response));
+    assert_eq!(
+        response.first(),
+        Some(&3),
+        "must be refused: {}",
+        text_of(&response)
+    );
+    assert!(
+        text_of(&response).contains("not a superuser"),
+        "{}",
+        text_of(&response)
+    );
 
     // And the refusal has to have been real, not merely reported.
     assert!(

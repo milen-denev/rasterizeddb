@@ -32,30 +32,30 @@ pub mod lexer_query;
 pub mod order_by;
 
 pub mod aggregate;
-pub mod join;
-pub mod json_map;
-pub mod path_index;
 pub mod column_default;
 pub mod cte;
 pub mod expr;
 pub mod foreign_key;
+pub mod join;
+pub mod json_map;
+pub mod path_index;
 
-/// Table-level and composite `UNIQUE` constraints.
-pub mod unique_key;
+pub mod catalog_views;
+pub mod check;
+pub mod executor;
+pub mod generated;
 pub mod lexer_alter;
 pub mod nullable;
-pub mod catalog_views;
 pub mod row_lock;
-pub mod type_modifier;
 pub mod sequence;
-pub mod generated;
-pub mod check;
-pub mod window;
 pub mod subquery;
-pub mod executor;
+pub mod type_modifier;
+/// Table-level and composite `UNIQUE` constraints.
+pub mod unique_key;
+pub mod window;
 
+#[cfg(feature = "s3_backup")]
+pub mod backup_exec;
 /// `BACKUP`, `RESTORE` and `SHOW BACKUPS`, behind the `s3_backup` feature.
 #[cfg(feature = "s3_backup")]
 pub mod lexer_backup;
-#[cfg(feature = "s3_backup")]
-pub mod backup_exec;

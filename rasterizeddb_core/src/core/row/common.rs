@@ -741,10 +741,7 @@ unsafe fn contains_big(haystack: &[u8], needle: &[u8]) -> bool {
             let mut mask = _mm256_movemask_epi8(eq) as u32;
             while mask != 0 {
                 let pos = i + mask.trailing_zeros() as usize;
-                if simd_equals(
-                    std::slice::from_raw_parts(hp.add(pos), m),
-                    needle,
-                ) {
+                if simd_equals(std::slice::from_raw_parts(hp.add(pos), m), needle) {
                     return true;
                 }
                 mask &= mask.wrapping_sub(1);
@@ -771,10 +768,7 @@ unsafe fn contains_big(haystack: &[u8], needle: &[u8]) -> bool {
             let mut mask = _mm_movemask_epi8(eq) as u32;
             while mask != 0 {
                 let pos = i + mask.trailing_zeros() as usize;
-                if simd_equals(
-                    std::slice::from_raw_parts(hp.add(pos), m),
-                    needle,
-                ) {
+                if simd_equals(std::slice::from_raw_parts(hp.add(pos), m), needle) {
                     return true;
                 }
                 mask &= mask.wrapping_sub(1);
@@ -929,12 +923,28 @@ mod tests {
         assert!(!simd_compare_strings(b, a, &ComparerOperation::Less));
         assert!(simd_compare_strings(a, b, &ComparerOperation::LessOrEquals));
         assert!(simd_compare_strings(a, a, &ComparerOperation::LessOrEquals));
-        assert!(simd_compare_strings(a, a, &ComparerOperation::GreaterOrEquals));
+        assert!(simd_compare_strings(
+            a,
+            a,
+            &ComparerOperation::GreaterOrEquals
+        ));
         assert!(simd_compare_strings(a, a, &ComparerOperation::Equals));
         assert!(simd_compare_strings(a, b, &ComparerOperation::NotEquals));
-        assert!(simd_compare_strings(a, "ell".as_bytes(), &ComparerOperation::Contains));
-        assert!(simd_compare_strings(a, "he".as_bytes(), &ComparerOperation::StartsWith));
-        assert!(simd_compare_strings(a, "lo".as_bytes(), &ComparerOperation::EndsWith));
+        assert!(simd_compare_strings(
+            a,
+            "ell".as_bytes(),
+            &ComparerOperation::Contains
+        ));
+        assert!(simd_compare_strings(
+            a,
+            "he".as_bytes(),
+            &ComparerOperation::StartsWith
+        ));
+        assert!(simd_compare_strings(
+            a,
+            "lo".as_bytes(),
+            &ComparerOperation::EndsWith
+        ));
     }
 
     #[test]
@@ -1758,7 +1768,9 @@ mod tests {
         // Deterministic LCG: a fixed seed keeps failures reproducible.
         let mut state = 0x2545_F491_4F6C_DD1Du64;
         let mut next = move || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (state >> 33) as u32
         };
 
@@ -1821,9 +1833,9 @@ mod tests {
             b"ab",
             b"\xFF",
             b"\x80\x00",
-            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",  // 33: past one AVX2 block
-            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",  // differs in the tail
-            b"aaaaaaaaaaaaaaaab",                  // differs inside an SSE block
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", // 33: past one AVX2 block
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab", // differs in the tail
+            b"aaaaaaaaaaaaaaaab",                 // differs inside an SSE block
         ];
 
         for a in cases {
@@ -1949,7 +1961,10 @@ mod like_tests {
         assert!(!m("ac", "a_c"), "underscore is not optional");
         assert!(!m("abbc", "a_c"), "underscore is not greedy");
         assert!(m("abc", "___"));
-        assert!(m("a_c", "a_c"), "a literal underscore in the value still matches");
+        assert!(
+            m("a_c", "a_c"),
+            "a literal underscore in the value still matches"
+        );
     }
 
     /// Consecutive and trailing wildcards are common in generated SQL.

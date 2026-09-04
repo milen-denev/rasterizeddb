@@ -370,11 +370,11 @@ impl DbType {
             // narrowest type it does have.
             DbType::I8 | DbType::I16 => 21, // int2
             DbType::I32 => 23,              // int4
-            DbType::I64 => 20, // int8
+            DbType::I64 => 20,              // int8
             DbType::U8 | DbType::U16 | DbType::U32 | DbType::U64 => 20, // best-effort
             DbType::F32 => 700,
             DbType::F64 => 701,
-            DbType::STRING => 25, // TEXT
+            DbType::STRING => 25,     // TEXT
             DbType::DATETIME => 1184, // timestamptz
             DbType::UUID => 2950,
             DbType::INET => 869,

@@ -228,7 +228,11 @@ impl SyncMode {
             "sync" | "synchronous" => Some(SyncMode::Quorum(1)),
             "all" | "every" => Some(SyncMode::All),
             _ => {
-                let digits = lowered.strip_prefix("quorum")?.trim().trim_start_matches(':').trim();
+                let digits = lowered
+                    .strip_prefix("quorum")?
+                    .trim()
+                    .trim_start_matches(':')
+                    .trim();
                 digits.parse().ok().map(SyncMode::Quorum)
             }
         }
@@ -284,7 +288,12 @@ pub enum ConflictPolicy {
 
 impl ConflictPolicy {
     pub fn parse(text: &str) -> Option<ConflictPolicy> {
-        match text.trim().to_ascii_lowercase().replace(['-', '_'], " ").as_str() {
+        match text
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['-', '_'], " ")
+            .as_str()
+        {
             "abort" | "error" | "reject" => Some(ConflictPolicy::Abort),
             "skip" | "ignore" => Some(ConflictPolicy::Skip),
             "lww" | "last writer wins" | "last write wins" | "latest" => {
@@ -329,7 +338,12 @@ pub enum AuthMode {
 
 impl AuthMode {
     pub fn parse(text: &str) -> Option<AuthMode> {
-        match text.trim().to_ascii_lowercase().replace(['-', '_'], "").as_str() {
+        match text
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['-', '_'], "")
+            .as_str()
+        {
             "insecure" | "none" | "off" => Some(AuthMode::Insecure),
             "pinned" | "pin" | "fingerprint" => Some(AuthMode::Pinned),
             "ca" | "mtls" | "mutualtls" | "pki" => Some(AuthMode::Ca),
@@ -384,11 +398,9 @@ impl TlsMaterial {
                     );
                 }
                 if self.peer_fingerprints.is_empty() {
-                    return Err(
-                        "pinned authentication needs the peers' fingerprints: pass \
+                    return Err("pinned authentication needs the peers' fingerprints: pass \
                          --replication-peer-fingerprint once per node"
-                            .to_string(),
-                    );
+                        .to_string());
                 }
                 for value in &self.peer_fingerprints {
                     rastcp::tls::parse_fingerprint(value)
@@ -398,16 +410,13 @@ impl TlsMaterial {
             }
             AuthMode::Ca => {
                 if self.cert_path.is_none() || self.key_path.is_none() {
-                    return Err(
-                        "mutual TLS needs this node's own certificate: pass \
+                    return Err("mutual TLS needs this node's own certificate: pass \
                          --replication-cert and --replication-key"
-                            .to_string(),
-                    );
+                        .to_string());
                 }
                 if self.ca_path.is_none() {
                     return Err(
-                        "mutual TLS needs the cluster authority: pass --replication-ca"
-                            .to_string(),
+                        "mutual TLS needs the cluster authority: pass --replication-ca".to_string(),
                     );
                 }
                 Ok(())
@@ -432,7 +441,10 @@ impl TlsMaterial {
             AuthMode::Insecure => rastcp::tls::Trust::AcceptAny,
             AuthMode::Pinned => rastcp::tls::Trust::Pinned(self.fingerprints()?),
             AuthMode::Ca => {
-                let path = self.ca_path.as_deref().ok_or("no certificate authority configured")?;
+                let path = self
+                    .ca_path
+                    .as_deref()
+                    .ok_or("no certificate authority configured")?;
                 rastcp::tls::Trust::RootCa(
                     rastcp::tls::load_certificates(path).map_err(|e| e.to_string())?,
                 )
@@ -446,7 +458,10 @@ impl TlsMaterial {
             AuthMode::Insecure => rastcp::tls::ClientAuth::None,
             AuthMode::Pinned => rastcp::tls::ClientAuth::RequirePinned(self.fingerprints()?),
             AuthMode::Ca => {
-                let path = self.ca_path.as_deref().ok_or("no certificate authority configured")?;
+                let path = self
+                    .ca_path
+                    .as_deref()
+                    .ok_or("no certificate authority configured")?;
                 rastcp::tls::ClientAuth::RequireCa(
                     rastcp::tls::load_certificates(path).map_err(|e| e.to_string())?,
                 )
@@ -457,8 +472,13 @@ impl TlsMaterial {
     /// This node's own certificate and key, when it has one configured.
     pub fn identity(
         &self,
-    ) -> Result<Option<(Vec<rustls::pki_types::CertificateDer<'static>>, rustls::pki_types::PrivateKeyDer<'static>)>, String>
-    {
+    ) -> Result<
+        Option<(
+            Vec<rustls::pki_types::CertificateDer<'static>>,
+            rustls::pki_types::PrivateKeyDer<'static>,
+        )>,
+        String,
+    > {
         let (Some(cert), Some(key)) = (self.cert_path.as_deref(), self.key_path.as_deref()) else {
             return Ok(None);
         };
@@ -709,8 +729,14 @@ mod tests {
 
     #[test]
     fn a_bare_codec_name_implies_whether_to_compress() {
-        assert_eq!(Compression::parse("none").unwrap().mode, CompressionMode::Off);
-        assert_eq!(Compression::parse("zstd").unwrap().mode, CompressionMode::Always);
+        assert_eq!(
+            Compression::parse("none").unwrap().mode,
+            CompressionMode::Off
+        );
+        assert_eq!(
+            Compression::parse("zstd").unwrap().mode,
+            CompressionMode::Always
+        );
         assert_eq!(Compression::parse("zstd").unwrap().codec, Codec::Zstd);
     }
 
@@ -760,7 +786,10 @@ mod tests {
 
     #[test]
     fn two_peers_under_one_name_are_rejected() {
-        let mut config = ReplicationConfig { node_id: 1, ..Default::default() };
+        let mut config = ReplicationConfig {
+            node_id: 1,
+            ..Default::default()
+        };
         config.peers.push(PeerConfig::new("a", "1.1.1.1:1"));
         config.peers.push(PeerConfig::new("a", "2.2.2.2:2"));
 

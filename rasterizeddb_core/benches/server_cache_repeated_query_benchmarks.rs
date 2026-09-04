@@ -8,6 +8,7 @@ use rastcp::{
     client::{TcpClient, TcpClientBuilder},
     server::TcpServerBuilder,
 };
+use rasterizeddb_core::cache::query_cache::QueryCacheEntry;
 use rasterizeddb_core::{
     BATCH_SIZE, MAX_PERMITS_THREADS,
     cache::atomic_cache::AtomicGenericCache,
@@ -15,9 +16,7 @@ use rasterizeddb_core::{
         database::Database,
         db_type::DbType,
         processor::concurrent_processor::{ATOMIC_CACHE, ENABLE_CACHE},
-        row::{
-            row::{ColumnWritePayload, RowWrite},
-        },
+        row::row::{ColumnWritePayload, RowWrite},
         rql::{
             executor::execute,
             lexer_ct::{CreateColumnData, CreateTable},
@@ -26,7 +25,6 @@ use rasterizeddb_core::{
     },
     memory_pool::{MEMORY_POOL, MemoryBlock},
 };
-use rasterizeddb_core::cache::query_cache::QueryCacheEntry;
 use rclite::Arc;
 use smallvec::smallvec;
 use tempfile::TempDir;
@@ -61,7 +59,7 @@ fn build_context() -> BenchContext {
         // entry is detectable rather than merely unlikely.
         AtomicGenericCache::<u64, Arc<QueryCacheEntry>>::new(1024, 10240)
     });
-    
+
     ENABLE_CACHE.get_or_init(|| true);
 
     let runtime = Builder::new_multi_thread()
@@ -99,7 +97,9 @@ fn build_context() -> BenchContext {
             "server_cache_repeated_query_benchmarks setup: cold={} us warm={} us delta={} us",
             cold_elapsed.as_micros(),
             warm_elapsed.as_micros(),
-            cold_elapsed.as_micros().saturating_sub(warm_elapsed.as_micros())
+            cold_elapsed
+                .as_micros()
+                .saturating_sub(warm_elapsed.as_micros())
         );
     });
 
@@ -363,7 +363,11 @@ async fn send_query(port: u16, query: &str) -> Vec<u8> {
 }
 
 fn assert_one_row_response(response: &[u8]) {
-    assert_eq!(response.first().copied(), Some(2), "expected rows result marker");
+    assert_eq!(
+        response.first().copied(),
+        Some(2),
+        "expected rows result marker"
+    );
     assert!(response.len() > 1, "expected serialized row payload");
 }
 

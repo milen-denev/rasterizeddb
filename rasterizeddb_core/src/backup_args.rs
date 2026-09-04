@@ -8,9 +8,9 @@ use std::path::{Path, PathBuf};
 
 use clap::Args;
 
+use rasterizeddb_core::core::backup::BackupConfig;
 use rasterizeddb_core::core::backup::manifest::RecoveryTarget;
 use rasterizeddb_core::core::backup::s3::{Credentials, Endpoint};
-use rasterizeddb_core::core::backup::BackupConfig;
 
 /// zstd's ceiling. Above 19 it enters "ultra" territory, where memory and time
 /// climb steeply for a ratio that on database files barely moves.
@@ -107,7 +107,11 @@ pub struct BackupArgs {
     /// with no snapshot at all gets one immediately whatever this is set to —
     /// the log starts archiving as soon as the server does, and segments with
     /// no snapshot under them restore nothing.
-    #[arg(long = "s3-snapshot-interval-secs", value_name = "N", default_value_t = 86_400)]
+    #[arg(
+        long = "s3-snapshot-interval-secs",
+        value_name = "N",
+        default_value_t = 86_400
+    )]
     pub snapshot_interval_secs: u64,
 
     /// Seconds between log archive flushes, or 0 for manual only
@@ -326,13 +330,14 @@ impl BackupArgs {
             return Ok(RecoveryTarget::Snapshot(id.clone()));
         }
         if let Some(text) = &self.restore_at_time {
-            let unix = rasterizeddb_core::core::backup::timeutil::parse_rfc3339(text)
-                .ok_or_else(|| {
+            let unix = rasterizeddb_core::core::backup::timeutil::parse_rfc3339(text).ok_or_else(
+                || {
                     format!(
                         "--restore-at-time {text:?} is not a timestamp; \
                          expected something like '2026-08-20T10:00:00Z'"
                     )
-                })?;
+                },
+            )?;
             return Ok(RecoveryTarget::Time(unix));
         }
         Ok(RecoveryTarget::Latest)

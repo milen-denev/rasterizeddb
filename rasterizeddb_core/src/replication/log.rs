@@ -162,7 +162,8 @@ impl ReplicationLog {
                 );
                 break at;
             }
-            let len = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().expect("4 bytes")) as usize;
+            let len =
+                u32::from_le_bytes(bytes[at + 4..at + 8].try_into().expect("4 bytes")) as usize;
             let crc = u32::from_le_bytes(bytes[at + 8..at + 12].try_into().expect("4 bytes"));
 
             let payload_at = at + RECORD_HEADER;
@@ -183,7 +184,10 @@ impl ReplicationLog {
                 Ok(record) => {
                     index.entry(record.origin).or_default().insert(
                         record.seq,
-                        RecordLoc { offset: at as u64, len: len as u32 },
+                        RecordLoc {
+                            offset: at as u64,
+                            len: len as u32,
+                        },
                     );
                     last_hlc = last_hlc.max(record.commit_hlc);
                     if hot.len() == HOT_RECORDS {
@@ -249,11 +253,13 @@ impl ReplicationLog {
                 let written = write_record(&mut log.writer, &payload)?;
                 log.end += written;
 
-                self.index
-                    .lock()
-                    .entry(record.origin)
-                    .or_default()
-                    .insert(record.seq, RecordLoc { offset, len: payload.len() as u32 });
+                self.index.lock().entry(record.origin).or_default().insert(
+                    record.seq,
+                    RecordLoc {
+                        offset,
+                        len: payload.len() as u32,
+                    },
+                );
             }
         }
 
@@ -421,7 +427,10 @@ impl ReplicationLog {
                 Err(e) => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!("replication log record at {} is unreadable: {}", loc.offset, e),
+                        format!(
+                            "replication log record at {} is unreadable: {}",
+                            loc.offset, e
+                        ),
                     ));
                 }
             }
@@ -452,7 +461,10 @@ impl ReplicationLog {
         let mut records = Vec::new();
         let mut bytes = 0usize;
         let mut more = false;
-        for record in hot.iter().filter(|r| r.origin == origin && r.seq > after_seq) {
+        for record in hot
+            .iter()
+            .filter(|r| r.origin == origin && r.seq > after_seq)
+        {
             if records.len() == max_records || (bytes >= max_bytes && !records.is_empty()) {
                 more = true;
                 break;
@@ -522,10 +534,13 @@ impl ReplicationLog {
 
             let offset = end;
             end += write_record(&mut target, &payload)?;
-            rebuilt
-                .entry(origin)
-                .or_default()
-                .insert(seq, RecordLoc { offset, len: loc.len });
+            rebuilt.entry(origin).or_default().insert(
+                seq,
+                RecordLoc {
+                    offset,
+                    len: loc.len,
+                },
+            );
         }
 
         target.flush()?;
@@ -572,7 +587,9 @@ const STATE_REWRITE_AFTER: u64 = 16_384;
 
 impl std::fmt::Debug for AppliedState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AppliedState").field("positions", &*self.positions.lock()).finish()
+        f.debug_struct("AppliedState")
+            .field("positions", &*self.positions.lock())
+            .finish()
     }
 }
 
@@ -660,7 +677,10 @@ impl AppliedState {
         }
         drop(file);
 
-        if self.appends.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+        if self
+            .appends
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1
             >= STATE_REWRITE_AFTER
         {
             self.rewrite()?;
@@ -681,7 +701,10 @@ impl AppliedState {
         self.positions
             .lock()
             .iter()
-            .map(|(origin, seq)| VectorEntry { origin: *origin, seq: *seq })
+            .map(|(origin, seq)| VectorEntry {
+                origin: *origin,
+                seq: *seq,
+            })
             .collect()
     }
 
@@ -700,8 +723,12 @@ impl AppliedState {
             return Ok(());
         };
 
-        let snapshot: Vec<(NodeId, u64)> =
-            self.positions.lock().iter().map(|(o, s)| (*o, *s)).collect();
+        let snapshot: Vec<(NodeId, u64)> = self
+            .positions
+            .lock()
+            .iter()
+            .map(|(o, s)| (*o, *s))
+            .collect();
 
         let temp_path = path.with_extension("rewriting");
         {
@@ -766,7 +793,10 @@ mod tests {
         }
 
         let (records, _) = log.read_after(1, 7, 100, 1 << 20).unwrap();
-        assert_eq!(records.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![8, 9, 10]);
+        assert_eq!(
+            records.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![8, 9, 10]
+        );
     }
 
     #[test]
@@ -861,7 +891,11 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
 
         let log = ReplicationLog::open(dir.path(), 1 << 20).unwrap();
-        assert_eq!(log.highest(1), 0, "nothing after a bad checksum may be trusted");
+        assert_eq!(
+            log.highest(1),
+            0,
+            "nothing after a bad checksum may be trusted"
+        );
     }
 
     #[test]
@@ -874,9 +908,16 @@ mod tests {
             log.append(&record(1, seq)).unwrap();
         }
 
-        assert!(log.bytes() <= 4096 + 512, "retention should bound the file: {}", log.bytes());
+        assert!(
+            log.bytes() <= 4096 + 512,
+            "retention should bound the file: {}",
+            log.bytes()
+        );
         assert_eq!(log.highest(1), 500, "the newest record must survive");
-        assert!(log.earliest(1) > 1, "the oldest ones should have been dropped");
+        assert!(
+            log.earliest(1) > 1,
+            "the oldest ones should have been dropped"
+        );
     }
 
     #[test]
@@ -895,7 +936,10 @@ mod tests {
     fn an_empty_origin_can_always_be_served() {
         let dir = tempfile::tempdir().unwrap();
         let log = ReplicationLog::open(dir.path(), 1 << 20).unwrap();
-        assert!(log.can_serve(42, 0), "nothing is held, so nothing is missing");
+        assert!(
+            log.can_serve(42, 0),
+            "nothing is held, so nothing is missing"
+        );
     }
 
     #[test]
@@ -925,15 +969,24 @@ mod tests {
             log.earliest(1) > 1,
             "the window has dropped the oldest records, so it must not claim to hold them"
         );
-        assert!(!log.can_serve(1, 0), "sequence 1 is gone; the peer must be told to resync");
-        assert!(log.can_serve(1, HOT_RECORDS as u64 + 499), "the tail is still there");
+        assert!(
+            !log.can_serve(1, 0),
+            "sequence 1 is gone; the peer must be told to resync"
+        );
+        assert!(
+            log.can_serve(1, HOT_RECORDS as u64 + 499),
+            "the tail is still there"
+        );
     }
 
     #[test]
     fn applied_positions_only_move_forwards() {
         let state = AppliedState::in_memory();
         assert!(state.record(1, 5).unwrap());
-        assert!(!state.record(1, 3).unwrap(), "an older position is not an advance");
+        assert!(
+            !state.record(1, 3).unwrap(),
+            "an older position is not an advance"
+        );
         assert_eq!(state.high_water(1), 5);
         assert!(state.already_applied(1, 4));
         assert!(!state.already_applied(1, 6));
@@ -1000,8 +1053,14 @@ mod tests {
         }
         state.flush().unwrap();
 
-        let size = std::fs::metadata(dir.path().join(STATE_FILE)).unwrap().len();
-        assert!(size < STATE_REWRITE_AFTER * 16, "the file should have been rewritten: {}", size);
+        let size = std::fs::metadata(dir.path().join(STATE_FILE))
+            .unwrap()
+            .len();
+        assert!(
+            size < STATE_REWRITE_AFTER * 16,
+            "the file should have been rewritten: {}",
+            size
+        );
         assert_eq!(state.high_water(1), STATE_REWRITE_AFTER + 100);
     }
 
@@ -1015,6 +1074,12 @@ mod tests {
         vector.sort_unstable_by_key(|e| e.origin);
         assert_eq!(vector.len(), 2);
         assert_eq!(vector[0], VectorEntry { origin: 1, seq: 3 });
-        assert_eq!(vector[1], VectorEntry { origin: 9, seq: 100 });
+        assert_eq!(
+            vector[1],
+            VectorEntry {
+                origin: 9,
+                seq: 100
+            }
+        );
     }
 }

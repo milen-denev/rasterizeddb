@@ -96,7 +96,11 @@ pub async fn load<S: StorageIO>(schema_io: Arc<S>) -> SmallVec<[TypeModifier; 8]
     let mut buffer = vec![0u8; TYPE_MODIFIER_SIZE as usize];
     for i in 0..(len / TYPE_MODIFIER_SIZE) {
         let mut position = i * TYPE_MODIFIER_SIZE;
-        if io.read_data_into_buffer(&mut position, &mut buffer).await.is_err() {
+        if io
+            .read_data_into_buffer(&mut position, &mut buffer)
+            .await
+            .is_err()
+        {
             break;
         }
         match TypeModifier::from_vec(&buffer) {
@@ -196,7 +200,10 @@ mod tests {
 
     #[test]
     fn a_declared_modifier_is_read() {
-        assert_eq!(parse_numeric_modifier("NUMERIC(38, 16)"), Some(Ok((38, 16))));
+        assert_eq!(
+            parse_numeric_modifier("NUMERIC(38, 16)"),
+            Some(Ok((38, 16)))
+        );
         assert_eq!(parse_numeric_modifier("numeric(10,2)"), Some(Ok((10, 2))));
         // No fractional part declared means none.
         assert_eq!(parse_numeric_modifier("DECIMAL(10)"), Some(Ok((10, 0))));

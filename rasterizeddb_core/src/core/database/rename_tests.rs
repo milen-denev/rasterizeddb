@@ -47,7 +47,12 @@ async fn the_rename_file_list_matches_what_a_table_creates() {
 
     // Touch every sidecar so the lazily-created ones exist.
     let table = db.tables.get("filelist").expect("table").clone();
-    for suffix in ["_schema_FK.db", "_schema_DEF.db", "_schema_UK.db", "_schema_JSON.db"] {
+    for suffix in [
+        "_schema_FK.db",
+        "_schema_DEF.db",
+        "_schema_UK.db",
+        "_schema_JSON.db",
+    ] {
         let io = db
             .db_io_pointers
             .create_new(format!("filelist{}", suffix))
@@ -93,11 +98,17 @@ async fn a_rename_moves_the_table_and_its_rows() {
     db.rename_table("role", "roles").await.expect("rename");
 
     assert!(db.tables.contains_key("roles"), "the new name is not live");
-    assert!(!db.tables.contains_key("role"), "the old name is still live");
+    assert!(
+        !db.tables.contains_key("role"),
+        "the old name is still live"
+    );
 
     // The catalogue is what survives a restart, so it is what the assertion has
     // to be about.
-    assert!(db.catalogue_contains("roles").await, "the catalogue lost the new name");
+    assert!(
+        db.catalogue_contains("roles").await,
+        "the catalogue lost the new name"
+    );
     assert!(
         !db.catalogue_contains("role").await,
         "the old catalogue row was not tombstoned, so the table comes back twice"
@@ -116,7 +127,10 @@ async fn the_renamed_table_survives_a_reopen_under_its_new_name() {
     // The point of the whole ordering: what the catalogue says is what comes
     // back. An in-memory rename that does not survive here is not a rename.
     let db = open_db(dir.path()).await;
-    assert!(db.tables.contains_key("roles"), "the rename did not survive a reopen");
+    assert!(
+        db.tables.contains_key("roles"),
+        "the rename did not survive a reopen"
+    );
     assert!(
         !db.tables.contains_key("role"),
         "the old name came back, so the table exists twice after a restart"
@@ -130,7 +144,11 @@ async fn the_schema_record_carries_the_new_name() {
     create(&db, "role").await;
     db.rename_table("role", "roles").await.expect("rename");
 
-    let schema_io = Arc::new(db.db_io_pointers.create_new("roles_schema.db".to_string()).await);
+    let schema_io = Arc::new(
+        db.db_io_pointers
+            .create_new("roles_schema.db".to_string())
+            .await,
+    );
     let schema = TableSchema::load(schema_io).await.expect("load schema");
     assert_eq!(
         schema.name, "roles",
@@ -271,7 +289,9 @@ async fn recovery_finishes_a_rename_that_reached_the_catalogue() {
         // A crash in the window the ordering deliberately produces: the new
         // catalogue row is written, the old one is not yet tombstoned. Both
         // names exist and both read.
-        db.record_rename_intent("role", "roles").await.expect("intent");
+        db.record_rename_intent("role", "roles")
+            .await
+            .expect("intent");
         db.copy_table_files("role", "roles").await.expect("copy");
         db.rewrite_schema_name("roles").await.expect("schema");
         db.remember_in_catalogue("roles").await.expect("catalogue");
@@ -282,14 +302,21 @@ async fn recovery_finishes_a_rename_that_reached_the_catalogue() {
     // Reopening completes it: the catalogue recorded the commit, so recovery
     // finishes rather than unwinds.
     let db = open_db(dir.path()).await;
-    assert!(db.tables.contains_key("roles"), "recovery lost the renamed table");
+    assert!(
+        db.tables.contains_key("roles"),
+        "recovery lost the renamed table"
+    );
     assert!(
         !db.tables.contains_key("role"),
         "recovery left the duplicate in place, so the table exists twice"
     );
     let mut ids = read_ids(&db, "roles").await;
     ids.sort();
-    assert_eq!(ids, vec![1, 2, 3, 4, 5], "recovery kept the name but lost the rows");
+    assert_eq!(
+        ids,
+        vec![1, 2, 3, 4, 5],
+        "recovery kept the name but lost the rows"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -303,7 +330,9 @@ async fn recovery_abandons_a_rename_that_never_reached_the_catalogue() {
         }
 
         // A crash before the commit point: files copied, catalogue untouched.
-        db.record_rename_intent("role", "roles").await.expect("intent");
+        db.record_rename_intent("role", "roles")
+            .await
+            .expect("intent");
         db.copy_table_files("role", "roles").await.expect("copy");
     }
 
@@ -320,7 +349,11 @@ async fn recovery_abandons_a_rename_that_never_reached_the_catalogue() {
     );
     let mut ids = read_ids(&db, "role").await;
     ids.sort();
-    assert_eq!(ids, vec![1, 2, 3, 4, 5], "the original lost rows to a failed rename");
+    assert_eq!(
+        ids,
+        vec![1, 2, 3, 4, 5],
+        "the original lost rows to a failed rename"
+    );
 
     // The orphaned copy is gone rather than left to accumulate.
     let leftover = std::fs::read_dir(dir.path())
@@ -382,7 +415,10 @@ async fn dropping_a_table_removes_every_file_it_created() {
         insert_id(&db, "gone", i).await;
     }
 
-    assert!(db.drop_table("gone").await.expect("drop"), "the table was not dropped");
+    assert!(
+        db.drop_table("gone").await.expect("drop"),
+        "the table was not dropped"
+    );
 
     let leftovers: Vec<String> = std::fs::read_dir(dir.path())
         .unwrap()
@@ -411,7 +447,10 @@ async fn dropping_a_table_takes_its_json_shadow_tables_with_it() {
     let shadow = json_map::shadow_table_name("owner", "doc");
     let mut create_owner = CreateTable {
         table_name: "owner".to_string(),
-        columns: vec![CreateColumnData { name: "id".to_string(), data_type: DbType::I32 }],
+        columns: vec![CreateColumnData {
+            name: "id".to_string(),
+            data_type: DbType::I32,
+        }],
         unique_columns: Vec::new(),
         foreign_keys: Vec::new(),
         defaults: Vec::new(),
@@ -434,7 +473,10 @@ async fn dropping_a_table_takes_its_json_shadow_tables_with_it() {
     // The executor creates the shadow lazily on first write; standing in for it
     // here so the drop has something to find.
     create(&db, &shadow).await;
-    assert!(db.tables.contains_key(&shadow), "setup did not create the shadow");
+    assert!(
+        db.tables.contains_key(&shadow),
+        "setup did not create the shadow"
+    );
 
     db.drop_table("owner").await.expect("drop");
 
@@ -450,7 +492,13 @@ async fn dropping_a_table_takes_its_json_shadow_tables_with_it() {
         .unwrap()
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().to_string())
-        .filter(|n| n.starts_with(&format!("{}.", shadow)) || n.starts_with(&format!("{}_", shadow)))
+        .filter(|n| {
+            n.starts_with(&format!("{}.", shadow)) || n.starts_with(&format!("{}_", shadow))
+        })
         .collect();
-    assert!(leftovers.is_empty(), "the shadow's files survived: {:?}", leftovers);
+    assert!(
+        leftovers.is_empty(),
+        "the shadow's files survived: {:?}",
+        leftovers
+    );
 }

@@ -32,19 +32,33 @@ async fn run(db: &Arc<Database>, q: &str) -> Vec<u8> {
 /// Asserting on the rendered response would pass on almost anything, so the
 /// rows are decoded and the group keys read out of them.
 fn first_column_strings(response: &[u8]) -> Vec<String> {
-    assert_eq!(response.first(), Some(&2u8), "not a row response: {:?}", response);
+    assert_eq!(
+        response.first(),
+        Some(&2u8),
+        "not a row response: {:?}",
+        response
+    );
     let rows = vec_into_rows(&response[1..]).expect("rows");
     let mut out: Vec<String> = rows
         .iter()
         .filter_map(|row| row.columns.first())
-        .map(|c| String::from_utf8_lossy(c.data.into_slice()).trim().to_string())
+        .map(|c| {
+            String::from_utf8_lossy(c.data.into_slice())
+                .trim()
+                .to_string()
+        })
         .collect();
     out.sort();
     out
 }
 
 fn first_column_ints(response: &[u8]) -> Vec<i64> {
-    assert_eq!(response.first(), Some(&2u8), "not a row response: {:?}", response);
+    assert_eq!(
+        response.first(),
+        Some(&2u8),
+        "not a row response: {:?}",
+        response
+    );
     let rows = vec_into_rows(&response[1..]).expect("rows");
     let mut out: Vec<i64> = rows
         .iter()
@@ -69,7 +83,11 @@ async fn group_by_alone_collapses_duplicates() {
     std::fs::create_dir_all(&dir).expect("dir");
 
     let db = Arc::new(Database::new_with_backend(&dir, false).await);
-    run(&db, "CREATE TABLE g (id INT NOT NULL, city TEXT NOT NULL, n INT NOT NULL)").await;
+    run(
+        &db,
+        "CREATE TABLE g (id INT NOT NULL, city TEXT NOT NULL, n INT NOT NULL)",
+    )
+    .await;
     for (id, city, n) in [
         (1, "sofia", 1),
         (2, "sofia", 2),
@@ -79,7 +97,10 @@ async fn group_by_alone_collapses_duplicates() {
     ] {
         run(
             &db,
-            &format!("INSERT INTO g (id, city, n) VALUES ({}, '{}', {})", id, city, n),
+            &format!(
+                "INSERT INTO g (id, city, n) VALUES ({}, '{}', {})",
+                id, city, n
+            ),
         )
         .await;
     }
@@ -88,7 +109,11 @@ async fn group_by_alone_collapses_duplicates() {
     let out = run(&db, "SELECT city FROM g GROUP BY city").await;
     assert_eq!(
         first_column_strings(&out),
-        vec!["plovdiv".to_string(), "sofia".to_string(), "varna".to_string()],
+        vec![
+            "plovdiv".to_string(),
+            "sofia".to_string(),
+            "varna".to_string()
+        ],
         "GROUP BY without an aggregate did not collapse the duplicates"
     );
 
@@ -132,11 +157,19 @@ async fn group_by_alone_works_over_a_join() {
     run(&db, "CREATE TABLE p (id INT NOT NULL, city TEXT NOT NULL)").await;
     run(&db, "CREATE TABLE q (id INT NOT NULL, p_id INT NOT NULL)").await;
     for (id, city) in [(1, "sofia"), (2, "varna")] {
-        run(&db, &format!("INSERT INTO p (id, city) VALUES ({}, '{}')", id, city)).await;
+        run(
+            &db,
+            &format!("INSERT INTO p (id, city) VALUES ({}, '{}')", id, city),
+        )
+        .await;
     }
     // Two rows against `sofia`, so an ungrouped join would repeat it.
     for (id, p_id) in [(10, 1), (11, 1), (12, 2)] {
-        run(&db, &format!("INSERT INTO q (id, p_id) VALUES ({}, {})", id, p_id)).await;
+        run(
+            &db,
+            &format!("INSERT INTO q (id, p_id) VALUES ({}, {})", id, p_id),
+        )
+        .await;
     }
 
     let out = run(

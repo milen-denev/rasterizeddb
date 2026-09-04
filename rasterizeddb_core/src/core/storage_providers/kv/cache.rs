@@ -50,7 +50,10 @@ pub struct ChunkCache {
 impl ChunkCache {
     pub fn new(budget_bytes: u64) -> Self {
         Self {
-            inner: Mutex::new(Inner { entries: HashMap::new(), bytes: 0 }),
+            inner: Mutex::new(Inner {
+                entries: HashMap::new(),
+                bytes: 0,
+            }),
             budget: budget_bytes.max(1),
             clock: AtomicU64::new(0),
             hits: AtomicU64::new(0),
@@ -120,8 +123,12 @@ impl ChunkCache {
     /// publishes a new generation, and when a file is dropped.
     pub fn invalidate_file(&self, file: u64) {
         let mut inner = self.inner.lock();
-        let doomed: Vec<ChunkId> =
-            inner.entries.keys().filter(|k| k.file == file).copied().collect();
+        let doomed: Vec<ChunkId> = inner
+            .entries
+            .keys()
+            .filter(|k| k.file == file)
+            .copied()
+            .collect();
         for id in doomed {
             if let Some(entry) = inner.entries.remove(&id) {
                 inner.bytes -= entry.data.len() as u64;

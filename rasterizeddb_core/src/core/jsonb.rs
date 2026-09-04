@@ -160,8 +160,7 @@ fn write_object(out: &mut Vec<u8>, fields: &Map<String, Value>) {
     // Sorted for the binary search, and deduplicated last-wins. `Map` is
     // insertion-ordered unless serde_json is built with `preserve_order`, and
     // either way cannot be relied on to be sorted.
-    let mut entries: Vec<(&str, &Value)> =
-        fields.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    let mut entries: Vec<(&str, &Value)> = fields.iter().map(|(k, v)| (k.as_str(), v)).collect();
     entries.sort_by(|a, b| a.0.cmp(b.0));
     entries.dedup_by(|later, earlier| {
         // `dedup_by` keeps `earlier` and drops `later`, so the last of a run
@@ -207,7 +206,9 @@ pub fn decode(bytes: &[u8]) -> Result<Value, String> {
 }
 
 fn read_value(bytes: &[u8]) -> Result<(Value, usize), String> {
-    let tag = *bytes.first().ok_or("a document ended where a value was expected")?;
+    let tag = *bytes
+        .first()
+        .ok_or("a document ended where a value was expected")?;
     match tag {
         TAG_NULL => Ok((Value::Null, 1)),
         TAG_FALSE => Ok((Value::Bool(false), 1)),
@@ -240,7 +241,10 @@ fn read_value(bytes: &[u8]) -> Result<(Value, usize), String> {
                 let slice = slice_at(bytes, body_at, entry, entry + 4)?;
                 items.push(decode(slice)?);
             }
-            Ok((Value::Array(items), total_len(bytes, body_at, table_at, count, ARR_ENTRY)?))
+            Ok((
+                Value::Array(items),
+                total_len(bytes, body_at, table_at, count, ARR_ENTRY)?,
+            ))
         }
         TAG_OBJ => {
             let (count, table_at, body_at) = composite_header(bytes, OBJ_ENTRY)?;
@@ -252,7 +256,10 @@ fn read_value(bytes: &[u8]) -> Result<(Value, usize), String> {
                 let value = slice_at(bytes, body_at, entry + 8, entry + 12)?;
                 fields.insert(key.to_string(), decode(value)?);
             }
-            Ok((Value::Object(fields), total_len(bytes, body_at, table_at, count, OBJ_ENTRY)?))
+            Ok((
+                Value::Object(fields),
+                total_len(bytes, body_at, table_at, count, OBJ_ENTRY)?,
+            ))
         }
         other => Err(format!("{:#04x} is not a JSON value tag", other)),
     }
@@ -260,7 +267,9 @@ fn read_value(bytes: &[u8]) -> Result<(Value, usize), String> {
 
 fn read_len_prefixed(bytes: &[u8]) -> Result<(&[u8], usize), String> {
     let len = read_u32(bytes, 1)? as usize;
-    let raw = bytes.get(5..5 + len).ok_or("a length-prefixed value was truncated")?;
+    let raw = bytes
+        .get(5..5 + len)
+        .ok_or("a length-prefixed value was truncated")?;
     Ok((raw, 5 + len))
 }
 
@@ -268,7 +277,11 @@ fn composite_header(bytes: &[u8], stride: usize) -> Result<(usize, usize, usize)
     let count = read_u32(bytes, 1)? as usize;
     let table_at: usize = 5;
     let body_at = table_at
-        .checked_add(count.checked_mul(stride).ok_or("a composite claims an impossible size")?)
+        .checked_add(
+            count
+                .checked_mul(stride)
+                .ok_or("a composite claims an impossible size")?,
+        )
         .ok_or("a composite claims an impossible size")?;
     if bytes.len() < body_at {
         return Err("a composite's offset table is truncated".to_string());
@@ -304,13 +317,19 @@ fn slice_at<'a>(
 ) -> Result<&'a [u8], String> {
     let offset = read_u32(bytes, off_at)? as usize;
     let len = read_u32(bytes, len_at)? as usize;
-    let start = body_at.checked_add(offset).ok_or("an offset is out of range")?;
+    let start = body_at
+        .checked_add(offset)
+        .ok_or("an offset is out of range")?;
     let end = start.checked_add(len).ok_or("a length is out of range")?;
-    bytes.get(start..end).ok_or_else(|| "a value is truncated".to_string())
+    bytes
+        .get(start..end)
+        .ok_or_else(|| "a value is truncated".to_string())
 }
 
 fn read_u32(bytes: &[u8], at: usize) -> Result<u32, String> {
-    let raw = bytes.get(at..at + 4).ok_or("a document ended inside a header")?;
+    let raw = bytes
+        .get(at..at + 4)
+        .ok_or("a document ended inside a header")?;
     Ok(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
 }
 
@@ -401,7 +420,16 @@ pub fn as_text(bytes: &[u8]) -> Option<String> {
 pub fn looks_encoded(bytes: &[u8]) -> bool {
     matches!(
         bytes.first(),
-        Some(&TAG_NULL | &TAG_FALSE | &TAG_TRUE | &TAG_INT | &TAG_NUM | &TAG_STR | &TAG_ARR | &TAG_OBJ)
+        Some(
+            &TAG_NULL
+                | &TAG_FALSE
+                | &TAG_TRUE
+                | &TAG_INT
+                | &TAG_NUM
+                | &TAG_STR
+                | &TAG_ARR
+                | &TAG_OBJ
+        )
     )
 }
 
@@ -473,8 +501,14 @@ mod tests {
     fn keys_differing_only_in_case_are_separate() {
         let value = json!({"date": "lower", "Date": "upper"});
         let encoded = encode(&value);
-        assert_eq!(as_text(get_key(&encoded, "date").unwrap()).as_deref(), Some("lower"));
-        assert_eq!(as_text(get_key(&encoded, "Date").unwrap()).as_deref(), Some("upper"));
+        assert_eq!(
+            as_text(get_key(&encoded, "date").unwrap()).as_deref(),
+            Some("lower")
+        );
+        assert_eq!(
+            as_text(get_key(&encoded, "Date").unwrap()).as_deref(),
+            Some("upper")
+        );
         assert_eq!(decode(&encoded).unwrap(), value);
     }
 
@@ -492,9 +526,18 @@ mod tests {
         });
         let encoded = encode(&value);
         assert_eq!(decode(&encoded).unwrap(), value);
-        assert_eq!(as_text(get_key(&encoded, "QA Comments").unwrap()).as_deref(), Some("1"));
-        assert_eq!(as_text(get_key(&encoded, "").unwrap()).as_deref(), Some("4"));
-        assert_eq!(as_text(get_key(&encoded, "ключ").unwrap()).as_deref(), Some("5"));
+        assert_eq!(
+            as_text(get_key(&encoded, "QA Comments").unwrap()).as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            as_text(get_key(&encoded, "").unwrap()).as_deref(),
+            Some("4")
+        );
+        assert_eq!(
+            as_text(get_key(&encoded, "ключ").unwrap()).as_deref(),
+            Some("5")
+        );
     }
 
     #[test]
@@ -506,7 +549,10 @@ mod tests {
         let mut with_dup = fields.clone();
         with_dup.insert("a".to_string(), json!(2));
         let encoded = encode(&Value::Object(with_dup));
-        assert_eq!(as_text(get_key(&encoded, "a").unwrap()).as_deref(), Some("2"));
+        assert_eq!(
+            as_text(get_key(&encoded, "a").unwrap()).as_deref(),
+            Some("2")
+        );
     }
 
     #[test]
@@ -530,8 +576,14 @@ mod tests {
     #[test]
     fn a_negative_index_counts_from_the_end() {
         let encoded = encode(&json!([1, 2, 3]));
-        assert_eq!(as_text(get_index(&encoded, -1).unwrap()).as_deref(), Some("3"));
-        assert_eq!(as_text(get_index(&encoded, -3).unwrap()).as_deref(), Some("1"));
+        assert_eq!(
+            as_text(get_index(&encoded, -1).unwrap()).as_deref(),
+            Some("3")
+        );
+        assert_eq!(
+            as_text(get_index(&encoded, -3).unwrap()).as_deref(),
+            Some("1")
+        );
         assert!(get_index(&encoded, -4).is_none());
         assert!(get_index(&encoded, 3).is_none());
     }
@@ -548,13 +600,31 @@ mod tests {
             "a": [1, 2],
             "o": {"k": 1},
         }));
-        assert_eq!(as_text(get_key(&encoded, "s").unwrap()).as_deref(), Some("plain"));
-        assert_eq!(as_text(get_key(&encoded, "n").unwrap()).as_deref(), Some("42"));
-        assert_eq!(as_text(get_key(&encoded, "f").unwrap()).as_deref(), Some("1.25"));
-        assert_eq!(as_text(get_key(&encoded, "b").unwrap()).as_deref(), Some("true"));
+        assert_eq!(
+            as_text(get_key(&encoded, "s").unwrap()).as_deref(),
+            Some("plain")
+        );
+        assert_eq!(
+            as_text(get_key(&encoded, "n").unwrap()).as_deref(),
+            Some("42")
+        );
+        assert_eq!(
+            as_text(get_key(&encoded, "f").unwrap()).as_deref(),
+            Some("1.25")
+        );
+        assert_eq!(
+            as_text(get_key(&encoded, "b").unwrap()).as_deref(),
+            Some("true")
+        );
         assert_eq!(as_text(get_key(&encoded, "z").unwrap()), None);
-        assert_eq!(as_text(get_key(&encoded, "a").unwrap()).as_deref(), Some("[1,2]"));
-        assert_eq!(as_text(get_key(&encoded, "o").unwrap()).as_deref(), Some("{\"k\":1}"));
+        assert_eq!(
+            as_text(get_key(&encoded, "a").unwrap()).as_deref(),
+            Some("[1,2]")
+        );
+        assert_eq!(
+            as_text(get_key(&encoded, "o").unwrap()).as_deref(),
+            Some("{\"k\":1}")
+        );
     }
 
     /// A large integer and a high-precision decimal both have to come back as
@@ -590,7 +660,10 @@ mod tests {
         // thousand without building any of the others.
         let found = get_path(
             &encoded,
-            &[Step::Key("key_01234".to_string()), Step::Key("n".to_string())],
+            &[
+                Step::Key("key_01234".to_string()),
+                Step::Key("n".to_string()),
+            ],
         )
         .expect("the key resolves");
         assert_eq!(as_text(found).as_deref(), Some("1234"));
@@ -728,7 +801,11 @@ pub fn parse_path_expression(expr: &str) -> Option<PathExpr> {
     if steps.is_empty() {
         return None;
     }
-    Some(PathExpr { column, steps, as_text })
+    Some(PathExpr {
+        column,
+        steps,
+        as_text,
+    })
 }
 
 fn strip_outer_parens(text: &str) -> &str {
@@ -816,7 +893,12 @@ fn parse_brace_array(text: &str) -> Option<Vec<String>> {
     if inner.trim().is_empty() {
         return None;
     }
-    Some(inner.split(',').map(|p| p.trim().trim_matches('"').to_string()).collect())
+    Some(
+        inner
+            .split(',')
+            .map(|p| p.trim().trim_matches('"').to_string())
+            .collect(),
+    )
 }
 
 /// A `#>` path element: digits are an array index, anything else a key.
@@ -870,7 +952,12 @@ mod path_tests {
         ] {
             let parsed = parse_path_expression(variant)
                 .unwrap_or_else(|| panic!("{} should parse", variant));
-            assert_eq!(parsed.index_key(), canonical, "{} keyed differently", variant);
+            assert_eq!(
+                parsed.index_key(),
+                canonical,
+                "{} keyed differently",
+                variant
+            );
         }
     }
 
@@ -909,17 +996,17 @@ mod path_tests {
     #[test]
     fn what_is_not_a_path_is_refused() {
         for text in [
-            "doc",                 // no step
-            "",                    // nothing
-            "doc->",               // no key
-            "doc->>",              // no key
-            "'literal'",           // not an identifier
-            "doc->'a' extra",      // trailing text
-            "doc->>'a'->>'b'",     // text cannot be indexed further
-            "doc->>'a'->'b'",      // same
-            "count(*)",            // an ordinary expression
+            "doc",             // no step
+            "",                // nothing
+            "doc->",           // no key
+            "doc->>",          // no key
+            "'literal'",       // not an identifier
+            "doc->'a' extra",  // trailing text
+            "doc->>'a'->>'b'", // text cannot be indexed further
+            "doc->>'a'->'b'",  // same
+            "count(*)",        // an ordinary expression
             "a + b",
-            "doc#>'{}'",           // an empty path array
+            "doc#>'{}'", // an empty path array
             "doc#>'notbraces'",
         ] {
             assert!(
@@ -937,13 +1024,22 @@ mod path_tests {
             "status": "live",
         }));
         let p = parse_path_expression("doc->>'status'").unwrap();
-        assert_eq!(as_text(p.resolve(&document).unwrap()).as_deref(), Some("live"));
+        assert_eq!(
+            as_text(p.resolve(&document).unwrap()).as_deref(),
+            Some("live")
+        );
 
         let p = parse_path_expression("doc->'a'->'b'->0->>'c'").unwrap();
-        assert_eq!(as_text(p.resolve(&document).unwrap()).as_deref(), Some("found"));
+        assert_eq!(
+            as_text(p.resolve(&document).unwrap()).as_deref(),
+            Some("found")
+        );
 
         let p = parse_path_expression("doc#>>'{a,b,0,c}'").unwrap();
-        assert_eq!(as_text(p.resolve(&document).unwrap()).as_deref(), Some("found"));
+        assert_eq!(
+            as_text(p.resolve(&document).unwrap()).as_deref(),
+            Some("found")
+        );
 
         let p = parse_path_expression("doc->>'missing'").unwrap();
         assert!(p.resolve(&document).is_none());

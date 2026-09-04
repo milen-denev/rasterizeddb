@@ -48,11 +48,22 @@ const KV_FORMAT_VERSION: u32 = 1;
 /// How one store is reached, before anything has been opened.
 #[derive(Clone, Debug)]
 enum StoreSpec {
-    Directory { path: String, root: String },
+    Directory {
+        path: String,
+        root: String,
+    },
     #[cfg(feature = "kv_storage_s3")]
-    S3 { endpoint: String, region: String, bucket: String, root: String, path_style: bool },
+    S3 {
+        endpoint: String,
+        region: String,
+        bucket: String,
+        root: String,
+        path_style: bool,
+    },
     /// Parsed, but this build cannot open it.
-    Unsupported { kind: String },
+    Unsupported {
+        kind: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -73,7 +84,10 @@ impl KvRegistry {
     /// A registry with no stores, for a database that has no `db_kv.cfg` and for
     /// an in-memory one.
     pub fn inert() -> Self {
-        Self { entries: HashMap::new(), open: tokio::sync::Mutex::new(HashMap::new()) }
+        Self {
+            entries: HashMap::new(),
+            open: tokio::sync::Mutex::new(HashMap::new()),
+        }
     }
 
     /// Reads `db_kv.cfg` from `root` if it is there.
@@ -95,12 +109,23 @@ impl KvRegistry {
         match parse(&text) {
             Ok(entries) => {
                 if !entries.is_empty() {
-                    info!("{} configures {} key/value store(s)", KV_FILE, entries.len());
+                    info!(
+                        "{} configures {} key/value store(s)",
+                        KV_FILE,
+                        entries.len()
+                    );
                 }
-                Self { entries, open: tokio::sync::Mutex::new(HashMap::new()) }
+                Self {
+                    entries,
+                    open: tokio::sync::Mutex::new(HashMap::new()),
+                }
             }
             Err(e) => {
-                error!("{} is not a key/value store configuration ({})", path.display(), e);
+                error!(
+                    "{} is not a key/value store configuration ({})",
+                    path.display(),
+                    e
+                );
                 Self::inert()
             }
         }
@@ -127,7 +152,12 @@ impl KvRegistry {
         Some(match &entry.spec {
             StoreSpec::Directory { path, root } => format!("dir {path} ({root})"),
             #[cfg(feature = "kv_storage_s3")]
-            StoreSpec::S3 { endpoint, bucket, root, .. } => {
+            StoreSpec::S3 {
+                endpoint,
+                bucket,
+                root,
+                ..
+            } => {
                 format!("s3 {endpoint}/{bucket} ({root})")
             }
             StoreSpec::Unsupported { kind } => format!("{kind} (not supported by this build)"),
@@ -152,11 +182,19 @@ impl KvRegistry {
                 (Arc::new(LocalDirStore::new(path)?), root.clone())
             }
             #[cfg(feature = "kv_storage_s3")]
-            StoreSpec::S3 { endpoint, region, bucket, root, path_style } => {
-                let store =
-                    crate::core::storage_providers::kv::S3KvStore::from_parts(
-                        endpoint, region, bucket, *path_style,
-                    )?;
+            StoreSpec::S3 {
+                endpoint,
+                region,
+                bucket,
+                root,
+                path_style,
+            } => {
+                let store = crate::core::storage_providers::kv::S3KvStore::from_parts(
+                    endpoint,
+                    region,
+                    bucket,
+                    *path_style,
+                )?;
                 (Arc::new(store), root.clone())
             }
             StoreSpec::Unsupported { kind } => {
@@ -175,7 +213,10 @@ impl KvRegistry {
             apply_tuning(&mut config, key, *value);
         }
         let family = KvFamily::open(store, config).await?;
-        info!("key/value store '{name}' opened ({})", family.store().describe());
+        info!(
+            "key/value store '{name}' opened ({})",
+            family.store().describe()
+        );
         open.insert(name.to_string(), family.clone());
         Ok(family)
     }
@@ -240,8 +281,10 @@ fn parse(text: &str) -> Result<HashMap<String, StoreEntry>, String> {
 
         match keyword {
             "version" => {
-                let value: u32 =
-                    fields.next().and_then(|v| v.trim().parse().ok()).ok_or_else(|| at("version"))?;
+                let value: u32 = fields
+                    .next()
+                    .and_then(|v| v.trim().parse().ok())
+                    .ok_or_else(|| at("version"))?;
                 if value > KV_FORMAT_VERSION {
                     return Err(format!(
                         "this file is version {}, and this build understands up to {}",
@@ -252,7 +295,11 @@ fn parse(text: &str) -> Result<HashMap<String, StoreEntry>, String> {
             }
             "store" => {
                 let name = fields.next().ok_or_else(|| at("store"))?.trim().to_string();
-                let kind = fields.next().ok_or_else(|| at("store"))?.trim().to_ascii_lowercase();
+                let kind = fields
+                    .next()
+                    .ok_or_else(|| at("store"))?
+                    .trim()
+                    .to_ascii_lowercase();
                 // Settings are `key=value` and positional fields never contain
                 // an `=`, so the two are told apart by shape rather than by
                 // position — a store written without an optional positional
@@ -262,8 +309,15 @@ fn parse(text: &str) -> Result<HashMap<String, StoreEntry>, String> {
                     rest.iter().partition(|f| !f.contains('='));
                 let spec = parse_store(&kind, &positional, &at)?;
                 let tuning = parse_tuning(&settings, &at)?;
-                if entries.insert(name.clone(), StoreEntry { spec, tuning }).is_some() {
-                    return Err(format!("line {}: store {:?} is defined twice", number + 1, name));
+                if entries
+                    .insert(name.clone(), StoreEntry { spec, tuning })
+                    .is_some()
+                {
+                    return Err(format!(
+                        "line {}: store {:?} is defined twice",
+                        number + 1,
+                        name
+                    ));
                 }
             }
             other => {
@@ -285,7 +339,11 @@ fn parse_store(
 ) -> Result<StoreSpec, String> {
     match kind {
         "dir" => {
-            let path = rest.first().ok_or_else(|| at("store dir"))?.trim().to_string();
+            let path = rest
+                .first()
+                .ok_or_else(|| at("store dir"))?
+                .trim()
+                .to_string();
             let root = rest.get(1).map(|r| r.trim()).unwrap_or("rdb").to_string();
             if path.is_empty() {
                 return Err(at("store dir"));
@@ -294,25 +352,44 @@ fn parse_store(
         }
         #[cfg(feature = "kv_storage_s3")]
         "s3" => {
-            let endpoint = rest.first().ok_or_else(|| at("store s3"))?.trim().to_string();
-            let region = rest.get(1).ok_or_else(|| at("store s3"))?.trim().to_string();
-            let bucket = rest.get(2).ok_or_else(|| at("store s3"))?.trim().to_string();
+            let endpoint = rest
+                .first()
+                .ok_or_else(|| at("store s3"))?
+                .trim()
+                .to_string();
+            let region = rest
+                .get(1)
+                .ok_or_else(|| at("store s3"))?
+                .trim()
+                .to_string();
+            let bucket = rest
+                .get(2)
+                .ok_or_else(|| at("store s3"))?
+                .trim()
+                .to_string();
             let root = rest.get(3).map(|r| r.trim()).unwrap_or("rdb").to_string();
             // MinIO and any bucket whose name is not DNS-safe need path style.
-            let path_style = rest.get(4).is_some_and(|s| s.trim().eq_ignore_ascii_case("path"));
+            let path_style = rest
+                .get(4)
+                .is_some_and(|s| s.trim().eq_ignore_ascii_case("path"));
             if endpoint.is_empty() || bucket.is_empty() {
                 return Err(at("store s3"));
             }
-            Ok(StoreSpec::S3 { endpoint, region, bucket, root, path_style })
+            Ok(StoreSpec::S3 {
+                endpoint,
+                region,
+                bucket,
+                root,
+                path_style,
+            })
         }
-        other => Ok(StoreSpec::Unsupported { kind: other.to_string() }),
+        other => Ok(StoreSpec::Unsupported {
+            kind: other.to_string(),
+        }),
     }
 }
 
-fn parse_tuning(
-    rest: &[&str],
-    at: &dyn Fn(&str) -> String,
-) -> Result<Vec<(String, u64)>, String> {
+fn parse_tuning(rest: &[&str], at: &dyn Fn(&str) -> String) -> Result<Vec<(String, u64)>, String> {
     let mut out = Vec::new();
     for field in rest {
         let field = field.trim();

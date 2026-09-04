@@ -351,7 +351,7 @@ impl HavingOp {
             ">=" => HavingOp::Ge,
             "<" => HavingOp::Lt,
             "<=" => HavingOp::Le,
-        _ => return None,
+            _ => return None,
         })
     }
 
@@ -412,11 +412,22 @@ enum Acc {
     /// Exact running total plus the count, for `SUM` and `AVG` over exact
     /// types. `scaled` records whether the input was already in `DECIMAL`
     /// units, which decides whether `AVG` has to scale before dividing.
-    ExactSum { total: i128, n: i64, scaled: bool },
-    FloatSum { total: f64, n: i64 },
+    ExactSum {
+        total: i128,
+        n: i64,
+        scaled: bool,
+    },
+    FloatSum {
+        total: f64,
+        n: i64,
+    },
     /// `MIN`/`MAX` keep the winning value's raw bytes, so the result has the
     /// argument's own type without a decode/encode round trip.
-    Extreme { best: Option<Vec<u8>>, ty: DbType, want_max: bool },
+    Extreme {
+        best: Option<Vec<u8>>,
+        ty: DbType,
+        want_max: bool,
+    },
 }
 
 impl Acc {
@@ -454,20 +465,28 @@ impl Acc {
                 }
             }
             Acc::ExactSum { total, n, .. } => {
-                let (Some(b), Some(t)) = (bytes, ty) else { return };
+                let (Some(b), Some(t)) = (bytes, ty) else {
+                    return;
+                };
                 if let Some(v) = decode_exact(b, t) {
                     *total = total.saturating_add(v);
                     *n += 1;
                 }
             }
             Acc::FloatSum { total, n } => {
-                let (Some(b), Some(t)) = (bytes, ty) else { return };
+                let (Some(b), Some(t)) = (bytes, ty) else {
+                    return;
+                };
                 if let Some(v) = decode_float(b, t) {
                     *total += v;
                     *n += 1;
                 }
             }
-            Acc::Extreme { best, ty: acc_ty, want_max } => {
+            Acc::Extreme {
+                best,
+                ty: acc_ty,
+                want_max,
+            } => {
                 let Some(b) = bytes else { return };
                 if b.is_empty() {
                     return;
@@ -867,7 +886,12 @@ pub fn fold(plan: &AggregatePlan, rows: &[Row]) -> Result<Vec<Row>, String> {
                 // A window reads rows the fold no longer has; reaching it
                 // here means it was routed wrongly.
                 SelectItem::Window { db_type, .. } => (Vec::new(), db_type.clone()),
-                SelectItem::Computed { expr, inputs, db_type, .. } => {
+                SelectItem::Computed {
+                    expr,
+                    inputs,
+                    db_type,
+                    ..
+                } => {
                     // The finished aggregates become a one-row table the
                     // expression reads: slot `j` is addressed as write_order
                     // `j`. A NULL result is left out of the row entirely, which
@@ -895,9 +919,7 @@ pub fn fold(plan: &AggregatePlan, rows: &[Row]) -> Result<Vec<Row>, String> {
                         field.write_order = j as u64;
                         synth_schema.push(field);
 
-                        if let Some(bytes) =
-                            computed_accs[i][j].finish_nullable(input.func, &ty)
-                        {
+                        if let Some(bytes) = computed_accs[i][j].finish_nullable(input.func, &ty) {
                             synth_columns.push(Column {
                                 schema_id: j as u64,
                                 data: mb_from(&bytes),
@@ -905,7 +927,11 @@ pub fn fold(plan: &AggregatePlan, rows: &[Row]) -> Result<Vec<Row>, String> {
                             });
                         }
                     }
-                    let synth = Row { position: 0, columns: synth_columns, length: 0 };
+                    let synth = Row {
+                        position: 0,
+                        columns: synth_columns,
+                        length: 0,
+                    };
                     let value = crate::core::rql::expr::eval(expr, &synth, &synth_schema)?;
                     match value {
                         crate::core::rql::expr::Value::Null => (Vec::new(), db_type.clone()),
@@ -920,7 +946,11 @@ pub fn fold(plan: &AggregatePlan, rows: &[Row]) -> Result<Vec<Row>, String> {
             });
         }
 
-        out.push(Row { position: 0, columns, length: 0 });
+        out.push(Row {
+            position: 0,
+            columns,
+            length: 0,
+        });
     }
 
     // Groups are sorted here rather than in the scan: they do not exist until
@@ -941,8 +971,16 @@ pub fn fold(plan: &AggregatePlan, rows: &[Row]) -> Result<Vec<Row>, String> {
     if !sort_keys.is_empty() {
         out.sort_by(|a, b| {
             for (idx, descending, ty) in sort_keys.iter() {
-                let av = a.columns.get(*idx).map(|c| c.data.into_slice()).unwrap_or(&[]);
-                let bv = b.columns.get(*idx).map(|c| c.data.into_slice()).unwrap_or(&[]);
+                let av = a
+                    .columns
+                    .get(*idx)
+                    .map(|c| c.data.into_slice())
+                    .unwrap_or(&[]);
+                let bv = b
+                    .columns
+                    .get(*idx)
+                    .map(|c| c.data.into_slice())
+                    .unwrap_or(&[]);
                 let ord = compare_values(av, bv, ty);
                 let ord = if *descending { ord.reverse() } else { ord };
                 if ord != std::cmp::Ordering::Equal {
@@ -1021,8 +1059,14 @@ mod tests {
 
     #[test]
     fn scalar_names_are_recognised_and_unknown_ones_are_not() {
-        assert_eq!(ScalarFunc::parse("now").map(|(f, _)| f), Some(ScalarFunc::Now));
-        assert_eq!(ScalarFunc::parse("NOW").map(|(f, _)| f), Some(ScalarFunc::Now));
+        assert_eq!(
+            ScalarFunc::parse("now").map(|(f, _)| f),
+            Some(ScalarFunc::Now)
+        );
+        assert_eq!(
+            ScalarFunc::parse("NOW").map(|(f, _)| f),
+            Some(ScalarFunc::Now)
+        );
         assert_eq!(
             ScalarFunc::parse("gen_random_uuid").map(|(f, _)| f),
             Some(ScalarFunc::GenRandomUuid)
@@ -1033,9 +1077,15 @@ mod tests {
         assert!(ScalarFunc::parse("definitely_not_a_function").is_none());
     }
 
-
     fn field(name: &str, ty: DbType, write_order: u64) -> SchemaField {
-        SchemaField::new(name.to_string(), ty.clone(), ty.get_size(), 0, write_order, false)
+        SchemaField::new(
+            name.to_string(),
+            ty.clone(),
+            ty.get_size(),
+            0,
+            write_order,
+            false,
+        )
     }
 
     fn row(values: &[(u64, DbType, Vec<u8>)]) -> Row {
@@ -1047,15 +1097,32 @@ mod tests {
                 column_type: ty.clone(),
             });
         }
-        Row { position: 0, columns, length: 0 }
+        Row {
+            position: 0,
+            columns,
+            length: 0,
+        }
     }
 
     fn agg(func: AggFunc, arg: Option<SchemaField>) -> SelectItem {
-        SelectItem::Aggregate { func, arg, label: func.name().to_string(), filter: None }
+        SelectItem::Aggregate {
+            func,
+            arg,
+            label: func.name().to_string(),
+            filter: None,
+        }
     }
 
     fn plan(items: Vec<SelectItem>, group_by: Vec<SchemaField>) -> AggregatePlan {
-        AggregatePlan { items, group_by, computed_keys: Vec::new(), having: None, order_by: Vec::new(), limit: None, offset: None }
+        AggregatePlan {
+            items,
+            group_by,
+            computed_keys: Vec::new(),
+            having: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        }
     }
 
     /// Builds `COALESCE(MAX(<field>), 0) + 1` the way the parser does.
@@ -1074,7 +1141,10 @@ mod tests {
             expr: Expr::Arith(
                 Box::new(Expr::Coalesce(vec![
                     Expr::Column(slot),
-                    Expr::Literal { bytes: 0i64.to_le_bytes().to_vec(), db_type: DbType::I64 },
+                    Expr::Literal {
+                        bytes: 0i64.to_le_bytes().to_vec(),
+                        db_type: DbType::I64,
+                    },
                 ])),
                 ArithOp::Add,
                 Box::new(Expr::Literal {
@@ -1082,7 +1152,10 @@ mod tests {
                     db_type: DbType::I64,
                 }),
             ),
-            inputs: vec![ComputedInput { func: AggFunc::Max, arg: Some(f.clone()) }],
+            inputs: vec![ComputedInput {
+                func: AggFunc::Max,
+                arg: Some(f.clone()),
+            }],
             db_type: DbType::I64,
             label: "next".to_string(),
         }
@@ -1122,13 +1195,15 @@ mod tests {
             ]),
         ];
         let items = vec![
-            SelectItem::Column { field: k.clone(), label: "k".to_string() },
+            SelectItem::Column {
+                field: k.clone(),
+                label: "k".to_string(),
+            },
             coalesce_max_plus_one(&v),
         ];
         let out = fold(&plan(items, vec![k]), &rows).unwrap();
         assert_eq!(out.len(), 2);
-        let mut got: Vec<(i64, i64)> =
-            out.iter().map(|r| (i64_of(r, 0), i64_of(r, 1))).collect();
+        let mut got: Vec<(i64, i64)> = out.iter().map(|r| (i64_of(r, 0), i64_of(r, 1))).collect();
         got.sort();
         assert_eq!(got, vec![(1, 41), (2, 6)]);
     }
@@ -1170,7 +1245,10 @@ mod tests {
                 ArithOp::Div,
                 Box::new(Expr::Column(slot)),
             ),
-            inputs: vec![ComputedInput { func: AggFunc::Count, arg: Some(f) }],
+            inputs: vec![ComputedInput {
+                func: AggFunc::Count,
+                arg: Some(f),
+            }],
             db_type: DbType::I64,
             label: "x".to_string(),
         };
@@ -1227,7 +1305,11 @@ mod tests {
             row(&[]),
             row(&[(0, DbType::STRING, b"b".to_vec())]),
         ];
-        let out = fold(&plan(vec![agg(AggFunc::Count, Some(f.clone()))], vec![]), &rows).unwrap();
+        let out = fold(
+            &plan(vec![agg(AggFunc::Count, Some(f.clone()))], vec![]),
+            &rows,
+        )
+        .unwrap();
         assert_eq!(i64_of(&out[0], 0), 2);
 
         // The empty string is a value. Counting it as absent reported a column
@@ -1248,7 +1330,11 @@ mod tests {
             .map(|v| row(&[(0, DbType::I64, v.to_le_bytes().to_vec())]))
             .collect();
 
-        let out = fold(&plan(vec![agg(AggFunc::Sum, Some(f.clone()))], vec![]), &rows).unwrap();
+        let out = fold(
+            &plan(vec![agg(AggFunc::Sum, Some(f.clone()))], vec![]),
+            &rows,
+        )
+        .unwrap();
         assert_eq!(i64_of(&out[0], 0), 60);
 
         let out = fold(&plan(vec![agg(AggFunc::Avg, Some(f))], vec![]), &rows).unwrap();
@@ -1294,13 +1380,20 @@ mod tests {
 
         let out = fold(
             &plan(
-                vec![agg(AggFunc::Min, Some(f.clone())), agg(AggFunc::Max, Some(f))],
+                vec![
+                    agg(AggFunc::Min, Some(f.clone())),
+                    agg(AggFunc::Max, Some(f)),
+                ],
                 vec![],
             ),
             &rows,
         )
         .unwrap();
-        assert_eq!(i64_of(&out[0], 0), -3, "MIN must compare numerically, not bytewise");
+        assert_eq!(
+            i64_of(&out[0], 0),
+            -3,
+            "MIN must compare numerically, not bytewise"
+        );
         assert_eq!(i64_of(&out[0], 1), 42);
     }
 
@@ -1313,7 +1406,10 @@ mod tests {
             row(&[(0, DbType::STRING, b"paid".to_vec())]),
         ];
         let items = vec![
-            SelectItem::Column { field: status.clone(), label: "status".to_string() },
+            SelectItem::Column {
+                field: status.clone(),
+                label: "status".to_string(),
+            },
             agg(AggFunc::Count, None),
         ];
         let mut p = plan(items, vec![status]);
@@ -1334,16 +1430,32 @@ mod tests {
         let a = field("a", DbType::STRING, 0);
         let b = field("b", DbType::STRING, 1);
         let rows = vec![
-            row(&[(0, DbType::STRING, b"a".to_vec()), (1, DbType::STRING, b"bc".to_vec())]),
-            row(&[(0, DbType::STRING, b"ab".to_vec()), (1, DbType::STRING, b"c".to_vec())]),
+            row(&[
+                (0, DbType::STRING, b"a".to_vec()),
+                (1, DbType::STRING, b"bc".to_vec()),
+            ]),
+            row(&[
+                (0, DbType::STRING, b"ab".to_vec()),
+                (1, DbType::STRING, b"c".to_vec()),
+            ]),
         ];
         let items = vec![
-            SelectItem::Column { field: a.clone(), label: "a".to_string() },
-            SelectItem::Column { field: b.clone(), label: "b".to_string() },
+            SelectItem::Column {
+                field: a.clone(),
+                label: "a".to_string(),
+            },
+            SelectItem::Column {
+                field: b.clone(),
+                label: "b".to_string(),
+            },
             agg(AggFunc::Count, None),
         ];
         let out = fold(&plan(items, vec![a, b]), &rows).unwrap();
-        assert_eq!(out.len(), 2, "\"a\"+\"bc\" and \"ab\"+\"c\" are different groups");
+        assert_eq!(
+            out.len(),
+            2,
+            "\"a\"+\"bc\" and \"ab\"+\"c\" are different groups"
+        );
     }
 
     #[test]
@@ -1355,7 +1467,10 @@ mod tests {
             row(&[(0, DbType::STRING, b"paid".to_vec())]),
         ];
         let items = vec![
-            SelectItem::Column { field: status.clone(), label: "status".to_string() },
+            SelectItem::Column {
+                field: status.clone(),
+                label: "status".to_string(),
+            },
             agg(AggFunc::Count, None),
         ];
         let mut p = plan(items, vec![status]);
@@ -1383,7 +1498,10 @@ mod tests {
             row(&[(0, DbType::STRING, b"c".to_vec())]),
         ];
         let items = vec![
-            SelectItem::Column { field: status.clone(), label: "status".to_string() },
+            SelectItem::Column {
+                field: status.clone(),
+                label: "status".to_string(),
+            },
             agg(AggFunc::Count, None),
         ];
         let mut p = plan(items, vec![status]);
@@ -1405,7 +1523,10 @@ mod tests {
         let expr = Expr::Arith(
             Box::new(Expr::Column(x.clone())),
             ArithOp::Add,
-            Box::new(Expr::Literal { bytes: 100i64.to_le_bytes().to_vec(), db_type: DbType::I64 }),
+            Box::new(Expr::Literal {
+                bytes: 100i64.to_le_bytes().to_vec(),
+                db_type: DbType::I64,
+            }),
         );
         let bucket = field("bucket", DbType::I64, 100);
         let p = AggregatePlan {
@@ -1436,8 +1557,7 @@ mod tests {
         ];
         let out = fold(&p, &rows).unwrap();
         assert_eq!(out.len(), 2, "two buckets");
-        let mut got: Vec<(i64, i64)> =
-            out.iter().map(|r| (i64_of(r, 0), i64_of(r, 1))).collect();
+        let mut got: Vec<(i64, i64)> = out.iter().map(|r| (i64_of(r, 0), i64_of(r, 1))).collect();
         got.sort();
         // The echoed value is the *evaluated* key — 101/102, not the stored
         // 1/2 — which is what proves the expression ran rather than the
@@ -1457,8 +1577,14 @@ mod tests {
             (1, DbType::I64, 2i64.to_le_bytes().to_vec()),
         ])];
         let items = vec![
-            SelectItem::Column { field: b.clone(), label: "b".to_string() },
-            SelectItem::Column { field: a.clone(), label: "a".to_string() },
+            SelectItem::Column {
+                field: b.clone(),
+                label: "b".to_string(),
+            },
+            SelectItem::Column {
+                field: a.clone(),
+                label: "a".to_string(),
+            },
             agg(AggFunc::Count, None),
         ];
         let out = fold(&plan(items, vec![a, b]), &rows).unwrap();
@@ -1470,11 +1596,23 @@ mod tests {
     #[test]
     fn result_types_follow_postgres_where_it_matters() {
         assert_eq!(AggFunc::Count.result_type(None), DbType::I64);
-        assert_eq!(AggFunc::Count.result_type(Some(&DbType::STRING)), DbType::I64);
-        assert_eq!(AggFunc::Sum.result_type(Some(&DbType::DECIMAL)), DbType::DECIMAL);
+        assert_eq!(
+            AggFunc::Count.result_type(Some(&DbType::STRING)),
+            DbType::I64
+        );
+        assert_eq!(
+            AggFunc::Sum.result_type(Some(&DbType::DECIMAL)),
+            DbType::DECIMAL
+        );
         assert_eq!(AggFunc::Sum.result_type(Some(&DbType::I32)), DbType::I64);
         assert_eq!(AggFunc::Sum.result_type(Some(&DbType::F32)), DbType::F64);
-        assert_eq!(AggFunc::Avg.result_type(Some(&DbType::I64)), DbType::DECIMAL);
-        assert_eq!(AggFunc::Min.result_type(Some(&DbType::STRING)), DbType::STRING);
+        assert_eq!(
+            AggFunc::Avg.result_type(Some(&DbType::I64)),
+            DbType::DECIMAL
+        );
+        assert_eq!(
+            AggFunc::Min.result_type(Some(&DbType::STRING)),
+            DbType::STRING
+        );
     }
 }

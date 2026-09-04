@@ -54,15 +54,27 @@ fn payload(bytes: &[u8], write_order: u32, column_type: DbType) -> ColumnWritePa
     let mut mb = MEMORY_POOL.acquire(bytes.len());
     mb.into_slice_mut().copy_from_slice(bytes);
     let size = column_type.get_size();
-    ColumnWritePayload { data: mb, write_order, column_type, size }
+    ColumnWritePayload {
+        data: mb,
+        write_order,
+        column_type,
+        size,
+    }
 }
 
 fn row_of(id: u64) -> RowWrite {
-    let mut rw = RowWrite { columns_writing_data: SmallVec::new() };
-    rw.columns_writing_data.push(payload(&id.to_le_bytes(), 0, DbType::U64));
-    rw.columns_writing_data.push(payload(&(id as i32).to_le_bytes(), 1, DbType::I32));
+    let mut rw = RowWrite {
+        columns_writing_data: SmallVec::new(),
+    };
     rw.columns_writing_data
-        .push(payload(format!("row-payload-of-a-realistic-width-{:08}", id).as_bytes(), 2, DbType::STRING));
+        .push(payload(&id.to_le_bytes(), 0, DbType::U64));
+    rw.columns_writing_data
+        .push(payload(&(id as i32).to_le_bytes(), 1, DbType::I32));
+    rw.columns_writing_data.push(payload(
+        format!("row-payload-of-a-realistic-width-{:08}", id).as_bytes(),
+        2,
+        DbType::STRING,
+    ));
     rw
 }
 
@@ -82,7 +94,9 @@ fn full_fetch(fields: &SmallVec<[SchemaField; 20]>) -> rasterizeddb_core::core::
             schema_id,
         });
     }
-    rasterizeddb_core::core::row::row::RowFetch { columns_fetching_data: cols }
+    rasterizeddb_core::core::row::row::RowFetch {
+        columns_fetching_data: cols,
+    }
 }
 
 async fn build_table(dir: &std::path::Path, name: &str, rows: u64) -> Table<LocalStorageProvider> {
@@ -92,9 +106,18 @@ async fn build_table(dir: &std::path::Path, name: &str, rows: u64) -> Table<Loca
         name,
         io,
         vec![
-            CreateColumnData { name: "id".into(), data_type: DbType::U64 },
-            CreateColumnData { name: "cat".into(), data_type: DbType::I32 },
-            CreateColumnData { name: "label".into(), data_type: DbType::STRING },
+            CreateColumnData {
+                name: "id".into(),
+                data_type: DbType::U64,
+            },
+            CreateColumnData {
+                name: "cat".into(),
+                data_type: DbType::I32,
+            },
+            CreateColumnData {
+                name: "label".into(),
+                data_type: DbType::STRING,
+            },
         ],
     )
     .await;
@@ -106,7 +129,10 @@ async fn build_table(dir: &std::path::Path, name: &str, rows: u64) -> Table<Loca
 
 /// The sweep itself, over a table with a realistic proportion of tombstones.
 fn bench_sweep(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     let dir = bench_dir();
 
     let table = rt.block_on(async {
@@ -136,7 +162,10 @@ fn bench_sweep(c: &mut Criterion) {
 ///
 /// The difference is the whole per-row cost of reclamation on the write path.
 fn bench_insert_paths(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     let mut group = c.benchmark_group("vacuum");
     group.sample_size(20);
 
@@ -184,7 +213,10 @@ fn bench_insert_paths(c: &mut Criterion) {
 
 /// Full compaction: what `VACUUM FULL` costs per live row.
 fn bench_compaction(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     let mut group = c.benchmark_group("vacuum");
     group.sample_size(10);
 

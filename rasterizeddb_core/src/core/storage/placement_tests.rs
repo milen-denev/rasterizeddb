@@ -18,8 +18,14 @@ fn create_statement(name: &str) -> CreateTable {
     CreateTable {
         table_name: name.to_string(),
         columns: vec![
-            CreateColumnData { name: "id".to_string(), data_type: DbType::I32 },
-            CreateColumnData { name: "label".to_string(), data_type: DbType::STRING },
+            CreateColumnData {
+                name: "id".to_string(),
+                data_type: DbType::I32,
+            },
+            CreateColumnData {
+                name: "label".to_string(),
+                data_type: DbType::STRING,
+            },
         ],
         unique_columns: Vec::new(),
         foreign_keys: Vec::new(),
@@ -57,7 +63,10 @@ fn files_for(dir: &std::path::Path, table: &str) -> Vec<String> {
 }
 
 async fn insert(db: &Arc<Database>, table: &str, id: i32, label: &str) {
-    let sql = format!("INSERT INTO {} (id, label) VALUES ({}, '{}')", table, id, label);
+    let sql = format!(
+        "INSERT INTO {} (id, label) VALUES ({}, '{}')",
+        table, id, label
+    );
     let purpose = crate::core::rql::lexer_s1::recognize_query_purpose(&sql)
         .unwrap_or_else(|| panic!("could not parse {sql}"));
     let result = crate::core::rql::executor::execute(purpose, db.clone()).await;
@@ -74,11 +83,18 @@ async fn a_table_is_created_in_the_location_the_policy_chose() {
 
     let db = open(root.path()).await;
     db.storage
-        .add_location(&second.path().to_string_lossy(), LocationRole::Primary, 1, true)
+        .add_location(
+            &second.path().to_string_lossy(),
+            LocationRole::Primary,
+            1,
+            true,
+        )
         .unwrap();
     // Pinned rather than left to a policy: this test is about the files
     // following the placement, not about how the placement was reached.
-    db.storage.pin("elsewhere", &second.path().to_string_lossy()).unwrap();
+    db.storage
+        .pin("elsewhere", &second.path().to_string_lossy())
+        .unwrap();
 
     db.add_table(create_statement("elsewhere")).await.unwrap();
 
@@ -108,7 +124,9 @@ async fn a_placed_table_still_holds_its_rows_after_a_restart() {
 
     {
         let db = open(root.path()).await;
-        db.storage.add_location(&second_path, LocationRole::Primary, 1, true).unwrap();
+        db.storage
+            .add_location(&second_path, LocationRole::Primary, 1, true)
+            .unwrap();
         db.storage.pin("moved", &second_path).unwrap();
         db.add_table(create_statement("moved")).await.unwrap();
         insert(&db, "moved", 1, "first").await;
@@ -121,7 +139,11 @@ async fn a_placed_table_still_holds_its_rows_after_a_restart() {
         Some(second_path.as_str()),
         "the placement must come back from the pool file"
     );
-    let table = db.tables.get("moved").expect("the table should be in the catalogue").clone();
+    let table = db
+        .tables
+        .get("moved")
+        .expect("the table should be in the catalogue")
+        .clone();
     assert_eq!(
         StorageIO::get_location(&*table.io_rows).as_deref(),
         Some(second_path.as_str()),
@@ -141,7 +163,9 @@ async fn a_backup_location_gets_a_byte_identical_copy() {
 
     {
         let db = open(root.path()).await;
-        db.storage.add_location(&backup_path, LocationRole::Backup, 1, true).unwrap();
+        db.storage
+            .add_location(&backup_path, LocationRole::Backup, 1, true)
+            .unwrap();
         // Reopened so the catalogue's own files are mirrored too: the mirror is
         // decided when a file is opened, and these were opened before the
         // backup location existed.
@@ -156,7 +180,10 @@ async fn a_backup_location_gets_a_byte_identical_copy() {
     for name in ["mirrored.db", "mirrored_pointers.db", "mirrored_schema.db"] {
         let primary = std::fs::read(root.path().join(name)).unwrap_or_default();
         let copy = std::fs::read(backup.path().join(name)).unwrap_or_default();
-        assert!(!primary.is_empty(), "{name} is empty in the database directory");
+        assert!(
+            !primary.is_empty(),
+            "{name} is empty in the database directory"
+        );
         assert_eq!(
             primary, copy,
             "{name} in the backup location is not byte-identical to the primary"
@@ -166,7 +193,10 @@ async fn a_backup_location_gets_a_byte_identical_copy() {
     // The catalogue too, or the backup directory would hold every table and no
     // list of them — and would not open as a database.
     let catalogue = std::fs::read(backup.path().join("db_data_rows.db")).unwrap_or_default();
-    assert!(!catalogue.is_empty(), "the backup location has no copy of the catalogue");
+    assert!(
+        !catalogue.is_empty(),
+        "the backup location has no copy of the catalogue"
+    );
 }
 
 /// A backup location added while the server is running applies to the next
@@ -181,28 +211,46 @@ async fn a_backup_added_at_runtime_covers_the_next_table() {
     let backup_path = backup.path().to_string_lossy().into_owned();
 
     let db = open(root.path()).await;
-    db.add_table(create_statement("before_backup")).await.unwrap();
+    db.add_table(create_statement("before_backup"))
+        .await
+        .unwrap();
     insert(&db, "before_backup", 1, "unprotected").await;
 
-    db.storage.add_location(&backup_path, LocationRole::Backup, 1, true).unwrap();
+    db.storage
+        .add_location(&backup_path, LocationRole::Backup, 1, true)
+        .unwrap();
 
-    db.add_table(create_statement("after_backup")).await.unwrap();
+    db.add_table(create_statement("after_backup"))
+        .await
+        .unwrap();
     insert(&db, "after_backup", 1, "protected").await;
 
     let primary = std::fs::read(root.path().join("after_backup.db")).unwrap();
     let copy = std::fs::read(backup.path().join("after_backup.db")).unwrap_or_default();
     assert!(!primary.is_empty());
-    assert_eq!(primary, copy, "a table created after the backup was added is not mirrored");
+    assert_eq!(
+        primary, copy,
+        "a table created after the backup was added is not mirrored"
+    );
 
     // And the table opened earlier is not, which the reporting must not claim
     // otherwise.
     assert_eq!(
-        db.tables.get("before_backup").unwrap().io_rows.backup_count(),
+        db.tables
+            .get("before_backup")
+            .unwrap()
+            .io_rows
+            .backup_count(),
         0,
         "a table already open cannot have acquired a backup copy"
     );
     assert!(
-        db.tables.get("after_backup").unwrap().io_rows.backup_count() > 0,
+        db.tables
+            .get("after_backup")
+            .unwrap()
+            .io_rows
+            .backup_count()
+            > 0,
         "a table created after the backup was added should have one"
     );
 }
@@ -215,7 +263,9 @@ async fn a_backup_directory_opens_as_a_database_of_its_own() {
 
     {
         let db = open(root.path()).await;
-        db.storage.add_location(&backup_path, LocationRole::Backup, 1, true).unwrap();
+        db.storage
+            .add_location(&backup_path, LocationRole::Backup, 1, true)
+            .unwrap();
         drop(db);
 
         let db = open(root.path()).await;
@@ -246,7 +296,9 @@ async fn moving_a_table_takes_its_files_with_it() {
     let second_path = second.path().to_string_lossy().into_owned();
 
     let db = open(root.path()).await;
-    db.storage.add_location(&second_path, LocationRole::Primary, 1, true).unwrap();
+    db.storage
+        .add_location(&second_path, LocationRole::Primary, 1, true)
+        .unwrap();
     db.add_table(create_statement("travelling")).await.unwrap();
     insert(&db, "travelling", 1, "before").await;
 
@@ -254,7 +306,10 @@ async fn moving_a_table_takes_its_files_with_it() {
     assert!(!before.is_empty());
 
     let copied = db.move_table_to("travelling", &second_path).await.unwrap();
-    assert!(copied > 0, "a move that copied nothing has not moved anything");
+    assert!(
+        copied > 0,
+        "a move that copied nothing has not moved anything"
+    );
 
     assert_eq!(
         files_for(root.path(), "travelling"),
@@ -262,15 +317,24 @@ async fn moving_a_table_takes_its_files_with_it() {
         "the original files should be gone once the move commits"
     );
     let after = std::fs::read(second.path().join("travelling.db")).unwrap();
-    assert_eq!(before, after, "the moved row file is not the one that was there");
+    assert_eq!(
+        before, after,
+        "the moved row file is not the one that was there"
+    );
 
-    assert_eq!(db.storage.location_of("travelling").as_deref(), Some(second_path.as_str()));
+    assert_eq!(
+        db.storage.location_of("travelling").as_deref(),
+        Some(second_path.as_str())
+    );
 
     // Still writable at its new address, which a move that left a stale handle
     // in the table map would not be.
     insert(&db, "travelling", 2, "after").await;
     let table = db.tables.get("travelling").unwrap().clone();
-    assert_eq!(StorageIO::get_location(&*table.io_rows).as_deref(), Some(second_path.as_str()));
+    assert_eq!(
+        StorageIO::get_location(&*table.io_rows).as_deref(),
+        Some(second_path.as_str())
+    );
 }
 
 /// A backup directory is flat: a table on the root and the same table on a
@@ -286,13 +350,19 @@ async fn a_move_keeps_the_backup_copy() {
     let backup_path = backup.path().to_string_lossy().into_owned();
 
     let db = open(root.path()).await;
-    db.storage.add_location(&second_path, LocationRole::Primary, 1, true).unwrap();
-    db.storage.add_location(&backup_path, LocationRole::Backup, 1, true).unwrap();
+    db.storage
+        .add_location(&second_path, LocationRole::Primary, 1, true)
+        .unwrap();
+    db.storage
+        .add_location(&backup_path, LocationRole::Backup, 1, true)
+        .unwrap();
 
     db.add_table(create_statement("shuttled")).await.unwrap();
     insert(&db, "shuttled", 1, "row").await;
     assert!(
-        !std::fs::read(backup.path().join("shuttled.db")).unwrap_or_default().is_empty(),
+        !std::fs::read(backup.path().join("shuttled.db"))
+            .unwrap_or_default()
+            .is_empty(),
         "the table should be mirrored before it moves"
     );
 
@@ -300,7 +370,10 @@ async fn a_move_keeps_the_backup_copy() {
 
     let primary = std::fs::read(second.path().join("shuttled.db")).unwrap();
     let copy = std::fs::read(backup.path().join("shuttled.db")).unwrap_or_default();
-    assert!(!primary.is_empty(), "the moved table has no rows at its destination");
+    assert!(
+        !primary.is_empty(),
+        "the moved table has no rows at its destination"
+    );
     assert_eq!(
         primary, copy,
         "the backup copy did not survive the move: a moved table must not lose its mirror"
@@ -310,7 +383,10 @@ async fn a_move_keeps_the_backup_copy() {
     insert(&db, "shuttled", 2, "after").await;
     let primary = std::fs::read(second.path().join("shuttled.db")).unwrap();
     let copy = std::fs::read(backup.path().join("shuttled.db")).unwrap_or_default();
-    assert_eq!(primary, copy, "writes after the move are not reaching the backup");
+    assert_eq!(
+        primary, copy,
+        "writes after the move are not reaching the backup"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -320,7 +396,9 @@ async fn a_move_into_a_backup_location_is_refused() {
     let backup_path = backup.path().to_string_lossy().into_owned();
 
     let db = open(root.path()).await;
-    db.storage.add_location(&backup_path, LocationRole::Backup, 1, true).unwrap();
+    db.storage
+        .add_location(&backup_path, LocationRole::Backup, 1, true)
+        .unwrap();
     db.add_table(create_statement("staying")).await.unwrap();
 
     let refused = db.move_table_to("staying", &backup_path).await.unwrap_err();
@@ -341,7 +419,9 @@ async fn dropping_a_placed_table_removes_its_files_and_its_placement() {
     let second_path = second.path().to_string_lossy().into_owned();
 
     let db = open(root.path()).await;
-    db.storage.add_location(&second_path, LocationRole::Primary, 1, true).unwrap();
+    db.storage
+        .add_location(&second_path, LocationRole::Primary, 1, true)
+        .unwrap();
     db.storage.pin("temporary", &second_path).unwrap();
     db.add_table(create_statement("temporary")).await.unwrap();
     assert!(!files_for(second.path(), "temporary").is_empty());
@@ -366,13 +446,18 @@ async fn a_renamed_table_keeps_its_location() {
     let second_path = second.path().to_string_lossy().into_owned();
 
     let db = open(root.path()).await;
-    db.storage.add_location(&second_path, LocationRole::Primary, 1, true).unwrap();
+    db.storage
+        .add_location(&second_path, LocationRole::Primary, 1, true)
+        .unwrap();
     db.storage.pin("before", &second_path).unwrap();
     db.add_table(create_statement("before")).await.unwrap();
 
     db.rename_table("before", "after").await.unwrap();
 
-    assert_eq!(db.storage.location_of("after").as_deref(), Some(second_path.as_str()));
+    assert_eq!(
+        db.storage.location_of("after").as_deref(),
+        Some(second_path.as_str())
+    );
     assert!(db.storage.location_of("before").is_none());
     assert!(
         !files_for(second.path(), "after").is_empty(),
@@ -392,7 +477,12 @@ async fn free_space_placement_prefers_the_roomier_location() {
 
     let db = open(root.path()).await;
     db.storage
-        .add_location(&second.path().to_string_lossy(), LocationRole::Primary, 1, true)
+        .add_location(
+            &second.path().to_string_lossy(),
+            LocationRole::Primary,
+            1,
+            true,
+        )
         .unwrap();
     db.storage.set_policy(PlacementPolicy::FreeSpace);
 
@@ -400,10 +490,12 @@ async fn free_space_placement_prefers_the_roomier_location() {
     // which one wins is not something to assert. What is worth asserting is
     // that the decision is *made* — a policy that silently fell back to the
     // root would pass a weaker test.
-    let chosen = db.storage.would_place().expect("a file-backed database always places somewhere");
+    let chosen = db
+        .storage
+        .would_place()
+        .expect("a file-backed database always places somewhere");
     assert!(
-        chosen == root.path().to_string_lossy()
-            || chosen == second.path().to_string_lossy(),
+        chosen == root.path().to_string_lossy() || chosen == second.path().to_string_lossy(),
         "free-space placement chose {chosen}, which is neither location"
     );
 
@@ -426,7 +518,9 @@ async fn a_rebalance_evacuates_a_disabled_location() {
     let second_path = second.path().to_string_lossy().into_owned();
 
     let db = open(root.path()).await;
-    db.storage.add_location(&second_path, LocationRole::Primary, 1, true).unwrap();
+    db.storage
+        .add_location(&second_path, LocationRole::Primary, 1, true)
+        .unwrap();
     db.storage.pin("draining", &second_path).unwrap();
     db.add_table(create_statement("draining")).await.unwrap();
     insert(&db, "draining", 1, "row").await;
@@ -454,7 +548,9 @@ async fn a_dry_run_moves_nothing() {
     let second_path = second.path().to_string_lossy().into_owned();
 
     let db = open(root.path()).await;
-    db.storage.add_location(&second_path, LocationRole::Primary, 1, true).unwrap();
+    db.storage
+        .add_location(&second_path, LocationRole::Primary, 1, true)
+        .unwrap();
     db.storage.pin("still", &second_path).unwrap();
     db.add_table(create_statement("still")).await.unwrap();
     db.storage.set_enabled(&second_path, false).unwrap();
@@ -543,7 +639,14 @@ async fn a_location_added_in_sql_takes_the_next_table() {
 
     // Weighted far above the root, so the choice is not a coin toss between two
     // directories on the same filesystem.
-    run(&db, &format!("STORAGE ALTER LOCATION '{}' SET WEIGHT = 100000", second_path)).await;
+    run(
+        &db,
+        &format!(
+            "STORAGE ALTER LOCATION '{}' SET WEIGHT = 100000",
+            second_path
+        ),
+    )
+    .await;
     run(&db, "STORAGE SET POLICY = 'free-space'").await;
 
     db.add_table(create_statement("chosen")).await.unwrap();
@@ -594,14 +697,21 @@ async fn moving_a_table_through_sql_takes_its_rows_with_it() {
     insert(&db, "relocated", 1, "carried").await;
 
     let before = std::fs::read(root.path().join("relocated.db")).unwrap();
-    let moved = run(&db, &format!("STORAGE MOVE TABLE relocated TO '{}'", second_path)).await;
+    let moved = run(
+        &db,
+        &format!("STORAGE MOVE TABLE relocated TO '{}'", second_path),
+    )
+    .await;
     assert!(
         moved.iter().any(|line| line.contains("moved relocated")),
         "the move should report what it did: {moved:?}"
     );
 
     let after = std::fs::read(second.path().join("relocated.db")).unwrap();
-    assert_eq!(before, after, "the moved rows are not the ones that were there");
+    assert_eq!(
+        before, after,
+        "the moved rows are not the ones that were there"
+    );
 
     // And the table still answers, which a move that left a stale handle behind
     // would not.

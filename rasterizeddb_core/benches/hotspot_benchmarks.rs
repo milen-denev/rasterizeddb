@@ -148,12 +148,16 @@ fn bench_memory_pool(c: &mut Criterion) {
     // Heap path: string columns and row buffers. A tight acquire/drop loop is
     // exactly what the row-fetch path does per column per row.
     for &size in [32usize, 64, 256, 4096].iter() {
-        group.bench_with_input(BenchmarkId::new("acquire_drop_heap", size), &size, |b, &s| {
-            b.iter(|| {
-                let mb = MEMORY_POOL.acquire(black_box(s));
-                black_box(mb.len())
-            })
-        });
+        group.bench_with_input(
+            BenchmarkId::new("acquire_drop_heap", size),
+            &size,
+            |b, &s| {
+                b.iter(|| {
+                    let mb = MEMORY_POOL.acquire(black_box(s));
+                    black_box(mb.len())
+                })
+            },
+        );
     }
 
     // Several live blocks at once: the single-slot reuse cache can only satisfy

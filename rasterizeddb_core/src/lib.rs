@@ -1,6 +1,6 @@
+use cacheguard::CacheGuard;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
-use cacheguard::CacheGuard;
 
 pub(crate) const SERVER_PORT: u16 = 61170;
 
@@ -25,7 +25,6 @@ pub static BATCH_SIZE: OnceLock<usize> = OnceLock::new(); // 10K by default
 pub fn batch_size() -> usize {
     BATCH_SIZE.get().copied().unwrap_or(10_000)
 }
-
 
 /// Filter tuning lives in `core::filter::settings`, which is runtime-mutable
 /// so `SET FILTER ...` and the `--filter-*` CLI flags reach the same state.
@@ -228,7 +227,12 @@ pub fn set_wal_writer_delay_ms(ms: u64) {
 /// local log — answering "off" to any of them would be quietly weaker than what
 /// was asked for.
 pub fn parse_synchronous_commit(value: &str) -> Option<bool> {
-    match value.trim().trim_matches(['\'', '"']).to_ascii_lowercase().as_str() {
+    match value
+        .trim()
+        .trim_matches(['\'', '"'])
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "on" | "true" | "yes" | "1" | "t" | "local" | "remote_write" | "remote_apply" => Some(true),
         "off" | "false" | "no" | "0" | "f" => Some(false),
         _ => None,

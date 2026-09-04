@@ -474,7 +474,10 @@ fn tokenize_inner<'a>(
                         j += 1;
                     }
                     if j >= bytes.len() {
-                        return Err(format!("unclosed string literal starting at position {}", i));
+                        return Err(format!(
+                            "unclosed string literal starting at position {}",
+                            i
+                        ));
                     }
                     lit.push_str(&s[segment..j]);
                     if bytes.get(j + 1) == Some(&b'\'') {
@@ -556,10 +559,7 @@ fn tokenize_inner<'a>(
                     // or a column that happens to share an operator's name —
                     // has no operand type to take; refused rather than unwrapped.
                     let Some(op_type) = expression_type_context.clone() else {
-                        return Err(format!(
-                            "operator {} has no left-hand operand",
-                            normalized
-                        ));
+                        return Err(format!("operator {} has no left-hand operand", normalized));
                     };
                     out.push(Token::Ident((normalized.clone(), op_type, 0)));
                     continue;
@@ -675,7 +675,10 @@ fn tokenize_inner<'a>(
                                 || (next_i + 8 <= bytes.len()
                                     && &bytes[next_i..next_i + 8] == b"ENDSWITH")
                             {
-                                return Err(format!("unknown column '{}' is not defined in the schema", id));
+                                return Err(format!(
+                                    "unknown column '{}' is not defined in the schema",
+                                    id
+                                ));
                             }
                         }
                     }
@@ -683,7 +686,10 @@ fn tokenize_inner<'a>(
                     // For identifiers not found in schema, this should probably be an error
                     // since all valid fields should be in the schema
                     // But if you want to allow unknown identifiers, you could use a default type
-                    return Err(format!("unknown identifier '{}' is not defined in the schema", id));
+                    return Err(format!(
+                        "unknown identifier '{}' is not defined in the schema",
+                        id
+                    ));
                 }
             }
 
@@ -807,7 +813,11 @@ fn typed_literal_type(id: &str, bytes: &[u8], at: usize) -> Option<DbType> {
     while j < bytes.len() && (bytes[j] as char).is_whitespace() {
         j += 1;
     }
-    if bytes.get(j) == Some(&b'\'') { Some(db_type) } else { None }
+    if bytes.get(j) == Some(&b'\'') {
+        Some(db_type)
+    } else {
+        None
+    }
 }
 
 // Rest of the helper functions remain the same but with optimized implementations
@@ -864,7 +874,9 @@ fn parse_by_db_type(value_str: &str, db_type: &DbType) -> Result<NumericValue, S
 fn parse_default(value_str: &str) -> Result<NumericValue, String> {
     let out_of_range = || format!("numeric literal {} is out of range", value_str);
     if value_str.contains('.') {
-        Ok(NumericValue::F64(value_str.parse().map_err(|_| out_of_range())?))
+        Ok(NumericValue::F64(
+            value_str.parse().map_err(|_| out_of_range())?,
+        ))
     } else {
         let parsed_num: i64 = value_str.parse().map_err(|_| out_of_range())?;
         if parsed_num >= i32::MIN as i64 && parsed_num <= i32::MAX as i64 {
@@ -988,14 +1000,21 @@ mod tests {
         let schema = create_schema_2();
         let toks = tokenize_inner("name = 'O''Brien'", &schema).expect("one literal");
         assert!(
-            toks.iter().any(|t| matches!(t, Token::StringLit(s) if s == "O'Brien")),
+            toks.iter()
+                .any(|t| matches!(t, Token::StringLit(s) if s == "O'Brien")),
             "got {:?}",
             toks
         );
         let toks = tokenize_inner("name = ''''", &schema).expect("a lone quote");
-        assert!(toks.iter().any(|t| matches!(t, Token::StringLit(s) if s == "'")));
+        assert!(
+            toks.iter()
+                .any(|t| matches!(t, Token::StringLit(s) if s == "'"))
+        );
         let toks = tokenize_inner("name = ''", &schema).expect("empty");
-        assert!(toks.iter().any(|t| matches!(t, Token::StringLit(s) if s.is_empty())));
+        assert!(
+            toks.iter()
+                .any(|t| matches!(t, Token::StringLit(s) if s.is_empty()))
+        );
     }
 
     /// A literal the column's type cannot hold used to parse as that type's

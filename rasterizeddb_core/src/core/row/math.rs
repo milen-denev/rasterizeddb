@@ -1,6 +1,6 @@
 use crate::{
     core::{db_type::DbType, processor::transformer::MathOperation},
-    memory_pool::{MemoryBlock, MEMORY_POOL},
+    memory_pool::{MEMORY_POOL, MemoryBlock},
 };
 
 use super::common::{FromF64, FromLeBytes, IntoF64};
@@ -599,8 +599,8 @@ mod tests {
         let input2_block = to_le_bytes(3i16);
         let input1 = input1_block.into_slice();
         let input2 = input2_block.into_slice();
-        let err = perform_math_operation(input1, input2, &DbType::I32, &MathOperation::Add)
-            .unwrap_err();
+        let err =
+            perform_math_operation(input1, input2, &DbType::I32, &MathOperation::Add).unwrap_err();
         assert_eq!(err, EvalError::OperandSizeMismatch);
     }
 

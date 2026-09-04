@@ -35,7 +35,7 @@ use log::{info, warn};
 
 use super::manifest::{Manifest, RecoveryTarget, SnapshotEntry};
 use super::s3::S3Client;
-use super::{archive, manifest, timeutil, BackupConfig};
+use super::{BackupConfig, archive, manifest, timeutil};
 
 /// Written into a restored directory, so an operator can tell what it is.
 const MARKER_FILE: &str = "RESTORED.json";
@@ -199,7 +199,6 @@ async fn build(
     target: RecoveryTarget,
     final_dir: &Path,
 ) -> io::Result<RestoreReport> {
-
     // One GET decides the whole plan: which snapshot, which segments, where to
     // stop. This is what the manifest exists for.
     let manifest_key = config.key(manifest::MANIFEST_KEY);
@@ -266,7 +265,11 @@ async fn build(
         Ok(dropped) if !dropped.is_empty() => warn!(
             "The source placed {} on storage locations outside its database directory, which no \
              snapshot copies. Those tables are not in this backup and will read as missing: {}",
-            if dropped.len() == 1 { "a table" } else { "tables" },
+            if dropped.len() == 1 {
+                "a table"
+            } else {
+                "tables"
+            },
             dropped.join(", ")
         ),
         Ok(_) => {}
@@ -316,7 +319,11 @@ async fn build(
                  no archived log covers that window. The restored copy of that database may be \
                  internally inconsistent.",
                 snapshot.id,
-                if database.is_empty() { "the default database" } else { database.as_str() },
+                if database.is_empty() {
+                    "the default database"
+                } else {
+                    database.as_str()
+                },
                 w.start_lsn,
                 w.end_lsn
             );
@@ -418,7 +425,11 @@ fn verify_archive_covers(manifest: &Manifest, snapshot: &SnapshotEntry) -> io::R
                  looks healthy and is not. Choose an older snapshot whose window is still \
                  covered.",
                 snapshot.id,
-                if database.is_empty() { "the default database" } else { database.as_str() },
+                if database.is_empty() {
+                    "the default database"
+                } else {
+                    database.as_str()
+                },
                 window.end_lsn,
                 archived_through
             ),

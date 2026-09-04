@@ -143,7 +143,11 @@ pub async fn load<S: StorageIO>(schema_io: Arc<S>) -> SmallVec<[UniqueKey; 4]> {
     let mut buffer = vec![0u8; UNIQUE_KEY_SIZE as usize];
     for i in 0..count {
         let mut position = i * UNIQUE_KEY_SIZE;
-        if io.read_data_into_buffer(&mut position, &mut buffer).await.is_err() {
+        if io
+            .read_data_into_buffer(&mut position, &mut buffer)
+            .await
+            .is_err()
+        {
             break;
         }
         match UniqueKey::from_vec(&buffer) {
@@ -180,7 +184,11 @@ pub async fn remove<S: StorageIO>(schema_io: Arc<S>, name: &str) -> io::Result<b
     for i in 0..count {
         let position = i * UNIQUE_KEY_SIZE;
         let mut cursor = position;
-        if io.read_data_into_buffer(&mut cursor, &mut buffer).await.is_err() {
+        if io
+            .read_data_into_buffer(&mut cursor, &mut buffer)
+            .await
+            .is_err()
+        {
             break;
         }
         let Ok(mut key) = UniqueKey::from_vec(&buffer) else {
@@ -190,7 +198,8 @@ pub async fn remove<S: StorageIO>(schema_io: Arc<S>, name: &str) -> io::Result<b
             continue;
         }
         key.is_deleted = true;
-        io.write_data_seek(io::SeekFrom::Start(position), &key.into_vec()).await;
+        io.write_data_seek(io::SeekFrom::Start(position), &key.into_vec())
+            .await;
         return Ok(true);
     }
 
@@ -257,7 +266,11 @@ pub fn parse_clause(clause: &str, table: &str) -> Result<Option<UniqueKey>, Stri
     }
 
     let name = name.unwrap_or_else(|| UniqueKey::default_name(table, &columns));
-    Ok(Some(UniqueKey { name, columns, is_deleted: false }))
+    Ok(Some(UniqueKey {
+        name,
+        columns,
+        is_deleted: false,
+    }))
 }
 
 #[cfg(test)]
@@ -278,7 +291,11 @@ mod tests {
     fn a_composite_record_round_trips() {
         let key = UniqueKey {
             name: "memberships_org_id_user_id_key".to_string(),
-            columns: vec!["org_id".to_string(), "user_id".to_string(), "role".to_string()],
+            columns: vec![
+                "org_id".to_string(),
+                "user_id".to_string(),
+                "role".to_string(),
+            ],
             is_deleted: false,
         };
         assert_eq!(UniqueKey::from_vec(&key.into_vec()).unwrap(), key);
@@ -308,7 +325,10 @@ mod tests {
     #[test]
     fn a_composite_constraint_keeps_every_column_in_order() {
         let key = parsed("UNIQUE (org_id, user_id)");
-        assert_eq!(key.columns, vec!["org_id".to_string(), "user_id".to_string()]);
+        assert_eq!(
+            key.columns,
+            vec!["org_id".to_string(), "user_id".to_string()]
+        );
         assert_eq!(key.name, "t_org_id_user_id_key");
     }
 
@@ -316,7 +336,10 @@ mod tests {
     fn a_named_constraint_keeps_its_name() {
         let key = parsed("CONSTRAINT uq_membership UNIQUE (org_id, user_id)");
         assert_eq!(key.name, "uq_membership");
-        assert_eq!(key.columns, vec!["org_id".to_string(), "user_id".to_string()]);
+        assert_eq!(
+            key.columns,
+            vec!["org_id".to_string(), "user_id".to_string()]
+        );
     }
 
     /// `PRIMARY KEY` is `UNIQUE NOT NULL`; the uniqueness half lands here.
@@ -342,23 +365,43 @@ mod tests {
     #[test]
     fn another_kind_of_clause_falls_through() {
         assert_eq!(parse_clause("id INTEGER", "t").unwrap(), None);
-        assert_eq!(parse_clause("FOREIGN KEY (a) REFERENCES u (b)", "t").unwrap(), None);
+        assert_eq!(
+            parse_clause("FOREIGN KEY (a) REFERENCES u (b)", "t").unwrap(),
+            None
+        );
         assert_eq!(parse_clause("CHECK (a > 0)", "t").unwrap(), None);
-        assert_eq!(parse_clause("CONSTRAINT c CHECK (a > 0)", "t").unwrap(), None);
+        assert_eq!(
+            parse_clause("CONSTRAINT c CHECK (a > 0)", "t").unwrap(),
+            None
+        );
     }
 
     /// A constraint that cannot be honoured is an error, never a silent skip.
     #[test]
     fn an_unusable_constraint_is_reported() {
-        assert!(parse_clause("UNIQUE", "t").unwrap_err().contains("list its columns"));
-        assert!(parse_clause("UNIQUE (", "t").unwrap_err().contains("not closed"));
-        assert!(parse_clause("UNIQUE ()", "t").unwrap_err().contains("no columns"));
+        assert!(
+            parse_clause("UNIQUE", "t")
+                .unwrap_err()
+                .contains("list its columns")
+        );
+        assert!(
+            parse_clause("UNIQUE (", "t")
+                .unwrap_err()
+                .contains("not closed")
+        );
+        assert!(
+            parse_clause("UNIQUE ()", "t")
+                .unwrap_err()
+                .contains("no columns")
+        );
         let wide = (0..MAX_COLUMNS + 1)
             .map(|i| format!("c{}", i))
             .collect::<Vec<_>>()
             .join(", ");
-        assert!(parse_clause(&format!("UNIQUE ({})", wide), "t")
-            .unwrap_err()
-            .contains("at most"));
+        assert!(
+            parse_clause(&format!("UNIQUE ({})", wide), "t")
+                .unwrap_err()
+                .contains("at most")
+        );
     }
 }

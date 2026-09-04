@@ -47,8 +47,8 @@ use crate::core::storage_providers::traits::StorageIO;
 pub use column::{FilterConfig, bitmap_words, choose_f};
 pub use hash::{HashSeed, canonical_hash, is_fingerprintable, is_indexable};
 pub use sarg::SargProgram;
-pub use zonemap::SargOp;
 pub use settings::{FilterSettings, Overrides, Resolved, settings};
+pub use zonemap::SargOp;
 
 use column::ColumnFilter;
 
@@ -286,7 +286,9 @@ impl TableFilters {
                 span_summary,
             )));
         }
-        let cfg = table.map(|t| settings::settings().resolve(t, "").cfg).unwrap_or(cfg);
+        let cfg = table
+            .map(|t| settings::settings().resolve(t, "").cfg)
+            .unwrap_or(cfg);
         let meta = Self::meta_of(&columns);
 
         Self {
@@ -378,7 +380,11 @@ impl TableFilters {
             .iter()
             .map(|c| {
                 let g = c.read();
-                if g.unknown_below() > 0 { 0 } else { g.valid_upto() }
+                if g.unknown_below() > 0 {
+                    0
+                } else {
+                    g.valid_upto()
+                }
             })
             .min()
             .unwrap_or(0)
@@ -433,11 +439,17 @@ impl TableFilters {
             // anything, and folding it into a fresh base image shortens the
             // chain. Half is the point where the next full rewrite would have
             // cost the same anyway.
-            if bytes.len() as u64 * 2 >= at { None } else { Some(bytes) }
+            if bytes.len() as u64 * 2 >= at {
+                None
+            } else {
+                Some(bytes)
+            }
         };
 
         let is_base = plan.is_none();
-        let mut bytes = plan.take().unwrap_or_else(|| persist::serialize(&refs, self.seed, n_slots));
+        let mut bytes = plan
+            .take()
+            .unwrap_or_else(|| persist::serialize(&refs, self.seed, n_slots));
         let offset = if is_base { 0 } else { at };
         let end = offset + bytes.len() as u64;
         persist::terminate(&mut bytes);
@@ -712,7 +724,11 @@ impl TableFilters {
                 // Width 0 means "no fingerprint planes". Two ways to get there:
                 // a gated-out column, maintained but not probed, and a
                 // bounds-only column that never had planes to begin with.
-                let f = if g.is_gated_out() || !g.has_fingerprints() { 0 } else { g.current_f() };
+                let f = if g.is_gated_out() || !g.has_fingerprints() {
+                    0
+                } else {
+                    g.current_f()
+                };
                 (g.write_order, f, g.estimated_distinct(), g.bytes())
             })
             .collect()
@@ -755,7 +771,9 @@ impl TableFilters {
             MaskExpr::And(branches) => {
                 let mut acc: Option<Vec<u64>> = None;
                 for b in branches {
-                    let Some(m) = self.eval(b, n_slots, scratch) else { continue };
+                    let Some(m) = self.eval(b, n_slots, scratch) else {
+                        continue;
+                    };
                     match acc.as_mut() {
                         Some(a) => {
                             for (d, s) in a.iter_mut().zip(m.iter()) {

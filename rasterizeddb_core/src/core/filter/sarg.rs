@@ -44,7 +44,6 @@
 //! than approximate — see that function for which neighbouring operators are
 //! deliberately left opaque and why.
 
-
 use crate::core::db_type::DbType;
 use crate::core::tokenizer::query_tokenizer::{NumericValue, Token, numeric_value_to_db_type};
 use crate::core::value_codec::coerce_literal;
@@ -101,7 +100,9 @@ pub struct SargProgram {
 
 impl Default for SargProgram {
     fn default() -> Self {
-        Self { root: MaskExpr::All }
+        Self {
+            root: MaskExpr::All,
+        }
     }
 }
 
@@ -197,7 +198,11 @@ fn conjunct_to_pred(toks: &[Token], filters: &TableFilters) -> Option<SargPredic
     };
     let value = coerce_literal(&raw, &from, db_type)?;
 
-    Some(SargPredicate { write_order, op, value })
+    Some(SargPredicate {
+        write_order,
+        op,
+        value,
+    })
 }
 
 /// Lower `col STARTSWITH 'abc'` to the range `col >= 'abc' AND col < 'abd'`.
@@ -226,16 +231,22 @@ fn starts_with_to_range(toks: &[Token], filters: &TableFilters) -> Option<MaskEx
     if toks.len() != 3 {
         return None;
     }
-    let Token::Ident((op_name, _, _)) = &toks[1] else { return None };
+    let Token::Ident((op_name, _, _)) = &toks[1] else {
+        return None;
+    };
     if !op_name.eq_ignore_ascii_case("STARTSWITH") {
         return None;
     }
 
-    let Token::Ident((_, db_type, write_order)) = &toks[0] else { return None };
+    let Token::Ident((_, db_type, write_order)) = &toks[0] else {
+        return None;
+    };
     if !matches!(db_type, DbType::STRING) {
         return None;
     }
-    let Token::StringLit(prefix) = &toks[2] else { return None };
+    let Token::StringLit(prefix) = &toks[2] else {
+        return None;
+    };
 
     let write_order = *write_order as u32;
     if !filters.indexes(write_order) {
@@ -249,11 +260,19 @@ fn starts_with_to_range(toks: &[Token], filters: &TableFilters) -> Option<MaskEx
         return Some(MaskExpr::All);
     }
 
-    let ge = SargPredicate { write_order, op: SargOp::Ge, value: lo.clone() };
+    let ge = SargPredicate {
+        write_order,
+        op: SargOp::Ge,
+        value: lo.clone(),
+    };
     Some(match successor(&lo) {
         Some(hi) => MaskExpr::And(vec![
             MaskExpr::Pred(ge),
-            MaskExpr::Pred(SargPredicate { write_order, op: SargOp::Lt, value: hi }),
+            MaskExpr::Pred(SargPredicate {
+                write_order,
+                op: SargOp::Lt,
+                value: hi,
+            }),
         ]),
         // An all-`0xFF` prefix has nothing above it to bound against, so the
         // lower bound is the whole of what can be said. Weaker, still sound.
@@ -300,7 +319,11 @@ impl<'a> Parser<'a> {
             self.pos += 1;
             branches.push(self.parse_and());
         }
-        if branches.len() == 1 { branches.pop().unwrap() } else { MaskExpr::Or(branches) }
+        if branches.len() == 1 {
+            branches.pop().unwrap()
+        } else {
+            MaskExpr::Or(branches)
+        }
     }
 
     fn parse_and(&mut self) -> MaskExpr {
@@ -309,7 +332,11 @@ impl<'a> Parser<'a> {
             self.pos += 1;
             branches.push(self.parse_atom());
         }
-        if branches.len() == 1 { branches.pop().unwrap() } else { MaskExpr::And(branches) }
+        if branches.len() == 1 {
+            branches.pop().unwrap()
+        } else {
+            MaskExpr::And(branches)
+        }
     }
 
     /// Skip to the next separator at this nesting level, discarding whatever we
@@ -382,7 +409,12 @@ pub fn extract(tokens: &[Token], filters: &TableFilters) -> Option<SargProgram> 
         return None;
     }
 
-    let mut p = Parser { toks: tokens, pos: 0, filters, bad: false };
+    let mut p = Parser {
+        toks: tokens,
+        pos: 0,
+        filters,
+        bad: false,
+    };
     let root = p.parse_or();
 
     // Trailing tokens mean the structure was not what we thought it was — most

@@ -1,6 +1,6 @@
 use byteorder::{ByteOrder, LittleEndian};
-use rastcp::error::RastcpError;
 use rastcp::client::{TcpClient, TcpClientBuilder};
+use rastcp::error::RastcpError;
 use rastcp::session::ClientAuthenticator;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -10,10 +10,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
-use crate::core::support_types::QueryExecutionResult;
-use crate::native_auth::PasswordAuthenticator;
 use crate::SERVER_PORT;
 use crate::core::row::row::{self, ReturnResult};
+use crate::core::support_types::QueryExecutionResult;
+use crate::native_auth::PasswordAuthenticator;
 
 const MIN_POOL_SIZE: usize = 1;
 const DEFAULT_MAX_POOL_SIZE: usize = 10;
@@ -30,9 +30,7 @@ fn rastcp_error_to_io_error(error: RastcpError) -> io::Error {
         }
         RastcpError::ConnectionTimeout
         | RastcpError::TlsHandshakeTimeout
-        | RastcpError::HandlerTimeout => {
-            io::Error::new(io::ErrorKind::TimedOut, error.to_string())
-        }
+        | RastcpError::HandlerTimeout => io::Error::new(io::ErrorKind::TimedOut, error.to_string()),
         RastcpError::ConnectionLimitReached | RastcpError::ConnectionBackpressure => {
             io::Error::new(io::ErrorKind::WouldBlock, error.to_string())
         }
@@ -99,7 +97,9 @@ fn normalize_pool_limits_with_budget(
     let max_pool_size = requested_max_pool_size
         .max(MIN_POOL_SIZE)
         .min(normalized_budget);
-    let min_pool_size = requested_min_pool_size.max(MIN_POOL_SIZE).min(max_pool_size);
+    let min_pool_size = requested_min_pool_size
+        .max(MIN_POOL_SIZE)
+        .min(max_pool_size);
 
     (min_pool_size, max_pool_size)
 }
@@ -169,8 +169,7 @@ impl PooledClient {
     ) -> io::Result<()> {
         // Check connection and reconnect if needed
         if !self.client.is_connected() {
-            self.client =
-                open_connection(server_address, transport_timeout, credentials).await?;
+            self.client = open_connection(server_address, transport_timeout, credentials).await?;
         }
         self.last_used = Instant::now();
         Ok(())
@@ -294,14 +293,16 @@ impl DbClientPool {
 
     /// Get a client from the pool or create a new one
     async fn get_client(&self) -> io::Result<PooledClientGuard> {
-        let permit = self
-            .checkout_permits
-            .clone()
-            .acquire_owned();
+        let permit = self.checkout_permits.clone().acquire_owned();
 
         let permit = tokio::time::timeout(self.checkout_timeout, permit)
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Timed out waiting for a pooled client"))?
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Timed out waiting for a pooled client",
+                )
+            })?
             .map_err(|_| io::Error::other("Client pool is shutting down"))?;
 
         let wait_deadline = Instant::now() + self.checkout_timeout;
@@ -420,7 +421,8 @@ impl DbClientPool {
         };
 
         if removed_clients > 0 {
-            self.current_size.fetch_sub(removed_clients, Ordering::AcqRel);
+            self.current_size
+                .fetch_sub(removed_clients, Ordering::AcqRel);
         }
 
         let mut replenished_clients = Vec::new();
@@ -692,7 +694,6 @@ impl DbClient {
     }
 
     fn parse_query_response(response: Vec<u8>) -> io::Result<QueryExecutionResult> {
-
         // Parse the response
         if response.is_empty() {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "Empty response"));
@@ -768,8 +769,7 @@ mod tests {
 
     #[test]
     fn normalize_pool_limits_caps_requested_max_to_budget() {
-        let (min_pool_size, max_pool_size) =
-            normalize_pool_limits_with_budget(10, 5_000, 32);
+        let (min_pool_size, max_pool_size) = normalize_pool_limits_with_budget(10, 5_000, 32);
 
         assert_eq!(min_pool_size, 10);
         assert_eq!(max_pool_size, 32);
@@ -777,8 +777,7 @@ mod tests {
 
     #[test]
     fn normalize_pool_limits_keeps_min_within_max() {
-        let (min_pool_size, max_pool_size) =
-            normalize_pool_limits_with_budget(64, 4, 128);
+        let (min_pool_size, max_pool_size) = normalize_pool_limits_with_budget(64, 4, 128);
 
         assert_eq!(min_pool_size, 4);
         assert_eq!(max_pool_size, 4);
@@ -886,8 +885,8 @@ mod tests {
                 DEFAULT_CHECKOUT_TIMEOUT,
                 None,
             )
-                .await
-                .unwrap(),
+            .await
+            .unwrap(),
         );
 
         let first_guard = pool.get_client().await.unwrap();
@@ -912,7 +911,7 @@ mod tests {
 
 #[cfg(test)]
 mod address_tests {
-    use super::{resolve_server_address, SERVER_PORT};
+    use super::{SERVER_PORT, resolve_server_address};
 
     #[test]
     fn a_bare_host_gets_the_default_port() {
@@ -929,14 +928,20 @@ mod address_tests {
     #[test]
     fn an_explicit_port_is_kept() {
         assert_eq!(resolve_server_address("127.0.0.1:7000"), "127.0.0.1:7000");
-        assert_eq!(resolve_server_address("db.internal:7000"), "db.internal:7000");
+        assert_eq!(
+            resolve_server_address("db.internal:7000"),
+            "db.internal:7000"
+        );
     }
 
     #[test]
     fn a_bare_ipv6_literal_is_bracketed_before_the_port_is_appended() {
         // Appending to the bare literal would give `::1:61170`, which parses
         // as neither an address nor a port.
-        assert_eq!(resolve_server_address("::1"), format!("[::1]:{SERVER_PORT}"));
+        assert_eq!(
+            resolve_server_address("::1"),
+            format!("[::1]:{SERVER_PORT}")
+        );
         assert_eq!(
             resolve_server_address("fe80::1"),
             format!("[fe80::1]:{SERVER_PORT}")
@@ -946,7 +951,10 @@ mod address_tests {
     #[test]
     fn a_bracketed_ipv6_keeps_or_gains_a_port() {
         assert_eq!(resolve_server_address("[::1]:7000"), "[::1]:7000");
-        assert_eq!(resolve_server_address("[::1]"), format!("[::1]:{SERVER_PORT}"));
+        assert_eq!(
+            resolve_server_address("[::1]"),
+            format!("[::1]:{SERVER_PORT}")
+        );
     }
 
     #[test]

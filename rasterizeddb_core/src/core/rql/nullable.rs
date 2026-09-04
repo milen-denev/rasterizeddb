@@ -61,7 +61,9 @@ pub fn flag_field<'a>(
     schema: &'a SmallVec<[SchemaField; 20]>,
 ) -> Option<&'a SchemaField> {
     let name = flag_column_name(column);
-    schema.iter().find(|f| f.name.eq_ignore_ascii_case(&name) && !f.is_deleted)
+    schema
+        .iter()
+        .find(|f| f.name.eq_ignore_ascii_case(&name) && !f.is_deleted)
 }
 
 /// Whether `column` may hold `NULL`.
@@ -129,7 +131,10 @@ mod tests {
     fn companion_columns_are_hidden_from_the_client() {
         assert!(is_hidden("__null_country"));
         assert!(!is_hidden("country"));
-        assert!(!is_hidden("null_country"), "only the reserved prefix counts");
+        assert!(
+            !is_hidden("null_country"),
+            "only the reserved prefix counts"
+        );
 
         let s = schema_with(&[
             ("id", DbType::I32),

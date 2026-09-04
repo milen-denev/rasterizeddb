@@ -190,7 +190,9 @@ impl SuperBloom {
         if self.words.len() < needed {
             self.words.resize(needed, 0);
         }
-        let Some((base, masks)) = self.locate(superzone, hash) else { return };
+        let Some((base, masks)) = self.locate(superzone, hash) else {
+            return;
+        };
         for (w, m) in self.words[base..base + LANES].iter_mut().zip(masks) {
             *w |= m;
         }
@@ -205,7 +207,9 @@ impl SuperBloom {
         if superzone >= self.superzone_count() {
             return true;
         }
-        let Some((base, masks)) = self.locate(superzone, hash) else { return true };
+        let Some((base, masks)) = self.locate(superzone, hash) else {
+            return true;
+        };
         self.words[base..base + LANES]
             .iter()
             .zip(masks)
@@ -260,7 +264,11 @@ mod tests {
             .filter(|_| b.may_contain(0, fastrand::u64(..)))
             .count();
         let fpp = hits as f64 / trials as f64;
-        assert!(fpp < 0.02, "200 keys in 4096 bits gave {:.3} false positives", fpp);
+        assert!(
+            fpp < 0.02,
+            "200 keys in 4096 bits gave {:.3} false positives",
+            fpp
+        );
     }
 
     #[test]

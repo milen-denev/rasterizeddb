@@ -87,7 +87,9 @@ fn parse_args() -> Args {
     }
 
     if a.mode.is_empty() || a.dir.is_empty() {
-        eprintln!("usage: profile_rw <write|read> --dir PATH [--rows N] [--iters N] [--workload scan|point|narrow|agg|like|all] [--sync on|off] [--cache on|off] [--tune-alloc on|off]");
+        eprintln!(
+            "usage: profile_rw <write|read> --dir PATH [--rows N] [--iters N] [--workload scan|point|narrow|agg|like|all] [--sync on|off] [--cache on|off] [--tune-alloc on|off]"
+        );
         std::process::exit(2);
     }
     a

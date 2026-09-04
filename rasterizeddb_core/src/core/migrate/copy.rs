@@ -160,7 +160,10 @@ mod tests {
 
     #[test]
     fn an_empty_value_is_an_empty_string_not_a_null() {
-        assert_eq!(row("1\t\t2"), vec![Some("1".into()), Some("".into()), Some("2".into())]);
+        assert_eq!(
+            row("1\t\t2"),
+            vec![Some("1".into()), Some("".into()), Some("2".into())]
+        );
     }
 
     #[test]

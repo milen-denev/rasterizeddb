@@ -102,7 +102,8 @@ pub fn record_abandoned_hit() {
 /// a table run near its entry limit would spend most inserts evicting a live
 /// neighbour; the headroom keeps the load factor around 50% instead.
 pub fn init(max_entries: usize) -> &'static std::sync::Arc<QueryCache> {
-    QUERY_CACHE.get_or_init(|| QueryCache::new(max_entries.saturating_mul(2).max(1024), max_entries))
+    QUERY_CACHE
+        .get_or_init(|| QueryCache::new(max_entries.saturating_mul(2).max(1024), max_entries))
 }
 
 /// Whether caching is on. Unset means off — a library embedder that never

@@ -39,11 +39,18 @@ enum Node {
     /// `%` — any run of characters, including none.
     AnyString,
     /// `[abc]`, `[^abc]`, `[a-z]`.
-    Class { negated: bool, items: Vec<ClassItem> },
+    Class {
+        negated: bool,
+        items: Vec<ClassItem>,
+    },
     /// `(a|b|c)`, and the top level of a pattern that has a `|` in it.
     Alt(Vec<Vec<Node>>),
     /// `x*`, `x+`, `x?`, `x{m,n}`.
-    Repeat { node: Box<Node>, min: u32, max: Option<u32> },
+    Repeat {
+        node: Box<Node>,
+        min: u32,
+        max: Option<u32>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -242,7 +249,11 @@ fn parse_quantifier(chars: &[char], at: &mut usize, atom: Node) -> Result<Node, 
         }
         _ => return Ok(atom),
     };
-    Ok(Node::Repeat { node: Box::new(atom), min, max })
+    Ok(Node::Repeat {
+        node: Box::new(atom),
+        min,
+        max,
+    })
 }
 
 // ------------------------------------------------------------------ matching
@@ -264,7 +275,9 @@ fn match_nodes(nodes: &[Node], text: &[char], pos: usize, steps: &mut u32) -> bo
         // Tried longest-first, which finds a match no sooner but keeps the
         // greedy semantics a reader expects when a pattern is also used to
         // capture. Either order answers the same yes/no.
-        Node::AnyString => (pos..=text.len()).rev().any(|p| match_nodes(rest, text, p, steps)),
+        Node::AnyString => (pos..=text.len())
+            .rev()
+            .any(|p| match_nodes(rest, text, p, steps)),
         Node::Class { negated, items } => {
             if pos >= text.len() {
                 return false;
@@ -281,9 +294,7 @@ fn match_nodes(nodes: &[Node], text: &[char], pos: usize, steps: &mut u32) -> bo
             combined.extend_from_slice(rest);
             match_nodes(&combined, text, pos, steps)
         }),
-        Node::Repeat { node, min, max } => {
-            match_repeat(node, *min, *max, rest, text, pos, steps)
-        }
+        Node::Repeat { node, min, max } => match_repeat(node, *min, *max, rest, text, pos, steps),
     }
 }
 

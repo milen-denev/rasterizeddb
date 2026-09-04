@@ -83,7 +83,10 @@ impl ReferentialAction {
 
     /// Whether the action blocks the parent change rather than propagating it.
     pub fn blocks(self) -> bool {
-        matches!(self, ReferentialAction::NoAction | ReferentialAction::Restrict)
+        matches!(
+            self,
+            ReferentialAction::NoAction | ReferentialAction::Restrict
+        )
     }
 }
 
@@ -172,7 +175,11 @@ pub async fn load<S: StorageIO>(schema_io: Arc<S>) -> SmallVec<[ForeignKey; 4]> 
     let mut buffer = vec![0u8; FOREIGN_KEY_SIZE as usize];
     for i in 0..count {
         let mut position = i * FOREIGN_KEY_SIZE;
-        if io.read_data_into_buffer(&mut position, &mut buffer).await.is_err() {
+        if io
+            .read_data_into_buffer(&mut position, &mut buffer)
+            .await
+            .is_err()
+        {
             break;
         }
         match ForeignKey::from_vec(&buffer) {
@@ -209,7 +216,11 @@ pub async fn remove<S: StorageIO>(schema_io: Arc<S>, name: &str) -> io::Result<b
     for i in 0..count {
         let position = i * FOREIGN_KEY_SIZE;
         let mut cursor = position;
-        if io.read_data_into_buffer(&mut cursor, &mut buffer).await.is_err() {
+        if io
+            .read_data_into_buffer(&mut cursor, &mut buffer)
+            .await
+            .is_err()
+        {
             break;
         }
         let Ok(mut fk) = ForeignKey::from_vec(&buffer) else {
@@ -219,7 +230,8 @@ pub async fn remove<S: StorageIO>(schema_io: Arc<S>, name: &str) -> io::Result<b
             continue;
         }
         fk.is_deleted = true;
-        io.write_data_seek(io::SeekFrom::Start(position), &fk.into_vec()).await;
+        io.write_data_seek(io::SeekFrom::Start(position), &fk.into_vec())
+            .await;
         return Ok(true);
     }
 
@@ -417,8 +429,12 @@ mod tests {
         assert!(parse_clause("FOREIGN KEY (a)", None, None).is_err());
         assert!(parse_clause("FOREIGN KEY (a) REFERENCES t", None, None).is_err());
         assert!(
-            parse_clause("FOREIGN KEY (a) REFERENCES t (b) ON DELETE SET SOMETHING", None, None)
-                .is_err(),
+            parse_clause(
+                "FOREIGN KEY (a) REFERENCES t (b) ON DELETE SET SOMETHING",
+                None,
+                None
+            )
+            .is_err(),
             "an unknown action must be refused rather than read as NO ACTION"
         );
     }
@@ -463,11 +479,26 @@ mod tests {
 
     #[test]
     fn actions_parse_from_their_sql_spellings() {
-        assert_eq!(ReferentialAction::parse("CASCADE"), Some(ReferentialAction::Cascade));
-        assert_eq!(ReferentialAction::parse("set null"), Some(ReferentialAction::SetNull));
-        assert_eq!(ReferentialAction::parse("NO ACTION"), Some(ReferentialAction::NoAction));
-        assert_eq!(ReferentialAction::parse("RESTRICT"), Some(ReferentialAction::Restrict));
-        assert_eq!(ReferentialAction::parse("SET DEFAULT"), Some(ReferentialAction::SetDefault));
+        assert_eq!(
+            ReferentialAction::parse("CASCADE"),
+            Some(ReferentialAction::Cascade)
+        );
+        assert_eq!(
+            ReferentialAction::parse("set null"),
+            Some(ReferentialAction::SetNull)
+        );
+        assert_eq!(
+            ReferentialAction::parse("NO ACTION"),
+            Some(ReferentialAction::NoAction)
+        );
+        assert_eq!(
+            ReferentialAction::parse("RESTRICT"),
+            Some(ReferentialAction::Restrict)
+        );
+        assert_eq!(
+            ReferentialAction::parse("SET DEFAULT"),
+            Some(ReferentialAction::SetDefault)
+        );
         assert_eq!(ReferentialAction::parse("nonsense"), None);
     }
 

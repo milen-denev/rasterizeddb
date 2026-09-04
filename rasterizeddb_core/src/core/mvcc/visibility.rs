@@ -27,7 +27,10 @@ pub enum Visibility {
     /// `deleted == false`. Only its `xmax` says it is gone.
     All,
     /// Visible as of a snapshot, resolving outcomes through the manager.
-    AsOf { snapshot: Snapshot, manager: Arc<TransactionManager> },
+    AsOf {
+        snapshot: Snapshot,
+        manager: Arc<TransactionManager>,
+    },
 }
 
 impl Visibility {
@@ -167,7 +170,10 @@ mod tests {
         let v = Visibility::for_snapshot(m.snapshot(NO_TX), m.clone());
 
         assert!(v.visible(false, FROZEN_TX, NO_TX));
-        assert!(!v.visible(false, running, NO_TX), "not untouched: someone is writing it");
+        assert!(
+            !v.visible(false, running, NO_TX),
+            "not untouched: someone is writing it"
+        );
     }
 
     /// A snapshot must never reduce to "return everything not tombstoned",
@@ -199,7 +205,10 @@ mod tests {
         let v = Visibility::for_snapshot(m.snapshot(NO_TX), m.clone());
 
         assert!(!v.visible(false, writer, NO_TX));
-        assert!(v.visible(false, FROZEN_TX, NO_TX), "existing rows are unaffected");
+        assert!(
+            v.visible(false, FROZEN_TX, NO_TX),
+            "existing rows are unaffected"
+        );
     }
 
     #[test]
@@ -221,7 +230,10 @@ mod tests {
         let other = m.begin();
         let v = Visibility::for_snapshot(m.snapshot(other), m.clone());
 
-        assert!(!v.visible(false, FROZEN_TX, deleter), "committed before the snapshot");
+        assert!(
+            !v.visible(false, FROZEN_TX, deleter),
+            "committed before the snapshot"
+        );
     }
 
     #[test]
@@ -265,7 +277,10 @@ mod reclamation_lemma {
         // Reclaimable: xmax committed, and below the oldest transaction that
         // could still be running.
         assert_eq!(m.outcome(deleter), TxOutcome::Committed);
-        assert!(deleter < m.oldest_active(), "the bound has not advanced past it");
+        assert!(
+            deleter < m.oldest_active(),
+            "the bound has not advanced past it"
+        );
 
         // Every snapshot from here on — including one belonging to a
         // transaction that starts later — must decline it.
@@ -349,7 +364,10 @@ mod reclamation_lemma {
         // A stamped row on an unversioned table is not a shape that occurs, but
         // the rule must not depend on that.
         assert!(!Visibility::All.visible(true, 42, 43));
-        assert!(Visibility::All.visible(false, FROZEN_TX, NO_TX), "and a live row still shows");
+        assert!(
+            Visibility::All.visible(false, FROZEN_TX, NO_TX),
+            "and a live row still shows"
+        );
     }
 
     /// The converse: a version still visible to *someone* must not satisfy the
@@ -367,7 +385,10 @@ mod reclamation_lemma {
         let deleter = m.begin();
         m.commit(deleter);
 
-        assert!(reader_view.visible(false, writer, deleter), "the reader still sees it");
+        assert!(
+            reader_view.visible(false, writer, deleter),
+            "the reader still sees it"
+        );
         assert!(
             deleter > m.oldest_active(),
             "the bound must not have passed a delete an open reader predates"

@@ -153,7 +153,9 @@ impl BoundKind {
     #[inline]
     const fn of(db_type: &DbType) -> Option<Self> {
         if matches!(db_type, DbType::STRING) {
-            return Some(BoundKind::Prefix { k: STRING_BOUND_PREFIX });
+            return Some(BoundKind::Prefix {
+                k: STRING_BOUND_PREFIX,
+            });
         }
         match ordered_width(db_type) {
             Some(0) | None => None,
@@ -261,7 +263,12 @@ pub struct ZoneMap {
 impl ZoneMap {
     pub fn new(db_type: DbType) -> Option<Self> {
         let kind = BoundKind::of(&db_type)?;
-        Some(Self { db_type, kind, data: Vec::new(), valid: Vec::new() })
+        Some(Self {
+            db_type,
+            kind,
+            data: Vec::new(),
+            valid: Vec::new(),
+        })
     }
 
     pub fn from_parts(db_type: DbType, data: Vec<u8>, valid: Vec<u64>) -> Option<Self> {
@@ -270,7 +277,12 @@ impl ZoneMap {
         if stride == 0 || data.len() % stride != 0 {
             return None;
         }
-        Some(Self { db_type, kind, data, valid })
+        Some(Self {
+            db_type,
+            kind,
+            data,
+            valid,
+        })
     }
 
     #[inline]
@@ -300,7 +312,9 @@ impl ZoneMap {
     #[inline]
     fn is_valid(&self, zone: u64) -> bool {
         let w = (zone / 64) as usize;
-        self.valid.get(w).is_some_and(|v| (v >> (zone % 64)) & 1 == 1)
+        self.valid
+            .get(w)
+            .is_some_and(|v| (v >> (zone % 64)) & 1 == 1)
     }
 
     #[inline]

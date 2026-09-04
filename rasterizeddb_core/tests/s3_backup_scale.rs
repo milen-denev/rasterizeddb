@@ -73,7 +73,9 @@ fn incompressible(seed: u64, len: usize) -> Vec<u8> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_large_snapshot_uploads_and_restores_byte_for_byte() {
     let Ok(megabytes) = std::env::var("RDB_S3_SCALE_MB") else {
-        eprintln!("skipping scale test: set RDB_S3_SCALE_MB=256 (and RDB_S3_TEST_ENDPOINT) to run it");
+        eprintln!(
+            "skipping scale test: set RDB_S3_SCALE_MB=256 (and RDB_S3_TEST_ENDPOINT) to run it"
+        );
         return;
     };
     let megabytes: usize = megabytes.parse().expect("RDB_S3_SCALE_MB must be a number");

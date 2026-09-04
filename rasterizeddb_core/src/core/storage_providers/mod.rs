@@ -1,11 +1,11 @@
-pub mod file_sync;
 pub mod backend;
-pub mod memory;
-pub mod traits;
-pub mod mock_file_sync;
+pub mod file_sync;
 pub mod helpers;
 #[cfg(feature = "kv_storage")]
 pub mod kv;
+pub mod memory;
+pub mod mock_file_sync;
+pub mod traits;
 
 use crc::{CRC_32_ISO_HDLC, Crc};
 

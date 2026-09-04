@@ -1,7 +1,4 @@
-use std::{
-    io::Cursor,
-    sync::atomic::AtomicU64,
-};
+use std::{io::Cursor, sync::atomic::AtomicU64};
 
 use rclite::Arc;
 
@@ -14,6 +11,7 @@ use crc::{CRC_32_ISO_HDLC, Crc};
 use itertools::Itertools;
 use smallvec::SmallVec;
 
+use crate::core::mvcc::transaction::{FROZEN_TX, NO_TX, TxId};
 use crate::{
     core::{
         db_type::DbType,
@@ -24,7 +22,6 @@ use crate::{
     },
     memory_pool::{MEMORY_POOL, MemoryBlock},
 };
-use crate::core::mvcc::transaction::{FROZEN_TX, NO_TX, TxId};
 use branches::unlikely;
 use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
 
@@ -280,7 +277,12 @@ impl<S: StorageIO> RowPointerIterator<S> {
             let bytes = TOTAL_LENGTH;
             let mut probe_at = self.position;
             let slice = &mut self.buffer.into_slice_mut()[..bytes];
-            if self.io.read_data_into_buffer(&mut probe_at, slice).await.is_ok() {
+            if self
+                .io
+                .read_data_into_buffer(&mut probe_at, slice)
+                .await
+                .is_ok()
+            {
                 lo = 1;
             }
         }
@@ -381,7 +383,12 @@ impl<S: StorageIO> RowPointerIterator<S> {
                 let usable = readable * TOTAL_LENGTH as u64;
                 let mut read_at = self.position;
                 let slice = &mut self.buffer.into_slice_mut()[..usable as usize];
-                if self.io.read_data_into_buffer(&mut read_at, slice).await.is_err() {
+                if self
+                    .io
+                    .read_data_into_buffer(&mut read_at, slice)
+                    .await
+                    .is_err()
+                {
                     self.end_of_data = true;
                     self.buffer_valid_length = 0;
                     return Ok(());
@@ -465,10 +472,7 @@ impl<S: StorageIO> RowPointerIterator<S> {
 
     /// Get the next RowPointer from the buffer, loading a new chunk if necessary
     pub async fn next_row_pointer(&mut self) -> Result<Option<RowPointer>> {
-        Ok(self
-            .next_row_pointer_with_offset()
-            .await?
-            .map(|(_, p)| p))
+        Ok(self.next_row_pointer_with_offset().await?.map(|(_, p)| p))
     }
 
     /// Get multiple RowPointers at once, up to BATCH_SIZE
@@ -559,9 +563,8 @@ impl<S: StorageIO> RowPointerIterator<S> {
                     }
                 }
 
-                let arr_ref: &[u8; TOTAL_LENGTH] = unsafe {
-                    &*(buf_ptr.add(self.buffer_index) as *const [u8; TOTAL_LENGTH])
-                };
+                let arr_ref: &[u8; TOTAL_LENGTH] =
+                    unsafe { &*(buf_ptr.add(self.buffer_index) as *const [u8; TOTAL_LENGTH]) };
                 let row_pointer = RowPointer::from_slice(arr_ref);
                 self.buffer_index += TOTAL_LENGTH;
 
@@ -1127,7 +1130,11 @@ impl RowPointer {
         }
     }
 
-    fn build_row_data(row_write: &RowWrite, total_bytes: usize, total_string_size: usize) -> MemoryBlock {
+    fn build_row_data(
+        row_write: &RowWrite,
+        total_bytes: usize,
+        total_string_size: usize,
+    ) -> MemoryBlock {
         let mut block = MEMORY_POOL.acquire(total_bytes);
         let slice = block.into_slice_mut();
 
@@ -1289,29 +1296,35 @@ impl RowPointer {
             // Retire the old version and append the replacement. Under
             // versioning that is a stamp rather than a tombstone, so a snapshot
             // older than this update still reads the row it was looking at.
-            self.delete(pointers_io.clone(), pointer_record_pos, Some(txn), written_by)
-                .await?;
-
-            let (new_pointer_record_pos, new_pointer) = RowPointer::write_row_with_pointer_record_pos(
-                pointers_io,
-                rows_io,
-                last_id,
-                table_length,
-                #[cfg(feature = "enable_long_row")]
-                cluster,
-                row_write,
-                // Same transaction: tombstoning the old pointer and appending
-                // the replacement must not be separable by a crash.
+            self.delete(
+                pointers_io.clone(),
+                pointer_record_pos,
                 Some(txn),
-                free_space,
-                // The replacement is the same row, so it keeps the row's
-                // history rather than presenting itself as newly created.
-                Some(&previous),
-                // ...but it is a new *version*, so it is stamped with the
-                // transaction making the change, not the one that inserted it.
                 written_by,
             )
             .await?;
+
+            let (new_pointer_record_pos, new_pointer) =
+                RowPointer::write_row_with_pointer_record_pos(
+                    pointers_io,
+                    rows_io,
+                    last_id,
+                    table_length,
+                    #[cfg(feature = "enable_long_row")]
+                    cluster,
+                    row_write,
+                    // Same transaction: tombstoning the old pointer and appending
+                    // the replacement must not be separable by a crash.
+                    Some(txn),
+                    free_space,
+                    // The replacement is the same row, so it keeps the row's
+                    // history rather than presenting itself as newly created.
+                    Some(&previous),
+                    // ...but it is a new *version*, so it is stamped with the
+                    // transaction making the change, not the one that inserted it.
+                    written_by,
+                )
+                .await?;
 
             if owns_txn {
                 if let Err(e) = pointers_io_for_commit.commit_durable(txn).await {
@@ -1635,15 +1648,16 @@ impl RowPointer {
         }
 
         // Create a vector to hold all the columns
-        let mut columns: SmallVec<[Column; 32]> = SmallVec::with_capacity(row_fetch.columns_fetching_data.len());
-        
+        let mut columns: SmallVec<[Column; 32]> =
+            SmallVec::with_capacity(row_fetch.columns_fetching_data.len());
+
         // Pre-allocate columns with placeholders
         for _ in 0..row_fetch.columns_fetching_data.len() {
-             columns.push(Column {
-                 schema_id: 0,
-                 data: MemoryBlock::default(),
-                 column_type: DbType::U8,
-             });
+            columns.push(Column {
+                schema_id: 0,
+                data: MemoryBlock::default(),
+                column_type: DbType::U8,
+            });
         }
 
         let mut string_headers_buffer: SmallVec<[u8; 128]> = SmallVec::new();
@@ -1656,7 +1670,7 @@ impl RowPointer {
             } else {
                 let position = self.position + column_data.column_offset as u64;
                 let c_size = column_data.size as usize;
-                
+
                 let block = MEMORY_POOL.acquire(c_size);
                 let col = &mut columns[i];
                 col.data = block;
@@ -1672,11 +1686,14 @@ impl RowPointer {
 
         if !string_col_indices.is_empty() {
             string_headers_buffer.resize(string_col_indices.len() * 12, 0);
-            
-            for (chunk, &col_idx) in string_headers_buffer.chunks_exact_mut(12).zip(string_col_indices.iter()) {
-                 let column_data = &row_fetch.columns_fetching_data[col_idx];
-                 let position = self.position + column_data.column_offset as u64;
-                 first_pass_reads.push((position, chunk));
+
+            for (chunk, &col_idx) in string_headers_buffer
+                .chunks_exact_mut(12)
+                .zip(string_col_indices.iter())
+            {
+                let column_data = &row_fetch.columns_fetching_data[col_idx];
+                let position = self.position + column_data.column_offset as u64;
+                first_pass_reads.push((position, chunk));
             }
         }
 
@@ -1688,7 +1705,7 @@ impl RowPointer {
                 .await
                 .map_err(super::error::RowError::Io)?;
         }
-        
+
         drop(first_pass_reads);
 
         if !string_col_indices.is_empty() {
@@ -1697,10 +1714,13 @@ impl RowPointer {
             let row_len = self.length as u64;
             let row_end = row_start.saturating_add(row_len);
             const MAX_REASONABLE_STRING_BYTES: usize = 64 * 1024 * 1024;
-            
-            for (chunk, &col_idx) in string_headers_buffer.chunks_exact(12).zip(string_col_indices.iter()) {
-                let string_row_position = self.position
-                    + u64::from_le_bytes(chunk[0..8].try_into().unwrap());
+
+            for (chunk, &col_idx) in string_headers_buffer
+                .chunks_exact(12)
+                .zip(string_col_indices.iter())
+            {
+                let string_row_position =
+                    self.position + u64::from_le_bytes(chunk[0..8].try_into().unwrap());
                 let string_size = u32::from_le_bytes(chunk[8..12].try_into().unwrap()) as usize;
 
                 let col = &mut columns[col_idx];
@@ -1736,7 +1756,7 @@ impl RowPointer {
                 let buf = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
                 second_pass_reads.push((string_row_position, buf));
             }
-            
+
             if !second_pass_reads.is_empty() {
                 io.read_vectored(&mut second_pass_reads)
                     .await
@@ -1809,7 +1829,7 @@ impl RowPointer {
                 if unlikely(col.data.into_slice().len() != c_size) {
                     col.data = MEMORY_POOL.acquire(c_size);
                 }
-                
+
                 col.schema_id = column_data.schema_id;
                 col.column_type = column_data.column_type.clone();
 
@@ -1822,11 +1842,14 @@ impl RowPointer {
 
         if !string_col_indices.is_empty() {
             string_headers_buffer.resize(string_col_indices.len() * 12, 0);
-            
-            for (chunk, &col_idx) in string_headers_buffer.chunks_exact_mut(12).zip(string_col_indices.iter()) {
-                 let column_data = &row_fetch.columns_fetching_data[col_idx];
-                 let position = self.position + column_data.column_offset as u64;
-                 first_pass_reads.push((position, chunk));
+
+            for (chunk, &col_idx) in string_headers_buffer
+                .chunks_exact_mut(12)
+                .zip(string_col_indices.iter())
+            {
+                let column_data = &row_fetch.columns_fetching_data[col_idx];
+                let position = self.position + column_data.column_offset as u64;
+                first_pass_reads.push((position, chunk));
             }
         }
 
@@ -1835,7 +1858,7 @@ impl RowPointer {
                 io.read_vectored(&mut first_pass_reads).await?;
             }
         }
-        
+
         drop(first_pass_reads);
 
         if !string_col_indices.is_empty() {
@@ -1844,12 +1867,15 @@ impl RowPointer {
             let row_len = self.length as u64;
             let row_end = row_start.saturating_add(row_len);
             const MAX_REASONABLE_STRING_BYTES: usize = 64 * 1024 * 1024;
-            
-            for (chunk, &col_idx) in string_headers_buffer.chunks_exact(12).zip(string_col_indices.iter()) {
-                let string_row_position = self.position
-                    + u64::from_le_bytes(chunk[0..8].try_into().unwrap());
+
+            for (chunk, &col_idx) in string_headers_buffer
+                .chunks_exact(12)
+                .zip(string_col_indices.iter())
+            {
+                let string_row_position =
+                    self.position + u64::from_le_bytes(chunk[0..8].try_into().unwrap());
                 let string_size = u32::from_le_bytes(chunk[8..12].try_into().unwrap()) as usize;
-                
+
                 let col = &mut columns[col_idx];
 
                 if string_size == 0 {
@@ -1882,7 +1908,7 @@ impl RowPointer {
                 if col.data.into_slice().len() != string_size {
                     col.data = MEMORY_POOL.acquire(string_size);
                 }
-                
+
                 col.schema_id = row_fetch.columns_fetching_data[col_idx].schema_id;
                 col.column_type = DbType::STRING;
 
@@ -1891,7 +1917,7 @@ impl RowPointer {
                 let buf = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
                 second_pass_reads.push((string_row_position, buf));
             }
-            
+
             if !second_pass_reads.is_empty() {
                 if !io.try_read_vectored_sync(&mut second_pass_reads) {
                     io.read_vectored(&mut second_pass_reads).await?;
@@ -2555,7 +2581,9 @@ mod tests {
         let (pos, mut p) = it.next_row_pointer_with_offset().await.unwrap().unwrap();
         assert_eq!(p.deleted, false);
 
-        p.delete(mock_io.clone(), pos, None, FROZEN_TX).await.unwrap();
+        p.delete(mock_io.clone(), pos, None, FROZEN_TX)
+            .await
+            .unwrap();
 
         let mut read_pos = pos;
         let mut slice: [u8; TOTAL_LENGTH] = [0; TOTAL_LENGTH];
@@ -2593,7 +2621,9 @@ mod tests {
         .unwrap();
 
         // Find pointer record offset.
-        let mut it = RowPointerIterator::new(mock_io_pointers.clone()).await.unwrap();
+        let mut it = RowPointerIterator::new(mock_io_pointers.clone())
+            .await
+            .unwrap();
         let (pos, mut p) = it.next_row_pointer_with_offset().await.unwrap().unwrap();
         assert_eq!(p.id, initial.id);
 
@@ -2666,7 +2696,9 @@ mod tests {
         .unwrap();
 
         // Locate pointer record.
-        let mut it = RowPointerIterator::new(mock_io_pointers.clone()).await.unwrap();
+        let mut it = RowPointerIterator::new(mock_io_pointers.clone())
+            .await
+            .unwrap();
         let (pos, mut p) = it.next_row_pointer_with_offset().await.unwrap().unwrap();
 
         // Bigger update: expand a string.
@@ -2699,7 +2731,9 @@ mod tests {
         assert!(!new_pointer.deleted);
 
         // Iterating should see at least one non-deleted pointer (the appended one).
-        let mut it2 = RowPointerIterator::new(mock_io_pointers.clone()).await.unwrap();
+        let mut it2 = RowPointerIterator::new(mock_io_pointers.clone())
+            .await
+            .unwrap();
         let mut count = 0usize;
         while let Some(_p) = it2.next_row_pointer().await.unwrap() {
             count += 1;

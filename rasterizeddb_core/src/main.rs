@@ -3,11 +3,13 @@ use std::env;
 use clap::Parser;
 
 use log::LevelFilter;
-use rasterizeddb_core::{BATCH_SIZE, MAX_PERMITS_THREADS, cache::query_cache, core::database::Database};
+use rasterizeddb_core::{
+    BATCH_SIZE, MAX_PERMITS_THREADS, cache::query_cache, core::database::Database,
+};
 use tokio::runtime::Builder;
 
-use rasterizeddb_core::configuration::Configuration;
 use clap::ValueEnum;
+use rasterizeddb_core::configuration::Configuration;
 
 /// S3 backup and restore flags. Off by default and absent from the binary
 /// entirely without the feature.
@@ -37,7 +39,11 @@ enum Protocol {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "rasterizeddb_core", version, about = "RasterizedDB Core Server")]
+#[command(
+    name = "rasterizeddb_core",
+    version,
+    about = "RasterizedDB Core Server"
+)]
 struct Args {
     /// Database location directory path (default: none, required)
     #[arg(long, value_name = "PATH")]
@@ -48,7 +54,11 @@ struct Args {
     batch_size: Option<usize>,
 
     /// Number of concurrent worker threads (default: 16)
-    #[arg(long = "concurrent-threads", alias = "concurrent_threads", value_name = "N")]
+    #[arg(
+        long = "concurrent-threads",
+        alias = "concurrent_threads",
+        value_name = "N"
+    )]
     concurrent_threads: Option<usize>,
 
     /// Whether a commit waits for its fdatasync (default: on)
@@ -66,7 +76,11 @@ struct Args {
     /// A session can override it for itself with `SET synchronous_commit = off`,
     /// and it can be changed on a running server with
     /// `SET CONFIG wal.synchronous_commit = off`.
-    #[arg(long = "synchronous-commit", alias = "synchronous_commit", value_name = "on|off")]
+    #[arg(
+        long = "synchronous-commit",
+        alias = "synchronous_commit",
+        value_name = "on|off"
+    )]
     synchronous_commit: Option<String>,
 
     /// How long an asynchronous commit may go unsynced, in milliseconds
@@ -74,7 +88,11 @@ struct Args {
     ///
     /// The bound on what `--synchronous-commit off` can lose. Ignored while
     /// synchronous commit is on, because nothing is then left for the writer.
-    #[arg(long = "wal-writer-delay-ms", alias = "wal_writer_delay_ms", value_name = "MS")]
+    #[arg(
+        long = "wal-writer-delay-ms",
+        alias = "wal_writer_delay_ms",
+        value_name = "MS"
+    )]
     wal_writer_delay_ms: Option<u64>,
 
     /// Logging level off, error, warn, info, debug, trace (default: error)
@@ -105,7 +123,11 @@ struct Args {
     filter_enabled: Option<bool>,
 
     /// Index rows that predate the filter when a table opens.
-    #[arg(long = "filter-backfill", alias = "filter_backfill", value_name = "BOOL")]
+    #[arg(
+        long = "filter-backfill",
+        alias = "filter_backfill",
+        value_name = "BOOL"
+    )]
     filter_backfill: Option<bool>,
 
     /// Skip the candidate mask when it would prune less than this fraction.
@@ -158,7 +180,11 @@ struct Args {
     ///
     /// Only affects columns created from now on; what an existing column is, is
     /// recorded in its schema.
-    #[arg(long = "json-shadow-tables", alias = "json_shadow_tables", value_name = "BOOL")]
+    #[arg(
+        long = "json-shadow-tables",
+        alias = "json_shadow_tables",
+        value_name = "BOOL"
+    )]
     json_shadow_tables: Option<bool>,
 
     #[arg(long = "in-memory", alias = "in_memory", default_value_t = false)]
@@ -525,7 +551,10 @@ fn replication_config(
     // used instead of silently running unauthenticated.
     config.auth = match args.replication_auth.as_deref() {
         Some(text) => AuthMode::parse(text).ok_or_else(|| {
-            format!("--replication-auth {:?}: expected insecure, pinned or ca", text)
+            format!(
+                "--replication-auth {:?}: expected insecure, pinned or ca",
+                text
+            )
         })?,
         None if args.replication_ca.is_some() => AuthMode::Ca,
         None if args.replication_cert.is_some() => AuthMode::Pinned,
@@ -554,7 +583,10 @@ fn replication_config(
     }
     if let Some(mode) = args.replication_mode.as_deref() {
         config.sync_mode = SyncMode::parse(mode).ok_or_else(|| {
-            format!("--replication-mode {:?}: expected async, sync, quorum:N or all", mode)
+            format!(
+                "--replication-mode {:?}: expected async, sync, quorum:N or all",
+                mode
+            )
         })?;
     }
     if let Some(ms) = args.replication_ack_timeout_ms {
@@ -624,7 +656,10 @@ fn main() -> std::io::Result<()> {
                 println!("wrote {}", cert_path.display());
                 println!("wrote {} (mode 0600)", key_path.display());
                 println!();
-                println!("fingerprint: {}", rastcp::tls::format_fingerprint(&fingerprint));
+                println!(
+                    "fingerprint: {}",
+                    rastcp::tls::format_fingerprint(&fingerprint)
+                );
                 println!();
                 println!("Start this node with:");
                 println!(
@@ -640,7 +675,10 @@ fn main() -> std::io::Result<()> {
                 return Ok(());
             }
             Err(e) => {
-                eprintln!("could not generate a replication identity in {}: {}", dir, e);
+                eprintln!(
+                    "could not generate a replication identity in {}: {}",
+                    dir, e
+                );
                 std::process::exit(2);
             }
         }
@@ -664,7 +702,9 @@ fn main() -> std::io::Result<()> {
         storage_min_free: None,
     };
 
-    MAX_PERMITS_THREADS.set(config.concurrent_threads.unwrap_or(16)).unwrap();
+    MAX_PERMITS_THREADS
+        .set(config.concurrent_threads.unwrap_or(16))
+        .unwrap();
     BATCH_SIZE.set(config.batch_size.unwrap_or(10_000)).unwrap();
 
     // Durability. These seed the same runtime state `SET synchronous_commit` and
@@ -749,7 +789,11 @@ fn main() -> std::io::Result<()> {
     query_cache::ENABLE_CACHE.get_or_init(|| enable_cache);
 
     let rt = Builder::new_multi_thread()
-        .worker_threads(config.concurrent_threads.unwrap_or(rasterizeddb_core::max_permits_threads()))
+        .worker_threads(
+            config
+                .concurrent_threads
+                .unwrap_or(rasterizeddb_core::max_permits_threads()),
+        )
         .thread_stack_size(STACK_SIZE)
         .enable_all()
         .build()?;

@@ -52,8 +52,7 @@ fn guard_null(column: &str, fragment: &str, schema: &SmallVec<[SchemaField; 20]>
 /// `<->` is here too even though it yields a distance rather than a boolean:
 /// lexing it is what lets the planner report it as an unsupported *operator*
 /// rather than as an unexpected character.
-pub const PG_OPERATORS: &[&str] =
-    &["<<=", ">>=", "<->", "@>", "<@", "&&", "<<", ">>", "@@"];
+pub const PG_OPERATORS: &[&str] = &["<<=", ">>=", "<->", "@>", "<@", "&&", "<<", ">>", "@@"];
 
 #[derive(Debug, Clone, PartialEq)]
 enum Tok {
@@ -149,7 +148,11 @@ fn lex(clause: &str) -> Result<Vec<Tok>, String> {
                     }
                 }
                 let text = clause[start..i].to_string();
-                out.push(if quote == b'"' { Tok::Word(text) } else { Tok::Str(text) });
+                out.push(if quote == b'"' {
+                    Tok::Word(text)
+                } else {
+                    Tok::Str(text)
+                });
             }
             b'(' => {
                 out.push(Tok::LPar);
@@ -170,12 +173,20 @@ fn lex(clause: &str) -> Result<Vec<Tok>, String> {
             // not an operator anywhere in this grammar.
             b'-' if bytes.get(i + 1) == Some(&b'>') => {
                 let start = i;
-                i += if bytes.get(i + 2) == Some(&b'>') { 3 } else { 2 };
+                i += if bytes.get(i + 2) == Some(&b'>') {
+                    3
+                } else {
+                    2
+                };
                 out.push(Tok::Sym(clause[start..i].to_string()));
             }
             b'#' if bytes.get(i + 1) == Some(&b'>') => {
                 let start = i;
-                i += if bytes.get(i + 2) == Some(&b'>') { 3 } else { 2 };
+                i += if bytes.get(i + 2) == Some(&b'>') {
+                    3
+                } else {
+                    2
+                };
                 out.push(Tok::Sym(clause[start..i].to_string()));
             }
             // PostgreSQL's structural operators. Taken before the ordered
@@ -186,10 +197,7 @@ fn lex(clause: &str) -> Result<Vec<Tok>, String> {
             // Longest first — `<<=` before `<<`, `>>=` before `>>` — or a
             // network containment test would lose its `=` and silently become
             // the strict operator.
-            _ if PG_OPERATORS
-                .iter()
-                .any(|sym| clause[i..].starts_with(*sym)) =>
-            {
+            _ if PG_OPERATORS.iter().any(|sym| clause[i..].starts_with(*sym)) => {
                 let symbol = PG_OPERATORS
                     .iter()
                     .find(|sym| clause[i..].starts_with(**sym))
@@ -260,9 +268,7 @@ fn lex(clause: &str) -> Result<Vec<Tok>, String> {
                 loop {
                     match bytes.get(j) {
                         None => {
-                            return Err(
-                                "unterminated key after the JSONB operator '?'".to_string()
-                            )
+                            return Err("unterminated key after the JSONB operator '?'".to_string());
                         }
                         Some(b'\'') if bytes.get(j + 1) == Some(&b'\'') => j += 2,
                         Some(b'\'') => {
@@ -295,15 +301,13 @@ fn lex(clause: &str) -> Result<Vec<Tok>, String> {
             // change what the comparison means, so those still say so plainly
             // rather than being silently reinterpreted.
             b':' if bytes.get(i + 1) == Some(&b':') => {
-                let over_literal = matches!(
-                    out.last(),
-                    Some(Tok::Str(_))
-                ) || matches!(
-                    out.last(),
-                    Some(Tok::Word(w))
-                        if !w.is_empty()
-                            && w.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '-')
-                );
+                let over_literal = matches!(out.last(), Some(Tok::Str(_)))
+                    || matches!(
+                        out.last(),
+                        Some(Tok::Word(w))
+                            if !w.is_empty()
+                                && w.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '-')
+                    );
                 // Over anything else the cast is *kept*, as one symbol, and
                 // carried to the stages that can act on it.
                 //
@@ -320,8 +324,7 @@ fn lex(clause: &str) -> Result<Vec<Tok>, String> {
                         k += 1;
                     }
                     let name_start = k;
-                    while k < bytes.len()
-                        && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_')
+                    while k < bytes.len() && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_')
                     {
                         k += 1;
                     }
@@ -386,23 +389,17 @@ fn lex(clause: &str) -> Result<Vec<Tok>, String> {
                     i += 1;
                 }
                 let name_start = i;
-                while i < bytes.len()
-                    && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
-                {
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                     i += 1;
                 }
                 if i == name_start {
-                    return Err(
-                        "a `::` cast in a WHERE clause is not supported yet".to_string()
-                    );
+                    return Err("a `::` cast in a WHERE clause is not supported yet".to_string());
                 }
                 // A parameterised or array type — `numeric(10,2)`, `text[]` —
                 // is not a bare name, and dropping only part of it would leave
                 // stray punctuation for the parser to trip over.
                 if matches!(bytes.get(i), Some(b'(') | Some(b'[')) {
-                    return Err(
-                        "a `::` cast in a WHERE clause is not supported yet".to_string()
-                    );
+                    return Err("a `::` cast in a WHERE clause is not supported yet".to_string());
                 }
 
                 // With the cast gone, a wrapper that existed only to carry it
@@ -447,7 +444,12 @@ fn lex(clause: &str) -> Result<Vec<Tok>, String> {
                     }
                 }
             }
-            _ => return Err(format!("unexpected character '{}' in WHERE clause", c as char)),
+            _ => {
+                return Err(format!(
+                    "unexpected character '{}' in WHERE clause",
+                    c as char
+                ));
+            }
         }
     }
 
@@ -462,7 +464,10 @@ fn resolve_column(raw: &str, schema: &SmallVec<[SchemaField; 20]>) -> Option<Str
     let unquoted = raw.trim_matches('"');
     // Try the whole name first, so a column that genuinely contains a dot wins
     // over a qualifier interpretation.
-    if let Some(f) = schema.iter().find(|f| f.name.eq_ignore_ascii_case(unquoted) && !f.is_deleted) {
+    if let Some(f) = schema
+        .iter()
+        .find(|f| f.name.eq_ignore_ascii_case(unquoted) && !f.is_deleted)
+    {
         return Some(f.name.clone());
     }
     // Each segment carries its own quoting in `"users"."name"`, so the last
@@ -592,8 +597,8 @@ fn fold_null_comparisons(clause: &str) -> String {
             break;
         }
 
-        let is_eq = bytes[i] == b'='
-            || (upper[i..].starts_with("<>") || upper[i..].starts_with("!="));
+        let is_eq =
+            bytes[i] == b'=' || (upper[i..].starts_with("<>") || upper[i..].starts_with("!="));
         if is_eq {
             let width = if bytes[i] == b'=' { 1 } else { 2 };
             let rest = clause[i + width..].trim_start();
@@ -605,9 +610,8 @@ fn fold_null_comparisons(clause: &str) -> String {
                 // Everything from the start of this term through the NULL.
                 out.truncate(term_start);
                 out.push_str("1 = 0");
-                let consumed = (i + width)
-                    + (clause[i + width..].len() - rest.len())
-                    + "NULL".len();
+                let consumed =
+                    (i + width) + (clause[i + width..].len() - rest.len()) + "NULL".len();
                 i = consumed;
                 continue;
             }
@@ -620,10 +624,7 @@ fn fold_null_comparisons(clause: &str) -> String {
     out
 }
 
-pub fn rewrite_where(
-    clause: &str,
-    schema: &SmallVec<[SchemaField; 20]>,
-) -> Result<String, String> {
+pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Result<String, String> {
     if clause.trim().is_empty() {
         return Ok(String::new());
     }
@@ -671,7 +672,10 @@ pub fn rewrite_where(
 
                 // `col IS [NOT] NULL` and `col IS [NOT] DISTINCT FROM x`
                 if next.map(|t| t.is_keyword("is")).unwrap_or(false) {
-                    let negated = toks.get(i + 2).map(|t| t.is_keyword("not")).unwrap_or(false);
+                    let negated = toks
+                        .get(i + 2)
+                        .map(|t| t.is_keyword("not"))
+                        .unwrap_or(false);
                     let null_at = if negated { i + 3 } else { i + 2 };
 
                     // `IS [NOT] DISTINCT FROM` is the null-safe comparison: it
@@ -686,8 +690,16 @@ pub fn rewrite_where(
                     //
                     // On a NOT NULL column there is no companion and no third
                     // outcome, so it degenerates to plain `!=` / `=`.
-                    if toks.get(null_at).map(|t| t.is_keyword("distinct")).unwrap_or(false) {
-                        if !toks.get(null_at + 1).map(|t| t.is_keyword("from")).unwrap_or(false) {
+                    if toks
+                        .get(null_at)
+                        .map(|t| t.is_keyword("distinct"))
+                        .unwrap_or(false)
+                    {
+                        if !toks
+                            .get(null_at + 1)
+                            .map(|t| t.is_keyword("from"))
+                            .unwrap_or(false)
+                        {
                             return Err("IS DISTINCT must be followed by FROM".to_string());
                         }
                         let value_at = null_at + 2;
@@ -723,7 +735,11 @@ pub fn rewrite_where(
                         continue;
                     }
 
-                    if !toks.get(null_at).map(|t| t.is_keyword("null")).unwrap_or(false) {
+                    if !toks
+                        .get(null_at)
+                        .map(|t| t.is_keyword("null"))
+                        .unwrap_or(false)
+                    {
                         return Err(
                             "IS must be followed by NULL, NOT NULL, or [NOT] DISTINCT FROM"
                                 .to_string(),
@@ -785,17 +801,29 @@ pub fn rewrite_where(
                         .iter()
                         .map(|v| format!("{} {} {}", col, op, v))
                         .collect();
-                    out.push(guard_null(&col, &format!("({})", parts.join(joiner)), schema));
+                    out.push(guard_null(
+                        &col,
+                        &format!("({})", parts.join(joiner)),
+                        schema,
+                    ));
                     i = after;
                     continue;
                 }
 
-                if toks.get(kw_at).map(|t| t.is_keyword("between")).unwrap_or(false) {
+                if toks
+                    .get(kw_at)
+                    .map(|t| t.is_keyword("between"))
+                    .unwrap_or(false)
+                {
                     let lo = toks
                         .get(kw_at + 1)
                         .filter(|t| is_value_start(t))
                         .ok_or("BETWEEN is missing its lower bound")?;
-                    if !toks.get(kw_at + 2).map(|t| t.is_keyword("and")).unwrap_or(false) {
+                    if !toks
+                        .get(kw_at + 2)
+                        .map(|t| t.is_keyword("and"))
+                        .unwrap_or(false)
+                    {
                         return Err("BETWEEN bounds must be separated by AND".to_string());
                     }
                     let hi = toks
@@ -843,8 +871,14 @@ pub fn rewrite_where(
                 // folded into the one-word operator the tokenizer's string-op
                 // table can carry — the same trick `IS NULL` uses to become a
                 // comparison against the nullability companion.
-                if toks.get(kw_at).map(|t| t.is_keyword("similar")).unwrap_or(false)
-                    && toks.get(kw_at + 1).map(|t| t.is_keyword("to")).unwrap_or(false)
+                if toks
+                    .get(kw_at)
+                    .map(|t| t.is_keyword("similar"))
+                    .unwrap_or(false)
+                    && toks
+                        .get(kw_at + 1)
+                        .map(|t| t.is_keyword("to"))
+                        .unwrap_or(false)
                 {
                     let pattern = toks
                         .get(kw_at + 2)
@@ -869,17 +903,26 @@ pub fn rewrite_where(
                 }
 
                 // `col [NOT] LIKE 'pattern'` / `ILIKE`
-                let case_insensitive =
-                    toks.get(kw_at).map(|t| t.is_keyword("ilike")).unwrap_or(false);
+                let case_insensitive = toks
+                    .get(kw_at)
+                    .map(|t| t.is_keyword("ilike"))
+                    .unwrap_or(false);
                 let is_like = case_insensitive
-                    || toks.get(kw_at).map(|t| t.is_keyword("like")).unwrap_or(false);
+                    || toks
+                        .get(kw_at)
+                        .map(|t| t.is_keyword("like"))
+                        .unwrap_or(false);
                 if is_like {
                     let pattern = toks.get(kw_at + 1).ok_or("LIKE is missing its pattern")?;
                     let (op, literal) = like_to_operator(pattern, case_insensitive)?;
                     if negated {
                         return Err("NOT LIKE is not supported yet".to_string());
                     }
-                    out.push(guard_null(&col, &format!("{} {} {}", col, op, literal), schema));
+                    out.push(guard_null(
+                        &col,
+                        &format!("{} {} {}", col, op, literal),
+                        schema,
+                    ));
                     i = kw_at + 2;
                     continue;
                 }
@@ -889,13 +932,11 @@ pub fn rewrite_where(
                 // around it, which reads the same — `AND` binds tighter than
                 // `OR`, so a term inside an `OR` chain is still guarded as a
                 // unit — and needs nothing taken back.
-                let preceded_by_arithmetic = i > 0
-                    && matches!(toks.get(i - 1), Some(Tok::Sym(sym)) if is_arithmetic(sym));
+                let preceded_by_arithmetic =
+                    i > 0 && matches!(toks.get(i - 1), Some(Tok::Sym(sym)) if is_arithmetic(sym));
                 if preceded_by_arithmetic {
                     if nullable::is_nullable(&col, schema) {
-                        if let Some(flag) =
-                            nullable::flag_field(&col, schema)
-                        {
+                        if let Some(flag) = nullable::flag_field(&col, schema) {
                             let at = term_start.min(out.len());
                             out.insert(at, format!("{} = 0 AND", flag.name));
                         }
@@ -909,8 +950,7 @@ pub fn rewrite_where(
                 // is an operand, never a truth test; without this check the
                 // `age` in `5 = age` became `age = 1` and the clause read
                 // `5 = age = 1`.
-                let preceded_by_operator =
-                    i > 0 && matches!(toks.get(i - 1), Some(Tok::Sym(_)));
+                let preceded_by_operator = i > 0 && matches!(toks.get(i - 1), Some(Tok::Sym(_)));
                 if preceded_by_operator {
                     // `<value> <op> <nullable col>` at the start of a term: the
                     // two tokens already emitted are the rest of this
@@ -924,9 +964,7 @@ pub fn rewrite_where(
                                 .get(i - 3)
                                 .map(|t| t.is_keyword("and") || t.is_keyword("or"))
                                 .unwrap_or(false));
-                    if nullable::is_nullable(&col, schema)
-                        && term_starts_at_value
-                        && out.len() >= 2
+                    if nullable::is_nullable(&col, schema) && term_starts_at_value && out.len() >= 2
                     {
                         let op = out.pop().expect("two entries");
                         let lhs = out.pop().expect("two entries");
@@ -943,16 +981,15 @@ pub fn rewrite_where(
                 // — which the evaluator has no form for, so it becomes the
                 // equality it means. "On its own" is decided by what follows:
                 // an operator means this is an ordinary comparison.
-                let followed_by_operator = matches!(
-                    toks.get(i + 1),
-                    Some(Tok::Sym(_))
-                ) || toks
-                    .get(i + 1)
-                    .map(|t| {
-                        t.is_keyword("contains") || t.is_keyword("startswith")
-                            || t.is_keyword("endswith")
-                    })
-                    .unwrap_or(false);
+                let followed_by_operator = matches!(toks.get(i + 1), Some(Tok::Sym(_)))
+                    || toks
+                        .get(i + 1)
+                        .map(|t| {
+                            t.is_keyword("contains")
+                                || t.is_keyword("startswith")
+                                || t.is_keyword("endswith")
+                        })
+                        .unwrap_or(false);
 
                 if !followed_by_operator {
                     // `NOT flag` was emitted as a pending negation; consume it.
@@ -1048,9 +1085,18 @@ pub fn rewrite_where(
 
             // Words that are part of the grammar the evaluator understands.
             const PASS_THROUGH: [&str; 12] = [
-                "AND", "OR", "LIKE", "ILIKE", "SIMILARTO",
-                "CONTAINS", "STARTSWITH", "ENDSWITH", "ICONTAINS", "ISTARTSWITH",
-                "IENDSWITH", "IEQUALS",
+                "AND",
+                "OR",
+                "LIKE",
+                "ILIKE",
+                "SIMILARTO",
+                "CONTAINS",
+                "STARTSWITH",
+                "ENDSWITH",
+                "ICONTAINS",
+                "ISTARTSWITH",
+                "IENDSWITH",
+                "IEQUALS",
             ];
             if PASS_THROUGH.iter().any(|k| raw.eq_ignore_ascii_case(k)) {
                 out.push(raw.to_ascii_uppercase());
@@ -1345,22 +1391,25 @@ mod tests {
     #[test]
     fn plain_comparisons_pass_through() {
         assert_eq!(rw("id = 5"), "id = 5");
-        assert_eq!(rw("age >= 18 AND name = 'bob'"), "age >= 18 AND name = 'bob'");
+        assert_eq!(
+            rw("age >= 18 AND name = 'bob'"),
+            "age >= 18 AND name = 'bob'"
+        );
     }
 
     #[test]
     fn in_becomes_a_disjunction_of_equalities() {
-        assert_eq!(rw("country IN ('BG', 'DE')"), "(country = 'BG' OR country = 'DE')");
+        assert_eq!(
+            rw("country IN ('BG', 'DE')"),
+            "(country = 'BG' OR country = 'DE')"
+        );
         assert_eq!(rw("id IN (1)"), "(id = 1)");
     }
 
     #[test]
     fn not_in_becomes_a_conjunction_of_inequalities() {
         assert_eq!(rw("country NOT IN ('DE')"), "(country != 'DE')");
-        assert_eq!(
-            rw("id NOT IN (1, 2)"),
-            "(id != 1 AND id != 2)"
-        );
+        assert_eq!(rw("id NOT IN (1, 2)"), "(id != 1 AND id != 2)");
     }
 
     #[test]
@@ -1520,9 +1569,15 @@ mod tests {
     #[test]
     fn non_ascii_literals_pass_through_byte_for_byte() {
         assert_eq!(rw("name = 'Müller'"), "name = 'Müller'");
-        assert_eq!(rw("name = '日本語' AND id = 1"), "name = '日本語' AND id = 1");
+        assert_eq!(
+            rw("name = '日本語' AND id = 1"),
+            "name = '日本語' AND id = 1"
+        );
         assert_eq!(rw("name != 'café'"), "name != 'café'");
-        assert_eq!(rwn("country = 'Ελλάδα'"), "(__null_country = 0 AND country = 'Ελλάδα')");
+        assert_eq!(
+            rwn("country = 'Ελλάδα'"),
+            "(__null_country = 0 AND country = 'Ελλάδα')"
+        );
     }
 
     #[test]
@@ -1535,12 +1590,18 @@ mod tests {
 
     #[test]
     fn a_nullable_column_on_the_right_is_guarded_like_one_on_the_left() {
-        assert_eq!(rwn("'BG' = country"), "(__null_country = 0 AND 'BG' = country)");
+        assert_eq!(
+            rwn("'BG' = country"),
+            "(__null_country = 0 AND 'BG' = country)"
+        );
         assert_eq!(
             rwn("id = 1 AND 'BG' = country"),
             "id = 1 AND (__null_country = 0 AND 'BG' = country)"
         );
-        assert_eq!(rwn("name = country"), "(__null_country = 0 AND name = country)");
+        assert_eq!(
+            rwn("name = country"),
+            "(__null_country = 0 AND name = country)"
+        );
     }
 
     #[test]
@@ -1562,8 +1623,14 @@ mod tests {
     /// stored for a `NULL` string are also empty.
     #[test]
     fn comparisons_against_a_nullable_column_are_guarded() {
-        assert_eq!(rwn("country = 'BG'"), "(__null_country = 0 AND country = 'BG')");
-        assert_eq!(rwn("country != 'BG'"), "(__null_country = 0 AND country != 'BG')");
+        assert_eq!(
+            rwn("country = 'BG'"),
+            "(__null_country = 0 AND country = 'BG')"
+        );
+        assert_eq!(
+            rwn("country != 'BG'"),
+            "(__null_country = 0 AND country != 'BG')"
+        );
         assert_eq!(rwn("country = ''"), "(__null_country = 0 AND country = '')");
     }
 
@@ -1651,7 +1718,14 @@ mod any_all_tests {
             .into_iter()
             .enumerate()
         {
-            s.push(SchemaField::new(name.to_string(), ty, 12, 0, i as u64, false));
+            s.push(SchemaField::new(
+                name.to_string(),
+                ty,
+                12,
+                0,
+                i as u64,
+                false,
+            ));
         }
         s
     }
@@ -1724,7 +1798,15 @@ mod any_all_tests {
         let clause = "id = ANY('{\"8bf0ea43-f179-41c6-ae8f-4a1354be8bdf\",\
                      \"1bb0afa7-1562-4f76-b200-81ce381abd10\"}')";
         let out = rewrite_where(clause, &schema()).expect("rewrites");
-        assert!(out.contains("id = '8bf0ea43-f179-41c6-ae8f-4a1354be8bdf'"), "{}", out);
-        assert!(out.contains("id = '1bb0afa7-1562-4f76-b200-81ce381abd10'"), "{}", out);
+        assert!(
+            out.contains("id = '8bf0ea43-f179-41c6-ae8f-4a1354be8bdf'"),
+            "{}",
+            out
+        );
+        assert!(
+            out.contains("id = '1bb0afa7-1562-4f76-b200-81ce381abd10'"),
+            "{}",
+            out
+        );
     }
 }

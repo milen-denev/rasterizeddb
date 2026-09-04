@@ -72,7 +72,9 @@ fn fresh(tag: &str) -> String {
 fn stores_document(response: &[u8], expected: &str) -> bool {
     let value: serde_json::Value = serde_json::from_str(expected).expect("expected parses");
     let encoded = rasterizeddb_core::core::jsonb::encode(&value);
-    response.windows(encoded.len()).any(|window| window == encoded.as_slice())
+    response
+        .windows(encoded.len())
+        .any(|window| window == encoded.as_slice())
 }
 
 fn assert_stores(response: &[u8], expected: &str) {
@@ -140,13 +142,21 @@ fn a_document_keyed_by_data_costs_one_write() {
         init_globals();
         let dir = fresh("mapshaped");
         let db = Arc::new(Database::new_with_backend(&dir, false).await);
-        run(&db, "CREATE TABLE stats (id INT NOT NULL, column_stats JSONB NULL)").await;
+        run(
+            &db,
+            "CREATE TABLE stats (id INT NOT NULL, column_stats JSONB NULL)",
+        )
+        .await;
 
         // 200 rows, every one carrying keys no other row has.
         for row in 0..200 {
             let document = format!(
                 r#"{{"col_{}_{}":{{"nulls":{},"distinct":{}}},"col_{}_b":{{"nulls":0}}}}"#,
-                row, row, row, row * 3, row
+                row,
+                row,
+                row,
+                row * 3,
+                row
             );
             run(
                 &db,
@@ -169,7 +179,10 @@ fn a_document_keyed_by_data_costs_one_write() {
         );
 
         let got = run(&db, "SELECT column_stats FROM stats WHERE id = 199").await;
-        assert_stores(&got, r#"{"col_199_199":{"nulls":199,"distinct":597},"col_199_b":{"nulls":0}}"#);
+        assert_stores(
+            &got,
+            r#"{"col_199_199":{"nulls":199,"distinct":597},"col_199_b":{"nulls":0}}"#,
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     });
@@ -213,7 +226,11 @@ fn an_update_replaces_the_document() {
         let db = Arc::new(Database::new_with_backend(&dir, false).await);
         run(&db, "CREATE TABLE t (id INT NOT NULL, doc JSONB NULL)").await;
         run(&db, r#"INSERT INTO t (id, doc) VALUES (1, '{"v":1}')"#).await;
-        run(&db, r#"UPDATE t SET doc = '{"v":2,"added":"yes"}' WHERE id = 1"#).await;
+        run(
+            &db,
+            r#"UPDATE t SET doc = '{"v":2,"added":"yes"}' WHERE id = 1"#,
+        )
+        .await;
         let got = run(&db, "SELECT doc FROM t WHERE id = 1").await;
         assert_stores(&got, r#"{"v":2,"added":"yes"}"#);
         let _ = std::fs::remove_dir_all(&dir);
@@ -241,7 +258,11 @@ fn a_path_operator_reads_into_a_document() {
         let text = |bytes: Vec<u8>| String::from_utf8_lossy(&bytes).to_string();
 
         let got = text(run(&db, "SELECT doc->>'status' FROM t WHERE id = 1").await);
-        assert!(got.contains("live") && !got.contains("\"live\""), "->> on a string: {:?}", got);
+        assert!(
+            got.contains("live") && !got.contains("\"live\""),
+            "->> on a string: {:?}",
+            got
+        );
 
         let got = text(run(&db, "SELECT doc->>'hits' FROM t WHERE id = 1").await);
         assert!(got.contains("42"), "->> on a number: {:?}", got);
@@ -259,7 +280,11 @@ fn a_path_operator_reads_into_a_document() {
 
         // A key that is not there is NULL, not an error.
         let out = run(&db, "SELECT doc->>'missing' FROM t WHERE id = 1").await;
-        assert_eq!(out.first(), Some(&2), "a missing key should not fail the query");
+        assert_eq!(
+            out.first(),
+            Some(&2),
+            "a missing key should not fail the query"
+        );
 
         // `->` keeps it a document, so the bytes are still the encoded form.
         let got = run(&db, "SELECT doc->'nested' FROM t WHERE id = 1").await;
@@ -268,7 +293,6 @@ fn a_path_operator_reads_into_a_document() {
         let _ = std::fs::remove_dir_all(&dir);
     });
 }
-
 
 /// A path in a `WHERE` clause. Shredding made a document's fields queryable
 /// only through the internal shadow table, under a hashed name; this is the
@@ -279,7 +303,11 @@ fn a_path_operator_filters_rows() {
         init_globals();
         let dir = fresh("wherepath");
         let db = Arc::new(Database::new_with_backend(&dir, false).await);
-        run(&db, "CREATE TABLE t (id INT NOT NULL, tag TEXT NULL, doc JSONB NULL)").await;
+        run(
+            &db,
+            "CREATE TABLE t (id INT NOT NULL, tag TEXT NULL, doc JSONB NULL)",
+        )
+        .await;
         for (id, status, hits) in [(1, "live", 42), (2, "dead", 7), (3, "live", 99)] {
             run(
                 &db,
@@ -319,13 +347,25 @@ fn a_path_operator_filters_rows() {
 
         // A key no document has matches nothing, rather than failing.
         let got = tags(run(&db, "SELECT tag FROM t WHERE doc->>'missing' = 'x'").await);
-        assert!(got.is_empty(), "a missing key should match nothing: {:?}", got);
+        assert!(
+            got.is_empty(),
+            "a missing key should match nothing: {:?}",
+            got
+        );
 
         // Combined with an ordinary predicate.
         let got = tags(
-            run(&db, "SELECT tag FROM t WHERE doc->>'status' = 'live' AND id > 1").await,
+            run(
+                &db,
+                "SELECT tag FROM t WHERE doc->>'status' = 'live' AND id > 1",
+            )
+            .await,
         );
-        assert_eq!(got, vec!["row-3"], "path predicate combined with a column one");
+        assert_eq!(
+            got,
+            vec!["row-3"],
+            "path predicate combined with a column one"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     });
@@ -345,7 +385,11 @@ fn an_index_over_a_path_is_declared_and_survives_a_reopen() {
         {
             let db = Arc::new(Database::new_with_backend(&dir, false).await);
             run(&db, "CREATE TABLE t (id INT NOT NULL, doc JSONB NULL)").await;
-            run(&db, r#"INSERT INTO t (id, doc) VALUES (1, '{"status":"live"}')"#).await;
+            run(
+                &db,
+                r#"INSERT INTO t (id, doc) VALUES (1, '{"status":"live"}')"#,
+            )
+            .await;
             run(&db, "CREATE INDEX ix_status ON t ((doc->>'status'))").await;
 
             let declared = {
@@ -364,7 +408,11 @@ fn an_index_over_a_path_is_declared_and_survives_a_reopen() {
                 let entry = db.tables.get("t").expect("table after reopen");
                 entry.schema.path_indexes.clone()
             };
-            assert_eq!(declared.len(), 1, "the declaration did not survive the reopen");
+            assert_eq!(
+                declared.len(),
+                1,
+                "the declaration did not survive the reopen"
+            );
 
             // Rows still read correctly with a declaration present.
             let got = run(&db, "SELECT id FROM t WHERE doc->>'status' = 'live'").await;
@@ -373,7 +421,10 @@ fn an_index_over_a_path_is_declared_and_survives_a_reopen() {
             // Dropping it takes it away, and that survives too.
             run(&db, "DROP INDEX ix_status").await;
             let entry = db.tables.get("t").expect("table");
-            assert!(entry.schema.path_indexes.is_empty(), "the drop was not recorded");
+            assert!(
+                entry.schema.path_indexes.is_empty(),
+                "the drop was not recorded"
+            );
         }
         {
             let db = Arc::new(Database::new_with_backend(&dir, false).await);
@@ -395,7 +446,11 @@ fn an_index_that_cannot_be_built_is_refused_with_a_reason() {
         init_globals();
         let dir = fresh("refuseindex");
         let db = Arc::new(Database::new_with_backend(&dir, false).await);
-        run(&db, "CREATE TABLE t (id INT NOT NULL, name TEXT NULL, doc JSONB NULL)").await;
+        run(
+            &db,
+            "CREATE TABLE t (id INT NOT NULL, name TEXT NULL, doc JSONB NULL)",
+        )
+        .await;
 
         // `->` yields a document, whose type differs row to row — see
         // `path_index`. Indexing it could prune rows that do match.
@@ -405,7 +460,10 @@ fn an_index_that_cannot_be_built_is_refused_with_a_reason() {
 
         // A path into something that is not a document.
         let refused = try_run(&db, "CREATE INDEX ix ON t ((name->>'k'))").await;
-        assert!(refused.is_err(), "a path into a non-document should be refused");
+        assert!(
+            refused.is_err(),
+            "a path into a non-document should be refused"
+        );
 
         // An index over an ordinary column is not claimed here at all: the
         // engine maintains one over every eligible column already, and over the
@@ -420,4 +478,3 @@ fn an_index_that_cannot_be_built_is_refused_with_a_reason() {
         let _ = std::fs::remove_dir_all(&dir);
     });
 }
-

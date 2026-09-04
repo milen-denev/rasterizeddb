@@ -20,8 +20,14 @@ fn create_statement(name: &str) -> CreateTable {
     CreateTable {
         table_name: name.to_string(),
         columns: vec![
-            CreateColumnData { name: "id".to_string(), data_type: DbType::I32 },
-            CreateColumnData { name: "label".to_string(), data_type: DbType::STRING },
+            CreateColumnData {
+                name: "id".to_string(),
+                data_type: DbType::I32,
+            },
+            CreateColumnData {
+                name: "label".to_string(),
+                data_type: DbType::STRING,
+            },
         ],
         unique_columns: Vec::new(),
         foreign_keys: Vec::new(),
@@ -42,7 +48,10 @@ async fn open(dir: &std::path::Path) -> Arc<Database> {
 }
 
 async fn insert(db: &Arc<Database>, table: &str, id: i32, label: &str) {
-    let sql = format!("INSERT INTO {} (id, label) VALUES ({}, '{}')", table, id, label);
+    let sql = format!(
+        "INSERT INTO {} (id, label) VALUES ({}, '{}')",
+        table, id, label
+    );
     let purpose = crate::core::rql::lexer_s1::recognize_query_purpose(&sql)
         .unwrap_or_else(|| panic!("could not parse {sql}"));
     let result = crate::core::rql::executor::execute(purpose, db.clone()).await;
@@ -53,7 +62,10 @@ async fn insert(db: &Arc<Database>, table: &str, id: i32, label: &str) {
 fn full_fetch(fields: &SmallVec<[SchemaField; 20]>) -> RowFetch {
     let calc = SchemaCalculator;
     let mut cols = SmallVec::new();
-    for f in fields.iter().sorted_by(|a, b| a.write_order.cmp(&b.write_order)) {
+    for f in fields
+        .iter()
+        .sorted_by(|a, b| a.write_order.cmp(&b.write_order))
+    {
         let (column_offset, schema_id) = calc.calculate_schema_offset(&f.name, fields);
         cols.push(ColumnFetchingData {
             column_offset,
@@ -62,7 +74,9 @@ fn full_fetch(fields: &SmallVec<[SchemaField; 20]>) -> RowFetch {
             schema_id,
         });
     }
-    RowFetch { columns_fetching_data: cols }
+    RowFetch {
+        columns_fetching_data: cols,
+    }
 }
 
 async fn row_count(db: &Arc<Database>, table: &str) -> usize {
@@ -85,7 +99,9 @@ async fn row_count(db: &Arc<Database>, table: &str) -> usize {
 /// Files whose name begins with `table`, anywhere under `dir`.
 fn files_for(dir: &std::path::Path, table: &str) -> Vec<String> {
     fn walk(dir: &std::path::Path, table: &str, out: &mut Vec<String>) {
-        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -125,21 +141,34 @@ fn a_bare_path_is_still_a_directory() {
     );
     // A drive letter is not a scheme. Reading `C:` as one would turn every
     // Windows placement into an unknown backend.
-    assert!(matches!(TableBackend::parse("C:\\data\\rdb"), TableBackend::Directory(_)));
+    assert!(matches!(
+        TableBackend::parse("C:\\data\\rdb"),
+        TableBackend::Directory(_)
+    ));
 }
 
 #[test]
 fn the_other_backends_round_trip_through_their_spec() {
     for spec in ["memory:", "kv:local", "kv:archive-2"] {
         let parsed = TableBackend::parse(spec);
-        assert_eq!(parsed.as_spec(), spec, "{spec} did not survive a round trip");
+        assert_eq!(
+            parsed.as_spec(),
+            spec,
+            "{spec} did not survive a round trip"
+        );
         assert!(!parsed.is_file_based(), "{spec} claimed to be file-backed");
         assert!(parsed.directory().is_none(), "{spec} produced a directory");
     }
-    assert_eq!(TableBackend::parse("KV:local"), TableBackend::KeyValue("local".to_string()));
+    assert_eq!(
+        TableBackend::parse("KV:local"),
+        TableBackend::KeyValue("local".to_string())
+    );
     assert_eq!(TableBackend::parse("MEMORY:"), TableBackend::Memory);
     // A scheme with nothing after it is not a store name; it is a path.
-    assert!(matches!(TableBackend::parse("kv:"), TableBackend::Directory(_)));
+    assert!(matches!(
+        TableBackend::parse("kv:"),
+        TableBackend::Directory(_)
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -151,7 +180,9 @@ async fn a_table_placed_in_memory_writes_no_files() {
     let root = tempfile::tempdir().unwrap();
     let db = open(root.path()).await;
 
-    db.storage.pin_backend("scratch", &TableBackend::Memory).unwrap();
+    db.storage
+        .pin_backend("scratch", &TableBackend::Memory)
+        .unwrap();
     db.add_table(create_statement("scratch")).await.unwrap();
     insert(&db, "scratch", 1, "one").await;
     insert(&db, "scratch", 2, "two").await;
@@ -193,7 +224,11 @@ async fn a_table_placed_on_a_key_value_store_survives_a_restart() {
     );
 
     let db = open(root.path()).await;
-    assert_eq!(row_count(&db, "archived").await, 25, "the rows did not survive the restart");
+    assert_eq!(
+        row_count(&db, "archived").await,
+        25,
+        "the rows did not survive the restart"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -203,9 +238,18 @@ async fn one_database_holds_all_three_backends_at_once() {
     write_kv_config(root.path(), store.path());
 
     let db = open(root.path()).await;
-    db.storage.pin_backend("kept", &TableBackend::Directory(root.path().to_string_lossy().into_owned())).unwrap();
-    db.storage.pin_backend("scratch", &TableBackend::Memory).unwrap();
-    db.storage.pin_backend("archived", &TableBackend::KeyValue("local".to_string())).unwrap();
+    db.storage
+        .pin_backend(
+            "kept",
+            &TableBackend::Directory(root.path().to_string_lossy().into_owned()),
+        )
+        .unwrap();
+    db.storage
+        .pin_backend("scratch", &TableBackend::Memory)
+        .unwrap();
+    db.storage
+        .pin_backend("archived", &TableBackend::KeyValue("local".to_string()))
+        .unwrap();
 
     for table in ["kept", "scratch", "archived"] {
         db.add_table(create_statement(table)).await.unwrap();
@@ -216,7 +260,10 @@ async fn one_database_holds_all_three_backends_at_once() {
     for table in ["kept", "scratch", "archived"] {
         assert_eq!(row_count(&db, table).await, 2, "{table} did not read back");
     }
-    assert!(!files_for(root.path(), "kept").is_empty(), "the file table wrote nothing");
+    assert!(
+        !files_for(root.path(), "kept").is_empty(),
+        "the file table wrote nothing"
+    );
     assert!(files_for(root.path(), "scratch").is_empty());
     assert!(files_for(root.path(), "archived").is_empty());
 }
@@ -231,10 +278,17 @@ async fn moving_a_table_that_has_no_files_is_refused() {
     let second = tempfile::tempdir().unwrap();
     let db = open(root.path()).await;
     db.storage
-        .add_location(&second.path().to_string_lossy(), super::LocationRole::Primary, 1, true)
+        .add_location(
+            &second.path().to_string_lossy(),
+            super::LocationRole::Primary,
+            1,
+            true,
+        )
         .unwrap();
 
-    db.storage.pin_backend("scratch", &TableBackend::Memory).unwrap();
+    db.storage
+        .pin_backend("scratch", &TableBackend::Memory)
+        .unwrap();
     db.add_table(create_statement("scratch")).await.unwrap();
 
     let error = super::relocate::move_table(&db, "scratch", &second.path().to_string_lossy())
@@ -300,7 +354,9 @@ async fn a_name_reused_on_a_different_backend_does_not_inherit_the_old_one() {
     {
         let db = open(root.path()).await;
 
-        db.storage.pin_backend("twice", &TableBackend::Memory).unwrap();
+        db.storage
+            .pin_backend("twice", &TableBackend::Memory)
+            .unwrap();
         db.add_table(create_statement("twice")).await.unwrap();
         insert(&db, "twice", 1, "in-memory").await;
         assert_eq!(row_count(&db, "twice").await, 1);
@@ -340,7 +396,9 @@ async fn a_seed_cached_before_the_placement_changed_is_not_reused() {
 
     {
         let db = open(root.path()).await;
-        db.storage.pin_backend("later", &TableBackend::Memory).unwrap();
+        db.storage
+            .pin_backend("later", &TableBackend::Memory)
+            .unwrap();
         // Resolves the name, and caches a seed, without creating anything.
         let _ = db.table_bytes("later").await;
 
@@ -366,7 +424,9 @@ async fn a_rename_carries_the_backend_across() {
     let root = tempfile::tempdir().unwrap();
     let db = open(root.path()).await;
 
-    db.storage.pin_backend("before", &TableBackend::Memory).unwrap();
+    db.storage
+        .pin_backend("before", &TableBackend::Memory)
+        .unwrap();
     assert_eq!(db.storage.backend_of("before"), Some(TableBackend::Memory));
 
     db.storage.rename("before", "after");
@@ -383,7 +443,9 @@ async fn a_non_directory_placement_survives_the_pool_file() {
     let root = tempfile::tempdir().unwrap();
     {
         let db = open(root.path()).await;
-        db.storage.pin_backend("scratch", &TableBackend::Memory).unwrap();
+        db.storage
+            .pin_backend("scratch", &TableBackend::Memory)
+            .unwrap();
         db.storage
             .pin_backend("archived", &TableBackend::KeyValue("local".to_string()))
             .unwrap();

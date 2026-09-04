@@ -31,13 +31,21 @@ fn payload(bytes: &[u8], write_order: u32, column_type: DbType) -> ColumnWritePa
     let mut mb = MEMORY_POOL.acquire(bytes.len());
     mb.into_slice_mut().copy_from_slice(bytes);
     let size = column_type.get_size();
-    ColumnWritePayload { data: mb, write_order, column_type, size }
+    ColumnWritePayload {
+        data: mb,
+        write_order,
+        column_type,
+        size,
+    }
 }
 
 fn full_fetch(fields: &SmallVec<[SchemaField; 20]>) -> RowFetch {
     let calc = SchemaCalculator::default();
     let mut cols = SmallVec::new();
-    for f in fields.iter().sorted_by(|a, b| a.write_order.cmp(&b.write_order)) {
+    for f in fields
+        .iter()
+        .sorted_by(|a, b| a.write_order.cmp(&b.write_order))
+    {
         let (column_offset, schema_id) = calc.calculate_schema_offset(&f.name, fields);
         cols.push(ColumnFetchingData {
             column_offset,
@@ -46,7 +54,9 @@ fn full_fetch(fields: &SmallVec<[SchemaField; 20]>) -> RowFetch {
             schema_id,
         });
     }
-    RowFetch { columns_fetching_data: cols }
+    RowFetch {
+        columns_fetching_data: cols,
+    }
 }
 
 /// Table with `id U64` (unique), `cat I32` (64 distinct), `label STRING` (unique).
@@ -73,9 +83,18 @@ async fn open_table(dir: &std::path::Path, name: &str) -> Table<LocalStorageProv
         name,
         io,
         vec![
-            CreateColumnData { name: "id".into(), data_type: DbType::U64 },
-            CreateColumnData { name: "cat".into(), data_type: DbType::I32 },
-            CreateColumnData { name: "label".into(), data_type: DbType::STRING },
+            CreateColumnData {
+                name: "id".into(),
+                data_type: DbType::U64,
+            },
+            CreateColumnData {
+                name: "cat".into(),
+                data_type: DbType::I32,
+            },
+            CreateColumnData {
+                name: "label".into(),
+                data_type: DbType::STRING,
+            },
         ],
     )
     .await
@@ -84,11 +103,15 @@ async fn open_table(dir: &std::path::Path, name: &str) -> Table<LocalStorageProv
 async fn fill(table: &Table<LocalStorageProvider>) {
     for i in 0..N {
         let label = format!("l{}", i);
-        let mut rw = RowWrite { columns_writing_data: SmallVec::new() };
-        rw.columns_writing_data.push(payload(&i.to_le_bytes(), 0, DbType::U64));
+        let mut rw = RowWrite {
+            columns_writing_data: SmallVec::new(),
+        };
+        rw.columns_writing_data
+            .push(payload(&i.to_le_bytes(), 0, DbType::U64));
         rw.columns_writing_data
             .push(payload(&((i % 64) as i32).to_le_bytes(), 1, DbType::I32));
-        rw.columns_writing_data.push(payload(label.as_bytes(), 2, DbType::STRING));
+        rw.columns_writing_data
+            .push(payload(label.as_bytes(), 2, DbType::STRING));
         table.insert_row(rw).await.unwrap();
     }
 }
@@ -211,7 +234,12 @@ async fn deletes_are_reflected() {
     // Neighbours must survive: a delete clears exactly one slot.
     for near in [1233u64, 1235] {
         let rows = run(&table, &format!("id = {}", near)).await;
-        assert_eq!(ids_of(&rows), vec![near], "delete leaked into slot {}", near);
+        assert_eq!(
+            ids_of(&rows),
+            vec![near],
+            "delete leaked into slot {}",
+            near
+        );
     }
 
     let rows = run(&table, "").await;
@@ -252,7 +280,9 @@ async fn filter_actually_prunes() {
     )
     .expect("id = <lit> must be sargable");
 
-    let bm = filters.evaluate(&program, N).expect("should produce a bitmap");
+    let bm = filters
+        .evaluate(&program, N)
+        .expect("should produce a bitmap");
     assert!(bm.get(1234), "true match was pruned");
     assert!(
         bm.count() < N / 10,
@@ -297,7 +327,11 @@ async fn reopen_reuses_the_checkpoint() {
     let filters = table.filters.as_ref().expect("filters should be active");
 
     // The checkpoint covered every row, so nothing needed rescanning.
-    assert_eq!(filters.resume_slot(), N, "checkpoint did not cover the table");
+    assert_eq!(
+        filters.resume_slot(),
+        N,
+        "checkpoint did not cover the table"
+    );
     assert!(filters.is_complete());
 
     for target in [0u64, 512, 1234, N - 1] {
@@ -313,7 +347,7 @@ async fn reopen_indexes_rows_written_after_the_checkpoint() {
     let dir = tempfile::tempdir().unwrap();
     {
         let table = open_table(dir.path(), "flt_delta").await;
-    table.wait_filters_ready().await;
+        table.wait_filters_ready().await;
         fill(&table).await;
         table.checkpoint_filters().await;
 
@@ -321,11 +355,15 @@ async fn reopen_indexes_rows_written_after_the_checkpoint() {
         // nothing about these.
         for i in N..N + 300 {
             let label = format!("l{}", i);
-            let mut rw = RowWrite { columns_writing_data: SmallVec::new() };
-            rw.columns_writing_data.push(payload(&i.to_le_bytes(), 0, DbType::U64));
+            let mut rw = RowWrite {
+                columns_writing_data: SmallVec::new(),
+            };
+            rw.columns_writing_data
+                .push(payload(&i.to_le_bytes(), 0, DbType::U64));
             rw.columns_writing_data
                 .push(payload(&((i % 64) as i32).to_le_bytes(), 1, DbType::I32));
-            rw.columns_writing_data.push(payload(label.as_bytes(), 2, DbType::STRING));
+            rw.columns_writing_data
+                .push(payload(label.as_bytes(), 2, DbType::STRING));
             table.insert_row(rw).await.unwrap();
         }
     }
@@ -335,7 +373,12 @@ async fn reopen_indexes_rows_written_after_the_checkpoint() {
     table.wait_filters_ready().await;
     for target in [5u64, N - 1, N, N + 150, N + 299] {
         let rows = run(&table, &format!("id = {}", target)).await;
-        assert_eq!(ids_of(&rows), vec![target], "id = {} after delta backfill", target);
+        assert_eq!(
+            ids_of(&rows),
+            vec![target],
+            "id = {} after delta backfill",
+            target
+        );
     }
     let rows = run(&table, "").await;
     assert_eq!(rows.len() as u64, N + 300);
@@ -346,7 +389,7 @@ async fn reopen_after_delete_is_still_correct() {
     let dir = tempfile::tempdir().unwrap();
     {
         let table = open_table(dir.path(), "flt_reopen_del").await;
-    table.wait_filters_ready().await;
+        table.wait_filters_ready().await;
         fill(&table).await;
         table.checkpoint_filters().await;
         // A delete marks the sidecar dirty; delete_rows re-checkpoints after.
@@ -376,7 +419,7 @@ async fn reopen_after_update_finds_the_new_value() {
     let dir = tempfile::tempdir().unwrap();
     {
         let table = open_table(dir.path(), "flt_reopen_upd").await;
-    table.wait_filters_ready().await;
+        table.wait_filters_ready().await;
         fill(&table).await;
         table.checkpoint_filters().await;
 
@@ -401,7 +444,7 @@ async fn corrupt_sidecar_falls_back_to_a_rebuild() {
     let dir = tempfile::tempdir().unwrap();
     {
         let table = open_table(dir.path(), "flt_corrupt").await;
-    table.wait_filters_ready().await;
+        table.wait_filters_ready().await;
         fill(&table).await;
         table.checkpoint_filters().await;
     }
@@ -418,7 +461,12 @@ async fn corrupt_sidecar_falls_back_to_a_rebuild() {
     table.wait_filters_ready().await;
     for target in [0u64, 1234, N - 1] {
         let rows = run(&table, &format!("id = {}", target)).await;
-        assert_eq!(ids_of(&rows), vec![target], "id = {} after corrupt sidecar", target);
+        assert_eq!(
+            ids_of(&rows),
+            vec![target],
+            "id = {} after corrupt sidecar",
+            target
+        );
     }
 }
 
@@ -459,7 +507,10 @@ async fn literal_first_comparisons_match_the_same_rows_as_column_first() {
         ids_of(&forward),
         "`1990 < id` must select the same rows as `id > 1990`"
     );
-    assert!(!ids_of(&reversed).is_empty(), "expected the range to match some rows");
+    assert!(
+        !ids_of(&reversed).is_empty(),
+        "expected the range to match some rows"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -480,7 +531,11 @@ async fn range_on_string_column_falls_back() {
     assert!(!rows.is_empty(), "string range returned nothing");
     for id in ids_of(&rows) {
         let label = format!("l{}", id);
-        assert!(label.as_bytes() >= b"l999".as_slice(), "{} should not match", label);
+        assert!(
+            label.as_bytes() >= b"l999".as_slice(),
+            "{} should not match",
+            label
+        );
     }
 }
 
@@ -489,7 +544,7 @@ async fn range_prunes_after_reopen() {
     let dir = tempfile::tempdir().unwrap();
     {
         let table = open_table(dir.path(), "flt_range_reopen").await;
-    table.wait_filters_ready().await;
+        table.wait_filters_ready().await;
         fill(&table).await;
         table.checkpoint_filters().await;
     }
@@ -507,7 +562,11 @@ async fn range_prunes_after_reopen() {
     )
     .unwrap();
     let bm = filters.evaluate(&program, N).unwrap();
-    assert!(bm.count() < N / 2, "bounds lost selectivity across reopen: {}", bm.count());
+    assert!(
+        bm.count() < N / 2,
+        "bounds lost selectivity across reopen: {}",
+        bm.count()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -581,7 +640,12 @@ async fn or_still_prunes() {
 
     let bm = filters.evaluate(&program, N).expect("bitmap");
     assert!(bm.get(5) && bm.get(9), "true matches pruned");
-    assert!(bm.count() < N / 10, "union barely pruned: {} of {}", bm.count(), N);
+    assert!(
+        bm.count() < N / 10,
+        "union barely pruned: {} of {}",
+        bm.count(),
+        N
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -598,7 +662,11 @@ async fn mutation_marks_the_sidecar_dirty_on_disk() {
     let table = open_table(dir.path(), "flt_dirty").await;
     fill(&table).await;
     table.checkpoint_filters().await;
-    assert_eq!(std::fs::read(&path).unwrap()[13], 0, "fresh checkpoint should be clean");
+    assert_eq!(
+        std::fs::read(&path).unwrap()[13],
+        0,
+        "fresh checkpoint should be clean"
+    );
 
     table
         .delete_rows("id = 42", full_fetch(&table.schema.fields), None)
@@ -631,7 +699,10 @@ async fn maintenance_runs_without_any_explicit_checkpoint() {
         // interval without anything being wrong.
         for _ in 0..600 {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            if std::fs::read(&path).map(|b| b.len() > 64 && b[13] == 0).unwrap_or(false) {
+            if std::fs::read(&path)
+                .map(|b| b.len() > 64 && b[13] == 0)
+                .unwrap_or(false)
+            {
                 break;
             }
         }
@@ -687,7 +758,12 @@ async fn in_lists_are_exact_and_filtered() {
     for id in [5u64, 9, 1999] {
         assert!(bm.get(id), "IN member {} pruned", id);
     }
-    assert!(bm.count() < N / 10, "IN barely pruned: {} of {}", bm.count(), N);
+    assert!(
+        bm.count() < N / 10,
+        "IN barely pruned: {} of {}",
+        bm.count(),
+        N
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -736,7 +812,11 @@ async fn in_combined_with_another_predicate_is_exact() {
     assert_eq!(ids_of(&rows), vec![4, 68]);
 
     let rows = run_rewritten(&table, "id IN (4, 68, 5) AND cat = 4").await;
-    assert_eq!(ids_of(&rows), vec![4, 68], "operand order must not change the answer");
+    assert_eq!(
+        ids_of(&rows),
+        vec![4, 68],
+        "operand order must not change the answer"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -746,7 +826,12 @@ async fn negated_forms_are_exact() {
     // `NOT BETWEEN` desugars to `(x < lo OR x > hi)` — a genuine disjunction of
     // ranges, so it IS filterable.
     let rows = run_rewritten(&table, "id NOT BETWEEN 10 AND 20").await;
-    assert_eq!(ids_of(&rows), (0..N).filter(|i| !(10..=20).contains(i)).collect::<Vec<_>>());
+    assert_eq!(
+        ids_of(&rows),
+        (0..N)
+            .filter(|i| !(10..=20).contains(i))
+            .collect::<Vec<_>>()
+    );
 
     // `NOT IN` desugars to a conjunction of inequalities. `!=` is not sargable —
     // probe(v) over-approximates `= v`, so its complement UNDER-approximates and
@@ -754,7 +839,9 @@ async fn negated_forms_are_exact() {
     let rows = run_rewritten(&table, "id NOT IN (5, 9, 1999)").await;
     assert_eq!(
         ids_of(&rows),
-        (0..N).filter(|i| ![5, 9, 1999].contains(i)).collect::<Vec<_>>()
+        (0..N)
+            .filter(|i| ![5, 9, 1999].contains(i))
+            .collect::<Vec<_>>()
     );
 
     // Mixed: the filterable half still applies, the opaque half contributes

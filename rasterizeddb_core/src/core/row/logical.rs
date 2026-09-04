@@ -232,7 +232,8 @@ fn string_comparison(input1: &[u8], input2: &[u8], operation: &ComparerOperation
 #[cfg(test)]
 mod tests {
     use crate::core::{
-        db_type::DbType, processor::transformer::ComparerOperation, row::logical::perform_comparison_operation
+        db_type::DbType, processor::transformer::ComparerOperation,
+        row::logical::perform_comparison_operation,
     };
 
     #[test]
@@ -240,42 +241,55 @@ mod tests {
         let input1 = 10i32.to_le_bytes();
         let input2 = 5i32.to_le_bytes();
 
-        assert!(perform_comparison_operation(
-            &input1,
-            &input1,
-            &DbType::I32,
-            &ComparerOperation::Equals
-        ).unwrap());
-        assert!(!perform_comparison_operation(
-            &input1,
-            &input2,
-            &DbType::I32,
-            &ComparerOperation::Equals
-        ).unwrap());
-        assert!(perform_comparison_operation(
-            &input2,
-            &input1,
-            &DbType::I32,
-            &ComparerOperation::Less
-        ).unwrap());
-        assert!(perform_comparison_operation(
-            &input1,
-            &input2,
-            &DbType::I32,
-            &ComparerOperation::Greater
-        ).unwrap());
-        assert!(perform_comparison_operation(
-            &input1,
-            &input1,
-            &DbType::I32,
-            &ComparerOperation::GreaterOrEquals
-        ).unwrap());
-        assert!(perform_comparison_operation(
-            &input2,
-            &input1,
-            &DbType::I32,
-            &ComparerOperation::LessOrEquals
-        ).unwrap());
+        assert!(
+            perform_comparison_operation(
+                &input1,
+                &input1,
+                &DbType::I32,
+                &ComparerOperation::Equals
+            )
+            .unwrap()
+        );
+        assert!(
+            !perform_comparison_operation(
+                &input1,
+                &input2,
+                &DbType::I32,
+                &ComparerOperation::Equals
+            )
+            .unwrap()
+        );
+        assert!(
+            perform_comparison_operation(&input2, &input1, &DbType::I32, &ComparerOperation::Less)
+                .unwrap()
+        );
+        assert!(
+            perform_comparison_operation(
+                &input1,
+                &input2,
+                &DbType::I32,
+                &ComparerOperation::Greater
+            )
+            .unwrap()
+        );
+        assert!(
+            perform_comparison_operation(
+                &input1,
+                &input1,
+                &DbType::I32,
+                &ComparerOperation::GreaterOrEquals
+            )
+            .unwrap()
+        );
+        assert!(
+            perform_comparison_operation(
+                &input2,
+                &input1,
+                &DbType::I32,
+                &ComparerOperation::LessOrEquals
+            )
+            .unwrap()
+        );
     }
 
     #[test]
@@ -284,24 +298,33 @@ mod tests {
         let input2 = "world".as_bytes();
         let input3 = "hello".as_bytes();
 
-        assert!(perform_comparison_operation(
-            input1,
-            input3,
-            &DbType::STRING,
-            &ComparerOperation::Equals
-        ).unwrap());
-        assert!(!perform_comparison_operation(
-            input1,
-            input2,
-            &DbType::STRING,
-            &ComparerOperation::Equals
-        ).unwrap());
-        assert!(perform_comparison_operation(
-            input1,
-            input2,
-            &DbType::STRING,
-            &ComparerOperation::NotEquals
-        ).unwrap());
+        assert!(
+            perform_comparison_operation(
+                input1,
+                input3,
+                &DbType::STRING,
+                &ComparerOperation::Equals
+            )
+            .unwrap()
+        );
+        assert!(
+            !perform_comparison_operation(
+                input1,
+                input2,
+                &DbType::STRING,
+                &ComparerOperation::Equals
+            )
+            .unwrap()
+        );
+        assert!(
+            perform_comparison_operation(
+                input1,
+                input2,
+                &DbType::STRING,
+                &ComparerOperation::NotEquals
+            )
+            .unwrap()
+        );
     }
 
     /// Instants are microseconds since the Unix epoch, held little-endian. A
@@ -322,11 +345,19 @@ mod tests {
 
         assert!(lt(&earlier, &later));
         assert!(!lt(&later, &earlier));
-        assert!(lt(&high_low_byte, &low_byte_trap), "must not compare byte-wise");
+        assert!(
+            lt(&high_low_byte, &low_byte_trap),
+            "must not compare byte-wise"
+        );
         assert!(lt(&before_epoch, &earlier), "pre-1970 instants sort first");
         assert!(
-            perform_comparison_operation(&earlier, &earlier, &DbType::DATETIME, &ComparerOperation::Equals)
-                .unwrap()
+            perform_comparison_operation(
+                &earlier,
+                &earlier,
+                &DbType::DATETIME,
+                &ComparerOperation::Equals
+            )
+            .unwrap()
         );
     }
 
@@ -372,7 +403,15 @@ mod tests {
     /// are derived from the fourth.
     #[test]
     fn string_orderings_agree_with_each_other() {
-        let cases = ["", "a", "ab", "abc", "abd", "b", "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"];
+        let cases = [
+            "",
+            "a",
+            "ab",
+            "abc",
+            "abd",
+            "b",
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        ];
         for a in cases {
             for b in cases {
                 let c = |op: ComparerOperation| {
@@ -404,35 +443,63 @@ mod tests {
         let t = [1u8];
         let f = [0u8];
         assert!(
-            perform_comparison_operation(&t, &t, &DbType::BOOL, &ComparerOperation::Equals).unwrap()
+            perform_comparison_operation(&t, &t, &DbType::BOOL, &ComparerOperation::Equals)
+                .unwrap()
         );
         assert!(
-            perform_comparison_operation(&t, &f, &DbType::BOOL, &ComparerOperation::NotEquals).unwrap()
+            perform_comparison_operation(&t, &f, &DbType::BOOL, &ComparerOperation::NotEquals)
+                .unwrap()
         );
 
         let a = ('a' as u32).to_le_bytes();
         let b = ('b' as u32).to_le_bytes();
-        assert!(perform_comparison_operation(&a, &b, &DbType::CHAR, &ComparerOperation::Less).unwrap());
+        assert!(
+            perform_comparison_operation(&a, &b, &DbType::CHAR, &ComparerOperation::Less).unwrap()
+        );
     }
 
     #[test]
     fn decimal_compares_as_scaled_units() {
-        let one_five = crate::core::value_codec::parse_decimal("1.5").unwrap().to_le_bytes();
-        let one_five_padded = crate::core::value_codec::parse_decimal("1.500").unwrap().to_le_bytes();
-        let two = crate::core::value_codec::parse_decimal("2").unwrap().to_le_bytes();
-        let negative = crate::core::value_codec::parse_decimal("-1").unwrap().to_le_bytes();
+        let one_five = crate::core::value_codec::parse_decimal("1.5")
+            .unwrap()
+            .to_le_bytes();
+        let one_five_padded = crate::core::value_codec::parse_decimal("1.500")
+            .unwrap()
+            .to_le_bytes();
+        let two = crate::core::value_codec::parse_decimal("2")
+            .unwrap()
+            .to_le_bytes();
+        let negative = crate::core::value_codec::parse_decimal("-1")
+            .unwrap()
+            .to_le_bytes();
 
         assert!(
-            perform_comparison_operation(&one_five, &one_five_padded, &DbType::DECIMAL, &ComparerOperation::Equals)
-                .unwrap(),
+            perform_comparison_operation(
+                &one_five,
+                &one_five_padded,
+                &DbType::DECIMAL,
+                &ComparerOperation::Equals
+            )
+            .unwrap(),
             "trailing zeroes must not change the stored units"
         );
         assert!(
-            perform_comparison_operation(&one_five, &two, &DbType::DECIMAL, &ComparerOperation::Less).unwrap()
+            perform_comparison_operation(
+                &one_five,
+                &two,
+                &DbType::DECIMAL,
+                &ComparerOperation::Less
+            )
+            .unwrap()
         );
         assert!(
-            perform_comparison_operation(&negative, &one_five, &DbType::DECIMAL, &ComparerOperation::Less)
-                .unwrap()
+            perform_comparison_operation(
+                &negative,
+                &one_five,
+                &DbType::DECIMAL,
+                &ComparerOperation::Less
+            )
+            .unwrap()
         );
     }
 
@@ -443,13 +510,16 @@ mod tests {
         let high = parse_uuid("ffffffff-0000-0000-0000-000000000000").unwrap();
 
         assert!(
-            perform_comparison_operation(&low, &low, &DbType::UUID, &ComparerOperation::Equals).unwrap()
+            perform_comparison_operation(&low, &low, &DbType::UUID, &ComparerOperation::Equals)
+                .unwrap()
         );
         assert!(
-            perform_comparison_operation(&low, &high, &DbType::UUID, &ComparerOperation::Less).unwrap()
+            perform_comparison_operation(&low, &high, &DbType::UUID, &ComparerOperation::Less)
+                .unwrap()
         );
         assert!(
-            perform_comparison_operation(&high, &low, &DbType::UUID, &ComparerOperation::Greater).unwrap()
+            perform_comparison_operation(&high, &low, &DbType::UUID, &ComparerOperation::Greater)
+                .unwrap()
         );
     }
 
@@ -461,14 +531,27 @@ mod tests {
         let v6 = parse_inet("::1").unwrap();
 
         assert!(
-            perform_comparison_operation(&v4_low, &v4_high, &DbType::INET, &ComparerOperation::Less).unwrap()
+            perform_comparison_operation(
+                &v4_low,
+                &v4_high,
+                &DbType::INET,
+                &ComparerOperation::Less
+            )
+            .unwrap()
         );
         assert!(
-            perform_comparison_operation(&v4_high, &v6, &DbType::INET, &ComparerOperation::Less).unwrap(),
+            perform_comparison_operation(&v4_high, &v6, &DbType::INET, &ComparerOperation::Less)
+                .unwrap(),
             "IPv4 sorts before IPv6"
         );
         assert!(
-            perform_comparison_operation(&v4_low, &v4_low, &DbType::INET, &ComparerOperation::Equals).unwrap()
+            perform_comparison_operation(
+                &v4_low,
+                &v4_low,
+                &DbType::INET,
+                &ComparerOperation::Equals
+            )
+            .unwrap()
         );
     }
 
@@ -484,7 +567,12 @@ mod tests {
             Err(EvalError::OperandSizeMismatch)
         );
         assert_eq!(
-            perform_comparison_operation(&short, &short, &DbType::DATETIME, &ComparerOperation::Equals),
+            perform_comparison_operation(
+                &short,
+                &short,
+                &DbType::DATETIME,
+                &ComparerOperation::Equals
+            ),
             Err(EvalError::OperandSizeMismatch)
         );
     }
@@ -547,12 +635,36 @@ mod tests {
             perform_comparison_operation(a.as_bytes(), b.as_bytes(), &DbType::STRING, &op).unwrap()
         };
 
-        assert!(cmp("Acme", "ACME", ComparerOperation::EqualsCaseInsensitive));
-        assert!(!cmp("Acme", "Acme Ltd", ComparerOperation::EqualsCaseInsensitive));
-        assert!(cmp("alice@ACME.test", "acme", ComparerOperation::ContainsCaseInsensitive));
-        assert!(cmp("Alice", "AL", ComparerOperation::StartsWithCaseInsensitive));
-        assert!(cmp("Alice", "CE", ComparerOperation::EndsWithCaseInsensitive));
-        assert!(!cmp("Alice", "zz", ComparerOperation::ContainsCaseInsensitive));
+        assert!(cmp(
+            "Acme",
+            "ACME",
+            ComparerOperation::EqualsCaseInsensitive
+        ));
+        assert!(!cmp(
+            "Acme",
+            "Acme Ltd",
+            ComparerOperation::EqualsCaseInsensitive
+        ));
+        assert!(cmp(
+            "alice@ACME.test",
+            "acme",
+            ComparerOperation::ContainsCaseInsensitive
+        ));
+        assert!(cmp(
+            "Alice",
+            "AL",
+            ComparerOperation::StartsWithCaseInsensitive
+        ));
+        assert!(cmp(
+            "Alice",
+            "CE",
+            ComparerOperation::EndsWithCaseInsensitive
+        ));
+        assert!(!cmp(
+            "Alice",
+            "zz",
+            ComparerOperation::ContainsCaseInsensitive
+        ));
 
         // The case-sensitive operators must be unaffected.
         assert!(!cmp("Acme", "ACME", ComparerOperation::Equals));
@@ -564,8 +676,13 @@ mod tests {
     #[test]
     fn case_folding_does_not_reach_beyond_the_ascii_alphabet() {
         let cmp = |a: &[u8], b: &[u8]| {
-            perform_comparison_operation(a, b, &DbType::STRING, &ComparerOperation::EqualsCaseInsensitive)
-                .unwrap()
+            perform_comparison_operation(
+                a,
+                b,
+                &DbType::STRING,
+                &ComparerOperation::EqualsCaseInsensitive,
+            )
+            .unwrap()
         };
 
         assert!(!cmp(b"_", b"?"), "0x5F must not fold onto 0x3F");

@@ -272,8 +272,11 @@ pub fn parse(item: &str, schema: &[SchemaField]) -> Option<Result<WindowSpec, St
     };
     let (min_args, max_args) = func.arity();
     // `COUNT(*)` is the no-argument form spelled with a star.
-    let arguments: Vec<&str> =
-        if arguments.len() == 1 && arguments[0] == "*" { Vec::new() } else { arguments };
+    let arguments: Vec<&str> = if arguments.len() == 1 && arguments[0] == "*" {
+        Vec::new()
+    } else {
+        arguments
+    };
     if arguments.len() < min_args || arguments.len() > max_args {
         return Some(Err(format!(
             "{}() takes {} argument(s), not {}",
@@ -307,7 +310,7 @@ pub fn parse(item: &str, schema: &[SchemaField]) -> Option<Result<WindowSpec, St
                     "the second argument of {}() must be a constant number, not '{}'",
                     name.to_ascii_uppercase(),
                     text.trim()
-                )))
+                )));
             }
         },
     };
@@ -351,7 +354,12 @@ fn split_arguments(text: &str) -> Vec<&str> {
 }
 
 fn resolve_column(text: &str, schema: &[SchemaField]) -> Result<SchemaField, String> {
-    let bare = text.trim().rsplit('.').next().unwrap_or(text).trim_matches('"');
+    let bare = text
+        .trim()
+        .rsplit('.')
+        .next()
+        .unwrap_or(text)
+        .trim_matches('"');
     schema
         .iter()
         .find(|f| f.name.eq_ignore_ascii_case(bare) && !f.is_deleted)
@@ -431,7 +439,10 @@ fn build(
         None => "",
     };
 
-    let partition_by = resolve(partition_text)?.into_iter().map(|(f, _)| f).collect();
+    let partition_by = resolve(partition_text)?
+        .into_iter()
+        .map(|(f, _)| f)
+        .collect();
     let order_by = resolve(order_text)?;
 
     let frame = match frame_at {
@@ -452,7 +463,10 @@ fn build(
 
 /// `ROWS BETWEEN 5 PRECEDING AND CURRENT ROW`, and the single-bound forms.
 fn parse_frame(text: &str) -> Result<Frame, String> {
-    let words: Vec<String> = text.split_whitespace().map(|w| w.to_ascii_uppercase()).collect();
+    let words: Vec<String> = text
+        .split_whitespace()
+        .map(|w| w.to_ascii_uppercase())
+        .collect();
     let mode = match words.first().map(String::as_str) {
         Some("ROWS") => FrameMode::Rows,
         Some("RANGE") => FrameMode::Range,
@@ -491,9 +505,9 @@ fn parse_frame(text: &str) -> Result<Frame, String> {
     // implemented; an offset is refused rather than answered as though it
     // counted rows, which would be a different set of rows and no error.
     if mode == FrameMode::Range
-        && [start, end].iter().any(|b| {
-            matches!(b, FrameBound::Preceding(_) | FrameBound::Following(_))
-        })
+        && [start, end]
+            .iter()
+            .any(|b| matches!(b, FrameBound::Preceding(_) | FrameBound::Following(_)))
     {
         return Err(
             "a RANGE frame with an offset is not supported yet; use ROWS, or a frame              bounded by UNBOUNDED/CURRENT ROW"
@@ -648,9 +662,11 @@ pub fn assign(rows: &[Row], spec: &WindowSpec) -> Vec<WindowValue> {
                     };
                     Some(value.to_le_bytes().to_vec())
                 }
-                WindowFunc::CumeDist => {
-                    Some((peer_end[position] as f64 / count as f64).to_le_bytes().to_vec())
-                }
+                WindowFunc::CumeDist => Some(
+                    (peer_end[position] as f64 / count as f64)
+                        .to_le_bytes()
+                        .to_vec(),
+                ),
                 // Addressed by position in the partition, not through the frame.
                 WindowFunc::Lag | WindowFunc::Lead => {
                     let step = if spec.func == WindowFunc::Lag {
@@ -966,9 +982,7 @@ fn read_integral(bytes: &[u8], db_type: &DbType) -> Option<i128> {
         DbType::I16 => i16::from_le_bytes(bytes.get(0..2)?.try_into().ok()?) as i128,
         DbType::I32 => i32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?) as i128,
         DbType::I64 => i64::from_le_bytes(bytes.get(0..8)?.try_into().ok()?) as i128,
-        DbType::I128 | DbType::DECIMAL => {
-            i128::from_le_bytes(bytes.get(0..16)?.try_into().ok()?)
-        }
+        DbType::I128 | DbType::DECIMAL => i128::from_le_bytes(bytes.get(0..16)?.try_into().ok()?),
         DbType::U8 => *bytes.first()? as i128,
         DbType::U16 => u16::from_le_bytes(bytes.get(0..2)?.try_into().ok()?) as i128,
         DbType::U32 => u32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?) as i128,
@@ -1032,8 +1046,7 @@ fn find_word(upper: &str, phrase: &str) -> Option<usize> {
     while let Some(at) = upper[from..].find(words[0]) {
         let start = from + at;
         let mut cursor = start + words[0].len();
-        let mut ok = start == 0
-            || !upper.as_bytes()[start - 1].is_ascii_alphanumeric();
+        let mut ok = start == 0 || !upper.as_bytes()[start - 1].is_ascii_alphanumeric();
         for word in &words[1..] {
             let rest = &upper[cursor..];
             let trimmed = rest.trim_start();

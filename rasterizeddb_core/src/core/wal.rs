@@ -428,7 +428,8 @@ impl Wal {
     /// file when this returns but not yet on stable storage; pass the sequence
     /// to [`Wal::commit_through`] for that.
     pub fn log(&self, txn: u64, file_id: u64, offset: u64, bytes: &[u8]) -> io::Result<u64> {
-        self.log_at(txn, file_id, offset, bytes, None).map(|(seq, _)| seq)
+        self.log_at(txn, file_id, offset, bytes, None)
+            .map(|(seq, _)| seq)
     }
 
     /// As [`Wal::log`], but also reports the payload's offset within the log.
@@ -656,7 +657,8 @@ impl Wal {
         let mut buf: Vec<u8> = Vec::new();
 
         for w in held {
-            self.pending_bytes.fetch_sub(w.len as u64, Ordering::Relaxed);
+            self.pending_bytes
+                .fetch_sub(w.len as u64, Ordering::Relaxed);
 
             // The payload is already on stable storage in the log, so read it
             // back from there rather than having kept a second copy in memory.
@@ -797,7 +799,8 @@ impl Wal {
         let seq = {
             let mut file = self.writer.lock();
             file.write_all(&header)?;
-            self.write_pos.fetch_add(HEADER_LEN as u64, Ordering::Relaxed);
+            self.write_pos
+                .fetch_add(HEADER_LEN as u64, Ordering::Relaxed);
             self.issued.fetch_add(1, Ordering::AcqRel) + 1
         };
 
@@ -1296,7 +1299,11 @@ pub fn wal_for(dir: &str) -> Option<Arc<Wal>> {
 /// For [`crate::core::log_writer`], which flushes on a timer for commits that
 /// did not wait for a sync of their own and so has no one database to ask.
 pub fn registered() -> Vec<(String, Arc<Wal>)> {
-    wals().lock().iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    wals()
+        .lock()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
 }
 
 /// Installs the log for `dir`, replacing any previous one.
@@ -1395,9 +1402,7 @@ pub fn open_and_recover(dir: &str) -> io::Result<(Arc<Wal>, RecoveryStats)> {
     register_directory(dir, &wal)?;
 
     let files = wal.clone();
-    let stats = Wal::recover(&wal_path, move |id| {
-        files.files.lock().get(&id).cloned()
-    })?;
+    let stats = Wal::recover(&wal_path, move |id| files.files.lock().get(&id).cloned())?;
 
     // Resume the commit sequence where the previous run left off, so it stays
     // monotonic across restarts and can serve as a durable point-in-time token.
@@ -1449,7 +1454,11 @@ pub fn scan_commit_range(bytes: &[u8]) -> (u64, u64, u64) {
             break;
         }
 
-        let stored_crc = u32::from_le_bytes(header[HEADER_CRC_LEN..HEADER_LEN].try_into().expect("4 bytes"));
+        let stored_crc = u32::from_le_bytes(
+            header[HEADER_CRC_LEN..HEADER_LEN]
+                .try_into()
+                .expect("4 bytes"),
+        );
         let mut digest = CRC.digest();
         digest.update(&header[0..HEADER_CRC_LEN]);
         digest.update(&bytes[offset + HEADER_LEN..offset + HEADER_LEN + len]);
@@ -1513,7 +1522,10 @@ mod tests {
     use super::*;
 
     fn temp_dir() -> tempfile::TempDir {
-        tempfile::Builder::new().prefix("rastdb_wal_").tempdir().unwrap()
+        tempfile::Builder::new()
+            .prefix("rastdb_wal_")
+            .tempdir()
+            .unwrap()
     }
 
     fn read_file(p: &Path) -> Vec<u8> {
@@ -1633,7 +1645,11 @@ mod tests {
 
         wal.commit_txn(txn).unwrap();
 
-        assert_eq!(read_file(&data), b"NEWOLDOLD", "commit applies the overwrite");
+        assert_eq!(
+            read_file(&data),
+            b"NEWOLDOLD",
+            "commit applies the overwrite"
+        );
     }
 
     /// An overwrite whose transaction never commits leaves the old value intact
@@ -1694,7 +1710,8 @@ mod tests {
                 wal.log_in_place(txn, rows_id, i * 4, b"NEWR").unwrap();
                 wal.log_in_place(txn, ptrs_id, i * 4, b"NEWP").unwrap();
             }
-            wal.commit_through(wal.issued.load(Ordering::Acquire)).unwrap();
+            wal.commit_through(wal.issued.load(Ordering::Acquire))
+                .unwrap();
         }
 
         // Nothing reached the files: overwrites wait for the commit.
@@ -1715,8 +1732,15 @@ mod tests {
         .unwrap();
 
         assert_eq!(stats.applied, 0);
-        assert_eq!(stats.rolled_back, 16, "all sixteen writes belong to the statement");
-        assert_eq!(read_file(&rows), vec![b'.'; 64], "no row may be half-updated");
+        assert_eq!(
+            stats.rolled_back, 16,
+            "all sixteen writes belong to the statement"
+        );
+        assert_eq!(
+            read_file(&rows),
+            vec![b'.'; 64],
+            "no row may be half-updated"
+        );
         assert_eq!(read_file(&ptrs), vec![b'.'; 64]);
     }
 
@@ -1913,7 +1937,10 @@ mod tests {
         let dir = temp_dir();
         let wal_path = dir.path().join(DEFAULT_WAL_NAME);
         let data = dir.path().join("sidecar.db");
-        assert!(!data.exists(), "the point of this test is that it is missing");
+        assert!(
+            !data.exists(),
+            "the point of this test is that it is missing"
+        );
 
         let wal = Wal::open(&wal_path).unwrap();
         let id = file_id_for_name("sidecar.db");
@@ -2114,8 +2141,7 @@ mod tests {
 
             {
                 let db = rclite::Arc::new(crate::core::database::Database::new(&dir_str).await);
-                let _ =
-                    exec_sql(&db, "CREATE TABLE torn (id UBIGINT, payload VARCHAR);").await;
+                let _ = exec_sql(&db, "CREATE TABLE torn (id UBIGINT, payload VARCHAR);").await;
                 for id in 1..=4u64 {
                     let sql = format!(
                         "INSERT INTO torn (id, payload) VALUES ({}, '{}');",
@@ -2163,7 +2189,9 @@ mod tests {
                         .expect("u64"),
                 );
                 let payload = String::from_utf8_lossy(
-                    row.get_column("payload", schema).expect("payload").into_slice(),
+                    row.get_column("payload", schema)
+                        .expect("payload")
+                        .into_slice(),
                 )
                 .to_string();
                 assert_eq!(
@@ -2250,16 +2278,24 @@ mod tests {
             before = wal.commit_lsn();
             assert!(before > 0);
 
-            assert!(wal.checkpoint().unwrap(), "the log should have been discarded");
+            assert!(
+                wal.checkpoint().unwrap(),
+                "the log should have been discarded"
+            );
             assert_eq!(
-                std::fs::metadata(dir.path().join(DEFAULT_WAL_NAME)).unwrap().len(),
+                std::fs::metadata(dir.path().join(DEFAULT_WAL_NAME))
+                    .unwrap()
+                    .len(),
                 0,
                 "nothing is left in the log to recover the sequence from"
             );
         }
 
         let (wal, stats) = open_and_recover(&dir_str).unwrap();
-        assert_eq!(stats.last_commit_lsn, 0, "an empty log recovers no sequence");
+        assert_eq!(
+            stats.last_commit_lsn, 0,
+            "an empty log recovers no sequence"
+        );
         assert_eq!(
             wal.commit_lsn(),
             before,
@@ -2452,11 +2488,7 @@ mod tests {
         let _ = crate::core::processor::concurrent_processor::ENABLE_CACHE.set(false);
 
         let db = rclite::Arc::new(crate::core::database::Database::new(&dir).await);
-        let _ = exec_sql(
-            &db,
-            "CREATE TABLE crashy (id UBIGINT, payload VARCHAR);",
-        )
-        .await;
+        let _ = exec_sql(&db, "CREATE TABLE crashy (id UBIGINT, payload VARCHAR);").await;
 
         for id in 1u64.. {
             let sql = format!(
@@ -2496,7 +2528,9 @@ mod tests {
                         .expect("u64"),
                 );
                 let payload = String::from_utf8_lossy(
-                    row.get_column("payload", schema).expect("payload").into_slice(),
+                    row.get_column("payload", schema)
+                        .expect("payload")
+                        .into_slice(),
                 )
                 .to_string();
                 (id, payload)
@@ -2654,7 +2688,9 @@ mod tests {
                     .expect("u64"),
             );
             let payload = String::from_utf8_lossy(
-                row.get_column("payload", schema).expect("payload").into_slice(),
+                row.get_column("payload", schema)
+                    .expect("payload")
+                    .into_slice(),
             )
             .to_string();
             assert_eq!(payload, payload_for(id), "row {} came back corrupted", id);
@@ -2744,9 +2780,8 @@ mod tests {
 
         rows.into_iter()
             .filter_map(|row| {
-                let id = u64::from_le_bytes(
-                    row.get_column("id", schema)?.into_slice().try_into().ok()?,
-                );
+                let id =
+                    u64::from_le_bytes(row.get_column("id", schema)?.into_slice().try_into().ok()?);
                 let blob = row.get_column("blob", schema)?;
                 let bytes = blob.into_slice();
                 let distinct: std::collections::BTreeSet<u8> = bytes.iter().copied().collect();
@@ -2754,7 +2789,6 @@ mod tests {
             })
             .collect()
     }
-
 
     /// Same, but with enough traffic to force the log to checkpoint and
     /// truncate underneath. Truncation discards records already applied to their
@@ -2772,7 +2806,10 @@ mod tests {
             let _ = exec_sql(&db, "INSERT INTO t (id, blob) VALUES (1, 'x');").await;
             // Churn until the log has certainly checkpointed at least once.
             for round in 0..400u64 {
-                let sql = format!("UPDATE t SET blob = '{}' WHERE id > 0", blob_of(b'a' + (round % 26) as u8));
+                let sql = format!(
+                    "UPDATE t SET blob = '{}' WHERE id > 0",
+                    blob_of(b'a' + (round % 26) as u8)
+                );
                 let _ = exec_sql(&db, &sql).await;
             }
             if let Some(w) = crate::core::wal::wal_for(&dir_str) {
@@ -2801,7 +2838,10 @@ mod tests {
             let _ = exec_sql(&db, "CREATE TABLE t (id UBIGINT, blob VARCHAR);").await;
             let _ = exec_sql(&db, "INSERT INTO t (id, blob) VALUES (1, 'x');").await;
             let res = exec_sql(&db, "SELECT id FROM t WHERE id > 0").await;
-            assert!(res.len() > 1, "the row must be visible in the session that wrote it");
+            assert!(
+                res.len() > 1,
+                "the row must be visible in the session that wrote it"
+            );
         }
 
         let db = rclite::Arc::new(crate::core::database::Database::new(&dir_str).await);
@@ -2832,7 +2872,11 @@ mod tests {
         let exe = std::env::current_exe().expect("test binary");
 
         let mut child = Command::new(&exe)
-            .args(["--exact", "core::wal::tests::crash_update_child", "--nocapture"])
+            .args([
+                "--exact",
+                "core::wal::tests::crash_update_child",
+                "--nocapture",
+            ])
             .env(CRASH_UPDATE_ENV, &dir_str)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -2880,7 +2924,11 @@ mod tests {
         let exe = std::env::current_exe().expect("test binary");
 
         let mut child = Command::new(&exe)
-            .args(["--exact", "core::wal::tests::crash_child_writer", "--nocapture"])
+            .args([
+                "--exact",
+                "core::wal::tests::crash_child_writer",
+                "--nocapture",
+            ])
             .env(CRASH_DIR_ENV, &dir_str)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -3020,9 +3068,7 @@ mod tests {
         wal.poisoned.store(true, Ordering::Release);
         assert!(wal.commit_txn_deferred(txn).is_err());
     }
-
 }
-
 
 #[cfg(test)]
 mod recovery_race_tests {
@@ -3081,7 +3127,10 @@ mod recovery_race_tests {
     /// itself by design. This pins the arithmetic surviving the moment.
     #[test]
     fn recovery_racing_a_writer_does_not_underflow_the_tail_count() {
-        let dir = tempfile::Builder::new().prefix("rastdb_race_").tempdir().unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("rastdb_race_")
+            .tempdir()
+            .unwrap();
         let path = dir.path().join("race.wal");
         let wal = std::sync::Arc::new(Wal::open(&path).unwrap());
 
@@ -3136,6 +3185,11 @@ mod recovery_race_tests {
         // the true size and failed a test that was behaving correctly.
         let per_record = (HEADER_LEN + 8) + HEADER_LEN;
         let ceiling = ((SEED_RECORDS + WRITER_BUDGET) * per_record) as u64;
-        assert!(size <= ceiling, "the log grew to {} bytes, past its {} ceiling", size, ceiling);
+        assert!(
+            size <= ceiling,
+            "the log grew to {} bytes, past its {} ceiling",
+            size,
+            ceiling
+        );
     }
 }

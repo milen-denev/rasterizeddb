@@ -1,6 +1,6 @@
 use std::{
     arch::x86_64::{_MM_HINT_T0, _mm_prefetch},
-    fmt
+    fmt,
 };
 
 #[cfg(feature = "memory_pool_reuse")]
@@ -102,7 +102,11 @@ fn class_index(alloc_size: usize) -> Option<usize> {
         return None;
     }
     let shift = alloc_size.trailing_zeros();
-    debug_assert_eq!(1usize << shift, alloc_size, "size class must be a power of two");
+    debug_assert_eq!(
+        1usize << shift,
+        alloc_size,
+        "size class must be a power of two"
+    );
     Some((shift - MIN_CLASS_SHIFT) as usize)
 }
 

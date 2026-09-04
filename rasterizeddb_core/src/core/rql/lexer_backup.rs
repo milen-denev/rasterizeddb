@@ -107,9 +107,7 @@ fn parse_restore(words: &[String]) -> Result<BackupStatement, String> {
                         index += 3;
                     }
                     _ => {
-                        return Err(
-                            "FROM must be followed by S3 or SNAPSHOT '<id>'".to_string()
-                        );
+                        return Err("FROM must be followed by S3 or SNAPSHOT '<id>'".to_string());
                     }
                 }
             }
@@ -129,9 +127,9 @@ fn parse_restore(words: &[String]) -> Result<BackupStatement, String> {
                     .get(index + 1)
                     .map(|w| w.to_ascii_uppercase())
                     .ok_or("AT must be followed by LSN or TIME")?;
-                let value = words
-                    .get(index + 2)
-                    .ok_or("AT needs a value, as in AT LSN 918273 or AT TIME '2026-08-20 10:00:00'")?;
+                let value = words.get(index + 2).ok_or(
+                    "AT needs a value, as in AT LSN 918273 or AT TIME '2026-08-20 10:00:00'",
+                )?;
                 match kind.as_str() {
                     "LSN" => {
                         let lsn: u64 = unquote(value)
@@ -141,17 +139,20 @@ fn parse_restore(words: &[String]) -> Result<BackupStatement, String> {
                     }
                     "TIME" | "TIMESTAMP" => {
                         let text = unquote(value);
-                        let unix = crate::core::backup::timeutil::parse_rfc3339(&text)
-                            .ok_or_else(|| {
+                        let unix = crate::core::backup::timeutil::parse_rfc3339(&text).ok_or_else(
+                            || {
                                 format!(
                                     "'{text}' is not a timestamp; expected something like \
                                      '2026-08-20T10:00:00Z' or '2026-08-20 10:00:00'"
                                 )
-                            })?;
+                            },
+                        )?;
                         set_once(&mut target, RecoveryTarget::Time(unix))?;
                     }
                     other => {
-                        return Err(format!("AT {other} is not a recovery target; use LSN or TIME"));
+                        return Err(format!(
+                            "AT {other} is not a recovery target; use LSN or TIME"
+                        ));
                     }
                 }
                 index += 3;
@@ -343,12 +344,21 @@ mod tests {
     #[test]
     fn an_unknown_backup_subject_is_rejected() {
         let err = parse("BACKUP TABLE users").unwrap_err();
-        assert!(err.contains("expected DATABASE, WAL, PRUNE or ROLLOVER"), "{err}");
+        assert!(
+            err.contains("expected DATABASE, WAL, PRUNE or ROLLOVER"),
+            "{err}"
+        );
     }
 
     #[test]
     fn a_rollover_is_parsed() {
-        assert!(matches!(parse("BACKUP ROLLOVER"), Ok(Some(BackupStatement::Rollover))));
-        assert!(matches!(parse("backup rollover"), Ok(Some(BackupStatement::Rollover))));
+        assert!(matches!(
+            parse("BACKUP ROLLOVER"),
+            Ok(Some(BackupStatement::Rollover))
+        ));
+        assert!(matches!(
+            parse("backup rollover"),
+            Ok(Some(BackupStatement::Rollover))
+        ));
     }
 }

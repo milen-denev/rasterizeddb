@@ -31,7 +31,11 @@ static SEQUENCES: std::sync::LazyLock<DashMap<String, AtomicI64>> =
 
 /// The name PostgreSQL gives the sequence behind `t.c`.
 pub fn sequence_name(table: &str, column: &str) -> String {
-    format!("{}_{}_seq", table.to_ascii_lowercase(), column.to_ascii_lowercase())
+    format!(
+        "{}_{}_seq",
+        table.to_ascii_lowercase(),
+        column.to_ascii_lowercase()
+    )
 }
 
 /// The sequence a `nextval('…')` expression names, or `None` when the
@@ -82,7 +86,9 @@ pub fn is_seeded(name: &str) -> bool {
 /// `last` is the largest value already stored, so the next value handed out is
 /// `last + 1`. A fresh table seeds with `0`.
 pub fn seed(name: &str, last: i64) {
-    SEQUENCES.entry(name.to_string()).or_insert_with(|| AtomicI64::new(last));
+    SEQUENCES
+        .entry(name.to_string())
+        .or_insert_with(|| AtomicI64::new(last));
 }
 
 /// The next value of a sequence.
@@ -91,7 +97,9 @@ pub fn seed(name: &str, last: i64) {
 /// process wants and what a reopened one gets only after [`seed`] has run —
 /// hence the seeding pass the insert path makes first.
 pub fn next(name: &str) -> i64 {
-    let entry = SEQUENCES.entry(name.to_string()).or_insert_with(|| AtomicI64::new(0));
+    let entry = SEQUENCES
+        .entry(name.to_string())
+        .or_insert_with(|| AtomicI64::new(0));
     entry.value().fetch_add(1, Ordering::SeqCst) + 1
 }
 
@@ -120,9 +128,20 @@ pub fn max_of_column(
         };
         let bytes = column.data.into_slice();
         let value = match db_type {
-            DbType::I16 => bytes.get(0..2).and_then(|b| b.try_into().ok()).map(i16::from_le_bytes).map(i64::from),
-            DbType::I32 => bytes.get(0..4).and_then(|b| b.try_into().ok()).map(i32::from_le_bytes).map(i64::from),
-            DbType::I64 => bytes.get(0..8).and_then(|b| b.try_into().ok()).map(i64::from_le_bytes),
+            DbType::I16 => bytes
+                .get(0..2)
+                .and_then(|b| b.try_into().ok())
+                .map(i16::from_le_bytes)
+                .map(i64::from),
+            DbType::I32 => bytes
+                .get(0..4)
+                .and_then(|b| b.try_into().ok())
+                .map(i32::from_le_bytes)
+                .map(i64::from),
+            DbType::I64 => bytes
+                .get(0..8)
+                .and_then(|b| b.try_into().ok())
+                .map(i64::from_le_bytes),
             _ => None,
         };
         if let Some(value) = value {
@@ -138,12 +157,18 @@ mod tests {
 
     #[test]
     fn a_nextval_expression_yields_its_sequence_name() {
-        assert_eq!(parse_nextval("nextval('t_id_seq')").as_deref(), Some("t_id_seq"));
+        assert_eq!(
+            parse_nextval("nextval('t_id_seq')").as_deref(),
+            Some("t_id_seq")
+        );
         assert_eq!(
             parse_nextval("nextval('t_id_seq'::regclass)").as_deref(),
             Some("t_id_seq")
         );
-        assert_eq!(parse_nextval("NEXTVAL(\"t_id_seq\")").as_deref(), Some("t_id_seq"));
+        assert_eq!(
+            parse_nextval("NEXTVAL(\"t_id_seq\")").as_deref(),
+            Some("t_id_seq")
+        );
         assert!(parse_nextval("CURRENT_TIMESTAMP").is_none());
         assert!(parse_nextval("gen_random_uuid()").is_none());
     }

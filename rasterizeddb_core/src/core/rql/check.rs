@@ -74,7 +74,10 @@ impl CheckConstraint {
         }
 
         let read = |at: usize, len: usize| -> Result<String, String> {
-            let end = raw[at..at + len].iter().position(|&b| b == 0).unwrap_or(len - 1);
+            let end = raw[at..at + len]
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(len - 1);
             std::str::from_utf8(&raw[at..at + end])
                 .map(str::to_string)
                 .map_err(|e| format!("invalid UTF-8 in check-constraint record: {}", e))
@@ -105,7 +108,11 @@ pub async fn load<S: StorageIO>(schema_io: Arc<S>) -> SmallVec<[CheckConstraint;
     let mut buffer = vec![0u8; CHECK_SIZE as usize];
     for i in 0..(len / CHECK_SIZE) {
         let mut position = i * CHECK_SIZE;
-        if io.read_data_into_buffer(&mut position, &mut buffer).await.is_err() {
+        if io
+            .read_data_into_buffer(&mut position, &mut buffer)
+            .await
+            .is_err()
+        {
             break;
         }
         match CheckConstraint::from_vec(&buffer) {
@@ -123,14 +130,14 @@ pub async fn load<S: StorageIO>(schema_io: Arc<S>) -> SmallVec<[CheckConstraint;
 }
 
 /// Appends a constraint, superseding any earlier one of the same name.
-pub async fn append<S: StorageIO>(
-    schema_io: Arc<S>,
-    entry: &CheckConstraint,
-) -> io::Result<()> {
+pub async fn append<S: StorageIO>(schema_io: Arc<S>, entry: &CheckConstraint) -> io::Result<()> {
     if entry.expression.len() > MAX_EXPRESSION_LEN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("a check expression may be at most {} characters", MAX_EXPRESSION_LEN),
+            format!(
+                "a check expression may be at most {} characters",
+                MAX_EXPRESSION_LEN
+            ),
         ));
     }
     let io = schema_io.create_new(sidecar_name(&schema_io)).await;
@@ -190,7 +197,11 @@ pub fn split_clause(definition: &str) -> (String, Option<String>) {
 /// The name PostgreSQL would give an unnamed check on `table`.
 pub fn derived_name(table: &str, column: Option<&str>, ordinal: usize) -> String {
     match column {
-        Some(column) => format!("{}_{}_check", table.to_ascii_lowercase(), column.to_ascii_lowercase()),
+        Some(column) => format!(
+            "{}_{}_check",
+            table.to_ascii_lowercase(),
+            column.to_ascii_lowercase()
+        ),
         None => format!("{}_check{}", table.to_ascii_lowercase(), ordinal),
     }
 }
@@ -261,7 +272,10 @@ mod tests {
 
     #[test]
     fn an_unnamed_check_takes_the_name_postgres_would_give_it() {
-        assert_eq!(derived_name("orders", Some("status"), 0), "orders_status_check");
+        assert_eq!(
+            derived_name("orders", Some("status"), 0),
+            "orders_status_check"
+        );
         assert_eq!(derived_name("orders", None, 2), "orders_check2");
     }
 }

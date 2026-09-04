@@ -134,7 +134,13 @@ pub fn split_locking_clause(sql: &str) -> Result<(String, Option<RowLock>), Stri
         format!("{} {}", head, rest)
     };
 
-    Ok((statement, Some(RowLock { strength, behaviour })))
+    Ok((
+        statement,
+        Some(RowLock {
+            strength,
+            behaviour,
+        }),
+    ))
 }
 
 #[cfg(test)]
@@ -195,8 +201,16 @@ mod tests {
             "SELECT c.id FROM job AS c WHERE c.status = 'pending' \
              ORDER BY c.next_attempt_at ASC FOR UPDATE SKIP LOCKED LIMIT 1",
         );
-        assert!(rest.ends_with("LIMIT 1"), "the LIMIT must survive: {}", rest);
-        assert!(!rest.to_ascii_uppercase().contains("FOR UPDATE"), "{}", rest);
+        assert!(
+            rest.ends_with("LIMIT 1"),
+            "the LIMIT must survive: {}",
+            rest
+        );
+        assert!(
+            !rest.to_ascii_uppercase().contains("FOR UPDATE"),
+            "{}",
+            rest
+        );
         assert_eq!(l.unwrap().behaviour, LockWait::Skip);
 
         let (rest, _) = lock("SELECT id FROM t FOR UPDATE OFFSET 5");
@@ -240,7 +254,11 @@ pub fn parse_lock_table(sql: &str) -> Option<Result<LockTable, String>> {
     let upper_rest = rest.to_ascii_uppercase();
     let list_end = crate::core::rql::join::find_keyword(&upper_rest, "IN", 0)
         .into_iter()
-        .chain(crate::core::rql::join::find_keyword(&upper_rest, "NOWAIT", 0))
+        .chain(crate::core::rql::join::find_keyword(
+            &upper_rest,
+            "NOWAIT",
+            0,
+        ))
         .min()
         .unwrap_or(rest.len());
 
@@ -272,7 +290,10 @@ pub fn parse_lock_table(sql: &str) -> Option<Result<LockTable, String>> {
                 "LOCK TABLE ... IN <mode> needs the word MODE, as in `IN SHARE MODE`".to_string(),
             ));
         };
-        let named = upper_after[..mode_end].split_whitespace().collect::<Vec<_>>().join(" ");
+        let named = upper_after[..mode_end]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         mode = match named.as_str() {
             // Readers. `SHARE` blocks writers but not other readers.
             "ACCESS SHARE" | "ROW SHARE" | "SHARE" => TableLockMode::Shared,
@@ -301,7 +322,11 @@ pub fn parse_lock_table(sql: &str) -> Option<Result<LockTable, String>> {
         return Some(Err(format!("'{}' is not part of a LOCK statement", tail)));
     }
 
-    Some(Ok(LockTable { tables, mode, nowait }))
+    Some(Ok(LockTable {
+        tables,
+        mode,
+        nowait,
+    }))
 }
 
 #[cfg(test)]
@@ -330,7 +355,10 @@ mod lock_table_tests {
             parsed("LOCK TABLE a, b").tables,
             vec!["a".to_string(), "b".to_string()]
         );
-        assert_eq!(parsed("LOCK TABLE t IN SHARE MODE").mode, TableLockMode::Shared);
+        assert_eq!(
+            parsed("LOCK TABLE t IN SHARE MODE").mode,
+            TableLockMode::Shared
+        );
         assert_eq!(
             parsed("LOCK TABLE t IN ACCESS SHARE MODE").mode,
             TableLockMode::Shared
@@ -341,7 +369,10 @@ mod lock_table_tests {
         );
         assert!(parsed("LOCK TABLE t IN EXCLUSIVE MODE NOWAIT").nowait);
         // Quoted and schema-qualified names are what an ORM emits.
-        assert_eq!(parsed("LOCK TABLE \"public\".\"t\"").tables, vec!["t".to_string()]);
+        assert_eq!(
+            parsed("LOCK TABLE \"public\".\"t\"").tables,
+            vec!["t".to_string()]
+        );
     }
 
     #[test]
@@ -353,7 +384,11 @@ mod lock_table_tests {
     fn an_unknown_mode_is_refused_rather_than_defaulted() {
         // Defaulting would hand back a weaker lock than asked for while
         // reporting success.
-        assert!(parse_lock_table("LOCK TABLE t IN WEIRD MODE").unwrap().is_err());
+        assert!(
+            parse_lock_table("LOCK TABLE t IN WEIRD MODE")
+                .unwrap()
+                .is_err()
+        );
         assert!(parse_lock_table("LOCK TABLE t IN SHARE").unwrap().is_err());
         assert!(parse_lock_table("LOCK TABLE").unwrap().is_err());
     }
