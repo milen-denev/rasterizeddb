@@ -1668,14 +1668,31 @@ async fn describe_query(
     }
 
     // A `WITH` prefix is stripped and the statement it introduces is described
-    // instead. The CTE bodies decide what the *rows* are, never what the
-    // columns are, so describing the outer query answers the question — and it
-    // does so without building the CTE, which is the part that must not happen
-    // here. If the outer query reads the CTE as a relation the description
-    // falls through to `None` below, since that name genuinely does not exist
-    // yet.
-    if let Ok(Some((_, outer))) = crate::core::rql::cte::split_with(stmt) {
-        if let Some(fields) = Box::pin(describe_resolved(database, &outer, None)).await? {
+    // instead — but the outer query usually reads a CTE *as its source
+    // relation*, and that name is not in `database.tables`. Describing the
+    // outer statement alone therefore answered `None` for every ordinary
+    // `WITH … SELECT … FROM <cte>`: the client got `NoData`, `Execute` sent
+    // the rows anyway, and every field came back unreadable — the right row
+    // count with no columns, which is the quietest way to be wrong.
+    //
+    // So each CTE body is described first and its columns become a relation
+    // the outer statement can be described against, exactly as the derived
+    // table below already does. Describing is not materialising: no CTE is
+    // built, and each body is only resolved for its column types. They are
+    // accumulated in order so a later CTE may read an earlier one, which is
+    // the order `WITH a AS (…), b AS (… FROM a)` is written in.
+    if let Ok(Some((defs, outer))) = crate::core::rql::cte::split_with(stmt) {
+        let mut relations: Vec<(String, ScratchFields)> = Vec::new();
+        for def in &defs {
+            match Box::pin(describe_resolved(database, &def.body, &relations)).await? {
+                Some((columns, _)) => relations.push((def.name.clone(), scratch_fields(&columns))),
+                // A body this cannot resolve leaves the rest unresolvable too.
+                // The outer statement is still tried below: it may not read the
+                // CTE at all, which is the shape that always worked.
+                None => break,
+            }
+        }
+        if let Some(fields) = Box::pin(describe_resolved(database, &outer, &relations)).await? {
             if fields.1 {
                 return Ok(Some(fields));
             }
@@ -1710,29 +1727,12 @@ async fn describe_query(
     // outer statement is rewritten to name the alias as an ordinary relation.
     if let Some((start, end, inner, alias)) = crate::core::rql::cte::next_derived_table(stmt) {
         if !alias.is_empty() {
-            if let Some((columns, _)) = Box::pin(describe_resolved(database, &inner, None)).await? {
-                let mut fields: smallvec::SmallVec<[crate::core::row::schema::SchemaField; 20]> =
-                    smallvec::SmallVec::new();
-                let mut offset = 0u64;
-                for (order, (name, ty)) in columns.iter().enumerate() {
-                    let size = ty.get_size();
-                    fields.push(crate::core::row::schema::SchemaField::new(
-                        name.to_string(),
-                        ty.clone(),
-                        size,
-                        offset,
-                        order as u64,
-                        false,
-                    ));
-                    offset += size as u64;
-                }
+            if let Some((columns, _)) = Box::pin(describe_resolved(database, &inner, &[])).await? {
+                let fields = scratch_fields(&columns);
                 let rewritten = format!("{}{} {}{}", &stmt[..start], alias, alias, &stmt[end..]);
-                if let Some(described) = Box::pin(describe_resolved(
-                    database,
-                    &rewritten,
-                    Some((&alias, &fields)),
-                ))
-                .await?
+                let relations = [(alias.clone(), fields)];
+                if let Some(described) =
+                    Box::pin(describe_resolved(database, &rewritten, &relations)).await?
                 {
                     return Ok(Some(described));
                 }
@@ -1740,7 +1740,33 @@ async fn describe_query(
         }
     }
 
-    return describe_resolved(database, stmt, None).await;
+    return describe_resolved(database, stmt, &[]).await;
+}
+
+/// The columns of a relation that exists only while one statement is described.
+type ScratchFields = smallvec::SmallVec<[crate::core::row::schema::SchemaField; 20]>;
+
+/// Turns a described column list into a schema the planner can resolve names
+/// against.
+///
+/// Offsets are laid out as a real table's would be. Nothing is registered
+/// anywhere: this exists for the length of one describe.
+fn scratch_fields(columns: &[(&'static str, DbType)]) -> ScratchFields {
+    let mut fields: ScratchFields = smallvec::SmallVec::new();
+    let mut offset = 0u64;
+    for (order, (name, ty)) in columns.iter().enumerate() {
+        let size = ty.get_size();
+        fields.push(crate::core::row::schema::SchemaField::new(
+            name.to_string(),
+            ty.clone(),
+            size,
+            offset,
+            order as u64,
+            false,
+        ));
+        offset += size as u64;
+    }
+    fields
 }
 
 /// Describes `SELECT <aggregates> FROM ( … ) alias` without running the inner
@@ -1796,14 +1822,11 @@ fn describe_without_predicate(sql: &str) -> Option<String> {
 async fn describe_resolved(
     database: &Arc<Database>,
     query: &str,
-    // A relation that exists only for this statement — a derived table whose
-    // columns were resolved from its inner query. It is not in
+    // Relations that exist only for this statement — a derived table or a CTE
+    // whose columns were resolved from its own query. They are not in
     // `database.tables` and must not be put there: describing must not
     // materialise anything.
-    derived: Option<(
-        &str,
-        &smallvec::SmallVec<[crate::core::row::schema::SchemaField; 20]>,
-    )>,
+    derived: &[(String, ScratchFields)],
 ) -> io::Result<Option<(Vec<(&'static str, DbType)>, bool)>> {
     let stmt = query.trim();
     if stmt.is_empty() {
@@ -2000,10 +2023,11 @@ async fn describe_resolved(
                 // described as returning no columns, and the client then read
                 // the rows that followed under no resolvable names.
                 let schema_of = |name: &str| {
-                    if let Some((alias, fields)) = derived {
-                        if name.eq_ignore_ascii_case(alias) {
-                            return Some((*fields).clone());
-                        }
+                    if let Some((_, fields)) = derived
+                        .iter()
+                        .find(|(alias, _)| name.eq_ignore_ascii_case(alias))
+                    {
+                        return Some(fields.clone());
                     }
                     database
                         .tables
@@ -2038,8 +2062,9 @@ async fn describe_resolved(
                 None
             } else {
                 derived
-                    .filter(|(alias, _)| qr.table_name.eq_ignore_ascii_case(alias))
-                    .map(|(_, fields)| (*fields).clone())
+                    .iter()
+                    .find(|(alias, _)| qr.table_name.eq_ignore_ascii_case(alias))
+                    .map(|(_, fields)| fields.clone())
                     .or_else(|| crate::core::rql::catalog_views::synthetic_schema(&qr.table_name))
             };
             let real_table = database.tables.get(&qr.table_name);
