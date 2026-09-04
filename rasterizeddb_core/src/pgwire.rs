@@ -269,7 +269,80 @@ const SSL_REQUEST_CODE: i32 = 80877103; // 0x04D2162F (1234, 5679)
 const CANCEL_REQUEST_CODE: i32 = 80877102; // 0x04D2162E (1234, 5678)
 const GSSENC_REQUEST_CODE: i32 = 80877104; // 0x04D21630 (1234, 5680)
 
+tokio::task_local! {
+    /// A second handle on this session's socket, for noticing that the client
+    /// has gone while a statement is running.
+    ///
+    /// A task-local rather than a parameter: the whole session — startup, TLS,
+    /// authentication, the message loop and every statement — runs in one task,
+    /// and threading it through four signatures would touch the TLS and
+    /// non-TLS startup paths for something only the statement path reads.
+    static PEER_WATCH: Option<StdArc<std::net::TcpStream>>;
+}
+
+/// The client's socket, and a duplicate of it to watch.
+///
+/// `try_clone` dups the descriptor, so the copy sees the same connection: a
+/// `peek` on it reports end-of-file when the peer sends FIN, and reports it
+/// whether or not the session is inside TLS, because it is watching the TCP
+/// stream underneath.
+///
+/// Watching is best-effort. If the descriptor cannot be duplicated the session
+/// runs exactly as it did before, with `statement_timeout` as its only bound.
+fn duplicate_for_watch(
+    tcp: TcpStream,
+) -> io::Result<(TcpStream, Option<StdArc<std::net::TcpStream>>)> {
+    let standard = tcp.into_std()?;
+    // Kept as a *std* socket, in non-blocking mode, because it is peeked from
+    // inside the scan rather than awaited: see `StatementCancel::gone`.
+    let watch = standard
+        .try_clone()
+        .and_then(|copy| {
+            copy.set_nonblocking(true)?;
+            Ok(copy)
+        })
+        .map(StdArc::new)
+        .ok();
+    Ok((TcpStream::from_std(standard)?, watch))
+}
+
+/// Whether the client on `socket` has gone, without blocking and without
+/// consuming anything.
+///
+/// `MSG_PEEK` leaves the bytes where they are, which it must: the extended
+/// protocol pipelines Parse/Bind/Describe/Execute/Sync, and a check that
+/// consumed them would steal protocol messages from the session.
+fn client_has_gone(socket: &std::net::TcpStream) -> bool {
+    let mut byte = [0u8; 1];
+    match socket.peek(&mut byte) {
+        // Readable and empty is end-of-file: the peer sent FIN.
+        Ok(0) => true,
+        // Bytes waiting, so the client is still there.
+        Ok(_) => false,
+        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => false,
+        // A reset — which is what an abandoned client with unread data sends —
+        // or any other error: this socket will not come back.
+        Err(_) => true,
+    }
+}
+
 async fn handle_connection(
+    catalog: Arc<DatabaseCatalog>,
+    tcp: TcpStream,
+    acceptor: Option<TlsAcceptor>,
+    tls_mode: TlsMode,
+    auth: AuthConfig,
+) -> io::Result<()> {
+    let (tcp, watch) = duplicate_for_watch(tcp)?;
+    PEER_WATCH
+        .scope(
+            watch,
+            handle_connection_inner(catalog, tcp, acceptor, tls_mode, auth),
+        )
+        .await
+}
+
+async fn handle_connection_inner(
     catalog: Arc<DatabaseCatalog>,
     mut tcp: TcpStream,
     acceptor: Option<TlsAcceptor>,
@@ -467,7 +540,112 @@ where
     };
 
     send_startup_responses(stream).await?;
-    run_message_loop(catalog, &database, auth.clone(), principal, stream).await
+    let startup_timeout = startup_statement_timeout(parameters);
+    run_message_loop(
+        catalog,
+        &database,
+        auth.clone(),
+        principal,
+        stream,
+        startup_timeout,
+    )
+    .await
+}
+
+#[cfg(test)]
+mod peer_watch_tests {
+    use super::client_has_gone;
+
+    /// The assumption the whole disconnect check rests on: a duplicate of the
+    /// accepted socket reports the peer's departure.
+    #[test]
+    fn a_duplicate_descriptor_sees_the_client_go() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("addr");
+        let client = std::net::TcpStream::connect(address).expect("connect");
+        let (accepted, _) = listener.accept().expect("accept");
+
+        let watch = accepted.try_clone().expect("dup");
+        watch.set_nonblocking(true).expect("nonblocking");
+
+        assert!(!client_has_gone(&watch), "the client is still connected");
+
+        drop(client);
+        // The close travels through the loopback; give it a moment.
+        for _ in 0..200 {
+            if client_has_gone(&watch) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("a departed client was never noticed on the duplicate descriptor");
+    }
+}
+
+/// `statement_timeout` as the StartupMessage asked for it.
+///
+/// Drivers set this at connection time rather than with a `SET` roundtrip —
+/// sea-orm's `ConnectOptions::statement_timeout` becomes libpq's
+/// `options=-c statement_timeout=…`, and its documentation says so — so an
+/// implementation that only honoured `SET` would leave every sea-orm
+/// application unprotected while looking correct from `psql`.
+///
+/// Both spellings are accepted: the parameter on its own, which PostgreSQL
+/// allows for any GUC, and inside `options`.
+fn startup_statement_timeout(parameters: &HashMap<String, String>) -> Option<u64> {
+    if let Some(direct) = parameters.get("statement_timeout") {
+        if let Some(ms) = parse_statement_timeout(direct) {
+            return Some(ms);
+        }
+    }
+
+    // `-c name=value`, `-cname=value` and `--name=value`, space separated. A
+    // backslash escapes a space, which is how libpq carries a value containing
+    // one; nothing here needs that, but consuming it keeps the split honest.
+    let options = parameters.get("options")?;
+    let mut fields: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut escaped = false;
+    for ch in options.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch.is_whitespace() {
+            if !current.is_empty() {
+                fields.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(ch);
+        }
+    }
+    if !current.is_empty() {
+        fields.push(current);
+    }
+
+    let mut index = 0usize;
+    while index < fields.len() {
+        let field = fields[index].as_str();
+        // `-c` with the setting in the next field, or joined to it.
+        let setting = if field == "-c" || field == "--" {
+            index += 1;
+            fields.get(index).map(String::as_str)
+        } else if let Some(rest) = field.strip_prefix("--") {
+            Some(rest)
+        } else {
+            field.strip_prefix("-c")
+        };
+        if let Some((name, value)) = setting.and_then(|s| s.split_once('=')) {
+            if name.trim().eq_ignore_ascii_case("statement_timeout") {
+                if let Some(ms) = parse_statement_timeout(value) {
+                    return Some(ms);
+                }
+            }
+        }
+        index += 1;
+    }
+    None
 }
 
 /// Who a session is, as established at start-up.
@@ -548,11 +726,16 @@ async fn run_message_loop<S>(
     auth: AuthConfig,
     principal: Principal,
     stream: &mut S,
+    startup_statement_timeout: Option<u64>,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut state = SessionState::new(catalog, database.name.clone(), auth, principal);
+    // Applied before the first statement, so a driver that set it at connection
+    // time is protected by it from the very first query rather than from
+    // whenever it happens to issue a `SET`.
+    state.statement_timeout_ms = startup_statement_timeout;
     // A connection that drops mid-transaction must not leave it running: it
     // would hold back reclamation forever and its versions would never resolve.
     // The loop returns from several places, so the cleanup is a guard rather
@@ -693,6 +876,13 @@ struct SessionState {
     /// What `SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY` set, and
     /// what a `BEGIN` with no access mode of its own inherits.
     default_read_only: bool,
+    /// `SET statement_timeout` for this session, in milliseconds.
+    ///
+    /// `None` means the session never set one; zero means explicitly disabled,
+    /// which is PostgreSQL's default and its way of spelling "no limit". Kept
+    /// as milliseconds because that is the unit `SHOW` reports when the value
+    /// carries no unit of its own.
+    statement_timeout_ms: Option<u64>,
     /// `SET synchronous_commit = off` for this session, if it set one.
     ///
     /// `None` means follow the server, which is what a session that never asks
@@ -885,6 +1075,7 @@ impl SessionState {
             transaction: None,
             default_isolation: IsolationLevel::default(),
             default_read_only: false,
+            statement_timeout_ms: None,
             synchronous_commit: None,
             statement_tx: None,
             statement_failed: false,
@@ -1354,7 +1545,7 @@ where
         }
     };
 
-    execute_single_statement(
+    execute_recorded(
         database,
         state,
         stream,
@@ -2269,6 +2460,148 @@ where
     }
 }
 
+/// Runs one statement and records what it cost.
+///
+/// The wrapper rather than [`execute_single_statement`] itself, because that
+/// function returns early on several refusals — a `LOCK TABLE` outside a block,
+/// a CTE it cannot materialise — and a statement that was refused is exactly
+/// the one someone reading `SHOW QUERIES` is looking for. Both protocols enter
+/// here: the simple query loop and the extended protocol's `Execute`.
+/// Runs one statement under this session's cancel signal.
+///
+/// The signal is established here, around the whole of the work — above the
+/// statistics machinery and outside every one of its exits. That placement is
+/// deliberate: statement recording can be off at build time *or* switched off
+/// live, and scoping the signal inside the recorded path would mean turning
+/// statement statistics off silently stopped enforcing `statement_timeout`.
+/// An operator turning off an observability feature must not disarm a safety
+/// one.
+async fn execute_recorded<S>(
+    database: &Arc<Database>,
+    state: &mut SessionState,
+    stream: &mut S,
+    stmt: &str,
+    result_formats: &[i16],
+    omit_description: bool,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    // Zero means no limit, as it does in PostgreSQL, so it produces no
+    // deadline rather than one that has already passed.
+    let deadline = state
+        .statement_timeout_ms
+        .filter(|ms| *ms > 0)
+        .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
+    // The scan asks this per batch, in the same place it checks the deadline.
+    let cancel = {
+        let base = crate::core::cancel::StatementCancel::new(deadline);
+        match PEER_WATCH.try_with(|w| w.clone()).ok().flatten() {
+            Some(watch) => {
+                std::sync::Arc::new(base.watching(Box::new(move || client_has_gone(&watch))))
+            }
+            None => std::sync::Arc::new(base),
+        }
+    };
+
+    // The statement is **not** dropped when the client goes: it is asked to
+    // stop, and unwinds through the ordinary scan-error path. Dropping it would
+    // cancel at an await point with none of its cleanup done — a CTE's
+    // temporary tables never dropped, an autocommit transaction left
+    // `InProgress` holding back reclamation.
+    crate::core::cancel::STATEMENT_CANCEL
+        .scope(
+            cancel,
+            execute_recorded_inner(
+                database,
+                state,
+                stream,
+                stmt,
+                result_formats,
+                omit_description,
+            ),
+        )
+        .await
+}
+
+async fn execute_recorded_inner<S>(
+    database: &Arc<Database>,
+    state: &mut SessionState,
+    stream: &mut S,
+    stmt: &str,
+    result_formats: &[i16],
+    omit_description: bool,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    // Whether this statement failed, and why, belongs to this statement. Reset
+    // here rather than inside, where the reset sat below the early returns and
+    // so left the previous statement's flag standing for them.
+    state.statement_failed = false;
+    state.statement_error = None;
+
+    #[cfg(not(feature = "query_stats"))]
+    {
+        return execute_single_statement(
+            database,
+            state,
+            stream,
+            stmt,
+            result_formats,
+            omit_description,
+        )
+        .await;
+    }
+
+    #[cfg(feature = "query_stats")]
+    {
+        let Some(recording) = crate::core::query_stats::begin() else {
+            return execute_single_statement(
+                database,
+                state,
+                stream,
+                stmt,
+                result_formats,
+                omit_description,
+            )
+            .await;
+        };
+
+        // Boxed for the same reason the inner call is: this path is deep, and
+        // the future of a statement is the largest one in the process.
+        let running = Box::pin(execute_single_statement(
+            database,
+            state,
+            stream,
+            stmt,
+            result_formats,
+            omit_description,
+        ));
+        let result = crate::core::query_stats::observe(recording.probe(), running).await;
+
+        let failure = state
+            .statement_failed
+            // A failure always carries its message — `fail_statement` records
+            // one — but the record should say a statement failed even if some
+            // path one day reports one without.
+            .then(|| {
+                state
+                    .statement_error
+                    .clone()
+                    .unwrap_or_else(|| "failed".to_string())
+            });
+        crate::core::query_stats::finish(
+            recording,
+            stmt,
+            &state.database_name,
+            &state.principal.name,
+            failure.as_deref(),
+        );
+        result
+    }
+}
+
 /// Runs one statement, materialising any `WITH` clause first.
 ///
 /// The temporary tables a CTE materialises into are dropped on **every** exit
@@ -2450,8 +2783,6 @@ where
             state.statement_tx = Some(tx);
         }
     }
-    state.statement_failed = false;
-
     let result = Box::pin(execute_single_statement_inner(
         database,
         state,
@@ -2469,9 +2800,21 @@ where
     // *which* statement the engine refused. Logged once, at the boundary where
     // the outcome is known.
     if state.statement_failed {
-        match state.statement_error.take() {
-            Some(reason) => log::error!("Statement failed ({}): {}", reason, effective),
-            None => log::error!("Statement failed: {}", effective),
+        // Read rather than taken: `execute_recorded` needs the same message to
+        // put in the statement log, and clears it before the next statement.
+        match state.statement_error.as_deref() {
+            // Redacted: a store statement that fails would otherwise write its
+            // S3 keys to the server log, and a failing one is the likeliest to
+            // be retried, logged again, and pasted into a bug report.
+            Some(reason) => log::error!(
+                "Statement failed ({}): {}",
+                reason,
+                crate::core::redact::statement(effective)
+            ),
+            None => log::error!(
+                "Statement failed: {}",
+                crate::core::redact::statement(effective)
+            ),
         }
     }
 
@@ -3072,7 +3415,16 @@ fn sqlstate_for(message: &str) -> &'static str {
     let m = message.to_ascii_lowercase();
     let has = |needle: &str| m.contains(needle);
 
-    if has("could not serialize access") {
+    // `57014` is `query_canceled`, which is what a driver watches for to tell
+    // "the server gave up on this" apart from "this statement is wrong".
+    if has("canceling statement") {
+        "57014"
+    } else if has("could not serialize access") || has("reclaimed while the query was reading") {
+        // The reclaimed-row guard is a serialisation failure in the sense that
+        // matters to a client: the statement applied nothing and re-running it
+        // is the correct response. `40001` says exactly that, and every
+        // Postgres-shaped retry loop already branches on it — which beats every
+        // caller learning one more bespoke message to match on.
         "40001"
     } else if has("duplicate value for unique") || has("duplicate key value") {
         "23505"
@@ -3210,7 +3562,7 @@ where
     let statements = split_statements(query);
 
     for stmt in statements {
-        execute_single_statement(database, state, stream, &stmt, &[], false).await?;
+        execute_recorded(database, state, stream, &stmt, &[], false).await?;
         // PostgreSQL stops a multi-statement string at the first failure.
         // Inside a block the poisoning refuses the rest; outside one nothing
         // did, so a migration sent as one string had its first statement fail
@@ -3839,6 +4191,35 @@ fn is_set_local(lower: &str) -> bool {
         .is_some_and(|rest| rest.trim_start().starts_with("local "))
 }
 
+/// `statement_timeout`'s value, in milliseconds.
+///
+/// PostgreSQL takes a bare number as milliseconds, or a number with a unit.
+/// `DEFAULT` and `0` both mean no limit, which is stored as zero rather than
+/// as absence so that `SHOW` can tell "set to nothing" from "never set".
+fn parse_statement_timeout(value: &str) -> Option<u64> {
+    let v = value.trim().trim_matches('\'').trim_matches('"').trim();
+    if v.eq_ignore_ascii_case("default") {
+        return Some(0);
+    }
+    // A value that is all digits has no unit; `find` returning `None` is that
+    // case, not a failure.
+    let digits_end = v.find(|c: char| !c.is_ascii_digit()).unwrap_or(v.len());
+    if digits_end == 0 {
+        return None;
+    }
+    let (number, unit) = (&v[..digits_end], v[digits_end..].trim());
+    let n: u64 = number.parse().ok()?;
+    let multiplier = match unit.to_ascii_lowercase().as_str() {
+        "" | "ms" => 1,
+        "s" => 1_000,
+        "min" => 60_000,
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        _ => return None,
+    };
+    n.checked_mul(multiplier)
+}
+
 fn strip_setting(lower: &str, key: &str) -> Option<Option<String>> {
     let s = lower.trim().trim_end_matches(';').trim();
 
@@ -3933,6 +4314,41 @@ where
                         &format!(
                             "invalid value for parameter \"synchronous_commit\": \"{}\" \
                              (use on, off, local, remote_write or remote_apply)",
+                            value
+                        ),
+                    )
+                    .await?;
+                }
+            },
+        }
+        return Ok(true);
+    }
+
+    // `statement_timeout` is a real setting here too, for the same reason
+    // `synchronous_commit` is: something enforces it. Answered before the
+    // generic branch below, which would acknowledge it and drop it — which is
+    // what it did, while `SHOW` then reported `0`, so a client that set one was
+    // told it had not taken and an operator was told statements were unbounded
+    // when they had just been bounded.
+    if let Some(rest) = strip_setting(&s_lower, "statement_timeout") {
+        match rest {
+            // `RESET`, or `SET … = DEFAULT`: back to the server's default,
+            // which is no limit.
+            None => {
+                state.statement_timeout_ms = None;
+                send_command_complete(stream, "SET").await?;
+            }
+            Some(value) => match parse_statement_timeout(&value) {
+                Some(ms) => {
+                    state.statement_timeout_ms = Some(ms);
+                    send_command_complete(stream, "SET").await?;
+                }
+                None => {
+                    send_error_response(
+                        stream,
+                        "22023",
+                        &format!(
+                            "invalid value for parameter \"statement_timeout\": \"{}\"",
                             value
                         ),
                     )
@@ -4105,9 +4521,18 @@ fn show_parameter(state: &SessionState, key: &str) -> Option<String> {
         // server's otherwise.
         "synchronous_commit" => on_off(state.synchronous_commit()).to_string(),
         "wal_writer_delay" => format!("{}ms", crate::wal_writer_delay_ms()),
-        "statement_timeout" | "lock_timeout" | "idle_in_transaction_session_timeout" => {
-            "0".to_string()
-        }
+        // Reported as this session set it. It used to answer a hardcoded "0"
+        // whatever had been set, which reads as "no timeout configured" — so a
+        // client that set one, and an operator checking whether statements were
+        // bounded, were both told the opposite of the truth.
+        "statement_timeout" => match state.statement_timeout_ms {
+            Some(ms) => format!("{}ms", ms),
+            None => "0".to_string(),
+        },
+        // Still unenforced, and still answered as disabled, which is what they
+        // are. Not grouped with `statement_timeout` any more precisely because
+        // that one now means something.
+        "lock_timeout" | "idle_in_transaction_session_timeout" => "0".to_string(),
         _ => return None,
     };
     Some(value)
@@ -5583,6 +6008,13 @@ mod sqlstate_tests {
             ),
             (
                 "could not serialize access due to concurrent update of row 3 by transaction 9",
+                "40001",
+            ),
+            // The reclaimed-row guard. PMS keys its read retry on this code, so
+            // the phrase and the code are a contract, not an implementation
+            // detail — the exact text `EvalError::RowMovedUnderScan` produces.
+            (
+                "a row was reclaimed while the query was reading it; retry the statement",
                 "40001",
             ),
             ("relation 'nope' does not exist", "42P01"),

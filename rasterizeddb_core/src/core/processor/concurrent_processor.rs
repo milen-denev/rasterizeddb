@@ -494,6 +494,15 @@ impl ConcurrentProcessor {
         eval_error: Arc<CacheGuard<AtomicU8>>,
         // Which row versions the workers may emit.
         visibility: Visibility,
+        // Why this statement should stop, if it should.
+        //
+        // Passed in rather than read from the task-local: a task-local does not
+        // cross `task::spawn`, and the workers are where the per-row work
+        // actually happens. Checking only in the dispatch loop below was not
+        // enough — dispatch hands out every batch long before the workers have
+        // finished them, so the check stopped running while the scan was still
+        // going.
+        cancel: Option<StdArc<crate::core::cancel::StatementCancel>>,
         // `ORDER BY … LIMIT k`: each worker keeps only its own best `k` rows.
         //
         // A worker's discarded row cannot be in the global best `k` — it lost
@@ -580,6 +589,7 @@ impl ConcurrentProcessor {
             // cache line every worker would otherwise write to per row, which is
             // the contention the `rows_scanned` counter is batched to avoid.
             let mut counted: u64 = 0;
+            let cancel_ref = cancel.as_ref().map(StdArc::clone);
             let limit_opt = limit;
             let visibility_ref = visibility.clone();
             // Sampled once per worker rather than per row: it is a bound, not a
@@ -631,6 +641,21 @@ impl ConcurrentProcessor {
                 let mut acc_pairs: Vec<(Row, RowPointer)> = Vec::new();
 
                 while let Ok(pointers) = work_rx.recv().await {
+                    // Asked before the batch rather than after: the point is not
+                    // to finish this batch faster but to stop starting new ones.
+                    // The error is recorded before the stop flag, so the
+                    // statement fails through `check_worker_outcome` rather than
+                    // returning the rows it happened to reach.
+                    if let Some(reason) = cancel_ref.as_ref().and_then(|c| c.tripped()) {
+                        let _ = eval_error_ref.compare_exchange(
+                            0,
+                            reason.eval_error().to_code(),
+                            std::sync::atomic::Ordering::AcqRel,
+                            std::sync::atomic::Ordering::Acquire,
+                        );
+                        stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                        break;
+                    }
                     let batch_read_start = std::time::Instant::now();
 
                     if no_filter {
@@ -1050,6 +1075,36 @@ impl ConcurrentProcessor {
             }
 
             if pointers.is_empty() {
+                break;
+            }
+
+            // The candidate rows this statement has had to look at. Counted
+            // here rather than in the workers: this loop runs in the task that
+            // is executing the statement, so the counter is reachable without
+            // being passed down, and one add per batch is not a contended cache
+            // line in the per-row loop. Pointers the filter index excluded were
+            // dropped inside the iterator and so are not counted, which is what
+            // makes the figure show that the index worked.
+            #[cfg(feature = "query_stats")]
+            crate::core::query_stats::note_rows_scanned(pointers.len() as u64);
+
+            // Whether this statement is still allowed to run. Checked here, in
+            // the task executing it, because the signal is a task-local and
+            // does not cross the `task::spawn` that made the workers.
+            //
+            // The error is recorded BEFORE the stop flag is set, and the order
+            // is the whole point: `check_worker_outcome` reads the error, and a
+            // stop flag on its own is indistinguishable from a scan that
+            // finished — so a cancelled statement would return the rows it
+            // happened to reach as though they were the complete answer.
+            if let Some(reason) = crate::core::cancel::tripped() {
+                let _ = eval_error.compare_exchange(
+                    0,
+                    reason.eval_error().to_code(),
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                );
+                stop_processing.store(true, std::sync::atomic::Ordering::Relaxed);
                 break;
             }
 
@@ -1480,6 +1535,7 @@ impl ConcurrentProcessor {
             Arc::clone(&reading_time_total),
             Arc::clone(&eval_error),
             visibility,
+            crate::core::cancel::current(),
             None,
             Some(Arc::clone(&counter)),
         )
@@ -1618,6 +1674,7 @@ impl ConcurrentProcessor {
             Arc::clone(&reading_time_total),
             Arc::clone(&eval_error),
             visibility.clone(),
+            crate::core::cancel::current(),
             // Applied even while the row pointers are being collected.
             //
             // This used to be `if tx_rp.is_some() { None }`, on the reasoning
@@ -1844,6 +1901,7 @@ impl ConcurrentProcessor {
             Arc::clone(&reading_time_total),
             Arc::clone(&eval_error),
             visibility.clone(),
+            crate::core::cancel::current(),
             // Bytes mode never sorts — `process_into_bytes` falls back to the
             // row-mode path when an ORDER BY is asked for — so there is no key
             // to keep a top-N by.
@@ -2015,6 +2073,25 @@ impl ConcurrentProcessor {
             }
 
             if pointers.is_empty() {
+                break;
+            }
+
+            // As in the row-mode dispatcher above: the candidate rows this
+            // statement read, counted once per batch in the task running it.
+            #[cfg(feature = "query_stats")]
+            crate::core::query_stats::note_rows_scanned(pointers.len() as u64);
+
+            // As in the row-mode dispatcher above: the error is recorded before
+            // the stop flag, so a cancelled scan fails rather than returning a
+            // prefix of its rows as a complete answer.
+            if let Some(reason) = crate::core::cancel::tripped() {
+                let _ = eval_error.compare_exchange(
+                    0,
+                    reason.eval_error().to_code(),
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                );
+                stop_processing.store(true, std::sync::atomic::Ordering::Relaxed);
                 break;
             }
 
