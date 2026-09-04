@@ -196,6 +196,9 @@ pub struct LocalStorageProvider {
     // Monotonic generation counter; bumped whenever the mmap is refreshed.
     // Used to cheaply invalidate per-thread cached mmap handles.
     pub(crate) mmap_gen: CacheGuard<AtomicU64>,
+    /// Identifies this provider's mapping in the per-thread cache, for the life
+    /// of the process. See [`next_mmap_key`].
+    pub(crate) mmap_key: u64,
     pub(crate) hash: u32,
     _locked: CacheGuard<AtomicBool>,
     // true when there is data in temp_file waiting to be flushed
@@ -249,6 +252,7 @@ impl Clone for LocalStorageProvider {
                 .into(),
             _memory_map: Arc::new(arc_swap::ArcSwap::new(map)),
             mmap_gen: AtomicU64::new(1).into(),
+            mmap_key: next_mmap_key(),
             hash: CRC.checksum(format!("{}+++{}", self.location, self.table_name).as_bytes()),
             _locked: AtomicBool::new(false).into(),
             temp_has_data: AtomicBool::new(self.temp_has_data.load(Ordering::Relaxed)).into(),
@@ -288,6 +292,30 @@ thread_local! {
     // IMPORTANT: this must be keyed per provider; otherwise different providers would
     // incorrectly share a cached mmap within the same thread.
     static TLS_MMAP_CACHE: RefCell<(u64, u64, Option<Arc<Mmap>>)> = RefCell::new((0, 0, None));
+}
+
+/// Hands each provider a key that is never reused.
+///
+/// The per-thread cache above used to key on `Arc::as_ptr(&self._memory_map)`,
+/// which is an address — and an address is only unique among the objects alive
+/// at one moment. Drop a provider and build another and the allocator hands
+/// back the same block, so the new provider looked up the old one's entry; with
+/// `mmap_gen` at 1 on both, as it is on every freshly-opened file, the
+/// generation did not tell them apart either and the read was served from the
+/// *previous file's* mapping.
+///
+/// What that looks like from outside is a file whose length is right and whose
+/// bytes belong to a different file. `STORAGE MOVE TABLE` was the clearest
+/// case, because it opens a table's files one after another and drops each
+/// before opening the next: a moved table arrived with its CHECK-constraint
+/// sidecar full of the field sidecar's bytes and the constraint silently
+/// stopped being enforced. Anything that opens files in sequence on one thread
+/// was exposed.
+///
+/// A counter costs the same to read as the pointer did and cannot repeat.
+fn next_mmap_key() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 impl LocalStorageProvider {
@@ -423,6 +451,7 @@ impl LocalStorageProvider {
                 inplace_end: AtomicU64::new(0).into(),
                 _memory_map: map,
                 mmap_gen: AtomicU64::new(1).into(),
+                mmap_key: next_mmap_key(),
                 hash: CRC.checksum(format!("{}+++{}", final_location, table_name).as_bytes()),
                 _locked: AtomicBool::new(false).into(),
                 temp_file_len: AtomicU64::new(temp_len).into(),
@@ -555,6 +584,7 @@ impl LocalStorageProvider {
                 inplace_end: AtomicU64::new(0).into(),
                 _memory_map: map,
                 mmap_gen: AtomicU64::new(1).into(),
+                mmap_key: next_mmap_key(),
                 hash: CRC.checksum(format!("{}+++{}", location_str, "CONFIG_TABLE.db").as_bytes()),
                 _locked: AtomicBool::new(false).into(),
                 temp_file_len: AtomicU64::new(temp_len).into(),
@@ -736,7 +766,7 @@ impl LocalStorageProvider {
 
     #[inline(always)]
     fn with_cached_mmap<R>(&self, f: impl FnOnce(&Mmap) -> R) -> R {
-        let provider_key = Arc::as_ptr(&self._memory_map) as usize as u64;
+        let provider_key = self.mmap_key;
         let generation = self.mmap_gen.load(Ordering::Acquire);
         TLS_MMAP_CACHE.with(|cell| {
             let mut state = cell.borrow_mut();
@@ -1596,6 +1626,7 @@ impl StorageIO for LocalStorageProvider {
                 MmapOptions::new().map(&file_read_mmap).unwrap()
             }))),
             mmap_gen: AtomicU64::new(1).into(),
+            mmap_key: next_mmap_key(),
             hash: CRC.checksum(format!("{}+++{}", final_location, "temp.db").as_bytes()),
             _locked: AtomicBool::new(false).into(),
             temp_has_data: AtomicBool::new(false).into(),
@@ -1746,6 +1777,7 @@ impl StorageIO for LocalStorageProvider {
                 MmapOptions::new().map(&file_read_mmap).unwrap()
             }))),
             mmap_gen: AtomicU64::new(1).into(),
+            mmap_key: next_mmap_key(),
             hash: CRC.checksum(format!("{}+++{}", final_location, name).as_bytes()),
             _locked: AtomicBool::new(false).into(),
             temp_has_data: AtomicBool::new(false).into(),
@@ -2487,5 +2519,87 @@ mod test {
         assert_eq!(&buf1[..], &data[0..100]);
         assert_eq!(&buf2[..], &data[1000..1200]);
         assert_eq!(&buf3[..], &data[4000..4050]);
+    }
+
+    /// A provider's per-thread cache key is never one a dropped provider used.
+    ///
+    /// This is the invariant, and it is the one that broke. The cache was keyed
+    /// on `Arc::as_ptr(&self._memory_map)` — an address, which is unique only
+    /// among the objects alive at one moment. Drop a provider, open another,
+    /// and the allocator hands back the same block; with `mmap_gen` at 1 on
+    /// both, as it is on every freshly-opened file, nothing else told them
+    /// apart and the second file's reads were served from the first file's
+    /// mapping. The read reported success and returned another file's bytes at
+    /// this file's length.
+    ///
+    /// Asserted on the key rather than on the bytes because the bytes only go
+    /// wrong when the allocator actually reuses the block, and whether it does
+    /// is not something a test controls — see
+    /// [`a_reopened_file_does_not_read_the_previous_one`], which exercises the
+    /// same path and did *not* reproduce it in-process even though a server
+    /// reproduced it every time.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropped_providers_cache_key_is_never_reissued() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        std::fs::write(dir.path().join("first.db"), b"A").unwrap();
+        std::fs::write(dir.path().join("second.db"), b"B").unwrap();
+
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..64 {
+            for name in ["first.db", "second.db"] {
+                let io = LocalStorageProvider::new(&root, Some(name)).await;
+                assert!(
+                    seen.insert(io.mmap_key),
+                    "{name} was given a cache key a dropped provider already used, so a \
+                     read through it can be answered from that provider's mapping"
+                );
+                // A clone maps the file again rather than sharing the handle,
+                // so it is a second mapping and needs a key of its own — two
+                // containers that can be remapped independently must not share
+                // one cache entry.
+                assert!(
+                    seen.insert(io.clone().mmap_key),
+                    "a clone reused a key, but it holds a mapping of its own"
+                );
+            }
+        }
+    }
+
+    /// The same hazard from the outside: two files read one after the other,
+    /// each provider dropped before the next is opened, must each return their
+    /// own bytes.
+    ///
+    /// Kept even though it does not reproduce the bug in-process. It is the
+    /// shape `copy_between` uses — siblings off one parent provider, opened and
+    /// dropped in turn — and a future change that breaks the read path in a way
+    /// the key invariant does not cover fails here.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reopened_file_does_not_read_the_previous_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+
+        // Different lengths, so a wrong answer is a wrong *prefix* rather than
+        // only wrong bytes — the way the real corruption showed up.
+        let first = vec![b'A'; 306];
+        let second = vec![b'B'; 643];
+        std::fs::write(dir.path().join("first.db"), &first).unwrap();
+        std::fs::write(dir.path().join("second.db"), &second).unwrap();
+
+        // Opened as a table's files are: siblings off one parent provider, each
+        // dropped at the end of its turn before the next is opened. That is the
+        // shape `copy_between` uses, and the shape that reproduced.
+        let parent = LocalStorageProvider::new(&root, Some("parent.db")).await;
+        for pass in 0..64 {
+            for (name, expected) in [("first.db", &first), ("second.db", &second)] {
+                let io = parent.create_new(name.to_string()).await;
+                let mut buffer = vec![0u8; expected.len()];
+                io.read_data_into_buffer(&mut 0, &mut buffer).await.unwrap();
+                assert_eq!(
+                    &buffer, expected,
+                    "pass {pass}: {name} returned another file's bytes at its own length"
+                );
+            }
+        }
     }
 }
