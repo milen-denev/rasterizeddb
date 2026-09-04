@@ -728,13 +728,52 @@ pub struct TransformerProcessor<'a> {
     comparison_program: SmallVec<[EvalOp; 24]>,
     /// Parentheses opening before the next comparison to be added.
     pending_opens: u8,
+    /// The boolean program could not be represented, so no evaluation using it
+    /// may be trusted. Turned into an error at the next `execute_row` rather
+    /// than allowed to fall back to the flat walk, which ignores parentheses
+    /// and would be a second silently wrong answer.
+    program_overflowed: bool,
+    /// The program no longer matches the transformers, and has to be rebuilt
+    /// before the next evaluation.
+    ///
+    /// Building it is O(comparisons), and it used to be rebuilt by every
+    /// `add_comparison` — so parsing a clause with n comparisons cost O(n²) and
+    /// threw away n-1 of the programs it built. On 2026-09-02 that wedged the
+    /// 192.168.1.7 node: one runtime worker spent 13 minutes of CPU inside
+    /// `refresh_comparison_program` while the accept loop starved, so the port
+    /// listened and answered nobody. Measured before the fix, on a clause of
+    /// `(a = i AND b = 'xi')` groups ORed together:
+    ///
+    /// ```text
+    ///    800 comparisons    ~100 ms
+    ///   1600 comparisons    ~500 ms
+    ///   3200 comparisons   ~2100 ms      quadruples as n doubles
+    /// ```
+    ///
+    /// Deferring the build to the first evaluation makes it O(n) once. The flag
+    /// is checked per row rather than per comparison, which is one predictable
+    /// branch against work that is already per-row.
+    program_dirty: bool,
 }
 
 /// One step of the compiled boolean program, in postfix order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvalOp {
     /// Push the comparison result at this index.
-    Value(u16),
+    ///
+    /// `u32`, not `u16`. As a `u16` the index was produced by `index as u16`,
+    /// which truncates: a clause with more than 65,535 comparisons wrapped to
+    /// 0, 1, 2 … and built a *valid-looking* program over the wrong
+    /// comparisons. Nothing detected it — every wrapped index resolves to a
+    /// result that exists, so the "plan and results disagree" fallback below
+    /// never fired — and the predicate silently stopped discriminating.
+    ///
+    /// It was reachable from ordinary SQL: a correlated `EXISTS` is rewritten
+    /// to `IN` and the inner query is materialised one literal per inner row,
+    /// so `EXISTS (SELECT 1 FROM t WHERE t.k = outer.k)` over a table of more
+    /// than 65,535 rows returned *every* outer row, and so did `NOT EXISTS`.
+    /// Measured boundary: 65,535 correct, 65,536 wrong.
+    Value(u32),
     And,
     Or,
 }
@@ -752,6 +791,8 @@ impl<'a> TransformerProcessor<'a> {
             max_result_store_index: 0,
             comparison_program: SmallVec::new(),
             pending_opens: 0,
+            program_dirty: false,
+            program_overflowed: false,
         }
     }
 
@@ -777,6 +818,7 @@ impl<'a> TransformerProcessor<'a> {
         // A worker reusing a compiled plan must recompile the boolean program
         // with it, or its evaluation silently falls back to the flat form.
         self.refresh_comparison_program();
+        self.program_dirty = false;
         self.ensure_intermediate_capacity();
     }
 
@@ -835,7 +877,7 @@ impl<'a> TransformerProcessor<'a> {
                 break;
             }
         }
-        self.refresh_comparison_program();
+        self.program_dirty = true;
     }
 
     /// Compiles the boolean structure to postfix by shunting-yard, so the
@@ -888,7 +930,17 @@ impl<'a> TransformerProcessor<'a> {
                 ops.push(StackOp::LParen);
             }
 
-            out.push(EvalOp::Value(index as u16));
+            let Ok(slot) = u32::try_from(index) else {
+                // Unreachable in practice — it would take four billion
+                // comparisons, and the transformers themselves would exhaust
+                // memory long first. Handled anyway, because the last time
+                // this width was assumed sufficient the overflow was silent
+                // and wrong for two years' worth of large `EXISTS` queries.
+                self.program_overflowed = true;
+                self.comparison_program.clear();
+                return;
+            };
+            out.push(EvalOp::Value(slot));
 
             for _ in 0..*closes {
                 while let Some(top) = ops.pop() {
@@ -961,7 +1013,9 @@ impl<'a> TransformerProcessor<'a> {
         transformer.group_opens = self.pending_opens;
         self.pending_opens = 0;
         self.transformers.push_back(transformer);
-        self.refresh_comparison_program();
+        // Marked, not rebuilt: see `program_dirty`. Rebuilding here made
+        // parsing quadratic in the number of comparisons.
+        self.program_dirty = true;
     }
 
     // New: Ensure intermediate_results has enough capacity once (no per-row scans).
@@ -986,6 +1040,19 @@ impl<'a> TransformerProcessor<'a> {
         comparison_results: &mut SmallVec<[(bool, Option<Next>); 20]>,
     ) -> Result<bool, EvalError> {
         comparison_results.clear();
+        // The one place the program is guaranteed to be current before it is
+        // read. `evaluate_comparison_results` takes `&self` and cannot rebuild,
+        // and every other entry point would have to remember to; this cannot be
+        // forgotten, because nothing evaluates without coming through here.
+        if self.program_dirty {
+            self.refresh_comparison_program();
+            self.program_dirty = false;
+        }
+        // Failing the statement is the whole point: the alternative is the flat
+        // walk, which cannot see the parentheses the program existed to honour.
+        if self.program_overflowed {
+            return Err(EvalError::PredicateTooComplex);
+        }
         self.ensure_intermediate_capacity();
 
         for t in self.transformers.iter() {

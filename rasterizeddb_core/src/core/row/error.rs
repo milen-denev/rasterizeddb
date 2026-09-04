@@ -119,6 +119,31 @@ pub enum EvalError {
     /// `WHERE is_active = true` against an unimplemented type must fail the
     /// query, not the worker evaluating it.
     UnsupportedType,
+    /// The statement outlived `statement_timeout`.
+    ///
+    /// Not an evaluation failure like the others, but it travels the same way:
+    /// the scan reports it through the shared atomic and the statement fails
+    /// with it. That is the whole point — a cancelled scan must surface an
+    /// error, because the alternative is returning the rows it happened to
+    /// reach as though they were the complete answer.
+    StatementTimeout,
+    /// The client that asked for this statement is gone.
+    ClientWentAway,
+    /// The `WHERE` clause has more comparisons than the compiled boolean
+    /// program can index.
+    ///
+    /// Reported rather than approximated. The index used to be cast to `u16`,
+    /// so a clause with more than 65,535 comparisons wrapped its indices to
+    /// 0, 1, 2 … and produced a *valid-looking* program over the wrong
+    /// comparisons — the predicate silently stopped discriminating and the
+    /// query returned every row. A correlated `EXISTS` materialises one
+    /// comparison per inner row, so any such subquery over a table above that
+    /// size was quietly ignored. The width is now `u32`; this exists so that
+    /// exceeding even that fails the query instead of answering it wrongly.
+    PredicateTooComplex,
+    /// A row's storage was handed to a writer between the scan reading its
+    /// sort key and reading the rest of it.
+    RowMovedUnderScan,
 }
 
 impl EvalError {
@@ -131,6 +156,16 @@ impl EvalError {
             }
             EvalError::ArithmeticOverflow => "integer out of range",
             EvalError::UnsupportedType => "operation is not supported for this column type",
+            EvalError::StatementTimeout => "canceling statement due to statement timeout",
+            EvalError::ClientWentAway => {
+                "canceling statement because the client closed the connection"
+            }
+            EvalError::PredicateTooComplex => {
+                "the WHERE clause has too many comparisons to evaluate"
+            }
+            EvalError::RowMovedUnderScan => {
+                "a row was reclaimed while the query was reading it; retry the statement"
+            }
         }
     }
 
@@ -143,6 +178,10 @@ impl EvalError {
             EvalError::OperandSizeMismatch => 3,
             EvalError::ArithmeticOverflow => 4,
             EvalError::UnsupportedType => 5,
+            EvalError::StatementTimeout => 6,
+            EvalError::ClientWentAway => 7,
+            EvalError::PredicateTooComplex => 8,
+            EvalError::RowMovedUnderScan => 9,
         }
     }
 
@@ -153,6 +192,10 @@ impl EvalError {
             3 => Some(EvalError::OperandSizeMismatch),
             4 => Some(EvalError::ArithmeticOverflow),
             5 => Some(EvalError::UnsupportedType),
+            6 => Some(EvalError::StatementTimeout),
+            7 => Some(EvalError::ClientWentAway),
+            8 => Some(EvalError::PredicateTooComplex),
+            9 => Some(EvalError::RowMovedUnderScan),
             _ => None,
         }
     }
