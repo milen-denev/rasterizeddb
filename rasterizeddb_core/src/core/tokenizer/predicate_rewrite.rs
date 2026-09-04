@@ -553,6 +553,226 @@ fn like_to_operator(
 ///
 /// `IS NULL` and `IS NOT NULL` are left alone: those ask a different question
 /// and the engine answers them.
+/// Whether the `(` at `at` opens a function call's argument list rather than a
+/// group.
+///
+/// `substring(x, 1)` has a top-level comma and would otherwise look exactly
+/// like the left half of a row comparison — and `substring(x, 1) > (y)` would
+/// then be rejected for having two values on the left and one on the right,
+/// turning a working query into an error. A call is told apart by what precedes
+/// the parenthesis: an identifier character or a closing quote means the
+/// parenthesis belongs to a name.
+fn opens_a_call(s: &str, at: usize) -> bool {
+    s[..at]
+        .chars()
+        .next_back()
+        .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '"' || c == ']')
+}
+
+/// Index just past the parenthesis matching the one at `open`, ignoring
+/// parentheses inside string literals and quoted identifiers.
+fn matching_paren_at(s: &str, open: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut i = open;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                b'\'' | b'"' => quote = Some(c),
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The comma-separated items of `inner`, split only at the top level.
+fn split_row_items(inner: &str) -> Vec<&str> {
+    let bytes = inner.as_bytes();
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut start = 0usize;
+    for i in 0..bytes.len() {
+        let c = bytes[i];
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                b'\'' | b'"' => quote = Some(c),
+                b'(' => depth += 1,
+                b')' => depth = depth.saturating_sub(1),
+                b',' if depth == 0 => {
+                    out.push(inner[start..i].trim());
+                    start = i + 1;
+                }
+                _ => {}
+            },
+        }
+    }
+    out.push(inner[start..].trim());
+    out
+}
+
+/// The boolean form of a row-value comparison, built right to left.
+///
+/// `(a, b) > (c, d)` is `a > c OR (a = c AND b > d)` — the leading columns
+/// decide unless they tie, and only the last one uses the original operator, so
+/// `>=` differs from `>` in exactly one place.
+fn row_comparison(left: &[&str], right: &[&str], op: &str) -> String {
+    if left.len() == 1 {
+        return format!("{} {} {}", left[0], op, right[0]);
+    }
+    // `=` and `<>` do not cascade: they are all-of and any-of.
+    let strict = match op {
+        ">" | ">=" => ">",
+        "<" | "<=" => "<",
+        other => other,
+    };
+    format!(
+        "({} {} {} OR ({} = {} AND {}))",
+        left[0],
+        strict,
+        right[0],
+        left[0],
+        right[0],
+        row_comparison(&left[1..], &right[1..], op)
+    )
+}
+
+/// Rewrites SQL's row-value comparisons into the boolean form the planner can
+/// evaluate: `(a, b) > (c, d)` becomes `(a > c OR (a = c AND b > d))`.
+///
+/// This is the canonical keyset-pagination idiom — every ORM and every ported
+/// query reaches for it, and PostgreSQL supports it — but the parser met a `(`
+/// where it wanted a value and reported `expected closing parenthesis`. The
+/// message sent two people hunting for a quoting mistake in their own SQL.
+///
+/// It was worse than an unsupported feature because of *where* it failed: a
+/// keyset page has no cursor on the first page, so page one carries no tuple
+/// and succeeds. Every page after it fails. A migration would start, die on
+/// page two, and look like "the save silently does nothing" — and a table small
+/// enough to fit one page worked perfectly, which is the worst possible way for
+/// a feature gap to present.
+///
+/// Only a parenthesised group holding a top-level comma is touched, and only
+/// when a comparison operator and a group of the same arity follow it, so an
+/// ordinary `(a = 1) AND (b = 2)` and a tuple `IN` list are both left alone.
+fn expand_row_value_comparisons(clause: &str) -> Result<String, String> {
+    const OPS: &[&str] = &[">=", "<=", "<>", "!=", "=", ">", "<"];
+    let mut current = clause.to_string();
+
+    // Bounded: each pass replaces one comparison with a form that has no
+    // top-level comma, so the count strictly decreases.
+    for _ in 0..64 {
+        let bytes = current.as_bytes();
+        let mut quote: Option<u8> = None;
+        let mut replacement: Option<(usize, usize, String)> = None;
+
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let c = bytes[i];
+            match quote {
+                Some(q) => {
+                    if c == q {
+                        quote = None;
+                    }
+                }
+                None => {
+                    if c == b'\'' || c == b'"' {
+                        quote = Some(c);
+                    } else if c == b'(' && !opens_a_call(&current, i) {
+                        if let Some(close) = matching_paren_at(&current, i) {
+                            let left_items = split_row_items(&current[i + 1..close]);
+                            if left_items.len() >= 2 {
+                                let after = &current[close + 1..];
+                                let lead = after.len() - after.trim_start().len();
+                                let rest = after.trim_start();
+                                if let Some(op) = OPS.iter().find(|op| rest.starts_with(**op)) {
+                                    let tail = rest[op.len()..].trim_start();
+                                    let consumed = close
+                                        + 1
+                                        + lead
+                                        + op.len()
+                                        + (rest[op.len()..].len() - tail.len());
+                                    if tail.starts_with('(') {
+                                        if let Some(rclose) = matching_paren_at(&current, consumed)
+                                        {
+                                            let right_items =
+                                                split_row_items(&current[consumed + 1..rclose]);
+                                            if right_items.len() == left_items.len() {
+                                                let expanded = match *op {
+                                                    "=" => left_items
+                                                        .iter()
+                                                        .zip(right_items.iter())
+                                                        .map(|(l, r)| format!("{l} = {r}"))
+                                                        .collect::<Vec<_>>()
+                                                        .join(" AND "),
+                                                    "<>" | "!=" => left_items
+                                                        .iter()
+                                                        .zip(right_items.iter())
+                                                        .map(|(l, r)| format!("{l} <> {r}"))
+                                                        .collect::<Vec<_>>()
+                                                        .join(" OR "),
+                                                    other => row_comparison(
+                                                        &left_items,
+                                                        &right_items,
+                                                        other,
+                                                    ),
+                                                };
+                                                replacement =
+                                                    Some((i, rclose + 1, format!("({expanded})")));
+                                            } else {
+                                                return Err(format!(
+                                                    "a row comparison needs the same number \
+                                                     of values on both sides, but the left \
+                                                     has {} and the right has {}",
+                                                    left_items.len(),
+                                                    right_items.len()
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if replacement.is_some() {
+                break;
+            }
+            i += 1;
+        }
+
+        match replacement {
+            Some((start, end, text)) => {
+                current = format!("{}{}{}", &current[..start], text, &current[end..]);
+            }
+            None => return Ok(current),
+        }
+    }
+    Err("too many row comparisons in one clause".to_string())
+}
+
 fn fold_null_comparisons(clause: &str) -> String {
     let upper = clause.to_ascii_uppercase();
     let bytes = clause.as_bytes();
@@ -602,10 +822,19 @@ fn fold_null_comparisons(clause: &str) -> String {
         if is_eq {
             let width = if bytes[i] == b'=' { 1 } else { 2 };
             let rest = clause[i + width..].trim_start();
-            let rest_upper = rest.to_ascii_uppercase();
-            let ends_term = rest_upper == "NULL"
-                || rest_upper.starts_with("NULL ")
-                || rest_upper.starts_with("NULL)");
+            // Only the four bytes after the operator decide this, so only those
+            // are looked at. Uppercasing the whole remainder instead — which is
+            // what this did — allocated and copied it once per `=` in the
+            // clause, making the rewrite quadratic in the number of
+            // comparisons: a 51,200-term `OR` chain spent ~98% of its time
+            // here, and `__memmove_evex_unaligned_erms` was 46% of the server's
+            // profile. The three patterns below are exactly the three the
+            // uppercased comparison accepted: `NULL` at the end of the clause,
+            // `NULL `, and `NULL)`.
+            let rest_bytes = rest.as_bytes();
+            let ends_term = rest_bytes.len() >= 4
+                && rest_bytes[..4].eq_ignore_ascii_case(b"NULL")
+                && matches!(rest_bytes.get(4), None | Some(b' ') | Some(b')'));
             if ends_term {
                 // Everything from the start of this term through the NULL.
                 out.truncate(term_start);
@@ -628,6 +857,11 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
     if clause.trim().is_empty() {
         return Ok(String::new());
     }
+
+    // Row-value comparisons become their boolean form first, so everything
+    // downstream — the NULL fold, the guards, the tokenizer — sees only shapes
+    // it already understands.
+    let clause = &expand_row_value_comparisons(clause)?;
 
     // `x = NULL` is never true in SQL — NULL is not a value anything equals,
     // which is why `IS NULL` exists. Folded to a false predicate here so the
@@ -1704,6 +1938,35 @@ mod tests {
     fn empty_clause_stays_empty() {
         assert_eq!(rw(""), "");
         assert_eq!(rw("   "), "");
+    }
+
+    /// The `= NULL` fold decides on the four bytes after the operator and the
+    /// one after those. Uppercasing the whole remainder to decide it — which is
+    /// what this did — made the rewrite quadratic in the number of comparisons,
+    /// so these pin the shapes the cheap test has to keep accepting, and the
+    /// near-misses it must keep refusing.
+    #[test]
+    fn the_null_fold_accepts_exactly_end_space_and_close_paren() {
+        // `NULL` at the end of the clause, before a space, before a `)`.
+        assert_eq!(rw("country = NULL"), "1 = 0");
+        assert_eq!(rw("country = NULL AND id = 1"), "1 = 0 AND id = 1");
+        assert_eq!(rw("(country = NULL) OR id = 1"), "( 1 = 0 ) OR id = 1");
+        // Any casing, either inequality spelling, and no space required.
+        assert_eq!(rw("country = nUlL"), "1 = 0");
+        assert_eq!(rw("country <> NULL"), "1 = 0");
+        assert_eq!(rw("country != null"), "1 = 0");
+        assert_eq!(rw("country =NULL"), "1 = 0");
+
+        // A longer identifier is not `NULL` and must not be folded away.
+        assert!(err("country = NULLX").contains("unknown column"));
+        // Too short to be `NULL` at all.
+        assert!(err("country = NU").contains("unknown column"));
+        // A tab or newline after `NULL` was never accepted either — only a
+        // literal space was — and the statement is refused rather than folded.
+        // Preserved deliberately: this is behaviour, not an accident of how the
+        // check was written.
+        assert!(err("country = NULL\tAND id = 1").contains("NULL literals"));
+        assert!(err("country = NULL\nAND id = 1").contains("NULL literals"));
     }
 }
 

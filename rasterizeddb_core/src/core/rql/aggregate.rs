@@ -179,6 +179,14 @@ pub enum ScalarFunc {
     /// Current timestamp. Evaluated per row rather than per statement, so it
     /// does not yet carry PostgreSQL's transaction-timestamp semantics.
     Now,
+    /// Today's date, as that day's midnight UTC.
+    ///
+    /// A `DATETIME` rather than a type of its own: a `DATE` column is stored as
+    /// a timestamp at midnight here, so the two compare directly. Narrowing the
+    /// clock is what makes `on_day < CURRENT_DATE` mean the day and not the
+    /// instant — the full timestamp would put every row recorded earlier today
+    /// on the wrong side of it.
+    CurrentDate,
     /// A fresh random UUID for each row.
     GenRandomUuid,
 }
@@ -187,6 +195,7 @@ impl ScalarFunc {
     pub fn parse(name: &str) -> Option<(ScalarFunc, DbType)> {
         match name.trim().to_ascii_uppercase().as_str() {
             "NOW" | "CURRENT_TIMESTAMP" => Some((ScalarFunc::Now, DbType::DATETIME)),
+            "CURRENT_DATE" => Some((ScalarFunc::CurrentDate, DbType::DATETIME)),
             "GEN_RANDOM_UUID" | "UUID_GENERATE_V4" => {
                 Some((ScalarFunc::GenRandomUuid, DbType::UUID))
             }
@@ -203,6 +212,17 @@ impl ScalarFunc {
                     .map(|d| d.as_micros() as i64)
                     .unwrap_or(0);
                 micros.to_le_bytes().to_vec()
+            }
+            ScalarFunc::CurrentDate => {
+                let micros = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_micros() as i64)
+                    .unwrap_or(0);
+                const DAY: i64 = 86_400_000_000;
+                // `rem_euclid` rather than `%`: a pre-epoch instant has a
+                // negative remainder, which would round the day *up* and put
+                // midnight in the future.
+                (micros - micros.rem_euclid(DAY)).to_le_bytes().to_vec()
             }
             ScalarFunc::GenRandomUuid => {
                 // Version 4, variant 1, per RFC 4122 — the shape a client

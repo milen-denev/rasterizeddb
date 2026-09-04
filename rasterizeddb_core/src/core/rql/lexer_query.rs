@@ -1227,6 +1227,12 @@ pub fn row_fetch_from_select_query(
     let from_start = {
         let mut found = None;
         let mut quote: Option<u8> = None;
+        // `EXTRACT(EPOCH FROM ts)` puts a `FROM` inside the select list, and it
+        // is not the statement's. Splitting there took the rest of the call as
+        // the relation and reported "relation does not exist" about a statement
+        // whose actual `FROM` names a table that exists — an error naming
+        // nothing the author wrote.
+        let mut depth = 0i32;
         let mut i = select_end;
         while i + 4 <= sql_bytes.len() {
             let c = sql_bytes[i];
@@ -1239,7 +1245,12 @@ pub fn row_fetch_from_select_query(
                 None => {
                     if c == b'\'' || c == b'"' {
                         quote = Some(c);
-                    } else if &sql_bytes[i..i + 4] == b"FROM"
+                    } else if c == b'(' {
+                        depth += 1;
+                    } else if c == b')' {
+                        depth -= 1;
+                    } else if depth == 0
+                        && &sql_bytes[i..i + 4] == b"FROM"
                         && sql_bytes[i - 1].is_ascii_whitespace()
                         && sql_bytes
                             .get(i + 4)

@@ -441,9 +441,41 @@ pub fn recognize_query_purpose(query: &str) -> Option<QueryPurpose> {
     } else if simd_compare_strings(query_bytes, b"DELETE FROM", &StartsWith) {
         Some(DeleteRow(query_trimmed.to_string()))
     } else if simd_compare_strings(query_bytes, b"SELECT", &StartsWith) {
-        // Extract table name after "FROM"
+        // Extract table name after the statement's own "FROM".
+        //
+        // Depth-aware, because a select item may contain one: `EXTRACT(EPOCH
+        // FROM ts)` made the table name `ts)`, which then failed as "relation
+        // does not exist" — naming nothing the author wrote, about a statement
+        // whose real `FROM` names a table that is there.
         let tokens: Vec<&str> = query_trimmed.split_whitespace().collect();
-        if let Some(from_index) = tokens.iter().position(|&t| t.eq_ignore_ascii_case("FROM")) {
+        let from_index = {
+            let mut depth = 0i32;
+            let mut quote: Option<char> = None;
+            let mut found = None;
+            for (at, token) in tokens.iter().enumerate() {
+                if depth == 0 && quote.is_none() && token.eq_ignore_ascii_case("FROM") {
+                    found = Some(at);
+                    break;
+                }
+                for c in token.chars() {
+                    match quote {
+                        Some(q) => {
+                            if c == q {
+                                quote = None;
+                            }
+                        }
+                        None => match c {
+                            '\'' | '"' => quote = Some(c),
+                            '(' => depth += 1,
+                            ')' => depth -= 1,
+                            _ => {}
+                        },
+                    }
+                }
+            }
+            found
+        };
+        if let Some(from_index) = from_index {
             if let Some(table_name_extract) = tokens.get(from_index + 1) {
                 Some(QueryRows(QueryRowsData {
                     table_name: normalize_table_name(table_name_extract),

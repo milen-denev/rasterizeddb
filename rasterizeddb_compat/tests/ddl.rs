@@ -679,8 +679,9 @@ async fn an_unsupported_expression_names_itself_rather_than_blaming_the_schema()
         // report a missing column. A cast in the select list works; one in a
         // WHERE clause does not, and saying so is the difference between a
         // reader fixing the query and a reader auditing a schema that is fine.
+        // A cast in a `WHERE` still is not supported. `CAST(v AS TEXT)` in the
+        // select list moved to the working list below when it was implemented.
         ("SELECT id FROM ue WHERE v::TEXT = '10'", "cast"),
-        ("SELECT CAST(v AS TEXT) FROM ue", "cast"),
         ("SELECT CASE WHEN v > 5 THEN 1 ELSE 2 END FROM ue", "case when"),
         ("SELECT CASE WHEN v > 10 THEN 'hi' WHEN v > 5 THEN 'mid' ELSE 'lo' END FROM ue", "case when"),
         ("SELECT DISTINCT ON (id, v) id FROM ue", "distinct on"),
@@ -690,13 +691,19 @@ async fn an_unsupported_expression_names_itself_rather_than_blaming_the_schema()
         assert!(!err.contains("not found in schema"), "{} blamed the schema: {}", sql, err);
     }
 
-    // Window functions were on the list above until they were implemented.
-    // Asserted as *working* rather than deleted, so the entry keeps earning its
-    // place: an unsupported-feature list that quietly loses items stops being
-    // evidence of anything.
+    // Window functions, and now `CAST(x AS type)`, were on the list above until
+    // they were implemented. Asserted as *working* rather than deleted, so the
+    // entry keeps earning its place: an unsupported-feature list that quietly
+    // loses items stops being evidence of anything.
+    //
+    // `CAST(…)` was never merely unimplemented — it separates its arguments
+    // with a keyword rather than a comma, so the argument splitter never
+    // reached it, the same way `EXTRACT(EPOCH FROM …)` was not reached.
     for sql in [
         "SELECT ROW_NUMBER() OVER (ORDER BY v) FROM ue",
         "SELECT ROW_NUMBER() OVER (PARTITION BY id ORDER BY v, nm) FROM ue",
+        "SELECT CAST(v AS TEXT) FROM ue",
+        "SELECT CAST(v AS BIGINT) FROM ue",
     ] {
         run(&pool, sql).await.unwrap_or_else(|e| panic!("{} -> {}", sql, e));
     }

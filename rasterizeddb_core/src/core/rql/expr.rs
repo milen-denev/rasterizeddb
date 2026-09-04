@@ -34,6 +34,14 @@ impl Value {
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
     }
+
+    /// The type this value carries, or `None` for NULL.
+    pub fn db_type(&self) -> Option<&DbType> {
+        match self {
+            Value::Data { db_type, .. } => Some(db_type),
+            Value::Null => None,
+        }
+    }
 }
 
 /// A comparison used by `CASE WHEN`.
@@ -136,6 +144,11 @@ pub enum TextFunc {
     Upper,
     /// `date_trunc('minute', ts)` — an instant floored to a unit.
     DateTrunc,
+    /// `EXTRACT(EPOCH FROM x)` — a field of an instant or a span.
+    ///
+    /// The field is carried as the first argument, a string literal, because
+    /// `Expr::Call` has nowhere else to put it.
+    Extract,
     /// `to_tsvector(config, document)` — a document reduced to its lexemes.
     ToTsVector,
     /// `to_tsquery(config, query)` — a boolean query over lexemes.
@@ -235,6 +248,12 @@ pub fn needs_evaluation(text: &str) -> bool {
     if upper.starts_with("CASE ") {
         return true;
     }
+    // `CURRENT_TIMESTAMP` is a value written without a call's parentheses, so
+    // the `(` test below never saw it and the term was left for the predicate
+    // tokenizer to read as a column name.
+    if keyword_constant(trimmed).is_some() {
+        return true;
+    }
     match trimmed.find('(') {
         Some(open) => {
             let name = trimmed[..open].trim();
@@ -254,7 +273,7 @@ fn split_args(text: &str) -> Vec<String> {
 }
 
 /// Index of the parenthesis matching the one at `open`, ignoring quoted text.
-fn matching_paren(text: &str, open: usize) -> Option<usize> {
+pub(crate) fn matching_paren(text: &str, open: usize) -> Option<usize> {
     let bytes = text.as_bytes();
     let mut depth = 0usize;
     let mut quote: Option<u8> = None;
@@ -588,6 +607,68 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                 });
             }
 
+            // `CAST(x AS type)` is the standard spelling of `x::type`, and
+            // like `EXTRACT` it separates its arguments with a keyword rather
+            // than a comma — so it has to be read before the argument splitter,
+            // which would hand `x AS type` to `parse` as one expression.
+            //
+            // Compiled to the same `Expr::Cast` the `::` form produces, so
+            // there is one implementation of what a cast does rather than two
+            // that could disagree.
+            if name.eq_ignore_ascii_case("cast") {
+                let inner = args_text.trim();
+                let at = crate::core::rql::join::find_keyword(inner, "AS", 0).ok_or_else(|| {
+                    format!(
+                        "CAST needs a value and a type, as in `CAST(x AS bigint)`; got '{}'",
+                        inner
+                    )
+                })?;
+                let value = parse(inner[..at].trim(), schema)?;
+                let type_name = inner[at + "AS".len()..].trim();
+                let target = cast_target(type_name)
+                    .ok_or_else(|| format!("cast to '{}' is not supported yet", type_name))?;
+                return Ok(Expr::Cast(Box::new(value), target));
+            }
+
+            // `EXTRACT(EPOCH FROM x)` separates its two arguments with `FROM`,
+            // not a comma, so it is read before the argument splitter — which
+            // would hand the whole of `EPOCH FROM x` to `parse` as one
+            // expression and fail on `EPOCH` as an unknown column. That is
+            // exactly what it did: "relation does not exist", about a statement
+            // naming no relation.
+            if name.eq_ignore_ascii_case("extract") {
+                let inner = args_text.trim();
+                let at =
+                    crate::core::rql::join::find_keyword(inner, "FROM", 0).ok_or_else(|| {
+                        format!(
+                            "EXTRACT needs a field and a value, as in \
+                         `EXTRACT(EPOCH FROM ts)`; got '{}'",
+                            inner
+                        )
+                    })?;
+                let field = inner[..at].trim().trim_matches('\'').to_ascii_uppercase();
+                let source = parse(inner[at + "FROM".len()..].trim(), schema)?;
+                if field != "EPOCH" {
+                    // Refused by name rather than approximated: the calendar
+                    // fields need a civil-date decomposition this does not have,
+                    // and a plausible wrong number is worse than a refusal.
+                    return Err(format!(
+                        "EXTRACT({} FROM …) is not supported yet; only EPOCH is",
+                        field
+                    ));
+                }
+                return Ok(Expr::Call(
+                    TextFunc::Extract,
+                    vec![
+                        Expr::Literal {
+                            bytes: field.into_bytes(),
+                            db_type: DbType::STRING,
+                        },
+                        source,
+                    ],
+                ));
+            }
+
             // `pg_column_size(t)` names a *relation*, which resolves to no
             // column — the answer is the whole row's width. Parsed specially so
             // the argument's failure to resolve is not the function's failure.
@@ -742,7 +823,95 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
         .find(|f| f.name.eq_ignore_ascii_case(bare) && !f.is_deleted)
     {
         Some(field) => Ok(Expr::Column(field.clone())),
-        None => Err(format!("'{}' is neither a column nor a value", text)),
+        // Reached only once no column answers to the name, so a table that does
+        // carry a column called `current_timestamp` still reads its own data.
+        None => match keyword_constant(text) {
+            Some(expr) => Ok(expr),
+            None => Err(format!("'{}' is neither a column nor a value", text)),
+        },
+    }
+}
+
+/// Orders two rows by their already-evaluated `ORDER BY` key values.
+///
+/// `directions` is `(descending, nulls_first)` per key, in significance order.
+/// Shared by the single-table expression sort and the join's, so that
+/// `ORDER BY <expr>` means one thing: two comparators that disagree about NULL
+/// placement produce wrong rows, not slow ones.
+///
+/// NULL placement defaults to NULLs largest — last ascending, first descending
+/// — and an explicit placement sits outside the descending reversal, which is
+/// what `NULLS FIRST` on a `DESC` key has to mean.
+pub fn compare_key_values(
+    a: &[Value],
+    b: &[Value],
+    directions: &[(bool, Option<bool>)],
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    for (i, (descending, nulls_first)) in directions.iter().enumerate() {
+        let (Some(av), Some(bv)) = (a.get(i), b.get(i)) else {
+            continue;
+        };
+        let nulls_come_first = nulls_first.unwrap_or(*descending);
+        let ord = match (av.is_null(), bv.is_null()) {
+            (true, true) => Ordering::Equal,
+            (true, false) => {
+                if nulls_come_first {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (false, true) => {
+                if nulls_come_first {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
+            }
+            (false, false) => {
+                // Incomparable values keep their existing order rather than
+                // panicking the comparator.
+                let ord = compare(av, bv).unwrap_or(Ordering::Equal);
+                if *descending { ord.reverse() } else { ord }
+            }
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
+}
+
+/// The SQL value keywords spelled without parentheses.
+///
+/// `CURRENT_TIMESTAMP` is a value, not a call, so every path that recognises a
+/// function by its `(` misses it: `WHERE next_attempt_at <= CURRENT_TIMESTAMP`
+/// reached the predicate tokenizer as the unknown column `CURRENT_TIMESTAMP`
+/// while the identical `now()` worked.
+///
+/// Quoted and qualified names are left alone. PostgreSQL reserves these words,
+/// so a column may only be named one of them by quoting it, and `t.x` is always
+/// a column of `t` — folding either would replace stored data with the clock.
+fn keyword_constant(text: &str) -> Option<Expr> {
+    let trimmed = text.trim();
+    if trimmed.contains('"') || trimmed.contains('.') {
+        return None;
+    }
+    let now = crate::core::rql::aggregate::ScalarFunc::Now;
+    match trimmed.to_ascii_uppercase().as_str() {
+        // PostgreSQL separates these three by *when in the transaction* the
+        // clock is read, which this engine does not model yet; they are all the
+        // wall clock here, on the same terms `column_default` already accepts
+        // them for.
+        "CURRENT_TIMESTAMP" | "LOCALTIMESTAMP" | "TRANSACTION_TIMESTAMP" => Some(Expr::Scalar(now)),
+        "CURRENT_DATE" => Some(Expr::Scalar(
+            crate::core::rql::aggregate::ScalarFunc::CurrentDate,
+        )),
+        // `CURRENT_TIME` and `LOCALTIME` are deliberately absent: there is no
+        // constant that encodes a bare time of day here, and a wrong instant is
+        // worse than an honest "not supported". They still fail by name.
+        _ => None,
     }
 }
 
@@ -1048,6 +1217,29 @@ pub fn trailing_cast(text: &str) -> Option<(&str, &str)> {
 }
 
 /// The columns a condition reads, including both sides of the comparison.
+/// The columns a whole boolean tree reads, with duplicates removed.
+pub fn cond_columns(cond: &Cond) -> Vec<SchemaField> {
+    let mut out: Vec<SchemaField> = Vec::new();
+    fn walk(cond: &Cond, out: &mut Vec<SchemaField>) {
+        match cond {
+            Cond::Cmp(c) => {
+                for field in condition_columns(c) {
+                    if !out.iter().any(|f: &SchemaField| f.name == field.name) {
+                        out.push(field);
+                    }
+                }
+            }
+            Cond::And(parts) | Cond::Or(parts) => {
+                for part in parts {
+                    walk(part, out);
+                }
+            }
+        }
+    }
+    walk(cond, &mut out);
+    out
+}
+
 pub fn condition_columns(condition: &Condition) -> Vec<SchemaField> {
     let mut out = columns_of(&condition.left);
     if let Some(right) = &condition.right {
@@ -1184,12 +1376,17 @@ pub fn static_type(expr: &Expr) -> DbType {
         }
         Expr::Scalar(func) => match func {
             crate::core::rql::aggregate::ScalarFunc::Now => DbType::DATETIME,
+            crate::core::rql::aggregate::ScalarFunc::CurrentDate => DbType::DATETIME,
             crate::core::rql::aggregate::ScalarFunc::GenRandomUuid => DbType::STRING,
         },
         Expr::Cast(_, db_type) => db_type.clone(),
         Expr::Concat(_, _) => DbType::STRING,
         Expr::Call(TextFunc::ColumnSize | TextFunc::RelationSize, _) => DbType::I64,
         Expr::Call(TextFunc::DateTrunc, _) => DbType::DATETIME,
+        // `double precision`, which is what PostgreSQL's own `EXTRACT` returned
+        // before it moved to `numeric`, and what every driver decodes without a
+        // decimal type.
+        Expr::Call(TextFunc::Extract, _) => DbType::F64,
         Expr::Call(_, _) => DbType::STRING,
         // The branches of these all have to agree in SQL, so the first one that
         // is not a bare NULL decides.
@@ -1529,6 +1726,42 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
         // A timestamp floored to a unit, which is what a `GROUP BY` over time
         // buckets on. Microseconds since the epoch, so truncation is integer
         // arithmetic — except months and years, whose length varies.
+        TextFunc::Extract => {
+            let Value::Data { bytes, db_type } = &args[1] else {
+                return Ok(Value::Null);
+            };
+            // An instant and a span are stored differently: a timestamp is
+            // eight bytes of little-endian microseconds, while an interval is
+            // PostgreSQL's own sixteen-byte wire layout, big-endian, carrying
+            // months and days separately because neither is a fixed number of
+            // microseconds. Reading the second as the first is what made
+            // `EXTRACT(EPOCH FROM (a - b))` come back NULL.
+            let seconds = match db_type {
+                DbType::INTERVAL => {
+                    let Some(span) = crate::core::pg_types::decode_interval(bytes) else {
+                        return Ok(Value::Null);
+                    };
+                    // PostgreSQL's `EPOCH` of an interval counts a month as 30
+                    // days, which is the one place it does treat a month as
+                    // fixed — the result is a duration, not a calendar move.
+                    span.micros as f64 / 1_000_000.0
+                        + span.days as f64 * 86_400.0
+                        + span.months as f64 * 30.0 * 86_400.0
+                }
+                _ => {
+                    if bytes.len() != 8 {
+                        return Ok(Value::Null);
+                    }
+                    let mut raw = [0u8; 8];
+                    raw.copy_from_slice(bytes);
+                    i64::from_le_bytes(raw) as f64 / 1_000_000.0
+                }
+            };
+            Value::Data {
+                bytes: seconds.to_le_bytes().to_vec(),
+                db_type: DbType::F64,
+            }
+        }
         TextFunc::DateTrunc => {
             let unit = as_text(&args[0]).trim().to_ascii_lowercase();
             let Value::Data { bytes, .. } = &args[1] else {
@@ -2035,6 +2268,7 @@ pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, Str
         Expr::Scalar(func) => {
             let (_, db_type) = crate::core::rql::aggregate::ScalarFunc::parse(match func {
                 crate::core::rql::aggregate::ScalarFunc::Now => "now",
+                crate::core::rql::aggregate::ScalarFunc::CurrentDate => "current_date",
                 crate::core::rql::aggregate::ScalarFunc::GenRandomUuid => "gen_random_uuid",
             })
             .expect("known function");
@@ -2201,7 +2435,7 @@ pub(crate) fn coerce_to(value: Value, target: &DbType) -> Value {
     }
 }
 
-fn cast(value: Value, target: &DbType) -> Result<Value, String> {
+pub fn cast(value: Value, target: &DbType) -> Result<Value, String> {
     let Value::Data { bytes, db_type } = value else {
         return Ok(Value::Null);
     };
@@ -2307,27 +2541,32 @@ fn cast(value: Value, target: &DbType) -> Result<Value, String> {
     };
     if let Some(n) = as_i64(&value) {
         let encoded = match target {
-            DbType::I8 => (n as i8).to_le_bytes().to_vec(),
-            DbType::I16 => (n as i16).to_le_bytes().to_vec(),
-            DbType::I32 => (n as i32).to_le_bytes().to_vec(),
-            DbType::I64 => n.to_le_bytes().to_vec(),
-            DbType::U8 => (n as u8).to_le_bytes().to_vec(),
-            DbType::U16 => (n as u16).to_le_bytes().to_vec(),
-            DbType::U32 => (n as u32).to_le_bytes().to_vec(),
-            DbType::U64 => (n as u64).to_le_bytes().to_vec(),
-            DbType::F32 => (n as f32).to_le_bytes().to_vec(),
-            DbType::F64 => (n as f64).to_le_bytes().to_vec(),
-            _ => {
-                return Err(format!(
-                    "cast from {:?} to {:?} is not supported yet",
-                    db_type, target
-                ));
-            }
+            DbType::I8 => Some((n as i8).to_le_bytes().to_vec()),
+            DbType::I16 => Some((n as i16).to_le_bytes().to_vec()),
+            DbType::I32 => Some((n as i32).to_le_bytes().to_vec()),
+            DbType::I64 => Some(n.to_le_bytes().to_vec()),
+            DbType::U8 => Some((n as u8).to_le_bytes().to_vec()),
+            DbType::U16 => Some((n as u16).to_le_bytes().to_vec()),
+            DbType::U32 => Some((n as u32).to_le_bytes().to_vec()),
+            DbType::U64 => Some((n as u64).to_le_bytes().to_vec()),
+            DbType::F32 => Some((n as f32).to_le_bytes().to_vec()),
+            DbType::F64 => Some((n as f64).to_le_bytes().to_vec()),
+            // A target this table does not cover — `NUMERIC` above all — is
+            // **not** an error: it falls through to the text rendering below,
+            // which reads an integer back as a decimal perfectly well.
+            //
+            // Returning an error here made `CAST(n AS NUMERIC)` fail, and an
+            // aggregate over it then swallowed that failure as a NULL and
+            // reported the sum as **0** — a plausible number, on a chart, that
+            // nobody would question.
+            _ => None,
         };
-        return Ok(Value::Data {
-            bytes: encoded,
-            db_type: target.clone(),
-        });
+        if let Some(encoded) = encoded {
+            return Ok(Value::Data {
+                bytes: encoded,
+                db_type: target.clone(),
+            });
+        }
     }
 
     // Everything else goes through text: rendered, then re-read as the

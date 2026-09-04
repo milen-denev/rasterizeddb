@@ -196,6 +196,14 @@ async fn run_subquery(
     // correlated subquery would reference an outer column, which the inner
     // table's schema does not have, so it fails here by name rather than being
     // silently evaluated against the wrong relation.
+    // A statement's constants are folded once, at the wire entry, before
+    // anything parses the predicate. An inner statement never passes through
+    // there: `WHERE next_attempt_at <= CURRENT_TIMESTAMP` inside a derived
+    // table or a CTE still reached the tokenizer as an unknown column, and even
+    // `now()` did, while both worked in the identical outer predicate.
+    let folded = fold_where_constants(sql);
+    let sql = folded.as_str();
+
     let purpose =
         recognize_query_purpose(sql).ok_or_else(|| format!("cannot parse subquery '{}'", sql))?;
     if !matches!(purpose, QueryPurpose::QueryRows(_)) {
@@ -3386,6 +3394,25 @@ fn fold_constants_in_predicate(text: &str) -> String {
         match conjunct {
             BooleanPiece::Separator(sep) => out.push_str(sep),
             BooleanPiece::Term(term) => {
+                // A bare boolean literal is a predicate in its own right, and
+                // the tokenizer reads only comparisons — `WHERE false` reached
+                // the parser as an empty token stream ("Unexpected end of token
+                // stream"), in `SELECT`, `UPDATE` and `DELETE` alike.
+                //
+                // It is not an exotic thing to write: an ORM renders it as the
+                // identity element of a filter chain it collected no conditions
+                // for — sea-orm's empty `Condition::all()` is `WHERE TRUE` and
+                // its empty `Condition::any()` is `WHERE FALSE` — so a query
+                // built from an empty list failed outright instead of returning
+                // everything or nothing.
+                //
+                // Written as the comparison it means, the existing machinery
+                // answers it; `1=0` already worked, which is what makes this
+                // the whole fix rather than a new evaluation path.
+                if let Some(equivalent) = boolean_literal_term(term) {
+                    out.push_str(&equivalent);
+                    continue;
+                }
                 // Fold each side of the comparison independently: only one of
                 // them is usually constant.
                 match find_comparison(term) {
@@ -3400,6 +3427,25 @@ fn fold_constants_in_predicate(text: &str) -> String {
         }
     }
     out
+}
+
+/// A predicate term that is nothing but `TRUE` or `FALSE`, as the equivalent
+/// comparison.
+///
+/// Quoted and qualified names are left alone: `"true"` is a column, and only a
+/// bare keyword is the literal.
+fn boolean_literal_term(term: &str) -> Option<String> {
+    let trimmed = term.trim();
+    let replacement = match trimmed.to_ascii_uppercase().as_str() {
+        "TRUE" => "1=1",
+        "FALSE" => "1=0",
+        _ => return None,
+    };
+    // The surrounding whitespace belongs to the statement, not the term —
+    // dropping it would run the substitution into the next keyword.
+    let lead = &term[..term.len() - term.trim_start().len()];
+    let tail = &term[term.trim_end().len()..];
+    Some(format!("{}{}{}", lead, replacement, tail))
 }
 
 enum BooleanPiece<'a> {

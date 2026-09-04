@@ -2,7 +2,9 @@ use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use super::query_tokenizer::{Token, numeric_to_mb, numeric_value_to_db_type, str_to_mb, tokenize};
+use super::query_tokenizer::{
+    NumericValue, Token, numeric_to_mb, numeric_value_to_db_type, str_to_mb, tokenize,
+};
 
 use crate::core::db_type::DbType;
 use crate::core::processor::transformer::{
@@ -663,6 +665,26 @@ impl<'a, 'b> QueryParser<'a, 'b> {
         Ok((lhs_op, lhs_type))
     }
 
+    /// Negates a literal, widening an unsigned one to the signed type that can
+    /// hold it — `-1` is tokenized as an unsigned `1`, and `0u64 - 1` would
+    /// wrap rather than be negative.
+    fn negate_numeric_inner(n: &NumericValue) -> Option<NumericValue> {
+        Some(match *n {
+            NumericValue::I8(v) => NumericValue::I8(v.checked_neg()?),
+            NumericValue::I16(v) => NumericValue::I16(v.checked_neg()?),
+            NumericValue::I32(v) => NumericValue::I32(v.checked_neg()?),
+            NumericValue::I64(v) => NumericValue::I64(v.checked_neg()?),
+            NumericValue::I128(v) => NumericValue::I128(v.checked_neg()?),
+            NumericValue::U8(v) => NumericValue::I16(-(v as i16)),
+            NumericValue::U16(v) => NumericValue::I32(-(v as i32)),
+            NumericValue::U32(v) => NumericValue::I64(-(v as i64)),
+            NumericValue::U64(v) => NumericValue::I128(-(v as i128)),
+            NumericValue::U128(v) => NumericValue::I128(-(i128::try_from(v).ok()?)),
+            NumericValue::F32(v) => NumericValue::F32(-v),
+            NumericValue::F64(v) => NumericValue::F64(-v),
+        })
+    }
+
     fn parse_factor<'c>(
         &mut self,
         cols: &SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
@@ -672,6 +694,26 @@ impl<'a, 'b> QueryParser<'a, 'b> {
             .ok_or_else(|| "Unexpected end of token stream".to_string())?;
 
         match token {
+            // A signed literal: `WHERE queryid = -8455582427799197754`. The
+            // tokenizer emits the sign as its own operator, so the parser saw a
+            // factor beginning with `Op("-")` and refused the statement — while
+            // the identical positive literal parsed. A leading `+` is accepted
+            // for symmetry and means nothing.
+            Token::Op(ref op) if op == "-" || op == "+" => {
+                let negate = op == "-";
+                let Some(Token::Number(n)) = self.next() else {
+                    return Err(format!("expected a number after '{}'", op));
+                };
+                let n = if negate {
+                    Self::negate_numeric_inner(&n)
+                        .ok_or_else(|| "numeric literal is out of range".to_string())?
+                } else {
+                    n
+                };
+                let db_type = numeric_value_to_db_type(&n);
+                let mb = numeric_to_mb(&n);
+                Ok((ComparisonOperand::Direct(mb), db_type))
+            }
             Token::Number(n) => {
                 let db_type = numeric_value_to_db_type(&n);
                 let mb = numeric_to_mb(&n);
