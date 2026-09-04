@@ -2083,6 +2083,54 @@ impl<S: StorageIO> Table<S> {
 
     /// Queries through `reader`'s snapshot, so it sees its own uncommitted
     /// writes and nobody else's.
+    /// How many rows match, for a plan that wants nothing but the count.
+    ///
+    /// Additive alongside [`Self::query_row_in_txn`] rather than a mode on it:
+    /// the two return different things and share only their preamble. See
+    /// [`crate::core::rql::aggregate::is_row_count_only`] for which plans may
+    /// use it.
+    ///
+    /// No `limit` and no `order_by` are taken. Both belong to the aggregated
+    /// output rather than to its input, so there is nothing here for them to
+    /// mean — and the scan-ceiling machinery `query_row_with_visibility` runs
+    /// exists to bound an ordered scan, which this never is.
+    pub async fn count_rows_in_txn(
+        &self,
+        query: &str,
+        schema_fields: &Vec<SchemaField>,
+        query_row_fetch: RowFetch,
+        reader: TxId,
+    ) -> Result<u64> {
+        let visibility = self.visibility_for(reader);
+
+        // The same two guards the row path takes, for the same reason:
+        // reclamation may not hand out an extent while a pointer into it is
+        // still in play, even though this path never dereferences one.
+        let _gate = self.compaction_gate.read().await;
+        let _read = self.read_guard();
+
+        let generation = self.cache_generation();
+        let base_candidates = self.build_candidates(query, None).await;
+
+        let mut iterator = RowPointerIterator::new(self.io_pointers.clone())
+            .await
+            .unwrap();
+        iterator.set_candidates(base_candidates);
+
+        self.concurrent_processor
+            .process_count(
+                &self.cache_scope,
+                query,
+                query_row_fetch,
+                schema_fields,
+                self.io_rows.clone(),
+                &mut iterator,
+                cache_generation_for(&visibility, generation),
+                visibility,
+            )
+            .await
+    }
+
     pub async fn query_row_in_txn(
         &self,
         query: &str,

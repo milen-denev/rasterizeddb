@@ -449,6 +449,98 @@ pub struct AggregatePlan {
     pub offset: Option<u64>,
 }
 
+/// The single row [`fold`] would have produced for a count-only plan.
+///
+/// Deliberately here rather than at the call site: it has to agree with the
+/// emit loop in `fold` about the output row's shape — one column per item,
+/// `schema_id` being the item's index, `Acc::Count`'s little-endian `i64` — and
+/// the two are only checkable against each other if they can be read together.
+/// `a_counted_plan_matches_what_the_fold_would_emit` pins the agreement.
+///
+/// One row always, never zero: `SELECT COUNT(*)` over an empty table is `0`,
+/// not an empty result. That asymmetry with `GROUP BY` — which yields no row
+/// for no input — is why this cannot be folded into the grouped path.
+pub fn row_count_result(plan: &AggregatePlan, count: u64) -> Vec<Row> {
+    let bytes = (count as i64).to_le_bytes().to_vec();
+    let mut columns: SmallVec<[Column; 32]> = SmallVec::new();
+    for (i, _) in plan.items.iter().enumerate() {
+        columns.push(Column {
+            schema_id: i as u64,
+            data: mb_from(&bytes),
+            column_type: DbType::I64,
+        });
+    }
+    vec![Row {
+        position: 0,
+        columns,
+        length: 0,
+    }]
+}
+
+/// True when the plan's whole answer is "how many rows matched".
+///
+/// Such a plan needs no column value from any row, so the scan can count
+/// matches and never build one — see
+/// [`crate::core::processor::concurrent_processor::ConcurrentProcessor::process_count`].
+/// The ordinary path materialises every matching row into a `Vec<Row>` before
+/// folding, which for a million-row count is ~1.5 GB of `Row` to produce a
+/// single integer.
+///
+/// Every condition here is load-bearing, and the traps are that several of them
+/// are invisible in the item's `func` and `arg` alone:
+///
+///  * **`filter` must be `None`.** `COUNT(*) FILTER (WHERE status = 'failed')`
+///    has `arg: None` exactly like a bare `COUNT(*)`, so testing only the
+///    function and the argument admits it — and then it returns the count of
+///    *every* matched row. That is a plausible number on a dashboard rather
+///    than an error, which is the worst failure this code can have.
+///  * **`arg` must be `None`.** `COUNT(col)` skips NULLs, so it needs the
+///    column. `arg_expr` is excluded with it: a computed argument is never a
+///    `Count`, but the pairing is what makes that safe to rely on.
+///  * **No `group_by`, `computed_keys` or `having`.** Each of those reads
+///    values — to form a key, to compute one, or to decide which groups
+///    survive.
+///  * **At least one item, and every item an aggregate.** A `Column`,
+///    `Literal` or `ScalarFunc` in the select list occupies an output slot this
+///    path cannot fill, and an empty plan has no answer to give.
+///
+///  * **`limit` and `offset` must be absent.** They shape the *aggregated*
+///    output — one row here — and the fast path returns straight from the
+///    executor without the paging the fold's caller would have applied. So
+///    `SELECT COUNT(*) FROM t LIMIT 0` emitted its row and answered a count
+///    where the correct reply is no rows at all, and `OFFSET 1` did the same.
+///    Rejecting them costs nothing: they fall to the ordinary path, which
+///    already handles them, and nobody writes `COUNT(*) … LIMIT 0` for speed.
+///    `LIMIT 0` in particular is not exotic — drivers issue it to fetch column
+///    metadata without rows.
+///
+/// `order_by` is not tested, and does not need to be: it orders the aggregated
+/// output, and one row is already in order.
+///
+/// The shape of the mistake is worth remembering — this guard is an allowlist
+/// over a struct, so every field of [`AggregatePlan`] it does not read is a way
+/// for a query to take a path that ignores it.
+pub fn is_row_count_only(plan: &AggregatePlan) -> bool {
+    plan.group_by.is_empty()
+        && plan.computed_keys.is_empty()
+        && plan.having.is_none()
+        && plan.limit.is_none()
+        && plan.offset.is_none()
+        && !plan.items.is_empty()
+        && plan.items.iter().all(|item| {
+            matches!(
+                item,
+                SelectItem::Aggregate {
+                    func: AggFunc::Count,
+                    arg: None,
+                    filter: None,
+                    arg_expr: None,
+                    ..
+                }
+            )
+        })
+}
+
 /// A running accumulator for one aggregate within one group.
 #[derive(Debug, Clone)]
 enum Acc {
@@ -1212,6 +1304,136 @@ mod tests {
             limit: None,
             offset: None,
         }
+    }
+
+    /// Everything that must keep a plan *off* the count-only fast path.
+    ///
+    /// Each rejection here is a wrong answer rather than an error if it is
+    /// missed, which is why they are pinned one at a time: the fast path counts
+    /// matched rows and emits one row, so a plan that reaches it wrongly gets a
+    /// plausible number instead of a failure.
+    #[test]
+    fn only_a_bare_count_takes_the_count_only_path() {
+        let f = field("age", DbType::I32, 1);
+
+        // The shapes that may take it.
+        assert!(is_row_count_only(&plan(
+            vec![agg(AggFunc::Count, None)],
+            vec![]
+        )));
+        assert!(is_row_count_only(&plan(
+            vec![agg(AggFunc::Count, None), agg(AggFunc::Count, None)],
+            vec![]
+        )));
+
+        // `COUNT(col)` skips NULLs, so it has to read the column.
+        assert!(!is_row_count_only(&plan(
+            vec![agg(AggFunc::Count, Some(f.clone()))],
+            vec![]
+        )));
+
+        // Not a count at all.
+        assert!(!is_row_count_only(&plan(
+            vec![agg(AggFunc::Sum, Some(f.clone()))],
+            vec![]
+        )));
+
+        // A grouped count needs the key's value.
+        assert!(!is_row_count_only(&plan(
+            vec![agg(AggFunc::Count, None)],
+            vec![f.clone()]
+        )));
+
+        // One bare count beside anything else is still not count-only: the
+        // other item owns an output slot this path cannot fill.
+        assert!(!is_row_count_only(&plan(
+            vec![
+                agg(AggFunc::Count, None),
+                agg(AggFunc::Sum, Some(f.clone()))
+            ],
+            vec![]
+        )));
+
+        // An empty plan has no answer to give.
+        assert!(!is_row_count_only(&plan(vec![], vec![])));
+
+        // `COUNT(*) FILTER (WHERE …)` carries `arg: None` exactly like a bare
+        // `COUNT(*)`, so a guard testing only the function and the argument
+        // admits it — and then answers with the *unfiltered* count.
+        let filtered = match agg(AggFunc::Count, None) {
+            SelectItem::Aggregate {
+                func,
+                arg,
+                label,
+                arg_expr,
+                ..
+            } => SelectItem::Aggregate {
+                func,
+                arg,
+                label,
+                arg_expr,
+                // An empty `And` is the cheapest valid condition; only the
+                // filter's *presence* is under test here.
+                filter: Some(AggregateFilter {
+                    condition: crate::core::rql::expr::Cond::And(Vec::new()),
+                    schema: Vec::new(),
+                }),
+            },
+            other => other,
+        };
+        assert!(!is_row_count_only(&plan(vec![filtered], vec![])));
+
+        // `HAVING` decides which groups survive, which needs the values.
+        let mut having = plan(vec![agg(AggFunc::Count, None)], vec![]);
+        having.having = Some(Having {
+            func: AggFunc::Count,
+            arg: None,
+            op: HavingOp::Gt,
+            literal: "0".to_string(),
+        });
+        assert!(!is_row_count_only(&having));
+
+        // `LIMIT 0` must return no rows, and `OFFSET 1` past a one-row result
+        // likewise. The fast path returns straight from the executor and never
+        // reaches the paging the fold's caller applies, so both have to fall
+        // through to the ordinary path. Drivers issue `LIMIT 0` to read column
+        // metadata, so this is not an exotic shape.
+        let mut limited = plan(vec![agg(AggFunc::Count, None)], vec![]);
+        limited.limit = Some(0);
+        assert!(!is_row_count_only(&limited));
+
+        let mut limited_one = plan(vec![agg(AggFunc::Count, None)], vec![]);
+        limited_one.limit = Some(1);
+        assert!(!is_row_count_only(&limited_one));
+
+        let mut offset = plan(vec![agg(AggFunc::Count, None)], vec![]);
+        offset.offset = Some(1);
+        assert!(!is_row_count_only(&offset));
+    }
+
+    /// The fast path's row has to be the one the fold would have produced.
+    #[test]
+    fn a_counted_plan_matches_what_the_fold_would_emit() {
+        let p = plan(
+            vec![agg(AggFunc::Count, None), agg(AggFunc::Count, None)],
+            vec![],
+        );
+        let out = row_count_result(&p, 7);
+
+        assert_eq!(out.len(), 1, "a count always answers with exactly one row");
+        assert_eq!(out[0].columns.len(), p.items.len());
+        for (i, c) in out[0].columns.iter().enumerate() {
+            assert_eq!(c.schema_id, i as u64, "column {i} carries its item's index");
+            assert_eq!(c.column_type, DbType::I64);
+            assert_eq!(c.data.into_slice(), &7i64.to_le_bytes());
+        }
+
+        // Zero is a row, not the absence of one — `SELECT COUNT(*)` over an
+        // empty table answers 0. This is the asymmetry with `GROUP BY`, which
+        // yields no rows for no input.
+        let zero = row_count_result(&plan(vec![agg(AggFunc::Count, None)], vec![]), 0);
+        assert_eq!(zero.len(), 1);
+        assert_eq!(zero[0].columns[0].data.into_slice(), &0i64.to_le_bytes());
     }
 
     /// Builds `COALESCE(MAX(<field>), 0) + 1` the way the parser does.

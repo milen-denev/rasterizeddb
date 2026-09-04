@@ -8239,6 +8239,43 @@ pub async fn execute_with_context(
             // takes the row-mode path: the bytes path never materialises a
             // `Vec<Row>` for the fold to read.
             if let Some(plan) = query_row.aggregate.clone() {
+                // `SELECT COUNT(*)` and nothing else: the scan counts matches
+                // and never builds a row. The general path below fetches every
+                // matching row into a `Vec<Row>` for the fold to walk, which is
+                // ~1.5 GB of `Row` for a million-row count and measured four
+                // times the cost of *sorting* the same table.
+                //
+                // `is_row_count_only` is where the safety lives — in particular
+                // it rejects `COUNT(*) FILTER (WHERE …)`, whose `arg` is `None`
+                // exactly like a bare `COUNT(*)` and which would otherwise be
+                // answered with the unfiltered count.
+                if crate::core::rql::aggregate::is_row_count_only(&plan) {
+                    match table
+                        .count_rows_in_txn(
+                            &query_row.where_clause,
+                            &schema.fields.to_vec(),
+                            query_row.query_row_fetch,
+                            tx,
+                        )
+                        .await
+                    {
+                        Ok(count) => {
+                            let mut result = vec![2u8];
+                            for row in &crate::core::rql::aggregate::row_count_result(&plan, count)
+                            {
+                                row.extend_serialized(&mut result);
+                            }
+                            return result;
+                        }
+                        Err(e) => {
+                            error!("Failed to execute count query: {}", e);
+                            let mut result = vec![3u8];
+                            result.extend_from_slice(e.to_string().as_bytes());
+                            return result;
+                        }
+                    }
+                }
+
                 // The fold has to see the `__null_` companions of every column
                 // it reads, or a NULL is indistinguishable from the zeros its
                 // value column holds. The select path fetches them because the

@@ -385,3 +385,53 @@ async fn entries_are_not_shared_across_tables_or_clauses() {
         ROW_COUNT as usize
     );
 }
+
+/// Each row served from a cached top-N must carry its own payload.
+///
+/// The cached path no longer fetches the payload while it sorts: with an
+/// `ORDER BY … LIMIT` it reads the sort key, keeps the pointer, and reads the
+/// rest afterwards for the rows that survived. `order_by_survives_a_cache_hit`
+/// above checks the sort column, which is the one column that cannot detect a
+/// row stitched to the wrong pointer — so this checks the *other* column, and
+/// checks it against the same ordering uncapped rather than against the
+/// `id + age == ROW_COUNT` invariant the fixture happens to satisfy. A payload
+/// read through the wrong pointer is a real row and satisfies that invariant
+/// perfectly; it is simply the wrong row, and only the uncapped answer says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cached_top_n_keeps_each_row_with_its_own_payload() {
+    let _serial = SERIAL.lock().await;
+    init_globals();
+    let dir = tempfile::tempdir().unwrap();
+    let db = setup(dir.path().to_str().unwrap(), "t_pairs").await;
+
+    const ALL: &str = "SELECT id, age FROM t_pairs WHERE id > 0";
+    const SORTED: &str = "SELECT id, age FROM t_pairs WHERE id > 0 ORDER BY age ASC";
+
+    clear_cache();
+    let full = run(&db, SORTED).await;
+    let full_ids = column_u64(&full, 0);
+    let full_ages = column_i32(&full, 1);
+    assert_eq!(full_ids.len(), ROW_COUNT as usize, "the uncapped answer is short");
+
+    // Warm the entry with the unordered clause, so every page below is served
+    // from the cache rather than rescanned.
+    clear_cache();
+    let _ = run(&db, ALL).await;
+
+    for cap in [1usize, 3, 10, ROW_COUNT as usize] {
+        let sql = format!("{SORTED} LIMIT {cap}");
+        let page = run(&db, &sql).await;
+        let want = cap.min(ROW_COUNT as usize);
+        assert_eq!(
+            column_u64(&page, 0),
+            full_ids[..want].to_vec(),
+            "LIMIT {cap}: ids differ from the uncapped ordering, so a row was \
+             paired with another row's payload"
+        );
+        assert_eq!(
+            column_i32(&page, 1),
+            full_ages[..want].to_vec(),
+            "LIMIT {cap}: ages differ from the uncapped ordering"
+        );
+    }
+}

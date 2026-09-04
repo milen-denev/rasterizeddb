@@ -176,7 +176,16 @@ async fn write_mode(database: &Arc<Database>, args: &Args) {
 
 async fn read_mode(database: &Arc<Database>, args: &Args) {
     let workloads: Vec<&str> = if args.workload == "all" {
-        vec!["scan", "point", "narrow", "agg", "like"]
+        vec![
+            "scan",
+            "point",
+            "narrow",
+            "agg",
+            "like",
+            "count",
+            "topn",
+            "topn_narrow",
+        ]
     } else {
         vec![args.workload.as_str()]
     };
@@ -252,6 +261,21 @@ fn query_for(workload: &str, i: u64, rows: usize) -> String {
         "agg" => "SELECT COUNT(*), AVG(salary) FROM bench WHERE age > 44".to_string(),
         // String predicate: the SIMD compare path.
         "like" => "SELECT id, name FROM bench WHERE name LIKE '%42'".to_string(),
+        // A full pass that fetches no row payload at all: every slot is walked
+        // and visibility-tested, and nothing else happens. This is the floor
+        // cost of touching a table, and on the 192.168.1.7 node it is ~600 ns
+        // per slot — 580 ms to count a million rows.
+        "count" => "SELECT COUNT(*) FROM bench".to_string(),
+        // `ORDER BY … LIMIT k`. The sort key defeats the early-exit that makes
+        // a bare `LIMIT` cheap, so this pays the full pass above and then keeps
+        // only k rows. Measured on that node: 1.5 ms without the ORDER BY,
+        // ~860 ms with it, on the same million-row table.
+        "topn" => "SELECT id, age, salary, name FROM bench ORDER BY name LIMIT 200".to_string(),
+        // The same shape with the payload narrowed to the sort key alone. If
+        // the cost were the payload rather than the pass, this would be much
+        // cheaper than `topn`; on the live node it was only ~9 % cheaper, which
+        // is what sent this profiling run looking at the pass instead.
+        "topn_narrow" => "SELECT name FROM bench ORDER BY name LIMIT 200".to_string(),
         other => {
             eprintln!("unknown workload: {other}");
             std::process::exit(2)

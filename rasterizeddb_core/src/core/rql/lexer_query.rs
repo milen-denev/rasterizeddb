@@ -1969,15 +1969,15 @@ pub fn row_fetch_from_select_query(
                 .next()
                 .unwrap_or(&term.token)
                 .trim_matches('"');
-            schema.iter().any(|f| {
-                f.name.eq_ignore_ascii_case(bare)
-                    && !f.is_deleted
-                    // A nullable key must not byte-sort: a stored NULL is the
-                    // type's zeroes there, so NULL timestamps sorted as 1970
-                    // instead of last. The expression path reads the
-                    // companion and places NULLs where PostgreSQL does.
-                    && crate::core::rql::nullable::flag_field(&f.name, schema).is_none()
-            })
+            // A nullable key is allowed now: the scan fetches its `__null_x`
+            // companion (below) and the sort reads it, so a stored NULL is no
+            // longer byte-compared as the type's zeroes. Routing these to the
+            // expression path instead meant the scan ran unbounded — it is
+            // handed no limit there — so `ORDER BY <nullable> LIMIT 3` had to
+            // materialise every matching row to return three.
+            schema
+                .iter()
+                .any(|f| f.name.eq_ignore_ascii_case(bare) && !f.is_deleted)
         }
     });
     let mut order_expressions: Vec<(crate::core::rql::expr::Expr, bool, Option<bool>)> = Vec::new();
@@ -2021,6 +2021,18 @@ pub fn row_fetch_from_select_query(
         // not selected still has to be fetched.
         if let Some(order_spec) = order_by.as_deref() {
             for (name, _) in crate::core::rql::order_by::parse_spec(order_spec) {
+                // A nullable key is only sortable with its companion in the
+                // row, so the companion is fetched too. Both ride after the
+                // visible columns and are trimmed before the client sees the
+                // row, exactly as an unselected sort key already was.
+                if let Some(flag) = crate::core::rql::nullable::flag_field(&name, schema) {
+                    if !requested_columns
+                        .iter()
+                        .any(|c| c.eq_ignore_ascii_case(&flag.name))
+                    {
+                        requested_columns.push(flag.name.clone());
+                    }
+                }
                 if !requested_columns
                     .iter()
                     .any(|c| c.eq_ignore_ascii_case(&name))
