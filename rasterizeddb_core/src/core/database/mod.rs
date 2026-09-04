@@ -177,9 +177,18 @@ impl TransactionFamily {
 /// this feature listed four entries and omitted `.db` — the row data itself —
 /// which would have moved the schema and the pointers while orphaning every
 /// row, leaving pointers resolving into a file that no longer existed. The list
-/// is asserted against `Table::new_with_constraints` by
-/// `the_rename_file_list_matches_what_a_table_creates`, so a sixth sidecar
-/// added later fails that test rather than being silently left behind.
+/// is asserted against the files a real table produces by
+/// `the_rename_file_list_matches_what_a_table_creates`, so a sidecar added
+/// later fails that test rather than being silently left behind.
+///
+/// That guard was itself short for a while, and the three entries it missed say
+/// what to watch for: several sidecars are opened only when a schema is
+/// *loaded*, so a table that has been created and never reopened has fewer
+/// files on disk than the same table after a restart. Checking a
+/// freshly-created table is checking the smaller set. `CHK`, `GEN` and `PIX`
+/// sat outside this list that way — a rename dropped a table's CHECK
+/// constraints, its generated columns and its JSON path indexes, and left the
+/// files under the old name for the next table to inherit.
 const RENAMED_SUFFIXES: &[&str] = &[
     // Row data. First deliberately: it is the one whose absence is silent.
     ".db",
@@ -192,6 +201,9 @@ const RENAMED_SUFFIXES: &[&str] = &[
     "_schema_UK.db",
     "_schema_JSON.db",
     "_schema_TYP.db",
+    "_schema_CHK.db",
+    "_schema_GEN.db",
+    "_schema_PIX.db",
     // Derived: the filter rebuilds from the pointers and the sequence from
     // `load_id_sequence`, so a failure to copy either is recoverable. They are
     // copied anyway because copying is cheaper than rebuilding.
@@ -476,20 +488,94 @@ async fn seed_at(pool: &StoragePool, location: &str, table_name: &str) -> Arc<Db
     )
 }
 
+/// The provider a table's files are created from, on a named *backend*.
+///
+/// The generalisation of [`seed_at`] that a move between backends needs: it has
+/// to open the destination before the placement says the table is there, and
+/// the destination may not be a directory at all.
+///
+/// Deliberately fallible where `seed_at` is not. A directory that cannot be
+/// written fails at the first write and the caller finds out; a key/value store
+/// that cannot be opened would otherwise fall back to memory — see
+/// [`fallback_seed`] — and a move into it would report success having copied
+/// the table into a buffer that dies with the process.
+#[cfg(feature = "storage_pools")]
+async fn seed_for_backend(
+    pool: &StoragePool,
+    _kv: &KvStores,
+    backend: &crate::core::storage::TableBackend,
+    table_name: &str,
+) -> io::Result<Arc<DbStorageProvider>> {
+    use crate::core::storage::TableBackend;
+
+    match backend {
+        TableBackend::Directory(path) => Ok(seed_at(pool, path, table_name).await),
+        TableBackend::Memory => Ok(Arc::new(DbStorageProvider::new_memory(&format!(
+            "{table_name}_pointers.db"
+        )))),
+        #[cfg(feature = "kv_storage")]
+        TableBackend::KeyValue(store) => {
+            let family = _kv.family(store).await?;
+            let provider =
+                DbStorageProvider::new_key_value(family, &format!("{table_name}_pointers.db"))
+                    .await?;
+            Ok(Arc::new(provider))
+        }
+        #[cfg(not(feature = "kv_storage"))]
+        other => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("this server cannot open a {} backend", other.kind()),
+        )),
+    }
+}
+
 #[cfg(not(feature = "storage_pools"))]
 async fn seed_in(
     io_pointers: &Arc<DbStorageProvider>,
     _pool: &StoragePool,
     _kv: &KvStores,
     _seeds: &SeedCache,
-    _table_name: &str,
+    table_name: &str,
 ) -> Arc<DbStorageProvider> {
+    // A statement-scoped relation never reaches a disk. See `temp_seed`.
+    if let Some(seed) = temp_seed(table_name) {
+        return seed;
+    }
     io_pointers.clone()
+}
+
+/// The provider a table's files are resolved from, for a test that wants to
+/// read one of them directly.
+///
+/// `seed_in` is private and takes four of a `Database`'s fields; a test that
+/// reached for them individually would go stale the moment one moves.
+#[cfg(test)]
+pub(crate) async fn seed_for_tests(
+    database: &Database,
+    table_name: &str,
+) -> Arc<DbStorageProvider> {
+    seed_in(
+        &database.db_io_pointers,
+        &database.storage,
+        &database.kv,
+        &database.seeds,
+        table_name,
+    )
+    .await
 }
 
 /// Chooses and records where a table about to be created goes.
 #[cfg(feature = "storage_pools")]
 fn pool_place(pool: &StoragePool, table_name: &str) {
+    // A statement-scoped relation is in memory and so is in no directory —
+    // recording a placement for it would name one its files are not in. It
+    // would also be the expensive half of this: `place` and `forget` each take
+    // the pool's write lock and `persist()` the whole placement map, so a
+    // materialised CTE rewrote that file twice, and every concurrent statement
+    // with a CTE in it queued behind the same lock. See `temp_seed`.
+    if temp_seed(table_name).is_some() {
+        return;
+    }
     pool.place(table_name);
 }
 
@@ -1404,8 +1490,8 @@ impl Database {
         total
     }
 
-    /// Moves a table's files into `destination`, which must be a storage
-    /// location of this database.
+    /// Moves a table's bytes onto `destination`, which may be a storage
+    /// location, another key/value store, or memory.
     ///
     /// Returns the number of bytes copied.
     ///
@@ -1414,52 +1500,101 @@ impl Database {
     /// Copy, then flip the placement, then delete the originals. Every window
     /// between those steps leaves a *leak* rather than a loss:
     ///
-    /// * crash after the copy — the placement still names the old directory,
-    ///   the table opens from it unchanged, and the new copies are orphans that
+    /// * crash after the copy — the placement still names the old backend, the
+    ///   table opens from it unchanged, and the new copies are orphans that
     ///   nothing reads. `db_storage.cfg` is the only thing that decides where a
-    ///   table is, so files it does not name are invisible.
-    /// * crash after the flip — the table opens from the new directory and the
+    ///   table is, so bytes it does not name are invisible.
+    /// * crash after the flip — the table opens from the new backend and the
     ///   originals are the orphans.
     ///
     /// The placement flip is a rename over `db_storage.cfg`, so there is no
     /// state in which it is half-applied. That is the whole reason the pool
     /// file is rewritten atomically rather than appended to.
+    ///
+    /// # Why this works for every backend
+    ///
+    /// The copy is `StorageIO` to `StorageIO`, one named file at a time. It
+    /// never reads a directory entry, an object key or a buffer address, so a
+    /// directory, an in-memory registry and a key/value family are all just a
+    /// provider to it — which is what makes file to memory to key/value to S3
+    /// one operation instead of twelve.
+    ///
+    /// The two things that are *not* backend-agnostic are handled by the
+    /// caller: a directory destination has to be a location of this database,
+    /// and a store destination has to be configured. Both are checked here
+    /// before anything is copied.
     #[cfg(feature = "storage_pools")]
     pub async fn move_table_to(&self, table_name: &str, destination: &str) -> io::Result<u64> {
-        use crate::core::storage::LocationRole;
+        let backend = crate::core::storage::TableBackend::parse(destination);
+        self.move_table_to_backend(table_name, &backend).await
+    }
 
-        let destination = crate::core::storage::normalize(destination);
+    /// [`Self::move_table_to`], with the destination already resolved.
+    #[cfg(feature = "storage_pools")]
+    pub async fn move_table_to_backend(
+        &self,
+        table_name: &str,
+        destination: &crate::core::storage::TableBackend,
+    ) -> io::Result<u64> {
+        use crate::core::storage::{LocationRole, TableBackend};
+
         let root = self
             .storage
             .root()
             .ok_or_else(|| io::Error::other("this database is in memory"))?
             .to_string();
 
-        match self.storage.role_of(&destination) {
-            Some(LocationRole::Primary) => {}
-            Some(LocationRole::Backup) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "{} is a backup location: its contents are written by mirroring, \
-                         and a table moved into it would be overwritten",
-                        destination
-                    ),
-                ));
+        // A directory has to be one this database writes into; the other
+        // backends have their own answer to "does this exist", and both are
+        // asked before a byte is copied.
+        match destination {
+            TableBackend::Directory(path) => match self.storage.role_of(path) {
+                Some(LocationRole::Primary) => {}
+                Some(LocationRole::Backup) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "{} is a backup location: its contents are written by mirroring, \
+                             and a table moved into it would be overwritten",
+                            path
+                        ),
+                    ));
+                }
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("{} is not a storage location of this database", path),
+                    ));
+                }
+            },
+            TableBackend::Memory => {}
+            #[cfg(feature = "kv_storage")]
+            TableBackend::KeyValue(store) => {
+                if !self.kv.has(store) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!(
+                            "no key/value store named '{}' in {}",
+                            store,
+                            crate::core::storage::kv_registry::KV_FILE
+                        ),
+                    ));
+                }
             }
-            None => {
+            #[cfg(not(feature = "kv_storage"))]
+            other => {
                 return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("{} is not a storage location of this database", destination),
+                    io::ErrorKind::Unsupported,
+                    format!("this server cannot open a {} backend", other.kind()),
                 ));
             }
         }
 
         let current = self
             .storage
-            .location_of(table_name)
-            .unwrap_or_else(|| root.clone());
-        if current == destination {
+            .backend_of(table_name)
+            .unwrap_or_else(|| TableBackend::Directory(root.clone()));
+        if current == *destination {
             return Ok(0);
         }
 
@@ -1467,7 +1602,17 @@ impl Database {
             return Err(io::Error::new(io::ErrorKind::NotFound, "Table not found"));
         }
 
-        // The handle goes first so its maintenance task stops before the files
+        // Every write this table has made has to be on the source before the
+        // source is read. The handle's own maintenance stops when it is removed
+        // below, but a write-ahead log record still only in the page cache is
+        // not something dropping a handle flushes — and the originals are
+        // deleted at the end of this, so anything left there is lost rather
+        // than merely late.
+        if let Err(e) = self.sync_durable() {
+            warn!("could not flush before moving {}: {}", table_name, e);
+        }
+
+        // The handle goes first so its maintenance task stops before the bytes
         // are read: a background flush landing mid-copy would put bytes in the
         // source that the copy has already passed. Same reasoning as
         // `rename_table`.
@@ -1486,7 +1631,25 @@ impl Database {
         // opened, and the catalogue's provider may predate the backup location.
         // Deriving from it would move a mirrored table onto a disk and quietly
         // stop mirroring it.
-        let to = seed_at(&self.storage, &destination, table_name).await;
+        //
+        // Boxed for the reason `seed_in` boxes its own: this is on a statement's
+        // await chain and the key/value arm is much the largest of the three.
+        let to = match Box::pin(seed_for_backend(
+            &self.storage,
+            &self.kv,
+            destination,
+            table_name,
+        ))
+        .await
+        {
+            Ok(to) => to,
+            Err(e) => {
+                if let Some(table) = table {
+                    self.tables.insert(table_name.to_string(), table);
+                }
+                return Err(e);
+            }
+        };
 
         let copied = copy_between(&from, &to, table_name).await;
 
@@ -1503,14 +1666,19 @@ impl Database {
                 if let Some(table) = table {
                     self.tables.insert(table_name.to_string(), table);
                 }
-                error!("Could not move {} to {}: {}", table_name, destination, e);
+                error!(
+                    "Could not move {} to {}: {}",
+                    table_name,
+                    destination.as_spec(),
+                    e
+                );
                 return Err(e);
             }
         };
 
         // The flip. Everything before it is reversible by deleting copies;
-        // everything after it reads from the new directory.
-        if let Err(e) = self.storage.pin(table_name, &destination) {
+        // everything after it reads from the new backend.
+        if let Err(e) = self.storage.pin_backend(table_name, destination) {
             discard_files(&Arc::new(to.without_backups()), table_name).await;
             if let Some(table) = table {
                 self.tables.insert(table_name.to_string(), table);
@@ -1518,12 +1686,77 @@ impl Database {
             return Err(io::Error::other(e));
         }
 
+        // The seed cache is keyed on `(spec, table)`, so the destination's
+        // entry is a different one — and it has to be *written*, not left to be
+        // built later. An in-memory backend's identity is the registry its seed
+        // created: rebuilding a seed for `memory:` would make a second, empty
+        // one and the rows just copied would be unreachable. The source's entry
+        // goes for the opposite reason: it holds the bytes this is about to
+        // delete, and a later move back to that backend must not find them.
+        self.seeds
+            .remove(&(current.as_spec(), table_name.to_string()));
+        if !destination.is_file_based() {
+            self.seeds
+                .insert((destination.as_spec(), table_name.to_string()), to.clone());
+        }
+
         // The old handle is dropped rather than reused: it holds file handles
-        // and a memory map of the *old* directory, and reading through it after
-        // the flip would serve rows from files this is about to delete.
+        // and a memory map of the *old* backend, and reading through it after
+        // the flip would serve rows from bytes this is about to delete.
         drop(table);
 
-        let mut reopened = Table::new(table_name, to, Vec::new()).await;
+        let mut reopened = Table::new(table_name, to.clone(), Vec::new()).await;
+        if reopened.schema_unreadable {
+            // Publishing it would be a table with no columns, which is what the
+            // guard exists to prevent. But *returning here* used to leave the
+            // table in neither place: removed from the live map, and with the
+            // placement already flipped, so the running server could not see it
+            // at all until a restart. An operator watching a move fail would
+            // find the table gone.
+            //
+            // The source bytes are still there — `discard_files` is below this
+            // point — so the whole move can be undone: put the placement back,
+            // reopen from the source, and delete the bad copy. That turns a
+            // failed move into a no-op, which is what it should always have
+            // been.
+            error!(
+                "table '{}' could not be read at {} after the copy; rolling the move back",
+                table_name,
+                destination.as_spec()
+            );
+            let rolled_back = self.storage.pin_backend(table_name, &current).is_ok();
+            self.seeds
+                .remove(&(destination.as_spec(), table_name.to_string()));
+            if !current.is_file_based() {
+                self.seeds
+                    .insert((current.as_spec(), table_name.to_string()), from.clone());
+            }
+            discard_files(&Arc::new(to.without_backups()), table_name).await;
+
+            let mut restored = Table::new(table_name, from, Vec::new()).await;
+            if rolled_back && !restored.schema_unreadable {
+                restored.scope_cache_to_database(self.id);
+                restored.enable_versioning(self.transactions.clone());
+                self.tables
+                    .insert(table_name.to_string(), Arc::new(restored));
+            } else {
+                // Both copies unreadable, or the placement would not go back.
+                // Nothing to publish, and saying so is the only honest answer —
+                // but the bytes are still under the placement that is recorded.
+                error!(
+                    "table '{}' could not be restored to {} either; it is absent from this \
+                     server until it is restarted",
+                    table_name,
+                    current.as_spec()
+                );
+            }
+            return Err(io::Error::other(format!(
+                "table '{}' was copied to {} but its schema could not be read there; the \
+                 move was rolled back and the table is where it was",
+                table_name,
+                destination.as_spec()
+            )));
+        }
         reopened.scope_cache_to_database(self.id);
         reopened.enable_versioning(self.transactions.clone());
         self.tables
@@ -1532,9 +1765,43 @@ impl Database {
         // The old primary's files, and only those — see `without_backups`.
         discard_files(&Arc::new(from.without_backups()), table_name).await;
 
+        // Make the destination durable before reporting success.
+        //
+        // `copy_between` commits each file it writes, but reopening the table
+        // writes more — a schema header, an id sequence — and those are
+        // *non-transactional*, so a key/value backend leaves them to its
+        // background service and its flush interval. A server that stopped
+        // inside that window came back with the table on the new store and
+        // none of its rows: the move had reported success and the data was
+        // gone. It showed up as a restart in a test losing 12 rows of 12,
+        // intermittently, which is exactly how long that window is.
+        //
+        // The file backend has no equivalent gap here — its own commit path
+        // already ran — so this is asked of the provider rather than branched
+        // on the backend, and is a no-op where there is nothing to flush.
+        #[cfg(feature = "kv_storage")]
+        if let Some(family) = to.kv_family()
+            && let Err(e) = family.flush_all().await
+        {
+            // The bytes are copied and the placement is flipped, so this is a
+            // durability warning rather than a failed move: the background
+            // service will still write them out. Reported because "moved" must
+            // not imply "survives a crash from this instant" when it does not.
+            warn!(
+                "moved {} to {} but could not flush the store: {}. The move is applied; \
+                 its last writes are durable once the store's flush interval elapses",
+                table_name,
+                destination.as_spec(),
+                e
+            );
+        }
+
         info!(
             "Moved {} from {} to {} ({} bytes)",
-            table_name, current, destination, copied
+            table_name,
+            current.as_spec(),
+            destination.as_spec(),
+            copied
         );
         Ok(copied)
     }

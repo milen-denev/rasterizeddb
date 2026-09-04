@@ -45,8 +45,20 @@ async fn the_rename_file_list_matches_what_a_table_creates() {
     let db = open_db(dir.path()).await;
     create(&db, "filelist").await;
 
-    // Touch every sidecar so the lazily-created ones exist.
+    // Reopening is what makes the lazily-created sidecars exist: several of
+    // them are only opened when a schema is *loaded*, so a table that has been
+    // created and never reopened has fewer files on disk than the same table
+    // after a restart. Asserting against the freshly-created set is how three
+    // sidecars — CHK, GEN and PIX — sat outside this list unnoticed: they were
+    // never on disk while this test was looking.
     let table = db.tables.get("filelist").expect("table").clone();
+    let schema_io = db
+        .db_io_pointers
+        .create_new("filelist_schema.db".to_string())
+        .await;
+    let _ = TableSchema::load(Arc::new(schema_io))
+        .await
+        .expect("load the schema back");
     for suffix in [
         "_schema_FK.db",
         "_schema_DEF.db",

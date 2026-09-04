@@ -60,6 +60,78 @@ impl DbStorageProvider {
         )
     }
 
+    /// What is holding these bytes, as a console groups tables by.
+    ///
+    /// One word, and a stable one: it is a value somebody filters and sorts a
+    /// table list by, so it is not prose and it does not carry a path. Where
+    /// the bytes actually are is [`Self::location`], which is prose and may be
+    /// empty.
+    ///
+    /// | value | what it means |
+    /// |---|---|
+    /// | `memory` | in this process, and gone when it exits |
+    /// | `file` | ordinary files in a directory |
+    /// | `mirrored` | files, written to a primary directory and to backups |
+    /// | `s3` | objects in an S3-compatible store |
+    /// | `kv-directory` | the object layout, in a local directory |
+    /// | `kv-memory` | the object layout, in a map |
+    ///
+    /// The three `kv-*` answers are one storage engine over three backing
+    /// stores, and they are kept apart rather than folded into one `object`
+    /// because what an operator does about a slow table differs completely
+    /// between them — a local directory is a disk to look at, and S3 is a
+    /// request count to pay for.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::File(_) => "file",
+            Self::Memory(_) => "memory",
+            #[cfg(feature = "storage_pools")]
+            Self::Mirror(_) => "mirrored",
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.family().store().kind(),
+        }
+    }
+
+    /// Where those bytes are, in the form an operator would act on: a
+    /// directory, a bucket, or nothing at all for a database that has none.
+    pub fn location(&self) -> String {
+        match self {
+            Self::File(p) => p.location.clone(),
+            // Not the empty string, and not the process id either: what matters
+            // about an in-memory table is that it does not survive, and this is
+            // read by someone deciding whether they have a problem.
+            Self::Memory(_) => "(in process memory, not persisted)".to_string(),
+            #[cfg(feature = "storage_pools")]
+            Self::Mirror(p) => {
+                let copies = p.backup_count();
+                format!(
+                    "{} (+{} backup {})",
+                    p.primary().location,
+                    copies,
+                    if copies == 1 { "copy" } else { "copies" }
+                )
+            }
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => {
+                let family = p.family();
+                format!("{}/{}", family.store().describe(), family.config().root)
+            }
+        }
+    }
+
+    /// The key/value family behind this provider, if one is.
+    ///
+    /// The page cache and the request counters live on the family and are
+    /// shared by every file of the database, so they are reported once for the
+    /// database rather than per table.
+    #[cfg(feature = "kv_storage")]
+    pub fn kv_family(&self) -> Option<&std::sync::Arc<super::kv::KvFamily>> {
+        match self {
+            Self::KeyValue(p) => Some(p.family()),
+            _ => None,
+        }
+    }
+
     /// Whether this provider keeps backup copies, and how many.
     #[cfg(feature = "storage_pools")]
     pub fn backup_count(&self) -> usize {

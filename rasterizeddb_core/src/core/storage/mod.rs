@@ -62,6 +62,7 @@
 mod backend_tests;
 #[cfg(feature = "kv_storage")]
 pub mod kv_registry;
+pub mod kv_sql;
 pub mod mirror;
 #[cfg(test)]
 mod placement_tests;

@@ -27,7 +27,9 @@ use rclite::Arc;
 
 use crate::core::database::Database;
 
-use super::{LocationRole, PlacementPolicy, StorageManager, available_bytes, human_bytes};
+use super::{
+    LocationRole, PlacementPolicy, StorageManager, TableBackend, available_bytes, human_bytes,
+};
 
 /// One move a rebalance intends.
 struct Move {
@@ -39,50 +41,96 @@ struct Move {
     reason: &'static str,
 }
 
-/// `STORAGE MOVE TABLE <name> TO '<path>'`, and the line it reports.
+/// `STORAGE MOVE TABLE <name> TO '<spec>'`, and the lines it reports.
 ///
 /// A move to where the table already is is success, not an error — a rebalance
 /// script that names every table should not fail on the ones the policy already
 /// put in the right place — but it says so rather than reporting a copy of zero
 /// bytes, which reads as a move that silently did nothing.
+///
+/// # It is a conversion, not only a relocation
+///
+/// `<spec>` is a backend, so this is also how a table changes what holds it:
+/// a directory, `memory:`, or `kv:<store>` — and a store is a local directory
+/// or an S3 bucket depending only on how it was defined. The copy itself is
+/// backend-agnostic (see [`crate::core::database::Database::move_table_to_backend`]);
+/// what is not agnostic, and what this reports, is which of the file-backed
+/// features the table gains or loses on arrival. Saying nothing there is how an
+/// operator ends up with a table that is no longer in any backup and no
+/// indication that it changed.
 pub async fn move_table(
     database: &Arc<Database>,
     table: &str,
-    destination: &str,
-) -> Result<String, String> {
+    destination: &TableBackend,
+) -> Result<Vec<String>, String> {
     let pool = &database.storage;
     let root = pool.root().ok_or("this database is in memory")?.to_string();
 
-    // Relocation is a file-based feature, and a table that is not file-based
-    // does not get it. There is no file to copy, and doing this by rows would be
-    // a different operation with different guarantees wearing the same name.
-    if let Some(backend) = pool.backend_of(table)
-        && !backend.is_file_based()
-    {
-        return Err(format!(
-            "{} is an {} table, so it has no files to move between directories",
+    let current = pool
+        .backend_of(table)
+        .unwrap_or(TableBackend::Directory(root));
+
+    if current == *destination {
+        return Ok(vec![format!(
+            "{} is already on {}",
             table,
-            backend.kind()
-        ));
-    }
-
-    let current = pool.location_of(table).unwrap_or(root);
-
-    if current == destination {
-        return Ok(format!("{} is already in {}", table, destination));
+            where_it_is(destination)
+        )]);
     }
 
     let bytes = database
-        .move_table_to(table, destination)
+        .move_table_to_backend(table, destination)
         .await
         .map_err(|e| e.to_string())?;
 
-    Ok(format!(
-        "moved {} to {} ({})",
+    let mut lines = vec![format!(
+        "moved {} from {} to {} ({})",
         table,
-        destination,
+        where_it_is(&current),
+        where_it_is(destination),
         human_bytes(bytes)
-    ))
+    )];
+    lines.extend(consequences(&current, destination));
+    Ok(lines)
+}
+
+/// How a backend reads in a sentence an operator is looking at.
+fn where_it_is(backend: &TableBackend) -> String {
+    match backend {
+        TableBackend::Directory(path) => path.clone(),
+        TableBackend::Memory => "memory".to_string(),
+        TableBackend::KeyValue(store) => format!("key/value store '{store}'"),
+    }
+}
+
+/// What the table gained or lost by arriving where it did.
+///
+/// Backup, the write-ahead log, relocation and the free-space policy are
+/// features *about files*. Crossing that line in either direction is the part
+/// of a move that is invisible afterwards: the rows read back identically, and
+/// the next snapshot is the first hint that the table is no longer in one.
+fn consequences(from: &TableBackend, to: &TableBackend) -> Vec<String> {
+    let mut lines = Vec::new();
+    match to {
+        TableBackend::Memory => lines.push(
+            "it is now in this process only: it does not survive a restart, it is in no \
+             backup, and it has no write-ahead log"
+                .to_string(),
+        ),
+        TableBackend::KeyValue(_) => lines.push(
+            "it is durable in the store, but it is no longer covered by backups or by \
+             STORAGE REBALANCE, and it has no write-ahead log — its durability is \
+             the delta object written at each commit"
+                .to_string(),
+        ),
+        TableBackend::Directory(_) if !from.is_file_based() => lines.push(
+            "it is a file-backed table again: backups include it, the write-ahead log \
+             covers it, and the free-space policy counts it"
+                .to_string(),
+        ),
+        TableBackend::Directory(_) => {}
+    }
+    lines
 }
 
 /// `STORAGE REBALANCE [DRY RUN]`.
@@ -122,7 +170,10 @@ pub async fn rebalance(database: &Arc<Database>, dry_run: bool) -> Result<Vec<St
         // move is individually atomic — see `Database::move_table_to` — so
         // stopping leaves a consistent database with part of the plan applied,
         // and the next `STORAGE REBALANCE` re-plans from where it got to.
-        match database.move_table_to(&step.table, &step.to).await {
+        match database
+            .move_table_to_backend(&step.table, &TableBackend::Directory(step.to.clone()))
+            .await
+        {
             Ok(bytes) => {
                 moved += 1;
                 moved_bytes = moved_bytes.saturating_add(bytes);

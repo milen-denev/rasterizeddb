@@ -73,6 +73,20 @@ pub trait KvStore: Send + Sync + 'static {
 
     /// Short human-readable identity, for log lines and errors.
     fn describe(&self) -> String;
+
+    /// What kind of thing is behind this store, as a console groups tables by.
+    ///
+    /// A separate answer from [`KvStore::describe`] rather than something to be
+    /// read out of it: `describe` is prose for a log line and free to be
+    /// reworded, and a caller that classified a table by matching on `s3://`
+    /// would silently start calling every S3 table something else the day it
+    /// gained a region or lost its scheme. This is the stable half.
+    ///
+    /// The default is deliberately vague — a store that has not said what it is
+    /// should not be reported as a file or as S3.
+    fn kind(&self) -> &'static str {
+        "object"
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -166,6 +180,10 @@ impl KvStore for MemoryKvStore {
 
     fn describe(&self) -> String {
         "memory".to_string()
+    }
+
+    fn kind(&self) -> &'static str {
+        "kv-memory"
     }
 }
 
@@ -341,5 +359,12 @@ impl KvStore for LocalDirStore {
 
     fn describe(&self) -> String {
         format!("dir:{}", self.root.display())
+    }
+
+    /// Not `file`: the bytes are in a directory, but the *layout* is the object
+    /// one — chunks and a delta log — and everything an operator would do about
+    /// a slow table differs between the two.
+    fn kind(&self) -> &'static str {
+        "kv-directory"
     }
 }

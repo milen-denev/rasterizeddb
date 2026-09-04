@@ -53,12 +53,32 @@ impl S3KvStore {
         bucket: &str,
         path_style: bool,
     ) -> io::Result<Self> {
-        let credentials = Credentials::from_env().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are not set",
-            )
-        })?;
+        Self::from_parts_with(endpoint, region, bucket, path_style, None)
+    }
+
+    /// As [`Self::from_parts`], with credentials the caller already holds.
+    ///
+    /// `None` falls back to the environment. A store configured with its own
+    /// credentials takes them rather than the process's, so two stores in one
+    /// database can be in two accounts — which is the whole reason a store
+    /// carries them at all.
+    pub fn from_parts_with(
+        endpoint: &str,
+        region: &str,
+        bucket: &str,
+        path_style: bool,
+        credentials: Option<Credentials>,
+    ) -> io::Result<Self> {
+        let credentials = match credentials {
+            Some(credentials) => credentials,
+            None => Credentials::from_env().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "this store has no credentials of its own and AWS_ACCESS_KEY_ID / \
+                     AWS_SECRET_ACCESS_KEY are not set",
+                )
+            })?,
+        };
         let endpoint = Endpoint::parse(endpoint).map_err(io::Error::other)?;
         Self::new(S3Config {
             endpoint,
@@ -148,5 +168,9 @@ impl KvStore for S3KvStore {
 
     fn describe(&self) -> String {
         self.describe.clone()
+    }
+
+    fn kind(&self) -> &'static str {
+        "s3"
     }
 }

@@ -18,12 +18,16 @@ Target: `rasterizeddb_core::core::storage_providers::kv`, edition 2024.
 | `kv::provider` — `KvConfig`, `KvFamily`, `KvStorageProvider` | **Done.** §4–6 |
 | `DbStorageProvider::KeyValue` variant | **Done.** §9 |
 | Per-table placement, `db_kv.cfg`, `STORAGE PLACE TABLE … AT 'kv:…'` | **Done.** §9 |
+| `STORAGE ADD/ALTER/DROP STORE`, `SHOW STORAGE STORES` | **Done.** §9 |
+| Per-store credentials in `db_kv_secrets.cfg` (0600) | **Done.** §9 |
+| `STORAGE MOVE TABLE` converting between every backend | **Done.** §9 |
 | Crash-safe commit spanning several files | **Done.** §6 |
 | Compaction, delta retirement, recovery | **Done.** §4.4, §4.5 |
 | `create_temp` / `swap_temp` without a rename | **Done.** §4.6 |
 
 Not done: a multi-writer lease (§8) and a local disk cache tier (§5). Backup and
-relocation deliberately do **not** cover a key/value table — see §9.
+the free-space policy deliberately do **not** cover a key/value table — see §9.
+Relocation does, but as a conversion rather than a directory move.
 
 ## 1. Why an object store needs a different layout
 
@@ -279,6 +283,120 @@ run several stateless nodes, and that is precisely what is not yet safe.
 | `flush_interval_ms` | 200 | Exposure window for non-transactional writes |
 | `spill_bytes` | 8 MiB | Unstored records held before they are written out early |
 
+### Defining a store
+
+Everything here is a statement. Nothing needs the server stopped, and nothing
+needs a file edited by hand:
+
+```sql
+STORAGE ADD STORE archive S3 WITH (
+    ENDPOINT   = 'https://s3.us-east-1.amazonaws.com',
+    REGION     = 'us-east-1',
+    BUCKET     = 'my-bucket',
+    PREFIX     = 'rdb/archive',
+    ADDRESSING = 'virtual',        -- 'path' for MinIO, or a non-DNS-safe bucket
+    CHUNK_SIZE = '4MiB');
+
+STORAGE ADD STORE scratch DIRECTORY WITH (PATH = '/mnt/fast/kv', PREFIX = 'scratch');
+
+STORAGE ALTER STORE archive SET CACHE_BYTES = '512MiB';
+STORAGE DROP STORE scratch;
+SHOW STORAGE STORES;
+```
+
+Only `ENDPOINT` and `BUCKET` are required for S3; `REGION` defaults to
+`us-east-1` (it is signed over, and the stores that ignore it — MinIO, Ceph, R2
+— are the ones set up first), `PREFIX` to `rdb`, and `ADDRESSING` to `virtual`.
+Any of the settings in the table above may appear in `WITH (...)` or in
+`ALTER STORE ... SET`, and sizes take `4MiB` as readily as a byte count.
+
+`STORAGE ADD STORE IF NOT EXISTS <name> ...` is for a deployment that configures
+its own store and issues the statement on every start-up: there is no good moment
+for it to decide whether this is the first one, and wrapping the statement in a
+`SHOW` and a branch is a race as well as a nuisance. Re-issuing the same
+definition is a no-op. Re-issuing a **different** one is refused and names the
+fields that differ — leaving the old address in place would make the statement a
+lie, and adopting the new one would repoint a store out from under whatever is
+already on it. Credentials given on that path are still applied, because
+re-issuing with a key read from the environment is how such a deployment rotates
+one.
+
+### Credentials
+
+A store may carry its own, which is what lets two stores in one database live in
+two accounts:
+
+```sql
+STORAGE ADD STORE archive S3 WITH (
+    ENDPOINT = '...', BUCKET = '...',
+    ACCESS_KEY_ID     = 'AKIA...',
+    SECRET_ACCESS_KEY = '...',
+    SESSION_TOKEN     = '...');          -- for STS / IRSA / instance roles
+
+STORAGE ALTER STORE archive SET ACCESS_KEY_ID = '...', SECRET_ACCESS_KEY = '...';
+```
+
+A store given none signs with `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` /
+`AWS_SESSION_TOKEN` from the server's environment, as before. `SHOW STORAGE
+STORES` has a `credentials` column saying which of the two a store is on — never
+the credentials themselves.
+
+**They are not written to `db_kv.cfg`.** That file is rewritten by the server,
+quoted in errors and readable by anyone who can list the database directory, so
+a secret in it is a secret in the logs. Credentials go to `db_kv_secrets.cfg`
+beside it, created `0600`, and nothing renders them back: not `SHOW`, not
+`describe`, not a `Debug` impl, not a parse error — that parser reports line
+numbers and never the line. The split also keeps `db_kv.cfg` safe to paste into
+a ticket.
+
+What the split does **not** protect is a copy of the directory: a backup carries
+`db_kv_secrets.cfg` like any other file, so a backup of this database is as
+sensitive as the key in it. That is the one place to think before pointing a
+snapshot somewhere less private.
+
+Rotation is allowed where an address change is not — a new key moves no bytes,
+so `ALTER STORE ... SET SECRET_ACCESS_KEY` works while tables are placed on the
+store. A store this server already has **open** keeps signing with the
+credentials it opened with until the server restarts; the statement says so.
+Live rotation would mean swapping the signer under a shared `S3Client`, which is
+a change to the client `s3_backup` also uses, and is not done.
+
+`WITH (...)` tracks quotes, so a value may contain a comma, a `)`, an `=` or the
+word `WITH`. It has **no escape sequence**: a value cannot contain the quote
+character it is wrapped in, and an unterminated one is refused rather than read
+short. Parse errors in a `WITH` list name the key and never quote the offending
+text, because that text can be a credential and an error message is a log line.
+
+Half a credential — a key id with no secret, or a session token alone — is an
+error rather than a partial update: it would leave a store that looks configured
+and fails at its first request, by which time the failure reads as a wrong
+endpoint. A `DIRECTORY` store refuses credentials outright, since it signs
+nothing.
+
+**Adding a store does not contact it.** No request is made until a table is
+placed there, so a wrong endpoint, a missing bucket or an absent credential is
+still silent at `ADD STORE` time and shows up as the first table failing to
+open. `SHOW STORAGE STORES` has an `opened` column that says which of the two a
+store is in.
+
+Three things are refused rather than allowed to become silent:
+
+- **Dropping a store a table is placed on.** A placement naming a store that is
+  gone is what stops the *database* opening (§9), so this would be a statement
+  that succeeds now and refuses to start later. It names the tables.
+- **Repointing a store a table is placed on** — `ENDPOINT`, `BUCKET`, `PREFIX`
+  and the rest. Changing an address does not move any bytes: the old prefix
+  keeps them and the table reads an empty one. Move the tables off first. The
+  settings that only tune it can be changed at any time.
+- **Writing a store file this server could not parse.** A file that fails to
+  parse and a file that is absent both leave the registry empty, and rewriting
+  the first would replace an operator's stores with nothing.
+
+A store already open keeps the geometry and the page budget it was opened with
+until the server restarts — said in the statement's own output, because
+`chunk_size` is not a setting so much as a different layout for the same bytes,
+and the family holding it is shared by every open table on that store.
+
 ### Choosing it for a table
 
 A table's placement in `db_storage.cfg` is a *backend spec*, not only a
@@ -290,18 +408,57 @@ STORAGE PLACE TABLE events AT 'kv:archive';   -- before the table is created
 CREATE TABLE events (...);
 ```
 
-The stores themselves are named in `db_kv.cfg` beside `db_storage.cfg`:
+Once it exists, `SHOW TABLES` says which backend each table ended up on — `s3`,
+`kv-directory` or `kv-memory` for these, against `file` or `memory` for the rest
+— and `SHOW TABLE STATS events` reports the store's page cache beside it, where
+the miss count is the number of requests the store has actually been asked for.
+See [introspection.md](introspection.md#what-is-holding-a-table).
 
-```text
-version 1
-store   archive  s3   https://s3.us-east-1.amazonaws.com  us-east-1  my-bucket  rdb/archive  virtual
-store   scratch  dir  /mnt/fast/kv                        scratch
+### Converting a table between backends
+
+`STORAGE MOVE TABLE` takes the same spec, so moving a table between disks and
+converting it from files to an object store are one statement:
+
+```sql
+STORAGE MOVE TABLE events TO 'kv:archive';    -- files      -> S3
+STORAGE MOVE TABLE events TO 'kv:scratch';    -- S3         -> a local kv store
+STORAGE MOVE TABLE events TO 'memory:';       -- ... or into this process
+STORAGE MOVE TABLE events TO '/mnt/disk2';    -- ... and back onto files
 ```
 
-Credentials come from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` /
-`AWS_SESSION_TOKEN`, never from the file — it is rewritten by the server, copied
-into backups, and readable by anyone who can list the database directory.
-Trailing `key=value` fields override any `KvConfig` setting for that store.
+The copy is `StorageIO` to `StorageIO`, one named file at a time. It never reads
+a directory entry, an object key or a buffer address, so a directory, an
+in-memory registry and a key/value family are all just a provider to it — which
+is what makes every pairing one operation rather than twelve. The ordering is
+the one the directory-to-directory move already used: copy, flip the placement,
+delete the originals, so every window leaves an orphan rather than a loss.
+
+What is *not* backend-agnostic is what the table gains or loses on arrival, and
+each move says so in its own output. Crossing the file boundary in either
+direction is otherwise invisible: the rows read back identically, and the next
+snapshot is the first hint that a table is no longer in one.
+
+Two checks happen before a byte is copied — a directory destination must be a
+storage location of this database, and a store destination must be configured —
+because after that the table has left the live map.
+
+### The file it writes
+
+The statements rewrite `db_kv.cfg`, beside `db_storage.cfg`, atomically. It can
+still be read and hand-edited while the server is stopped:
+
+```text
+version	1
+store	archive	s3	https://s3.us-east-1.amazonaws.com	us-east-1	my-bucket	rdb/archive	virtual
+store	scratch	dir	/mnt/fast/kv	scratch
+```
+
+Every gap is a **single TAB**. Spaces do not parse, and they fail quietly:
+`version 1` written with a space is not recognised as the version line, the file
+is then rejected for having none, and every store it defines silently ceases to
+exist. Trailing `key=value` fields override any `KvConfig` setting for that
+store. A store of a kind this build cannot open — a newer server's, say — is
+kept verbatim when the file is rewritten rather than reduced to a stub.
 
 One database can hold file, in-memory and key/value tables at once. Nothing else
 about such a table differs: it is the same `Table` over the same
@@ -315,8 +472,9 @@ Backup, relocation, the write-ahead log and the free-space policy are features
 - **Not in a backup.** A snapshot is a copy of a directory. Every snapshot logs
   the tables it could not include and says a restore will not bring them back —
   the one thing worse than not backing them up is finding out at a restore.
-- **`STORAGE MOVE TABLE` is refused**, naming the backend, rather than reporting
-  a copy of zero bytes.
+- **Not a `STORAGE MOVE TABLE` between directories.** It has no files to put in
+  one. `STORAGE MOVE TABLE t TO '/mnt/disk2'` converts it back into a file table
+  instead, which is a different operation and says so.
 - **No write-ahead log.** Durability comes from the delta object instead (§6),
   and `get_location()` returning `None` is what tells the engine so.
 - **Not a rebalance candidate**, and not counted against any location's free
@@ -359,3 +517,16 @@ Worth knowing what they cover, because the interesting ones are not the obvious 
   provider, comparing bytes at every step.
 - **The engine on top of it** — a real `Table` doing 200 inserts, a full scan, a
   filtered query, and a restart that recovers the rows from the store.
+
+The statements are covered separately, in
+`core::storage::backend_tests` (`cargo test -p rasterizeddb_core --lib
+storage::backend_tests`). The two worth knowing there:
+
+- **A table round-tripping every backend** — files to memory to a store to
+  memory to files to a store — asserting the same rows at every step, that the
+  database directory is left empty, and that a restart still finds them. It is
+  also what catches a sidecar missing from the copy list, as leftover files: a
+  table's own files are the only complete statement of what a table is.
+- **A store definition the file could not hold** — a credential, an unreadable
+  file, and a store of a kind this build cannot open being rewritten by a server
+  that does not understand it.

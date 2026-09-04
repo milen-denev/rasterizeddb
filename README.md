@@ -496,13 +496,36 @@ STORAGE REBALANCE DRY RUN;                -- what it would move, and why
 STORAGE REBALANCE;                        -- do it
 STORAGE DROP LOCATION '/mnt/nvme1';       -- refused while it still holds tables
 
-SHOW STORAGE;                             -- a line per location, with free space
+SHOW STORAGE;                             -- a line per location and store, with free space
 SHOW STORAGE STATS;                       -- pool-wide figures as columns
 SHOW STORAGE LOCATIONS;                   -- a row per location
+SHOW STORAGE STORES;                      -- a row per key/value store
 SHOW STORAGE PLACEMENTS;                  -- which directory each table is in
 SHOW STORAGE POLICY;
 SHOW STORAGE KEYS;
 ```
+
+A directory is not the only thing a table can sit on. An object store is defined
+by statement too, and then a table is placed on it or converted onto it:
+
+```sql
+STORAGE ADD STORE archive S3 WITH (
+    ENDPOINT          = 'https://s3.us-east-1.amazonaws.com',
+    BUCKET            = 'my-bucket',
+    PREFIX            = 'rdb/archive',
+    ACCESS_KEY_ID     = 'AKIA...',        -- or leave both out and it signs with
+    SECRET_ACCESS_KEY = '...');           -- the server's AWS_* environment
+
+STORAGE PLACE TABLE events AT 'kv:archive';   -- before CREATE TABLE
+STORAGE MOVE TABLE orders TO 'kv:archive';    -- ... or convert one that exists
+STORAGE MOVE TABLE orders TO 'memory:';       -- files, memory, kv, S3: one statement
+STORAGE MOVE TABLE orders TO '/mnt/nvme2';    -- and back
+```
+
+The copy is provider to provider, so every pairing of backends is the same
+operation. What differs is what the table gains or loses by arriving — backups,
+the write-ahead log, the free-space policy are features about *files* — and each
+move says which. See [docs/kv-storage.md](docs/kv-storage.md).
 
 Unlike the replication statements, these are **persisted**: where each table
 lives is recorded in `db_storage.cfg` in the database directory, and a location

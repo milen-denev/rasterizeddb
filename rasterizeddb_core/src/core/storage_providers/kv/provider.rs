@@ -117,7 +117,15 @@ impl KvConfig {
         }
     }
 
-    fn validate(&self) -> io::Result<()> {
+    /// Whether this configuration can actually open a file.
+    ///
+    /// Public because the statement that *defines* a store has to answer this
+    /// before the store exists. It used to be checked only when a family was
+    /// opened, which is long after `STORAGE ADD STORE` has reported success —
+    /// so a `CHUNK_SIZE` that is not a multiple of `PAGE_SIZE` produced a store
+    /// that was listed, placeable, and could never be opened. See
+    /// [`crate::core::storage::kv_registry::check_tuning`].
+    pub fn validate(&self) -> io::Result<()> {
         if self.page_size == 0 || self.chunk_size == 0 {
             return Err(io::Error::new(
                 ErrorKind::InvalidInput,
