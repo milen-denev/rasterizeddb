@@ -1072,3 +1072,113 @@ mod engine {
         );
     }
 }
+
+#[tokio::test]
+async fn a_write_outside_a_transaction_survives_a_restart_with_flush() {
+    // The schema, the foreign-key sidecars and the sequence files are all
+    // written through the plain `StorageIO` API, which carries no transaction.
+    let store: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+    {
+        let family = open_family(store.clone()).await;
+        let io = open(&family, "schema.db").await;
+        io.append_data(b"schema bytes", true).await;
+        io.flush().await.unwrap();
+    }
+    let family = open_family(store).await;
+    let io = open(&family, "schema.db").await;
+    assert_eq!(read_all(&io).await, b"schema bytes");
+}
+
+#[tokio::test]
+async fn a_write_outside_a_transaction_survives_a_restart_without_flush() {
+    // Same, but nothing asks for a flush — which is what a table's schema gets
+    // today, since `TableSchema::save` just writes.
+    let store: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+    {
+        let family = open_family(store.clone()).await;
+        let io = open(&family, "schema.db").await;
+        io.append_data(b"schema bytes", true).await;
+    }
+    let family = open_family(store).await;
+    let io = open(&family, "schema.db").await;
+    assert_eq!(read_all(&io).await, b"schema bytes");
+}
+
+#[tokio::test]
+async fn two_files_written_outside_a_transaction_both_survive() {
+    // A schema is two files — the header and its `_FIELDS` sidecar — and a
+    // schema that recovers its header but not its fields is a table that opens
+    // with zero columns.
+    let store: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+    {
+        let family = open_family(store.clone()).await;
+        let header = open(&family, "schema.db").await;
+        let fields = open(&family, "schema_FIELDS.db").await;
+        header.append_data(b"header", true).await;
+        fields.append_data(b"fields", true).await;
+        header.flush().await.unwrap();
+        fields.flush().await.unwrap();
+    }
+    let family = open_family(store).await;
+    assert_eq!(read_all(&open(&family, "schema.db").await).await, b"header");
+    assert_eq!(
+        read_all(&open(&family, "schema_FIELDS.db").await).await,
+        b"fields"
+    );
+}
+
+/// A file dropped and immediately reopened under the same name keeps the bytes
+/// written after the drop.
+///
+/// `drop_io` cannot await — it is a synchronous trait method and deleting is a
+/// round trip — so it spawns the erase. `erase` then lists and deletes the
+/// file's **whole key prefix**, and the name is the prefix. Reopen that name
+/// before the spawned task runs and the new file's objects are inside the set
+/// the old file is about to sweep.
+///
+/// The result is data that reads back correctly from the overlay for as long as
+/// the process lives and is simply absent after a restart, which is the worst
+/// shape a storage bug can take. `drop_io`'s comment says reopening a dropped
+/// name "gets a fresh file, which is what unlinking a path does" — but unlinking
+/// is synchronous, and this is not.
+///
+/// Reached by anything that drops a name and recreates it: `DROP TABLE` then
+/// `CREATE TABLE` of the same name on a key/value store, and
+/// `STORAGE MOVE TABLE` moving a table off a store and back.
+/// Fixed by gating `open_file` on `KvFamily::erasing`, so a reopen waits for the
+/// dropped file's sweep. Looped because the failure was timing-dependent — it
+/// reproduced on the first attempt, but a fix that merely narrowed the window
+/// would pass a single pass.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_name_reopened_after_a_drop_is_not_erased_by_the_old_file() {
+    for attempt in 0..20 {
+        let store = Arc::new(MemoryKvStore::new());
+        let family = open_family(store.clone()).await;
+
+        let first = open(&family, "rows.db").await;
+        first.append_data(b"first generation", true).await;
+        first.drop_io();
+
+        // Same name, straight away — the window the spawned erase lives in.
+        let second = open(&family, "rows.db").await;
+        second.append_data(b"second generation", true).await;
+        let token = second.begin_txn();
+        second.commit_durable(token).await.unwrap();
+
+        // Let the spawned erase run.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // What a restart sees: a fresh family over the same store.
+        let reopened = KvFamily::open(store.clone() as Arc<dyn KvStore>, tiny_config())
+            .await
+            .unwrap();
+        let after = open(&reopened, "rows.db").await;
+        let bytes = read_all(&after).await;
+        assert!(
+            bytes.ends_with(b"second generation"),
+            "attempt {attempt}: the reopened name lost its bytes to the dropped file's \
+             erase — read back {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+}

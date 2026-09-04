@@ -186,6 +186,22 @@ pub struct KvFamily {
     recovered: Mutex<HashMap<String, FileRecovery>>,
     /// Transactions some batch declared committed, across every file.
     committed: Arc<std::collections::HashSet<u64>>,
+    /// Names whose objects a dropped file is still sweeping.
+    ///
+    /// `drop_io` is a synchronous trait method and deleting is a round trip, so
+    /// the erase is spawned. Its comment says reopening the name meanwhile
+    /// "gets a fresh file, which is what unlinking a path does" — but unlinking
+    /// is synchronous and this is not, and `erase` deletes the file's whole key
+    /// prefix, which is the *name*. So a name reopened inside that window had
+    /// the new file's objects swept by the old file's task: bytes that read
+    /// back correctly from the overlay for the life of the process and are
+    /// simply absent after a restart.
+    ///
+    /// Reached by anything that drops a name and recreates it — `DROP TABLE`
+    /// then `CREATE TABLE` of the same name, and `STORAGE MOVE TABLE` moving a
+    /// table off a store and back. [`KvFamily::open_file`] waits on this, which
+    /// is what makes the reopen behave the way the comment claimed.
+    erasing: dashmap::DashMap<String, Arc<tokio::sync::Semaphore>>,
 }
 
 impl KvFamily {
@@ -320,6 +336,7 @@ impl KvFamily {
             next_txn: AtomicU64::new(max_txn + 1),
             recovered: Mutex::new(recovered),
             committed: Arc::new(committed),
+            erasing: dashmap::DashMap::new(),
         }))
     }
 
@@ -386,6 +403,15 @@ impl KvFamily {
     async fn open_file(self: &Arc<Self>, name: &str) -> io::Result<Arc<KvFile>> {
         if let Some(existing) = self.files.get(name) {
             return Ok(existing.clone());
+        }
+        // A previous incarnation of this name may still be sweeping its
+        // objects. Opening now would build a file whose first writes that task
+        // is about to delete, so wait for it — the gate is closed rather than
+        // signalled, which wakes every waiter and cannot be missed by one that
+        // arrives late.
+        let pending = self.erasing.get(name).map(|gate| gate.clone());
+        if let Some(gate) = pending {
+            let _ = gate.acquire().await;
         }
         let file = KvFile::open(self, name).await?;
         // Another task may have opened the same name while we were reading the
@@ -1557,6 +1583,36 @@ impl KvStorageProvider {
     /// overlay hold the same bytes until a batch is written. Nothing becomes
     /// visible to a restart: a spilled record still waits for a batch to name
     /// its transaction.
+    /// Puts an untransacted write into the store before returning.
+    ///
+    /// A write that carries no transaction is recorded under transaction 0,
+    /// which recovery treats as already committed — but only if the bytes ever
+    /// reached the store. `maybe_spill` alone does not get them there: it
+    /// spills to bound memory, so a write smaller than the threshold stays
+    /// resident, and nothing flushes on drop because `Drop` cannot await.
+    ///
+    /// Behind a file there is an OS page cache that a clean shutdown writes
+    /// out; behind this there is nothing, so "written" has to mean "put". A
+    /// table's schema, its foreign-key sidecars and its sequences all take this
+    /// path, and losing them silently is how a KV-backed table came back from a
+    /// clean restart with its rows intact and **zero columns**.
+    ///
+    /// The cost lands on metadata writes only. Row data goes through the
+    /// transaction API, which batches a whole statement into one put.
+    async fn persist_untransacted(&self, what: &str) {
+        if let Err(e) = self.file.flush(None).await {
+            // Reported rather than swallowed: the caller's API returns nothing,
+            // so a lost metadata write would otherwise be invisible until the
+            // next restart, which is exactly the failure this exists to stop.
+            log::error!(
+                "kv: {} on '{}' could not be made durable: {}",
+                what,
+                self.file.name,
+                e
+            );
+        }
+    }
+
     async fn maybe_spill(&self) {
         let over = {
             let state = self.file.state.lock();
@@ -1583,6 +1639,7 @@ impl StorageIO for KvStorageProvider {
     async fn write_data(&self, position: u64, buffer: &[u8]) {
         self.file.write_at(0, position, buffer);
         self.maybe_spill().await;
+        self.persist_untransacted("write_data").await;
     }
 
     async fn write_data_seek(&self, seek: SeekFrom, buffer: &[u8]) {
@@ -1625,14 +1682,21 @@ impl StorageIO for KvStorageProvider {
         self.file.try_read_many_sync(reads)
     }
 
-    async fn append_data(&self, buffer: &[u8], _immediate: bool) {
+    async fn append_data(&self, buffer: &[u8], immediate: bool) {
         self.file.append(0, buffer);
         self.maybe_spill().await;
+        if immediate {
+            self.persist_untransacted("append_data").await;
+        }
     }
 
-    async fn append_data_returning_offset(&self, buffer: &[u8], _immediate: bool) -> u64 {
+    async fn append_data_returning_offset(&self, buffer: &[u8], immediate: bool) -> u64 {
         let offset = self.file.append(0, buffer);
         self.maybe_spill().await;
+        if immediate {
+            self.persist_untransacted("append_data_returning_offset")
+                .await;
+        }
         offset
     }
 
@@ -1851,6 +1915,11 @@ impl StorageIO for KvStorageProvider {
         }
         self.family.files.remove(&self.file.name);
         let file = self.file.clone();
+        // Registered before the task is spawned, so a reopen that races this
+        // sees the gate rather than an empty map.
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        self.family.erasing.insert(file.name.clone(), gate.clone());
+        let family = self.family.clone();
         // Sync in the trait, and deleting is a round trip. Reopening the name
         // meanwhile gets a fresh file, which is what unlinking a path does.
         //
@@ -1863,12 +1932,23 @@ impl StorageIO for KvStorageProvider {
                     if let Err(e) = file.erase().await {
                         error!("kv: could not erase {}: {e}", file.name);
                     }
+                    // Closed first, then removed: a waiter holding the gate
+                    // wakes either way, and one that reads the map after the
+                    // removal finds nothing to wait for because there is not.
+                    gate.close();
+                    family.erasing.remove(&file.name);
                 });
             }
-            Err(_) => warn!(
-                "kv: {} was dropped with no runtime to delete its objects; they are orphaned",
-                file.name
-            ),
+            Err(_) => {
+                // No runtime, so nothing will sweep and nothing must wait.
+                gate.close();
+                family.erasing.remove(&file.name);
+                warn!(
+                    "kv: {} was dropped with no runtime to delete its objects; they are \
+                     orphaned",
+                    file.name
+                )
+            }
         }
     }
 
