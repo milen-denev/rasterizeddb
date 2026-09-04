@@ -428,6 +428,42 @@ fn fallback_seed(table_name: &str) -> Arc<DbStorageProvider> {
     )))
 }
 
+/// Memory-backed storage for a relation that cannot outlive its statement.
+///
+/// A CTE and a derived table are both turned into real relations before the
+/// scan can read them — see [`crate::core::rql::cte::materialize_query`] — and
+/// they are dropped again before the statement returns. Nothing can read one
+/// afterwards: the name carries per-execution entropy, so it is not even
+/// reproducible by the session that made it, and a crash mid-statement leaves
+/// files whose only possible reader has already gone away.
+///
+/// Given files, each one costs five `create_new` calls (`_pointers`, the rows
+/// file, `_schema`, `_flt`, `_seq`) and five deletions, every one of them
+/// durable. Measured against the deployment on 192.168.1.7, that is a flat
+/// ~130 ms per materialisation, independent of row count, column count and
+/// whether the outer query aggregates:
+///
+/// ```text
+/// SELECT COUNT(*) FROM t                              0.08 ms   (server-side)
+/// SELECT COUNT(*) FROM (SELECT id FROM t) AS s      126.0  ms
+/// WITH s AS (SELECT id FROM t) SELECT COUNT(*) FROM s 129.0  ms
+/// ```
+///
+/// It dominated that server: `SELECT COUNT(*) … FROM (…) AS sub_query` is what
+/// sea-orm's `paginate()` emits, so every paginated list view paid it once, and
+/// the single most expensive statement on the node — two CTEs feeding an
+/// `UPDATE … RETURNING`, scanning four rows per call — spent about half of its
+/// 594 ms mean here before doing any work of its own.
+///
+/// The durability that costs those milliseconds buys nothing, so it is not
+/// bought. Everything else about the relation is unchanged: it is a real table
+/// with a real schema, created and dropped through the ordinary paths.
+fn temp_seed(table_name: &str) -> Option<Arc<DbStorageProvider>> {
+    table_name
+        .starts_with(crate::core::rql::cte::TEMP_TABLE_PREFIX)
+        .then(|| Arc::new(DbStorageProvider::new_memory(table_name)))
+}
+
 #[cfg(feature = "storage_pools")]
 async fn seed_in(
     io_pointers: &Arc<DbStorageProvider>,
@@ -436,6 +472,11 @@ async fn seed_in(
     seeds: &SeedCache,
     table_name: &str,
 ) -> Arc<DbStorageProvider> {
+    // A statement-scoped relation never reaches a disk. See `temp_seed`.
+    if let Some(seed) = temp_seed(table_name) {
+        return seed;
+    }
+
     // Boxed, so opening a key/value store does not enlarge this frame for the
     // tables that will never take that branch. `seed_in` is on `add_table`'s
     // await chain, which already sits close to a test thread's 2 MiB stack, and
@@ -585,6 +626,10 @@ fn pool_place(_pool: &StoragePool, _table_name: &str) {}
 /// Forgets a dropped table's placement.
 #[cfg(feature = "storage_pools")]
 fn pool_forget(pool: &StoragePool, table_name: &str) {
+    // Nothing to forget: `pool_place` records no placement for one of these.
+    if temp_seed(table_name).is_some() {
+        return;
+    }
     pool.forget(table_name);
 }
 
@@ -846,6 +891,44 @@ impl Database {
         let id = next_database_id();
 
         for (table_name, _) in tables_names {
+            // A statement-scoped relation that survived to an open is garbage,
+            // always, and is reaped here rather than reported.
+            //
+            // `materialize_query` creates one, uses it, and drops it inside a
+            // single statement, and its name carries per-execution entropy — so
+            // nothing can refer to one after the process that made it is gone,
+            // not even the session that made it. Reaching this loop means a
+            // crash or a kill landed between the create and the drop.
+            //
+            // Before this, each such leftover was logged as "its schema could
+            // not be read" on every subsequent start, forever: on the
+            // 192.168.1.7 node, 13 of them produced 32 error lines at each boot
+            // and had done since 2026-09-01. That is noise that trains an
+            // operator to skim exactly the part of the log where a real
+            // unreadable table would appear.
+            //
+            // Files first, then the catalogue row, matching `drop_table`: a row
+            // tombstoned first would leave the files with nothing naming them.
+            // `io_pointers` rather than `seed_in`, deliberately — `temp_seed`
+            // now answers with memory-backed storage for these names, which
+            // would discard nothing. These leftovers predate that and are real
+            // files in the database's own directory.
+            if table_name.starts_with(crate::core::rql::cte::TEMP_TABLE_PREFIX) {
+                discard_files(&io_pointers, &table_name).await;
+                pool_forget(&storage, &table_name);
+                if let Err(e) =
+                    tombstone_catalogue_row(&io_pointers, &io_rows, &io_schema, &table_name).await
+                {
+                    // Worth a line each: it means the reaper cannot make
+                    // progress and the entry will be back at the next start.
+                    error!(
+                        "could not reap the leftover temporary table '{}': {}",
+                        table_name, e
+                    );
+                }
+                continue;
+            }
+
             // A table whose backend is not configured is left out of the live
             // map entirely, so a query for it says the table does not exist.
             // Opening it anyway would answer that query with no rows, which is

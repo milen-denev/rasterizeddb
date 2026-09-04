@@ -277,6 +277,16 @@ fn sql_type_of(db_type: &DbType) -> Option<&'static str> {
     })
 }
 
+/// The prefix every materialised CTE and derived table's name carries.
+///
+/// Public because it is the one thing that identifies a relation as
+/// statement-scoped from the outside. `Database::seed_in` reads it to give such
+/// a table memory-backed storage instead of files, and `pool_place` reads it to
+/// record no placement for one: a relation that is created and dropped inside a
+/// single statement can never be read after that statement ends, so nothing it
+/// writes has to reach a disk.
+pub const TEMP_TABLE_PREFIX: &str = "__cte_";
+
 /// A temporary table name that cannot collide with a user's table or with
 /// another execution — including another session running the *same* statement.
 ///
@@ -303,7 +313,7 @@ fn temp_name(cte: &str, statement: &str, index: usize) -> String {
         .filter(|c| c.is_alphanumeric() || *c == '_')
         .take(24)
         .collect();
-    format!("__cte_{}_{}_{:x}", safe, index, hash)
+    format!("{}{}_{}_{:x}", TEMP_TABLE_PREFIX, safe, index, hash)
 }
 
 /// Replaces references to a CTE *as a relation*, leaving same-named columns
