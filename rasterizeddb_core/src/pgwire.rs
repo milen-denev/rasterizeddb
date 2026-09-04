@@ -2560,7 +2560,7 @@ where
     // nothing on this side naming the statement that produced it — which is the
     // position several days of debugging started from. Off at the default
     // level; `--log-level debug` turns it on.
-    log::debug!("Statement: {}", stmt.trim());
+    log::debug!("Statement: {}", crate::core::redact::statement(stmt.trim()));
 
     if handle_transaction_control(database, state, stream, stmt).await? {
         return Ok(());

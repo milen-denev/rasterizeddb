@@ -18,6 +18,8 @@ pub mod mvcc;
 pub mod pg_ops;
 pub mod pg_types;
 pub mod processor;
+/// Cutting statement text at a secret, for every surface that keeps one.
+pub mod redact;
 pub mod row;
 pub mod rql;
 pub mod similar_to;
