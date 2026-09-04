@@ -26,6 +26,16 @@ use crate::views;
 /// memory. The user can change it in the browser's footer.
 pub const DEFAULT_PAGE: usize = 200;
 
+/// Statements the activity page asks for.
+///
+/// Below what a RasterizedDB server keeps by default (256, and
+/// `SET CONFIG query_stats.recent` moves it), so the page shows the whole ring
+/// on a stock server and a bounded slice of a larger one. The same number is
+/// sent to PostgreSQL, where it caps `pg_stat_activity` — a server with more
+/// than two hundred backends running statements at once has a problem this
+/// page is not the right lens for.
+pub const RECENT_STATEMENTS: usize = 200;
+
 pub struct Studio {
     /// The connection form, which is also the profile being edited.
     pub form: Connection,
@@ -70,6 +80,10 @@ pub struct Studio {
     /// tables do not share one.
     pub column_widths: HashMap<String, f32>,
     pub resizing: Option<Resize>,
+    /// How each grid is sorted, keyed by the same scope its widths are. Empty
+    /// means every grid is in the order the server returned it, which is the
+    /// order that was there before any of this existed.
+    pub sort: HashMap<String, GridSort>,
     /// Where the data grid is scrolled to, and how tall its window is, so it
     /// only builds the rows that can be seen. `None` until the first scroll.
     pub data_viewport: Option<(f32, f32)>,
@@ -108,6 +122,10 @@ pub struct Studio {
     pub import: dialect::ImportRequest,
     pub import_running: bool,
     pub import_report: Vec<String>,
+
+    // --- activity
+    /// Everything the activity page reads, or `None` before the first load.
+    pub activity: Option<ActivitySnapshot>,
 
     // --- replication
     pub replication: Option<ReplicationSnapshot>,
@@ -158,6 +176,7 @@ pub enum Tab {
     Schema,
     Data,
     Query,
+    Activity,
     Backup,
     Storage,
     Replication,
@@ -166,13 +185,18 @@ pub enum Tab {
 }
 
 impl Tab {
-    pub const ALL: [Tab; 11] = [
+    pub const ALL: [Tab; 12] = [
         Tab::Dashboard,
         Tab::Overview,
         Tab::Tables,
         Tab::Schema,
         Tab::Data,
         Tab::Query,
+        // Next to QUERY, and after it: the two are the same subject from
+        // opposite ends. QUERY is the statement you are writing; ACTIVITY is
+        // every statement the server has already answered, this console's
+        // included.
+        Tab::Activity,
         Tab::Backup,
         // Next to BACKUP rather than next to CONFIG: both pages are about where
         // the bytes are and what happens when a disk goes, and an operator
@@ -191,6 +215,7 @@ impl Tab {
             Tab::Schema => "SCHEMA",
             Tab::Data => "DATA",
             Tab::Query => "QUERY",
+            Tab::Activity => "ACTIVITY",
             Tab::Backup => "BACKUP",
             Tab::Storage => "STORAGE",
             Tab::Replication => "REPLICATION",
@@ -219,6 +244,20 @@ pub struct Resize {
     /// position.
     pub from: Option<f32>,
     pub start_width: f32,
+}
+
+/// How one grid is sorted.
+///
+/// Held per grid rather than per column so that clicking a second header
+/// replaces the sort instead of adding to it: a console sorts by one thing, and
+/// a multi-column sort nobody can see the shape of is a grid whose order looks
+/// arbitrary.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GridSort {
+    /// The [`crate::views::GridColumn`] key, not the header text — the same
+    /// identity a remembered width is stored against.
+    pub column: String,
+    pub descending: bool,
 }
 
 /// A cell being edited in place.
@@ -346,6 +385,7 @@ pub enum Refresh {
     Backups,
     Replication,
     Storage,
+    Activity,
 }
 
 #[derive(Debug, Clone)]
@@ -432,6 +472,11 @@ pub enum Message {
     StorageReport(Result<Vec<String>, String>),
     DismissStorageReport,
 
+    // --- activity
+    ReloadActivity,
+    ActivityLoaded(Box<ActivitySnapshot>),
+    ResetStatementStats,
+
     // --- replication
     ReloadReplication,
     ReplicationLoaded(Box<ReplicationSnapshot>),
@@ -460,6 +505,10 @@ pub enum Message {
     PagePrev,
     PageSize(String),
     DataScrolled(iced::widget::scrollable::Viewport),
+    /// Sort a grid by one of its columns: the grid's scope, then the column
+    /// key. Clicking the same header again reverses it, and a third time
+    /// returns the grid to the server's order.
+    SortColumn(String, String),
     BeginColumnResize(String, f32),
     ColumnResizeMove(f32),
     EndColumnResize,
@@ -731,6 +780,7 @@ impl Studio {
             inserting: None,
             column_widths: HashMap::new(),
             resizing: None,
+            sort: HashMap::new(),
             data_viewport: None,
             editor: text_editor::Content::with_text(
                 "-- Ctrl+Enter runs everything in this editor.\n\
@@ -753,6 +803,7 @@ impl Studio {
             import: dialect::ImportRequest::default(),
             import_running: false,
             import_report: Vec::new(),
+            activity: None,
             replication: None,
             peer_name: String::new(),
             peer_address: String::new(),
@@ -833,6 +884,28 @@ impl Studio {
             .iter()
             .filter(|t| needle.is_empty() || t.name.to_ascii_lowercase().contains(&needle))
             .collect()
+    }
+
+    /// The sort a header click asked the data browser for, if any.
+    ///
+    /// Keyed by table, like the grid it belongs to: opening another table shows
+    /// that table's own sort rather than inheriting one for a column it may not
+    /// even have.
+    pub fn data_sort(&self) -> Option<GridSort> {
+        let table = self.selected_table.as_deref()?;
+        let sort = self.sort.get(&format!("{}{}", views::DATA_SCOPE, table))?;
+
+        // A column that has since been dropped would go out as `ORDER BY
+        // "gone"`, and the browser would answer every page with the server's
+        // error — under a header that no longer has the column to click a
+        // second time. An empty column list means they have not loaded yet,
+        // which is not the same as the column being absent.
+        if !self.columns.is_empty()
+            && !self.columns.iter().any(|c| c.name.eq_ignore_ascii_case(&sort.column))
+        {
+            return None;
+        }
+        Some(sort.clone())
     }
 
     /// The column the data browser orders and addresses rows by.
@@ -958,6 +1031,7 @@ impl Studio {
                 self.session = None;
                 self.flavor_warning = None;
                 self.backup = None;
+                self.activity = None;
                 self.replication = None;
                 self.storage = None;
                 self.storage_report.clear();
@@ -986,6 +1060,10 @@ impl Studio {
                     // must not be, since the whole point of opening it is
                     // usually that something has gone wrong.
                     Tab::Backup => self.load_backups(),
+                    // And again, most of all here: this page is a list of what
+                    // the server has just done, so a cached one is a list of
+                    // what it had done when the tab was last open.
+                    Tab::Activity => self.load_activity(),
                     // Same reasoning as the backup catalogue: a stale answer on
                     // this page is worse than a slow one.
                     Tab::Replication => self.load_replication(),
@@ -1393,6 +1471,27 @@ impl Studio {
             }
             Message::DismissStorageReport => { self.storage_report.clear(); Task::none() }
 
+            // ---- activity -----------------------------------------------------
+            Message::ReloadActivity => self.load_activity(),
+            Message::ActivityLoaded(snapshot) => {
+                self.activity = Some(*snapshot);
+                Task::none()
+            }
+            Message::ResetStatementStats => {
+                // Confirmed rather than done, and not because it is dangerous:
+                // it is not. It is *shared* — every other session loses the
+                // history too, and the slow statement someone else is halfway
+                // through diagnosing goes with it.
+                self.modal = Some(Modal::Confirm {
+                    title: "Forget every statement".to_string(),
+                    body: "The server drops what it has recorded: the recent list and the                            per-shape totals, for every session and not just this console.                            Nothing that has run is affected — this is the record of it, not the                            thing itself — but anybody else looking at a slow statement right now                            loses it mid-sentence."
+                        .to_string(),
+                    statement: dialect::reset_statement_stats_sql(self.flavor()).to_string(),
+                    refresh: Refresh::Activity,
+                });
+                Task::none()
+            }
+
             // ---- replication --------------------------------------------------
             Message::ReloadReplication => self.load_replication(),
             Message::ReplicationLoaded(snapshot) => {
@@ -1546,6 +1645,37 @@ impl Studio {
                 ));
                 Task::none()
             }
+            Message::SortColumn(scope, column) => {
+                // Ascending, then descending, then back to the order the
+                // server returned. The third state matters: a grid the console
+                // has re-sorted shows a different order from the one the
+                // statement produced, and there has to be a way back to it
+                // without reconnecting.
+                match self.sort.get(&scope) {
+                    Some(sort) if sort.column == column && !sort.descending => {
+                        self.sort.insert(scope.clone(), GridSort { column, descending: true });
+                    }
+                    Some(sort) if sort.column == column => {
+                        self.sort.remove(&scope);
+                    }
+                    _ => {
+                        self.sort.insert(scope.clone(), GridSort { column, descending: false });
+                    }
+                }
+
+                // The data browser holds one page of a table, so sorting it
+                // here would sort the page rather than the table — the first
+                // hundred rows the server happened to return, rearranged, over
+                // a heading that claims to order the whole thing. It goes back
+                // to the server instead, from page one, because the sort
+                // changes which rows the first page even contains.
+                if scope.starts_with(views::DATA_SCOPE) {
+                    self.data_page = 0;
+                    self.editing = None;
+                    return self.load_page();
+                }
+                Task::none()
+            }
             Message::BeginColumnResize(key, width) => {
                 self.resizing = Some(Resize { key, from: None, start_width: width });
                 Task::none()
@@ -1670,7 +1800,11 @@ impl Studio {
                     return Task::none();
                 };
                 let table = self.selected_table.clone().unwrap_or_default();
-                let rendered = crate::export::render(grid, format, &table);
+                // In the order it is on screen, not the order it arrived: a
+                // result someone re-sorted and then copied has to come out the
+                // way they were looking at it.
+                let grid = views::in_sorted_order(self.sort.get(views::QUERY_SCOPE), grid);
+                let rendered = crate::export::render(&grid, format, &table);
                 let rows = grid.rows.len();
                 Task::batch([
                     iced::clipboard::write(rendered),
@@ -1687,7 +1821,8 @@ impl Studio {
                     return Task::none();
                 };
                 let table = self.selected_table.clone().unwrap_or_default();
-                let contents = crate::export::render(grid, format, &table);
+                let grid = views::in_sorted_order(self.sort.get(views::QUERY_SCOPE), grid);
+                let contents = crate::export::render(&grid, format, &table);
                 let base = if table.is_empty() {
                     format!("result-{}", index + 1)
                 } else {
@@ -1957,6 +2092,7 @@ impl Studio {
                     Refresh::Backups => self.load_backups(),
                     Refresh::Replication => self.load_replication(),
                     Refresh::Storage => self.load_storage(),
+                    Refresh::Activity => self.load_activity(),
                 }
             }
             Message::StatementFinished(_, sql, elapsed, Err(e)) => {
@@ -2034,6 +2170,46 @@ impl Studio {
                 (started.elapsed(), result)
             },
             |(elapsed, result)| Message::ImportFinished(elapsed, result),
+        )
+    }
+
+    /// Reads the recent statements and the per-shape totals in one task.
+    ///
+    /// Both go through the same "did the server understand the statement"
+    /// check as the backup, replication and storage pages, and here it earns
+    /// its keep twice over: a RasterizedDB build without `query_stats` answers
+    /// `SHOW QUERIES` as a runtime parameter rather than refusing it, and a
+    /// PostgreSQL without the extension loaded refuses `pg_stat_statements`
+    /// outright. Both would otherwise render as a server that has run nothing,
+    /// which is the one thing neither of them is.
+    ///
+    /// The two halves are checked separately because they fail separately: on
+    /// PostgreSQL `pg_stat_activity` always answers while `pg_stat_statements`
+    /// usually does not, and a page that hid the half that worked would be
+    /// blank on most PostgreSQL servers.
+    fn load_activity(&self) -> Task<Message> {
+        let Some(session) = self.session.clone() else { return Task::none() };
+        let flavor = session.flavor;
+        let recent_sql = dialect::recent_statements_sql(flavor, RECENT_STATEMENTS);
+        let shapes_sql = dialect::statement_shapes_sql(flavor).to_string();
+
+        Task::perform(
+            async move {
+                let (recent, recent_supported) = match session.query(&recent_sql).await {
+                    Ok(grid) if grid.column_index("statement").is_some() => {
+                        (dialect::parse_statement_records(&grid), true)
+                    }
+                    _ => (Vec::new(), false),
+                };
+                let (shapes, shapes_supported) = match session.query(&shapes_sql).await {
+                    Ok(grid) if grid.column_index("calls").is_some() => {
+                        (dialect::parse_statement_shapes(&grid), true)
+                    }
+                    _ => (Vec::new(), false),
+                };
+                Box::new(ActivitySnapshot { recent, recent_supported, shapes, shapes_supported })
+            },
+            Message::ActivityLoaded,
         )
     }
 
@@ -2433,9 +2609,11 @@ impl Studio {
             return Task::none();
         };
         let key = self.row_key();
+        let sort = self.data_sort();
         let sql = dialect::page_sql(
             &table,
             key.as_ref().map(|k| k.column.as_str()),
+            sort.as_ref().map(|s| (s.column.as_str(), s.descending)),
             self.page_size,
             self.data_page * self.page_size,
         );
@@ -2925,6 +3103,7 @@ mod tests {
     fn table(name: &str, primary_key: &str) -> TableInfo {
         TableInfo {
             name: name.to_string(),
+            storage: "file".to_string(),
             row_slots: 0,
             columns: 0,
             data_bytes: 0,
@@ -2971,6 +3150,7 @@ mod tests {
             dialect::page_sql(
                 "rdb_roles",
                 studio.row_key().as_ref().map(|k| k.column.as_str()),
+                None,
                 200,
                 0
             ),

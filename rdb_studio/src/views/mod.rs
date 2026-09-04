@@ -6,6 +6,7 @@
 //! question answered. What is here is the shape of the work — pick a table on
 //! the left, pick a lens across the top, read it in the middle.
 
+pub mod activity;
 pub mod backup;
 pub mod config;
 pub mod dashboard;
@@ -24,7 +25,7 @@ use iced::widget::{
 };
 use iced::{Center, Element, Fill, Length};
 
-use crate::app::{Message, Modal, ModalKind, Refresh, Status, Studio, Tab};
+use crate::app::{GridSort, Message, Modal, ModalKind, Refresh, Status, Studio, Tab};
 use crate::model::*;
 use crate::theme;
 
@@ -159,6 +160,7 @@ fn pane(studio: &Studio) -> Element<'_, Message> {
         Tab::Schema => schema::view(studio),
         Tab::Data => data::view(studio),
         Tab::Query => query::view(studio),
+        Tab::Activity => activity::view(studio),
         Tab::Backup => backup::view(studio),
         Tab::Storage => storage::view(studio),
         Tab::Replication => replication::view(studio),
@@ -844,6 +846,15 @@ pub fn format_metric(metric: &str, value: &str) -> String {
 /// The gap between two columns, which is also the width of the drag handle.
 pub const GRIP: f32 = 5.0;
 
+/// What the data browser's grid scope starts with. Sorting that grid goes back
+/// to the server rather than rearranging the page in hand, and this is how
+/// [`crate::app::Studio::update`] recognises it.
+pub const DATA_SCOPE: &str = "data:";
+
+/// The scope every result set on the query screen is laid out under. Shared, so
+/// that running the same statement again keeps the widths and the sort.
+pub const QUERY_SCOPE: &str = "query";
+
 /// One column of a grid.
 pub struct GridColumn {
     /// Stable identity for the remembered width. Not the header text: a header
@@ -859,6 +870,11 @@ pub struct GridColumn {
     /// Width before anybody drags it.
     pub width: f32,
     pub right: bool,
+    /// Whether clicking the header sorts by this column. False for the ones
+    /// that hold a button or a row of badges rather than a value — there is no
+    /// order to put `RESTORE…` in, and a header that responds to a click by
+    /// doing nothing is worse than one that does not respond.
+    pub sortable: bool,
 }
 
 impl GridColumn {
@@ -867,12 +883,19 @@ impl GridColumn {
         header: impl Into<String>,
         width: f32,
     ) -> Self {
-        Self { key: key.into(), header: header.into(), width, right: false }
+        Self { key: key.into(), header: header.into(), width, right: false, sortable: true }
     }
 
     /// A column of figures, which reads down the page only when right-aligned.
     pub fn right(mut self) -> Self {
         self.right = true;
+        self
+    }
+
+    /// A column holding a control or a row of badges rather than a value, which
+    /// nothing can meaningfully be ordered by.
+    pub fn unsortable(mut self) -> Self {
+        self.sortable = false;
         self
     }
 }
@@ -896,17 +919,41 @@ pub struct GridLayout<'a> {
     pub viewport: Option<(f32, f32)>,
     /// Emitted as the grid scrolls, when it is virtualised.
     pub on_scroll: Option<fn(iced::widget::scrollable::Viewport) -> Message>,
+    /// Which column this grid is sorted by, if the user has picked one.
+    pub sort: Option<&'a GridSort>,
+    /// Whether the *server* applied that sort. Set by the data browser, which
+    /// holds one page of a table: re-sorting the page here would rearrange the
+    /// hundred rows that happened to arrive under a heading claiming to order
+    /// the whole table. The header still shows the arrow; the rows are simply
+    /// left in the order they came in.
+    pub sorted_by_server: bool,
 }
 
 impl<'a> GridLayout<'a> {
     pub fn new(studio: &'a Studio, scope: impl Into<String>) -> Self {
+        let scope = scope.into();
         Self {
             widths: &studio.column_widths,
-            scope: scope.into(),
+            sort: studio.sort.get(&scope),
+            scope,
             resizing: studio.resizing.is_some(),
             viewport: None,
             on_scroll: None,
+            sorted_by_server: false,
         }
+    }
+
+    /// The rows already arrived in the sorted order; the grid should show the
+    /// arrow but not reorder anything. See [`GridLayout::sorted_by_server`].
+    pub fn sorted_by_server(mut self) -> Self {
+        self.sorted_by_server = true;
+        self
+    }
+
+    /// The column this grid is sorted by, and which way, when the grid is the
+    /// one doing the sorting.
+    fn client_sort(&self) -> Option<&GridSort> {
+        self.sort.filter(|_| !self.sorted_by_server)
     }
 
     /// Turns on row virtualisation, tracking the scroll position through
@@ -958,6 +1005,147 @@ pub fn grid_total(widths: &[f32]) -> f32 {
     widths.iter().sum::<f32>() + GRIP * widths.len() as f32
 }
 
+// --- sorting
+//
+// Every grid here is sorted the same way and by the same rule: the view hands
+// back one [`SortKey`] per row for whichever column was clicked, and the order
+// is worked out from those. The alternative — sorting the *rendered* cells —
+// looks simpler and is wrong: the cells hold `1.2 GiB` and `900 MiB`, and
+// ordering those as text puts the gigabyte first.
+
+/// One row's value in the column being sorted by, reduced to something two
+/// rows can be ordered by.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SortKey {
+    /// No value: a NULL, a blank, a dash. Sorted last in both directions,
+    /// because "missing" has no place in an order and rows with nothing in the
+    /// column are not what somebody sorting by it is looking for.
+    Empty,
+    Number(f64),
+    Text(String),
+}
+
+impl SortKey {
+    /// A string value, empty ones counting as missing.
+    pub fn text(value: impl AsRef<str>) -> Self {
+        let value = value.as_ref().trim();
+        if value.is_empty() || value == "—" {
+            SortKey::Empty
+        } else {
+            SortKey::Text(value.to_ascii_lowercase())
+        }
+    }
+
+    /// A figure the view already holds as a number, so it orders by magnitude
+    /// rather than by however it was formatted.
+    pub fn number(value: impl Into<f64>) -> Self {
+        SortKey::Number(value.into())
+    }
+
+    /// A cell of a result set, whose type nothing here knows: a value that
+    /// parses as a number is ordered as one, so an `id` column does not run
+    /// 1, 10, 100, 2.
+    pub fn cell(value: Option<&str>) -> Self {
+        match value {
+            None => SortKey::Empty,
+            Some(value) => match value.trim().parse::<f64>() {
+                Ok(number) if number.is_finite() => SortKey::Number(number),
+                _ => SortKey::text(value),
+            },
+        }
+    }
+}
+
+fn compare(a: &SortKey, b: &SortKey, descending: bool) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (SortKey::Empty, SortKey::Empty) => Ordering::Equal,
+        (SortKey::Empty, _) => Ordering::Greater,
+        (_, SortKey::Empty) => Ordering::Less,
+        _ => {
+            let ordering = match (a, b) {
+                (SortKey::Number(a), SortKey::Number(b)) => {
+                    // `total_cmp` rather than `partial_cmp`: a NaN would
+                    // otherwise make the comparator inconsistent, which is a
+                    // panic in `sort_by` and not merely a wrong order.
+                    a.total_cmp(b)
+                }
+                (SortKey::Text(a), SortKey::Text(b)) => a.cmp(b),
+                // Mixed types in one column: numbers first, so a column of
+                // figures with an odd label in it still reads as figures.
+                (SortKey::Number(_), SortKey::Text(_)) => Ordering::Less,
+                (SortKey::Text(_), SortKey::Number(_)) => Ordering::Greater,
+                _ => Ordering::Equal,
+            };
+            if descending { ordering.reverse() } else { ordering }
+        }
+    }
+}
+
+/// Reorders a view's rows to the grid's current sort, if it has one.
+///
+/// The key function is called once per row rather than once per comparison —
+/// it usually allocates, and a comparison-time key on a five-thousand-row grid
+/// is sixty thousand allocations per redraw.
+///
+/// The sort is stable, so rows the column does not tell apart stay in the order
+/// the server returned them.
+pub fn sort_rows<T>(
+    layout: &GridLayout<'_>,
+    rows: &mut Vec<T>,
+    key: impl Fn(&T, &str) -> SortKey,
+) {
+    let Some(sort) = layout.client_sort() else { return };
+    let mut decorated: Vec<(SortKey, T)> =
+        rows.drain(..).map(|row| (key(&row, &sort.column), row)).collect();
+    decorated.sort_by(|(a, _), (b, _)| compare(a, b, sort.descending));
+    rows.extend(decorated.into_iter().map(|(_, row)| row));
+}
+
+/// The order a result set's rows should be shown in, as indices into it.
+///
+/// `None` when the grid is unsorted, which lets the caller skip building the
+/// vector at all — the common case, and the one on the largest grids.
+pub fn sorted_order(layout: &GridLayout<'_>, grid: &Grid) -> Option<Vec<usize>> {
+    order_by(layout.client_sort(), grid)
+}
+
+/// A copy of the result in the order it is on screen.
+///
+/// What is exported and what is copied has to be what was looked at. Someone
+/// sorts a result by cost, exports it, and opens a file in the order the server
+/// happened to return — a file that is not wrong so much as not the thing they
+/// asked for, and nothing in it says so.
+///
+/// Borrows when the grid is unsorted, which is the ordinary case.
+pub fn in_sorted_order<'a>(
+    sort: Option<&GridSort>,
+    grid: &'a Grid,
+) -> std::borrow::Cow<'a, Grid> {
+    match order_by(sort, grid) {
+        None => std::borrow::Cow::Borrowed(grid),
+        Some(order) => std::borrow::Cow::Owned(Grid {
+            columns: grid.columns.clone(),
+            rows: order.into_iter().map(|index| grid.rows[index].clone()).collect(),
+            tag: grid.tag.clone(),
+        }),
+    }
+}
+
+fn order_by(sort: Option<&GridSort>, grid: &Grid) -> Option<Vec<usize>> {
+    let sort = sort?;
+    let column = grid.columns.iter().position(|name| *name == sort.column)?;
+
+    let mut decorated: Vec<(SortKey, usize)> = (0..grid.rows.len())
+        .map(|index| {
+            let value = grid.rows[index].get(column).and_then(Option::as_deref);
+            (SortKey::cell(value), index)
+        })
+        .collect();
+    decorated.sort_by(|(a, _), (b, _)| compare(a, b, sort.descending));
+    Some(decorated.into_iter().map(|(_, index)| index).collect())
+}
+
 /// The header, with a drag handle after every column.
 pub fn grid_header<'a>(
     layout: &GridLayout<'_>,
@@ -967,22 +1155,41 @@ pub fn grid_header<'a>(
     let mut header = row![].spacing(0);
     for (index, column) in columns.iter().enumerate() {
         let width = widths.get(index).copied().unwrap_or(column.width);
-        header = header.push(
-            container(
-                text(column.header.clone())
-                    .size(10)
-                    .font(theme::MONO)
-                    .color(theme::RUST)
-                    .align_x(if column.right {
-                        iced::alignment::Horizontal::Right
-                    } else {
-                        iced::alignment::Horizontal::Left
-                    })
-                    .width(Fill),
-            )
-            .padding([4, 6])
-            .width(Length::Fixed(width)),
-        );
+        let sorted = layout.sort.filter(|sort| sort.column == column.key);
+
+        // The arrow is the only thing that says which way the grid is ordered,
+        // and it has to be part of the label rather than a second element: the
+        // header is laid out to a fixed width, and an arrow beside the text
+        // would push a right-aligned heading off its own column.
+        let label = text(match sorted {
+            Some(sort) if sort.descending => format!("{} ▼", column.header),
+            Some(_) => format!("{} ▲", column.header),
+            None => column.header.clone(),
+        })
+        .size(10)
+        .font(theme::MONO)
+        .align_x(if column.right {
+            iced::alignment::Horizontal::Right
+        } else {
+            iced::alignment::Horizontal::Left
+        })
+        .width(Fill);
+
+        let cell: Element<'a, Message> = if column.sortable && !column.header.is_empty() {
+            iced::widget::button(label)
+                .padding([4, 6])
+                .width(Fill)
+                .style(theme::sort_header(sorted.is_some()))
+                .on_press(Message::SortColumn(
+                    layout.scope.clone(),
+                    column.key.to_string(),
+                ))
+                .into()
+        } else {
+            container(label.color(theme::RUST)).padding([4, 6]).into()
+        };
+
+        header = header.push(container(cell).width(Length::Fixed(width)));
 
         let key = width_key(&layout.scope, &column.key);
         header = header.push(
@@ -1169,6 +1376,12 @@ pub fn result_grid<'a>(
     let mut header = grid_header(&layout, &columns, &widths);
     let mut total = grid_total(&widths);
 
+    // Display position to source row. `None` — no sort, or a sort the server
+    // already applied — means the two are the same, and a five-thousand-entry
+    // identity vector is not built to say so.
+    let order = sorted_order(&layout, grid);
+    let source = |display: usize| order.as_ref().map_or(display, |order| order[display]);
+
     if trailing.is_some() {
         total += 70.0;
         header = container(
@@ -1195,7 +1408,12 @@ pub fn result_grid<'a>(
         // whole result deserves rather than the length of what is built.
         body = body.push(Space::new().height(Length::Fixed(above)));
     }
-    for row_index in window.clone() {
+    for display in window.clone() {
+        // Everything addressed *by row* — an edit, a delete — is addressed by
+        // the source index, not by where the row happens to be on screen. A
+        // sorted grid that handed out display positions would edit whichever
+        // row used to be there.
+        let row_index = source(display);
         let values = &grid.rows[row_index];
         let cells: Vec<Element<'_, Message>> = values
             .iter()
@@ -1209,7 +1427,7 @@ pub fn result_grid<'a>(
         let row_element = container(line)
             .width(Length::Fixed(total))
             .height(Length::Fixed(ROW_HEIGHT));
-        body = body.push(grid_stripe(row_index, row_element.into()));
+        body = body.push(grid_stripe(display, row_element.into()));
     }
     if below > 0.0 {
         body = body.push(Space::new().height(Length::Fixed(below)));
@@ -1276,6 +1494,16 @@ pub fn metric_grid(
     ];
     let widths = column_widths(&layout, &specs);
     let total = grid_total(&widths);
+
+    // By name to find one, or by value to see which of forty figures is the
+    // large one. The values are mostly numbers written as text, which is why
+    // `SortKey::cell` decides that per value rather than per column.
+    let mut stats: Vec<&Stat> = stats.iter().collect();
+    sort_rows(&layout, &mut stats, |stat, column| match column {
+        "value" => SortKey::cell(Some(&stat.value)),
+        "detail" => SortKey::text(&stat.detail),
+        _ => SortKey::text(&stat.metric),
+    });
 
     let mut body = column![].spacing(0);
     for (index, stat) in stats.iter().enumerate() {
@@ -1391,7 +1619,21 @@ mod tests {
             resizing: false,
             viewport: None,
             on_scroll: None,
+            sort: None,
+            sorted_by_server: false,
         }
+    }
+
+    fn sorted<'a>(
+        widths: &'a HashMap<String, f32>,
+        sort: &'a GridSort,
+        scope: &str,
+    ) -> GridLayout<'a> {
+        GridLayout { sort: Some(sort), ..layout(widths, scope) }
+    }
+
+    fn by(column: &str, descending: bool) -> GridSort {
+        GridSort { column: column.to_string(), descending }
     }
 
     #[test]
@@ -1443,6 +1685,136 @@ mod tests {
     #[test]
     fn a_long_header_widens_its_own_column() {
         assert!(default_width("RECLAIMABLE_BYTES", 2) > default_width("N", 2));
+    }
+
+    // --- sorting
+
+    /// The whole reason the views hand back a key instead of the rendered
+    /// cell: `1.2 GiB` and `900 MiB` order the wrong way round as text.
+    #[test]
+    fn figures_sort_by_magnitude_and_not_by_their_formatting() {
+        let widths = HashMap::new();
+        let sort = by("size", false);
+        let mut rows = vec![("a", 900u64 * 1024 * 1024), ("b", 1288490188), ("c", 512)];
+        sort_rows(&sorted(&widths, &sort, "tables"), &mut rows, |(_, size), _| {
+            SortKey::number(*size as f64)
+        });
+        assert_eq!(rows.iter().map(|(name, _)| *name).collect::<Vec<_>>(), ["c", "a", "b"]);
+    }
+
+    /// Ascending, then descending. The order has to actually reverse, not just
+    /// redraw the arrow.
+    #[test]
+    fn a_second_click_reverses_the_order() {
+        let widths = HashMap::new();
+        let sort = by("name", true);
+        let mut rows = vec!["carol", "alice", "bob"];
+        sort_rows(&sorted(&widths, &sort, "tables"), &mut rows, |row, _| SortKey::text(row));
+        assert_eq!(rows, ["carol", "bob", "alice"]);
+    }
+
+    /// A row with nothing in the sorted column is not what somebody sorting by
+    /// it is looking for, in either direction.
+    #[test]
+    fn missing_values_stay_at_the_bottom_both_ways() {
+        let widths = HashMap::new();
+        for descending in [false, true] {
+            let sort = by("key", descending);
+            let mut rows = vec![Some(2.0), None, Some(1.0), None];
+            sort_rows(&sorted(&widths, &sort, "g"), &mut rows, |row, _| match row {
+                Some(value) => SortKey::number(*value),
+                None => SortKey::Empty,
+            });
+            assert_eq!(&rows[2..], &[None, None], "descending = {descending}");
+        }
+    }
+
+    /// Rows the column does not tell apart keep the order the server sent them
+    /// in, which is the only order left that means anything.
+    #[test]
+    fn ties_keep_the_servers_order() {
+        let widths = HashMap::new();
+        let sort = by("kind", false);
+        let mut rows = vec![("first", "wal"), ("second", "wal"), ("third", "wal")];
+        sort_rows(&sorted(&widths, &sort, "backup"), &mut rows, |(_, kind), _| {
+            SortKey::text(kind)
+        });
+        assert_eq!(
+            rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            ["first", "second", "third"]
+        );
+    }
+
+    /// An unsorted grid is left exactly as it arrived — no sort is the state
+    /// every grid starts in and the one the third click returns it to.
+    #[test]
+    fn an_unsorted_grid_is_left_alone() {
+        let widths = HashMap::new();
+        let mut rows = vec!["c", "a", "b"];
+        sort_rows(&layout(&widths, "tables"), &mut rows, |row, _| SortKey::text(row));
+        assert_eq!(rows, ["c", "a", "b"]);
+    }
+
+    fn grid() -> Grid {
+        Grid {
+            columns: vec!["id".into(), "name".into()],
+            rows: vec![
+                vec![Some("10".into()), Some("carol".into())],
+                vec![Some("2".into()), Some("alice".into())],
+                vec![None, Some("bob".into())],
+            ],
+            tag: String::new(),
+        }
+    }
+
+    /// A result set carries no types, so the values decide: an `id` column
+    /// that ordered as text would run 1, 10, 100, 2.
+    #[test]
+    fn a_result_column_of_numbers_sorts_as_numbers() {
+        let widths = HashMap::new();
+        let sort = by("id", false);
+        let order = sorted_order(&sorted(&widths, &sort, "query"), &grid()).unwrap();
+        assert_eq!(order, vec![1, 0, 2], "the NULL row belongs last");
+    }
+
+    /// The indices are into the result, not positions on screen: an edit or a
+    /// delete addressed by display position would hit the wrong row.
+    #[test]
+    fn a_sorted_result_still_points_at_its_own_rows() {
+        let widths = HashMap::new();
+        let sort = by("name", false);
+        let grid = grid();
+        let order = sorted_order(&sorted(&widths, &sort, "query"), &grid).unwrap();
+        let names: Vec<&str> = order
+            .iter()
+            .map(|index| grid.rows[*index][1].as_deref().unwrap())
+            .collect();
+        assert_eq!(names, ["alice", "bob", "carol"]);
+    }
+
+    /// Run a different statement and the old sort names a column the new
+    /// result does not have. That is not an error and not a panic; it is an
+    /// unsorted grid.
+    #[test]
+    fn a_sort_on_a_column_that_is_gone_orders_nothing() {
+        let widths = HashMap::new();
+        let sort = by("vanished", false);
+        assert!(sorted_order(&sorted(&widths, &sort, "query"), &grid()).is_none());
+    }
+
+    /// The data browser's rows are ordered by the server. Sorting them again
+    /// here would rearrange the page in hand under a heading that claims to
+    /// order the whole table.
+    #[test]
+    fn a_server_sorted_grid_is_not_sorted_twice() {
+        let widths = HashMap::new();
+        let sort = by("id", true);
+        let layout = GridLayout {
+            sorted_by_server: true,
+            ..sorted(&widths, &sort, "data:users")
+        };
+        assert!(sorted_order(&layout, &grid()).is_none());
+        assert!(layout.sort.is_some(), "the header still shows which way it is sorted");
     }
 
     // --- virtualisation

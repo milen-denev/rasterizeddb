@@ -53,8 +53,12 @@ pub fn view(studio: &Studio) -> Element<'_, Message> {
 
     let grid = result_grid(
         &studio.data,
-        super::GridLayout::new(studio, format!("data:{}", table))
-            .virtualised(studio.data_viewport, Message::DataScrolled),
+        // The server did the sorting: this grid holds one page of the table,
+        // and reordering the page here would rearrange a hundred arbitrary rows
+        // under a heading that claims to order the whole thing.
+        super::GridLayout::new(studio, format!("{}{}", super::DATA_SCOPE, table))
+            .virtualised(studio.data_viewport, Message::DataScrolled)
+            .sorted_by_server(),
         move |index| numeric.get(index).copied().unwrap_or(false),
         move |row_index, column_index, value| {
             let is_editing = editing

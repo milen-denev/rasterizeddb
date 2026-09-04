@@ -283,6 +283,24 @@ pub fn cell(selected_cell: bool) -> impl Fn(&Theme, button::Status) -> button::S
     }
 }
 
+/// A column header that sorts the grid when clicked.
+///
+/// Flat by default, because a header row of buttons that look like buttons
+/// reads as a toolbar rather than as a heading. What makes it discoverable is
+/// the hover: the header lights up under the cursor the way every other
+/// clickable thing here does.
+pub fn sort_header(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_, status| {
+        let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        button::Style {
+            background: Some(Background::Color(if hovered { LINE } else { Color::TRANSPARENT })),
+            text_color: if active { RUST_BRIGHT } else { RUST },
+            border: Border { color: Color::TRANSPARENT, width: 0.0, radius: border::radius(0) },
+            ..button::Style::default()
+        }
+    }
+}
+
 // --- inputs -----------------------------------------------------------------
 
 pub fn input(_: &Theme, status: text_input::Status) -> text_input::Style {

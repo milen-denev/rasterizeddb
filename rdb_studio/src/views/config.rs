@@ -24,7 +24,7 @@ use super::{framed, small_button};
 
 pub fn view(studio: &Studio) -> Element<'_, Message> {
     let needle = studio.config_filter.to_ascii_lowercase();
-    let matching: Vec<&ConfigEntry> = studio
+    let mut matching: Vec<&ConfigEntry> = studio
         .config
         .iter()
         .filter(|entry| {
@@ -45,12 +45,25 @@ pub fn view(studio: &Studio) -> Element<'_, Message> {
     let widths = super::column_widths(&layout, &specs);
     let total = super::grid_total(&widths);
 
+    // Sorting flattens the sections. They are an ordering of their own — the
+    // settings arrive grouped and each group is announced by a heading — and
+    // keeping them while sorting would produce a page of one-row sections in
+    // an order nobody asked for. The heading a sorted list loses is the
+    // section name, which is the first half of every key in the column beside
+    // it, so nothing is actually hidden.
+    let grouped = layout.sort.is_none();
+    super::sort_rows(&layout, &mut matching, |entry, column| match column {
+        "value" => super::SortKey::cell(Some(&entry.value)),
+        "help" => super::SortKey::text(&entry.help),
+        _ => super::SortKey::text(entry.qualified()),
+    });
+
     let mut body = column![].spacing(0);
     let mut current = String::new();
     let mut index = 0usize;
 
     for entry in &matching {
-        if entry.section != current {
+        if grouped && entry.section != current {
             current = entry.section.clone();
             index = 0;
             body = body.push(

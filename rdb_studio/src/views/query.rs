@@ -234,7 +234,7 @@ fn results(studio: &Studio) -> Element<'_, Message> {
 
                 let grid_view = result_grid(
                     grid,
-                    super::GridLayout::new(studio, "query"),
+                    super::GridLayout::new(studio, super::QUERY_SCOPE),
                     |_| false,
                     |_, _, value| plain_cell(value, false),
                     None,

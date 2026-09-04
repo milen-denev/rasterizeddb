@@ -14,10 +14,11 @@ cargo run -p rdb_studio -- studio-demo # open a saved profile straight away
 |---|---|
 | **Dashboard** | What is the database *doing*, as a live line per metric, plus where the space is going |
 | **Overview** | Every statistic the server reports, grouped, with the six that matter as tiles |
-| **Tables** | Every table with its sizes, and one table's columns, constraints and statistics |
+| **Tables** | Every table with its sizes and what is holding it — memory, files, S3 — and one table's columns, constraints and statistics |
 | **Schema** | The foreign keys as a layered map, each line anchored at the column it joins |
 | **Data** | A page of rows, editable in place, with insert and delete |
 | **Query** | Several statements at a time, each reporting separately, with timings and a history you can prune |
+| **Activity** | What the *server* has been running, what each cost, how many rows it had to read to answer, and how much of the time went on relations it had to build first |
 | **Backup** | What is stored in S3, whether archiving is healthy, and restoring from it |
 | **Storage** | Which directories the database writes into, how full each is, and which one holds each table |
 | **Replication** | Whether it is on, who it is talking to, and how far behind they are |
@@ -37,8 +38,9 @@ whole of [`src/dialect.rs`](src/dialect.rs):
   `SHOW DATABASE STATS`, `SHOW TABLES`, `SHOW TABLE STATS <t>`,
   `SHOW COLUMNS FROM <t>`, `SHOW SCHEMA MAP`, `SHOW DATABASES`,
   `SHOW CONFIG`, `SHOW CONFIG KEYS`, `SET CONFIG <key> = <value>`,
-  `SHOW BACKUP STATUS`, `SHOW REPLICATION STATS` and
-  `SHOW REPLICATION PEER STATUS`. See
+  `SHOW BACKUP STATUS`, `SHOW REPLICATION STATS`,
+  `SHOW REPLICATION PEER STATUS`, `SHOW QUERIES`, `SHOW QUERY STATS` and
+  `RESET QUERY STATS`. See
   [docs/introspection.md](../docs/introspection.md).
 - **PostgreSQL** answers the equivalent `pg_catalog` / `pg_stat_*` queries.
 
@@ -50,6 +52,17 @@ in a banner that stays up — when the answer disagrees with what you chose.
 Two figures have no PostgreSQL equivalent and are marked rather than faked:
 `reclaimable_bytes` is estimated from `n_dead_tup`, and `filters_ready`
 describes an index only RasterizedDB has.
+
+The activity screen is the sharpest case of the same rule, because there the
+*question* differs and not just a figure. RasterizedDB keeps a ring of finished
+statements; PostgreSQL keeps none, and the nearest thing it has —
+`pg_stat_activity` — is what its backends are executing at this instant. So that
+pane is headed "RUNNING NOW · THIS INSTANT, NOT A HISTORY" there, and the two
+columns nobody can answer for a statement that has not finished — rows returned,
+rows scanned — show as dashes rather than zeroes. The lower pane is
+`pg_stat_statements`, which genuinely is the equivalent of `SHOW QUERY STATS`,
+and the page says so plainly when the extension is not loaded instead of
+rendering an empty table.
 
 ## The query screen
 
@@ -225,6 +238,11 @@ For the same reason a page is always ordered by that key. Without an `ORDER BY`
 neither engine promises the same order twice, so page 2 can repeat a row from
 page 1 and skip another.
 
+Clicking a header in the data browser sorts the **table**, not the page: the
+statement goes back to the server with an `ORDER BY` in front of the key and
+comes back from page one. Sorting the page in hand would rearrange the hundred
+rows that happened to arrive under a heading claiming to order the whole thing.
+
 ## Columns
 
 Every grid in the console is the same four pieces — resolve the widths, draw the
@@ -237,6 +255,21 @@ header, double-click it to go back to the default.
 Widths are remembered per grid and, where the columns belong to a table, per
 table — two grids with a `name` column do not share its width, and neither do
 two tables.
+
+Clicking a header sorts by it; clicking again reverses it; a third click puts
+the grid back into the order the server returned. That third state is not
+decoration: a re-sorted grid shows a different order from the one the statement
+produced, and there has to be a way back to it without reconnecting. Rows are
+ordered by what the figure *is*, not by how it was printed — `1.2 GiB` sorts
+above `900 MiB` — and a row with nothing in the sorted column goes to the
+bottom in both directions, because "missing" has no place in an order. Rows the
+column cannot tell apart keep the order they arrived in.
+
+Columns holding a button or a row of badges have nothing to order by and do not
+respond to a click. Sorting the configuration list flattens its sections, since
+the sections are an ordering of their own and keeping them would produce a page
+of one-row groups; the section name is the first half of every key in the
+column beside it, so nothing is hidden.
 
 They are separate pieces rather than one `grid(columns, rows)` call because the
 screens genuinely differ: the table list makes each row a button, the catalogue

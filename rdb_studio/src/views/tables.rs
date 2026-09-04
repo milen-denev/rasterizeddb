@@ -1,10 +1,11 @@
 //! Two panes: every table with its sizes, and everything about the one
 //! selected.
 //!
-//! The list is sorted by the server. Sorting it here by size would be more
-//! useful and is deliberately not done yet — a console that re-sorts on the
-//! client shows a different order from the one `SHOW TABLES` returns, which
-//! makes the two disagree about what "the first table" means.
+//! The list arrives in the server's order and stays in it until a header is
+//! clicked. "Which table is the big one" is the question this pane exists to
+//! answer and it is one click away now; the third click puts the list back
+//! into `SHOW TABLES` order, so the two never silently disagree about what
+//! "the first table" means.
 
 use iced::widget::{column, container, row, rule, text};
 use iced::{Element, Fill, Length};
@@ -24,13 +25,27 @@ fn list(studio: &Studio) -> Element<'_, Message> {
     let columns = columns();
     let widths = super::column_widths(&layout, &columns);
 
+    let mut tables = studio.filtered_tables();
+    super::sort_rows(&layout, &mut tables, |table, column| match column {
+        "storage" => super::SortKey::text(&table.storage),
+        "row_slots" => super::SortKey::number(table.row_slots as f64),
+        "columns" => super::SortKey::number(table.columns as f64),
+        "data" => super::SortKey::number(table.data_bytes as f64),
+        "index" => super::SortKey::number(table.index_bytes as f64),
+        "total" => super::SortKey::number(table.total_bytes as f64),
+        "reclaimable" => super::SortKey::number(table.reclaimable_bytes as f64),
+        "primary_key" => super::SortKey::text(&table.primary_key),
+        _ => super::SortKey::text(&table.name),
+    });
+
     let mut body = column![].spacing(0);
-    for (index, table) in studio.filtered_tables().into_iter().enumerate() {
+    for (index, table) in tables.into_iter().enumerate() {
         let active = studio.selected_table.as_deref() == Some(table.name.as_str());
         let line = super::grid_row(
             &widths,
             vec![
                 super::grid_cell(table.name.clone(), false, theme::TEXT),
+                storage_cell(table),
                 super::grid_cell(count(table.row_slots), true, theme::TEXT),
                 super::grid_cell(count(table.columns), true, theme::TEXT_DIM),
                 super::grid_cell(bytes(table.data_bytes), true, theme::TEXT),
@@ -89,6 +104,7 @@ fn list(studio: &Studio) -> Element<'_, Message> {
 fn columns() -> Vec<super::GridColumn> {
     vec![
         super::GridColumn::new("table", "TABLE", 200.0),
+        super::GridColumn::new("storage", "STORAGE", 116.0),
         super::GridColumn::new("row_slots", "ROW SLOTS", 96.0).right(),
         super::GridColumn::new("columns", "COLS", 60.0).right(),
         super::GridColumn::new("data", "DATA", 92.0).right(),
@@ -97,6 +113,25 @@ fn columns() -> Vec<super::GridColumn> {
         super::GridColumn::new("reclaimable", "RECLAIMABLE", 108.0).right(),
         super::GridColumn::new("primary_key", "PRIMARY KEY", 150.0),
     ]
+}
+
+/// What is holding the table, as a badge.
+///
+/// Coloured by whether the contents survive the server going away, not by which
+/// backend it is: a table in memory and a PostgreSQL `UNLOGGED` table are
+/// different technologies and the same fact about a restart, which is the thing
+/// somebody scanning this list needs to notice. A server that does not report
+/// the column gets no badge rather than a wrong one.
+fn storage_cell(table: &TableInfo) -> Element<'_, Message> {
+    if table.storage.is_empty() {
+        return super::grid_cell("—", false, theme::TEXT_FAINT);
+    }
+    container(super::pill(
+        table.storage.to_ascii_uppercase(),
+        if table.durable() { theme::TEXT_DIM } else { theme::WARN },
+    ))
+    .padding([3, 6])
+    .into()
 }
 
 fn detail(studio: &Studio) -> Element<'_, Message> {
@@ -115,13 +150,20 @@ fn detail(studio: &Studio) -> Element<'_, Message> {
     let specs = vec![
         super::GridColumn::new("column", "COLUMN", 170.0),
         super::GridColumn::new("type", "TYPE", 140.0),
-        super::GridColumn::new("flags", "", 170.0),
+        super::GridColumn::new("flags", "", 170.0).unsortable(),
         super::GridColumn::new("default", "DEFAULT", 160.0),
     ];
     let widths = super::column_widths(&layout, &specs);
 
+    let mut infos: Vec<&ColumnInfo> = studio.columns.iter().collect();
+    super::sort_rows(&layout, &mut infos, |info, column| match column {
+        "type" => super::SortKey::text(&info.data_type),
+        "default" => super::SortKey::text(&info.default),
+        _ => super::SortKey::text(&info.name),
+    });
+
     let mut column_rows = column![].spacing(0);
-    for (index, info) in studio.columns.iter().enumerate() {
+    for (index, info) in infos.into_iter().enumerate() {
         let mut flags = row![].spacing(4);
         if info.primary_key {
             flags = flags.push(super::pill("PK", theme::RUST));
@@ -192,4 +234,109 @@ fn detail(studio: &Studio) -> Element<'_, Message> {
     container(framed(name.to_uppercase(), None, body.into()))
         .width(Length::Fixed(560.0))
         .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::GridSort;
+
+    fn table(name: &str, total: u64, storage: &str, key: &str) -> TableInfo {
+        TableInfo {
+            name: name.into(),
+            storage: storage.into(),
+            row_slots: total / 8,
+            columns: 4,
+            data_bytes: total / 2,
+            index_bytes: total / 4,
+            total_bytes: total,
+            reclaimable_bytes: 0,
+            primary_key: key.into(),
+            immutable: false,
+            indexed: true,
+        }
+    }
+
+    fn studio_with_tables() -> Studio {
+        let (mut studio, _) = Studio::new(None);
+        studio.tables = vec![
+            table("users", 4096, "file", "id"),
+            table("events", 1_048_576, "memory", ""),
+            table("audit", 512, "s3", "uuid"),
+        ];
+        studio.selected_table = Some("users".into());
+        studio.columns = vec![ColumnInfo {
+            position: 1,
+            name: "id".into(),
+            data_type: "BIGINT".into(),
+            nullable: false,
+            unique: true,
+            primary_key: true,
+            default: String::new(),
+            indexed: true,
+            json_table: String::new(),
+        }];
+        studio
+    }
+
+    /// Sorting must not lose a row, whichever column it is asked for — a
+    /// table list that quietly dropped one is a console reporting a database
+    /// that does not exist.
+    #[test]
+    fn every_column_sorts_and_keeps_every_table() {
+        let mut studio = studio_with_tables();
+        for column in columns() {
+            for descending in [false, true] {
+                studio.sort.insert(
+                    "tables".to_string(),
+                    GridSort { column: column.key.to_string(), descending },
+                );
+                let layout = super::super::GridLayout::new(&studio, "tables");
+                let mut tables = studio.filtered_tables();
+                let before = tables.len();
+                super::super::sort_rows(&layout, &mut tables, |table, key| match key {
+                    "storage" => super::super::SortKey::text(&table.storage),
+                    _ => super::super::SortKey::text(&table.name),
+                });
+                assert_eq!(tables.len(), before, "{} lost a row", column.key);
+            }
+        }
+    }
+
+    /// The question this pane is opened to answer: which table is the big one.
+    #[test]
+    fn sorting_by_size_puts_the_biggest_table_first() {
+        let mut studio = studio_with_tables();
+        studio.sort.insert(
+            "tables".to_string(),
+            GridSort { column: "total".into(), descending: true },
+        );
+        let layout = super::super::GridLayout::new(&studio, "tables");
+        let mut tables = studio.filtered_tables();
+        super::super::sort_rows(&layout, &mut tables, |table, _| {
+            super::super::SortKey::number(table.total_bytes as f64)
+        });
+        assert_eq!(tables[0].name, "events");
+        assert_eq!(tables[2].name, "audit");
+    }
+
+    /// Both panes render with a sort applied. A header declaring nine columns
+    /// over rows supplying eight is a runtime fault, and the sorted path is a
+    /// path nobody looks at until it is already wrong.
+    #[test]
+    fn both_panes_render_sorted() {
+        let mut studio = studio_with_tables();
+        for column in columns() {
+            studio.sort.insert(
+                "tables".to_string(),
+                GridSort { column: column.key.to_string(), descending: true },
+            );
+            let _ = view(&studio);
+        }
+        studio.sort.insert(
+            "columns:users".to_string(),
+            GridSort { column: "type".into(), descending: false },
+        );
+        let _ = view(&studio);
+    }
 }

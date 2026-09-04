@@ -84,6 +84,9 @@ async fn main() {
     studio.tables = (0..60)
         .map(|i| rdb_studio::model::TableInfo {
             name: format!("table_{i}"),
+            // Every third one in memory, so the badge is measured in both of
+            // its states rather than only the common one.
+            storage: if i % 3 == 0 { "memory".into() } else { "file".into() },
             row_slots: 1000 + i,
             columns: 12,
             data_bytes: 4096 * (i + 1),

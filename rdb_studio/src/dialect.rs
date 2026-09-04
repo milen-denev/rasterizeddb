@@ -24,10 +24,18 @@
 //! - **`filters_ready`** describes RasterizedDB's own index catching up with
 //!   the rows. Nothing in PostgreSQL is ever behind in that sense, so it reads
 //!   `true`.
+//!
+//! The activity page adds a third case, and a sharper one: PostgreSQL keeps no
+//! statement *history*. `pg_stat_activity` reports what each backend is
+//! executing right now, which is a different question with the same shape, so
+//! the page renders it under a different heading — see
+//! [`recent_statements_label`] — and the columns it genuinely cannot answer
+//! come back empty rather than zero.
 
 use crate::model::{
     BackupEntry, ColumnInfo, ConfigEntry, DatabaseInfo, Flavor, Grid, PeerStatus, Relationship,
-    RestoreReport, RestoreTarget, Stat, StorageLocation, TableInfo, TablePlacement,
+    RestoreReport, RestoreTarget, Stat, StatementRecord, StatementShape, StorageLocation,
+    TableInfo, TablePlacement,
 };
 
 // ---------------------------------------------------------------------------
@@ -90,6 +98,195 @@ pub fn databases_sql(flavor: Flavor) -> &'static str {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Activity
+// ---------------------------------------------------------------------------
+
+/// What to send for the statements the server has answered most recently.
+///
+/// The two servers answer two different questions here and the page says which
+/// — see [`recent_statements_label`]. RasterizedDB keeps a ring of finished
+/// statements; PostgreSQL keeps none, and the closest thing it has is the list
+/// of what its backends are executing at this instant.
+pub fn recent_statements_sql(flavor: Flavor, limit: usize) -> String {
+    match flavor {
+        Flavor::Rasterized => format!("SHOW QUERIES {}", limit),
+        Flavor::Postgres => PG_RECENT_STATEMENTS.replace("$LIMIT$", &limit.to_string()),
+    }
+}
+
+/// What the recent pane is a list *of*, which is not the same on both servers.
+pub fn recent_statements_label(flavor: Flavor) -> &'static str {
+    match flavor {
+        Flavor::Rasterized => "RECENT · NEWEST FIRST",
+        Flavor::Postgres => "RUNNING NOW · THIS INSTANT, NOT A HISTORY",
+    }
+}
+
+/// The caveat under that heading, or nothing when there is none.
+pub fn recent_statements_caveat(flavor: Flavor) -> Option<&'static str> {
+    match flavor {
+        Flavor::Rasterized => None,
+        Flavor::Postgres => Some(
+            "PostgreSQL keeps no history of finished statements. This is pg_stat_activity: what \
+             each backend is executing right now. A statement that has already returned is not \
+             here, and neither figure beside it — rows returned, rows scanned — exists for a \
+             statement that has not finished.",
+        ),
+    }
+}
+
+/// What to send for the per-shape totals.
+pub fn statement_shapes_sql(flavor: Flavor) -> &'static str {
+    match flavor {
+        Flavor::Rasterized => "SHOW QUERY STATS",
+        Flavor::Postgres => PG_STATEMENT_SHAPES,
+    }
+}
+
+/// What to send to forget both.
+///
+/// RasterizedDB answers PostgreSQL's spelling too, but the console sends each
+/// server its own: the native one is what an operator would type, and it is
+/// what the confirmation dialog shows them before they agree to it.
+pub fn reset_statement_stats_sql(flavor: Flavor) -> &'static str {
+    match flavor {
+        Flavor::Rasterized => "RESET QUERY STATS",
+        Flavor::Postgres => "SELECT pg_stat_statements_reset()",
+    }
+}
+
+/// Why the recent list is missing, which is a different thing from why the
+/// aggregate is.
+///
+/// Worth its own message rather than reusing the aggregate's: on PostgreSQL the
+/// two panes come from different places, and `pg_stat_activity` is present on
+/// every server — so telling someone to install `pg_stat_statements` when the
+/// *recent* pane is empty would send them after the wrong thing entirely.
+pub fn recent_statements_missing(flavor: Flavor) -> &'static str {
+    match flavor {
+        Flavor::Rasterized => {
+            "This server does not record what it runs. It answered SHOW QUERIES as if it were a \
+             runtime parameter, which is what a build without the query_stats feature — or from \
+             before it existed — does. Rebuild with --features query_stats."
+        }
+        Flavor::Postgres => {
+            "This server did not answer the pg_stat_activity query. That view exists on every \
+             PostgreSQL server, so this is usually privileges rather than absence: a role without \
+             pg_read_all_stats (or membership of the monitoring role) sees other sessions with \
+             their query text hidden, and an older server may not have every column this uses."
+        }
+    }
+}
+
+/// Why the aggregate is missing, which is a different thing on each server.
+pub fn statement_shapes_missing(flavor: Flavor) -> &'static str {
+    match flavor {
+        Flavor::Rasterized => {
+            "This server does not record what it runs. It answered SHOW QUERY STATS as if it \
+             were a runtime parameter, which is what a build without the query_stats feature — \
+             or from before it existed — does. Rebuild with --features query_stats."
+        }
+        Flavor::Postgres => {
+            "pg_stat_statements is not loaded. It ships with PostgreSQL but is off until it is \
+             both listed in shared_preload_libraries (which needs a restart) and installed with \
+             CREATE EXTENSION pg_stat_statements."
+        }
+    }
+}
+
+pub fn parse_statement_records(grid: &Grid) -> Vec<StatementRecord> {
+    (0..grid.rows.len())
+        .map(|row| StatementRecord {
+            started_at: grid.value(row, "started_at").unwrap_or_default().trim().to_string(),
+            duration_ms: grid.real(row, "duration_ms").unwrap_or(0.0),
+            rows: grid.number(row, "rows"),
+            rows_scanned: grid.number(row, "rows_scanned"),
+            materialised: grid.number(row, "materialised"),
+            materialised_ms: grid.real(row, "materialised_ms"),
+            status: grid.value(row, "status").unwrap_or_default().trim().to_string(),
+            database: grid.value(row, "database").unwrap_or_default().to_string(),
+            username: grid.value(row, "username").unwrap_or_default().to_string(),
+            statement: grid.value(row, "statement").unwrap_or_default().to_string(),
+            error: grid.value(row, "error").unwrap_or_default().to_string(),
+        })
+        .collect()
+}
+
+pub fn parse_statement_shapes(grid: &Grid) -> Vec<StatementShape> {
+    (0..grid.rows.len())
+        .map(|row| StatementShape {
+            queryid: grid.value(row, "queryid").unwrap_or_default().trim().to_string(),
+            calls: grid.number(row, "calls").unwrap_or(0),
+            total_ms: grid.real(row, "total_ms").unwrap_or(0.0),
+            mean_ms: grid.real(row, "mean_ms").unwrap_or(0.0),
+            min_ms: grid.real(row, "min_ms").unwrap_or(0.0),
+            max_ms: grid.real(row, "max_ms").unwrap_or(0.0),
+            stddev_ms: grid.real(row, "stddev_ms").unwrap_or(0.0),
+            rows: grid.number(row, "rows"),
+            rows_scanned: grid.number(row, "rows_scanned"),
+            materialised: grid.number(row, "materialised"),
+            materialised_ms: grid.real(row, "materialised_ms"),
+            errors: grid.number(row, "errors"),
+            last_seen: grid.value(row, "last_seen").unwrap_or_default().trim().to_string(),
+            statement: grid.value(row, "statement").unwrap_or_default().to_string(),
+        })
+        .collect()
+}
+
+/// PostgreSQL's nearest thing to a recent-statement list.
+///
+/// Every column the RasterizedDB form has, so one parser reads both. The two it
+/// cannot fill come back as the empty string rather than as `0`: the page
+/// renders that as a dash, where a zero would say the statement scanned nothing.
+///
+/// The console's own connection is excluded, because its query would otherwise
+/// always be the most recent thing running and a page whose top row is always
+/// itself says nothing.
+const PG_RECENT_STATEMENTS: &str = "\
+SELECT
+  coalesce(to_char(query_start, 'YYYY-MM-DD HH24:MI:SS.US'), '')                 AS started_at,
+  coalesce(round(
+    extract(epoch FROM (clock_timestamp() - query_start))::numeric * 1000, 3)::text,
+    '0')                                                                         AS duration_ms,
+  ''                                                                             AS rows,
+  ''                                                                             AS rows_scanned,
+  coalesce(state, '')                                                            AS status,
+  coalesce(datname, '')                                                          AS database,
+  coalesce(usename, '')                                                          AS username,
+  coalesce(query, '')                                                            AS statement,
+  ''                                                                             AS error
+FROM pg_stat_activity
+WHERE pid <> pg_backend_pid() AND coalesce(query, '') <> ''
+ORDER BY query_start DESC NULLS LAST
+LIMIT $LIMIT$";
+
+/// PostgreSQL's own per-shape aggregate, named to match the RasterizedDB form.
+///
+/// The extension already normalises literals to `$1`, so `statement` means the
+/// same thing on both sides. `rows_scanned` has no counterpart at all: the
+/// nearest figure, `shared_blks_read`, counts eight-kilobyte blocks fetched
+/// through a buffer cache, which is neither rows nor comparable between two
+/// engines that store rows differently. Left empty rather than converted into a
+/// row count nobody could defend.
+const PG_STATEMENT_SHAPES: &str = "\
+SELECT
+  s.queryid::text                             AS queryid,
+  s.calls::text                               AS calls,
+  round(s.total_exec_time::numeric, 3)::text  AS total_ms,
+  round(s.mean_exec_time::numeric, 3)::text   AS mean_ms,
+  round(s.min_exec_time::numeric, 3)::text    AS min_ms,
+  round(s.max_exec_time::numeric, 3)::text    AS max_ms,
+  round(s.stddev_exec_time::numeric, 3)::text AS stddev_ms,
+  s.rows::text                                AS rows,
+  ''                                          AS rows_scanned,
+  ''                                          AS errors,
+  ''                                          AS last_seen,
+  s.query                                     AS statement
+FROM pg_stat_statements s
+ORDER BY s.total_exec_time DESC
+LIMIT 200";
+
 /// The statement that changes one knob, or an explanation of why there is none.
 ///
 /// PostgreSQL splits this in two and the split matters: `SET` lasts for the
@@ -125,11 +322,40 @@ pub fn set_config_sql(flavor: Flavor, entry: &ConfigEntry, value: &str) -> Resul
 /// skip another — and an editor that then writes back by row position would
 /// write to the wrong row. The key is the primary key where there is one; where
 /// there is not, the console says so rather than paging on nothing.
-pub fn page_sql(table: &str, order_by: Option<&str>, limit: usize, offset: usize) -> String {
+///
+/// `sort` is the column a header was clicked on, and whether it was clicked
+/// twice. It goes *in front of* the key rather than replacing it: sorting by a
+/// column with a thousand equal values would otherwise leave those thousand
+/// rows in no defined order, which is the unstable paging this function exists
+/// to avoid — the key behind it breaks every tie the same way each time.
+pub fn page_sql(
+    table: &str,
+    order_by: Option<&str>,
+    sort: Option<(&str, bool)>,
+    limit: usize,
+    offset: usize,
+) -> String {
     let mut sql = format!("SELECT * FROM {}", quote_ident(table));
-    if let Some(key) = order_by {
-        sql.push_str(&format!(" ORDER BY {}", quote_ident(key)));
+
+    let mut terms: Vec<String> = Vec::new();
+    if let Some((column, descending)) = sort {
+        terms.push(format!(
+            "{}{}",
+            quote_ident(column),
+            if descending { " DESC" } else { "" }
+        ));
     }
+    if let Some(key) = order_by {
+        // Not twice: `ORDER BY "id" DESC, "id"` is not what the second term
+        // means, and some servers reject it.
+        if sort.map(|(column, _)| column) != Some(key) {
+            terms.push(quote_ident(key));
+        }
+    }
+    if !terms.is_empty() {
+        sql.push_str(&format!(" ORDER BY {}", terms.join(", ")));
+    }
+
     sql.push_str(&format!(" LIMIT {} OFFSET {}", limit, offset));
     sql
 }
@@ -956,6 +1182,9 @@ pub fn parse_tables(grid: &Grid) -> Vec<TableInfo> {
     (0..grid.rows.len())
         .map(|row| TableInfo {
             name: grid.value(row, "table_name").unwrap_or_default().to_string(),
+            // Empty from a server that does not report it, which the badge
+            // reads as "nothing to say" rather than as a kind of storage.
+            storage: grid.value(row, "storage").unwrap_or_default().trim().to_string(),
             row_slots: grid.number(row, "row_slots").unwrap_or(0),
             columns: grid.number(row, "columns").unwrap_or(0),
             data_bytes: grid.number(row, "data_bytes").unwrap_or(0),
@@ -1129,9 +1358,21 @@ SELECT metric, value, detail FROM (
 ) s ORDER BY ord";
 
 /// The table list. Column names match `SHOW TABLES` exactly.
+///
+/// `storage` is nearly constant here and that is the truth rather than a gap:
+/// every PostgreSQL relation is files in a tablespace. The two exceptions it
+/// does have are worth reporting, because both are emptied by a crash —
+/// `relpersistence` separates an `UNLOGGED` table and a temporary one from an
+/// ordinary one, which is the same distinction the RasterizedDB side draws
+/// between a file-backed table and an in-memory one.
 const PG_TABLES: &str = "\
 SELECT
   t.relname::text                                        AS table_name,
+  CASE t.relpersistence
+    WHEN 'u' THEN 'file-unlogged'
+    WHEN 't' THEN 'temporary'
+    ELSE 'file'
+  END                                                    AS storage,
   (s.n_live_tup + s.n_dead_tup)::text                    AS row_slots,
   (SELECT count(*) FROM pg_attribute a
     WHERE a.attrelid = t.oid AND a.attnum > 0 AND NOT a.attisdropped)::text AS columns,
@@ -1346,6 +1587,230 @@ mod tests {
     fn a_floor_needs_a_size() {
         assert!(storage_set_min_free_sql("").is_err());
         assert_eq!(storage_set_min_free_sql(" 2GiB ").unwrap(), "STORAGE SET MIN_FREE = '2GiB'");
+    }
+
+    // -- activity ---------------------------------------------------------
+
+    /// The two servers' answers are read by one parser, so what they name the
+    /// columns is the whole contract between them. Both grids are written out
+    /// here as each server produces them.
+    #[test]
+    fn the_statement_grids_are_read_the_same_from_either_server() {
+        // RasterizedDB: `SHOW QUERIES`, which answers every column.
+        let rdb = Grid {
+            columns: vec![
+                "started_at".into(),
+                "duration_ms".into(),
+                "rows".into(),
+                "rows_scanned".into(),
+                "status".into(),
+                "database".into(),
+                "username".into(),
+                "statement".into(),
+                "error".into(),
+            ],
+            rows: vec![vec![
+                Some("2026-09-01 09:14:02.7103".into()),
+                Some("0.718".into()),
+                Some("2".into()),
+                Some("3".into()),
+                Some("ok".into()),
+                Some("postgres".into()),
+                Some("rasterized".into()),
+                Some("SELECT id FROM t WHERE v > 15".into()),
+                Some("".into()),
+            ]],
+            ..Grid::default()
+        };
+
+        // PostgreSQL: `pg_stat_activity`, which cannot answer two of them and
+        // says so with an empty string rather than a zero.
+        let pg = Grid {
+            columns: rdb.columns.clone(),
+            rows: vec![vec![
+                Some("2026-09-01 09:14:02.710300".into()),
+                Some("12.500".into()),
+                Some("".into()),
+                Some("".into()),
+                Some("active".into()),
+                Some("shop".into()),
+                Some("app".into()),
+                Some("SELECT id FROM t WHERE v > $1".into()),
+                Some("".into()),
+            ]],
+            ..Grid::default()
+        };
+
+        let mine = &parse_statement_records(&rdb)[0];
+        assert_eq!(mine.rows, Some(2));
+        assert_eq!(mine.rows_scanned, Some(3));
+        assert_eq!(mine.duration_ms, 0.718);
+        assert!(!mine.failed());
+
+        let theirs = &parse_statement_records(&pg)[0];
+        // The distinction the whole page rests on: a figure the server cannot
+        // produce is absent, not zero. Rendering it as `0` would say the
+        // statement scanned nothing.
+        assert_eq!(theirs.rows, None);
+        assert_eq!(theirs.rows_scanned, None);
+        assert_eq!(theirs.status, "active");
+        assert!(!theirs.failed());
+    }
+
+    /// A statement the server refused is a statement that ran, and the page
+    /// separates it by the reason rather than by the word in `status`.
+    #[test]
+    fn a_refused_statement_reads_as_failed() {
+        let grid = Grid {
+            columns: vec!["status".into(), "error".into(), "statement".into()],
+            rows: vec![
+                vec![Some("error".into()), Some("relation does not exist".into()), Some("SELECT 1".into())],
+                vec![Some("ok".into()), Some("".into()), Some("SELECT 1".into())],
+                // A server that reported a reason but no status word is still
+                // reporting a failure.
+                vec![Some("".into()), Some("write conflict".into()), Some("UPDATE t SET a = 1".into())],
+            ],
+            ..Grid::default()
+        };
+        let parsed = parse_statement_records(&grid);
+        assert!(parsed[0].failed());
+        assert!(!parsed[1].failed());
+        assert!(parsed[2].failed());
+    }
+
+    #[test]
+    fn the_shape_grids_are_read_the_same_from_either_server() {
+        let columns: Vec<String> = vec![
+            "queryid".into(),
+            "calls".into(),
+            "total_ms".into(),
+            "mean_ms".into(),
+            "min_ms".into(),
+            "max_ms".into(),
+            "stddev_ms".into(),
+            "rows".into(),
+            "rows_scanned".into(),
+            "errors".into(),
+            "last_seen".into(),
+            "statement".into(),
+        ];
+
+        let rdb = Grid {
+            columns: columns.clone(),
+            rows: vec![vec![
+                Some("2537360768813479364".into()),
+                Some("3".into()),
+                Some("1.705".into()),
+                Some("0.568".into()),
+                Some("0.373".into()),
+                Some("0.718".into()),
+                Some("0.144".into()),
+                Some("6".into()),
+                Some("9".into()),
+                Some("0".into()),
+                Some("2026-09-01 09:14:46.422114".into()),
+                Some("SELECT id FROM t WHERE v > $1".into()),
+            ]],
+            ..Grid::default()
+        };
+
+        let pg = Grid {
+            columns,
+            rows: vec![vec![
+                // PostgreSQL's queryid is signed, and half of them are
+                // negative. Kept as text for exactly that reason.
+                Some("-4718895680489935218".into()),
+                Some("3".into()),
+                Some("1.705".into()),
+                Some("0.568".into()),
+                Some("0.373".into()),
+                Some("0.718".into()),
+                Some("0.144".into()),
+                Some("6".into()),
+                Some("".into()),
+                Some("".into()),
+                Some("".into()),
+                Some("SELECT id FROM t WHERE v > $1".into()),
+            ]],
+            ..Grid::default()
+        };
+
+        let mine = &parse_statement_shapes(&rdb)[0];
+        assert_eq!(mine.calls, 3);
+        assert_eq!(mine.rows_scanned, Some(9));
+        assert_eq!(mine.errors, Some(0));
+        assert_eq!(mine.mean_ms, 0.568);
+
+        let theirs = &parse_statement_shapes(&pg)[0];
+        assert_eq!(theirs.calls, 3);
+        assert_eq!(theirs.queryid, "-4718895680489935218");
+        // Neither has a counterpart in pg_stat_statements, and `errors` in
+        // particular must not read as "none failed".
+        assert_eq!(theirs.rows_scanned, None);
+        assert_eq!(theirs.errors, None);
+        assert!(theirs.last_seen.is_empty());
+    }
+
+    /// The console sends each server its own spelling, even though
+    /// RasterizedDB accepts PostgreSQL's too: the dialog shows the operator the
+    /// statement before they agree to it, and it should be one they recognise.
+    #[test]
+    fn each_server_is_asked_in_its_own_words() {
+        assert_eq!(recent_statements_sql(Flavor::Rasterized, 50), "SHOW QUERIES 50");
+        assert!(recent_statements_sql(Flavor::Postgres, 50).contains("FROM pg_stat_activity"));
+        assert!(recent_statements_sql(Flavor::Postgres, 50).ends_with("LIMIT 50"));
+        assert_eq!(statement_shapes_sql(Flavor::Rasterized), "SHOW QUERY STATS");
+        assert!(statement_shapes_sql(Flavor::Postgres).contains("FROM pg_stat_statements"));
+        assert_eq!(reset_statement_stats_sql(Flavor::Rasterized), "RESET QUERY STATS");
+        assert_eq!(
+            reset_statement_stats_sql(Flavor::Postgres),
+            "SELECT pg_stat_statements_reset()"
+        );
+        // The heading is not shared: one pane is a history and the other is an
+        // instant, and a page that called both "recent" would be lying about
+        // one of them.
+        assert_ne!(
+            recent_statements_label(Flavor::Rasterized),
+            recent_statements_label(Flavor::Postgres)
+        );
+        assert!(recent_statements_caveat(Flavor::Rasterized).is_none());
+        assert!(recent_statements_caveat(Flavor::Postgres).is_some());
+    }
+
+    /// A table list from a server too old to report `storage` must still read,
+    /// and must not invent a kind for it.
+    #[test]
+    fn a_table_list_without_a_storage_column_still_parses() {
+        let grid = Grid {
+            columns: vec!["table_name".into(), "row_slots".into(), "primary_key".into()],
+            rows: vec![vec![Some("orders".into()), Some("12".into()), Some("id".into())]],
+            ..Grid::default()
+        };
+        let parsed = parse_tables(&grid);
+        assert_eq!(parsed[0].name, "orders");
+        assert!(parsed[0].storage.is_empty());
+        assert!(parsed[0].durable(), "an unanswered question is not a warning");
+    }
+
+    #[test]
+    fn the_storage_kind_is_read_from_either_server() {
+        let grid = Grid {
+            columns: vec!["table_name".into(), "storage".into()],
+            rows: vec![
+                vec![Some("a".into()), Some("file".into())],
+                vec![Some("b".into()), Some("memory".into())],
+                vec![Some("c".into()), Some("s3".into())],
+                // PostgreSQL's two ephemeral kinds.
+                vec![Some("d".into()), Some("file-unlogged".into())],
+                vec![Some("e".into()), Some("temporary".into())],
+            ],
+            ..Grid::default()
+        };
+        let parsed = parse_tables(&grid);
+        assert_eq!(
+            parsed.iter().map(|t| t.durable()).collect::<Vec<_>>(),
+            vec![true, false, true, false, false]
+        );
     }
 
     #[test]
@@ -1677,12 +2142,47 @@ mod tests {
     #[test]
     fn a_page_orders_by_the_key_when_there_is_one() {
         assert_eq!(
-            page_sql("users", Some("id"), 50, 100),
+            page_sql("users", Some("id"), None, 50, 100),
             "SELECT * FROM \"users\" ORDER BY \"id\" LIMIT 50 OFFSET 100"
         );
         assert_eq!(
-            page_sql("users", None, 50, 0),
+            page_sql("users", None, None, 50, 0),
             "SELECT * FROM \"users\" LIMIT 50 OFFSET 0"
+        );
+    }
+
+    /// A clicked header sorts the whole table, not the page in hand — and the
+    /// key stays behind it, or a column full of equal values would page
+    /// unstably again.
+    #[test]
+    fn a_clicked_header_orders_in_front_of_the_key() {
+        assert_eq!(
+            page_sql("users", Some("id"), Some(("email", false)), 50, 0),
+            "SELECT * FROM \"users\" ORDER BY \"email\", \"id\" LIMIT 50 OFFSET 0"
+        );
+        assert_eq!(
+            page_sql("users", Some("id"), Some(("email", true)), 50, 0),
+            "SELECT * FROM \"users\" ORDER BY \"email\" DESC, \"id\" LIMIT 50 OFFSET 0"
+        );
+    }
+
+    /// Sorting by the key itself must not name it twice: `ORDER BY "id" DESC,
+    /// "id"` does not mean what it looks like, and some servers refuse it.
+    #[test]
+    fn sorting_by_the_key_names_it_once() {
+        assert_eq!(
+            page_sql("users", Some("id"), Some(("id", true)), 50, 0),
+            "SELECT * FROM \"users\" ORDER BY \"id\" DESC LIMIT 50 OFFSET 0"
+        );
+    }
+
+    /// A table with nothing identifying a row can still be sorted; it just has
+    /// no tie-break, which the browser already warns about.
+    #[test]
+    fn a_keyless_table_still_sorts() {
+        assert_eq!(
+            page_sql("events", None, Some(("at", true)), 50, 0),
+            "SELECT * FROM \"events\" ORDER BY \"at\" DESC LIMIT 50 OFFSET 0"
         );
     }
 }

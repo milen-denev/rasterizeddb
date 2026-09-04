@@ -365,10 +365,11 @@ cargo run -p rdb_studio -- my-profile  # open a saved one straight away
 ```
 
 Live dashboard, database and table statistics, a schema map drawn from the
-foreign keys, an editable data browser, a SQL editor, S3 backup and restore, a
-storage view for placing tables across disks, a replication view, and a
-configuration screen that knows which settings a running server can actually
-change. See [rdb_studio/README.md](rdb_studio/README.md).
+foreign keys, an editable data browser, a SQL editor, an activity screen showing
+what the server has been running and how much of each table it had to read, S3
+backup and restore, a storage view for placing tables across disks, a
+replication view, and a configuration screen that knows which settings a running
+server can actually change. See [rdb_studio/README.md](rdb_studio/README.md).
 
 It reads the introspection statements the engine gained for it —
 `SHOW TABLES`, `SHOW DATABASE STATS`, `SHOW SCHEMA MAP`, `SHOW CONFIG`,

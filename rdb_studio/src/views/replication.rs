@@ -374,13 +374,26 @@ fn peers<'a>(
         super::GridColumn::new("sent", "SENT", 104.0).right(),
         super::GridColumn::new("dropped", "DROPPED", 92.0).right(),
         super::GridColumn::new("codec", "CODEC", 84.0),
-        super::GridColumn::new("actions", "", 264.0),
+        super::GridColumn::new("actions", "", 264.0).unsortable(),
     ];
     let widths = super::column_widths(&layout, &columns);
     let total = super::grid_total(&widths);
 
+    let mut peers: Vec<&PeerStatus> = snapshot.peers.iter().collect();
+    super::sort_rows(&layout, &mut peers, |peer, column| match column {
+        "address" => super::SortKey::text(&peer.address),
+        "state" => super::SortKey::text(peer.health().label()),
+        "lag" => super::SortKey::number(peer.lag as f64),
+        "acked" => super::SortKey::number(peer.acked_seq as f64),
+        "queued" => super::SortKey::number(peer.queued as f64),
+        "sent" => super::SortKey::number(peer.records_sent as f64),
+        "dropped" => super::SortKey::number(peer.dropped as f64),
+        "codec" => super::SortKey::text(&peer.codec),
+        _ => super::SortKey::text(&peer.name),
+    });
+
     let mut body = column![].spacing(0);
-    for (index, peer) in snapshot.peers.iter().enumerate() {
+    for (index, peer) in peers.into_iter().enumerate() {
         let health = peer.health();
         let colour = match health {
             PeerHealth::Healthy => theme::OK,

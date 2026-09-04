@@ -99,6 +99,14 @@ async fn exercise(session: &Session) {
         tables.iter().any(|t| !t.primary_key.is_empty()),
         "{flavor}: no table reported a primary key, so nothing would be editable"
     );
+    // Both servers name what is holding each table, in one vocabulary. An
+    // empty answer here is what the console renders as "—", so a server that
+    // stopped reporting it would quietly lose the column rather than fail.
+    assert!(
+        tables.iter().all(|t| !t.storage.is_empty()),
+        "{flavor}: a table reported no storage kind: {:?}",
+        tables.iter().filter(|t| t.storage.is_empty()).map(|t| &t.name).collect::<Vec<_>>()
+    );
 
     let edges = session
         .query(dialect::schema_map_sql(flavor))
@@ -163,6 +171,73 @@ async fn exercise(session: &Session) {
          grey out an edit that in fact works"
     );
 
+    // What the server has been running. Both panes of the activity page, and
+    // the one place a difference between the two servers is not cosmetic: the
+    // recent list is a *history* on RasterizedDB and an *instant* on
+    // PostgreSQL, and only the first can be asserted to hold anything.
+    let recent = session
+        .query(&dialect::recent_statements_sql(flavor, 20))
+        .await
+        .unwrap_or_else(|e| panic!("{flavor}: recent statements: {e}"));
+    assert!(
+        recent.column_index("statement").is_some(),
+        "{flavor}: the recent-statement result has no `statement` column, so the page would \
+         render a server that has run nothing"
+    );
+    let recent = dialect::parse_statement_records(&recent);
+    if matches!(flavor, Flavor::Rasterized) {
+        // Everything above just ran through this connection, so a server that
+        // keeps a history cannot report an empty one.
+        assert!(
+            !recent.is_empty(),
+            "{flavor}: nothing recorded, though this test has just run a dozen statements"
+        );
+        assert!(
+            recent.iter().any(|r| !r.statement.is_empty()),
+            "{flavor}: statements recorded with no text"
+        );
+        // The column the page exists for. A server that answered the statement
+        // but left this blank would render a grid of dashes.
+        assert!(
+            recent.iter().all(|r| r.rows.is_some() && r.rows_scanned.is_some()),
+            "{flavor}: a record came back without rows/rows_scanned, which the page reads as \
+             `this server cannot answer that`"
+        );
+    }
+
+    // The aggregate. On PostgreSQL this needs an extension that is usually not
+    // loaded, and its absence is the page's own reported state rather than a
+    // failure of the console — so it is noted and skipped rather than failing
+    // a test run against a stock server.
+    match session.query(dialect::statement_shapes_sql(flavor)).await {
+        Ok(grid) => {
+            assert!(
+                grid.column_index("calls").is_some(),
+                "{flavor}: the statement aggregate has no `calls` column"
+            );
+            let shapes = dialect::parse_statement_shapes(&grid);
+            if matches!(flavor, Flavor::Rasterized) {
+                assert!(!shapes.is_empty(), "{flavor}: no statement shapes recorded");
+                assert!(
+                    shapes.iter().all(|s| s.calls > 0),
+                    "{flavor}: a shape recorded with no calls"
+                );
+                // Normalisation is what makes this an aggregate rather than a
+                // second copy of the list above: the page's own repeated
+                // `SHOW TABLES` must have folded into one row.
+                assert!(
+                    shapes.iter().map(|s| s.calls).sum::<u64>() >= shapes.len() as u64,
+                    "{flavor}: fewer calls than shapes, which cannot happen"
+                );
+            }
+        }
+        Err(e) if matches!(flavor, Flavor::Postgres) => {
+            eprintln!("{flavor}: pg_stat_statements is not loaded, so the aggregate pane would \
+                       show its explanation rather than rows: {e}");
+        }
+        Err(e) => panic!("{flavor}: statement shapes: {e}"),
+    }
+
     for table in &tables {
         let stats = session
             .query(&dialect::table_stats_sql(flavor, &table.name))
@@ -188,7 +263,7 @@ async fn exercise(session: &Session) {
         let key = (!table.primary_key.is_empty() && !table.primary_key.contains(','))
             .then(|| table.primary_key.clone());
         let page = session
-            .query(&dialect::page_sql(&table.name, key.as_deref(), 10, 0))
+            .query(&dialect::page_sql(&table.name, key.as_deref(), None, 10, 0))
             .await
             .unwrap_or_else(|e| panic!("{flavor}: page of {}: {e}", table.name));
         assert_eq!(
@@ -290,7 +365,7 @@ async fn exercise_writes(session: &Session) {
         .unwrap_or_else(|e| panic!("{flavor}: update to null: {e}"));
 
     let page = session
-        .query(&dialect::page_sql(table, Some("id"), 10, 0))
+        .query(&dialect::page_sql(table, Some("id"), None, 10, 0))
         .await
         .unwrap_or_else(|e| panic!("{flavor}: read back: {e}"));
     assert_eq!(page.value(0, "label"), Some("changed"), "{flavor}: the update did not land");
@@ -311,7 +386,7 @@ async fn exercise_writes(session: &Session) {
         .unwrap_or_else(|e| panic!("{flavor}: delete: {e}"));
 
     let page = session
-        .query(&dialect::page_sql(table, Some("id"), 10, 0))
+        .query(&dialect::page_sql(table, Some("id"), None, 10, 0))
         .await
         .unwrap_or_else(|e| panic!("{flavor}: read back after delete: {e}"));
     assert!(page.rows.is_empty(), "{flavor}: the delete did not land");

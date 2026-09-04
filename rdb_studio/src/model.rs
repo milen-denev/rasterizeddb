@@ -128,6 +128,15 @@ impl Grid {
         self.value(row, column)?.trim().parse().ok()
     }
 
+    /// A column of milliseconds, or `None` when the server left it blank.
+    ///
+    /// Separate from [`Grid::number`] rather than folded into it: a duration
+    /// that read as an integer would round every sub-millisecond statement to
+    /// zero, and most statements are sub-millisecond.
+    pub fn real(&self, row: usize, column: &str) -> Option<f64> {
+        self.value(row, column)?.trim().parse().ok()
+    }
+
     pub fn flag(&self, row: usize, column: &str) -> Option<bool> {
         Some(matches!(
             self.value(row, column)?.trim(),
@@ -148,6 +157,11 @@ pub struct Stat {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableInfo {
     pub name: String,
+    /// What is holding the table, in the server's own vocabulary — `file`,
+    /// `memory`, `s3`, `mirrored`, `kv-directory`, `kv-memory` from
+    /// RasterizedDB, and `file` / `file-unlogged` / `temporary` from
+    /// PostgreSQL. Empty from a server too old to say.
+    pub storage: String,
     pub row_slots: u64,
     pub columns: u64,
     pub data_bytes: u64,
@@ -159,6 +173,27 @@ pub struct TableInfo {
     /// Whether the engine's own index has caught up. Always true against
     /// PostgreSQL, which has no equivalent state to be behind in.
     pub indexed: bool,
+}
+
+impl TableInfo {
+    pub fn durable(&self) -> bool {
+        storage_is_durable(&self.storage)
+    }
+}
+
+/// Whether a table's contents outlive the process serving them.
+///
+/// Strict on purpose. PostgreSQL's `UNLOGGED` and temporary tables are files on
+/// a disk, and both are *emptied* after a crash — so for the question this
+/// answers, "would this table still be here", they belong with the in-memory
+/// backends and not with the durable ones.
+///
+/// Anything unrecognised counts as durable, including the empty string a server
+/// too old to have the column returns. The alternative would mark every table
+/// on such a server as ephemeral, which is a warning about nothing — and this
+/// is used to colour a badge, where a false alarm costs more than a missing one.
+pub fn storage_is_durable(kind: &str) -> bool {
+    !matches!(kind, "memory" | "kv-memory" | "temporary" | "file-unlogged")
 }
 
 /// A column of a table.
@@ -739,6 +774,24 @@ mod tests {
         assert!(RunOutcome::Failed("boom".into()).failed());
     }
 
+    /// The badge answers "would this table still be here", so anything that a
+    /// crash empties belongs with the in-memory backends however it is stored.
+    #[test]
+    fn durability_is_about_surviving_a_crash_not_about_being_a_file() {
+        for durable in ["file", "mirrored", "s3", "kv-directory"] {
+            assert!(storage_is_durable(durable), "{durable} should read as durable");
+        }
+        for ephemeral in ["memory", "kv-memory", "temporary", "file-unlogged"] {
+            assert!(!storage_is_durable(ephemeral), "{ephemeral} outlives nothing");
+        }
+        // A server that does not report the column, and one that reports
+        // something this console has never heard of, both get the benefit of
+        // the doubt: the badge is a warning, and a false one costs more than a
+        // missing one.
+        assert!(storage_is_durable(""));
+        assert!(storage_is_durable("something-new"));
+    }
+
     #[test]
     fn bytes_scale_to_a_readable_unit() {
         assert_eq!(bytes(0), "0 B");
@@ -1184,6 +1237,147 @@ impl StorageSnapshot {
     /// Where a table created now would go, as the server worked it out.
     pub fn next_placement(&self) -> Option<&str> {
         self.metric("next_placement").filter(|value| !value.is_empty())
+    }
+}
+
+/// One statement the server has answered, as the activity page lists it.
+///
+/// `rows` and `rows_scanned` are optional because PostgreSQL cannot answer
+/// them for a running statement: `pg_stat_activity` says what a backend is
+/// executing, not what it has read. A figure nobody can produce renders as a
+/// dash rather than as a zero, which would read as "it scanned nothing".
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatementRecord {
+    pub started_at: String,
+    pub duration_ms: f64,
+    pub rows: Option<u64>,
+    pub rows_scanned: Option<u64>,
+    /// Relations this statement had to build before it could answer — one per
+    /// CTE and per derived table — and the time that took. `None` from
+    /// PostgreSQL, which has no equivalent because it does not build them.
+    pub materialised: Option<u64>,
+    pub materialised_ms: Option<f64>,
+    /// `ok` or `error` on RasterizedDB; the backend's state on PostgreSQL.
+    pub status: String,
+    pub database: String,
+    pub username: String,
+    pub statement: String,
+    pub error: String,
+}
+
+impl StatementRecord {
+    pub fn failed(&self) -> bool {
+        !self.error.is_empty() || self.status.eq_ignore_ascii_case("error")
+    }
+
+    pub fn heavy(&self) -> bool {
+        scan_is_heavy(self.rows, self.rows_scanned)
+    }
+}
+
+/// Every execution of one statement shape, folded together.
+///
+/// `rows_scanned`, `errors` and `last_seen` are `None` against PostgreSQL,
+/// whose `pg_stat_statements` has no counterpart for any of them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatementShape {
+    pub queryid: String,
+    pub calls: u64,
+    pub total_ms: f64,
+    pub mean_ms: f64,
+    pub min_ms: f64,
+    pub max_ms: f64,
+    pub stddev_ms: f64,
+    pub rows: Option<u64>,
+    pub rows_scanned: Option<u64>,
+    /// Totals across every execution of this shape. See [`StatementRecord`].
+    pub materialised: Option<u64>,
+    pub materialised_ms: Option<f64>,
+    pub errors: Option<u64>,
+    pub last_seen: String,
+    pub statement: String,
+}
+
+impl StatementShape {
+    pub fn heavy(&self) -> bool {
+        scan_is_heavy(self.rows, self.rows_scanned)
+    }
+}
+
+/// Rows a scan has to read before it is worth pointing at.
+///
+/// The engine scans any table below `filter.min_table_rows` — 10,000 by
+/// default — without consulting its index at all, on the measured argument that
+/// the mask costs more than the read it would save. Flagging those would flag
+/// every statement against a small table, which is every statement on a small
+/// database.
+pub const SCAN_HEAVY_ROWS: u64 = 10_000;
+
+/// How many rows a statement may read per row returned before the ratio is the
+/// interesting thing about it.
+pub const SCAN_HEAVY_RATIO: u64 = 100;
+
+/// Whether a statement read far more than it had to.
+///
+/// This is the reading the `rows_scanned` column exists for: a hundred rows
+/// read for each one returned, over a table large enough for the index to have
+/// been consulted, is a predicate nothing indexes. A statement that returned
+/// nothing is judged as though it had returned one row — a full scan that found
+/// no match is the same missing index, and dividing by zero would otherwise
+/// hide the worst case.
+pub fn scan_is_heavy(rows: Option<u64>, scanned: Option<u64>) -> bool {
+    let (Some(rows), Some(scanned)) = (rows, scanned) else { return false };
+    scanned >= SCAN_HEAVY_ROWS && scanned / rows.max(1) >= SCAN_HEAVY_RATIO
+}
+
+/// Everything the activity page reads, gathered in one round trip.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActivitySnapshot {
+    pub recent: Vec<StatementRecord>,
+    /// Whether the server answered the recent-statement question at all.
+    ///
+    /// The same trap as the backup, replication and storage pages: a server
+    /// built without `query_stats` — or from before it existed — does not
+    /// refuse `SHOW QUERIES`. The wire layer answers an unknown `SHOW x` as a
+    /// runtime parameter, with one empty column named after it, which parses
+    /// into an empty list that looks exactly like a server that has run
+    /// nothing.
+    pub recent_supported: bool,
+    pub shapes: Vec<StatementShape>,
+    /// Whether the aggregate answered. On PostgreSQL this is false until
+    /// somebody runs `CREATE EXTENSION pg_stat_statements`.
+    pub shapes_supported: bool,
+}
+
+impl ActivitySnapshot {
+    pub fn failures(&self) -> usize {
+        self.recent.iter().filter(|r| r.failed()).count()
+    }
+
+    /// The slowest statement in the ring, which is the one an operator opened
+    /// this page to find.
+    pub fn slowest(&self) -> Option<&StatementRecord> {
+        self.recent
+            .iter()
+            .max_by(|a, b| a.duration_ms.total_cmp(&b.duration_ms))
+    }
+
+    /// Rows read and rows returned across everything the ring holds.
+    ///
+    /// `None` when the server cannot answer either, rather than a ratio of
+    /// zeroes.
+    pub fn scan_totals(&self) -> Option<(u64, u64)> {
+        let mut any = false;
+        let mut scanned = 0u64;
+        let mut returned = 0u64;
+        for record in &self.recent {
+            if let (Some(r), Some(s)) = (record.rows, record.rows_scanned) {
+                any = true;
+                returned += r;
+                scanned += s;
+            }
+        }
+        any.then_some((scanned, returned))
     }
 }
 
