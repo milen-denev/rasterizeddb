@@ -18,7 +18,11 @@ use sqlx::{AssertSqlSafe, Connection, Executor, Row};
 use rasterizeddb_compat::TestServer;
 use std::time::{Duration, Instant};
 
-const ROWS: i64 = 100_000;
+/// Rows are added in batches of this many until the scan is slow enough to
+/// interrupt, up to `MAX_ROWS`. A fixed count stopped working when the scan
+/// got faster: 100k rows went from several hundred milliseconds to under 100.
+const BATCH_ROWS: i64 = 100_000;
+const MAX_ROWS: i64 = 600_000;
 /// Matches nothing, and `%…%` cannot be answered from the zone maps, so every
 /// row is read and no output is produced until the end.
 const SCAN: &str = "SELECT id FROM p WHERE tag LIKE '%zzzqqq%'";
@@ -32,27 +36,36 @@ async fn a_disconnected_client_stops_its_statement() {
     ))
     .await
     .expect("create");
-    for chunk in (0..ROWS).collect::<Vec<_>>().chunks(5_000) {
-        let values = chunk
-            .iter()
-            .map(|i| format!("({i}, 'tag{}', {i})", i % 977))
-            .collect::<Vec<_>>()
-            .join(",");
-        conn.execute(AssertSqlSafe(format!(
-            "INSERT INTO p (id, tag, n) VALUES {values}"
-        )))
-        .await
-        .expect("insert");
-    }
+    // Baseline: how long the scan takes when nobody interrupts it. Grown a
+    // batch at a time until it is long enough to tell "stopped" from
+    // "finished", and bounded so a fast machine cannot make this unbounded.
+    let mut loaded = 0i64;
+    let baseline = loop {
+        for chunk in (loaded..loaded + BATCH_ROWS).collect::<Vec<_>>().chunks(5_000) {
+            let values = chunk
+                .iter()
+                .map(|i| format!("({i}, 'tag{}', {i})", i % 977))
+                .collect::<Vec<_>>()
+                .join(",");
+            conn.execute(AssertSqlSafe(format!(
+                "INSERT INTO p (id, tag, n) VALUES {values}"
+            )))
+            .await
+            .expect("insert");
+        }
+        loaded += BATCH_ROWS;
 
-    // Baseline: how long the scan takes when nobody interrupts it.
-    let started = Instant::now();
-    let rows = sqlx::query(AssertSqlSafe(SCAN))
-        .fetch_all(&mut conn)
-        .await
-        .expect("baseline");
-    let baseline = started.elapsed();
-    assert!(rows.is_empty());
+        let started = Instant::now();
+        let rows = sqlx::query(AssertSqlSafe(SCAN))
+            .fetch_all(&mut conn)
+            .await
+            .expect("baseline");
+        let baseline = started.elapsed();
+        assert!(rows.is_empty());
+        if baseline > Duration::from_millis(300) || loaded >= MAX_ROWS {
+            break baseline;
+        }
+    };
     assert!(
         baseline > Duration::from_millis(200),
         "the scan is too quick ({baseline:?}) for this test to distinguish anything"

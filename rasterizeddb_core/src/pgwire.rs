@@ -24,13 +24,17 @@ use crate::core::{
     database::catalog::{DatabaseCatalog, DatabaseStatement, parse_database_statement},
     db_type::DbType,
     mvcc::transaction::TxId,
-    row::row::{Row, vec_into_rows},
+    row::row::Row,
     rql::{
         lexer_query::row_fetch_from_select_query, lexer_s1::QueryPurpose,
         lexer_s1::recognize_query_purpose,
     },
 };
 use crate::pg_params::{BoundParam, inline_params};
+
+mod param_infer;
+mod statement_intern;
+mod wire_out;
 
 /// Start a minimal PostgreSQL wire-protocol server (pgwire).
 ///
@@ -277,7 +281,47 @@ tokio::task_local! {
     /// authentication, the message loop and every statement — runs in one task,
     /// and threading it through four signatures would touch the TLS and
     /// non-TLS startup paths for something only the statement path reads.
-    static PEER_WATCH: Option<StdArc<std::net::TcpStream>>;
+    static PEER_WATCH: Option<StdArc<PeerWatch>>;
+
+    /// Where this session publishes the statement it is running, for a
+    /// `CancelRequest` arriving on another connection to find. A task-local for
+    /// the reason `PEER_WATCH` is one.
+    static SESSION_CANCEL: StdArc<crate::core::cancel::SessionCancel>;
+}
+
+/// The duplicate descriptor `PEER_WATCH` holds, and what the session's read
+/// buffer knows that the descriptor cannot see.
+///
+/// The session reads through [`wire_out::WireStream`], which takes whatever the
+/// kernel has in one read. Messages a client pipelined behind the statement
+/// running now therefore sit in that buffer rather than in the kernel, where
+/// `peek` would have found them — so a client that sent `Query` then
+/// `Terminate` and closed would look gone where it used to look present.
+/// `input_buffered` restores the old answer: bytes still unread anywhere mean
+/// the client is not known to have gone.
+pub(crate) struct PeerWatch {
+    socket: std::net::TcpStream,
+    input_buffered: std::sync::atomic::AtomicBool,
+}
+
+impl PeerWatch {
+    fn new(socket: std::net::TcpStream) -> Self {
+        Self {
+            socket,
+            input_buffered: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Records whether unread client bytes are held in the session's buffer.
+    pub(crate) fn set_input_buffered(&self, buffered: bool) {
+        self.input_buffered.store(buffered, Ordering::Relaxed);
+    }
+
+    /// `client_has_gone`, answered as if the read buffer were still in the
+    /// kernel.
+    fn gone(&self) -> bool {
+        !self.input_buffered.load(Ordering::Relaxed) && client_has_gone(&self.socket)
+    }
 }
 
 /// The client's socket, and a duplicate of it to watch.
@@ -291,7 +335,7 @@ tokio::task_local! {
 /// runs exactly as it did before, with `statement_timeout` as its only bound.
 fn duplicate_for_watch(
     tcp: TcpStream,
-) -> io::Result<(TcpStream, Option<StdArc<std::net::TcpStream>>)> {
+) -> io::Result<(TcpStream, Option<StdArc<PeerWatch>>)> {
     let standard = tcp.into_std()?;
     // Kept as a *std* socket, in non-blocking mode, because it is peeked from
     // inside the scan rather than awaited: see `StatementCancel::gone`.
@@ -301,7 +345,7 @@ fn duplicate_for_watch(
             copy.set_nonblocking(true)?;
             Ok(copy)
         })
-        .map(StdArc::new)
+        .map(|copy| StdArc::new(PeerWatch::new(copy)))
         .ok();
     Ok((TcpStream::from_std(standard)?, watch))
 }
@@ -355,6 +399,18 @@ async fn handle_connection_inner(
     loop {
         let (first_len, first_buf) = read_startup_packet(&mut tcp).await?;
         let first_code = i32::from_be_bytes(first_buf[0..4].try_into().unwrap());
+
+        // CancelRequest: length 16, the code, then the process id and secret
+        // key a session was given in BackendKeyData. Answered with nothing —
+        // PostgreSQL never says whether a cancel matched anything — and the
+        // connection, which exists only to carry it, is closed.
+        if first_len == 16 && first_code == CANCEL_REQUEST_CODE {
+            let pid = i32::from_be_bytes(first_buf[4..8].try_into().unwrap());
+            let key = i32::from_be_bytes(first_buf[8..12].try_into().unwrap());
+            let stopped = crate::core::cancel::cancel_request(pid, key);
+            log::debug!("pgwire CancelRequest for session {}: {}", pid, stopped);
+            return Ok(());
+        }
 
         if first_len == 8 {
             match first_code {
@@ -523,7 +579,29 @@ where
     // what is still attached before it removes anything.
     let database = session.database().clone();
 
-    let principal = match authenticate(&database, stream, parameters, auth).await {
+    // From here on the session reads and writes through one buffer each way;
+    // see `wire_out` for when output is sent. Nothing reads `stream` directly
+    // after this, which is what lets the read buffer run ahead safely.
+    let watch = PEER_WATCH.try_with(|w| w.clone()).ok().flatten();
+    let mut conn = wire_out::WireStream::new(stream, watch);
+    let result = authenticate_and_serve(catalog, &database, &mut conn, parameters, auth).await;
+    // Whatever is still buffered was owed to the client. Best-effort: on an
+    // error path the socket may already be gone.
+    let _ = conn.flush().await;
+    result
+}
+
+async fn authenticate_and_serve<S>(
+    catalog: Arc<DatabaseCatalog>,
+    database: &Arc<Database>,
+    stream: &mut S,
+    parameters: &HashMap<String, String>,
+    auth: &AuthConfig,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let principal = match authenticate(database, stream, parameters, auth).await {
         Ok(principal) => {
             log::debug!(
                 "authenticated {} via {}",
@@ -539,17 +617,27 @@ where
         }
     };
 
-    send_startup_responses(stream).await?;
+    // This session's cancel target: a process id unique among live sessions
+    // and a secret key from the cryptographic generator, removed from the
+    // registry when the session ends (the guard is dropped).
+    let mut key = [0u8; 4];
+    crate::auth::fill_random(&mut key);
+    let registration = crate::core::cancel::register_session(key);
+    send_startup_responses(stream, registration.pid, registration.key).await?;
     let startup_timeout = startup_statement_timeout(parameters);
-    run_message_loop(
-        catalog,
-        &database,
-        auth.clone(),
-        principal,
-        stream,
-        startup_timeout,
-    )
-    .await
+    SESSION_CANCEL
+        .scope(
+            registration.session.clone(),
+            run_message_loop(
+                catalog,
+                database,
+                auth.clone(),
+                principal,
+                stream,
+                startup_timeout,
+            ),
+        )
+        .await
 }
 
 #[cfg(test)]
@@ -706,7 +794,7 @@ fn privileged_statement(stmt: &str) -> Option<&'static str> {
     }
 }
 
-async fn send_startup_responses<S>(stream: &mut S) -> io::Result<()>
+async fn send_startup_responses<S>(stream: &mut S, pid: i32, key: i32) -> io::Result<()>
 where
     S: AsyncWrite + Unpin,
 {
@@ -718,7 +806,7 @@ where
     send_parameter_status(stream, "DateStyle", "ISO, MDY").await?;
     send_parameter_status(stream, "standard_conforming_strings", "on").await?;
     send_parameter_status(stream, "TimeZone", "UTC").await?;
-    send_backend_key_data(stream).await?;
+    send_backend_key_data(stream, pid, key).await?;
     send_ready_for_query(stream, b'I').await?;
     Ok(())
 }
@@ -743,16 +831,79 @@ where
     // would hold back reclamation forever and its versions would never resolve.
     // The loop returns from several places, so the cleanup is a guard rather
     // than a line at the end.
-    let result = run_message_loop_inner(database, &mut state, stream).await;
+    //
+    // A statement that panics unwinds out of the loop; caught here so the
+    // cleanup below runs for it too, rather than the task dying with the
+    // transaction left `InProgress` — which holds `oldest_active`, and with
+    // it every snapshot horizon and every vacuum, for the life of the process.
+    let result = {
+        use futures::FutureExt;
+        match std::panic::AssertUnwindSafe(run_message_loop_inner(database, &mut state, stream))
+            .catch_unwind()
+            .await
+        {
+            Ok(result) => result,
+            Err(payload) => {
+                // The panic's own message, so the next occurrence names its
+                // cause: a client sees only the socket closing (sqlx reports
+                // "UnexpectedEof"), and this line is all that is left.
+                let message = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "<non-string panic payload>".to_string());
+                log::error!("a statement panicked; closing the connection: {}", message);
+                Err(io::Error::other(format!("a statement panicked: {}", message)))
+            }
+        }
+    };
     if let Some(t) = state.transaction.take() {
         log::info!(
             "connection closed with transaction {} open; rolling it back",
             t.id
         );
-        database.transactions.abort(t.id);
-        flush_outcomes(database);
+        // `Database::abort_transaction`, not the manager's `abort`: the latter
+        // ends the transaction but leaves its row and key locks in the lock
+        // table and its replication buffers in the capture map.
+        let wrote = database.transactions.wrote_family(t.id);
+        database.abort_transaction(t.id);
+        if wrote {
+            flush_outcomes(database);
+        }
     }
     result
+}
+
+/// The transaction a statement opened for itself (a data-modifying CTE
+/// outside a block), aborted when dropped unless the statement closed it.
+///
+/// The statement returns early from several places — an unsupported CTE, a
+/// failed derived table, a failed catalog view, a client write error — and
+/// none of those used to end it, so it stayed `InProgress` forever and held
+/// back `oldest_active` for the life of the process. Dropping also covers a
+/// panic unwinding through.
+struct OwnedStatementTx<'a> {
+    database: &'a Arc<Database>,
+    tx: Option<TxId>,
+}
+
+impl OwnedStatementTx<'_> {
+    /// The statement closes the transaction itself from here on.
+    fn disarm(&mut self) {
+        self.tx = None;
+    }
+}
+
+impl Drop for OwnedStatementTx<'_> {
+    fn drop(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            let wrote = self.database.transactions.wrote_family(tx);
+            self.database.abort_transaction(tx);
+            if wrote {
+                flush_outcomes(self.database);
+            }
+        }
+    }
 }
 
 async fn run_message_loop_inner<S>(
@@ -772,14 +923,18 @@ where
         }
 
         let len = read_i32_be(stream).await?;
-        if len < 4 {
+        // Checked against the type's limit before anything is allocated, as
+        // PostgreSQL does: a length is only a claim, and allocating whatever
+        // an authenticated client claims let one message pin up to 2 GB.
+        let body = i64::from(len) - 4;
+        if body < 0 || body as u64 > frontend_message_limit(tag[0]) {
+            let _ = send_fatal_error_response(stream, "08P01", "invalid message length").await;
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid message length",
             ));
         }
-        let mut payload = vec![0u8; (len - 4) as usize];
-        stream.read_exact(&mut payload).await?;
+        let payload = read_message_body(stream, body as usize).await?;
 
         // An error opens a discard window that only `Sync` closes.
         //
@@ -802,6 +957,12 @@ where
                 state.error_in_batch = false;
                 let query = read_cstring(&payload);
                 handle_simple_query(database, state, stream, query).await?;
+                // And it closes its own window: it has already answered with
+                // `ReadyForQuery`. A failure inside it (`fail_statement` sets
+                // the flag) otherwise left the window open, so the *next*
+                // extended batch was discarded up to its Sync and the client
+                // read a bare `ReadyForQuery` where it expected ParseComplete.
+                state.error_in_batch = false;
             }
             // Extended query protocol (Parse/Bind/Describe/Execute/Sync/...)
             b'P' => {
@@ -827,11 +988,19 @@ where
                 // This is also what closes the discard window opened by an
                 // error earlier in the batch.
                 state.error_in_batch = false;
+                // Outside a block, Sync ends the implicit transaction and with
+                // it every portal's suspended result, as in PostgreSQL. Inside
+                // one, a suspended portal lives until the block ends.
+                if state.transaction.is_none() {
+                    for info in state.portals.values_mut() {
+                        info.suspended = None;
+                    }
+                }
                 let status = state.ready_status();
                 send_ready_for_query(stream, status).await?;
             }
             b'H' => {
-                // Flush: no server-side buffering beyond what AsyncWrite already does.
+                // Flush: send everything buffered so far (see `wire_out`).
                 stream.flush().await?;
             }
             b'X' => return Ok(()),
@@ -1138,7 +1307,10 @@ impl SessionState {
 }
 
 struct StatementInfo {
-    sql: String,
+    /// Shared rather than owned: every `Execute` and `Describe` needs the text
+    /// while also needing `state` mutably, and a deep copy per message was the
+    /// price of that before.
+    sql: StdArc<str>,
     param_oids: Vec<i32>,
     /// The column list this statement was last described with, and the schema
     /// generation it was described at.
@@ -1149,8 +1321,60 @@ struct StatementInfo {
     /// keeps appearing, and every column after it is read from the wrong
     /// place. PostgreSQL refuses that with "cached plan must not change result
     /// type" and drivers re-prepare; this is what makes that check possible.
-    described: Option<(u64, Vec<(String, DbType)>)>,
+    ///
+    /// The list is interned (`statement_intern`): every session described
+    /// with the same columns holds the same allocation.
+    described: Option<(u64, statement_intern::Fields)>,
+    /// Remembered `Describe` answers, at most one per kind. See
+    /// [`DescribeCacheEntry`].
+    describe_cache: Vec<DescribeCacheEntry>,
+    /// The parameter types the last statement describe reported, where the
+    /// client declared none (`param_infer`). Bind decodes values as these: a
+    /// client encodes each one as the type it was told.
+    inferred_oids: Option<Vec<i32>>,
 }
+
+/// One `Describe` answer, and everything it was computed from.
+///
+/// A described type is not just a label: the same field list types the
+/// payload, so a stale entry corrupts values rather than names. The key is
+/// therefore everything that can change the answer:
+///
+/// * `kind` — a statement (`S`) is described with stand-ins for its
+///   placeholders, a portal (`P`) with its bound values;
+/// * `text` — exactly what was described: the statement for `S`, the statement
+///   with the portal's values inlined for `P`. `SELECT $1 AS v FROM t` is an
+///   integer column for one bound value and text for another, so the values
+///   themselves are part of the key, not just their types;
+/// * the declared parameter types, which decide how a value is inlined — not
+///   stored, because the cache lives in the statement they belong to, and a
+///   re-Parse keeps it only when they are identical;
+/// * `generation` — the database's schema generation, read *before*
+///   describing. Every schema change bumps it once it has completed, so an
+///   entry computed against an older shape can never match a later lookup.
+///
+/// Only a description with columns is kept. "No columns" can stop being true
+/// when a table is created, which is not a change to any table's shape.
+#[derive(Clone, Debug)]
+struct DescribeCacheEntry {
+    kind: u8,
+    generation: u64,
+    /// `None`: the statement's own text (a statement describe, or a portal
+    /// with nothing bound). Otherwise the text with the values inlined.
+    text: Option<Box<str>>,
+    fields: statement_intern::Fields,
+}
+
+impl DescribeCacheEntry {
+    fn answers(&self, kind: u8, generation: u64, inlined: Option<&str>) -> bool {
+        self.kind == kind && self.generation == generation && self.text.as_deref() == inlined
+    }
+}
+
+/// Longest text a describe answer is remembered for. Past this the statement
+/// is mostly values — a wide INSERT … RETURNING — and keeping a copy of it per
+/// statement would cost more memory than the describe costs time.
+const DESCRIBE_CACHE_MAX_TEXT: usize = 16 * 1024;
 
 #[derive(Clone, Debug, Default)]
 struct PortalInfo {
@@ -1158,7 +1382,141 @@ struct PortalInfo {
     result_formats: Vec<i16>,
     /// Values bound by the Bind message, positionally. Inlined into the
     /// statement text at Execute time because the engine parses SQL only.
-    params: Vec<BoundParam>,
+    ///
+    /// Shared, so `Execute` and `Describe` can hold them across their use of
+    /// `state` without copying every value.
+    params: StdArc<[BoundParam]>,
+    /// The rest of a result an `Execute` with a row limit stopped part-way
+    /// through. See [`SuspendedResult`].
+    suspended: Option<Box<SuspendedResult>>,
+}
+
+/// What is left of a portal's result after an `Execute` with a nonzero
+/// `max_rows` sent `PortalSuspended`: the messages the statement produced, as
+/// the wire bytes they will be sent as, and how far into them the client has
+/// been sent. The next `Execute` on the portal resumes from `at` instead of
+/// running the statement again.
+///
+/// Held as encoded messages rather than rows so it is independent of how the
+/// result was produced: whatever the statement wrote to the wire is what is
+/// paged, in order, untouched — a fresh `RowDescription`, the `DataRow`s, the
+/// `CommandComplete` at the end.
+#[derive(Clone, Debug, Default)]
+struct SuspendedResult {
+    bytes: Vec<u8>,
+    at: usize,
+}
+
+impl SuspendedResult {
+    /// What is left once a paged result has been sent in full: the portal is
+    /// exhausted, and executing it again answers `CommandComplete` with no rows
+    /// — as PostgreSQL does — rather than running the statement afresh. A
+    /// client paging until it gets an empty page relies on exactly that; it
+    /// was otherwise handed the first page again, forever.
+    fn exhausted(sent: &[u8]) -> Self {
+        // The `CommandComplete` the statement sent, its count replaced by 0.
+        let mut tag = None;
+        let mut i = 0usize;
+        while i + 5 <= sent.len() {
+            let len = i32::from_be_bytes([sent[i + 1], sent[i + 2], sent[i + 3], sent[i + 4]]);
+            let end = (i + 1 + len.max(4) as usize).min(sent.len());
+            if sent[i] == b'C' {
+                let body = &sent[i + 5..end];
+                let text = String::from_utf8_lossy(body.split(|b| *b == 0).next().unwrap_or(&[]));
+                let verb = text.split_whitespace().next().unwrap_or("SELECT").to_string();
+                tag = Some(if verb == "INSERT" { "INSERT 0 0".to_string() } else { format!("{} 0", verb) });
+            }
+            i = end;
+        }
+        let tag = tag.unwrap_or_else(|| "SELECT 0".to_string());
+        let mut bytes = Vec::with_capacity(tag.len() + 6);
+        bytes.push(b'C');
+        bytes.extend_from_slice(&((tag.len() + 5) as i32).to_be_bytes());
+        bytes.extend_from_slice(tag.as_bytes());
+        bytes.push(0);
+        // `at` is left at 0 and never advanced past this one message: every
+        // later Execute replays it.
+        SuspendedResult { bytes, at: usize::MAX }
+    }
+}
+
+/// A stream that keeps what is written to it instead of sending it, and reads
+/// from the real stream. Lets `Execute` run a statement exactly as it always
+/// does and page the result afterwards.
+struct CaptureWrites<'a, S> {
+    inner: &'a mut S,
+    out: Vec<u8>,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for CaptureWrites<'_, S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut *self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: Unpin> AsyncWrite for CaptureWrites<'_, S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        self.out.extend_from_slice(buf);
+        std::task::Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// Sends the messages of `result` from `result.at` on, stopping before the
+/// `DataRow` that would exceed `max_rows` (0: no limit). Returns `true` when it
+/// stopped early — `PortalSuspended` has then been sent and `result.at` points
+/// at the first row still owed.
+async fn send_result_window<S>(
+    stream: &mut S,
+    result: &mut SuspendedResult,
+    max_rows: i32,
+) -> io::Result<bool>
+where
+    S: AsyncWrite + Unpin,
+{
+    let bytes = &result.bytes;
+    let start = result.at;
+    let mut i = start;
+    let mut rows = 0i32;
+    while i + 5 <= bytes.len() {
+        let tag = bytes[i];
+        let len = i32::from_be_bytes([bytes[i + 1], bytes[i + 2], bytes[i + 3], bytes[i + 4]]);
+        if tag == b'D' {
+            if max_rows > 0 && rows == max_rows {
+                stream.write_all(&bytes[start..i]).await?;
+                result.at = i;
+                // PortalSuspended.
+                send_message(stream, b's', &[]).await?;
+                return Ok(true);
+            }
+            rows += 1;
+        }
+        i += 1 + (len.max(4) as usize);
+    }
+    stream.write_all(&bytes[start..]).await?;
+    result.at = bytes.len();
+    Ok(false)
 }
 
 async fn handle_parse<S>(state: &mut SessionState, stream: &mut S, payload: &[u8]) -> io::Result<()>
@@ -1179,12 +1537,31 @@ where
         param_oids.push(oid);
     }
 
+    // Stored with escape and dollar-quoted strings already rewritten as the
+    // standard strings they mean, so describing, inlining and executing it all
+    // read one kind of literal; see `sql_scan`.
+    let query = match crate::core::sql_scan::normalize_string_literals(&query) {
+        Ok(std::borrow::Cow::Borrowed(_)) => query,
+        Ok(std::borrow::Cow::Owned(text)) => text,
+        Err(e) => return fail_statement(state, stream, "22025", &e).await,
+    };
+
+    // Re-preparing the identical text with the identical parameter types — an
+    // unnamed statement re-sent with every command — keeps what was learned
+    // describing it. Anything else starts afresh.
+    let describe_cache = match state.statements.remove(&stmt_name) {
+        Some(old) if *old.sql == *query && old.param_oids == param_oids => old.describe_cache,
+        _ => Vec::new(),
+    };
     state.statements.insert(
         stmt_name,
         StatementInfo {
             described: None,
-            sql: query,
+            // Shared with every other session that prepared the same text.
+            sql: statement_intern::sql(&query),
             param_oids,
+            describe_cache,
+            inferred_oids: None,
         },
     );
     // ParseComplete
@@ -1214,7 +1591,12 @@ where
     // A name Parse never saw is an error, not an empty statement: binding it
     // used to answer BindComplete, and the Execute that followed ran whatever
     // the unnamed statement held.
-    let Some(param_oids) = state.statements.get(&stmt).map(|s| s.param_oids.clone()) else {
+    // The types the client was told at describe, where it declared none.
+    let Some(param_oids) = state
+        .statements
+        .get(&stmt)
+        .map(|s| s.inferred_oids.clone().unwrap_or_else(|| s.param_oids.clone()))
+    else {
         return fail_statement(
             state,
             stream,
@@ -1272,7 +1654,8 @@ where
         PortalInfo {
             stmt_name: stmt,
             result_formats,
-            params,
+            params: params.into(),
+            suspended: None,
         },
     );
     // BindComplete
@@ -1299,9 +1682,11 @@ where
     let (name, _) = read_cstring_owned(payload, 1)?;
 
     let (stmt_name, result_formats, bound) = match kind {
-        b'S' => (name, vec![], Vec::new()),
-        b'P' => match state.portals.get(&name).cloned() {
-            Some(info) => (info.stmt_name, info.result_formats, info.params),
+        b'S' => (name, vec![], StdArc::<[BoundParam]>::from(Vec::new())),
+        b'P' => match state.portals.get(&name).map(|info| {
+            (info.stmt_name.clone(), info.result_formats.clone(), info.params.clone())
+        }) {
+            Some(parts) => parts,
             // Not the unnamed portal: describing a name Bind never saw has to
             // say so, or the client caches the shape of some other statement.
             None => {
@@ -1322,7 +1707,11 @@ where
         }
     };
 
-    let Some(query) = state.statements.get(&stmt_name).map(|s| s.sql.as_str()) else {
+    let Some((sql, param_oids)) = state
+        .statements
+        .get(&stmt_name)
+        .map(|s| (s.sql.clone(), s.param_oids.clone()))
+    else {
         return fail_statement(
             state,
             stream,
@@ -1337,31 +1726,96 @@ where
     // parse — the placeholder is not a literal — so `describe_query` gave up
     // and the portal was answered with `NoData`. `Execute` then sent the rows
     // anyway, and the client reported "D message without prior T".
-    let inlined;
-    let query = if bound.is_empty() {
-        query
+    let inlined = if bound.is_empty() {
+        None
     } else {
-        match inline_params(query, &bound) {
-            Ok(sql) => {
-                inlined = sql;
-                inlined.as_str()
-            }
-            Err(_) => query,
-        }
+        inline_params(&sql, &bound).ok()
+    };
+    let query: &str = inlined.as_deref().unwrap_or(&sql);
+
+    // Read before describing, never after: a schema change that lands while
+    // the describe runs then leaves the entry under a generation no later
+    // lookup will see. See `DescribeCacheEntry`.
+    let generation = database
+        .schema_generation
+        .load(std::sync::atomic::Ordering::Acquire);
+    let cached = state.statements.get(&stmt_name).and_then(|info| {
+        info.describe_cache
+            .iter()
+            .find(|e| e.answers(kind, generation, inlined.as_deref()))
+            .map(|e| e.fields.clone())
+    });
+
+    let description = match cached {
+        Some(fields) => Some((fields, true)),
+        None => describe_for_wire(database, query)
+            .await?
+            .map(|(fields, is_select)| (statement_intern::fields(&fields), is_select)),
     };
 
+    // A *statement* describe answers with ParameterDescription first. A
+    // *portal* describe must not: its parameters are already bound, and the
+    // protocol says the reply is RowDescription or NoData alone. The extra `t`
+    // message left libpq reading the description as malformed, which surfaced
+    // as "D message without prior T".
+    if kind == b'S' {
+        // One OID per parameter, each declared one as declared and the rest
+        // inferred from where they stand. Reporting the declared list alone
+        // told a client that declared nothing that there was nothing to bind.
+        let reported = param_infer::infer(database, &sql, &param_oids);
+        send_parameter_description(stream, &reported).await?;
+        if let Some(info) = state.statements.get_mut(&stmt_name) {
+            info.inferred_oids = (reported != param_oids).then_some(reported);
+        }
+    }
+
+    // Try to produce RowDescription for SELECT; otherwise NoData.
+    if let Some((fields, true)) = description {
+        if let Some(info) = state.statements.get_mut(&stmt_name) {
+            // Remembered so a later `Execute` can tell whether the shape the
+            // client cached is still the shape the table has.
+            info.described = Some((generation, fields.clone()));
+            if query.len() <= DESCRIBE_CACHE_MAX_TEXT
+                && !info
+                    .describe_cache
+                    .iter()
+                    .any(|e| e.answers(kind, generation, inlined.as_deref()))
+            {
+                info.describe_cache.retain(|e| e.kind != kind);
+                info.describe_cache.push(DescribeCacheEntry {
+                    kind,
+                    generation,
+                    text: inlined.as_deref().map(Box::from),
+                    fields: fields.clone(),
+                });
+            }
+        }
+        send_row_description(stream, &fields, &result_formats).await?;
+        return Ok(());
+    }
+
+    send_message(stream, b'n', &[]).await
+}
+
+/// Describes `query` the way a `Describe` message must: with its unbound
+/// placeholders replaced by a stand-in that parses.
+///
+/// Returns what `describe_query` does — `None` when nothing could be
+/// described, `Some((fields, false))` for a statement that returns no rows.
+async fn describe_for_wire(
+    database: &Arc<Database>,
+    query: &str,
+) -> io::Result<Option<(Vec<(String, DbType)>, bool)>> {
     // A statement describe has no bound values to inline, so its placeholders
     // are replaced with a stand-in that parses. See `substitute_placeholders`.
-    let mut substituted: Option<String> = None;
     if has_placeholder(query) {
         for stand_in in ["NULL", "1", "'1'"] {
             let candidate = substitute_placeholders(query, stand_in);
-            let describable = describe_query(database, &candidate)
-                .await?
-                .is_some_and(|(_, is_select)| is_select);
-            if describable {
-                substituted = Some(candidate);
-                break;
+            let described = describe_query(database, &candidate).await?;
+            // The answer for the stand-in that worked is the answer: it used
+            // to be thrown away and the same text described a second time.
+            if described.as_ref().is_some_and(|(_, is_select)| *is_select) {
+                return Ok(described);
             }
         }
         // A statement that returns no rows is *correctly* described as
@@ -1382,7 +1836,7 @@ where
         let expects_rows = upper.starts_with("SELECT")
             || upper.starts_with("WITH")
             || crate::core::rql::lexer_ir::returning_split(&effective).is_some();
-        if substituted.is_none() && expects_rows {
+        if expects_rows {
             // Named rather than silently answered with `NoData`: a driver that
             // caches a statement's column list caches *no columns*, and every
             // later read of it comes back with the right values under no
@@ -1395,50 +1849,7 @@ where
             );
         }
     }
-    let query = match &substituted {
-        Some(sql) => sql.as_str(),
-        None => query,
-    };
-
-    // A *statement* describe answers with ParameterDescription first. A
-    // *portal* describe must not: its parameters are already bound, and the
-    // protocol says the reply is RowDescription or NoData alone. The extra `t`
-    // message left libpq reading the description as malformed, which surfaced
-    // as "D message without prior T".
-    if kind == b'S' {
-        let param_oids: Vec<i32> = state
-            .statements
-            .get(&stmt_name)
-            .map(|s| s.param_oids.clone())
-            .unwrap_or_default();
-        send_parameter_description(stream, &param_oids).await?;
-    }
-
-    // Try to produce RowDescription for SELECT; otherwise NoData.
-    if let Some((fields, is_select)) = describe_query(database, query).await? {
-        if is_select {
-            // Remembered so a later `Execute` can tell whether the shape the
-            // client cached is still the shape the table has.
-            if let Some(info) = state.statements.get_mut(&stmt_name) {
-                info.described = Some((
-                    database
-                        .schema_generation
-                        .load(std::sync::atomic::Ordering::Acquire),
-                    fields
-                        .iter()
-                        .map(|(n, t)| (n.to_string(), t.clone()))
-                        .collect(),
-                ));
-            }
-            send_row_description(stream, &fields, &result_formats).await?;
-        } else {
-            // NoData
-            send_message(stream, b'n', &[]).await?;
-        }
-        return Ok(());
-    }
-
-    send_message(stream, b'n', &[]).await
+    describe_query(database, query).await
 }
 
 async fn handle_execute<S>(
@@ -1452,7 +1863,29 @@ where
 {
     // Execute payload: cstring portal, i32 max_rows
     let (portal, i) = read_cstring_owned(payload, 0)?;
-    let _ = read_i32_be_from(payload, i)?;
+    let (max_rows, _) = read_i32_be_from(payload, i)?;
+
+    // A portal an earlier Execute suspended resumes where it stopped; the
+    // statement is not run again. One it already ran to the end answers with
+    // an empty `CommandComplete`.
+    if let Some(mut pending) = state
+        .portals
+        .get_mut(&portal)
+        .and_then(|info| info.suspended.take())
+    {
+        let next = if pending.at == usize::MAX {
+            stream.write_all(&pending.bytes).await?;
+            pending
+        } else if send_result_window(stream, &mut pending, max_rows).await? {
+            pending
+        } else {
+            Box::new(SuspendedResult::exhausted(&pending.bytes))
+        };
+        if let Some(info) = state.portals.get_mut(&portal) {
+            info.suspended = Some(next);
+        }
+        return Ok(());
+    }
 
     // An unknown portal is refused, never substituted: the fallback used to
     // be the unnamed statement with no parameters, so an Execute naming a
@@ -1467,20 +1900,21 @@ where
         )
         .await;
     };
+    // The values and the text are shared handles, not copies: the shape check
+    // below needs `state` mutably, so neither can stay borrowed from it, and
+    // copying every bound value per Execute was what that used to cost.
     let (stmt_name, result_formats, params) = (
         info.stmt_name.clone(),
         info.result_formats.clone(),
         info.params.clone(),
     );
 
-    // Owned: the shape check below needs `state` mutably, and holding a
-    // borrow of the statement across it would pin the map.
-    let query = state
+    let query: StdArc<str> = state
         .statements
         .get(&stmt_name)
         .map(|s| s.sql.clone())
-        .unwrap_or_default();
-    let query = query.as_str();
+        .unwrap_or_else(|| StdArc::from(""));
+    let query: &str = &query;
 
     if query.trim().is_empty() {
         state.error_in_batch = true;
@@ -1506,15 +1940,16 @@ where
             let current = describe_query(database, query)
                 .await?
                 .filter(|(_, is_select)| *is_select)
-                .map(|(fields, _)| {
-                    fields
-                        .iter()
-                        .map(|(n, t)| (n.to_string(), t.clone()))
-                        .collect::<Vec<_>>()
-                });
-            let changed = current.as_deref() != Some(described.as_slice());
+                .map(|(fields, _)| fields);
+            let changed = current.as_deref() != Some(&*described);
             if let Some(info) = state.statements.get_mut(&stmt_name) {
-                info.described = Some((now, current.clone().unwrap_or(described)));
+                info.described = Some((
+                    now,
+                    current
+                        .as_deref()
+                        .map(statement_intern::fields)
+                        .unwrap_or(described),
+                ));
             }
             if changed {
                 // The rows go out with a fresh `RowDescription` in front of
@@ -1548,15 +1983,55 @@ where
         }
     };
 
+    // No row limit — what nearly every client sends — runs straight to the
+    // client as it always has. `COPY` is excluded too: it waits for the
+    // client to answer what it sent, which a captured reply never reaches.
+    let is_copy = query
+        .trim_start()
+        .get(..4)
+        .is_some_and(|w| w.eq_ignore_ascii_case("COPY"));
+    if max_rows <= 0 || is_copy {
+        return execute_recorded(
+            database,
+            state,
+            stream,
+            &query,
+            &result_formats,
+            !schema_changed,
+        )
+        .await;
+    }
+
+    // A row limit: the statement runs exactly as above, into a buffer, and
+    // the result is sent `max_rows` DataRows at a time. The engine builds the
+    // whole result before sending any of it either way, so holding the encoded
+    // rest costs what the rows already cost.
+    let mut capture = CaptureWrites {
+        inner: &mut *stream,
+        out: Vec::new(),
+    };
     execute_recorded(
         database,
         state,
-        stream,
+        &mut capture,
         &query,
         &result_formats,
         !schema_changed,
     )
-    .await
+    .await?;
+    let mut result = SuspendedResult {
+        bytes: capture.out,
+        at: 0,
+    };
+    let next = if send_result_window(stream, &mut result, max_rows).await? {
+        result
+    } else {
+        SuspendedResult::exhausted(&result.bytes)
+    };
+    if let Some(info) = state.portals.get_mut(&portal) {
+        info.suspended = Some(Box::new(next));
+    }
+    Ok(())
 }
 
 async fn handle_close<S>(state: &mut SessionState, stream: &mut S, payload: &[u8]) -> io::Result<()>
@@ -1600,16 +2075,21 @@ where
 /// literal that parses will do. Several are tried because no single one fits
 /// every position — `NULL` cannot be a `LIMIT`, a number cannot be compared
 /// against a text column, and a string cannot be compared against a number.
+///
+/// Everything but a placeholder is copied as it stands, in runs. It used to
+/// be pushed a byte at a time as `byte as char`, which re-encodes every byte
+/// above 0x7F as a character of its own: `"tëst"` became `"tÃ«st"`, so a
+/// statement naming a non-ASCII table or column described as nothing.
 fn substitute_placeholders(sql: &str, stand_in: &str) -> String {
     let bytes = sql.as_bytes();
     let mut out = String::with_capacity(sql.len());
     let mut quote: Option<u8> = None;
+    let mut copied = 0usize;
     let mut i = 0usize;
     while i < bytes.len() {
         let c = bytes[i];
         match quote {
             Some(q) => {
-                out.push(c as char);
                 if c == q {
                     quote = None;
                 }
@@ -1618,23 +2098,37 @@ fn substitute_placeholders(sql: &str, stand_in: &str) -> String {
             None => {
                 if c == b'\'' || c == b'"' {
                     quote = Some(c);
-                    out.push(c as char);
                     i += 1;
                 } else if c == b'$' && bytes.get(i + 1).is_some_and(|d| d.is_ascii_digit()) {
                     let mut j = i + 1;
                     while j < bytes.len() && bytes[j].is_ascii_digit() {
                         j += 1;
                     }
+                    // `i` and `j` sit on ASCII bytes, so both are boundaries.
+                    out.push_str(&sql[copied..i]);
                     out.push_str(stand_in);
                     i = j;
+                    copied = j;
                 } else {
-                    out.push(c as char);
                     i += 1;
                 }
             }
         }
     }
+    out.push_str(&sql[copied..]);
     out
+}
+
+#[cfg(test)]
+mod substitute_placeholder_tests {
+    #[test]
+    fn non_ascii_text_survives_the_stand_in() {
+        assert_eq!(
+            super::substitute_placeholders(r#"SELECT "naïve" FROM "tëst" WHERE "日本" = $1 AND x = '€$2'"#, "NULL"),
+            r#"SELECT "naïve" FROM "tëst" WHERE "日本" = NULL AND x = '€$2'"#
+        );
+        assert_eq!(super::substitute_placeholders("ü=$12,$1", "'1'"), "ü='1','1'");
+    }
 }
 
 /// Whether the statement still carries an unbound placeholder.
@@ -1661,7 +2155,7 @@ fn has_placeholder(sql: &str) -> bool {
 async fn describe_query(
     database: &Arc<Database>,
     query: &str,
-) -> io::Result<Option<(Vec<(&'static str, DbType)>, bool)>> {
+) -> io::Result<Option<(Vec<(String, DbType)>, bool)>> {
     let stmt = query.trim();
     if stmt.is_empty() {
         return Ok(None);
@@ -1751,7 +2245,7 @@ type ScratchFields = smallvec::SmallVec<[crate::core::row::schema::SchemaField; 
 ///
 /// Offsets are laid out as a real table's would be. Nothing is registered
 /// anywhere: this exists for the length of one describe.
-fn scratch_fields(columns: &[(&'static str, DbType)]) -> ScratchFields {
+fn scratch_fields(columns: &[(String, DbType)]) -> ScratchFields {
     let mut fields: ScratchFields = smallvec::SmallVec::new();
     let mut offset = 0u64;
     for (order, (name, ty)) in columns.iter().enumerate() {
@@ -1776,7 +2270,7 @@ fn scratch_fields(columns: &[(&'static str, DbType)]) -> ScratchFields {
 /// and it is the case that matters, since a paginated count is written this way
 /// by every ORM. Anything whose type depends on the inner relation returns
 /// `None` and is described the ordinary way.
-fn describe_aggregate_over_derived(stmt: &str) -> Option<Vec<(&'static str, DbType)>> {
+fn describe_aggregate_over_derived(stmt: &str) -> Option<Vec<(String, DbType)>> {
     let upper = stmt.trim_start().to_ascii_uppercase();
     if !upper.starts_with("SELECT") {
         return None;
@@ -1787,7 +2281,7 @@ fn describe_aggregate_over_derived(stmt: &str) -> Option<Vec<(&'static str, DbTy
     }
 
     let select_list = stmt["SELECT".len()..from_at].trim();
-    let mut fields: Vec<(&'static str, DbType)> = Vec::new();
+    let mut fields: Vec<(String, DbType)> = Vec::new();
     for item in crate::core::rql::join::split_top_level_commas(select_list) {
         let item = item.trim();
         let (expr, alias) = crate::core::rql::lexer_query::split_alias(item);
@@ -1796,8 +2290,8 @@ fn describe_aggregate_over_derived(stmt: &str) -> Option<Vec<(&'static str, DbTy
             return None;
         }
         let label = alias.unwrap_or_else(|| "count".to_string());
-        let leaked: &'static str = Box::leak(label.into_boxed_str());
-        fields.push((leaked, DbType::I64));
+        let label: String = label;
+        fields.push((label, DbType::I64));
     }
     if fields.is_empty() {
         None
@@ -1827,7 +2321,7 @@ async fn describe_resolved(
     // `database.tables` and must not be put there: describing must not
     // materialise anything.
     derived: &[(String, ScratchFields)],
-) -> io::Result<Option<(Vec<(&'static str, DbType)>, bool)>> {
+) -> io::Result<Option<(Vec<(String, DbType)>, bool)>> {
     let stmt = query.trim();
     if stmt.is_empty() {
         return Ok(None);
@@ -1840,7 +2334,7 @@ async fn describe_resolved(
     // which every driver reads as a protocol violation.
     #[cfg(feature = "pg_import")]
     if crate::core::migrate::sql::is_import_statement(stmt) {
-        return Ok(Some((vec![("import", DbType::STRING)], true)));
+        return Ok(Some((vec![("import".to_string(), DbType::STRING)], true)));
     }
 
     // Answered by `handle_builtin_query`, above the engine. Without an arm here
@@ -1854,28 +2348,30 @@ async fn describe_resolved(
             || recognize_query_purpose(stmt).is_none() && parse_database_statement(stmt).is_none();
         if builtin {
             if lower == "select 1" || lower == "select 1::int" {
-                return Ok(Some((vec![("?column?", DbType::I32)], true)));
+                return Ok(Some((vec![("?column?".to_string(), DbType::I32)], true)));
             }
             if lower == "select version()" {
-                return Ok(Some((vec![("version", DbType::STRING)], true)));
+                return Ok(Some((vec![("version".to_string(), DbType::STRING)], true)));
             }
             if let Some(key) = lower.strip_prefix("show ") {
-                let leaked: &'static str = Box::leak(key.trim().to_string().into_boxed_str());
-                return Ok(Some((vec![(leaked, DbType::STRING)], true)));
+                let label: String = key.trim().to_string();
+                return Ok(Some((vec![(label, DbType::STRING)], true)));
             }
         }
     }
 
     if let Some(Ok(DatabaseStatement::List)) = parse_database_statement(stmt) {
         return Ok(Some((
-            vec![
+            [
                 ("database_name", DbType::STRING),
                 ("location", DbType::STRING),
-                ("tables", DbType::U64),
-                ("sessions", DbType::U64),
+                ("tables", DbType::I64),
+                ("sessions", DbType::I64),
                 ("is_default", DbType::BOOL),
                 ("is_current", DbType::BOOL),
-            ],
+            ]
+            .map(|(name, ty)| (name.to_string(), ty))
+            .to_vec(),
             true,
         )));
     }
@@ -1907,13 +2403,12 @@ async fn describe_resolved(
                     // first field, because that is what COUNT was scanning. The
                     // count was right and its name was another column's.
                     if let Some(plan) = &parsed.aggregate {
-                        let fields: Vec<(&'static str, DbType)> = plan
+                        let fields: Vec<(String, DbType)> = plan
                             .items
                             .iter()
                             .map(|item| {
-                                let leaked: &'static str =
-                                    Box::leak(item.label().to_string().into_boxed_str());
-                                (leaked, item.result_type())
+                                let label: String = item.label().to_string();
+                                (label, item.result_type())
                             })
                             .collect();
                         if !fields.is_empty() {
@@ -1921,16 +2416,15 @@ async fn describe_resolved(
                         }
                     }
 
-                    let fields: Vec<(&'static str, DbType)> = parsed
+                    let fields: Vec<(String, DbType)> = parsed
                         .requested_row_fetch
                         .columns_fetching_data
                         .iter()
                         .take(parsed.visible_columns)
                         .filter_map(|c| {
                             field_of(&schema, c.schema_id).map(|f| {
-                                let leaked: &'static str =
-                                    Box::leak(f.name.clone().into_boxed_str());
-                                (leaked, f.db_type.clone())
+                                let label: String = f.name.clone();
+                                (label, f.db_type.clone())
                             })
                         })
                         .collect();
@@ -1955,8 +2449,8 @@ async fn describe_resolved(
                         fields
                             .into_iter()
                             .map(|(name, ty)| {
-                                let leaked: &'static str = Box::leak(name.into_boxed_str());
-                                (leaked, ty)
+                                let label: String = name;
+                                (label, ty)
                             })
                             .collect(),
                         true,
@@ -1970,8 +2464,8 @@ async fn describe_resolved(
                     .unwrap_or_else(crate::replication::sql::result_fields)
                     .into_iter()
                     .map(|(name, ty)| {
-                        let leaked: &'static str = Box::leak(name.into_boxed_str());
-                        (leaked, ty)
+                        let label: String = name;
+                        (label, ty)
                     })
                     .collect(),
                 true,
@@ -1984,8 +2478,8 @@ async fn describe_resolved(
                     .unwrap_or_else(crate::core::storage::sql::result_fields)
                     .into_iter()
                     .map(|(name, ty)| {
-                        let leaked: &'static str = Box::leak(name.into_boxed_str());
-                        (leaked, ty)
+                        let label: String = name;
+                        (label, ty)
                     })
                     .collect(),
                 true,
@@ -2004,8 +2498,8 @@ async fn describe_resolved(
                         fields
                             .into_iter()
                             .map(|(name, ty)| {
-                                let leaked: &'static str = Box::leak(name.into_boxed_str());
-                                (leaked, ty)
+                                let label: String = name;
+                                (label, ty)
                             })
                             .collect(),
                         true,
@@ -2041,8 +2535,8 @@ async fn describe_resolved(
                             join_output_columns(&plan, database)
                                 .into_iter()
                                 .map(|(name, ty)| {
-                                    let leaked: &'static str = Box::leak(name.into_boxed_str());
-                                    (leaked, ty)
+                                    let label: String = name;
+                                    (label, ty)
                                 })
                                 .collect(),
                             true,
@@ -2146,8 +2640,8 @@ async fn describe_resolved(
                 )
             }) {
                 for item in &parsed.select_items {
-                    let leaked: &'static str = Box::leak(item.label().to_string().into_boxed_str());
-                    fields.push((leaked, advertised(item)));
+                    let label: String = item.label().to_string();
+                    fields.push((label, advertised(item)));
                 }
                 return Ok(Some((fields, true)));
             }
@@ -2156,8 +2650,8 @@ async fn describe_resolved(
             // are the select items, named and typed by the plan.
             if let Some(plan) = &parsed.aggregate {
                 for item in &plan.items {
-                    let leaked: &'static str = Box::leak(item.label().to_string().into_boxed_str());
-                    fields.push((leaked, advertised(item)));
+                    let label: String = item.label().to_string();
+                    fields.push((label, advertised(item)));
                 }
                 return Ok(Some((fields, true)));
             }
@@ -2171,14 +2665,14 @@ async fn describe_resolved(
                 let Some(field) = field_of(&table_fields, c.schema_id) else {
                     continue;
                 };
-                let leaked: &'static str = Box::leak(field.name.clone().into_boxed_str());
+                let label: String = field.name.clone();
                 // A catalogue view has no `TableSchema` and no JSON columns, so
                 // the field's own type is what it reports.
                 let ty = match &real_table {
                     Some(t) => reported_type(field, &t.schema),
                     None => field.db_type.clone(),
                 };
-                fields.push((leaked, ty));
+                fields.push((label, ty));
             }
             Ok(Some((fields, true)))
         }
@@ -2191,8 +2685,8 @@ async fn describe_resolved(
                     let fields = cols
                         .iter()
                         .map(|f| {
-                            let leaked: &'static str = Box::leak(f.name.clone().into_boxed_str());
-                            (leaked, reported_type(f, &table.schema))
+                            let label: String = f.name.clone();
+                            (label, reported_type(f, &table.schema))
                         })
                         .collect();
                     Ok(Some((fields, true)))
@@ -2227,8 +2721,8 @@ async fn describe_resolved(
                     let fields = cols
                         .iter()
                         .map(|f| {
-                            let leaked: &'static str = Box::leak(f.name.clone().into_boxed_str());
-                            (leaked, reported_type(f, &table.schema))
+                            let label: String = f.name.clone();
+                            (label, reported_type(f, &table.schema))
                         })
                         .collect();
                     Ok(Some((fields, true)))
@@ -2249,18 +2743,21 @@ enum CatalogCell {
 }
 
 fn catalog_row(cells: &[CatalogCell]) -> Row {
-    let mut columns: smallvec::SmallVec<[crate::core::row::row::Column; 32]> =
+    let mut columns: crate::core::row::row::RowColumns =
         smallvec::SmallVec::new();
     for (index, cell) in cells.iter().enumerate() {
         let (bytes, column_type): (Vec<u8>, DbType) = match cell {
             CatalogCell::Text(text) => (text.as_bytes().to_vec(), DbType::STRING),
-            CatalogCell::Number(n) => (n.to_le_bytes().to_vec(), DbType::U64),
+            CatalogCell::Number(n) => (
+                crate::core::value_codec::count_as_bigint(*n).to_le_bytes().to_vec(),
+                DbType::I64,
+            ),
             CatalogCell::Flag(b) => (vec![u8::from(*b)], DbType::BOOL),
         };
         let mut block = crate::memory_pool::MEMORY_POOL.acquire(bytes.len());
         block.into_slice_mut().copy_from_slice(&bytes);
         columns.push(crate::core::row::row::Column {
-            schema_id: index as u64,
+            schema_id: crate::core::row::row::schema_id_of(index as u64),
             data: block,
             column_type,
         });
@@ -2298,6 +2795,25 @@ where
     if let Some(t) = state.transaction.as_mut() {
         t.failed = true;
     }
+    // The planning paths report every failure as a syntax error; a pattern the
+    // `SIMILAR TO` matcher refuses is PostgreSQL's `2201B` instead.
+    // Likewise a LIKE pattern ending in its escape (`22025`) and an ESCAPE
+    // clause that is not one character (`22019`).
+    let sqlstate = if sqlstate != "42601" {
+        sqlstate
+    } else if message.starts_with("invalid regular expression") {
+        "2201B"
+    } else if message.starts_with("LIKE pattern must not end with escape character") {
+        "22025"
+    } else if message.starts_with("invalid escape string") {
+        "22019"
+    } else if message.contains(" types ") && message.ends_with(" cannot be matched") {
+        // `CASE types integer and text cannot be matched` — PostgreSQL's
+        // datatype_mismatch.
+        "42804"
+    } else {
+        sqlstate
+    };
     send_error_response(stream, sqlstate, message).await
 }
 
@@ -2445,8 +2961,8 @@ where
             let fields = vec![
                 ("database_name".to_string(), DbType::STRING),
                 ("location".to_string(), DbType::STRING),
-                ("tables".to_string(), DbType::U64),
-                ("sessions".to_string(), DbType::U64),
+                ("tables".to_string(), DbType::I64),
+                ("sessions".to_string(), DbType::I64),
                 ("is_default".to_string(), DbType::BOOL),
                 ("is_current".to_string(), DbType::BOOL),
             ];
@@ -2526,28 +3042,41 @@ where
         let base = crate::core::cancel::StatementCancel::new(deadline);
         match PEER_WATCH.try_with(|w| w.clone()).ok().flatten() {
             Some(watch) => {
-                std::sync::Arc::new(base.watching(Box::new(move || client_has_gone(&watch))))
+                std::sync::Arc::new(base.watching(Box::new(move || watch.gone())))
             }
             None => std::sync::Arc::new(base),
         }
     };
+
+    // Published for the length of the statement, so a CancelRequest finds
+    // *this* statement's signal and nothing else. The guard clears the slot on
+    // every way out — including this future being dropped — and only if the
+    // slot still holds this statement, so a cancel that arrives late trips a
+    // signal no one reads instead of stopping the next statement. Set here,
+    // above the query-stats paths, for the reason the scope below is.
+    let _published = SESSION_CANCEL
+        .try_with(|session| session.publish(cancel.clone()))
+        .ok();
 
     // The statement is **not** dropped when the client goes: it is asked to
     // stop, and unwinds through the ordinary scan-error path. Dropping it would
     // cancel at an await point with none of its cleanup done — a CTE's
     // temporary tables never dropped, an autocommit transaction left
     // `InProgress` holding back reclamation.
+    //
+    // Notices the engine raises for this statement are collected here and
+    // sent ahead of its `CommandComplete` (see `send_command_complete`).
     crate::core::cancel::STATEMENT_CANCEL
         .scope(
             cancel,
-            execute_recorded_inner(
+            crate::core::notice::collect(execute_recorded_inner(
                 database,
                 state,
                 stream,
                 stmt,
                 result_formats,
                 omit_description,
-            ),
+            )),
         )
         .await
 }
@@ -2682,6 +3211,10 @@ where
     let effective_tx = cte_tx
         .map(|(tx, _)| tx)
         .unwrap_or(crate::core::mvcc::transaction::FROZEN_TX);
+    let mut owned_tx = OwnedStatementTx {
+        database,
+        tx: cte_tx.and_then(|(tx, owned)| owned.then_some(tx)),
+    };
 
     // A unique index is a constraint; rewritten into the ALTER TABLE the engine
     // enforces before anything else looks at the statement.
@@ -2863,6 +3396,7 @@ where
     // of whether the statement worked — the same signal `COMMIT` reads.
     if let Some((tx, owned)) = cte_tx {
         if owned {
+            owned_tx.disarm();
             let failed =
                 state.statement_failed || state.transaction.as_ref().is_some_and(|t| t.failed);
             // Asked before the commit, which retires the transaction and
@@ -3120,30 +3654,18 @@ where
     // The declared decimal scale of each output column, where the statement
     // selects from a table that recorded one.
     let select_scales: Option<Vec<u32>> = match &purpose {
-        QueryPurpose::QueryRows(qr) => database.tables.get(&qr.table_name).and_then(|t| {
-            let schema = &t.schema;
-            if schema.type_modifiers.is_empty() {
-                return None;
-            }
-            crate::core::rql::lexer_query::row_fetch_from_select_query(&purpose, &schema.fields)
-                .ok()
-                .map(|parsed| {
-                    parsed
-                        .requested_row_fetch
-                        .columns_fetching_data
-                        .iter()
-                        .take(parsed.visible_columns)
-                        .map(|c| {
-                            field_of(&schema.fields, c.schema_id).map_or(0, |field| {
-                                crate::core::rql::type_modifier::scale_of(
-                                    &field.name,
-                                    &schema.type_modifiers,
-                                ) as u32
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                })
-        }),
+        // Shared with the subquery boundary (`executor::query_output_scales`),
+        // which must read the same bytes at the same scales.
+        QueryPurpose::QueryRows(_) => crate::core::rql::executor::query_output_scales(&purpose, database),
+        // `RETURNING` sends rows too, and a returned column is read straight
+        // from storage at its own scale. Without these arms every `RETURNING v`
+        // over a `NUMERIC(p, s)` column was rendered at the engine default.
+        QueryPurpose::UpdateRow(sql) | QueryPurpose::DeleteRow(sql) => {
+            let skip = if matches!(purpose, QueryPurpose::UpdateRow(_)) { 1 } else { 2 };
+            let name = sql.split_whitespace().nth(skip).unwrap_or("").trim_matches('"').to_string();
+            returning_scales(database, &name, sql)
+        }
+        QueryPurpose::InsertRow(ir) => returning_scales(database, &ir.table_name, &ir.query),
         _ => None,
     };
 
@@ -3331,8 +3853,14 @@ where
 
     // `execute` consumes QueryPurpose, but we still want `purpose_kind`/`select_fields`.
     // Re-recognize the query to get an owned QueryPurpose to pass into the engine.
-    let purpose_exec = recognize_query_purpose(stmt)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "query purpose disappeared"))?;
+    //
+    // A statement that does not re-recognise fails on its own rather than
+    // closing the connection: an `Err` here would end the session, and the
+    // client would see only its socket close.
+    let Some(purpose_exec) = recognize_query_purpose(stmt) else {
+        fail_statement(state, stream, "XX000", "internal error: the statement could not be re-read for execution").await?;
+        return Ok(());
+    };
 
     // Inside a block the statement joins the session's transaction, so it sees
     // the block's own earlier writes and its effects stay invisible to everyone
@@ -3396,21 +3924,30 @@ where
         }
         2 => {
             let rows_bytes = &resp[1..];
-            let rows = vec_into_rows(rows_bytes)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            // Checked whole before anything is sent; the rows are then encoded
+            // from these bytes in place rather than decoded into `Row`s.
+            // A damaged result fails the statement, not the session.
+            let row_count = match validate_serialized_rows(rows_bytes) {
+                Ok(n) => n,
+                Err(e) => {
+                    log::error!("the engine returned a damaged result: {}", e);
+                    fail_statement(state, stream, "XX000", &format!("internal error: damaged result ({})", e)).await?;
+                    return Ok(());
+                }
+            };
             // `INSERT ... RETURNING` sends rows but must still complete with an
             // INSERT tag; a client that saw "SELECT n" would not count the write.
             let tag = match purpose_kind {
-                PurposeKind::InsertRow => format!("INSERT 0 {}", rows.len()),
-                PurposeKind::UpdateRow => format!("UPDATE {}", rows.len()),
-                PurposeKind::DeleteRow => format!("DELETE {}", rows.len()),
-                _ => format!("SELECT {}", rows.len()),
+                PurposeKind::InsertRow => format!("INSERT 0 {}", row_count),
+                PurposeKind::UpdateRow => format!("UPDATE {}", row_count),
+                PurposeKind::DeleteRow => format!("DELETE {}", row_count),
+                _ => format!("SELECT {}", row_count),
             };
-            send_query_result(
+            send_serialized_query_result(
                 stream,
                 select_fields.as_deref(),
                 select_scales.as_deref(),
-                &rows,
+                rows_bytes,
                 result_formats,
                 &tag,
                 omit_description,
@@ -3454,6 +3991,10 @@ fn sqlstate_for(message: &str) -> &'static str {
     // "the server gave up on this" apart from "this statement is wrong".
     if has("canceling statement") {
         "57014"
+    } else if has("deadlock detected") {
+        // `40P01`, which drivers retry like `40001`: one party to the cycle
+        // was failed so the others could proceed.
+        "40P01"
     } else if has("could not serialize access") || has("reclaimed while the query was reading") {
         // The reclaimed-row guard is a serialisation failure in the sense that
         // matters to a client: the statement applied nothing and re-running it
@@ -3486,11 +4027,32 @@ fn sqlstate_for(message: &str) -> &'static str {
         "42701"
     } else if has("already exists") {
         "42710"
-    } else if has("out of range") {
+    } else if has("date/time field value out of range") {
+        // Before the generic "out of range": a date/time field is 22008.
+        "22008"
+    } else if has("invalid input syntax for type timestamp")
+        || has("invalid input syntax for type date")
+        || has("invalid input syntax for type time")
+        || has("invalid input syntax for type interval")
+    {
+        // PostgreSQL's `invalid_datetime_format`, not the generic 22P02.
+        "22007"
+    } else if has("out of range") || has("numeric field overflow") {
         "22003"
     } else if has("division by zero") {
         "22012"
-    } else if has("invalid input syntax") || has("could not parse") || has("cannot parse") {
+    } else if has("invalid regular expression") {
+        "2201B"
+    } else if has("statement too complex") {
+        "54001"
+    } else if has("invalid hexadecimal") {
+        // `byteain`'s hex errors are `invalid_parameter_value`.
+        "22023"
+    } else if has("invalid input syntax")
+        || has("could not parse")
+        || has("cannot parse")
+        || has("malformed array literal")
+    {
         "22P02"
     } else if has("not supported") || has("unsupported") {
         "0A000"
@@ -3594,7 +4156,17 @@ where
     // the same rows;" — was chopped in half, and the leading fragment parsed as
     // nothing, reported as "syntax error or unsupported query" about a
     // perfectly good statement.
-    let statements = split_statements(query);
+    // Escape and dollar-quoted strings become standard strings before the
+    // splitter or anything after it reads the text; see `sql_scan`.
+    let normalized = match crate::core::sql_scan::normalize_string_literals(query) {
+        Ok(text) => text,
+        Err(e) => {
+            fail_statement(state, stream, "22025", &e).await?;
+            let status = state.ready_status();
+            return send_ready_for_query(stream, status).await;
+        }
+    };
+    let statements = split_statements(&normalized);
 
     for stmt in statements {
         execute_recorded(database, state, stream, &stmt, &[], false).await?;
@@ -4711,67 +5283,349 @@ async fn send_query_result<S>(
 where
     S: AsyncWrite + Unpin,
 {
-    let col_meta: Vec<(String, DbType)> = if let Some(f) = fields {
-        f.to_vec()
+    let derived: Vec<(String, DbType)>;
+    let col_meta: &[(String, DbType)] = if let Some(f) = fields {
+        f
     } else if let Some(first) = rows.first() {
-        first
+        derived = first
             .columns
             .iter()
             .enumerate()
             .map(|(i, c)| (format!("column{}", i + 1), c.column_type.clone()))
-            .collect()
+            .collect();
+        &derived
     } else {
-        Vec::new()
+        &[]
     };
 
-    let fields_ref: Vec<(&str, DbType)> = col_meta
-        .iter()
-        .map(|(n, t)| (n.as_str(), t.clone()))
-        .collect();
-
     if !omit_description {
-        send_row_description(stream, &fields_ref, result_formats).await?;
+        send_row_description(stream, col_meta, result_formats).await?;
     }
 
+    // Each row is encoded straight into one reused frame — cells written in
+    // place, lengths patched in after — and handed over as a single write.
+    let mut frame: Vec<u8> = Vec::with_capacity(256);
     for row in rows {
-        let mut values = Vec::with_capacity(row.columns.len());
+        // Counted here as `send_data_row` counts the rows it sends.
+        #[cfg(feature = "query_stats")]
+        crate::core::query_stats::note_rows(1);
+
+        frame.clear();
+        let start = wire_out::begin_message(&mut frame, b'D');
+        let count: i16 = row.columns.len().try_into().unwrap_or(i16::MAX);
+        frame.extend_from_slice(&count.to_be_bytes());
         for (i, col) in row.columns.iter().enumerate() {
-            let format_code = if result_formats.is_empty() {
-                0
-            } else if result_formats.len() == 1 {
-                result_formats[0]
-            } else {
-                *result_formats.get(i).unwrap_or(&0)
-            };
-
-            // The row carries the *storage* type — `BYTEA` and `ARRAY` are
-            // both stored as `STRING` — so formatting follows the declared
-            // type instead. `DbType::NULL` is the exception: the executor sets
-            // it on the row to mark a NULL, and that must win.
-            let db_type = if col.column_type == DbType::NULL {
-                DbType::NULL
-            } else {
-                col_meta
-                    .get(i)
-                    .map(|(_, t)| t.clone())
-                    .unwrap_or_else(|| col.column_type.clone())
-            };
-
-            let scale = scales.and_then(|s| s.get(i)).copied();
-            let val = if format_code == 1 {
-                format_column_binary(db_type, col.data.into_slice(), scale)
-            } else {
-                format_column_text_scaled(db_type, col.data.into_slice(), scale)
-                    .map(|s| s.into_bytes())
-            };
-            values.push(val);
+            encode_result_cell(
+                &mut frame,
+                i,
+                &col.column_type,
+                col.data.into_slice(),
+                col_meta,
+                scales,
+                result_formats,
+            );
         }
-        let refs: Vec<Option<&[u8]>> = values.iter().map(|v| v.as_deref()).collect();
-        send_data_row(stream, &refs).await?;
+        wire_out::finish_message(&mut frame, start)?;
+        stream.write_all(&frame).await?;
     }
 
     send_command_complete(stream, command_tag).await?;
     Ok(())
+}
+
+/// One cell of a DataRow: its length, then its value in the requested format.
+///
+/// Shared by both result senders, so a decoded row and a serialized one
+/// cannot be encoded differently.
+#[inline]
+fn encode_result_cell(
+    frame: &mut Vec<u8>,
+    i: usize,
+    stored_type: &DbType,
+    data: &[u8],
+    col_meta: &[(String, DbType)],
+    scales: Option<&[u32]>,
+    result_formats: &[i16],
+) {
+    let format_code = if result_formats.is_empty() {
+        0
+    } else if result_formats.len() == 1 {
+        result_formats[0]
+    } else {
+        *result_formats.get(i).unwrap_or(&0)
+    };
+
+    // The row carries the *storage* type — `BYTEA` and `ARRAY` are
+    // both stored as `STRING` — so formatting follows the declared
+    // type instead. `DbType::NULL` is the exception: the executor sets
+    // it on the row to mark a NULL, and that must win.
+    let db_type = if *stored_type == DbType::NULL {
+        &DbType::NULL
+    } else {
+        col_meta.get(i).map(|(_, t)| t).unwrap_or(stored_type)
+    };
+
+    let scale = scales.and_then(|s| s.get(i)).copied();
+    let len_at = frame.len();
+    frame.extend_from_slice(&[0u8; 4]);
+    // A `numeric` that carries its own display scale (an `AVG` result; see
+    // `value_codec::decimal_cell_with_scale`) is written at that scale, which
+    // overrides the column's, and keeps it in the binary form's `dscale`.
+    let own_scale = (*db_type == DbType::DECIMAL)
+        .then(|| crate::core::value_codec::split_decimal_cell(data))
+        .flatten()
+        .and_then(|(v, s)| s.map(|s| (v, s)));
+    let present = if let Some((v, s)) = own_scale {
+        if format_code == 1 {
+            frame.extend_from_slice(&crate::core::value_codec::encode_pg_numeric_with_dscale(v, s));
+        } else {
+            crate::core::value_codec::format_decimal_scaled_into(v, s, frame);
+        }
+        true
+    } else if format_code == 1 {
+        wire_out::encode_cell_binary(db_type, data, scale, frame)
+    } else {
+        wire_out::encode_cell_text(db_type, data, scale, frame)
+    };
+    let len: i32 = if present {
+        (frame.len() - len_at - 4).try_into().unwrap_or(i32::MAX)
+    } else {
+        -1
+    };
+    frame[len_at..len_at + 4].copy_from_slice(&len.to_be_bytes());
+}
+
+/// How many rows a serialized engine result holds, after checking every row
+/// and column length in it.
+///
+/// Run before anything is sent, so a damaged result fails the statement
+/// cleanly instead of after a RowDescription and part of the rows have gone
+/// out — the guarantee decoding the whole result up front used to give.
+fn validate_serialized_rows(rows_bytes: &[u8]) -> io::Result<usize> {
+    let mut count = 0usize;
+    for span in crate::core::row::row::serialized_rows(rows_bytes) {
+        for cell in crate::core::row::row::serialized_cells(span?)? {
+            cell?;
+        }
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// [`send_query_result`] over the engine's serialized rows, encoding each
+/// DataRow from the bytes in place.
+///
+/// The rows used to be decoded into a `Vec<Row>` first — a `Row` is ~1.5 KB
+/// whatever it holds, so a million-row result cost ~1.5 GB of decoded copies
+/// on top of the bytes they came from, only to be read once and dropped.
+/// `rows_bytes` must have passed [`validate_serialized_rows`].
+async fn send_serialized_query_result<S>(
+    stream: &mut S,
+    fields: Option<&[(String, DbType)]>,
+    scales: Option<&[u32]>,
+    rows_bytes: &[u8],
+    result_formats: &[i16],
+    command_tag: &str,
+    omit_description: bool,
+) -> io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let invalid = |e: io::Error| io::Error::new(io::ErrorKind::InvalidData, e.to_string());
+
+    let derived: Vec<(String, DbType)>;
+    let col_meta: &[(String, DbType)] = if let Some(f) = fields {
+        f
+    } else if let Some(first) = crate::core::row::row::serialized_rows(rows_bytes).next() {
+        let mut meta = Vec::new();
+        for (i, cell) in crate::core::row::row::serialized_cells(first.map_err(invalid)?)
+            .map_err(invalid)?
+            .enumerate()
+        {
+            meta.push((format!("column{}", i + 1), cell.map_err(invalid)?.column_type));
+        }
+        derived = meta;
+        &derived
+    } else {
+        &[]
+    };
+
+    if !omit_description {
+        send_row_description(stream, col_meta, result_formats).await?;
+    }
+
+    let mut frame: Vec<u8> = Vec::with_capacity(256);
+    for (sent, span) in crate::core::row::row::serialized_rows(rows_bytes).enumerate() {
+        #[cfg(feature = "query_stats")]
+        crate::core::query_stats::note_rows(1);
+
+        // A buffered write completes without suspending, so a large result
+        // could be encoded start to finish without giving the worker thread
+        // back. One yield per 4096 rows lets the tasks queued behind it run.
+        if sent % 4096 == 4095 && crate::core::processor::concurrent_processor::latency_guards_on() {
+            tokio::task::yield_now().await;
+        }
+
+        frame.clear();
+        let start = wire_out::begin_message(&mut frame, b'D');
+        // The column count is not in the row's header, so it is patched in
+        // once the cells are written.
+        let count_at = frame.len();
+        frame.extend_from_slice(&[0u8; 2]);
+        let mut columns = 0usize;
+        for (i, cell) in crate::core::row::row::serialized_cells(span.map_err(invalid)?)
+            .map_err(invalid)?
+            .enumerate()
+        {
+            let cell = cell.map_err(invalid)?;
+            encode_result_cell(
+                &mut frame,
+                i,
+                &cell.column_type,
+                cell.data,
+                col_meta,
+                scales,
+                result_formats,
+            );
+            columns += 1;
+        }
+        let count: i16 = columns.try_into().unwrap_or(i16::MAX);
+        frame[count_at..count_at + 2].copy_from_slice(&count.to_be_bytes());
+        wire_out::finish_message(&mut frame, start)?;
+        stream.write_all(&frame).await?;
+    }
+
+    send_command_complete(stream, command_tag).await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod serialized_result_tests {
+    //! The serialized-row sender against the decoded-row one it replaced on
+    //! the query path: same rows, same bytes on the wire, for every shape the
+    //! encoder branches on — NULL markers, declared types that differ from the
+    //! stored ones, NUMERIC scales by slot, text/binary/mixed formats, derived
+    //! column names, and rows of different widths.
+    use super::*;
+    use crate::core::row::row::{Column, rows_into_vec};
+    use crate::memory_pool::MEMORY_POOL;
+
+    fn cell(schema_id: u64, ty: DbType, bytes: &[u8]) -> Column {
+        let mut data = MEMORY_POOL.acquire(bytes.len());
+        if !bytes.is_empty() {
+            data.into_slice_mut().copy_from_slice(bytes);
+        }
+        Column {
+            schema_id: crate::core::row::row::schema_id_of(schema_id),
+            data,
+            column_type: ty,
+        }
+    }
+
+    fn rows() -> Vec<Row> {
+        let mut out = Vec::new();
+        for i in 0..40i64 {
+            let mut columns = crate::core::row::row::RowColumns::new();
+            columns.push(cell(0, DbType::I64, &(i * 1_000_003 - 7).to_le_bytes()));
+            columns.push(if i % 5 == 0 {
+                cell(1, DbType::NULL, &[])
+            } else {
+                cell(1, DbType::STRING, format!("text {i} 'q' ü").as_bytes())
+            });
+            columns.push(cell(2, DbType::DECIMAL, &((i as i128 - 20) * 123_456_789).to_le_bytes()));
+            columns.push(cell(3, DbType::F64, &[f64::NAN, -0.0, 1.5, f64::INFINITY][i as usize % 4].to_le_bytes()));
+            // Stored as text, declared BYTEA.
+            columns.push(cell(4, DbType::STRING, &[0u8, 1, 0xff, i as u8]));
+            columns.push(cell(5, DbType::DATETIME, &(i * 86_400_000_000).to_le_bytes()));
+            columns.push(cell(6, DbType::BOOL, &[(i % 2) as u8]));
+            if i % 7 == 3 {
+                // A row narrower than the description.
+                columns.truncate(4);
+            }
+            out.push(Row {
+                position: 0,
+                columns,
+                length: 0,
+            });
+        }
+        out
+    }
+
+    async fn both(
+        rows: &[Row],
+        fields: Option<&[(String, DbType)]>,
+        scales: Option<&[u32]>,
+        formats: &[i16],
+        omit: bool,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let bytes = rows_into_vec(rows.to_vec());
+        let decoded = crate::core::row::row::vec_into_rows(&bytes).unwrap();
+        let mut old = Vec::new();
+        send_query_result(&mut old, fields, scales, &decoded, formats, "SELECT x", omit)
+            .await
+            .unwrap();
+        assert_eq!(validate_serialized_rows(&bytes).unwrap(), rows.len());
+        let mut new = Vec::new();
+        send_serialized_query_result(&mut new, fields, scales, &bytes, formats, "SELECT x", omit)
+            .await
+            .unwrap();
+        (old, new)
+    }
+
+    #[tokio::test]
+    async fn serialized_rows_go_out_byte_identical() {
+        let fields: Vec<(String, DbType)> = [
+            ("id", DbType::I64),
+            ("t", DbType::STRING),
+            ("n", DbType::DECIMAL),
+            ("f", DbType::F64),
+            ("b", DbType::BYTEA),
+            ("ts", DbType::DATETIME),
+            ("ok", DbType::BOOL),
+        ]
+        .into_iter()
+        .map(|(n, t)| (n.to_string(), t))
+        .collect();
+        let scale_sets: [Option<Vec<u32>>; 3] = [None, Some(vec![0, 0, 2, 0, 0, 0, 0]), Some(vec![0, 0, 16])];
+        let format_sets: [&[i16]; 4] = [&[], &[0], &[1], &[0, 1, 1, 0, 1, 0, 1]];
+        let all = rows();
+        let mut compared = 0;
+        for subset in [&all[..0], &all[..1], &all[..]] {
+            for fields in [Some(fields.as_slice()), None] {
+                for scales in &scale_sets {
+                    for formats in format_sets {
+                        for omit in [false, true] {
+                            let (old, new) =
+                                both(subset, fields, scales.as_deref(), formats, omit).await;
+                            assert_eq!(
+                                old,
+                                new,
+                                "rows {} fields {} scales {:?} formats {:?} omit {}",
+                                subset.len(),
+                                fields.is_some(),
+                                scales,
+                                formats,
+                                omit
+                            );
+                            compared += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(compared, 3 * 2 * 3 * 4 * 2);
+    }
+
+    #[test]
+    fn a_damaged_result_is_refused_before_anything_is_sent() {
+        let bytes = rows_into_vec(rows());
+        assert!(validate_serialized_rows(&bytes[..bytes.len() - 2]).is_err());
+        // A column length that runs past its row.
+        let mut bad = bytes.clone();
+        let header = if cfg!(feature = "enable_long_row") { 8 } else { 4 };
+        bad[header..header + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(validate_serialized_rows(&bad).is_err());
+    }
 }
 
 fn format_column_binary(db_type: DbType, bytes: &[u8], scale: Option<u32>) -> Option<Vec<u8>> {
@@ -4796,22 +5650,32 @@ fn format_column_binary(db_type: DbType, bytes: &[u8], scale: Option<u32>) -> Op
             if bytes.is_empty() {
                 return None;
             }
-            let document = crate::core::jsonb::decode(bytes).ok()?;
-            let text = document.to_string();
-            let mut out = Vec::with_capacity(text.len() + 1);
+            let mut out = Vec::with_capacity(bytes.len() + 1);
             out.push(1u8);
-            out.extend_from_slice(text.as_bytes());
+            crate::core::jsonb::render_text_into(bytes, &mut out).ok()?;
             Some(out)
         }
-        DbType::I8 | DbType::U8 => {
+        // `int2` on the wire. An `I8` is signed: `bytes[0] as i16` zero-extended
+        // it, so -1 reached a binary client as 255 while the text path said -1.
+        DbType::I8 => {
             if bytes.len() == 1 {
-                let val = bytes[0] as i16;
-                Some(val.to_be_bytes().to_vec())
+                Some(i16::from(bytes[0] as i8).to_be_bytes().to_vec())
             } else {
                 None
             }
         }
-        DbType::I16 | DbType::U16 => {
+        // The unsigned widths are advertised as `int8`, so they go out as
+        // eight bytes; at their own width a binary client refused them.
+        DbType::U8 | DbType::U16 | DbType::U32 => {
+            if matches!(bytes.len(), 1 | 2 | 4) {
+                let mut le = [0u8; 8];
+                le[..bytes.len()].copy_from_slice(bytes);
+                Some(u64::from_le_bytes(le).to_be_bytes().to_vec())
+            } else {
+                None
+            }
+        }
+        DbType::I16 => {
             if bytes.len() == 2 {
                 let mut arr = [0u8; 2];
                 arr.copy_from_slice(bytes);
@@ -4821,7 +5685,7 @@ fn format_column_binary(db_type: DbType, bytes: &[u8], scale: Option<u32>) -> Op
                 None
             }
         }
-        DbType::I32 | DbType::U32 => {
+        DbType::I32 => {
             if bytes.len() == 4 {
                 let mut arr = [0u8; 4];
                 arr.copy_from_slice(bytes);
@@ -4831,7 +5695,7 @@ fn format_column_binary(db_type: DbType, bytes: &[u8], scale: Option<u32>) -> Op
                 None
             }
         }
-        DbType::I64 | DbType::U64 => {
+        DbType::I64 => {
             if bytes.len() == 8 {
                 let mut arr = [0u8; 8];
                 arr.copy_from_slice(bytes);
@@ -4841,6 +5705,10 @@ fn format_column_binary(db_type: DbType, bytes: &[u8], scale: Option<u32>) -> Op
                 None
             }
         }
+        // Advertised as `numeric` (`DbType::pg_oid`): integers wider than
+        // `bigint`, at scale 0. Sent as an 8-byte `int8`, a `UBIGINT` above
+        // `i64::MAX` decoded as negative; a `HUGEINT` went out as text.
+        DbType::U64 | DbType::I128 | DbType::U128 => wide_integer_numeric(db_type, bytes),
         DbType::F32 => {
             if bytes.len() == 4 {
                 let mut arr = [0u8; 4];
@@ -4885,6 +5753,10 @@ fn format_column_binary(db_type: DbType, bytes: &[u8], scale: Option<u32>) -> Op
         }
         // Binary `numeric` is a base-10000 digit string, not a machine integer.
         DbType::DECIMAL => {
+            // A value carrying its own display scale (an `AVG` result).
+            if let Some((v, Some(own))) = crate::core::value_codec::split_decimal_cell(bytes) {
+                return Some(crate::core::value_codec::encode_pg_numeric_with_dscale(v, own));
+            }
             if bytes.len() == 16 {
                 let mut arr = [0u8; 16];
                 arr.copy_from_slice(bytes);
@@ -4908,8 +5780,10 @@ fn format_column_binary(db_type: DbType, bytes: &[u8], scale: Option<u32>) -> Op
                 let mut arr = [0u8; 8];
                 arr.copy_from_slice(bytes);
                 let us = i64::from_le_bytes(arr);
+                // Wrapping, as release builds always did; a debug build
+                // panicked on a value within 2^63 µs of the bottom.
                 Some(
-                    (us - crate::core::value_codec::PG_EPOCH_OFFSET_US)
+                    us.wrapping_sub(crate::core::value_codec::PG_EPOCH_OFFSET_US)
                         .to_be_bytes()
                         .to_vec(),
                 )
@@ -4928,6 +5802,25 @@ fn format_column_binary(db_type: DbType, bytes: &[u8], scale: Option<u32>) -> Op
             } else {
                 Some(bytes.to_vec())
             }
+        }
+        // `inet`'s binary form: family (2 = IPv4, 3 = IPv6), prefix bits, the
+        // is-cidr flag, the address length, the address. It fell through to
+        // the catch-all below, which sent the *text* rendering to a client
+        // that asked for binary, and tokio-postgres failed to deserialise it.
+        // Stored as family (4/6), sixteen address bytes, prefix.
+        DbType::INET => {
+            if bytes.len() != crate::core::value_codec::INET_LEN {
+                return None;
+            }
+            let (family, len) = match bytes[0] {
+                4 => (2u8, 4usize),
+                6 => (3u8, 16usize),
+                _ => return None,
+            };
+            let mut out = Vec::with_capacity(4 + len);
+            out.extend_from_slice(&[family, bytes[17], 0, len as u8]);
+            out.extend_from_slice(&bytes[1..1 + len]);
+            Some(out)
         }
         // Stored in PostgreSQL's binary layout already, so the binary result is
         // the stored bytes. Falling through to the catch-all below would have
@@ -4963,8 +5856,74 @@ fn format_column_text(db_type: DbType, bytes: &[u8]) -> Option<String> {
     format_column_text_scaled(db_type, bytes, None)
 }
 
+/// A `UBIGINT`, `HUGEINT` or `UHUGEINT` value as binary `numeric` at scale 0.
+///
+/// Read through the text renderer, so the two formats cannot disagree about
+/// which number the bytes hold (a value stored as decimal text included).
+fn wide_integer_numeric(db_type: DbType, bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(8 + 2 * 10);
+    match (&db_type, bytes.len()) {
+        (DbType::U64, 8) => crate::core::value_codec::encode_pg_numeric_u128_into(
+            u64::from_le_bytes(bytes.try_into().ok()?) as u128,
+            &mut out,
+        ),
+        (DbType::U128, 16) => crate::core::value_codec::encode_pg_numeric_u128_into(
+            u128::from_le_bytes(bytes.try_into().ok()?),
+            &mut out,
+        ),
+        (DbType::I128, 16) => crate::core::value_codec::encode_pg_numeric_i128_into(
+            i128::from_le_bytes(bytes.try_into().ok()?),
+            &mut out,
+        ),
+        _ => {
+            let text = format_column_text(db_type, bytes)?;
+            if text.starts_with('-') {
+                crate::core::value_codec::encode_pg_numeric_i128_into(text.parse().ok()?, &mut out);
+            } else {
+                crate::core::value_codec::encode_pg_numeric_u128_into(text.parse().ok()?, &mut out);
+            }
+        }
+    }
+    Some(out)
+}
+
+/// `String::from_utf8_lossy(bytes).to_string()`, with one copy instead of
+/// three when the bytes are valid UTF-8.
+fn text_from_bytes(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text.to_owned(),
+        Err(_) => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
+/// The declared decimal scale of each `RETURNING` item, when the table has any
+/// `NUMERIC(p, s)` column. A computed item is evaluated at the engine scale.
+fn returning_scales(database: &Arc<Database>, table: &str, sql: &str) -> Option<Vec<u32>> {
+    let fields = database.tables.get(table).and_then(|t| {
+        (!t.schema.type_modifiers.is_empty()).then(|| t.schema.fields.clone())
+    })?;
+    let items = crate::core::rql::lexer_ir::returning_items(sql, &fields)?.ok()?;
+    let engine = crate::core::value_codec::DECIMAL_SCALE;
+    Some(
+        items
+            .iter()
+            .map(|item| match item {
+                crate::core::rql::lexer_ir::ReturningItem::Column(field) => field.scale.unwrap_or(engine),
+                crate::core::rql::lexer_ir::ReturningItem::Computed { .. } => engine,
+            })
+            .collect(),
+    )
+}
+
 /// Renders a value, honouring a column's declared decimal scale.
 fn format_column_text_scaled(db_type: DbType, bytes: &[u8], scale: Option<u32>) -> Option<String> {
+    // A value carrying its own display scale (an `AVG` result) wins over the
+    // column's.
+    if db_type == DbType::DECIMAL {
+        if let Some((v, Some(own))) = crate::core::value_codec::split_decimal_cell(bytes) {
+            return Some(crate::core::value_codec::format_decimal_scaled(v, own));
+        }
+    }
     if let (DbType::DECIMAL, Some(scale)) = (&db_type, scale) {
         if bytes.len() == 16 {
             let mut arr = [0u8; 16];
@@ -5105,8 +6064,10 @@ fn format_column_text_inner(db_type: DbType, bytes: &[u8]) -> Option<String> {
         // JSON itself. The type exists to change what the column is *called* on
         // the wire, not how it is written.
         DbType::STRING | DbType::UNKNOWN | DbType::JSON => {
-            // Treat as UTF-8 text.
-            String::from_utf8_lossy(bytes).to_string()
+            // Treat as UTF-8 text. Valid text — nearly always — is one
+            // validating pass and one copy; only invalid bytes take the lossy
+            // path and its replacement characters.
+            text_from_bytes(bytes)
         }
 
         // A stored document, rendered back to the JSON text a client expects.
@@ -5116,8 +6077,9 @@ fn format_column_text_inner(db_type: DbType, bytes: &[u8]) -> Option<String> {
             if bytes.is_empty() {
                 String::new()
             } else {
-                match crate::core::jsonb::decode(bytes) {
-                    Ok(document) => document.to_string(),
+                let mut out = Vec::with_capacity(bytes.len());
+                match crate::core::jsonb::render_text_into(bytes, &mut out) {
+                    Ok(()) => String::from_utf8(out).ok()?,
                     // Refused rather than shown as mojibake: a column holding
                     // something that is not a document is a bug worth seeing.
                     Err(e) => {
@@ -5132,7 +6094,10 @@ fn format_column_text_inner(db_type: DbType, bytes: &[u8]) -> Option<String> {
             // 8-byte LE microseconds since the Unix epoch. The server reports
             // TimeZone=UTC at startup, so the offset is always +00.
             let Some(us) = le_i64(bytes) else { return None };
-            format!("{}+00", crate::core::value_codec::format_timestamp_us(us))
+            let mut out = Vec::with_capacity(29);
+            crate::core::value_codec::format_timestamp_us_into(us, &mut out);
+            out.extend_from_slice(b"+00");
+            String::from_utf8(out).ok()?
         }
 
         DbType::UUID => {
@@ -5154,10 +6119,13 @@ fn format_column_text_inner(db_type: DbType, bytes: &[u8]) -> Option<String> {
             None => return None,
         },
 
-        DbType::DECIMAL => {
-            let Some(v) = le_i128(bytes) else { return None };
-            crate::core::value_codec::format_decimal(v)
-        }
+        DbType::DECIMAL => match crate::core::value_codec::split_decimal_cell(bytes) {
+            Some((v, Some(own))) => crate::core::value_codec::format_decimal_scaled(v, own),
+            _ => {
+                let Some(v) = le_i128(bytes) else { return None };
+                crate::core::value_codec::format_decimal(v)
+            }
+        },
 
         DbType::BOOL => {
             // Postgres canonical text is 't' or 'f'.
@@ -5179,7 +6147,7 @@ fn format_column_text_inner(db_type: DbType, bytes: &[u8]) -> Option<String> {
                     .map(|c| c.to_string())
                     .unwrap_or_else(|| code.to_string())
             } else {
-                String::from_utf8_lossy(bytes).to_string()
+                text_from_bytes(bytes)
             }
         }
 
@@ -5268,10 +6236,12 @@ fn format_column_text_inner(db_type: DbType, bytes: &[u8]) -> Option<String> {
             }
         }
         DbType::I128 => {
-            if let Some(s) = ascii_decimal(bytes) {
-                s.to_string()
-            } else if let Some(v) = le_i128(bytes) {
+            // Width first, as for `U64`: sixteen bytes that happen to be
+            // ASCII digits are still a binary `i128`.
+            if let Some(v) = le_i128(bytes) {
                 v.to_string()
+            } else if let Some(s) = ascii_decimal(bytes) {
+                s.to_string()
             } else {
                 return None;
             }
@@ -5362,10 +6332,10 @@ fn format_column_text_inner(db_type: DbType, bytes: &[u8]) -> Option<String> {
             }
         }
         DbType::U128 => {
-            if let Some(s) = ascii_decimal(bytes) {
-                s.to_string()
-            } else if let Some(v) = le_u128(bytes) {
+            if let Some(v) = le_u128(bytes) {
                 v.to_string()
+            } else if let Some(s) = ascii_decimal(bytes) {
+                s.to_string()
             } else {
                 return None;
             }
@@ -5540,9 +6510,7 @@ where
 
         AuthMethod::Md5 => {
             let mut salt = [0u8; 4];
-            for byte in salt.iter_mut() {
-                *byte = fastrand::u8(..);
-            }
+            crate::auth::fill_random(&mut salt);
             let mut payload = Vec::with_capacity(8);
             payload.extend_from_slice(&5i32.to_be_bytes());
             payload.extend_from_slice(&salt);
@@ -5658,6 +6626,15 @@ where
     let mut tag = [0u8; 1];
     stream.read_exact(&mut tag).await?;
     let len = read_i32_be(stream).await?;
+    // Only authentication exchanges read through here, before the client has
+    // proved anything, so the length is capped as PostgreSQL caps an auth
+    // message (PG_MAX_AUTH_TOKEN_LENGTH) rather than allocated as asked.
+    if len > MAX_AUTH_MESSAGE_LENGTH {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "authentication message too long",
+        ));
+    }
     if len < 4 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -5690,13 +6667,12 @@ where
     send_message(stream, b'S', &payload).await
 }
 
-async fn send_backend_key_data<S>(stream: &mut S) -> io::Result<()>
+async fn send_backend_key_data<S>(stream: &mut S, pid: i32, key: i32) -> io::Result<()>
 where
     S: AsyncWrite + Unpin,
 {
-    // We don't implement CancelRequest, so this is just filler.
-    let pid = std::process::id() as i32;
-    let key = fastrand::i32(..);
+    // What a client sends back in a CancelRequest to stop this session's
+    // running statement; see `cancel::register_session`.
     let mut payload = Vec::with_capacity(8);
     payload.extend_from_slice(&pid.to_be_bytes());
     payload.extend_from_slice(&key.to_be_bytes());
@@ -5707,17 +6683,45 @@ async fn send_ready_for_query<S>(stream: &mut S, status: u8) -> io::Result<()>
 where
     S: AsyncWrite + Unpin,
 {
-    send_message(stream, b'Z', &[status]).await
+    send_message(stream, b'Z', &[status]).await?;
+    // The end of a statement or batch: the client is waiting for all of it.
+    stream.flush().await
 }
 
 async fn send_command_complete<S>(stream: &mut S, tag: &str) -> io::Result<()>
 where
     S: AsyncWrite + Unpin,
 {
+    // Whatever the engine raised for this statement goes first, as
+    // PostgreSQL orders it: notices, then the completion they belong to.
+    for notice in crate::core::notice::drain() {
+        send_engine_notice(stream, &notice).await?;
+    }
     let mut payload = Vec::with_capacity(tag.len() + 1);
     payload.extend_from_slice(tag.as_bytes());
     payload.push(0);
     send_message(stream, b'C', &payload).await
+}
+
+/// A `NoticeResponse` for a notice the engine raised: severity (localised
+/// `S` and non-localised `V`), SQLSTATE and message.
+async fn send_engine_notice<S>(stream: &mut S, notice: &crate::core::notice::Notice) -> io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let mut payload = Vec::with_capacity(notice.message.len() + 32);
+    for (field, value) in [
+        (b'S', notice.severity),
+        (b'V', notice.severity),
+        (b'C', notice.sqlstate),
+        (b'M', notice.message.as_str()),
+    ] {
+        payload.push(field);
+        payload.extend_from_slice(value.as_bytes());
+        payload.push(0);
+    }
+    payload.push(0);
+    send_message(stream, b'N', &payload).await
 }
 
 async fn send_error_response<S>(stream: &mut S, sqlstate: &str, message: &str) -> io::Result<()>
@@ -5742,7 +6746,10 @@ where
 
     payload.push(0);
 
-    send_message(stream, b'E', &payload).await
+    send_message(stream, b'E', &payload).await?;
+    // Sent now rather than at the next `ReadyForQuery`: an error must reach
+    // the client even on a path that ends the session instead.
+    stream.flush().await
 }
 /// A `NoticeResponse`: something the client should hear about that is not an
 /// error. `BEGIN` inside a block and `COMMIT` outside one are both notices in
@@ -5771,13 +6778,14 @@ where
     send_message(stream, b'N', &payload).await
 }
 
-async fn send_row_description<S>(
+async fn send_row_description<S, N>(
     stream: &mut S,
-    fields: &[(&str, DbType)],
+    fields: &[(N, DbType)],
     result_formats: &[i16],
 ) -> io::Result<()>
 where
     S: AsyncWrite + Unpin,
+    N: AsRef<str>,
 {
     // RowDescription message:
     // 'T'
@@ -5799,7 +6807,7 @@ where
 
     for (i, (name, db_type)) in fields.iter().enumerate() {
         // field name
-        payload.extend_from_slice(name.as_bytes());
+        payload.extend_from_slice(name.as_ref().as_bytes());
         payload.push(0);
 
         // table_oid
@@ -5858,22 +6866,28 @@ where
     #[cfg(feature = "query_stats")]
     crate::core::query_stats::note_rows(1);
 
-    let mut payload = Vec::new();
+    // The whole frame in one buffer, length patched in at the end, so the
+    // row is one write.
+    let mut frame = Vec::with_capacity(
+        7 + values.iter().map(|v| 4 + v.map_or(0, <[u8]>::len)).sum::<usize>(),
+    );
+    let start = wire_out::begin_message(&mut frame, b'D');
     let count: i16 = values.len().try_into().unwrap_or(i16::MAX);
-    payload.extend_from_slice(&count.to_be_bytes());
+    frame.extend_from_slice(&count.to_be_bytes());
 
     for v in values {
         match v {
-            None => payload.extend_from_slice(&(-1i32).to_be_bytes()),
+            None => frame.extend_from_slice(&(-1i32).to_be_bytes()),
             Some(bytes) => {
                 let len: i32 = bytes.len().try_into().unwrap_or(i32::MAX);
-                payload.extend_from_slice(&len.to_be_bytes());
-                payload.extend_from_slice(bytes);
+                frame.extend_from_slice(&len.to_be_bytes());
+                frame.extend_from_slice(bytes);
             }
         }
     }
 
-    send_message(stream, b'D', &payload).await
+    wire_out::finish_message(&mut frame, start)?;
+    stream.write_all(&frame).await
 }
 
 // fn db_type_to_pg(t: DbType) -> (i32, i16) {
@@ -5900,12 +6914,56 @@ where
         .try_into()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "message too large"))?;
 
-    stream.write_all(&[tag]).await?;
-    stream.write_all(&len.to_be_bytes()).await?;
+    let mut header = [0u8; 5];
+    header[0] = tag;
+    header[1..].copy_from_slice(&len.to_be_bytes());
+    stream.write_all(&header).await?;
     stream.write_all(payload).await?;
-    // For TLS streams (tokio-rustls), writes may be buffered until flush.
-    stream.flush().await?;
+    // Not flushed here. The session stream (`wire_out::WireStream`) buffers,
+    // and is flushed at `ReadyForQuery`, at a `Flush` message, on an error,
+    // and before any read that has to wait on the client — the last of which
+    // covers every exchange, such as authentication, that waits for a reply
+    // without a `ReadyForQuery`. The few writes made before the session is
+    // wrapped flush themselves.
     Ok(())
+}
+
+/// PostgreSQL's `PQ_LARGE_MESSAGE_LIMIT` and `PQ_SMALL_MESSAGE_LIMIT`.
+const LARGE_MESSAGE_LIMIT: u64 = 0x3fff_ffff;
+const SMALL_MESSAGE_LIMIT: u64 = 10_000;
+
+/// The longest body a frontend message of type `tag` may have, as
+/// PostgreSQL's `SocketBackend` assigns it: messages that carry statement text
+/// or data may be large, the fixed-shape control messages may not. A type
+/// PostgreSQL does not accept gets the small limit; it is refused once read.
+fn frontend_message_limit(tag: u8) -> u64 {
+    match tag {
+        // Query, FunctionCall, CopyData, Bind, Parse.
+        b'Q' | b'F' | b'd' | b'B' | b'P' => LARGE_MESSAGE_LIMIT,
+        // Terminate, Close, Describe, Execute, Flush, Sync, CopyDone, CopyFail.
+        _ => SMALL_MESSAGE_LIMIT,
+    }
+}
+
+/// Reads a message body of `len` bytes, growing the buffer as bytes arrive.
+///
+/// The length has passed the type's limit, but it is still only a claim: a
+/// client that claims 900 MB and sends nothing would otherwise pin 900 MB for
+/// as long as it keeps the socket open. The buffer starts small and grows by
+/// what has actually been read.
+async fn read_message_body<S>(stream: &mut S, len: usize) -> io::Result<Vec<u8>>
+where
+    S: AsyncRead + Unpin,
+{
+    const STEP: usize = 1 << 20;
+    let mut payload: Vec<u8> = Vec::with_capacity(len.min(STEP));
+    while payload.len() < len {
+        let want = (len - payload.len()).min(STEP);
+        let start = payload.len();
+        payload.resize(start + want, 0);
+        stream.read_exact(&mut payload[start..]).await?;
+    }
+    Ok(payload)
 }
 
 async fn read_i32_be<S>(stream: &mut S) -> io::Result<i32>
@@ -5943,12 +7001,21 @@ fn parse_startup_parameters(payload: &[u8]) -> HashMap<String, String> {
     out
 }
 
+/// PostgreSQL's `MAX_STARTUP_PACKET_LENGTH`.
+const MAX_STARTUP_PACKET_LENGTH: i32 = 10_000;
+/// PostgreSQL's `PG_MAX_AUTH_TOKEN_LENGTH`, plus the four length bytes.
+const MAX_AUTH_MESSAGE_LENGTH: i32 = 65_535 + 4;
+
 async fn read_startup_packet<S>(stream: &mut S) -> io::Result<(i32, Vec<u8>)>
 where
     S: AsyncRead + Unpin,
 {
     let len = read_i32_be(stream).await?;
-    if len < 8 {
+    // Bounded before allocating: the length is chosen by a client that has not
+    // authenticated, and up to 2 GiB of `vec![0; len]` was an allocation the
+    // process could not survive. PostgreSQL caps the startup packet at 10,000
+    // bytes (MAX_STARTUP_PACKET_LENGTH) for the same reason.
+    if !(8..=MAX_STARTUP_PACKET_LENGTH).contains(&len) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid startup packet",
@@ -5983,7 +7050,9 @@ where
 
     payload.push(0);
 
-    send_message(stream, b'E', &payload).await
+    send_message(stream, b'E', &payload).await?;
+    // The session ends after this; nothing else will flush it.
+    stream.flush().await
 }
 
 /// Installs the process-wide crypto provider rustls needs.
@@ -6049,6 +7118,106 @@ fn load_tls_from_pem(
 fn read_cstring(bytes: &[u8]) -> &str {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     std::str::from_utf8(&bytes[..end]).unwrap_or("")
+}
+
+#[cfg(test)]
+mod engine_notice_tests {
+    use super::*;
+
+    /// A notice the engine raises during a statement reaches the client as a
+    /// `NoticeResponse` with S, V, C and M fields, before that statement's
+    /// `CommandComplete` — the order PostgreSQL uses and drivers expect.
+    #[tokio::test]
+    async fn engine_notices_precede_command_complete() {
+        let (mut ours, mut theirs) = tokio::io::duplex(4096);
+        crate::core::notice::collect(async {
+            crate::core::notice::push("WARNING", "01000", "space not returned");
+            send_command_complete(&mut ours, "VACUUM").await.unwrap();
+            // Sent once: the next statement starts clean.
+            send_command_complete(&mut ours, "SELECT 0").await.unwrap();
+        })
+        .await;
+        drop(ours);
+        let mut bytes = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut theirs, &mut bytes)
+            .await
+            .unwrap();
+
+        assert_eq!(bytes[0], b'N', "the notice must come first");
+        let len = i32::from_be_bytes(bytes[1..5].try_into().unwrap()) as usize;
+        let body = &bytes[5..1 + len];
+        let fields: Vec<(u8, String)> = body
+            .split(|b| *b == 0)
+            .filter(|f| !f.is_empty())
+            .map(|f| (f[0], String::from_utf8_lossy(&f[1..]).to_string()))
+            .collect();
+        assert_eq!(
+            fields,
+            vec![
+                (b'S', "WARNING".to_string()),
+                (b'V', "WARNING".to_string()),
+                (b'C', "01000".to_string()),
+                (b'M', "space not returned".to_string()),
+            ]
+        );
+        let rest = &bytes[1 + len..];
+        assert_eq!(rest[0], b'C');
+        let tags: Vec<u8> = {
+            let mut tags = Vec::new();
+            let mut i = 0;
+            while i < rest.len() {
+                tags.push(rest[i]);
+                let l = i32::from_be_bytes(rest[i + 1..i + 5].try_into().unwrap()) as usize;
+                i += 1 + l;
+            }
+            tags
+        };
+        assert_eq!(tags, vec![b'C', b'C'], "the notice was sent twice");
+    }
+}
+
+#[cfg(test)]
+mod pre_auth_length_tests {
+    use super::*;
+
+    /// A client that has not authenticated chooses these lengths. A 2 GiB
+    /// claim must be refused as malformed before anything is allocated — the
+    /// old code allocated it and only then failed to read (or, on a smaller
+    /// machine, took the process down).
+    fn run<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    #[test]
+    fn an_oversized_startup_packet_is_refused_before_allocating() {
+        run(async {
+        for len in [i32::MAX, MAX_STARTUP_PACKET_LENGTH + 1] {
+            let bytes = len.to_be_bytes();
+            let mut stream: &[u8] = &bytes;
+            let err = read_startup_packet(&mut stream).await.unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "length {len}");
+        }
+        // The largest legal one still reads.
+        let mut packet = MAX_STARTUP_PACKET_LENGTH.to_be_bytes().to_vec();
+        packet.resize(MAX_STARTUP_PACKET_LENGTH as usize, 0);
+        let mut stream: &[u8] = &packet;
+        assert!(read_startup_packet(&mut stream).await.is_ok());
+        });
+    }
+
+    #[test]
+    fn an_oversized_auth_message_is_refused_before_allocating() {
+        run(async {
+        let mut bytes = vec![b'p'];
+        bytes.extend_from_slice(&i32::MAX.to_be_bytes());
+        let mut stream: &[u8] = &bytes;
+        let err = read_message(&mut stream).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        });
+    }
 }
 
 #[cfg(test)]
@@ -6472,7 +7641,7 @@ mod describe_rowless_family_tests {
             is_select,
             "SHOW BACKUPS returns rows, so it must describe as a select"
         );
-        let names: Vec<&str> = fields.iter().map(|(name, _)| *name).collect();
+        let names: Vec<&str> = fields.iter().map(|(name, _)| name.as_str()).collect();
         assert_eq!(
             names,
             vec![
@@ -6501,7 +7670,7 @@ mod describe_rowless_family_tests {
                 .expect("RESTORE described as returning no columns");
 
         assert!(is_select);
-        assert_eq!(fields.first().map(|(name, _)| *name), Some("snapshot_id"));
+        assert_eq!(fields.first().map(|(name, _)| name.as_str()), Some("snapshot_id"));
     }
 
     /// A counted statement is *correctly* undescribable — it reports a count,

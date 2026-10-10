@@ -101,10 +101,10 @@ pub fn wal_checkpoint_bytes() -> u64 {
 /// is set, so the tuning cannot help the one allocation that matters and only
 /// retains the rest.
 ///
-/// **The buffer is the actual bug.** A scan materialises `Vec<Row>` and `Row`
-/// is 1560 bytes whatever it holds, because `columns` is a
-/// `SmallVec<[Column; 32]>` — 32 inline columns for a five-column table. Make
-/// that buffer proportional to the data and none of this tuning is needed.
+/// **The buffer is the actual bug.** A scan materialises `Vec<Row>`, and `Row`
+/// was 1560 bytes whatever it held, because `columns` inlined 32 columns for a
+/// five-column table. It now inlines `row::ROW_INLINE_COLUMNS` (12); making
+/// that buffer proportional to the data is what makes this tuning unneeded.
 ///
 /// Idempotent, and a no-op off glibc.
 pub fn tune_allocator() {

@@ -2,6 +2,10 @@
 pub mod backup;
 pub mod bulk_load;
 pub mod cancel;
+pub mod notice;
+pub mod sync_audit;
+#[cfg(test)]
+mod downgrade_tests;
 pub mod database;
 pub mod db_type;
 pub mod filter;
@@ -27,6 +31,8 @@ pub mod redact;
 pub mod row;
 pub mod rql;
 pub mod similar_to;
+/// The shared quote-aware scanner, and escape/dollar-string normalisation.
+pub mod sql_scan;
 /// Several storage directories for one database, behind the `storage_pools`
 /// feature.
 #[cfg(feature = "storage_pools")]

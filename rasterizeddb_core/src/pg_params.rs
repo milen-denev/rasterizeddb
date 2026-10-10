@@ -42,6 +42,28 @@ pub const OID_NUMERIC: i32 = 1700;
 pub const OID_UUID: i32 = 2950;
 pub const OID_JSON: i32 = 114;
 pub const OID_JSONB: i32 = 3802;
+pub const OID_TIMETZ: i32 = 1266;
+pub const OID_INTERVAL: i32 = 1186;
+pub const OID_INET: i32 = 869;
+pub const OID_CIDR: i32 = 650;
+pub const OID_MACADDR: i32 = 829;
+pub const OID_MACADDR8: i32 = 774;
+pub const OID_MONEY: i32 = 790;
+pub const OID_BIT: i32 = 1560;
+pub const OID_VARBIT: i32 = 1562;
+pub const OID_POINT: i32 = 600;
+pub const OID_LSEG: i32 = 601;
+pub const OID_PATH: i32 = 602;
+pub const OID_BOX: i32 = 603;
+pub const OID_POLYGON: i32 = 604;
+pub const OID_LINE: i32 = 628;
+pub const OID_CIRCLE: i32 = 718;
+pub const OID_INT4RANGE: i32 = 3904;
+pub const OID_NUMRANGE: i32 = 3906;
+pub const OID_TSRANGE: i32 = 3908;
+pub const OID_TSTZRANGE: i32 = 3910;
+pub const OID_DATERANGE: i32 = 3912;
+pub const OID_INT8RANGE: i32 = 3926;
 
 /// Postgres timestamps count microseconds from 2000-01-01, Unix epoch counts
 /// seconds from 1970-01-01. This is the gap, in microseconds.
@@ -73,83 +95,49 @@ pub fn oid_to_db_type(oid: i32) -> Option<DbType> {
 /// bodies, and comments are left alone, so a statement that merely *mentions*
 /// `$1` in text is not corrupted.
 pub fn inline_params(sql: &str, params: &[BoundParam]) -> Result<String, String> {
-    if params.is_empty() || !sql.as_bytes().contains(&b'$') {
+    let bytes = sql.as_bytes();
+    if params.is_empty() || memchr::memchr(b'$', bytes).is_none() {
         return Ok(sql.to_string());
     }
 
-    let bytes = sql.as_bytes();
+    // Everything but a placeholder is copied verbatim, so the text is copied
+    // in runs: `copied` marks the start of the run not yet written, and only a
+    // substitution flushes it. The scan itself jumps between the bytes that
+    // can start something — a quote, a comment, a `$` — rather than visiting
+    // every character; the body of a string literal, which is most of a wide
+    // INSERT, is crossed with one `memchr`.
     let mut out = String::with_capacity(sql.len() + params.len() * 16);
+    let mut copied = 0usize;
     let mut i = 0usize;
 
     while i < bytes.len() {
-        let c = bytes[i];
-        match c {
-            // Single-quoted string literal; '' is an escaped quote.
-            b'\'' => {
-                let start = i;
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b'\'' {
-                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                            i += 2;
-                            continue;
-                        }
-                        i += 1;
-                        break;
-                    }
-                    i += 1;
-                }
-                out.push_str(&sql[start..i]);
-            }
+        match bytes[i..].iter().position(|&b| SQL_SPECIAL[b as usize]) {
+            Some(p) => i += p,
+            None => break,
+        }
+        match bytes[i] {
+            // Single-quoted string literal; '' is an escaped quote. After an
+            // `E` prefix a backslash escapes the next byte as well, so `\'`
+            // does not end it.
+            b'\'' => i = string_literal_end(bytes, i, is_escape_string_quote(bytes, i)),
             // Quoted identifier; "" is an escaped quote.
-            b'"' => {
-                let start = i;
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b'"' {
-                        if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
-                            i += 2;
-                            continue;
-                        }
-                        i += 1;
-                        break;
-                    }
-                    i += 1;
-                }
-                out.push_str(&sql[start..i]);
-            }
-            // Line comment.
-            b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
-                let start = i;
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-                out.push_str(&sql[start..i]);
+            b'"' => i = quoted_end(bytes, i, b'"'),
+            // Line comment, up to (not including) the newline.
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                i = memchr::memchr(b'\n', &bytes[i..]).map_or(bytes.len(), |p| i + p);
             }
             // Block comment, which Postgres allows to nest.
-            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
-                let start = i;
-                let mut depth = 1usize;
-                i += 2;
-                while i < bytes.len() && depth > 0 {
-                    if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
-                        depth += 1;
-                        i += 2;
-                    } else if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-                        depth -= 1;
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
-                }
-                out.push_str(&sql[start..i]);
-            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => i = block_comment_end(bytes, i),
             b'$' => {
-                // `$tag$ ... $tag$` dollar-quoted body, or a `$N` placeholder.
-                if let Some(end) = dollar_quote_end(bytes, i) {
-                    out.push_str(&sql[i..end]);
-                    i = end;
-                    continue;
+                // `$tag$ ... $tag$` dollar-quoted body — unless the `$` is
+                // inside an identifier, where PostgreSQL allows it — or a `$N`
+                // placeholder.
+                let in_identifier = i > 0 && is_identifier_byte(bytes[i - 1]);
+                if !in_identifier {
+                    if let Some(end) = dollar_quote_end(bytes, i) {
+                        i = end;
+                        continue;
+                    }
                 }
 
                 let mut j = i + 1;
@@ -157,8 +145,7 @@ pub fn inline_params(sql: &str, params: &[BoundParam]) -> Result<String, String>
                     j += 1;
                 }
                 if j == i + 1 {
-                    // A bare `$` that starts nothing; emit it unchanged.
-                    out.push('$');
+                    // A bare `$` that starts nothing; left as it is.
                     i += 1;
                     continue;
                 }
@@ -172,7 +159,8 @@ pub fn inline_params(sql: &str, params: &[BoundParam]) -> Result<String, String>
                         n
                     ));
                 }
-                out.push_str(&param_to_literal(&params[n - 1])?);
+                out.push_str(&sql[copied..i]);
+                push_param_literal(&mut out, &params[n - 1])?;
                 i = j;
 
                 // A cast written on the placeholder goes with it.
@@ -215,20 +203,108 @@ pub fn inline_params(sql: &str, params: &[BoundParam]) -> Result<String, String>
                         i = k;
                     }
                 }
+                copied = i;
             }
-            _ => {
-                // Copy the whole UTF-8 sequence, not just the lead byte.
-                let ch_len = utf8_len(c);
-                let end = (i + ch_len).min(bytes.len());
-                out.push_str(&sql[i..end]);
-                i = end;
-            }
+            // A lone `-` or `/`.
+            _ => i += 1,
         }
     }
 
+    out.push_str(&sql[copied..]);
     Ok(out)
 }
 
+/// The bytes that can begin a construct `inline_params` must look inside or
+/// step over. Every other byte — including every byte of a multi-byte UTF-8
+/// character, all of which are >= 0x80 — is copied as it stands.
+static SQL_SPECIAL: [bool; 256] = {
+    let mut table = [false; 256];
+    table[b'\'' as usize] = true;
+    table[b'"' as usize] = true;
+    table[b'-' as usize] = true;
+    table[b'/' as usize] = true;
+    table[b'$' as usize] = true;
+    table
+};
+
+/// A byte that continues an identifier, so a `$` or a quote right after it
+/// belongs to (or follows) a name rather than opening something.
+#[inline]
+fn is_identifier_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
+}
+
+/// True when the `'` at `quote` opens an escape string: `E'…'` / `e'…'`, with
+/// the `E` a word of its own rather than the end of an identifier.
+#[inline]
+fn is_escape_string_quote(bytes: &[u8], quote: usize) -> bool {
+    quote >= 1
+        && matches!(bytes[quote - 1], b'E' | b'e')
+        && (quote < 2 || !(is_identifier_byte(bytes[quote - 2]) || bytes[quote - 2] == b'$'))
+}
+
+/// Index just past the string literal opening at `start` (or the end of the
+/// text when it is unterminated). In an escape string a backslash escapes
+/// whatever byte follows it.
+fn string_literal_end(bytes: &[u8], start: usize, escapes: bool) -> usize {
+    let mut i = start + 1;
+    loop {
+        let found = if escapes {
+            memchr::memchr2(b'\'', b'\\', &bytes[i..])
+        } else {
+            memchr::memchr(b'\'', &bytes[i..])
+        };
+        let Some(p) = found else {
+            return bytes.len();
+        };
+        i += p;
+        if bytes[i] == b'\\' {
+            i = (i + 2).min(bytes.len());
+            continue;
+        }
+        // A quote: doubled, it is an escaped quote and the literal goes on.
+        if bytes.get(i + 1) == Some(&b'\'') {
+            i += 2;
+            continue;
+        }
+        return i + 1;
+    }
+}
+
+/// Index just past the `quote`-delimited run opening at `start`, where a
+/// doubled quote stands for itself.
+fn quoted_end(bytes: &[u8], start: usize, quote: u8) -> usize {
+    let mut i = start + 1;
+    while let Some(p) = memchr::memchr(quote, &bytes[i..]) {
+        i += p;
+        if bytes.get(i + 1) == Some(&quote) {
+            i += 2;
+            continue;
+        }
+        return i + 1;
+    }
+    bytes.len()
+}
+
+/// Index just past the (possibly nested) block comment opening at `start`.
+fn block_comment_end(bytes: &[u8], start: usize) -> usize {
+    let mut depth = 1usize;
+    let mut i = start + 2;
+    while i < bytes.len() && depth > 0 {
+        if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            depth += 1;
+            i += 2;
+        } else if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            depth -= 1;
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    i
+}
+
+#[cfg(test)]
 #[inline]
 fn utf8_len(b: u8) -> usize {
     if b < 0x80 {
@@ -285,27 +361,64 @@ pub fn param_to_literal(p: &BoundParam) -> Result<String, String> {
     binary_param_literal(p.oid, raw)
 }
 
+/// [`param_to_literal`], appended to `out` — the form `inline_params` uses, so
+/// the common text and string parameters are quoted straight into the
+/// statement rather than into a `String` of their own first.
+fn push_param_literal(out: &mut String, p: &BoundParam) -> Result<(), String> {
+    let Some(raw) = p.value.as_deref() else {
+        out.push_str("NULL");
+        return Ok(());
+    };
+
+    if p.format == 0 {
+        let text = std::str::from_utf8(raw)
+            .map_err(|_| "text parameter is not valid UTF-8".to_string())?;
+        push_text_param_literal(out, p.oid, text);
+        return Ok(());
+    }
+
+    match p.oid {
+        OID_TEXT | OID_VARCHAR | OID_BPCHAR | OID_NAME | OID_CHAR => {
+            let s = std::str::from_utf8(raw)
+                .map_err(|_| "binary text parameter is not valid UTF-8".to_string())?;
+            push_quoted_literal(out, s);
+            Ok(())
+        }
+        _ => {
+            out.push_str(&binary_param_literal(p.oid, raw)?);
+            Ok(())
+        }
+    }
+}
+
 /// Text-format parameters arrive already in their SQL rendering; only quoting
 /// needs deciding, and that follows from the declared type.
 fn text_param_literal(oid: i32, text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    push_text_param_literal(&mut out, oid, text);
+    out
+}
+
+/// [`text_param_literal`], appended to `out`.
+fn push_text_param_literal(out: &mut String, oid: i32, text: &str) {
     match oid {
         OID_BOOL => {
             let t = matches!(text, "t" | "true" | "TRUE" | "1" | "y" | "yes" | "on");
-            if t { "1".to_string() } else { "0".to_string() }
+            out.push_str(if t { "1" } else { "0" });
         }
         OID_INT2 | OID_INT4 | OID_INT8 | OID_OID | OID_FLOAT4 | OID_FLOAT8 | OID_NUMERIC => {
             // Numeric shapes pass through; anything else is quoted so a
             // malformed value fails as a value rather than as syntax.
             if is_numeric_literal(text) {
-                text.to_string()
+                out.push_str(text);
             } else {
-                quote_literal(text)
+                push_quoted_literal(out, text);
             }
         }
         // An unspecified OID (0) is whatever the text looks like: sqlx sends
         // this for untyped placeholders.
-        0 if is_numeric_literal(text) => text.to_string(),
-        _ => quote_literal(text),
+        0 if is_numeric_literal(text) => out.push_str(text),
+        _ => push_quoted_literal(out, text),
     }
 }
 
@@ -376,19 +489,128 @@ fn binary_param_literal(oid: i32, raw: &[u8]) -> Result<String, String> {
             Ok(quote_literal(s))
         }
         OID_BYTEA => {
-            let mut s = String::with_capacity(raw.len() * 2 + 4);
-            s.push_str("'\\x");
-            for b in raw {
-                s.push_str(&format!("{:02x}", b));
-            }
-            s.push('\'');
-            Ok(s)
+            // The shared nibble table rather than a `format!` per byte, which
+            // allocated a String for every byte of the value.
+            let mut s = Vec::with_capacity(raw.len() * 2 + 4);
+            s.push(b'\'');
+            crate::core::value_codec::format_bytea_into(raw, &mut s);
+            s.push(b'\'');
+            Ok(String::from_utf8(s).expect("a quote, \\x and hex digits are ASCII"))
+        }
+        // The types stored in PostgreSQL's own wire layout
+        // (`pg_types`): a binary parameter *is* the stored form, so it is
+        // rendered by the same formatter the result path uses, and the
+        // literal then parses back to exactly those bytes — one codec, so the
+        // binary and text binds of a value cannot store different bytes.
+        OID_TIMETZ | OID_INTERVAL | OID_MACADDR | OID_MACADDR8 | OID_BIT | OID_VARBIT
+        | OID_POINT | OID_LSEG | OID_PATH | OID_BOX | OID_POLYGON | OID_LINE | OID_CIRCLE
+        | OID_INT4RANGE | OID_INT8RANGE | OID_NUMRANGE | OID_TSRANGE | OID_TSTZRANGE
+        | OID_DATERANGE => {
+            let text = wire_type_text(oid, raw)
+                .ok_or_else(|| format!("binary parameter of type OID {} is malformed", oid))?;
+            Ok(quote_literal(&text))
+        }
+        // `inet` / `cidr`: family (2 = IPv4, 3 = IPv6), prefix bits, the
+        // is-cidr flag, the address length, then the address.
+        OID_INET | OID_CIDR => {
+            let text = inet_text(oid, raw)
+                .ok_or_else(|| "binary inet parameter is malformed".to_string())?;
+            Ok(quote_literal(&text))
+        }
+        // `money`: an `int8` count of cents (the scale `lc_monetary` gives
+        // every locale this engine runs in), rendered as an exact amount.
+        OID_MONEY => {
+            let cents = be_i64(raw)?;
+            let sign = if cents < 0 { "-" } else { "" };
+            let magnitude = cents.unsigned_abs();
+            Ok(format!("{}{}.{:02}", sign, magnitude / 100, magnitude % 100))
         }
         _ => match array_element_oid(oid) {
             Some(element) => binary_array_literal(element, raw),
             None => Err(format!("unsupported binary parameter type OID {}", oid)),
         },
     }
+}
+
+/// The text form of a value of one of the wire-layout types, from its binary
+/// form — which is also its stored form.
+fn wire_type_text(oid: i32, raw: &[u8]) -> Option<String> {
+    use crate::core::pg_types as pg;
+    let exact = |len: usize| (raw.len() == len).then_some(());
+    match oid {
+        OID_TIMETZ => {
+            exact(pg::TIMETZ_LEN)?;
+            pg::format_timetz(raw)
+        }
+        OID_INTERVAL => {
+            exact(pg::INTERVAL_LEN)?;
+            pg::format_interval(raw)
+        }
+        OID_MACADDR => {
+            exact(pg::MACADDR_LEN)?;
+            Some(pg::format_macaddr(raw))
+        }
+        OID_MACADDR8 => {
+            exact(pg::MACADDR8_LEN)?;
+            Some(pg::format_macaddr(raw))
+        }
+        OID_BIT | OID_VARBIT => pg::format_bit_string(raw),
+        OID_POINT => {
+            exact(pg::POINT_LEN)?;
+            pg::format_point(raw)
+        }
+        OID_LSEG => {
+            exact(pg::LSEG_LEN)?;
+            pg::format_lseg(raw)
+        }
+        OID_BOX => {
+            exact(pg::LSEG_LEN)?;
+            pg::format_box(raw)
+        }
+        OID_LINE => {
+            exact(pg::LINE_LEN)?;
+            pg::format_line(raw)
+        }
+        OID_CIRCLE => {
+            exact(24)?;
+            pg::format_circle(raw)
+        }
+        OID_PATH => pg::format_path(raw),
+        OID_POLYGON => pg::format_polygon(raw),
+        OID_INT4RANGE => pg::format_range(&DbType::INT4RANGE, raw),
+        OID_INT8RANGE => pg::format_range(&DbType::INT8RANGE, raw),
+        OID_NUMRANGE => pg::format_range(&DbType::NUMRANGE, raw),
+        OID_TSRANGE => pg::format_range(&DbType::TSRANGE, raw),
+        OID_TSTZRANGE => pg::format_range(&DbType::TSTZRANGE, raw),
+        OID_DATERANGE => pg::format_range(&DbType::DATERANGE, raw),
+        _ => None,
+    }
+}
+
+/// `inet` / `cidr` binary to `addr[/bits]`. A host address (all bits) is
+/// written without its prefix for `inet`, as PostgreSQL prints it; `cidr`
+/// always carries one.
+fn inet_text(oid: i32, raw: &[u8]) -> Option<String> {
+    let (&family, rest) = raw.split_first()?;
+    let (&bits, rest) = rest.split_first()?;
+    let (_is_cidr, rest) = rest.split_first()?;
+    let (&len, addr) = rest.split_first()?;
+    if addr.len() != len as usize {
+        return None;
+    }
+    let (ip, max): (std::net::IpAddr, u8) = match (family, len) {
+        (2, 4) => (std::net::Ipv4Addr::from(<[u8; 4]>::try_from(addr).ok()?).into(), 32),
+        (3, 16) => (std::net::Ipv6Addr::from(<[u8; 16]>::try_from(addr).ok()?).into(), 128),
+        _ => return None,
+    };
+    if bits > max {
+        return None;
+    }
+    Some(if bits == max && oid == OID_INET {
+        ip.to_string()
+    } else {
+        format!("{}/{}", ip, bits)
+    })
 }
 
 /// The element type of an array OID, or `None` if this is not an array.
@@ -414,6 +636,33 @@ fn array_element_oid(oid: i32) -> Option<i32> {
         1183 => OID_TIME,
         2951 => OID_UUID,
         1001 => OID_BYTEA,
+        1002 => OID_CHAR,
+        1003 => OID_NAME,
+        1028 => OID_OID,
+        199 => OID_JSON,
+        3807 => OID_JSONB,
+        1041 => OID_INET,
+        651 => OID_CIDR,
+        1040 => OID_MACADDR,
+        775 => OID_MACADDR8,
+        791 => OID_MONEY,
+        1187 => OID_INTERVAL,
+        1270 => OID_TIMETZ,
+        1561 => OID_BIT,
+        1563 => OID_VARBIT,
+        1017 => OID_POINT,
+        1018 => OID_LSEG,
+        1019 => OID_PATH,
+        1020 => OID_BOX,
+        1027 => OID_POLYGON,
+        629 => OID_LINE,
+        719 => OID_CIRCLE,
+        3905 => OID_INT4RANGE,
+        3927 => OID_INT8RANGE,
+        3907 => OID_NUMRANGE,
+        3909 => OID_TSRANGE,
+        3911 => OID_TSTZRANGE,
+        3913 => OID_DATERANGE,
         _ => return None,
     })
 }
@@ -537,15 +786,24 @@ fn is_numeric_literal(text: &str) -> bool {
 /// Single-quotes a value, doubling any quote it contains.
 pub fn quote_literal(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for c in s.chars() {
-        if c == '\'' {
-            out.push('\'');
-        }
-        out.push(c);
-    }
-    out.push('\'');
+    push_quoted_literal(&mut out, s);
     out
+}
+
+/// [`quote_literal`], appended to `out`: the text between quotes is copied in
+/// runs found with `memchr` rather than a character at a time.
+pub fn push_quoted_literal(out: &mut String, s: &str) {
+    out.reserve(s.len() + 2);
+    out.push('\'');
+    let mut start = 0usize;
+    for at in memchr::memchr_iter(b'\'', s.as_bytes()) {
+        // `at` is an ASCII quote, so both slices end on character boundaries.
+        out.push_str(&s[start..=at]);
+        out.push('\'');
+        start = at + 1;
+    }
+    out.push_str(&s[start..]);
+    out.push('\'');
 }
 
 fn fmt_f64(v: f64) -> String {
@@ -822,6 +1080,35 @@ mod tests {
     }
 
     #[test]
+    fn leaves_placeholders_inside_escape_strings_alone() {
+        // In `E'…'` a backslash escapes the next character, so `\'` does not
+        // end the literal. Read as a standard string, the literal ended there
+        // and the `$1` that is still inside it was substituted — a parameter
+        // value spliced into the middle of a string constant.
+        let out = inline_params(r"SELECT E'it\'s $1', $1", &[text(OID_INT4, "5")]).unwrap();
+        assert_eq!(out, r"SELECT E'it\'s $1', 5");
+        let out = inline_params(r"SELECT e'\\', $1", &[text(OID_INT4, "5")]).unwrap();
+        assert_eq!(out, r"SELECT e'\\', 5");
+        let out = inline_params(r"SELECT E'a''b\' $1' || $1", &[text(OID_INT4, "5")]).unwrap();
+        assert_eq!(out, r"SELECT E'a''b\' $1' || 5");
+        // An identifier ending in E is not an escape-string prefix: a standard
+        // string follows, where a backslash is just a backslash.
+        let out = inline_params(r"SELECT name'\' , $1", &[text(OID_INT4, "5")]).unwrap();
+        assert_eq!(out, r"SELECT name'\' , 5");
+    }
+
+    #[test]
+    fn a_dollar_inside_an_identifier_does_not_open_a_dollar_quote() {
+        // `a$b$` is an identifier (PostgreSQL allows `$` after the first
+        // character). Read as the opening `$b$` of a dollar quote, it swallowed
+        // the rest of the statement and the placeholders in it stayed unbound.
+        let out = inline_params("SELECT a$b$ FROM t WHERE x = $1", &[text(OID_INT4, "5")]).unwrap();
+        assert_eq!(out, "SELECT a$b$ FROM t WHERE x = 5");
+        let out = inline_params("SELECT $$ $1 $$, $1", &[text(OID_INT4, "5")]).unwrap();
+        assert_eq!(out, "SELECT $$ $1 $$, 5");
+    }
+
+    #[test]
     fn escapes_quotes_in_text_params() {
         let out = inline_params("SELECT $1", &[text(OID_TEXT, "O'Brien")]).unwrap();
         assert_eq!(out, "SELECT 'O''Brien'");
@@ -1062,7 +1349,485 @@ mod binary_array_tests {
     }
 
     #[test]
+    fn money_inet_and_cidr_decode_to_their_text_forms() {
+        assert_eq!(binary_param_literal(OID_MONEY, &(-123_456i64).to_be_bytes()).unwrap(), "-1234.56");
+        assert_eq!(binary_param_literal(OID_MONEY, &5i64.to_be_bytes()).unwrap(), "0.05");
+        assert_eq!(binary_param_literal(OID_INET, &[2, 32, 0, 4, 10, 1, 2, 3]).unwrap(), "'10.1.2.3'");
+        assert_eq!(binary_param_literal(OID_CIDR, &[2, 32, 1, 4, 10, 1, 2, 3]).unwrap(), "'10.1.2.3/32'");
+        assert!(binary_param_literal(OID_INET, &[2, 33, 0, 4, 10, 1, 2, 3]).is_err());
+        assert!(binary_param_literal(OID_POINT, &[0; 15]).is_err(), "wrong width is refused");
+    }
+
+    #[test]
+    fn arrays_of_the_wire_layout_types_decode_element_by_element() {
+        // inet[]: two addresses.
+        let raw = array(OID_INET, &[Some(vec![2, 32, 0, 4, 10, 0, 0, 1]), Some(vec![2, 8, 0, 4, 10, 0, 0, 0])]);
+        assert_eq!(binary_param_literal(1041, &raw).unwrap(), "'{\"10.0.0.1\",\"10.0.0.0/8\"}'");
+        // date[] with a NULL.
+        let raw = array(OID_DATE, &[Some(0i32.to_be_bytes().to_vec()), None]);
+        assert_eq!(binary_param_literal(1182, &raw).unwrap(), "'{\"2000-01-01 00:00:00\",NULL}'");
+        // point[].
+        let point: Vec<u8> = [1.5f64, -2.0].iter().flat_map(|v| v.to_be_bytes()).collect();
+        let raw = array(OID_POINT, &[Some(point)]);
+        assert_eq!(binary_param_literal(1017, &raw).unwrap(), "'{\"(1.5,-2)\"}'");
+        // jsonb[]: the version byte is unwrapped per element, and the
+        // document's own quotes are escaped inside the array literal.
+        let raw = array(OID_JSONB, &[Some([vec![1u8], b"{\"k\":1}".to_vec()].concat())]);
+        assert_eq!(binary_param_literal(3807, &raw).unwrap(), "'{\"{\\\"k\\\":1}\"}'");
+        // interval[].
+        let iv = [60_000_000i64.to_be_bytes().to_vec(), 0i32.to_be_bytes().to_vec(), 0i32.to_be_bytes().to_vec()].concat();
+        let raw = array(OID_INTERVAL, &[Some(iv)]);
+        assert!(binary_param_literal(1187, &raw).unwrap().contains("00:01:00"));
+    }
+
+    #[test]
     fn a_type_that_is_not_an_array_is_still_refused() {
         assert!(binary_param_literal(9999, b"x").is_err());
+    }
+}
+
+/// The byte-at-a-time `inline_params` this module shipped with — plus the
+/// E-string and identifier-`$` fixes — kept to check the run-copying rewrite
+/// against.
+#[cfg(test)]
+mod inline_reference {
+    use super::*;
+
+    fn inline_params_reference(sql: &str, params: &[BoundParam]) -> Result<String, String> {
+        if params.is_empty() || !sql.as_bytes().contains(&b'$') {
+            return Ok(sql.to_string());
+        }
+
+        let bytes = sql.as_bytes();
+        let mut out = String::with_capacity(sql.len() + params.len() * 16);
+        let mut i = 0usize;
+
+        while i < bytes.len() {
+            let c = bytes[i];
+            match c {
+                // Single-quoted string literal; '' is an escaped quote.
+                b'\'' => {
+                    let escapes = is_escape_string_quote(bytes, i);
+                    let start = i;
+                    i += 1;
+                    while i < bytes.len() {
+                        if escapes && bytes[i] == b'\\' {
+                            i = (i + 2).min(bytes.len());
+                            continue;
+                        }
+                        if bytes[i] == b'\'' {
+                            if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                                i += 2;
+                                continue;
+                            }
+                            i += 1;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    out.push_str(&sql[start..i]);
+                }
+                // Quoted identifier; "" is an escaped quote.
+                b'"' => {
+                    let start = i;
+                    i += 1;
+                    while i < bytes.len() {
+                        if bytes[i] == b'"' {
+                            if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                                i += 2;
+                                continue;
+                            }
+                            i += 1;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    out.push_str(&sql[start..i]);
+                }
+                // Line comment.
+                b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
+                    let start = i;
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                    out.push_str(&sql[start..i]);
+                }
+                // Block comment, which Postgres allows to nest.
+                b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                    let start = i;
+                    let mut depth = 1usize;
+                    i += 2;
+                    while i < bytes.len() && depth > 0 {
+                        if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                            depth += 1;
+                            i += 2;
+                        } else if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                            depth -= 1;
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    out.push_str(&sql[start..i]);
+                }
+                b'$' => {
+                    // `$tag$ ... $tag$` dollar-quoted body, or a `$N` placeholder.
+                    if let Some(end) = (i == 0 || !is_identifier_byte(bytes[i - 1]))
+                        .then(|| dollar_quote_end(bytes, i))
+                        .flatten()
+                    {
+                        out.push_str(&sql[i..end]);
+                        i = end;
+                        continue;
+                    }
+
+                    let mut j = i + 1;
+                    while j < bytes.len() && bytes[j].is_ascii_digit() {
+                        j += 1;
+                    }
+                    if j == i + 1 {
+                        // A bare `$` that starts nothing; emit it unchanged.
+                        out.push('$');
+                        i += 1;
+                        continue;
+                    }
+                    let n: usize = sql[i + 1..j]
+                        .parse()
+                        .map_err(|_| format!("invalid parameter placeholder '{}'", &sql[i..j]))?;
+                    if n == 0 || n > params.len() {
+                        return Err(format!(
+                            "bind message supplies {} parameters, but statement requires ${}",
+                            params.len(),
+                            n
+                        ));
+                    }
+                    out.push_str(&param_to_literal(&params[n - 1])?);
+                    i = j;
+
+                    // A cast written on the placeholder goes with it.
+                    //
+                    // Clients pin a bound value's type in SQL — `$6::text`,
+                    // `$n::jsonb`, `$n::bigint` — whenever the parameter's type
+                    // would otherwise be ambiguous. A whole codec can be built on
+                    // it: bind everything as a string and let the cast say what it
+                    // is. That is correct SQL and PostgreSQL resolves it.
+                    //
+                    // Substituting the value here leaves the cast attached to a
+                    // literal, and every parser downstream of this point then sees
+                    // a token that is not the value: `'Jordan Patel'::text` stored
+                    // whole, quotes and all; `NULL::jsonb` failing the `NULL` test
+                    // that plain `NULL` passes, so a nullable document column
+                    // rejected the row as a schema mismatch; and `'{…}'::jsonb`
+                    // handed to a JSON parser that stopped at the leading quote.
+                    // Each of those was a separate report against a different
+                    // column type, and all of them are this one line.
+                    //
+                    // The cast is redundant once the value is inlined — the column
+                    // it is being written to, or compared against, supplies the
+                    // type. Only a cast *directly* on the placeholder is consumed;
+                    // one written on a column or an expression is left alone,
+                    // because there it can change what the statement means.
+                    if bytes.get(i) == Some(&b':') && bytes.get(i + 1) == Some(&b':') {
+                        let mut k = i + 2;
+                        while k < bytes.len() && (bytes[k] as char).is_whitespace() {
+                            k += 1;
+                        }
+                        let name_start = k;
+                        while k < bytes.len() && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_')
+                        {
+                            k += 1;
+                        }
+                        // A bare type name only. A parameterised or array type —
+                        // `numeric(10,2)`, `text[]` — is left in place rather than
+                        // half-consumed, which would strand punctuation.
+                        if k > name_start && !matches!(bytes.get(k), Some(b'(') | Some(b'[')) {
+                            i = k;
+                        }
+                    }
+                }
+                _ => {
+                    // Copy the whole UTF-8 sequence, not just the lead byte.
+                    let ch_len = utf8_len(c);
+                    let end = (i + ch_len).min(bytes.len());
+                    out.push_str(&sql[i..end]);
+                    i = end;
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// The old `quote_literal`, a character at a time.
+    fn quote_literal_reference(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() + 2);
+        out.push('\'');
+        for c in s.chars() {
+            if c == '\'' {
+                out.push('\'');
+            }
+            out.push(c);
+        }
+        out.push('\'');
+        out
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn pick<'a>(&mut self, items: &[&'a str]) -> &'a str {
+            items[(self.next() % items.len() as u64) as usize]
+        }
+    }
+
+    const FRAGMENTS: &[&str] = &[
+        "SELECT ",
+        "INSERT INTO t (a, b) VALUES (",
+        ", ",
+        ") ",
+        " WHERE x = ",
+        "$1",
+        "$2",
+        "$3",
+        "$4",
+        "$12",
+        "$0",
+        "$1::text",
+        "$2::jsonb",
+        "$3 :: int",
+        "$1::numeric(10,2)",
+        "$2::text[]",
+        "'plain'",
+        "'it''s $1'",
+        "''",
+        "'",
+        r"E'a\'b $1'",
+        r"e'\\'",
+        r"E'x''y\n$2'",
+        r"name'\' ",
+        r"E'trailing\",
+        "\"col $1\"",
+        "\"a\"\"b\"",
+        "\"",
+        "-- c $1\n",
+        "--",
+        "/* $1 /* $2 */ */",
+        "/* open",
+        "$$ $1 $$",
+        "$tag$ $2 $tag$",
+        "$tag$ open",
+        "a$b$",
+        "x$1",
+        "$",
+        "$ ",
+        "-",
+        "/",
+        "- 1",
+        "/ 2",
+        "ü",
+        "日本",
+        "🙂",
+        "\n",
+        " ",
+        "(",
+        ")",
+        "café$1",
+        "E",
+        "e",
+        r"_E'\'",
+        "1E'z'",
+        "$9999999999999999999999",
+    ];
+
+    fn params() -> Vec<BoundParam> {
+        let t = |oid: i32, s: &str| BoundParam {
+            value: Some(s.as_bytes().to_vec()),
+            format: 0,
+            oid,
+        };
+        vec![
+            t(OID_TEXT, "O'Brien ''q'' 日本"),
+            t(0, "42"),
+            t(OID_INT4, "not a number"),
+            BoundParam {
+                value: None,
+                format: 0,
+                oid: OID_TEXT,
+            },
+            t(OID_BOOL, "true"),
+            BoundParam {
+                value: Some(b"bin'ary".to_vec()),
+                format: 1,
+                oid: OID_VARCHAR,
+            },
+            BoundParam {
+                value: Some(vec![0, 1, 0xab, 0xff]),
+                format: 1,
+                oid: OID_BYTEA,
+            },
+            t(OID_JSONB, "{\"k\": \"v'\"}"),
+            t(OID_NUMERIC, "-1.5e3"),
+            t(OID_TEXT, ""),
+            t(OID_TEXT, "$1 -- /* '"),
+            t(OID_TEXT, "''''"),
+            BoundParam {
+                value: Some(vec![0xff, 0xfe]),
+                format: 0,
+                oid: OID_TEXT,
+            },
+        ]
+    }
+
+    #[test]
+    fn matches_the_reference_over_generated_statements() {
+        let params = params();
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        for round in 0..50_000 {
+            let n = 1 + (rng.next() % 14) as usize;
+            let mut sql = String::new();
+            for _ in 0..n {
+                sql.push_str(rng.pick(FRAGMENTS));
+            }
+            // Fewer parameters sometimes, so out-of-range errors are compared;
+            // all of them otherwise, including the invalid UTF-8 one.
+            let take = match round % 7 {
+                0 => 2,
+                1 => params.len(),
+                _ => params.len() - 1,
+            };
+            let p = &params[..take];
+            assert_eq!(
+                inline_params(&sql, p),
+                inline_params_reference(&sql, p),
+                "statement: {:?}",
+                sql
+            );
+        }
+    }
+
+    #[test]
+    fn quoting_matches_the_reference() {
+        let mut rng = Rng(7);
+        for _ in 0..5_000 {
+            let n = (rng.next() % 10) as usize;
+            let mut s = String::new();
+            for _ in 0..n {
+                s.push_str(rng.pick(&["'", "''", "a", "日本", " ", "\\", "🙂", "\"", "x'y"]));
+            }
+            assert_eq!(quote_literal(&s), quote_literal_reference(&s), "{:?}", s);
+        }
+    }
+
+    #[test]
+    fn bytea_matches_the_per_byte_format() {
+        let raw: Vec<u8> = (0..=255u8).collect();
+        let mut expected = String::from("'\\x");
+        for b in &raw {
+            expected.push_str(&format!("{:02x}", b));
+        }
+        expected.push('\'');
+        assert_eq!(binary_param_literal(OID_BYTEA, &raw).unwrap(), expected);
+        assert_eq!(binary_param_literal(OID_BYTEA, &[]).unwrap(), "'\\x'");
+    }
+
+    /// Release-mode timing of the rewrite against the reference, on a wide
+    /// multi-row INSERT of text and JSON values, bound and as literal text:
+    /// `cargo test --release -p rasterizeddb_core --lib -- --ignored inline_params_bench --nocapture`
+    #[test]
+    #[ignore]
+    fn inline_params_bench() {
+        let mut sql = String::from("INSERT INTO t (id, name, doc, note) VALUES ");
+        let mut params = Vec::new();
+        let doc = format!("{{\"payload\": \"{}\", \"n\": [1, 2, 3]}}", "x".repeat(400));
+        for r in 0..200usize {
+            if r > 0 {
+                sql.push_str(", ");
+            }
+            let base = r * 4;
+            sql.push_str(&format!(
+                "(${}, ${}, ${}::jsonb, ${})",
+                base + 1,
+                base + 2,
+                base + 3,
+                base + 4
+            ));
+            params.push(BoundParam {
+                value: Some((r as i32).to_be_bytes().to_vec()),
+                format: 1,
+                oid: OID_INT4,
+            });
+            params.push(BoundParam {
+                value: Some(format!("name {} with O'Quote and ünïcode", r).into_bytes()),
+                format: 0,
+                oid: OID_TEXT,
+            });
+            params.push(BoundParam {
+                value: Some(doc.clone().into_bytes()),
+                format: 0,
+                oid: OID_JSONB,
+            });
+            params.push(BoundParam {
+                value: Some("y".repeat(300).into_bytes()),
+                format: 0,
+                oid: OID_TEXT,
+            });
+        }
+        assert_eq!(
+            inline_params(&sql, &params),
+            inline_params_reference(&sql, &params)
+        );
+        // The same statement with every value already a literal and one
+        // placeholder left: the shape where the scan, not the quoting, is the
+        // work.
+        let literal_sql = format!("{} RETURNING $1", inline_params(&sql, &params).unwrap());
+        let one = [BoundParam {
+            value: Some(b"1".to_vec()),
+            format: 0,
+            oid: 0,
+        }];
+
+        let iters = 300u32;
+        for round in 0..4 {
+            let t = std::time::Instant::now();
+            for _ in 0..iters {
+                std::hint::black_box(
+                    inline_params_reference(std::hint::black_box(&sql), &params).unwrap(),
+                );
+            }
+            let old_bound = t.elapsed() / iters;
+            let t = std::time::Instant::now();
+            for _ in 0..iters {
+                std::hint::black_box(inline_params(std::hint::black_box(&sql), &params).unwrap());
+            }
+            let new_bound = t.elapsed() / iters;
+            let t = std::time::Instant::now();
+            for _ in 0..iters {
+                std::hint::black_box(
+                    inline_params_reference(std::hint::black_box(&literal_sql), &one).unwrap(),
+                );
+            }
+            let old_lit = t.elapsed() / iters;
+            let t = std::time::Instant::now();
+            for _ in 0..iters {
+                std::hint::black_box(
+                    inline_params(std::hint::black_box(&literal_sql), &one).unwrap(),
+                );
+            }
+            let new_lit = t.elapsed() / iters;
+            println!(
+                "round {round}: 800 bound params -> {} B: old {:?} new {:?} | {} B of literals: old {:?} new {:?}",
+                literal_sql.len(),
+                old_bound,
+                new_bound,
+                literal_sql.len(),
+                old_lit,
+                new_lit,
+            );
+        }
     }
 }

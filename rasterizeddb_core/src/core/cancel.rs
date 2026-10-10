@@ -38,6 +38,8 @@ pub enum CancelReason {
     Timeout,
     /// The connection that asked for it closed.
     ClientWentAway,
+    /// A `CancelRequest` carrying this session's key arrived.
+    UserRequest,
 }
 
 impl CancelReason {
@@ -46,6 +48,7 @@ impl CancelReason {
         match self {
             CancelReason::Timeout => EvalError::StatementTimeout,
             CancelReason::ClientWentAway => EvalError::ClientWentAway,
+            CancelReason::UserRequest => EvalError::UserCanceled,
         }
     }
 }
@@ -108,6 +111,7 @@ impl StatementCancel {
         let code = match reason {
             CancelReason::Timeout => 1,
             CancelReason::ClientWentAway => 2,
+            CancelReason::UserRequest => 3,
         };
         // First writer wins: the first reason is the true one, and a later
         // deadline should not relabel a client that had already gone.
@@ -124,6 +128,7 @@ impl StatementCancel {
         match self.flagged.load(Ordering::Acquire) {
             1 => return Some(CancelReason::Timeout),
             2 => return Some(CancelReason::ClientWentAway),
+            3 => return Some(CancelReason::UserRequest),
             _ => {}
         }
         if let Some(at) = self.deadline {
@@ -161,4 +166,193 @@ pub fn current() -> Option<Arc<StatementCancel>> {
 /// Why the current statement should stop, if there is a signal and it tripped.
 pub fn tripped() -> Option<CancelReason> {
     STATEMENT_CANCEL.try_with(|c| c.tripped()).ok().flatten()
+}
+
+// ------------------------------------------------------------ CancelRequest
+
+/// One connection's cancellation target: the secret key it was handed in
+/// `BackendKeyData`, and the statement it is running right now, if any.
+///
+/// The slot holds the running statement's own [`StatementCancel`], never a
+/// session-wide flag. A `CancelRequest` flags exactly the statement it found in
+/// the slot, so one that arrives after that statement has finished trips a
+/// signal nothing reads any more — it can never stop the *next* statement.
+pub struct SessionCancel {
+    key: [u8; 4],
+    current: std::sync::Mutex<Option<Arc<StatementCancel>>>,
+}
+
+impl SessionCancel {
+    /// Makes `statement` the one a `CancelRequest` for this session stops,
+    /// until the returned guard is dropped.
+    ///
+    /// The guard clears the slot on every way out of the statement — a
+    /// return, an error, the future being dropped — and only if the slot
+    /// still holds *this* statement, so a guard outliving its statement
+    /// cannot clear its successor.
+    pub fn publish(self: &Arc<Self>, statement: Arc<StatementCancel>) -> PublishedStatement {
+        *self.current.lock().unwrap_or_else(|e| e.into_inner()) = Some(statement.clone());
+        PublishedStatement {
+            session: self.clone(),
+            statement,
+        }
+    }
+}
+
+/// Clears a session's cancel slot when its statement ends. See
+/// [`SessionCancel::publish`].
+pub struct PublishedStatement {
+    session: Arc<SessionCancel>,
+    statement: Arc<StatementCancel>,
+}
+
+impl Drop for PublishedStatement {
+    fn drop(&mut self) {
+        let mut slot = self.session.current.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.as_ref().is_some_and(|s| Arc::ptr_eq(s, &self.statement)) {
+            *slot = None;
+        }
+    }
+}
+
+/// A connection's entry in the cancel registry, removed when dropped.
+pub struct CancelRegistration {
+    /// The "process id" sent in `BackendKeyData`: unique per live session in
+    /// this process, which a real process id is not — every session here
+    /// shares one.
+    pub pid: i32,
+    /// The secret half, as sent.
+    pub key: i32,
+    pub session: Arc<SessionCancel>,
+}
+
+impl Drop for CancelRegistration {
+    fn drop(&mut self) {
+        registry().lock().unwrap_or_else(|e| e.into_inner()).remove(&self.pid);
+    }
+}
+
+fn registry() -> &'static std::sync::Mutex<std::collections::HashMap<i32, Arc<SessionCancel>>> {
+    static REGISTRY: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<i32, Arc<SessionCancel>>>,
+    > = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(Default::default)
+}
+
+/// Registers a new session under a fresh `(pid, key)`. `key` must come from a
+/// cryptographic generator: it is all that stands between any client able to
+/// open a connection and every other session's running statement.
+pub fn register_session(key: [u8; 4]) -> CancelRegistration {
+    static NEXT_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
+    let session = Arc::new(SessionCancel {
+        key,
+        current: std::sync::Mutex::new(None),
+    });
+    let mut map = registry().lock().unwrap_or_else(|e| e.into_inner());
+    let pid = loop {
+        // Positive and nonzero, and not one a live session already holds.
+        let candidate = NEXT_PID.fetch_add(1, Ordering::Relaxed) & 0x7fff_ffff;
+        if candidate != 0 && !map.contains_key(&candidate) {
+            break candidate;
+        }
+    };
+    map.insert(pid, session.clone());
+    CancelRegistration {
+        pid,
+        key: i32::from_be_bytes(key),
+        session,
+    }
+}
+
+/// Answers a `CancelRequest`: stops the statement session `pid` is running, if
+/// `key` is that session's key and a statement is running. Returns whether one
+/// was flagged.
+///
+/// The key is compared in constant time, so the time a refusal takes says
+/// nothing about how much of a guess was right. Nothing is reported back to
+/// the requester either way, as in PostgreSQL.
+pub fn cancel_request(pid: i32, key: i32) -> bool {
+    let Some(session) = registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&pid)
+        .cloned()
+    else {
+        return false;
+    };
+    if !keys_match(&session.key, &key.to_be_bytes()) {
+        return false;
+    }
+    let running = session
+        .current
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    match running {
+        Some(statement) => {
+            statement.flag(CancelReason::UserRequest);
+            true
+        }
+        None => false,
+    }
+}
+
+fn keys_match(a: &[u8; 4], b: &[u8; 4]) -> bool {
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    std::hint::black_box(diff) == 0
+}
+
+#[cfg(test)]
+mod cancel_request_tests {
+    use super::*;
+
+    #[test]
+    fn a_request_stops_only_the_statement_running_when_it_arrives() {
+        let reg = register_session([1, 2, 3, 4]);
+        // Nothing running: nothing to stop.
+        assert!(!cancel_request(reg.pid, reg.key));
+
+        let first = Arc::new(StatementCancel::new(None));
+        let published = reg.session.publish(first.clone());
+        // A wrong key does nothing.
+        assert!(!cancel_request(reg.pid, reg.key ^ 1));
+        assert_eq!(first.tripped(), None);
+        assert!(cancel_request(reg.pid, reg.key));
+        assert_eq!(first.tripped(), Some(CancelReason::UserRequest));
+        drop(published);
+
+        // The next statement starts clean, and a late request finds nothing.
+        let second = Arc::new(StatementCancel::new(None));
+        let _p2 = reg.session.publish(second.clone());
+        assert_eq!(second.tripped(), None);
+        drop(_p2);
+        assert!(!cancel_request(reg.pid, reg.key));
+        assert_eq!(second.tripped(), None);
+    }
+
+    #[test]
+    fn a_stale_guard_does_not_clear_its_successor() {
+        let reg = register_session([9, 9, 9, 9]);
+        let a = Arc::new(StatementCancel::new(None));
+        let b = Arc::new(StatementCancel::new(None));
+        let guard_a = reg.session.publish(a);
+        let _guard_b = reg.session.publish(b.clone());
+        drop(guard_a);
+        assert!(cancel_request(reg.pid, reg.key), "b is still published");
+        assert_eq!(b.tripped(), Some(CancelReason::UserRequest));
+    }
+
+    #[test]
+    fn pids_are_unique_and_deregistered() {
+        let a = register_session([0; 4]);
+        let b = register_session([0; 4]);
+        assert_ne!(a.pid, b.pid);
+        let pid = a.pid;
+        let key = a.key;
+        drop(a);
+        assert!(!cancel_request(pid, key));
+    }
 }
