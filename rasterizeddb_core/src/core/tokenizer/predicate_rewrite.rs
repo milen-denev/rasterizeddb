@@ -1113,6 +1113,26 @@ fn is_value_start(tok: &Tok) -> bool {
     matches!(tok, Tok::Str(_) | Tok::Word(_) | Tok::LPar)
 }
 
+/// One bound of a `BETWEEN`: its rendered text and the index after it.
+///
+/// A negative number arrives as two tokens, the sign and the digits, so
+/// `n BETWEEN -3 AND 3` used to fail with "missing its lower bound": the
+/// first token after `BETWEEN` was a `-`, which is not where a value
+/// starts. A sign directly followed by a number is one value here.
+fn bound_at(toks: &[Tok], at: usize) -> Option<(String, usize)> {
+    match (toks.get(at), toks.get(at + 1)) {
+        (Some(Tok::Sym(sign)), Some(Tok::Word(digits)))
+            if (sign == "-" || sign == "+")
+                && digits.starts_with(|c: char| c.is_ascii_digit() || c == '.') =>
+        {
+            let text = if sign == "-" { format!("-{digits}") } else { digits.clone() };
+            Some((text, at + 2))
+        }
+        (Some(tok), _) if is_value_start(tok) => Some((render_value(tok), at + 1)),
+        _ => None,
+    }
+}
+
 /// Renders one value token, folding boolean keywords into the 1/0 the engine
 /// stores. `NULL` is passed through for the caller to reject in context.
 fn render_value(tok: &Tok) -> String {
@@ -1888,44 +1908,28 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
                     .map(|t| t.is_keyword("between"))
                     .unwrap_or(false)
                 {
-                    let lo = toks
-                        .get(kw_at + 1)
-                        .filter(|t| is_value_start(t))
-                        .ok_or("BETWEEN is missing its lower bound")?;
+                    let (lo, after_lo) =
+                        bound_at(&toks, kw_at + 1).ok_or("BETWEEN is missing its lower bound")?;
                     if !toks
-                        .get(kw_at + 2)
+                        .get(after_lo)
                         .map(|t| t.is_keyword("and"))
                         .unwrap_or(false)
                     {
                         return Err("BETWEEN bounds must be separated by AND".to_string());
                     }
-                    let hi = toks
-                        .get(kw_at + 3)
-                        .filter(|t| is_value_start(t))
-                        .ok_or("BETWEEN is missing its upper bound")?;
+                    let (hi, after_hi) =
+                        bound_at(&toks, after_lo + 1).ok_or("BETWEEN is missing its upper bound")?;
 
                     // `NOT BETWEEN` is the complement: outside the range on
                     // either side, which is a disjunction rather than a
                     // conjunction.
                     let fragment = if negated {
-                        format!(
-                            "({} < {} OR {} > {})",
-                            col,
-                            render_value(lo),
-                            col,
-                            render_value(hi)
-                        )
+                        format!("({} < {} OR {} > {})", col, lo, col, hi)
                     } else {
-                        format!(
-                            "({} >= {} AND {} <= {})",
-                            col,
-                            render_value(lo),
-                            col,
-                            render_value(hi)
-                        )
+                        format!("({} >= {} AND {} <= {})", col, lo, col, hi)
                     };
                     out.push(guard_null(&col, &fragment, schema));
-                    i = kw_at + 4;
+                    i = after_hi;
                     continue;
                 }
 
@@ -2474,6 +2478,29 @@ fn parse_in_list(toks: &[Tok], start: usize) -> Result<(Vec<String>, usize), Str
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn between_takes_negative_bounds() {
+        let mut schema: SmallVec<[crate::core::row::schema::SchemaField; 20]> = SmallVec::new();
+        schema.push(crate::core::row::schema::SchemaField::new(
+            "n".into(),
+            crate::core::db_type::DbType::F64,
+            8,
+            0,
+            0,
+            false,
+        ));
+        for (sql, lo, hi) in [
+            ("n BETWEEN -3 AND -3", "-3", "-3"),
+            ("n BETWEEN -10 AND 5", "-10", "5"),
+            ("n BETWEEN +2 AND 7.5", "2", "7.5"),
+            ("n BETWEEN -1.5 AND -0.5", "-1.5", "-0.5"),
+        ] {
+            let out = rewrite_where(sql, &schema).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            assert!(out.contains(&format!(">= {lo}")) && out.contains(&format!("<= {hi}")), "{sql} -> {out}");
+        }
+    }
+
     use super::*;
     use crate::core::db_type::DbType;
 
