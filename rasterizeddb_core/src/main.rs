@@ -21,6 +21,10 @@ mod backup_args;
 #[cfg(feature = "pg_import")]
 mod pg_import_args;
 
+/// Redis-compatible key/value store flags.
+#[cfg(feature = "kv_cache")]
+mod kv_args;
+
 #[derive(Clone, Debug, ValueEnum)]
 enum PgTlsMode {
     /// No TLS. Uses cleartext only.
@@ -443,6 +447,10 @@ struct Args {
     #[cfg(feature = "pg_import")]
     #[command(flatten)]
     pg_import: pg_import_args::PgImportArgs,
+
+    #[cfg(feature = "kv_cache")]
+    #[command(flatten)]
+    kv: kv_args::KvArgs,
 }
 
 /// Applies `--storage-location`, `--storage-policy` and `--storage-min-free`
@@ -990,6 +998,44 @@ fn main() -> std::io::Result<()> {
                         }
                     }
                 }
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }
+            }
+        }
+
+        // The Redis protocol, beside whichever SQL protocol runs below. Bound
+        // here so a port that cannot be had stops the start-up with the
+        // reason, rather than failing quietly in a task.
+        #[cfg(feature = "kv_cache")]
+        {
+            if let Err(e) = args.kv.apply() {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+            match args.kv.listener(&args.pg_user) {
+                Ok(Some(config)) => {
+                    match rasterizeddb_core::core::kv_cache::resp::bind(&config).await {
+                        Ok(listener) => {
+                            let database = arc_database.clone();
+                            let handle = arc_database.kv_cache.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) =
+                                    rasterizeddb_core::core::kv_cache::resp::serve(listener, database, handle, config)
+                                        .await
+                                {
+                                    log::error!("kv cache: the Redis listener stopped: {e}");
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            eprintln!("could not start the Redis protocol listener: {e}");
+                            std::process::exit(2);
+                        }
+                    }
+                }
+                Ok(None) => {}
                 Err(e) => {
                     eprintln!("{e}");
                     std::process::exit(2);

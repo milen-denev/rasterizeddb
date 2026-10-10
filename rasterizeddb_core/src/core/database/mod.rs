@@ -732,6 +732,11 @@ pub struct Database {
     /// in-memory table have to reach the same buffers, and two lookups of the
     /// same key/value table the same family. See [`SeedCache`].
     seeds: SeedCache,
+
+    /// The Redis-compatible key/value store (`KV …` statements and the RESP
+    /// port). Built lazily: a database that never uses it allocates nothing.
+    #[cfg(feature = "kv_cache")]
+    pub kv_cache: crate::core::kv_cache::KvCacheHandle,
 }
 
 impl Database {
@@ -978,6 +983,12 @@ impl Database {
             storage,
             kv: kv_stores,
             seeds,
+            #[cfg(feature = "kv_cache")]
+            kv_cache: {
+                let handle = crate::core::kv_cache::KvCacheHandle::new((!in_memory).then_some(location));
+                handle.load_snapshot_if_present();
+                handle
+            },
         }
     }
 

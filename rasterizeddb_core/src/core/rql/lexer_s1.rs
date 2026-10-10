@@ -35,6 +35,10 @@ pub enum QueryPurpose {
     /// reported as an unrecognised query, so the operator sees which clause
     /// was wrong instead of a bare syntax error.
     IntrospectError(String),
+    /// `KV <command> …`: a Redis command against the database's key/value
+    /// store. Parsed and executed by [`crate::core::kv_cache::sql`].
+    #[cfg(feature = "kv_cache")]
+    KvCache(String),
     /// `REPLICATION ...` / `SHOW REPLICATION ...` — running the cluster from
     /// SQL. Parsed and executed by [`crate::replication::sql`].
     Replication(String),
@@ -353,6 +357,13 @@ pub fn recognize_query_purpose(query: &str) -> Option<QueryPurpose> {
     #[cfg(feature = "storage_pools")]
     if crate::core::storage::sql::is_storage_statement(query_trimmed) {
         return Some(Storage(query_trimmed.to_string()));
+    }
+
+    // `KV` is not a statement keyword anywhere else, and what follows it is a
+    // Redis command, not SQL, so nothing below may try to read it.
+    #[cfg(feature = "kv_cache")]
+    if crate::core::kv_cache::sql::is_kv_statement(query_trimmed) {
+        return Some(KvCache(query_trimmed.to_string()));
     }
 
     // After the three surfaces above, each of which owns a longer `SHOW`

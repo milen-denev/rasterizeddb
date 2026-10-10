@@ -139,7 +139,7 @@ name = "vacuum_benchmarks"
 harness = false
 
 [features]
-default = ["memory_pool_reuse", "replication_compression", "s3_backup", "pg_import", "storage_pools", "kv_storage", "kv_storage_s3", "query_stats"]
+default = ["memory_pool_reuse", "replication_compression", "s3_backup", "pg_import", "storage_pools", "kv_storage", "kv_storage_s3", "query_stats", "kv_cache"]
 enable_long_row = []
 enable_data_verification = []
 memory_pool_reuse = []
@@ -200,6 +200,16 @@ kv_storage_s3 = ["kv_storage", "s3_backup"]
 # own: the ring is a `VecDeque` behind the `parking_lot` already in the tree, and
 # the timestamps go through the calendar arithmetic `pg_params` already has.
 query_stats = []
+
+# A Redis-compatible key/value store inside the database: `KV …` statements on
+# the PostgreSQL port, and the Redis protocol itself on `--kv-port`.
+#
+# It adds no crate of its own. The store is hashbrown tables behind the
+# `parking_lot` locks already in the tree, the protocol is spoken over the
+# `tokio` the other listeners use, and `AUTH` checks the database's own roles
+# through `auth`. Nothing is allocated until the first `KV` statement or RESP
+# connection, and the port is closed unless `--kv-port` is given.
+kv_cache = []
 
 # Snapshot + point-in-time backup to any S3-compatible object store.
 #

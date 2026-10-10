@@ -7944,6 +7944,10 @@ fn query_sql(query: &QueryPurpose) -> String {
         QueryPurpose::Storage(sql) => sql.clone(),
         QueryPurpose::Introspect(_) => String::new(),
         QueryPurpose::IntrospectError(message) => message.clone(),
+        // The key/value store is not replicated, and a value may be a secret
+        // (a session token), so there is nothing to record.
+        #[cfg(feature = "kv_cache")]
+        QueryPurpose::KvCache(_) => String::new(),
         #[cfg(feature = "s3_backup")]
         QueryPurpose::Backup(_) => String::new(),
         #[cfg(feature = "s3_backup")]
@@ -9477,6 +9481,12 @@ pub(crate) async fn execute_with_need(
         QueryPurpose::IntrospectError(message) => {
             error!("introspection statement rejected: {}", message);
             return ddl_error(message);
+        }
+        // The key/value store: no table, no transaction. The command runs
+        // against the store, which has its own per-key atomicity.
+        #[cfg(feature = "kv_cache")]
+        QueryPurpose::KvCache(sql) => {
+            return crate::core::kv_cache::sql::execute(sql, &database.kv_cache).await;
         }
         QueryPurpose::FilterControl(sql) => {
             return match crate::core::filter::sql::execute(sql) {

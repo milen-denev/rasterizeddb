@@ -790,6 +790,15 @@ fn privileged_statement(stmt: &str) -> Option<&'static str> {
         ("RESTORE", _) => Some("RESTORE"),
         ("STORAGE", _) => Some("STORAGE"),
         ("REPLICATION", _) => Some("REPLICATION"),
+        // The key/value store's server-level commands: they change the
+        // process's settings, write files, or empty every database at once.
+        // Reading the settings (`KV CONFIG GET`) is not administering them.
+        ("KV", "FLUSHALL") => Some("KV FLUSHALL"),
+        ("KV", "SAVE") | ("KV", "BGSAVE") => Some("KV SAVE"),
+        ("KV", "CONFIG") => match words.next().unwrap_or("") {
+            "GET" => None,
+            _ => Some("KV CONFIG"),
+        },
         _ => None,
     }
 }
@@ -2458,6 +2467,10 @@ async fn describe_resolved(
                 }),
             );
         }
+        #[cfg(feature = "kv_cache")]
+        QueryPurpose::KvCache(sql) => {
+            return Ok(Some((crate::core::kv_cache::sql::result_fields(sql), true)));
+        }
         QueryPurpose::Replication(sql) => {
             return Ok(Some((
                 crate::replication::sql::structured_fields(sql)
@@ -3686,6 +3699,10 @@ where
         // Introspection rows belong to no relation either, so their column
         // names come from the statement.
         QueryPurpose::Introspect(statement) => crate::core::introspect::result_fields(statement),
+        // A `KV` command's rows belong to no relation; its columns come from
+        // the command.
+        #[cfg(feature = "kv_cache")]
+        QueryPurpose::KvCache(sql) => Some(crate::core::kv_cache::sql::result_fields(sql)),
         QueryPurpose::QueryRows(qr) if crate::core::rql::join::statement_has_join(&qr.query) => {
             let schema_of = |name: &str| database.tables.get(name).map(|t| t.schema.fields.clone());
             match crate::core::rql::join::plan_statement(&qr.query, &schema_of) {
@@ -7298,6 +7315,11 @@ mod authorization_tests {
             ("RESTORE DATABASE FROM S3 TO '/etc'", "RESTORE"),
             ("STORAGE ADD LOCATION '/mnt/x'", "STORAGE"),
             ("REPLICATION ENABLE", "REPLICATION"),
+            ("KV FLUSHALL", "KV FLUSHALL"),
+            ("kv save", "KV SAVE"),
+            ("KV BGSAVE", "KV SAVE"),
+            ("KV CONFIG SET maxmemory 1gb", "KV CONFIG"),
+            ("KV CONFIG RESETSTAT", "KV CONFIG"),
         ] {
             assert_eq!(privileged_statement(sql), Some(verb), "{sql:?}");
         }
@@ -7311,6 +7333,9 @@ mod authorization_tests {
             "SHOW REPLICATION STATS",
             "SHOW CONFIG",
             "SHOW FILTER",
+            "KV CONFIG GET maxmemory",
+            "KV GET session:1",
+            "KV FLUSHDB",
             "SET search_path TO public",
             "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
             "SELECT * FROM roles",

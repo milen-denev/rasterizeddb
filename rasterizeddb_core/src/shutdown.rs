@@ -60,6 +60,10 @@ where
 /// Skipping this is not corruption - recovery replays the log on the next
 /// start - but it makes that start-up slower for no reason.
 pub fn finalize() {
+    // Before the WAL: a store saving on exit writes its own file, and should
+    // not find the process already half gone.
+    #[cfg(feature = "kv_cache")]
+    crate::core::kv_cache::save_all_on_exit();
     match crate::core::wal::checkpoint_all() {
         Ok(()) => info!("WAL checkpointed on shutdown"),
         Err(e) => error!("WAL checkpoint failed during shutdown: {e}"),
