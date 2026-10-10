@@ -252,8 +252,13 @@ fn returning_labels(body: &str) -> Option<Vec<String>> {
 fn sql_type_of(db_type: &DbType) -> Option<&'static str> {
     Some(match db_type {
         DbType::I8 | DbType::I16 | DbType::I32 => "INTEGER",
-        DbType::I64 | DbType::I128 => "BIGINT",
-        DbType::U8 | DbType::U16 | DbType::U32 | DbType::U64 | DbType::U128 => "BIGINT",
+        DbType::I64 | DbType::U8 | DbType::U16 | DbType::U32 => "BIGINT",
+        // Their own widths: as `BIGINT` a `UBIGINT` above `i64::MAX` read
+        // back negative, a 16-byte integer was cut to eight, and the column
+        // advertised `int8` where the base table's said `numeric`.
+        DbType::U64 => "UBIGINT",
+        DbType::I128 => "HUGEINT",
+        DbType::U128 => "UHUGEINT",
         DbType::F32 | DbType::F64 => "DOUBLE",
         DbType::DECIMAL => "NUMERIC",
         DbType::BOOL => "BOOLEAN",

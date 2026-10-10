@@ -195,6 +195,323 @@ fn write_object(out: &mut Vec<u8>, fields: &Map<String, Value>) {
     }
 }
 
+/// Encodes a document straight from its JSON text.
+///
+/// The same bytes as `encode(&serde_json::from_str(text)?)`, without the
+/// `Value` tree in between: no `String` per key and value, no map node per
+/// entry, no `Vec` per array. serde_json still does the lexing — unescaping,
+/// number parsing, the depth limit and every error message are its own — and
+/// hands each value to [`ValueSeed`], which writes the encoding as it goes.
+/// A composite's offset table cannot be written until its last element is
+/// known, so its children are laid out first and the header is put in front
+/// of them when it closes; an object whose keys did not arrive sorted and
+/// unique is re-laid in key order then, last value winning, as
+/// [`write_object`] does.
+///
+/// One deliberate divergence: with serde_json's `raw_value` feature on (it is,
+/// in this workspace), a `Value` reads an object whose first key is
+/// `"$serde_json::private::RawValue"` as a *raw value* and stores the document
+/// its string holds instead of the object. That is a serde_json internal
+/// leaking into user data; here the object is stored as written.
+pub fn encode_text(text: &str) -> Result<Vec<u8>, String> {
+    let mut builder = Builder {
+        out: Vec::with_capacity(text.len() + 16),
+        slots: Vec::new(),
+        order: Vec::new(),
+    };
+    let mut de = serde_json::Deserializer::from_str(text);
+    serde::de::DeserializeSeed::deserialize(ValueSeed(&mut builder), &mut de)
+        .map_err(|e| e.to_string())?;
+    de.end().map_err(|e| e.to_string())?;
+    Ok(builder.out)
+}
+
+/// The output of [`encode_text`] and the scratch its composites share.
+struct Builder {
+    out: Vec<u8>,
+    /// For each open composite, its children: `(key_off, key_len, val_off,
+    /// val_len)` as absolute positions in `out` (keys are zero-length for an
+    /// array). A stack — a composite pushes its own above its parent's and
+    /// truncates back when it closes.
+    slots: Vec<[u32; 4]>,
+    /// Scratch for sorting an object's entries when it closes.
+    order: Vec<u32>,
+}
+
+impl Builder {
+    fn begin_len_prefixed(&mut self, tag: u8) -> usize {
+        self.out.push(tag);
+        let at = self.out.len();
+        self.out.extend_from_slice(&[0u8; 4]);
+        at
+    }
+
+    fn end_len_prefixed(&mut self, at: usize) {
+        let len = (self.out.len() - at - 4) as u32;
+        self.out[at..at + 4].copy_from_slice(&len.to_le_bytes());
+    }
+
+    fn string(&mut self, text: &str) {
+        self.out.push(TAG_STR);
+        write_len_prefixed(&mut self.out, text.as_bytes());
+    }
+
+    fn integer(&mut self, v: i64) {
+        self.out.push(TAG_INT);
+        self.out.extend_from_slice(&v.to_le_bytes());
+    }
+
+    /// A number `write_number` would store as text: `Number`'s own `Display`,
+    /// written in place.
+    fn number_text(&mut self, n: &serde_json::Number) {
+        use std::io::Write;
+        let at = self.begin_len_prefixed(TAG_NUM);
+        let _ = write!(self.out, "{}", n);
+        self.end_len_prefixed(at);
+    }
+
+    /// Puts a composite's header and offset table in front of its children,
+    /// which occupy `out[start..]`, described by `slots[base..]`.
+    fn close(&mut self, tag: u8, start: usize, base: usize) {
+        let count = self.slots.len() - base;
+        let stride = if tag == TAG_ARR { ARR_ENTRY } else { OBJ_ENTRY };
+        let header = 5 + count * stride;
+
+        // An object's entries must be sorted and unique. Usually they already
+        // are, and the children can stay where they are, as for an array.
+        let in_order = tag == TAG_ARR
+            || self.slots[base..].windows(2).all(|w| {
+                let a = &self.out[w[0][0] as usize..(w[0][0] + w[0][1]) as usize];
+                let b = &self.out[w[1][0] as usize..(w[1][0] + w[1][1]) as usize];
+                a < b
+            });
+
+        if in_order {
+            let end = self.out.len();
+            self.out.resize(end + header, 0);
+            self.out.copy_within(start..end, start + header);
+            let body_at = start + header;
+            self.out[start] = tag;
+            self.out[start + 1..start + 5].copy_from_slice(&(count as u32).to_le_bytes());
+            for (index, slot) in self.slots[base..].iter().enumerate() {
+                let entry = start + 5 + index * stride;
+                // Positions moved right by `header`; relative to the body they
+                // are what they were relative to `start`.
+                let rel = |abs: u32| (abs as usize - start) as u32;
+                if tag == TAG_ARR {
+                    self.out[entry..entry + 4].copy_from_slice(&rel(slot[2]).to_le_bytes());
+                    self.out[entry + 4..entry + 8].copy_from_slice(&slot[3].to_le_bytes());
+                } else {
+                    self.out[entry..entry + 4].copy_from_slice(&rel(slot[0]).to_le_bytes());
+                    self.out[entry + 4..entry + 8].copy_from_slice(&slot[1].to_le_bytes());
+                    self.out[entry + 8..entry + 12].copy_from_slice(&rel(slot[2]).to_le_bytes());
+                    self.out[entry + 12..entry + 16].copy_from_slice(&slot[3].to_le_bytes());
+                }
+            }
+            debug_assert_eq!(body_at + (end - start), self.out.len());
+            self.slots.truncate(base);
+            return;
+        }
+
+        // Sorted by key, ties by arrival, then each run of equal keys reduced
+        // to its last arrival — `write_object`'s stable sort and last-wins
+        // dedup, without its allocation.
+        self.order.clear();
+        self.order.extend(0..count as u32);
+        {
+            let (out, slots) = (&self.out, &self.slots[base..]);
+            let key = |i: u32| {
+                let s = &slots[i as usize];
+                &out[s[0] as usize..(s[0] + s[1]) as usize]
+            };
+            self.order
+                .sort_unstable_by(|a, b| key(*a).cmp(key(*b)).then(a.cmp(b)));
+            let mut kept = 0;
+            for at in 0..self.order.len() {
+                let last_of_run =
+                    at + 1 == self.order.len() || key(self.order[at]) != key(self.order[at + 1]);
+                if last_of_run {
+                    self.order[kept] = self.order[at];
+                    kept += 1;
+                }
+            }
+            self.order.truncate(kept);
+        }
+
+        // Laid out after the scratch, then moved down over it.
+        let kept = self.order.len();
+        let table = 5 + kept * OBJ_ENTRY;
+        let final_at = self.out.len();
+        self.out.resize(final_at + table, 0);
+        self.out[final_at] = TAG_OBJ;
+        self.out[final_at + 1..final_at + 5].copy_from_slice(&(kept as u32).to_le_bytes());
+        let body_at = final_at + table;
+        for index in 0..kept {
+            let slot = self.slots[base + self.order[index] as usize];
+            let key_off = self.out.len() - body_at;
+            self.out
+                .extend_from_within(slot[0] as usize..(slot[0] + slot[1]) as usize);
+            let val_off = self.out.len() - body_at;
+            self.out
+                .extend_from_within(slot[2] as usize..(slot[2] + slot[3]) as usize);
+            let entry = final_at + 5 + index * OBJ_ENTRY;
+            self.out[entry..entry + 4].copy_from_slice(&(key_off as u32).to_le_bytes());
+            self.out[entry + 4..entry + 8].copy_from_slice(&slot[1].to_le_bytes());
+            self.out[entry + 8..entry + 12].copy_from_slice(&(val_off as u32).to_le_bytes());
+            self.out[entry + 12..entry + 16].copy_from_slice(&slot[3].to_le_bytes());
+        }
+        let end = self.out.len();
+        self.out.copy_within(final_at..end, start);
+        self.out.truncate(start + (end - final_at));
+        self.slots.truncate(base);
+    }
+}
+
+/// Writes one JSON value into a [`Builder`]; see [`encode_text`].
+struct ValueSeed<'b>(&'b mut Builder);
+
+impl<'de> serde::de::DeserializeSeed<'de> for ValueSeed<'_> {
+    type Value = ();
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for ValueSeed<'_> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("any valid JSON value")
+    }
+
+    fn visit_bool<E>(self, v: bool) -> Result<(), E> {
+        self.0.out.push(if v { TAG_TRUE } else { TAG_FALSE });
+        Ok(())
+    }
+
+    fn visit_i64<E>(self, v: i64) -> Result<(), E> {
+        self.0.integer(v);
+        Ok(())
+    }
+
+    fn visit_u64<E>(self, v: u64) -> Result<(), E> {
+        // `Number::as_i64` holds exactly the `u64`s up to `i64::MAX`.
+        match i64::try_from(v) {
+            Ok(i) => self.0.integer(i),
+            Err(_) => self.0.number_text(&serde_json::Number::from(v)),
+        }
+        Ok(())
+    }
+
+    fn visit_i128<E: serde::de::Error>(self, v: i128) -> Result<(), E> {
+        if let Ok(i) = i64::try_from(v) {
+            self.0.integer(i);
+        } else if let Ok(u) = u64::try_from(v) {
+            self.0.number_text(&serde_json::Number::from(u));
+        } else {
+            return Err(E::custom("JSON number out of range"));
+        }
+        Ok(())
+    }
+
+    fn visit_u128<E: serde::de::Error>(self, v: u128) -> Result<(), E> {
+        match u64::try_from(v) {
+            Ok(u) => self.visit_u64(u),
+            Err(_) => Err(E::custom("JSON number out of range")),
+        }
+    }
+
+    fn visit_f64<E>(self, v: f64) -> Result<(), E> {
+        // `Value`'s visitor turns a non-finite float into `null`; JSON text
+        // cannot spell one, but the rule is kept.
+        match serde_json::Number::from_f64(v) {
+            Some(n) => self.0.number_text(&n),
+            None => self.0.out.push(TAG_NULL),
+        }
+        Ok(())
+    }
+
+    fn visit_str<E>(self, v: &str) -> Result<(), E> {
+        self.0.string(v);
+        Ok(())
+    }
+
+    fn visit_unit<E>(self) -> Result<(), E> {
+        self.0.out.push(TAG_NULL);
+        Ok(())
+    }
+
+    fn visit_none<E>(self) -> Result<(), E> {
+        self.0.out.push(TAG_NULL);
+        Ok(())
+    }
+
+    fn visit_some<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_any(self)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        let b = self.0;
+        let (start, base) = (b.out.len(), b.slots.len());
+        loop {
+            let at = b.out.len();
+            if seq.next_element_seed(ValueSeed(&mut *b))?.is_none() {
+                break;
+            }
+            let len = (b.out.len() - at) as u32;
+            b.slots.push([0, 0, at as u32, len]);
+        }
+        b.close(TAG_ARR, start, base);
+        Ok(())
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        let b = self.0;
+        let (start, base) = (b.out.len(), b.slots.len());
+        loop {
+            let key_at = b.out.len();
+            if map.next_key_seed(KeySeed(&mut *b))?.is_none() {
+                break;
+            }
+            let val_at = b.out.len();
+            map.next_value_seed(ValueSeed(&mut *b))?;
+            b.slots.push([
+                key_at as u32,
+                (val_at - key_at) as u32,
+                val_at as u32,
+                (b.out.len() - val_at) as u32,
+            ]);
+        }
+        b.close(TAG_OBJ, start, base);
+        Ok(())
+    }
+}
+
+/// Writes an object key's bytes, bare, into a [`Builder`].
+struct KeySeed<'b>(&'b mut Builder);
+
+impl<'de> serde::de::DeserializeSeed<'de> for KeySeed<'_> {
+    type Value = ();
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_str(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for KeySeed<'_> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a string key")
+    }
+
+    fn visit_str<E>(self, v: &str) -> Result<(), E> {
+        self.0.out.extend_from_slice(v.as_bytes());
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // decoding
 // ---------------------------------------------------------------------------
@@ -409,8 +726,514 @@ pub fn as_text(bytes: &[u8]) -> Option<String> {
             let (raw, _) = read_len_prefixed(bytes).ok()?;
             Some(std::str::from_utf8(raw).ok()?.to_string())
         }
-        _ => Some(decode(bytes).ok()?.to_string()),
+        _ => {
+            let mut out = Vec::with_capacity(bytes.len());
+            render_text_into(bytes, &mut out).ok()?;
+            String::from_utf8(out).ok()
+        }
     }
+}
+
+// ---------------------------------------------------------------------------
+// containment
+// ---------------------------------------------------------------------------
+
+/// PostgreSQL's `jsonb @>`, answered on the encoded bytes of both documents.
+///
+/// Nothing is decoded and nothing allocated: a key is found by binary search
+/// over the sorted offset table, and a nested value is a subslice. The rules
+/// are PostgreSQL's `JsonbDeepContains`, which differ from a naive "every part
+/// of the right is somewhere in the left" in three ways that each answered
+/// wrongly before:
+///
+/// - **A bare scalar on the right is contained in a *top-level* array only.**
+///   `'[1,2]' @> '2'` is true; `'{"a":[1,2]}' @> '{"a":1}'` and
+///   `'[1,[2]]' @> '[2]'` are false — inside a structure a scalar matches only
+///   an equal scalar, and an array element that is itself an array is a
+///   container, never searched for scalars.
+/// - **Numbers compare as numbers.** `'{"a":1.0}' @> '{"a":1}'` is true; JSON
+///   value equality said false, because `1.0` and `1` are different `Number`s.
+/// - **Types must agree at every level.** An object contains only an object,
+///   an array only an array; `1` is not `"1"`.
+///
+/// `None` means a document is malformed.
+pub fn contains(outer: &[u8], inner: &[u8]) -> Option<bool> {
+    let (o, i) = (*outer.first()?, *inner.first()?);
+    // PostgreSQL's first test: an object root contains only an object root.
+    if (o == TAG_OBJ) != (i == TAG_OBJ) {
+        return Some(false);
+    }
+    match (is_container(o), is_container(i)) {
+        (true, true) => nested_contains(outer, inner),
+        // A top-level scalar is PostgreSQL's raw-scalar pseudo-array of one
+        // element: `[x] @> y` searches the scalars of the left, and a raw
+        // scalar on the left contains no real array.
+        (true, false) => array_has_scalar(&Composite::of(outer, ARR_ENTRY)?, outer, inner),
+        (false, true) => Some(false),
+        (false, false) => scalar_eq(outer, inner),
+    }
+}
+
+/// PostgreSQL's `jsonb ? text`: whether `key` is a top-level key of an
+/// object, a top-level **string** element of an array, or — for a document
+/// that is a bare string — that string.
+///
+/// The array case is what `doc->'k' <> ''` could not express: `'["a","b"]' ?
+/// 'a'` is true in PostgreSQL, while the path form looks up a key and finds
+/// none. Only string elements count — `'[1]' ? '1'` is false — and only at the
+/// top level. `None` when the document is malformed.
+pub fn key_exists(doc: &[u8], key: &str) -> Option<bool> {
+    match *doc.first()? {
+        TAG_OBJ => Some(get_key(doc, key).is_some()),
+        TAG_ARR => {
+            let a = Composite::of(doc, ARR_ENTRY)?;
+            for at in 0..a.count {
+                let element = a.element(doc, at)?;
+                if element.first() == Some(&TAG_STR)
+                    && read_len_prefixed(element).ok()?.0 == key.as_bytes()
+                {
+                    return Some(true);
+                }
+            }
+            Some(false)
+        }
+        TAG_STR => Some(read_len_prefixed(doc).ok()?.0 == key.as_bytes()),
+        tag if tag <= TAG_OBJ => Some(false),
+        _ => None,
+    }
+}
+
+#[inline]
+fn is_container(tag: u8) -> bool {
+    tag == TAG_ARR || tag == TAG_OBJ
+}
+
+/// A composite's header, read once so a search does not re-read it per probe.
+struct Composite {
+    count: usize,
+    table_at: usize,
+    body_at: usize,
+}
+
+impl Composite {
+    #[inline]
+    fn of(bytes: &[u8], stride: usize) -> Option<Composite> {
+        let (count, table_at, body_at) = composite_header(bytes, stride).ok()?;
+        Some(Composite {
+            count,
+            table_at,
+            body_at,
+        })
+    }
+
+    /// The `index`th array element.
+    #[inline]
+    fn element<'a>(&self, bytes: &'a [u8], index: usize) -> Option<&'a [u8]> {
+        let entry = self.table_at + index * ARR_ENTRY;
+        slice_at(bytes, self.body_at, entry, entry + 4).ok()
+    }
+
+    /// The `index`th object entry's key and value.
+    #[inline]
+    fn entry<'a>(&self, bytes: &'a [u8], index: usize) -> Option<(&'a [u8], &'a [u8])> {
+        let entry = self.table_at + index * OBJ_ENTRY;
+        Some((
+            slice_at(bytes, self.body_at, entry, entry + 4).ok()?,
+            slice_at(bytes, self.body_at, entry + 8, entry + 12).ok()?,
+        ))
+    }
+}
+
+/// Containment between two values below the top level, or two top-level
+/// containers.
+fn nested_contains(outer: &[u8], inner: &[u8]) -> Option<bool> {
+    let (o, i) = (*outer.first()?, *inner.first()?);
+    match (o, i) {
+        (TAG_OBJ, TAG_OBJ) => object_contains(outer, inner),
+        (TAG_ARR, TAG_ARR) => array_contains(outer, inner),
+        _ if !is_container(o) && !is_container(i) => scalar_eq(outer, inner),
+        // A container against a scalar, or an object against an array.
+        _ => Some(false),
+    }
+}
+
+fn object_contains(outer: &[u8], inner: &[u8]) -> Option<bool> {
+    let a = Composite::of(outer, OBJ_ENTRY)?;
+    let b = Composite::of(inner, OBJ_ENTRY)?;
+    // Keys are unique, so a right side with more keys cannot be contained.
+    if b.count > a.count {
+        return Some(false);
+    }
+    // Both sides are sorted, so each key's search starts where the last one
+    // ended.
+    let mut low = 0usize;
+    for index in 0..b.count {
+        let (key, want) = b.entry(inner, index)?;
+        let mut high = a.count;
+        let mut found = None;
+        while low < high {
+            let mid = (low + high) / 2;
+            let (candidate, value) = a.entry(outer, mid)?;
+            match candidate.cmp(key) {
+                std::cmp::Ordering::Less => low = mid + 1,
+                std::cmp::Ordering::Greater => high = mid,
+                std::cmp::Ordering::Equal => {
+                    found = Some(value);
+                    low = mid + 1;
+                    break;
+                }
+            }
+        }
+        let Some(have) = found else {
+            return Some(false);
+        };
+        if !nested_contains(have, want)? {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
+fn array_contains(outer: &[u8], inner: &[u8]) -> Option<bool> {
+    let a = Composite::of(outer, ARR_ENTRY)?;
+    let b = Composite::of(inner, ARR_ENTRY)?;
+    for index in 0..b.count {
+        let want = b.element(inner, index)?;
+        let found = if is_container(*want.first()?) {
+            // A container is matched against the left's containers only.
+            let mut any = false;
+            for at in 0..a.count {
+                let have = a.element(outer, at)?;
+                if is_container(*have.first()?) && nested_contains(have, want)? {
+                    any = true;
+                    break;
+                }
+            }
+            any
+        } else {
+            array_has_scalar(&a, outer, want)?
+        };
+        if !found {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
+/// Whether an array holds an element equal to `scalar`. Only the scalar
+/// elements are candidates: `[[2]]` does not hold `2`.
+fn array_has_scalar(a: &Composite, outer: &[u8], scalar: &[u8]) -> Option<bool> {
+    for at in 0..a.count {
+        let have = a.element(outer, at)?;
+        if !is_container(*have.first()?) && scalar_eq(have, scalar)? {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+/// Equality of two encoded scalars, as PostgreSQL's `equalsJsonbScalarValue`:
+/// the same kind, then the same value — numerically, for numbers.
+fn scalar_eq(a: &[u8], b: &[u8]) -> Option<bool> {
+    let (ta, tb) = (*a.first()?, *b.first()?);
+    // A tag this module never writes is a malformed document, not a value
+    // that happens to differ.
+    if ta > TAG_OBJ || tb > TAG_OBJ {
+        return None;
+    }
+    let number = |t: u8| t == TAG_INT || t == TAG_NUM;
+    Some(match (ta, tb) {
+        (TAG_INT, TAG_INT) => a.get(1..9)? == b.get(1..9)?,
+        _ if number(ta) && number(tb) => {
+            let mut buf_a = [0u8; 20];
+            let mut buf_b = [0u8; 20];
+            numbers_equal(number_text(a, &mut buf_a)?, number_text(b, &mut buf_b)?)
+        }
+        (TAG_STR, TAG_STR) => read_len_prefixed(a).ok()?.0 == read_len_prefixed(b).ok()?.0,
+        _ => ta == tb && matches!(ta, TAG_NULL | TAG_TRUE | TAG_FALSE),
+    })
+}
+
+/// The decimal text of an encoded number. An integer is formatted into `buf`.
+fn number_text<'a>(bytes: &'a [u8], buf: &'a mut [u8; 20]) -> Option<&'a [u8]> {
+    match *bytes.first()? {
+        TAG_INT => {
+            let v = i64::from_le_bytes(bytes.get(1..9)?.try_into().ok()?);
+            let mut n = v.unsigned_abs();
+            let mut at = buf.len();
+            loop {
+                at -= 1;
+                buf[at] = b'0' + (n % 10) as u8;
+                n /= 10;
+                if n == 0 {
+                    break;
+                }
+            }
+            if v < 0 {
+                at -= 1;
+                buf[at] = b'-';
+            }
+            Some(&buf[at..])
+        }
+        TAG_NUM => Some(read_len_prefixed(bytes).ok()?.0),
+        _ => None,
+    }
+}
+
+/// A JSON number's value, without its spelling: the sign, the significant
+/// digits with no leading or trailing zeros, and where the decimal point falls
+/// relative to the first of them. `1`, `1.0`, `1.00` and `1e0` agree; `0` and
+/// `-0.0` are both zero.
+struct NumberParts<'a> {
+    negative: bool,
+    int: &'a [u8],
+    frac: &'a [u8],
+    /// Leading zeros skipped across `int` then `frac`.
+    lead: usize,
+    /// Significant digits after `lead`, trailing zeros excluded.
+    len: usize,
+    /// Position of the decimal point after the first significant digit's
+    /// predecessor: the value is `0.DIGITS × 10^point`.
+    point: i64,
+}
+
+impl<'a> NumberParts<'a> {
+    fn parse(text: &'a [u8]) -> Option<NumberParts<'a>> {
+        let (negative, rest) = match text.first()? {
+            b'-' => (true, &text[1..]),
+            _ => (false, text),
+        };
+        let mantissa_end = rest
+            .iter()
+            .position(|b| *b == b'e' || *b == b'E')
+            .unwrap_or(rest.len());
+        let exponent: i64 = if mantissa_end < rest.len() {
+            let e = std::str::from_utf8(&rest[mantissa_end + 1..]).ok()?;
+            let e = e.strip_prefix('+').unwrap_or(e);
+            // Far beyond anything a JSON number can mean; saturated so a
+            // pathological exponent cannot wrap.
+            e.parse::<i64>().ok().map(|v| v.clamp(-1 << 40, 1 << 40))?
+        } else {
+            0
+        };
+        let mantissa = &rest[..mantissa_end];
+        let (int, frac) = match mantissa.iter().position(|b| *b == b'.') {
+            Some(dot) => (&mantissa[..dot], &mantissa[dot + 1..]),
+            None => (mantissa, &mantissa[..0]),
+        };
+        if !int.iter().chain(frac).all(u8::is_ascii_digit) || int.len() + frac.len() == 0 {
+            return None;
+        }
+        let total = int.len() + frac.len();
+        let digit = |i: usize| if i < int.len() { int[i] } else { frac[i - int.len()] };
+        let lead = (0..total).take_while(|&i| digit(i) == b'0').count();
+        let trail = (lead..total).rev().take_while(|&i| digit(i) == b'0').count();
+        Some(NumberParts {
+            negative,
+            int,
+            frac,
+            lead,
+            len: total - lead - trail,
+            point: int.len() as i64 - lead as i64 + exponent,
+        })
+    }
+
+    fn digits(&self) -> impl Iterator<Item = u8> + '_ {
+        self.int
+            .iter()
+            .chain(self.frac.iter())
+            .skip(self.lead)
+            .take(self.len)
+            .copied()
+    }
+}
+
+/// Whether two JSON number spellings denote the same value.
+fn numbers_equal(a: &[u8], b: &[u8]) -> bool {
+    if a == b {
+        return true;
+    }
+    let (Some(x), Some(y)) = (NumberParts::parse(a), NumberParts::parse(b)) else {
+        return false;
+    };
+    match (x.len == 0, y.len == 0) {
+        (true, true) => true,
+        (false, false) => {
+            x.negative == y.negative && x.point == y.point && x.len == y.len && x.digits().eq(y.digits())
+        }
+        _ => false,
+    }
+}
+
+/// Whether two JSON numbers are equal as numbers — `1.0` and `1` are. Used
+/// by [`crate::core::pg_ops::json_contains`], the decoded-tree reference that
+/// [`contains`] is checked against.
+pub fn json_numbers_equal(a: &serde_json::Number, b: &serde_json::Number) -> bool {
+    numbers_equal(a.to_string().as_bytes(), b.to_string().as_bytes())
+}
+
+// ---------------------------------------------------------------------------
+// rendering
+// ---------------------------------------------------------------------------
+
+/// Appends the JSON text of the document `bytes` encodes to `out`.
+///
+/// Byte-for-byte what `decode(bytes)?.to_string()` produces, without building
+/// the `Value` first: no map inserts, no `String` per key and value, and string
+/// contents copied in runs between the bytes that need escaping.
+///
+/// Two shapes are handed to that original path instead of rendered here, so
+/// that what comes out never depends on which path ran: a number stored as
+/// text whose canonical form only `serde_json` knows (it is parsed and printed
+/// exactly as before), and an object whose keys are not strictly ascending —
+/// which this module never writes, but `decode` would re-sort and deduplicate.
+/// Anything malformed also goes that way, so the error is the same one.
+pub fn render_text_into(bytes: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
+    let start = out.len();
+    if render_value(bytes, out).is_ok() {
+        return Ok(());
+    }
+    out.truncate(start);
+    let value = decode(bytes)?;
+    serde_json::to_writer(&mut *out, &value).map_err(|e| e.to_string())
+}
+
+/// `Err(())` means "render this through `decode` instead", not that the
+/// document is bad.
+fn render_value(bytes: &[u8], out: &mut Vec<u8>) -> Result<(), ()> {
+    match *bytes.first().ok_or(())? {
+        TAG_NULL => out.extend_from_slice(b"null"),
+        TAG_FALSE => out.extend_from_slice(b"false"),
+        TAG_TRUE => out.extend_from_slice(b"true"),
+        TAG_INT => {
+            let raw = bytes.get(1..9).ok_or(())?;
+            let value = i64::from_le_bytes(raw.try_into().map_err(|_| ())?);
+            crate::core::value_codec::write_i64(out, value);
+        }
+        TAG_NUM => {
+            // Parsed and printed by serde_json, as `decode` does: `1.50`
+            // prints as `1.5`, `1e2` as `100.0`, and only serde_json's own
+            // float printer says exactly how.
+            let (text, _) = read_len_prefixed(bytes).map_err(|_| ())?;
+            let text = std::str::from_utf8(text).map_err(|_| ())?;
+            let value: Value = serde_json::from_str(text).map_err(|_| ())?;
+            serde_json::to_writer(&mut *out, &value).map_err(|_| ())?;
+        }
+        TAG_STR => {
+            let (raw, _) = read_len_prefixed(bytes).map_err(|_| ())?;
+            write_json_string(out, std::str::from_utf8(raw).map_err(|_| ())?);
+        }
+        TAG_ARR => {
+            let (count, table_at, body_at) = composite_header(bytes, ARR_ENTRY).map_err(|_| ())?;
+            out.push(b'[');
+            for index in 0..count {
+                if index > 0 {
+                    out.push(b',');
+                }
+                let entry = table_at + index * ARR_ENTRY;
+                let slice = slice_at(bytes, body_at, entry, entry + 4).map_err(|_| ())?;
+                render_value(slice, out)?;
+            }
+            out.push(b']');
+        }
+        TAG_OBJ => {
+            let (count, table_at, body_at) = composite_header(bytes, OBJ_ENTRY).map_err(|_| ())?;
+            out.push(b'{');
+            let mut previous: Option<&[u8]> = None;
+            for index in 0..count {
+                let entry = table_at + index * OBJ_ENTRY;
+                let key = slice_at(bytes, body_at, entry, entry + 4).map_err(|_| ())?;
+                // A map would reorder or merge these; let `decode` do it.
+                if previous.is_some_and(|p| p >= key) {
+                    return Err(());
+                }
+                previous = Some(key);
+                if index > 0 {
+                    out.push(b',');
+                }
+                write_json_string(out, std::str::from_utf8(key).map_err(|_| ())?);
+                out.push(b':');
+                let value = slice_at(bytes, body_at, entry + 8, entry + 12).map_err(|_| ())?;
+                render_value(value, out)?;
+            }
+            out.push(b'}');
+        }
+        _ => return Err(()),
+    }
+    Ok(())
+}
+
+/// Whether a byte must be escaped inside a JSON string, as serde_json decides
+/// it: the control characters, the quote and the backslash. Nothing else —
+/// not `/`, not DEL, not anything non-ASCII.
+#[inline]
+fn needs_escape(b: u8) -> bool {
+    b < 0x20 || b == b'"' || b == b'\\'
+}
+
+/// Where the next byte needing an escape is, eight bytes at a time.
+#[inline]
+fn next_escape(bytes: &[u8], mut i: usize) -> usize {
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    while i + 8 <= bytes.len() {
+        let w = u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
+        // A byte below 0x20, or equal to '"' or '\\'. The classic zero-byte
+        // test, applied to `w - 0x20` (bytes below 0x20 borrow) and to `w`
+        // xor each special byte (equal bytes become zero). It can report a
+        // false hit next to a real one, never miss one, so a hit is
+        // re-checked a byte at a time below.
+        let quote = w ^ (LO * b'"' as u64);
+        let slash = w ^ (LO * b'\\' as u64);
+        let hit = ((w.wrapping_sub(LO * 0x20) & !w)
+            | (quote.wrapping_sub(LO) & !quote)
+            | (slash.wrapping_sub(LO) & !slash))
+            & HI;
+        if hit != 0 {
+            break;
+        }
+        i += 8;
+    }
+    while i < bytes.len() && !needs_escape(bytes[i]) {
+        i += 1;
+    }
+    i
+}
+
+/// Appends `text` as a JSON string, escaped exactly as serde_json escapes it.
+fn write_json_string(out: &mut Vec<u8>, text: &str) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = text.as_bytes();
+    out.reserve(bytes.len() + 2);
+    out.push(b'"');
+    let mut run = 0;
+    loop {
+        let at = next_escape(bytes, run);
+        out.extend_from_slice(&bytes[run..at]);
+        if at == bytes.len() {
+            break;
+        }
+        let b = bytes[at];
+        match b {
+            b'"' => out.extend_from_slice(b"\\\""),
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            0x08 => out.extend_from_slice(b"\\b"),
+            0x0C => out.extend_from_slice(b"\\f"),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b'\r' => out.extend_from_slice(b"\\r"),
+            b'\t' => out.extend_from_slice(b"\\t"),
+            _ => out.extend_from_slice(&[
+                b'\\',
+                b'u',
+                b'0',
+                b'0',
+                HEX[(b >> 4) as usize],
+                HEX[(b & 0xF) as usize],
+            ]),
+        }
+        run = at + 1;
+    }
+    out.push(b'"');
 }
 
 /// Whether these bytes could be a document this module wrote.
@@ -1043,5 +1866,412 @@ mod path_tests {
 
         let p = parse_path_expression("doc->>'missing'").unwrap();
         assert!(p.resolve(&document).is_none());
+    }
+}
+
+/// `render_text_into` against what it replaced, `decode(..)?.to_string()`,
+/// over generated documents and hand-made blobs, byte for byte.
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+    use serde_json::json;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    fn random_string(rng: &mut Rng) -> String {
+        const PIECES: &[&str] = &[
+            "a", "Z", " ", "\"", "\\", "/", "\n", "\r", "\t", "\u{8}", "\u{c}", "\u{0}", "\u{1f}",
+            "\u{7f}", "é", "日本", "\u{1F600}", "\u{2028}", "plain ascii run of text ",
+            "0123456789abcdef",
+        ];
+        let mut s = String::new();
+        for _ in 0..rng.below(40) {
+            s.push_str(PIECES[rng.below(PIECES.len() as u64) as usize]);
+        }
+        s
+    }
+
+    fn random_number(rng: &mut Rng) -> Value {
+        match rng.below(8) {
+            0 => json!(rng.next() as i64),
+            1 => json!(rng.next()),
+            2 => json!(f64::from_bits(rng.next()) % 1e6),
+            3 => {
+                let f = f64::from_bits(rng.next());
+                if f.is_finite() { json!(f) } else { json!(0.5) }
+            }
+            4 => json!(i64::MIN),
+            5 => json!(-0.0),
+            6 => serde_json::from_str("1.50").unwrap(),
+            _ => serde_json::from_str("123456789012345678901234567890").unwrap(),
+        }
+    }
+
+    fn random_value(rng: &mut Rng, depth: u32) -> Value {
+        let pick = if depth >= 4 { rng.below(4) } else { rng.below(7) };
+        match pick {
+            0 => Value::Null,
+            1 => Value::Bool(rng.below(2) == 0),
+            2 => random_number(rng),
+            3 => Value::String(random_string(rng)),
+            4 | 5 => Value::Array((0..rng.below(6)).map(|_| random_value(rng, depth + 1)).collect()),
+            _ => {
+                let mut map = Map::new();
+                for _ in 0..rng.below(6) {
+                    map.insert(random_string(rng), random_value(rng, depth + 1));
+                }
+                Value::Object(map)
+            }
+        }
+    }
+
+    fn old(bytes: &[u8]) -> Result<String, String> {
+        decode(bytes).map(|v| v.to_string())
+    }
+
+    fn new(bytes: &[u8]) -> Result<String, String> {
+        let mut out = b"prefix".to_vec();
+        render_text_into(bytes, &mut out)?;
+        Ok(String::from_utf8(out[6..].to_vec()).expect("rendered JSON is UTF-8"))
+    }
+
+    #[test]
+    fn generated_documents_render_identically() {
+        let mut rng = Rng(0x0DDB_A11C_AFE5_EED5);
+        let fixed = [
+            json!(null),
+            json!({}),
+            json!([]),
+            json!({"": ""}),
+            json!([[], {}, [[]], {"a": {}}]),
+            json!("\u{0}\u{1}\u{2}\u{3}\u{4}\u{5}\u{6}\u{7}\u{8}\u{9}\u{a}\u{b}\u{c}\u{d}\u{e}\u{f}\u{10}\u{1f}\"\\"),
+            json!({"b": 1, "a": 2, "aa": 3, "B": 4, "é": 5}),
+            json!([1.0, 1e300, -1e-300, 0.1, 100.0, -0.0, 9007199254740993u64]),
+        ];
+        let mut docs: Vec<Value> = fixed.to_vec();
+        for _ in 0..5000 {
+            docs.push(random_value(&mut rng, 0));
+        }
+        for doc in docs {
+            let bytes = encode(&doc);
+            assert_eq!(new(&bytes), old(&bytes), "{doc}");
+        }
+    }
+
+    /// Old-vs-new timing. Run with
+    /// `cargo test --release -p rasterizeddb_core --lib -- --ignored jsonb_render_bench --nocapture`.
+    #[test]
+    #[ignore]
+    fn jsonb_render_bench() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let docs: Vec<(&str, Vec<u8>)> = vec![
+            ("small object", encode(&json!({"id": 12345, "name": "Ada Lovelace", "active": true, "score": 98.5, "tags": ["a", "b"]}))),
+            ("nested 2 KB", encode(&json!({
+                "user": {"id": 1, "email": "someone@example.com", "roles": ["admin", "dev", "ops"], "address": {"street": "1 Long Road", "city": "Somewhere", "zip": "12345"}},
+                "items": (0..20).map(|i| json!({"sku": format!("SKU-{i:05}"), "qty": i, "price": 9.99 + i as f64, "note": "line one\nline \"two\""})).collect::<Vec<_>>(),
+                "meta": {"created": "2026-10-08T12:00:00Z", "version": 3}
+            }))),
+            ("long text value", encode(&json!({"body": "lorem ipsum dolor sit amet ".repeat(80)}))),
+        ];
+        for (name, bytes) in &docs {
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            let reps = 2000;
+            for _ in 0..15 {
+                let t = Instant::now();
+                for _ in 0..reps { black_box(decode(black_box(bytes)).unwrap().to_string()); }
+                a.push(t.elapsed().as_nanos() as f64 / reps as f64);
+                let t = Instant::now();
+                let mut out = Vec::with_capacity(bytes.len());
+                for _ in 0..reps { out.clear(); render_text_into(black_box(bytes), &mut out).unwrap(); black_box(&out); }
+                b.push(t.elapsed().as_nanos() as f64 / reps as f64);
+            }
+            a.sort_by(f64::total_cmp);
+            b.sort_by(f64::total_cmp);
+            println!("jsonb {name:<16} old {:>9.1} ns  new {:>9.1} ns  ({:.2}x)", a[7], b[7], a[7] / b[7]);
+        }
+    }
+
+    /// Every run length around the eight-byte scan, with the special byte at
+    /// every position.
+    #[test]
+    fn escapes_are_found_at_every_offset() {
+        for len in 0..40usize {
+            for at in 0..len {
+                for special in [b'"', b'\\', 0u8, 0x1f, b'\n', 0x7f, b'/'] {
+                    let mut raw = vec![b'x'; len];
+                    raw[at] = special;
+                    let text = String::from_utf8(raw).unwrap();
+                    let bytes = encode(&Value::String(text.clone()));
+                    assert_eq!(new(&bytes), old(&bytes), "{text:?}");
+                }
+            }
+        }
+    }
+
+    /// Blobs this module never writes still render as `decode` would, error
+    /// included: out-of-order and duplicate keys, a number stored as text in a
+    /// non-canonical form, truncation, bad tags and bad UTF-8.
+    #[test]
+    fn unusual_blobs_render_identically() {
+        fn obj(entries: &[(&[u8], Vec<u8>)]) -> Vec<u8> {
+            let mut out = vec![TAG_OBJ];
+            out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+            let table_at = out.len();
+            out.resize(table_at + entries.len() * OBJ_ENTRY, 0);
+            let body_at = out.len();
+            for (i, (k, v)) in entries.iter().enumerate() {
+                let key_off = out.len() - body_at;
+                out.extend_from_slice(k);
+                let val_off = out.len() - body_at;
+                out.extend_from_slice(v);
+                let e = table_at + i * OBJ_ENTRY;
+                out[e..e + 4].copy_from_slice(&(key_off as u32).to_le_bytes());
+                out[e + 4..e + 8].copy_from_slice(&(k.len() as u32).to_le_bytes());
+                out[e + 8..e + 12].copy_from_slice(&(val_off as u32).to_le_bytes());
+                out[e + 12..e + 16].copy_from_slice(&(v.len() as u32).to_le_bytes());
+            }
+            out
+        }
+        fn num(text: &str) -> Vec<u8> {
+            let mut out = vec![TAG_NUM];
+            out.extend_from_slice(&(text.len() as u32).to_le_bytes());
+            out.extend_from_slice(text.as_bytes());
+            out
+        }
+        let one = encode(&json!(1));
+        let two = encode(&json!(2));
+        let blobs: Vec<Vec<u8>> = vec![
+            obj(&[(b"b", one.clone()), (b"a", two.clone())]),
+            obj(&[(b"a", one.clone()), (b"a", two.clone())]),
+            obj(&[(b"a", one.clone()), (b"b", num("1.50"))]),
+            obj(&[(b"\xff", one.clone())]),
+            num("1e2"),
+            num("-0"),
+            num("1.0"),
+            num("12345678901234567890123"),
+            num("not a number"),
+            num("\"a string\""),
+            vec![],
+            vec![0x09],
+            vec![TAG_INT, 1, 2],
+            vec![TAG_STR, 3, 0, 0, 0, b'a'],
+            vec![TAG_STR, 1, 0, 0, 0, 0xff],
+            vec![TAG_ARR, 2, 0, 0, 0],
+            vec![TAG_ARR, 1, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, TAG_NULL],
+            // Trailing bytes after a complete value are ignored by both.
+            [encode(&json!([1, "x"])), vec![0xAB, 0xCD]].concat(),
+        ];
+        for blob in blobs {
+            assert_eq!(new(&blob), old(&blob), "{blob:?}");
+        }
+    }
+}
+
+/// [`encode_text`] against the path it replaces — `serde_json::from_str` into
+/// a `Value`, then [`encode`] — which is kept as the reference.
+#[cfg(test)]
+mod encode_text_tests {
+    use super::*;
+
+    fn reference(text: &str) -> Result<Vec<u8>, String> {
+        serde_json::from_str::<Value>(text)
+            .map(|v| encode(&v))
+            .map_err(|e| e.to_string())
+    }
+
+    fn check(text: &str) {
+        assert_eq!(encode_text(text), reference(text), "{text:?}");
+    }
+
+    #[test]
+    fn hand_picked_documents_encode_identically() {
+        for text in [
+            "null", "true", "false", "0", "-0", "-0.0", "1", "-1", "1.0", "1.50", "1e2", "1E+2",
+            "-2.5e-8", "0.1", "9223372036854775807", "9223372036854775808",
+            "-9223372036854775808", "-9223372036854775809", "18446744073709551615",
+            "18446744073709551616", "123456789012345678901234567890", "1e308", "5e-324",
+            "\"\"", "\"plain\"", r#""esc \" \\ \/ \b \f \n \r \t \u00e9 \ud83d\ude00""#,
+            "\"\u{1F600} raw\"", "[]", "{}", "[[]]", "[{}]", "{\"a\":{}}", " [ 1 , 2 ] ",
+            "[1,\"a\",null,true,[2,[3,[4]]],{\"k\":[]}]",
+            r#"{"b":1,"a":2}"#, r#"{"a":1,"a":2}"#, r#"{"a":1,"b":2,"a":3}"#,
+            r#"{"b":{"y":1,"x":2},"a":[{"d":1,"c":2}]}"#, r#"{"":1,"\u0000":2,"é":3,"e":4}"#,
+            r#"{"a\"b":1,"a":2,"a\\":3}"#, r#"{"z":1,"y":2,"x":3,"y":4,"z":5}"#,
+            "{\"$serde_json::private::RawValueX\":1}",
+        ] {
+            check(text);
+        }
+    }
+
+    #[test]
+    fn malformed_text_is_refused_with_the_same_error() {
+        let deep_ok = format!("{}{}", "[".repeat(120), "]".repeat(120));
+        let too_deep = format!("{}{}", "[".repeat(200), "]".repeat(200));
+        for text in [
+            "", " ", "{", "}", "[1,]", "[1 2]", "{\"a\"}", "{\"a\":}", "{a:1}", "{\"a\":1,}",
+            "nul", "tru", "01", "1.", ".5", "1e", "+1", "--1", "\"unterminated", "\"\\x\"",
+            "\"\\ud800\"", "[1] x", "1 2", "{\"a\":1}}", "\u{0}", "1e400", "-1e400", "[1e999]",
+            "\"tab\tin string\"", "NaN", "Infinity",
+        ] {
+            let (new, old) = (encode_text(text), reference(text));
+            assert!(old.is_err(), "reference accepted {text:?}");
+            assert_eq!(new, old, "{text:?}");
+        }
+        check(&deep_ok);
+        assert_eq!(encode_text(&too_deep), reference(&too_deep));
+        assert!(encode_text(&too_deep).is_err());
+    }
+
+    /// The one place the two differ, on purpose: serde_json's `raw_value`
+    /// marker key, which the `Value` path reads as an instruction.
+    #[test]
+    fn the_raw_value_marker_key_is_just_a_key() {
+        let text = r#"{"$serde_json::private::RawValue":"[1,2]"}"#;
+        let stored = encode_text(text).unwrap();
+        assert_eq!(
+            decode(&stored).unwrap(),
+            serde_json::json!({"$serde_json::private::RawValue": "[1,2]"})
+        );
+    }
+
+    fn gen_text(rng: &mut fastrand::Rng, depth: u32, out: &mut String) {
+        let ws = |rng: &mut fastrand::Rng, out: &mut String| {
+            if rng.u8(0..6) == 0 {
+                out.push_str([" ", "\n", "\t ", "\r\n"][rng.usize(0..4)]);
+            }
+        };
+        ws(rng, out);
+        let leaf = depth == 0 || rng.u8(0..10) < 4;
+        if leaf {
+            match rng.u8(0..14) {
+                0 => out.push_str("null"),
+                1 => out.push_str("true"),
+                2 => out.push_str("false"),
+                3 => out.push_str(&rng.i64(..).to_string()),
+                4 => out.push_str(&rng.u64(..).to_string()),
+                5 => out.push_str(&rng.i32(-1000..1000).to_string()),
+                6 => {
+                    let f = (rng.f64() - 0.5) * 10f64.powi(rng.i32(-30..30));
+                    out.push_str(&format!("{}", f));
+                }
+                7 => out.push_str(
+                    ["1.0", "1.50", "1e2", "-0", "-0.0", "2E-3", "123456789012345678901234", "0.1e+1", "100e-2"]
+                        [rng.usize(0..9)],
+                ),
+                8 => out.push_str(&format!("{:e}", rng.f64() * 1e10)),
+                _ => {
+                    out.push('"');
+                    for _ in 0..rng.usize(0..8) {
+                        out.push_str(
+                            ["a", "Z", " ", "é", "日", "\\\"", "\\\\", "\\n", "\\u0041", "\\ud83d\\ude00", "\\u0000", "/", "\\/"]
+                                [rng.usize(0..13)],
+                        );
+                    }
+                    out.push('"');
+                }
+            }
+        } else if rng.bool() {
+            out.push('[');
+            let n = rng.usize(0..5);
+            for i in 0..n {
+                if i > 0 {
+                    out.push(',');
+                }
+                gen_text(rng, depth - 1, out);
+            }
+            ws(rng, out);
+            out.push(']');
+        } else {
+            out.push('{');
+            let n = rng.usize(0..6);
+            for i in 0..n {
+                if i > 0 {
+                    out.push(',');
+                }
+                ws(rng, out);
+                // Few distinct keys, so duplicates and disorder are common.
+                out.push_str(["\"a\"", "\"b\"", "\"c\"", "\"aa\"", "\"\"", "\"\\u0061\"", "\"B\"", "\"é\""][rng.usize(0..8)]);
+                ws(rng, out);
+                out.push(':');
+                gen_text(rng, depth - 1, out);
+            }
+            ws(rng, out);
+            out.push('}');
+        }
+        ws(rng, out);
+    }
+
+    #[test]
+    fn generated_documents_encode_identically() {
+        let mut rng = fastrand::Rng::with_seed(0x5eed_1500);
+        let mut text = String::new();
+        let mut broken = 0usize;
+        for i in 0..40_000 {
+            text.clear();
+            gen_text(&mut rng, 4, &mut text);
+            // Every tenth document is damaged, so errors are compared too.
+            if i % 10 == 0 && !text.is_empty() {
+                let at = rng.usize(0..text.len());
+                if text.is_char_boundary(at) {
+                    text.insert(at, [',', ']', '}', '"', ':', 'x'][rng.usize(0..6)]);
+                }
+            }
+            let (new, old) = (encode_text(&text), reference(&text));
+            broken += old.is_err() as usize;
+            assert_eq!(new, old, "{text:?}");
+        }
+        assert!(broken > 1000, "only {broken} malformed documents were exercised");
+    }
+
+    /// Insert-path cost: text to blob through a `Value` against straight.
+    /// `cargo test --release -p rasterizeddb_core --lib -- --ignored encode_text_bench --nocapture`
+    #[test]
+    #[ignore]
+    fn encode_text_bench() {
+        let docs: Vec<String> = (0..2000)
+            .map(|i| {
+                format!(
+                    r#"{{"id":{i},"status":"{}","is_risk_flagged":{},"tags":["alpha","beta","t{}"],"meta":{{"score":{}.5,"owner":"user-{}","nested":{{"k":[1,2,3],"label":"a \"quoted\" label"}}}},"amount":1{}.25,"created_at":"2026-10-08T12:34:56Z","notes":null}}"#,
+                    ["open", "closed", "pending"][i % 3],
+                    i % 2 == 0,
+                    i % 7,
+                    i % 100,
+                    i % 13,
+                    i % 50,
+                )
+            })
+            .collect();
+        let bytes: usize = docs.iter().map(|d| d.len()).sum();
+        for round in 0..6 {
+            let t = std::time::Instant::now();
+            let mut sum = 0usize;
+            for d in &docs {
+                sum += reference(std::hint::black_box(d)).unwrap().len();
+            }
+            let old_ns = t.elapsed().as_nanos() as f64 / docs.len() as f64;
+            let t = std::time::Instant::now();
+            let mut sum2 = 0usize;
+            for d in &docs {
+                sum2 += encode_text(std::hint::black_box(d)).unwrap().len();
+            }
+            let new_ns = t.elapsed().as_nanos() as f64 / docs.len() as f64;
+            assert_eq!(sum, sum2);
+            println!(
+                "round {round}: via Value {old_ns:.0} ns/doc, direct {new_ns:.0} ns/doc ({:.2}x), {} bytes/doc",
+                old_ns / new_ns,
+                bytes / docs.len()
+            );
+        }
     }
 }

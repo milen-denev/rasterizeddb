@@ -123,7 +123,7 @@ pub fn max_of_column(
     use crate::core::db_type::DbType;
     let mut max: Option<i64> = None;
     for row in rows {
-        let Some(column) = row.columns.iter().find(|c| c.schema_id == write_order) else {
+        let Some(column) = row.columns.iter().find(|c| u64::from(c.schema_id) == write_order) else {
             continue;
         };
         let bytes = column.data.into_slice();

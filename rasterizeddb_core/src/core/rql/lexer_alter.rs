@@ -516,6 +516,10 @@ pub fn parse_column_type(tokens: &[&str]) -> Result<(DbType, usize), String> {
         "UINT" | "UINT32" | "UINT4" => DbType::U32,
         "USMALLINT" | "UINT16" | "UINT2" => DbType::U16,
         "UTINYINT" | "UINT1" => DbType::U8,
+        // 128-bit integers. `SHOW CREATE TABLE` already wrote these names for
+        // such a column, but nothing parsed them back.
+        "HUGEINT" | "INT128" => DbType::I128,
+        "UHUGEINT" | "UINT128" => DbType::U128,
 
         "REAL" | "FLOAT4" => DbType::F32,
         // Postgres treats a bare FLOAT as double precision.

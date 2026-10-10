@@ -684,7 +684,9 @@ fn sql_type_name(db_type: &crate::core::db_type::DbType) -> &'static str {
         DbType::BOOL => "boolean",
         DbType::I8 | DbType::I16 => "smallint",
         DbType::I32 => "integer",
-        DbType::I64 | DbType::U8 | DbType::U16 | DbType::U32 | DbType::U64 => "bigint",
+        DbType::I64 | DbType::U8 | DbType::U16 | DbType::U32 => "bigint",
+        // Wider than `bigint`; advertised as `numeric` on the wire too.
+        DbType::U64 | DbType::I128 | DbType::U128 => "numeric",
         DbType::F32 => "real",
         DbType::F64 => "double precision",
         DbType::DATETIME => "timestamp with time zone",

@@ -853,6 +853,13 @@ fn parse_by_db_type(value_str: &str, db_type: &DbType) -> Result<NumericValue, S
             .parse()
             .map_err(|_| format!("value {} is out of range for type {:?}", value_str, db_type))
     }
+    // A fractional literal beside an integer is a fraction, not an integer that
+    // failed to parse: `i * 2.5` and `age > 2.5` are numeric in PostgreSQL. It
+    // stays a float, and the planner meets the two at a common type.
+    let integer = !matches!(db_type, DbType::F32 | DbType::F64);
+    if integer && value_str.contains('.') {
+        return parse_default(value_str);
+    }
     Ok(match db_type {
         DbType::I8 => NumericValue::I8(parse(value_str, db_type)?),
         DbType::I16 => NumericValue::I16(parse(value_str, db_type)?),

@@ -309,7 +309,20 @@ pub fn recognize_query_purpose(query: &str) -> Option<QueryPurpose> {
     // UPDATE — is ordinary SQL, and every clause parser would otherwise have to
     // tolerate one. Without this the whole statement came back as "syntax error
     // or unsupported query".
-    let without_comments = strip_sql_comments(query);
+    // Escape strings (`E'it\'s'`) and dollar-quoted strings are rewritten
+    // into the standard strings they mean before anything scans the text:
+    // every scanner below knows standard strings, and an escaped quote ended
+    // the literal early for all of them. See `sql_scan`. A no-op (borrowed)
+    // for text that has neither, which includes everything the wire layer has
+    // already normalised.
+    let normalized = match crate::core::sql_scan::normalize_string_literals(query) {
+        Ok(text) => text,
+        Err(e) => {
+            log::warn!("statement rejected: {}", e);
+            return None;
+        }
+    };
+    let without_comments = strip_sql_comments(&normalized);
     let query = without_comments.as_str();
     let query_trimmed = query.trim().trim_end_matches(';').trim_end();
     let query_trimmed = if query_trimmed.is_empty() {

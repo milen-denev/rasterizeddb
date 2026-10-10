@@ -98,11 +98,11 @@ fn sidecar_name<S: crate::core::storage_providers::traits::StorageIO>(
 /// Reads a table's declared path indexes.
 pub async fn load<S: crate::core::storage_providers::traits::StorageIO>(
     schema_io: rclite::Arc<S>,
-) -> smallvec::SmallVec<[PathIndex; 4]> {
+) -> Vec<PathIndex> {
     let io = schema_io.create_new(sidecar_name(&schema_io)).await;
     let len = io.get_len().await;
 
-    let mut out: smallvec::SmallVec<[PathIndex; 4]> = smallvec::SmallVec::new();
+    let mut out: Vec<PathIndex> = Vec::new();
     if len < PATH_INDEX_SIZE {
         return out;
     }

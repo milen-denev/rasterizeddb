@@ -17,7 +17,6 @@
 use std::io;
 
 use rclite::Arc;
-use smallvec::SmallVec;
 
 use crate::core::storage_providers::traits::StorageIO;
 
@@ -84,11 +83,11 @@ fn sidecar_name<S: StorageIO>(schema_io: &Arc<S>) -> String {
 }
 
 /// Reads a table's declared type modifiers.
-pub async fn load<S: StorageIO>(schema_io: Arc<S>) -> SmallVec<[TypeModifier; 8]> {
+pub async fn load<S: StorageIO>(schema_io: Arc<S>) -> Vec<TypeModifier> {
     let io = schema_io.create_new(sidecar_name(&schema_io)).await;
     let len = io.get_len().await;
 
-    let mut out: SmallVec<[TypeModifier; 8]> = SmallVec::new();
+    let mut out: Vec<TypeModifier> = Vec::new();
     if len < TYPE_MODIFIER_SIZE {
         return out;
     }

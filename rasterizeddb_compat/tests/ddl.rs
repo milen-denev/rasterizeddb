@@ -658,6 +658,11 @@ async fn an_unsupported_expression_names_itself_rather_than_blaming_the_schema()
         // result, so a check anchored on an identifier before `::` would miss
         // it — and three separate functions have to resolve first.
         ("SELECT LEAST(GREATEST(COALESCE(v, 1), 0), 32767)::smallint FROM ue", "10"),
+        // An un-aliased `CASE … END` used to be cut at its first space and read
+        // as `CASE` plus an alias; it was on the unsupported list below until
+        // that was fixed. Asserted as working, with the value it must compute.
+        ("SELECT CASE WHEN v > 5 THEN 1 ELSE 2 END FROM ue", "1"),
+        ("SELECT CASE WHEN v > 10 THEN 'hi' WHEN v > 5 THEN 'mid' ELSE 'lo' END FROM ue", "mid"),
     ] {
         let rows = sqlx::query(sql).fetch_all(&pool).await.unwrap_or_else(|e| panic!("{}: {}", sql, e));
         assert_eq!(rows.len(), 1, "{}", sql);
@@ -682,8 +687,6 @@ async fn an_unsupported_expression_names_itself_rather_than_blaming_the_schema()
         // A cast in a `WHERE` still is not supported. `CAST(v AS TEXT)` in the
         // select list moved to the working list below when it was implemented.
         ("SELECT id FROM ue WHERE v::TEXT = '10'", "cast"),
-        ("SELECT CASE WHEN v > 5 THEN 1 ELSE 2 END FROM ue", "case when"),
-        ("SELECT CASE WHEN v > 10 THEN 'hi' WHEN v > 5 THEN 'mid' ELSE 'lo' END FROM ue", "case when"),
         ("SELECT DISTINCT ON (id, v) id FROM ue", "distinct on"),
     ] {
         let err = run(&pool, sql).await.expect_err(sql).to_ascii_lowercase();

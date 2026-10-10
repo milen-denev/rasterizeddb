@@ -372,11 +372,11 @@ fn sidecar_name<S: crate::core::storage_providers::traits::StorageIO>(
 /// Reads a table's JSON column registrations.
 pub async fn load<S: crate::core::storage_providers::traits::StorageIO>(
     schema_io: rclite::Arc<S>,
-) -> smallvec::SmallVec<[JsonColumn; 4]> {
+) -> Vec<JsonColumn> {
     let io = schema_io.create_new(sidecar_name(&schema_io)).await;
     let len = io.get_len().await;
 
-    let mut out: smallvec::SmallVec<[JsonColumn; 4]> = smallvec::SmallVec::new();
+    let mut out: Vec<JsonColumn> = Vec::new();
     if len < JSON_COLUMN_SIZE {
         return out;
     }

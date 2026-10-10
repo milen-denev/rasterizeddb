@@ -152,8 +152,9 @@ fn encode_assignment(
             let value =
                 crate::core::value_codec::parse_decimal_scaled(text, scale).ok_or_else(|| {
                     format!(
-                        "'{}' is not a number that column '{}' can hold",
-                        text, field.name
+                        "{} for column \"{}\"",
+                        crate::core::value_codec::refusal_message(&DbType::DECIMAL, text),
+                        field.name
                     )
                 })?;
             let bytes = value.to_le_bytes();
@@ -163,10 +164,12 @@ fn encode_assignment(
         }
     }
 
+    // PostgreSQL's reason, from which the wire layer derives its SQLSTATE.
     let encoded = value_to_mb(trimmed, &field.db_type).ok_or_else(|| {
         format!(
-            "cannot read the value '{}' for column '{}'",
-            trimmed, field.name
+            "{} for column \"{}\"",
+            crate::core::value_codec::refusal_message(&field.db_type, trimmed),
+            field.name
         )
     })?;
 
@@ -192,11 +195,26 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> Option<MemoryBlock> {
     }
 
     Some(match db_type {
+        // `byteain`, from the literal as written: its quotes are undone once
+        // (an `E'…'` string's escapes included), and input PostgreSQL refuses
+        // fails the statement. Through the shared arm below, the quotes were
+        // undone twice and a refused value was stored as zero bytes.
+        DbType::BYTEA => {
+            let bytes = match crate::core::value_codec::encode_bytea_sql(value_str) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    warn!("Refused BYTEA value {:?}: {}", value_str, e);
+                    return None;
+                }
+            };
+            let mut mb = MEMORY_POOL.acquire(bytes.len());
+            mb.into_slice_mut().copy_from_slice(&bytes);
+            mb
+        }
         // Every type whose literal is text with a syntax of its own. Listed
         // alongside `BYTEA` and `ARRAY` rather than given an arm each, because
         // they all reach the same encoder — see `lexer_ir`'s matching arm.
-        DbType::BYTEA
-        | DbType::ARRAY
+        DbType::ARRAY
         | DbType::INTERVAL
         | DbType::MACADDR
         | DbType::MACADDR8
@@ -230,18 +248,15 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> Option<MemoryBlock> {
                     mb.into_slice_mut().copy_from_slice(&bytes);
                     mb
                 }
-                None => {
-                    warn!("Failed to parse {:?} value {:?}", db_type, value_str);
-                    MemoryBlock::default()
-                }
+                // Refused, not stored empty — see the matching arm in `lexer_ir`.
+                None => return None,
             }
         }
         // See the same arm in `lexer_ir`: a document is validated and encoded
         // here, because this is the last point that can still refuse it.
         DbType::JSONB => {
             let stripped = crate::core::value_codec::unquote_sql(value_str);
-            let document: serde_json::Value = serde_json::from_str(&stripped).ok()?;
-            let encoded = crate::core::jsonb::encode(&document);
+            let encoded = crate::core::jsonb::encode_text(&stripped).ok()?;
             let mut mb = MEMORY_POOL.acquire(encoded.len());
             mb.into_slice_mut().copy_from_slice(&encoded);
             mb
@@ -341,7 +356,7 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> Option<MemoryBlock> {
         }
         DbType::BOOL => {
             let stripped = strip_surrounding_quotes(value_str);
-            let v = parse_postgres_bool(stripped).unwrap_or(0);
+            let v = parse_postgres_bool(stripped)?;
             let bytes = v.to_le_bytes();
             let mut mb = MEMORY_POOL.acquire(bytes.len());
             mb.into_slice_mut().copy_from_slice(&bytes);
@@ -358,10 +373,8 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> Option<MemoryBlock> {
                     mb.into_slice_mut().copy_from_slice(&bytes);
                     mb
                 }
-                None => {
-                    warn!("Failed to parse {:?} value {:?}", db_type, value_str);
-                    MemoryBlock::default()
-                }
+                // Refused, not stored empty — see the matching arm in `lexer_ir`.
+                None => return None,
             }
         }
         // Reporting-only: a JSON column's value is written as the UUID it

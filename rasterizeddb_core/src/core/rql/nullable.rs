@@ -56,18 +56,28 @@ pub fn is_hidden(name: &str) -> bool {
 }
 
 /// The companion column for `column`, if that column is nullable.
-pub fn flag_field<'a>(
-    column: &str,
-    schema: &'a SmallVec<[SchemaField; 20]>,
-) -> Option<&'a SchemaField> {
-    let name = flag_column_name(column);
+///
+/// Matches `__null_<column>` without building that name: the expression
+/// evaluator asks this once per column reference per row, and the `format!`
+/// it used to do was an allocation each time. The comparison is the same
+/// ASCII-case-insensitive one, on the prefix and the rest separately.
+pub fn flag_field<'a>(column: &str, schema: &'a [SchemaField]) -> Option<&'a SchemaField> {
     schema
         .iter()
-        .find(|f| f.name.eq_ignore_ascii_case(&name) && !f.is_deleted)
+        .find(|f| !f.is_deleted && is_flag_name_of(&f.name, column))
+}
+
+/// Whether `name` is `__null_<column>`, ignoring ASCII case.
+#[inline]
+pub fn is_flag_name_of(name: &str, column: &str) -> bool {
+    let (n, p, c) = (name.as_bytes(), NULL_FLAG_PREFIX.as_bytes(), column.as_bytes());
+    n.len() == p.len() + c.len()
+        && n[..p.len()].eq_ignore_ascii_case(p)
+        && n[p.len()..].eq_ignore_ascii_case(c)
 }
 
 /// Whether `column` may hold `NULL`.
-pub fn is_nullable(column: &str, schema: &SmallVec<[SchemaField; 20]>) -> bool {
+pub fn is_nullable(column: &str, schema: &[SchemaField]) -> bool {
     flag_field(column, schema).is_some()
 }
 
@@ -125,6 +135,35 @@ mod tests {
         assert!(!is_nullable("id", &s));
         // Resolution follows the same case-insensitive rule as column lookup.
         assert!(is_nullable("COUNTRY", &s));
+    }
+
+    /// The allocation-free match against the definition it replaced: build
+    /// `__null_<column>` and compare with `eq_ignore_ascii_case`.
+    #[test]
+    fn flag_name_match_agrees_with_building_the_name() {
+        let names = [
+            "__null_country", "__NULL_Country", "__null_", "__null_countr", "__null_countryx",
+            "_null_country", "country", "__null_é", "__null_É", "__null___null_x", "__null_x",
+            "", "__nul", "__null_日本",
+        ];
+        let columns = ["country", "COUNTRY", "", "é", "x", "__null_x", "日本", "countr"];
+        for name in names {
+            for column in columns {
+                let built = flag_column_name(column);
+                assert_eq!(
+                    is_flag_name_of(name, column),
+                    name.eq_ignore_ascii_case(&built),
+                    "{:?} vs {:?}",
+                    name,
+                    column
+                );
+            }
+        }
+        // A deleted companion is not one.
+        let mut s = schema_with(&[("a", DbType::I32), ("__null_a", DbType::BOOL)]);
+        assert!(flag_field("A", &s).is_some());
+        s[1].is_deleted = true;
+        assert!(flag_field("a", &s).is_none());
     }
 
     #[test]

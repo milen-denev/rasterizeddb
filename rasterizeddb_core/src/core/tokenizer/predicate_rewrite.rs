@@ -27,6 +27,620 @@ use smallvec::SmallVec;
 use crate::core::row::schema::SchemaField;
 use crate::core::rql::nullable;
 
+/// The predicate that is false for every row, NaN and NULL included, in the
+/// grammar the evaluator reads. The same spelling `fold_null_comparisons` and
+/// the subquery rewrites use, which is what lets the planner recognise it.
+pub const CONSTANT_FALSE: &str = "1 = 0";
+/// Its complement, true for every row.
+pub const CONSTANT_TRUE: &str = "1 = 1";
+
+/// The index just past the single-quoted literal opening at `open`, with `''`
+/// as an escaped quote.
+fn quoted_end(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut j = open + 1;
+    loop {
+        match bytes.get(j)? {
+            b'\'' if bytes.get(j + 1) == Some(&b'\'') => j += 2,
+            b'\'' => return Some(j + 1),
+            _ => j += 1,
+        }
+    }
+}
+
+/// The key list of `?|` / `?&` starting at `at`: `'{a,b}'` or
+/// `ARRAY['a', 'b']` (with an optional `::text[]` after either), rendered as
+/// one quoted `'{…}'` literal, and where it ended.
+fn key_list_operand(clause: &str, at: usize) -> Option<(String, usize)> {
+    let bytes = clause.as_bytes();
+    let (array_text, mut end) = if bytes.get(at) == Some(&b'\'') {
+        let end = quoted_end(bytes, at)?;
+        let text = clause[at + 1..end - 1].replace("''", "'");
+        (text, end)
+    } else if clause.get(at..at + 5)?.eq_ignore_ascii_case("array") {
+        let mut j = at + 5;
+        while bytes.get(j).is_some_and(|b| b.is_ascii_whitespace()) {
+            j += 1;
+        }
+        if bytes.get(j) != Some(&b'[') {
+            return None;
+        }
+        j += 1;
+        let mut elements: Vec<String> = Vec::new();
+        loop {
+            while bytes.get(j).is_some_and(|b| b.is_ascii_whitespace()) {
+                j += 1;
+            }
+            match bytes.get(j)? {
+                b']' if elements.is_empty() => {
+                    j += 1;
+                    break;
+                }
+                b'\'' => {
+                    let end = quoted_end(bytes, j)?;
+                    let text = clause[j + 1..end - 1].replace("''", "'");
+                    elements.push(format!(
+                        "\"{}\"",
+                        text.replace('\\', "\\\\").replace('"', "\\\"")
+                    ));
+                    j = end;
+                }
+                _ if clause.get(j..j + 4).is_some_and(|w| w.eq_ignore_ascii_case("null")) => {
+                    elements.push("NULL".to_string());
+                    j += 4;
+                }
+                _ => return None,
+            }
+            while bytes.get(j).is_some_and(|b| b.is_ascii_whitespace()) {
+                j += 1;
+            }
+            match bytes.get(j)? {
+                b',' => j += 1,
+                b']' => {
+                    j += 1;
+                    break;
+                }
+                _ => return None,
+            }
+        }
+        (format!("{{{}}}", elements.join(",")), j)
+    } else {
+        return None;
+    };
+    // `::text[]` / `::varchar[]` names the type the list already is.
+    let mut k = end;
+    while bytes.get(k).is_some_and(|b| b.is_ascii_whitespace()) {
+        k += 1;
+    }
+    if clause.get(k..k + 2) == Some("::") {
+        let mut m = k + 2;
+        while bytes
+            .get(m)
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b' ')
+        {
+            m += 1;
+        }
+        if clause.get(m..m + 2) == Some("[]") {
+            end = m + 2;
+        }
+    }
+    // Validated now, so a malformed list fails the statement here rather than
+    // every row.
+    text_array_elements(&array_text)?;
+    Some((quote_standard(&array_text), end))
+}
+
+/// The elements of a PostgreSQL text-array literal's *text* — `{a,"b c",NULL}`
+/// — with an unquoted `NULL` as `None`. `None` overall for text that is not an
+/// array literal.
+pub fn text_array_elements(text: &str) -> Option<Vec<Option<String>>> {
+    let inner = text.trim().strip_prefix('{')?.strip_suffix('}')?;
+    if inner.trim().is_empty() {
+        return Some(Vec::new());
+    }
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut in_quotes = false;
+    let mut escaped = false;
+    let finish = |current: &mut String, quoted: &mut bool, out: &mut Vec<Option<String>>| {
+        let element = if *quoted {
+            Some(std::mem::take(current))
+        } else {
+            let t = current.trim().to_string();
+            current.clear();
+            if t.eq_ignore_ascii_case("null") {
+                None
+            } else {
+                Some(t)
+            }
+        };
+        *quoted = false;
+        out.push(element);
+    };
+    for c in inner.chars() {
+        if escaped {
+            current.push(c);
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if in_quotes => escaped = true,
+            '"' => {
+                in_quotes = !in_quotes;
+                quoted = true;
+            }
+            ',' if !in_quotes => finish(&mut current, &mut quoted, &mut out),
+            _ => current.push(c),
+        }
+    }
+    if in_quotes || escaped {
+        return None;
+    }
+    finish(&mut current, &mut quoted, &mut out);
+    Some(out)
+}
+
+/// `TRUE`, `FALSE` or `UNKNOWN` after `IS [NOT]`.
+fn truth_keyword(tok: &Tok) -> Option<&'static str> {
+    ["true", "false", "unknown"]
+        .into_iter()
+        .find(|k| tok.is_keyword(k))
+}
+
+/// The comparison operator that holds exactly where `op` does not, for a
+/// non-NULL operand. Exact under every ordering the evaluator uses — floats
+/// included, since PostgreSQL's order is total (NaN is the largest value).
+fn negated_operator(op: &str) -> Option<&'static str> {
+    Some(match op {
+        "=" => "!=",
+        "!=" | "<>" => "=",
+        "<" => ">=",
+        "<=" => ">",
+        ">" => "<=",
+        ">=" => "<",
+        _ => return None,
+    })
+}
+
+/// `x IS [NOT] TRUE | FALSE | UNKNOWN`, with PostgreSQL's three-valued
+/// meaning, as the two-valued grammar the evaluator reads.
+///
+/// `x` is a boolean column (`comparison` is `None`) or the comparison
+/// `col <op> literal`. The value is NULL exactly when the column is, so the
+/// companion carries the third truth value:
+///
+/// ```text
+/// IS TRUE       ->  not null AND  x         IS NOT TRUE   ->  null OR NOT x
+/// IS FALSE      ->  not null AND  NOT x     IS NOT FALSE  ->  null OR x
+/// IS UNKNOWN    ->  null                    IS NOT UNKNOWN ->  not null
+/// ```
+///
+/// On a NOT NULL column the companion terms fall away and each test is the
+/// plain comparison or its complement, or a constant for `UNKNOWN`.
+fn truth_test(
+    col: &str,
+    comparison: Option<(&str, String)>,
+    truth: &str,
+    negated: bool,
+    schema: &SmallVec<[SchemaField; 20]>,
+) -> String {
+    let (holds, fails) = match &comparison {
+        None => (format!("{} = 1", col), format!("{} = 0", col)),
+        Some((op, value)) => (
+            format!("{} {} {}", col, op, value),
+            format!(
+                "{} {} {}",
+                col,
+                negated_operator(op).expect("checked by the caller"),
+                value
+            ),
+        ),
+    };
+    let flag = nullable::flag_field(col, schema).map(|f| f.name.clone());
+    match (truth, negated, flag) {
+        ("unknown", false, Some(f)) => format!("{} = 1", f),
+        ("unknown", true, Some(f)) => format!("{} = 0", f),
+        ("unknown", false, None) => CONSTANT_FALSE.to_string(),
+        ("unknown", true, None) => CONSTANT_TRUE.to_string(),
+        (t, false, flag) => {
+            let test = if t == "true" { holds } else { fails };
+            match flag {
+                Some(f) => format!("({} = 0 AND {})", f, test),
+                None => test,
+            }
+        }
+        (t, true, flag) => {
+            let test = if t == "true" { fails } else { holds };
+            match flag {
+                Some(f) => format!("({} = 1 OR {})", f, test),
+                None => test,
+            }
+        }
+    }
+}
+
+/// Rewrites every `( <expression> ) IS [NOT] TRUE | FALSE | UNKNOWN` in the
+/// clause into its two-valued expansion, leaving everything else as it was.
+fn expand_truth_tests<'c>(
+    clause: &'c str,
+    schema: &SmallVec<[SchemaField; 20]>,
+) -> Result<std::borrow::Cow<'c, str>, String> {
+    let upper = clause.to_ascii_uppercase();
+    let maybe = upper.contains("IS")
+        && (upper.contains("TRUE") || upper.contains("FALSE") || upper.contains("UNKNOWN"));
+    if !maybe {
+        return Ok(std::borrow::Cow::Borrowed(clause));
+    }
+    let toks = lex(clause)?;
+    let mut out: Vec<String> = Vec::with_capacity(toks.len());
+    let mut changed = false;
+    let mut i = 0usize;
+    while i < toks.len() {
+        if matches!(toks[i], Tok::LPar) {
+            if let Some((text, after)) = parenthesised_truth_test(&toks, i, schema)? {
+                out.push(text);
+                i = after;
+                changed = true;
+                continue;
+            }
+        }
+        out.push(toks[i].render());
+        i += 1;
+    }
+    Ok(if changed {
+        std::borrow::Cow::Owned(out.join(" "))
+    } else {
+        std::borrow::Cow::Borrowed(clause)
+    })
+}
+
+/// `( <boolean expression> ) IS [NOT] TRUE | FALSE | UNKNOWN` starting at the
+/// parenthesis at `at`: the rewritten text and the index past it, or `None`
+/// when the tokens are not that shape.
+///
+/// The expression is AND/OR/NOT over comparisons (`a > b`, `a + 1 <= 5`) and
+/// boolean columns. SQL gives each of those three values — a comparison is
+/// NULL exactly when a column it reads is — and the evaluator has two, so the
+/// test is expanded into four two-valued formulas built bottom-up:
+///
+/// ```text
+///            T (is true)          F (is false)        NT (not true)         NF (not false)
+/// a op b     nn AND a op b        nn AND a !op b      null OR a !op b       null OR a op b
+/// A AND B    T(A) AND T(B)        F(A) OR F(B)        NT(A) OR NT(B)        NF(A) AND NF(B)
+/// A OR B     T(A) OR T(B)         F(A) AND F(B)       NT(A) AND NT(B)       NF(A) OR NF(B)
+/// NOT A      F(A)                 T(A)                NF(A)                 NT(A)
+/// ```
+///
+/// where `nn` is "every nullable column it reads is set" and `null` its
+/// complement, and `!op` the complementary operator (exact: every order the
+/// evaluator uses is total, floats included). `IS UNKNOWN` is `NT AND NF`,
+/// `IS NOT UNKNOWN` is `T OR F`. Anything else inside — a function, `LIKE`,
+/// `IN`, a NULL literal — is refused by name, never approximated.
+fn parenthesised_truth_test(
+    toks: &[Tok],
+    at: usize,
+    schema: &SmallVec<[SchemaField; 20]>,
+) -> Result<Option<(String, usize)>, String> {
+    // The group's extent.
+    let mut depth = 0usize;
+    let mut close = None;
+    for (i, t) in toks.iter().enumerate().skip(at) {
+        match t {
+            Tok::LPar => depth += 1,
+            Tok::RPar => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(close) = close else {
+        return Ok(None);
+    };
+    if !toks.get(close + 1).is_some_and(|t| t.is_keyword("is")) {
+        return Ok(None);
+    }
+    let negated = toks.get(close + 2).is_some_and(|t| t.is_keyword("not"));
+    let truth_at = close + 2 + usize::from(negated);
+    let Some(truth) = toks.get(truth_at).and_then(truth_keyword) else {
+        return Ok(None);
+    };
+    let inner = &toks[at + 1..close];
+    let tree = TruthParser {
+        toks: inner,
+        pos: 0,
+        schema,
+    }
+    .parse()
+    .map_err(|e| {
+        format!(
+            "IS {}{} over this expression is not supported: {}",
+            if negated { "NOT " } else { "" },
+            truth.to_ascii_uppercase(),
+            e
+        )
+    })?;
+    let text = match (truth, negated) {
+        ("true", false) => tree.render(Want::T),
+        ("true", true) => tree.render(Want::NT),
+        ("false", false) => tree.render(Want::F),
+        ("false", true) => tree.render(Want::NF),
+        (_, false) => format!("({} AND {})", tree.render(Want::NT), tree.render(Want::NF)),
+        (_, true) => format!("({} OR {})", tree.render(Want::T), tree.render(Want::F)),
+    };
+    Ok(Some((text, truth_at + 1)))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Want {
+    T,
+    F,
+    NT,
+    NF,
+}
+
+enum TruthNode {
+    /// A comparison, rendered with its operator and with the complementary
+    /// one, and the companions of the nullable columns it reads.
+    Atom {
+        holds: String,
+        fails: String,
+        flags: Vec<String>,
+    },
+    /// A comparison with a NULL literal: unknown for every row.
+    Unknown,
+    And(Box<TruthNode>, Box<TruthNode>),
+    Or(Box<TruthNode>, Box<TruthNode>),
+    Not(Box<TruthNode>),
+}
+
+impl TruthNode {
+    fn render(&self, want: Want) -> String {
+        match self {
+            TruthNode::Atom {
+                holds,
+                fails,
+                flags,
+            } => {
+                let (test, guarded) = match want {
+                    Want::T => (holds, true),
+                    Want::F => (fails, true),
+                    Want::NT => (fails, false),
+                    Want::NF => (holds, false),
+                };
+                if flags.is_empty() {
+                    return format!("( {} )", test);
+                }
+                let mut parts: Vec<String> = flags
+                    .iter()
+                    .map(|f| format!("{} = {}", f, if guarded { 0 } else { 1 }))
+                    .collect();
+                parts.push(test.clone());
+                format!("( {} )", parts.join(if guarded { " AND " } else { " OR " }))
+            }
+            TruthNode::Unknown => match want {
+                Want::T | Want::F => CONSTANT_FALSE.to_string(),
+                Want::NT | Want::NF => CONSTANT_TRUE.to_string(),
+            },
+            TruthNode::Not(inner) => inner.render(match want {
+                Want::T => Want::F,
+                Want::F => Want::T,
+                Want::NT => Want::NF,
+                Want::NF => Want::NT,
+            }),
+            TruthNode::And(a, b) => {
+                let joiner = match want {
+                    Want::T | Want::NF => " AND ",
+                    Want::F | Want::NT => " OR ",
+                };
+                format!("( {}{}{} )", a.render(want), joiner, b.render(want))
+            }
+            TruthNode::Or(a, b) => {
+                let joiner = match want {
+                    Want::T | Want::NF => " OR ",
+                    Want::F | Want::NT => " AND ",
+                };
+                format!("( {}{}{} )", a.render(want), joiner, b.render(want))
+            }
+        }
+    }
+}
+
+struct TruthParser<'a> {
+    toks: &'a [Tok],
+    pos: usize,
+    schema: &'a SmallVec<[SchemaField; 20]>,
+}
+
+impl TruthParser<'_> {
+    fn parse(mut self) -> Result<TruthNode, String> {
+        if self.toks.is_empty() {
+            return Err("the parentheses are empty".to_string());
+        }
+        let node = self.or()?;
+        if self.pos != self.toks.len() {
+            return Err(format!("unexpected '{}'", self.toks[self.pos].render()));
+        }
+        Ok(node)
+    }
+
+    fn or(&mut self) -> Result<TruthNode, String> {
+        let mut left = self.and()?;
+        while self.toks.get(self.pos).is_some_and(|t| t.is_keyword("or")) {
+            self.pos += 1;
+            left = TruthNode::Or(Box::new(left), Box::new(self.and()?));
+        }
+        Ok(left)
+    }
+
+    fn and(&mut self) -> Result<TruthNode, String> {
+        let mut left = self.not()?;
+        while self.toks.get(self.pos).is_some_and(|t| t.is_keyword("and")) {
+            self.pos += 1;
+            left = TruthNode::And(Box::new(left), Box::new(self.not()?));
+        }
+        Ok(left)
+    }
+
+    fn not(&mut self) -> Result<TruthNode, String> {
+        if self.toks.get(self.pos).is_some_and(|t| t.is_keyword("not")) {
+            self.pos += 1;
+            return Ok(TruthNode::Not(Box::new(self.not()?)));
+        }
+        // A parenthesis opening a boolean group, rather than an operand.
+        if matches!(self.toks.get(self.pos), Some(Tok::LPar)) && opens_boolean_group(self.toks, self.pos) {
+            let mut depth = 0usize;
+            let mut end = self.pos;
+            for (i, t) in self.toks.iter().enumerate().skip(self.pos) {
+                match t {
+                    Tok::LPar => depth += 1,
+                    Tok::RPar => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = i;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // `(a + 1) > 2` also opens with a group; only a group followed by
+            // a connective or the end is a condition.
+            let after = self.toks.get(end + 1);
+            if after.is_none() || after.is_some_and(|t| t.is_keyword("and") || t.is_keyword("or")) {
+                let inner = TruthParser {
+                    toks: &self.toks[self.pos + 1..end],
+                    pos: 0,
+                    schema: self.schema,
+                }
+                .parse()?;
+                self.pos = end + 1;
+                return Ok(inner);
+            }
+        }
+        self.atom()
+    }
+
+    fn atom(&mut self) -> Result<TruthNode, String> {
+        let start = self.pos;
+        let mut depth = 0usize;
+        while let Some(t) = self.toks.get(self.pos) {
+            match t {
+                Tok::LPar => depth += 1,
+                Tok::RPar => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                }
+                _ if depth == 0 && (t.is_keyword("and") || t.is_keyword("or")) => break,
+                _ => {}
+            }
+            self.pos += 1;
+        }
+        let toks = &self.toks[start..self.pos];
+        if toks.is_empty() {
+            return Err("a condition is missing".to_string());
+        }
+
+        let mut flags: Vec<String> = Vec::new();
+        let mut rendered: Vec<String> = Vec::with_capacity(toks.len());
+        let mut null_literal = false;
+        let mut op_at = None;
+        let mut depth = 0usize;
+        for (i, t) in toks.iter().enumerate() {
+            match t {
+                Tok::LPar => {
+                    depth += 1;
+                    rendered.push("(".to_string());
+                }
+                Tok::RPar => {
+                    depth = depth.saturating_sub(1);
+                    rendered.push(")".to_string());
+                }
+                Tok::Sym(sym) if negated_operator(sym).is_some() => {
+                    if depth != 0 || op_at.is_some() {
+                        return Err(format!("'{}' is not a single comparison", render_tokens(toks)));
+                    }
+                    op_at = Some(i);
+                    rendered.push(sym.clone());
+                }
+                Tok::Sym(sym) if is_arithmetic(sym) => rendered.push(sym.clone()),
+                Tok::Str(_) => rendered.push(t.render()),
+                Tok::Word(w) => {
+                    if let Some(col) = resolve_column(w, self.schema) {
+                        if let Some(flag) = nullable::flag_field(&col, self.schema) {
+                            if !flags.contains(&flag.name) {
+                                flags.push(flag.name.clone());
+                            }
+                        }
+                        rendered.push(col);
+                    } else if w.eq_ignore_ascii_case("null") {
+                        null_literal = true;
+                        rendered.push("NULL".to_string());
+                    } else if w.bytes().next().is_some_and(|b| b.is_ascii_digit())
+                        || w.eq_ignore_ascii_case("true")
+                        || w.eq_ignore_ascii_case("false")
+                    {
+                        rendered.push(render_value(t));
+                    } else {
+                        return Err(format!("'{}' cannot be evaluated here", w));
+                    }
+                }
+                other => return Err(format!("'{}' cannot be evaluated here", other.render())),
+            }
+        }
+        match op_at {
+            Some(op_at) => {
+                if op_at == 0 || op_at + 1 == toks.len() {
+                    return Err(format!("'{}' is missing an operand", render_tokens(toks)));
+                }
+                let Tok::Sym(op) = &toks[op_at] else {
+                    unreachable!("found above")
+                };
+                // Any comparison with a NULL — and any arithmetic on one — is
+                // NULL, whatever the other side holds.
+                if null_literal {
+                    return Ok(TruthNode::Unknown);
+                }
+                let holds = rendered.join(" ");
+                let mut negated = rendered.clone();
+                negated[op_at] = negated_operator(op).expect("checked").to_string();
+                Ok(TruthNode::Atom {
+                    holds,
+                    fails: negated.join(" "),
+                    flags,
+                })
+            }
+            None => {
+                // A boolean column standing alone.
+                let [Tok::Word(w)] = toks else {
+                    return Err(format!("'{}' is not a condition", render_tokens(toks)));
+                };
+                let col = resolve_column(w, self.schema)
+                    .filter(|c| {
+                        self.schema
+                            .iter()
+                            .any(|f| f.name == *c && f.db_type == crate::core::db_type::DbType::BOOL)
+                    })
+                    .ok_or_else(|| format!("'{}' is not a boolean column", w))?;
+                Ok(TruthNode::Atom {
+                    holds: format!("{} = 1", col),
+                    fails: format!("{} = 0", col),
+                    flags,
+                })
+            }
+        }
+    }
+}
+
+fn render_tokens(toks: &[Tok]) -> String {
+    toks.iter().map(|t| t.render()).collect::<Vec<_>>().join(" ")
+}
+
 /// Wraps a comparison so a `NULL` row cannot satisfy it.
 ///
 /// SQL evaluates any comparison against `NULL` to *unknown*, and returns a row
@@ -52,7 +666,13 @@ fn guard_null(column: &str, fragment: &str, schema: &SmallVec<[SchemaField; 20]>
 /// `<->` is here too even though it yields a distance rather than a boolean:
 /// lexing it is what lets the planner report it as an unsupported *operator*
 /// rather than as an unexpected character.
-pub const PG_OPERATORS: &[&str] = &["<<=", ">>=", "<->", "@>", "<@", "&&", "<<", ">>", "@@"];
+///
+/// The JSONB key-existence operators `?|`, `?&` and `?` close the list. This
+/// module's own lexer reads them in a dedicated arm (it has to canonicalise the
+/// key list), and emits them for the engine tokenizer, which lexes them here.
+pub const PG_OPERATORS: &[&str] = &[
+    "<<=", ">>=", "<->", "@>", "<@", "&&", "<<", ">>", "@@", "?|", "?&", "?",
+];
 
 #[derive(Debug, Clone, PartialEq)]
 enum Tok {
@@ -94,6 +714,22 @@ fn lex(clause: &str) -> Result<Vec<Tok>, String> {
 
         if c.is_ascii_whitespace() {
             i += 1;
+            continue;
+        }
+
+        // `E'…'`: PostgreSQL's escape string, where a backslash escapes. Read
+        // here and handed on as an ordinary standard-conforming literal, so
+        // nothing downstream needs to know the form existed — a `LIKE E'a\\_b'`
+        // pattern then carries the single backslash its LIKE escape needs.
+        if c == b'\''
+            && i > 0
+            && matches!(bytes[i - 1], b'E' | b'e')
+            && matches!(out.last(), Some(Tok::Word(w)) if w.eq_ignore_ascii_case("e"))
+        {
+            let (text, end) = escape_string(clause, i)?;
+            out.pop();
+            out.push(Tok::Str(quote_standard(&text)));
+            i = end;
             continue;
         }
 
@@ -197,7 +833,7 @@ fn lex(clause: &str) -> Result<Vec<Tok>, String> {
             // Longest first — `<<=` before `<<`, `>>=` before `>>` — or a
             // network containment test would lose its `=` and silently become
             // the strict operator.
-            _ if PG_OPERATORS.iter().any(|sym| clause[i..].starts_with(*sym)) => {
+            _ if c != b'?' && PG_OPERATORS.iter().any(|sym| clause[i..].starts_with(*sym)) => {
                 let symbol = PG_OPERATORS
                     .iter()
                     .find(|sym| clause[i..].starts_with(**sym))
@@ -229,61 +865,53 @@ fn lex(clause: &str) -> Result<Vec<Tok>, String> {
                 }
                 out.push(Tok::Word(clause[start..i].to_string()));
             }
-            // `?` is JSONB key existence: `data ? 'k'` asks whether the
-            // document has that key at the top level.
+            // `?`, `?|` and `?&` are JSONB key existence: `data ? 'k'` asks
+            // whether the document has that key at the top level — or, for an
+            // array, holds that string as a top-level element, which is what
+            // the `data->'k' <> ''` rewrite this replaced could not see:
+            // `'["a","b"]' ? 'a'` is true in PostgreSQL and matched nothing
+            // here. Each is now an operator of its own (`pg_ops::PgOp`),
+            // answered on the encoded document (`jsonb::key_exists`).
             //
-            // Compiled to `data->'k' <> ''` rather than given a predicate kind
-            // of its own, because that form already means exactly this. A raw
-            // path extract yields empty bytes for an absent key and the
-            // encoded value for a present one — and a present key whose value
-            // is JSON `null` encodes to something non-empty, which is the
-            // distinction that separates `?` from `->> IS NOT NULL`. So the
-            // rewrite is not an approximation: `{"k": null} ? 'k'` is true
-            // here as it is in PostgreSQL.
+            // `?|` / `?&` take an array of keys, written `ARRAY['a','b']` or
+            // `'{a,b}'`; both are canonicalised to the second, one string
+            // literal the engine tokenizer can carry.
             //
             // Parameters are substituted before a predicate reaches this, so a
             // `?` here is never a placeholder.
             b'?' => {
-                // `?|` and `?&` take an array of keys and are a different
-                // shape; refused by name rather than half-implemented.
-                if matches!(bytes.get(i + 1), Some(b'|') | Some(b'&')) {
-                    return Err(format!(
-                        "the JSONB operator '?{}' is not supported yet;                          test each key with `?` and combine with OR/AND",
-                        bytes[i + 1] as char
-                    ));
-                }
-                let mut j = i + 1;
+                let symbol = match bytes.get(i + 1) {
+                    Some(b'|') => "?|",
+                    Some(b'&') => "?&",
+                    _ => "?",
+                };
+                let mut j = i + symbol.len();
                 while j < bytes.len() && (bytes[j] as char).is_whitespace() {
                     j += 1;
                 }
-                if bytes.get(j) != Some(&b'\'') {
-                    return Err(
-                        "the JSONB operator '?' needs a quoted key, as in `data ? 'name'`"
-                            .to_string(),
-                    );
-                }
-                // The key literal, with `''` as an escaped quote.
-                let start = j;
-                j += 1;
-                loop {
-                    match bytes.get(j) {
-                        None => {
-                            return Err("unterminated key after the JSONB operator '?'".to_string());
-                        }
-                        Some(b'\'') if bytes.get(j + 1) == Some(&b'\'') => j += 2,
-                        Some(b'\'') => {
-                            j += 1;
-                            break;
-                        }
-                        Some(_) => j += 1,
+                let (operand, end) = if symbol == "?" {
+                    if bytes.get(j) != Some(&b'\'') {
+                        return Err(
+                            "the JSONB operator '?' needs a quoted key, as in `data ? 'name'`"
+                                .to_string(),
+                        );
                     }
-                }
-                let key = clause[start..j].to_string();
-                out.push(Tok::Sym("->".to_string()));
-                out.push(Tok::Str(key));
-                out.push(Tok::Sym("<>".to_string()));
-                out.push(Tok::Str("''".to_string()));
-                i = j;
+                    let end = quoted_end(bytes, j).ok_or_else(|| {
+                        "unterminated key after the JSONB operator '?'".to_string()
+                    })?;
+                    (clause[j..end].to_string(), end)
+                } else {
+                    key_list_operand(clause, j).ok_or_else(|| {
+                        format!(
+                            "the JSONB operator '{}' needs an array of keys, as in \
+                             `data {} array['a','b']` or `data {} '{{a,b}}'`",
+                            symbol, symbol, symbol
+                        )
+                    })?
+                };
+                out.push(Tok::Sym(symbol.to_string()));
+                out.push(Tok::Str(operand));
+                i = end;
                 continue;
             }
             // `::` is a cast, not a stray colon. Saying so sends the reader to
@@ -499,36 +1127,205 @@ fn render_value(tok: &Tok) -> String {
 ///
 /// Returns the operator and the literal to compare against, or an error when
 /// the pattern needs wildcard machinery the engine does not have.
-fn like_to_operator(
-    pattern_tok: &Tok,
-    case_insensitive: bool,
-) -> Result<(&'static str, String), String> {
+/// The characters a pattern token stands for, with its SQL quoting removed: a
+/// doubled quote inside is one quote. A bare word is taken as written, as it
+/// always was.
+fn pattern_text(pattern_tok: &Tok) -> String {
     let raw = pattern_tok.render();
     let quote = raw.chars().next().unwrap_or('\'');
-    let inner = if raw.len() >= 2 && (quote == '\'' || quote == '"') {
-        &raw[1..raw.len() - 1]
+    if raw.len() >= 2 && (quote == '\'' || quote == '"') {
+        let doubled: String = [quote, quote].iter().collect();
+        raw[1..raw.len() - 1].replace(&doubled, &quote.to_string())
     } else {
-        raw.as_str()
-    };
+        raw
+    }
+}
 
-    let leading = inner.starts_with('%');
-    let trailing = inner.ends_with('%') && inner.len() > 1;
-    let core = inner.trim_start_matches('%').trim_end_matches('%');
+/// `text` as a standard-conforming SQL literal: quoted, inner quotes doubled.
+fn quote_standard(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "''"))
+}
+
+/// Reads the `E'…'` string whose opening quote is at `open`, resolving its
+/// backslash escapes as PostgreSQL does. Returns the text and the index just
+/// past the closing quote.
+fn escape_string(clause: &str, open: usize) -> Result<(String, usize), String> {
+    let chars: Vec<(usize, char)> = clause[open + 1..].char_indices().collect();
+    let mut out = String::new();
+    let mut k = 0usize;
+    let hex = |s: &[(usize, char)], from: usize, max: usize| -> (u32, usize) {
+        let mut v = 0u32;
+        let mut n = 0usize;
+        while n < max {
+            match s.get(from + n).and_then(|(_, c)| c.to_digit(16)) {
+                Some(d) => v = v * 16 + d,
+                None => break,
+            }
+            n += 1;
+        }
+        (v, n)
+    };
+    while k < chars.len() {
+        let c = chars[k].1;
+        match c {
+            '\'' => {
+                if chars.get(k + 1).map(|(_, c)| *c) == Some('\'') {
+                    out.push('\'');
+                    k += 2;
+                    continue;
+                }
+                return Ok((out, open + 1 + chars[k].0 + 1));
+            }
+            '\\' => {
+                let Some(&(_, e)) = chars.get(k + 1) else { break };
+                k += 2;
+                match e {
+                    'b' => out.push('\u{8}'),
+                    'f' => out.push('\u{c}'),
+                    'n' => out.push('\n'),
+                    'r' => out.push('\r'),
+                    't' => out.push('\t'),
+                    '0'..='7' => {
+                        let mut v = e.to_digit(8).unwrap_or(0);
+                        let mut n = 0;
+                        while n < 2 {
+                            match chars.get(k).and_then(|(_, c)| c.to_digit(8)) {
+                                Some(d) => v = v * 8 + d,
+                                None => break,
+                            }
+                            k += 1;
+                            n += 1;
+                        }
+                        out.push(char::from_u32(v & 0xFF).unwrap_or('\u{fffd}'));
+                    }
+                    'x' => {
+                        let (v, n) = hex(&chars, k, 2);
+                        if n == 0 {
+                            out.push('x');
+                        } else {
+                            k += n;
+                            out.push(char::from_u32(v).unwrap_or('\u{fffd}'));
+                        }
+                    }
+                    'u' | 'U' => {
+                        let want = if e == 'u' { 4 } else { 8 };
+                        let (v, n) = hex(&chars, k, want);
+                        if n != want {
+                            return Err(format!("invalid Unicode escape in E'' string at offset {}", open));
+                        }
+                        k += n;
+                        out.push(
+                            char::from_u32(v)
+                                .ok_or_else(|| format!("invalid Unicode escape value {:#x}", v))?,
+                        );
+                    }
+                    other => out.push(other),
+                }
+            }
+            other => {
+                out.push(other);
+                k += 1;
+            }
+        }
+    }
+    Err(format!("unterminated string literal at offset {}", open))
+}
+
+/// A `LIKE` pattern as tokens, decoded with its escape character.
+#[derive(Clone, Copy, PartialEq)]
+enum LikePiece {
+    Literal(char),
+    /// `_`
+    One,
+    /// `%`
+    Any,
+}
+
+/// Decodes `text` as a `LIKE` pattern whose escape character is `escape`
+/// (`None` for `ESCAPE ''`). PostgreSQL refuses a pattern that ends in its
+/// escape character (22025).
+fn like_pieces(text: &str, escape: Option<char>) -> Result<Vec<LikePiece>, String> {
+    let mut out = Vec::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if Some(c) == escape {
+            match chars.next() {
+                Some(next) => out.push(LikePiece::Literal(next)),
+                None => {
+                    return Err("LIKE pattern must not end with escape character".to_string());
+                }
+            }
+        } else {
+            out.push(match c {
+                '%' => LikePiece::Any,
+                '_' => LikePiece::One,
+                c => LikePiece::Literal(c),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// The pattern in the form the engine's matcher reads: `\` is the escape,
+/// whatever the statement's own escape character was.
+fn canonical_like_pattern(pieces: &[LikePiece]) -> String {
+    let mut out = String::with_capacity(pieces.len() + 4);
+    for piece in pieces {
+        match piece {
+            LikePiece::Any => out.push('%'),
+            LikePiece::One => out.push('_'),
+            LikePiece::Literal(c @ ('%' | '_' | '\\')) => {
+                out.push('\\');
+                out.push(*c);
+            }
+            LikePiece::Literal(c) => out.push(*c),
+        }
+    }
+    out
+}
+
+fn like_to_operator(
+    text: &str,
+    escape: Option<char>,
+    case_insensitive: bool,
+) -> Result<(&'static str, String), String> {
+    let pieces = like_pieces(text, escape)?;
+    let leading = pieces.first() == Some(&LikePiece::Any);
+    let trailing = pieces.last() == Some(&LikePiece::Any) && pieces.len() > 1;
+    let core_start = pieces.iter().take_while(|p| **p == LikePiece::Any).count();
+    let core_end = pieces.len()
+        - pieces[core_start..]
+            .iter()
+            .rev()
+            .take_while(|p| **p == LikePiece::Any)
+            .count();
+    let core = &pieces[core_start..core_end];
 
     // A `_`, or a `%` that is not merely leading or trailing, cannot be reduced
     // to a prefix/suffix/substring test — `a%b` is not
     // `STARTSWITH 'a' AND CONTAINS 'b'`, which does not require `b` to follow
     // `a` and loses the ordering entirely once there are three segments. These
-    // go to the pattern matcher with their wildcards intact.
+    // go to the pattern matcher with their wildcards intact, escapes written
+    // with the backslash the matcher reads.
+    //
+    // Only *unescaped* wildcards count: `'%a\_b%'` — Django's `contains` — is a
+    // substring test for `a_b`, not a pattern.
     //
     // Deliberately not sargable: `sarg::op_of` only accepts `Token::Op` and five
     // comparisons, and a string operator arrives as `Token::Ident`, so this
     // yields `MaskExpr::All` and the scan is unfiltered rather than wrongly
     // pruned. `a_like_predicate_is_never_sargable` pins that.
-    if inner.contains('_') || core.contains('%') {
+    if pieces.contains(&LikePiece::One) || core.contains(&LikePiece::Any) {
         let op = if case_insensitive { "ILIKE" } else { "LIKE" };
-        return Ok((op, format!("'{}'", inner)));
+        return Ok((op, quote_standard(&canonical_like_pattern(&pieces))));
     }
+    let core: String = core
+        .iter()
+        .map(|p| match p {
+            LikePiece::Literal(c) => *c,
+            _ => unreachable!("wildcards were ruled out above"),
+        })
+        .collect();
 
     let op = match (leading, trailing, case_insensitive) {
         (true, true, false) => "CONTAINS",
@@ -542,7 +1339,7 @@ fn like_to_operator(
         (false, false, true) => "IEQUALS",
     };
 
-    Ok((op, format!("'{}'", core)))
+    Ok((op, quote_standard(&core)))
 }
 
 /// Rewrites a `WHERE` clause into the engine's basic comparison grammar.
@@ -863,6 +1660,12 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
     // it already understands.
     let clause = &expand_row_value_comparisons(clause)?;
 
+    // `( <expression> ) IS [NOT] TRUE | FALSE | UNKNOWN` is expanded before
+    // `x = NULL` is folded to false: under a truth test a comparison with NULL
+    // is *unknown*, not false, and `(a = NULL) IS UNKNOWN` holds for every
+    // row. See `parenthesised_truth_test`.
+    let clause = &expand_truth_tests(clause, schema)?;
+
     // `x = NULL` is never true in SQL — NULL is not a value anything equals,
     // which is why `IS NULL` exists. Folded to a false predicate here so the
     // comparison never reaches the tokenizer, where an untyped NULL against a
@@ -948,8 +1751,10 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
                         if value.eq_ignore_ascii_case("null") {
                             out.push(match nullable::flag_field(&col, schema) {
                                 Some(flag) => format!("{} = {}", flag.name, u8::from(negated)),
-                                None if negated => format!("{} != {}", col, col),
-                                None => format!("{} = {}", col, col),
+                                // A constant: see `IS NULL` below for why not
+                                // `col = col`.
+                                None if negated => CONSTANT_FALSE.to_string(),
+                                None => CONSTANT_TRUE.to_string(),
                             });
                             i = value_at + 1;
                             continue;
@@ -969,13 +1774,30 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
                         continue;
                     }
 
+                    // `flag IS [NOT] TRUE | FALSE | UNKNOWN`.
+                    if let Some(truth) = toks.get(null_at).and_then(truth_keyword) {
+                        let is_bool = schema.iter().any(|f| {
+                            f.name == col && f.db_type == crate::core::db_type::DbType::BOOL
+                        });
+                        if !is_bool {
+                            return Err(format!(
+                                "argument of IS {} must be type boolean, not the column '{}'",
+                                truth.to_ascii_uppercase(),
+                                col
+                            ));
+                        }
+                        out.push(truth_test(&col, None, truth, negated, schema));
+                        i = null_at + 1;
+                        continue;
+                    }
+
                     if !toks
                         .get(null_at)
                         .map(|t| t.is_keyword("null"))
                         .unwrap_or(false)
                     {
                         return Err(
-                            "IS must be followed by NULL, NOT NULL, or [NOT] DISTINCT FROM"
+                            "IS must be followed by NULL, NOT NULL, TRUE, FALSE, UNKNOWN, or [NOT] DISTINCT FROM"
                                 .to_string(),
                         );
                     }
@@ -985,11 +1807,13 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
                         // plain equality against it.
                         Some(flag) => format!("{} = {}", flag.name, u8::from(!negated)),
                         // A `NOT NULL` column can never be NULL, so the test is
-                        // a constant. Comparing the column against itself
-                        // expresses both constants without needing a literal of
-                        // the column's type.
-                        None if negated => format!("{} = {}", col, col),
-                        None => format!("{} != {}", col, col),
+                        // a constant — written as one. It used to be the column
+                        // compared against itself, which is not a constant for
+                        // a float: NaN != NaN under IEEE, so on a NOT NULL
+                        // float column `IS NULL` returned every NaN row and
+                        // `IS NOT NULL` dropped them.
+                        None if negated => CONSTANT_TRUE.to_string(),
+                        None => CONSTANT_FALSE.to_string(),
                     });
                     i = null_at + 1;
                     continue;
@@ -1016,15 +1840,30 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
                     let (values, after) = parse_in_list(&toks, kw_at + 1)?;
 
                     // `x IN ()` arises when a subquery returned nothing. It can
-                    // never hold, and `x NOT IN ()` always holds. Comparing the
-                    // column against itself expresses both without needing a
-                    // constant of the column's type.
+                    // never hold, and `x NOT IN ()` always holds — constants,
+                    // for every value including NaN and NULL.
                     if values.is_empty() {
                         out.push(if negated {
-                            format!("{} = {}", col, col)
+                            CONSTANT_TRUE.to_string()
                         } else {
-                            format!("{} != {}", col, col)
+                            CONSTANT_FALSE.to_string()
                         });
+                        i = after;
+                        continue;
+                    }
+
+                    // A NULL in the list: `x IN (1, NULL)` is `x = 1 OR
+                    // unknown`, which holds exactly where `x = 1` does, so the
+                    // NULL drops out. `x NOT IN (1, NULL)` is `x <> 1 AND
+                    // unknown`, which is never true — for any row, NULL or
+                    // not — so the whole term is the constant.
+                    let has_null = values.iter().any(|v| v.eq_ignore_ascii_case("null"));
+                    let values: Vec<&String> = values
+                        .iter()
+                        .filter(|v| !v.eq_ignore_ascii_case("null"))
+                        .collect();
+                    if (negated && has_null) || values.is_empty() {
+                        out.push(CONSTANT_FALSE.to_string());
                         i = after;
                         continue;
                     }
@@ -1123,6 +1962,14 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
                     if negated {
                         return Err("NOT SIMILAR TO is not supported yet".to_string());
                     }
+                    // A pattern the matcher cannot use fails the statement here
+                    // rather than matching nothing on every row.
+                    if let Some(inner) = literal
+                        .strip_prefix('\'')
+                        .and_then(|l| l.strip_suffix('\''))
+                    {
+                        crate::core::similar_to::validate(&inner.replace("''", "'"), Some('\\'))?;
+                    }
                     // `Tok::Str` keeps the quotes it was written with, so the
                     // literal is emitted as-is. Adding a pair around it made
                     // `''101%''`, which the tokenizer read as an empty string
@@ -1148,7 +1995,30 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
                         .unwrap_or(false);
                 if is_like {
                     let pattern = toks.get(kw_at + 1).ok_or("LIKE is missing its pattern")?;
-                    let (op, literal) = like_to_operator(pattern, case_insensitive)?;
+                    // `ESCAPE 'c'` picks the escape character; `ESCAPE ''`
+                    // turns escaping off. The default is a backslash.
+                    let mut next = kw_at + 2;
+                    let mut escape = Some('\\');
+                    if toks.get(next).is_some_and(|t| t.is_keyword("escape")) {
+                        let Some(escape_tok @ Tok::Str(_)) = toks.get(next + 1) else {
+                            return Err("ESCAPE needs a quoted string".to_string());
+                        };
+                        let text = pattern_text(escape_tok);
+                        let mut chars = text.chars();
+                        escape = match (chars.next(), chars.next()) {
+                            (None, _) => None,
+                            (Some(c), None) => Some(c),
+                            _ => {
+                                return Err(
+                                    "invalid escape string: it must be empty or one character"
+                                        .to_string(),
+                                );
+                            }
+                        };
+                        next += 2;
+                    }
+                    let (op, literal) =
+                        like_to_operator(&pattern_text(pattern), escape, case_insensitive)?;
                     if negated {
                         return Err("NOT LIKE is not supported yet".to_string());
                     }
@@ -1157,7 +2027,7 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
                         &format!("{} {} {}", col, op, literal),
                         schema,
                     ));
-                    i = kw_at + 2;
+                    i = next;
                     continue;
                 }
 
@@ -1478,13 +2348,14 @@ fn any_or_all_expansion(
     };
 
     // An empty array: `= ANY('{}')` holds for nothing, `<> ALL('{}')` for
-    // everything. Expressed by comparing the column with itself, which needs no
-    // constant of the column's type.
+    // everything — constants, which the column compared with itself is not for
+    // a float holding NaN.
     if values.is_empty() {
+        let _ = col;
         let term = if negated {
-            format!("{} = {}", col, col)
+            CONSTANT_TRUE.to_string()
         } else {
-            format!("{} != {}", col, col)
+            CONSTANT_FALSE.to_string()
         };
         return Ok(Some((term, col_at + 6)));
     }
@@ -1571,6 +2442,22 @@ fn parse_in_list(toks: &[Tok], start: usize) -> Result<(Vec<String>, usize), Str
             }
             Some(Tok::LPar) => {
                 return Err("subqueries inside IN are not supported yet".to_string());
+            }
+            // A signed number is one value. The sign lexes as its own symbol,
+            // so `x IN (-1, 2)` used to become `x = - OR x = 1 OR x = 2` and
+            // fail to plan.
+            Some(Tok::Sym(sign)) if (sign == "-" || sign == "+")
+                && matches!(toks.get(i + 1), Some(Tok::Word(w)) if w.bytes().next().is_some_and(|b| b.is_ascii_digit())) =>
+            {
+                let Some(Tok::Word(number)) = toks.get(i + 1) else {
+                    unreachable!("matched above");
+                };
+                values.push(if sign == "-" {
+                    format!("-{}", number)
+                } else {
+                    number.clone()
+                });
+                i += 2;
             }
             Some(t) => {
                 if t.is_keyword("select") {
@@ -1681,6 +2568,35 @@ mod tests {
     }
 
     #[test]
+    fn like_escapes_are_honoured_when_choosing_the_operator() {
+        // Django's `contains`: every `_` and `%` in the value escaped.
+        assert_eq!(rw("name LIKE '%a\\_b%'"), "name CONTAINS 'a_b'");
+        assert_eq!(rw("name LIKE '%50\\%%'"), "name CONTAINS '50%'");
+        assert_eq!(rw("name LIKE '50\\%'"), "name = '50%'");
+        assert_eq!(rw("name LIKE 'a\\%b%'"), "name STARTSWITH 'a%b'");
+        assert_eq!(rw("name LIKE '%a\\\\b'"), "name ENDSWITH 'a\\b'");
+        assert_eq!(rw("name ILIKE '%a\\_b%'"), "name ICONTAINS 'a_b'");
+        assert_eq!(rw("name LIKE 'it''s%'"), "name STARTSWITH 'it''s'");
+        // An interior wildcard keeps the pattern, escapes and all.
+        assert_eq!(rw("name LIKE 'a\\_%b'"), "name LIKE 'a\\_%b'");
+        // ESCAPE picks another escape character, or none.
+        assert_eq!(rw("name LIKE 'a!_b%' ESCAPE '!'"), "name STARTSWITH 'a_b'");
+        assert_eq!(rw("name LIKE 'a!_%b' ESCAPE '!'"), "name LIKE 'a\\_%b'");
+        assert_eq!(rw("name LIKE 'a\\b%' ESCAPE '!'"), "name STARTSWITH 'a\\b'");
+        assert_eq!(rw("name LIKE 'a\\_%' ESCAPE ''"), "name LIKE 'a\\\\_%'");
+        // An E'' string has its backslash escapes resolved first.
+        assert_eq!(rw("name LIKE E'%a\\\\_b%'"), "name CONTAINS 'a_b'");
+        assert_eq!(rw("name LIKE E'it\\'s%'"), "name STARTSWITH 'it''s'");
+    }
+
+    #[test]
+    fn a_like_pattern_ending_in_its_escape_is_refused() {
+        assert!(err("name LIKE 'ab\\'").contains("must not end with escape character"));
+        assert!(err("name LIKE 'ab!' ESCAPE '!'").contains("must not end with escape character"));
+        assert!(err("name LIKE 'ab' ESCAPE 'xy'").contains("invalid escape string"));
+    }
+
+    #[test]
     fn like_patterns_the_simple_operators_cannot_express_become_a_pattern_test() {
         // These used to be refused, and refusing was right at the time: `a%b` is
         // not `STARTSWITH 'a' AND CONTAINS 'b'`, which does not require `b` to
@@ -1778,8 +2694,12 @@ mod tests {
         assert_eq!(rw("country <> NULL"), "1 = 0");
         // The whole comparison goes, not just its right-hand side.
         assert_eq!(rw("id = 5 AND country = NULL"), "id = 5 AND 1 = 0");
-        // `IS NULL` asks a different question and must not be folded away.
-        assert_ne!(rw("country IS NULL"), "1 = 0");
+        // `IS NULL` asks a different question and must not be folded away —
+        // on a nullable column. (On a NOT NULL one it *is* the constant.)
+        assert_ne!(
+            rewrite_where("country IS NULL", &nullable_schema()).unwrap(),
+            "1 = 0"
+        );
     }
 
     /// A schema where `country` is nullable and `id` is not.
@@ -1849,8 +2769,8 @@ mod tests {
     /// knowing the constraint.
     #[test]
     fn is_null_on_a_non_nullable_column_is_a_constant() {
-        assert_eq!(rw("id IS NULL"), "id != id");
-        assert_eq!(rw("id IS NOT NULL"), "id = id");
+        assert_eq!(rw("id IS NULL"), CONSTANT_FALSE);
+        assert_eq!(rw("id IS NOT NULL"), CONSTANT_TRUE);
     }
 
     /// The guard is what stops `country = ''` matching a `NULL` row: the bytes
@@ -1930,8 +2850,8 @@ mod tests {
     /// predicate that matches everything.
     #[test]
     fn an_empty_in_list_can_never_hold() {
-        assert_eq!(rw("id IN ()"), "id != id");
-        assert_eq!(rw("id NOT IN ()"), "id = id");
+        assert_eq!(rw("id IN ()"), CONSTANT_FALSE);
+        assert_eq!(rw("id NOT IN ()"), CONSTANT_TRUE);
     }
 
     #[test]
@@ -2024,9 +2944,9 @@ mod any_all_tests {
     #[test]
     fn an_empty_array_is_expressed_without_a_typed_constant() {
         let out = rewrite_where("id = ANY('{}')", &schema()).expect("rewrites");
-        assert!(out.contains("id != id"), "{}", out);
+        assert_eq!(out, CONSTANT_FALSE);
         let out = rewrite_where("id <> ALL('{}')", &schema()).expect("rewrites");
-        assert!(out.contains("id = id"), "{}", out);
+        assert_eq!(out, CONSTANT_TRUE);
     }
 
     /// `<> ANY` and `= ALL` are legal SQL meaning something else entirely.

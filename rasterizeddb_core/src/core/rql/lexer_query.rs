@@ -2,7 +2,7 @@ use log::debug;
 use smallvec::SmallVec;
 use std::collections::HashSet;
 
-use crate::core::rql::aggregate::{AggFunc, Having, HavingOp, SelectItem};
+use crate::core::rql::aggregate::{AggFunc, SelectItem};
 use crate::core::{
     processor::transformer::ComparerOperation,
     row::{
@@ -135,14 +135,24 @@ fn parse_computed_item(
             crate::core::rql::aggregate::COMPUTED_INPUT_PREFIX,
             slot
         );
-        synth_schema.push(SchemaField::new(
+        let mut synth_field = SchemaField::new(
             name.clone(),
             ty.clone(),
             ty.get_size(),
             0,
             slot as u64,
             false,
-        ));
+        );
+        // SUM, MIN and MAX of a `NUMERIC(p, s)` column fold its stored
+        // integers, so their result is at the column's scale; AVG divides at
+        // the engine scale or wider (`AggFunc::decimal_output_scale`). Carried
+        // here so the expression lifts it to the engine scale like a column
+        // read — `MIN(v) + 1` over a `NUMERIC(10,2)` added 1 to 100 as 10^9
+        // to 10^4.
+        if matches!(ty, crate::core::db_type::DbType::DECIMAL) {
+            synth_field.scale = Some(func.decimal_output_scale(arg.as_ref()));
+        }
+        synth_schema.push(synth_field);
         inputs.push(crate::core::rql::aggregate::ComputedInput { func, arg });
         rewritten.push_str(&name);
         cursor = *end;
@@ -435,14 +445,20 @@ fn parse_select_items(
         // quote as the whole item, so an expression *beginning* with a literal
         // was truncated to it.
         if crate::core::rql::expr::needs_evaluation(expr) || looks_like_row_expression(expr) {
-            if let Ok(parsed) = crate::core::rql::expr::parse(expr, schema) {
-                let db_type = crate::core::rql::expr::static_type(&parsed);
-                out.push(SelectItem::RowExpr {
-                    expr: parsed,
-                    db_type,
-                    label: alias.clone().unwrap_or_else(|| "?column?".to_string()),
-                });
-                continue;
+            match crate::core::rql::expr::parse(expr, schema) {
+                Ok(parsed) => {
+                    let db_type = crate::core::rql::expr::static_type(&parsed);
+                    out.push(SelectItem::RowExpr {
+                        expr: parsed,
+                        db_type,
+                        label: alias.clone().unwrap_or_else(|| "?column?".to_string()),
+                    });
+                    continue;
+                }
+                // A type error is the statement's answer; falling through
+                // would report the item as an unsupported construct instead.
+                Err(e) if e.ends_with(" cannot be matched") => return Err(e),
+                Err(_) => {}
             }
         }
 
@@ -777,6 +793,23 @@ pub(crate) fn split_alias(item: &str) -> (&str, Option<String>) {
         }
     }
 
+    // A whole `CASE … END` block with no alias is one expression. Without an
+    // `AS` it fell through to the whitespace split below, which took `CASE`
+    // as the expression and `WHEN` as its alias, so the item was reported as
+    // unsupported.
+    {
+        let t = item.trim();
+        let upper = t.to_ascii_uppercase();
+        // Whole words only: `case_id case_end` is a column and its alias.
+        let starts = upper.starts_with("CASE")
+            && upper[4..].starts_with(|c: char| c.is_ascii_whitespace());
+        let ends = upper.ends_with("END")
+            && upper[..upper.len() - 3].ends_with(|c: char| c.is_ascii_whitespace());
+        if starts && ends {
+            return (t, None);
+        }
+    }
+
     // A quoted string literal is a single token however many spaces it holds.
     // Splitting on whitespace turned `'Zapier Integration'` into the expression
     // `'Zapier` plus an alias `Integration'`, so the item no longer looked like
@@ -908,56 +941,65 @@ pub(crate) fn split_alias(item: &str) -> (&str, Option<String>) {
     }
 }
 
-/// Parses `HAVING <aggregate> <op> <literal>`.
-fn parse_having(text: &str, schema: &SmallVec<[SchemaField; 20]>) -> Result<Having, String> {
-    let text = text.trim();
-    // Find the comparison operator outside the function's parentheses.
-    let bytes = text.as_bytes();
-    let mut depth = 0usize;
-    let mut op_at = None;
-    for (i, b) in bytes.iter().enumerate() {
-        match b {
-            b'(' => depth += 1,
-            b')' => depth = depth.saturating_sub(1),
-            b'=' | b'<' | b'>' | b'!' if depth == 0 => {
-                op_at = Some(i);
-                break;
-            }
-            _ => {}
+/// Parses a `HAVING` clause: the aggregate conditions the fold evaluates, and
+/// the terms over plain columns that the caller moves into `WHERE`. See
+/// [`crate::core::rql::having`], which the join planner shares.
+fn parse_having(
+    text: &str,
+    schema: &SmallVec<[SchemaField; 20]>,
+) -> Result<crate::core::rql::having::HavingSplit, String> {
+    crate::core::rql::having::parse(text, &mut |call: &str| {
+        match parse_select_items(call, schema)?.into_iter().next() {
+            Some(item @ SelectItem::Aggregate { .. }) => Ok(item),
+            _ => Err(format!("'{}' is not an aggregate HAVING can test", call)),
         }
-    }
-    let op_at = op_at.ok_or_else(|| {
-        "HAVING must compare an aggregate against a constant, as in `HAVING COUNT(*) > 1`"
-            .to_string()
-    })?;
+    })
+}
 
-    let mut op_end = op_at + 1;
-    if op_end < bytes.len() && matches!(bytes[op_end], b'=' | b'>') {
-        op_end += 1;
-    }
-    let op = HavingOp::parse(&text[op_at..op_end]).ok_or_else(|| {
-        format!(
-            "unknown comparison operator in HAVING: '{}'",
-            &text[op_at..op_end]
-        )
-    })?;
+/// Whether grouping by `field` makes every group a single row of its relation,
+/// so that the relation's other columns are functionally dependent on it.
+///
+/// True for a column that is `UNIQUE` (a `PRIMARY KEY` is too) and NOT NULL —
+/// which here means it has no `__null_` companion. NOT NULL matters: NULLs are
+/// distinct to a unique constraint and one group to the fold.
+///
+/// Uniqueness has to hold under the *fold's* equality, which is byte equality
+/// of the key. Every uniqueness check that treats byte-identical values as
+/// equal guarantees that; and the planner appends the dependent columns to the
+/// group key rather than assuming them constant, so a uniqueness the data does
+/// not actually have splits groups instead of merging rows.
+///
+/// Shared with the join planner, which applies it per relation.
+pub(crate) fn determines_its_relation(
+    field: &SchemaField,
+    schema: &SmallVec<[SchemaField; 20]>,
+) -> bool {
+    field.is_unique
+        && !field.is_deleted
+        && crate::core::rql::nullable::flag_field(&field.name, schema).is_none()
+}
 
-    let lhs = text[..op_at].trim();
-    let literal = text[op_end..].trim().to_string();
-    if literal.is_empty() {
-        return Err("HAVING is missing the value to compare against".to_string());
+/// The stored column a `GROUP BY` item names, when the item is exactly a
+/// column reference — `status`, `t.status`, `"Status"`.
+///
+/// Only then. The item used to be cut at its first space and its qualifier
+/// dropped, so `GROUP BY g % 2` grouped by `g`: five groups where there are
+/// two, every count wrong, and no error.
+fn plain_group_column<'s>(
+    item: &str,
+    schema: &'s SmallVec<[SchemaField; 20]>,
+) -> Option<&'s SchemaField> {
+    let item = item.trim();
+    let bare = item.rsplit('.').next().unwrap_or(item);
+    let name = bare.trim_matches('"');
+    let qualifier_ok = item.len() == bare.len()
+        || is_identifier(item[..item.len() - bare.len() - 1].trim_matches('"'));
+    if !qualifier_ok || !(is_identifier(name) || (bare.starts_with('"') && bare.ends_with('"'))) {
+        return None;
     }
-
-    let items = parse_select_items(lhs, schema)?;
-    match items.into_iter().next() {
-        Some(SelectItem::Aggregate { func, arg, .. }) => Ok(Having {
-            func,
-            arg,
-            op,
-            literal,
-        }),
-        _ => Err("HAVING must test an aggregate, not a plain column".to_string()),
-    }
+    schema
+        .iter()
+        .find(|f| f.name.eq_ignore_ascii_case(name) && !f.is_deleted)
 }
 
 /// Resolves every `ORDER BY` key against the schema and renders the spec the
@@ -1389,6 +1431,62 @@ pub fn row_fetch_from_select_query(
     // Desugar `IN` / `BETWEEN` / `LIKE`, fold boolean literals, and resolve
     // qualified or quoted column names, so the evaluator only ever sees the
     // basic `column <op> value` grammar it implements.
+    //
+    // A HAVING term over plain grouping columns — `HAVING status = 'x'` — is
+    // moved into WHERE first. Every row of a group carries the same bytes in a
+    // plain GROUP BY column, so the term holds for the group exactly when it
+    // holds for each of its rows. That is not true of a computed key, nor of a
+    // query without GROUP BY (its one group exists even with no rows), and
+    // both are refused rather than moved.
+    let having_split = match having_raw {
+        None => None,
+        Some(text) => Some(parse_having(text, schema)?),
+    };
+    let mut where_combined: Option<String> = None;
+    if let Some(split) = &having_split {
+        if !split.row_terms.is_empty() {
+            let Some(list) = group_by_raw else {
+                return Err(format!(
+                    "HAVING term '{}' tests no aggregate, and the query has no GROUP BY",
+                    split.row_terms[0].text
+                ));
+            };
+            let mut plain: Vec<&SchemaField> =
+                crate::core::rql::join::split_top_level_commas(list)
+                    .iter()
+                    .filter_map(|item| plain_group_column(item, schema))
+                    .collect();
+            // Grouped by a unique NOT NULL column, every column is constant
+            // within a group, so a term over any of them moves into WHERE.
+            if plain.iter().any(|f| determines_its_relation(f, schema)) {
+                plain = schema.iter().filter(|f| !f.is_deleted).collect();
+            }
+            let mut text = if where_raw.trim().is_empty() {
+                String::new()
+            } else {
+                format!("({})", where_raw)
+            };
+            for term in &split.row_terms {
+                for column in &term.columns {
+                    let bare = column.rsplit('.').next().unwrap_or(column).trim_matches('"');
+                    if !plain.iter().any(|f| f.name.eq_ignore_ascii_case(bare)) {
+                        return Err(format!(
+                            "column '{}' must appear in GROUP BY or be used in an aggregate function",
+                            column
+                        ));
+                    }
+                }
+                if !text.is_empty() {
+                    text.push_str(" AND ");
+                }
+                text.push('(');
+                text.push_str(&term.text);
+                text.push(')');
+            }
+            where_combined = Some(text);
+        }
+    }
+    let where_raw = where_combined.as_deref().unwrap_or(where_raw);
     let where_owned = crate::core::tokenizer::predicate_rewrite::rewrite_where(where_raw, schema)?;
     let where_part = where_owned.as_str();
 
@@ -1516,7 +1614,7 @@ pub fn row_fetch_from_select_query(
     // Neither has a scanned column to read, so those become computed keys the
     // fold evaluates per row.
     let mut computed_group_keys: Vec<crate::core::rql::aggregate::ComputedKey> = Vec::new();
-    let group_by: Vec<SchemaField> = match group_by_raw {
+    let mut group_by: Vec<SchemaField> = match group_by_raw {
         None => Vec::new(),
         Some(list) => {
             // Virtual write_orders sit above every real field's, so a
@@ -1527,18 +1625,7 @@ pub fn row_fetch_from_select_query(
             // its own, as `date_trunc('minute', created_at)` does.
             for item_text in crate::core::rql::join::split_top_level_commas(list) {
                 let item = item_text.trim();
-                let name = item
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("")
-                    .rsplit('.')
-                    .next()
-                    .unwrap_or("")
-                    .trim_matches('"');
-                if let Some(field) = schema
-                    .iter()
-                    .find(|f| f.name.eq_ignore_ascii_case(name) && !f.is_deleted)
-                {
+                if let Some(field) = plain_group_column(item, schema) {
                     out.push(field.clone());
                     continue;
                 }
@@ -1649,11 +1736,32 @@ pub fn row_fetch_from_select_query(
 
     // Every non-aggregate select item of a grouped query must be a grouping
     // key; otherwise its value is not determined by the group.
+    //
+    // Unless the column is functionally dependent on the grouping (PostgreSQL
+    // since 9.1): grouping by a column that is unique and NOT NULL makes each
+    // group one row, so every other column of the relation is determined.
+    // Django's `.annotate()` and Rails' `group(:id)` emit exactly
+    // `SELECT a.id, a.name, COUNT(*) … GROUP BY a.id`, which was refused. Such a
+    // column is appended to the group key rather than trusted to be constant:
+    // the result is the same when the key really is unique, and still a
+    // correct grouping if it ever is not.
+    let determined_by_key = group_by
+        .iter()
+        .filter(|g| {
+            !computed_group_keys
+                .iter()
+                .any(|k| k.write_order == g.write_order)
+        })
+        .any(|g| determines_its_relation(g, schema));
     if is_grouped {
         for (position, item) in select_items.iter().enumerate() {
             match item {
                 SelectItem::Column { field, label } => {
                     if !group_by.iter().any(|g| g.write_order == field.write_order) {
+                        if determined_by_key {
+                            group_by.push(field.clone());
+                            continue;
+                        }
                         return Err(format!(
                             "column '{}' must appear in GROUP BY or be used in an aggregate",
                             label
@@ -1677,10 +1785,9 @@ pub fn row_fetch_from_select_query(
         }
     }
 
-    let having = match having_raw {
-        None => None,
-        Some(text) => Some(parse_having(text, schema)?),
-    };
+    // Parsed above, before WHERE was rewritten; its plain-column terms are
+    // already part of the WHERE clause.
+    let having = having_split.and_then(|split| split.having);
 
     let aggregate = if is_grouped {
         Some(crate::core::rql::aggregate::AggregatePlan {
@@ -1693,20 +1800,13 @@ pub fn row_fetch_from_select_query(
                 // the input rows are gone by then.
                 let mut keys = Vec::with_capacity(order_terms.len());
                 for term in &order_terms {
-                    // The fold's sort compares finished output bytes and has
-                    // no NULL companion to read, so a placement it cannot
-                    // honour is refused rather than quietly ignored.
-                    if term.nulls_first.is_some() {
-                        return Err(
-                            "ORDER BY ... NULLS FIRST/LAST is not supported for grouped queries yet"
-                                .to_string(),
-                        );
-                    }
+                    // `NULLS FIRST`/`LAST` is carried through: the fold's
+                    // sort reads NULL-ness from each output cell's type.
                     let label =
                         resolve_output_label(&term.token, &select_items).ok_or_else(|| {
                             format!("ORDER BY term '{}' is not in the SELECT list", term.token)
                         })?;
-                    keys.push((label, term.descending));
+                    keys.push((label, term.descending, term.nulls_first));
                 }
                 keys
             },
@@ -1836,10 +1936,30 @@ pub fn row_fetch_from_select_query(
                 _ => {}
             }
         }
+        // Every column a HAVING aggregate reads: its argument (or what a
+        // computed argument reads) and what its FILTER reads.
         if let Some(h) = aggregate.as_ref().and_then(|a| a.having.as_ref()) {
-            if let Some(f) = &h.arg {
-                if !cols.iter().any(|c| c == &f.name) {
-                    cols.push(f.name.clone());
+            for item in &h.aggregates {
+                if let SelectItem::Aggregate {
+                    arg,
+                    filter,
+                    arg_expr,
+                    ..
+                } = item
+                {
+                    let mut names: Vec<&str> = Vec::new();
+                    match arg_expr {
+                        Some(argument) => names.extend(argument.schema.iter().map(|f| f.name.as_str())),
+                        None => names.extend(arg.iter().map(|f| f.name.as_str())),
+                    }
+                    if let Some(filter) = filter {
+                        names.extend(filter.schema.iter().map(|f| f.name.as_str()));
+                    }
+                    for name in names {
+                        if !cols.iter().any(|c| c == name) {
+                            cols.push(name.to_string());
+                        }
+                    }
                 }
             }
         }
@@ -2013,7 +2133,11 @@ pub fn row_fetch_from_select_query(
             }
         }
 
-        (order_by, None, None)
+        // The offset is kept even though the limit is not: the executor
+        // applies both *after* deduplicating (its `distinct` skip/take), which
+        // is where PostgreSQL applies them. Passing `None` here dropped the
+        // clause, so `DISTINCT … OFFSET n` silently returned page one.
+        (order_by, None, offset)
     } else if scan_can_sort {
         let order_by = resolve_order_spec(&order_terms, schema)?;
 

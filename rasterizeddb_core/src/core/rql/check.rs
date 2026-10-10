@@ -22,7 +22,6 @@
 use std::io;
 
 use rclite::Arc;
-use smallvec::SmallVec;
 
 use crate::core::storage_providers::traits::StorageIO;
 
@@ -96,11 +95,11 @@ fn sidecar_name<S: StorageIO>(schema_io: &Arc<S>) -> String {
 }
 
 /// Reads a table's check constraints.
-pub async fn load<S: StorageIO>(schema_io: Arc<S>) -> SmallVec<[CheckConstraint; 4]> {
+pub async fn load<S: StorageIO>(schema_io: Arc<S>) -> Vec<CheckConstraint> {
     let io = schema_io.create_new(sidecar_name(&schema_io)).await;
     let len = io.get_len().await;
 
-    let mut out: SmallVec<[CheckConstraint; 4]> = SmallVec::new();
+    let mut out: Vec<CheckConstraint> = Vec::new();
     if len < CHECK_SIZE {
         return out;
     }

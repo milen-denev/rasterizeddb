@@ -99,6 +99,208 @@ impl<'a, 'b> QueryParser<'a, 'b> {
         Some(ComparisonOperand::Direct(out))
     }
 
+    /// One operand of `NUMERIC` arithmetic, brought to the engine scale.
+    ///
+    /// Arithmetic over decimals runs at the engine scale, as the expression
+    /// evaluator's does (`expr::to_engine_scale`). A literal is re-encoded there
+    /// once, now; a `NUMERIC(p, s)` column is lifted per row, which is the
+    /// returned scale; an integer column is cast per row. An arithmetic result
+    /// is already there. Anything else is refused by name rather than compared
+    /// at the wrong width or scale.
+    fn decimal_operand(
+        &self,
+        operand: ComparisonOperand,
+        db_type: &DbType,
+    ) -> Result<(ComparisonOperand, Option<u32>), String> {
+        if *db_type == DbType::DECIMAL {
+            let lift = match &operand {
+                ComparisonOperand::DirectWithIndex(..) => self.scale_of(&operand),
+                _ => None,
+            };
+            return Ok((operand, lift));
+        }
+        let numeric = matches!(
+            db_type,
+            DbType::I8
+                | DbType::I16
+                | DbType::I32
+                | DbType::I64
+                | DbType::I128
+                | DbType::U8
+                | DbType::U16
+                | DbType::U32
+                | DbType::U64
+                | DbType::U128
+                | DbType::F32
+                | DbType::F64
+        );
+        match operand {
+            ComparisonOperand::Direct(_) if numeric => {
+                let rescaled = Self::rescale_decimal_literal(
+                    &operand,
+                    db_type,
+                    crate::core::value_codec::DECIMAL_SCALE,
+                )
+                .ok_or_else(|| "a literal in NUMERIC arithmetic is not a number".to_string())?;
+                Ok((rescaled, None))
+            }
+            ComparisonOperand::DirectWithIndex(mb, index)
+                if numeric && !matches!(db_type, DbType::F32 | DbType::F64) =>
+            {
+                Ok((
+                    ComparisonOperand::CastWithIndex(mb, index, db_type.clone(), DbType::DECIMAL),
+                    None,
+                ))
+            }
+            // An arithmetic result of another type — the `1 * 2` of
+            // `v + 1 * 2`, or `id * 2` — converted per row, as a column is.
+            ComparisonOperand::Intermediate(idx) if numeric => Ok((
+                ComparisonOperand::IntermediateCast(idx, db_type.clone(), DbType::DECIMAL),
+                None,
+            )),
+            _ => Err(format!(
+                "a {} operand cannot be combined with a NUMERIC one here",
+                db_type
+            )),
+        }
+    }
+
+    /// Both operands of an arithmetic step or comparison, when either is
+    /// `NUMERIC`: see [`Self::decimal_operand`]. `None` when neither is.
+    #[allow(clippy::type_complexity)]
+    fn decimal_operands(
+        &self,
+        left: ComparisonOperand,
+        left_type: &DbType,
+        right: ComparisonOperand,
+        right_type: &DbType,
+    ) -> Result<
+        Result<(ComparisonOperand, ComparisonOperand, Option<u32>, Option<u32>), (ComparisonOperand, ComparisonOperand)>,
+        String,
+    > {
+        if *left_type != DbType::DECIMAL && *right_type != DbType::DECIMAL {
+            return Ok(Err((left, right)));
+        }
+        let (left, left_lift) = self.decimal_operand(left, left_type)?;
+        let (right, right_lift) = self.decimal_operand(right, right_type)?;
+        Ok(Ok((left, right, left_lift, right_lift)))
+    }
+
+    /// Brings two operands of different numeric types to one, for an
+    /// arithmetic step or an ordered comparison that the evaluator would
+    /// otherwise refuse as an operand-size mismatch: `0.5 * 2` multiplied an
+    /// eight-byte float by a four-byte integer, and `i32col = i64col` compared
+    /// unequal widths.
+    ///
+    /// A literal is re-encoded (once, now); a column or an arithmetic result is
+    /// converted per row. The common type is the non-literal side's when the
+    /// literal fits it — so a column's bytes stay untouched where possible —
+    /// and otherwise the wider of the two: `F64` once a float is involved,
+    /// `I64` (or `I128` past it) for integers. `NUMERIC` is not handled here; it
+    /// has its own scale-aware path. Pairs that are not both plain numbers are
+    /// returned unchanged.
+    fn promote_numeric(
+        left: ComparisonOperand,
+        left_type: DbType,
+        right: ComparisonOperand,
+        right_type: DbType,
+    ) -> (ComparisonOperand, ComparisonOperand, DbType, DbType) {
+        fn int(t: &DbType) -> bool {
+            matches!(
+                t,
+                DbType::I8
+                    | DbType::I16
+                    | DbType::I32
+                    | DbType::I64
+                    | DbType::I128
+                    | DbType::U8
+                    | DbType::U16
+                    | DbType::U32
+                    | DbType::U64
+                    | DbType::U128
+            )
+        }
+        fn float(t: &DbType) -> bool {
+            matches!(t, DbType::F32 | DbType::F64)
+        }
+        let numeric = |t: &DbType| int(t) || float(t);
+        if left_type == right_type || !numeric(&left_type) || !numeric(&right_type) {
+            return (left, right, left_type, right_type);
+        }
+        let literal = |o: &ComparisonOperand| matches!(o, ComparisonOperand::Direct(_));
+        let convertible = |o: &ComparisonOperand| {
+            matches!(
+                o,
+                ComparisonOperand::Direct(_)
+                    | ComparisonOperand::DirectWithIndex(..)
+                    | ComparisonOperand::Intermediate(_)
+                    | ComparisonOperand::IntermediateCast(..)
+            )
+        };
+        if !convertible(&left) || !convertible(&right) {
+            return (left, right, left_type, right_type);
+        }
+        let wide = |a: &DbType, b: &DbType| -> DbType {
+            if float(a) || float(b) {
+                DbType::F64
+            } else if [a, b]
+                .iter()
+                .any(|t| matches!(t, DbType::U64 | DbType::I128 | DbType::U128))
+            {
+                DbType::I128
+            } else {
+                DbType::I64
+            }
+        };
+        let encode = |o: &ComparisonOperand, from: &DbType, to: &DbType| -> Option<ComparisonOperand> {
+            match o {
+                ComparisonOperand::Direct(mb) => {
+                    let bytes =
+                        crate::core::value_codec::coerce_literal(mb.into_slice(), from, to)?;
+                    let mut out = MEMORY_POOL.acquire(bytes.len());
+                    out.into_slice_mut().copy_from_slice(&bytes);
+                    Some(ComparisonOperand::Direct(out))
+                }
+                ComparisonOperand::DirectWithIndex(mb, idx) => Some(
+                    ComparisonOperand::CastWithIndex(mb.clone(), *idx, from.clone(), to.clone()),
+                ),
+                ComparisonOperand::Intermediate(idx) => Some(
+                    ComparisonOperand::IntermediateCast(*idx, from.clone(), to.clone()),
+                ),
+                ComparisonOperand::IntermediateCast(idx, original, _) => Some(
+                    ComparisonOperand::IntermediateCast(*idx, original.clone(), to.clone()),
+                ),
+                _ => None,
+            }
+        };
+        // The non-literal side's type, when the literal fits it exactly — a
+        // float literal into an integer column does not.
+        let target = match (literal(&left), literal(&right)) {
+            (true, false) if !(float(&left_type) && int(&right_type)) => {
+                encode(&left, &left_type, &right_type).map(|_| right_type.clone())
+            }
+            (false, true) if !(float(&right_type) && int(&left_type)) => {
+                encode(&right, &right_type, &left_type).map(|_| left_type.clone())
+            }
+            _ => None,
+        }
+        .unwrap_or_else(|| wide(&left_type, &right_type));
+        let l = if left_type == target {
+            Some(left.clone())
+        } else {
+            encode(&left, &left_type, &target)
+        };
+        let r = if right_type == target {
+            Some(right.clone())
+        } else {
+            encode(&right, &right_type, &target)
+        };
+        match (l, r) {
+            (Some(l), Some(r)) => (l, r, target.clone(), target),
+            _ => (left, right, left_type, right_type),
+        }
+    }
+
     #[inline]
     pub fn reset_for_new_data(&mut self) {
         // Intentionally empty: keep used_column_indices and plan; no per-row cloning anymore.
@@ -400,9 +602,42 @@ impl<'a, 'b> QueryParser<'a, 'b> {
                     }
                 }
                 // Two columns of the same declared scale need no work; two of
-                // *different* scales cannot be compared byte-for-byte, and are
-                // left to the reconciliation below to refuse.
+                // *different* scales are lifted to the engine scale below.
                 _ => (left_op, right_op, left_type, right_type),
+            }
+        };
+
+        // A `NUMERIC` comparison that cannot be answered on stored bytes at one
+        // column's scale: either side is an arithmetic result — which is at the
+        // engine scale — or both are columns of different declared scales.
+        // Both sides are brought to the engine scale, the literal now and a
+        // column per row. `v + 1 > 101` was refused here as an operand-size
+        // mismatch, and `a > b` over `NUMERIC(10,2)` and `NUMERIC(12,4)`
+        // compared integers a hundredfold apart and answered.
+        //
+        // The plain `column op literal` shape never comes here: it keeps the
+        // literal at the column's own scale, which is what the filter index
+        // hashes. Nor does an operator over text or a document.
+        let mut operand_scales: (Option<u32>, Option<u32>) = (None, None);
+        let comparing = matches!(op_str, "=" | "!=" | "<>" | ">" | ">=" | "<" | "<=");
+        let (left_op, right_op, left_type, right_type) = {
+            let arithmetic = (left_op.is_intermediate() && left_type == DbType::DECIMAL)
+                || (right_op.is_intermediate() && right_type == DbType::DECIMAL);
+            let mixed_columns = left_type == DbType::DECIMAL
+                && right_type == DbType::DECIMAL
+                && left_op.is_column()
+                && right_op.is_column()
+                && self.scale_of(&left_op) != self.scale_of(&right_op);
+            if comparing && (arithmetic || mixed_columns) {
+                match self.decimal_operands(left_op, &left_type, right_op, &right_type)? {
+                    Ok((l, r, ls, rs)) => {
+                        operand_scales = (ls, rs);
+                        (l, r, DbType::DECIMAL, DbType::DECIMAL)
+                    }
+                    Err((l, r)) => (l, r, left_type, right_type),
+                }
+            } else {
+                (left_op, right_op, left_type, right_type)
             }
         };
 
@@ -428,7 +663,7 @@ impl<'a, 'b> QueryParser<'a, 'b> {
             // reaching the element reader.
             let (right_op, right_type) = match (&right_op, &right_type) {
                 (ComparisonOperand::Direct(literal), DbType::STRING)
-                    if left_type != DbType::STRING =>
+                    if left_type != DbType::STRING && !op.takes_text_operand() =>
                 {
                     match std::str::from_utf8(literal.into_slice())
                         .ok()
@@ -462,6 +697,14 @@ impl<'a, 'b> QueryParser<'a, 'b> {
         // what lets the filter index recognise the predicate.
         let (left_op, right_op, left_type, right_type) =
             Self::reconcile_operand_types(left_op, right_op, left_type, right_type)?;
+        // What reconciliation leaves mismatched — an arithmetic result against
+        // a literal or a column, or two columns of different widths — meets at
+        // a common numeric type. Ordered comparisons only.
+        let (left_op, right_op, left_type, right_type) = if comparing {
+            Self::promote_numeric(left_op, left_type, right_op, right_type)
+        } else {
+            (left_op, right_op, left_type, right_type)
+        };
 
         let cmp = match op_str {
             "=" => ComparerOperation::Equals,
@@ -506,6 +749,10 @@ impl<'a, 'b> QueryParser<'a, 'b> {
 
         self.query_transformer
             .add_comparison(comparison_type, left_op, right_op, cmp, None);
+        if operand_scales != (None, None) {
+            self.query_transformer
+                .set_last_operand_scales(operand_scales.0, operand_scales.1);
+        }
         Ok(())
     }
 
@@ -551,7 +798,40 @@ impl<'a, 'b> QueryParser<'a, 'b> {
             Ok(mb)
         }
 
+        // A fractional literal against an integer column has no exact integer
+        // form; it is left as it is for `promote_numeric`, which compares the
+        // two as floats, rather than refused.
+        let float_vs_int = |lit: &DbType, col: &DbType| {
+            matches!(lit, DbType::F32 | DbType::F64)
+                && matches!(
+                    col,
+                    DbType::I8
+                        | DbType::I16
+                        | DbType::I32
+                        | DbType::I64
+                        | DbType::I128
+                        | DbType::U8
+                        | DbType::U16
+                        | DbType::U32
+                        | DbType::U64
+                        | DbType::U128
+                )
+        };
+        let keeps_fraction = |lit: &MemoryBlock, from: &DbType, to: &DbType| {
+            float_vs_int(from, to)
+                && crate::core::value_codec::coerce_literal(lit.into_slice(), from, to).is_none()
+        };
         match (&left_op, &right_op) {
+            (ComparisonOperand::Direct(lit), ComparisonOperand::DirectWithIndex(_, _))
+                if left_type != right_type && keeps_fraction(lit, &left_type, &right_type) =>
+            {
+                Ok((left_op, right_op, left_type, right_type))
+            }
+            (ComparisonOperand::DirectWithIndex(_, _), ComparisonOperand::Direct(lit))
+                if left_type != right_type && keeps_fraction(lit, &right_type, &left_type) =>
+            {
+                Ok((left_op, right_op, left_type, right_type))
+            }
             (ComparisonOperand::Direct(lit), ComparisonOperand::DirectWithIndex(_, _))
                 if left_type != right_type =>
             {
@@ -635,9 +915,31 @@ impl<'a, 'b> QueryParser<'a, 'b> {
                 ),
             };
 
+            // `NUMERIC` arithmetic runs at the engine scale; see
+            // `decimal_operands`. Temporal arithmetic never involves one.
+            let temporal = matches!(
+                math,
+                MathOperation::IntervalBetween | MathOperation::ShiftForward | MathOperation::ShiftBackward
+            );
+            let (lhs, rhs, scales, math_type, result_type) = match if temporal {
+                Ok(Err((lhs_op, rhs_op)))
+            } else {
+                self.decimal_operands(lhs_op, &lhs_type, rhs_op, &rhs_type)
+            }? {
+                Ok((l, r, ls, rs)) => (l, r, Some((ls, rs)), DbType::DECIMAL, DbType::DECIMAL),
+                Err((l, r)) if temporal => (l, r, None, lhs_type.clone(), result_type),
+                Err((l, r)) => {
+                    let (l, r, t, _) = Self::promote_numeric(l, lhs_type.clone(), r, rhs_type.clone());
+                    (l, r, None, t.clone(), t)
+                }
+            };
+
             let idx =
                 self.query_transformer
-                    .add_math_operation(lhs_type.clone(), lhs_op, rhs_op, math);
+                    .add_math_operation(math_type, lhs, rhs, math);
+            if let Some((ls, rs)) = scales {
+                self.query_transformer.set_last_operand_scales(ls, rs);
+            }
             lhs_op = ComparisonOperand::Intermediate(idx);
             lhs_type = result_type;
         }
@@ -648,18 +950,36 @@ impl<'a, 'b> QueryParser<'a, 'b> {
         &mut self,
         cols: &SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
     ) -> Result<(ComparisonOperand, DbType), String> {
-        let (mut lhs_op, lhs_type) = self.parse_factor(cols)?;
+        let (mut lhs_op, mut lhs_type) = self.parse_factor(cols)?;
         while let Some(op_str) = self.peek_op(&["*", "/"]) {
             self.next();
-            let (rhs_op, _) = self.parse_factor(cols)?;
+            let (rhs_op, rhs_type) = self.parse_factor(cols)?;
             let math = if op_str == "*" {
                 MathOperation::Multiply
             } else {
                 MathOperation::Divide
             };
+            // `NUMERIC` arithmetic runs at the engine scale; see
+            // `decimal_operands`.
+            let (lhs, rhs, scales) =
+                match self.decimal_operands(lhs_op, &lhs_type, rhs_op, &rhs_type)? {
+                    Ok((l, r, ls, rs)) => {
+                        lhs_type = DbType::DECIMAL;
+                        (l, r, Some((ls, rs)))
+                    }
+                    Err((l, r)) => {
+                        let (l, r, t, _) =
+                            Self::promote_numeric(l, lhs_type.clone(), r, rhs_type.clone());
+                        lhs_type = t;
+                        (l, r, None)
+                    }
+                };
             let idx =
                 self.query_transformer
-                    .add_math_operation(lhs_type.clone(), lhs_op, rhs_op, math);
+                    .add_math_operation(lhs_type.clone(), lhs, rhs, math);
+            if let Some((ls, rs)) = scales {
+                self.query_transformer.set_last_operand_scales(ls, rs);
+            }
             lhs_op = ComparisonOperand::Intermediate(idx);
         }
         Ok((lhs_op, lhs_type))
@@ -2013,29 +2333,33 @@ mod tests {
         assert_eq!(res.unwrap(), false);
     }
 
+    /// Two integer columns of different widths (`I32` against `U8`) compare
+    /// as numbers. This used to panic on an operand-size mismatch, and the
+    /// test pinned the panic.
     #[test]
-    #[should_panic]
     fn test_column_vs_column_false() {
         let schema = create_schema();
         static COLUMNS: LazyLock<Box<SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>>> =
             LazyLock::new(|| Box::new(setup_test_columns()));
         let columns = &*COLUMNS;
-        let query = "id = age";
-        let tokens = tokenize(query, &schema);
-
-        let mut buffer = Buffer {
-            transformers: SmallVec::new(),
-            intermediate_results: SmallVec::new(),
-            bool_buffer: SmallVec::new(),
-        };
-        let transformer = UnsafeCell::new(TransformerProcessor::new(
-            &mut buffer.transformers,
-            &mut buffer.intermediate_results,
-        ));
-        let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
-        let _ = parser
-            .evaluate_row(columns, &mut buffer.bool_buffer)
-            .unwrap();
+        for (query, want) in [("id = age", false), ("id > age", true), ("age < id", true)] {
+            let tokens = tokenize(query, &schema);
+            let mut buffer = Buffer {
+                transformers: SmallVec::new(),
+                intermediate_results: SmallVec::new(),
+                bool_buffer: SmallVec::new(),
+            };
+            let transformer = UnsafeCell::new(TransformerProcessor::new(
+                &mut buffer.transformers,
+                &mut buffer.intermediate_results,
+            ));
+            let mut parser = QueryParser::new(&tokens, unsafe { &mut *transformer.get() });
+            let got = parser
+                .evaluate_row(columns, &mut buffer.bool_buffer)
+                .unwrap();
+            // id = 42, age = 30.
+            assert_eq!(got, want, "{query}");
+        }
     }
 
     #[test]

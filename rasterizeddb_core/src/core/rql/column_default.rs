@@ -8,7 +8,6 @@
 use std::io;
 
 use rclite::Arc;
-use smallvec::SmallVec;
 
 use crate::core::db_type::DbType;
 use crate::core::storage_providers::traits::StorageIO;
@@ -81,11 +80,11 @@ fn sidecar_name<S: StorageIO>(schema_io: &Arc<S>) -> String {
 }
 
 /// Reads a table's column defaults.
-pub async fn load<S: StorageIO>(schema_io: Arc<S>) -> SmallVec<[ColumnDefault; 8]> {
+pub async fn load<S: StorageIO>(schema_io: Arc<S>) -> Vec<ColumnDefault> {
     let io = schema_io.create_new(sidecar_name(&schema_io)).await;
     let len = io.get_len().await;
 
-    let mut out: SmallVec<[ColumnDefault; 8]> = SmallVec::new();
+    let mut out: Vec<ColumnDefault> = Vec::new();
     if len < COLUMN_DEFAULT_SIZE {
         return out;
     }
@@ -256,17 +255,17 @@ pub fn evaluate(expression: &str, db_type: &DbType) -> Result<String, String> {
         return Ok(crate::core::rql::sequence::next(&name).to_string());
     }
 
-    if matches!(upper.as_str(), "GEN_RANDOM_UUID()" | "UUID_GENERATE_V4()") {
-        let mut bytes = [0u8; 16];
-        for byte in bytes.iter_mut() {
-            *byte = fastrand::u8(..);
-        }
-        // Version 4, variant 1, as the function promises.
-        bytes[6] = (bytes[6] & 0x0f) | 0x40;
-        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    if upper == "UUIDV7()" {
         return Ok(format!(
             "'{}'",
-            crate::core::value_codec::format_uuid(&bytes)
+            crate::core::value_codec::format_uuid(&crate::core::rql::aggregate::uuid_v7())
+        ));
+    }
+
+    if matches!(upper.as_str(), "GEN_RANDOM_UUID()" | "UUID_GENERATE_V4()" | "UUIDV4()") {
+        return Ok(format!(
+            "'{}'",
+            crate::core::value_codec::format_uuid(&crate::core::value_codec::random_uuid_v4())
         ));
     }
 
@@ -299,7 +298,7 @@ pub fn evaluate(expression: &str, db_type: &DbType) -> Result<String, String> {
 
     Err(format!(
         "DEFAULT {} is not supported: literals, TRUE/FALSE, NULL, CURRENT_TIMESTAMP, now(), \
-         clock_timestamp(), CURRENT_DATE, CURRENT_TIME and gen_random_uuid() are understood",
+         clock_timestamp(), CURRENT_DATE, CURRENT_TIME, gen_random_uuid() and uuidv7() are understood",
         text
     ))
 }

@@ -1,5 +1,7 @@
 use std::arch::x86_64::*;
 
+use smallvec::SmallVec;
+
 use crate::core::processor::transformer::ComparerOperation;
 use crate::memory_pool::MEMORY_POOL;
 use crate::memory_pool::MemoryBlock;
@@ -185,23 +187,20 @@ pub fn simd_compare_strings(input1: &[u8], input2: &[u8], operation: &ComparerOp
         ComparerOperation::Greater => !unsafe { simd_greater_or_equal(input2, input1) },
         // a <= b  <=>  b >= a
         ComparerOperation::LessOrEquals => unsafe { simd_greater_or_equal(input2, input1) },
-        ComparerOperation::EqualsCaseInsensitive => ci_equals(input1, input2),
-        ComparerOperation::ContainsCaseInsensitive => ci_contains(input1, input2),
-        ComparerOperation::StartsWithCaseInsensitive => ci_starts_with(input1, input2),
-        ComparerOperation::EndsWithCaseInsensitive => ci_ends_with(input1, input2),
+        // Case-insensitive: the ASCII folder, unless its answer can differ from
+        // full Unicode lowering — see `ci_compare`.
+        ComparerOperation::EqualsCaseInsensitive
+        | ComparerOperation::ContainsCaseInsensitive
+        | ComparerOperation::StartsWithCaseInsensitive
+        | ComparerOperation::EndsWithCaseInsensitive
+        | ComparerOperation::LikeCaseInsensitive => ci_compare(input1, input2, operation),
         ComparerOperation::Like => like_match(input1, input2, false),
-        ComparerOperation::LikeCaseInsensitive => like_match(input1, input2, true),
         // `SIMILAR TO`: a pattern language of its own, matched in
-        // `crate::core::similar_to`. A malformed pattern matches nothing here
-        // — it was already reported when the predicate was parsed.
-        ComparerOperation::SimilarTo => {
-            match (std::str::from_utf8(input1), std::str::from_utf8(input2)) {
-                (Ok(text), Ok(pattern)) => {
-                    crate::core::similar_to::matches_default(text, pattern).unwrap_or(false)
-                }
-                _ => false,
-            }
-        }
+        // `crate::core::similar_to`. The scan reaches it through
+        // `logical::perform_comparison_operation`, which calls
+        // `similar_to_compare` first so that a pattern the matcher refuses
+        // fails the statement; this arm only serves callers that want a bool.
+        ComparerOperation::SimilarTo => similar_to_compare(input1, input2).unwrap_or(false),
         // A structural operator is not a string comparison. `@@` is the one
         // that can reach here — a `tsvector` is text — and it is answered by
         // the text-search matcher rather than by a byte compare.
@@ -216,21 +215,242 @@ pub fn simd_compare_strings(input1: &[u8], input2: &[u8], operation: &ComparerOp
     }
 }
 
+/// `value SIMILAR TO pattern`, with a refusal reported rather than answered.
+///
+/// A malformed pattern was already refused when the predicate was planned, so
+/// `InvalidPattern` here is a safety net; `PatternTooComplex` is a value too
+/// costly to match against this pattern. Either fails the statement — a
+/// `false` would drop the row and look exactly like a non-match. A value or
+/// pattern that is not UTF-8 text does not match, as before.
+pub(crate) fn similar_to_compare(
+    value: &[u8],
+    pattern: &[u8],
+) -> Result<bool, crate::core::row::error::EvalError> {
+    use crate::core::row::error::EvalError;
+    use crate::core::similar_to::MatchError;
+    match (std::str::from_utf8(value), std::str::from_utf8(pattern)) {
+        (Ok(text), Ok(pattern)) => {
+            crate::core::similar_to::evaluate(text, pattern, Some('\\')).map_err(|e| match e {
+                MatchError::Invalid(_) => EvalError::InvalidPattern,
+                MatchError::TooComplex => EvalError::PatternTooComplex,
+            })
+        }
+        _ => Ok(false),
+    }
+}
+
 // Case-insensitive comparisons, backing `ILIKE`.
 //
-// Folding is ASCII-only. Postgres folds according to the database collation,
-// so a non-ASCII letter compares case-sensitively here where Postgres would
-// match it. Handling the general case needs a Unicode case table, and these are
-// scalar rather than SIMD because `ILIKE` is not on the hot path — the aim is a
-// correct answer, not a fast wrong one.
+// The functions below fold ASCII only, and are what runs whenever both sides
+// are ASCII. `simd_compare_strings` sends anything else to
+// `ci_compare_unicode`, which lowers both sides in full first.
+//
+// `ILIKE '%x%'` — the ORM search box — becomes `ICONTAINS` and runs once per
+// row, so the substring search is vectorised the same way `contains_small`
+// is: see `anchor_find`.
+
+/// A case-insensitive operator: `lower(value) op lower(pattern)`, answered by
+/// the ASCII folder whenever that is provably the same answer.
+///
+/// For an ASCII pattern it is, unless lowering a non-ASCII character of the
+/// value can produce what the pattern matches. Exactly two characters lower to
+/// anything containing ASCII — the Kelvin sign `U+212A` (to `k`) and capital
+/// `I` with dot `U+0130` (to `i` + `U+0307`, the only one that changes the
+/// character count) — which `lowering_reaches_ascii_exactly_twice` checks over
+/// every code point. So the ASCII answer stands when the pattern has no `k`,
+/// no `i` and (for `LIKE`) no `_`; or when the value holds neither of those
+/// characters' lead bytes (`0xE2`, `0xC4`); or, outside `LIKE` with `_`, when
+/// the ASCII folder already said yes (a match among unchanged characters
+/// survives lowering).
+///
+/// That keeps the common case free of any extra pass over the value. Measured
+/// on 1M ASCII values of 50-500 bytes against the ASCII-only dispatcher
+/// (`ilike_dispatch_ascii_bench`): a pattern without `k`/`i`/`_` costs
+/// +3-5 ns a row (classifying the pattern); one with a `k` or `i` adds one
+/// `memchr2` over the value on rows the ASCII folder rejected, +11 ns a row.
+/// Testing `is_ascii` on both sides first, the obvious version, cost
+/// ISTARTSWITH 3-4x.
+#[inline(always)]
+fn ci_compare(input1: &[u8], input2: &[u8], operation: &ComparerOperation) -> bool {
+    match operation {
+        ComparerOperation::EqualsCaseInsensitive => ci_compare_op::<CI_EQ>(input1, input2),
+        ComparerOperation::StartsWithCaseInsensitive => ci_compare_op::<CI_STARTS>(input1, input2),
+        ComparerOperation::EndsWithCaseInsensitive => ci_compare_op::<CI_ENDS>(input1, input2),
+        ComparerOperation::ContainsCaseInsensitive => ci_compare_op::<CI_CONTAINS>(input1, input2),
+        _ => ci_compare_op::<CI_LIKE>(input1, input2),
+    }
+}
+
+const CI_EQ: u8 = 0;
+const CI_STARTS: u8 = 1;
+const CI_ENDS: u8 = 2;
+const CI_CONTAINS: u8 = 3;
+const CI_LIKE: u8 = 4;
+
+/// [`ci_compare`] for one operator, chosen at compile time so each arm of the
+/// dispatcher carries only its own check.
+#[inline(always)]
+fn ci_compare_op<const OP: u8>(input1: &[u8], input2: &[u8]) -> bool {
+    let operation = match OP {
+        CI_EQ => &ComparerOperation::EqualsCaseInsensitive,
+        CI_STARTS => &ComparerOperation::StartsWithCaseInsensitive,
+        CI_ENDS => &ComparerOperation::EndsWithCaseInsensitive,
+        CI_CONTAINS => &ComparerOperation::ContainsCaseInsensitive,
+        _ => &ComparerOperation::LikeCaseInsensitive,
+    };
+    let (non_ascii, reach, under) = classify_pattern(input2);
+    if non_ascii {
+        return ci_compare_unicode(input1, input2, operation);
+    }
+    let ascii = match OP {
+        CI_EQ => ci_equals(input1, input2),
+        CI_STARTS => ci_starts_with(input1, input2),
+        CI_ENDS => ci_ends_with(input1, input2),
+        CI_CONTAINS => ci_contains(input1, input2),
+        _ => like_match(input1, input2, true),
+    };
+    let under = OP == CI_LIKE && under;
+    if (ascii && !under) || !(under || reach) {
+        return ascii;
+    }
+    // `window`: the bytes of the value whose lowering can reach the pattern.
+    // A character lowers to no less than a third of its bytes (the Kelvin sign,
+    // three bytes to one), so a prefix or suffix of `m` lowered bytes comes
+    // from at most `3m` (plus a partial character) bytes of the value.
+    let n = input1.len();
+    let reach_len = (3 * input2.len() + 4).min(n);
+    let window = match OP {
+        // Longer than `3m`, the value cannot lower to `m` bytes at all.
+        CI_EQ if n > 3 * input2.len() => 0..0,
+        CI_STARTS => 0..reach_len,
+        CI_ENDS => n - reach_len..n,
+        _ => 0..n,
+    };
+    if !holds_ascii_lowering(&input1[window]) {
+        return ascii;
+    }
+    ci_compare_unicode(input1, input2, operation)
+}
+
+/// Whether `bytes` hold `İ` (`C4 B0`) or the Kelvin sign (`E2 84 AA`) — the
+/// only characters whose lowercase reaches ASCII. Found by their lead bytes and
+/// confirmed, so ordinary `0xE2` text (curly quotes, dashes, `€`) does not send
+/// a row down the slow path.
+#[inline]
+fn holds_ascii_lowering(bytes: &[u8]) -> bool {
+    memchr::memchr2_iter(0xC4, 0xE2, bytes).any(|at| match bytes[at] {
+        0xC4 => bytes.get(at + 1) == Some(&0xB0),
+        _ => bytes.get(at + 1..at + 3) == Some(&[0x84, 0xAA][..]),
+    })
+}
+
+/// One pass over the pattern, eight bytes at a time: is any byte non-ASCII,
+/// does it hold a `k`/`i` (either case) that a non-ASCII character lowers to,
+/// does it hold a `_`. Runs once per row, so it is SWAR rather than a byte loop.
+#[inline(always)]
+fn classify_pattern(p: &[u8]) -> (bool, bool, bool) {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    // Exact: non-zero iff some byte of `v` is zero.
+    let has_zero = |v: u64| v.wrapping_sub(ONES) & !v & HIGH;
+    let mut high = 0u64;
+    let mut reach = 0u64;
+    let mut under = 0u64;
+    let mut word = |w: u64| {
+        high |= w;
+        let l = w | (ONES * 0x20);
+        reach |= has_zero(l ^ (ONES * b'k' as u64)) | has_zero(l ^ (ONES * b'i' as u64));
+        under |= has_zero(w ^ (ONES * b'_' as u64));
+    };
+    let n = p.len();
+    let u16_at = |i: usize| u16::from_le_bytes([p[i], p[i + 1]]) as u64;
+    let u32_at = |i: usize| u32::from_le_bytes(p[i..i + 4].try_into().expect("four bytes")) as u64;
+    // Bytes that are none of the three, filling a short pattern's word.
+    const PAD: u64 = ONES * b'0' as u64;
+    if n >= 8 {
+        let mut chunks = p.chunks_exact(8);
+        for c in &mut chunks {
+            word(u64::from_le_bytes(c.try_into().expect("eight bytes")));
+        }
+        if !chunks.remainder().is_empty() {
+            // The last eight bytes, overlapping what was already read: every
+            // test here is "any byte", so reading a byte twice is harmless.
+            word(u64::from_le_bytes(p[n - 8..].try_into().expect("eight bytes")));
+        }
+    } else if n >= 4 {
+        word(u32_at(0) | (u32_at(n - 4) << 32));
+    } else if n >= 2 {
+        word(u16_at(0) | (u16_at(n - 2) << 16) | (PAD << 32));
+    } else if n == 1 {
+        word(p[0] as u64 | (PAD << 8));
+    }
+    (high & HIGH != 0, reach != 0, under != 0)
+}
+
+/// A case-insensitive operator on text the ASCII folder cannot answer.
+///
+/// PostgreSQL defines `ILIKE` for a multi-byte encoding as `lower(value) LIKE
+/// lower(pattern)`, so that is what this does, with the lowering `lower()`
+/// itself uses here (`str::to_lowercase`) — `'É' ILIKE 'é'` and
+/// `lower('É') = lower('é')` cannot disagree. The ASCII folders cannot be used
+/// for this even when one side is ASCII: lowering changes lengths (`'K'`, the
+/// Kelvin sign, is three bytes and lowers to an ASCII `k`), so their
+/// length-first shortcuts would answer `false` for a match.
+///
+/// Bytes that are not UTF-8 are not text to lower; they fold ASCII only, as
+/// before.
+#[cold]
+#[inline(never)]
+fn ci_compare_unicode(input1: &[u8], input2: &[u8], operation: &ComparerOperation) -> bool {
+    let (Ok(a), Ok(b)) = (std::str::from_utf8(input1), std::str::from_utf8(input2)) else {
+        return match operation {
+            ComparerOperation::EqualsCaseInsensitive => ci_equals(input1, input2),
+            ComparerOperation::ContainsCaseInsensitive => ci_contains(input1, input2),
+            ComparerOperation::StartsWithCaseInsensitive => ci_starts_with(input1, input2),
+            ComparerOperation::EndsWithCaseInsensitive => ci_ends_with(input1, input2),
+            _ => like_match(input1, input2, true),
+        };
+    };
+    let (a, b) = (a.to_lowercase(), b.to_lowercase());
+    match operation {
+        ComparerOperation::EqualsCaseInsensitive => a == b,
+        ComparerOperation::ContainsCaseInsensitive => a.contains(b.as_str()),
+        ComparerOperation::StartsWithCaseInsensitive => a.starts_with(b.as_str()),
+        ComparerOperation::EndsWithCaseInsensitive => a.ends_with(b.as_str()),
+        _ => like_match(a.as_bytes(), b.as_bytes(), false),
+    }
+}
+
+/// ASCII lowercase, branch-free so a fixed-width loop over it vectorises.
+/// Identical to `u8::to_ascii_lowercase`.
+#[inline(always)]
+fn fold_ascii(b: u8) -> u8 {
+    b | (((b.wrapping_sub(b'A') < 26) as u8) << 5)
+}
 
 #[inline]
 fn ci_equals(input1: &[u8], input2: &[u8]) -> bool {
-    input1.len() == input2.len()
-        && input1
-            .iter()
-            .zip(input2.iter())
-            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    if input1.len() != input2.len() {
+        return false;
+    }
+    // Sixteen bytes at a time with no early exit inside a block, which the
+    // compiler turns into a handful of vector instructions; the tail is the
+    // plain per-byte compare.
+    let mut a = input1.chunks_exact(16);
+    let mut b = input2.chunks_exact(16);
+    for (x, y) in (&mut a).zip(&mut b) {
+        let mut diff = 0u8;
+        for k in 0..16 {
+            diff |= fold_ascii(x[k]) ^ fold_ascii(y[k]);
+        }
+        if diff != 0 {
+            return false;
+        }
+    }
+    a.remainder()
+        .iter()
+        .zip(b.remainder())
+        .all(|(x, y)| x.eq_ignore_ascii_case(y))
 }
 
 #[inline]
@@ -245,17 +465,138 @@ fn ci_ends_with(haystack: &[u8], needle: &[u8]) -> bool {
 
 #[inline]
 fn ci_contains(haystack: &[u8], needle: &[u8]) -> bool {
-    // The empty needle is contained in everything, matching `simd_contains`
-    // and SQL's `x ILIKE '%%'`.
-    if needle.is_empty() {
-        return true;
+    // The empty needle is contained in everything, as in `simd_contains` and
+    // SQL's `x ILIKE '%%'`.
+    anchor_find::<true>(haystack, needle).is_some()
+}
+
+/// How one anchor byte of a needle is compared against the haystack: OR the
+/// haystack byte with `or`, then test for equality with `target`.
+///
+/// For an ASCII letter `or` is `0x20` and `target` its lowercase form — the
+/// only bytes that OR `0x20` maps onto a lowercase letter are that letter's two
+/// cases, so the test is exact. Anything else is compared as is, which keeps
+/// non-ASCII bytes case-sensitive, as `ci_equals` does.
+#[inline(always)]
+fn anchor_of<const FOLD: bool>(b: u8) -> (u8, u8) {
+    if FOLD && b.is_ascii_alphabetic() {
+        (0x20, b.to_ascii_lowercase())
+    } else {
+        (0, b)
     }
-    if needle.len() > haystack.len() {
-        return false;
+}
+
+#[inline(always)]
+fn anchor_eq<const FOLD: bool>(a: &[u8], b: &[u8]) -> bool {
+    if FOLD { ci_equals(a, b) } else { a == b }
+}
+
+/// The byte offset of the first occurrence of `needle` in `haystack`; ASCII
+/// letters compare case-insensitively when `FOLD`.
+///
+/// The first/last-byte filter of `contains_small`, generalised to folding: each
+/// 32-byte block is loaded at `i` and at `i + m - 1`, OR-ed with the anchor's
+/// fold mask, compared, and the two masks ANDed, so only positions where both
+/// ends line up reach a full comparison of the interior. The scalar fallback it
+/// replaced re-folded both sides at every position, O(n·m) on every row.
+///
+/// Leftmost-first: candidates are confirmed in ascending order.
+#[inline]
+pub(crate) fn anchor_find<const FOLD: bool>(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    let n = haystack.len();
+    let m = needle.len();
+    if m == 0 {
+        return Some(0);
     }
-    haystack
-        .windows(needle.len())
-        .any(|window| ci_equals(window, needle))
+    if m > n {
+        return None;
+    }
+    let n_minus_m = n - m;
+    let (or_first, first) = anchor_of::<FOLD>(needle[0]);
+    let (or_last, last) = anchor_of::<FOLD>(needle[m - 1]);
+    // What a candidate still has to confirm: the anchors are already known to
+    // match, so only the bytes between them (none when `m <= 2`).
+    let inner = if m > 2 { &needle[1..m - 1] } else { &needle[..0] };
+    let confirm = |pos: usize| -> bool {
+        m <= 2 || anchor_eq::<FOLD>(&haystack[pos + 1..pos + m - 1], inner)
+    };
+
+    let hp = haystack.as_ptr();
+    let mut i = 0usize;
+
+    // SAFETY: the guards keep both loads — 32 (or 16) bytes at `i` and at
+    // `i + m - 1` — inside the haystack, exactly as in `contains_small`. AVX2
+    // is assumed, as everywhere in this module (target-cpu=x86-64-v3).
+    unsafe {
+        if n_minus_m >= 31 {
+            let v_or_first = _mm256_set1_epi8(or_first as i8);
+            let v_or_last = _mm256_set1_epi8(or_last as i8);
+            let v_first = _mm256_set1_epi8(first as i8);
+            let v_last = _mm256_set1_epi8(last as i8);
+            while i + 31 <= n_minus_m {
+                let block_first = _mm256_or_si256(
+                    _mm256_loadu_si256(hp.add(i) as *const __m256i),
+                    v_or_first,
+                );
+                let block_last = _mm256_or_si256(
+                    _mm256_loadu_si256(hp.add(i + m - 1) as *const __m256i),
+                    v_or_last,
+                );
+                let eq = _mm256_and_si256(
+                    _mm256_cmpeq_epi8(block_first, v_first),
+                    _mm256_cmpeq_epi8(block_last, v_last),
+                );
+                let mut mask = _mm256_movemask_epi8(eq) as u32;
+                while mask != 0 {
+                    let pos = i + mask.trailing_zeros() as usize;
+                    if confirm(pos) {
+                        return Some(pos);
+                    }
+                    mask &= mask.wrapping_sub(1);
+                }
+                i += 32;
+            }
+        }
+
+        if i + 15 <= n_minus_m {
+            let v_or_first = _mm_set1_epi8(or_first as i8);
+            let v_or_last = _mm_set1_epi8(or_last as i8);
+            let v_first = _mm_set1_epi8(first as i8);
+            let v_last = _mm_set1_epi8(last as i8);
+            while i + 15 <= n_minus_m {
+                let block_first =
+                    _mm_or_si128(_mm_loadu_si128(hp.add(i) as *const __m128i), v_or_first);
+                let block_last = _mm_or_si128(
+                    _mm_loadu_si128(hp.add(i + m - 1) as *const __m128i),
+                    v_or_last,
+                );
+                let eq = _mm_and_si128(
+                    _mm_cmpeq_epi8(block_first, v_first),
+                    _mm_cmpeq_epi8(block_last, v_last),
+                );
+                let mut mask = _mm_movemask_epi8(eq) as u32;
+                while mask != 0 {
+                    let pos = i + mask.trailing_zeros() as usize;
+                    if confirm(pos) {
+                        return Some(pos);
+                    }
+                    mask &= mask.wrapping_sub(1);
+                }
+                i += 16;
+            }
+        }
+    }
+
+    while i <= n_minus_m {
+        if (haystack[i] | or_first) == first
+            && (haystack[i + m - 1] | or_last) == last
+            && confirm(i)
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 #[inline(always)]
@@ -530,8 +871,10 @@ unsafe fn simd_contains(haystack: &[u8], needle: &[u8]) -> bool {
     let n = haystack.len();
     let m = needle.len();
 
+    // The empty string is a substring of every string. `LIKE '%%'` reaches here
+    // as `CONTAINS ''`, and answering false dropped every row PostgreSQL keeps.
     if m == 0 {
-        return false; // Empty needle is not found by convention
+        return true;
     }
 
     if m > n {
@@ -1098,13 +1441,14 @@ mod tests {
 
     #[test]
     fn test_simd_compare_strings_contains_edge_cases() {
-        // Empty needle (current behavior is false)
-        assert!(!simd_compare_strings(
+        // Empty needle: the empty string is in every string, which is what
+        // `LIKE '%%'` (rewritten to `CONTAINS ''`) needs to answer.
+        assert!(simd_compare_strings(
             "abc".as_bytes(),
             "".as_bytes(),
             &ComparerOperation::Contains
         ));
-        assert!(!simd_compare_strings(
+        assert!(simd_compare_strings(
             "".as_bytes(),
             "".as_bytes(),
             &ComparerOperation::Contains
@@ -1886,35 +2230,279 @@ mod tests {
 /// for the naive recursion. This is O(n·m) worst case and O(n) on the patterns
 /// anyone actually writes, with no stack growth.
 pub fn like_match(value: &[u8], pattern: &[u8], fold: bool) -> bool {
+    // The common shapes have no `_`: `'a%b'`, `'%x%y%'`. Those are answered by
+    // finding each literal segment with a vectorised search instead of walking
+    // the value a byte at a time with backtracking.
+    let answer = if pattern.contains(&b'\\') {
+        // PostgreSQL's default escape: `\` makes the next character literal.
+        // Django escapes every `_` and `%` of a searched value this way.
+        if fold {
+            like_match_escaped_segments::<true>(value, pattern)
+        } else {
+            like_match_escaped_segments::<false>(value, pattern)
+        }
+    } else if !pattern.contains(&b'_') {
+        let segments: SmallVec<[&[u8]; 8]> = pattern.split(|&b| b == b'%').collect();
+        if fold {
+            match_segments::<true>(value, &segments, pattern)
+        } else {
+            match_segments::<false>(value, &segments, pattern)
+        }
+    } else {
+        None
+    };
+    match answer {
+        Some(answer) => answer,
+        None => like_match_stepping(value, pattern, fold),
+    }
+}
+
+/// [`match_segments`] for a pattern containing escapes: its segments are
+/// unescaped first. `None` when the pattern has an unescaped `_`, which needs
+/// the stepping matcher. A trailing lone backslash is a literal backslash
+/// here, as in [`like_match_stepping`]; the planner refuses such a pattern
+/// before it gets this far.
+fn like_match_escaped_segments<const FOLD: bool>(value: &[u8], pattern: &[u8]) -> Option<bool> {
+    let mut literal: Vec<u8> = Vec::with_capacity(pattern.len());
+    let mut bounds: SmallVec<[(usize, usize); 8]> = SmallVec::new();
+    let mut start = 0usize;
+    let mut p = 0usize;
+    while p < pattern.len() {
+        match like_token(pattern, p) {
+            (LikeToken::Any, _) => return None,
+            (LikeToken::Star, width) => {
+                bounds.push((start, literal.len()));
+                start = literal.len();
+                p += width;
+            }
+            (LikeToken::Lit(b), width) => {
+                literal.push(b);
+                p += width;
+            }
+        }
+    }
+    bounds.push((start, literal.len()));
+    let segments: SmallVec<[&[u8]; 8]> = bounds.iter().map(|&(a, b)| &literal[a..b]).collect();
+    match_segments::<FOLD>(value, &segments, pattern)
+}
+
+/// `LIKE` for a pattern with no `_`: literal `segments` that were separated by
+/// `%` (one segment means no `%` at all). `pattern` is the pattern as written,
+/// for the UTF-8 check below.
+///
+/// The first segment must be a prefix and the last a suffix (unless the pattern
+/// starts or ends with `%`, which makes them empty); the segments between are
+/// found in order, each leftmost-first after the previous one, inside what the
+/// prefix and suffix leave. Leftmost-first is optimal for `%`-only patterns:
+/// taking an earlier occurrence never leaves less room for what follows.
+///
+/// `None` means "ask `like_match_stepping`". That is needed only for a match on
+/// a value or pattern that is not valid UTF-8: the stepping matcher retries a
+/// `%` a whole *character* at a time, so in a malformed sequence it can skip a
+/// byte offset this search would accept. Every offset it does try, this tries
+/// too, so a `false` here is always its answer as well; only a `true` needs the
+/// check, and only then is the value validated.
+#[inline]
+fn match_segments<const FOLD: bool>(
+    value: &[u8],
+    segments: &[&[u8]],
+    pattern: &[u8],
+) -> Option<bool> {
+    let [prefix, middle @ .., suffix] = segments else {
+        // No wildcard at all: equality.
+        return Some(anchor_eq::<FOLD>(value, segments.first().copied().unwrap_or(&[])));
+    };
+    if value.len() < prefix.len() + suffix.len() {
+        return Some(false);
+    }
+    let tail_at = value.len() - suffix.len();
+    if !anchor_eq::<FOLD>(&value[..prefix.len()], prefix)
+        || !anchor_eq::<FOLD>(&value[tail_at..], suffix)
+    {
+        return Some(false);
+    }
+    let mut cursor = prefix.len();
+    for segment in middle {
+        if segment.is_empty() {
+            continue;
+        }
+        match anchor_find::<FOLD>(&value[cursor..tail_at], segment) {
+            Some(at) => cursor += at + segment.len(),
+            None => return Some(false),
+        }
+    }
+    if std::str::from_utf8(value).is_ok() && std::str::from_utf8(pattern).is_ok() {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// One element of a `LIKE` pattern.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum LikeToken {
+    /// `_`: one character.
+    Any,
+    /// `%`: any run of characters.
+    Star,
+    /// A byte that matches itself — including `\_`, `\%` and `\\`.
+    Lit(u8),
+}
+
+/// The token at `p` and how many pattern bytes it spans. A backslash escapes
+/// the next byte; one at the very end stands for itself.
+#[inline(always)]
+fn like_token(pattern: &[u8], p: usize) -> (LikeToken, usize) {
+    match pattern[p] {
+        b'_' => (LikeToken::Any, 1),
+        b'%' => (LikeToken::Star, 1),
+        b'\\' if p + 1 < pattern.len() => (LikeToken::Lit(pattern[p + 1]), 2),
+        b => (LikeToken::Lit(b), 1),
+    }
+}
+
+/// The general matcher, for patterns with `_`, and the reference
+/// `match_segments` is tested against.
+///
+/// After a `%` fails, the retry used to step one character at a time. When the
+/// token after the `%` is a literal, every retry that does not land on that
+/// literal fails at once, so the retry jumps straight to the next occurrence
+/// with the vectorised search instead — on a valid UTF-8 value and pattern,
+/// where every character boundary is a retry position and an occurrence of a
+/// character's first byte is always on one. Otherwise it steps as before.
+/// `stepping_skip_agrees_with_stepping_one_character_at_a_time` pins that.
+fn like_match_stepping(value: &[u8], pattern: &[u8], fold: bool) -> bool {
     let norm = |b: u8| if fold { b.to_ascii_lowercase() } else { b };
+    // `_` is one *character*, as in PostgreSQL: `'é' LIKE '_'` is true, and
+    // `é` is two bytes. A `%` retry steps a whole character too, so `v` stays
+    // on a character boundary and a later `_` never starts mid-sequence.
+    let char_len = |at: usize| -> usize {
+        let len = match value[at] {
+            0xF0..=0xFF => 4,
+            0xE0..=0xEF => 3,
+            0xC0..=0xDF => 2,
+            _ => 1,
+        };
+        len.min(value.len() - at)
+    };
+    // Whether the jump is allowed; worked out the first time it is wanted.
+    let mut can_skip: Option<bool> = None;
+    // The literal byte after the current `%`, if the token after it is one —
+    // worked out when the `%` is reached rather than on every retry.
+    let mut star_next: Option<u8> = None;
 
     let (mut v, mut p) = (0usize, 0usize);
     // Where to resume if the current `%` guess turns out to be wrong.
     let (mut star_p, mut star_v) = (usize::MAX, 0usize);
 
     while v < value.len() {
-        if p < pattern.len() && pattern[p] == b'_' {
-            v += 1;
-            p += 1;
-        } else if p < pattern.len() && pattern[p] == b'%' {
-            // Remember this `%` and try matching it against nothing first.
-            star_p = p;
-            star_v = v;
-            p += 1;
-        } else if p < pattern.len() && norm(pattern[p]) == norm(value[v]) {
-            v += 1;
-            p += 1;
-        } else if star_p != usize::MAX {
-            // Backtrack: let the last `%` swallow one more character.
-            star_v += 1;
-            v = star_v;
-            p = star_p + 1;
-        } else {
+        if p < pattern.len() {
+            match like_token(pattern, p) {
+                (LikeToken::Any, width) => {
+                    v += char_len(v);
+                    p += width;
+                    continue;
+                }
+                (LikeToken::Star, width) => {
+                    // Remember this `%` and try matching it against nothing
+                    // first.
+                    star_p = p;
+                    star_v = v;
+                    p += width;
+                    star_next = match (p < pattern.len()).then(|| like_token(pattern, p)) {
+                        Some((LikeToken::Lit(b), _)) => Some(b),
+                        _ => None,
+                    };
+                    continue;
+                }
+                (LikeToken::Lit(b), width) if norm(b) == norm(value[v]) => {
+                    v += 1;
+                    p += width;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        if star_p == usize::MAX {
             return false;
         }
+        // Backtrack: let the last `%` swallow one more character.
+        star_v += char_len(star_v);
+        if let Some(b) = star_next {
+            let allowed = *can_skip.get_or_insert_with(|| {
+                std::str::from_utf8(value).is_ok() && std::str::from_utf8(pattern).is_ok()
+            });
+            if allowed {
+                let found = if fold {
+                    anchor_find::<true>(&value[star_v..], &[b])
+                } else {
+                    anchor_find::<false>(&value[star_v..], &[b])
+                };
+                match found {
+                    Some(at) => star_v += at,
+                    // No later position can start the literal, so every
+                    // remaining retry fails.
+                    None => return false,
+                }
+            }
+        }
+        v = star_v;
+        p = star_p + 1;
     }
 
-    // Trailing `%`s can match the empty remainder; anything else cannot.
+    // Trailing `%`s can match the empty remainder; anything else cannot. An
+    // escaped `%` is `\%` here, so it is not mistaken for one.
+    while p < pattern.len() && pattern[p] == b'%' {
+        p += 1;
+    }
+    p == pattern.len()
+}
+
+/// The stepping matcher as it was before the jump: one character per retry.
+/// Kept as the reference the jump is tested against.
+#[cfg(test)]
+fn like_match_stepping_reference(value: &[u8], pattern: &[u8], fold: bool) -> bool {
+    let norm = |b: u8| if fold { b.to_ascii_lowercase() } else { b };
+    let char_len = |at: usize| -> usize {
+        let len = match value[at] {
+            0xF0..=0xFF => 4,
+            0xE0..=0xEF => 3,
+            0xC0..=0xDF => 2,
+            _ => 1,
+        };
+        len.min(value.len() - at)
+    };
+    let (mut v, mut p) = (0usize, 0usize);
+    let (mut star_p, mut star_v) = (usize::MAX, 0usize);
+    while v < value.len() {
+        if p < pattern.len() {
+            match like_token(pattern, p) {
+                (LikeToken::Any, width) => {
+                    v += char_len(v);
+                    p += width;
+                    continue;
+                }
+                (LikeToken::Star, width) => {
+                    star_p = p;
+                    star_v = v;
+                    p += width;
+                    continue;
+                }
+                (LikeToken::Lit(b), width) if norm(b) == norm(value[v]) => {
+                    v += 1;
+                    p += width;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        if star_p == usize::MAX {
+            return false;
+        }
+        star_v += char_len(star_v);
+        v = star_v;
+        p = star_p + 1;
+    }
     while p < pattern.len() && pattern[p] == b'%' {
         p += 1;
     }
@@ -1967,6 +2555,42 @@ mod like_tests {
         );
     }
 
+    /// A character, not a byte: `é` is two bytes, `€` three, `😀` four.
+    #[test]
+    fn underscore_matches_one_multibyte_character() {
+        assert!(m("é", "_"));
+        assert!(!m("é", "__"), "two bytes are still one character");
+        assert!(m("€", "_"));
+        assert!(m("😀", "_"));
+        assert!(m("aéc", "a_c"));
+        assert!(m("crème", "cr_me"));
+        assert!(m("日本語", "_本_"));
+        assert!(!m("日本語", "____"));
+        // A `%` retry must not leave `_` starting inside a sequence: here the
+        // first guess for `%` fails and the retries step `é` as a unit.
+        assert!(m("éé!", "%_!"));
+        assert!(m("xéy", "%_y"));
+        assert!(!m("é", "%__"));
+    }
+
+    #[test]
+    fn only_wildcards_match_everything() {
+        // `LIKE '%%'` is rewritten to `CONTAINS ''` before it gets here, but the
+        // matcher must agree with that rewrite.
+        assert!(m("", "%%"));
+        assert!(m("abc", "%%"));
+        assert!(super::simd_compare_strings(
+            b"abc",
+            b"",
+            &crate::core::processor::transformer::ComparerOperation::Contains
+        ));
+        assert!(super::simd_compare_strings(
+            b"",
+            b"",
+            &crate::core::processor::transformer::ComparerOperation::Contains
+        ));
+    }
+
     /// Consecutive and trailing wildcards are common in generated SQL.
     #[test]
     fn repeated_and_trailing_wildcards_collapse() {
@@ -1992,9 +2616,520 @@ mod like_tests {
         assert!(!like_match(value.as_bytes(), pattern.as_bytes(), false));
     }
 
+    /// A small deterministic generator, so a failure names a reproducible input.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self, bound: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % bound as u64) as usize
+        }
+    }
+
+    /// Byte strings built from pieces chosen to collide: letters in both
+    /// cases, non-letters next to them in the ASCII table (`@`, `[`, `` ` ``,
+    /// `{` differ from letters only in bit 5), multibyte characters, and
+    /// malformed UTF-8 fragments.
+    fn generate(rng: &mut Rng, pieces: &[&[u8]], max: usize) -> Vec<u8> {
+        let len = rng.next(max + 1);
+        let mut out = Vec::new();
+        for _ in 0..len {
+            out.extend_from_slice(pieces[rng.next(pieces.len())]);
+        }
+        out
+    }
+
+    const VALUE_PIECES: &[&[u8]] = &[
+        b"a", b"A", b"b", b"B", b"c", b"z", b"Z", b"@", b"[", b"`", b"{", b" ", b"%",
+        b"_", "é".as_bytes(), "É".as_bytes(), "€".as_bytes(), "😀".as_bytes(), b"\xC3",
+        b"\xA9", b"\xFF", b"ab", b"AB", b"abc", b"\\",
+    ];
+    const PATTERN_PIECES: &[&[u8]] = &[
+        b"a", b"A", b"b", b"B", b"c", b"Z", b"@", b"`", b"%", b"%", b"%", b"%%", " ".as_bytes(),
+        "é".as_bytes(), "€".as_bytes(), b"\xA9", b"ab", b"aB", b"\\", b"\\%", b"\\_",
+        b"\\\\", b"\\a",
+    ];
+
+    /// The segment search must agree with the stepping matcher on every
+    /// `_`-free pattern, folded and not, including on malformed UTF-8 where it
+    /// has to hand back to the stepping matcher.
+    #[test]
+    fn segment_search_agrees_with_the_stepping_matcher() {
+        let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+        for _ in 0..300_000 {
+            let value = generate(&mut rng, VALUE_PIECES, 12);
+            let pattern = generate(&mut rng, PATTERN_PIECES, 7);
+            for fold in [false, true] {
+                assert_eq!(
+                    like_match(&value, &pattern, fold),
+                    super::like_match_stepping_reference(&value, &pattern, fold),
+                    "value {:?} pattern {:?} fold {}",
+                    String::from_utf8_lossy(&value),
+                    String::from_utf8_lossy(&pattern),
+                    fold
+                );
+            }
+        }
+        // Long values, so the vector paths of the search run, with segments
+        // drawn from the value itself so most patterns match.
+        for _ in 0..20_000 {
+            let value = generate(&mut rng, VALUE_PIECES, 120);
+            let mut pattern = Vec::new();
+            for _ in 0..rng.next(4) + 1 {
+                if rng.next(3) == 0 {
+                    pattern.push(b'%');
+                }
+                if !value.is_empty() {
+                    let at = rng.next(value.len());
+                    let len = rng.next(6).min(value.len() - at);
+                    pattern.extend(value[at..at + len].iter().filter(|b| **b != b'_'));
+                }
+                pattern.push(b'%');
+            }
+            if rng.next(2) == 0 {
+                pattern.pop();
+            }
+            for fold in [false, true] {
+                let mut p = pattern.clone();
+                if fold {
+                    p.iter_mut().for_each(|b| *b = b.to_ascii_uppercase());
+                }
+                assert_eq!(
+                    like_match(&value, &p, fold),
+                    super::like_match_stepping_reference(&value, &p, fold),
+                    "value {:?} pattern {:?} fold {}",
+                    String::from_utf8_lossy(&value),
+                    String::from_utf8_lossy(&p),
+                    fold
+                );
+            }
+        }
+    }
+
+    /// The stepping matcher's jump to the next occurrence of the literal after
+    /// a `%` must give exactly the one-character-at-a-time answer, on patterns
+    /// with `_`, escapes, multibyte and malformed UTF-8, folded and not.
+    #[test]
+    fn stepping_skip_agrees_with_stepping_one_character_at_a_time() {
+        let pieces: &[&[u8]] = &[
+            b"a", b"A", b"b", b"c", b"%", b"%", b"_", b"_", b"\\_", b"\\%", b"\\\\",
+            "é".as_bytes(), "€".as_bytes(), b"\xA9", b"\xC3", b"ab", b"aB", b"\\",
+        ];
+        let mut rng = Rng(0x0BAD_5EED_1234_5678);
+        for round in 0..300_000 {
+            let value = generate(&mut rng, VALUE_PIECES, if round % 8 == 0 { 60 } else { 12 });
+            let pattern = generate(&mut rng, pieces, 7);
+            for fold in [false, true] {
+                assert_eq!(
+                    super::like_match_stepping(&value, &pattern, fold),
+                    super::like_match_stepping_reference(&value, &pattern, fold),
+                    "value {:?} pattern {:?} fold {}",
+                    String::from_utf8_lossy(&value),
+                    String::from_utf8_lossy(&pattern),
+                    fold
+                );
+                // And the dispatcher, which routes escaped and `_`-free
+                // patterns elsewhere, agrees with both.
+                assert_eq!(
+                    like_match(&value, &pattern, fold),
+                    super::like_match_stepping_reference(&value, &pattern, fold),
+                    "like_match: value {:?} pattern {:?} fold {}",
+                    String::from_utf8_lossy(&value),
+                    String::from_utf8_lossy(&pattern),
+                    fold
+                );
+            }
+        }
+    }
+
+    /// The scalar search `ci_contains` used before it was vectorised.
+    fn reference_ci_contains(haystack: &[u8], needle: &[u8]) -> bool {
+        needle.is_empty()
+            || (needle.len() <= haystack.len()
+                && haystack
+                    .windows(needle.len())
+                    .any(|w| w.iter().zip(needle).all(|(a, b)| a.eq_ignore_ascii_case(b))))
+    }
+
+    /// `ICONTAINS`, `IEQUALS`, `ISTARTSWITH`, `IENDSWITH` against the scalar
+    /// definitions, over haystacks long enough to run the 32- and 16-byte
+    /// blocks and their tails, and needles from 0 to 40 bytes — including ones
+    /// cut from the haystack with their case flipped, so most searches hit.
+    ///
+    /// These are the ASCII folders, called directly: the dispatcher sends
+    /// non-ASCII text to the Unicode path instead, which
+    /// `unicode_fold_tests` holds to its own definition.
+    #[test]
+    fn case_insensitive_search_agrees_with_the_scalar_definition() {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        for round in 0..200_000 {
+            let hay = generate(&mut rng, VALUE_PIECES, if round % 4 == 0 { 90 } else { 20 });
+            let needle = if !hay.is_empty() && rng.next(3) != 0 {
+                let at = rng.next(hay.len());
+                let len = rng.next(41).min(hay.len() - at);
+                hay[at..at + len]
+                    .iter()
+                    .map(|b| match rng.next(3) {
+                        0 => b.to_ascii_uppercase(),
+                        1 => b.to_ascii_lowercase(),
+                        _ => *b,
+                    })
+                    .collect()
+            } else {
+                generate(&mut rng, VALUE_PIECES, 4)
+            };
+            let ctx = || {
+                format!(
+                    "hay {:?} needle {:?}",
+                    String::from_utf8_lossy(&hay),
+                    String::from_utf8_lossy(&needle)
+                )
+            };
+            assert_eq!(
+                super::ci_contains(&hay, &needle),
+                reference_ci_contains(&hay, &needle),
+                "contains: {}",
+                ctx()
+            );
+            let eq = |a: &[u8], b: &[u8]| {
+                a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
+            };
+            assert_eq!(
+                super::ci_equals(&hay, &needle),
+                eq(&hay, &needle),
+                "equals: {}",
+                ctx()
+            );
+            assert_eq!(
+                super::ci_starts_with(&hay, &needle),
+                hay.len() >= needle.len() && eq(&hay[..needle.len()], &needle),
+                "starts: {}",
+                ctx()
+            );
+            assert_eq!(
+                super::ci_ends_with(&hay, &needle),
+                hay.len() >= needle.len() && eq(&hay[hay.len() - needle.len()..], &needle),
+                "ends: {}",
+                ctx()
+            );
+            // And the position, which the `LIKE` segment search relies on.
+            let expect = if needle.is_empty() {
+                Some(0)
+            } else {
+                hay.windows(needle.len()).position(|w| eq(w, &needle))
+            };
+            assert_eq!(super::anchor_find::<true>(&hay, &needle), expect, "find: {}", ctx());
+            let expect_cs = if needle.is_empty() {
+                Some(0)
+            } else {
+                hay.windows(needle.len()).position(|w| w == &needle[..])
+            };
+            assert_eq!(super::anchor_find::<false>(&hay, &needle), expect_cs, "find cs: {}", ctx());
+        }
+    }
+
+    /// Every byte value against every other as a one-byte needle: the OR-0x20
+    /// anchor must accept exactly the two cases of a letter and nothing else.
+    #[test]
+    fn the_folded_anchor_accepts_exactly_the_two_cases() {
+        for h in 0..=255u8 {
+            for n in 0..=255u8 {
+                let hay = [h; 40];
+                assert_eq!(
+                    super::ci_contains(&hay, &[n]),
+                    h.eq_ignore_ascii_case(&n),
+                    "h={h:#x} n={n:#x}"
+                );
+            }
+        }
+    }
+
+    fn bench_corpus(count: usize) -> Vec<Vec<u8>> {
+        let mut rng = Rng(0xDEAD_BEEF_CAFE_F00D);
+        let words: &[&[u8]] = &[
+            b"the", b"Quick", b"brown", b"FOX", b"jumps", b"over", b"lazy", b"dog", b"Order",
+            b"customer", b"Invoice", b"shipped", b"pending", b"Berlin", b"sofia", b"needlework",
+        ];
+        (0..count)
+            .map(|_| {
+                let target = 50 + rng.next(451);
+                let mut v = Vec::with_capacity(target + 16);
+                while v.len() < target {
+                    v.extend_from_slice(words[rng.next(words.len())]);
+                    v.push(b' ');
+                }
+                v
+            })
+            .collect()
+    }
+
+    /// `simd_compare_strings` as it was before the Unicode path: every
+    /// operator's arm, the case-insensitive ones straight to the ASCII folders.
+    #[inline(always)]
+    fn old_dispatch(
+        input1: &[u8],
+        input2: &[u8],
+        operation: &crate::core::processor::transformer::ComparerOperation,
+    ) -> bool {
+        use crate::core::processor::transformer::ComparerOperation;
+        match operation {
+            ComparerOperation::EqualsCaseInsensitive => super::ci_equals(input1, input2),
+            ComparerOperation::ContainsCaseInsensitive => super::ci_contains(input1, input2),
+            ComparerOperation::StartsWithCaseInsensitive => super::ci_starts_with(input1, input2),
+            ComparerOperation::EndsWithCaseInsensitive => super::ci_ends_with(input1, input2),
+            ComparerOperation::LikeCaseInsensitive => like_match(input1, input2, true),
+            other => super::simd_compare_strings(input1, input2, other),
+        }
+    }
+
+    /// What the Unicode check costs ASCII text: the dispatcher (two `is_ascii`
+    /// passes, then the ASCII folder) against the folder called directly, which
+    /// is what the dispatcher did before. Interleaved, five rounds.
+    /// `cargo test --release -p rasterizeddb_core --lib -- --ignored
+    /// ilike_dispatch_ascii_bench --nocapture`.
+    #[test]
+    #[ignore]
+    fn ilike_dispatch_ascii_bench() {
+        use crate::core::processor::transformer::ComparerOperation as Op;
+        use std::hint::black_box;
+        let corpus = bench_corpus(1_000_000);
+        let time = |label: &str, f: &dyn Fn(&[u8]) -> bool| {
+            let t = std::time::Instant::now();
+            let hits = corpus.iter().filter(|v| f(black_box(v))).count();
+            println!("  {label:<52} {:>9.2?}  ({hits} hits)", t.elapsed());
+        };
+        for round in 0..5 {
+            println!("round {round}");
+            for needle in [&b"NEEDLE"[..], b"Customer Invoice"] {
+                let name = String::from_utf8_lossy(needle);
+                time(&format!("ICONTAINS '{name}' old dispatch"), &|v| {
+                    old_dispatch(v, needle, &Op::ContainsCaseInsensitive)
+                });
+                time(&format!("ISTARTSWITH '{name}' old dispatch"), &|v| {
+                    old_dispatch(v, needle, &Op::StartsWithCaseInsensitive)
+                });
+                time(&format!("ICONTAINS '{name}' direct"), &|v| super::ci_contains(v, needle));
+                time(&format!("ICONTAINS '{name}' dispatch"), &|v| {
+                    super::simd_compare_strings(v, needle, &Op::ContainsCaseInsensitive)
+                });
+                time(&format!("ISTARTSWITH '{name}' direct"), &|v| super::ci_starts_with(v, needle));
+                time(&format!("ISTARTSWITH '{name}' dispatch"), &|v| {
+                    super::simd_compare_strings(v, needle, &Op::StartsWithCaseInsensitive)
+                });
+            }
+            let pattern = &b"%order%berlin%"[..];
+            time("ILIKE '%order%berlin%' direct", &|v| like_match(v, pattern, true));
+            time("ILIKE '%order%berlin%' dispatch", &|v| {
+                super::simd_compare_strings(v, pattern, &Op::LikeCaseInsensitive)
+            });
+        }
+    }
+
+    /// `cargo test --release -p rasterizeddb_core --lib -- --ignored
+    /// ilike_like_bench --nocapture`. 1M values of 50-500 bytes.
+    #[test]
+    #[ignore]
+    fn ilike_like_bench() {
+        use std::hint::black_box;
+        let corpus = bench_corpus(1_000_000);
+        let time = |label: &str, f: &dyn Fn(&[u8]) -> bool| {
+            let t = std::time::Instant::now();
+            let hits = corpus.iter().filter(|v| f(black_box(v))).count();
+            println!("  {label:<46} {:>9.2?}  ({hits} hits)", t.elapsed());
+        };
+        for round in 0..3 {
+            println!("round {round}");
+            for needle in [&b"NEEDLE"[..], b"zq", b"Customer Invoice", b"xyzzy-not-there"] {
+                let name = String::from_utf8_lossy(needle);
+                time(&format!("ILIKE '%{name}%' old"), &|v| reference_ci_contains(v, needle));
+                time(&format!("ILIKE '%{name}%' new"), &|v| super::ci_contains(v, needle));
+            }
+            for pattern in [&b"the%fox%dog"[..], b"%order%berlin%", b"%zq%x%"] {
+                let name = String::from_utf8_lossy(pattern);
+                time(&format!("LIKE '{name}' old"), &|v| {
+                    super::like_match_stepping(v, pattern, false)
+                });
+                time(&format!("LIKE '{name}' new"), &|v| like_match(v, pattern, false));
+                time(&format!("ILIKE '{name}' old"), &|v| {
+                    super::like_match_stepping(v, pattern, true)
+                });
+                time(&format!("ILIKE '{name}' new"), &|v| like_match(v, pattern, true));
+            }
+            // Patterns with `_` go to the stepping matcher.
+            for pattern in [&b"%or_er%berlin%"[..], b"%c_stomer%", b"%zq_x%", b"the%_ox%"] {
+                let name = String::from_utf8_lossy(pattern);
+                time(&format!("LIKE '{name}' stepping old"), &|v| {
+                    super::like_match_stepping_reference(v, pattern, false)
+                });
+                time(&format!("LIKE '{name}' stepping new"), &|v| like_match(v, pattern, false));
+                time(&format!("ILIKE '{name}' stepping old"), &|v| {
+                    super::like_match_stepping_reference(v, pattern, true)
+                });
+                time(&format!("ILIKE '{name}' stepping new"), &|v| like_match(v, pattern, true));
+            }
+        }
+    }
+
+    /// PostgreSQL's default escape: a backslash makes the next character
+    /// literal, so `\_`, `\%` and `\\` match themselves. Django escapes every
+    /// `_` and `%` in a `contains` lookup this way.
+    #[test]
+    fn a_backslash_escapes_the_next_character() {
+        assert!(m("a_b", "a\\_b"));
+        assert!(!m("axb", "a\\_b"), "an escaped underscore is not a wildcard");
+        assert!(m("50%", "50\\%"));
+        assert!(!m("500", "50\\%"), "an escaped percent is not a wildcard");
+        assert!(!m("50%x", "50\\%"));
+        assert!(m("a\\b", "a\\\\b"), "an escaped backslash is one backslash");
+        assert!(!m("ab", "a\\\\b"));
+        assert!(m("xa_by", "%a\\_b%"));
+        assert!(!m("xaxby", "%a\\_b%"));
+        assert!(m("xa_bzy", "%a\\_b%y"));
+        assert!(!m("xaxbzy", "%a\\_b%y"));
+        assert!(m("q%r_s", "_\\%_\\__"));
+        assert!(!m("q%rxs", "_\\%_\\__"));
+        assert!(m("ab", "\\a\\b"), "an escaped ordinary character is itself");
+        // ILIKE folds escaped letters too.
+        assert!(like_match(b"A_B", b"a\\_b", true));
+        assert!(!like_match(b"AxB", b"a\\_b", true));
+        assert!(like_match(b"zA_Bz%", b"%a\\_b%\\%", true));
+    }
+
     #[test]
     fn folding_is_applied_to_both_sides() {
         assert!(like_match(b"UserTable:X", b"usertable:%", true));
         assert!(!like_match(b"UserTable:X", b"usertable:%", false));
+    }
+}
+
+#[cfg(test)]
+mod unicode_fold_tests {
+    use super::simd_compare_strings;
+    use crate::core::processor::transformer::ComparerOperation;
+
+    fn ci(a: &str, b: &str, op: ComparerOperation) -> bool {
+        simd_compare_strings(a.as_bytes(), b.as_bytes(), &op)
+    }
+
+    /// `ci_compare` trusts the ASCII folder on the strength of this: only two
+    /// non-ASCII characters lower to anything with ASCII in it, and only one
+    /// lowers to more than one character. Checked over every code point, as
+    /// both `char::to_lowercase` and `str::to_lowercase` (which differs for a
+    /// final sigma) compute it.
+    #[test]
+    fn lowering_reaches_ascii_exactly_twice() {
+        let mut reaches = Vec::new();
+        let mut widens = Vec::new();
+        for c in (0x80u32..=0x10FFFF).filter_map(char::from_u32) {
+            let lowered: String = c.to_lowercase().collect();
+            for l in [lowered.clone(), c.to_string().to_lowercase(), format!("a{}", c).to_lowercase()[1..].to_string()] {
+                if l.bytes().any(|b| b.is_ascii()) && !reaches.contains(&c) {
+                    reaches.push(c);
+                }
+                if l.chars().count() != 1 && !widens.contains(&c) {
+                    widens.push(c);
+                }
+            }
+        }
+        assert_eq!(reaches, vec!['\u{130}', '\u{212A}']);
+        assert_eq!(widens, vec!['\u{130}']);
+        // And the lead bytes `ci_compare` scans the value for.
+        assert_eq!('\u{130}'.to_string().as_bytes()[0], 0xC4);
+        assert_eq!('\u{212A}'.to_string().as_bytes()[0], 0xE2);
+    }
+
+    #[test]
+    fn pattern_classification_matches_a_byte_loop() {
+        let mut seed = 0x1234_5678_9ABC_DEF1u64;
+        for len in 0..40 {
+            for _ in 0..2000 {
+                let p: Vec<u8> = (0..len)
+                    .map(|_| {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        // Mostly the interesting bytes and their neighbours.
+                        let pick = b"kKiIjJlLhH_^`0\x7f\x80\xff\xc4\xe2aZ";
+                        if seed % 4 == 0 { (seed >> 8) as u8 } else { pick[(seed >> 8) as usize % pick.len()] }
+                    })
+                    .collect();
+                let want = (
+                    p.iter().any(|b| *b >= 0x80),
+                    p.iter().any(|b| matches!(b, b'k' | b'K' | b'i' | b'I')),
+                    p.contains(&b'_'),
+                );
+                // `reach` is only consulted for ASCII patterns.
+                let got = super::classify_pattern(&p);
+                assert_eq!(got.0, want.0, "{:?}", p);
+                if !want.0 {
+                    assert_eq!(got, want, "{:?}", p);
+                }
+            }
+        }
+    }
+
+    /// The cases PostgreSQL answers `true` and the ASCII-only folder answered
+    /// `false`: a non-ASCII letter in another case.
+    #[test]
+    fn non_ascii_letters_fold_like_lower() {
+        use ComparerOperation::*;
+        assert!(ci("é", "É", EqualsCaseInsensitive));
+        assert!(ci("crème brûlée", "CRÈME", StartsWithCaseInsensitive));
+        assert!(ci("crème brûlée", "BRÛLÉE", EndsWithCaseInsensitive));
+        assert!(ci("Ελληνικά κείμενα", "ΚΕΊΜΕΝΑ", ContainsCaseInsensitive));
+        assert!(ci("ПРИВЕТ мир", "привет%", LikeCaseInsensitive));
+        assert!(ci("ПРИВЕТ мир", "_РИВЕТ МИР", LikeCaseInsensitive));
+        assert!(ci("Ünïcödé", "üNÏCÖDÉ", LikeCaseInsensitive));
+        // Lowering changes length: the Kelvin sign is three bytes and lowers to
+        // ASCII `k`, so a length-first shortcut would refuse this.
+        assert!(ci("\u{212A}elvin", "kelvin", EqualsCaseInsensitive));
+        assert!(ci("100\u{212A}", "%k", LikeCaseInsensitive));
+        // Still not equal where the lowered forms differ.
+        assert!(!ci("é", "e", EqualsCaseInsensitive));
+        assert!(!ci("ß", "SS", EqualsCaseInsensitive), "lower() does not case-fold ß");
+        assert!(!ci("crème", "CREME", ContainsCaseInsensitive));
+        // Escapes and wildcards survive lowering.
+        assert!(ci("É_x", "é\\_X", LikeCaseInsensitive));
+        assert!(!ci("Éyx", "é\\_X", LikeCaseInsensitive));
+    }
+
+    /// For text, every case-insensitive operator must equal its case-sensitive
+    /// counterpart applied to `to_lowercase` of both sides — what `ILIKE` is in
+    /// PostgreSQL and what `lower()` computes here. ASCII inputs included, so
+    /// the fast path is held to the same definition.
+    #[test]
+    fn every_operator_matches_lowered_comparison() {
+        use ComparerOperation::*;
+        let alphabet = [
+            "a", "A", "é", "É", "ß", "\u{212A}", "k", "K", "İ", "i", "I", "Σ", "ς", "σ", "%", "_", "x",
+            "\u{307}", "€", "’",
+        ];
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        for _ in 0..100_000 {
+            let mut make = |max: usize| -> String {
+                let len = next(max + 1);
+                (0..len).map(|_| alphabet[next(alphabet.len())]).collect()
+            };
+            let a = make(12);
+            let b = make(3);
+            let (la, lb) = (a.to_lowercase(), b.to_lowercase());
+            let cases = [
+                (EqualsCaseInsensitive, la == lb),
+                (ContainsCaseInsensitive, la.contains(lb.as_str())),
+                (StartsWithCaseInsensitive, la.starts_with(lb.as_str())),
+                (EndsWithCaseInsensitive, la.ends_with(lb.as_str())),
+                (LikeCaseInsensitive, super::like_match(la.as_bytes(), lb.as_bytes(), false)),
+            ];
+            for (op, want) in cases {
+                assert_eq!(ci(&a, &b, op.clone()), want, "{:?} {:?} {:?}", a, op, b);
+            }
+        }
     }
 }

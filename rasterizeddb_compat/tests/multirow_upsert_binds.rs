@@ -379,7 +379,6 @@ async fn a_conflict_against_an_uncommitted_row_in_the_same_transaction_is_skippe
 /// spawning two tasks does not by itself make them overlap. Worth knowing about
 /// every test of this shape: the concurrency is incidental, and the counting is
 /// what detects the failure.
-#[ignore = "same open uniqueness TOCTOU as identical_pages_sent_at_once_do_not_duplicate_rows"]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_concurrent_upsert_never_reports_a_duplicate_key() {
     let (_server, pool) = server().await;
@@ -897,7 +896,6 @@ async fn values_that_look_like_syntax_do_not_rewrite_the_statement() {
 /// Ignored rather than left red so a shared suite stays green while the fix is
 /// decided. **Remove the `#[ignore]` with the fix** — a test that documents a
 /// known-bad behaviour is worth nothing if nobody notices it starting to pass.
-#[ignore = "reproduces an open uniqueness TOCTOU: concurrent ON CONFLICT DO NOTHING stores             duplicate rows in a UNIQUE column. Un-ignore when the write path is fixed."]
 #[tokio::test(flavor = "multi_thread")]
 async fn identical_pages_sent_at_once_do_not_duplicate_rows() {
     let (_server, pool) = server().await;

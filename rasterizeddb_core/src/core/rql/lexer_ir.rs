@@ -47,6 +47,30 @@ fn value_to_mb_scaled(
     value_to_mb(value_str, db_type)
 }
 
+thread_local! {
+    /// Why the last `insert_row_with_defaults` on this thread refused a value,
+    /// in PostgreSQL's words. The function answers `None` for every failure,
+    /// and its callers reported each one as a "schema mismatch" (XX000); this
+    /// carries the real reason, and with it the real SQLSTATE, to the one
+    /// caller that reports it. Same thread by construction: the build is
+    /// synchronous and the caller reads it before its next `await`.
+    static REFUSAL: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Takes the reason the last insert build on this thread refused a value.
+pub fn take_refusal() -> Option<String> {
+    REFUSAL.with(|r| r.borrow_mut().take())
+}
+
+fn note_refusal(column: &str, db_type: &DbType, value: &str) {
+    let message = format!(
+        "{} for column \"{}\"",
+        crate::core::value_codec::refusal_message(db_type, value),
+        column
+    );
+    REFUSAL.with(|r| *r.borrow_mut() = Some(message));
+}
+
 fn value_to_mb(value_str: &str, db_type: &DbType) -> Option<MemoryBlock> {
     // `'x'::text` is a value, not the four tokens it looks like.
     //
@@ -199,13 +223,9 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> Option<MemoryBlock> {
         }
         DbType::BOOL => {
             let stripped = strip_surrounding_quotes(value_str);
-            let val_u8 = parse_postgres_bool(stripped).unwrap_or_else(|| {
-                warn!(
-                    "Failed to parse BOOL value {:?}; defaulting to false",
-                    value_str
-                );
-                0
-            });
+            // Refused, not defaulted: storing `false` for `'maybe'` was a wrong
+            // value reported as success. PostgreSQL answers 22P02.
+            let val_u8 = parse_postgres_bool(stripped)?;
             let bytes = val_u8.to_le_bytes();
             let mut mb = MEMORY_POOL.acquire(bytes.len());
             mb.into_slice_mut().copy_from_slice(&bytes);
@@ -222,10 +242,10 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> Option<MemoryBlock> {
                     mb.into_slice_mut().copy_from_slice(&bytes);
                     mb
                 }
-                None => {
-                    warn!("Failed to parse {:?} value {:?}", db_type, value_str);
-                    MemoryBlock::default()
-                }
+                // Refused rather than stored empty: an empty block reads back
+                // as a zero timestamp, a nil UUID or an empty value — a wrong
+                // value reported as success.
+                None => return None,
             }
         }
         DbType::STRING | DbType::CHAR => {
@@ -244,10 +264,25 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> Option<MemoryBlock> {
         // document would otherwise be stored and read back as one.
         DbType::JSONB => {
             let stripped = crate::core::value_codec::unquote_sql(value_str);
-            let document: serde_json::Value = serde_json::from_str(&stripped).ok()?;
-            let encoded = crate::core::jsonb::encode(&document);
+            let encoded = crate::core::jsonb::encode_text(&stripped).ok()?;
             let mut mb = MEMORY_POOL.acquire(encoded.len());
             mb.into_slice_mut().copy_from_slice(&encoded);
+            mb
+        }
+        // `byteain`, from the literal as written: its quotes are undone once
+        // (an `E'…'` string's escapes included), and input PostgreSQL refuses
+        // fails the statement. Through the shared arm below, the quotes were
+        // undone twice and a refused value was stored as zero bytes.
+        DbType::BYTEA => {
+            let bytes = match crate::core::value_codec::encode_bytea_sql(value_str) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    warn!("Refused BYTEA value {:?}: {}", value_str, e);
+                    return None;
+                }
+            };
+            let mut mb = MEMORY_POOL.acquire(bytes.len());
+            mb.into_slice_mut().copy_from_slice(&bytes);
             mb
         }
         // Variable-width values with a syntax of their own: `\xdeadbeef` and
@@ -255,8 +290,7 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> Option<MemoryBlock> {
         // Every type whose literal is text with a syntax of its own, sharing
         // one encoder so the `INSERT` and `UPDATE` paths cannot disagree about
         // what they accept.
-        DbType::BYTEA
-        | DbType::ARRAY
+        DbType::ARRAY
         | DbType::INTERVAL
         | DbType::MACADDR
         | DbType::MACADDR8
@@ -291,10 +325,10 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> Option<MemoryBlock> {
                     mb.into_slice_mut().copy_from_slice(&bytes);
                     mb
                 }
-                None => {
-                    warn!("Failed to parse {:?} value {:?}", db_type, value_str);
-                    MemoryBlock::default()
-                }
+                // Refused rather than stored empty: an empty block reads back
+                // as a zero timestamp, a nil UUID or an empty value — a wrong
+                // value reported as success.
+                None => return None,
             }
         }
         // Marker types carry no value. This used to panic, which made a column
@@ -344,31 +378,10 @@ pub fn assignments_of_insert(sql: &str) -> Option<Vec<(String, String)>> {
     Some(columns.into_iter().zip(values).collect())
 }
 
-/// Index of the parenthesis closing the one at `open`, ignoring quoted text.
+/// Index of the parenthesis closing the one at `open`, ignoring quoted text
+/// of every kind — an escape string's `\'` or a dollar-quoted `)` included.
 fn matching_paren(sql: &str, open: usize) -> Option<usize> {
-    let bytes = sql.as_bytes();
-    let mut depth = 0usize;
-    let mut i = open;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\'' => {
-                i += 1;
-                while i < bytes.len() && bytes[i] != b'\'' {
-                    i += 1;
-                }
-            }
-            b'(' => depth += 1,
-            b')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
+    crate::core::sql_scan::matching_close(sql, open)
 }
 
 /// Rewrites `INSERT INTO t VALUES (…)` — no column list — into
@@ -422,7 +435,8 @@ pub fn supply_column_list(sql: &str, schema: &[SchemaField]) -> Option<String> {
 }
 
 /// Position of `word` in `upper` at or after `from`, outside quotes and on a
-/// word boundary, or `None`.
+/// word boundary, or `None`. The match ignores ASCII case, so `upper` may be
+/// the statement as written.
 fn find_word(upper: &str, word: &str, from: usize) -> Option<usize> {
     let bytes = upper.as_bytes();
     let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
@@ -433,9 +447,17 @@ fn find_word(upper: &str, word: &str, from: usize) -> Option<usize> {
         match bytes[i] {
             b'\'' if !in_identifier => in_string = !in_string,
             b'"' if !in_string => in_identifier = !in_identifier,
+            // Compared as bytes: `upper[i..]` panics when `i` falls inside a
+            // multi-byte character, which an unquoted identifier like `tëst`
+            // puts outside every quote — it took the worker down mid-INSERT.
+            //
+            // Case-insensitive, so the original statement can be searched
+            // without upper-casing a copy of it (`word` is upper case).
             _ if !in_string
                 && !in_identifier
-                && upper[i..].starts_with(word)
+                && bytes
+                    .get(i..i + word.len())
+                    .is_some_and(|w| w.eq_ignore_ascii_case(word.as_bytes()))
                 && (i == 0 || !is_word(bytes[i - 1]))
                 && bytes.get(i + word.len()).map_or(true, |b| !is_word(*b)) =>
             {
@@ -462,37 +484,11 @@ fn quote_identifier(name: &str) -> String {
     }
 }
 
-/// Splits a VALUES list on commas outside quotes and parentheses.
+/// Splits a VALUES list on commas at nesting depth zero; see
+/// [`parse_csv_values`]. It tracked parentheses but not brackets, escape
+/// strings or dollar quotes.
 fn split_values(list: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut current = String::new();
-    let mut depth = 0usize;
-    let mut quoted = false;
-
-    for c in list.chars() {
-        match c {
-            '\'' => {
-                quoted = !quoted;
-                current.push(c);
-            }
-            '(' if !quoted => {
-                depth += 1;
-                current.push(c);
-            }
-            ')' if !quoted => {
-                depth = depth.saturating_sub(1);
-                current.push(c);
-            }
-            ',' if !quoted && depth == 0 => {
-                out.push(std::mem::take(&mut current).trim().to_string())
-            }
-            _ => current.push(c),
-        }
-    }
-    if !current.trim().is_empty() {
-        out.push(current.trim().to_string());
-    }
-    out
+    parse_csv_values(list).into_iter().map(str::to_string).collect()
 }
 
 /// Extracts the column list of a `RETURNING` clause, resolved against the schema.
@@ -528,8 +524,10 @@ fn split_values(list: &str) -> Vec<String> {
 pub fn insert_select_source(sql: &str) -> Option<(&str, &str)> {
     const INSERT_INTO: &str = "INSERT INTO";
     let trimmed = sql.trim_start();
+    // Byte comparisons throughout: slicing `&str` at a keyword's length panics
+    // when that length falls inside a multi-byte character.
     if trimmed.len() < INSERT_INTO.len()
-        || !trimmed[..INSERT_INTO.len()].eq_ignore_ascii_case(INSERT_INTO)
+        || !trimmed.as_bytes()[..INSERT_INTO.len()].eq_ignore_ascii_case(INSERT_INTO.as_bytes())
     {
         return None;
     }
@@ -554,11 +552,10 @@ pub fn insert_select_source(sql: &str) -> Option<(&str, &str)> {
     // `selection` must not read as a query.
     let starts_word = |keyword: &str| {
         rest.len() >= keyword.len()
-            && rest[..keyword.len()].eq_ignore_ascii_case(keyword)
-            && rest[keyword.len()..]
-                .chars()
-                .next()
-                .map_or(true, |c| c.is_whitespace() || c == '(')
+            && rest.as_bytes()[..keyword.len()].eq_ignore_ascii_case(keyword.as_bytes())
+            && rest.as_bytes()
+                .get(keyword.len())
+                .map_or(true, |c| c.is_ascii_whitespace() || *c == b'(')
     };
     if !starts_word("SELECT") && !starts_word("WITH") {
         return None;
@@ -804,6 +801,22 @@ fn parse_items(list: &str, schema: &[SchemaField]) -> Result<Vec<ReturningItem>,
     Ok(out)
 }
 
+/// Splits a `VALUES` tuple's contents into its values, each trimmed and
+/// borrowed from `s`.
+///
+/// Quotes are kept: they are what distinguishes the keyword `NULL` from the
+/// four-character string `'NULL'`, and each type's encoder strips them itself.
+/// A trailing empty value is dropped (`1, ` is one value) while an empty one
+/// between commas is kept, as it always was.
+///
+/// A comma separates values only at nesting depth zero — outside every string
+/// (standard, escape, dollar-quoted), quoted identifier, `(…)` and `[…]`. It
+/// used to track quotes alone, so `ARRAY[1,2]` was two values: three columns
+/// given `(ARRAY[1,2], 3)` stored `ARRAY[1` and `2]` and reported success.
+fn parse_csv_values(s: &str) -> Vec<&str> {
+    crate::core::sql_scan::split_top_level(s, b',')
+}
+
 /// Pads or truncates a column value to the width its slot expects.
 ///
 /// `STRING` is variable-width and is left alone; every other type occupies a
@@ -869,13 +882,20 @@ pub fn insert_row_with_defaults(
     defaults: &[crate::core::rql::column_default::ColumnDefault],
     modifiers: &[crate::core::rql::type_modifier::TypeModifier],
 ) -> Option<RowWrite> {
+    REFUSAL.with(|r| *r.borrow_mut() = None);
     if let QueryPurpose::InsertRow(sql) = qp {
         let sql = sql.query.as_str();
         // Trim leading whitespace and newlines
         let sql_trimmed =
             sql.trim_start_matches(|c: char| c.is_whitespace() || c == '\n' || c == '\r');
-        let sql_upper = sql_trimmed.to_ascii_uppercase();
-        if !sql_upper.starts_with("INSERT INTO") {
+        // No upper-cased copy of the statement: it was made only to find two
+        // keywords, and a wide INSERT is mostly value text. Both are matched
+        // case-insensitively in place instead.
+        if !sql_trimmed
+            .as_bytes()
+            .get(.."INSERT INTO".len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(b"INSERT INTO"))
+        {
             error!(
                 "INSERT parse failed: query does not start with INSERT INTO. prefix={:?}",
                 sql_trimmed.chars().take(80).collect::<String>()
@@ -892,91 +912,51 @@ pub fn insert_row_with_defaults(
         /// `VALUES (1, 'a)b')` closed at the `)` *inside* the string, so the
         /// row was stored as `'a` — a silently truncated value from a
         /// well-formed statement, with no error anywhere.
+        ///
+        /// `start` is a byte offset and the walk is over bytes. It used to be
+        /// `char_indices().skip(start)`, which skips `start` *characters*: every
+        /// multi-byte character before the parenthesis — a table called
+        /// `"tëst"`, a column called `"日本"` — moved the walk past it, so the
+        /// tuple was taken for the column list or never found at all. The
+        /// delimiters are ASCII, and a byte of a multi-byte UTF-8 character is
+        /// never ASCII, so a byte walk cannot match inside one.
         fn extract_paren_block(
             s: &str,
-            open: char,
-            close: char,
+            open: u8,
+            close: u8,
             start: usize,
         ) -> Option<(usize, usize)> {
+            let bytes = s.as_bytes();
             let mut depth = 0;
             let mut begin = None;
-            let mut in_single = false;
-            let mut in_double = false;
-            for (i, c) in s.char_indices().skip(start) {
-                match c {
-                    '\'' if !in_double => in_single = !in_single,
-                    '"' if !in_single => in_double = !in_double,
-                    _ if in_single || in_double => {}
-                    _ if c == open => {
-                        if depth == 0 {
-                            begin = Some(i);
-                        }
-                        depth += 1;
-                    }
-                    _ if c == close => {
-                        depth -= 1;
-                        if depth == 0 {
-                            return begin.map(|b| (b, i));
-                        }
-                    }
-                    _ => {}
+            let mut i = start;
+            while i < bytes.len() {
+                // Every kind of quoted run is stepped over whole, an escape
+                // string's `\'` and a dollar-quoted body included.
+                if let Some(end) = crate::core::sql_scan::skip_quoted(bytes, i) {
+                    i = end;
+                    continue;
                 }
+                let c = bytes[i];
+                if c == open {
+                    if depth == 0 {
+                        begin = Some(i);
+                    }
+                    depth += 1;
+                } else if c == close {
+                    depth -= 1;
+                    if depth == 0 {
+                        return begin.map(|b| (b, i));
+                    }
+                }
+                i += 1;
             }
             None
         }
 
-        // --- Helper to parse comma-separated values respecting quotes ---
-        fn parse_csv_values(s: &str) -> Vec<String> {
-            let mut values = Vec::new();
-            let mut current_value = String::new();
-            let mut in_quotes = false;
-            let mut quote_char = '"';
-            let mut chars = s.chars();
-
-            while let Some(c) = chars.next() {
-                match c {
-                    '"' | '\'' if !in_quotes => {
-                        in_quotes = true;
-                        quote_char = c;
-                        current_value.push(c);
-                    }
-                    c if c == quote_char && in_quotes => {
-                        in_quotes = false;
-                        current_value.push(c);
-                    }
-                    ',' if !in_quotes => {
-                        // Quotes are kept: they are what distinguishes the
-                        // keyword `NULL` from the four-character string
-                        // `'NULL'`. Each type's encoder strips them itself.
-                        values.push(current_value.trim().to_string());
-                        current_value.clear();
-                    }
-                    _ => {
-                        current_value.push(c);
-                    }
-                }
-            }
-
-            // Don't forget the last value
-            let trimmed = current_value.trim();
-            if !trimmed.is_empty() {
-                values.push(trimmed.to_string());
-            }
-
-            values
-        }
-
-        // Find columns block after "INSERT INTO table_name"
-        let insert_kw = match sql_upper.find("INSERT INTO") {
-            Some(v) => v,
-            None => {
-                error!(
-                    "INSERT parse failed: could not find INSERT INTO keyword. prefix={:?}",
-                    sql_trimmed.chars().take(120).collect::<String>()
-                );
-                return None;
-            }
-        };
+        // Find columns block after "INSERT INTO table_name"; the statement
+        // was just checked to start with it.
+        let insert_kw = 0usize;
         // Skip table name: find first '(' after "INSERT INTO"
         let table_paren_start = match sql[insert_kw..].find('(') {
             Some(v) => v + insert_kw,
@@ -988,7 +968,7 @@ pub fn insert_row_with_defaults(
                 return None;
             }
         };
-        let (col_start, col_end) = match extract_paren_block(sql, '(', ')', table_paren_start) {
+        let (col_start, col_end) = match extract_paren_block(sql, b'(', b')', table_paren_start) {
             Some(v) => v,
             None => {
                 error!(
@@ -1005,21 +985,14 @@ pub fn insert_row_with_defaults(
         // a table name: the shadow table for a JSON key called `values_json`
         // is named `…_values_json_…`, so the column list was taken for the
         // tuple and every column name was parsed as a value.
-        let values_kw = match find_word(&sql_upper, "VALUES", col_end) {
+        // `find_word` matches case-insensitively, so the offset is already the
+        // keyword's offset in `sql` — it used to be found a second time by
+        // lower-casing the whole tail of the statement.
+        let values_kw_real = match find_word(sql, "VALUES", col_end) {
             Some(v) => v,
             None => {
                 error!(
                     "INSERT parse failed: missing VALUES keyword. prefix={:?}",
-                    sql_trimmed.chars().take(200).collect::<String>()
-                );
-                return None;
-            }
-        };
-        let values_kw_real = match sql[values_kw..].to_ascii_lowercase().find("values") {
-            Some(v) => values_kw + v,
-            None => {
-                error!(
-                    "INSERT parse failed: could not locate VALUES keyword in original query. prefix={:?}",
                     sql_trimmed.chars().take(200).collect::<String>()
                 );
                 return None;
@@ -1035,7 +1008,7 @@ pub fn insert_row_with_defaults(
                 return None;
             }
         };
-        let (val_start, val_end) = match extract_paren_block(sql, '(', ')', values_paren_start) {
+        let (val_start, val_end) = match extract_paren_block(sql, b'(', b')', values_paren_start) {
             Some(v) => v,
             None => {
                 error!(
@@ -1096,14 +1069,18 @@ pub fn insert_row_with_defaults(
             // produces until real nullability lands.
             // `VALUES (…, DEFAULT, …)` means the same as leaving the column
             // out, so it is resolved through the same expression.
-            let value = &if value.trim().eq_ignore_ascii_case("DEFAULT") {
-                crate::core::rql::column_default::expression_for(col_name, defaults)
-                    .and_then(|e| {
-                        crate::core::rql::column_default::evaluate(e, &schema_field.db_type).ok()
-                    })
-                    .unwrap_or_else(|| "NULL".to_string())
+            let default_owned;
+            let value: &str = if value.trim().eq_ignore_ascii_case("DEFAULT") {
+                default_owned =
+                    crate::core::rql::column_default::expression_for(col_name, defaults)
+                        .and_then(|e| {
+                            crate::core::rql::column_default::evaluate(e, &schema_field.db_type)
+                                .ok()
+                        })
+                        .unwrap_or_else(|| "NULL".to_string());
+                &default_owned
             } else {
-                value.clone()
+                value
             };
 
             // A function call in VALUES is evaluated, or refused. It must not
@@ -1111,10 +1088,10 @@ pub fn insert_row_with_defaults(
             // block: `INSERT … VALUES (gen_random_uuid())` stored a zero UUID
             // and reported success.
             let value_owned;
-            let value = if crate::core::rql::expr::needs_evaluation(&value) {
+            let value = if crate::core::rql::expr::needs_evaluation(value) {
                 // There is no row yet, so only a constant-foldable expression
                 // has meaning here — a nullary function or a literal.
-                let expr = crate::core::rql::expr::parse(&value, &[])
+                let expr = crate::core::rql::expr::parse(value, &[])
                     .map_err(|e| {
                         error!("INSERT parse failed: {}", e);
                     })
@@ -1146,7 +1123,11 @@ pub fn insert_row_with_defaults(
                     value,
                     &schema_field.db_type,
                     declared_scale(&schema_field.name, modifiers),
-                )?,
+                )
+                .or_else(|| {
+                    note_refusal(&schema_field.name, &schema_field.db_type, value);
+                    None
+                })?,
                 &schema_field.db_type,
                 schema_field.size as usize,
                 col_name,
@@ -2179,10 +2160,19 @@ fn find_values_keyword(sql: &str, upper: &str) -> Option<usize> {
             b'\'' if !in_double => in_single = !in_single,
             b'"' if !in_single => in_double = !in_double,
             _ if !in_single && !in_double => {
-                if upper[i..].starts_with("VALUES") {
-                    let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+                // Bytes, not `upper[i..]`, which panics inside a multi-byte
+                // character of an unquoted identifier.
+                if upper.as_bytes()[i..].starts_with(b"VALUES") {
+                    // An identifier byte on either side means this is inside a
+                    // name — `raw_values`, `order_values`, `valuesx` — not the
+                    // keyword. `_`, `$` and non-ASCII bytes are identifier bytes
+                    // too: matching inside `raw_values` split the statement at
+                    // the column list, the tuple splitter gave up, and the
+                    // single-row fallback silently kept only the first tuple.
+                    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80;
+                    let before_ok = i == 0 || !ident(bytes[i - 1]);
                     let after = i + "VALUES".len();
-                    let after_ok = after >= bytes.len() || !bytes[after].is_ascii_alphanumeric();
+                    let after_ok = after >= bytes.len() || !ident(bytes[after]);
                     if before_ok && after_ok {
                         return Some(i);
                     }
@@ -2201,6 +2191,20 @@ mod multi_row_values {
 
     fn split(sql: &str) -> Option<Result<Vec<String>, String>> {
         split_values_tuples(sql)
+    }
+
+    #[test]
+    fn non_ascii_outside_quotes_does_not_panic_the_keyword_scanners() {
+        // Each of these sliced `&str` at every byte and panicked inside `ë`.
+        let sql = "INSERT INTO tëst (naïve, id) VALUES ('ü', 2), ('ø', 3)";
+        let split = split("INSERT INTO tëst (naïve, id) VALUES ('ü', 2), ('ø', 3)")
+            .expect("two tuples")
+            .expect("splits");
+        assert_eq!(split[1], "INSERT INTO tëst (naïve, id) VALUES ('ø', 3)");
+        let upper = sql.to_ascii_uppercase();
+        assert_eq!(find_word(&upper, "VALUES", 0), sql.find("VALUES"));
+        assert!(insert_select_source("INSERT INTO t (a) aëëë").is_none());
+        assert!(insert_select_source("INSERT INTë").is_none());
     }
 
     #[test]
@@ -2415,5 +2419,151 @@ mod column_list_supply {
         let s = vec![field("Order Id", 0, false)];
         let out = supply_column_list("INSERT INTO t VALUES (1)", &s).unwrap();
         assert_eq!(out, "INSERT INTO t (\"Order Id\") VALUES (1)");
+    }
+}
+
+#[cfg(test)]
+mod insert_parse_bench {
+    use super::*;
+    use crate::core::rql::lexer_s1::InsertRowData;
+
+    fn field(name: &str, db_type: DbType, size: u32, order: u64) -> SchemaField {
+        SchemaField {
+            name: name.to_string(),
+            db_type,
+            size,
+            offset: 0,
+            write_order: order,
+            is_unique: false,
+            is_deleted: false,
+            scale: None,
+        }
+    }
+
+    /// A wide multi-row INSERT of text and JSON values, parsed the way the
+    /// executor parses it: split into one statement per tuple, each parsed.
+    /// `cargo test --release -p rasterizeddb_core --lib -- --ignored insert_parse_bench --nocapture`
+    #[test]
+    #[ignore]
+    fn insert_parse_bench() {
+        let schema = vec![
+            field("id", DbType::I64, 8, 0),
+            field("name", DbType::STRING, 12, 1),
+            field("doc", DbType::STRING, 12, 2),
+            field("note", DbType::STRING, 12, 3),
+            field("qty", DbType::I32, 4, 4),
+        ];
+        let doc = format!(
+            "{{\"payload\": \"{}\", \"tags\": [\"a\", \"b''c\"], \"n\": 1}}",
+            "x".repeat(2000)
+        );
+        let mut sql = String::from("INSERT INTO items (id, name, doc, note, qty) VALUES ");
+        for r in 0..100 {
+            if r > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!(
+                "({}, 'name {} with O''Quote and ünïcode', '{}', '{}', {})",
+                r,
+                r,
+                doc,
+                "note, with (parens) ".repeat(20),
+                r * 3
+            ));
+        }
+        let tuples = split_values_tuples(&sql).unwrap().unwrap();
+        let purposes: Vec<QueryPurpose> = tuples
+            .iter()
+            .map(|t| {
+                QueryPurpose::InsertRow(InsertRowData {
+                    query: t.clone(),
+                    table_name: "items".to_string(),
+                    on_conflict_do_nothing: false,
+                    on_conflict_update: None,
+                })
+            })
+            .collect();
+        for qp in &purposes {
+            assert!(insert_row_with_defaults(qp, &schema, &[], &[]).is_some());
+        }
+        let iters = 50u32;
+        for round in 0..4 {
+            let t = std::time::Instant::now();
+            for _ in 0..iters {
+                for qp in &purposes {
+                    std::hint::black_box(insert_row_with_defaults(
+                        std::hint::black_box(qp),
+                        &schema,
+                        &[],
+                        &[],
+                    ));
+                }
+            }
+            println!(
+                "round {round}: {} tuples, {} B statement: {:?} per statement",
+                purposes.len(),
+                sql.len(),
+                t.elapsed() / iters
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod csv_values_reference {
+    /// `parse_csv_values` as it was: a character at a time into owned strings.
+    fn reference(s: &str) -> Vec<String> {
+        let mut values = Vec::new();
+        let mut current_value = String::new();
+        let mut in_quotes = false;
+        let mut quote_char = '"';
+        for c in s.chars() {
+            match c {
+                '"' | '\'' if !in_quotes => {
+                    in_quotes = true;
+                    quote_char = c;
+                    current_value.push(c);
+                }
+                c if c == quote_char && in_quotes => {
+                    in_quotes = false;
+                    current_value.push(c);
+                }
+                ',' if !in_quotes => {
+                    values.push(current_value.trim().to_string());
+                    current_value.clear();
+                }
+                _ => current_value.push(c),
+            }
+        }
+        let trimmed = current_value.trim();
+        if !trimmed.is_empty() {
+            values.push(trimmed.to_string());
+        }
+        values
+    }
+
+    #[test]
+    fn matches_the_reference() {
+        let pieces = [
+            // No brackets, `E` prefixes or `$`: the reference tracked quotes
+            // alone, and nesting is what the rewrite changed on purpose.
+            "'", "''", "\"", ",", ", ", " ", "a", "NULL", "'x,y'", "\"q,\"", "日本", "ü",
+            "\u{2003}", "\n", "1.5", "'it''s'", "\\", "🙂",
+        ];
+        let mut state = 0x853c_49e6_748f_ea9bu64;
+        for _ in 0..100_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let n = (state % 12) as usize;
+            let mut s = String::new();
+            let mut r = state;
+            for _ in 0..n {
+                r = r.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s.push_str(pieces[((r >> 33) % pieces.len() as u64) as usize]);
+            }
+            let got: Vec<String> = super::parse_csv_values(&s).into_iter().map(str::to_string).collect();
+            assert_eq!(got, reference(&s), "{:?}", s);
+        }
     }
 }
