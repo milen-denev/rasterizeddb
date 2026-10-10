@@ -248,6 +248,21 @@ replay stops at the first one it cannot read whole, so what is lost is whole
 transactions off the end of the log, never half of one. It is a durability
 knob, not a consistency one.
 
+### Indexes
+
+`CREATE INDEX` builds a real B-tree or hash index over one or more columns,
+and every `PRIMARY KEY`, `UNIQUE` column and composite unique constraint gets
+one implicitly. With no `USING`, the method is chosen from the column types:
+a hash where only equality is ever asked (UUID, JSONB), a B-tree everywhere
+else. A query uses an index for `=`, `IN`, ranges, `BETWEEN` and prefix
+`LIKE`, and a `UNIQUE` check probes it rather than scanning. Point reads by
+primary key are 5–6.6× faster than without, and upserts 4.8×.
+
+An index may only ever return too much, never too little: the scan rechecks
+every candidate. An end-to-end test runs an indexed and an unindexed table
+through the same random writes and requires identical answers. See
+[docs/indexes.md](docs/indexes.md).
+
 ### The filter index
 
 Scans are pruned by a bit-level index rather than a B-tree. It is a positional
