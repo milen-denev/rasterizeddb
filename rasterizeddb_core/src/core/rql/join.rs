@@ -1,4 +1,4 @@
-//! `INNER` and `LEFT JOIN` planning and execution.
+//! `INNER`, `LEFT`, `RIGHT`, `FULL` and `CROSS` join planning and execution.
 //!
 //! Joins get their own path end to end, because the single-table plan is built
 //! from one schema and one `RowFetch`, and a join needs one of each per
@@ -18,8 +18,6 @@
 //! predicate evaluator over combined rows, and quietly evaluating it *before*
 //! the join — which is what a naive push-down would do — changes the answer.
 
-use std::collections::HashMap;
-
 use smallvec::SmallVec;
 
 use crate::core::db_type::DbType;
@@ -34,6 +32,51 @@ pub enum JoinKind {
     /// row. It has no join key, so it is the one kind `combine` handles without
     /// building a hash index.
     Cross,
+    /// `RIGHT [OUTER] JOIN`: every row of the joined relation survives; the
+    /// relations before it are NULL where it matched nothing.
+    Right,
+    /// `FULL [OUTER] JOIN`: both sides survive, each NULL-padded where it
+    /// matched nothing.
+    Full,
+}
+
+impl JoinKind {
+    /// True when the relations joined *before* this one may come out absent.
+    fn nulls_earlier(self) -> bool {
+        matches!(self, JoinKind::Right | JoinKind::Full)
+    }
+
+    /// True when the relation this join attaches may come out absent.
+    fn nulls_this(self) -> bool {
+        matches!(self, JoinKind::Left | JoinKind::Full)
+    }
+}
+
+/// Whether relation `rel` may contribute no row to a joined tuple: it is the
+/// null-supplying side of an outer join. A `RIGHT` or `FULL` join makes every
+/// relation before it nullable, not just the one it names, because the join
+/// runs left-deep over everything combined so far.
+fn may_be_unmatched(kinds: &[Option<JoinKind>], rel: usize) -> bool {
+    kinds.get(rel).copied().flatten().is_some_and(JoinKind::nulls_this)
+        || kinds
+            .iter()
+            .skip(rel + 1)
+            .flatten()
+            .any(|kind| kind.nulls_earlier())
+}
+
+/// The `ON` terms of a `RIGHT` or `FULL` join that read only the joined
+/// relation, evaluated against each of its rows before hashing.
+///
+/// Not a scan predicate, as they are for `INNER` and `LEFT`: there a row the
+/// term rejects simply cannot match, which filtering the scan reproduces. Here
+/// the joined relation is the *preserved* side, so a rejected row must still
+/// come out — NULL-padded — and filtering the scan would delete it.
+#[derive(Debug, Clone)]
+pub struct MatchCondition {
+    pub cond: crate::core::rql::expr::Cond,
+    /// The relation's own schema, which the scanned rows are laid out to.
+    pub schema: Vec<SchemaField>,
 }
 
 /// One relation in the `FROM` clause, after the first.
@@ -75,6 +118,16 @@ pub struct Relation {
     /// index empty so *every* left row survives as unmatched — which is how
     /// this returned all rows instead of the unmatched ones.
     pub require_unmatched: bool,
+    /// `ON` terms deciding which of this relation's rows may match, for a
+    /// `RIGHT`/`FULL` join. See [`MatchCondition`].
+    pub match_condition: Option<MatchCondition>,
+    /// `ON` terms that read only the relations joined *before* this one —
+    /// `LEFT JOIN b ON b.k = a.k AND a.active` — evaluated against each tuple
+    /// so far: a tuple they reject matches nothing here. For an INNER join
+    /// that drops it, as a `WHERE` would; for LEFT and FULL it survives
+    /// NULL-padded, and for RIGHT and FULL the rows it would have matched come
+    /// out unmatched — PostgreSQL's meaning in every case.
+    pub left_condition: Option<PostJoinFilter>,
 }
 
 /// A predicate evaluated over combined rows, after the join.
@@ -196,6 +249,48 @@ impl JoinPlan {
             .map(|i| (i.label.clone(), i.field.db_type.clone()))
             .collect()
     }
+
+    /// The scale each output column's `DECIMAL` bytes are stored at, slot for
+    /// slot with [`JoinPlan::output_columns`] — what pgwire must render them at.
+    ///
+    /// A column read straight through a join is at its own declared scale, and
+    /// so are `SUM`/`MIN`/`MAX` of one; `AVG` is at
+    /// `AggFunc::decimal_output_scale`; anything computed is at the engine
+    /// scale, as `expr::eval` produces it. Without this a join was rendered at
+    /// the engine scale throughout, so a `NUMERIC(10,2)` holding 1.25 read
+    /// back through any join as 0.000000125.
+    pub fn output_scales(&self) -> Vec<u32> {
+        use crate::core::rql::aggregate::SelectItem;
+        let engine = crate::core::value_codec::DECIMAL_SCALE;
+        if let Some(agg) = &self.aggregate {
+            return agg
+                .items
+                .iter()
+                .map(|item| match item {
+                    SelectItem::Column { field, .. } => field.scale.unwrap_or(engine),
+                    SelectItem::Aggregate {
+                        func,
+                        arg,
+                        arg_expr: None,
+                        ..
+                    } if item.result_type() == DbType::DECIMAL => {
+                        func.decimal_output_scale(arg.as_ref())
+                    }
+                    _ => engine,
+                })
+                .collect();
+        }
+        self.items
+            .iter()
+            .map(|i| {
+                if i.expr.is_some() || i.literal.is_some() || i.scalar.is_some() {
+                    engine
+                } else {
+                    i.field.scale.unwrap_or(engine)
+                }
+            })
+            .collect()
+    }
 }
 
 /// Builds a `RowFetch` for a set of schema fields.
@@ -216,41 +311,501 @@ pub fn fetch_for(fields: &[SchemaField], schema: &SmallVec<[SchemaField; 20]>) -
     }
 }
 
-/// Reads one column's bytes out of a scanned row.
-fn column_bytes<'a>(row: &'a Row, write_order: u64) -> Option<&'a [u8]> {
-    row.columns
-        .iter()
-        .find(|c| c.schema_id == write_order)
-        .map(|c| c.data.into_slice())
+/// A tuple slot whose relation contributed no row — an outer join that matched
+/// nothing.
+const NO_ROW: u32 = u32::MAX;
+
+#[cfg(feature = "enable_long_row")]
+const ROW_HEADER: usize = 8;
+#[cfg(not(feature = "enable_long_row"))]
+const ROW_HEADER: usize = 4;
+
+/// One relation's scanned rows.
+///
+/// The join reads its relations in the scan's serialized form: one contiguous
+/// buffer plus a `u32` start offset per row. A materialised `Row` is ~1.5 KB
+/// whatever it holds — its columns are an inline `SmallVec` of 32 — so a
+/// million-row relation was 1.56 GB of `Row` holding a few dozen bytes each;
+/// serialized it is the bytes plus 4 per row. Cells are read in place by
+/// [`RowRef::column`].
+pub enum RowSet {
+    /// Decoded rows: what a caller that already has them hands over.
+    Rows(Vec<Row>),
+    /// A scan's serialized rows (`Row::extend_serialized`'s format), and where
+    /// each starts.
+    Serialized { bytes: Vec<u8>, starts: Vec<u32> },
 }
 
-/// One combined tuple: the row contributed by each relation, or `None` where a
-/// `LEFT JOIN` found no match.
-type Combined = Vec<Option<Row>>;
+impl RowSet {
+    /// Indexes a scan's serialized rows. Refused when the buffer is past what a
+    /// `u32` offset can address, or ends partway through a row.
+    pub fn from_serialized(bytes: Vec<u8>) -> Result<Self, String> {
+        if bytes.len() > u32::MAX as usize {
+            return Err("a relation is too large to join".to_string());
+        }
+        let mut starts = Vec::new();
+        let mut at = 0usize;
+        for row in crate::core::row::row::serialized_rows(&bytes) {
+            let row = row.map_err(|e| format!("a scanned row could not be read: {}", e))?;
+            starts.push(at as u32);
+            at += row.len();
+        }
+        Ok(RowSet::Serialized { bytes, starts })
+    }
+
+    /// Serializes decoded rows — for tests, and for comparing the two forms.
+    pub fn serialize(rows: &[Row]) -> Result<Self, String> {
+        let mut bytes = Vec::new();
+        for row in rows {
+            row.extend_serialized(&mut bytes);
+        }
+        Self::from_serialized(bytes)
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            RowSet::Rows(rows) => rows.len(),
+            RowSet::Serialized { starts, .. } => starts.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    pub fn get(&self, i: usize) -> Option<RowRef<'_>> {
+        match self {
+            RowSet::Rows(rows) => rows.get(i).map(RowRef::Row),
+            RowSet::Serialized { bytes, starts } => {
+                let start = *starts.get(i)? as usize;
+                let end = starts.get(i + 1).map_or(bytes.len(), |e| *e as usize);
+                Some(RowRef::Bytes(&bytes[start..end]))
+            }
+        }
+    }
+}
+
+/// One scanned row, decoded or serialized.
+#[derive(Clone, Copy)]
+pub enum RowRef<'a> {
+    Row(&'a Row),
+    /// One serialized row, length header included.
+    Bytes(&'a [u8]),
+}
+
+impl<'a> RowRef<'a> {
+    /// The first cell carrying `schema_id`, as `find` on a `Row` would pick
+    /// it: its bytes and its type.
+    #[inline]
+    pub fn column(self, schema_id: u64) -> Option<(&'a [u8], DbType)> {
+        match self {
+            RowRef::Row(row) => row
+                .columns
+                .iter()
+                .find(|c| u64::from(c.schema_id) == schema_id)
+                .map(|c| (c.data.into_slice(), c.column_type.clone())),
+            RowRef::Bytes(bytes) => {
+                // Per cell: an 8-byte size, an 8-byte schema id, the data, and
+                // a 1-byte type tag. Every length is checked against the
+                // buffer, as `Row::decode` checks it.
+                let mut p = ROW_HEADER;
+                while p + 17 <= bytes.len() {
+                    let size = u64::from_le_bytes(bytes[p..p + 8].try_into().unwrap());
+                    let id = u64::from_le_bytes(bytes[p + 8..p + 16].try_into().unwrap());
+                    let data_at = p + 16;
+                    let end = usize::try_from(size).ok()?.checked_add(data_at)?;
+                    if end >= bytes.len() {
+                        return None;
+                    }
+                    if id == schema_id {
+                        return Some((&bytes[data_at..end], DbType::from_byte(bytes[end])));
+                    }
+                    p = end + 1;
+                }
+                None
+            }
+        }
+    }
+
+    /// Runs `f` over the row as a `Row`, decoding a serialized one for the
+    /// call. For the evaluator, which reads `Row`s.
+    pub fn with_row<T>(self, f: impl FnOnce(&Row) -> T) -> Result<T, String> {
+        match self {
+            RowRef::Row(row) => Ok(f(row)),
+            RowRef::Bytes(bytes) => Row::decode(bytes)
+                .map(|row| f(&row))
+                .map_err(|e| format!("a scanned row could not be read: {}", e)),
+        }
+    }
+}
+
+/// The joined tuples, as row indices into the scanned relations.
+///
+/// A tuple used to be a `Vec<Option<Row>>` filled with deep copies of every
+/// row it held — and a `Row` is ~1.5 KB whatever it carries, with
+/// `MemoryBlock::clone` a real copy — so every join step cloned every row of
+/// every tuple again. Here a tuple is `width` `u32`s in one flat buffer, and
+/// the rows are read in place; the output columns are copied exactly once, by
+/// [`project`].
+pub struct Joined<'a> {
+    scanned: &'a [RowSet],
+    width: usize,
+    slots: Vec<u32>,
+}
+
+/// One joined tuple: the row each relation contributed, or none.
+#[derive(Clone, Copy)]
+pub struct Tuple<'a> {
+    scanned: &'a [RowSet],
+    slots: &'a [u32],
+}
+
+impl<'a> Tuple<'a> {
+    /// The row relation `rel` contributed, or `None` where an outer join
+    /// matched nothing.
+    #[inline]
+    pub fn get(&self, rel: usize) -> Option<RowRef<'a>> {
+        let at = *self.slots.get(rel)?;
+        if at == NO_ROW {
+            return None;
+        }
+        self.scanned.get(rel)?.get(at as usize)
+    }
+}
+
+impl<'a> Joined<'a> {
+    fn empty(scanned: &'a [RowSet]) -> Self {
+        Joined {
+            scanned,
+            width: 1,
+            slots: Vec::new(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.slots.len() / self.width
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    pub fn tuple(&self, i: usize) -> Tuple<'_> {
+        Tuple {
+            scanned: self.scanned,
+            slots: &self.slots[i * self.width..(i + 1) * self.width],
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = Tuple<'_>> + '_ {
+        let scanned = self.scanned;
+        self.slots
+            .chunks_exact(self.width)
+            .map(move |slots| Tuple { scanned, slots })
+    }
+
+    /// Keeps the tuples `keep` answers true for, in order.
+    fn retain(&mut self, mut keep: impl FnMut(usize, Tuple<'_>) -> bool) {
+        let mut kept: Vec<u32> = Vec::with_capacity(self.slots.len());
+        for (i, slots) in self.slots.chunks_exact(self.width).enumerate() {
+            if keep(
+                i,
+                Tuple {
+                    scanned: self.scanned,
+                    slots,
+                },
+            ) {
+                kept.extend_from_slice(slots);
+            }
+        }
+        self.slots = kept;
+    }
+}
+
+/// Test relations, serialized as a scan hands them over — the production form —
+/// except every third one, kept decoded so both forms stay exercised.
+#[cfg(test)]
+fn sets(rels: Vec<Vec<Row>>) -> Vec<RowSet> {
+    rels.into_iter()
+        .enumerate()
+        .map(|(i, rows)| {
+            if i % 3 == 2 {
+                RowSet::Rows(rows)
+            } else {
+                RowSet::serialize(&rows).expect("serializable")
+            }
+        })
+        .collect()
+}
+
+/// One column of a join key, and the companion that says whether it is NULL.
+#[derive(Clone, Copy)]
+struct KeyColumn {
+    write_order: u64,
+    flag: Option<u64>,
+}
+
+/// A key column's bytes, or `None` when the row holds no value there — the
+/// column is absent, typed NULL, or its companion flag is set.
+///
+/// NULL equals nothing in SQL, so a NULL key must never match. A NULL is
+/// stored as its type's zeroes, so comparing the bytes alone matched a NULL
+/// integer key against a real `0` (and a NULL text against `''`).
+#[inline]
+fn key_bytes<'r>(row: RowRef<'r>, key: KeyColumn) -> Option<&'r [u8]> {
+    let (bytes, ty) = row.column(key.write_order)?;
+    if ty == DbType::NULL {
+        return None;
+    }
+    if let Some(flag) = key.flag {
+        if row
+            .column(flag)
+            .is_some_and(|(b, _)| crate::core::rql::nullable::flag_is_set(b))
+        {
+            return None;
+        }
+    }
+    Some(bytes)
+}
+
+/// Every key column of a row, or `None` if any is absent or NULL.
+///
+/// Kept as separate slices rather than a concatenation: joining the bytes would
+/// make `("ab", "c")` and `("a", "bc")` the same key, which is a wrong match
+/// rather than a missed one. Inline for up to four columns, so a composite key
+/// allocates nothing per row.
+#[inline]
+fn composite_key<'r>(row: RowRef<'r>, keys: &[KeyColumn]) -> Option<SmallVec<[&'r [u8]; 4]>> {
+    keys.iter().map(|k| key_bytes(row, *k)).collect()
+}
+
+/// One hash-join step: joins relation `idx` onto the tuples so far.
+///
+/// The build side is a `HashTable<u32>` of chain heads — row indices only, the
+/// key read back from the row whenever two hashes collide — with the chains
+/// threaded through `next`. The `HashMap<K, (head, tail)>` this replaces held
+/// a 16-byte slice (or a `SmallVec` of them) and two `u32`s per bucket, about
+/// 52 MB for a million build rows against ~10 MB here. Chains are built back to
+/// front, so a key's matches still come out in scan order.
+///
+/// `eligible` is the right rows the `ON` clause's own terms admit; `None`
+/// admits all. A row it rejects can match nothing, but a `RIGHT`/`FULL` join
+/// still returns it, NULL-padded — which is why those terms cannot be pushed
+/// into the scan the way they are for `INNER` and `LEFT`.
+///
+/// `anti` is a presence-only probe for a `LEFT` join whose relation must end
+/// up unmatched (`WHERE r.k IS NULL`): a tuple that matches is dropped here
+/// rather than fanned out into one tuple per match and discarded afterwards,
+/// and only the unmatched ones are kept, with this side absent.
+#[allow(clippy::too_many_arguments)]
+fn hash_step<'r, K: std::hash::Hash + Eq>(
+    kind: JoinKind,
+    idx: usize,
+    left_rel: usize,
+    width: usize,
+    scanned: &'r [RowSet],
+    combined: &[u32],
+    eligible: Option<&[bool]>,
+    left_ok: Option<&[bool]>,
+    anti: bool,
+    left_key: impl Fn(RowRef<'r>) -> Option<K>,
+    right_key: impl Fn(RowRef<'r>) -> Option<K>,
+) -> Vec<u32> {
+    use std::hash::BuildHasher;
+    let right = &scanned[idx];
+    let state = ahash::RandomState::new();
+
+    // An INNER join is symmetric, so the hash goes on whichever side is
+    // smaller: a hundred tuples joined to a million rows built a
+    // million-entry table to probe a hundred times. Output then comes out
+    // grouped by the right row rather than by the tuple — a join without
+    // ORDER BY has no defined order.
+    if kind == JoinKind::Inner
+        && !anti
+        && eligible.is_none()
+        && combined.len() / width < right.len()
+        && !always_build_right()
+    {
+        let tuples = combined.len() / width;
+        let tuple_key = |t: usize| -> Option<K> {
+            if left_ok.is_some_and(|ok| !ok[t]) {
+                return None;
+            }
+            let left = combined[t * width + left_rel];
+            if left == NO_ROW {
+                return None;
+            }
+            scanned[left_rel].get(left as usize).and_then(&left_key)
+        };
+        let mut heads: hashbrown::HashTable<u32> = hashbrown::HashTable::with_capacity(tuples);
+        let mut next: Vec<u32> = vec![NO_ROW; tuples];
+        for t in (0..tuples).rev() {
+            let Some(key) = tuple_key(t) else { continue };
+            let hash = state.hash_one(&key);
+            match heads.find_mut(hash, |at| tuple_key(*at as usize).is_some_and(|k| k == key)) {
+                Some(head) => {
+                    next[t] = *head;
+                    *head = t as u32;
+                }
+                None => {
+                    heads.insert_unique(hash, t as u32, |at| {
+                        tuple_key(*at as usize).map_or(0, |k| state.hash_one(&k))
+                    });
+                }
+            }
+        }
+        let mut out: Vec<u32> = Vec::new();
+        for r in 0..right.len() {
+            let Some(key) = right.get(r).and_then(&right_key) else { continue };
+            let hash = state.hash_one(&key);
+            let Some(mut t) = heads
+                .find(hash, |at| tuple_key(*at as usize).is_some_and(|k| k == key))
+                .copied()
+            else {
+                continue;
+            };
+            while t != NO_ROW {
+                let at = out.len();
+                out.extend_from_slice(&combined[t as usize * width..(t as usize + 1) * width]);
+                out[at + idx] = r as u32;
+                t = next[t as usize];
+            }
+        }
+        return out;
+    }
+
+    let row = |at: usize| right.get(at).expect("a row index from this relation");
+    let rehash = |at: &u32| -> u64 {
+        // Only rows that produced a key are ever inserted.
+        right_key(row(*at as usize)).map_or(0, |k| state.hash_one(&k))
+    };
+    let mut heads: hashbrown::HashTable<u32> = hashbrown::HashTable::with_capacity(right.len());
+    let mut next: Vec<u32> = if anti { Vec::new() } else { vec![NO_ROW; right.len()] };
+    for r in (0..right.len()).rev() {
+        if eligible.is_some_and(|e| !e[r]) {
+            continue;
+        }
+        let Some(key) = right_key(row(r)) else { continue };
+        let hash = state.hash_one(&key);
+        let same = |at: &u32| right_key(row(*at as usize)).is_some_and(|k| k == key);
+        match heads.find_mut(hash, same) {
+            Some(head) => {
+                if !anti {
+                    next[r] = *head;
+                    *head = r as u32;
+                }
+            }
+            None => {
+                heads.insert_unique(hash, r as u32, rehash);
+            }
+        }
+    }
+
+    let keep_left = matches!(kind, JoinKind::Left | JoinKind::Full);
+    let keep_right = matches!(kind, JoinKind::Right | JoinKind::Full);
+    debug_assert!(!anti || kind == JoinKind::Left, "the presence probe is a LEFT join's");
+    let mut matched: Vec<bool> = if keep_right {
+        vec![false; right.len()]
+    } else {
+        Vec::new()
+    };
+
+    let mut out: Vec<u32> = Vec::with_capacity(combined.len());
+    for (t, tuple) in combined.chunks_exact(width).enumerate() {
+        let left = tuple[left_rel];
+        let head = if left == NO_ROW || left_ok.is_some_and(|ok| !ok[t]) {
+            // An earlier outer join left this side empty: a NULL key.
+            None
+        } else {
+            scanned[left_rel]
+                .get(left as usize)
+                .and_then(&left_key)
+                .and_then(|k| {
+                    let hash = state.hash_one(&k);
+                    heads
+                        .find(hash, |at| right_key(row(*at as usize)).is_some_and(|rk| rk == k))
+                        .copied()
+                })
+        };
+        match head {
+            // Matched: the anti-join's predicate rejects every such tuple.
+            Some(_) if anti => {}
+            Some(mut r) => {
+                while r != NO_ROW {
+                    let at = out.len();
+                    out.extend_from_slice(tuple);
+                    out[at + idx] = r;
+                    if keep_right {
+                        matched[r as usize] = true;
+                    }
+                    r = next[r as usize];
+                }
+            }
+            // An inner or right join drops the tuple; a left or full join
+            // keeps it with this side absent.
+            None => {
+                if keep_left {
+                    out.extend_from_slice(tuple);
+                }
+            }
+        }
+    }
+
+    // Every right row nothing matched — including one with a NULL key, and
+    // one the `ON` terms rejected — survives with every earlier relation
+    // absent.
+    if keep_right {
+        for (r, hit) in matched.iter().enumerate() {
+            if !*hit {
+                let at = out.len();
+                out.resize(at + width, NO_ROW);
+                out[at + idx] = r as u32;
+            }
+        }
+    }
+    out
+}
+
+/// `RDB_JOIN_BUILD_RIGHT=1`: always hash the joined relation, as before the
+/// smaller side was chosen. Read once. For A/B measurement only.
+fn always_build_right() -> bool {
+    static RIGHT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *RIGHT.get_or_init(|| std::env::var_os("RDB_JOIN_BUILD_RIGHT").is_some_and(|v| v == "1"))
+}
 
 /// Executes the join over already-scanned per-relation rows.
 ///
 /// `scanned[i]` holds the rows of `plan.relations[i]`. Relations must be joined
 /// in declaration order, each to one that precedes it, which is what the `FROM`
 /// clause guarantees.
-/// Executes the join, or says why it could not.
 ///
 /// The error is returned rather than swallowed: a post-join predicate that
 /// fails to compile used to produce an empty result, which reads as a query
 /// that matched nothing rather than one that never ran.
-pub fn combine(plan: &JoinPlan, scanned: &[Vec<Row>]) -> Result<Vec<Combined>, String> {
+pub fn combine<'a>(plan: &JoinPlan, scanned: &'a [RowSet]) -> Result<Joined<'a>, String> {
     if plan.relations.is_empty() || scanned.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Joined::empty(scanned));
+    }
+    if scanned.len() < plan.relations.len() {
+        return Err(format!(
+            "the join has {} relations but {} were scanned",
+            plan.relations.len(),
+            scanned.len()
+        ));
+    }
+    // `NO_ROW` is `u32::MAX`, so a row index must stay below it. A relation
+    // that large could not be materialised anyway — a `Row` is ~1.5 KB.
+    if scanned.iter().any(|rows| rows.len() >= NO_ROW as usize) {
+        return Err("a relation is too large to join".to_string());
     }
 
-    let mut combined: Vec<Combined> = scanned[0]
-        .iter()
-        .map(|r| {
-            let mut slots: Combined = vec![None; plan.relations.len()];
-            slots[0] = Some(r.clone());
-            slots
-        })
-        .collect();
+    let width = plan.relations.len();
+    let mut combined: Vec<u32> = Vec::with_capacity(scanned[0].len() * width);
+    for r in 0..scanned[0].len() {
+        combined.push(r as u32);
+        combined.extend(std::iter::repeat_n(NO_ROW, width - 1));
+    }
 
     for (idx, relation) in plan.relations.iter().enumerate().skip(1) {
         let Some(join) = relation.join.as_ref() else {
@@ -260,37 +815,58 @@ pub fn combine(plan: &JoinPlan, scanned: &[Vec<Row>]) -> Result<Vec<Combined>, S
         // A cross join pairs every combined row with every row of this
         // relation. No key, no hash index — just the product.
         if join.kind == JoinKind::Cross {
-            let mut next: Vec<Combined> = Vec::with_capacity(combined.len() * scanned[idx].len());
-            for tuple in &combined {
-                for row in &scanned[idx] {
-                    let mut extended = tuple.clone();
-                    extended[idx] = Some(row.clone());
-                    next.push(extended);
+            let right_n = scanned[idx].len();
+            let mut next: Vec<u32> = Vec::with_capacity(combined.len() * right_n);
+            for tuple in combined.chunks_exact(width) {
+                for r in 0..right_n {
+                    let at = next.len();
+                    next.extend_from_slice(tuple);
+                    next[at + idx] = r as u32;
                 }
             }
             combined = next;
             continue;
         }
 
-        // Resolve every key column to the write order the scanned rows carry.
-        let mut left_wos: Vec<u64> = Vec::with_capacity(join.keys.len());
-        let mut right_wos: Vec<u64> = Vec::with_capacity(join.keys.len());
+        // Resolve every key column to the write order the scanned rows carry,
+        // and to its NULL companion when the column is nullable.
+        let companion = |rel: &Relation, name: &str| -> Option<u64> {
+            rel.fetch_columns
+                .iter()
+                .find(|f| {
+                    crate::core::rql::nullable::is_hidden(&f.name)
+                        && f.name.len() > crate::core::rql::nullable::NULL_FLAG_PREFIX.len()
+                        && f.name[crate::core::rql::nullable::NULL_FLAG_PREFIX.len()..]
+                            .eq_ignore_ascii_case(name)
+                        && !f.is_deleted
+                })
+                .map(|f| f.write_order)
+        };
+        let left_relation = &plan.relations[join.left_rel];
+        let mut left_keys: Vec<KeyColumn> = Vec::with_capacity(join.keys.len());
+        let mut right_keys: Vec<KeyColumn> = Vec::with_capacity(join.keys.len());
         let mut resolved = !join.keys.is_empty();
         for (left_name, right_name) in &join.keys {
-            let l = plan.relations[join.left_rel]
+            let l = left_relation
                 .fetch_columns
                 .iter()
                 .find(|f| f.name.eq_ignore_ascii_case(left_name) && !f.is_deleted)
-                .map(|f| f.write_order);
+                .map(|f| KeyColumn {
+                    write_order: f.write_order,
+                    flag: companion(left_relation, left_name),
+                });
             let r = relation
                 .fetch_columns
                 .iter()
                 .find(|f| f.name.eq_ignore_ascii_case(right_name) && !f.is_deleted)
-                .map(|f| f.write_order);
+                .map(|f| KeyColumn {
+                    write_order: f.write_order,
+                    flag: companion(relation, right_name),
+                });
             match (l, r) {
                 (Some(l), Some(r)) => {
-                    left_wos.push(l);
-                    right_wos.push(r);
+                    left_keys.push(l);
+                    right_keys.push(r);
                 }
                 _ => {
                     resolved = false;
@@ -299,67 +875,113 @@ pub fn combine(plan: &JoinPlan, scanned: &[Vec<Row>]) -> Result<Vec<Combined>, S
             }
         }
 
-        if !resolved {
-            // A join key that was not fetched cannot match anything; an inner
-            // join is then empty and a left join keeps its left rows.
-            if join.kind == JoinKind::Inner {
-                return Ok(Vec::new());
+        // The `ON` clause's own terms on this relation, for the joins that
+        // must still return the rows those terms reject.
+        let eligible: Option<Vec<bool>> = match relation.match_condition.as_ref() {
+            Some(condition) => Some(
+                (0..scanned[idx].len())
+                    .map(|r| {
+                        scanned[idx]
+                            .get(r)
+                            .expect("in range")
+                            .with_row(|row| {
+                                crate::core::rql::expr::eval_cond(
+                                    &condition.cond,
+                                    row,
+                                    &condition.schema,
+                                )
+                            })?
+                    })
+                    .collect::<Result<_, _>>()?,
+            ),
+            None => None,
+        };
+
+        // A presence-only probe is exact for a LEFT join whose relation must
+        // end up unmatched, as long as nothing after it can resurrect a tuple
+        // the anti-join would drop: a later RIGHT/FULL join marks its rows
+        // matched by the tuples it sees, so dropping one early would turn its
+        // partner into a NULL-padded row that then *passes* `r.k IS NULL`.
+        let anti = relation.require_unmatched
+            && join.kind == JoinKind::Left
+            && plan.relations[idx + 1..]
+                .iter()
+                .all(|r| r.join.as_ref().is_none_or(|j| !j.kind.nulls_earlier()));
+
+        // `ON` terms over the earlier relations: which tuples so far may match.
+        let left_ok: Option<Vec<bool>> = match relation.left_condition.as_ref() {
+            Some(filter) => {
+                let so_far = Joined {
+                    scanned,
+                    width,
+                    slots: combined.clone(),
+                };
+                Some(apply_post_join(plan, filter, &so_far)?)
             }
-            continue;
-        }
+            None => None,
+        };
 
-        /// Every key column of a row, or `None` if any is absent.
-        ///
-        /// A `Vec` of slices rather than a concatenation: joining the bytes
-        /// would make `("ab", "c")` and `("a", "bc")` the same key, which is a
-        /// wrong match rather than a missed one.
-        fn key_of<'r>(row: &'r Row, wos: &[u64]) -> Option<Vec<&'r [u8]>> {
-            wos.iter().map(|wo| column_bytes(row, *wo)).collect()
-        }
-
-        // Hash the right side once, then probe per combined row. Duplicate keys
-        // are kept, so a one-to-many join fans out as SQL requires.
-        let mut index: HashMap<Vec<&[u8]>, Vec<&Row>> = HashMap::new();
-        for row in &scanned[idx] {
-            if let Some(key) = key_of(row, &right_wos) {
-                index.entry(key).or_default().push(row);
-            }
-        }
-
-        let mut next: Vec<Combined> = Vec::with_capacity(combined.len());
-        for tuple in combined.into_iter() {
-            let key = tuple[join.left_rel]
-                .as_ref()
-                .and_then(|r| key_of(r, &left_wos));
-
-            match key.as_ref().and_then(|k| index.get(k)) {
-                Some(matches) => {
-                    for m in matches {
-                        let mut extended = tuple.clone();
-                        extended[idx] = Some((*m).clone());
-                        next.push(extended);
-                    }
-                }
-                None => {
-                    // An inner join drops the tuple; a left join keeps it with
-                    // the right side absent.
-                    if join.kind == JoinKind::Left {
-                        next.push(tuple);
-                    }
-                }
-            }
-        }
-        combined = next;
+        combined = if !resolved {
+            // A join key that was not fetched cannot match anything: an inner
+            // join is then empty, a left join keeps its left rows, a right
+            // join keeps its right rows, and a full join keeps both.
+            hash_step::<&[u8]>(
+                join.kind,
+                idx,
+                join.left_rel,
+                width,
+                scanned,
+                &combined,
+                eligible.as_deref(),
+                left_ok.as_deref(),
+                anti,
+                |_| None,
+                |_| None,
+            )
+        } else if left_keys.len() == 1 {
+            // The common case: one key column, hashed as a bare slice.
+            let (l, r) = (left_keys[0], right_keys[0]);
+            hash_step(
+                join.kind,
+                idx,
+                join.left_rel,
+                width,
+                scanned,
+                &combined,
+                eligible.as_deref(),
+                left_ok.as_deref(),
+                anti,
+                |row| key_bytes(row, l),
+                |row| key_bytes(row, r),
+            )
+        } else {
+            hash_step(
+                join.kind,
+                idx,
+                join.left_rel,
+                width,
+                scanned,
+                &combined,
+                eligible.as_deref(),
+                left_ok.as_deref(),
+                anti,
+                |row| composite_key(row, &left_keys),
+                |row| composite_key(row, &right_keys),
+            )
+        };
     }
+
+    let mut joined = Joined {
+        scanned,
+        width,
+        slots: combined,
+    };
 
     // Cross-relation `WHERE` terms are answered here, for the same reason: the
     // combined row is the first thing that has columns from both sides.
     if let Some(filter) = plan.post_join.as_ref() {
-        match apply_post_join(plan, filter, &combined) {
-            Ok(keep) => {
-                let mut iter = keep.into_iter();
-                combined.retain(|_| iter.next().unwrap_or(false));
-            }
+        match apply_post_join(plan, filter, &joined) {
+            Ok(keep) => joined.retain(|i, _| keep.get(i).copied().unwrap_or(false)),
             Err(e) => {
                 // Returning no rows here made a failed predicate look like a
                 // query that simply matched nothing — the caller sees success.
@@ -372,15 +994,15 @@ pub fn combine(plan: &JoinPlan, scanned: &[Vec<Row>]) -> Result<Vec<Combined>, S
     // Anti-joins are applied here, after every relation has been matched: the
     // question "did this relation find a row" only has an answer now.
     if plan.relations.iter().any(|r| r.require_unmatched) {
-        combined.retain(|tuple| {
+        joined.retain(|_, tuple| {
             plan.relations
                 .iter()
                 .enumerate()
-                .all(|(i, r)| !r.require_unmatched || tuple[i].is_none())
+                .all(|(i, r)| !r.require_unmatched || tuple.get(i).is_none())
         });
     }
 
-    Ok(combined)
+    Ok(joined)
 }
 
 /// Evaluates the post-join predicate over each combined tuple.
@@ -393,7 +1015,7 @@ pub fn combine(plan: &JoinPlan, scanned: &[Vec<Row>]) -> Result<Vec<Combined>, S
 fn apply_post_join(
     plan: &JoinPlan,
     filter: &PostJoinFilter,
-    combined: &[Combined],
+    combined: &Joined<'_>,
 ) -> Result<Vec<bool>, String> {
     use crate::core::processor::concurrent_processor::ConcurrentProcessor;
     use crate::core::processor::concurrent_processor::RowView;
@@ -427,12 +1049,29 @@ fn apply_post_join(
     let mut bool_buffer: SmallVec<[(bool, Option<crate::core::processor::transformer::Next>); 20]> =
         SmallVec::new();
 
-    for tuple in combined {
-        let row = combined_row(plan, &filter.columns, tuple);
+    let companions = Companions::new(plan, &filter.columns);
+    for tuple in combined.iter() {
+        let row = combined_row_with(plan, &filter.columns, &companions, tuple);
         let mut map: SmallVec<[u8; 32]> = SmallVec::new();
         map.resize(filter.schema.len(), u8::MAX);
         for (pos, column) in row.columns.iter().enumerate() {
             let wo = column.schema_id as usize;
+            // `u8::MAX` is the absent sentinel, so a position at or past it
+            // cannot be stored — truncating it read another column's bytes.
+            // `build_post_join_filter` sends every term of a row that wide to
+            // the expression evaluator, so the tokenizer never sees one; this
+            // refuses rather than answers if that ever stops being true.
+            if pos >= u8::MAX as usize {
+                if !no_filter {
+                    return Err(format!(
+                        "a post-join predicate over {} combined columns cannot be evaluated by \
+                         the predicate engine, which addresses at most {}",
+                        row.columns.len(),
+                        u8::MAX - 1
+                    ));
+                }
+                break;
+            }
             if wo < map.len() {
                 map[wo] = pos as u8;
             }
@@ -462,22 +1101,72 @@ fn apply_post_join(
     Ok(out)
 }
 
-/// Projects combined tuples into output rows, then sorts and pages them.
-pub fn project(plan: &JoinPlan, combined: Vec<Combined>) -> Vec<Row> {
-    let mut out: Vec<Row> = Vec::with_capacity(combined.len());
+/// What projecting one tuple needs that is the same for every tuple, resolved
+/// once per statement.
+pub struct Projector<'p> {
+    plan: &'p JoinPlan,
+    /// Each fetched item's NULL companion, found once rather than by a name
+    /// search per output cell.
+    item_flags: Vec<Option<u64>>,
+    /// An expression in the select list is evaluated against the combined row,
+    /// which is the first thing that has columns from both sides — built per
+    /// tuple only when something needs it.
+    wants_combined: bool,
+    layout_companions: Option<Companions>,
+    /// The first expression failure, reported once by [`Projector::report`].
+    expression_failure: Option<String>,
+}
 
-    // Built once per tuple, and only when something needs it: an expression in
-    // the select list is evaluated against the combined row, which is the first
-    // thing that has columns from both sides.
-    let wants_combined = plan.items.iter().any(|i| i.expr.is_some());
-    let mut expression_failure: Option<String> = None;
+impl<'p> Projector<'p> {
+    pub fn new(plan: &'p JoinPlan) -> Self {
+        let item_flags: Vec<Option<u64>> = plan
+            .items
+            .iter()
+            .map(|item| {
+                if item.literal.is_some() || item.scalar.is_some() || item.expr.is_some() {
+                    return None;
+                }
+                plan.relations.get(item.rel).and_then(|relation| {
+                    relation
+                        .fetch_columns
+                        .iter()
+                        .find(|f| {
+                            crate::core::rql::nullable::is_hidden(&f.name)
+                                && f.name.len() > crate::core::rql::nullable::NULL_FLAG_PREFIX.len()
+                                && f.name[crate::core::rql::nullable::NULL_FLAG_PREFIX.len()..]
+                                    .eq_ignore_ascii_case(&item.field.name)
+                        })
+                        .map(|flag| flag.write_order)
+                })
+            })
+            .collect();
+        Projector {
+            plan,
+            item_flags,
+            wants_combined: plan.items.iter().any(|i| i.expr.is_some()),
+            layout_companions: plan
+                .order_layout
+                .as_ref()
+                .map(|layout| Companions::new(plan, &layout.columns)),
+            expression_failure: None,
+        }
+    }
 
-    for tuple in &combined {
-        let synthetic = match (wants_combined, plan.order_layout.as_ref()) {
-            (true, Some(layout)) => Some(combined_row(plan, &layout.columns, tuple)),
+    /// One output row for one tuple. Output columns are positional: column `i`
+    /// is `plan.items[i]`, with `schema_id == i`.
+    pub fn row(&mut self, tuple: Tuple<'_>) -> Row {
+        let plan = self.plan;
+        let synthetic = match (
+            self.wants_combined,
+            plan.order_layout.as_ref(),
+            self.layout_companions.as_ref(),
+        ) {
+            (true, Some(layout), Some(companions)) => {
+                Some(combined_row_with(plan, &layout.columns, companions, tuple))
+            }
             _ => None,
         };
-        let mut columns: SmallVec<[Column; 32]> = SmallVec::new();
+        let mut columns: crate::core::row::row::RowColumns = SmallVec::new();
         for (i, item) in plan.items.iter().enumerate() {
             // An expression fills the position it was written in, and carries
             // its own type: a NULL result has to leave as a NULL rather than as
@@ -505,56 +1194,41 @@ pub fn project(plan: &JoinPlan, combined: Vec<Combined>) -> Vec<Row> {
                                         (bytes, db_type)
                                     }
                                     Ok(crate::core::rql::expr::Value::Null) => {
-                                        (Vec::new(), crate::core::db_type::DbType::NULL)
+                                        (Vec::new(), DbType::NULL)
                                     }
                                     Err(e) => {
-                                        expression_failure.get_or_insert(e);
-                                        (Vec::new(), crate::core::db_type::DbType::NULL)
+                                        self.expression_failure.get_or_insert(e);
+                                        (Vec::new(), DbType::NULL)
                                     }
                                 }
                             }
                             Err(e) => {
-                                expression_failure.get_or_insert(e);
-                                (Vec::new(), crate::core::db_type::DbType::NULL)
+                                self.expression_failure.get_or_insert(e);
+                                (Vec::new(), DbType::NULL)
                             }
                         }
                     }
-                    _ => (Vec::new(), crate::core::db_type::DbType::NULL),
+                    _ => (Vec::new(), DbType::NULL),
                 };
-                let mut mb = crate::memory_pool::MEMORY_POOL.acquire(bytes.len());
-                if !bytes.is_empty() {
-                    mb.into_slice_mut().copy_from_slice(&bytes);
-                }
                 columns.push(Column {
-                    schema_id: i as u64,
-                    data: mb,
+                    schema_id: crate::core::row::row::schema_id_of(i as u64),
+                    data: mb_from(&bytes),
                     column_type,
                 });
                 continue;
             }
             let data = if let Some(bytes) = item.literal.as_ref() {
-                let mut mb = crate::memory_pool::MEMORY_POOL.acquire(bytes.len());
-                if !bytes.is_empty() {
-                    mb.into_slice_mut().copy_from_slice(bytes);
-                }
-                mb
+                mb_from(bytes)
             } else if let Some(func) = item.scalar {
                 // Evaluated here, inside the per-row loop, for the same reason
                 // the single-table path does: a value computed once would be
                 // repeated in every row.
-                let bytes = func.evaluate();
-                let mut mb = crate::memory_pool::MEMORY_POOL.acquire(bytes.len());
-                mb.into_slice_mut().copy_from_slice(&bytes);
-                mb
+                mb_from(&func.evaluate())
             } else {
-                tuple[item.rel]
-                    .as_ref()
-                    .and_then(|r| {
-                        r.columns
-                            .iter()
-                            .find(|c| c.schema_id == item.field.write_order)
-                            .map(|c| c.data.clone())
-                    })
+                tuple
+                    .get(item.rel)
+                    .and_then(|r| r.column(item.field.write_order))
+                    .map(|(bytes, _)| mb_from(bytes))
                     .unwrap_or_default()
             };
 
@@ -575,26 +1249,14 @@ pub fn project(plan: &JoinPlan, combined: Vec<Combined>) -> Vec<Row> {
             let is_null = if item.literal.is_some() || item.scalar.is_some() {
                 false
             } else {
-                match tuple[item.rel].as_ref() {
+                match tuple.get(item.rel) {
                     // The relation contributed no row at all — an outer join
                     // that matched nothing. Every column of it is NULL.
                     None => true,
-                    Some(r) => plan.relations[item.rel]
-                        .fetch_columns
-                        .iter()
-                        .find(|f| {
-                            crate::core::rql::nullable::is_hidden(&f.name)
-                                && f.name.len() > crate::core::rql::nullable::NULL_FLAG_PREFIX.len()
-                                && f.name[crate::core::rql::nullable::NULL_FLAG_PREFIX.len()..]
-                                    .eq_ignore_ascii_case(&item.field.name)
-                        })
+                    Some(r) => self.item_flags[i]
                         .and_then(|flag| {
-                            r.columns
-                                .iter()
-                                .find(|c| c.schema_id == flag.write_order)
-                                .map(|c| {
-                                    crate::core::rql::nullable::flag_is_set(c.data.into_slice())
-                                })
+                            r.column(flag)
+                                .map(|(b, _)| crate::core::rql::nullable::flag_is_set(b))
                         })
                         .unwrap_or(false),
                 }
@@ -603,7 +1265,7 @@ pub fn project(plan: &JoinPlan, combined: Vec<Combined>) -> Vec<Row> {
             columns.push(Column {
                 // Output columns are positional: a joined row has no single
                 // schema for its ids to refer to.
-                schema_id: i as u64,
+                schema_id: crate::core::row::row::schema_id_of(i as u64),
                 data,
                 column_type: if is_null {
                     DbType::NULL
@@ -612,22 +1274,52 @@ pub fn project(plan: &JoinPlan, combined: Vec<Combined>) -> Vec<Row> {
                 },
             });
         }
-        out.push(Row {
+        Row {
             position: 0,
             columns,
             length: 0,
-        });
+        }
     }
 
-    if let Some(e) = expression_failure {
-        // Reported once. The column is NULL in every row it failed for, which
-        // is visible; saying nothing would leave a NULL that looks like data.
-        log::error!("join SELECT list expression failed: {}", e);
+    /// Logs the first expression failure, once. The column is NULL in every
+    /// row it failed for, which is visible; saying nothing would leave a NULL
+    /// that looks like data.
+    pub fn report(&self) {
+        if let Some(e) = self.expression_failure.as_ref() {
+            log::error!("join SELECT list expression failed: {}", e);
+        }
     }
+}
 
-    // Sorting runs here rather than in the scan, because the order is over the
-    // combined rows and a per-relation sort would not survive the join.
-    //
+fn mb_from(bytes: &[u8]) -> crate::memory_pool::MemoryBlock {
+    let mut mb = crate::memory_pool::MEMORY_POOL.acquire(bytes.len());
+    if !bytes.is_empty() {
+        mb.into_slice_mut().copy_from_slice(bytes);
+    }
+    mb
+}
+
+/// Projects combined tuples into output rows, then sorts and pages them.
+///
+/// [`project_serialized`], decoded. For the paths that must still edit rows
+/// after projecting — hydrating a shredded JSON column — and for tests.
+pub fn project(plan: &JoinPlan, combined: Joined<'_>) -> Vec<Row> {
+    let mut bytes = Vec::new();
+    project_serialized(plan, &combined, &mut bytes);
+    crate::core::row::row::vec_into_rows(&bytes).expect("rows this function serialized")
+}
+
+/// Projects combined tuples into serialized output rows appended to `out`,
+/// sorted, de-duplicated and paged.
+///
+/// Each output row is built, serialized and dropped, so what is resident is
+/// the compact serialized rows and a `u32` per row — never a `Vec<Row>` of
+/// 1.5 KB elements. `ORDER BY` sorts row indices, not rows (an expression sort
+/// used to move a 1584-byte `(keys, Row)` element per swap), and `DISTINCT`
+/// keeps a hash table of row indices rather than a byte copy of every row.
+pub fn project_serialized(plan: &JoinPlan, combined: &Joined<'_>, out: &mut Vec<u8>) {
+    let mut projector = Projector::new(plan);
+
     // A key addresses a projected column by position, so it is resolved once
     // here rather than per comparison.
     let sort_keys: Vec<(usize, bool, DbType)> = plan
@@ -641,7 +1333,40 @@ pub fn project(plan: &JoinPlan, combined: Vec<Combined>) -> Vec<Row> {
             Some((idx, *descending, field.db_type.clone()))
         })
         .collect();
+    let expression_sort = !plan.order_exprs.is_empty() && plan.order_layout.is_some();
+    let reorders = expression_sort
+        || (plan.order_exprs.is_empty() && !sort_keys.is_empty())
+        || plan.distinct;
 
+    // Nothing reorders or merges rows: straight into the result, projecting
+    // only the page `OFFSET`/`LIMIT` keep.
+    if !reorders {
+        let skip = plan.offset.map_or(0, |o| o as usize);
+        let take = plan.limit.map_or(usize::MAX, |l| l as usize);
+        for tuple in combined.iter().skip(skip).take(take) {
+            projector.row(tuple).extend_serialized(out);
+        }
+        projector.report();
+        return;
+    }
+
+    let mut rows: Vec<u8> = Vec::with_capacity(combined.len() * 32);
+    let mut starts: Vec<usize> = Vec::with_capacity(combined.len());
+    for tuple in combined.iter() {
+        starts.push(rows.len());
+        projector.row(tuple).extend_serialized(&mut rows);
+    }
+    projector.report();
+    let row_at = |i: u32| -> &[u8] {
+        let i = i as usize;
+        let end = starts.get(i + 1).copied().unwrap_or(rows.len());
+        &rows[starts[i]..end]
+    };
+
+    // Sorting runs here rather than in the scan, because the order is over the
+    // combined rows and a per-relation sort would not survive the join. Both
+    // sorts are stable over the scan order, as the row sorts they replace were.
+    let mut order: Vec<u32> = (0..starts.len() as u32).collect();
     if !plan.order_exprs.is_empty() {
         if let Some(layout) = plan.order_layout.as_ref() {
             let directions: Vec<(bool, Option<bool>)> = plan
@@ -651,11 +1376,12 @@ pub fn project(plan: &JoinPlan, combined: Vec<Combined>) -> Vec<Row> {
                 .collect();
             // Evaluated once per row up front: a comparator must not fail, and
             // re-evaluating inside one would be quadratic anyway.
+            let companions = Companions::new(plan, &layout.columns);
             let mut failure: Option<String> = None;
-            let mut keyed: Vec<(Vec<crate::core::rql::expr::Value>, Row)> =
-                Vec::with_capacity(out.len());
-            for (index, row) in out.into_iter().enumerate() {
-                let synthetic = combined_row(plan, &layout.columns, &combined[index]);
+            let mut keys: Vec<Vec<crate::core::rql::expr::Value>> = Vec::with_capacity(order.len());
+            for index in 0..combined.len() {
+                let synthetic =
+                    combined_row_with(plan, &layout.columns, &companions, combined.tuple(index));
                 let mut values = Vec::with_capacity(plan.order_exprs.len());
                 for (expr, _, _) in plan.order_exprs.iter() {
                     match crate::core::rql::expr::eval(expr, &synthetic, &layout.schema) {
@@ -670,31 +1396,29 @@ pub fn project(plan: &JoinPlan, combined: Vec<Combined>) -> Vec<Row> {
                         }
                     }
                 }
-                keyed.push((values, row));
+                keys.push(values);
             }
             if let Some(e) = failure {
                 log::error!("join ORDER BY expression failed: {}", e);
             }
-            keyed.sort_by(|a, b| {
-                crate::core::rql::expr::compare_key_values(&a.0, &b.0, &directions)
+            sort_or_select(&mut order, plan, |a, b| {
+                crate::core::rql::expr::compare_key_values(
+                    &keys[a as usize],
+                    &keys[b as usize],
+                    &directions,
+                )
             });
-            out = keyed.into_iter().map(|(_, row)| row).collect();
         }
     } else if !sort_keys.is_empty() {
-        out.sort_by(|a, b| {
+        sort_or_select(&mut order, plan, |a, b| {
+            let (ra, rb) = (RowRef::Bytes(row_at(a)), RowRef::Bytes(row_at(b)));
             for (idx, descending, ty) in sort_keys.iter() {
-                let av = a
-                    .columns
-                    .get(*idx)
-                    .map(|c| c.data.into_slice())
-                    .unwrap_or(&[]);
-                let bv = b
-                    .columns
-                    .get(*idx)
-                    .map(|c| c.data.into_slice())
-                    .unwrap_or(&[]);
-                let ord = compare_by_type(av, bv, ty);
-                let ord = if *descending { ord.reverse() } else { ord };
+                let ord = compare_projected_cells(
+                    ra.column(*idx as u64),
+                    rb.column(*idx as u64),
+                    ty,
+                    *descending,
+                );
                 if ord != std::cmp::Ordering::Equal {
                     return ord;
                 }
@@ -707,40 +1431,129 @@ pub fn project(plan: &JoinPlan, combined: Vec<Combined>) -> Vec<Row> {
     // `OFFSET`/`LIMIT`: SQL evaluates it first, so `LIMIT 10` over a distinct
     // set means ten distinct rows, not however many of the first ten differed.
     //
-    // Two rows are the same when every projected column holds the same bytes
-    // and the same type. The type is part of the key because a NULL arrives as
+    // Two rows are the same when their serialized forms are: every column
+    // holds the same bytes and the same type (the schema ids are positions,
+    // equal in every row). The type is part of it because a NULL arrives as
     // empty bytes typed `NULL`, and an empty string is empty bytes typed
     // `STRING` — telling those apart is what keeps a NULL from collapsing into
-    // an empty value. Order is preserved: the first of each group is kept, so
-    // an `ORDER BY` that has already run is not disturbed.
+    // an empty value. The first of each group is kept, so an `ORDER BY` that
+    // has already run is not disturbed.
     if plan.distinct {
-        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
-        out.retain(|row| {
-            let mut key: Vec<u8> = Vec::new();
-            for column in row.columns.iter() {
-                let bytes = column.data.into_slice();
-                key.push(column.column_type.to_byte());
-                key.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-                key.extend_from_slice(bytes);
+        use std::hash::BuildHasher;
+        let state = ahash::RandomState::new();
+        let mut seen: hashbrown::HashTable<u32> = hashbrown::HashTable::with_capacity(order.len());
+        order.retain(|i| {
+            let row = row_at(*i);
+            let hash = state.hash_one(row);
+            if seen.find(hash, |j| row_at(*j) == row).is_some() {
+                return false;
             }
-            seen.insert(key)
+            seen.insert_unique(hash, *i, |j| state.hash_one(row_at(*j)));
+            true
         });
     }
 
-    if let Some(off) = plan.offset {
-        out = out.into_iter().skip(off as usize).collect();
+    let skip = plan.offset.map_or(0, |o| o as usize);
+    let take = plan.limit.map_or(usize::MAX, |l| l as usize);
+    for i in order.into_iter().skip(skip).take(take) {
+        out.extend_from_slice(row_at(i));
     }
-    if let Some(limit) = plan.limit {
-        out.truncate(limit as usize);
-    }
+}
 
-    out
+/// Orders `order` by `cmp`, ties left in scan order — or, when a page without
+/// DISTINCT needs only its first `OFFSET + LIMIT` rows, selects those and
+/// sorts just them. Breaking ties on the row index makes the comparison total,
+/// so the selection returns exactly the stable sort's prefix.
+fn sort_or_select(
+    order: &mut Vec<u32>,
+    plan: &JoinPlan,
+    cmp: impl Fn(u32, u32) -> std::cmp::Ordering,
+) {
+    let total = |a: &u32, b: &u32| cmp(*a, *b).then(a.cmp(b));
+    let keep = match (plan.distinct, plan.limit) {
+        (false, Some(limit)) => plan.offset.unwrap_or(0).saturating_add(limit) as usize,
+        _ => usize::MAX,
+    };
+    if keep == 0 {
+        order.clear();
+    } else if keep < order.len() {
+        order.select_nth_unstable_by(keep - 1, total);
+        order.truncate(keep);
+        order.sort_unstable_by(total);
+    } else {
+        order.sort_unstable_by(total);
+    }
+}
+
+/// Folds the joined tuples straight into the aggregate, one projected row at a
+/// time — no `Vec<Row>` of the projection is built first.
+pub fn fold_joined(
+    plan: &JoinPlan,
+    agg: &crate::core::rql::aggregate::AggregatePlan,
+    combined: &Joined<'_>,
+    out: &mut Vec<u8>,
+) -> Result<(), String> {
+    let mut projector = Projector::new(plan);
+    let mut folder = crate::core::rql::aggregate::Folder::new(agg);
+    for tuple in combined.iter() {
+        folder.push(&projector.row(tuple))?;
+    }
+    projector.report();
+    folder.finish_into(out)
+}
+
+/// Orders two projected cells for one `ORDER BY` key, PostgreSQL's way: a
+/// NULL is larger than every value, so it sorts last under `ASC` and first
+/// under `DESC`. (An explicit `NULLS FIRST`/`LAST` never reaches here — the
+/// planner sends any such term down the expression sort, which honours it.)
+///
+/// NULL-ness is read from the cell's **type**, which `project` sets from the
+/// companion column or from an outer join that matched nothing. Never from
+/// the bytes: a matched row's NULL integer holds `0`'s bytes, and reading
+/// those sorted it as zero — tied with a real `0` — while an unmatched side,
+/// holding no bytes at all, sorted *first* under `ASC`.
+#[cfg(test)]
+fn compare_projected(
+    a: Option<&Column>,
+    b: Option<&Column>,
+    ty: &DbType,
+    descending: bool,
+) -> std::cmp::Ordering {
+    compare_projected_cells(
+        a.map(|c| (c.data.into_slice(), c.column_type.clone())),
+        b.map(|c| (c.data.into_slice(), c.column_type.clone())),
+        ty,
+        descending,
+    )
+}
+
+/// [`compare_projected`] over cells read in place: bytes and type.
+fn compare_projected_cells(
+    a: Option<(&[u8], DbType)>,
+    b: Option<(&[u8], DbType)>,
+    ty: &DbType,
+    descending: bool,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let is_null = |c: &Option<(&[u8], DbType)>| c.as_ref().is_none_or(|(_, t)| *t == DbType::NULL);
+    let ord = match (is_null(&a), is_null(&b)) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => compare_by_type(
+            a.map(|(bytes, _)| bytes).unwrap_or(&[]),
+            b.map(|(bytes, _)| bytes).unwrap_or(&[]),
+            ty,
+        ),
+    };
+    if descending { ord.reverse() } else { ord }
 }
 
 fn compare_by_type(a: &[u8], b: &[u8], ty: &DbType) -> std::cmp::Ordering {
     if a.is_empty() || b.is_empty() {
-        // An absent value from an unmatched LEFT JOIN sorts first, the way SQL
-        // orders NULLs under NULLS FIRST.
+        // Not a NULL — `compare_projected` has already taken those out — but
+        // an empty value, which only text has: `''` sorts before any other
+        // string, as its bytes do.
         return a.len().cmp(&b.len());
     }
     // The same comparator the single-table sort uses, so `ORDER BY` means the
@@ -825,17 +1638,9 @@ pub(crate) fn split_top_level_commas(text: &str) -> Vec<String> {
     parts
 }
 
-/// Accepts `FROM a [AS] x JOIN b [AS] y ON x.c = y.d [JOIN …]`, with `INNER`
-/// and `LEFT [OUTER]` joins. `CROSS`, `RIGHT` and `FULL` are refused by name so
-/// the failure says which join type is missing.
+/// Accepts `FROM a [AS] x JOIN b [AS] y ON x.c = y.d [JOIN …]`, with `INNER`,
+/// `LEFT [OUTER]`, `RIGHT [OUTER]`, `FULL [OUTER]` and `CROSS` joins.
 pub fn parse_from_clause(from_clause: &str) -> Result<Vec<RelationRef>, String> {
-    let upper = from_clause.to_ascii_uppercase();
-
-    for unsupported in ["RIGHT JOIN", "FULL JOIN", "RIGHT OUTER", "FULL OUTER"] {
-        if upper.contains(unsupported) {
-            return Err(format!("{} is not supported yet", unsupported));
-        }
-    }
 
     // `FROM a, b` is a cross join written the old way. Each top-level comma
     // starts a new relation that pairs with everything before it; the parts
@@ -894,6 +1699,14 @@ pub fn parse_from_clause(from_clause: &str) -> Result<Vec<RelationRef>, String> 
                     (trim_last_words(head, 2), JoinKind::Left)
                 } else if last_word == "LEFT" {
                     (trim_last_words(head, 1), JoinKind::Left)
+                } else if last_word == "OUTER" && second_last == "RIGHT" {
+                    (trim_last_words(head, 2), JoinKind::Right)
+                } else if last_word == "RIGHT" {
+                    (trim_last_words(head, 1), JoinKind::Right)
+                } else if last_word == "OUTER" && second_last == "FULL" {
+                    (trim_last_words(head, 2), JoinKind::Full)
+                } else if last_word == "FULL" {
+                    (trim_last_words(head, 1), JoinKind::Full)
                 } else if last_word == "INNER" {
                     (trim_last_words(head, 1), JoinKind::Inner)
                 } else if last_word == "CROSS" {
@@ -1058,12 +1871,13 @@ fn anti_join_column(
     rel: usize,
     relations: &[RelationRef],
     schemas: &[SmallVec<[SchemaField; 20]>],
+    join: Option<&JoinedRelation>,
 ) -> AntiJoin {
     let trimmed = conjunct.trim();
     let upper = trimmed.to_ascii_uppercase();
     let Some(head) = upper.strip_suffix("IS NULL") else {
         return AntiJoin::NotApplicable(format!(
-            "WHERE term '{}' filters '{}', which is the outer side of a LEFT JOIN. Only \
+            "WHERE term '{}' filters '{}', which is the null-supplying side of an outer join. Only \
              '<column> IS NULL' is supported there; anything else would be applied before the \
              join and change which rows count as unmatched",
             trimmed, relations[rel].label
@@ -1072,12 +1886,26 @@ fn anti_join_column(
     let column_text = trimmed[..head.trim_end().len()].trim();
     let (_, column) = split_qualified(column_text);
 
-    // Only sound when a matched row cannot itself hold NULL there. A nullable
-    // column would make `IS NULL` true for a row that *did* match, which is not
-    // the same question.
+    // A nullable column is sound too when it is one of this relation's own
+    // equi-join keys and the relation is attached by an INNER or LEFT join:
+    // its rows then enter a tuple only by matching, a NULL key never matches
+    // (`key_bytes`), so a present row's key is never NULL and `IS NULL` is
+    // exactly "found no match". Not for RIGHT/FULL, which keep this relation's
+    // unmatched rows — NULL keys included — present in the tuple.
+    let own_key = join.is_some_and(|j| {
+        matches!(j.kind, JoinKind::Left | JoinKind::Inner)
+            && j.keys.iter().any(|(_, right)| right.eq_ignore_ascii_case(&column))
+    });
+    if own_key {
+        return AntiJoin::Unmatched;
+    }
+
+    // Otherwise only sound when a matched row cannot itself hold NULL there. A
+    // nullable column would make `IS NULL` true for a row that *did* match,
+    // which is not the same question.
     match crate::core::rql::nullable::flag_field(&column, &schemas[rel]) {
         Some(_) => AntiJoin::NotApplicable(format!(
-            "WHERE term '{}' tests a nullable column on the outer side of a LEFT JOIN, where \
+            "WHERE term '{}' tests a nullable column on the null-supplying side of an outer join, where \
              IS NULL cannot distinguish 'no matching row' from 'matched with a NULL value'",
             trimmed
         )),
@@ -1666,6 +2494,11 @@ pub fn plan(
     // --- join conditions -----------------------------------------------
     let mut joins: Vec<Option<JoinedRelation>> = vec![None; relations.len()];
     let mut on_extra: Vec<Vec<String>> = vec![Vec::new(); relations.len()];
+    // `ON` terms of a `RIGHT`/`FULL` join on its own relation: evaluated at
+    // match time, never pushed into the scan. See [`MatchCondition`].
+    let mut match_terms: Vec<Vec<String>> = vec![Vec::new(); relations.len()];
+    // `ON` terms over earlier relations only; see `Relation::left_condition`.
+    let mut left_terms: Vec<Vec<String>> = vec![Vec::new(); relations.len()];
     // `ON` conditions with no hash key, which become post-join predicates.
     let mut expression_joins: Vec<String> = Vec::new();
     for (i, r) in relations.iter().enumerate() {
@@ -1740,7 +2573,13 @@ pub fn plan(
         for term in &raw.extra {
             let referenced = relations_referenced(term, &relations, &schemas);
             match referenced.as_slice() {
-                [only] if *only == i => on_extra[i].push(term.clone()),
+                [only] if *only == i => {
+                    if raw.kind.nulls_earlier() {
+                        match_terms[i].push(term.clone());
+                    } else {
+                        on_extra[i].push(term.clone());
+                    }
+                }
                 [] => {
                     return Err(format!(
                         "ON term '{}' references no column of '{}'",
@@ -1786,6 +2625,12 @@ pub fn plan(
                         return Err(malformed());
                     }
                 }
+                // Reads only relations joined before this one: it decides which
+                // of the tuples so far may match, never which of this
+                // relation's rows exist.
+                refs if refs.iter().all(|r| *r < i) => {
+                    left_terms[i].push(term.clone());
+                }
                 _ => {
                     return Err(format!(
                         "ON term '{}' spans more than the relation being joined, which is not \
@@ -1823,11 +2668,20 @@ pub fn plan(
                 // rows count as unmatched. The module already refuses
                 // two-relation conjuncts for exactly this reason; the same
                 // argument applies here and was simply not carried over.
-                let null_supplying = joins[rel]
-                    .as_ref()
-                    .is_some_and(|j| j.kind == JoinKind::Left);
+                //
+                // A `RIGHT` or `FULL` join makes every relation before it
+                // null-supplying too, and a `FULL` join its own relation.
+                let kinds: Vec<Option<JoinKind>> =
+                    joins.iter().map(|j| j.as_ref().map(|j| j.kind)).collect();
+                let null_supplying = may_be_unmatched(&kinds, rel);
                 if null_supplying {
-                    match anti_join_column(&conjunct, rel, &relations, &schemas) {
+                    match anti_join_column(
+                        &conjunct,
+                        rel,
+                        &relations,
+                        &schemas,
+                        joins[rel].as_ref(),
+                    ) {
                         AntiJoin::Unmatched => {
                             anti_join[rel] = true;
                         }
@@ -1864,6 +2718,46 @@ pub fn plan(
         }
     }
 
+    // --- NULL join keys, dropped at the scan ----------------------------
+    //
+    // A NULL key matches nothing (`key_bytes`), so a row holding one can only
+    // reach the output where its side is *preserved*. Where it is not, the
+    // scan drops it and it is never materialised:
+    //
+    // * the relation an INNER or LEFT join attaches — its rows enter a tuple
+    //   only by matching, so a NULL-keyed one never does;
+    // * the left side of an INNER join — every tuple whose key there is NULL is
+    //   dropped at that step, and a row removed from the scan yields either no
+    //   tuple or a tuple with that side absent, which the step drops alike.
+    //
+    // Never the preserved side of an outer join (LEFT's left, RIGHT's right,
+    // either side of FULL): those rows come out NULL-padded. The flag test is
+    // the engine's own desugaring of `IS NOT NULL` (see `nullable`).
+    let mut not_null: Vec<Vec<String>> = vec![Vec::new(); relations.len()];
+    for (i, join) in joins.iter().enumerate() {
+        let Some(join) = join.as_ref() else { continue };
+        let sides: &[(usize, bool)] = match join.kind {
+            JoinKind::Inner => &[(0, true), (1, true)],
+            JoinKind::Left => &[(1, true)],
+            JoinKind::Right | JoinKind::Full | JoinKind::Cross => &[],
+        };
+        for (side, _) in sides {
+            let rel = if *side == 0 { join.left_rel } else { i };
+            for (left_name, right_name) in &join.keys {
+                let column = if *side == 0 { left_name } else { right_name };
+                if let Some(flag) = crate::core::rql::nullable::flag_field(column, &schemas[rel]) {
+                    let term = format!("{} = 0", flag.name);
+                    if !not_null[rel].contains(&term) {
+                        not_null[rel].push(term);
+                    }
+                }
+            }
+        }
+    }
+    for (rel, terms) in not_null.into_iter().enumerate() {
+        predicates[rel].extend(terms);
+    }
+
     // --- aggregate stage -------------------------------------------------
     //
     // The fold reads the *projected* join rows, whose columns are positional,
@@ -1881,6 +2775,7 @@ pub fn plan(
         offset,
         &mut items,
         &resolve,
+        &schemas,
         &mut expr_arguments,
     )?;
 
@@ -2092,6 +2987,26 @@ pub fn plan(
                 }
             }
         }
+        // And for an `ON` term over earlier relations, evaluated against the
+        // tuple so far.
+        for terms in &left_terms {
+            for term in terms {
+                for field in schemas[i].iter() {
+                    if term_names_column(term, &r.label, &r.table, &field.name) {
+                        push(field, &mut fetch);
+                    }
+                }
+            }
+        }
+        // And for an `ON` term evaluated at match time, which reads its
+        // relation's rows directly.
+        for term in &match_terms[i] {
+            for field in schemas[i].iter() {
+                if term_names_column(term, &r.label, &r.table, &field.name) {
+                    push(field, &mut fetch);
+                }
+            }
+        }
         // Every fetched column's NULL companion comes with it.
         //
         // A NULL is not a property of a value's bytes here — a NULL
@@ -2132,6 +3047,33 @@ pub fn plan(
             crate::core::tokenizer::predicate_rewrite::rewrite_where(&joined, &schemas[i])?
         };
 
+        // Read against the relation's own schema: the qualifier is stripped,
+        // since the scanned rows carry the table's real write orders.
+        let match_condition = if match_terms[i].is_empty() {
+            None
+        } else {
+            let written = match_terms[i].join(" AND ");
+            let mut text = written.clone();
+            let mut fields: Vec<&SchemaField> = schemas[i].iter().collect();
+            // Longest first, so `b.ab` is not partly rewritten by `b.a`.
+            fields.sort_by_key(|f| std::cmp::Reverse(f.name.len()));
+            for field in fields {
+                for prefix in [&r.label, &r.table] {
+                    text = replace_qualified(&text, &format!("{}.{}", prefix, field.name), &field.name);
+                }
+            }
+            let schema: Vec<SchemaField> = schemas[i].iter().cloned().collect();
+            let cond = crate::core::rql::expr::parse_cond(&text, &schema).map_err(|e| {
+                format!(
+                    "ON term '{}' of the outer join on '{}' could not be read: {}",
+                    written.trim(),
+                    r.label,
+                    e
+                )
+            })?;
+            Some(MatchCondition { cond, schema })
+        };
+
         out_relations.push(Relation {
             table: r.table.clone(),
             label: r.label.clone(),
@@ -2139,7 +3081,15 @@ pub fn plan(
             predicate,
             fetch_columns: fetch,
             require_unmatched: anti_join[i],
+            match_condition,
+            left_condition: None,
         });
+    }
+    for (i, terms) in left_terms.iter().enumerate() {
+        if !terms.is_empty() {
+            let filter = build_post_join_filter(terms, &out_relations)?;
+            out_relations[i].left_condition = Some(filter);
+        }
     }
 
     let post_join = if cross_relation.is_empty() {
@@ -2369,17 +3319,64 @@ pub fn combined_layout(relations: &[Relation]) -> CombinedLayout {
 /// *type* to decide that, and this row is rebuilt from declared types — so the
 /// companion's flag is turned into `DbType::NULL` here, or every NULL arrives
 /// as a value holding zeroes and comparisons against it quietly succeed.
-pub fn combined_row(plan: &JoinPlan, columns_map: &[Vec<u64>], tuple: &Combined) -> Row {
-    let mut columns: SmallVec<[Column; 32]> = SmallVec::new();
+pub fn combined_row(plan: &JoinPlan, columns_map: &[Vec<u64>], tuple: Tuple<'_>) -> Row {
+    combined_row_with(plan, columns_map, &Companions::new(plan, columns_map), tuple)
+}
+
+/// Each mapped column's NULL companion, by relation and position: the write
+/// order of the `__null_` field that tracks it, if any.
+///
+/// Found once per plan rather than by a name search per column per tuple —
+/// which made flattening a tuple quadratic in the number of fetched columns.
+pub struct Companions(Vec<Vec<Option<u64>>>);
+
+impl Companions {
+    pub fn new(plan: &JoinPlan, columns_map: &[Vec<u64>]) -> Self {
+        Companions(
+            columns_map
+                .iter()
+                .enumerate()
+                .map(|(rel, mapping)| {
+                    (0..mapping.len())
+                        .map(|i| {
+                            let relation = &plan.relations[rel];
+                            let field = &relation.fetch_columns[i];
+                            relation
+                                .fetch_columns
+                                .iter()
+                                .find(|f| {
+                                    crate::core::rql::nullable::is_hidden(&f.name)
+                                        && f.name.len()
+                                            > crate::core::rql::nullable::NULL_FLAG_PREFIX.len()
+                                        && f.name
+                                            [crate::core::rql::nullable::NULL_FLAG_PREFIX.len()..]
+                                            .eq_ignore_ascii_case(&field.name)
+                                })
+                                .map(|flag| flag.write_order)
+                        })
+                        .collect()
+                })
+                .collect(),
+        )
+    }
+}
+
+/// [`combined_row`] with the companions already resolved.
+pub fn combined_row_with(
+    plan: &JoinPlan,
+    columns_map: &[Vec<u64>],
+    companions: &Companions,
+    tuple: Tuple<'_>,
+) -> Row {
+    let mut columns: crate::core::row::row::RowColumns = SmallVec::new();
     for (rel, mapping) in columns_map.iter().enumerate() {
         for (i, write_order) in mapping.iter().enumerate() {
             let field = &plan.relations[rel].fetch_columns[i];
-            let source = tuple.get(rel).and_then(|r| r.as_ref()).and_then(|row| {
-                row.columns
-                    .iter()
-                    .find(|c| c.schema_id == field.write_order)
-            });
-            let data = source.map(|c| c.data.clone()).unwrap_or_default();
+            let data = tuple
+                .get(rel)
+                .and_then(|row| row.column(field.write_order))
+                .map(|(bytes, _)| mb_from(bytes))
+                .unwrap_or_default();
 
             // An outer join that matched nothing contributes no row at all, and
             // every column it would have supplied is NULL by definition. Typed
@@ -2389,31 +3386,19 @@ pub fn combined_row(plan: &JoinPlan, columns_map: &[Vec<u64>], tuple: &Combined)
             // that emptiness instead of falling through to `t.b`, and it then
             // compared as incomparable, which a sort reads as "equal" and
             // leaves in scan order while reporting the rows as ordered.
-            let unmatched = tuple.get(rel).and_then(|r| r.as_ref()).is_none();
+            let unmatched = tuple.get(rel).is_none();
             let is_null = unmatched
-                || plan.relations[rel]
-                    .fetch_columns
-                    .iter()
-                    .find(|f| {
-                        crate::core::rql::nullable::is_hidden(&f.name)
-                            && f.name.len() > crate::core::rql::nullable::NULL_FLAG_PREFIX.len()
-                            && f.name[crate::core::rql::nullable::NULL_FLAG_PREFIX.len()..]
-                                .eq_ignore_ascii_case(&field.name)
-                    })
+                || companions.0[rel][i]
                     .and_then(|flag| {
-                        tuple.get(rel).and_then(|r| r.as_ref()).and_then(|row| {
-                            row.columns
-                                .iter()
-                                .find(|c| c.schema_id == flag.write_order)
-                                .map(|c| {
-                                    crate::core::rql::nullable::flag_is_set(c.data.into_slice())
-                                })
+                        tuple.get(rel).and_then(|row| {
+                            row.column(flag)
+                                .map(|(b, _)| crate::core::rql::nullable::flag_is_set(b))
                         })
                     })
                     .unwrap_or(false);
 
             columns.push(Column {
-                schema_id: *write_order,
+                schema_id: crate::core::row::row::schema_id_of(*write_order),
                 data,
                 column_type: if is_null {
                     crate::core::db_type::DbType::NULL
@@ -2460,10 +3445,22 @@ fn build_post_join_filter(
     // sets to NULL for exactly those cells, so it answers "unknown" as SQL
     // says it should. A term that can see one is therefore sent there, even
     // though the tokenizer would happily compile it.
-    let optional: Vec<bool> = relations
+    let kinds: Vec<Option<JoinKind>> = relations
         .iter()
-        .map(|r| matches!(r.join.as_ref().map(|j| j.kind), Some(JoinKind::Left)))
+        .map(|r| r.join.as_ref().map(|j| j.kind))
         .collect();
+    let optional: Vec<bool> = (0..relations.len())
+        .map(|at| may_be_unmatched(&kinds, at))
+        .collect();
+
+    // The predicate engine reads the combined row through a `u8` position map
+    // (`RowView`), with `u8::MAX` meaning "absent". A combined row of 255 or
+    // more columns cannot be addressed by it: position 256 wrapped to 0 and
+    // read another column's bytes, and position 255 read as absent — both
+    // answering rather than failing. The expression evaluator looks columns up
+    // by write order with no such limit, so a row that wide sends every term
+    // there instead.
+    let too_wide_for_tokenizer = schema.len() >= u8::MAX as usize;
 
     for term in terms {
         let touches_optional = relations.iter().enumerate().any(|(at, relation)| {
@@ -2478,7 +3475,7 @@ fn build_post_join_filter(
             rewritten = replace_qualified(&rewritten, from, to);
         }
 
-        if touches_optional {
+        if touches_optional || too_wide_for_tokenizer {
             expr_terms.push(crate::core::rql::expr::parse_cond(&rewritten, &schema)?);
             continue;
         }
@@ -2607,12 +3604,14 @@ fn build_aggregate_stage(
     offset: Option<u64>,
     items: &mut Vec<JoinSelectItem>,
     resolve: &dyn Fn(&str) -> Result<(usize, SchemaField), String>,
+    // Each relation's schema, for the functional-dependency test.
+    schemas: &[SmallVec<[SchemaField; 20]>],
     // Aggregate arguments that are expressions, in the order their placeholder
     // items were pushed. The caller parses them once the fetch lists are
     // settled and fills in both the item and the aggregate's argument type.
     expr_arguments: &mut Vec<String>,
 ) -> Result<Option<crate::core::rql::aggregate::AggregatePlan>, String> {
-    use crate::core::rql::aggregate::{AggFunc, Having, SelectItem};
+    use crate::core::rql::aggregate::{AggFunc, SelectItem};
 
     // Only a genuine aggregate puts the statement on the fold path. A nullary
     // scalar like `now()` adds a column without grouping anything; counting it
@@ -2668,17 +3667,28 @@ fn build_aggregate_stage(
                 items.len() - 1
             }
         };
-        SchemaField::new(
+        let mut positioned = SchemaField::new(
             field.name.clone(),
             field.db_type.clone(),
             field.size,
             0,
             pos as u64,
             false,
-        )
+        );
+        // The projected bytes are the column's own, at its declared scale. The
+        // fold's `SUM`/`AVG`, `HAVING`'s literal coercion and the rendered
+        // scale all read it from here; dropping it compared a `NUMERIC(10,2)`
+        // sum against a literal encoded at nine places.
+        positioned.scale = field.scale;
+        positioned
     }
 
     let mut group_by: Vec<SchemaField> = Vec::new();
+    // Relations a grouping key determines: grouped by a column that is unique
+    // and NOT NULL in that relation (`lexer_query::determines_its_relation`),
+    // every group holds at most one of its rows — so its other columns may be
+    // selected without being grouped, as PostgreSQL allows for a primary key.
+    let mut determined: Vec<bool> = vec![false; schemas.len()];
     if let Some(list) = group_by_clause {
         for raw in list.split(',') {
             let name = raw.trim().split_whitespace().next().unwrap_or("");
@@ -2686,6 +3696,11 @@ fn build_aggregate_stage(
                 continue;
             }
             let (rel, field) = resolve(name)?;
+            if schemas.get(rel).is_some_and(|schema| {
+                crate::core::rql::lexer_query::determines_its_relation(&field, schema)
+            }) {
+                determined[rel] = true;
+            }
             group_by.push(positional(rel, field, items));
         }
     }
@@ -2938,6 +3953,17 @@ fn build_aggregate_stage(
             if !group_by
                 .iter()
                 .any(|g| g.write_order == synthetic.write_order)
+                && determined.get(rel).copied().unwrap_or(false)
+            {
+                // Functionally dependent on a grouped key of its own
+                // relation. Appended to the group key rather than assumed
+                // constant per group: if the data ever broke the uniqueness,
+                // groups would split, never merge rows with different values.
+                group_by.push(synthetic.clone());
+            }
+            if !group_by
+                .iter()
+                .any(|g| g.write_order == synthetic.write_order)
             {
                 return Err(format!(
                     "column '{}' must appear in GROUP BY or be used in an aggregate",
@@ -2951,38 +3977,80 @@ fn build_aggregate_stage(
         }
     }
 
+    // The shared `HAVING` parser (`having.rs`): a boolean tree whose every
+    // literal is coerced against its aggregate at plan time. The one-comparison
+    // splitter it replaces took everything after the first operator as the
+    // literal, could not read `1 AND SUM(x) > 5`, and kept every group.
     let having = match having_clause {
         None => None,
         Some(text) => {
-            let (func, arg_text, op, literal) = split_having(text)?;
-            let arg = match arg_text {
-                None => None,
-                Some(name) => {
-                    let (rel, field) = resolve(&name)?;
-                    Some(positional(rel, field, items))
+            let mut resolve_call = |call: &str| -> Result<SelectItem, String> {
+                let (rebuilt, filter_text) =
+                    crate::core::rql::lexer_query::split_aggregate_filter(call);
+                let call = rebuilt.as_deref().unwrap_or(call).trim();
+                let open = call
+                    .find('(')
+                    .ok_or_else(|| format!("'{}' is not an aggregate call", call))?;
+                let close = call
+                    .rfind(')')
+                    .ok_or_else(|| format!("unterminated function call in '{}'", call))?;
+                if !call[close + 1..].trim().is_empty() {
+                    return Err(format!("'{}' is not an aggregate call", call));
                 }
+                let name = call[..open].trim();
+                let func = AggFunc::parse(name)
+                    .ok_or_else(|| format!("function '{}' is not supported yet", name))?;
+                let arg_text = call[open + 1..close].trim();
+                let arg = if arg_text == "*" {
+                    if func != AggFunc::Count {
+                        return Err(format!("{}(*) is not valid", name.to_uppercase()));
+                    }
+                    None
+                } else {
+                    // A computed argument is projected as a pending expression
+                    // whose type is filled in later from the select list only,
+                    // so one that appears only in HAVING cannot be carried yet.
+                    let (rel, field) = resolve(arg_text).map_err(|_| {
+                        format!(
+                            "HAVING over a join supports an aggregate of a column, not of \
+                             '{}', yet",
+                            arg_text
+                        )
+                    })?;
+                    Some(positional(rel, field, items))
+                };
+                let filter = match &filter_text {
+                    Some(text) => Some(filter_over_join(text, items)?),
+                    None => None,
+                };
+                Ok(SelectItem::Aggregate {
+                    func,
+                    arg,
+                    label: func.name().to_string(),
+                    filter,
+                    arg_expr: None,
+                })
             };
-            Some(Having {
-                func,
-                arg,
-                op,
-                literal,
-            })
+            let split = crate::core::rql::having::parse(text, &mut resolve_call)?;
+            // A term that reads no aggregate would have to move into `WHERE`,
+            // which is already split per relation by the time HAVING is seen.
+            // Refused rather than dropped: dropping it widens the result.
+            if let Some(term) = split.row_terms.first() {
+                return Err(format!(
+                    "HAVING term '{}' over a join must test an aggregate; move it to WHERE",
+                    term.text
+                ));
+            }
+            split.having
         }
     };
 
     // Ordering is by output label: a group has no relation to sort within.
     let mut fold_order = Vec::with_capacity(order_by.len());
     for term in order_by {
-        if term.nulls_first.is_some() {
-            return Err(
-                "ORDER BY ... NULLS FIRST/LAST is not supported for grouped queries yet"
-                    .to_string(),
-            );
-        }
         let label = crate::core::rql::aggregate::resolve_order_label(&term.token, &fold_items)
             .ok_or_else(|| format!("ORDER BY term '{}' is not in the SELECT list", term.token))?;
-        fold_order.push((label, term.descending));
+        fold_order.push((label, term.descending, term.nulls_first));
     }
 
     Ok(Some(crate::core::rql::aggregate::AggregatePlan {
@@ -3101,76 +4169,6 @@ fn split_expr_alias(entry: &str) -> (&str, Option<String>) {
     }
 }
 
-/// Splits `HAVING <aggregate> <op> <literal>` into its parts, leaving the
-/// argument unresolved so the caller can place it positionally.
-fn split_having(
-    text: &str,
-) -> Result<
-    (
-        crate::core::rql::aggregate::AggFunc,
-        Option<String>,
-        crate::core::rql::aggregate::HavingOp,
-        String,
-    ),
-    String,
-> {
-    use crate::core::rql::aggregate::{AggFunc, HavingOp};
-
-    let text = text.trim();
-    let bytes = text.as_bytes();
-    let mut depth = 0usize;
-    let mut op_at = None;
-    for (i, b) in bytes.iter().enumerate() {
-        match b {
-            b'(' => depth += 1,
-            b')' => depth = depth.saturating_sub(1),
-            b'=' | b'<' | b'>' | b'!' if depth == 0 => {
-                op_at = Some(i);
-                break;
-            }
-            _ => {}
-        }
-    }
-    let op_at = op_at.ok_or_else(|| {
-        "HAVING must compare an aggregate against a constant, as in `HAVING COUNT(*) > 1`"
-            .to_string()
-    })?;
-
-    let mut op_end = op_at + 1;
-    if op_end < bytes.len() && matches!(bytes[op_end], b'=' | b'>') {
-        op_end += 1;
-    }
-    let op = HavingOp::parse(&text[op_at..op_end]).ok_or_else(|| {
-        format!(
-            "unknown comparison operator in HAVING: '{}'",
-            &text[op_at..op_end]
-        )
-    })?;
-
-    let lhs = text[..op_at].trim();
-    let literal = text[op_end..].trim().to_string();
-    if literal.is_empty() {
-        return Err("HAVING is missing the value to compare against".to_string());
-    }
-
-    let open = lhs
-        .find('(')
-        .ok_or_else(|| "HAVING must test an aggregate, not a plain column".to_string())?;
-    let close = lhs
-        .rfind(')')
-        .ok_or_else(|| format!("unterminated function call in '{}'", lhs))?;
-    let func = AggFunc::parse(lhs[..open].trim())
-        .ok_or_else(|| format!("function '{}' is not supported yet", lhs[..open].trim()))?;
-    let arg_text = lhs[open + 1..close].trim();
-    let arg = if arg_text == "*" {
-        None
-    } else {
-        Some(arg_text.to_string())
-    };
-
-    Ok((func, arg, op, literal))
-}
-
 /// True when a `SELECT` statement's `FROM` clause contains a join.
 pub fn statement_has_join(sql: &str) -> bool {
     let upper = sql.to_ascii_uppercase();
@@ -3181,7 +4179,11 @@ pub fn statement_has_join(sql: &str) -> bool {
         return false;
     };
     let start = from + "FROM".len();
-    let end = ["WHERE", "ORDER", "LIMIT", "OFFSET", "GROUP", "HAVING"]
+    // `UNION` ends the first branch's FROM clause: without it the comma in the
+    // *next* branch's select list — `FROM a UNION SELECT id, label FROM b` —
+    // read as a comma join, and the statement was planned as one, failing
+    // with "relation 'label' does not exist".
+    let end = ["WHERE", "ORDER", "LIMIT", "OFFSET", "GROUP", "HAVING", "UNION"]
         .iter()
         .filter_map(|kw| find_keyword(sql, kw, start))
         .min()
@@ -3442,10 +4444,10 @@ mod tests {
     }
 
     fn row(cells: &[(u64, DbType, &[u8])]) -> Row {
-        let mut columns: SmallVec<[Column; 32]> = SmallVec::new();
+        let mut columns: crate::core::row::row::RowColumns = SmallVec::new();
         for (schema_id, ty, bytes) in cells {
             columns.push(Column {
-                schema_id: *schema_id,
+                schema_id: crate::core::row::row::schema_id_of(*schema_id),
                 data: mb(bytes),
                 column_type: ty.clone(),
             });
@@ -3473,6 +4475,8 @@ mod tests {
                     join: None,
                     predicate: String::new(),
                     require_unmatched: false,
+                    match_condition: None,
+                    left_condition: None,
                     fetch_columns: vec![u_id, u_name.clone(), u_domain],
                 },
                 Relation {
@@ -3485,6 +4489,8 @@ mod tests {
                     }),
                     predicate: String::new(),
                     require_unmatched: false,
+                    match_condition: None,
+                    left_condition: None,
                     fetch_columns: vec![d_id, d_name.clone()],
                 },
             ],
@@ -3561,7 +4567,7 @@ mod tests {
     #[test]
     fn inner_join_pairs_rows_on_the_key() {
         let plan = two_relation_plan(JoinKind::Inner);
-        let out = project(&plan, combine(&plan, &[users(), domains()]).expect("join"));
+        let out = project(&plan, combine(&plan, &sets(vec![users(), domains()])).expect("join"));
         assert_eq!(
             rendered(&out),
             vec!["Alice|Acme", "Bob|Acme", "Carol|Globex"]
@@ -3575,7 +4581,7 @@ mod tests {
         let only_globex = vec![domains()[1].clone()];
         let out = project(
             &plan,
-            combine(&plan, &[users(), only_globex]).expect("join"),
+            combine(&plan, &sets(vec![users(), only_globex])).expect("join"),
         );
         assert_eq!(rendered(&out), vec!["Carol|Globex"]);
     }
@@ -3586,7 +4592,7 @@ mod tests {
         let only_globex = vec![domains()[1].clone()];
         let out = project(
             &plan,
-            combine(&plan, &[users(), only_globex]).expect("join"),
+            combine(&plan, &sets(vec![users(), only_globex])).expect("join"),
         );
         assert_eq!(rendered(&out), vec!["Alice|", "Bob|", "Carol|Globex"]);
     }
@@ -3602,7 +4608,7 @@ mod tests {
             (0, DbType::STRING, b"d1"),
             (1, DbType::STRING, b"Acme Two"),
         ]));
-        let out = project(&plan, combine(&plan, &[users(), ds]).expect("join"));
+        let out = project(&plan, combine(&plan, &sets(vec![users(), ds])).expect("join"));
         assert_eq!(out.len(), 5, "Alice and Bob each match two rows");
     }
 
@@ -3611,7 +4617,7 @@ mod tests {
         let mut plan = two_relation_plan(JoinKind::Inner);
         let name = plan.relations[0].fetch_columns[1].clone();
         plan.order_by = vec![(0, name, true)];
-        let out = project(&plan, combine(&plan, &[users(), domains()]).expect("join"));
+        let out = project(&plan, combine(&plan, &sets(vec![users(), domains()])).expect("join"));
         assert_eq!(
             rendered(&out),
             vec!["Carol|Globex", "Bob|Acme", "Alice|Acme"]
@@ -3627,7 +4633,7 @@ mod tests {
         // Domain ascending, and within one domain the name descending. Alice
         // and Bob tie on Acme, so only the second key separates them.
         plan.order_by = vec![(1, domain, false), (0, name, true)];
-        let out = project(&plan, combine(&plan, &[users(), domains()]).expect("join"));
+        let out = project(&plan, combine(&plan, &sets(vec![users(), domains()])).expect("join"));
         assert_eq!(
             rendered(&out),
             vec!["Bob|Acme", "Alice|Acme", "Carol|Globex"]
@@ -3641,7 +4647,7 @@ mod tests {
         plan.order_by = vec![(0, name, false)];
         plan.offset = Some(1);
         plan.limit = Some(1);
-        let out = project(&plan, combine(&plan, &[users(), domains()]).expect("join"));
+        let out = project(&plan, combine(&plan, &sets(vec![users(), domains()])).expect("join"));
         assert_eq!(rendered(&out), vec!["Bob|Acme"]);
     }
 
@@ -3650,16 +4656,74 @@ mod tests {
         let plan = two_relation_plan(JoinKind::Inner);
         let out = project(
             &plan,
-            combine(&plan, &[Vec::new(), domains()]).expect("join"),
+            combine(&plan, &sets(vec![Vec::new(), domains()])).expect("join"),
         );
         assert!(out.is_empty());
+    }
+
+    /// PostgreSQL's NULL placement, decided by the cell's type and never by
+    /// its bytes.
+    #[test]
+    fn projected_sort_treats_null_as_larger_than_every_value() {
+        use std::cmp::Ordering::*;
+        let cell = |ty: DbType, bytes: &[u8]| Column {
+            schema_id: 0,
+            data: mb(bytes),
+            column_type: ty,
+        };
+        let zero = cell(DbType::I64, &0i64.to_le_bytes());
+        let minus = cell(DbType::I64, &(-5i64).to_le_bytes());
+        // A matched row's NULL: zero bytes, typed NULL from its companion.
+        let null_zeros = cell(DbType::NULL, &0i64.to_le_bytes());
+        // An unmatched outer side: no bytes at all.
+        let null_empty = cell(DbType::NULL, &[]);
+        let ty = DbType::I64;
+        for null in [&null_zeros, &null_empty] {
+            assert_eq!(compare_projected(Some(null), Some(&zero), &ty, false), Greater);
+            assert_eq!(compare_projected(Some(&zero), Some(null), &ty, false), Less);
+            assert_eq!(compare_projected(Some(null), Some(&minus), &ty, true), Less);
+            assert_eq!(compare_projected(Some(&minus), Some(null), &ty, true), Greater);
+        }
+        assert_eq!(compare_projected(Some(&null_zeros), Some(&null_empty), &ty, false), Equal);
+        assert_eq!(compare_projected(None, Some(&zero), &ty, false), Greater);
+        assert_eq!(compare_projected(Some(&minus), Some(&zero), &ty, false), Less);
+        assert_eq!(compare_projected(Some(&minus), Some(&zero), &ty, true), Greater);
+
+        // Text: '' is a value, smaller than other strings, and not a NULL.
+        let empty = cell(DbType::STRING, b"");
+        let a = cell(DbType::STRING, b"a");
+        let null_text = cell(DbType::NULL, b"");
+        let ty = DbType::STRING;
+        assert_eq!(compare_projected(Some(&empty), Some(&a), &ty, false), Less);
+        assert_eq!(compare_projected(Some(&null_text), Some(&empty), &ty, false), Greater);
+        assert_eq!(compare_projected(Some(&null_text), Some(&empty), &ty, true), Less);
+    }
+
+    /// The unmatched rows of a LEFT JOIN sort last ascending, first descending.
+    #[test]
+    fn left_join_ordering_puts_unmatched_rows_where_postgres_does() {
+        let mut plan = two_relation_plan(JoinKind::Left);
+        let domain = plan.relations[1].fetch_columns[1].clone();
+        let name = plan.relations[0].fetch_columns[1].clone();
+        let only_globex = vec![domains()[1].clone()];
+        plan.order_by = vec![(1, domain.clone(), false), (0, name.clone(), false)];
+        let out = project(
+            &plan,
+            combine(&plan, &sets(vec![users(), only_globex.clone()])).expect("join"),
+        );
+        assert_eq!(rendered(&out), vec!["Carol|Globex", "Alice|", "Bob|"]);
+
+        plan.order_by = vec![(1, domain, true), (0, name, false)];
+        plan.limit = Some(2);
+        let out = project(&plan, combine(&plan, &sets(vec![users(), only_globex])).expect("join"));
+        assert_eq!(rendered(&out), vec!["Alice|", "Bob|"]);
     }
 
     /// A left join whose right side is empty still returns every left row.
     #[test]
     fn left_join_against_an_empty_relation_keeps_every_left_row() {
         let plan = two_relation_plan(JoinKind::Left);
-        let out = project(&plan, combine(&plan, &[users(), Vec::new()]).expect("join"));
+        let out = project(&plan, combine(&plan, &sets(vec![users(), Vec::new()])).expect("join"));
         assert_eq!(rendered(&out), vec!["Alice|", "Bob|", "Carol|"]);
     }
 }
@@ -3798,5 +4862,805 @@ mod constant_term_tests {
         ] {
             assert!(!is_constant_term(term), "{} should not be constant", term);
         }
+    }
+}
+
+#[cfg(test)]
+mod join_bench {
+    use super::*;
+    use crate::memory_pool::MEMORY_POOL;
+
+    fn field(name: &str, ty: DbType, write_order: u64) -> SchemaField {
+        SchemaField::new(
+            name.to_string(),
+            ty.clone(),
+            ty.get_size(),
+            0,
+            write_order,
+            false,
+        )
+    }
+
+    fn row(cells: &[(u64, i64)]) -> Row {
+        let mut columns: crate::core::row::row::RowColumns = SmallVec::new();
+        for (schema_id, v) in cells {
+            let mut m = MEMORY_POOL.acquire(8);
+            m.into_slice_mut().copy_from_slice(&v.to_le_bytes());
+            columns.push(Column {
+                schema_id: crate::core::row::row::schema_id_of(*schema_id),
+                data: m,
+                column_type: DbType::I64,
+            });
+        }
+        Row {
+            position: 0,
+            columns,
+            length: 0,
+        }
+    }
+
+    fn peak_rss_kb() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("VmHWM:"))
+                    .and_then(|l| l.split_whitespace().nth(1)?.parse().ok())
+            })
+            .unwrap_or(0)
+    }
+
+    /// `cargo test --release -p rasterizeddb_core --lib -- --ignored
+    /// join_bench --nocapture`: a hash join of 100k x 100k rows, 1:1, and a
+    /// 10k x 100k fan-out, timing `combine` + `project`.
+    #[test]
+    #[ignore]
+    fn join_bench() {
+        let schema_of = |name: &str| -> Option<SmallVec<[SchemaField; 20]>> {
+            match name {
+                "a" => Some(
+                    [field("id", DbType::I64, 0), field("val", DbType::I64, 1)]
+                        .into_iter()
+                        .collect(),
+                ),
+                "b" => Some(
+                    [
+                        field("id", DbType::I64, 0),
+                        field("a_id", DbType::I64, 1),
+                        field("val", DbType::I64, 2),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+                _ => None,
+            }
+        };
+        let which = std::env::var("JOIN_BENCH_CASE").ok();
+        let cases: [(&str, &str, u64, u64, u64); 3] = [
+            ("inner_1to1", "a JOIN b ON b.a_id = a.id", 100_000, 100_000, 100_000),
+            ("left_half", "a LEFT JOIN b ON b.a_id = a.id", 100_000, 100_000, 200_000),
+            ("inner_fanout", "a JOIN b ON b.a_id = a.id", 10_000, 100_000, 10_000),
+        ];
+        for (name, from, left_n, right_n, key_space) in cases {
+            if which.as_deref().is_some_and(|w| w != name) {
+                continue;
+            }
+            let relations = parse_from_clause(from).unwrap();
+            let plan = plan(
+                relations,
+                "a.id, a.val, b.val",
+                "",
+                None,
+                None,
+                Vec::new(),
+                None,
+                None,
+                &schema_of,
+            )
+            .unwrap();
+            let mut rng = fastrand::Rng::with_seed(7);
+            let a: Vec<Row> = (0..left_n as i64).map(|i| row(&[(0, i), (1, i * 3)])).collect();
+            let b: Vec<Row> = (0..right_n as i64)
+                .map(|i| {
+                    let key = if name == "inner_1to1" {
+                        i
+                    } else {
+                        (rng.u64(..) % key_space) as i64
+                    };
+                    row(&[(0, i), (1, key), (2, i * 7)])
+                })
+                .collect();
+            // The production form; `JOIN_BENCH_ROWS=1` keeps them decoded.
+            let scanned = if std::env::var_os("JOIN_BENCH_ROWS").is_some() {
+                vec![RowSet::Rows(a), RowSet::Rows(b)]
+            } else {
+                let sets = vec![RowSet::serialize(&a).unwrap(), RowSet::serialize(&b).unwrap()];
+                drop(a);
+                drop(b);
+                sets
+            };
+            let base = peak_rss_kb();
+            let mut times = Vec::new();
+            let mut out_len = 0;
+            for _ in 0..5 {
+                let t = std::time::Instant::now();
+                let out = project(&plan, combine(&plan, &scanned).unwrap());
+                times.push(t.elapsed().as_secs_f64() * 1000.0);
+                out_len = out.len();
+            }
+            times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            println!(
+                "join_bench case={} out={} min={:.1}ms median={:.1}ms peak_rss_delta={}MB",
+                name,
+                out_len,
+                times[0],
+                times[2],
+                (peak_rss_kb().saturating_sub(base)) / 1024
+            );
+        }
+    }
+}
+
+/// The hash join checked against a nested-loop reference that follows
+/// PostgreSQL's outer-join rules directly, over generated relations with NULL
+/// keys (typed NULL and companion-flagged), duplicate keys on both sides,
+/// empty sides, composite keys, `ON` terms on a preserved side, and three-way
+/// chains.
+#[cfg(test)]
+mod outer_join_reference {
+    use super::*;
+    use crate::memory_pool::MEMORY_POOL;
+
+    fn field(name: &str, ty: DbType, write_order: u64) -> SchemaField {
+        SchemaField::new(
+            name.to_string(),
+            ty.clone(),
+            ty.get_size(),
+            0,
+            write_order,
+            false,
+        )
+    }
+
+    fn schema_of(name: &str) -> Option<SmallVec<[SchemaField; 20]>> {
+        let fields = match name {
+            "ta" => vec![
+                field("id", DbType::I64, 0),
+                field("k", DbType::I64, 1),
+                field("__null_k", DbType::BOOL, 2),
+            ],
+            "tb" => vec![
+                field("id", DbType::I64, 0),
+                field("k", DbType::I64, 1),
+                field("__null_k", DbType::BOOL, 2),
+                field("s", DbType::STRING, 3),
+            ],
+            "tc" => vec![
+                field("id", DbType::I64, 0),
+                field("bk", DbType::I64, 1),
+                field("__null_bk", DbType::BOOL, 2),
+            ],
+            _ => return None,
+        };
+        Some(fields.into_iter().collect())
+    }
+
+    fn mb(bytes: &[u8]) -> crate::memory_pool::MemoryBlock {
+        let mut m = MEMORY_POOL.acquire(bytes.len());
+        if !bytes.is_empty() {
+            m.into_slice_mut().copy_from_slice(bytes);
+        }
+        m
+    }
+
+    /// A generated row: `id`, a key that may be NULL, and a text column.
+    #[derive(Clone, Debug)]
+    struct Gen {
+        id: i64,
+        key: Option<i64>,
+        s: &'static str,
+    }
+
+    /// The row as the scan would hand it over. A NULL key is stored as its
+    /// type's zeroes with the companion set — or, every third time, as a cell
+    /// typed NULL, which is what a rebuilt row carries.
+    fn scanned(rows: &[Gen], with_text: bool) -> Vec<Row> {
+        rows.iter()
+            .map(|g| {
+                let mut columns: crate::core::row::row::RowColumns = SmallVec::new();
+                columns.push(Column {
+                    schema_id: 0,
+                    data: mb(&g.id.to_le_bytes()),
+                    column_type: DbType::I64,
+                });
+                let typed_null = g.key.is_none() && g.id % 3 == 0;
+                columns.push(Column {
+                    schema_id: 1,
+                    data: mb(&g.key.unwrap_or(0).to_le_bytes()),
+                    column_type: if typed_null { DbType::NULL } else { DbType::I64 },
+                });
+                columns.push(Column {
+                    schema_id: 2,
+                    data: mb(&[u8::from(g.key.is_none())]),
+                    column_type: DbType::BOOL,
+                });
+                if with_text {
+                    columns.push(Column {
+                        schema_id: 3,
+                        data: mb(g.s.as_bytes()),
+                        column_type: DbType::STRING,
+                    });
+                }
+                Row {
+                    position: 0,
+                    columns,
+                    length: 0,
+                }
+            })
+            .collect()
+    }
+
+    fn generate(rng: &mut fastrand::Rng, n: usize, keys: i64, id_base: i64) -> Vec<Gen> {
+        (0..n)
+            .map(|i| Gen {
+                id: id_base + i as i64,
+                // Zero is a real key here, so a NULL stored as zeroes would
+                // match it if NULL-ness were read from the bytes.
+                key: if rng.u8(..) < 40 {
+                    None
+                } else {
+                    Some(rng.i64(0..keys))
+                },
+                s: ["x", "y", ""][rng.usize(..3)],
+            })
+            .collect()
+    }
+
+    type Out = Vec<Vec<Option<i64>>>;
+
+    fn render(rows: &[Row]) -> Out {
+        let mut out: Out = rows
+            .iter()
+            .map(|r| {
+                r.columns
+                    .iter()
+                    .map(|c| {
+                        if c.column_type == DbType::NULL {
+                            None
+                        } else {
+                            Some(i64::from_le_bytes(
+                                c.data.into_slice().try_into().expect("8 bytes"),
+                            ))
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// One left-deep outer-join step over tuples of row indices, by the
+    /// definition: pair what matches, then pad what did not.
+    fn reference_step(
+        kind: JoinKind,
+        tuples: Vec<Vec<Option<usize>>>,
+        width: usize,
+        right_len: usize,
+        matches: impl Fn(&[Option<usize>], usize) -> bool,
+    ) -> Vec<Vec<Option<usize>>> {
+        let mut out = Vec::new();
+        let mut right_hit = vec![false; right_len];
+        for t in &tuples {
+            let mut any = false;
+            for r in 0..right_len {
+                if matches(t, r) {
+                    any = true;
+                    right_hit[r] = true;
+                    let mut e = t.clone();
+                    e.push(Some(r));
+                    out.push(e);
+                }
+            }
+            if !any && matches!(kind, JoinKind::Left | JoinKind::Full) {
+                let mut e = t.clone();
+                e.push(None);
+                out.push(e);
+            }
+        }
+        if matches!(kind, JoinKind::Right | JoinKind::Full) {
+            for (r, hit) in right_hit.iter().enumerate() {
+                if !hit {
+                    let mut e = vec![None; width];
+                    e.push(Some(r));
+                    out.push(e);
+                }
+            }
+        }
+        out
+    }
+
+    fn kind_sql(kind: JoinKind) -> &'static str {
+        match kind {
+            JoinKind::Inner => "JOIN",
+            JoinKind::Left => "LEFT JOIN",
+            JoinKind::Right => "RIGHT OUTER JOIN",
+            JoinKind::Full => "FULL JOIN",
+            JoinKind::Cross => unreachable!(),
+        }
+    }
+
+    fn run(sql_from: &str, select: &str, rels: &[Vec<Row>]) -> Out {
+        let plan = plan(
+            parse_from_clause(sql_from).expect("from"),
+            select,
+            "",
+            None,
+            None,
+            Vec::new(),
+            None,
+            None,
+            &schema_of,
+        )
+        .unwrap_or_else(|e| panic!("plan {}: {}", sql_from, e));
+        render(&project(&plan, combine(&plan, &sets(rels.to_vec())).expect("join")))
+    }
+
+    fn cell(rows: &[Gen], at: Option<usize>, f: impl Fn(&Gen) -> Option<i64>) -> Option<i64> {
+        at.and_then(|i| f(&rows[i]))
+    }
+
+    #[test]
+    fn two_way_joins_of_every_kind_match_the_definition() {
+        let mut rng = fastrand::Rng::with_seed(0x0a17);
+        let kinds = [JoinKind::Inner, JoinKind::Left, JoinKind::Right, JoinKind::Full];
+        for round in 0..120 {
+            let (na, nb) = match round % 8 {
+                0 => (0, rng.usize(0..20)),
+                1 => (rng.usize(0..20), 0),
+                2 => (0, 0),
+                _ => (rng.usize(1..40), rng.usize(1..40)),
+            };
+            let keys = [1i64, 3, 10][round % 3];
+            let a = generate(&mut rng, na, keys, 0);
+            // Ids overlap a's, so the composite variant has pairs to find.
+            let b = generate(&mut rng, nb, keys, 0);
+            let rels = vec![scanned(&a, false), scanned(&b, true)];
+            for kind in kinds {
+                // A single key, a composite key, and a single key with an ON
+                // term on the joined relation (match-time for RIGHT/FULL).
+                for variant in 0..3 {
+                    if variant == 2 && !kind.nulls_earlier() {
+                        // INNER/LEFT push that term into the scan, which this
+                        // test does not run.
+                        continue;
+                    }
+                    let on = match variant {
+                        0 => "b.k = a.k",
+                        1 => "a.k = b.k AND b.id = a.id",
+                        _ => "a.k = b.k AND b.s = 'x'",
+                    };
+                    let from = format!("ta a {} tb b ON {}", kind_sql(kind), on);
+                    let got = run(&from, "a.id, a.k, b.id, b.k", &rels);
+
+                    let matches = |t: &[Option<usize>], r: usize| -> bool {
+                        let Some(l) = t[0] else { return false };
+                        let (x, y) = (&a[l], &b[r]);
+                        let key = matches!((x.key, y.key), (Some(p), Some(q)) if p == q);
+                        key && match variant {
+                            0 => true,
+                            1 => y.id == x.id,
+                            _ => y.s == "x",
+                        }
+                    };
+                    let start: Vec<Vec<Option<usize>>> = (0..a.len()).map(|i| vec![Some(i)]).collect();
+                    let tuples = reference_step(kind, start, 1, b.len(), matches);
+                    let mut want: Out = tuples
+                        .iter()
+                        .map(|t| {
+                            let (l, r) = (t[0], t[1]);
+                            vec![
+                                cell(&a, l, |g| Some(g.id)),
+                                cell(&a, l, |g| g.key),
+                                cell(&b, r, |g| Some(g.id)),
+                                cell(&b, r, |g| g.key),
+                            ]
+                        })
+                        .collect();
+                    want.sort();
+                    assert_eq!(got, want, "round {} {:?} variant {}: {}", round, kind, variant, from);
+                }
+            }
+        }
+    }
+
+    fn run_where(sql_from: &str, select: &str, where_clause: &str, rels: &[Vec<Row>]) -> Out {
+        let plan = plan(
+            parse_from_clause(sql_from).expect("from"),
+            select,
+            where_clause,
+            None,
+            None,
+            Vec::new(),
+            None,
+            None,
+            &schema_of,
+        )
+        .unwrap_or_else(|e| panic!("plan {} WHERE {}: {}", sql_from, where_clause, e));
+        render(&project(&plan, combine(&plan, &sets(rels.to_vec())).expect("join")))
+    }
+
+    /// The pre-rewrite `project`'s sort, DISTINCT and paging, over a
+    /// materialised `Vec<Row>` — the reference `project_serialized` must
+    /// reproduce row for row.
+    fn project_reference(plan: &JoinPlan, combined: &Joined<'_>) -> Vec<Row> {
+        let mut projector = Projector::new(plan);
+        let mut out: Vec<Row> = combined.iter().map(|t| projector.row(t)).collect();
+        let sort_keys: Vec<(usize, bool, DbType)> = plan
+            .order_by
+            .iter()
+            .filter_map(|(rel, field, descending)| {
+                let idx = plan
+                    .items
+                    .iter()
+                    .position(|i| i.rel == *rel && i.field.write_order == field.write_order)?;
+                Some((idx, *descending, field.db_type.clone()))
+            })
+            .collect();
+        if !plan.order_exprs.is_empty() {
+            if let Some(layout) = plan.order_layout.as_ref() {
+                let directions: Vec<(bool, Option<bool>)> = plan
+                    .order_exprs
+                    .iter()
+                    .map(|(_, d, n)| (*d, *n))
+                    .collect();
+                let companions = Companions::new(plan, &layout.columns);
+                let mut keyed: Vec<(Vec<crate::core::rql::expr::Value>, Row)> = Vec::new();
+                for (index, row) in out.into_iter().enumerate() {
+                    let synthetic =
+                        combined_row_with(plan, &layout.columns, &companions, combined.tuple(index));
+                    let values = plan
+                        .order_exprs
+                        .iter()
+                        .map(|(e, _, _)| {
+                            crate::core::rql::expr::eval(e, &synthetic, &layout.schema)
+                                .unwrap_or(crate::core::rql::expr::Value::Null)
+                        })
+                        .collect();
+                    keyed.push((values, row));
+                }
+                keyed.sort_by(|a, b| {
+                    crate::core::rql::expr::compare_key_values(&a.0, &b.0, &directions)
+                });
+                out = keyed.into_iter().map(|(_, r)| r).collect();
+            }
+        } else if !sort_keys.is_empty() {
+            out.sort_by(|a, b| {
+                for (idx, descending, ty) in sort_keys.iter() {
+                    let ord =
+                        compare_projected(a.columns.get(*idx), b.columns.get(*idx), ty, *descending);
+                    if ord != std::cmp::Ordering::Equal {
+                        return ord;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+        }
+        if plan.distinct {
+            let mut seen = std::collections::HashSet::new();
+            out.retain(|row| {
+                let mut key: Vec<u8> = Vec::new();
+                for column in row.columns.iter() {
+                    let bytes = column.data.into_slice();
+                    key.push(column.column_type.to_byte());
+                    key.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                    key.extend_from_slice(bytes);
+                }
+                seen.insert(key)
+            });
+        }
+        if let Some(off) = plan.offset {
+            out = out.into_iter().skip(off as usize).collect();
+        }
+        if let Some(limit) = plan.limit {
+            out.truncate(limit as usize);
+        }
+        out
+    }
+
+    fn exact(rows: &[Row]) -> Vec<Vec<(u64, u8, Vec<u8>)>> {
+        rows.iter()
+            .map(|r| {
+                r.columns
+                    .iter()
+                    .map(|c| (u64::from(c.schema_id), c.column_type.to_byte(), c.data.into_slice().to_vec()))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// `project_serialized` — sorting indices, DISTINCT by row hash, paging
+    /// without copies — against the row-moving implementation it replaced, in
+    /// order and byte for byte, over NULL keys, duplicate rows, ties, column
+    /// and expression sorts, and every page shape.
+    #[test]
+    fn serialized_projection_matches_the_row_projection() {
+        let mut rng = fastrand::Rng::with_seed(0x9a0e);
+        let orders = [
+            "",
+            "a.k",
+            "b.k DESC, a.id",
+            "a.k + b.k DESC, a.id",
+            "COALESCE(b.k, a.k) NULLS FIRST, b.id DESC",
+        ];
+        let pages = [(None, None), (Some(5u64), None), (Some(3), Some(2u64)), (None, Some(4)), (Some(0), None)];
+        let mut checked = 0usize;
+        for round in 0..30 {
+            let keys = [1i64, 3, 6][round % 3];
+            let na = rng.usize(0..30);
+            let a = generate(&mut rng, na, keys, 0);
+            let nb = rng.usize(0..30);
+            let b = generate(&mut rng, nb, keys, 1000);
+            let rels = sets(vec![scanned(&a, false), scanned(&b, true)]);
+            for kind in ["JOIN", "LEFT JOIN", "FULL JOIN"] {
+                let from = format!("ta a {} tb b ON b.k = a.k", kind);
+                for (select, distinct) in [("a.id, a.k, b.id, b.k", false), ("a.k, b.k", true), ("b.k", true)] {
+                    for order in orders {
+                        for (limit, offset) in pages {
+                            let mut sql = format!(
+                                "SELECT {}{} FROM {}",
+                                if distinct { "DISTINCT " } else { "" },
+                                select,
+                                from
+                            );
+                            if !order.is_empty() {
+                                sql.push_str(&format!(" ORDER BY {}", order));
+                            }
+                            if let Some(l) = limit {
+                                sql.push_str(&format!(" LIMIT {}", l));
+                            }
+                            if let Some(o) = offset {
+                                sql.push_str(&format!(" OFFSET {}", o));
+                            }
+                            // A DISTINCT whose ORDER BY is not in the select
+                            // list is refused, as in PostgreSQL.
+                            let Ok(p) = plan_statement(&sql, &schema_of) else {
+                                continue;
+                            };
+                            assert_eq!(p.distinct, distinct, "{}", sql);
+                            let joined = combine(&p, &rels).expect("join");
+                            let want = project_reference(&p, &joined);
+                            let mut bytes = Vec::new();
+                            project_serialized(&p, &joined, &mut bytes);
+                            let got = crate::core::row::row::vec_into_rows(&bytes).expect("rows");
+                            assert_eq!(exact(&got), exact(&want), "round {}: {}", round, sql);
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        // Every shape planned except the refused DISTINCT/ORDER BY pairs.
+        assert!(checked > 30 * 3 * 3 * 2 * 5, "only {} shapes planned", checked);
+    }
+
+    /// `LEFT JOIN … WHERE r.k IS NULL` on the nullable join key — the
+    /// presence-only probe — against the definition: every tuple of the
+    /// ordinary join, then the WHERE applied to it. Chained with a further
+    /// join of every kind, since a later RIGHT/FULL join is what makes the
+    /// early drop unsound (and must fall back to the fan-out path).
+    #[test]
+    fn anti_joins_on_a_nullable_key_match_the_definition() {
+        let mut rng = fastrand::Rng::with_seed(0xa471);
+        let kinds = [JoinKind::Inner, JoinKind::Left, JoinKind::Right, JoinKind::Full];
+        for round in 0..60 {
+            let keys = [1i64, 3, 8][round % 3];
+            let na = rng.usize(0..25);
+            let a = generate(&mut rng, na, keys, 0);
+            let nb = rng.usize(0..25);
+            let b = generate(&mut rng, nb, keys, 1000);
+            let nc = rng.usize(0..15);
+            let c = generate(&mut rng, nc, keys, 2000);
+            let rels2 = vec![scanned(&a, false), scanned(&b, true)];
+            let rels3 = vec![scanned(&a, false), scanned(&b, true), scanned(&c, false)];
+            let key_eq = |p: Option<i64>, q: Option<i64>| matches!((p, q), (Some(p), Some(q)) if p == q);
+
+            // Two-way.
+            let got = run_where("ta a LEFT JOIN tb b ON b.k = a.k", "a.id, a.k", "b.k IS NULL", &rels2);
+            let start: Vec<Vec<Option<usize>>> = (0..a.len()).map(|i| vec![Some(i)]).collect();
+            let t = reference_step(JoinKind::Left, start.clone(), 1, b.len(), |t, r| {
+                t[0].is_some_and(|l| key_eq(a[l].key, b[r].key))
+            });
+            let mut want: Out = t
+                .iter()
+                .filter(|t| t[1].is_none_or(|r| b[r].key.is_none()))
+                .map(|t| vec![cell(&a, t[0], |g| Some(g.id)), cell(&a, t[0], |g| g.key)])
+                .collect();
+            want.sort();
+            assert_eq!(got, want, "round {} two-way", round);
+
+            // Followed by a join of every kind onto `a`.
+            for k2 in kinds {
+                let from = format!(
+                    "ta a LEFT JOIN tb b ON b.k = a.k {} tc c ON c.bk = a.k",
+                    kind_sql(k2)
+                );
+                let got = run_where(&from, "a.id, c.id", "b.k IS NULL", &rels3);
+                let t1 = reference_step(JoinKind::Left, start.clone(), 1, b.len(), |t, r| {
+                    t[0].is_some_and(|l| key_eq(a[l].key, b[r].key))
+                });
+                let t2 = reference_step(k2, t1, 2, c.len(), |t, r| {
+                    t[0].is_some_and(|l| key_eq(a[l].key, c[r].key))
+                });
+                let mut want: Out = t2
+                    .iter()
+                    .filter(|t| t[1].is_none_or(|r| b[r].key.is_none()))
+                    .map(|t| vec![cell(&a, t[0], |g| Some(g.id)), cell(&c, t[2], |g| Some(g.id))])
+                    .collect();
+                want.sort();
+                assert_eq!(got, want, "round {}: {}", round, from);
+            }
+        }
+    }
+
+    /// NULL-keyed rows are dropped in the scan of every side that is not
+    /// preserved, and of no side that is.
+    #[test]
+    fn null_keys_are_filtered_only_on_unpreserved_sides() {
+        let planned = |from: &str| {
+            plan(
+                parse_from_clause(from).expect("from"),
+                "a.id",
+                "",
+                None,
+                None,
+                Vec::new(),
+                None,
+                None,
+                &schema_of,
+            )
+            .unwrap_or_else(|e| panic!("plan {}: {}", from, e))
+        };
+        let filtered = |p: &JoinPlan, rel: usize| p.relations[rel].predicate.contains("__null_");
+        for (from, want) in [
+            ("ta a JOIN tb b ON b.k = a.k", [true, true]),
+            ("ta a LEFT JOIN tb b ON b.k = a.k", [false, true]),
+            ("ta a RIGHT JOIN tb b ON b.k = a.k", [false, false]),
+            ("ta a FULL JOIN tb b ON b.k = a.k", [false, false]),
+        ] {
+            let p = planned(from);
+            assert_eq!([filtered(&p, 0), filtered(&p, 1)], want, "{}", from);
+        }
+        // Three-way: c's key reads b; b is LEFT-joined (null-supplying) but the
+        // INNER join onto it drops every tuple whose b key is NULL anyway.
+        let p = planned("ta a LEFT JOIN tb b ON b.k = a.k JOIN tc c ON c.bk = b.k");
+        assert_eq!(
+            [filtered(&p, 0), filtered(&p, 1), filtered(&p, 2)],
+            [false, true, true]
+        );
+        let p = planned("ta a LEFT JOIN tb b ON b.k = a.k LEFT JOIN tc c ON c.bk = b.k");
+        assert_eq!(
+            [filtered(&p, 0), filtered(&p, 1), filtered(&p, 2)],
+            [false, true, true]
+        );
+    }
+
+    #[test]
+    fn three_way_chains_match_the_definition() {
+        let mut rng = fastrand::Rng::with_seed(0x3a3);
+        let kinds = [JoinKind::Inner, JoinKind::Left, JoinKind::Right, JoinKind::Full];
+        for round in 0..40 {
+            let keys = [2i64, 6][round % 2];
+            let na = rng.usize(0..15);
+            let a = generate(&mut rng, na, keys, 0);
+            let nb = rng.usize(0..15);
+            let b = generate(&mut rng, nb, keys, 1000);
+            let nc = rng.usize(0..15);
+            let c = generate(&mut rng, nc, keys, 2000);
+            let rels = vec![scanned(&a, false), scanned(&b, true), scanned(&c, false)];
+            for k1 in kinds {
+                for k2 in kinds {
+                    // c joins on b's key: when b is absent the key is NULL.
+                    let from = format!(
+                        "ta a {} tb b ON b.k = a.k {} tc c ON c.bk = b.k",
+                        kind_sql(k1),
+                        kind_sql(k2)
+                    );
+                    let got = run(&from, "a.id, b.id, c.id, c.bk", &rels);
+
+                    let start: Vec<Vec<Option<usize>>> = (0..a.len()).map(|i| vec![Some(i)]).collect();
+                    let t1 = reference_step(k1, start, 1, b.len(), |t, r| {
+                        t[0].is_some_and(|l| matches!((a[l].key, b[r].key), (Some(p), Some(q)) if p == q))
+                    });
+                    let t2 = reference_step(k2, t1, 2, c.len(), |t, r| {
+                        t[1].is_some_and(|m| matches!((b[m].key, c[r].key), (Some(p), Some(q)) if p == q))
+                    });
+                    let mut want: Out = t2
+                        .iter()
+                        .map(|t| {
+                            vec![
+                                cell(&a, t[0], |g| Some(g.id)),
+                                cell(&b, t[1], |g| Some(g.id)),
+                                cell(&c, t[2], |g| Some(g.id)),
+                                cell(&c, t[2], |g| g.key),
+                            ]
+                        })
+                        .collect();
+                    want.sort();
+                    assert_eq!(got, want, "round {}: {}", round, from);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_right_join_onto_an_empty_left_side_returns_every_right_row() {
+        let b = vec![
+            Gen { id: 1000, key: Some(0), s: "x" },
+            Gen { id: 1001, key: None, s: "y" },
+        ];
+        let rels = vec![Vec::new(), scanned(&b, true)];
+        let got = run("ta a RIGHT JOIN tb b ON b.k = a.k", "a.id, a.k, b.id, b.k", &rels);
+        assert_eq!(
+            got,
+            vec![
+                vec![None, None, Some(1000), Some(0)],
+                vec![None, None, Some(1001), None],
+            ]
+        );
+    }
+
+    /// RIGHT and FULL plan where they used to be refused by name, and a
+    /// `WHERE` term on a side they make nullable is still refused rather than
+    /// pushed into that side's scan.
+    #[test]
+    fn right_and_full_plan_and_guard_their_null_supplying_sides() {
+        for from in [
+            "ta a RIGHT JOIN tb b ON b.k = a.k",
+            "ta a RIGHT OUTER JOIN tb b ON b.k = a.k",
+            "ta a FULL JOIN tb b ON b.k = a.k",
+            "ta a FULL OUTER JOIN tb b ON b.k = a.k",
+        ] {
+            let refs = parse_from_clause(from).expect(from);
+            assert_eq!(refs.len(), 2, "{}", from);
+            assert_eq!(refs[1].table, "tb", "{}", from);
+        }
+        let planned = |from: &str, where_clause: &str| {
+            plan(
+                parse_from_clause(from).unwrap(),
+                "a.id, b.id",
+                where_clause,
+                None,
+                None,
+                Vec::new(),
+                None,
+                None,
+                &schema_of,
+            )
+        };
+        // The preserved side of a RIGHT JOIN filters its own scan.
+        let p = planned("ta a RIGHT JOIN tb b ON b.k = a.k", "b.id > 3").expect("preserved side");
+        assert!(!p.relations[1].predicate.is_empty());
+        // The null-supplying side may not.
+        assert!(planned("ta a RIGHT JOIN tb b ON b.k = a.k", "a.id > 3").is_err());
+        assert!(planned("ta a FULL JOIN tb b ON b.k = a.k", "a.id > 3").is_err());
+        assert!(planned("ta a FULL JOIN tb b ON b.k = a.k", "b.id > 3").is_err());
+        // An anti-join on a non-nullable column is still the one form allowed.
+        let p = planned("ta a RIGHT JOIN tb b ON b.k = a.k", "a.id IS NULL").expect("anti-join");
+        assert!(p.relations[0].require_unmatched);
+        // A later RIGHT JOIN makes an earlier preserved side nullable too.
+        assert!(planned(
+            "ta a LEFT JOIN tb b ON b.k = a.k RIGHT JOIN tc c ON c.bk = b.k",
+            "a.id > 3"
+        )
+        .is_err());
+        // An ON term on a RIGHT JOIN's own relation is a match condition, not
+        // a scan predicate.
+        let p = planned("ta a RIGHT JOIN tb b ON b.k = a.k AND b.s = 'x'", "").expect("on term");
+        assert!(p.relations[1].predicate.is_empty());
+        assert!(p.relations[1].match_condition.is_some());
+        let p = planned("ta a LEFT JOIN tb b ON b.k = a.k AND b.s = 'x'", "").expect("on term");
+        assert!(!p.relations[1].predicate.is_empty());
+        assert!(p.relations[1].match_condition.is_none());
     }
 }

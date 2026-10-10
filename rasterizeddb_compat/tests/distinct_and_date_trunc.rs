@@ -163,11 +163,16 @@ async fn a_rollup_groups_by_a_select_alias() {
     .await
     .expect("GROUP BY a select alias must work");
     assert_eq!(rows.len(), 2, "two minute buckets");
-    let bytes: Vec<i64> = rows
+    // `sum(bigint)` is a numeric, as in PostgreSQL (it used to be an int8).
+    let bytes: Vec<rust_decimal::Decimal> = rows
         .iter()
-        .map(|r| r.try_get::<i64, _>("bytes").expect("bytes"))
+        .map(|r| r.try_get::<rust_decimal::Decimal, _>("bytes").expect("bytes"))
         .collect();
-    assert_eq!(bytes, vec![600, 400], "21:47 holds three rows, 21:48 one");
+    assert_eq!(
+        bytes,
+        vec![rust_decimal::Decimal::from(600), rust_decimal::Decimal::from(400)],
+        "21:47 holds three rows, 21:48 one"
+    );
     // The bucket is still an instant, not text: a rollup the client cannot
     // compare as a timestamp would group and still be useless.
     use sqlx::Column;

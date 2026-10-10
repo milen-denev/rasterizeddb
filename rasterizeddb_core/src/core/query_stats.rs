@@ -122,9 +122,12 @@ const DEFAULT_RECENT: usize = 256;
 ///
 /// A workload whose literals defeat normalisation — an `IN` list of a different
 /// length every time — would otherwise grow this map without bound. At the cap
-/// the least recently seen shape is dropped, which costs a scan of the map on
-/// the statements that introduce a new shape while it is full.
+/// the least recently seen tenth ([`EVICT_BATCH`]) is dropped in one scan, so a
+/// stream of new shapes pays that scan once per batch rather than per shape.
 const MAX_DISTINCT: usize = 5_000;
+
+/// Shapes evicted at once when the map is full: a tenth of it.
+const EVICT_BATCH: usize = MAX_DISTINCT / 10;
 
 /// Characters of a statement kept. A generated `INSERT` can be megabytes, and
 /// no one reads past the first screen of one in a console.
@@ -154,10 +157,12 @@ pub fn capacity() -> usize {
 pub fn set_capacity(n: usize) {
     let n = n.min(100_000);
     RECENT_CAPACITY.store(n, Ordering::Relaxed);
+    let mut dropped = Vec::new();
     let mut log = log().lock();
     while log.recent.len() > n {
-        log.recent.pop_back();
+        dropped.extend(log.recent.pop_back());
     }
+    drop(log);
 }
 
 /// One statement, as it was answered.
@@ -238,9 +243,85 @@ impl Aggregate {
 struct Log {
     /// Newest first, so `SHOW QUERIES` reads off the front and a shrink drops
     /// from the back.
-    recent: VecDeque<Record>,
-    aggregate: HashMap<u64, Aggregate>,
+    recent: VecDeque<StoredRecord>,
+    aggregate: HashMap<u64, Aggregate, BuildIdentity>,
+    /// Database and user names seen so far, shared by every record that
+    /// carries them: a server has a handful of each, and two `to_string`s per
+    /// statement were two allocations for text the ring already held.
+    names: Vec<Arc<str>>,
 }
+
+/// The most distinct names interned. Past it a name is still stored, just
+/// not shared — so a client cycling through user names cannot grow this.
+const MAX_INTERNED: usize = 64;
+
+impl Log {
+    fn intern(&mut self, name: &str) -> Arc<str> {
+        if let Some(known) = self.names.iter().find(|n| ***n == *name) {
+            return known.clone();
+        }
+        let fresh: Arc<str> = Arc::from(name);
+        if self.names.len() < MAX_INTERNED {
+            self.names.push(fresh.clone());
+        }
+        fresh
+    }
+}
+
+/// [`Record`] as the ring keeps it: names shared, texts exactly sized.
+struct StoredRecord {
+    started_unix_us: i64,
+    duration_us: u64,
+    rows: u64,
+    rows_scanned: u64,
+    materialised: u64,
+    materialised_us: u64,
+    database: Arc<str>,
+    username: Arc<str>,
+    error: Option<Box<str>>,
+    queryid: u64,
+    sql: Box<str>,
+}
+
+impl StoredRecord {
+    fn to_record(&self) -> Record {
+        Record {
+            started_unix_us: self.started_unix_us,
+            duration_us: self.duration_us,
+            rows: self.rows,
+            rows_scanned: self.rows_scanned,
+            materialised: self.materialised,
+            materialised_us: self.materialised_us,
+            database: self.database.to_string(),
+            username: self.username.to_string(),
+            error: self.error.as_deref().map(str::to_string),
+            queryid: self.queryid,
+            sql: self.sql.to_string(),
+        }
+    }
+}
+
+/// The aggregate's key is a `queryid`, which is already a hash: SipHashing it
+/// again under the global lock buys nothing.
+#[derive(Default)]
+struct IdentityHasher(u64);
+
+impl std::hash::Hasher for IdentityHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        // Only `u64` keys reach this map; anything else folds, never panics.
+        for &b in bytes {
+            self.0 = (self.0 << 8) | b as u64;
+        }
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.0 = n;
+    }
+}
+
+type BuildIdentity = std::hash::BuildHasherDefault<IdentityHasher>;
 
 static LOG: OnceLock<Mutex<Log>> = OnceLock::new();
 
@@ -248,7 +329,8 @@ fn log() -> &'static Mutex<Log> {
     LOG.get_or_init(|| {
         Mutex::new(Log {
             recent: VecDeque::with_capacity(DEFAULT_RECENT),
-            aggregate: HashMap::new(),
+            aggregate: HashMap::default(),
+            names: Vec::new(),
         })
     })
 }
@@ -374,50 +456,75 @@ pub fn finish(
     let materialised = recording.probe.materialised.load(Ordering::Relaxed);
     let materialised_us = recording.probe.materialised_us.load(Ordering::Relaxed);
 
-    let text = truncate(redact(sql));
+    // Redacted and cut in one bounded pass: a multi-megabyte bulk `INSERT`
+    // costs a copy of its first `MAX_SQL_CHARS` characters, not of itself.
+    let text = crate::core::redact::statement_bounded(sql, MAX_SQL_CHARS);
     let normalized = normalize(&text);
     let queryid = hash_query(&normalized);
 
-    let record = Record {
+    // Exactly sized: `statement_bounded` and `normalize` both reserve for the
+    // worst case, and the ring and the map keep these for a long time.
+    let sql_text = text.into_boxed_str();
+    let error_text = error.map(|e| bounded(e).into_boxed_str());
+    // Only a new shape keeps its normalised text; for the rest it is dropped
+    // after the lock, below.
+    let mut normalized = Some(normalized);
+
+    let capacity = capacity();
+    // What leaves the ring and the map is freed after the lock is released:
+    // every statement on the server takes this lock, and a record's strings
+    // are not free to drop.
+    let mut evicted_records: Vec<StoredRecord> = Vec::new();
+    let mut evicted_shapes: Vec<Aggregate> = Vec::new();
+    let mut log = log().lock();
+
+    let record = StoredRecord {
         started_unix_us: recording.started_unix_us,
         duration_us,
         rows,
         rows_scanned,
         materialised,
         materialised_us,
-        database: database.to_string(),
-        username: username.to_string(),
-        error: error.map(|e| truncate(e.to_string())),
+        database: log.intern(database),
+        username: log.intern(username),
+        error: error_text,
         queryid,
-        sql: text,
+        sql: sql_text,
     };
-
-    let capacity = capacity();
-    let mut log = log().lock();
 
     if capacity > 0 {
         log.recent.push_front(record);
         while log.recent.len() > capacity {
-            log.recent.pop_back();
+            evicted_records.extend(log.recent.pop_back());
         }
+    } else {
+        evicted_records.push(record);
     }
 
-    // A new shape into a full map costs a scan for the coldest entry. Only
-    // `entry` would be cheaper, and only until the map grew without bound.
-    if !log.aggregate.contains_key(&queryid) && log.aggregate.len() >= MAX_DISTINCT {
-        if let Some(coldest) = log
+    // A new shape into a full map evicts the coldest tenth in one scan, so the
+    // scan is paid once per `EVICT_BATCH` new shapes rather than once each.
+    if log.aggregate.len() >= MAX_DISTINCT && !log.aggregate.contains_key(&queryid) {
+        let mut by_age: Vec<(i64, u64)> = log
             .aggregate
             .values()
-            .min_by_key(|a| a.last_seen_unix_us)
-            .map(|a| a.queryid)
-        {
-            log.aggregate.remove(&coldest);
+            .map(|a| (a.last_seen_unix_us, a.queryid))
+            .collect();
+        let batch = EVICT_BATCH.min(by_age.len());
+        if batch > 0 && batch < by_age.len() {
+            by_age.select_nth_unstable(batch - 1);
+        }
+        evicted_shapes.reserve(batch);
+        for &(_, coldest) in &by_age[..batch] {
+            evicted_shapes.extend(log.aggregate.remove(&coldest));
         }
     }
 
     let entry = log.aggregate.entry(queryid).or_insert_with(|| Aggregate {
         queryid,
-        query: normalized,
+        query: normalized
+            .take()
+            .map(|n| n.into_boxed_str().into_string())
+            .unwrap_or_default(),
         calls: 0,
         errors: 0,
         total_us: 0,
@@ -442,11 +549,21 @@ pub fn finish(
     entry.materialised += materialised;
     entry.materialised_us += materialised_us;
     entry.last_seen_unix_us = recording.started_unix_us;
+    drop(log);
+    drop(evicted_records);
+    drop(evicted_shapes);
+    drop(normalized);
 }
 
 /// The most recent statements, newest first.
 pub fn recent(limit: usize) -> Vec<Record> {
-    log().lock().recent.iter().take(limit).cloned().collect()
+    log()
+        .lock()
+        .recent
+        .iter()
+        .take(limit)
+        .map(StoredRecord::to_record)
+        .collect()
 }
 
 /// How much is being kept: statements in the ring, and distinct shapes.
@@ -477,6 +594,7 @@ pub fn reset() -> (usize, usize) {
     let counts = (log.recent.len(), log.aggregate.len());
     log.recent.clear();
     log.aggregate.clear();
+    log.names.clear();
     // A workload that filled the map to its cap should not keep that memory
     // after being asked to forget it.
     log.aggregate.shrink_to_fit();
@@ -498,6 +616,7 @@ fn now_unix_us() -> i64 {
 /// are role management and the PostgreSQL import, and a third one added later
 /// would be redacted by this without anyone having to remember to come back
 /// here. What is left is enough to see *that* a role was created.
+#[cfg(test)]
 fn redact(sql: &str) -> String {
     crate::core::redact::statement(sql)
 }
@@ -507,18 +626,18 @@ fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-fn truncate(mut text: String) -> String {
-    if text.chars().count() <= MAX_SQL_CHARS {
-        return text;
+/// The first `MAX_SQL_CHARS` characters of `text`, `…` marking a cut, copied
+/// without copying the rest.
+fn bounded(text: &str) -> String {
+    match text.char_indices().nth(MAX_SQL_CHARS) {
+        None => text.to_string(),
+        Some((cut, _)) => {
+            let mut kept = String::with_capacity(cut + '…'.len_utf8());
+            kept.push_str(&text[..cut]);
+            kept.push('…');
+            kept
+        }
     }
-    let cut = text
-        .char_indices()
-        .nth(MAX_SQL_CHARS)
-        .map(|(i, _)| i)
-        .unwrap_or(text.len());
-    text.truncate(cut);
-    text.push('…');
-    text
 }
 
 /// Replaces the parts of a statement that are data with `$n`, so every
@@ -622,6 +741,23 @@ pub fn normalize(sql: &str) -> String {
                 }
                 out.push_str(&sql[start..i]);
             }
+            // A dollar-quoted literal, `$$…$$` or `$tag$…$tag$`. Data like any
+            // other string: kept verbatim, every distinct function body or
+            // `DO` block became its own shape and churned the map.
+            b'$' if dollar_tag_len(&bytes[i..]).is_some() => {
+                let tag_len = dollar_tag_len(&bytes[i..]).expect("checked");
+                let tag = &bytes[i..i + tag_len];
+                let body = i + tag_len;
+                // An unterminated one runs to the end, as PostgreSQL's lexer
+                // reads it; the rest of the text is inside the literal.
+                i = bytes[body..]
+                    .windows(tag_len)
+                    .position(|w| w == tag)
+                    .map_or(bytes.len(), |at| body + at + tag_len);
+                placeholder += 1;
+                out.push('$');
+                out.push_str(&placeholder.to_string());
+            }
             // A parameter the client already wrote as one. Left as it is: the
             // statement's own numbering is more use than a renumbering of it.
             b'$' if bytes.get(i + 1).is_some_and(u8::is_ascii_digit) => {
@@ -661,6 +797,23 @@ pub fn normalize(sql: &str) -> String {
     }
 
     out
+}
+
+/// The length of the opening delimiter of a dollar-quoted literal at the
+/// start of `at` — `$$` or `$tag$`, where a tag is an identifier that does not
+/// start with a digit — or `None` if `at` does not open one.
+fn dollar_tag_len(at: &[u8]) -> Option<usize> {
+    if at.first() != Some(&b'$') {
+        return None;
+    }
+    let mut j = 1;
+    if at.get(1).is_some_and(u8::is_ascii_digit) {
+        return None;
+    }
+    while j < at.len() && (is_ident_byte(at[j]) || at[j] >= 0x80) {
+        j += 1;
+    }
+    (at.get(j) == Some(&b'$')).then_some(j + 1)
 }
 
 #[inline]
@@ -1107,6 +1260,25 @@ mod tests {
         assert_eq!(normalize("SELECT 'o''brien'"), "SELECT $1");
     }
 
+    /// `$$…$$` is a string literal. Kept verbatim, every distinct body was its
+    /// own shape and a workload of `DO` blocks churned the aggregate map.
+    #[test]
+    fn dollar_quoted_literals_become_placeholders() {
+        assert_eq!(
+            normalize("SELECT $$it's here$$, $fn$ body $$ inner $fn$ FROM t"),
+            "SELECT $1, $2 FROM t"
+        );
+        let a = hash_query(&normalize("DO $$BEGIN PERFORM 1; END$$"));
+        let b = hash_query(&normalize("DO $$BEGIN PERFORM 2; RAISE 'x'; END$$"));
+        assert_eq!(a, b, "two DO bodies are one shape");
+        // Parameters and identifiers containing `$` are not literals.
+        assert_eq!(normalize("SELECT a$b FROM t WHERE x = $1"), "SELECT a$b FROM t WHERE x = $1");
+        // An unterminated body is all literal, not a stream of tokens.
+        assert_eq!(normalize("SELECT $q$ never 'closed"), "SELECT $1");
+        // A multibyte body survives slicing.
+        assert_eq!(normalize("SELECT $$ünï$$ AS v"), "SELECT $1 AS v");
+    }
+
     #[test]
     fn whitespace_and_comments_do_not_make_a_new_shape() {
         let a = normalize("SELECT   a\n  FROM t -- why\n");
@@ -1225,6 +1397,91 @@ mod tests {
         // must not be charged to whatever statement is running.
         note_rows(5);
         note_rows_scanned(5);
+    }
+
+    /// `cargo test --release -p rasterizeddb_core --lib -- --ignored
+    /// query_stats_finish_bench --nocapture`. `finish` for statements of new
+    /// shapes once the map is full (each one evicts), and for a 1 MB one.
+    #[test]
+    #[ignore]
+    fn query_stats_finish_bench() {
+        let _serial = SERIAL.lock();
+        reset();
+        let texts: Vec<String> = (0..MAX_DISTINCT * 5)
+            .map(|i| format!("SELECT c{i} FROM some_table WHERE x = 1"))
+            .collect();
+        for t in &texts[..MAX_DISTINCT] {
+            finish(begin().unwrap(), t, "db", "u", None);
+        }
+        for round in 0..3 {
+            let start = std::time::Instant::now();
+            let base = MAX_DISTINCT * (1 + round);
+            for t in &texts[base..base + MAX_DISTINCT] {
+                finish(begin().unwrap(), t, "db", "u", None);
+            }
+            println!(
+                "round {round}: new shape into a full map {:.2} us/statement",
+                start.elapsed().as_secs_f64() * 1e6 / MAX_DISTINCT as f64
+            );
+        }
+        let mut big = String::from("INSERT INTO t VALUES ");
+        while big.len() < 1 << 20 {
+            big.push_str("(1, 'some text'),");
+        }
+        big.push_str("(2, 'x')");
+        let start = std::time::Instant::now();
+        for _ in 0..200 {
+            finish(begin().unwrap(), &big, "db", "u", None);
+        }
+        println!("1 MB statement: {:.1} us/statement", start.elapsed().as_secs_f64() * 1e6 / 200.0);
+        reset();
+    }
+
+    #[test]
+    fn a_full_map_evicts_a_batch_of_the_coldest() {
+        let _serial = SERIAL.lock();
+        reset();
+        for i in 0..MAX_DISTINCT {
+            let r = begin().unwrap();
+            finish(r, &format!("SELECT c{} FROM t", i), "db", "u", None);
+        }
+        assert_eq!(counts().1, MAX_DISTINCT);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        // Touched again, so it is the warmest of the old shapes.
+        let r = begin().unwrap();
+        finish(r, "SELECT c0 FROM t", "db", "u", None);
+
+        let r = begin().unwrap();
+        finish(r, "SELECT brand_new FROM t", "db", "u", None);
+        let shapes = aggregated();
+        assert_eq!(shapes.len(), MAX_DISTINCT - EVICT_BATCH + 1);
+        assert!(shapes.iter().any(|a| a.query == "SELECT brand_new FROM t"));
+        let warm = shapes.iter().find(|a| a.query == "SELECT c0 FROM t");
+        assert_eq!(warm.map(|a| a.calls), Some(2), "a recently seen shape was evicted");
+        // The next new shape needs no eviction.
+        let r = begin().unwrap();
+        finish(r, "SELECT another FROM t", "db", "u", None);
+        assert_eq!(counts().1, MAX_DISTINCT - EVICT_BATCH + 2);
+        reset();
+    }
+
+    /// A statement far past the cut is kept as its first characters, and a
+    /// secret beyond the cut is not kept either.
+    #[test]
+    fn a_huge_statement_is_kept_bounded() {
+        let _serial = SERIAL.lock();
+        reset();
+        let mut sql = String::from("INSERT INTO t VALUES ");
+        while sql.len() < 1 << 20 {
+            sql.push_str("(1, 'x'),");
+        }
+        sql.push_str("(2, 'y') PASSWORD 'hunter2'");
+        let r = begin().unwrap();
+        finish(r, &sql, "db", "u", None);
+        let kept = &recent(1)[0].sql;
+        assert_eq!(kept.chars().count(), MAX_SQL_CHARS + 1);
+        assert!(kept.ends_with('…') && !kept.contains("hunter2"));
+        reset();
     }
 
     #[test]

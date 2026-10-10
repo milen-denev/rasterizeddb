@@ -38,7 +38,11 @@ async fn execute_join(sql: &str, database: Arc<Database>, tx: TxId) -> Vec<u8> {
         }
     };
 
-    let mut scanned: Vec<Vec<crate::core::row::row::Row>> =
+    // Each relation is kept as the scan's serialized rows: a decoded `Row` is
+    // ~1.5 KB whatever it holds. `RDB_JOIN_ROWS=1` scans into `Vec<Row>`
+    // instead, the path this replaced, for A/B measurement.
+    let legacy_rows = legacy_join_rows();
+    let mut scanned: Vec<crate::core::rql::join::RowSet> =
         Vec::with_capacity(plan.relations.len());
     for relation in &plan.relations {
         // Cloned out so the map guard does not span the scan below.
@@ -67,22 +71,40 @@ async fn execute_join(sql: &str, database: Arc<Database>, tx: TxId) -> Vec<u8> {
 
         // No limit is pushed down: it applies to the joined output, and a cap
         // here would drop rows that the join still needs.
-        match table
-            .query_row_in_txn(
-                &relation.predicate,
-                &schema.to_vec(),
-                query_fetch,
-                requested,
-                None,
-                None,
-                tx,
-            )
-            .await
-        {
-            Ok(rows) => scanned.push(rows),
+        let set = if legacy_rows {
+            table
+                .query_row_in_txn(
+                    &relation.predicate,
+                    &schema.to_vec(),
+                    query_fetch,
+                    requested,
+                    None,
+                    None,
+                    tx,
+                )
+                .await
+                .map(crate::core::rql::join::RowSet::Rows)
+                .map_err(|e| e.to_string())
+        } else {
+            table
+                .query_row_bytes_in_txn(
+                    &relation.predicate,
+                    &schema.to_vec(),
+                    query_fetch,
+                    requested,
+                    None,
+                    None,
+                    tx,
+                )
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(crate::core::rql::join::RowSet::from_serialized)
+        };
+        match set {
+            Ok(set) => scanned.push(set),
             Err(e) => {
                 error!("Failed to scan '{}' for join: {}", relation.table, e);
-                return error(&e.to_string());
+                return error(&e);
             }
         }
     }
@@ -94,6 +116,38 @@ async fn execute_join(sql: &str, database: Arc<Database>, tx: TxId) -> Vec<u8> {
             return error(&e);
         }
     };
+    // A shredded JSON column projected through the join has to be hydrated in
+    // the projected rows (below), which needs them decoded. Everything else is
+    // serialized straight from the tuples, or folded straight from them.
+    let has_shadow_json = plan.items.iter().any(|item| {
+        item.literal.is_none()
+            && item.scalar.is_none()
+            && plan.relations.get(item.rel).is_some_and(|relation| {
+                database.tables.get(&relation.table).is_some_and(|t| {
+                    crate::core::rql::json_map::shadow_for(&item.field.name, &t.schema.json_columns)
+                        .is_some()
+                })
+            })
+    });
+    if !has_shadow_json && !legacy_rows {
+        return match plan.aggregate.as_ref() {
+            Some(agg) => {
+                let mut result = vec![2u8];
+                match crate::core::rql::join::fold_joined(&plan, agg, &combined, &mut result) {
+                Ok(()) => result,
+                Err(e) => {
+                    error!("Aggregate over join failed: {}", e);
+                    error(&e)
+                }
+                }
+            }
+            None => {
+                let mut result = vec![2u8];
+                crate::core::rql::join::project_serialized(&plan, &combined, &mut result);
+                result
+            }
+        };
+    }
     let mut rows = crate::core::rql::join::project(&plan, combined);
 
     // A shredded JSON column projected through a join is still the stored
@@ -192,6 +246,17 @@ async fn run_subquery(
     database: &Arc<Database>,
     tx: TxId,
 ) -> Result<Vec<crate::core::row::row::Row>, String> {
+    run_subquery_for(sql, database, tx, SubqueryNeed::All).await
+}
+
+/// [`run_subquery`] for a caller that needs only part of the result — see
+/// [`SubqueryNeed`]. The rows returned are then only good for that question.
+async fn run_subquery_for(
+    sql: &str,
+    database: &Arc<Database>,
+    tx: TxId,
+    need: SubqueryNeed,
+) -> Result<Vec<crate::core::row::row::Row>, String> {
     // The inner query is executed exactly once, with no outer row in scope. A
     // correlated subquery would reference an outer column, which the inner
     // table's schema does not have, so it fails here by name rather than being
@@ -215,7 +280,7 @@ async fn run_subquery(
     // materialised into a temporary table read back as empty, and an empty
     // scalar subquery becomes `''`, which then failed to compare against a
     // typed column.
-    let response = Box::pin(execute_with_context(purpose, database.clone(), 0, tx)).await;
+    let response = Box::pin(execute_with_need(purpose, database.clone(), 0, tx, need)).await;
     match response.first() {
         Some(2) => {}
         Some(3) => {
@@ -225,8 +290,227 @@ async fn run_subquery(
         _ => return Err("subquery returned no result set".to_string()),
     }
 
-    crate::core::row::row::vec_into_rows(&response[1..])
-        .map_err(|e| format!("subquery result could not be read: {}", e))
+    let mut rows = crate::core::row::row::vec_into_rows(&response[1..])
+        .map_err(|e| format!("subquery result could not be read: {}", e))?;
+    if let Some(scales) = recognize_query_purpose(sql)
+        .and_then(|purpose| query_output_scales(&purpose, database))
+    {
+        normalize_decimal_scales(&mut rows, &scales);
+    }
+    Ok(rows)
+}
+
+/// The scale each output column's `DECIMAL` bytes are stored at, slot for
+/// slot, for a `SELECT` — what a reader of the result must interpret them at.
+///
+/// One source for both readers: pgwire renders the client's rows by it, and
+/// [`run_subquery_for`] uses it to bring a subquery's rows to the engine scale
+/// before they become literals or a derived table's rows. They used to differ —
+/// pgwire knew a `NUMERIC(10,2)` column was at two places, the subquery path
+/// formatted every decimal at nine — so `(SELECT price …)` read 1.25 as
+/// 0.000000125.
+pub(crate) fn query_output_scales(
+    purpose: &QueryPurpose,
+    database: &Database,
+) -> Option<Vec<u32>> {
+    fn field_of(
+        fields: &[crate::core::row::schema::SchemaField],
+        schema_id: u64,
+    ) -> Option<&crate::core::row::schema::SchemaField> {
+        fields
+            .iter()
+            .find(|f| f.write_order == schema_id)
+            .or_else(|| fields.get(schema_id as usize))
+    }
+    match purpose {
+        // A join has no single table to take scales from; the plan knows what
+        // each output column is (`JoinPlan::output_scales`). Without this arm a
+        // join rendered every `NUMERIC(p, s)` at the engine scale.
+        QueryPurpose::QueryRows(qr) if crate::core::rql::join::statement_has_join(&qr.query) => {
+            let schema_of = |name: &str| database.tables.get(name).map(|t| t.schema.fields.clone());
+            crate::core::rql::join::plan_statement(&qr.query, &schema_of)
+                .ok()
+                .map(|plan| plan.output_scales())
+        }
+        QueryPurpose::QueryRows(qr) => database.tables.get(&qr.table_name).and_then(|t| {
+            let schema = &t.schema;
+            // Not skipped when the table declares no `NUMERIC(p, s)`: an
+            // aggregate's scale is not the column's — `sum(int8)` is a numeric
+            // at scale 0, `avg(int)` at sixteen places.
+            crate::core::rql::lexer_query::row_fetch_from_select_query(purpose, &schema.fields)
+                .ok()
+                .map(|parsed| {
+                    // Taken from the select list when there is one, slot for
+                    // slot. The fetched columns are the *inputs*: `v + 1, id, v`
+                    // fetches `v` and `id`, so reading scales off them gave the
+                    // third output the scale of `id`'s slot.
+                    use crate::core::rql::aggregate::{AggFunc, SelectItem};
+                    let engine = crate::core::value_codec::DECIMAL_SCALE;
+                    let declared = |name: &str| {
+                        crate::core::rql::type_modifier::scale_of(name, &schema.type_modifiers) as u32
+                    };
+                    // A column read straight through keeps the scale it is
+                    // stored at, and so do the aggregates that fold its raw
+                    // integers. Anything computed is evaluated at the engine
+                    // scale — `expr::eval` lifts every column it reads.
+                    let item_scale = |item: &SelectItem| match item {
+                        SelectItem::Column { field, .. } => declared(&field.name),
+                        // The fold's own rule, `AggFunc::decimal_output_scale`:
+                        // `SUM`/`MIN`/`MAX` at the argument's scale (0 for an
+                        // integer), `AVG` at sixteen places or the column's.
+                        // A computed argument is evaluated at the engine scale,
+                        // which its synthetic field already says.
+                        SelectItem::Aggregate {
+                            func,
+                            arg,
+                            arg_expr,
+                            ..
+                        } => {
+                            let arg = arg.as_ref().map(|f| {
+                                let mut f = f.clone();
+                                if arg_expr.is_none()
+                                    && f.db_type == crate::core::db_type::DbType::DECIMAL
+                                {
+                                    f.scale = Some(declared(&f.name));
+                                }
+                                f
+                            });
+                            func.decimal_output_scale(arg.as_ref())
+                        }
+                        // A window value is stored at the grouped aggregate's
+                        // scale for the same function — one rule, in
+                        // `WindowSpec::decimal_output_scale`.
+                        SelectItem::Window { spec, .. } => spec.decimal_output_scale(),
+                        _ => engine,
+                    };
+                    if let Some(plan) = &parsed.aggregate {
+                        return plan.items.iter().map(item_scale).collect::<Vec<_>>();
+                    }
+                    if !parsed.select_items.is_empty() {
+                        return parsed.select_items.iter().map(item_scale).collect::<Vec<_>>();
+                    }
+                    parsed
+                        .requested_row_fetch
+                        .columns_fetching_data
+                        .iter()
+                        .take(parsed.visible_columns)
+                        .map(|c| {
+                            field_of(&schema.fields, c.schema_id).map_or(0, |field| {
+                                crate::core::rql::type_modifier::scale_of(
+                                    &field.name,
+                                    &schema.type_modifiers,
+                                ) as u32
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+        }),
+        _ => None,
+    }
+}
+
+/// Brings every `DECIMAL` cell of a subquery's rows to the engine scale, from
+/// the scale [`query_output_scales`] says it is stored at.
+///
+/// Rows leaving one query for another carry no scale, and everything that
+/// reads them — literal substitution, a derived table's temp relation —
+/// assumes the engine's. Without this a `sum(bigint)` (a numeric at scale 0)
+/// read through a derived table was a billionth of itself, and so was any
+/// `NUMERIC(p, s)` column with `s` other than nine. Rounded half away from
+/// zero when the stored scale is wider.
+fn normalize_decimal_scales(rows: &mut [crate::core::row::row::Row], scales: &[u32]) {
+    use crate::core::db_type::DbType;
+    let target = crate::core::value_codec::DECIMAL_SCALE;
+    // No early return when every column is at the engine scale: a cell that
+    // carries its own scale still has to be normalised, and that is a
+    // property of the cell, not of the column list.
+    for row in rows.iter_mut() {
+        for (i, cell) in row.columns.iter_mut().enumerate() {
+            let Some(&from) = scales.get(i) else { break };
+            if cell.column_type != DbType::DECIMAL {
+                continue;
+            }
+            // A value carrying its own scale (an `AVG` result, see
+            // `value_codec::decimal_cell_with_scale`) is brought to the engine
+            // scale like any other, from *its* scale, and becomes an ordinary
+            // sixteen-byte cell: what leaves a query for another is uniform.
+            let (from, v) = match crate::core::value_codec::split_decimal_cell(cell.data.into_slice()) {
+                Some((v, Some(own))) => {
+                    let lifted = if own <= target {
+                        10i128.checked_pow(target - own).and_then(|f| v.checked_mul(f))
+                    } else {
+                        10i128.checked_pow(own - target).map(|f| {
+                            let q = v / f;
+                            let r = v % f;
+                            if r.unsigned_abs() * 2 >= f as u128 {
+                                if v < 0 { q - 1 } else { q + 1 }
+                            } else {
+                                q
+                            }
+                        })
+                    };
+                    if let Some(lifted) = lifted {
+                        let mut block = crate::memory_pool::MEMORY_POOL.acquire(16);
+                        block.into_slice_mut().copy_from_slice(&lifted.to_le_bytes());
+                        cell.data = block;
+                    }
+                    continue;
+                }
+                Some((v, None)) => (from, v),
+                None => continue,
+            };
+            if from == target {
+                continue;
+            }
+            let lifted = if from < target {
+                10i128.checked_pow(target - from).and_then(|f| v.checked_mul(f))
+            } else {
+                10i128.checked_pow(from - target).map(|f| {
+                    let q = v / f;
+                    let r = v % f;
+                    if r.unsigned_abs() * 2 >= f as u128 {
+                        if v < 0 { q - 1 } else { q + 1 }
+                    } else {
+                        q
+                    }
+                })
+            };
+            // A value the engine scale cannot hold is left as it was rather
+            // than replaced by a different number.
+            if let Some(lifted) = lifted {
+                cell.data.into_slice_mut().copy_from_slice(&lifted.to_le_bytes());
+            }
+        }
+    }
+}
+
+/// [`run_subquery`], returning the rows still serialized: the response with
+/// its result tag stripped. For a caller that only copies or compares rows.
+async fn run_subquery_serialized(
+    sql: &str,
+    database: &Arc<Database>,
+    tx: TxId,
+) -> Result<Vec<u8>, String> {
+    let folded = fold_where_constants(sql);
+    let sql = folded.as_str();
+    let purpose =
+        recognize_query_purpose(sql).ok_or_else(|| format!("cannot parse subquery '{}'", sql))?;
+    if !matches!(purpose, QueryPurpose::QueryRows(_)) {
+        return Err("only a SELECT may appear as a subquery".to_string());
+    }
+    let mut response =
+        Box::pin(execute_with_need(purpose, database.clone(), 0, tx, SubqueryNeed::All)).await;
+    match response.first() {
+        Some(2) => {
+            response.remove(0);
+            Ok(response)
+        }
+        Some(3) => Err(format!(
+            "subquery failed: {}",
+            String::from_utf8_lossy(&response[1..])
+        )),
+        _ => Err("subquery returned no result set".to_string()),
+    }
 }
 
 /// Runs a `SELECT` and returns its rows.
@@ -340,7 +624,7 @@ fn outer_relation_names(sql: &str) -> Vec<String> {
             let upper_word = word.to_ascii_uppercase();
             if matches!(
                 upper_word.as_str(),
-                "JOIN" | "INNER" | "LEFT" | "RIGHT" | "OUTER" | "ON"
+                "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "CROSS" | "OUTER" | "ON"
             ) {
                 continue;
             }
@@ -377,6 +661,22 @@ pub async fn substitute_in_subqueries(
         };
         let outer = outer_relation_names(&current);
 
+        // `ORDER BY` / `LIMIT` / `OFFSET` say nothing about *which* rows match,
+        // so they are lifted off before anything reads the predicate — see
+        // `strip_exists_tail` for what leaving them in place did.
+        let (clause, bounds) = subquery::strip_exists_tail(&clause)?;
+        if bounds.limit == Some(0) {
+            // `LIMIT 0` returns nothing, for every outer row.
+            let predicate = subquery::uncorrelated_exists_predicate(clause.negated, false);
+            current = format!(
+                "{}{}{}",
+                &current[..clause.start],
+                predicate,
+                &current[clause.end..]
+            );
+            continue;
+        }
+
         // An EXISTS correlating on several columns cannot become an `IN`, which
         // carries one column. Its rows are fetched once and expanded into a
         // tuple-wise predicate instead — exact, where a per-column `IN` would
@@ -385,7 +685,16 @@ pub async fn substitute_in_subqueries(
         // database, not one per row: run it once and fold the answer into a
         // constant the scan can evaluate.
         if let Some(inner) = subquery::uncorrelated_exists(&clause, &outer) {
-            let rows = run_subquery(&inner, database, tx).await?;
+            let rows = if bounds.offset > 0 {
+                // `OFFSET k` asks whether there are more than k rows. Run as
+                // written, less its ORDER BY, which cannot change the count.
+                let sql = format!("{} LIMIT 1 OFFSET {}", inner, bounds.offset);
+                run_subquery(&sql, database, tx).await?
+            } else {
+                // Only whether a row exists matters, so the scan may stop at
+                // the first one rather than producing and encoding them all.
+                run_subquery_for(&inner, database, tx, SubqueryNeed::Existence).await?
+            };
             let predicate =
                 subquery::uncorrelated_exists_predicate(clause.negated, !rows.is_empty());
             current = format!(
@@ -395,6 +704,13 @@ pub async fn substitute_in_subqueries(
                 &current[clause.end..]
             );
             continue;
+        }
+
+        if bounds.offset > 0 {
+            // "More than k matching rows per outer row" has no `IN` form.
+            return Err(
+                "EXISTS with an OFFSET in a correlated subquery is not supported".to_string(),
+            );
         }
 
         if let Some(spec) = subquery::multi_correlated_exists(&clause, &outer) {
@@ -425,7 +741,8 @@ pub async fn substitute_in_subqueries(
         let Some(found) = subquery::find_scalar_subquery(&current) else {
             break;
         };
-        let rows = run_subquery(&found.inner_sql, database, tx).await?;
+        // Two rows are enough to raise "more than one row".
+        let rows = run_subquery_for(&found.inner_sql, database, tx, SubqueryNeed::Scalar).await?;
         let literal = subquery::rows_to_scalar(&rows)?;
         current = format!(
             "{}{}{}",
@@ -444,13 +761,22 @@ pub async fn substitute_in_subqueries(
         // A correlated subquery would reference an outer column, which the
         // inner table's schema does not have, so it fails here by name rather
         // than being silently evaluated against the wrong relation.
-        let rows = run_subquery(&found.inner_sql, database, tx).await?;
-        let list = subquery::rows_to_value_list(&rows)?;
+        // Membership ignores order, so an unbounded ORDER BY is not run.
+        let rows =
+            run_subquery_for(&found.inner_sql, database, tx, SubqueryNeed::Membership).await?;
+        let (list, had_null) = subquery::rows_to_value_list(&rows)?;
 
+        // `x NOT IN (…, NULL)` is never true: x either equals a value (false)
+        // or is compared against NULL (unknown). `x IN ()` expresses exactly
+        // that — it never holds, and a NULL x is excluded as well.
+        let (start, replacement) = match (had_null, found.negated_start) {
+            (true, Some(not_at)) => (not_at, "IN ()".to_string()),
+            _ => (found.start, list),
+        };
         current = format!(
             "{}{}{}",
-            &current[..found.start],
-            list,
+            &current[..start],
+            replacement,
             &current[found.end..]
         );
     }
@@ -507,18 +833,8 @@ async fn check_foreign_keys(
             ));
         }
 
-        // Phrased as an ordinary query, so the check is filtered and evaluated
-        // by the same paths as any other predicate.
-        let probe = format!(
-            "SELECT {} FROM {} WHERE {} = {} LIMIT 1",
-            fk.parent_column, fk.parent_table, fk.parent_column, literal
-        );
-        let rows = run_subquery(&probe, database, tx)
-            .await
-            .map_err(|e| format!("foreign key \"{}\" could not be checked: {}", fk.name, e))?;
-
-        if rows.is_empty() {
-            return Err(format!(
+        let violation = || {
+            format!(
                 "insert or update on table \"{}\" violates foreign key constraint \"{}\": \
                  key ({})=({}) is not present in table \"{}\"",
                 table_name,
@@ -526,11 +842,394 @@ async fn check_foreign_keys(
                 fk.column,
                 literal.trim_matches('\''),
                 fk.parent_table
-            ));
+            )
+        };
+        let unchecked =
+            |e: String| format!("foreign key \"{}\" could not be checked: {}", fk.name, e);
+
+        // Already found, and key-share locked by this transaction, by the
+        // multi-row INSERT this row belongs to. The lock is held to commit, so
+        // nothing can have removed the parent since.
+        if FK_VERIFIED
+            .try_with(|v| {
+                v.borrow()
+                    .contains(&verified_key(&fk.parent_table, &fk.parent_column, literal))
+            })
+            .unwrap_or(false)
+        {
+            continue;
+        }
+
+        // Three steps, and the order is the fix. Probing alone — what this
+        // used to do — read the parent through this transaction's snapshot and
+        // took no lock, so a concurrent DELETE of the parent and this INSERT
+        // each saw the other's row still there and both committed: an orphan.
+        //
+        // 1. Find the parent as of now, for its stored key bytes.
+        // 2. Take the key-share lock on them (PostgreSQL's `FOR KEY SHARE`),
+        //    held to commit. A DELETE of that key holds the exclusive side
+        //    from before it looks at referencing rows, so whichever of the two
+        //    comes second waits for the first.
+        // 3. Look again under the lock. A DELETE that committed between 1 and
+        //    2 released its lock before this one was granted and left nothing
+        //    to wait for — only the second look sees that the parent is gone.
+        let found = referenced_values_now(
+            database,
+            &fk.parent_table,
+            &fk.parent_column,
+            std::slice::from_ref(literal),
+            tx,
+            Some(1),
+        )
+        .await
+        .map_err(unchecked)?;
+        let Some(key) = found.into_iter().next() else {
+            return Err(violation());
+        };
+        acquire_referenced_waiting(
+            database,
+            &fk.parent_table,
+            &fk.parent_column,
+            &key,
+            tx,
+            crate::core::rql::row_lock::LockStrength::Share,
+        )
+        .await?;
+        let still = referenced_values_now(
+            database,
+            &fk.parent_table,
+            &fk.parent_column,
+            std::slice::from_ref(literal),
+            tx,
+            Some(1),
+        )
+        .await
+        .map_err(unchecked)?;
+        if still.is_empty() {
+            return Err(violation());
         }
     }
 
     Ok(())
+}
+
+tokio::task_local! {
+    /// `(parent table, parent column, literal)` triples a multi-row `INSERT`
+    /// has already found and key-share locked for its transaction — see
+    /// [`prevalidate_foreign_keys`]. Scoped to that statement's task.
+    static FK_VERIFIED: std::cell::RefCell<std::collections::HashSet<(String, String, String)>>;
+}
+
+fn verified_key(table: &str, column: &str, literal: &str) -> (String, String, String) {
+    (
+        table.to_ascii_lowercase(),
+        column.to_ascii_lowercase(),
+        literal.trim().to_string(),
+    )
+}
+
+/// Checks the foreign keys of every tuple of a multi-row `INSERT` at once.
+///
+/// Per key: one probe for the distinct literals, a key-share lock on each
+/// value found, and one probe again under the locks — the same three steps
+/// [`check_foreign_keys`] takes per row, in three round trips for the whole
+/// statement instead of three per tuple. A 10 000-row insert into a child
+/// table spent ~85 % of its time in per-row checks.
+///
+/// Returns the triples it proved. It proves a key's literals only when the
+/// number of distinct values found equals the number of distinct literals:
+/// each literal denotes one value and the probe returns only values some
+/// literal denotes, so equal counts mean every literal matched. Anything short
+/// of that — a missing parent, two spellings of one value, a parent inserted
+/// by this same statement, a probe that fails to parse — proves nothing for
+/// that key, and the per-row check runs and reports exactly as it would have.
+async fn prevalidate_foreign_keys(
+    database: &Arc<Database>,
+    table_name: &str,
+    statements: &[String],
+    tx: TxId,
+) -> std::collections::HashSet<(String, String, String)> {
+    let mut verified = std::collections::HashSet::new();
+    if statements.len() < 2 {
+        return verified;
+    }
+    let foreign_keys = match database.tables.get(table_name) {
+        Some(t) => t.schema.foreign_keys.clone(),
+        None => return verified,
+    };
+    if foreign_keys.is_empty() {
+        return verified;
+    }
+    let rows: Vec<Vec<(String, String)>> = statements
+        .iter()
+        .map(|s| crate::core::rql::lexer_ir::assignments_of_insert(s).unwrap_or_default())
+        .collect();
+
+    for fk in foreign_keys.iter() {
+        if !database.tables.contains_key(&fk.parent_table) {
+            continue;
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut literals: Vec<String> = Vec::new();
+        for assignments in &rows {
+            let Some((_, literal)) = assignments
+                .iter()
+                .find(|(column, _)| column.eq_ignore_ascii_case(&fk.column))
+            else {
+                continue;
+            };
+            let literal = literal.trim();
+            if literal.eq_ignore_ascii_case("NULL") {
+                continue;
+            }
+            if seen.insert(literal.to_string()) {
+                literals.push(literal.to_string());
+            }
+        }
+        if literals.is_empty() {
+            continue;
+        }
+
+        let Ok(found) =
+            referenced_values_now(database, &fk.parent_table, &fk.parent_column, &literals, tx, None)
+                .await
+        else {
+            continue;
+        };
+        if found.len() != literals.len() {
+            continue;
+        }
+        let mut locked = true;
+        for key in &found {
+            if acquire_referenced_waiting(
+                database,
+                &fk.parent_table,
+                &fk.parent_column,
+                key,
+                tx,
+                crate::core::rql::row_lock::LockStrength::Share,
+            )
+            .await
+            .is_err()
+            {
+                // The per-row path will wait again and report the failure.
+                locked = false;
+                break;
+            }
+        }
+        if !locked {
+            continue;
+        }
+        let Ok(still) =
+            referenced_values_now(database, &fk.parent_table, &fk.parent_column, &literals, tx, None)
+                .await
+        else {
+            continue;
+        };
+        if still.len() != literals.len() {
+            continue;
+        }
+        for literal in &literals {
+            verified.insert(verified_key(&fk.parent_table, &fk.parent_column, literal));
+        }
+    }
+    verified
+}
+
+/// How many literals one referenced-key probe carries. `IN` is rewritten into
+/// a disjunction the evaluator tests per row, so one huge list costs more than
+/// a few moderate ones.
+const REFERENCED_PROBE_CHUNK: usize = 512;
+
+/// The stored bytes of `column` in every row of `table_name` whose value is
+/// one of `literals`, deduplicated — read **as of now** on `tx`'s behalf.
+///
+/// As of now, not through `tx`'s snapshot: a foreign-key check is a question
+/// about what is committed (plus `tx`'s own writes), and a `REPEATABLE READ`
+/// snapshot pinned before a concurrent commit answers it wrongly in both
+/// directions — a parent deleted since still looks present, a child inserted
+/// since still looks absent.
+///
+/// Calls the table directly with the predicate a `SELECT … WHERE column IN
+/// (…)` would produce — folded and rewritten by the same functions — rather
+/// than through the SQL entry, which cannot take a visibility, and which paid
+/// a parse and a serialise/deserialise round trip per probe.
+async fn referenced_values_now(
+    database: &Arc<Database>,
+    table_name: &str,
+    column: &str,
+    literals: &[String],
+    tx: TxId,
+    limit: Option<u64>,
+) -> Result<Vec<Vec<u8>>, String> {
+    let Some(table) = database.tables.get(table_name).map(|t| t.value().clone()) else {
+        return Err(format!("relation \"{}\" does not exist", table_name));
+    };
+    let schema = &table.schema.fields;
+    let Some(field) = schema
+        .iter()
+        .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(column))
+        .cloned()
+    else {
+        return Err(format!(
+            "column \"{}\" of relation \"{}\" does not exist",
+            column, table_name
+        ));
+    };
+    let requested = crate::core::rql::join::fetch_for(std::slice::from_ref(&field), schema);
+    let all_fields = schema.to_vec();
+
+    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    let mut values = Vec::new();
+    for chunk in literals.chunks(REFERENCED_PROBE_CHUNK) {
+        let predicate = if chunk.len() == 1 {
+            format!("{} = {}", field.name, chunk[0])
+        } else {
+            format!("{} IN ({})", field.name, chunk.join(", "))
+        };
+        // The constant fold works on a statement, so it is given one.
+        let statement = fold_where_constants(&format!(
+            "SELECT {} FROM {} WHERE {}",
+            field.name, table_name, predicate
+        ));
+        let Some(where_at) = crate::core::rql::join::find_keyword(&statement, "WHERE", 0) else {
+            return Err("the probe lost its WHERE clause".to_string());
+        };
+        let raw = statement[where_at + "WHERE".len()..].trim();
+        let rewritten = crate::core::tokenizer::predicate_rewrite::rewrite_where(raw, schema)?;
+
+        // Whatever the rewritten predicate reads — a nullable column's guard
+        // adds its companion — has to be fetched for the scan to test it.
+        let mut predicate_fields: Vec<crate::core::row::schema::SchemaField> = Vec::new();
+        for name in crate::core::rql::lexer_query::extract_where_columns(&rewritten, schema) {
+            if let Some(f) = schema.iter().find(|f| f.name == name) {
+                predicate_fields.push(f.clone());
+            }
+        }
+        let query_fetch = crate::core::rql::join::fetch_for(&predicate_fields, schema);
+
+        let rows = table
+            .query_row_with_visibility(
+                &rewritten,
+                &all_fields,
+                query_fetch,
+                requested.clone(),
+                limit,
+                None,
+                table.visibility_now_for(tx),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        for row in &rows {
+            if let Some(cell) = row.columns.first() {
+                let bytes = cell.data.into_slice();
+                if seen.insert(bytes.to_vec()) {
+                    values.push(bytes.to_vec());
+                }
+            }
+        }
+        if limit.is_some_and(|k| values.len() as u64 >= k) {
+            break;
+        }
+    }
+    Ok(values)
+}
+
+/// Takes a referenced-key lock, waiting for its holder the way `FOR UPDATE`
+/// does: polled, bounded by [`LOCK_WAIT_TIMEOUT`], and ended early by the
+/// statement's own timeout or its client going away.
+///
+/// The bound is what stands in for deadlock detection: two transactions each
+/// inserting a child of the parent the other is deleting would otherwise wait
+/// on each other forever. The timeout is reported as a serialization failure,
+/// which is what it is and what a client retries.
+async fn acquire_referenced_waiting(
+    database: &Arc<Database>,
+    table: &str,
+    column: &str,
+    key: &[u8],
+    tx: TxId,
+    strength: crate::core::rql::row_lock::LockStrength,
+) -> Result<(), String> {
+    use crate::core::mvcc::row_locks::Acquired;
+
+    let live = |candidate: TxId| {
+        matches!(
+            database.transactions.status().outcome(candidate),
+            crate::core::mvcc::transaction::TxOutcome::InProgress
+        )
+    };
+    let started = std::time::Instant::now();
+    let deadline = started + LOCK_WAIT_TIMEOUT;
+    let _waiting = database.row_locks.waiting_guard(tx);
+    loop {
+        let owner = match database
+            .row_locks
+            .acquire_referenced(table, column, key, tx, strength, &live)
+        {
+            Acquired::Yes => return Ok(()),
+            Acquired::Held(owner) => owner,
+        };
+        if let Some(reason) = crate::core::cancel::tripped() {
+            return Err(reason.eval_error().as_str().to_string());
+        }
+        if let Some(deadlock) = deadlock_check(
+            database,
+            tx,
+            started,
+            || {
+                database
+                    .row_locks
+                    .referenced_blockers(table, column, key, tx, strength, &live)
+            },
+            &live,
+        ) {
+            return Err(deadlock);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "could not serialize access: waited {}s for transaction {}, which holds a key \
+                 of \"{}\" that a foreign key references",
+                LOCK_WAIT_TIMEOUT.as_secs(),
+                owner,
+                table
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+/// The deadlock check every lock wait makes on each poll.
+///
+/// Once the wait has lasted `DEADLOCK_TIMEOUT` (1 s, PostgreSQL's
+/// `deadlock_timeout` default), the waiter enters its edges into the wait-for
+/// graph and asks whether it closes a cycle in which it is the victim. Exactly
+/// one participant of a cycle is: it fails with `deadlock detected` (`40P01`),
+/// its transaction's locks go with it, and the others proceed. Without this
+/// every party to a crossed wait sat out the full `LOCK_WAIT_TIMEOUT` and then
+/// all of them failed.
+fn deadlock_check(
+    database: &Arc<Database>,
+    tx: TxId,
+    waiting_since: std::time::Instant,
+    blockers: impl FnOnce() -> smallvec::SmallVec<[TxId; 4]>,
+    is_live: &dyn Fn(TxId) -> bool,
+) -> Option<String> {
+    if waiting_since.elapsed() < crate::core::mvcc::row_locks::DEADLOCK_TIMEOUT {
+        return None;
+    }
+    let blockers = blockers();
+    database.row_locks.set_waiting(tx, &blockers);
+    if database.row_locks.deadlock_victim(tx, is_live) {
+        database.row_locks.clear_waiting(tx);
+        return Some(format!(
+            "deadlock detected: transaction {} waits for transaction {}, which is waiting,              through a cycle, for transaction {}",
+            tx,
+            blockers.first().copied().unwrap_or(0),
+            tx
+        ));
+    }
+    None
 }
 
 /// Every foreign key in the database that points at `parent_table`.
@@ -577,20 +1276,40 @@ fn default_literal_for(database: &Arc<Database>, table: &str, column: &str) -> S
         .unwrap_or_else(|_| "NULL".to_string())
 }
 
+/// The values a `DELETE` is about to remove from one referenced column.
+pub(crate) struct ReferencedColumn {
+    /// The parent column some foreign key references.
+    column: String,
+    /// Each distinct value's stored bytes — what the key lock is taken on.
+    stored: Vec<Vec<u8>>,
+    /// The same values as SQL literals, index for index — what the
+    /// referencing tables are matched against.
+    literals: Vec<String>,
+}
+
 /// Applies each referencing table's `ON DELETE` action to the rows about to be
 /// removed from `parent_table`.
 ///
-/// `keys` are the referenced values of those rows, as SQL literals.
+/// `keys` holds, per referenced column, the values of those rows.
+///
+/// Every key is locked exclusively first (see
+/// [`crate::core::mvcc::row_locks::RowLocks::acquire_referenced`]), so a child
+/// insert still in flight is waited for rather than missed, and one starting
+/// later waits for this transaction. Referencing rows are then judged **as of
+/// now**, not through this transaction's snapshot, which may predate a child
+/// that committed while it waited.
 async fn apply_on_delete(
     database: &Arc<Database>,
     parent_table: &str,
-    keys: &[String],
+    keys: &[ReferencedColumn],
     depth: usize,
     // The transaction of the DELETE that triggered this. A cascade must land in
     // it, or the effect would be visible while its cause was not.
     tx: TxId,
 ) -> Result<(), String> {
-    if keys.is_empty() {
+    use crate::core::rql::foreign_key::ReferentialAction;
+
+    if keys.iter().all(|k| k.stored.is_empty()) {
         return Ok(());
     }
     if depth >= MAX_CASCADE_DEPTH {
@@ -601,41 +1320,72 @@ async fn apply_on_delete(
         ));
     }
 
+    for referenced in keys {
+        for key in &referenced.stored {
+            acquire_referenced_waiting(
+                database,
+                parent_table,
+                &referenced.column,
+                key,
+                tx,
+                crate::core::rql::row_lock::LockStrength::Update,
+            )
+            .await?;
+        }
+    }
+
     for (child_table, fk) in referencing_keys(database, parent_table) {
-        let list = keys.join(", ");
+        let Some(referenced) = keys
+            .iter()
+            .find(|k| k.column.eq_ignore_ascii_case(&fk.parent_column))
+        else {
+            continue;
+        };
+        if referenced.literals.is_empty() {
+            continue;
+        }
+        let list = referenced.literals.join(", ");
+        let unchecked =
+            |e: String| format!("foreign key \"{}\" could not be checked: {}", fk.name, e);
+        let violation = || {
+            format!(
+                "update or delete on table \"{}\" violates foreign key constraint \"{}\" \
+                 on table \"{}\"",
+                parent_table, fk.name, child_table
+            )
+        };
 
         if fk.on_delete.blocks() {
-            let probe = format!(
-                "SELECT {} FROM {} WHERE {} IN ({}) LIMIT 1",
-                fk.column, child_table, fk.column, list
-            );
-            let rows = run_subquery(&probe, database, tx)
-                .await
-                .map_err(|e| format!("foreign key \"{}\" could not be checked: {}", fk.name, e))?;
-            if !rows.is_empty() {
-                return Err(format!(
-                    "update or delete on table \"{}\" violates foreign key constraint \"{}\" \
-                     on table \"{}\"",
-                    parent_table, fk.name, child_table
-                ));
+            let referencing = referenced_values_now(
+                database,
+                &child_table,
+                &fk.column,
+                &referenced.literals,
+                tx,
+                Some(1),
+            )
+            .await
+            .map_err(unchecked)?;
+            if !referencing.is_empty() {
+                return Err(violation());
             }
             continue;
         }
 
         let statement = match fk.on_delete {
-            crate::core::rql::foreign_key::ReferentialAction::Cascade => {
+            ReferentialAction::Cascade => {
                 format!(
                     "DELETE FROM {} WHERE {} IN ({})",
                     child_table, fk.column, list
                 )
             }
-            crate::core::rql::foreign_key::ReferentialAction::SetNull => {
+            ReferentialAction::SetNull => {
                 format!(
                     "UPDATE {} SET {} = NULL WHERE {} IN ({})",
                     child_table, fk.column, fk.column, list
                 )
             }
-            crate::core::rql::foreign_key::ReferentialAction::SetDefault => {
+            ReferentialAction::SetDefault => {
                 let literal = default_literal_for(database, &child_table, &fk.column);
                 format!(
                     "UPDATE {} SET {} = {} WHERE {} IN ({})",
@@ -666,50 +1416,700 @@ async fn apply_on_delete(
                 fk.name, child_table, message
             ));
         }
+
+        // The action ran through this transaction's snapshot. Under
+        // `REPEATABLE READ` that can predate a child committed while the key
+        // lock was being waited for, and the action then never saw it. Asked
+        // as of now, anything still referencing the keys is exactly such a
+        // row — refused, never left behind as an orphan.
+        let left = referenced_values_now(
+            database,
+            &child_table,
+            &fk.column,
+            &referenced.literals,
+            tx,
+            Some(1),
+        )
+        .await
+        .map_err(unchecked)?;
+        if !left.is_empty() {
+            return Err(match fk.on_delete {
+                // The declared default is itself one of the deleted keys.
+                ReferentialAction::SetDefault => violation(),
+                _ => format!(
+                    "could not serialize access: a row of \"{}\" referencing \"{}\" was \
+                     committed after this transaction's snapshot, so foreign key \"{}\" could \
+                     not act on it",
+                    child_table, parent_table, fk.name
+                ),
+            });
+        }
     }
 
     Ok(())
 }
 
-/// The referenced values of the rows a `DELETE` is about to remove.
-async fn keys_about_to_be_deleted(
+/// The referenced values of the rows a `DELETE` is about to remove, one entry
+/// per parent column some foreign key references.
+///
+/// Per column: this used to collect the values of whichever referenced column
+/// came first and match *every* referencing table against them, so with two
+/// foreign keys on two different columns of one parent a delete cascaded into
+/// the children of a different, surviving parent.
+///
+/// Read through `visibility` — the snapshot the `DELETE` itself then scans
+/// with — and with the statement's own engine-form predicate and fetch, so the
+/// rows whose keys are processed are exactly the rows deleted. It used to be a
+/// separate `SELECT` with a snapshot of its own; in `READ COMMITTED` a parent
+/// row committed between that `SELECT` and the delete's scan was deleted with
+/// its children never considered.
+async fn keys_about_to_be_deleted<S: crate::core::storage_providers::traits::StorageIO>(
     database: &Arc<Database>,
+    table: &crate::core::row::table::Table<S>,
     table_name: &str,
     where_clause: &str,
-    tx: TxId,
-) -> Result<Vec<String>, String> {
-    let columns: Vec<String> = referencing_keys(database, table_name)
-        .into_iter()
-        .map(|(_, fk)| fk.parent_column)
-        .collect();
-    let Some(column) = columns.first() else {
-        return Ok(Vec::new());
-    };
+    query_row_fetch: &crate::core::row::row::RowFetch,
+    visibility: &crate::core::mvcc::Visibility,
+) -> Result<Vec<ReferencedColumn>, String> {
+    let mut columns: Vec<String> = Vec::new();
+    for (_, fk) in referencing_keys(database, table_name) {
+        if !columns
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(&fk.parent_column))
+        {
+            columns.push(fk.parent_column);
+        }
+    }
 
-    let probe = if where_clause.trim().is_empty() {
-        format!("SELECT {} FROM {}", column, table_name)
-    } else {
-        format!(
-            "SELECT {} FROM {} WHERE {}",
-            column, table_name, where_clause
+    let mut out = Vec::with_capacity(columns.len());
+    for column in columns {
+        let values =
+            column_values_as_of(table, &column, where_clause, query_row_fetch, visibility)
+                .await?;
+        let mut referenced = ReferencedColumn {
+            column,
+            stored: Vec::with_capacity(values.len()),
+            literals: Vec::with_capacity(values.len()),
+        };
+        for (bytes, literal) in values {
+            referenced.stored.push(bytes);
+            referenced.literals.push(literal);
+        }
+        out.push(referenced);
+    }
+
+    Ok(out)
+}
+
+/// The distinct non-NULL values of `column` in the rows `where_clause`
+/// matches under `visibility`: stored bytes, and the same value as a literal.
+///
+/// The predicate is in engine form and `query_row_fetch` is what it reads —
+/// both straight from the statement's own plan.
+async fn column_values_as_of<S: crate::core::storage_providers::traits::StorageIO>(
+    table: &crate::core::row::table::Table<S>,
+    column: &str,
+    where_clause: &str,
+    query_row_fetch: &crate::core::row::row::RowFetch,
+    visibility: &crate::core::mvcc::Visibility,
+) -> Result<Vec<(Vec<u8>, String)>, String> {
+    let schema = &table.schema.fields;
+    let Some(field) = schema
+        .iter()
+        .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(column))
+        .cloned()
+    else {
+        return Err(format!(
+            "column \"{}\" of relation \"{}\" does not exist",
+            column, table.schema.name
+        ));
+    };
+    // The companion, if the column is nullable: a NULL's value bytes are the
+    // type's zero, and a zero key would be locked and cascaded as if real.
+    let flag = crate::core::rql::nullable::flag_field(&field.name, schema).cloned();
+    let mut wanted = vec![field.clone()];
+    if let Some(f) = &flag {
+        wanted.push(f.clone());
+    }
+    let requested = crate::core::rql::join::fetch_for(&wanted, schema);
+
+    let rows = table
+        .query_row_with_visibility(
+            where_clause,
+            &schema.to_vec(),
+            query_row_fetch.clone(),
+            requested,
+            None,
+            None,
+            visibility.clone(),
         )
-    };
+        .await
+        .map_err(|e| e.to_string())?;
 
-    let rows = run_subquery(&probe, database, tx).await?;
-    let mut keys = Vec::with_capacity(rows.len());
+    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    let mut out = Vec::new();
     for row in &rows {
-        let Some(cell) = row.columns.first() else {
+        if let Some(f) = &flag {
+            let is_null = row
+                .columns
+                .iter()
+                .find(|c| u64::from(c.schema_id) == f.write_order)
+                .is_some_and(|c| c.data.into_slice().first().copied().unwrap_or(0) != 0);
+            if is_null {
+                continue;
+            }
+        }
+        let Some(cell) = row.columns.iter().find(|c| u64::from(c.schema_id) == field.write_order) else {
             continue;
         };
-        let Some(literal) =
-            crate::core::rql::subquery::value_to_literal(&cell.column_type, cell.data.into_slice())
+        let bytes = cell.data.into_slice();
+        if !seen.insert(bytes.to_vec()) {
+            continue;
+        }
+        out.push((bytes.to_vec(), key_literal(&field, bytes)?));
+    }
+    Ok(out)
+}
+
+/// A stored key value as a SQL literal, rendered by the column's declared type
+/// — never the cell's, which `physical()` has already erased — and at a
+/// `NUMERIC`'s own scale.
+fn key_literal(
+    field: &crate::core::row::schema::SchemaField,
+    bytes: &[u8],
+) -> Result<String, String> {
+    if field.db_type == crate::core::db_type::DbType::DECIMAL {
+        if let (Some(scale), Ok(raw)) = (field.scale, <[u8; 16]>::try_from(bytes)) {
+            return Ok(crate::core::value_codec::format_decimal_scaled(
+                i128::from_le_bytes(raw),
+                scale,
+            ));
+        }
+    }
+    // Refused rather than skipped: a key that cannot be named cannot have its
+    // referencing rows found, and skipping it would orphan them in silence.
+    crate::core::rql::subquery::value_to_literal(&field.db_type, bytes).ok_or_else(|| {
+        format!(
+            "foreign keys on column \"{}\" of type {:?} cannot be maintained",
+            field.name, field.db_type
+        )
+    })
+}
+
+/// What an `UPDATE` is about to do to the keys foreign keys reference.
+///
+/// Read through the statement's snapshot, which the update then scans with, so
+/// no key changes unseen. See `keys_about_to_be_deleted`.
+pub(crate) struct KeyChanges {
+    columns: Vec<KeyChange>,
+}
+
+/// One referenced column's changes: every old value the update moves, and
+/// what it moves to (`None` for NULL). Unchanged values are left out — an
+/// `UPDATE` that rewrites a key to itself changes nothing a child can see.
+struct KeyChange {
+    column: String,
+    old_stored: Vec<Vec<u8>>,
+    old_literals: Vec<String>,
+    new_literals: Vec<Option<String>>,
+}
+
+/// Whether an `UPDATE` needs one snapshot for the whole statement: a foreign
+/// key references a column it assigns, or one of its own foreign-key columns
+/// is assigned an expression whose per-row values have to be checked.
+fn update_needs_statement_snapshot<S: crate::core::storage_providers::traits::StorageIO>(
+    database: &Arc<Database>,
+    table: &crate::core::row::table::Table<S>,
+    table_name: &str,
+    plan: &crate::core::rql::lexer_ur::UpdateRow,
+) -> bool {
+    let assigned = |name: &str| {
+        table
+            .schema
+            .fields
+            .iter()
+            .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(name))
+            .is_some_and(|f| {
+                let wo = f.write_order as u32;
+                plan.updates.iter().any(|u| u.write_order == wo)
+                    || plan.expressions.iter().any(|(w, _)| *w == wo)
+            })
+    };
+    let by_expression = |name: &str| {
+        table
+            .schema
+            .fields
+            .iter()
+            .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(name))
+            .is_some_and(|f| plan.expressions.iter().any(|(w, _)| *w == f.write_order as u32))
+    };
+    table.schema.foreign_keys.iter().any(|fk| by_expression(&fk.column))
+        || referencing_keys(database, table_name)
+            .iter()
+            .any(|(_, fk)| assigned(&fk.parent_column))
+}
+
+/// The child side of an `UPDATE`'s foreign keys.
+///
+/// A constant assignment is checked as one literal, as an `INSERT`'s is. An
+/// assignment that is an expression — `pid = pid + 1`, a `CASE`, which is also
+/// what `ON UPDATE CASCADE` writes into a child — has a value per row, so each
+/// row's new value is computed exactly as the write path will and every
+/// distinct one is checked. It used to be pasted into the probe as if it were
+/// a literal, which failed to parse at best and compared against the wrong
+/// thing at worst.
+async fn check_foreign_keys_for_update<S: crate::core::storage_providers::traits::StorageIO>(
+    database: &Arc<Database>,
+    table: &crate::core::row::table::Table<S>,
+    table_name: &str,
+    plan: &crate::core::rql::lexer_ur::UpdateRow,
+    assignments: &[(String, String)],
+    visibility: Option<&crate::core::mvcc::Visibility>,
+    tx: TxId,
+) -> Result<(), String> {
+    let schema = &table.schema.fields;
+    let expression_of = |name: &str| {
+        schema
+            .iter()
+            .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(name))
+            .and_then(|f| {
+                plan.expressions
+                    .iter()
+                    .find(|(w, _)| *w == f.write_order as u32)
+                    .map(|(_, e)| (f.clone(), e))
+            })
+    };
+
+    let constants: Vec<(String, String)> = assignments
+        .iter()
+        .filter(|(column, _)| expression_of(column).is_none())
+        .cloned()
+        .collect();
+    check_foreign_keys(database, table_name, &constants, tx).await?;
+
+    let by_expression: Vec<_> = table
+        .schema
+        .foreign_keys
+        .iter()
+        .filter_map(|fk| expression_of(&fk.column).map(|(f, e)| (fk.column.clone(), f, e)))
+        .collect();
+    if by_expression.is_empty() {
+        return Ok(());
+    }
+    let Some(visibility) = visibility else {
+        return Err("an expression assigned to a foreign-key column needs a statement snapshot"
+            .to_string());
+    };
+    let full = crate::core::row::table::Table::<S>::build_full_row_fetch(schema);
+    let rows = table
+        .query_row_with_visibility(
+            &plan.where_clause,
+            &schema.to_vec(),
+            plan.query_row_fetch.clone(),
+            full,
+            None,
+            None,
+            visibility.clone(),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    for (column, field, expr) in by_expression {
+        let mut seen = std::collections::HashSet::new();
+        for row in &rows {
+            let value = crate::core::rql::expr::eval(expr, row, schema.as_slice())
+                .and_then(|v| crate::core::rql::expr::from_engine_scale(v, &field))?;
+            let literal = match value {
+                crate::core::rql::expr::Value::Null => continue,
+                crate::core::rql::expr::Value::Data { bytes, db_type } => {
+                    if db_type == field.db_type {
+                        key_literal(&field, &bytes)?
+                    } else {
+                        crate::core::rql::subquery::value_to_literal(&db_type, &bytes)
+                            .ok_or_else(|| {
+                                format!("the new value of \"{}\" is unrepresentable", column)
+                            })?
+                    }
+                }
+            };
+            if seen.insert(literal.clone()) {
+                check_foreign_keys(database, table_name, &[(column.clone(), literal)], tx).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The parent side of `ON UPDATE`: which referenced keys this `UPDATE`
+/// changes, per row, computed exactly as the write path will — constant
+/// assignments from the plan's payloads, expressions evaluated against each
+/// row as it stands before the update.
+///
+/// `None` when no foreign key references a column the statement assigns, so
+/// every other `UPDATE` pays one map lookup.
+async fn keys_about_to_change<S: crate::core::storage_providers::traits::StorageIO>(
+    database: &Arc<Database>,
+    table: &crate::core::row::table::Table<S>,
+    table_name: &str,
+    plan: &crate::core::rql::lexer_ur::UpdateRow,
+    visibility: &crate::core::mvcc::Visibility,
+) -> Result<Option<KeyChanges>, String> {
+    let schema = &table.schema.fields;
+    let assigned = |write_order: u32| {
+        plan.updates.iter().any(|u| u.write_order == write_order)
+            || plan.expressions.iter().any(|(w, _)| *w == write_order)
+    };
+
+    let mut columns: Vec<crate::core::row::schema::SchemaField> = Vec::new();
+    for (_, fk) in referencing_keys(database, table_name) {
+        let Some(field) = schema
+            .iter()
+            .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(&fk.parent_column))
         else {
             continue;
         };
-        keys.push(literal);
+        let flag = crate::core::rql::nullable::flag_field(&field.name, schema);
+        let touched = assigned(field.write_order as u32)
+            || flag.is_some_and(|f| assigned(f.write_order as u32));
+        if touched && !columns.iter().any(|c| c.write_order == field.write_order) {
+            columns.push(field.clone());
+        }
+    }
+    if columns.is_empty() {
+        return Ok(None);
     }
 
-    Ok(keys)
+    let full = crate::core::row::table::Table::<S>::build_full_row_fetch(schema);
+    let rows = table
+        .query_row_with_visibility(
+            &plan.where_clause,
+            &schema.to_vec(),
+            plan.query_row_fetch.clone(),
+            full,
+            None,
+            None,
+            visibility.clone(),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let cell = |row: &crate::core::row::row::Row, write_order: u64| -> Option<Vec<u8>> {
+        row.columns
+            .iter()
+            .find(|c| c.schema_id as u64 == write_order)
+            .map(|c| c.data.into_slice().to_vec())
+    };
+
+    let mut changes = Vec::with_capacity(columns.len());
+    for field in columns {
+        let flag = crate::core::rql::nullable::flag_field(&field.name, schema).cloned();
+        let wo = field.write_order as u32;
+        let mut change = KeyChange {
+            column: field.name.clone(),
+            old_stored: Vec::new(),
+            old_literals: Vec::new(),
+            new_literals: Vec::new(),
+        };
+        let mut index: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
+        for row in &rows {
+            let old_null = flag.as_ref().is_some_and(|f| {
+                cell(row, f.write_order as u64).is_some_and(|b| b.first().copied().unwrap_or(0) != 0)
+            });
+            if old_null {
+                continue;
+            }
+            let Some(old) = cell(row, field.write_order as u64) else {
+                continue;
+            };
+
+            // The new value, as the write path will compute it.
+            let new: Option<(Vec<u8>, crate::core::db_type::DbType)> = if let Some((_, expr)) =
+                plan.expressions.iter().find(|(w, _)| *w == wo)
+            {
+                let value = crate::core::rql::expr::eval(expr, row, schema.as_slice())
+                    .and_then(|v| crate::core::rql::expr::from_engine_scale(v, &field))?;
+                match value {
+                    crate::core::rql::expr::Value::Null => None,
+                    crate::core::rql::expr::Value::Data { bytes, db_type } => {
+                        Some((bytes.to_vec(), db_type))
+                    }
+                }
+            } else {
+                let set_null = flag.as_ref().is_some_and(|f| {
+                    plan.updates.iter().any(|u| {
+                        u.write_order == f.write_order as u32
+                            && u.data.into_slice().first().copied().unwrap_or(0) != 0
+                    })
+                });
+                if set_null {
+                    None
+                } else {
+                    match plan.updates.iter().find(|u| u.write_order == wo) {
+                        Some(u) => Some((u.data.into_slice().to_vec(), field.db_type.clone())),
+                        // Only the companion was assigned, and to "not null":
+                        // the value bytes stay what they were.
+                        None => Some((old.clone(), field.db_type.clone())),
+                    }
+                }
+            };
+            let new_literal = match &new {
+                Some((bytes, ty)) if *ty == field.db_type => Some(key_literal(&field, bytes)?),
+                // An expression's result is in the type it computed in (`3 - id`
+                // over an INT is a BIGINT), which the write path narrows; its
+                // literal is rendered in that type, and compared as a literal.
+                Some((bytes, ty)) => Some(
+                    crate::core::rql::subquery::value_to_literal(ty, bytes).ok_or_else(|| {
+                        format!(
+                            "cannot apply ON UPDATE for \"{}\": the new value is unrepresentable",
+                            field.name
+                        )
+                    })?,
+                ),
+                None => None,
+            };
+            let old_literal = key_literal(&field, &old)?;
+            if new_literal.as_deref() == Some(old_literal.as_str()) {
+                continue;
+            }
+            match index.get(&old) {
+                Some(&i) => {
+                    if change.new_literals[i] != new_literal {
+                        return Err(format!(
+                            "cannot apply ON UPDATE for \"{}\": rows sharing the key {} are \
+                             updated to different values",
+                            field.name, change.old_literals[i]
+                        ));
+                    }
+                }
+                None => {
+                    index.insert(old.clone(), change.old_stored.len());
+                    change.old_literals.push(old_literal);
+                    change.old_stored.push(old);
+                    change.new_literals.push(new_literal);
+                }
+            }
+        }
+        if !change.old_stored.is_empty() {
+            changes.push(change);
+        }
+    }
+    if changes.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(KeyChanges { columns: changes }))
+}
+
+/// Before the `UPDATE` writes: locks every key it moves — the same exclusive
+/// key lock a `DELETE` takes, so a child insert in flight is waited for and
+/// one arriving later waits — and applies `ON UPDATE RESTRICT`, which refuses
+/// immediately rather than at the end of the statement.
+async fn lock_keys_before_update(
+    database: &Arc<Database>,
+    parent_table: &str,
+    changes: &KeyChanges,
+    tx: TxId,
+) -> Result<(), String> {
+    for change in &changes.columns {
+        for key in &change.old_stored {
+            acquire_referenced_waiting(
+                database,
+                parent_table,
+                &change.column,
+                key,
+                tx,
+                crate::core::rql::row_lock::LockStrength::Update,
+            )
+            .await?;
+        }
+    }
+    for (child_table, fk) in referencing_keys(database, parent_table) {
+        if fk.on_update != crate::core::rql::foreign_key::ReferentialAction::Restrict {
+            continue;
+        }
+        let Some(change) = changes
+            .columns
+            .iter()
+            .find(|c| c.column.eq_ignore_ascii_case(&fk.parent_column))
+        else {
+            continue;
+        };
+        let referencing = referenced_values_now(
+            database,
+            &child_table,
+            &fk.column,
+            &change.old_literals,
+            tx,
+            Some(1),
+        )
+        .await
+        .map_err(|e| format!("foreign key \"{}\" could not be checked: {}", fk.name, e))?;
+        if !referencing.is_empty() {
+            return Err(format!(
+                "update or delete on table \"{}\" violates foreign key constraint \"{}\" on \
+                 table \"{}\"",
+                parent_table, fk.name, child_table
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// After the `UPDATE` wrote: each referencing table's `ON UPDATE` action.
+///
+/// `NO ACTION` is checked here, at the end of the statement as PostgreSQL
+/// does, and only for old keys that no parent row still holds — an update that
+/// moves one row's key onto another's (a swap) leaves nothing orphaned.
+/// `CASCADE` rewrites every pair in one statement (`CASE`), so pairs that
+/// chain — one row's new key another's old one — are applied to the children
+/// as they were, not one after another. Afterwards, as for `ON DELETE`, anything still
+/// referencing a vanished key as of now is a row the action could not see.
+async fn apply_on_update(
+    database: &Arc<Database>,
+    parent_table: &str,
+    changes: &KeyChanges,
+    depth: usize,
+    tx: TxId,
+) -> Result<(), String> {
+    use crate::core::rql::foreign_key::ReferentialAction;
+
+    if depth >= MAX_CASCADE_DEPTH {
+        return Err(format!(
+            "foreign key actions from \"{}\" nested more than {} levels deep, which suggests a \
+             cycle",
+            parent_table, MAX_CASCADE_DEPTH
+        ));
+    }
+
+    for (child_table, fk) in referencing_keys(database, parent_table) {
+        let Some(change) = changes
+            .columns
+            .iter()
+            .find(|c| c.column.eq_ignore_ascii_case(&fk.parent_column))
+        else {
+            continue;
+        };
+        let unchecked =
+            |e: String| format!("foreign key \"{}\" could not be checked: {}", fk.name, e);
+        let violation = || {
+            format!(
+                "update or delete on table \"{}\" violates foreign key constraint \"{}\" on \
+                 table \"{}\"",
+                parent_table, fk.name, child_table
+            )
+        };
+
+        // Old keys no parent holds any more, as of now.
+        let present: std::collections::HashSet<Vec<u8>> = referenced_values_now(
+            database,
+            parent_table,
+            &change.column,
+            &change.old_literals,
+            tx,
+            None,
+        )
+        .await
+        .map_err(unchecked)?
+        .into_iter()
+        .collect();
+        let vanished: Vec<usize> = (0..change.old_stored.len())
+            .filter(|i| !present.contains(&change.old_stored[*i]))
+            .collect();
+        if vanished.is_empty() {
+            continue;
+        }
+        let vanished_literals: Vec<String> =
+            vanished.iter().map(|i| change.old_literals[*i].clone()).collect();
+
+        let statement = match fk.on_update {
+            // Restrict refused before the write.
+            ReferentialAction::NoAction | ReferentialAction::Restrict => None,
+            ReferentialAction::Cascade => {
+                let new_of = |i: usize| {
+                    change.new_literals[i]
+                        .clone()
+                        .unwrap_or_else(|| "NULL".to_string())
+                };
+                let set = if vanished.len() == 1 {
+                    new_of(vanished[0])
+                } else {
+                    let mut case = "CASE".to_string();
+                    for i in &vanished {
+                        case.push_str(&format!(
+                            " WHEN {} = {} THEN {}",
+                            fk.column,
+                            change.old_literals[*i],
+                            new_of(*i)
+                        ));
+                    }
+                    case.push_str(&format!(" ELSE {} END", fk.column));
+                    case
+                };
+                Some(format!(
+                    "UPDATE {} SET {} = {} WHERE {} IN ({})",
+                    child_table,
+                    fk.column,
+                    set,
+                    fk.column,
+                    vanished_literals.join(", ")
+                ))
+            }
+            ReferentialAction::SetNull => Some(format!(
+                "UPDATE {} SET {} = NULL WHERE {} IN ({})",
+                child_table,
+                fk.column,
+                fk.column,
+                vanished_literals.join(", ")
+            )),
+            ReferentialAction::SetDefault => {
+                let literal = default_literal_for(database, &child_table, &fk.column);
+                Some(format!(
+                    "UPDATE {} SET {} = {} WHERE {} IN ({})",
+                    child_table,
+                    fk.column,
+                    literal,
+                    fk.column,
+                    vanished_literals.join(", ")
+                ))
+            }
+        };
+
+        if let Some(statement) = statement {
+            let Some(purpose) = recognize_query_purpose(&statement) else {
+                return Err(format!("could not build the action for \"{}\"", fk.name));
+            };
+            let response =
+                Box::pin(execute_with_context(purpose, database.clone(), depth + 1, tx)).await;
+            if response.first() == Some(&3) {
+                let message = String::from_utf8_lossy(&response[1..]).to_string();
+                return Err(format!(
+                    "foreign key \"{}\" action on \"{}\" failed: {}",
+                    fk.name, child_table, message
+                ));
+            }
+        }
+
+        let left = referenced_values_now(
+            database,
+            &child_table,
+            &fk.column,
+            &vanished_literals,
+            tx,
+            Some(1),
+        )
+        .await
+        .map_err(unchecked)?;
+        if !left.is_empty() {
+            return Err(match fk.on_update {
+                ReferentialAction::Cascade | ReferentialAction::SetNull => format!(
+                    "could not serialize access: a row of \"{}\" referencing \"{}\" was \
+                     committed after this transaction's snapshot, so foreign key \"{}\" could \
+                     not act on it",
+                    child_table, parent_table, fk.name
+                ),
+                _ => violation(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Adds columns to a table that already holds rows, by rewriting them.
@@ -832,7 +2232,7 @@ async fn rewrite_table_with_columns(
                 .iter()
                 .filter_map(|c| {
                     name_of
-                        .get(&c.schema_id)
+                        .get(&u64::from(c.schema_id))
                         .map(|name| (name.clone(), c.data.clone(), c.column_type.clone()))
                 })
                 .collect(),
@@ -1352,13 +2752,7 @@ async fn store_json_document(
 
 /// A fresh v4 UUID, formatted, to identify one stored document.
 fn new_json_reference() -> String {
-    let mut id = [0u8; 16];
-    for byte in id.iter_mut() {
-        *byte = fastrand::u8(..);
-    }
-    id[6] = (id[6] & 0x0f) | 0x40;
-    id[8] = (id[8] & 0x3f) | 0x80;
-    crate::core::value_codec::format_uuid(&id)
+    crate::core::value_codec::format_uuid(&crate::core::value_codec::random_uuid_v4())
 }
 
 /// Maps an object's fields onto shadow-table columns, creating and widening
@@ -1808,6 +3202,7 @@ async fn constant_select_insert(
     prefix: &str,
     select_sql: &str,
     returning_tail: Option<&str>,
+    conflict: &InsertConflict,
     database: &Arc<Database>,
     depth: usize,
     tx: TxId,
@@ -1884,9 +3279,31 @@ async fn constant_select_insert(
             .map(|tail| format!(" RETURNING {}", tail))
             .unwrap_or_default()
     );
-    let purpose = recognize_query_purpose(&rewritten)
+    let mut purpose = recognize_query_purpose(&rewritten)
         .ok_or_else(|| "could not parse the rewritten constant INSERT".to_string())?;
+    conflict.restore(&mut purpose);
     Ok(Box::pin(execute_with_context(purpose, database.clone(), depth, tx)).await)
+}
+
+/// The `ON CONFLICT` clause of an `INSERT`, as parsed.
+///
+/// The clause is split off the statement before anything else reads it, so a
+/// statement *rewritten* from the original — `INSERT … SELECT` turned into
+/// `INSERT … VALUES` — re-parses without it. Carried across and restored, as
+/// the multi-row `VALUES` path does; without it `INSERT … SELECT … ON CONFLICT
+/// DO NOTHING` raised a duplicate-key error for every conflicting row.
+pub(crate) struct InsertConflict {
+    pub do_nothing: bool,
+    pub update: Option<crate::core::rql::lexer_s1::ConflictUpdate>,
+}
+
+impl InsertConflict {
+    fn restore(&self, purpose: &mut QueryPurpose) {
+        if let QueryPurpose::InsertRow(data) = purpose {
+            data.on_conflict_do_nothing = self.do_nothing;
+            data.on_conflict_update = self.update.clone();
+        }
+    }
 }
 
 /// Evaluates a condition built only from literals, such as the `1 = 1` an
@@ -1922,41 +3339,55 @@ async fn execute_union(sql: &str, database: &Arc<Database>, tx: TxId) -> Vec<u8>
         return ddl_error("not a UNION");
     };
 
-    let mut rows: Vec<crate::core::row::row::Row> = Vec::new();
-    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    // The branches' rows stay serialized from the subquery response to the
+    // result: no `Vec<Row>` (1.5 KB a row), and `UNION`'s duplicate check keeps
+    // a hash table of where each kept row starts in `result` rather than a byte
+    // copy of every row. Two rows are equal exactly when their serialized
+    // forms are, as before.
+    use std::hash::BuildHasher;
+    let mut result = vec![2u8];
+    let mut starts: Vec<usize> = Vec::new();
+    let state = ahash::RandomState::new();
+    let mut seen: hashbrown::HashTable<u32> = hashbrown::HashTable::new();
+    let row_at = |result: &[u8], starts: &[usize], i: u32| -> std::ops::Range<usize> {
+        let i = i as usize;
+        starts[i]..starts.get(i + 1).copied().unwrap_or(result.len())
+    };
 
-    for branch in &branches {
+    'branches: for branch in &branches {
         if branch.trim().is_empty() {
             return ddl_error("a UNION branch is empty");
         }
-        let branch_rows = match run_subquery(branch, database, tx).await {
-            Ok(rows) => rows,
+        let branch_bytes = match run_subquery_serialized(branch, database, tx).await {
+            Ok(bytes) => bytes,
             Err(e) => {
                 error!("UNION branch failed: {}", e);
                 return ddl_error(&e);
             }
         };
-        for row in branch_rows {
+        for row in crate::core::row::row::serialized_rows(&branch_bytes) {
+            if limit.is_some_and(|n| starts.len() as u64 >= n) {
+                break 'branches;
+            }
+            let row = match row {
+                Ok(row) => row,
+                Err(e) => return ddl_error(&format!("a UNION branch's rows could not be read: {}", e)),
+            };
             if !all {
-                let mut key = Vec::new();
-                row.extend_serialized(&mut key);
-                if !seen.insert(key) {
+                let hash = state.hash_one(row);
+                if seen
+                    .find(hash, |i| &result[row_at(&result, &starts, *i)] == row)
+                    .is_some()
+                {
                     continue;
                 }
+                seen.insert_unique(hash, starts.len() as u32, |i| {
+                    state.hash_one(&result[row_at(&result, &starts, *i)])
+                });
             }
-            rows.push(row);
-            if limit.is_some_and(|n| rows.len() as u64 >= n) {
-                break;
-            }
+            starts.push(result.len());
+            result.extend_from_slice(row);
         }
-        if limit.is_some_and(|n| rows.len() as u64 >= n) {
-            break;
-        }
-    }
-
-    let mut result = vec![2u8];
-    for row in &rows {
-        row.extend_serialized(&mut result);
     }
     result
 }
@@ -2302,9 +3733,8 @@ fn scalar_comparison_holds(value: &str, op: &str, literal: &str) -> Result<bool,
     // Numbers compare numerically; anything else compares as text, which is
     // what an equality against a quoted constant wants.
     let ordering = match (lhs.parse::<f64>(), rhs.parse::<f64>()) {
-        (Ok(a), Ok(b)) => a
-            .partial_cmp(&b)
-            .ok_or_else(|| format!("cannot order '{}' against '{}'", lhs, rhs))?,
+        // PostgreSQL's float order, NaN included, shared with ORDER BY.
+        (Ok(a), Ok(b)) => crate::core::processor::concurrent_processor::pg_float_cmp(a, b),
         _ => lhs.cmp(rhs),
     };
     use std::cmp::Ordering::*;
@@ -2461,7 +3891,8 @@ async fn delete_using_join(
 
     // One delete per DISTINCT key: several source rows may match one target
     // row, and it can only be deleted once.
-    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    let mut seen: ahash::HashSet<Vec<u8>> =
+        ahash::HashSet::with_capacity_and_hasher(rows.len(), Default::default());
     let mut deleted = 0u64;
     let mut returned: Vec<u8> = Vec::new();
     for row in &rows {
@@ -2665,8 +4096,6 @@ async fn update_from_join(
     let returning_unqualified =
         returning.map(|r| format!("RETURNING {}", strip_qualifier(r.trim(), target_alias)));
 
-    let mut written = 0u64;
-    let mut returned: Vec<u8> = Vec::new();
     for row in &rows {
         if row.columns.len() < projection.len() {
             return Err(format!(
@@ -2675,6 +4104,56 @@ async fn update_from_join(
                 projection.len()
             ));
         }
+    }
+
+    // Decide every row's correlated terms before writing any row.
+    //
+    // PostgreSQL evaluates the whole statement against the snapshot it started
+    // with, so a subquery over the target table does not see the rows this
+    // statement has already updated. Deciding row by row between the writes
+    // let each subquery see the earlier writes — `(SELECT COUNT(*) … done = 1)
+    // = 0` updated one row per group where PostgreSQL updates them all.
+    //
+    // Deciding first also means the answer depends only on the substituted
+    // text, so each distinct one runs once: 4 000 joined rows over four groups
+    // ran 4 000 subqueries, each a scan, and now run four.
+    let mut keep_row: Vec<bool> = vec![true; rows.len()];
+    if !correlated.is_empty() {
+        let mut answers: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for (i, row) in rows.iter().enumerate() {
+            let mut bindings: Vec<(String, String)> = Vec::with_capacity(carried.len());
+            for (offset, reference) in carried.iter().enumerate() {
+                let column = &row.columns[carried_at + offset];
+                let literal = crate::core::rql::subquery::value_to_literal(
+                    &column.column_type,
+                    column.data.into_slice(),
+                )
+                .ok_or_else(|| "a joined value cannot be written".to_string())?;
+                bindings.push((reference.clone(), literal));
+            }
+            for term in &correlated {
+                let resolved = substitute_outer_refs(&term.inner_sql, &bindings);
+                let value = match answers.get(&resolved) {
+                    Some(value) => value.clone(),
+                    None => {
+                        let produced = run_subquery(&resolved, database, tx).await?;
+                        let value = crate::core::rql::subquery::rows_to_scalar(&produced)?;
+                        answers.insert(resolved, value.clone());
+                        value
+                    }
+                };
+                if !scalar_comparison_holds(&value, &term.op, &term.literal)? {
+                    keep_row[i] = false;
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut written = 0u64;
+    let mut returned: Vec<u8> = Vec::new();
+    for (row, _) in rows.iter().zip(&keep_row).filter(|(_, keep)| **keep) {
         let literal_at = |index: usize| -> Result<String, String> {
             let column = &row.columns[index];
             crate::core::rql::subquery::value_to_literal(
@@ -2683,27 +4162,6 @@ async fn update_from_join(
             )
             .ok_or_else(|| "a joined value cannot be written".to_string())
         };
-
-        // Decide the correlated terms for this row before writing anything.
-        if !correlated.is_empty() {
-            let mut bindings: Vec<(String, String)> = Vec::with_capacity(carried.len());
-            for (offset, reference) in carried.iter().enumerate() {
-                bindings.push((reference.clone(), literal_at(carried_at + offset)?));
-            }
-            let mut keep = true;
-            for term in &correlated {
-                let resolved = substitute_outer_refs(&term.inner_sql, &bindings);
-                let produced = run_subquery(&resolved, database, tx).await?;
-                let value = crate::core::rql::subquery::rows_to_scalar(&produced)?;
-                if !scalar_comparison_holds(&value, &term.op, &term.literal)? {
-                    keep = false;
-                    break;
-                }
-            }
-            if !keep {
-                continue;
-            }
-        }
 
         let key_literal = literal_at(0)?;
         let mut sets: Vec<String> = Vec::with_capacity(assignments.len());
@@ -2935,7 +4393,7 @@ async fn lock_selected_rows(
     let key_at = |row: &crate::core::row::row::Row| -> Option<Vec<u8>> {
         row.columns
             .iter()
-            .find(|c| c.schema_id == key_field.write_order)
+            .find(|c| u64::from(c.schema_id) == key_field.write_order)
             .map(|c| c.data.into_slice().to_vec())
     };
 
@@ -2967,8 +4425,30 @@ async fn lock_selected_rows(
             .row_locks
             .acquire(table_name, &key, tx, lock.strength, &live);
         if matches!(lock.behaviour, LockWait::Wait) {
-            let deadline = std::time::Instant::now() + LOCK_WAIT_TIMEOUT;
+            let started = std::time::Instant::now();
+            let deadline = started + LOCK_WAIT_TIMEOUT;
+            let _waiting = database.row_locks.waiting_guard(tx);
             while let Acquired::Held(_) = outcome {
+                // The statement's own bound comes first: `statement_timeout`
+                // and a client that has gone both end the wait, as the same
+                // error a cancelled scan reports. An error and never the rows
+                // locked so far — a short claim would read as a complete one.
+                if let Some(reason) = crate::core::cancel::tripped() {
+                    return Err(reason.eval_error().as_str().to_string());
+                }
+                if let Some(deadlock) = deadlock_check(
+                    database,
+                    tx,
+                    started,
+                    || {
+                        database
+                            .row_locks
+                            .row_blockers(table_name, &key, tx, lock.strength, &live)
+                    },
+                    &live,
+                ) {
+                    return Err(deadlock);
+                }
                 if std::time::Instant::now() >= deadline {
                     break;
                 }
@@ -3041,8 +4521,28 @@ async fn execute_lock_table(
             .row_locks
             .acquire_table(name, tx, statement.mode, &live);
         if !statement.nowait {
-            let deadline = std::time::Instant::now() + LOCK_WAIT_TIMEOUT;
+            let started = std::time::Instant::now();
+            let deadline = started + LOCK_WAIT_TIMEOUT;
+            let _waiting = database.row_locks.waiting_guard(tx);
             while let Acquired::Held(_) = outcome {
+                // `statement_timeout` and a departed client end the wait, as
+                // the cancellation error rather than the lock-timeout one.
+                if let Some(reason) = crate::core::cancel::tripped() {
+                    return ddl_error(reason.eval_error().as_str());
+                }
+                if let Some(deadlock) = deadlock_check(
+                    &database,
+                    tx,
+                    started,
+                    || {
+                        database
+                            .row_locks
+                            .table_blockers(name, tx, statement.mode, &live)
+                    },
+                    &live,
+                ) {
+                    return ddl_error(&deadlock);
+                }
                 if std::time::Instant::now() >= deadline {
                     break;
                 }
@@ -3163,13 +4663,29 @@ fn check_not_null(
 /// `SELECT … FOR UPDATE` would reserve rows that another connection could then
 /// overwrite, which is the lost update the clause exists to prevent.
 ///
-/// Costs nothing when nobody holds a lock — the common case — because the lock
-/// table is consulted first and is empty.
+/// Costs nothing when nobody holds a row lock — the common case — because the
+/// lock table's count is consulted first and is zero.
 ///
-/// **Writers do not take locks of their own here.** A row being updated is not
-/// thereby locked against a later `FOR UPDATE`; MVCC's own write serialization
-/// covers concurrent writers. Extending this to acquire as well as check is
-/// the remaining step toward PostgreSQL's behaviour.
+/// **A writer takes the lock, not just checks it, when any row lock exists**,
+/// and holds it to the end of its transaction, as PostgreSQL's `UPDATE` and
+/// `DELETE` do. So inside a `BEGIN` block, a row this statement writes stays
+/// locked against another transaction's `FOR UPDATE` until `COMMIT` — that is
+/// intended, not a leak. Under autocommit the transaction ends with the
+/// statement and so does the lock. A savepoint's locks belong to its
+/// transaction (see `RowLocks::for_transactions`); they used to be recorded
+/// under the savepoint's own id, which nothing ever released.
+///
+/// When no row lock exists at all the writer takes none, to spare every
+/// `UPDATE` and `DELETE` the key lookup. The case that leaves open — a `FOR
+/// UPDATE` arriving while such a write is still uncommitted — is not a lost
+/// update: first-updater-wins makes that transaction's own later write of the
+/// row fail with `40001`. It is a difference in *when* the conflict surfaces,
+/// as a serialization failure rather than a lock wait.
+///
+/// The key column is [`identifying_field`], the one `FOR UPDATE` locks by. This
+/// used to pick only a column-level `UNIQUE`, so on a table identified by its
+/// primary key or a table-level `UNIQUE (col)` the writer looked for locks
+/// under no column at all and overwrote rows another transaction held.
 #[inline(never)]
 async fn refuse_write_to_locked_rows(
     database: &Arc<Database>,
@@ -3204,22 +4720,17 @@ async fn refuse_write_to_locked_rows(
         return Ok(());
     }
 
-    let (key_field, schema_fields) = {
+    let key_field = {
         let entry = database.tables.get(table_name);
         let Some(table) = entry.as_ref().clone() else {
             return Ok(());
         };
-        let Some(field) = table
-            .schema
-            .fields
-            .iter()
-            .find(|f| f.is_unique && !f.is_deleted)
-            .cloned()
-        else {
-            // Nothing here can be locked row-by-row, so nothing can conflict.
+        // `lock_selected_rows` refuses a table without one, so nothing here
+        // can be locked row-by-row and nothing can conflict.
+        let Some(field) = identifying_field(&table.schema) else {
             return Ok(());
         };
-        (field, table.schema.fields.clone())
+        field
     };
 
     let select = format!(
@@ -3247,7 +4758,6 @@ async fn refuse_write_to_locked_rows(
                 .row_locks
                 .acquire(table_name, key, tx, LockStrength::Update, &live)
         {
-            let _ = &schema_fields;
             return Err(format!(
                 "row of '{}' is locked by transaction {}; the statement that locked it must \
                  finish first",
@@ -3621,6 +5131,7 @@ fn strip_qualifier(text: &str, table: &str) -> String {
 /// as a runtime abort rather than as anything pointing here.
 async fn insert_from_select(
     query: &str,
+    conflict: &InsertConflict,
     database: &Arc<Database>,
     depth: usize,
     tx: TxId,
@@ -3639,7 +5150,7 @@ async fn insert_from_select(
     // folded to a constant.
     if crate::core::rql::join::find_keyword(select_sql, "FROM", 0).is_none() {
         return Some(
-            match constant_select_insert(prefix, select_sql, returning_tail, database, depth, tx)
+            match constant_select_insert(prefix, select_sql, returning_tail, conflict, database, depth, tx)
                 .await
             {
                 Ok(response) => response,
@@ -3696,11 +5207,12 @@ async fn insert_from_select(
             .unwrap_or_default()
     );
 
-    let Some(purpose) = recognize_query_purpose(&rewritten) else {
+    let Some(mut purpose) = recognize_query_purpose(&rewritten) else {
         return Some(ddl_error(
             "could not parse the statement rewritten from INSERT … SELECT",
         ));
     };
+    conflict.restore(&mut purpose);
     Some(Box::pin(execute_with_context(purpose, database.clone(), depth, tx)).await)
 }
 
@@ -4094,6 +5606,26 @@ async fn insert_values_batch(
         Ok(statements) => statements,
     };
 
+    // Every tuple's foreign keys, checked in one probe per key rather than one
+    // full query per row. What it verifies the per-row check then skips.
+    let verified =
+        prevalidate_foreign_keys(database, &row_data.table_name, &statements, tx).await;
+    FK_VERIFIED
+        .scope(
+            std::cell::RefCell::new(verified),
+            insert_values_tuples(row_data, statements, database, depth, tx),
+        )
+        .await
+}
+
+/// The per-tuple half of [`insert_values_batch`].
+async fn insert_values_tuples(
+    row_data: &crate::core::rql::lexer_s1::InsertRowData,
+    statements: Vec<String>,
+    database: &Arc<Database>,
+    depth: usize,
+    tx: TxId,
+) -> Option<Vec<u8>> {
     let mut inserted = 0u64;
     let mut returned: Vec<u8> = Vec::new();
     let mut any_returning = false;
@@ -4418,7 +5950,18 @@ fn retype_nulls_from_flags(
     schema: &crate::core::row::schema::TableSchema,
     rows: &mut [crate::core::row::row::Row],
 ) {
-    let pairs: Vec<(u64, u64)> = schema
+    let pairs = null_flag_pairs(schema);
+    if pairs.is_empty() {
+        return;
+    }
+    for row in rows.iter_mut() {
+        retype_row_nulls(&pairs, row);
+    }
+}
+
+/// `(value write_order, flag write_order)` for every nullable column.
+fn null_flag_pairs(schema: &crate::core::row::schema::TableSchema) -> Vec<(u64, u64)> {
+    schema
         .fields
         .iter()
         .filter(|f| !crate::core::rql::nullable::is_hidden(&f.name))
@@ -4426,24 +5969,153 @@ fn retype_nulls_from_flags(
             crate::core::rql::nullable::flag_field(&f.name, &schema.fields)
                 .map(|flag| (f.write_order, flag.write_order))
         })
-        .collect();
-    if pairs.is_empty() {
-        return;
-    }
-    for row in rows.iter_mut() {
-        for (value_order, flag_order) in &pairs {
-            let is_null = row
-                .columns
-                .iter()
-                .find(|c| c.schema_id == *flag_order)
-                .is_some_and(|c| crate::core::rql::nullable::flag_is_set(c.data.into_slice()));
-            if is_null {
-                if let Some(c) = row.columns.iter_mut().find(|c| c.schema_id == *value_order) {
-                    c.column_type = crate::core::db_type::DbType::NULL;
-                }
+        .collect()
+}
+
+/// [`retype_nulls_from_flags`] for one row.
+fn retype_row_nulls(pairs: &[(u64, u64)], row: &mut crate::core::row::row::Row) {
+    for (value_order, flag_order) in pairs {
+        let is_null = row
+            .columns
+            .iter()
+            .find(|c| u64::from(c.schema_id) == *flag_order)
+            .is_some_and(|c| crate::core::rql::nullable::flag_is_set(c.data.into_slice()));
+        if is_null {
+            if let Some(c) = row.columns.iter_mut().find(|c| u64::from(c.schema_id) == *value_order) {
+                c.column_type = crate::core::db_type::DbType::NULL;
             }
         }
     }
+}
+
+/// `RDB_JOIN_ROWS=1`: scan a join's relations into `Vec<Row>`, the path the
+/// serialized `RowSet` replaced. Read once. For A/B measurement only.
+fn legacy_join_rows() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var_os("RDB_JOIN_ROWS").is_some_and(|v| v == "1"))
+}
+
+/// `RDB_FOLD_ROWS=1`: fold through a materialised `Vec<Row>`, the path the
+/// streaming fold replaced. Read once. For A/B measurement only.
+fn legacy_row_fold() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var_os("RDB_FOLD_ROWS").is_some_and(|v| v == "1"))
+}
+
+/// Folds a scan's serialized rows into groups, decoding one row at a time.
+///
+/// Each row is retyped from its NULL flags exactly as
+/// [`retype_nulls_from_flags`] retypes a `Vec<Row>`, then pushed into the
+/// fold, then dropped — so what is resident is the scan's compact bytes and
+/// the groups, never every matched row as a `Row`.
+fn fold_serialized(
+    schema: &crate::core::row::schema::TableSchema,
+    plan: &crate::core::rql::aggregate::AggregatePlan,
+    bytes: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<(), String> {
+    let pairs = null_flag_pairs(schema);
+    let fold_part = |part: &[u8]| -> Result<crate::core::rql::aggregate::Folder<'_>, String> {
+        let mut folder = crate::core::rql::aggregate::Folder::new(plan);
+        for slice in crate::core::row::row::serialized_rows(part) {
+            let slice = slice.map_err(|e| format!("a scanned row could not be read: {}", e))?;
+            let mut row = crate::core::row::row::Row::decode(slice)
+                .map_err(|e| format!("a scanned row could not be read: {}", e))?;
+            if !pairs.is_empty() {
+                retype_row_nulls(&pairs, &mut row);
+            }
+            folder.push(&row)?;
+        }
+        Ok(folder)
+    };
+
+    // A large input is folded in parallel: contiguous parts, one folder each,
+    // merged in order. Merging part 0, then 1, … keeps the serial fold's
+    // first-seen group order, and the first error is the one the serial fold
+    // would have hit (every earlier part folded cleanly).
+    let parts = fold_parts(bytes);
+    if parts.len() <= 1 {
+        return fold_part(bytes)?.finish_into(out);
+    }
+    // Many groups make every part's table nearly as large as the whole one, so
+    // the merge costs what the parallelism saved, and the partial tables cost
+    // memory (measured: 100k groups over 1M rows, 256 MB serial against 413 MB
+    // in eight parts, no faster). The first part is folded alone first; if it
+    // already holds more than one group per 16 rows the rest is folded
+    // serially into it.
+    let mut folder = fold_part(parts[0])?;
+    let sampled = crate::core::row::row::count_serialized_rows(parts[0]) as usize;
+    if folder.groups().saturating_mul(16) > sampled {
+        for part in &parts[1..] {
+            for slice in crate::core::row::row::serialized_rows(part) {
+                let slice = slice.map_err(|e| format!("a scanned row could not be read: {}", e))?;
+                let mut row = crate::core::row::row::Row::decode(slice)
+                    .map_err(|e| format!("a scanned row could not be read: {}", e))?;
+                if !pairs.is_empty() {
+                    retype_row_nulls(&pairs, &mut row);
+                }
+                folder.push(&row)?;
+            }
+        }
+        return folder.finish_into(out);
+    }
+    let folded: Vec<Result<crate::core::rql::aggregate::Folder<'_>, String>> =
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = parts
+                .iter()
+                .skip(1)
+                .map(|part| scope.spawn(|| fold_part(part)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_else(|_| Err("a fold worker panicked".to_string())))
+                .collect()
+        });
+    for part in folded {
+        folder.merge(part?);
+    }
+    folder.finish_into(out)
+}
+
+/// Splits a scan's serialized rows into contiguous parts for a parallel fold:
+/// one part below [`PARALLEL_FOLD_MIN_ROWS`], otherwise one per available
+/// core up to eight (`RDB_FOLD_THREADS` overrides, `1` forces the serial
+/// fold). Parts end on row boundaries.
+fn fold_parts(bytes: &[u8]) -> Vec<&[u8]> {
+    const PARALLEL_FOLD_MIN_ROWS: u64 = 100_000;
+    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let threads = *THREADS.get_or_init(|| {
+        std::env::var("RDB_FOLD_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get().min(8)))
+            .max(1)
+    });
+    let rows = crate::core::row::row::count_serialized_rows(bytes);
+    if threads <= 1 || rows < PARALLEL_FOLD_MIN_ROWS {
+        return vec![bytes];
+    }
+    let per_part = rows.div_ceil(threads as u64);
+    let mut parts = Vec::with_capacity(threads);
+    let mut start = 0usize;
+    let mut at = 0usize;
+    let mut in_part = 0u64;
+    for row in crate::core::row::row::serialized_rows(bytes) {
+        let Ok(row) = row else { break };
+        at += row.len();
+        in_part += 1;
+        if in_part == per_part {
+            parts.push(&bytes[start..at]);
+            start = at;
+            in_part = 0;
+        }
+    }
+    // The rest, including any tail a damaged header cut short — the part's
+    // own fold reports that.
+    if start < bytes.len() {
+        parts.push(&bytes[start..]);
+    }
+    parts
 }
 
 /// Replace every shredded JSON column in `rows` with its document, as text.
@@ -4476,7 +6148,7 @@ async fn hydrate_json_columns(
             let Some(field) = schema
                 .fields
                 .iter()
-                .find(|f| f.write_order == cell.schema_id)
+                .find(|f| f.write_order == u64::from(cell.schema_id))
             else {
                 continue;
             };
@@ -4921,7 +6593,7 @@ fn check_constraints_hold(
     let mut row = crate::core::row::row::Row::default();
     for payload in payloads {
         row.columns.push(crate::core::row::row::Column {
-            schema_id: payload.write_order as u64,
+            schema_id: crate::core::row::row::schema_id_of(payload.write_order as u64),
             data: payload.data.clone(),
             column_type: payload.column_type.clone(),
         });
@@ -5033,7 +6705,7 @@ fn check_constraints_hold_for_update(
     let mut candidate = crate::core::row::row::Row::default();
     for payload in &plan.updates {
         candidate.columns.push(crate::core::row::row::Column {
-            schema_id: payload.write_order as u64,
+            schema_id: crate::core::row::row::schema_id_of(payload.write_order as u64),
             data: payload.data.clone(),
             column_type: payload.column_type.clone(),
         });
@@ -5105,7 +6777,7 @@ fn condition_reads_a_null(
         };
         row.columns
             .iter()
-            .find(|c| c.schema_id == flag.write_order)
+            .find(|c| u64::from(c.schema_id) == flag.write_order)
             .is_some_and(|c| crate::core::rql::nullable::flag_is_set(c.data.into_slice()))
     })
 }
@@ -5232,7 +6904,8 @@ async fn existing_rows_break_unique(
             )
         })?;
 
-    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    let mut seen: ahash::HashSet<Vec<u8>> =
+        ahash::HashSet::with_capacity_and_hasher(rows.len(), Default::default());
     for row in &rows {
         // Length-prefixed, so ('ab', 'c') and ('a', 'bc') are different tuples
         // rather than the same run of bytes.
@@ -5242,20 +6915,29 @@ async fn existing_rows_break_unique(
             let Some(column) = row
                 .columns
                 .iter()
-                .find(|c| c.schema_id == field.write_order)
+                .find(|c| u64::from(c.schema_id) == field.write_order)
             else {
                 has_null = true;
                 break;
             };
             // NULLS DISTINCT: a tuple containing a NULL conflicts with nothing.
-            let flagged_null = flag_of[index].is_some_and(|order| {
-                row.columns
-                    .iter()
-                    .find(|c| c.schema_id == order)
-                    .is_some_and(|c| crate::core::rql::nullable::flag_is_set(c.data.into_slice()))
-            });
+            //
+            // NULL is read from the companion (or a cell typed NULL), never
+            // from emptiness: `''` and a zero-length BYTEA are values, and
+            // treating them as NULL let a constraint be added over rows that
+            // already held them twice. Only a nullable column whose companion
+            // is missing from the row falls back to emptiness — the same rule
+            // `Table::written_value_is_null` applies at insert time.
             let bytes = column.data.into_slice();
-            if flagged_null || bytes.is_empty() {
+            let is_null = column.column_type == crate::core::db_type::DbType::NULL
+                || match flag_of[index] {
+                    None => false,
+                    Some(order) => match row.columns.iter().find(|c| u64::from(c.schema_id) == order) {
+                        Some(c) => crate::core::rql::nullable::flag_is_set(c.data.into_slice()),
+                        None => bytes.is_empty(),
+                    },
+                };
+            if is_null {
                 has_null = true;
                 break;
             }
@@ -5274,7 +6956,7 @@ async fn existing_rows_break_unique(
                 let rendered = row
                     .columns
                     .iter()
-                    .find(|c| c.schema_id == field.write_order)
+                    .find(|c| u64::from(c.schema_id) == field.write_order)
                     .and_then(|c| {
                         crate::core::rql::subquery::value_to_literal(
                             &field.db_type,
@@ -5545,6 +7227,20 @@ async fn execute_alter_table_action(
                         ddl_error(&e)
                     }
                 };
+            }
+
+            // A row's `Column::schema_id` is 32 bits, so a write order past
+            // that could not be carried by any row. Refused before anything
+            // is written, rather than truncated into another column's id.
+            let highest_new = schema
+                .fields
+                .iter()
+                .map(|f| f.write_order)
+                .max()
+                .map_or(0, |m| m.saturating_add(1))
+                .saturating_add(is_nullable as u64);
+            if let Err(e) = crate::core::row::row::check_write_order(highest_new) {
+                return ddl_error(&e);
             }
 
             let default =
@@ -6255,19 +7951,152 @@ fn query_sql(query: &QueryPurpose) -> String {
     }
 }
 
-/// Sorts materialised rows by evaluated `ORDER BY` expressions.
+/// Sorts a serialized result by evaluated `ORDER BY` expressions and decodes
+/// the rows the caller will use.
 ///
 /// NULL placement follows PostgreSQL: by default a NULL sorts as the largest
 /// value — last ascending, first descending — and an explicit `NULLS
 /// FIRST`/`LAST` overrides that independently of the direction, which is why
 /// the null arm sits outside the `descending` reversal.
+///
+/// `cap` is how many rows from the front of the order the caller will look
+/// at — `OFFSET + LIMIT` — and `None` when it needs every row (see the guard
+/// at the call site). The result is always exactly the first `cap` rows a
+/// *stable* sort of the whole input would produce, in that order: ties are
+/// broken on the row's position in the input, which makes the order total, so
+/// a selection followed by a sort of the survivors agrees with the full sort.
+///
+/// What it costs, against the stable sort of `(keys, Row)` it replaces: the
+/// sort moves `(keys, index)` pairs rather than ~1.5 KB rows, and with a cap
+/// no row outside the page is kept at all — each is decoded only for as long
+/// as its keys take to evaluate, and the page is decoded again from its bytes.
 fn sort_rows_by_expressions(
+    rows_bytes: &[u8],
+    keys: &[(crate::core::rql::expr::Expr, bool, Option<bool>)],
+    schema: &[crate::core::row::schema::SchemaField],
+    cap: Option<usize>,
+) -> Result<Vec<crate::core::row::row::Row>, String> {
+    use crate::core::row::row::Row;
+
+    let directions: Vec<(bool, Option<bool>)> = keys
+        .iter()
+        .map(|(_, descending, nulls)| (*descending, *nulls))
+        .collect();
+    // Every key is evaluated once per row, up front — a comparator must not
+    // error, and re-evaluating inside one would be quadratic anyway. Every
+    // row's keys are evaluated even with a cap, so a key that fails on any
+    // row still fails the statement.
+    let eval_keys = |row: &Row| -> Result<Vec<crate::core::rql::expr::Value>, String> {
+        let mut values = Vec::with_capacity(keys.len());
+        for (expr, _, _) in keys {
+            values.push(crate::core::rql::expr::eval(expr, row, schema)?);
+        }
+        Ok(values)
+    };
+
+    let total = crate::core::row::row::count_serialized_rows(rows_bytes) as usize;
+    match cap.filter(|c| *c < total) {
+        Some(cap) => {
+            let mut keyed: Vec<(Vec<crate::core::rql::expr::Value>, usize)> =
+                Vec::with_capacity(total);
+            let mut spans: Vec<&[u8]> = Vec::with_capacity(total);
+            for (index, span) in crate::core::row::row::serialized_rows(rows_bytes).enumerate() {
+                let span = span.map_err(|e| e.to_string())?;
+                let row = Row::decode(span).map_err(|e| e.to_string())?;
+                keyed.push((eval_keys(&row)?, index));
+                spans.push(span);
+            }
+            order_keyed_rows(&mut keyed, &directions, Some(cap));
+            keyed
+                .iter()
+                .map(|(_, index)| Row::decode(spans[*index]).map_err(|e| e.to_string()))
+                .collect()
+        }
+        None => {
+            let mut rows =
+                crate::core::row::row::vec_into_rows(rows_bytes).map_err(|e| e.to_string())?;
+            let mut keyed: Vec<(Vec<crate::core::rql::expr::Value>, usize)> =
+                Vec::with_capacity(rows.len());
+            for (index, row) in rows.iter().enumerate() {
+                keyed.push((eval_keys(row)?, index));
+            }
+            order_keyed_rows(&mut keyed, &directions, None);
+            // Each index appears once, so every row is taken exactly once.
+            Ok(keyed
+                .iter()
+                .map(|(_, index)| std::mem::take(&mut rows[*index]))
+                .collect())
+        }
+    }
+}
+
+/// Puts `(keys, input position)` pairs in `ORDER BY` order, keeping only the
+/// first `cap` when one is given.
+///
+/// The input position is the last key, so equal keys keep their input order —
+/// the answer a stable sort gives — and the order is total, which is what lets
+/// `select_nth_unstable_by` partition at the cap and agree with a full sort
+/// about which rows are in the page.
+fn order_keyed_rows(
+    keyed: &mut Vec<(Vec<crate::core::rql::expr::Value>, usize)>,
+    directions: &[(bool, Option<bool>)],
+    cap: Option<usize>,
+) {
+    let order = |a: &(Vec<crate::core::rql::expr::Value>, usize),
+                 b: &(Vec<crate::core::rql::expr::Value>, usize)| {
+        crate::core::rql::expr::compare_key_values(&a.0, &b.0, directions)
+            .then_with(|| a.1.cmp(&b.1))
+    };
+    if let Some(cap) = cap {
+        if cap == 0 {
+            keyed.clear();
+            return;
+        }
+        if cap < keyed.len() {
+            keyed.select_nth_unstable_by(cap - 1, order);
+            keyed.truncate(cap);
+        }
+    }
+    keyed.sort_unstable_by(order);
+}
+
+/// Where the post-scan loop takes its rows from: the page an expression sort
+/// already decoded, or the scan's serialized result, decoded a row at a time.
+enum PageRows<'a> {
+    Sorted(std::vec::IntoIter<crate::core::row::row::Row>),
+    Serialized(crate::core::row::row::SerializedRows<'a>),
+}
+
+impl PageRows<'_> {
+    fn next_row(&mut self) -> Option<Result<crate::core::row::row::Row, String>> {
+        match self {
+            PageRows::Sorted(rows) => rows.next().map(Ok),
+            PageRows::Serialized(spans) => Some(
+                spans
+                    .next()?
+                    .and_then(crate::core::row::row::Row::decode)
+                    .map_err(|e| e.to_string()),
+            ),
+        }
+    }
+
+    /// How many rows are left, for sizing; a header walk for serialized rows.
+    fn remaining_hint(&self, all: &[u8]) -> usize {
+        match self {
+            PageRows::Sorted(rows) => rows.len(),
+            PageRows::Serialized(_) => crate::core::row::row::count_serialized_rows(all) as usize,
+        }
+    }
+}
+
+/// The sort `sort_rows_by_expressions` replaced, kept as the reference its
+/// differential test compares against.
+#[cfg(test)]
+fn sort_rows_by_expressions_reference(
     rows: Vec<crate::core::row::row::Row>,
     keys: &[(crate::core::rql::expr::Expr, bool, Option<bool>)],
     schema: &[crate::core::row::schema::SchemaField],
 ) -> Result<Vec<crate::core::row::row::Row>, String> {
-    // Every key is evaluated once per row, up front — a comparator must not
-    // error, and re-evaluating inside one would be quadratic anyway.
     let mut keyed: Vec<(
         Vec<crate::core::rql::expr::Value>,
         crate::core::row::row::Row,
@@ -6287,6 +8116,235 @@ fn sort_rows_by_expressions(
     keyed.sort_by(|a, b| crate::core::rql::expr::compare_key_values(&a.0, &b.0, &directions));
 
     Ok(keyed.into_iter().map(|(_, row)| row).collect())
+}
+
+#[cfg(test)]
+mod expression_sort_tests {
+    //! The capped, index-sorted expression sort against the stable sort it
+    //! replaced, over data built to make them disagree if they can: heavy ties,
+    //! NULLs in both placements, NaN and signed zero, empty strings, and keys
+    //! of more than one column.
+    use super::{sort_rows_by_expressions, sort_rows_by_expressions_reference};
+    use crate::core::db_type::DbType;
+    use crate::core::row::row::{Column, Row, rows_into_vec, vec_into_rows};
+    use crate::core::row::schema::SchemaField;
+    use crate::memory_pool::MEMORY_POOL;
+    use smallvec::SmallVec;
+
+    fn schema() -> Vec<SchemaField> {
+        [
+            ("id", DbType::I64, 8),
+            ("a", DbType::I32, 4),
+            ("s", DbType::STRING, 0),
+            ("f", DbType::F64, 8),
+            ("n", DbType::I64, 8),
+            ("__null_n", DbType::BOOL, 1),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, (name, ty, size))| {
+            SchemaField::new(name.to_string(), ty, size, 0, i as u64, false)
+        })
+        .collect()
+    }
+
+    fn col(schema_id: u64, ty: DbType, bytes: &[u8]) -> Column {
+        let mut data = MEMORY_POOL.acquire(bytes.len());
+        if !bytes.is_empty() {
+            data.into_slice_mut().copy_from_slice(bytes);
+        }
+        Column {
+            schema_id: crate::core::row::row::schema_id_of(schema_id),
+            data,
+            column_type: ty,
+        }
+    }
+
+    /// Rows whose columns are ordered as a scan returns them, with `id` the
+    /// row's identity and never a key, so a mispaired row shows as a wrong id.
+    fn rows_bytes(count: usize, seed: u64) -> Vec<u8> {
+        let floats = [
+            0.0f64,
+            -0.0,
+            1.5,
+            -1.5,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            1.5,
+        ];
+        let strings = ["", "a", "b", "ab", "", "B", "a"];
+        let mut state = seed | 1;
+        let mut next = move |m: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % m
+        };
+        let mut rows = Vec::with_capacity(count);
+        for id in 0..count as i64 {
+            let null = next(4) == 0;
+            let mut columns: crate::core::row::row::RowColumns = SmallVec::new();
+            columns.push(col(0, DbType::I64, &id.to_le_bytes()));
+            columns.push(col(1, DbType::I32, &(next(5) as i32 - 2).to_le_bytes()));
+            columns.push(col(2, DbType::STRING, strings[next(7) as usize].as_bytes()));
+            columns.push(col(3, DbType::F64, &floats[next(8) as usize].to_le_bytes()));
+            columns.push(col(
+                4,
+                DbType::I64,
+                &(if null { 0 } else { next(3) as i64 }).to_le_bytes(),
+            ));
+            columns.push(col(5, DbType::BOOL, &[null as u8]));
+            rows.push(Row {
+                position: id as u64,
+                columns,
+                length: 0,
+            });
+        }
+        rows_into_vec(rows)
+    }
+
+    fn ids(rows: &[Row]) -> Vec<i64> {
+        rows.iter()
+            .map(|r| i64::from_le_bytes(r.columns[0].data.into_slice().try_into().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn capped_and_uncapped_agree_with_the_stable_sort() {
+        let schema = schema();
+        let key_sets: &[&[&str]] = &[
+            &["a"],
+            &["n"],
+            &["f"],
+            &["s"],
+            &["NULLIF(s, '')"],
+            &["a", "n"],
+            &["n", "f", "a"],
+            &["NULLIF(s, '')", "a", "f"],
+            // Same-typed operands: COALESCE over BIGINT and INTEGER yields
+            // values of two widths, which `expr::compare` does not order
+            // consistently — a separate defect, and one that makes *any* two
+            // sorts disagree, so it cannot be part of this comparison.
+            &["COALESCE(n, id)", "s"],
+        ];
+        // (descending, NULLS FIRST/LAST/default) for every key.
+        let placements: &[(bool, Option<bool>)] = &[
+            (false, None),
+            (true, None),
+            (false, Some(true)),
+            (true, Some(false)),
+            (false, Some(false)),
+            (true, Some(true)),
+        ];
+        let mut checked = 0;
+        for (seed, count) in [(7u64, 0usize), (11, 1), (13, 9), (17, 257), (19, 1500)] {
+            let bytes = rows_bytes(count, seed);
+            for keys in key_sets {
+                for (k, placement) in placements.iter().enumerate() {
+                    // Mix the placements across keys so a multi-key set does
+                    // not use one direction for all of them.
+                    let exprs: Vec<_> = keys
+                        .iter()
+                        .enumerate()
+                        .map(|(i, text)| {
+                            let (desc, nulls) = placements[(k + i) % placements.len()];
+                            let _ = placement;
+                            (
+                                crate::core::rql::expr::parse(text, &schema).unwrap(),
+                                desc,
+                                nulls,
+                            )
+                        })
+                        .collect();
+                    let reference = ids(&sort_rows_by_expressions_reference(
+                        vec_into_rows(&bytes).unwrap(),
+                        &exprs,
+                        &schema,
+                    )
+                    .unwrap());
+                    assert_eq!(reference.len(), count);
+                    for cap in [
+                        None,
+                        Some(0),
+                        Some(1),
+                        Some(2),
+                        Some(7),
+                        Some(50),
+                        Some(count.saturating_sub(1)),
+                        Some(count),
+                        Some(count + 3),
+                    ] {
+                        let got =
+                            ids(&sort_rows_by_expressions(&bytes, &exprs, &schema, cap).unwrap());
+                        let want = &reference[..cap.unwrap_or(count).min(count)];
+                        assert_eq!(
+                            got, want,
+                            "keys {:?} placement {} cap {:?} rows {}",
+                            keys, k, cap, count
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 1000);
+    }
+
+    /// The rows that come back are whole: every column, not just the keys.
+    #[test]
+    fn capped_rows_carry_every_column() {
+        let schema = schema();
+        let bytes = rows_bytes(300, 5);
+        let exprs = vec![(
+            crate::core::rql::expr::parse("f", &schema).unwrap(),
+            true,
+            None,
+        )];
+        let all = vec_into_rows(&bytes).unwrap();
+        let got = sort_rows_by_expressions(&bytes, &exprs, &schema, Some(10)).unwrap();
+        assert_eq!(got.len(), 10);
+        for row in &got {
+            let id = i64::from_le_bytes(row.columns[0].data.into_slice().try_into().unwrap());
+            let original = &all[id as usize];
+            assert_eq!(row.columns.len(), original.columns.len());
+            for (a, b) in row.columns.iter().zip(original.columns.iter()) {
+                assert_eq!(a.schema_id, b.schema_id);
+                assert_eq!(a.column_type, b.column_type);
+                assert_eq!(a.data.into_slice(), b.data.into_slice());
+            }
+        }
+    }
+
+    /// A key that fails on a row outside the page still fails the statement.
+    #[test]
+    fn a_key_error_past_the_page_still_fails() {
+        let schema = schema();
+        let bytes = rows_bytes(200, 3);
+        // `a` is -2..=2, so some row divides by zero.
+        let exprs = vec![(
+            crate::core::rql::expr::parse("id / a", &schema).unwrap(),
+            false,
+            None,
+        )];
+        assert!(sort_rows_by_expressions(&bytes, &exprs, &schema, Some(1)).is_err());
+        assert!(sort_rows_by_expressions(&bytes, &exprs, &schema, None).is_err());
+    }
+
+    /// A damaged buffer is an error, not a panic and not a short answer.
+    #[test]
+    fn a_truncated_buffer_is_an_error() {
+        let schema = schema();
+        let bytes = rows_bytes(20, 9);
+        let exprs = vec![(
+            crate::core::rql::expr::parse("a", &schema).unwrap(),
+            false,
+            None,
+        )];
+        let cut = &bytes[..bytes.len() - 3];
+        assert!(sort_rows_by_expressions(cut, &exprs, &schema, Some(2)).is_err());
+        assert!(sort_rows_by_expressions(cut, &exprs, &schema, None).is_err());
+    }
 }
 
 /// Reads the rows a write is about to affect, for its `RETURNING` clause.
@@ -6539,6 +8597,14 @@ async fn returning_rows_for_write<S: crate::core::storage_providers::traits::Sto
                 // the same evaluation error, and this runs before it, so both
                 // now fail identically.
                 let value = crate::core::rql::expr::eval(expression, row, schema)?;
+                // Back to the target's declared scale, as the write path does.
+                let value = match schema
+                    .iter()
+                    .find(|f| f.write_order as u32 == *write_order as u32)
+                {
+                    Some(target) => crate::core::rql::expr::from_engine_scale(value, target)?,
+                    None => value,
+                };
                 // NULL is a value here, not an absence: without an entry the
                 // placeholder overlay reported the empty string where the
                 // write path was about to store NULL and set its companion.
@@ -6579,7 +8645,7 @@ async fn returning_rows_for_write<S: crate::core::storage_providers::traits::Sto
             for column in row.columns.iter_mut() {
                 if let Some((_, data, db_type)) = computed
                     .iter()
-                    .find(|(order, _, _)| *order == column.schema_id)
+                    .find(|(order, _, _)| *order == u64::from(column.schema_id))
                 {
                     column.data = data.clone();
                     column.column_type = db_type.clone();
@@ -6587,7 +8653,7 @@ async fn returning_rows_for_write<S: crate::core::storage_providers::traits::Sto
                 }
                 if let Some(update) = updates
                     .iter()
-                    .find(|u| u64::from(u.write_order) == column.schema_id)
+                    .find(|u| u64::from(u.write_order) == u64::from(column.schema_id))
                 {
                     column.data = update.data.clone();
                     // An assignment of NULL overlays a NULL, not an empty value
@@ -6613,7 +8679,7 @@ async fn returning_rows_for_write<S: crate::core::storage_providers::traits::Sto
                     // emptiness: an empty *string* is a real value and must
                     // stay one.
                     let assigned_null = crate::core::rql::nullable::flag_field(
-                        &field_name_of(schema, column.schema_id).unwrap_or_default(),
+                        &field_name_of(schema, u64::from(column.schema_id)).unwrap_or_default(),
                         &schema_sv,
                     )
                     .and_then(|flag| {
@@ -6638,7 +8704,7 @@ async fn returning_rows_for_write<S: crate::core::storage_providers::traits::Sto
     // it — after the overlay, so `RETURNING (n - 1)` sees the value the
     // statement stored, which is what PostgreSQL reports.
     for row in rows.iter_mut() {
-        let mut built: smallvec::SmallVec<[crate::core::row::row::Column; 32]> =
+        let mut built: crate::core::row::row::RowColumns =
             smallvec::SmallVec::new();
         for (position, item) in items.iter().enumerate() {
             match item {
@@ -6646,16 +8712,16 @@ async fn returning_rows_for_write<S: crate::core::storage_providers::traits::Sto
                     let cell = row
                         .columns
                         .iter()
-                        .find(|c| c.schema_id == f.write_order)
+                        .find(|c| u64::from(c.schema_id) == f.write_order)
                         .cloned()
                         .map(|mut c| {
-                            c.schema_id = position as u64;
+                            c.schema_id = crate::core::row::row::schema_id_of(position as u64);
                             c
                         });
                     match cell {
                         Some(c) => built.push(c),
                         None => built.push(crate::core::row::row::Column {
-                            schema_id: position as u64,
+                            schema_id: crate::core::row::row::schema_id_of(position as u64),
                             data: crate::memory_pool::MemoryBlock::default(),
                             column_type: crate::core::db_type::DbType::NULL,
                         }),
@@ -6681,7 +8747,7 @@ async fn returning_rows_for_write<S: crate::core::storage_providers::traits::Sto
                     let mut mb = crate::memory_pool::MEMORY_POOL.acquire(bytes.len());
                     mb.into_slice_mut().copy_from_slice(&bytes);
                     built.push(crate::core::row::row::Column {
-                        schema_id: position as u64,
+                        schema_id: crate::core::row::row::schema_id_of(position as u64),
                         data: mb,
                         column_type: ty,
                     });
@@ -6893,7 +8959,28 @@ pub async fn execute_with_sync(
             );
         };
 
-        let response = Box::pin(execute_with_context(purpose, database.clone(), 0, tx)).await;
+        // A panic inside the statement is caught here, so its transaction is
+        // aborted like any failed statement's. Unwinding past this point used
+        // to leave it `InProgress` — invisible writes nobody would resolve, and
+        // `oldest_active` pinned below it for the life of the process.
+        let response = {
+            use futures::FutureExt;
+            match std::panic::AssertUnwindSafe(Box::pin(execute_with_context(
+                purpose,
+                database.clone(),
+                0,
+                tx,
+            )))
+            .catch_unwind()
+            .await
+            {
+                Ok(response) => response,
+                Err(_) => {
+                    error!("statement panicked; its transaction {} is aborted", tx);
+                    ddl_error("internal error: the statement panicked and was rolled back")
+                }
+            }
+        };
         let conflicted = is_retryable_conflict(&response);
 
         if !conflicted || !retryable || attempt >= MAX_CONFLICT_RETRIES {
@@ -7033,6 +9120,70 @@ pub async fn execute_with_sync(
 /// `depth` is the foreign-key cascade depth. Only the statement the client sent
 /// is recorded: a replica running it triggers the same cascades itself, and
 /// shipping both would apply them twice.
+/// One row of a bulk load (`IMPORT … FROM POSTGRES`), written exactly as the
+/// `INSERT` arm of [`execute_with_context`] writes the single-tuple,
+/// column-naming statement `sql` — the same row builder, the same checks, the
+/// same replication record — without the statement-level work that does not
+/// apply to such a statement: classifying it, the conflict-retry wrapper, the
+/// multi-row and `INSERT … SELECT` probes, `RETURNING`, the second parse for
+/// foreign keys.
+///
+/// `None` hands the row back to the ordinary path, which then decides it.
+/// That is the answer whenever this would not be the exact same write: a
+/// table with JSON columns (their shadow writes rewrite the statement), a
+/// generated column, a statement the row builder refuses, and any failure at
+/// all — every check here runs before the row is written, so a refused row
+/// has applied nothing, and the ordinary path reports it with its own words
+/// and retries a write conflict as it always does.
+#[cfg(feature = "pg_import")]
+pub(crate) async fn insert_loaded_row(
+    database: &Arc<Database>,
+    table_name: &str,
+    sql: &str,
+    tx: TxId,
+) -> Option<()> {
+    Box::pin(seed_sequences(database, table_name)).await;
+    let table = database.tables.get(table_name)?.value().clone();
+    let schema = &table.schema;
+    if !schema.json_columns.is_empty() {
+        return None;
+    }
+    let row_data = crate::core::rql::lexer_s1::InsertRowData {
+        table_name: table_name.to_string(),
+        query: sql.to_string(),
+        on_conflict_do_nothing: false,
+        on_conflict_update: None,
+    };
+    if supply_generated_values(&row_data, database).await.is_some() {
+        return None;
+    }
+    let assignments = crate::core::rql::lexer_ir::assignments_of_insert(sql);
+    check_not_null(
+        table_name,
+        &schema.fields,
+        assignments.as_deref().unwrap_or_default(),
+        &schema.defaults,
+        true,
+    )
+    .ok()?;
+    if let Some(assignments) = assignments.as_deref() {
+        check_foreign_keys(database, table_name, assignments, tx)
+            .await
+            .ok()?;
+    }
+    let purpose = QueryPurpose::InsertRow(row_data);
+    let insert_row = crate::core::rql::lexer_ir::insert_row_with_defaults(
+        &purpose,
+        &schema.fields,
+        &schema.defaults,
+        &schema.type_modifiers,
+    )?;
+    check_constraints_hold(table_name, schema, &insert_row.columns_writing_data).ok()?;
+    table.insert_row_in_txn(insert_row, tx).await.ok()?;
+    note_write(database, tx, 0, sql, Some(table_name));
+    Some(())
+}
+
 #[inline]
 fn note_write(database: &Arc<Database>, tx: TxId, depth: usize, sql: &str, table: Option<&str>) {
     if depth == 0 {
@@ -7150,6 +9301,93 @@ pub async fn execute_with_context(
     depth: usize,
     // The transaction this statement's reads and writes belong to.
     tx: TxId,
+) -> Vec<u8> {
+    execute_with_need(query, database, depth, tx, SubqueryNeed::All).await
+}
+
+/// How much of a `SELECT`'s result its caller will look at.
+///
+/// A subquery is often asked a narrower question than "every row": `EXISTS`
+/// only needs to know whether there is one, `IN` only which values occur, and
+/// a scalar subquery only whether there is more than one. Applied to the
+/// parsed statement of the single-table path, never to text, and only to the
+/// statement it is handed with — anything that statement runs in turn is
+/// executed with [`SubqueryNeed::All`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubqueryNeed {
+    All,
+    /// Whether any row exists.
+    Existence,
+    /// The set of values; order and multiplicity do not matter.
+    Membership,
+    /// At most one row is legal, so two are enough to tell.
+    Scalar,
+}
+
+/// Narrows a parsed single-table `SELECT` to what `need` asks for.
+///
+/// The allowlist is the fields that change which rows come back: an
+/// `OFFSET`, an aggregate (its LIMIT and ORDER BY apply to its output), a
+/// window function (computed over every row that survived `WHERE`, so
+/// capping the scan would change its values), `DISTINCT` (paged after the
+/// dedup), and a locking clause (which rows get locked is part of the
+/// result). Any of them present and the statement is left as written.
+pub(crate) fn apply_subquery_need(
+    query_row: &mut crate::core::rql::lexer_query::QueryRows,
+    need: SubqueryNeed,
+) {
+    if need == SubqueryNeed::All {
+        return;
+    }
+    let plain = query_row.offset.unwrap_or(0) == 0
+        && query_row.aggregate.is_none()
+        && query_row.window_slots.is_empty()
+        && !query_row.distinct
+        && query_row.row_lock.is_none();
+    if !plain {
+        return;
+    }
+    match need {
+        SubqueryNeed::All => {}
+        SubqueryNeed::Existence => {
+            // `LIMIT 0` stays 0; anything else becomes 1. Order cannot change
+            // whether a row exists.
+            let cap = query_row.written_limit.map_or(1, |l| l.min(1));
+            query_row.limit = Some(cap);
+            query_row.written_limit = Some(cap);
+            query_row.order_by = None;
+            query_row.order_expressions.clear();
+        }
+        SubqueryNeed::Membership => {
+            // Without a LIMIT the order decides nothing about which values
+            // occur. With one it decides which rows are kept, so it stays.
+            if query_row.written_limit.is_none() && query_row.limit.is_none() {
+                query_row.order_by = None;
+                query_row.order_expressions.clear();
+            }
+        }
+        SubqueryNeed::Scalar => {
+            // An explicit LIMIT (with its ORDER BY) picks the row and is kept.
+            // Without one, more than one row is an error and two rows are
+            // enough to raise it; which two does not matter.
+            if query_row.written_limit.is_none() && query_row.limit.is_none() {
+                query_row.limit = Some(2);
+                query_row.written_limit = Some(2);
+                query_row.order_by = None;
+                query_row.order_expressions.clear();
+            }
+        }
+    }
+}
+
+/// [`execute_with_context`] for a statement whose caller needs only part of
+/// its result. See [`SubqueryNeed`].
+pub(crate) async fn execute_with_need(
+    query: QueryPurpose,
+    database: Arc<Database>,
+    depth: usize,
+    tx: TxId,
+    need: SubqueryNeed,
 ) -> Vec<u8> {
     match &query {
         // An index over a document path. Recorded in the table's sidecar, which
@@ -7382,7 +9620,17 @@ pub async fn execute_with_context(
             // Kept out of this function's frame on purpose — see
             // `insert_from_select`.
             if let Some(response) =
-                Box::pin(insert_from_select(&row_data.query, &database, depth, tx)).await
+                Box::pin(insert_from_select(
+                    &row_data.query,
+                    &InsertConflict {
+                        do_nothing: row_data.on_conflict_do_nothing,
+                        update: row_data.on_conflict_update.clone(),
+                    },
+                    &database,
+                    depth,
+                    tx,
+                ))
+                .await
             {
                 return response;
             }
@@ -7558,7 +9806,7 @@ pub async fn execute_with_context(
                 // written, so it reflects exactly what was stored without
                 // reading the row back off disk.
                 let returned_row = returning.as_ref().map(|fields| {
-                    let mut columns: smallvec::SmallVec<[crate::core::row::row::Column; 32]> =
+                    let mut columns: crate::core::row::row::RowColumns =
                         smallvec::SmallVec::new();
                     for field in fields {
                         let payload = insert_row
@@ -7594,7 +9842,7 @@ pub async fn execute_with_context(
                                 })
                         };
                         columns.push(crate::core::row::row::Column {
-                            schema_id: field.write_order,
+                            schema_id: crate::core::row::row::schema_id_of(field.write_order),
                             data: if is_null {
                                 crate::memory_pool::MemoryBlock::default()
                             } else {
@@ -7711,6 +9959,14 @@ pub async fn execute_with_context(
                     return result;
                 }
             } else {
+                // A value the column cannot hold is reported as PostgreSQL
+                // reports it — the reason, and through it the SQLSTATE — rather
+                // than as the generic mismatch every refusal used to become.
+                if let Some(reason) = crate::core::rql::lexer_ir::take_refusal() {
+                    let mut result = vec![3u8];
+                    result.extend_from_slice(reason.as_bytes());
+                    return result;
+                }
                 error!("Cannot insert row due to schema mismatch");
                 let mut result: [u8; 1] = [1u8; 1];
                 result[0] = 3;
@@ -7931,10 +10187,56 @@ pub async fn execute_with_context(
                 return ddl_error(&e);
             }
 
+            // One snapshot for the statement when its foreign keys need to know
+            // which rows it changes: the rows judged and the rows written must
+            // be the same rows. `None` — every other UPDATE — leaves the write
+            // to take its own, as before.
+            let statement_visibility =
+                update_needs_statement_snapshot(&database, &table, &table_name, &update_plan)
+                    .then(|| table.visibility_for(tx));
+
             if let Some(assignments) =
                 crate::core::rql::lexer_ur::assignments_of_update(&query_sql(&query))
             {
-                if let Err(e) = check_foreign_keys(&database, &table_name, &assignments, tx).await {
+                if let Err(e) = check_foreign_keys_for_update(
+                    &database,
+                    &table,
+                    &table_name,
+                    &update_plan,
+                    &assignments,
+                    statement_visibility.as_ref(),
+                    tx,
+                )
+                .await
+                {
+                    error!("{}", e);
+                    return ddl_error(&e);
+                }
+            }
+
+            // The parent side: keys this statement moves, locked before the
+            // write and acted on after it. `None` — the common case — unless a
+            // foreign key references a column the statement assigns.
+            let key_changes = match statement_visibility.as_ref() {
+                None => None,
+                Some(visibility) => match keys_about_to_change(
+                    &database,
+                    &table,
+                    &table_name,
+                    &update_plan,
+                    visibility,
+                )
+                .await
+                {
+                    Ok(changes) => changes,
+                    Err(e) => {
+                        error!("{}", e);
+                        return ddl_error(&e);
+                    }
+                },
+            };
+            if let Some(changes) = key_changes.as_ref() {
+                if let Err(e) = lock_keys_before_update(&database, &table_name, changes, tx).await {
                     error!("{}", e);
                     return ddl_error(&e);
                 }
@@ -7966,18 +10268,27 @@ pub async fn execute_with_context(
             };
 
             match table
-                .update_rows_with_expressions(
+                .update_rows_as_of(
                     &update_plan.where_clause,
                     update_plan.query_row_fetch,
                     update_plan.updates,
                     &update_plan.expressions,
                     None,
                     tx,
+                    statement_visibility,
                 )
                 .await
             {
                 Ok(n) => {
                     info!("Updated {} rows", n);
+                    if let Some(changes) = key_changes.as_ref() {
+                        if let Err(e) =
+                            apply_on_update(&database, &table_name, changes, depth, tx).await
+                        {
+                            error!("{}", e);
+                            return ddl_error(&e);
+                        }
+                    }
                     note_write(&database, tx, depth, &query_sql(&query), Some(&table_name));
                     // A write that applied rows must not report none back.
                     //
@@ -8072,6 +10383,8 @@ pub async fn execute_with_context(
             };
 
             let mut reclaimed: u64 = 0;
+            // Tables compacted whose space could not be given back.
+            let mut untruncated: Vec<(String, &'static str)> = Vec::new();
             for name in names {
                 // Resolved and cloned per table rather than held across the
                 // await: a DashMap reference kept over one would block anything
@@ -8086,6 +10399,9 @@ pub async fn execute_with_context(
                             reclaimed = reclaimed
                                 .saturating_add(report.rows_bytes_freed)
                                 .saturating_add(report.pointer_bytes_freed);
+                            if let Some(why) = report.truncation_skipped {
+                                untruncated.push((name.clone(), why));
+                            }
                         }
                         Err(e) => {
                             error!("VACUUM FULL failed for {}: {}", name, e);
@@ -8117,6 +10433,23 @@ pub async fn execute_with_context(
                         }
                     }
                 }
+            }
+
+            // A VACUUM FULL that moved every row but returned nothing used to
+            // report plain success, with the reason only in a warn-level log
+            // line — invisible at the production level. It still succeeds, as
+            // PostgreSQL's would (maintenance jobs and ORMs expect it to), but
+            // the client is told why with a WARNING, and the table's
+            // `vacuum_full_untruncated` counter records it.
+            if !untruncated.is_empty() {
+                let names: Vec<&str> = untruncated.iter().map(|(n, _)| n.as_str()).collect();
+                let message = format!(
+                    "VACUUM FULL compacted {} but could not return the space to the filesystem: \
+                     {}. The data is intact; run VACUUM FULL again when write load allows",
+                    names.join(", "),
+                    untruncated[0].1,
+                );
+                crate::core::notice::push("WARNING", "01000", message);
             }
 
             info!("VACUUM reclaimed {} bytes", reclaimed);
@@ -8213,9 +10546,25 @@ pub async fn execute_with_context(
             // Referencing rows are dealt with before the parent goes, so a
             // blocking action can still refuse and a cascade still has the
             // parent's key to match on.
-            match keys_about_to_be_deleted(&database, &table_name, &delete_plan.where_clause, tx)
-                .await
-            {
+            // One snapshot for the statement when foreign keys point here: the
+            // keys whose referencing rows are dealt with and the rows the scan
+            // deletes must be the same rows. See `keys_about_to_be_deleted`.
+            let statement_visibility = (!referencing_keys(&database, &table_name).is_empty())
+                .then(|| table.visibility_for(tx));
+            match match statement_visibility.as_ref() {
+                Some(visibility) => {
+                    keys_about_to_be_deleted(
+                        &database,
+                        &table,
+                        &table_name,
+                        &delete_plan.where_clause,
+                        &delete_plan.query_row_fetch,
+                        visibility,
+                    )
+                    .await
+                }
+                None => Ok(Vec::new()),
+            } {
                 Ok(keys) => {
                     if let Err(e) = apply_on_delete(&database, &table_name, &keys, depth, tx).await
                     {
@@ -8252,11 +10601,12 @@ pub async fn execute_with_context(
             };
 
             match table
-                .delete_rows_in_txn(
+                .delete_rows_as_of(
                     &delete_plan.where_clause,
                     delete_plan.query_row_fetch,
                     None,
                     tx,
+                    statement_visibility,
                 )
                 .await
             {
@@ -8353,7 +10703,10 @@ pub async fn execute_with_context(
             // verbatim is the difference between the client seeing which
             // feature is missing and seeing a generic mismatch.
             let query_row = match row_fetch_from_select_query(&query, &schema.fields) {
-                Ok(q) => q,
+                Ok(mut q) => {
+                    apply_subquery_need(&mut q, need);
+                    q
+                }
                 Err(e) => {
                     error!("Cannot query rows: {}", e);
                     let mut result = vec![3u8];
@@ -8427,6 +10780,42 @@ pub async fn execute_with_context(
                     }
                     crate::core::rql::join::fetch_for(&wanted, &schema.fields)
                 };
+                // Folded straight from the scan's serialized rows, one decoded
+                // row at a time: the `Vec<Row>` the path below builds is
+                // 1.5 KB per matched row (1.56 GB for a million) before the
+                // fold reads any of it. A shredded JSON column still takes
+                // that path, because its documents are hydrated (async, per
+                // row) before grouping. `RDB_FOLD_ROWS=1` forces it, for A/B.
+                if schema.json_columns.is_empty() && !legacy_row_fold() {
+                    let folded = match table
+                        .query_row_bytes_in_txn(
+                            &query_row.where_clause,
+                            &schema.fields.to_vec(),
+                            query_row.query_row_fetch.clone(),
+                            aggregate_fetch.clone(),
+                            // No limit and no ordering, as below.
+                            None,
+                            None,
+                            tx,
+                        )
+                        .await
+                    {
+                        Ok(bytes) => {
+                            let mut result = vec![2u8];
+                            fold_serialized(&schema, &plan, &bytes, &mut result).map(|()| result)
+                        }
+                        Err(e) => Err(e.to_string()),
+                    };
+                    return match folded {
+                        Ok(result) => result,
+                        Err(e) => {
+                            error!("Aggregate failed: {}", e);
+                            let mut result = vec![3u8];
+                            result.extend_from_slice(e.as_bytes());
+                            result
+                        }
+                    };
+                }
                 match table
                     .query_row_in_txn(
                         &query_row.where_clause,
@@ -8592,7 +10981,10 @@ pub async fn execute_with_context(
                         // same queue would leave the second with nothing, which
                         // is the opposite of what the clause is for. The limit
                         // is applied below instead, once the skipping is done.
-                        if skip_locked { None } else { query_row.limit },
+                        // A window is computed over every row `WHERE` kept,
+                        // before paging, so a limit pushed into the scan made
+                        // `SUM(v) OVER ()` the sum of the page. Paged below.
+                        if skip_locked || has_windows { None } else { query_row.limit },
                         query_row.order_by,
                         tx,
                     )
@@ -8604,11 +10996,11 @@ pub async fn execute_with_context(
                             rows_bytes.len()
                         );
 
-                        // `OFFSET` drops rows from the front. The scan already
-                        // fetched `limit + offset` of them, so the skip happens
-                        // here rather than costing another pass over the table.
-                        let rows_bytes = if offset > 0
-                            || trim_sort_key
+                        // Everything below that needs a row decoded. `OFFSET`
+                        // is deliberately not in it: on its own it only drops
+                        // rows from the front, which the length headers can do
+                        // without decoding anything (below).
+                        let needs_rows = trim_sort_key
                             || distinct
                             || has_nullable
                             || has_literals
@@ -8616,70 +11008,238 @@ pub async fn execute_with_context(
                             || may_overfetch
                             || row_lock.is_some()
                             || has_windows
-                            || has_order_exprs
-                        {
-                            match crate::core::row::row::vec_into_rows(&rows_bytes) {
-                                Ok(rows) => {
+                            || has_order_exprs;
+
+                        // How many rows of an expression sort's output the
+                        // steps below can use, when that is fewer than all of
+                        // them. Cutting there lets the sort select rather than
+                        // sort, and keeps the page's rows — and only those —
+                        // for the per-row work (NULL retyping, trimming, JSON
+                        // hydration with its document loads, slot evaluation).
+                        //
+                        // An allowlist over `QueryRows`; each field is here
+                        // because of what it does with the rows past the page:
+                        //  * `distinct` — duplicates are removed after this
+                        //    point, so the page is not known until they are:
+                        //    blocks.
+                        //  * `window_slots` — a window is computed over every
+                        //    row that survived WHERE: blocks.
+                        //  * `row_lock` (any, including `SKIP LOCKED`) — rows
+                        //    the lock skips are replaced by later ones: blocks.
+                        //  * `written_limit` — no limit, no cap.
+                        //  * `offset` — part of the cap; the skip below still
+                        //    runs over the capped rows.
+                        //  * `aggregate` — returned above, never reaches here.
+                        //  * `limit`/`order_by` — what the scan was given; an
+                        //    expression sort runs over an unbounded, unsorted
+                        //    scan (`lexer_query`'s expression branch).
+                        //  * `literal_slots`, `scalar_slots`, `expr_slots`,
+                        //    `null_flag_positions`, `predicate_needs_extra_
+                        //    columns`, `visible_columns`, `select_items`, JSON
+                        //    columns — per row, nothing reads another row. A
+                        //    select expression that would fail on a row outside
+                        //    the page is therefore not evaluated there, which is
+                        //    what every LIMIT pushed into the scan already does.
+                        //  * `where_clause`, the fetches, `table_name` — spent
+                        //    by the scan.
+                        // A field added to `QueryRows` that looks at more than
+                        // one row has to be added here as a blocker.
+                        let expr_sort_cap: Option<usize> =
+                            if !distinct && !has_windows && row_lock.is_none() && !skip_locked {
+                                written_limit.map(|limit| {
+                                    usize::try_from(limit.saturating_add(offset))
+                                        .unwrap_or(usize::MAX)
+                                })
+                            } else {
+                                None
+                            };
+
+                        // Where the page starts in `rows_bytes`. Non-zero only
+                        // when `OFFSET` is the one thing to do here.
+                        let mut page_start = 0usize;
+
+                        // `OFFSET` drops rows from the front. The scan already
+                        // fetched `limit + offset` of them, so the skip happens
+                        // here rather than costing another pass over the table.
+                        let rows_bytes = if offset > 0 && !needs_rows {
+                            // The rows it drops are walked past by their
+                            // headers, never decoded; what remains is already
+                            // in the wire format.
+                            match crate::core::row::row::skip_serialized_rows(&rows_bytes, offset) {
+                                Ok(page) => {
+                                    page_start = rows_bytes.len() - page.len();
+                                    rows_bytes
+                                }
+                                Err(e) => {
+                                    error!("Failed to page the result set: {}", e);
+                                    let mut result = vec![3u8];
+                                    result.extend_from_slice(e.to_string().as_bytes());
+                                    return result;
+                                }
+                            }
+                        } else if needs_rows || offset > 0 {
+                            let decoded: Result<PageRows<'_>, String> =
+                                if has_order_exprs {
+                                    // A key reaching into a *shredded* JSON
+                                    // column would read a stored UUID, evaluate
+                                    // to NULL on every row, and quietly not sort
+                                    // at all.
+                                    let shadowed = order_exprs.iter().any(|(expr, ..)| {
+                                        crate::core::rql::expr::columns_of(expr).iter().any(|f| {
+                                            crate::core::rql::json_map::shadow_for(
+                                                &f.name,
+                                                &schema.json_columns,
+                                            )
+                                            .is_some()
+                                        })
+                                    });
+                                    if shadowed {
+                                        let e = "ORDER BY into a JSON column stored as shadow tables is not supported; store the column as native JSONB";
+                                        error!("{}", e);
+                                        let mut result = vec![3u8];
+                                        result.extend_from_slice(e.as_bytes());
+                                        return result;
+                                    }
                                     // Sorted before anything is trimmed: the
                                     // keys read columns that ride after the
                                     // visible ones, and `column_value` finds
                                     // NULL companions in the same row.
-                                    let rows = if has_order_exprs {
-                                        // A key reaching into a *shredded*
-                                        // JSON column would read a stored
-                                        // UUID, evaluate to NULL on every
-                                        // row, and quietly not sort at all.
-                                        let shadowed = order_exprs.iter().any(|(expr, ..)| {
-                                            crate::core::rql::expr::columns_of(expr).iter().any(
-                                                |f| {
-                                                    crate::core::rql::json_map::shadow_for(
-                                                        &f.name,
-                                                        &schema.json_columns,
-                                                    )
-                                                    .is_some()
-                                                },
-                                            )
-                                        });
-                                        if shadowed {
-                                            let e = "ORDER BY into a JSON column stored as shadow tables is not supported; store the column as native JSONB";
-                                            error!("{}", e);
-                                            let mut result = vec![3u8];
-                                            result.extend_from_slice(e.as_bytes());
-                                            return result;
-                                        }
-                                        match sort_rows_by_expressions(
-                                            rows,
+                                    // Decoding every row, evaluating its keys
+                                    // and sorting is CPU with no await in it;
+                                    // above a size it leaves the async worker
+                                    // so other sessions' tasks queued on that
+                                    // thread keep running (as the scan's own
+                                    // sort does).
+                                    let sort = || {
+                                        sort_rows_by_expressions(
+                                            &rows_bytes,
                                             &order_exprs,
                                             &slot_schema,
-                                        ) {
-                                            Ok(sorted) => sorted,
-                                            Err(e) => {
-                                                error!("ORDER BY failed: {}", e);
-                                                let mut result = vec![3u8];
-                                                result.extend_from_slice(e.as_bytes());
-                                                return result;
-                                            }
-                                        }
-                                    } else {
-                                        rows
+                                            expr_sort_cap,
+                                        )
                                     };
+                                    let large = crate::core::row::row::count_serialized_rows(&rows_bytes)
+                                        >= crate::core::processor::concurrent_processor::SORT_OFF_RUNTIME_ROWS
+                                            as u64;
+                                    let multi_thread = tokio::runtime::Handle::try_current()
+                                        .is_ok_and(|h| {
+                                            h.runtime_flavor()
+                                                == tokio::runtime::RuntimeFlavor::MultiThread
+                                        });
+                                    let sorted = if large
+                                        && multi_thread
+                                        && crate::core::processor::concurrent_processor::latency_guards_on()
+                                    {
+                                        tokio::task::block_in_place(sort)
+                                    } else {
+                                        sort()
+                                    };
+                                    sorted
+                                    .map(|rows| PageRows::Sorted(rows.into_iter()))
+                                    .map_err(|e| {
+                                        error!("ORDER BY failed: {}", e);
+                                        e
+                                    })
+                                } else {
+                                    // Decoded one at a time as the loop below
+                                    // asks for them, never as a `Vec<Row>`.
+                                    Ok(PageRows::Serialized(
+                                        crate::core::row::row::serialized_rows(&rows_bytes),
+                                    ))
+                                };
+                            match decoded {
+                                Ok(mut source) => {
+                                    // The page boundaries, decided before the
+                                    // loop so a streaming pass can apply them
+                                    // as it goes. `DISTINCT` removes rows, so
+                                    // paging has to run over what survived
+                                    // rather than over the scan's output. An
+                                    // expression sort ran over an unbounded
+                                    // scan, so the page is cut here too.
+                                    let (skip, take) = if distinct
+                                        || skip_locked
+                                        || has_order_exprs
+                                        || has_windows
+                                    {
+                                        (offset as usize, written_limit)
+                                    } else {
+                                        (offset as usize, None)
+                                    };
+
+                                    // Rows go straight from decode through the
+                                    // per-row steps into the output buffer, one
+                                    // at a time, unless a later step needs all
+                                    // of them together: a window is computed
+                                    // over the whole result, and a lock claims
+                                    // rows before any is handed over (and with
+                                    // SKIP LOCKED decides which rows the page
+                                    // holds). Holding a decoded copy of every
+                                    // row as well as the bytes it came from was
+                                    // ~1.5 KB a row on top of the result.
+                                    let streaming = !has_windows && row_lock.is_none();
+                                    let mut out: Vec<u8> = Vec::new();
+                                    let mut skipped = 0usize;
+                                    let mut emitted = 0u64;
+
                                     // Trim first, so `DISTINCT` compares only
                                     // the columns the client asked for and does
                                     // not treat rows as distinct because of a
                                     // sort key it cannot see.
-                                    let mut kept: Vec<crate::core::row::row::Row> =
-                                        Vec::with_capacity(rows.len());
-                                    let mut seen: std::collections::HashSet<Vec<u8>> =
-                                        std::collections::HashSet::new();
+                                    let mut kept: Vec<crate::core::row::row::Row> = if streaming {
+                                        Vec::new()
+                                    } else {
+                                        Vec::with_capacity(source.remaining_hint(&rows_bytes))
+                                    };
+                                    // Sized only when `DISTINCT` will use it:
+                                    // a hash table with room for every row is
+                                    // tens of megabytes on a large result.
+                                    let mut seen: ahash::HashSet<Vec<u8>> =
+                                        ahash::HashSet::with_capacity_and_hasher(
+                                            if distinct {
+                                                source.remaining_hint(&rows_bytes)
+                                            } else {
+                                                0
+                                            },
+                                            Default::default(),
+                                        );
 
-                                    for row in rows.into_iter() {
+                                    let mut processed = 0usize;
+                                    loop {
+                                        // The page is full: nothing after this
+                                        // can reach the client, so it is not
+                                        // decoded either.
+                                        if streaming && take.is_some_and(|cap| emitted >= cap) {
+                                            break;
+                                        }
+                                        // Nothing in this loop suspends unless
+                                        // a row needs a JSON document loaded,
+                                        // so a large result would hold the
+                                        // worker thread from first row to last
+                                        // and every task queued behind it —
+                                        // other sessions' point reads — would
+                                        // wait. One yield per 1024 rows.
+                                        processed += 1;
+                                        if processed % 1024 == 0
+                                            && crate::core::processor::concurrent_processor::latency_guards_on()
+                                        {
+                                            tokio::task::yield_now().await;
+                                        }
+                                        let mut row = match source.next_row() {
+                                            None => break,
+                                            Some(Ok(row)) => row,
+                                            Some(Err(e)) => {
+                                                error!("Failed to trim the result set: {}", e);
+                                                let mut result = vec![3u8];
+                                                result.extend_from_slice(e.as_bytes());
+                                                return result;
+                                            }
+                                        };
                                         // Retyping a `NULL` column as
                                         // `DbType::NULL` is what makes the wire
                                         // layer send an actual NULL: its
                                         // formatters yield no value for that
                                         // type. It must happen before the
                                         // companions are trimmed away.
-                                        let mut row = row;
                                         if has_nullable {
                                             for (i, flag_pos) in null_flags.iter().enumerate() {
                                                 let Some(p) = flag_pos else { continue };
@@ -8727,7 +11287,7 @@ pub async fn execute_with_context(
                                                 let Some(index) = row
                                                     .columns
                                                     .iter()
-                                                    .position(|c| c.schema_id == *schema_id)
+                                                    .position(|c| u64::from(c.schema_id) == *schema_id)
                                                 else {
                                                     continue;
                                                 };
@@ -8850,7 +11410,7 @@ pub async fn execute_with_context(
                                                     mb.into_slice_mut().copy_from_slice(value);
                                                 }
                                                 let column = crate::core::row::row::Column {
-                                                    schema_id: *position as u64,
+                                                    schema_id: crate::core::row::row::schema_id_of(*position as u64),
                                                     data: mb,
                                                     column_type: db_type.clone(),
                                                 };
@@ -8876,9 +11436,20 @@ pub async fn execute_with_context(
                                         if distinct {
                                             // Compare the serialized value
                                             // bytes, which is the same identity
-                                            // the client sees.
+                                            // the client sees — and whether
+                                            // the cell is NULL. A NULL's value
+                                            // bytes are its type's zeroes,
+                                            // empty for TEXT and BYTEA, so a
+                                            // key of bytes alone merged NULL
+                                            // with '' and answered two rows
+                                            // for {NULL, '', 'a'}.
                                             let mut key = Vec::new();
                                             for c in &row.columns {
+                                                key.push(
+                                                    (c.column_type
+                                                        == crate::core::db_type::DbType::NULL)
+                                                        as u8,
+                                                );
                                                 key.extend_from_slice(
                                                     &(c.data.into_slice().len() as u32)
                                                         .to_le_bytes(),
@@ -8890,8 +11461,20 @@ pub async fn execute_with_context(
                                             }
                                         }
 
+                                        if streaming {
+                                            if skipped < skip {
+                                                skipped += 1;
+                                                continue;
+                                            }
+                                            row.extend_serialized(&mut out);
+                                            emitted += 1;
+                                            continue;
+                                        }
                                         kept.push(row);
                                     }
+                                    if streaming {
+                                        out
+                                    } else {
 
                                     // Numbered over the rows that survived the
                                     // predicate, before any paging: PostgreSQL
@@ -8901,8 +11484,20 @@ pub async fn execute_with_context(
                                     let mut kept = kept;
                                     if has_windows {
                                         for (position, spec) in &window_slots {
-                                            let values =
-                                                crate::core::rql::window::assign(&kept, spec);
+                                            // An exact SUM/AVG that overflows
+                                            // is an error, as the grouped
+                                            // aggregate's is — never a NULL.
+                                            let values = match crate::core::rql::window::assign(
+                                                &kept, spec,
+                                            ) {
+                                                Ok(values) => values,
+                                                Err(e) => {
+                                                    error!("Window function failed: {}", e);
+                                                    let mut result = vec![3u8];
+                                                    result.extend_from_slice(e.as_bytes());
+                                                    return result;
+                                                }
+                                            };
                                             // The type the window produces, not
                                             // `I64`: an `AVG` is a decimal and
                                             // a `LAG(created_at)` is a
@@ -8927,7 +11522,7 @@ pub async fn execute_with_context(
                                                 row.columns.insert(
                                                     at,
                                                     crate::core::row::row::Column {
-                                                        schema_id: *position as u64,
+                                                        schema_id: crate::core::row::row::schema_id_of(*position as u64),
                                                         data: mb,
                                                         column_type: column_type.clone(),
                                                     },
@@ -8972,20 +11567,6 @@ pub async fn execute_with_context(
                                         },
                                     };
 
-                                    // `DISTINCT` removes rows, so paging has to
-                                    // run over what survived rather than over
-                                    // the scan's output.
-                                    // An expression sort ran over an unbounded
-                                    // scan, so the page is cut here too.
-                                    let (skip, take) = if distinct || skip_locked || has_order_exprs
-                                    {
-                                        (offset as usize, written_limit)
-                                    } else {
-                                        (offset as usize, None)
-                                    };
-
-                                    let mut out = Vec::with_capacity(rows_bytes.len());
-                                    let mut emitted = 0u64;
                                     for row in kept.iter().skip(skip) {
                                         if let Some(cap) = take {
                                             if emitted >= cap {
@@ -8996,11 +11577,11 @@ pub async fn execute_with_context(
                                         emitted += 1;
                                     }
                                     out
+                                    }
                                 }
                                 Err(e) => {
-                                    error!("Failed to trim the result set: {}", e);
                                     let mut result = vec![3u8];
-                                    result.extend_from_slice(e.to_string().as_bytes());
+                                    result.extend_from_slice(e.as_bytes());
                                     return result;
                                 }
                             }
@@ -9008,9 +11589,10 @@ pub async fn execute_with_context(
                             rows_bytes
                         };
 
-                        let mut final_vec = Vec::with_capacity(1 + rows_bytes.len());
+                        let page = &rows_bytes[page_start..];
+                        let mut final_vec = Vec::with_capacity(1 + page.len());
                         final_vec.push(2u8);
-                        final_vec.extend_from_slice(&rows_bytes);
+                        final_vec.extend_from_slice(page);
                         return final_vec;
                     }
                     Err(e) => {
@@ -9202,5 +11784,105 @@ mod update_from_tests {
         // Bytewise would put "10" before "9"; numerically it does not.
         assert!(!scalar_comparison_holds("10", "<", "9").unwrap());
         assert!(scalar_comparison_holds("'a'", "=", "'a'").unwrap());
+    }
+}
+
+#[cfg(test)]
+mod fold_parts_tests {
+    use super::*;
+
+    /// The parallel fold's parts tile the input on row boundaries: nothing is
+    /// dropped, duplicated or cut mid-row, and a small input is one part.
+    #[test]
+    fn parts_tile_the_rows_on_row_boundaries() {
+        use crate::core::row::row::{Column, Row, count_serialized_rows, serialized_rows};
+        let mut bytes = Vec::new();
+        for i in 0..250_003u64 {
+            let mut columns: crate::core::row::row::RowColumns = smallvec::SmallVec::new();
+            let width = (i % 5) as usize;
+            let mut mb = crate::memory_pool::MEMORY_POOL.acquire(width);
+            mb.into_slice_mut().fill(i as u8);
+            columns.push(Column {
+                schema_id: 0,
+                data: mb,
+                column_type: crate::core::db_type::DbType::STRING,
+            });
+            Row { position: 0, columns, length: 0 }.extend_serialized(&mut bytes);
+        }
+        let parts = fold_parts(&bytes);
+        assert!(parts.len() > 1 || std::thread::available_parallelism().map_or(1, |n| n.get()) == 1);
+        assert_eq!(parts.concat(), bytes);
+        let mut total = 0;
+        for part in &parts {
+            assert!(serialized_rows(part).all(|r| r.is_ok()), "a part ends mid-row");
+            total += count_serialized_rows(part);
+        }
+        assert_eq!(total, 250_003);
+        assert_eq!(fold_parts(&bytes[..1000]).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod future_size_tests {
+    //! How big a statement's future is. Every statement `Box::pin`s it at
+    //! least once — an allocation plus a copy of the whole state machine —
+    //! so its size is a per-statement cost, not only a stack concern.
+
+    use super::*;
+
+    /// `cargo test --release -p rasterizeddb_core --lib -- --ignored
+    /// statement_future_sizes --nocapture`.
+    #[tokio::test]
+    #[ignore]
+    async fn statement_future_sizes() {
+        let database = Arc::new(Database::new_with_backend("future_sizes", true).await);
+        let purpose = || recognize_query_purpose("SELECT a FROM t WHERE a = 1").expect("parse");
+        let tx = crate::core::mvcc::transaction::FROZEN_TX;
+        let f = execute_with_context(purpose(), database.clone(), 0, tx);
+        println!("execute_with_context: {} bytes", std::mem::size_of_val(&f));
+        drop(f);
+        let f = execute_with_need(purpose(), database.clone(), 0, tx, SubqueryNeed::All);
+        println!("execute_with_need:    {} bytes", std::mem::size_of_val(&f));
+        drop(f);
+        let f = execute_with_sync(purpose(), database.clone(), false);
+        println!("execute_with_sync:    {} bytes", std::mem::size_of_val(&f));
+        drop(f);
+        let f = execute_in_txn(purpose(), database.clone(), tx);
+        println!("execute_in_txn:       {} bytes", std::mem::size_of_val(&f));
+        drop(f);
+
+        // What the boxing itself costs per statement — allocation, the move
+        // into the box, the free — against what a whole point read costs.
+        run_sql(&database, "CREATE TABLE small (id BIGINT NOT NULL, s TEXT NOT NULL)").await;
+        let values: Vec<String> = (0..100).map(|i| format!("({i}, 's{i}')")).collect();
+        run_sql(&database, &format!("INSERT INTO small (id, s) VALUES {}", values.join(", "))).await;
+        let sql = "SELECT s FROM small WHERE id = 42";
+        let parsed = || recognize_query_purpose(sql).expect("parse");
+        for round in 0..6 {
+            let n = 100_000;
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                std::hint::black_box(parsed());
+            }
+            let parse = t.elapsed() / n;
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                let f = Box::pin(execute_with_context(parsed(), database.clone(), 0, tx));
+                std::hint::black_box(&f);
+                drop(f);
+            }
+            let boxing = (t.elapsed() / n).saturating_sub(parse);
+            let n = 20_000;
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                std::hint::black_box(execute(parsed(), database.clone()).await);
+            }
+            let statement = t.elapsed() / n;
+            println!("round {round}: Box::pin of the statement future {boxing:?}; whole point SELECT {statement:?}");
+        }
+    }
+
+    async fn run_sql(database: &Arc<Database>, sql: &str) -> Vec<u8> {
+        execute(recognize_query_purpose(sql).expect("parse"), database.clone()).await
     }
 }

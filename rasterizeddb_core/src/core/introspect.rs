@@ -274,7 +274,7 @@ fn normalize_name(raw: &str) -> String {
 /// to no relation, so their names come from the statement rather than a schema.
 pub fn result_fields(statement: &Introspect) -> Option<Vec<(String, DbType)>> {
     let text = |name: &str| (name.to_string(), DbType::STRING);
-    let number = |name: &str| (name.to_string(), DbType::U64);
+    let number = |name: &str| (name.to_string(), DbType::I64);
     let flag = |name: &str| (name.to_string(), DbType::BOOL);
     let real = |name: &str| (name.to_string(), DbType::F64);
     let signed = |name: &str| (name.to_string(), DbType::I64);
@@ -979,6 +979,11 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
         "vacuum_deferrals",
         vacuum.deferrals.load(Ordering::Relaxed).to_string(),
         "runs held off by an open snapshot",
+    );
+    push(
+        "vacuum_full_untruncated",
+        vacuum.full_untruncated.load(Ordering::Relaxed).to_string(),
+        "VACUUM FULL runs that compacted but could not return space (log busy)",
     );
     push(
         "vacuum_last_live_bytes",
@@ -2073,11 +2078,14 @@ enum Cell {
 }
 
 fn row(cells: &[Cell]) -> Row {
-    let mut columns: SmallVec<[Column; 32]> = SmallVec::new();
+    let mut columns: crate::core::row::row::RowColumns = SmallVec::new();
     for (index, cell) in cells.iter().enumerate() {
         let (bytes, column_type): (Vec<u8>, DbType) = match cell {
             Cell::Text(text) => (text.as_bytes().to_vec(), DbType::STRING),
-            Cell::Number(n) => (n.to_le_bytes().to_vec(), DbType::U64),
+            Cell::Number(n) => (
+                crate::core::value_codec::count_as_bigint(*n).to_le_bytes().to_vec(),
+                DbType::I64,
+            ),
             Cell::Flag(b) => (vec![u8::from(*b)], DbType::BOOL),
             Cell::Real(v) => (v.to_le_bytes().to_vec(), DbType::F64),
             Cell::Signed(v) => (v.to_le_bytes().to_vec(), DbType::I64),
@@ -2085,7 +2093,7 @@ fn row(cells: &[Cell]) -> Row {
         let mut block = MEMORY_POOL.acquire(bytes.len());
         block.into_slice_mut().copy_from_slice(&bytes);
         columns.push(Column {
-            schema_id: index as u64,
+            schema_id: crate::core::row::row::schema_id_of(index as u64),
             data: block,
             column_type,
         });

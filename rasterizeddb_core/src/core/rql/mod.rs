@@ -32,6 +32,8 @@ pub mod lexer_query;
 pub mod order_by;
 
 pub mod aggregate;
+/// `HAVING` parsing and evaluation, shared by the single-table and join planners.
+pub mod having;
 pub mod column_default;
 pub mod cte;
 pub mod expr;

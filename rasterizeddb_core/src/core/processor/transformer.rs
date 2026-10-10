@@ -44,6 +44,18 @@ pub struct ColumnTransformer {
     /// A `::` cast applied to the right operand — see [`Self::column_1_cast`].
     pub column_2_cast: Option<(DbType, DbType)>,
 
+    /// The declared scale of a `NUMERIC(p, s)` column read as the left
+    /// operand, when the operation needs it at the engine scale instead.
+    ///
+    /// Set by the planner only where the other side is at the engine scale —
+    /// arithmetic, which computes there, and a comparison against an
+    /// arithmetic result or a column of another scale. A plain `v > 50` keeps
+    /// comparing the stored bytes against a literal encoded at `s`, which is
+    /// what the filter index hashes. Lifted per row into a stack buffer.
+    pub column_1_scale: Option<u32>,
+    /// The same for the right operand.
+    pub column_2_scale: Option<u32>,
+
     /// Parentheses opening immediately before this comparison, and closing
     /// immediately after it.
     ///
@@ -58,6 +70,11 @@ pub struct ColumnTransformer {
     /// identical depths at every position.
     pub group_opens: u8,
     pub group_closes: u8,
+
+    /// A hashed `IN` / `NOT IN` list standing in for a run of `col = v`
+    /// comparisons ORed together (or `col <> v` ANDed). See [`InSet`]: when set,
+    /// the comparison answers by one lookup of the left operand.
+    pub in_set: Option<std::sync::Arc<InSet>>,
 }
 
 impl Clone for ColumnTransformer {
@@ -77,8 +94,11 @@ impl Clone for ColumnTransformer {
             column_1_cast: self.column_1_cast.clone(),
             column_2_cast: self.column_2_cast.clone(),
             column_2_path: self.column_2_path.clone(),
+            column_1_scale: self.column_1_scale,
+            column_2_scale: self.column_2_scale,
             group_opens: self.group_opens,
             group_closes: self.group_closes,
+            in_set: self.in_set.clone(),
         }
     }
 }
@@ -228,8 +248,11 @@ impl ColumnTransformer {
             column_2_path: None,
             column_1_index: None,
             column_2_index: None,
+            column_1_scale: None,
+            column_2_scale: None,
             group_opens: 0,
             group_closes: 0,
+            in_set: None,
         }
     }
 
@@ -301,6 +324,19 @@ impl ColumnTransformer {
             (None, None) => right_mb.into_slice(),
         };
 
+        // A `NUMERIC(p, s)` operand lifted to the engine scale, where the
+        // other side already is. In a stack buffer: this is per row.
+        let mut lifted_1 = [0u8; 16];
+        let input1 = match self.column_1_scale {
+            Some(scale) => lift_to_engine_scale(input1, scale, &mut lifted_1)?,
+            None => input1,
+        };
+        let mut lifted_2 = [0u8; 16];
+        let input2 = match self.column_2_scale {
+            Some(scale) => lift_to_engine_scale(input2, scale, &mut lifted_2)?,
+            None => input2,
+        };
+
         match self.transformer_type {
             ColumnTransformerType::MathOperation(ref operation) => {
                 if self.next.is_some() {
@@ -312,6 +348,10 @@ impl ColumnTransformer {
                     &self.column_type,
                     operation,
                 )?))
+            }
+            ColumnTransformerType::ComparerOperation(_) if self.in_set.is_some() => {
+                let set = self.in_set.as_ref().expect("guarded");
+                Ok(Either::Right((set.matches(input1)?, self.next.clone())))
             }
             ColumnTransformerType::ComparerOperation(ref operation) => {
                 // A cast path with nothing to read is SQL NULL, and a
@@ -518,6 +558,12 @@ pub enum ComparisonOperand {
     /// yet" — for a comparison that is ordinary SQL.
     CastWithIndex(MemoryBlock, usize, DbType, DbType),
     Intermediate(usize),
+    /// An arithmetic result converted `(from, to)` before use — an integer
+    /// sub-expression meeting a `NUMERIC` one, as in `v + 1 * 2`, where the
+    /// `1 * 2` is an integer and the addition runs at the engine decimal
+    /// scale. Without it the pair was refused: "a I32 operand cannot be
+    /// combined with a NUMERIC one here".
+    IntermediateCast(usize, DbType, DbType),
 }
 
 /// A path taken from a document column, resolved per row.
@@ -620,6 +666,10 @@ impl ComparisonOperand {
                 transformer.column_1_cast = Some((from.clone(), to.clone()));
             }
             ComparisonOperand::Intermediate(idx) => transformer.result_index_1 = Some(*idx),
+            ComparisonOperand::IntermediateCast(idx, from, to) => {
+                transformer.result_index_1 = Some(*idx);
+                transformer.column_1_cast = Some((from.clone(), to.clone()));
+            }
         }
     }
 
@@ -642,6 +692,10 @@ impl ComparisonOperand {
                 transformer.column_2_cast = Some((from.clone(), to.clone()));
             }
             ComparisonOperand::Intermediate(idx) => transformer.result_index_2 = Some(*idx),
+            ComparisonOperand::IntermediateCast(idx, from, to) => {
+                transformer.result_index_2 = Some(*idx);
+                transformer.column_2_cast = Some((from.clone(), to.clone()));
+            }
         }
     }
 }
@@ -652,6 +706,28 @@ impl ComparisonOperand {
 /// deliberate: the comparison then fails on a width or a value mismatch and
 /// answers `false` for that row, where returning an error would fail a whole
 /// scan over one unconvertible value.
+/// A `NUMERIC` stored at `scale`, moved to the engine scale as
+/// `expr::to_engine_scale` moves it: exact upward, truncated downward. Bytes
+/// that are not a decimal are passed through for the operation to refuse.
+#[inline]
+fn lift_to_engine_scale<'a>(
+    input: &'a [u8],
+    scale: u32,
+    buf: &'a mut [u8; 16],
+) -> Result<&'a [u8], EvalError> {
+    let Ok(raw) = <[u8; 16]>::try_from(input) else {
+        return Ok(input);
+    };
+    let lifted = crate::core::rql::expr::rescale_decimal(
+        i128::from_le_bytes(raw),
+        scale,
+        crate::core::value_codec::DECIMAL_SCALE,
+    )
+    .ok_or(EvalError::ArithmeticOverflow)?;
+    *buf = lifted.to_le_bytes();
+    Ok(&buf[..])
+}
+
 fn cast_block(source: &MemoryBlock, from: &DbType, to: &DbType) -> MemoryBlock {
     if from == to {
         return source.clone();
@@ -678,6 +754,282 @@ fn cast_block(source: &MemoryBlock, from: &DbType, to: &DbType) -> MemoryBlock {
     }
 }
 
+/// The fewest comparisons a run must hold before it becomes an [`InSet`].
+///
+/// Below this the chain is a handful of fixed-width compares, which a hash and
+/// a probe do not beat; see `in_set_bench` for the measurement.
+pub const IN_SET_MIN_VALUES: usize = 4;
+
+/// A hashed `x IN (v1, …, vN)` — or, negated, `x NOT IN (…)`.
+///
+/// `IN` is desugared to `(x = v1 OR … OR x = vN)` and each literal is coerced
+/// by the planner exactly as `x = literal` would be — declared NUMERIC scale,
+/// text re-encoded at the column's type, UUID/INET/timestamp layouts — so the
+/// values here are *already the bytes the comparison would have used*. The set
+/// is built from those, after planning, which is what keeps it from ever
+/// disagreeing with the chain it replaces. Evaluation then costs one hash and
+/// one probe per row instead of N comparisons with no short-circuit.
+///
+/// Membership is equality *as the evaluator defines it*: byte equality for
+/// every type admitted here, except floats, which follow PostgreSQL (`-0 = +0`,
+/// `NaN = NaN`) and are canonicalised on both sides. Types whose equality is
+/// not byte equality (the wire-layout types, whose ordering lives in
+/// `compare_bytes_as_type`) are never collapsed.
+#[derive(Debug)]
+pub struct InSet {
+    negated: bool,
+    key: InSetKey,
+    small: ahash::HashSet<u128>,
+    bytes: ahash::HashSet<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InSetKey {
+    /// A fixed-width value of at most 16 bytes, keyed as a zero-extended `u128`.
+    Fixed(usize),
+    /// A fixed-width value wider than 16 bytes (`INET`).
+    FixedBytes(usize),
+    Float32,
+    Float64,
+    /// Variable width: the bytes themselves.
+    Bytes,
+}
+
+impl InSetKey {
+    fn of(db_type: &DbType) -> Option<InSetKey> {
+        use crate::core::value_codec::{INET_LEN, UUID_LEN};
+        Some(match db_type {
+            DbType::I8 | DbType::U8 | DbType::BOOL => InSetKey::Fixed(1),
+            DbType::I16 | DbType::U16 => InSetKey::Fixed(2),
+            DbType::I32 | DbType::U32 | DbType::CHAR => InSetKey::Fixed(4),
+            DbType::I64 | DbType::U64 | DbType::DATETIME => InSetKey::Fixed(8),
+            DbType::I128 | DbType::U128 | DbType::DECIMAL => InSetKey::Fixed(16),
+            DbType::UUID => InSetKey::Fixed(UUID_LEN),
+            DbType::INET => InSetKey::FixedBytes(INET_LEN),
+            DbType::F32 => InSetKey::Float32,
+            DbType::F64 => InSetKey::Float64,
+            DbType::STRING => InSetKey::Bytes,
+            _ => return None,
+        })
+    }
+
+    /// The `u128` key for a value, or `None` when it has the wrong width — the
+    /// comparison it replaces would have failed with a size mismatch.
+    #[inline(always)]
+    fn small_key(&self, v: &[u8]) -> Option<u128> {
+        match *self {
+            InSetKey::Fixed(width) => {
+                if v.len() != width {
+                    return None;
+                }
+                let mut buf = [0u8; 16];
+                buf[..width].copy_from_slice(v);
+                Some(u128::from_le_bytes(buf))
+            }
+            InSetKey::Float32 => {
+                let a: [u8; 4] = v.try_into().ok()?;
+                let f = f32::from_le_bytes(a);
+                let f = if f == 0.0 {
+                    0.0f32
+                } else if f.is_nan() {
+                    f32::NAN
+                } else {
+                    f
+                };
+                Some(f.to_bits() as u128)
+            }
+            InSetKey::Float64 => {
+                let a: [u8; 8] = v.try_into().ok()?;
+                let f = f64::from_le_bytes(a);
+                let f = if f == 0.0 {
+                    0.0f64
+                } else if f.is_nan() {
+                    f64::NAN
+                } else {
+                    f
+                };
+                Some(f.to_bits() as u128)
+            }
+            InSetKey::FixedBytes(_) | InSetKey::Bytes => None,
+        }
+    }
+}
+
+impl InSet {
+    /// A set over `values` encoded as `db_type`, or `None` when that type is not
+    /// one whose equality this can reproduce, or a value is not well formed.
+    pub fn build<'v>(
+        db_type: &DbType,
+        values: impl Iterator<Item = &'v [u8]>,
+        negated: bool,
+    ) -> Option<InSet> {
+        let key = InSetKey::of(db_type)?;
+        let mut small = ahash::HashSet::default();
+        let mut bytes = ahash::HashSet::default();
+        for v in values {
+            match key {
+                InSetKey::Bytes => {
+                    bytes.insert(v.to_vec());
+                }
+                InSetKey::FixedBytes(width) => {
+                    if v.len() != width {
+                        return None;
+                    }
+                    bytes.insert(v.to_vec());
+                }
+                _ => {
+                    small.insert(key.small_key(v)?);
+                }
+            }
+        }
+        Some(InSet {
+            negated,
+            key,
+            small,
+            bytes,
+        })
+    }
+
+    /// Number of distinct values.
+    pub fn len(&self) -> usize {
+        self.small.len() + self.bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Whether the comparison chain this replaces holds for `value`.
+    #[inline]
+    pub fn matches(&self, value: &[u8]) -> Result<bool, EvalError> {
+        let found = match self.key {
+            InSetKey::Bytes => self.bytes.contains(value),
+            InSetKey::FixedBytes(width) => {
+                if value.len() != width {
+                    return Err(EvalError::OperandSizeMismatch);
+                }
+                self.bytes.contains(value)
+            }
+            _ => match self.key.small_key(value) {
+                Some(k) => self.small.contains(&k),
+                None => return Err(EvalError::OperandSizeMismatch),
+            },
+        };
+        Ok(found != self.negated)
+    }
+}
+
+/// Whether `t` is a `column = constant` (or `<>`) comparison a run can absorb,
+/// and if so its operator (`false` for `=`, `true` for `<>`), column and type.
+fn in_set_member(t: &ColumnTransformer) -> Option<(bool, usize, &DbType)> {
+    let ColumnTransformerType::ComparerOperation(op) = &t.transformer_type else {
+        return None;
+    };
+    let negated = match op {
+        ComparerOperation::Equals => false,
+        ComparerOperation::NotEquals => true,
+        _ => return None,
+    };
+    if t.in_set.is_some()
+        || t.result_index_1.is_some()
+        || t.column_1_path.is_some()
+        || t.column_1_cast.is_some()
+        || t.column_1_scale.is_some()
+        || t.column_2_index.is_some()
+        || t.result_index_2.is_some()
+        || t.column_2_path.is_some()
+        || t.column_2_cast.is_some()
+        || t.column_2_scale.is_some()
+        || t.column_2.is_none()
+    {
+        return None;
+    }
+    let column = t.column_1_index?;
+    InSetKey::of(&t.column_type)?;
+    Some((negated, column, &t.column_type))
+}
+
+/// Replaces every parenthesised run of `col = v1 OR … OR col = vN` (or `col <>
+/// v1 AND …`) over one column with a single [`InSet`] comparison.
+///
+/// Only a run that is *exactly* one parenthesised group is taken: its first
+/// comparison opens a group, its last closes one, and nothing inside opens or
+/// closes another — so the group's parentheses are the run's own and can be
+/// dropped with it. Everything about the comparisons except the constant must
+/// be identical (column, type, operator, no path, cast or scale lift), and the
+/// connective between them must be `OR` for `=` and `AND` for `<>`; anything
+/// else is left as it was. Returns whether anything changed.
+pub fn collapse_in_sets(transformers: &mut SmallVec<[ColumnTransformer; 36]>) -> bool {
+    let mut changed = false;
+    let mut i = 0usize;
+    while i < transformers.len() {
+        let Some((negated, column, db_type)) = in_set_member(&transformers[i]) else {
+            i += 1;
+            continue;
+        };
+        if transformers[i].group_opens == 0 || transformers[i].group_closes != 0 {
+            i += 1;
+            continue;
+        }
+        let db_type = db_type.clone();
+        let link = if negated { Next::And } else { Next::Or };
+        let mut end = None;
+        let mut j = i;
+        loop {
+            let t = &transformers[j];
+            if j > i {
+                match in_set_member(t) {
+                    Some((n, c, ty)) if n == negated && c == column && *ty == db_type => {}
+                    _ => break,
+                }
+                if t.group_opens != 0 {
+                    break;
+                }
+            }
+            if t.group_closes != 0 {
+                end = Some(j);
+                break;
+            }
+            if t.next.as_ref() != Some(&link) {
+                break;
+            }
+            j += 1;
+            if j >= transformers.len() {
+                break;
+            }
+        }
+        let Some(end) = end else {
+            i += 1;
+            continue;
+        };
+        if end + 1 - i < IN_SET_MIN_VALUES {
+            i = end + 1;
+            continue;
+        }
+        let set = InSet::build(
+            &db_type,
+            transformers[i..=end]
+                .iter()
+                .map(|t| t.column_2.as_ref().expect("checked").into_slice()),
+            negated,
+        );
+        let Some(set) = set else {
+            i = end + 1;
+            continue;
+        };
+        let mut merged = transformers[i].clone();
+        merged.in_set = Some(std::sync::Arc::new(set));
+        merged.group_opens -= 1;
+        merged.group_closes = transformers[end].group_closes - 1;
+        merged.next = transformers[end].next.clone();
+        transformers.drain(i + 1..=end);
+        transformers[i] = merged;
+        changed = true;
+        i += 1;
+    }
+    changed
+}
+
 #[derive(Debug, Clone)]
 pub struct TransformerPlan {
     transformers: SmallVec<[ColumnTransformer; 36]>,
@@ -691,7 +1043,7 @@ impl ComparisonOperand {
             ComparisonOperand::DirectWithIndex(mb, _) => mb,
             ComparisonOperand::PathWithIndex(mb, _, _) => mb,
             ComparisonOperand::CastWithIndex(mb, _, _, _) => mb,
-            ComparisonOperand::Intermediate(_) => {
+            ComparisonOperand::Intermediate(_) | ComparisonOperand::IntermediateCast(..) => {
                 panic!("Intermediate has no direct memory block")
             }
         }
@@ -708,7 +1060,10 @@ impl ComparisonOperand {
         matches!(self, ComparisonOperand::DirectWithIndex(_, _))
     }
     pub fn is_intermediate(&self) -> bool {
-        matches!(self, ComparisonOperand::Intermediate(_))
+        matches!(
+            self,
+            ComparisonOperand::Intermediate(_) | ComparisonOperand::IntermediateCast(..)
+        )
     }
 }
 
@@ -754,6 +1109,10 @@ pub struct TransformerProcessor<'a> {
     /// is checked per row rather than per comparison, which is one predictable
     /// branch against work that is already per-row.
     program_dirty: bool,
+    /// Whether runs of `col = v` are folded into hashed [`InSet`]s. Always on
+    /// outside the differential tests, which turn it off to evaluate the
+    /// comparison chain itself as the reference.
+    in_sets_enabled: bool,
 }
 
 /// One step of the compiled boolean program, in postfix order.
@@ -793,7 +1152,14 @@ impl<'a> TransformerProcessor<'a> {
             pending_opens: 0,
             program_dirty: false,
             program_overflowed: false,
+            in_sets_enabled: true,
         }
+    }
+
+    /// Turns the [`InSet`] folding off, so the comparison chain is evaluated as
+    /// written. For differential tests and benchmarks only.
+    pub fn set_in_sets_enabled(&mut self, enabled: bool) {
+        self.in_sets_enabled = enabled;
     }
 
     #[inline]
@@ -804,8 +1170,14 @@ impl<'a> TransformerProcessor<'a> {
     }
 
     pub fn snapshot_plan(&self) -> TransformerPlan {
+        let mut transformers = self.transformers.clone();
+        // Folded once here, in the plan every worker loads, rather than once
+        // per worker: a 50,000-value list is that many hash inserts.
+        if self.in_sets_enabled {
+            collapse_in_sets(&mut transformers);
+        }
         TransformerPlan {
-            transformers: self.transformers.clone(),
+            transformers,
             max_result_store_index: self.max_result_store_index,
         }
     }
@@ -855,6 +1227,16 @@ impl<'a> TransformerProcessor<'a> {
         result_store_idx
     }
 
+    /// Says that the operands of the transformer just added are `NUMERIC`
+    /// columns stored at these declared scales, to be lifted to the engine
+    /// scale before use. `None` leaves an operand as it is.
+    pub fn set_last_operand_scales(&mut self, left: Option<u32>, right: Option<u32>) {
+        if let Some(t) = self.transformers.last_mut() {
+            t.column_1_scale = left;
+            t.column_2_scale = right;
+        }
+    }
+
     /// Notes that a boolean group opens before the next comparison.
     pub fn open_group(&mut self) {
         self.pending_opens = self.pending_opens.saturating_add(1);
@@ -887,6 +1269,11 @@ impl<'a> TransformerProcessor<'a> {
     /// the results it indexes.
     fn refresh_comparison_program(&mut self) {
         self.comparison_program.clear();
+        // Before the program is built from the comparisons, so it indexes the
+        // folded list. A no-op on a plan that was folded when snapshotted.
+        if self.in_sets_enabled {
+            collapse_in_sets(self.transformers);
+        }
 
         let comparisons: SmallVec<[(u8, u8, Option<Next>); 24]> = self
             .transformers
@@ -1739,5 +2126,292 @@ mod tests {
         assert!(used.contains(&1));
         assert!(used.contains(&5));
         assert_eq!(used.len(), 3);
+    }
+}
+
+/// The hashed `IN` set against the comparison chain it replaces, over generated
+/// lists, types and NULLs. The chain is evaluated with folding switched off —
+/// the reference — and the two must agree on every row, errors included.
+#[cfg(test)]
+mod in_set_differential {
+    use super::*;
+    use crate::core::row::schema::SchemaField;
+    use crate::core::tokenizer::query_parser::QueryParser;
+    use crate::core::tokenizer::query_tokenizer::tokenize;
+    use crate::memory_pool::MEMORY_POOL;
+    use std::borrow::Cow;
+    use std::cell::UnsafeCell;
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+        fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
+            &xs[(self.next() as usize) % xs.len()]
+        }
+    }
+
+    fn mb(bytes: &[u8]) -> MemoryBlock {
+        let mut m = MEMORY_POOL.acquire(bytes.len());
+        m.into_slice_mut().copy_from_slice(bytes);
+        m
+    }
+
+    fn schema() -> SmallVec<[SchemaField; 20]> {
+        let mut d = SchemaField::new("d".to_string(), DbType::DECIMAL, 16, 0, 4, false);
+        d.scale = Some(2);
+        smallvec::smallvec![
+            SchemaField::new("a".to_string(), DbType::I32, 4, 0, 0, false),
+            SchemaField::new("b".to_string(), DbType::I64, 8, 0, 1, false),
+            SchemaField::new("s".to_string(), DbType::STRING, 12, 0, 2, false),
+            SchemaField::new("f".to_string(), DbType::F64, 8, 0, 3, false),
+            d,
+            SchemaField::new("u".to_string(), DbType::UUID, 16, 0, 5, false),
+            SchemaField::new("n".to_string(), DbType::I32, 4, 0, 6, false),
+            SchemaField::new("__null_n".to_string(), DbType::BOOL, 1, 0, 7, false),
+            SchemaField::new("r".to_string(), DbType::F32, 4, 0, 8, false),
+        ]
+    }
+
+    const INTS: &[&str] = &["-5", "0", "1", "2", "3", "7", "11", "12", "300", "-1"];
+    const STRS: &[&str] = &["'x'", "'y'", "'zz'", "''", "'it''s'", "'É'", "'X'"];
+    const FLOATS: &[&str] = &["0", "'-0'", "1.5", "'NaN'", "'Infinity'", "2", "-3.25"];
+    const DECS: &[&str] = &["1", "1.5", "2.25", "100", "0.01", "-7"];
+    const UUIDS: &[&str] = &[
+        "'00000000-0000-0000-0000-000000000001'",
+        "'00000000-0000-0000-0000-000000000002'",
+        "'ffffffff-ffff-ffff-ffff-ffffffffffff'",
+        "'12345678-1234-1234-1234-123456789abc'",
+    ];
+
+    fn domain(col: &str) -> &'static [&'static str] {
+        match col {
+            "a" | "b" | "n" => INTS,
+            "s" => STRS,
+            "f" | "r" => FLOATS,
+            "d" => DECS,
+            _ => UUIDS,
+        }
+    }
+
+    fn unquote(v: &str) -> String {
+        crate::core::value_codec::unquote_sql(v).to_string()
+    }
+
+    fn row(rng: &mut Lcg) -> SmallVec<[(Cow<'static, str>, MemoryBlock); 20]> {
+        let int = |rng: &mut Lcg| rng.pick(INTS).parse::<i64>().unwrap();
+        let fl = |rng: &mut Lcg| -> f64 {
+            match unquote(rng.pick(FLOATS)).as_str() {
+                "NaN" => {
+                    // A NaN with another payload is still NaN.
+                    if rng.next() % 2 == 0 {
+                        f64::NAN
+                    } else {
+                        f64::from_bits(0xfff8_0000_0000_0001)
+                    }
+                }
+                "Infinity" => f64::INFINITY,
+                t => t.parse().unwrap(),
+            }
+        };
+        let null = rng.next() % 4 == 0;
+        let mut cols: SmallVec<[(Cow<'static, str>, MemoryBlock); 20]> = SmallVec::new();
+        cols.push(("a".into(), mb(&(int(rng) as i32).to_le_bytes())));
+        cols.push(("b".into(), mb(&int(rng).to_le_bytes())));
+        cols.push(("s".into(), mb(unquote(rng.pick(STRS)).as_bytes())));
+        cols.push(("f".into(), mb(&fl(rng).to_le_bytes())));
+        let d = crate::core::value_codec::parse_decimal_scaled(&unquote(rng.pick(DECS)), 2).unwrap();
+        cols.push(("d".into(), mb(&d.to_le_bytes())));
+        let u = crate::core::value_codec::encode_literal(&DbType::UUID, &unquote(rng.pick(UUIDS)))
+            .unwrap();
+        cols.push(("u".into(), mb(&u)));
+        let n = if null { 0 } else { int(rng) as i32 };
+        cols.push(("n".into(), mb(&n.to_le_bytes())));
+        cols.push(("__null_n".into(), mb(&[u8::from(null)])));
+        cols.push(("r".into(), mb(&(fl(rng) as f32).to_le_bytes())));
+        cols
+    }
+
+    fn evaluate(
+        tokens: &SmallVec<[crate::core::tokenizer::query_tokenizer::Token; 36]>,
+        rows: &[SmallVec<[(Cow<'static, str>, MemoryBlock); 20]>],
+        folded: bool,
+    ) -> (Vec<Result<bool, String>>, usize) {
+        let schema = schema();
+        let mut transformers: SmallVec<[ColumnTransformer; 36]> = SmallVec::new();
+        let mut inter: SmallVec<[MemoryBlock; 20]> = SmallVec::new();
+        let mut results: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
+        let processor = UnsafeCell::new(TransformerProcessor::new(&mut transformers, &mut inter));
+        unsafe { &mut *processor.get() }.set_in_sets_enabled(folded);
+        let mut parser =
+            QueryParser::new(tokens, unsafe { &mut *processor.get() }).with_scales(&schema);
+        let out = rows
+            .iter()
+            .map(|r| parser.evaluate_row(r, &mut results))
+            .collect();
+        let comparisons = unsafe { &*processor.get() }.transformers.len();
+        (out, comparisons)
+    }
+
+    #[test]
+    fn the_hashed_set_agrees_with_the_chain() {
+        let schema = schema();
+        let mut rng = Lcg(0x5eed);
+        let rows: Vec<_> = (0..300).map(|_| row(&mut rng)).collect();
+        let mut folded_runs = 0;
+        let mut answered = 0;
+        for trial in 0..400 {
+            let col = *rng.pick(&["a", "b", "s", "f", "d", "u", "n", "r"]);
+            let len = *rng.pick(&[0usize, 1, 3, 4, 5, 9, 40, 200]);
+            let mut values: Vec<String> = (0..len).map(|_| rng.pick(domain(col)).to_string()).collect();
+            if rng.next() % 7 == 0 && !values.is_empty() {
+                values.push("NULL".to_string());
+            }
+            let negated = rng.next() % 3 == 0;
+            let list = format!(
+                "{} {}IN ({})",
+                col,
+                if negated { "NOT " } else { "" },
+                values.join(", ")
+            );
+            let clause = match trial % 3 {
+                0 => list,
+                1 => format!("(a > 5 OR {}) AND b <> 3", list),
+                _ => format!("{} AND s <> 'zz' OR a = 2", list),
+            };
+            let rewritten = crate::core::tokenizer::predicate_rewrite::rewrite_where(&clause, &schema)
+                .unwrap_or_else(|e| panic!("{clause}: {e}"));
+            let tokens = tokenize(&rewritten, &schema);
+            let (reference, chain_len) = evaluate(&tokens, &rows, false);
+            let (hashed, folded_len) = evaluate(&tokens, &rows, true);
+            if folded_len < chain_len {
+                folded_runs += 1;
+            }
+            if reference.iter().all(|r| r.is_ok()) {
+                answered += 1;
+            } else {
+                // An error is compared too, but a trial that only errors
+                // proves nothing about the set, so it must be rare.
+                eprintln!("{clause}: {:?}", reference.iter().find(|r| r.is_err()));
+            }
+            for (i, (r, h)) in reference.iter().zip(hashed.iter()).enumerate() {
+                assert_eq!(r, h, "{clause} disagrees on row {i}");
+            }
+        }
+        // The test is only worth something if the fold actually happened.
+        assert!(folded_runs > 100, "only {folded_runs} trials folded");
+        assert!(answered > 380, "only {answered} of 400 trials planned and ran");
+    }
+
+    #[test]
+    fn a_short_or_mixed_run_is_left_alone() {
+        let schema = schema();
+        for (clause, folds) in [
+            ("a IN (1, 2, 3)", false),
+            ("a IN (1, 2, 3, 4)", true),
+            ("a NOT IN (1, 2, 3, 4)", true),
+            ("(a = 1 OR a = 2 OR b = 3 OR a = 4)", false),
+            ("(a = 1 OR a = 2 OR a > 3 OR a = 4)", false),
+            ("(a = 1 OR a = 2 AND a = 3 OR a = 4)", false),
+            ("(a = 1 OR (a = 2 OR a = 3) OR a = 4)", false),
+            ("s IN ('x', 'y', 'zz', '')", true),
+            ("u IN ('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000002', 'ffffffff-ffff-ffff-ffff-ffffffffffff', '12345678-1234-1234-1234-123456789abc')", true),
+        ] {
+            let rewritten =
+                crate::core::tokenizer::predicate_rewrite::rewrite_where(clause, &schema).unwrap();
+            let tokens = tokenize(&rewritten, &schema);
+            let rows = vec![row(&mut Lcg(1))];
+            let (_, chain) = evaluate(&tokens, &rows, false);
+            let (_, folded) = evaluate(&tokens, &rows, true);
+            assert_eq!(folded < chain, folds, "{clause}");
+        }
+    }
+}
+
+/// `x IN (…)` per-row cost, the comparison chain against the hashed set.
+///
+/// `cargo test --release -p rasterizeddb_core --lib -- --ignored in_set_bench --nocapture`
+#[cfg(test)]
+mod in_set_bench {
+    use super::*;
+    use crate::core::row::schema::SchemaField;
+    use crate::core::tokenizer::query_parser::QueryParser;
+    use crate::core::tokenizer::query_tokenizer::tokenize;
+    use crate::memory_pool::MEMORY_POOL;
+    use std::borrow::Cow;
+    use std::cell::UnsafeCell;
+
+    fn run(n_values: usize, rows: usize, folded: bool) -> (f64, usize) {
+        let schema: SmallVec<[SchemaField; 20]> = smallvec::smallvec![
+            SchemaField::new("a".to_string(), DbType::I64, 8, 0, 0, false),
+            SchemaField::new("s".to_string(), DbType::STRING, 12, 0, 1, false),
+        ];
+        let list: Vec<String> = (0..n_values).map(|i| (i * 7).to_string()).collect();
+        let clause = format!("a IN ({})", list.join(", "));
+        let rewritten =
+            crate::core::tokenizer::predicate_rewrite::rewrite_where(&clause, &schema).unwrap();
+        let tokens = tokenize(&rewritten, &schema);
+        let mut transformers: SmallVec<[ColumnTransformer; 36]> = SmallVec::new();
+        let mut inter: SmallVec<[MemoryBlock; 20]> = SmallVec::new();
+        let processor = UnsafeCell::new(TransformerProcessor::new(&mut transformers, &mut inter));
+        unsafe { &mut *processor.get() }.set_in_sets_enabled(folded);
+        let mb = |b: &[u8]| {
+            let mut m = MEMORY_POOL.acquire(b.len());
+            m.into_slice_mut().copy_from_slice(b);
+            m
+        };
+        let mut cols: SmallVec<[(Cow<'static, str>, MemoryBlock); 20]> = SmallVec::new();
+        cols.push(("a".into(), mb(&0i64.to_le_bytes())));
+        cols.push(("s".into(), mb(b"x")));
+        {
+            let mut parser = QueryParser::new(&tokens, unsafe { &mut *processor.get() });
+            parser.execute(&cols).unwrap();
+        }
+        let p = unsafe { &mut *processor.get() };
+        // A pool of row images cycled through, so the measurement is the
+        // predicate and not the allocator.
+        let pool: Vec<[MemoryBlock; 2]> = (0..4096u64)
+            .map(|i| {
+                let v = ((i.wrapping_mul(2654435761)) % (n_values as u64 * 14 + 1)) as i64;
+                [mb(&v.to_le_bytes()), mb(b"x")]
+            })
+            .collect();
+        let mut results: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
+        let mut hits = 0usize;
+        let start = std::time::Instant::now();
+        for i in 0..rows {
+            if p.execute_row(&pool[i % pool.len()][..], &mut results).unwrap() {
+                hits += 1;
+            }
+        }
+        let ns = start.elapsed().as_nanos() as f64 / rows as f64;
+        (ns, hits)
+    }
+
+    #[test]
+    #[ignore]
+    fn in_set_bench() {
+        for (n, rows) in [
+            (4usize, 1_000_000usize),
+            (10, 1_000_000),
+            (1_000, 1_000_000),
+            (50_000, 20_000),
+        ] {
+            // Interleaved A/B, three rounds: the box drifts.
+            for round in 0..3 {
+                let (chain, h1) = run(n, rows, false);
+                let (set, h2) = run(n, rows, true);
+                assert_eq!(h1, h2, "the two paths disagree");
+                println!(
+                    "IN of {n:>6} values, {rows} rows, round {round}: chain {chain:>10.1} ns/row, set {set:>6.1} ns/row ({:.0}x), {h1} matches",
+                    chain / set
+                );
+            }
+        }
     }
 }

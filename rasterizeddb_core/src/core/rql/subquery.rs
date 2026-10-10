@@ -23,6 +23,9 @@ pub struct InSubquery {
     pub start: usize,
     pub end: usize,
     pub inner_sql: String,
+    /// For `NOT IN (SELECT …)`, where the `NOT` begins; `None` for a plain
+    /// `IN` (and for a scalar subquery).
+    pub negated_start: Option<usize>,
 }
 
 /// Finds the first `IN (SELECT …)` in a statement, ignoring string literals.
@@ -88,10 +91,19 @@ pub fn find_in_subquery(sql: &str) -> Option<InSubquery> {
                     if depth != 0 {
                         return None;
                     }
+                    let head = sql[..i].trim_end();
+                    let negated_start = (head.len() >= 3
+                        && head.as_bytes()[head.len() - 3..].eq_ignore_ascii_case(b"NOT")
+                        && (head.len() == 3 || {
+                            let b = head.as_bytes()[head.len() - 4];
+                            !b.is_ascii_alphanumeric() && b != b'_' && b != b'"'
+                        }))
+                    .then(|| head.len() - 3);
                     return Some(InSubquery {
                         start: j,
                         end: m,
                         inner_sql: sql[j + 1..m - 1].trim().to_string(),
+                        negated_start,
                     });
                 }
             }
@@ -200,6 +212,7 @@ pub fn find_scalar_subquery(sql: &str) -> Option<InSubquery> {
                             start: open,
                             end: m,
                             inner_sql,
+                            negated_start: None,
                         });
                     }
                     i = open + 1;
@@ -417,6 +430,90 @@ pub fn find_exists(sql: &str) -> Option<ExistsClause> {
     None
 }
 
+/// What the trailing `LIMIT` / `OFFSET` of an `EXISTS` body changes about its
+/// answer. `ORDER BY` changes nothing and is not recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ExistsBounds {
+    /// `LIMIT n` as written; `None` for no limit or `LIMIT ALL`.
+    pub limit: Option<u64>,
+    /// `OFFSET k`; 0 when absent.
+    pub offset: u64,
+}
+
+/// Splits a top-level `ORDER BY`, `LIMIT`, `OFFSET` (and their SQL:2008
+/// spellings) off the body of an `EXISTS`.
+///
+/// They have to go before the correlated rewrite looks at the `WHERE` clause.
+/// Left in place, `EXISTS (SELECT 1 FROM t WHERE t.a = o.b AND t.on LIMIT 1)` —
+/// the shape Django's `Exists()` emits — became `o.b IN (SELECT a FROM t WHERE
+/// t.on LIMIT 1)`, an `IN` list of ONE value, and every outer row matching any
+/// other value was silently dropped. With the `LIMIT` straight after the
+/// correlation the outer reference itself became `o.b LIMIT 1`.
+///
+/// What they mean for existence:
+/// * `ORDER BY` never changes whether a row exists;
+/// * `LIMIT n` with `n >= 1` never does either, and `LIMIT 0` makes it false;
+/// * `OFFSET k` asks for at least `k + 1` rows, which the caller must honour.
+///
+/// The search is quote- and parenthesis-aware, so a `LIMIT` inside a nested
+/// subquery or a string literal is left alone.
+pub fn strip_exists_tail(clause: &ExistsClause) -> Result<(ExistsClause, ExistsBounds), String> {
+    let normalized =
+        crate::core::tokenizer::pagination::normalize_pagination(clause.inner_sql.trim())?;
+    let mut body: &str = normalized.as_str();
+    let mut bounds = ExistsBounds::default();
+
+    // `normalize_pagination` leaves at most a canonical ` LIMIT n OFFSET m`
+    // tail, in that order, so it is peeled from the end.
+    if let Some((head, n)) = take_count_suffix(body, "OFFSET") {
+        bounds.offset = n;
+        body = head;
+    }
+    if let Some((head, n)) = take_count_suffix(body, "LIMIT") {
+        bounds.limit = Some(n);
+        body = head;
+    }
+
+    // `ORDER BY` is the last clause left once the pagination is gone.
+    if let Some(at) = crate::core::rql::join::find_phrase(body, &["ORDER", "BY"], 0) {
+        body = body[..at].trim_end();
+    }
+
+    Ok((
+        ExistsClause {
+            start: clause.start,
+            end: clause.end,
+            inner_sql: body.trim().to_string(),
+            negated: clause.negated,
+        },
+        bounds,
+    ))
+}
+
+/// `"… <KEYWORD> <digits>"` -> `("…", digits)`, matching the keyword as a
+/// whole, case-insensitive word.
+fn take_count_suffix<'a>(text: &'a str, keyword: &str) -> Option<(&'a str, u64)> {
+    let digits_at = text.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+    if digits_at == text.len() {
+        return None;
+    }
+    let count: u64 = text[digits_at..].parse().ok()?;
+    let head = text[..digits_at].trim_end();
+    if head.len() == text[..digits_at].len() || head.len() < keyword.len() {
+        // No whitespace between the keyword and the count.
+        return None;
+    }
+    let kw_at = head.len() - keyword.len();
+    if !head.is_char_boundary(kw_at) || !head[kw_at..].eq_ignore_ascii_case(keyword) {
+        return None;
+    }
+    let before = &head[..kw_at];
+    if !before.ends_with(|c: char| c.is_ascii_whitespace()) {
+        return None;
+    }
+    Some((before.trim_end(), count))
+}
+
 /// Rewrites a correlated `EXISTS` into the equivalent `IN` over the inner
 /// relation's join column.
 ///
@@ -428,10 +525,17 @@ pub fn find_exists(sql: &str) -> Option<ExistsClause> {
 ///
 /// Returns the replacement text, or an error naming what could not be handled.
 pub fn exists_to_in(clause: &ExistsClause, outer_relations: &[String]) -> Result<String, String> {
+    const SELECT_LEN: usize = "SELECT".len();
     let inner = clause.inner_sql.trim();
-    let upper = inner.to_ascii_uppercase();
+    let inner_text = inner;
 
-    if !upper.starts_with("SELECT ") {
+    if !inner
+        .get(..SELECT_LEN + 1)
+        .is_some_and(|h| {
+            h.as_bytes()[..SELECT_LEN].eq_ignore_ascii_case(b"SELECT")
+                && h.as_bytes()[SELECT_LEN].is_ascii_whitespace()
+        })
+    {
         return Err("EXISTS must contain a SELECT".to_string());
     }
     let from_at = crate::core::rql::join::find_keyword(inner, "FROM", 0)
@@ -458,6 +562,11 @@ pub fn exists_to_in(clause: &ExistsClause, outer_relations: &[String]) -> Result
         None => return Err(UNCORRELATED.to_string()),
         Some(w) => after_from[w + "WHERE".len()..].trim(),
     };
+    // `GROUP BY` / `HAVING` are not predicates: handed to `split_conjuncts`
+    // they were glued onto the last conjunct, where `o.b GROUP BY a` read as an
+    // outer reference. Split off here, and refused below once the subquery is
+    // known to correlate — the `IN` rewrite has nowhere to put them.
+    let (where_clause, grouping) = split_grouping(where_clause);
 
     // Split the inner predicate into the one term that correlates with the
     // outer query and everything else, which stays inside the subquery.
@@ -494,6 +603,23 @@ pub fn exists_to_in(clause: &ExistsClause, outer_relations: &[String]) -> Result
         return Err(UNCORRELATED.to_string());
     }
 
+    if !grouping.is_empty() {
+        return Err(
+            "a correlated EXISTS with GROUP BY or HAVING is not supported".to_string(),
+        );
+    }
+
+    // `EXISTS (SELECT COUNT(*) FROM t WHERE t.a = o.b)` — an aggregate with no
+    // GROUP BY yields exactly one row whatever matched, so the EXISTS holds for
+    // every outer row. The `IN` rewrite would instead ask whether a matching
+    // row exists: a plausible, wrong answer.
+    let select_list = &inner_text[SELECT_LEN..from_at];
+    if !crate::core::rql::lexer_query::find_aggregate_calls(select_list).is_empty()
+        && crate::core::rql::join::find_keyword(select_list, "OVER", 0).is_none()
+    {
+        return Ok(uncorrelated_exists_predicate(clause.negated, true).to_string());
+    }
+
     // More than one correlation cannot be expressed as `outer IN (SELECT inner)`,
     // which carries exactly one column — and `x IN (SELECT a) AND y IN (SELECT b)`
     // is a different, weaker question, since different inner rows may satisfy
@@ -518,23 +644,53 @@ pub fn exists_to_in(clause: &ExistsClause, outer_relations: &[String]) -> Result
             .to_string()
     };
 
+    // `EXISTS` is two-valued and `IN` is not, and the difference is NULL. A
+    // NULL join value matches nothing, so it is kept out of the list: in it, a
+    // `NOT IN` can never hold, and `NOT EXISTS` would have lost every row. The
+    // rest of the predicate is parenthesised so the extra term cannot bind to
+    // one arm of an `OR`.
     let subquery = if rest.is_empty() {
-        format!("SELECT {} FROM {}", inner_column, relation_text)
+        format!(
+            "SELECT {} FROM {} WHERE {} IS NOT NULL",
+            inner_column, relation_text, inner_column
+        )
     } else {
         format!(
-            "SELECT {} FROM {} WHERE {}",
+            "SELECT {} FROM {} WHERE {} IS NOT NULL AND ({})",
             inner_column,
             relation_text,
+            inner_column,
             rest.join(" AND ")
         )
     };
 
-    Ok(format!(
-        "{} {}IN ({})",
-        outer_ref,
-        if clause.negated { "NOT " } else { "" },
-        subquery
-    ))
+    if clause.negated {
+        // An outer NULL matches no inner row, so `NOT EXISTS` holds for it —
+        // while `NULL NOT IN (…)` is unknown and drops the row.
+        Ok(format!(
+            "({} IS NULL OR {} NOT IN ({}))",
+            outer_ref, outer_ref, subquery
+        ))
+    } else {
+        Ok(format!("{} IN ({})", outer_ref, subquery))
+    }
+}
+
+/// Splits `<predicate> GROUP BY … HAVING …` at its first top-level `GROUP BY`
+/// or `HAVING`, returning `(predicate, grouping)`; `grouping` is empty when
+/// there is neither.
+fn split_grouping(where_clause: &str) -> (&str, &str) {
+    let at = [
+        crate::core::rql::join::find_phrase(where_clause, &["GROUP", "BY"], 0),
+        crate::core::rql::join::find_keyword(where_clause, "HAVING", 0),
+    ]
+    .into_iter()
+    .flatten()
+    .min();
+    match at {
+        Some(at) => (where_clause[..at].trim_end(), where_clause[at..].trim()),
+        None => (where_clause, ""),
+    }
 }
 
 enum Side {
@@ -682,11 +838,6 @@ pub fn multi_exists_predicate(
     spec: &MultiCorrelatedExists,
     rows: &[Row],
 ) -> Result<String, String> {
-    if rows.is_empty() {
-        // Nothing to match: `EXISTS` is false for every row, `NOT EXISTS` true.
-        return Ok(if spec.negated { "1 = 1" } else { "1 = 0" }.to_string());
-    }
-
     let mut groups: Vec<String> = Vec::with_capacity(rows.len());
     for row in rows {
         if row.columns.len() != spec.outer_refs.len() {
@@ -695,6 +846,16 @@ pub fn multi_exists_predicate(
                 row.columns.len(),
                 spec.outer_refs.len()
             ));
+        }
+        // An inner row with a NULL in a correlated column equals no outer row,
+        // so it can neither satisfy `EXISTS` nor defeat `NOT EXISTS`. Rendered,
+        // it became `a.x = NULL`, which the predicate parser refused.
+        if row
+            .columns
+            .iter()
+            .any(|c| c.column_type == DbType::NULL)
+        {
+            continue;
         }
         let mut terms: Vec<String> = Vec::with_capacity(row.columns.len());
         for (outer, column) in spec.outer_refs.iter().zip(row.columns.iter()) {
@@ -716,7 +877,27 @@ pub fn multi_exists_predicate(
         groups.push(format!("({})", terms.join(joiner)));
     }
 
+    if groups.is_empty() {
+        // Nothing to match: `EXISTS` is false for every row, `NOT EXISTS` true.
+        return Ok(if spec.negated { "1 = 1" } else { "1 = 0" }.to_string());
+    }
+
     let joiner = if spec.negated { " AND " } else { " OR " };
+    if spec.negated {
+        // An outer row with a NULL in any correlated column matches no inner
+        // row, so `NOT EXISTS` holds for it; `a.x != 1` alone would be unknown
+        // for it and drop it.
+        let nulls: Vec<String> = spec
+            .outer_refs
+            .iter()
+            .map(|outer| format!("{} IS NULL", outer))
+            .collect();
+        return Ok(format!(
+            "({} OR ({}))",
+            nulls.join(" OR "),
+            groups.join(joiner)
+        ));
+    }
     Ok(format!("({})", groups.join(joiner)))
 }
 
@@ -830,7 +1011,12 @@ pub fn value_to_literal(db_type: &DbType, bytes: &[u8]) -> Option<String> {
                 bytes,
             )?)))
         }
-        DbType::DECIMAL => value_codec::format_decimal(i128::from_le_bytes(le::<16>(bytes)?)),
+        // A result value may carry its own display scale (an `AVG`); see
+        // `value_codec::decimal_cell_with_scale`.
+        DbType::DECIMAL => match value_codec::split_decimal_cell(bytes)? {
+            (v, Some(own)) => value_codec::format_decimal_scaled(v, own),
+            (v, None) => value_codec::format_decimal(v),
+        },
         DbType::BOOL => if bytes.first().copied().unwrap_or(0) != 0 {
             "1"
         } else {
@@ -920,8 +1106,24 @@ pub fn value_to_literal(db_type: &DbType, bytes: &[u8]) -> Option<String> {
 /// An empty result yields `()`. The `IN` desugaring reads that as a predicate
 /// that cannot hold, which is what `x IN (empty set)` means — rather than a
 /// syntax error, which is what an empty list would be if a user had written it.
-pub fn rows_to_value_list(rows: &[Row]) -> Result<String, String> {
-    let mut parts: Vec<String> = Vec::with_capacity(rows.len());
+///
+/// Duplicates are rendered once: membership does not depend on multiplicity,
+/// and every value in the list becomes one comparison per scanned outer row.
+///
+/// A NULL is left out of the list and reported as the second element instead.
+/// It equals nothing, so for `IN` dropping it is exact in a filter; for
+/// `NOT IN` it makes the predicate never true, which the caller expresses —
+/// rendered as a literal it reached the predicate parser as an unknown
+/// identifier.
+pub fn rows_to_value_list(rows: &[Row]) -> Result<(String, bool), String> {
+    let mut out = String::with_capacity(2 + rows.len() * 8);
+    out.push('(');
+    let mut had_null = false;
+    let mut first = true;
+    // Keyed by type tag and stored bytes, so equal values of different types
+    // (a UNION can mix them) are never merged.
+    let mut seen: ahash::HashSet<(u8, &[u8])> =
+        ahash::HashSet::with_capacity_and_hasher(rows.len(), Default::default());
 
     for row in rows {
         let column = row
@@ -931,17 +1133,29 @@ pub fn rows_to_value_list(rows: &[Row]) -> Result<String, String> {
         if row.columns.len() > 1 {
             return Err("a subquery used with IN must select exactly one column".to_string());
         }
-        let literal =
-            value_to_literal(&column.column_type, column.data.into_slice()).ok_or_else(|| {
-                format!(
-                    "subquery returned a {} value that cannot be compared",
-                    column.column_type
-                )
-            })?;
-        parts.push(literal);
+        if column.column_type == DbType::NULL {
+            had_null = true;
+            continue;
+        }
+        let bytes = column.data.into_slice();
+        if !seen.insert((column.column_type.to_byte(), bytes)) {
+            continue;
+        }
+        let literal = value_to_literal(&column.column_type, bytes).ok_or_else(|| {
+            format!(
+                "subquery returned a {} value that cannot be compared",
+                column.column_type
+            )
+        })?;
+        if !first {
+            out.push_str(", ");
+        }
+        first = false;
+        out.push_str(&literal);
     }
 
-    Ok(format!("({})", parts.join(", ")))
+    out.push(')');
+    Ok((out, had_null))
 }
 
 #[cfg(test)]
@@ -1054,7 +1268,7 @@ mod tests {
             let mut mb = MEMORY_POOL.acquire(bytes.len());
             mb.into_slice_mut().copy_from_slice(&bytes);
             Column {
-                schema_id,
+                schema_id: crate::core::row::row::schema_id_of(schema_id),
                 data: mb,
                 column_type: DbType::I32,
             }
@@ -1074,12 +1288,18 @@ mod tests {
         };
         let predicate = multi_exists_predicate(&spec, &[row(1, 1)]).unwrap();
         // De Morgan: "differs in at least one column", per inner row.
-        assert_eq!(predicate, "((a.x != 1 OR a.y != 1))");
+        assert_eq!(
+            predicate,
+            "(a.x IS NULL OR a.y IS NULL OR ((a.x != 1 OR a.y != 1)))"
+        );
 
         // The pair (1,1) must be excluded as a *pair*. A per-column rewrite
         // would also exclude (1,2) and (2,1), which is the bug this replaces.
         let two = multi_exists_predicate(&spec, &[row(1, 1), row(2, 2)]).unwrap();
-        assert_eq!(two, "((a.x != 1 OR a.y != 1) AND (a.x != 2 OR a.y != 2))");
+        assert_eq!(
+            two,
+            "(a.x IS NULL OR a.y IS NULL OR ((a.x != 1 OR a.y != 1) AND (a.x != 2 OR a.y != 2)))"
+        );
 
         let positive = MultiCorrelatedExists {
             negated: false,
@@ -1134,8 +1354,71 @@ mod tests {
         assert!(find_in_subquery("SELECT a FROM t WHERE x IN (SELECT y FROM u").is_none());
     }
 
+    fn tail(sql: &str) -> (String, ExistsBounds) {
+        let clause = find_exists(sql).expect("an EXISTS");
+        let (stripped, bounds) = strip_exists_tail(&clause).expect("strips");
+        (stripped.inner_sql, bounds)
+    }
+
+    #[test]
+    fn the_tail_of_an_exists_body_is_lifted_off() {
+        let (body, b) = tail("SELECT 1 FROM o WHERE EXISTS (SELECT 1 FROM t WHERE t.a = o.b AND t.on LIMIT 1)");
+        assert_eq!(body, "SELECT 1 FROM t WHERE t.a = o.b AND t.on");
+        assert_eq!(b, ExistsBounds { limit: Some(1), offset: 0 });
+
+        let (body, b) = tail("SELECT 1 FROM o WHERE EXISTS (SELECT 1 FROM t WHERE t.a = o.b\n ORDER  BY t.id DESC\nlimit 5 offset 2)");
+        assert_eq!(body, "SELECT 1 FROM t WHERE t.a = o.b");
+        assert_eq!(b, ExistsBounds { limit: Some(5), offset: 2 });
+
+        let (_, b) = tail("SELECT 1 FROM o WHERE EXISTS (SELECT 1 FROM t FETCH FIRST ROW ONLY)");
+        assert_eq!(b, ExistsBounds { limit: Some(1), offset: 0 });
+        let (_, b) = tail("SELECT 1 FROM o WHERE EXISTS (SELECT 1 FROM t LIMIT ALL)");
+        assert_eq!(b, ExistsBounds { limit: None, offset: 0 });
+        let (_, b) = tail("SELECT 1 FROM o WHERE NOT EXISTS (SELECT 1 FROM t LIMIT 0)");
+        assert_eq!(b.limit, Some(0));
+
+        // Nested and quoted keywords are not the body's own.
+        let (body, b) = tail(
+            "SELECT 1 FROM o WHERE EXISTS (SELECT 1 FROM t WHERE t.a = o.b AND t.c IN (SELECT c FROM u ORDER BY c LIMIT 3) AND t.n = 'LIMIT 9')",
+        );
+        assert!(body.ends_with("AND t.n = 'LIMIT 9'"), "{body}");
+        assert_eq!(b, ExistsBounds::default());
+    }
+
+    #[test]
+    fn a_correlated_exists_with_a_limit_rewrites_to_a_full_in() {
+        let sql = "SELECT id FROM o WHERE EXISTS (SELECT 1 FROM t WHERE t.a = o.b AND t.on = 1 LIMIT 1)";
+        let (clause, _) = strip_exists_tail(&find_exists(sql).unwrap()).unwrap();
+        let rewritten = exists_to_in(&clause, &["o".to_string()]).unwrap();
+        assert_eq!(rewritten, "o.b IN (SELECT a FROM t WHERE a IS NOT NULL AND (t.on = 1))");
+        assert!(!rewritten.contains("LIMIT"));
+    }
+
+    #[test]
+    fn a_correlated_exists_over_an_ungrouped_aggregate_always_holds() {
+        let clause = find_exists("SELECT id FROM o WHERE EXISTS (SELECT COUNT(*) FROM t WHERE t.a = o.b)").unwrap();
+        assert_eq!(exists_to_in(&clause, &["o".to_string()]).unwrap(), "1 = 1");
+        let clause = find_exists("SELECT id FROM o WHERE NOT EXISTS (SELECT max(t.x) FROM t WHERE t.a = o.b)").unwrap();
+        assert_eq!(exists_to_in(&clause, &["o".to_string()]).unwrap(), "1 = 0");
+        // A window function is not an aggregate: one row per match.
+        let clause = find_exists("SELECT id FROM o WHERE EXISTS (SELECT count(*) OVER () FROM t WHERE t.a = o.b)").unwrap();
+        assert!(exists_to_in(&clause, &["o".to_string()]).unwrap().contains(" IN ("));
+        // GROUP BY in a correlated body is refused rather than mangled.
+        let clause = find_exists("SELECT id FROM o WHERE EXISTS (SELECT 1 FROM t WHERE t.a = o.b GROUP BY a)").unwrap();
+        assert!(exists_to_in(&clause, &["o".to_string()]).is_err());
+    }
+
+    #[test]
+    fn not_in_records_where_its_not_begins() {
+        let sql = "SELECT a FROM t WHERE x NOT  IN (SELECT y FROM u)";
+        let found = find_in_subquery(sql).unwrap();
+        assert_eq!(&sql[found.negated_start.unwrap()..found.start], "NOT  IN ");
+        assert!(find_in_subquery("SELECT a FROM t WHERE x IN (SELECT y FROM u)").unwrap().negated_start.is_none());
+        assert!(find_in_subquery("SELECT a FROM t WHERE knot IN (SELECT y FROM u)").unwrap().negated_start.is_none());
+    }
+
     #[test]
     fn empty_results_render_as_an_empty_list() {
-        assert_eq!(rows_to_value_list(&[]).unwrap(), "()");
+        assert_eq!(rows_to_value_list(&[]).unwrap(), ("()".to_string(), false));
     }
 }
