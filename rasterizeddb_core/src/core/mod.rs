@@ -33,6 +33,7 @@ pub mod rql;
 pub mod similar_to;
 /// The shared quote-aware scanner, and escape/dollar-string normalisation.
 pub mod sql_scan;
+pub mod index;
 #[cfg(feature = "kv_cache")]
 pub mod kv_cache;
 /// Several storage directories for one database, behind the `storage_pools`

@@ -645,6 +645,10 @@ pub struct ReclaimContext<'a> {
     /// against the previous bound turns "has this slot been cleared already"
     /// into one integer test, instead of a set of every slot ever cleared.
     pub cleared_below: &'a AtomicU64,
+    /// The table's secondary indexes, which must forget every version this
+    /// sweep finds reclaimable, and the fetch that reads such a version's key
+    /// columns back from its row before the space is handed out.
+    pub indexes: Option<(&'a crate::core::index::TableIndexes, &'a crate::core::row::row::RowFetch)>,
 }
 
 impl ReclaimContext<'_> {
@@ -901,6 +905,9 @@ struct ScanResult {
     /// Highest end offset seen across every pointer, live or dead. Anything
     /// past it belongs to the append frontier and is not ours to hand out.
     frontier: u64,
+    /// Reclaimable versions a secondary index still holds: their keys are
+    /// read back and forgotten before this run publishes anything.
+    index_dead: Vec<(u64, crate::core::row::row_pointer::RowPointer)>,
 }
 
 /// Walks every pointer record of `io`, tombstones included, calling `visit` on
@@ -960,6 +967,31 @@ async fn sweep_pointers<S: StorageIO, F: FnMut(&RowPointer)>(
     Ok(())
 }
 
+/// Takes reclaimed versions out of the secondary indexes, keyed by what their
+/// rows hold. A row that cannot be read is forgotten without its key, which
+/// leaves at most a stale entry: a candidate the scan will find invisible.
+async fn forget_reclaimed<S: StorageIO>(
+    indexes: &crate::core::index::TableIndexes,
+    fetch: &crate::core::row::row::RowFetch,
+    io_rows: &S,
+    dead: &[(u64, crate::core::row::row_pointer::RowPointer)],
+) {
+    let mut row = crate::core::row::row::Row::default();
+    for (slot, pointer) in dead {
+        if pointer.fetch_row_reuse_async(io_rows, fetch, &mut row).await.is_ok() {
+            let get = |wo: u32| {
+                row.columns
+                    .iter()
+                    .find(|c| c.schema_id as u32 == wo)
+                    .map(|c| c.data.into_slice())
+            };
+            indexes.forget(*slot, Some(&get));
+        } else {
+            indexes.forget(*slot, None);
+        }
+    }
+}
+
 /// Reads every pointer record and reports the live and dead extents.
 async fn scan_pointers<S: StorageIO>(
     io_pointers: &S,
@@ -982,6 +1014,7 @@ async fn scan_pointers<S: StorageIO>(
         live_map_dropped: false,
         fingerprints_cleared: 0,
         frontier: 0,
+        index_dead: Vec::new(),
     };
 
     sweep_pointers(io_pointers, |pointer| {
@@ -1006,6 +1039,13 @@ async fn scan_pointers<S: StorageIO>(
 
         if horizon.is_reclaimable(pointer.deleted, pointer.xmin, pointer.xmax) {
             result.dead_rows += 1;
+            // Whatever retired it (a delete, an update's old version, an
+            // aborted insert), an index that still holds it has to let go,
+            // or it keeps the entry for good. Checked by the index's own
+            // slot bit, so each one is forgotten once.
+            if ctx.indexes.is_some_and(|(ix, _)| ix.holds(slot)) {
+                result.index_dead.push((slot, pointer.clone()));
+            }
             if let Some(extent) = extent {
                 push_dead(&mut result.dead, extent);
             }
@@ -1298,6 +1338,13 @@ pub async fn run_once<S: StorageIO>(
     // where it was and the next run re-clears rather than skipping.
     ctx.cleared_below
         .fetch_max(horizon.oldest_active(), Ordering::AcqRel);
+
+    // Before anything below can publish an extent: these versions' bytes are
+    // still theirs, so their keys read back true. Once published, the space
+    // could hold another row's bytes.
+    if let Some((indexes, fetch)) = ctx.indexes {
+        forget_reclaimed(indexes, fetch, io_rows, &scan.index_dead).await;
+    }
     let live_bytes = scan.live_bytes;
 
     let candidates = if scan.live_map_dropped {
@@ -1434,6 +1481,8 @@ pub struct VacuumService<S: StorageIO> {
     /// table so an explicit `VACUUM` and the service agree on what is already
     /// cleared.
     pub filters: Option<Arc<TableFilters>>,
+    /// The table's secondary indexes and their key-column fetch.
+    pub indexes: Option<(Arc<crate::core::index::TableIndexes>, crate::core::row::row::RowFetch)>,
     pub cleared_below: Arc<CacheGuard<AtomicU64>>,
     pub config: VacuumConfig,
     /// The table's write lock, compaction gate and cache generation, for the
@@ -1562,6 +1611,7 @@ impl<S: StorageIO> VacuumService<S> {
                     horizon: &horizon,
                     filters: self.filters.as_deref(),
                     cleared_below: &self.cleared_below,
+                    indexes: self.indexes.as_ref().map(|(ix, fetch)| (&**ix, fetch)),
                 };
 
                 match run_once(

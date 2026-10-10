@@ -378,7 +378,6 @@ pub struct TableSchema {
     pub name: String,
     pub fields: SmallVec<[SchemaField; 20]>,
     pub primary_key: Option<String>,
-    pub indexes: Vec<TableIndex>,
     pub is_immutable: bool,
     /// Foreign keys this table declares, loaded from its sidecar.
     pub foreign_keys: Vec<crate::core::rql::foreign_key::ForeignKey>,
@@ -392,6 +391,11 @@ pub struct TableSchema {
     /// no row layout — it says which paths the filter index should carry, and
     /// nothing else about the table depends on it.
     pub path_indexes: Vec<crate::core::rql::path_index::PathIndex>,
+    /// Indexes declared by `CREATE INDEX`, loaded from their sidecar. The
+    /// implicit ones a `PRIMARY KEY` or `UNIQUE` constraint brings are not
+    /// recorded here: they are derived from the constraints when the table
+    /// opens. See [`crate::core::index`].
+    pub secondary_indexes: Vec<crate::core::index::IndexDecl>,
     /// Table-level `UNIQUE` constraints, composite ones included, loaded from
     /// their sidecar. A single-column `UNIQUE` written inline on a column is
     /// recorded on the field instead, as `SchemaField::is_unique`.
@@ -409,12 +413,6 @@ pub struct TableSchema {
     pub generated: Vec<crate::core::rql::generated::GeneratedColumn>,
 }
 
-#[derive(Debug, Clone)]
-pub struct TableIndex {
-    pub name: String,
-    pub fields: Vec<String>,
-    pub is_unique: bool,
-}
 
 impl TableSchema {
     pub fn new(name: String, is_immutable: bool) -> Self {
@@ -422,12 +420,12 @@ impl TableSchema {
             name,
             fields: SmallVec::new(),
             primary_key: None,
-            indexes: Vec::new(),
             is_immutable,
             foreign_keys: Vec::new(),
             defaults: Vec::new(),
             json_columns: Vec::new(),
             path_indexes: Vec::new(),
+            secondary_indexes: Vec::new(),
             unique_keys: Vec::new(),
             type_modifiers: Vec::new(),
             generated: Vec::new(),
@@ -520,6 +518,7 @@ impl TableSchema {
         table_schema.defaults = crate::core::rql::column_default::load(schema_io.clone()).await;
         table_schema.json_columns = crate::core::rql::json_map::load(schema_io.clone()).await;
         table_schema.path_indexes = crate::core::rql::path_index::load(schema_io.clone()).await;
+        table_schema.secondary_indexes = crate::core::index::decl::load(schema_io.clone()).await;
         table_schema.unique_keys = crate::core::rql::unique_key::load(schema_io.clone()).await;
         table_schema.type_modifiers =
             crate::core::rql::type_modifier::load(schema_io.clone()).await;
@@ -610,7 +609,6 @@ impl TableSchema {
             name,
             fields: SmallVec::new(), // Fields are stored separately
             primary_key,
-            indexes: Vec::new(), // Indexes are stored separately,
             is_immutable: immutable,
             // Foreign keys and defaults live in their own sidecars; `load`
             // fills them in.
@@ -618,6 +616,7 @@ impl TableSchema {
             defaults: Vec::new(),
             json_columns: Vec::new(),
             path_indexes: Vec::new(),
+            secondary_indexes: Vec::new(),
             unique_keys: Vec::new(),
             type_modifiers: Vec::new(),
             generated: Vec::new(),
@@ -772,10 +771,6 @@ impl TableSchema {
 
     pub fn set_primary_key(&mut self, primary_key: String) {
         self.primary_key = Some(primary_key);
-    }
-
-    pub fn add_index(&mut self, index: TableIndex) {
-        self.indexes.push(index);
     }
 
     /// Clears a column's `UNIQUE` flag, persisting it the way

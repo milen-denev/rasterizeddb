@@ -40,6 +40,7 @@ const VIEWS: &[&str] = &[
     "pg_inherits",
     "pg_replication_slots",
     "pg_index",
+    "pg_indexes",
     "pg_database",
     "columns",
     "tables",
@@ -147,6 +148,13 @@ pub fn columns_of(view: &str) -> Option<&'static [(&'static str, DbType)]> {
             ("indislive", BOOL),
             ("indpred", STRING),
             ("indexprs", STRING),
+        ],
+        "pg_indexes" => &[
+            ("schemaname", STRING),
+            ("tablename", STRING),
+            ("indexname", STRING),
+            ("tablespace", STRING),
+            ("indexdef", STRING),
         ],
         "pg_database" => &[
             ("oid", I64),
@@ -975,6 +983,24 @@ async fn build(
                     }
                 }
 
+                // Indexes `CREATE INDEX` declared, each with its own
+                // identity and its column count.
+                if let Some(indexes) = table.indexes.as_ref() {
+                    for index in indexes.list.iter().filter(|i| !i.implicit) {
+                        rows.push(format!(
+                            "INSERT INTO {} (indexrelid, indrelid, indnatts, indisunique, \
+                             indisprimary, indisvalid, indisready, indislive, \
+                             indpred, indexprs) \
+                             VALUES ({}, {}, {}, 'f', 'f', 't', '{}', 't', '', '')",
+                            temp,
+                            oid_of(&format!("{}.{}", name, index.decl.name)),
+                            relid,
+                            index.columns.len(),
+                            if indexes.is_ready() { "t" } else { "f" },
+                        ));
+                    }
+                }
+
                 for (column, unique, primary) in keys {
                     // The index has an identity of its own, distinct from the
                     // table's, so a client joining `pg_index` to `pg_class`
@@ -1002,6 +1028,62 @@ async fn build(
                     "CREATE TABLE {} (indexrelid BIGINT, indrelid BIGINT, indnatts BIGINT, \
                      indisunique BOOL, indisprimary BOOL, indisvalid BOOL, indisready BOOL, \
                      indislive BOOL, indpred TEXT, indexprs TEXT)",
+                    temp
+                ),
+                rows,
+            )
+        }
+        // One row per index a table has: the implicit ones its `PRIMARY KEY`
+        // and `UNIQUE` constraints bring, and the ones `CREATE INDEX`
+        // declared, with the statement that would recreate each. This is the
+        // view a migration tool reads to decide whether an index it wants
+        // already exists.
+        "pg_indexes" => {
+            let mut rows = Vec::new();
+            for name in &tables {
+                let Some(table) = database.tables.get(name) else {
+                    continue;
+                };
+                let Some(indexes) = table.indexes.as_ref() else {
+                    continue;
+                };
+                for index in indexes.list.iter() {
+                    let columns: Vec<String> = index
+                        .columns
+                        .iter()
+                        .filter_map(|(wo, _)| {
+                            table
+                                .schema
+                                .fields
+                                .iter()
+                                .find(|f| f.write_order as u32 == *wo && !f.is_deleted)
+                                .map(|f| f.name.clone())
+                        })
+                        .collect();
+                    let def = format!(
+                        "CREATE {}INDEX {} ON {}.{} USING {} ({})",
+                        if index.decl.unique { "UNIQUE " } else { "" },
+                        index.decl.name,
+                        SCHEMA,
+                        name,
+                        index.method().name(),
+                        columns.join(", ")
+                    );
+                    rows.push(format!(
+                        "INSERT INTO {} (schemaname, tablename, indexname, tablespace, indexdef) \
+                         VALUES ('{}', '{}', '{}', '', '{}')",
+                        temp,
+                        SCHEMA,
+                        escape(name),
+                        escape(&index.decl.name),
+                        escape(&def),
+                    ));
+                }
+            }
+            (
+                format!(
+                    "CREATE TABLE {} (schemaname TEXT, tablename TEXT, indexname TEXT, \
+                     tablespace TEXT, indexdef TEXT)",
                     temp
                 ),
                 rows,

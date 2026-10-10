@@ -701,6 +701,12 @@ pub fn no_op_reason(sql: &str) -> Option<&'static str> {
     {
         return None;
     }
+    // A plain-column `CREATE INDEX` builds a real index now; see
+    // `crate::core::index::ddl`. Partial and expression indexes still fall
+    // through to the no-op below.
+    if crate::core::index::ddl::parse_create(sql).is_some() {
+        return None;
+    }
     if upper.starts_with("CREATE INDEX")
         || upper.starts_with("CREATE UNIQUE INDEX")
         || upper.starts_with("DROP INDEX")
@@ -1044,16 +1050,17 @@ mod tests {
         assert!(parse_drop_table("DROP TABLE a, b").is_err());
     }
 
-    /// An index over an ordinary column is still a no-op — the engine keeps
-    /// its own index over every eligible column, so declaring one adds
-    /// nothing. Index DDL over a *document path* is not, and neither is any
-    /// `DROP INDEX`: a drop names an index without saying what kind it is, and
-    /// answering "accepted, did nothing" to the drop of a path index that does
-    /// exist would be a silent lie. The executor takes every drop and answers
-    /// harmlessly for names it has never stored.
+    /// An index over plain columns is a real B-tree or hash index (see
+    /// `crate::core::index`), and so is one over a *document path*: both
+    /// reach the executor. So does every `DROP INDEX`, since a drop names an
+    /// index without saying what kind it is; the executor answers harmlessly
+    /// for names it never stored. What stays a no-op is what no index here
+    /// can honour: a partial index and an expression index.
     #[test]
     fn index_ddl_is_a_declared_no_op() {
-        assert!(no_op_reason("CREATE INDEX idx ON t (a)").is_some());
+        assert!(no_op_reason("CREATE INDEX idx ON t (a)").is_none());
+        assert!(no_op_reason("CREATE INDEX idx ON t (a) WHERE a > 0").is_some());
+        assert!(no_op_reason("CREATE INDEX idx ON t (lower(a))").is_some());
         assert!(
             no_op_reason("DROP INDEX idx").is_none(),
             "a drop has to reach the executor, which owns path indexes"

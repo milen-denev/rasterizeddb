@@ -204,6 +204,9 @@ const RENAMED_SUFFIXES: &[&str] = &[
     "_schema_CHK.db",
     "_schema_GEN.db",
     "_schema_PIX.db",
+    // `CREATE INDEX` declarations. The indexes themselves are rebuilt in
+    // memory at open; this is what says which ones to build.
+    "_schema_IDX.db",
     // Derived: the filter rebuilds from the pointers and the sequence from
     // `load_id_sequence`, so a failure to copy either is recoverable. They are
     // copied anyway because copying is cheaper than rebuilding.

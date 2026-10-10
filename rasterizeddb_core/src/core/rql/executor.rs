@@ -2149,6 +2149,8 @@ async fn rewrite_table_with_columns(
         type_modifiers,
         generated,
         checks,
+        carried_indexes,
+        carried_path_indexes,
         old_field_names,
         rows,
     ) = {
@@ -2209,6 +2211,31 @@ async fn rewrite_table_with_columns(
             // Carried for the same reason: a rewrite drops the table, and a
             // constraint lost here stops being enforced with nothing said.
             table.schema.checks.clone(),
+            // Index declarations, each with its columns by name: the rewrite
+            // renumbers columns, and a name is what survives it.
+            table
+                .schema
+                .secondary_indexes
+                .iter()
+                .map(|decl| {
+                    let names: Vec<Option<String>> = decl
+                        .columns
+                        .iter()
+                        .map(|wo| {
+                            table
+                                .schema
+                                .fields
+                                .iter()
+                                .find(|f| f.write_order as u32 == *wo && !f.is_deleted)
+                                .map(|f| f.name.clone())
+                        })
+                        .collect();
+                    (decl.clone(), names)
+                })
+                .collect::<Vec<_>>(),
+            // Path-index declarations, which a rewrite used to lose: the
+            // filter then stopped carrying the path, silently.
+            table.schema.path_indexes.clone(),
             old_field_names,
             rows,
         )
@@ -2271,6 +2298,49 @@ async fn rewrite_table_with_columns(
         })
         .await
         .map_err(|e| format!("could not recreate '{}': {}", table_name, e))?;
+
+    // Index declarations go back before the rows do, so reopening builds the
+    // (still empty) indexes and every reinserted row is indexed by its insert.
+    if !carried_indexes.is_empty() || !carried_path_indexes.is_empty() {
+        let (io_schema, fields) = {
+            let entry = database.tables.get(table_name);
+            let Some(table) = entry.as_ref().clone() else {
+                return Err(format!("relation '{}' vanished during rewrite", table_name));
+            };
+            (table.io_schema.clone(), table.schema.fields.clone())
+        };
+        for (decl, names) in carried_indexes {
+            // An index over a column this rewrite dropped goes with it, as in
+            // PostgreSQL.
+            let columns: Option<Vec<u32>> = names
+                .iter()
+                .map(|name| {
+                    let name = name.as_ref()?;
+                    fields
+                        .iter()
+                        .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(name))
+                        .map(|f| f.write_order as u32)
+                })
+                .collect();
+            let Some(columns) = columns else {
+                info!("index {} dropped with its column", decl.name);
+                continue;
+            };
+            let decl = crate::core::index::IndexDecl { columns, ..decl };
+            crate::core::index::decl::append(io_schema.clone(), &decl)
+                .await
+                .map_err(|e| format!("could not carry index {}: {}", decl.name, e))?;
+        }
+        for path_index in &carried_path_indexes {
+            crate::core::rql::path_index::append(io_schema.clone(), path_index)
+                .await
+                .map_err(|e| format!("could not carry index {}: {}", path_index.name, e))?;
+        }
+        database
+            .reload_table(table_name)
+            .await
+            .map_err(|e| format!("could not reopen '{}' with its indexes: {}", table_name, e))?;
+    }
 
     let entry = database.tables.get(table_name);
     let Some(table) = entry.as_ref().clone() else {
@@ -7864,6 +7934,125 @@ async fn execute_create_path_index(sql: &str, database: &Arc<Database>) -> Vec<u
     ddl_ok(0)
 }
 
+/// Whether an index of this name exists anywhere in the database. Index
+/// names are database-wide, as in PostgreSQL.
+fn index_name_taken(database: &Arc<Database>, name: &str) -> Option<String> {
+    for entry in database.tables.iter() {
+        let schema = &entry.value().schema;
+        if schema.path_indexes.iter().any(|i| i.name.eq_ignore_ascii_case(name))
+            || schema
+                .secondary_indexes
+                .iter()
+                .any(|i| i.name.eq_ignore_ascii_case(name))
+        {
+            return Some(entry.key().clone());
+        }
+    }
+    None
+}
+
+/// `CREATE INDEX` over plain columns: records the declaration and reopens the
+/// table, which builds the index from its rows.
+async fn execute_create_index(sql: &str, database: &Arc<Database>) -> Vec<u8> {
+    use crate::core::index::{self, IndexDecl};
+
+    let statement = match index::ddl::parse_create(sql) {
+        Some(Ok(s)) => s,
+        Some(Err(e)) => return ddl_error(&e),
+        None => return ddl_error("this is not an index over table columns"),
+    };
+    let name = statement.name_or_default();
+
+    let (io_schema, columns, types) = {
+        let entry = database.tables.get(&statement.table);
+        let Some(table) = entry.as_ref().clone() else {
+            return ddl_error(&format!("relation '{}' does not exist", statement.table));
+        };
+        let mut columns = Vec::new();
+        let mut types = Vec::new();
+        for column in &statement.columns {
+            match table
+                .schema
+                .fields
+                .iter()
+                .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(column))
+            {
+                Some(f) => {
+                    columns.push(f.write_order as u32);
+                    types.push(f.db_type.clone());
+                }
+                None => {
+                    return ddl_error(&format!(
+                        "column '{}' does not exist in '{}'",
+                        column, statement.table
+                    ));
+                }
+            }
+        }
+        (table.io_schema.clone(), columns, types)
+    };
+
+    if index_name_taken(database, &name).is_some() {
+        return if statement.if_not_exists {
+            ddl_ok(0)
+        } else {
+            ddl_error(&format!("relation \"{}\" already exists", name))
+        };
+    }
+
+    let method = match index::choose_method(statement.method, &types) {
+        Ok(m) => m,
+        Err(e) => return ddl_error(&e),
+    };
+    let decl = IndexDecl {
+        name: name.clone(),
+        method,
+        unique: false,
+        columns,
+        is_deleted: false,
+    };
+    if let Err(e) = index::decl::append(io_schema, &decl).await {
+        return ddl_error(&e.to_string());
+    }
+    if let Err(e) = database.reload_table(&statement.table).await {
+        return ddl_error(&format!(
+            "the index was recorded but the table could not be reopened: {}",
+            e
+        ));
+    }
+    info!("Created {} index {} on {}", method.name(), name, statement.table);
+    ddl_ok(0)
+}
+
+/// `DROP INDEX` of an index `CREATE INDEX` declared. `None` when no table
+/// declares one by that name, so the caller tries the other kinds.
+async fn execute_drop_index(sql: &str, database: &Arc<Database>) -> Option<Vec<u8>> {
+    let (name, _if_exists) = crate::core::rql::path_index::parse_drop(sql)?;
+    let (table_name, io_schema, decl) = database.tables.iter().find_map(|entry| {
+        entry
+            .value()
+            .schema
+            .secondary_indexes
+            .iter()
+            .find(|i| i.name.eq_ignore_ascii_case(&name))
+            .map(|d| (entry.key().clone(), entry.value().io_schema.clone(), d.clone()))
+    })?;
+    let tombstone = crate::core::index::IndexDecl {
+        is_deleted: true,
+        ..decl
+    };
+    if let Err(e) = crate::core::index::decl::append(io_schema, &tombstone).await {
+        return Some(ddl_error(&e.to_string()));
+    }
+    if let Err(e) = database.reload_table(&table_name).await {
+        return Some(ddl_error(&format!(
+            "the index was dropped but the table could not be reopened: {}",
+            e
+        )));
+    }
+    Some(ddl_ok(0))
+}
+
 /// Removes an index over a path, by the name it was declared under.
 async fn execute_drop_path_index(sql: &str, database: &Arc<Database>) -> Vec<u8> {
     use crate::core::rql::path_index;
@@ -9397,14 +9586,21 @@ pub(crate) async fn execute_with_need(
         // An index over a document path. Recorded in the table's sidecar, which
         // is read when the table is opened.
         QueryPurpose::CreateIndex(sql) => {
-            let response = Box::pin(execute_create_path_index(sql, &database)).await;
+            let response = if crate::core::rql::path_index::parse_create(sql).is_some() {
+                Box::pin(execute_create_path_index(sql, &database)).await
+            } else {
+                Box::pin(execute_create_index(sql, &database)).await
+            };
             if response.first() != Some(&3) {
                 note_write(&database, tx, depth, sql, None);
             }
             return response;
         }
         QueryPurpose::DropIndex(sql) => {
-            let response = Box::pin(execute_drop_path_index(sql, &database)).await;
+            let response = match Box::pin(execute_drop_index(sql, &database)).await {
+                Some(response) => response,
+                None => Box::pin(execute_drop_path_index(sql, &database)).await,
+            };
             if response.first() != Some(&3) {
                 note_write(&database, tx, depth, sql, None);
             }

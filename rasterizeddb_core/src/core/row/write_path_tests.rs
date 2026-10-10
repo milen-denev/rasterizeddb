@@ -640,6 +640,7 @@ async fn a_running_query_defers_publication() {
     let ctx = crate::core::vacuum::ReclaimContext {
         horizon: &horizon,
         filters: None,
+        indexes: None,
         cleared_below: &std::sync::atomic::AtomicU64::new(0),
     };
     let report = crate::core::vacuum::run_once(
@@ -1069,7 +1070,8 @@ async fn the_capped_path_never_rehands_a_reused_extent() {
         let ctx = crate::core::vacuum::ReclaimContext {
             horizon: &horizon,
             filters: None,
-            cleared_below: &std::sync::atomic::AtomicU64::new(0),
+            indexes: None,
+        cleared_below: &std::sync::atomic::AtomicU64::new(0),
         };
         crate::core::vacuum::run_once(
             &*t.io_pointers,
@@ -1731,7 +1733,8 @@ async fn a_permanently_busy_table_still_reclaims() {
         let ctx = crate::core::vacuum::ReclaimContext {
             horizon: &horizon,
             filters: None,
-            cleared_below: &std::sync::atomic::AtomicU64::new(0),
+            indexes: None,
+        cleared_below: &std::sync::atomic::AtomicU64::new(0),
         };
         crate::core::vacuum::run_once(
             &*t.io_pointers,

@@ -122,6 +122,10 @@ pub struct Table<S: StorageIO> {
     /// Shared with the maintenance task, which owns backfilling and
     /// checkpointing so neither ever runs on a caller's thread.
     pub filters: Option<StdArc<TableFilters>>,
+    /// Secondary indexes: those `CREATE INDEX` declared, and the implicit ones
+    /// of `PRIMARY KEY` and `UNIQUE`. `None` when the table has none. See
+    /// [`crate::core::index`] for why they may only ever over-report.
+    pub indexes: Option<StdArc<crate::core::index::TableIndexes>>,
     /// Byte ranges of the rows file that deleted or relocated rows left behind
     /// and the write path may reuse. Populated by the reclamation service.
     pub free_space: StdArc<FreeSpace>,
@@ -360,7 +364,12 @@ enum PendingFilterOp {
     /// Clear a slot's fingerprints once its row is gone for everyone.
     Delete(u64),
     /// (Re)fingerprint a slot from the row now durable at it.
-    Insert(u64, RowWrite),
+    ///
+    /// The third field is the slot's secondary-index keys *before* the write,
+    /// for an in-place overwrite: the slot keeps its number and changes its
+    /// value, so its old keys must go now that the new value is durable.
+    /// `None` for a version written at a fresh slot, which has no old keys.
+    Insert(u64, RowWrite, Option<Vec<Option<crate::core::index::KeyBuf>>>),
 }
 
 impl<S: StorageIO> Table<S> {
@@ -371,19 +380,34 @@ impl<S: StorageIO> Table<S> {
         if pending.is_empty() {
             return;
         }
-        match self.filters.as_ref() {
-            Some(filters) => {
-                for op in pending.drain(..) {
-                    match op {
-                        PendingFilterOp::Delete(slot) => filters.on_delete(slot),
-                        PendingFilterOp::Insert(slot, row_write) => {
-                            filters.on_insert(slot, &row_write)
+        for op in pending.drain(..) {
+            match op {
+                PendingFilterOp::Delete(slot) => {
+                    if let Some(filters) = self.filters.as_ref() {
+                        filters.on_delete(slot);
+                    }
+                    // A secondary index keeps the slot: vacuum forgets it once
+                    // nothing can reach the version, reading its key back then.
+                }
+                PendingFilterOp::Insert(slot, row_write, old_keys) => {
+                    if let Some(filters) = self.filters.as_ref() {
+                        filters.on_insert(slot, &row_write);
+                    }
+                    if let Some(indexes) = self.indexes.as_ref() {
+                        match old_keys {
+                            Some(old) => indexes.on_replace(slot, &old, &row_write),
+                            None => indexes.on_insert(slot, &row_write),
                         }
                     }
                 }
             }
-            None => pending.clear(),
         }
+    }
+
+    /// Whether writes have filter or index maintenance to stage.
+    #[inline]
+    fn maintains_indexes(&self) -> bool {
+        self.filters.is_some() || self.indexes.is_some()
     }
 }
 
@@ -619,6 +643,38 @@ impl<S: StorageIO> Table<S> {
         let free_space = StdArc::new(FreeSpace::new(crate::vacuum_enabled()));
         let readers = StdArc::new(ReaderRegistry::new());
 
+        // Secondary indexes are built from the table on a task of their own,
+        // like the filter backfill: `Table::new` returns at once, writes
+        // maintain the indexes from this moment, and queries use them once the
+        // build has covered every row that was already there.
+        let indexes = {
+            let list = crate::core::index::for_schema(&schema);
+            (!list.is_empty()).then(|| StdArc::new(crate::core::index::TableIndexes::new(list)))
+        };
+        if let Some(indexes) = indexes.clone() {
+            let io_pointers_task = io_pointers.clone();
+            let io_rows_task = io_rows.clone();
+            let fields = schema.fields.clone();
+            let readers_task = readers.clone();
+            let alive = maintenance_alive.clone();
+            let table_name_task = table_name.to_string();
+            tokio::spawn(async move {
+                if !alive.load(AtomicOrdering::Relaxed) {
+                    return;
+                }
+                match build_indexes(&indexes, &io_pointers_task, &io_rows_task, &fields, Some(&readers_task)).await {
+                    Ok(n) => {
+                        indexes.set_ready(true);
+                        info!("Built {} index(es) on {} over {} rows", indexes.list.len(), table_name_task, n);
+                    }
+                    Err(e) => error!(
+                        "Index build on {} failed; queries scan instead: {}",
+                        table_name_task, e
+                    ),
+                }
+            });
+        }
+
         // Everything the filter needs doing after this point — the initial
         // backfill and every checkpoint — happens on this task. No caller ever
         // pays for it: `Table::new` returns immediately and an insert never
@@ -727,6 +783,12 @@ impl<S: StorageIO> Table<S> {
                 dead_stamps: dead_stamps.clone(),
                 versions: versions.clone(),
                 filters: filters.clone(),
+                indexes: indexes
+                    .clone()
+                    .map(|ix| {
+                        let fetch = Self::build_fetch_for(&schema.fields, &ix.columns());
+                        (ix, fetch)
+                    }),
                 cleared_below: cleared_below.clone(),
                 config: VacuumConfig::default(),
                 write_lock: write_lock.clone(),
@@ -756,6 +818,7 @@ impl<S: StorageIO> Table<S> {
             concurrent_processor: ConcurrentProcessor::new(),
             cache_scope: schema_name_for_cache,
             filters,
+            indexes,
             free_space,
             readers,
             vacuum_stats,
@@ -984,10 +1047,15 @@ impl<S: StorageIO> Table<S> {
     pub async fn vacuum_now(&self) -> Result<VacuumReport> {
         let config = VacuumConfig::default();
         let horizon = self.version_horizon();
+        let index_fetch = self
+            .indexes
+            .as_ref()
+            .map(|ix| Self::build_fetch_for(&self.schema.fields, &ix.columns()));
         let ctx = crate::core::vacuum::ReclaimContext {
             horizon: &horizon,
             filters: self.filters.as_deref(),
             cleared_below: &self.cleared_below,
+            indexes: self.indexes.as_deref().zip(index_fetch.as_ref()),
         };
         let report = crate::core::vacuum::run_once(
             &*self.io_pointers,
@@ -1310,6 +1378,27 @@ impl<S: StorageIO> Table<S> {
             }
             self.filters_ready.store(true, AtomicOrdering::Release);
             self.checkpoint_filters().await;
+        }
+
+        // The secondary indexes name slots too, every one of which moved.
+        // Rebuilt under the same exclusive gate, so no query can ask a
+        // half-built index; one that fails to rebuild stays unready, and
+        // queries scan rather than trust slot numbers that no longer exist.
+        if let Some(indexes) = self.indexes.as_ref() {
+            indexes.set_ready(false);
+            indexes.clear();
+            match build_indexes(
+                indexes,
+                &self.io_pointers,
+                &self.io_rows,
+                &self.schema.fields,
+                self.free_space.is_enabled().then_some(&self.readers),
+            )
+            .await
+            {
+                Ok(_) => indexes.set_ready(true),
+                Err(e) => error!("Compaction could not rebuild the indexes; queries scan: {}", e),
+            }
         }
 
         // Every slot address moved and the filter was rebuilt from storage, so
@@ -1758,11 +1847,23 @@ impl<S: StorageIO> Table<S> {
         use crate::core::filter::sarg::{MaskExpr, SargPredicate, SargProgram};
         use crate::core::filter::zonemap::SargOp;
 
-        let mut iterator = RowPointerIterator::new(self.io_pointers.clone())
+        let mut iterator = RowPointerIterator::new_deferred(self.io_pointers.clone())
             .await
             .unwrap();
 
-        if let Some(filters) = self.filters.as_ref() {
+        // An index over exactly these columns names the candidate slots; the
+        // iterator then reads only the chunks holding them, and anything
+        // appended since the sample is a candidate by the list's own rule.
+        let from_index = match self.index_probe(tuple).await {
+            Some((slots, n_slots)) => {
+                let slots: Vec<u64> = slots.into_iter().filter(|s| *s < n_slots).collect();
+                iterator.set_candidates(Some(Arc::new(CandidateBitmap::sparse(slots, n_slots))));
+                true
+            }
+            None => false,
+        };
+
+        if let (false, Some(filters)) = (from_index, self.filters.as_ref()) {
             match tuple
                 .iter()
                 .find(|(field, _)| filters.indexes(field.write_order as u32))
@@ -1888,6 +1989,29 @@ impl<S: StorageIO> Table<S> {
         Ok(None)
     }
 
+    /// The slots that may hold exactly this key, from an index over exactly
+    /// these columns, and the table length sampled *before* the index was
+    /// asked. A slot at or past that length was appended since and must be
+    /// treated as a candidate too; the caller does.
+    ///
+    /// Sound for a uniqueness check because the check runs under
+    /// `unique_lock`, as does every write that could put a key under these
+    /// columns: an earlier writer has finished, its index entry included,
+    /// before this one looks.
+    async fn index_probe(&self, columns: &[(&SchemaField, &[u8])]) -> Option<(Vec<u64>, u64)> {
+        let indexes = self.indexes.as_ref()?;
+        let wos: SmallVec<[u32; 4]> = columns.iter().map(|(f, _)| f.write_order as u32).collect();
+        let index = indexes.exact(&wos)?;
+        let n_slots = self.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
+        let key = index.key_of(|wo| {
+            columns
+                .iter()
+                .find(|(f, _)| f.write_order as u32 == wo)
+                .map(|(_, v)| *v)
+        })?;
+        Some((index.slots_for_key(&key), n_slots))
+    }
+
     /// Id of a live row whose `field` equals `value`, other than `exclude_id`.
     async fn find_row_with_value(
         &self,
@@ -1924,9 +2048,20 @@ impl<S: StorageIO> Table<S> {
         // the check O(candidates), plus a pass over the bitmap's words.
         let mut probe_slots: Option<std::vec::IntoIter<u64>> = None;
 
+        // An index over exactly this column names the slots outright: a
+        // descent rather than a pass over a bitmap of the whole table, so an
+        // insert into a table with a primary key costs the same at a million
+        // rows as at a thousand.
+        if let Some((slots, n_slots)) = self.index_probe(&[(field, value)]).await {
+            let now = self.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
+            let mut slots = slots;
+            slots.extend(n_slots..now);
+            probe_slots = Some(slots.into_iter());
+        }
+
         // The mask is a superset, so a slot it clears genuinely cannot hold the
         // value; every slot it keeps is still compared byte for byte below.
-        if let Some(filters) = self.filters.as_ref() {
+        if let (None, Some(filters)) = (probe_slots.as_ref(), self.filters.as_ref()) {
             if filters.indexes(field.write_order as u32) {
                 let program = SargProgram {
                     root: MaskExpr::Pred(SargPredicate {
@@ -2305,6 +2440,50 @@ impl<S: StorageIO> Table<S> {
         Some(wanted)
     }
 
+    /// Each `NUMERIC(p, s)` column's scale, where it is not the engine
+    /// default, so a literal is bounded where the column stores it.
+    fn decimal_scales(&self) -> smallvec::SmallVec<[(u32, u32); 4]> {
+        self.schema
+            .fields
+            .iter()
+            .filter(|f| f.db_type == crate::core::db_type::DbType::DECIMAL)
+            .filter_map(|f| {
+                f.scale
+                    .filter(|s| *s != crate::core::value_codec::DECIMAL_SCALE)
+                    .map(|s| (f.write_order as u32, s))
+            })
+            .collect()
+    }
+
+    /// The candidate slots a secondary index gives for a WHERE clause, or
+    /// `None` when no index can narrow it, or none is built yet.
+    pub(crate) async fn index_candidates(&self, where_clause: &str) -> Option<Arc<CandidateBitmap>> {
+        let indexes = self.indexes.as_ref().filter(|i| i.is_ready())?;
+        if where_clause.trim().is_empty() {
+            return None;
+        }
+        // Sampled before the index is asked. A version appended after this
+        // sits at or past `n_slots`, which the bitmap counts as a candidate;
+        // one appended before it was indexed by its writer before it could
+        // commit, so a snapshot that can see it finds it here.
+        let n_slots = self.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
+        let tokens = crate::core::tokenizer::query_tokenizer::try_tokenize(where_clause, &self.schema.fields).ok()?;
+        let scales = self.decimal_scales();
+        let program = sarg::extract_gated(&tokens, &|wo| indexes.covers(wo), &scales)?;
+        let mut slots = indexes.plan(
+            &program.root,
+            &self.schema.fields,
+            crate::core::index::candidate_cap(n_slots),
+        )?;
+        slots.retain(|s| *s < n_slots);
+        info!(
+            "Index narrowed {} slots to {} candidates",
+            n_slots,
+            slots.len()
+        );
+        Some(Arc::new(CandidateBitmap::sparse(slots, n_slots)))
+    }
+
     /// Build a candidate mask for a WHERE clause, or `None` to scan normally.
     ///
     /// `pub(crate)` only so `write_path_tests` can assert on what it declines.
@@ -2321,6 +2500,12 @@ impl<S: StorageIO> Table<S> {
         // consulted, so it holds on a table with no filters too.
         if crate::core::filter::sarg::clause_is_constant_false(where_clause, &self.schema.fields) {
             return Some(Arc::new(CandidateBitmap::nothing()));
+        }
+        // A secondary index names the candidate slots outright, so it is
+        // asked first. When none can answer the clause, or the answer is too
+        // broad to be worth a slot list, the filter's mask is the next best.
+        if let Some(found) = self.index_candidates(where_clause).await {
+            return Some(found);
         }
         let filters = self.filters.as_ref()?;
         if where_clause.trim().is_empty() {
@@ -2487,6 +2672,11 @@ impl<S: StorageIO> Table<S> {
         if let Some(filters) = self.filters.as_ref() {
             filters.on_insert(record_pos / ROW_POINTER_RECORD_LEN as u64, &row_write);
         }
+        // Before this returns, and so before the inserting transaction can
+        // commit: no snapshot can see the row without its index entry.
+        if let Some(indexes) = self.indexes.as_ref() {
+            indexes.on_insert(record_pos / ROW_POINTER_RECORD_LEN as u64, &row_write);
+        }
 
         self.invalidate_query_caches();
 
@@ -2548,7 +2738,7 @@ impl<S: StorageIO> Table<S> {
         let generation = self.cache_generation();
         let base_candidates = self.build_candidates(query, None).await;
 
-        let mut iterator = RowPointerIterator::new(self.io_pointers.clone())
+        let mut iterator = RowPointerIterator::new_deferred(self.io_pointers.clone())
             .await
             .unwrap();
         iterator.set_candidates(base_candidates);
@@ -2635,7 +2825,7 @@ impl<S: StorageIO> Table<S> {
         let mut ceiling = self.monotonic_scan_ceiling(&order_by, limit, n_slots).await;
 
         let rows = loop {
-            let mut iterator = RowPointerIterator::new(self.io_pointers.clone())
+            let mut iterator = RowPointerIterator::new_deferred(self.io_pointers.clone())
                 .await
                 .unwrap();
             iterator.set_candidates(match ceiling {
@@ -2753,7 +2943,7 @@ impl<S: StorageIO> Table<S> {
         let visibility = self.visibility_for(reader);
         let generation = self.cache_generation();
 
-        let mut iterator = RowPointerIterator::new(self.io_pointers.clone())
+        let mut iterator = RowPointerIterator::new_deferred(self.io_pointers.clone())
             .await
             .unwrap();
         iterator.set_candidates(self.build_candidates(query, limit).await);
@@ -2781,6 +2971,29 @@ impl<S: StorageIO> Table<S> {
             limit
         );
         Ok(bytes)
+    }
+
+    /// A fetch of just the columns named by write order, for the index build
+    /// and for vacuum reading a reclaimed version's keys.
+    pub(crate) fn build_fetch_for(schema_fields: &SmallVec<[SchemaField; 20]>, columns: &[u32]) -> RowFetch {
+        let schema_calc = SchemaCalculator::default();
+        let mut columns_fetching_data = smallvec::SmallVec::new();
+        for field in schema_fields
+            .iter()
+            .filter(|f| !f.is_deleted && columns.contains(&(f.write_order as u32)))
+            .sorted_by(|a, b| a.write_order.cmp(&b.write_order))
+        {
+            let offset = schema_calc.calculate_schema_offset(&field.name, schema_fields);
+            columns_fetching_data.push(ColumnFetchingData {
+                column_offset: offset.0,
+                column_type: field.db_type.physical(),
+                size: field.size,
+                schema_id: offset.1,
+            });
+        }
+        RowFetch {
+            columns_fetching_data,
+        }
     }
 
     pub(crate) fn build_full_row_fetch(schema_fields: &SmallVec<[SchemaField; 20]>) -> RowFetch {
@@ -2870,7 +3083,7 @@ impl<S: StorageIO> Table<S> {
         // neither rewrites an existing record, and neither takes this lock.
         let _write = self.write_lock.lock().await;
 
-        let mut iterator = RowPointerIterator::new(self.io_pointers.clone())
+        let mut iterator = RowPointerIterator::new_deferred(self.io_pointers.clone())
             .await
             .unwrap();
         iterator.set_candidates(self.build_candidates(where_clause, limit).await);
@@ -3090,7 +3303,7 @@ impl<S: StorageIO> Table<S> {
         // match nothing.
         let _write = self.write_lock.lock().await;
 
-        let mut iterator = RowPointerIterator::new(self.io_pointers.clone())
+        let mut iterator = RowPointerIterator::new_deferred(self.io_pointers.clone())
             .await
             .unwrap();
         iterator.set_candidates(self.build_candidates(where_clause, limit).await);
@@ -3205,6 +3418,10 @@ impl<S: StorageIO> Table<S> {
                     });
                 }
             }
+
+            // The version's index keys as it stands, before the assignments:
+            // an in-place overwrite has to take the slot out from under them.
+            let old_keys = self.indexes.as_ref().map(|ix| ix.keys_of(&row_write));
 
             // Apply updates in-place in the RowWrite payloads.
             for upd in updates.iter() {
@@ -3388,10 +3605,11 @@ impl<S: StorageIO> Table<S> {
                     .write_columns_in_place(&pointer, &updates, txn, written_by)
                     .await
             {
-                if self.filters.is_some() {
+                if self.maintains_indexes() {
                     pending_filters.push(PendingFilterOp::Insert(
                         record_pos / ROW_POINTER_RECORD_LEN as u64,
                         row_write,
+                        old_keys,
                     ));
                 }
                 updated_count = updated_count.saturating_add(1);
@@ -3422,7 +3640,7 @@ impl<S: StorageIO> Table<S> {
                 .await;
 
             if let Ok((_, relocated)) = &update_result {
-                if self.filters.is_some() {
+                if self.maintains_indexes() {
                     let old_slot = record_pos / ROW_POINTER_RECORD_LEN as u64;
                     match relocated {
                         // A fresh pointer was appended for the new version.
@@ -3443,10 +3661,12 @@ impl<S: StorageIO> Table<S> {
                             pending_filters.push(PendingFilterOp::Insert(
                                 *new_pos / ROW_POINTER_RECORD_LEN as u64,
                                 row_write,
+                                None,
                             ));
                         }
-                        // Overwritten in place: same slot, new fingerprints.
-                        None => pending_filters.push(PendingFilterOp::Insert(old_slot, row_write)),
+                        // Overwritten in place: same slot, new fingerprints,
+                        // and the old index keys go.
+                        None => pending_filters.push(PendingFilterOp::Insert(old_slot, row_write, old_keys)),
                     }
                 }
             }
@@ -3578,6 +3798,67 @@ async fn backfill_into<S: StorageIO>(
         indexed, start_slot
     );
     Ok(indexed)
+}
+
+/// Fills `indexes` from every version on disk.
+///
+/// Holds a reader epoch for the reason the filter backfill does: it reads row
+/// bytes by pointer, and an extent reclaimed underneath it would be keyed
+/// with another row's value. Deleted pointers are skipped by the iterator.
+/// A version still visible to an old snapshot is indexed like any other,
+/// and vacuum forgets it once nothing can reach it.
+///
+/// Writers maintain the indexes while this runs, so a version written after
+/// the scan passed its slot is indexed by its writer. One the scan reaches
+/// as well is simply added twice, which a set ignores.
+async fn build_indexes<S: StorageIO>(
+    indexes: &crate::core::index::TableIndexes,
+    io_pointers: &Arc<S>,
+    io_rows: &Arc<S>,
+    fields: &SmallVec<[SchemaField; 20]>,
+    readers: Option<&StdArc<ReaderRegistry>>,
+) -> Result<u64> {
+    let _read = match readers {
+        Some(readers) => readers.enter(),
+        None => ReadTicket::inert(),
+    };
+    let fetch = Table::<S>::build_fetch_for(fields, &indexes.columns());
+    let mut iterator = RowPointerIterator::new(io_pointers.clone())
+        .await
+        .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+    let mut row = Row::default();
+    let mut built = 0u64;
+    loop {
+        let next = iterator
+            .next_row_pointer_with_offset()
+            .await
+            .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+        let Some((offset, pointer)) = next else { break };
+        let slot = offset / ROW_POINTER_RECORD_LEN as u64;
+        if pointer
+            .fetch_row_reuse_async(&**io_rows, &fetch, &mut row)
+            .await
+            .is_err()
+        {
+            // Unreadable here is not unreadable to the query, which may
+            // succeed later: kept as a candidate in every index.
+            for index in &indexes.list {
+                index.insert(slot, None);
+            }
+            continue;
+        }
+        for index in &indexes.list {
+            let key = index.key_of(|wo| {
+                row.columns
+                    .iter()
+                    .find(|c| c.schema_id as u32 == wo)
+                    .map(|c| c.data.into_slice())
+            });
+            index.insert(slot, key);
+        }
+        built += 1;
+    }
+    Ok(built)
 }
 
 #[cfg(test)]

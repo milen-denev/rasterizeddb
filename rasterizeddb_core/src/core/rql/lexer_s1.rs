@@ -420,7 +420,8 @@ pub fn recognize_query_purpose(query: &str) -> Option<QueryPurpose> {
 
         Some(Vacuum(VacuumRequest { table_name, full }))
     } else if simd_compare_strings(query_bytes, b"CREATE INDEX", &StartsWith)
-        && crate::core::rql::path_index::parse_create(query_trimmed).is_some()
+        && (crate::core::rql::path_index::parse_create(query_trimmed).is_some()
+            || crate::core::index::ddl::parse_create(query_trimmed).is_some())
     {
         Some(CreateIndex(query_trimmed.to_string()))
     } else if simd_compare_strings(query_bytes, b"DROP INDEX", &StartsWith) {
