@@ -837,7 +837,7 @@ pub fn is_structured(sql: &str) -> bool {
 /// The columns a structured form returns, or `None` for the text ones.
 pub fn structured_fields(sql: &str) -> Option<Vec<(String, DbType)>> {
     let text = |name: &str| (name.to_string(), DbType::STRING);
-    let number = |name: &str| (name.to_string(), DbType::U64);
+    let number = |name: &str| (name.to_string(), DbType::I64);
     let flag = |name: &str| (name.to_string(), DbType::BOOL);
 
     Some(match structured_kind(sql)? {
@@ -1122,13 +1122,18 @@ fn structured_row(cells: &[Cell]) -> Row {
     for (index, cell) in cells.iter().enumerate() {
         let (column_type, bytes): (DbType, Vec<u8>) = match cell {
             Cell::Text(text) => (DbType::STRING, text.as_bytes().to_vec()),
-            Cell::Number(value) => (DbType::U64, value.to_le_bytes().to_vec()),
+            Cell::Number(value) => (
+                DbType::I64,
+                crate::core::value_codec::count_as_bigint(*value)
+                    .to_le_bytes()
+                    .to_vec(),
+            ),
             Cell::Flag(value) => (DbType::BOOL, vec![*value as u8]),
         };
         let mut block = crate::memory_pool::MEMORY_POOL.acquire(bytes.len());
         block.into_slice_mut().copy_from_slice(&bytes);
         columns.push(Column {
-            schema_id: index as u64,
+            schema_id: crate::core::row::row::schema_id_of(index as u64),
             data: block,
             column_type,
         });

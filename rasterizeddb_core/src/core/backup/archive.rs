@@ -230,7 +230,7 @@ pub fn unpack(source: &mut impl Read, target_dir: &Path) -> io::Result<Vec<Entry
 /// It used to require a plain file name with no separator at all. That was
 /// safe, and it silently made a nested entry unrestorable, so the two sides had
 /// to be relaxed together.
-fn is_safe_name(name: &str) -> bool {
+pub(crate) fn is_safe_name(name: &str) -> bool {
     if name.is_empty()
         || name.starts_with('/')
         || name.ends_with('/')

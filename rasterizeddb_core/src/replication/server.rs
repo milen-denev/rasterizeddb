@@ -141,7 +141,10 @@ pub async fn serve(
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            flusher.flush();
+            // An fsync is blocking I/O; run on a runtime worker it parks that
+            // worker and every task queued behind it for the whole sync.
+            let flusher = flusher.clone();
+            let _ = tokio::task::spawn_blocking(move || flusher.flush()).await;
         }
     });
 

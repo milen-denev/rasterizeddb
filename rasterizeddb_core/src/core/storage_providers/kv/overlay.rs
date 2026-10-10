@@ -128,6 +128,33 @@ impl Overlay {
         }
     }
 
+    /// The parts of spans inside `[start, end)`, clipped to it, in order.
+    pub fn spans_within(&self, start: u64, end: u64) -> Vec<(u64, Vec<u8>)> {
+        let mut out = Vec::new();
+        if start >= end {
+            return out;
+        }
+        let first = self
+            .spans
+            .range(..=start)
+            .next_back()
+            .map(|(&k, _)| k)
+            .unwrap_or(start);
+        for (&k, span) in self.spans.range(first..) {
+            if k >= end {
+                break;
+            }
+            let span_end = k + span.len() as u64;
+            if span_end <= start {
+                continue;
+            }
+            let from = k.max(start);
+            let to = span_end.min(end);
+            out.push((from, span[(from - k) as usize..(to - k) as usize].to_vec()));
+        }
+        out
+    }
+
     /// Whether any span intersects `[start, end)`.
     pub fn intersects(&self, start: u64, end: u64) -> bool {
         if start >= end {

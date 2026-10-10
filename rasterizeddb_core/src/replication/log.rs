@@ -63,6 +63,148 @@ struct RecordLoc {
     len: u32,
 }
 
+/// One origin's sequence -> location map.
+///
+/// Sequences are dense in practice — one origin numbers its transactions
+/// 1, 2, 3, … — so the common shape is a `VecDeque` of 12-byte slots indexed
+/// from `base`, against roughly 48 bytes an entry for the `BTreeMap` it
+/// replaced (half-full leaves under sequential insertion).
+///
+/// Not *strictly* dense, so holes are allowed: two commits take sequences 5
+/// and 6 and may append 6 first, a failed append leaves its number unused, and
+/// a torn tail or a compaction can drop one. A hole is a slot whose offset is
+/// `HOLE`. A jump wide enough that holes would cost more than the map did
+/// switches that origin to the map, so no sequence pattern can blow up memory.
+#[derive(Debug)]
+enum SeqIndex {
+    Dense {
+        base: u64,
+        slots: std::collections::VecDeque<Slot>,
+    },
+    Sparse(BTreeMap<u64, RecordLoc>),
+}
+
+/// A packed `RecordLoc`: 12 bytes, where the plain struct pads to 16.
+#[derive(Clone, Copy, Debug)]
+#[repr(C, packed(4))]
+struct Slot {
+    offset: u64,
+    len: u32,
+}
+
+const HOLE: u64 = u64::MAX;
+
+/// The most holes one insert may add before the origin goes sparse (or the
+/// slot count, if larger: holes never more than double the memory).
+const MAX_HOLE_RUN: u64 = 4096;
+
+impl Default for SeqIndex {
+    fn default() -> Self {
+        SeqIndex::Dense {
+            base: 0,
+            slots: std::collections::VecDeque::new(),
+        }
+    }
+}
+
+impl SeqIndex {
+    fn insert(&mut self, seq: u64, loc: RecordLoc) {
+        let slot = Slot {
+            offset: loc.offset,
+            len: loc.len,
+        };
+        match self {
+            SeqIndex::Sparse(map) => {
+                map.insert(seq, loc);
+            }
+            SeqIndex::Dense { base, slots } => {
+                if slots.is_empty() {
+                    *base = seq;
+                    slots.push_back(slot);
+                    return;
+                }
+                let end = *base + slots.len() as u64;
+                let holes = if seq >= end {
+                    seq - end
+                } else if seq < *base {
+                    *base - seq - 1
+                } else {
+                    0
+                };
+                if holes > MAX_HOLE_RUN.max(slots.len() as u64) {
+                    let map: BTreeMap<u64, RecordLoc> = self.iter().collect();
+                    *self = SeqIndex::Sparse(map);
+                    self.insert(seq, loc);
+                    return;
+                }
+                if seq >= end {
+                    for _ in 0..holes {
+                        slots.push_back(Slot { offset: HOLE, len: 0 });
+                    }
+                    slots.push_back(slot);
+                } else if seq < *base {
+                    for _ in 0..holes {
+                        slots.push_front(Slot { offset: HOLE, len: 0 });
+                    }
+                    slots.push_front(slot);
+                    *base = seq;
+                } else {
+                    slots[(seq - *base) as usize] = slot;
+                }
+            }
+        }
+    }
+
+    /// The lowest sequence held. A dense index never has a hole at either end:
+    /// holes are only ever added between an existing slot and a new one.
+    fn first(&self) -> Option<u64> {
+        match self {
+            SeqIndex::Sparse(map) => map.keys().next().copied(),
+            SeqIndex::Dense { base, slots } => (!slots.is_empty()).then_some(*base),
+        }
+    }
+
+    fn last(&self) -> Option<u64> {
+        match self {
+            SeqIndex::Sparse(map) => map.keys().next_back().copied(),
+            SeqIndex::Dense { base, slots } => {
+                (!slots.is_empty()).then(|| *base + slots.len() as u64 - 1)
+            }
+        }
+    }
+
+    /// Every held `(seq, loc)` with `seq >= from`, ascending.
+    fn iter_from(&self, from: u64) -> Box<dyn Iterator<Item = (u64, RecordLoc)> + '_> {
+        match self {
+            SeqIndex::Sparse(map) => Box::new(map.range(from..).map(|(s, l)| (*s, *l))),
+            SeqIndex::Dense { base, slots } => {
+                let base = *base;
+                let skip = from.saturating_sub(base).min(slots.len() as u64) as usize;
+                Box::new(
+                    slots
+                        .iter()
+                        .enumerate()
+                        .skip(skip)
+                        .filter(|(_, slot)| slot.offset != HOLE)
+                        .map(move |(i, slot)| {
+                            (
+                                base + i as u64,
+                                RecordLoc {
+                                    offset: slot.offset,
+                                    len: slot.len,
+                                },
+                            )
+                        }),
+                )
+            }
+        }
+    }
+
+    fn iter(&self) -> Box<dyn Iterator<Item = (u64, RecordLoc)> + '_> {
+        self.iter_from(0)
+    }
+}
+
 /// Records kept in memory to answer a catch-up without touching the disk.
 ///
 /// A peer that is behind is almost always behind by one batch — it reconnected,
@@ -87,7 +229,7 @@ pub struct ReplicationLog {
     file: Mutex<Option<LogFile>>,
     /// Per origin, sequence to file location. A `BTreeMap` because every read
     /// is "everything after N", which is exactly a range scan.
-    index: Mutex<BTreeMap<NodeId, BTreeMap<u64, RecordLoc>>>,
+    index: Mutex<BTreeMap<NodeId, SeqIndex>>,
     /// The newest records, ready to serve without a read.
     hot: Mutex<std::collections::VecDeque<TxnRecord>>,
     retention_bytes: u64,
@@ -103,6 +245,33 @@ impl std::fmt::Debug for ReplicationLog {
         f.debug_struct("ReplicationLog")
             .field("retention_bytes", &self.retention_bytes)
             .finish()
+    }
+}
+
+/// `fdatasync`s a file through a duplicate descriptor, with no lock held.
+fn sync_unlocked(handle: &File) -> io::Result<()> {
+    #[cfg(test)]
+    {
+        let delay = test_hooks::SYNC_DELAY.with(|d| d.get());
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
+    }
+    handle.sync_data()
+}
+
+#[cfg(test)]
+mod test_hooks {
+    thread_local! {
+        /// Makes a sync on this thread slow enough for a test to observe
+        /// whether anything else waits for it.
+        pub static SYNC_DELAY: std::cell::Cell<std::time::Duration> =
+            const { std::cell::Cell::new(std::time::Duration::ZERO) };
+
+        /// Runs inside `AppliedState::rewrite` between copying the positions
+        /// and swapping the file, to put a `record` exactly in that window.
+        pub static BEFORE_STATE_SWAP: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+            const { std::cell::RefCell::new(None) };
     }
 }
 
@@ -141,7 +310,7 @@ impl ReplicationLog {
             .write(true)
             .open(&path)?;
 
-        let mut index: BTreeMap<NodeId, BTreeMap<u64, RecordLoc>> = BTreeMap::new();
+        let mut index: BTreeMap<NodeId, SeqIndex> = BTreeMap::new();
         let mut hot = std::collections::VecDeque::with_capacity(HOT_RECORDS);
         let mut last_hlc = NO_HLC;
 
@@ -280,13 +449,29 @@ impl ReplicationLog {
 
     /// Makes everything appended so far durable. Called by the periodic
     /// flusher and at shutdown.
+    ///
+    /// The buffer is handed to the kernel under the `file` lock, and the
+    /// `fdatasync` runs on a duplicate of the descriptor *after* the lock is
+    /// released. Every local commit appends under that lock, so syncing while
+    /// holding it stalled all committers for one fsync per flusher tick.
+    ///
+    /// Durability is unchanged: every byte appended before this call was
+    /// written to the inode before the lock was dropped, and the duplicate
+    /// syncs that same inode. If a compaction swaps the file in between, it
+    /// copied those bytes into its replacement and synced the replacement
+    /// before renaming it into place, so they are durable either way.
     pub fn flush(&self) -> io::Result<()> {
-        let mut file = self.file.lock();
-        if let Some(log) = file.as_mut() {
-            log.writer.flush()?;
-            log.writer.get_ref().sync_data()?;
-        }
-        Ok(())
+        let handle = {
+            let mut file = self.file.lock();
+            match file.as_mut() {
+                Some(log) => {
+                    log.writer.flush()?;
+                    log.writer.get_ref().try_clone()?
+                }
+                None => return Ok(()),
+            }
+        };
+        sync_unlocked(&handle)
     }
 
     /// Bytes the log currently occupies.
@@ -308,7 +493,7 @@ impl ReplicationLog {
             .index
             .lock()
             .get(&origin)
-            .and_then(|per_origin| per_origin.keys().next_back().copied())
+            .and_then(SeqIndex::last)
             .unwrap_or(0);
         if indexed != 0 {
             return indexed;
@@ -331,7 +516,7 @@ impl ReplicationLog {
             .index
             .lock()
             .get(&origin)
-            .and_then(|per_origin| per_origin.keys().next().copied())
+            .and_then(SeqIndex::first)
             .unwrap_or(0);
         if indexed != 0 {
             return indexed;
@@ -382,8 +567,8 @@ impl ReplicationLog {
                 // so that `after_seq == u64::MAX` cannot overflow into an empty
                 // range that silently reports "nothing to send".
                 Some(per_origin) => per_origin
-                    .range(after_seq.saturating_add(1)..)
-                    .map(|(_, loc)| *loc)
+                    .iter_from(after_seq.saturating_add(1))
+                    .map(|(_, loc)| loc)
                     .take(max_records + 1)
                     .collect(),
                 None => Vec::new(),
@@ -513,7 +698,7 @@ impl ReplicationLog {
         for (origin, per_origin) in index.iter() {
             for (seq, loc) in per_origin.iter() {
                 if loc.offset >= keep_from {
-                    kept.push((*origin, *seq, *loc));
+                    kept.push((*origin, seq, loc));
                 }
             }
         }
@@ -523,7 +708,7 @@ impl ReplicationLog {
         let mut source = OpenOptions::new().read(true).open(&log.path)?;
         let mut target = BufWriter::with_capacity(64 * 1024, File::create(&temp_path)?);
 
-        let mut rebuilt: BTreeMap<NodeId, BTreeMap<u64, RecordLoc>> = BTreeMap::new();
+        let mut rebuilt: BTreeMap<NodeId, SeqIndex> = BTreeMap::new();
         let mut end = 0u64;
         let mut payload = Vec::new();
         for (origin, seq, loc) in kept {
@@ -579,6 +764,10 @@ pub struct AppliedState {
     /// Padded for the same reason: incremented per applied record, and its
     /// unpadded neighbour is the writer `Mutex`.
     appends: CacheGuard<std::sync::atomic::AtomicU64>,
+    /// One rewrite at a time. Several `record` calls can cross the threshold
+    /// together, and two rewrites sharing the one temp path would interleave
+    /// their writes into it and rename a file missing positions.
+    rewriting: Mutex<()>,
 }
 
 /// Rewrite the state file after this many appends. At 16 bytes each that caps
@@ -600,6 +789,7 @@ impl AppliedState {
             file: Mutex::new(None),
             path: None,
             appends: std::sync::atomic::AtomicU64::new(0).into(),
+            rewriting: Mutex::new(()),
         }
     }
 
@@ -643,6 +833,7 @@ impl AppliedState {
             file: Mutex::new(Some(BufWriter::with_capacity(4096, handle))),
             path: Some(path),
             appends: std::sync::atomic::AtomicU64::new(0).into(),
+            rewriting: Mutex::new(()),
         })
     }
 
@@ -708,27 +899,50 @@ impl AppliedState {
             .collect()
     }
 
+    /// Same shape as [`ReplicationLog::flush`]: write out under the lock,
+    /// sync a duplicate descriptor outside it, so `record` is never parked
+    /// behind an fsync. A `rewrite` that swaps the file in between synced its
+    /// replacement before renaming it, so nothing written before this call is
+    /// left unsynced.
     pub fn flush(&self) -> io::Result<()> {
-        let mut file = self.file.lock();
-        if let Some(writer) = file.as_mut() {
-            writer.flush()?;
-            writer.get_ref().sync_data()?;
-        }
-        Ok(())
+        let handle = {
+            let mut file = self.file.lock();
+            match file.as_mut() {
+                Some(writer) => {
+                    writer.flush()?;
+                    writer.get_ref().try_clone()?
+                }
+                None => return Ok(()),
+            }
+        };
+        sync_unlocked(&handle)
     }
 
     /// Replaces the file with one record per origin.
+    ///
+    /// The positions are copied, written to a temp file and synced without
+    /// the `file` lock, so `record` is not parked behind the sync. A `record`
+    /// that lands in that window advances `positions` and appends to the *old*
+    /// file — which the rename then discards. So the swap re-reads the
+    /// positions under the `file` lock and appends whatever moved since the
+    /// copy to the new file before installing it. `record` updates `positions`
+    /// before it takes the `file` lock, so every advance is either in that
+    /// second read or written to the new file after the lock is released;
+    /// recovery takes the maximum per origin, so seeing one twice is harmless.
+    ///
+    /// Losing one did not merely cost a position: on restart this node asked
+    /// for that origin's transaction again and **applied it twice** — the
+    /// table stamps that would mark it superseded are not persisted, so a
+    /// replayed `INSERT` into a table without a unique key, or a `SET n = n +
+    /// 1`, landed a second time. On a clean restart too, since nothing
+    /// rewrote the file from memory at shutdown.
     fn rewrite(&self) -> io::Result<()> {
         let Some(path) = self.path.as_ref() else {
             return Ok(());
         };
+        let _one_at_a_time = self.rewriting.lock();
 
-        let snapshot: Vec<(NodeId, u64)> = self
-            .positions
-            .lock()
-            .iter()
-            .map(|(o, s)| (*o, *s))
-            .collect();
+        let snapshot: BTreeMap<NodeId, u64> = self.positions.lock().clone();
 
         let temp_path = path.with_extension("rewriting");
         {
@@ -741,11 +955,37 @@ impl AppliedState {
             target.get_ref().sync_data()?;
         }
 
-        let mut file = self.file.lock();
-        std::fs::rename(&temp_path, path)?;
+        #[cfg(test)]
+        test_hooks::BEFORE_STATE_SWAP.with(|hook| {
+            if let Some(f) = hook.borrow_mut().as_mut() {
+                f();
+            }
+        });
 
-        let mut handle = OpenOptions::new().read(true).write(true).open(path)?;
+        let mut file = self.file.lock();
+        // Whatever advanced after the copy above went to the old file only.
+        let moved: Vec<(NodeId, u64)> = self
+            .positions
+            .lock()
+            .iter()
+            .filter(|(origin, seq)| snapshot.get(origin) != Some(seq))
+            .map(|(o, s)| (*o, *s))
+            .collect();
+        let mut handle = OpenOptions::new().read(true).write(true).open(&temp_path)?;
         handle.seek(SeekFrom::End(0))?;
+        if !moved.is_empty() {
+            let mut extra = Vec::with_capacity(moved.len() * 16);
+            for (origin, seq) in &moved {
+                extra.extend_from_slice(&origin.to_le_bytes());
+                extra.extend_from_slice(&seq.to_le_bytes());
+            }
+            handle.write_all(&extra)?;
+            // Synced here, under the lock, only in this rare case: a `flush`
+            // may already have made these durable in the old file, and the
+            // rename must not take that back.
+            handle.sync_data()?;
+        }
+        std::fs::rename(&temp_path, path)?;
         *file = Some(BufWriter::with_capacity(4096, handle));
         self.appends.store(0, std::sync::atomic::Ordering::Relaxed);
 
@@ -843,6 +1083,182 @@ mod tests {
 
         let (records, _) = log.read_after(1, 5, 100, 1 << 20).unwrap();
         assert_eq!(records.len(), 5);
+    }
+
+    /// A commit appends under the same lock the flusher takes. The fsync must
+    /// not be inside it, or every committer waits out one sync per tick.
+    #[test]
+    fn appends_are_not_blocked_by_a_slow_flush() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(ReplicationLog::open(dir.path(), 1 << 20).unwrap());
+        let state = Arc::new(AppliedState::open(dir.path()).unwrap());
+        for seq in 1..=10 {
+            log.append(&record(1, seq)).unwrap();
+        }
+        state.record(7, 1).unwrap();
+
+        const SYNC: Duration = Duration::from_millis(600);
+        let syncing = Arc::new(std::sync::Barrier::new(2));
+        let flusher = {
+            let (log, state, syncing) = (log.clone(), state.clone(), syncing.clone());
+            std::thread::spawn(move || {
+                test_hooks::SYNC_DELAY.with(|d| d.set(SYNC));
+                syncing.wait();
+                let started = Instant::now();
+                log.flush().unwrap();
+                state.flush().unwrap();
+                started.elapsed()
+            })
+        };
+        syncing.wait();
+        // Give the flusher time to be inside its (slow) sync.
+        std::thread::sleep(Duration::from_millis(100));
+
+        let started = Instant::now();
+        log.append(&record(1, 11)).unwrap();
+        let log_append = started.elapsed();
+        // Past the log's sync and into the state's.
+        std::thread::sleep(SYNC);
+        let started = Instant::now();
+        state.record(7, 2).unwrap();
+        let state_record = started.elapsed();
+
+        let flush_took = flusher.join().unwrap();
+        assert!(
+            flush_took >= SYNC * 2,
+            "the injected delay did not apply ({flush_took:?}); the test proves nothing"
+        );
+        assert!(
+            log_append < Duration::from_millis(250),
+            "an append waited {log_append:?} for the flusher's fsync"
+        );
+        assert!(
+            state_record < Duration::from_millis(250),
+            "an applied-state record waited {state_record:?} for the flusher's fsync"
+        );
+
+        // And what the flush covered is on disk: a reopen finds it all.
+        log.flush().unwrap();
+        state.flush().unwrap();
+        drop((log, state));
+        let log = ReplicationLog::open(dir.path(), 1 << 20).unwrap();
+        assert_eq!(log.highest(1), 11);
+        let state = AppliedState::open(dir.path()).unwrap();
+        assert_eq!(state.high_water(7), 2);
+    }
+
+    /// The dense index must answer exactly as the `BTreeMap` it replaced, for
+    /// any insert order, holes and jumps included.
+    #[test]
+    fn seq_index_matches_a_map() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound
+        };
+        for round in 0..2_000 {
+            let mut dense = SeqIndex::default();
+            let mut map: BTreeMap<u64, RecordLoc> = BTreeMap::new();
+            let mut seq = 1 + next(1_000);
+            for i in 0..next(300) {
+                // Mostly the next number, sometimes out of order, a small gap,
+                // a rewrite of one held, or (rarely) a huge jump.
+                seq = match next(20) {
+                    0 => seq.saturating_sub(next(5)),
+                    1 => seq + 2 + next(10),
+                    2 if round % 7 == 0 => seq + 100_000 + next(1 << 30),
+                    _ => seq + 1,
+                };
+                let loc = RecordLoc { offset: i * 100 + next(50), len: next(1 << 20) as u32 };
+                dense.insert(seq, loc);
+                map.insert(seq, loc);
+            }
+            assert_eq!(dense.first(), map.keys().next().copied());
+            assert_eq!(dense.last(), map.keys().next_back().copied());
+            let probe = |from: u64| -> Vec<(u64, u64, u32)> {
+                dense.iter_from(from).map(|(s, l)| (s, l.offset, l.len)).collect()
+            };
+            let expect = |from: u64| -> Vec<(u64, u64, u32)> {
+                map.range(from..).map(|(s, l)| (*s, l.offset, l.len)).collect()
+            };
+            for from in [0, 1, seq / 2, seq, seq + 1, u64::MAX] {
+                assert_eq!(probe(from), expect(from), "round {round} from {from}");
+            }
+        }
+        assert_eq!(std::mem::size_of::<Slot>(), 12);
+    }
+
+    /// `cargo test --release -p rasterizeddb_core --lib -- --ignored
+    /// seq_index_memory --nocapture`. Resident growth for 4M dense entries.
+    #[test]
+    #[ignore]
+    fn seq_index_memory() {
+        fn rss_kb() -> u64 {
+            let statm = std::fs::read_to_string("/proc/self/statm").unwrap();
+            statm.split_whitespace().nth(1).unwrap().parse::<u64>().unwrap() * 4
+        }
+        const N: u64 = 4_000_000;
+        // Dense first and kept alive, so the map's pages cannot be the ones
+        // reused for it.
+        let before = rss_kb();
+        let mut dense = SeqIndex::default();
+        for i in 1..=N {
+            dense.insert(i, RecordLoc { offset: i * 64, len: 40 });
+        }
+        let dense_kb = rss_kb() - before;
+        let before = rss_kb();
+        let mut map: BTreeMap<u64, RecordLoc> = BTreeMap::new();
+        for i in 1..=N {
+            map.insert(i, RecordLoc { offset: i * 64, len: 40 });
+        }
+        let map_kb = rss_kb() - before;
+        std::hint::black_box((&dense, &map));
+        println!(
+            "{N} entries: BTreeMap {:.1} B/entry, SeqIndex {:.1} B/entry",
+            map_kb as f64 * 1024.0 / N as f64,
+            dense_kb as f64 * 1024.0 / N as f64
+        );
+    }
+
+    /// A position advanced while the state file is being rewritten must
+    /// survive the swap. It used to go to the old file only and vanish with
+    /// the rename, and the restarted node then applied that origin's
+    /// transaction a second time.
+    #[test]
+    fn a_record_racing_a_rewrite_survives_it() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(AppliedState::open(dir.path()).unwrap());
+        state.record(1, 5).unwrap();
+        state.record(2, 3).unwrap();
+
+        let racer = state.clone();
+        test_hooks::BEFORE_STATE_SWAP.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                // Lands between the copy and the swap: an advance of an origin
+                // the copy holds, and one it has never seen.
+                racer.record(2, 4).unwrap();
+                racer.record(9, 1).unwrap();
+            }));
+        });
+        // `reset` rewrites; the reset origin must stay gone.
+        state.reset(1).unwrap();
+        test_hooks::BEFORE_STATE_SWAP.with(|hook| *hook.borrow_mut() = None);
+
+        // After the swap, appends go to the new file.
+        state.record(2, 6).unwrap();
+        state.flush().unwrap();
+        drop(state);
+
+        let reopened = AppliedState::open(dir.path()).unwrap();
+        assert_eq!(reopened.high_water(9), 1, "an advance during the rewrite was lost");
+        assert_eq!(reopened.high_water(2), 6);
+        assert_eq!(reopened.high_water(1), 0, "the reset origin came back");
     }
 
     /// The shape a crash leaves: a record that got half-written.

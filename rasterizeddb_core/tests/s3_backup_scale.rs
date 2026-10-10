@@ -51,6 +51,7 @@ fn config(prefix: &str) -> Option<BackupConfig> {
         rollover_interval_secs: 0,
         retain_snapshots: 0,
         staging_max_bytes: 0,
+        incremental_min_bytes: 0,
     })
 }
 

@@ -26,7 +26,14 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped when a field's meaning changes. A reader that does not recognise the
 /// version refuses the manifest rather than restoring from half of it.
-pub const MANIFEST_VERSION: u32 = 1;
+///
+/// 2: a snapshot may keep some of its files as separate objects, possibly
+/// written by an *earlier* snapshot ([`SnapshotEntry::objects`]). A version-1
+/// reader would restore only the snapshot's own archive and silently leave
+/// those files out — so a catalogue that uses them is written as version 2,
+/// which such a reader refuses, and one that does not stays at 1 and remains
+/// readable by older builds. See [`Manifest::required_version`].
+pub const MANIFEST_VERSION: u32 = 2;
 
 /// Key of the catalogue within the configured prefix.
 pub const MANIFEST_KEY: &str = "MANIFEST.json";
@@ -90,21 +97,60 @@ impl Manifest {
     }
 
     pub fn decode(bytes: &[u8]) -> std::io::Result<Self> {
+        Self::decode_understanding(bytes, MANIFEST_VERSION)
+    }
+
+    /// `decode` as a build that understands versions up to `understood` would
+    /// run it. Separate so a test can play the part of an older reader.
+    pub fn decode_understanding(bytes: &[u8], understood: u32) -> std::io::Result<Self> {
         let manifest: Manifest = serde_json::from_slice(bytes)
             .map_err(|e| std::io::Error::other(format!("backup manifest is unreadable: {e}")))?;
-        if manifest.version > MANIFEST_VERSION {
+        if manifest.version > understood {
             return Err(std::io::Error::other(format!(
                 "backup manifest is version {} but this build understands {}",
-                manifest.version, MANIFEST_VERSION
+                manifest.version, understood
             )));
         }
         Ok(manifest)
     }
 
+    /// The lowest version that describes this catalogue faithfully: 2 once any
+    /// snapshot keeps files outside its archive, 1 otherwise — so a server that
+    /// never takes an incremental snapshot keeps writing catalogues an older
+    /// build can still restore from.
+    pub fn required_version(&self) -> u32 {
+        if self.snapshots.iter().any(|s| !s.objects.is_empty()) {
+            2
+        } else {
+            1
+        }
+    }
+
     pub fn encode(&self) -> Vec<u8> {
+        // The version is derived, never carried over: a catalogue that gained
+        // its first incremental snapshot must stop being readable by a build
+        // that would restore it without those files.
+        let mut stamped = self.clone();
+        stamped.version = self.required_version();
         // Pretty-printed: it is read by operators at least as often as by the
         // engine, and the size difference on an object this small is noise.
-        serde_json::to_vec_pretty(self).expect("a manifest is always serialisable")
+        serde_json::to_vec_pretty(&stamped).expect("a manifest is always serialisable")
+    }
+
+    /// Every content object any snapshot can reuse, by content hash.
+    ///
+    /// A snapshot reuses an object only if its bytes hash the same as the file
+    /// it is copying *and* have the same length, so an object found here is
+    /// byte-for-byte what a fresh upload would have stored.
+    pub fn reusable_objects(&self) -> std::collections::HashMap<(String, u64), String> {
+        let mut out = std::collections::HashMap::new();
+        for snapshot in &self.snapshots {
+            for object in &snapshot.objects {
+                out.entry((object.sha256.clone(), object.len))
+                    .or_insert_with(|| object.key.clone());
+            }
+        }
+        out
     }
 
     /// Snapshots newest first.
@@ -262,6 +308,30 @@ pub struct SnapshotEntry {
     /// operator what a restore is about to produce.
     #[serde(default)]
     pub files: Vec<String>,
+    /// Files kept as objects of their own rather than inside `key`'s archive.
+    ///
+    /// An incremental snapshot stores a large file this way, and a later
+    /// snapshot whose copy of the file hashes the same references the same
+    /// object instead of uploading it again — so `key` here may name an
+    /// object an *earlier* snapshot wrote. Retention therefore deletes an
+    /// object only once no surviving snapshot references it
+    /// ([`Manifest::plan_retention`]). Empty for a full snapshot, and for
+    /// every snapshot written before this existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub objects: Vec<FileObject>,
+}
+
+/// One file of a snapshot stored as its own compressed object.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileObject {
+    /// Relative path in the database directory, as in [`SnapshotEntry::files`].
+    pub name: String,
+    /// Uncompressed length.
+    pub len: u64,
+    /// Hex SHA-256 of the uncompressed bytes. Checked on restore.
+    pub sha256: String,
+    /// The object holding the zstd-compressed bytes.
+    pub key: String,
 }
 
 /// What one log had to be replayed through for a snapshot to be consistent.
@@ -371,7 +441,21 @@ impl Manifest {
         let retired: Vec<SnapshotEntry> = ordered.split_off(keep);
         let survivors = ordered;
 
-        let mut doomed: Vec<String> = retired.into_iter().map(|s| s.key).collect();
+        // An object goes only when no survivor references it: a newer
+        // incremental snapshot may be built on objects an older one wrote.
+        let still_referenced: std::collections::HashSet<&str> = survivors
+            .iter()
+            .flat_map(|s| s.objects.iter().map(|o| o.key.as_str()))
+            .collect();
+        let mut doomed: Vec<String> = Vec::new();
+        for snapshot in &retired {
+            for object in &snapshot.objects {
+                if !still_referenced.contains(object.key.as_str()) && !doomed.contains(&object.key) {
+                    doomed.push(object.key.clone());
+                }
+            }
+        }
+        doomed.extend(retired.into_iter().map(|s| s.key));
 
         let (segments, dropped): (Vec<SegmentEntry>, Vec<SegmentEntry>) = self
             .segments_ordered()
@@ -536,7 +620,57 @@ mod tests {
             file_count: 1,
             compression_level: 10,
             files: Vec::new(),
+            objects: Vec::new(),
         }
+    }
+
+    fn object(name: &str, key: &str) -> FileObject {
+        FileObject {
+            name: name.to_string(),
+            len: 10,
+            sha256: format!("hash-of-{key}"),
+            key: key.to_string(),
+        }
+    }
+
+    /// Retiring a snapshot must not delete an object a survivor still
+    /// references — the newer incremental snapshot was built on it.
+    #[test]
+    fn retention_keeps_objects_a_survivor_references() {
+        let mut m = manifest();
+        let mut old = sequenced("old", 1_000, 0);
+        old.objects = vec![object("a.db", "snapshots/old/0.zst"), object("b.db", "snapshots/old/1.zst")];
+        let mut new = sequenced("new", 2_000, 1);
+        // `a.db` unchanged: reused. `b.db` changed: uploaded afresh.
+        new.objects = vec![object("a.db", "snapshots/old/0.zst"), object("b.db", "snapshots/new/1.zst")];
+        m.snapshots = vec![old, new];
+
+        let plan = m.plan_retention(1);
+        assert_eq!(plan.snapshots.len(), 1);
+        assert!(plan.doomed.contains(&"snapshots/old/1.zst".to_string()));
+        assert!(plan.doomed.contains(&"snapshots/old.rdba.zst".to_string()));
+        assert!(
+            !plan.doomed.contains(&"snapshots/old/0.zst".to_string()),
+            "deleted an object the surviving snapshot restores from: {:?}",
+            plan.doomed
+        );
+        assert!(!plan.doomed.contains(&"snapshots/new/1.zst".to_string()));
+    }
+
+    /// A catalogue with incremental snapshots must be refused by a reader that
+    /// does not know about them; one without stays readable by it.
+    #[test]
+    fn an_old_reader_refuses_only_catalogues_it_would_misread() {
+        let mut m = manifest();
+        let plain = m.encode();
+        assert!(Manifest::decode_understanding(&plain, 1).is_ok());
+
+        m.snapshots[0].objects = vec![object("a.db", "snapshots/s1/0.zst")];
+        let bytes = m.encode();
+        let err = Manifest::decode_understanding(&bytes, 1).unwrap_err();
+        assert!(err.to_string().contains("version 2"), "{err}");
+        let back = Manifest::decode(&bytes).unwrap();
+        assert_eq!(back.snapshots[0].objects, m.snapshots[0].objects);
     }
 
     fn manifest() -> Manifest {
@@ -800,7 +934,8 @@ mod tests {
     fn refuses_a_future_version() {
         let mut m = manifest();
         m.version = MANIFEST_VERSION + 1;
-        let err = Manifest::decode(&m.encode()).unwrap_err();
+        // Serialised directly: `encode` derives the version from the content.
+        let err = Manifest::decode(&serde_json::to_vec(&m).unwrap()).unwrap_err();
         assert!(err.to_string().contains("this build understands"), "{err}");
     }
 

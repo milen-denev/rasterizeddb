@@ -87,6 +87,9 @@ pub mod manifest;
 mod pitr_tests;
 pub mod restore;
 pub mod s3;
+/// An in-process S3 for tests; see its module docs.
+#[doc(hidden)]
+pub mod fake_s3;
 pub mod timeutil;
 
 use manifest::{Manifest, RecoveryTarget, SegmentEntry, SnapshotEntry};
@@ -186,6 +189,16 @@ pub struct BackupConfig {
     /// is worse, so past this ceiling checkpoints go back to discarding the log
     /// and the operator is told loudly.
     pub staging_max_bytes: u64,
+    /// Files at least this large are stored as objects of their own, and a
+    /// later snapshot whose copy of one hashes the same reuses the object
+    /// instead of uploading it again. 0 — the default — takes every snapshot
+    /// as one self-contained archive, as before.
+    ///
+    /// What this trades: a snapshot of a mostly-idle database uploads only
+    /// what changed, but its restore then depends on objects earlier
+    /// snapshots wrote (retention keeps them while referenced), and files
+    /// outside the archive lose long-distance matching against each other.
+    pub incremental_min_bytes: u64,
 }
 
 impl BackupConfig {
@@ -528,8 +541,18 @@ impl BackupService {
 
     // ---- snapshot ----------------------------------------------------------
 
-    /// Takes a full snapshot and makes it restorable.
+    /// Takes a snapshot and makes it restorable.
+    ///
+    /// Incremental when `incremental_min_bytes` is set: see
+    /// [`BackupConfig::incremental_min_bytes`].
     pub async fn snapshot_now(self: &Arc<Self>) -> io::Result<SnapshotReport> {
+        self.take_snapshot(false).await
+    }
+
+    /// `full` refuses to reuse anything an earlier snapshot stored, so the
+    /// result depends on no older object — what a rollover needs before it
+    /// deletes every older generation.
+    async fn take_snapshot(self: &Arc<Self>, full: bool) -> io::Result<SnapshotReport> {
         let _one_at_a_time = self.snapshot_lock.lock().await;
         // A snapshot is a copy of a directory, so a table that is not in one is
         // not in the snapshot. That is the intended behaviour — a table on
@@ -594,7 +617,17 @@ impl BackupService {
         );
 
         let staged_before = self.staged_lengths()?;
-        let (uncompressed, compressed) = self.upload_snapshot(&key, &files).await?;
+        // Large files first, as objects of their own (or references to ones an
+        // earlier snapshot stored); the rest into this snapshot's archive.
+        let (archived, objects, objects_uncompressed, objects_compressed) =
+            if !full && self.config.incremental_min_bytes > 0 {
+                self.store_large_files(&id, &files).await?
+            } else {
+                (files.clone(), Vec::new(), 0, 0)
+            };
+        let (uncompressed, compressed) = self.upload_snapshot(&key, &archived).await?;
+        let (uncompressed, compressed) =
+            (uncompressed + objects_uncompressed, compressed + objects_compressed);
         self.check_staged_appends(&staged_before)?;
 
         // Cut the logs again. Everything written while the copy ran is now in a
@@ -650,6 +683,7 @@ impl BackupService {
             file_count: names.len() as u32,
             compression_level: self.config.snapshot_level,
             files: names,
+            objects,
         };
 
         // Released before the archive flush: that is network work and holding
@@ -659,13 +693,36 @@ impl BackupService {
         // Upload the window's log immediately. Until it is up there the
         // snapshot object exists but cannot be restored from.
         self.archive_wal_now().await?;
-        self.verify_log_is_archived(&id).await?;
+        self.verify_log_is_archived(&id, &entry.windows).await?;
 
         // Recorded only once the log behind it is known to be in S3, so a
         // catalogue entry always names a snapshot that can actually be
         // restored.
         {
             let mut manifest = self.manifest.lock().await;
+            // A reused object must still be referenced by a snapshot in the
+            // catalogue at the moment this one joins it. A prune running
+            // concurrently plans under this same lock: either it saw this
+            // entry and keeps the object, or it already dropped the last
+            // snapshot naming it and is deleting it — and then this snapshot
+            // would restore from an object that is gone. Refused, not
+            // repaired: the next snapshot simply uploads the file again.
+            let own_prefix = self.config.key(&format!("snapshots/{id}/"));
+            let live: std::collections::HashSet<&str> = manifest
+                .snapshots
+                .iter()
+                .flat_map(|s| s.objects.iter().map(|o| o.key.as_str()))
+                .collect();
+            if let Some(gone) = entry
+                .objects
+                .iter()
+                .find(|o| !o.key.starts_with(&own_prefix) && !live.contains(o.key.as_str()))
+            {
+                return Err(io::Error::other(format!(
+                    "snapshot {id} reused {} for {}, but retention removed it while the                      snapshot ran; the snapshot is abandoned and the next one will upload it",
+                    gone.key, gone.name
+                )));
+            }
             manifest.snapshots.push(entry.clone());
         }
 
@@ -836,53 +893,76 @@ impl BackupService {
     /// So the condition is checked directly rather than inferred: the live log
     /// must be empty and the staging directory drained. A pending transaction
     /// is usually brief, so it is retried before giving up.
-    async fn verify_log_is_archived(self: &Arc<Self>, snapshot_id: &str) -> io::Result<()> {
+    async fn verify_log_is_archived(
+        self: &Arc<Self>,
+        snapshot_id: &str,
+        windows: &[manifest::LogWindow],
+    ) -> io::Result<()> {
         // Asked of every log under the location. A sub-database whose records
         // are still in its own live log leaves its files in the copy without
         // the log that reconciles them, which is the same failure as the root's
         // and just as silent.
-        let live_bytes = || -> u64 {
-            self.log_streams()
-                .iter()
-                .map(|(_, wal)| wal.bytes_since_checkpoint())
-                .sum()
-        };
-        if self.log_streams().is_empty() {
+        //
+        // The question is whether every record *inside each window* is in the
+        // archive — not whether the logs are empty. A checkpoint keeps what
+        // was logged during its own sync pass, so under write load a log is
+        // never empty, and requiring that discarded every snapshot and every
+        // rollover taken while the database was busy.
+        let streams = self.log_streams();
+        if streams.is_empty() {
             // No log at all: nothing to archive, and the caller has already
             // been warned that this database has no point-in-time recovery.
             return Ok(());
         }
+        let window_of = |key: &str| windows.iter().find(|w| w.database == key);
 
         const ATTEMPTS: u32 = 5;
+        let mut short: Vec<String> = Vec::new();
         for attempt in 1..=ATTEMPTS {
-            if live_bytes() == 0 && self.staged_bytes() == 0 {
+            // Read before the upload below lists what is staged: whatever a
+            // checkpoint had staged by now is in that listing.
+            short = streams
+                .iter()
+                .filter_map(|(key, wal)| {
+                    let w = window_of(key)?;
+                    (!wal.staged_covers(w.start_lsn, w.end_lsn)).then(|| {
+                        format!(
+                            "{} through LSN {}",
+                            if key.is_empty() { "<default>" } else { key.as_str() },
+                            w.end_lsn
+                        )
+                    })
+                })
+                .collect();
+            // Uploads everything staged so far; a failure here is the error.
+            self.flush_staged_segments().await?;
+            if short.is_empty() {
                 return Ok(());
             }
             if attempt == ATTEMPTS {
                 break;
             }
             debug!(
-                "Snapshot {}: the log is not fully archived yet ({} bytes live, {} staged); \
-                 retrying ({}/{})",
+                "Snapshot {}: not yet staged: {}; retrying ({}/{})",
                 snapshot_id,
-                live_bytes(),
-                self.staged_bytes(),
+                short.join(", "),
                 attempt,
                 ATTEMPTS
             );
             tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
-            self.archive_wal_now().await?;
+            // A checkpoint can decline (another running, an in-place write
+            // pending); cut again.
+            self.checkpoint_all_logs().await?;
         }
 
         // Failing loses a snapshot; publishing would lose the ability to
         // restore one, and only at the moment someone needed it.
         Err(io::Error::other(format!(
             "snapshot {snapshot_id} was copied, but the log covering it could not be archived \
-             ({} bytes still in the live log, {} bytes still staged){}. Discarding it rather \
-             than recording a snapshot that cannot be restored; retry the backup.",
-            live_bytes(),
-            self.staged_bytes(),
-            if self.log_streams().iter().any(|(_, wal)| wal.is_poisoned()) {
+             (not staged: {}){}. Discarding it rather than recording a snapshot that cannot \
+             be restored; retry the backup.",
+            short.join(", "),
+            if streams.iter().any(|(_, wal)| wal.is_poisoned()) {
                 " — the log is poisoned by an earlier flush failure, so durability cannot be \
                  promised until the database is restarted"
             } else {
@@ -1022,6 +1102,108 @@ impl BackupService {
         // round the compressor stops with the same channel error.
         let uncompressed = produced?;
         Ok((uncompressed, uploaded?))
+    }
+
+    /// Stores every file of at least `incremental_min_bytes` as an object of
+    /// its own, or references the object an earlier snapshot stored for the
+    /// same bytes. Returns the files left for the archive, the objects, and
+    /// the uncompressed and newly uploaded compressed byte counts.
+    ///
+    /// Two passes over a file that is not reused: one to hash it for the
+    /// lookup, one to compress and upload it, which hashes again. The second
+    /// hash is the one recorded, so the catalogue always describes exactly the
+    /// bytes in the object even if the file changed between passes. Either
+    /// copy is a valid fuzzy copy: both were read after the checkpoint that
+    /// opens this snapshot's replay window.
+    async fn store_large_files(
+        self: &Arc<Self>,
+        id: &str,
+        files: &[(String, PathBuf)],
+    ) -> io::Result<(Vec<(String, PathBuf)>, Vec<manifest::FileObject>, u64, u64)> {
+        let reusable = self.manifest.lock().await.reusable_objects();
+        let mut archived = Vec::new();
+        let mut objects = Vec::new();
+        let (mut uncompressed, mut compressed) = (0u64, 0u64);
+
+        for (index, (name, path)) in files.iter().enumerate() {
+            let len = std::fs::metadata(path)?.len();
+            if len < self.config.incremental_min_bytes {
+                archived.push((name.clone(), path.clone()));
+                continue;
+            }
+            let hashed_path = path.clone();
+            let sha256 = tokio::task::spawn_blocking(move || hash_prefix(&hashed_path, len))
+                .await
+                .map_err(|e| io::Error::other(format!("snapshot hasher panicked: {e}")))??;
+            uncompressed += len;
+
+            if let Some(key) = reusable.get(&(sha256.clone(), len)) {
+                objects.push(manifest::FileObject {
+                    name: name.clone(),
+                    len,
+                    sha256,
+                    key: key.clone(),
+                });
+                continue;
+            }
+
+            let key = self.config.key(&format!("snapshots/{id}/{index:06}.zst"));
+            let (sha256, stored) = self.upload_file_object(&key, path, len).await?;
+            compressed += stored;
+            objects.push(manifest::FileObject {
+                name: name.clone(),
+                len,
+                sha256,
+                key,
+            });
+        }
+        Ok((archived, objects, uncompressed, compressed))
+    }
+
+    /// Compresses the first `len` bytes of `path` into `key`, hashing exactly
+    /// what it compresses. Returns the hash and the compressed size.
+    async fn upload_file_object(
+        self: &Arc<Self>,
+        key: &str,
+        path: &Path,
+        len: u64,
+    ) -> io::Result<(String, u64)> {
+        let part_size = self.config.part_size.max(5 * 1024 * 1024);
+        let (tx, rx) = kanal::bounded::<Vec<u8>>(2);
+        let level = self.config.snapshot_level;
+        let threads = self.compression_threads();
+        let long_range = self.config.long_range;
+        let path = path.to_path_buf();
+
+        let producer = tokio::task::spawn_blocking(move || -> io::Result<String> {
+            use sha2::Digest;
+            let sink = PartSink::new(tx, part_size);
+            let mut encoder = new_encoder(sink, level, threads, long_range)?;
+            encoder.set_pledged_src_size(Some(len))?;
+            let mut file = std::io::BufReader::with_capacity(256 * 1024, std::fs::File::open(&path)?);
+            let mut digest = sha2::Sha256::new();
+            let mut chunk = vec![0u8; 1024 * 1024];
+            let mut remaining = len;
+            while remaining > 0 {
+                let want = chunk.len().min(remaining as usize);
+                // Exactly `len`, as the archive does: a file that grows during
+                // the copy is captured at the length it had, and the log
+                // replay supplies the rest.
+                file.read_exact(&mut chunk[..want])?;
+                digest.update(&chunk[..want]);
+                encoder.write_all(&chunk[..want])?;
+                remaining -= want as u64;
+            }
+            encoder.finish()?.finish()?;
+            Ok(to_hex(&digest.finalize()))
+        });
+
+        let uploaded = self.upload_parts(key.to_string(), rx.to_async()).await;
+        let produced = producer
+            .await
+            .map_err(|e| io::Error::other(format!("snapshot compressor panicked: {e}")))?;
+        let sha256 = produced?;
+        Ok((sha256, uploaded?))
     }
 
     /// Part size that keeps a snapshot inside S3's 10 000-part ceiling.
@@ -1209,9 +1391,19 @@ impl BackupService {
         // told apart once concatenated. One bundle belongs to exactly one.
         for (database, paths) in staged {
             for group in group_by_size(&paths, self.config.wal_bundle_bytes)? {
-                let mut body = Vec::new();
+                // Opened first and sized from the handles, so the body is
+                // allocated once at its final size rather than regrown per
+                // segment. A staged segment is never appended to, so the sum
+                // is exact; `read_to_end` still copes if it were not.
+                let mut files = Vec::with_capacity(group.len());
+                let mut total = 0usize;
                 for path in &group {
-                    let mut file = std::fs::File::open(path)?;
+                    let file = std::fs::File::open(path)?;
+                    total += file.metadata()?.len() as usize;
+                    files.push(file);
+                }
+                let mut body = Vec::with_capacity(total);
+                for mut file in files {
                     file.read_to_end(&mut body)?;
                 }
 
@@ -1231,9 +1423,7 @@ impl BackupService {
                 let threads = self.compression_threads();
                 let long_range = self.config.long_range;
                 let compressed = tokio::task::spawn_blocking(move || -> io::Result<Vec<u8>> {
-                    let mut encoder = new_encoder(Vec::new(), level, threads, long_range)?;
-                    encoder.write_all(&body)?;
-                    encoder.finish()
+                    compress_bundle(&body, level, threads, long_range)
                 })
                 .await
                 .map_err(|e| io::Error::other(format!("segment compressor panicked: {e}")))??;
@@ -1436,7 +1626,9 @@ impl BackupService {
     /// was rather than leaving the bucket empty — the one outcome worse than a
     /// stale backup is no backup.
     pub async fn rollover_now(self: &Arc<Self>) -> io::Result<(SnapshotReport, u32)> {
-        let report = self.snapshot_now().await?;
+        // Full, never incremental: the prune below removes every older
+        // generation, and a snapshot that reused their objects would lose them.
+        let report = self.take_snapshot(true).await?;
         let removed = self.prune_keeping(1).await?;
 
         // Stamped only once both halves are done, and published on its own
@@ -1712,6 +1904,48 @@ pub async fn restore_from(
 // ---- shared plumbing -------------------------------------------------------
 
 /// A zstd encoder configured for this backup.
+/// Hex SHA-256 of the first `len` bytes of `path`.
+pub(crate) fn hash_prefix(path: &Path, len: u64) -> io::Result<String> {
+    use sha2::Digest;
+    let mut file = std::io::BufReader::with_capacity(256 * 1024, std::fs::File::open(path)?);
+    let mut digest = sha2::Sha256::new();
+    let mut chunk = vec![0u8; 1024 * 1024];
+    let mut remaining = len;
+    while remaining > 0 {
+        let want = chunk.len().min(remaining as usize);
+        file.read_exact(&mut chunk[..want])?;
+        digest.update(&chunk[..want]);
+        remaining -= want as u64;
+    }
+    Ok(to_hex(&digest.finalize()))
+}
+
+pub(crate) fn to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+/// Compresses one log bundle whose size is known up front.
+///
+/// The size is pledged to the encoder. Without it zstd has to assume an
+/// unbounded stream and sets up the whole configured window — 128 MiB with
+/// long-distance matching — for a bundle that is usually a few megabytes; with
+/// it the window and match tables are sized to the input, and the frame
+/// records the content size. A pledge that turned out wrong fails `finish`
+/// rather than producing a bad frame, and the size here is `body.len()` itself.
+fn compress_bundle(body: &[u8], level: i32, threads: u32, long_range: bool) -> io::Result<Vec<u8>> {
+    // Log records compress well; a quarter is a cheap first guess that saves
+    // the early regrowths without over-reserving much.
+    let mut encoder = new_encoder(Vec::with_capacity(body.len() / 4), level, threads, long_range)?;
+    encoder.set_pledged_src_size(Some(body.len() as u64))?;
+    encoder.write_all(body)?;
+    encoder.finish()
+}
+
 fn new_encoder<W: Write>(
     sink: W,
     level: i32,
@@ -1918,6 +2152,71 @@ impl Write for PartSink {
 }
 
 #[cfg(test)]
+mod bundle_tests {
+    use super::*;
+
+    /// Log-shaped bytes: a fixed frame around a few varying fields.
+    fn log_like(len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len + 64);
+        let mut i = 0u64;
+        while out.len() < len {
+            out.extend_from_slice(&0x4C52_5741u32.to_le_bytes());
+            out.extend_from_slice(&[1, 0, 0, 0]);
+            out.extend_from_slice(&i.to_le_bytes());
+            out.extend_from_slice(&(i * 7919 % 1_000_003).to_le_bytes());
+            out.extend_from_slice(format!("employee_{i}|dept_{}|", i % 32).as_bytes());
+            i += 1;
+        }
+        out.truncate(len);
+        out
+    }
+
+    #[test]
+    fn a_pledged_bundle_round_trips() {
+        for len in [0usize, 1, 4096, 3 << 20] {
+            let body = log_like(len);
+            for threads in [1, 4] {
+                let compressed = compress_bundle(&body, 6, threads, true).unwrap();
+                let back = zstd::stream::decode_all(&compressed[..]).unwrap();
+                assert_eq!(back, body, "len {len} threads {threads}");
+            }
+        }
+    }
+
+    /// `cargo test --release -p rasterizeddb_core --lib -- --ignored
+    /// bundle_compress_bench --nocapture`. The configured encoder with and
+    /// without the size pledged, on bundles of a few sizes.
+    #[test]
+    #[ignore]
+    fn bundle_compress_bench() {
+        for len in [256 << 10, 4 << 20, 32 << 20] {
+            let body = log_like(len);
+            let iters = (64 << 20) / len.max(1) + 1;
+            for round in 0..3 {
+                let t = std::time::Instant::now();
+                let mut old_size = 0;
+                for _ in 0..iters {
+                    let mut e = new_encoder(Vec::new(), 6, 1, true).unwrap();
+                    e.write_all(&body).unwrap();
+                    old_size = e.finish().unwrap().len();
+                }
+                let old = t.elapsed() / iters as u32;
+                let t = std::time::Instant::now();
+                let mut new_size = 0;
+                for _ in 0..iters {
+                    new_size = compress_bundle(&body, 6, 1, true).unwrap().len();
+                }
+                let new = t.elapsed() / iters as u32;
+                println!(
+                    "{} KiB round {round}: unpledged {old:?} ({old_size} B)  pledged {new:?} ({new_size} B)",
+                    len >> 10
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2115,6 +2414,7 @@ mod tests {
             retain_snapshots: 7,
             rollover_interval_secs: 0,
             staging_max_bytes: 4 * 1024 * 1024 * 1024,
+            incremental_min_bytes: 0,
         }
     }
 

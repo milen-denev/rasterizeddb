@@ -58,8 +58,25 @@ fn init_engine_globals() {
 
 /// A configuration pointed at the test bucket under a prefix of its own, so
 /// tests do not see each other's catalogues.
+///
+/// Without `RDB_S3_TEST_ENDPOINT` the suite runs against the in-process
+/// [`fake_s3`](rasterizeddb_core::core::backup::fake_s3), so it runs everywhere;
+/// set the variable to run it against a real store as well.
 fn config(prefix: &str) -> Option<BackupConfig> {
-    let endpoint = std::env::var("RDB_S3_TEST_ENDPOINT").ok()?;
+    let (endpoint, credentials) = match std::env::var("RDB_S3_TEST_ENDPOINT") {
+        Ok(endpoint) => (
+            endpoint,
+            Credentials::from_env().expect("AWS credentials must be set"),
+        ),
+        Err(_) => (
+            rasterizeddb_core::core::backup::fake_s3::shared().endpoint(),
+            Credentials {
+                access_key: "fake".to_string(),
+                secret_key: "fake".to_string(),
+                session_token: None,
+            },
+        ),
+    };
     Some(BackupConfig {
         bucket: std::env::var("RDB_S3_TEST_BUCKET").unwrap_or_else(|_| "rdbtest".to_string()),
         // Unique per run as well as per test: each run builds a fresh database
@@ -69,7 +86,7 @@ fn config(prefix: &str) -> Option<BackupConfig> {
         prefix: format!("e2e/{}/{prefix}", run_id()),
         region: std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
         endpoint: Endpoint::parse(&endpoint).expect("endpoint must be a URL"),
-        credentials: Credentials::from_env().expect("AWS credentials must be set"),
+        credentials,
         path_style: true,
         // Low levels: these tests are about correctness, and a high level would
         // spend seconds proving something the compression round-trip test in
@@ -89,6 +106,7 @@ fn config(prefix: &str) -> Option<BackupConfig> {
         rollover_interval_secs: 0,
         retain_snapshots: 0,
         staging_max_bytes: 0,
+        incremental_min_bytes: 0,
     })
 }
 
@@ -1298,4 +1316,556 @@ e2e_test!(a_restored_copy_reads_its_own_directory, config, {
         25,
         "the restored copy must hold its own data, not read the source's"
     );
+});
+
+// ---- incremental snapshots -------------------------------------------------
+
+/// The catalogue as it stands in the store.
+async fn read_manifest(config: &BackupConfig) -> (Vec<u8>, rasterizeddb_core::core::backup::manifest::Manifest) {
+    let bytes = client_for(config)
+        .get_object(&manifest_key(config))
+        .await
+        .expect("manifest");
+    let manifest = rasterizeddb_core::core::backup::manifest::Manifest::decode(&bytes).expect("decode");
+    (bytes, manifest)
+}
+
+/// Keys under the config's prefix that start with `under`.
+async fn keys_under(config: &BackupConfig, under: &str) -> Vec<String> {
+    let prefix = format!("{}{under}", config.normalized_prefix());
+    client_for(config)
+        .list_prefix(&prefix)
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect()
+}
+
+/// A database with one table big enough that its files go out as objects of
+/// their own, and one small table that the second snapshot changes.
+async fn incremental_source(live: &Path) -> Arc<Database> {
+    let database = Arc::new(Database::new(live.to_str().unwrap()).await);
+    run(&database, "CREATE TABLE big (id INT, payload STRING)").await;
+    run(&database, "CREATE TABLE small (id INT, note STRING)").await;
+    let values: Vec<String> = (0..400)
+        .map(|i| format!("({i}, '{}')", "x".repeat(100 + i % 7)))
+        .collect();
+    run(
+        &database,
+        &format!("INSERT INTO big (id, payload) VALUES {}", values.join(", ")),
+    )
+    .await;
+    run(&database, "INSERT INTO small (id, note) VALUES (1, 'one')").await;
+    database
+}
+
+fn incremental(config: BackupConfig) -> BackupConfig {
+    BackupConfig {
+        incremental_min_bytes: 4096,
+        ..config
+    }
+}
+
+e2e_test!(
+    incremental_snapshots_reuse_unchanged_files_and_survive_retention,
+    config,
+    {
+        let config = incremental(config);
+        let root = temp_testdir::TempDir::default();
+        let live = root.join("live");
+        std::fs::create_dir_all(&live).unwrap();
+        let database = incremental_source(&live).await;
+
+        let service = BackupService::connect(config.clone(), live.to_str().unwrap())
+            .await
+            .expect("connect");
+        let first = service.snapshot_now().await.expect("first snapshot");
+
+        // Only the small table changes between the two.
+        for i in 2..30 {
+            run(&database, &format!("INSERT INTO small (id, note) VALUES ({i}, 'later')")).await;
+        }
+        let second = service.snapshot_now().await.expect("second snapshot");
+
+        let (bytes, manifest) = read_manifest(&config).await;
+        let s1 = manifest.snapshots.iter().find(|s| s.id == first.id).unwrap();
+        let s2 = manifest.snapshots.iter().find(|s| s.id == second.id).unwrap();
+        assert!(!s1.objects.is_empty(), "nothing went out as an object: the test proves nothing");
+        let first_prefix = format!("snapshots/{}/", first.id);
+        let reused: Vec<_> = s2
+            .objects
+            .iter()
+            .filter(|o| o.key.contains(&first_prefix))
+            .collect();
+        assert!(
+            !reused.is_empty(),
+            "the second snapshot reused nothing from the first: {:?}",
+            s2.objects
+        );
+        assert!(
+            second.compressed_bytes < first.compressed_bytes,
+            "an incremental snapshot uploaded as much as a full one ({} vs {})",
+            second.compressed_bytes,
+            first.compressed_bytes
+        );
+        // A catalogue using objects is one an older build must refuse.
+        assert!(
+            rasterizeddb_core::core::backup::manifest::Manifest::decode_understanding(&bytes, 1)
+                .is_err(),
+            "a version-1 reader accepted a catalogue it would restore without its objects"
+        );
+
+        // Retention retires the first snapshot. Its archive and the objects
+        // only it used go; the objects the second reuses must stay.
+        service.prune_keeping(1).await.expect("prune");
+        let left = keys_under(&config, "snapshots/").await;
+        assert!(
+            !left.iter().any(|k| k.ends_with(&format!("{}.rdba.zst", first.id))),
+            "the retired snapshot's archive survived: {left:?}"
+        );
+        for object in &s2.objects {
+            assert!(
+                left.contains(&object.key),
+                "retention deleted {} which the surviving snapshot restores {} from",
+                object.key,
+                object.name
+            );
+        }
+        for object in &s1.objects {
+            if !s2.objects.iter().any(|o| o.key == object.key) {
+                assert!(!left.contains(&object.key), "orphaned object kept: {}", object.key);
+            }
+        }
+
+        // Restored with the source gone, so it can only read its own files.
+        drop(service);
+        drop(database);
+        std::fs::remove_dir_all(&live).expect("remove the source");
+        let target = root.join("restored");
+        rasterizeddb_core::core::backup::restore_from(&config, &target, RecoveryTarget::Latest)
+            .await
+            .expect("restore");
+        assert_eq!(count_in_restored(&target, "SELECT * FROM big").await, 400);
+        assert_eq!(count_in_restored(&target, "SELECT * FROM small").await, 29);
+    }
+);
+
+e2e_test!(
+    a_rollover_after_incremental_snapshots_stands_alone,
+    config,
+    {
+        let config = incremental(config);
+        let root = temp_testdir::TempDir::default();
+        let live = root.join("live");
+        std::fs::create_dir_all(&live).unwrap();
+        let database = incremental_source(&live).await;
+
+        let service = BackupService::connect(config.clone(), live.to_str().unwrap())
+            .await
+            .expect("connect");
+        service.snapshot_now().await.expect("first snapshot");
+        run(&database, "INSERT INTO small (id, note) VALUES (2, 'two')").await;
+        service.snapshot_now().await.expect("second snapshot");
+
+        let (report, _) = service.rollover_now().await.expect("rollover");
+        let (bytes, manifest) = read_manifest(&config).await;
+        assert_eq!(manifest.snapshots.len(), 1);
+        assert!(
+            manifest.snapshots[0].objects.is_empty(),
+            "a rollover must not depend on the generations it deletes"
+        );
+        // Nothing older is left, and the catalogue is readable by old builds again.
+        let left = keys_under(&config, "snapshots/").await;
+        assert_eq!(
+            left,
+            vec![format!(
+                "{}snapshots/{}.rdba.zst",
+                config.normalized_prefix(),
+                report.id
+            )],
+            "objects of earlier generations survived the rollover"
+        );
+        assert!(
+            rasterizeddb_core::core::backup::manifest::Manifest::decode_understanding(&bytes, 1)
+                .is_ok()
+        );
+
+        drop(service);
+        drop(database);
+        std::fs::remove_dir_all(&live).expect("remove the source");
+        let target = root.join("restored");
+        rasterizeddb_core::core::backup::restore_from(&config, &target, RecoveryTarget::Latest)
+            .await
+            .expect("restore");
+        assert_eq!(count_in_restored(&target, "SELECT * FROM big").await, 400);
+        assert_eq!(count_in_restored(&target, "SELECT * FROM small").await, 2);
+    }
+);
+
+e2e_test!(a_tampered_object_fails_the_restore, config, {
+    let config = incremental(config);
+    let root = temp_testdir::TempDir::default();
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    let database = incremental_source(&live).await;
+    let service = BackupService::connect(config.clone(), live.to_str().unwrap())
+        .await
+        .expect("connect");
+    service.snapshot_now().await.expect("snapshot");
+    drop(service);
+    drop(database);
+
+    let (_, manifest) = read_manifest(&config).await;
+    let object = manifest.snapshots[0].objects[0].clone();
+    // Same length, different bytes: only the hash can tell.
+    let forged = zstd::stream::encode_all(&vec![0x5Au8; object.len as usize][..], 3).unwrap();
+    client_for(&config)
+        .put_object(&object.key, &forged)
+        .await
+        .expect("overwrite");
+
+    let target = root.join("restored");
+    let err = rasterizeddb_core::core::backup::restore_from(&config, &target, RecoveryTarget::Latest)
+        .await
+        .expect_err("a restore from a forged object must fail, not succeed with wrong bytes");
+    assert!(err.to_string().contains("does not match the catalogue"), "{err}");
+});
+
+// ---- snapshots under write load ----------------------------------------------
+
+/// Inserts into `busy` until told to stop; returns how many it wrote.
+fn keep_writing(
+    database: Arc<Database>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> tokio::task::JoinHandle<usize> {
+    tokio::spawn(async move {
+        let mut n = 0usize;
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            let values: Vec<String> = (0..20)
+                .map(|i| format!("({}, '{}')", n * 20 + i, "w".repeat(200)))
+                .collect();
+            run(
+                &database,
+                &format!("INSERT INTO busy (id, note) VALUES {}", values.join(", ")),
+            )
+            .await;
+            n += 1;
+        }
+        n
+    })
+}
+
+e2e_test!(a_snapshot_and_a_rollover_succeed_while_writes_continue, config, {
+    // A checkpoint keeps what was logged during its own sync pass, so under
+    // write load the live log is never empty. Requiring it to be discarded
+    // every snapshot and every rollover on a busy node ("N bytes still in the
+    // live log").
+    let root = temp_testdir::TempDir::default();
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    let database = Arc::new(Database::new(live.to_str().unwrap()).await);
+    run(&database, "CREATE TABLE busy (id INT, note STRING)").await;
+
+    let service = BackupService::connect(config.clone(), live.to_str().unwrap())
+        .await
+        .expect("connect");
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = keep_writing(database.clone(), stop.clone());
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    for round in 0..3 {
+        service
+            .snapshot_now()
+            .await
+            .unwrap_or_else(|e| panic!("snapshot {round} under load: {e}"));
+    }
+    service.rollover_now().await.expect("rollover under load");
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let batches = writer.await.unwrap();
+    assert!(batches > 0, "the writer never ran: the test proves nothing");
+
+    // What the rollover kept restores into a database that opens and reads.
+    drop(service);
+    let target = root.join("restored");
+    rasterizeddb_core::core::backup::restore_from(&config, &target, RecoveryTarget::Latest)
+        .await
+        .expect("restore");
+    drop(database);
+    std::fs::remove_dir_all(&live).expect("remove the source");
+    let restored = count_in_restored(&target, "SELECT * FROM busy").await;
+    assert!(restored > 0, "restored {restored} rows");
+});
+
+e2e_test!(a_snapshot_whose_window_was_not_archived_is_refused, config, {
+    // The other half of the guarantee: a record inside the window that is not
+    // in the archive must still fail the snapshot. Archiving is taken away
+    // from the log, so the checkpoints during the snapshot drop records with
+    // no copy.
+    let root = temp_testdir::TempDir::default();
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    let database = Arc::new(Database::new(live.to_str().unwrap()).await);
+    run(&database, "CREATE TABLE busy (id INT, note STRING)").await;
+    let service = BackupService::connect(config.clone(), live.to_str().unwrap())
+        .await
+        .expect("connect");
+
+    let wal = rasterizeddb_core::core::wal::wal_for(live.to_str().unwrap()).expect("a log");
+    wal.set_archive_dir(None).unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = keep_writing(database.clone(), stop.clone());
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let outcome = service.snapshot_now().await;
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.await.unwrap();
+    let err = outcome.expect_err("a snapshot whose window is not in the archive was recorded");
+    assert!(err.to_string().contains("could not be archived"), "{err}");
+});
+
+// ---- a full restore round trip with every state file ------------------------
+
+/// Order-independent checksum of every column of every row a query returns,
+/// with the row count.
+async fn table_digest(database: &Arc<Database>, sql: &str) -> (usize, u64) {
+    let response = run(database, sql).await;
+    assert_eq!(response.first(), Some(&2u8), "{sql} returned no result set");
+    let rows = vec_into_rows(&response[1..]).expect("rows decode");
+    let mut sum = 0u64;
+    for row in &rows {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for column in row.columns.iter() {
+            for b in (column.schema_id as u64)
+                .to_le_bytes()
+                .iter()
+                .chain(column.data.into_slice().iter())
+            {
+                h ^= *b as u64;
+                h = h.wrapping_mul(0x1000_0000_01b3);
+            }
+        }
+        sum = sum.wrapping_add(h);
+    }
+    (rows.len(), sum)
+}
+
+/// What a restore must reproduce exactly.
+#[derive(Debug, PartialEq)]
+struct Fingerprint {
+    acct: (usize, u64),
+    prices: (usize, u64),
+    aborted_visible: usize,
+}
+
+async fn fingerprint(database: &Arc<Database>) -> Fingerprint {
+    Fingerprint {
+        acct: table_digest(database, "SELECT id, owner, bal FROM acct").await,
+        prices: table_digest(database, "SELECT id, amount FROM prices").await,
+        aborted_visible: count_rows(database, "SELECT id FROM acct WHERE id >= 900000").await,
+    }
+}
+
+/// Every outcome below `upto`, as the status log answers it.
+fn outcomes(database: &Arc<Database>, upto: u64) -> Vec<String> {
+    (1..upto)
+        .map(|tx| format!("{:?}", database.transactions.outcome(tx)))
+        .collect()
+}
+
+/// A restored copy must answer every query, every uniqueness check and every
+/// transaction-outcome lookup exactly as the source did — and keep working.
+async fn assert_restores_faithfully(
+    source: &Arc<Database>,
+    expected: &Fingerprint,
+    source_outcomes: &[String],
+    target: &Path,
+) {
+    let restored = Arc::new(Database::new(target.to_str().unwrap()).await);
+    assert_eq!(&fingerprint(&restored).await, expected, "query results differ");
+    let restored_outcomes = outcomes(&restored, source_outcomes.len() as u64 + 1);
+    let differing: Vec<usize> = (0..source_outcomes.len())
+        .filter(|i| source_outcomes[*i] != "forgotten")
+        .filter(|i| source_outcomes[*i] != restored_outcomes[*i])
+        .take(5)
+        .collect();
+    assert!(
+        differing.is_empty(),
+        "transaction outcomes differ, e.g. id {} source {} restored {}",
+        differing.first().map(|i| i + 1).unwrap_or(0),
+        differing.first().map(|i| source_outcomes[*i].as_str()).unwrap_or(""),
+        differing.first().map(|i| restored_outcomes[*i].as_str()).unwrap_or("")
+    );
+    let _ = source;
+
+    // Uniqueness survived.
+    let purpose = recognize_query_purpose("INSERT INTO acct (id, owner, bal) VALUES (500, 'dup', 0)")
+        .unwrap();
+    let dup = execute(purpose, restored.clone()).await;
+    assert_eq!(dup.first(), Some(&3u8), "a duplicate key was accepted after restore");
+
+    // It keeps working: writes, vacuum, settle and forget, a restart.
+    for i in 0..50 {
+        run(
+            &restored,
+            &format!("INSERT INTO acct (id, owner, bal) VALUES ({}, 'post', 1.5)", 500_000 + i),
+        )
+        .await;
+    }
+    run(&restored, "DELETE FROM acct WHERE id >= 500040").await;
+    run(&restored, "VACUUM acct").await;
+    restored.transactions.settle_now();
+    restored.transactions.try_forget();
+    restored.transactions.flush().unwrap();
+    let after = fingerprint(&restored).await;
+    assert_eq!(after.acct.0, expected.acct.0 + 40);
+    drop(restored);
+    let _ = rasterizeddb_core::core::wal::remove_for(target.to_str().unwrap());
+    let reopened = Arc::new(Database::new(target.to_str().unwrap()).await);
+    assert_eq!(fingerprint(&reopened).await, after, "a restart changed the restored copy");
+    drop(reopened);
+    let _ = rasterizeddb_core::core::wal::remove_for(target.to_str().unwrap());
+}
+
+e2e_test!(a_restore_reproduces_every_state_file, config, {
+    let root = temp_testdir::TempDir::default();
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    let database = Arc::new(Database::new(live.to_str().unwrap()).await);
+    run(&database, "CREATE TABLE acct (id INT PRIMARY KEY, owner STRING, bal NUMERIC(12, 3))").await;
+    run(&database, "CREATE TABLE prices (id INT, amount NUMERIC(18, 6))").await;
+
+    // Enough transactions to settle the status log (its smallest window is
+    // 4096 ids), with aborts among them so the settled set has holes.
+    database.transactions.set_settle_window(4096);
+    for i in 0..4_600u32 {
+        if i % 100 == 7 {
+            let tx = database.transactions.begin();
+            run_in_txn(
+                &database,
+                &format!("INSERT INTO acct (id, owner, bal) VALUES ({}, 'rolled back', 9.999)", 900_000 + i),
+                tx,
+            )
+            .await;
+            database.transactions.abort(tx);
+            continue;
+        }
+        run(
+            &database,
+            &format!(
+                "INSERT INTO acct (id, owner, bal) VALUES ({i}, 'owner{}', {}.{:03})",
+                i % 97,
+                i,
+                i % 1000
+            ),
+        )
+        .await;
+    }
+    let values: Vec<String> = (0..300).map(|i| format!("({i}, {i}.{:06})", i * 7919 % 1_000_000)).collect();
+    run(&database, &format!("INSERT INTO prices (id, amount) VALUES {}", values.join(", "))).await;
+    run(&database, "DELETE FROM acct WHERE id < 200").await;
+    run(&database, "VACUUM acct").await;
+    database.transactions.flush().unwrap();
+    let settled = database.transactions.settle_now();
+    let forgotten = database.transactions.try_forget();
+    database.transactions.flush().unwrap();
+    eprintln!("settled below {settled}, forgotten below {forgotten}");
+    assert!(settled > 0, "the status log never settled: the sidecar is not exercised");
+    // A running log persists its sidecar only every few million ids; opening
+    // one writes it. Restart, as a server that has run for a while has.
+    drop(database);
+    let _ = rasterizeddb_core::core::wal::remove_for(live.to_str().unwrap());
+    let database = Arc::new(Database::new(live.to_str().unwrap()).await);
+    // Forgetting waits for every table to have been swept clear of the ids.
+    run(&database, "VACUUM acct").await;
+    run(&database, "VACUUM prices").await;
+    for name in ["acct", "prices"] {
+        let table = database.tables.get(name).unwrap().value().clone();
+        let swept = table.neutralize_aborted_now().await.expect("forget sweep");
+        eprintln!("{name}: forget sweep {swept:?}, horizon {:?}", table.forget_horizon());
+    }
+    let forgotten = database.transactions.try_forget();
+    database.transactions.flush().unwrap();
+    eprintln!("after restart: forgotten below {forgotten}");
+    assert!(
+        live.join("db_transactions.status.settled").exists(),
+        "no settled sidecar was written"
+    );
+    assert!(
+        std::fs::read_dir(&live)
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().ends_with("_flt.db")),
+        "no filter sidecar on disk"
+    );
+
+    let expected = fingerprint(&database).await;
+    assert_eq!(expected.aborted_visible, 0);
+    // Ids below the forgotten horizon answer "committed" in the source by
+    // forgetting, and from the bitmap in a copy whose sidecar predates the
+    // forget; no row carries any of them (the sweep made sure), so only the
+    // ids a row can still ask about must agree. Marked as such here.
+    let forgotten_horizon = database.transactions.status().forgotten_below();
+    let mut source_outcomes = outcomes(&database, database.transactions.next_id());
+    for (i, answer) in source_outcomes.iter_mut().enumerate() {
+        if ((i + 1) as u64) < forgotten_horizon {
+            *answer = "forgotten".to_string();
+        }
+    }
+
+    // 1. A full snapshot.
+    let service = BackupService::connect(config.clone(), live.to_str().unwrap())
+        .await
+        .expect("connect");
+    service.snapshot_now().await.expect("full snapshot");
+    let target = root.join("restored_full");
+    rasterizeddb_core::core::backup::restore_from(&config, &target, RecoveryTarget::Latest)
+        .await
+        .expect("restore");
+    assert!(target.join("db_transactions.status.settled").exists(), "the sidecar was not restored");
+    assert_restores_faithfully(&database, &expected, &source_outcomes, &target).await;
+
+    // 2. The same copy as an older build's backup would leave it: no settled
+    // sidecar, and filter sidecars in a format this build refuses. It must
+    // open, rebuild what it refuses, and answer the same.
+    let older = root.join("restored_older");
+    rasterizeddb_core::core::backup::restore_from(&config, &older, RecoveryTarget::Latest)
+        .await
+        .expect("restore");
+    std::fs::remove_file(older.join("db_transactions.status.settled")).unwrap();
+    for entry in std::fs::read_dir(&older).unwrap().flatten() {
+        if entry.file_name().to_string_lossy().ends_with("_flt.db") {
+            let mut bytes = std::fs::read(entry.path()).unwrap();
+            if bytes.len() >= 10 {
+                bytes[8..10].copy_from_slice(&3u16.to_le_bytes());
+                std::fs::write(entry.path(), bytes).unwrap();
+            }
+        }
+    }
+    assert_restores_faithfully(&database, &expected, &source_outcomes, &older).await;
+    drop(service);
+
+    // 3. Incremental snapshots and a rollover, restored.
+    let incremental_config = BackupConfig {
+        incremental_min_bytes: 4096,
+        prefix: format!("{}-incremental", config.prefix),
+        ..config.clone()
+    };
+    let service = BackupService::connect(incremental_config.clone(), live.to_str().unwrap())
+        .await
+        .expect("connect");
+    service.snapshot_now().await.expect("first incremental snapshot");
+    service.snapshot_now().await.expect("second incremental snapshot");
+    let target = root.join("restored_incremental");
+    rasterizeddb_core::core::backup::restore_from(&incremental_config, &target, RecoveryTarget::Latest)
+        .await
+        .expect("restore incremental");
+    assert_restores_faithfully(&database, &expected, &source_outcomes, &target).await;
+
+    service.rollover_now().await.expect("rollover");
+    let target = root.join("restored_rollover");
+    rasterizeddb_core::core::backup::restore_from(&incremental_config, &target, RecoveryTarget::Latest)
+        .await
+        .expect("restore rollover");
+    assert_restores_faithfully(&database, &expected, &source_outcomes, &target).await;
 });

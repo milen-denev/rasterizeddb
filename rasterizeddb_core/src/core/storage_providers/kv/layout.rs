@@ -35,6 +35,16 @@ pub const MAGIC_DELTA: u32 = 0x564B_4452;
 pub const MAGIC_META: u32 = 0x4D4B_4452;
 pub const FORMAT_VERSION: u16 = 1;
 
+/// The version a delta batch carrying an `aborted` list is written at.
+///
+/// A build that predates the list reads a version-1 batch, ignores the
+/// list, and so would honour an in-doubt batch's commit of a transaction the
+/// list declares rolled back — a transaction the engine reported failed and
+/// whose space it reused. Such a batch is therefore written as version 2,
+/// which that build refuses (its decoder errors on any version but 1) rather
+/// than misreads. A batch with no aborts stays version 1 and readable by it.
+pub const DELTA_VERSION_WITH_ABORTS: u16 = 2;
+
 /// magic + version + flags + seq + base_gen + rec_count + commit_count + crc
 /// + reserved.
 pub const DELTA_HEADER_LEN: usize = 40;
@@ -117,6 +127,20 @@ pub struct DeltaBatch {
     pub base_gen: u64,
     pub committed: Vec<u64>,
     pub records: Vec<Record>,
+    /// Transactions this batch declares rolled back, each with the sequence of
+    /// the declaring batch whose put failed: `(txn, in_doubt_seq)`.
+    ///
+    /// A put that reported an error may still land later — the request was
+    /// sent, the client gave up on it. If it does, it declares a transaction
+    /// the engine was told had failed, and whose space it has since reused. An
+    /// abort here overrides any declaration of the same transaction, and is
+    /// needed only until the file's `compacted_upto` passes `in_doubt_seq`,
+    /// after which recovery discards that batch unread.
+    ///
+    /// Stored after the records, with its count in the header's formerly
+    /// reserved word, so a build that predates it reads such a batch as before
+    /// and ignores the list.
+    pub aborted: Vec<(u64, u64)>,
 }
 
 impl DeltaBatch {
@@ -129,7 +153,12 @@ impl DeltaBatch {
                 .sum::<usize>();
         let mut out = Vec::with_capacity(DELTA_HEADER_LEN + payload_len);
         out.extend_from_slice(&MAGIC_DELTA.to_le_bytes());
-        out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        let version = if self.aborted.is_empty() {
+            FORMAT_VERSION
+        } else {
+            DELTA_VERSION_WITH_ABORTS
+        };
+        out.extend_from_slice(&version.to_le_bytes());
         out.extend_from_slice(&0u16.to_le_bytes()); // flags
         out.extend_from_slice(&self.seq.to_le_bytes());
         out.extend_from_slice(&self.base_gen.to_le_bytes());
@@ -137,7 +166,7 @@ impl DeltaBatch {
         out.extend_from_slice(&(self.committed.len() as u32).to_le_bytes());
         // CRC slot, filled once the payload is laid down.
         out.extend_from_slice(&0u32.to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        out.extend_from_slice(&(self.aborted.len() as u32).to_le_bytes());
         debug_assert_eq!(out.len(), DELTA_HEADER_LEN);
 
         for txn in &self.committed {
@@ -149,6 +178,10 @@ impl DeltaBatch {
             out.extend_from_slice(&record.offset.to_le_bytes());
             out.extend_from_slice(&(record.payload.len() as u32).to_le_bytes());
             out.extend_from_slice(&record.payload);
+        }
+        for (txn, seq) in &self.aborted {
+            out.extend_from_slice(&txn.to_le_bytes());
+            out.extend_from_slice(&seq.to_le_bytes());
         }
 
         let crc = CRC.checksum(&out[DELTA_HEADER_LEN..]);
@@ -171,11 +204,12 @@ impl DeltaBatch {
             return Ok(None);
         }
         let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
-        if version != FORMAT_VERSION {
+        if version != FORMAT_VERSION && version != DELTA_VERSION_WITH_ABORTS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "kv delta batch is format version {version}, this build writes {FORMAT_VERSION}"
+                    "kv delta batch is format version {version}, this build reads \
+                     {FORMAT_VERSION} and {DELTA_VERSION_WITH_ABORTS}"
                 ),
             ));
         }
@@ -184,6 +218,7 @@ impl DeltaBatch {
         let rec_count = u32::from_le_bytes(bytes[24..28].try_into().unwrap()) as usize;
         let commit_count = u32::from_le_bytes(bytes[28..32].try_into().unwrap()) as usize;
         let crc = u32::from_le_bytes(bytes[32..36].try_into().unwrap());
+        let abort_count = u32::from_le_bytes(bytes[36..40].try_into().unwrap()) as usize;
 
         let payload = &bytes[DELTA_HEADER_LEN..];
         if CRC.checksum(payload) != crc {
@@ -225,11 +260,24 @@ impl DeltaBatch {
             cursor += len;
         }
 
+        let mut aborted = Vec::with_capacity(abort_count.min(1024));
+        for _ in 0..abort_count {
+            if cursor + 16 > payload.len() {
+                return Ok(None);
+            }
+            aborted.push((
+                u64::from_le_bytes(payload[cursor..cursor + 8].try_into().unwrap()),
+                u64::from_le_bytes(payload[cursor + 8..cursor + 16].try_into().unwrap()),
+            ));
+            cursor += 16;
+        }
+
         Ok(Some(Self {
             seq,
             base_gen,
             committed,
             records,
+            aborted,
         }))
     }
 }

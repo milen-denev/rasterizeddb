@@ -235,7 +235,14 @@ async fn build(
     );
 
     std::fs::create_dir_all(target_dir)?;
-    let bytes_restored = download_snapshot(client, snapshot, target_dir).await?;
+    let mut bytes_restored = download_snapshot(client, snapshot, target_dir).await?;
+    // Files an incremental snapshot keeps outside its archive — possibly in
+    // objects an earlier snapshot wrote. Each is checked against the length
+    // and hash the catalogue recorded: a wrong object here would restore a
+    // database that opens and answers with the wrong bytes.
+    for object in &snapshot.objects {
+        bytes_restored += download_object(client, object, target_dir).await?;
+    }
 
     // A file that was created while the snapshot was being copied is named in
     // the catalogue but has no archive entry. Replay needs it to exist before
@@ -551,6 +558,66 @@ async fn download_snapshot(
     unpacked
 }
 
+/// Fetches one file object into `target_dir`, verifying its length and hash.
+async fn download_object(
+    client: &S3Client,
+    object: &manifest::FileObject,
+    target_dir: &Path,
+) -> io::Result<u64> {
+    if !archive::is_safe_name(&object.name) {
+        return Err(io::Error::other(format!(
+            "backup catalogue names an unsafe path: {}",
+            object.name
+        )));
+    }
+    let path = target_dir.join(&object.name);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let (tx, rx) = kanal::bounded::<Vec<u8>>(4);
+    let expected = object.clone();
+    let writer = tokio::task::spawn_blocking(move || -> io::Result<u64> {
+        use sha2::Digest;
+        let mut decoder = zstd::stream::read::Decoder::new(ChannelReader::new(rx))?;
+        let mut out = io::BufWriter::with_capacity(256 * 1024, std::fs::File::create(&path)?);
+        let mut digest = sha2::Sha256::new();
+        let mut chunk = vec![0u8; 1024 * 1024];
+        let mut total = 0u64;
+        loop {
+            let n = decoder.read(&mut chunk)?;
+            if n == 0 {
+                break;
+            }
+            digest.update(&chunk[..n]);
+            out.write_all(&chunk[..n])?;
+            total += n as u64;
+        }
+        out.flush()?;
+        let sha256 = super::to_hex(&digest.finalize());
+        if total != expected.len || sha256 != expected.sha256 {
+            return Err(io::Error::other(format!(
+                "object {} for {} does not match the catalogue: {} bytes with SHA-256 {},                  expected {} bytes with {}",
+                expected.key, expected.name, total, sha256, expected.len, expected.sha256
+            )));
+        }
+        Ok(total)
+    });
+
+    let download = client
+        .get_object_streaming(&object.key, |chunk| {
+            tx.send(chunk.to_vec())
+                .map_err(|_| io::Error::other("the object writer stopped accepting data"))
+        })
+        .await;
+    // Dropped, never closed: see `download_snapshot`.
+    drop(tx);
+    let written = writer
+        .await
+        .map_err(|e| io::Error::other(format!("object writer panicked: {e}")))?;
+    download?;
+    written
+}
+
 /// Fetches every segment bundle the snapshot may need and concatenates them.
 ///
 /// Returns the number of bundles and the path of the file to replay.
@@ -732,6 +799,7 @@ mod tests {
             file_count: 1,
             compression_level: 3,
             files: Vec::new(),
+            objects: Vec::new(),
         }
     }
 

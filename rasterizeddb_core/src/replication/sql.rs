@@ -911,7 +911,7 @@ fn structured_kind(sql: &str) -> Option<Structured> {
 pub fn structured_fields(sql: &str) -> Option<Vec<(String, crate::core::db_type::DbType)>> {
     use crate::core::db_type::DbType;
     let text = |name: &str| (name.to_string(), DbType::STRING);
-    let number = |name: &str| (name.to_string(), DbType::U64);
+    let number = |name: &str| (name.to_string(), DbType::I64);
     let flag = |name: &str| (name.to_string(), DbType::BOOL);
 
     Some(match structured_kind(sql)? {
@@ -1199,17 +1199,20 @@ fn structured_row(cells: &[SCell]) -> crate::core::row::row::Row {
     use crate::core::db_type::DbType;
     use crate::core::row::row::{Column, Row};
 
-    let mut columns: smallvec::SmallVec<[Column; 32]> = smallvec::SmallVec::new();
+    let mut columns: crate::core::row::row::RowColumns = smallvec::SmallVec::new();
     for (index, cell) in cells.iter().enumerate() {
         let (bytes, column_type): (Vec<u8>, DbType) = match cell {
             SCell::Text(text) => (text.as_bytes().to_vec(), DbType::STRING),
-            SCell::Number(n) => (n.to_le_bytes().to_vec(), DbType::U64),
+            SCell::Number(n) => (
+                crate::core::value_codec::count_as_bigint(*n).to_le_bytes().to_vec(),
+                DbType::I64,
+            ),
             SCell::Flag(b) => (vec![u8::from(*b)], DbType::BOOL),
         };
         let mut block = crate::memory_pool::MEMORY_POOL.acquire(bytes.len());
         block.into_slice_mut().copy_from_slice(&bytes);
         columns.push(Column {
-            schema_id: index as u64,
+            schema_id: crate::core::row::row::schema_id_of(index as u64),
             data: block,
             column_type,
         });

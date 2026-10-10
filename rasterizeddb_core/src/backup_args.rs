@@ -152,6 +152,17 @@ pub struct BackupArgs {
     #[arg(long = "s3-rollover-hours", value_name = "HOURS", default_value_t = 0)]
     pub rollover_hours: u64,
 
+    /// Store files of at least this many MiB as objects of their own, so a
+    /// later snapshot reuses any whose bytes have not changed instead of
+    /// uploading them again (default: 0, off — every snapshot is one
+    /// self-contained archive).
+    ///
+    /// A catalogue holding such snapshots is written as manifest version 2,
+    /// which builds without this feature refuse rather than restore from
+    /// partially. Rollovers always take a full snapshot.
+    #[arg(long = "s3-incremental-min-mb", value_name = "MIB", default_value_t = 0)]
+    pub incremental_min_mb: u64,
+
     /// Staged log bytes after which archiving is suspended, in MiB
     /// (default: 4096). 0 disables the ceiling.
     ///
@@ -302,6 +313,7 @@ impl BackupArgs {
             retain_snapshots: self.retain_snapshots,
             rollover_interval_secs: self.rollover_hours.saturating_mul(3600),
             staging_max_bytes: self.staging_max_mb * 1024 * 1024,
+            incremental_min_bytes: self.incremental_min_mb.saturating_mul(1024 * 1024),
         })
     }
 

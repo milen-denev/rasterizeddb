@@ -54,6 +54,26 @@ const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495
 /// than the handshake it was meant to save.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Longest one attempt of a request may take before it counts as failed (and
+/// is retried, like any other failure), plus [`REQUEST_TIME_PER_BODY_BYTE`]
+/// for the body it sends.
+///
+/// There was no limit: a connection the network blackholed — a dead NAT
+/// entry, a load balancer that stopped answering — held the caller forever,
+/// and for the object-store backend the caller is a commit.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// One second per 256 KiB sent, so a large part upload on a slow link is not
+/// cut off by the flat limit.
+const REQUEST_BODY_BYTES_PER_SEC: u64 = 256 * 1024;
+
+/// How long a streamed download may go without a single byte arriving.
+///
+/// An idle limit rather than a whole-transfer one: a restore of a large
+/// database legitimately streams for hours, and only a stall should end it.
+/// A stalled attempt fails like a dropped connection, so
+/// `get_object_streaming` resumes it with a ranged request.
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Ceiling on a pooled response body held in memory. Bodies this module reads
 /// whole are manifests and XML replies; a snapshot is streamed instead.
 const MAX_INLINE_BODY: usize = 64 * 1024 * 1024;
@@ -172,7 +192,32 @@ impl Stream {
             Stream::Tls(s) => s.read(buf).await,
         }
     }
+
+    /// Reads at most `max` bytes onto the end of `buf`, into its spare
+    /// capacity: nothing is zeroed first and nothing is copied afterwards.
+    /// Returns how many arrived; 0 is end of stream.
+    async fn read_into(&mut self, buf: &mut Vec<u8>, max: usize) -> io::Result<usize> {
+        use tokio::io::{AsyncRead, ReadBuf};
+        buf.reserve(max);
+        let n = {
+            let spare = &mut buf.spare_capacity_mut()[..max];
+            let mut target = ReadBuf::uninit(spare);
+            std::future::poll_fn(|cx| match self {
+                Stream::Plain(s) => std::pin::Pin::new(s).poll_read(cx, &mut target),
+                Stream::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_read(cx, &mut target),
+            })
+            .await?;
+            target.filled().len()
+        };
+        // SAFETY: `poll_read` reports in `filled` exactly the prefix of the
+        // spare capacity it initialised, and `n <= max <= spare capacity`.
+        unsafe { buf.set_len(buf.len() + n) };
+        Ok(n)
+    }
 }
+
+/// The most a streamed body is read in one go.
+const READ_CHUNK: usize = 128 * 1024;
 
 pub struct S3Client {
     config: S3Config,
@@ -182,6 +227,10 @@ pub struct S3Client {
     /// The derived signing key and the day it belongs to. Deriving it is four
     /// HMACs; a day's worth of part uploads should pay for them once.
     signing_key: Mutex<Option<(String, [u8; 32])>>,
+    /// See [`REQUEST_TIMEOUT`]. A field so a test can shorten it.
+    request_timeout: Duration,
+    /// See [`STREAM_IDLE_TIMEOUT`]. A field so a test can shorten it.
+    stream_idle_timeout: Duration,
 }
 
 /// A streaming download that stopped early, and how far it got.
@@ -227,11 +276,21 @@ impl S3Client {
             tls,
             pool: Mutex::new(Vec::new()),
             signing_key: Mutex::new(None),
+            request_timeout: REQUEST_TIMEOUT,
+            stream_idle_timeout: STREAM_IDLE_TIMEOUT,
         })
     }
 
     pub fn bucket(&self) -> &str {
         &self.config.bucket
+    }
+
+    /// Overrides the per-attempt request deadline ([`REQUEST_TIMEOUT`] by
+    /// default). For tests and tooling that talk to a deliberately silent
+    /// endpoint; production keeps the default.
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
+        self
     }
 
     /// Host header for this request, which virtual-host addressing folds the
@@ -435,14 +494,32 @@ impl S3Client {
             error: e,
         };
 
-        let mut stream = self.connect().await.map_err(&mut fail)?;
+        let idle = self.stream_idle_timeout;
+        let stalled = || {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("no progress on GET {key} for {idle:?}"),
+            )
+        };
+        let mut stream = tokio::time::timeout(idle, self.connect())
+            .await
+            .map_err(|_| stalled())
+            .and_then(|r| r)
+            .map_err(&mut fail)?;
         let request = self
             .sign_request("GET", key, &[], extra, 0, None)
             .map_err(&mut fail)?;
-        stream.write_all(&request).await.map_err(&mut fail)?;
-        stream.flush().await.map_err(&mut fail)?;
+        tokio::time::timeout(idle, async {
+            stream.write_all(&request).await?;
+            stream.flush().await
+        })
+        .await
+        .map_err(|_| stalled())
+        .and_then(|r| r)
+        .map_err(&mut fail)?;
 
         let mut reader = ResponseReader::new();
+        reader.idle = Some(idle);
         let head = reader.read_head(&mut stream).await.map_err(&mut fail)?;
 
         if head.status / 100 != 2 {
@@ -520,6 +597,25 @@ impl S3Client {
                 )
                 .await?;
             expect_ok(&response, "POST ?delete", "")?;
+            // A multi-object delete answers 200 whatever happened to each key;
+            // the failures are `<Error>` entries in the body (in quiet mode
+            // they are all it lists). Reading only the status reported keys
+            // that were never deleted as deleted — for the object-store
+            // backend, a dropped table's objects left under a name that a new
+            // table of the same name then reads back after a restart.
+            let text = String::from_utf8_lossy(&response.body);
+            if let Some(start) = text.find("<Error>") {
+                let entry = &text[start..];
+                let failed = text.matches("<Error>").count();
+                return Err(io::Error::other(format!(
+                    "S3 did not delete {failed} of {} objects; first {}: {}",
+                    chunk.len(),
+                    xml_tag(entry, "Key").map(xml_unescape).unwrap_or_default(),
+                    xml_tag(entry, "Message")
+                        .or_else(|| xml_tag(entry, "Code"))
+                        .unwrap_or("unknown error")
+                )));
+            }
         }
         Ok(())
     }
@@ -667,12 +763,25 @@ impl S3Client {
         content_type: Option<&str>,
     ) -> io::Result<Response> {
         let mut attempt = 0;
+        let deadline = self.request_timeout
+            + Duration::from_secs(body.len() as u64 / REQUEST_BODY_BYTES_PER_SEC);
         loop {
             attempt += 1;
-            match self
-                .send_once(method, key, query, extra_headers, body, content_type)
-                .await
+            let outcome = match tokio::time::timeout(
+                deadline,
+                self.send_once(method, key, query, extra_headers, body, content_type),
+            )
+            .await
             {
+                Ok(outcome) => outcome,
+                // Dropping the attempt drops its connection with it, so a
+                // stalled stream never goes back into the pool.
+                Err(_) => Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("no complete response within {deadline:?}"),
+                )),
+            };
+            match outcome {
                 Ok(response) => {
                     let retryable = response.status == 429
                         || response.status == 503
@@ -961,6 +1070,30 @@ struct ResponseReader {
     buf: Vec<u8>,
     /// Bytes of `buf` already handed back.
     cursor: usize,
+    /// Longest a single read may wait for its first byte. See
+    /// [`STREAM_IDLE_TIMEOUT`]; `None` leaves the request's own deadline as
+    /// the only limit.
+    idle: Option<Duration>,
+}
+
+/// `stream.read_into`, failing with `TimedOut` if nothing arrives within
+/// `idle`.
+async fn read_idle(
+    idle: Option<Duration>,
+    stream: &mut Stream,
+    buf: &mut Vec<u8>,
+    max: usize,
+) -> io::Result<usize> {
+    match idle {
+        None => stream.read_into(buf, max).await,
+        Some(limit) => match tokio::time::timeout(limit, stream.read_into(buf, max)).await {
+            Ok(read) => read,
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("no bytes from S3 for {limit:?}"),
+            )),
+        },
+    }
 }
 
 impl ResponseReader {
@@ -968,6 +1101,7 @@ impl ResponseReader {
         Self {
             buf: Vec::with_capacity(8 * 1024),
             cursor: 0,
+            idle: None,
         }
     }
 
@@ -1035,6 +1169,29 @@ impl ResponseReader {
     }
 
     async fn read_body(&mut self, stream: &mut Stream, head: &Head) -> io::Result<Vec<u8>> {
+        // A body whose length is known is read straight into one buffer of
+        // that size: no regrowth, no zeroed scratch, no copy out of one.
+        if let (false, Some(len)) = (head.chunked, head.content_length) {
+            let len = usize::try_from(len).unwrap_or(usize::MAX);
+            if len > MAX_INLINE_BODY {
+                return Err(io::Error::other("S3 response body is too large to buffer"));
+            }
+            let mut out = Vec::with_capacity(len);
+            let buffered = (self.buf.len() - self.cursor).min(len);
+            out.extend_from_slice(&self.buf[self.cursor..self.cursor + buffered]);
+            self.cursor += buffered;
+            while out.len() < len {
+                let want = (len - out.len()).min(READ_CHUNK);
+                if read_idle(self.idle, stream, &mut out, want).await? == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "S3 response body ended early",
+                    ));
+                }
+            }
+            return Ok(out);
+        }
+
         let mut out = Vec::new();
         self.stream_body(stream, head, &mut |chunk: &[u8]| {
             if out.len() + chunk.len() > MAX_INLINE_BODY {
@@ -1073,13 +1230,21 @@ impl ResponseReader {
             sink(&self.buf[self.cursor..self.cursor + take])?;
             self.cursor += take;
             total += take as u64;
-            remaining -= take as u64;
+            // `u64::MAX` means read-to-close and must stay the sentinel:
+            // subtracting from it turned EOF into "ended early" whenever body
+            // bytes had arrived in the same packet as the headers.
+            if remaining != u64::MAX {
+                remaining -= take as u64;
+            }
         }
 
-        let mut chunk = vec![0u8; 128 * 1024];
+        // Allocated once and never zeroed: each read lands in its spare
+        // capacity.
+        let mut chunk: Vec<u8> = Vec::new();
         while remaining > 0 {
-            let want = chunk.len().min(remaining as usize);
-            let n = stream.read(&mut chunk[..want]).await?;
+            let want = READ_CHUNK.min(usize::try_from(remaining).unwrap_or(usize::MAX));
+            chunk.clear();
+            let n = read_idle(self.idle, stream, &mut chunk, want).await?;
             if n == 0 {
                 if remaining == u64::MAX {
                     break; // read-to-close finished normally
@@ -1089,7 +1254,7 @@ impl ResponseReader {
                     "S3 response body ended early",
                 ));
             }
-            sink(&chunk[..n])?;
+            sink(&chunk)?;
             total += n as u64;
             if remaining != u64::MAX {
                 remaining -= n as u64;
@@ -1154,16 +1319,17 @@ impl ResponseReader {
         if self.buf.len() - self.cursor >= want {
             return Ok(());
         }
-        let mut chunk = vec![0u8; 128 * 1024];
+        // Straight into the buffer's spare capacity: this runs for every line
+        // of a chunked body, and a fresh zeroed 128 KiB scratch per call was
+        // most of its cost.
         while self.buf.len() - self.cursor < want {
-            let n = stream.read(&mut chunk).await?;
+            let n = read_idle(self.idle, stream, &mut self.buf, READ_CHUNK).await?;
             if n == 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "S3 response body ended early",
                 ));
             }
-            self.buf.extend_from_slice(&chunk[..n]);
         }
         Ok(())
     }
@@ -1312,5 +1478,323 @@ impl<F: FnMut(&[u8]) -> io::Result<()>> Write for SinkWriter<F> {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod response_tests {
+    use super::*;
+
+    /// Serves `response` (split into `pieces` writes) on a local socket and
+    /// reads it back through `ResponseReader`.
+    async fn exchange(response: Vec<u8>, pieces: usize) -> (Head, io::Result<Vec<u8>>, Vec<u8>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let step = response.len().div_ceil(pieces.max(1)).max(1);
+            for part in response.chunks(step) {
+                socket.write_all(part).await.unwrap();
+                socket.flush().await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        });
+        let mut stream = Stream::Plain(TcpStream::connect(addr).await.unwrap());
+        let mut reader = ResponseReader::new();
+        let head = reader.read_head(&mut stream).await.unwrap();
+        let body = reader.read_body(&mut stream, &head).await;
+        // Whatever followed the body stays for the next reader, unconsumed.
+        let mut rest = reader.buf[reader.cursor..].to_vec();
+        server.await.unwrap();
+        let _ = stream.read_into(&mut rest, 1024).await;
+        (head, body, rest)
+    }
+
+    fn payload(n: usize) -> Vec<u8> {
+        (0..n).map(|i| (i * 31 % 251) as u8).collect()
+    }
+
+    #[tokio::test]
+    async fn content_length_bodies_read_exactly() {
+        for (len, pieces) in [(0usize, 1usize), (5, 1), (300_000, 7), (128 * 1024, 3), (1, 2)] {
+            let body = payload(len);
+            let mut response =
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {len}\r\n\r\n").into_bytes();
+            response.extend_from_slice(&body);
+            // Bytes past the body must not be swallowed into it.
+            response.extend_from_slice(b"NEXT");
+            let (head, got, rest) = exchange(response, pieces).await;
+            assert_eq!(head.status, 200);
+            assert_eq!(got.unwrap(), body, "len {len}");
+            assert!(rest.starts_with(b"NEXT") || rest.is_empty() || b"NEXT".starts_with(&rest), "len {len}: {rest:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_short_body_is_an_error_not_a_short_answer() {
+        let mut response = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n".to_vec();
+        response.extend_from_slice(&payload(60));
+        let (_, got, _) = exchange(response, 2).await;
+        assert_eq!(got.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn chunked_and_unframed_bodies_still_read() {
+        let body = payload(200_000);
+        let mut response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        for part in body.chunks(70_001) {
+            response.extend_from_slice(format!("{:x}\r\n", part.len()).as_bytes());
+            response.extend_from_slice(part);
+            response.extend_from_slice(b"\r\n");
+        }
+        response.extend_from_slice(b"0\r\n\r\n");
+        let (_, got, _) = exchange(response, 9).await;
+        assert_eq!(got.unwrap(), body);
+
+        let mut response = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec();
+        response.extend_from_slice(&body);
+        let (_, got, _) = exchange(response, 5).await;
+        assert_eq!(got.unwrap(), body);
+    }
+
+    #[tokio::test]
+    async fn streamed_bodies_reach_the_sink_whole() {
+        let body = payload(400_000);
+        let mut response =
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+        response.extend_from_slice(&body);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            for part in response.chunks(50_000) {
+                socket.write_all(part).await.unwrap();
+            }
+        });
+        let mut stream = Stream::Plain(TcpStream::connect(addr).await.unwrap());
+        let mut reader = ResponseReader::new();
+        let head = reader.read_head(&mut stream).await.unwrap();
+        let mut got = Vec::new();
+        let n = reader
+            .stream_body(&mut stream, &head, &mut |c: &[u8]| {
+                got.extend_from_slice(c);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(n as usize, body.len());
+        assert_eq!(got, body);
+    }
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Answers every request on a local socket with `reply`, or never answers
+    /// when it is `None`. Counts the requests it read.
+    async fn fake(reply: Option<&'static str>, seen: Arc<AtomicUsize>) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    // The head, then whatever body it announced.
+                    loop {
+                        let n = socket.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        let text = String::from_utf8_lossy(&buf).to_lowercase();
+                        if let Some(end) = text.find("\r\n\r\n") {
+                            let len = text
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:"))
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                                .unwrap_or(0);
+                            if buf.len() >= end + 4 + len {
+                                break;
+                            }
+                        }
+                    }
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    match reply {
+                        None => tokio::time::sleep(Duration::from_secs(3600)).await,
+                        Some(body) => {
+                            let out = format!(
+                                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = socket.write_all(out.as_bytes()).await;
+                        }
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    fn client(port: u16, attempts: u32) -> S3Client {
+        S3Client::new(S3Config {
+            endpoint: Endpoint::parse(&format!("http://127.0.0.1:{port}")).unwrap(),
+            region: "us-east-1".into(),
+            bucket: "b".into(),
+            credentials: Credentials {
+                access_key: "k".into(),
+                secret_key: "s".into(),
+                session_token: None,
+            },
+            path_style: true,
+            max_attempts: attempts,
+        })
+        .unwrap()
+    }
+
+    /// A server that accepts the request and never answers fails the request
+    /// — each attempt at its deadline — instead of holding the caller forever.
+    #[tokio::test]
+    async fn a_request_nobody_answers_times_out_and_is_retried() {
+        let seen = Arc::new(AtomicUsize::new(0));
+        let port = fake(None, seen.clone()).await;
+        let mut c = client(port, 2);
+        c.request_timeout = Duration::from_millis(300);
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(20), c.get_object_opt("t/META")).await;
+        let error = outcome
+            .expect("the request hung past every deadline")
+            .expect_err("a request nobody answered succeeded");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(seen.load(Ordering::SeqCst), 2, "each attempt reached the server");
+    }
+
+    /// Serves `body` to GETs. The first connection sends half of it and then
+    /// goes silent (when `stall_first`); every connection otherwise sends its
+    /// bytes in 8 pieces `gap` apart. A `Range: bytes=N-` request gets a 206
+    /// with the rest.
+    async fn streaming(body: Vec<u8>, stall_first: bool, gap: Duration) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body = Arc::new(body);
+        tokio::spawn(async move {
+            let mut first = true;
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let stall = std::mem::take(&mut first) && stall_first;
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let n = socket.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        head.extend_from_slice(&chunk[..n]);
+                    }
+                    let text = String::from_utf8_lossy(&head).to_lowercase();
+                    let from = text
+                        .lines()
+                        .find_map(|l| l.strip_prefix("range: bytes="))
+                        .and_then(|r| r.trim().trim_end_matches('-').parse::<usize>().ok());
+                    let (status, rest) = match from {
+                        Some(at) => ("206 Partial Content", &body[at..]),
+                        None => ("200 OK", &body[..]),
+                    };
+                    let out = format!(
+                        "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        rest.len()
+                    );
+                    if socket.write_all(out.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    if stall {
+                        let _ = socket.write_all(&rest[..rest.len() / 2]).await;
+                        tokio::time::sleep(Duration::from_secs(3600)).await;
+                        return;
+                    }
+                    for piece in rest.chunks(rest.len().div_ceil(8).max(1)) {
+                        if socket.write_all(piece).await.is_err() {
+                            return;
+                        }
+                        tokio::time::sleep(gap).await;
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    /// A download that stops sending part-way fails at the idle limit and is
+    /// resumed from where it stopped, delivering every byte once.
+    #[tokio::test]
+    async fn a_stalled_download_is_resumed_after_the_idle_limit() {
+        let body: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let port = streaming(body.clone(), true, Duration::ZERO).await;
+        let mut c = client(port, 3);
+        c.stream_idle_timeout = Duration::from_millis(300);
+        let mut got = Vec::new();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(20),
+            c.get_object_streaming("t/big", |chunk| {
+                got.extend_from_slice(chunk);
+                Ok(())
+            }),
+        )
+        .await
+        .expect("a stalled download hung");
+        assert_eq!(outcome.unwrap() as usize, body.len());
+        assert_eq!(got, body);
+    }
+
+    /// The limit is on silence, not on the whole transfer: a download that
+    /// keeps trickling for longer than the limit in total still completes.
+    #[tokio::test]
+    async fn a_slow_steady_download_is_not_cut_off() {
+        let body: Vec<u8> = (0..80_000u32).map(|i| (i % 13) as u8).collect();
+        // Eight pieces 150 ms apart: about 1.2 s in all, never 300 ms silent.
+        let port = streaming(body.clone(), false, Duration::from_millis(150)).await;
+        let mut c = client(port, 1);
+        c.stream_idle_timeout = Duration::from_millis(300);
+        let mut got = Vec::new();
+        let n = c
+            .get_object_streaming("t/slow", |chunk| {
+                got.extend_from_slice(chunk);
+                Ok(())
+            })
+            .await
+            .expect("a steady download was cut off");
+        assert_eq!(n as usize, body.len());
+        assert_eq!(got, body);
+    }
+
+    /// A 200 `DeleteResult` naming keys it could not delete is a failure.
+    #[tokio::test]
+    async fn a_delete_result_listing_errors_is_an_error() {
+        let seen = Arc::new(AtomicUsize::new(0));
+        let port = fake(
+            Some(
+                "<DeleteResult><Error><Key>t/x</Key><Code>AccessDenied</Code>\
+                 <Message>denied</Message></Error></DeleteResult>",
+            ),
+            seen,
+        )
+        .await;
+        let error = client(port, 1)
+            .delete_objects(&["t/x".to_string(), "t/y".to_string()])
+            .await
+            .expect_err("undeleted keys were reported as deleted");
+        let text = error.to_string();
+        assert!(text.contains("t/x") && text.contains("denied"), "{text}");
+
+        let port = fake(Some("<DeleteResult></DeleteResult>"), Arc::new(AtomicUsize::new(0))).await;
+        client(port, 1)
+            .delete_objects(&["t/x".to_string()])
+            .await
+            .expect("a quiet DeleteResult with no errors is success");
     }
 }

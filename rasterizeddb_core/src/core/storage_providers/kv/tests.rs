@@ -1009,7 +1009,7 @@ mod engine {
         let column = row
             .columns
             .iter()
-            .find(|c| c.schema_id == schema_id)
+            .find(|c| u64::from(c.schema_id) == schema_id)
             .unwrap();
         u64::from_le_bytes(column.data.into_slice().try_into().unwrap())
     }
@@ -1018,7 +1018,7 @@ mod engine {
         let column = row
             .columns
             .iter()
-            .find(|c| c.schema_id == schema_id)
+            .find(|c| u64::from(c.schema_id) == schema_id)
             .unwrap();
         String::from_utf8_lossy(column.data.into_slice()).to_string()
     }
@@ -1070,6 +1070,102 @@ mod engine {
             str_of(rows.iter().find(|r| u64_of(r, 0) == 99).unwrap(), 2),
             "value-99"
         );
+    }
+
+    /// A cold scan of a key/value table, alone and with three more scans of the
+    /// same table at once, counting what the store is asked for. Ignored; run
+    /// with `--ignored kv_bench --nocapture` in release.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore]
+    async fn kv_bench_engine_scan() {
+        use super::super::KvConfig;
+        use super::super::KvFamily;
+        use super::SlowStore;
+        use std::sync::atomic::Ordering;
+
+        init();
+        let mut config = KvConfig::new("e");
+        config.chunk_size = 256 * 1024;
+        config.page_size = 16 * 1024;
+        config.cache_bytes = 64 * 1024 * 1024;
+        let rows = 60_000u64;
+
+        let store = Arc::new(SlowStore::new(0));
+        {
+            let family = KvFamily::open(store.clone() as Arc<dyn KvStore>, config.clone())
+                .await
+                .unwrap();
+            let seed = KvStorageProvider::open(family.clone(), "seed").await.unwrap();
+            let table = Table::new(
+                "people",
+                RcArc::new(seed),
+                vec![
+                    CreateColumnData { name: "id".into(), data_type: DbType::U64 },
+                    CreateColumnData { name: "cat".into(), data_type: DbType::I32 },
+                    CreateColumnData { name: "label".into(), data_type: DbType::STRING },
+                ],
+            )
+            .await;
+            for id in 0..rows {
+                insert(&table, id, (id % 5) as i32, &format!("label-{id:08}")).await;
+            }
+            family.flush_all().await.unwrap();
+            for io in [&table.io_rows, &table.io_pointers] {
+                io.compact_now().await.unwrap();
+            }
+            family.flush_all().await.unwrap();
+        }
+
+        for round in 0..3 {
+            for scans in [1usize, 4] {
+                let latency = std::time::Duration::from_millis(20);
+                let slow = Arc::new(SlowStore {
+                    inner: MemoryKvStore::new(),
+                    latency,
+                    gets: Default::default(),
+                    ranges: Default::default(),
+                });
+                // Same objects, behind a store with latency.
+                for (key, bytes) in store
+                    .inner
+                    .list("e/")
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|o| o.key)
+                    .map(|k| {
+                        let v = futures::executor::block_on(store.inner.get(&k)).unwrap().unwrap();
+                        (k, v)
+                    })
+                {
+                    slow.inner.put(&key, bytes).await.unwrap();
+                }
+                let family = KvFamily::open(slow.clone() as Arc<dyn KvStore>, config.clone())
+                    .await
+                    .unwrap();
+                let seed = KvStorageProvider::open(family, "seed").await.unwrap();
+                let table = Arc::new(
+                    Table::new("people", RcArc::new(seed), Vec::new()).await,
+                );
+                let g0 = slow.gets.load(Ordering::Relaxed);
+                let r0 = slow.ranges.load(Ordering::Relaxed);
+                let started = std::time::Instant::now();
+                let mut tasks = Vec::new();
+                for _ in 0..scans {
+                    let table = table.clone();
+                    tasks.push(tokio::spawn(async move { query(&table, "cat = 3").await.len() }));
+                }
+                for t in tasks {
+                    assert_eq!(t.await.unwrap() as u64, rows / 5);
+                }
+                let ms = started.elapsed().as_secs_f64() * 1000.0;
+                println!(
+                    "round {round} engine_scan scans={scans} latency=20ms: gets={} ranges={} wall={ms:.1}ms",
+                    slow.gets.load(Ordering::Relaxed) - g0,
+                    slow.ranges.load(Ordering::Relaxed) - r0,
+                );
+            }
+        }
     }
 }
 
@@ -1181,4 +1277,1613 @@ async fn a_name_reopened_after_a_drop_is_not_erased_by_the_old_file() {
             String::from_utf8_lossy(&bytes)
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Single-flight fetches
+// ---------------------------------------------------------------------------
+
+/// Holds every whole-object GET until the test opens the gate, and counts what
+/// it is asked for. Ranged reads pass straight through.
+///
+/// The gate is what makes "two readers wanted one chunk at once" deterministic:
+/// the first request cannot finish before the second reader has arrived.
+struct GatedStore {
+    inner: MemoryKvStore,
+    gets: AtomicUsize,
+    ranges: AtomicUsize,
+    /// GETs to fail before succeeding, for the retry test.
+    fail_gets: AtomicUsize,
+    open: tokio::sync::watch::Sender<bool>,
+}
+
+impl GatedStore {
+    fn new() -> Self {
+        Self {
+            inner: MemoryKvStore::new(),
+            gets: AtomicUsize::new(0),
+            ranges: AtomicUsize::new(0),
+            fail_gets: AtomicUsize::new(0),
+            open: tokio::sync::watch::channel(true).0,
+        }
+    }
+    fn close(&self) {
+        self.open.send_replace(false);
+    }
+    fn release(&self) {
+        self.open.send_replace(true);
+    }
+    fn gets(&self) -> usize {
+        self.gets.load(Ordering::SeqCst)
+    }
+    fn ranges(&self) -> usize {
+        self.ranges.load(Ordering::SeqCst)
+    }
+}
+
+impl KvStore for GatedStore {
+    fn get<'a>(&'a self, key: &'a str) -> BoxFuture<'a, std::io::Result<Option<Vec<u8>>>> {
+        self.gets.fetch_add(1, Ordering::SeqCst);
+        let mut open = self.open.subscribe();
+        Box::pin(async move {
+            let _ = open.wait_for(|o| *o).await;
+            let failing = self
+                .fail_gets
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok();
+            if failing {
+                return Err(std::io::Error::other("store hiccup"));
+            }
+            self.inner.get(key).await
+        })
+    }
+    fn get_range<'a>(
+        &'a self,
+        key: &'a str,
+        offset: u64,
+        len: usize,
+    ) -> BoxFuture<'a, std::io::Result<Option<Vec<u8>>>> {
+        self.ranges.fetch_add(1, Ordering::SeqCst);
+        self.inner.get_range(key, offset, len)
+    }
+    fn put<'a>(&'a self, key: &'a str, body: Vec<u8>) -> BoxFuture<'a, std::io::Result<()>> {
+        self.inner.put(key, body)
+    }
+    fn delete<'a>(&'a self, keys: Vec<String>) -> BoxFuture<'a, std::io::Result<()>> {
+        self.inner.delete(keys)
+    }
+    fn list<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, std::io::Result<Vec<ObjectInfo>>> {
+        self.inner.list(prefix)
+    }
+    fn describe(&self) -> String {
+        "gated".to_string()
+    }
+}
+
+/// Four tiny-geometry chunks of patterned bytes, compacted into base objects
+/// and reopened behind a fresh family, so nothing is cached.
+async fn cold_gated_file(store: &Arc<GatedStore>, readahead: u64) -> (KvStorageProvider, Vec<u8>) {
+    let mut config = tiny_config();
+    config.readahead_chunks = readahead;
+    let data: Vec<u8> = (0..4096u32 * 4).map(|i| (i % 251) as u8).collect();
+    {
+        let family = KvFamily::open(store.clone() as Arc<dyn KvStore>, config.clone())
+            .await
+            .unwrap();
+        let io = KvStorageProvider::open(family, "rows.db").await.unwrap();
+        io.append_data(&data, true).await;
+        io.flush().await.unwrap();
+        io.compact_now().await.unwrap();
+    }
+    let family = KvFamily::open(store.clone() as Arc<dyn KvStore>, config)
+        .await
+        .unwrap();
+    (
+        KvStorageProvider::open(family, "rows.db").await.unwrap(),
+        data,
+    )
+}
+
+/// A vectored read of most of chunk 0 — enough pages that it fetches the whole
+/// object rather than ranges.
+async fn read_chunk_zero(io: &KvStorageProvider, data: &[u8]) -> std::io::Result<()> {
+    let mut buffers: Vec<Vec<u8>> = (0..4).map(|_| vec![0u8; 100]).collect();
+    let positions = [10u64, 1100, 2200, 3300];
+    let mut reads: Vec<(u64, &mut [u8])> = positions
+        .into_iter()
+        .zip(buffers.iter_mut().map(|b| b.as_mut_slice()))
+        .collect();
+    io.read_vectored(&mut reads).await?;
+    for (position, buffer) in reads.iter() {
+        let at = *position as usize;
+        assert_eq!(&buffer[..], &data[at..at + buffer.len()], "wrong bytes at {at}");
+    }
+    Ok(())
+}
+
+/// Lets every spawned reader reach its fetch. The gate holds the request, so
+/// time spent here cannot let one finish early.
+async fn settle() {
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_misses_on_one_chunk_cost_one_get() {
+    let store = Arc::new(GatedStore::new());
+    let (io, data) = cold_gated_file(&store, 0).await;
+    let data = Arc::new(data);
+
+    store.close();
+    let before = store.gets();
+    let readers: Vec<_> = (0..8)
+        .map(|_| {
+            let io = io.clone();
+            let data = data.clone();
+            tokio::spawn(async move { read_chunk_zero(&io, &data).await })
+        })
+        .collect();
+    settle().await;
+    store.release();
+    for reader in readers {
+        reader.await.unwrap().unwrap();
+    }
+    assert_eq!(
+        store.gets() - before,
+        1,
+        "eight readers missing one chunk at once each fetched it"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_ahead_in_flight_is_joined_rather_than_fetched_again() {
+    let store = Arc::new(GatedStore::new());
+    let (io, data) = cold_gated_file(&store, 2).await;
+    let (gets_before, ranges_before) = (store.gets(), store.ranges());
+
+    // Two sequential reads inside page 0: the first is a ranged read, the
+    // second is a cache hit that looks sequential and puts the rest of chunk 0
+    // and the chunks after it in flight — held at the gate.
+    store.close();
+    let mut buffer = vec![0u8; 512];
+    for at in [0u64, 512] {
+        let mut position = at;
+        io.read_data_into_buffer(&mut position, &mut buffer)
+            .await
+            .unwrap();
+        assert_eq!(&buffer[..], &data[at as usize..at as usize + 512]);
+    }
+    settle().await;
+    assert_eq!(store.ranges() - ranges_before, 1);
+    let prefetching = store.gets() - gets_before;
+    assert_eq!(prefetching, 1, "read-ahead did not start on chunk 0");
+
+    // The next page of chunk 0 is what the read-ahead is fetching. Waiting for
+    // it is one request; asking for the page by range is a second.
+    let reader = {
+        let io = io.clone();
+        tokio::spawn(async move {
+            let mut buffer = vec![0u8; 512];
+            let mut position = 1024u64;
+            io.read_data_into_buffer(&mut position, &mut buffer)
+                .await
+                .map(|_| buffer)
+        })
+    };
+    settle().await;
+    assert_eq!(
+        store.ranges() - ranges_before,
+        1,
+        "a page of a chunk already in flight was fetched again by range"
+    );
+    store.release();
+    let buffer = reader.await.unwrap().unwrap();
+    assert_eq!(&buffer[..], &data[1024..1536]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancelled_reader_strands_nobody_waiting_on_the_same_fetch() {
+    let store = Arc::new(GatedStore::new());
+    let (io, data) = cold_gated_file(&store, 0).await;
+    let data = Arc::new(data);
+
+    store.close();
+    let before = store.gets();
+    let first = {
+        let (io, data) = (io.clone(), data.clone());
+        tokio::spawn(async move { read_chunk_zero(&io, &data).await })
+    };
+    settle().await;
+    let second = {
+        let (io, data) = (io.clone(), data.clone());
+        tokio::spawn(async move { read_chunk_zero(&io, &data).await })
+    };
+    settle().await;
+    // The reader that started the request goes away before it is answered.
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    store.release();
+    second.await.unwrap().unwrap();
+    assert_eq!(store.gets() - before, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fetch_whose_readers_all_left_still_fills_the_cache() {
+    let store = Arc::new(GatedStore::new());
+    let (io, data) = cold_gated_file(&store, 0).await;
+    let data = Arc::new(data);
+
+    store.close();
+    let reader = {
+        let (io, data) = (io.clone(), data.clone());
+        tokio::spawn(async move { read_chunk_zero(&io, &data).await })
+    };
+    settle().await;
+    reader.abort();
+    let _ = reader.await;
+    let before = store.gets();
+    store.release();
+    settle().await;
+
+    // Resident now, so the synchronous path serves it without the store.
+    let mut buffer = vec![0u8; 100];
+    let served = io.try_read_vectored_sync(&mut [(1100u64, buffer.as_mut_slice())]);
+    assert!(served, "the abandoned fetch's pages never reached the cache");
+    assert_eq!(&buffer[..], &data[1100..1200]);
+    assert_eq!(store.gets(), before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_fetch_is_retried_rather_than_remembered() {
+    let store = Arc::new(GatedStore::new());
+    let (io, data) = cold_gated_file(&store, 0).await;
+    let data = Arc::new(data);
+
+    store.fail_gets.store(1, Ordering::SeqCst);
+    store.close();
+    let readers: Vec<_> = (0..4)
+        .map(|_| {
+            let (io, data) = (io.clone(), data.clone());
+            tokio::spawn(async move { read_chunk_zero(&io, &data).await })
+        })
+        .collect();
+    settle().await;
+    store.release();
+    for reader in readers {
+        let err = reader.await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("store hiccup"), "{err}");
+    }
+
+    // The store has recovered; the next read must ask it again.
+    read_chunk_zero(&io, &data).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fetch_that_straddles_an_invalidation_is_not_cached() {
+    use super::cache::{ChunkCache, ChunkId, FetchKey};
+
+    let cache = Arc::new(ChunkCache::new(1 << 20));
+    let key = FetchKey {
+        file: 7,
+        generation: 0,
+        index: 0,
+        whole: true,
+    };
+    let page = ChunkId {
+        file: 7,
+        generation: 0,
+        index: 0,
+    };
+
+    // A request that left before a compaction rewrote the chunk, and answers
+    // with the old bytes after the compaction invalidated it.
+    let (answer, answered) = tokio::sync::oneshot::channel::<()>();
+    let stale = cache.fetch(key, async move {
+        let _ = answered.await;
+        Ok(vec![(0u64, Arc::new(b"old bytes".to_vec()))])
+    });
+    cache.invalidate(page);
+    assert_eq!(cache.fetches_in_flight(), 0, "an invalidated fetch stayed joinable");
+
+    // A reader arriving now starts its own request rather than joining.
+    let fresh = cache.fetch(key, async {
+        Ok(vec![(0u64, Arc::new(b"new bytes".to_vec()))])
+    });
+    assert_eq!(fresh.await.unwrap()[0].1.as_slice(), b"new bytes");
+
+    let _ = answer.send(());
+    // Its own waiters still get what it fetched...
+    assert_eq!(stale.await.unwrap()[0].1.as_slice(), b"old bytes");
+    // ...but the cache keeps the new bytes, not the late old ones.
+    assert_eq!(
+        cache.get(page).expect("the fresh fetch was not cached").as_slice(),
+        b"new bytes"
+    );
+    assert_eq!(cache.fetches_in_flight(), 0);
+}
+
+/// Answers a chunk request from the store's state *now*, then holds the answer
+/// until released — a GET that left before a compaction rewrote the chunk and
+/// arrives after it finished.
+struct LateAnswerStore {
+    inner: MemoryKvStore,
+    hold_next: std::sync::atomic::AtomicBool,
+    held: tokio::sync::Notify,
+    started: tokio::sync::Notify,
+}
+
+impl KvStore for LateAnswerStore {
+    fn get<'a>(&'a self, key: &'a str) -> BoxFuture<'a, std::io::Result<Option<Vec<u8>>>> {
+        self.answer(self.inner.get(key))
+    }
+    fn get_range<'a>(
+        &'a self,
+        key: &'a str,
+        offset: u64,
+        len: usize,
+    ) -> BoxFuture<'a, std::io::Result<Option<Vec<u8>>>> {
+        self.answer(self.inner.get_range(key, offset, len))
+    }
+    fn put<'a>(&'a self, key: &'a str, body: Vec<u8>) -> BoxFuture<'a, std::io::Result<()>> {
+        self.inner.put(key, body)
+    }
+    fn delete<'a>(&'a self, keys: Vec<String>) -> BoxFuture<'a, std::io::Result<()>> {
+        self.inner.delete(keys)
+    }
+    fn list<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, std::io::Result<Vec<ObjectInfo>>> {
+        self.inner.list(prefix)
+    }
+    fn describe(&self) -> String {
+        "late-answer".to_string()
+    }
+}
+
+impl LateAnswerStore {
+    fn answer<'a>(
+        &'a self,
+        read: BoxFuture<'a, std::io::Result<Option<Vec<u8>>>>,
+    ) -> BoxFuture<'a, std::io::Result<Option<Vec<u8>>>> {
+        Box::pin(async move {
+            let answer = read.await;
+            if self.hold_next.swap(false, Ordering::SeqCst) {
+                self.started.notify_one();
+                self.held.notified().await;
+            }
+            answer
+        })
+    }
+}
+
+/// A read whose request left before a compaction folded a committed write into
+/// the chunk, and whose answer — the old bytes — arrived after it, must neither
+/// return those old bytes nor leave them in the cache. The overlay that covered
+/// them is gone by then, so a cached copy would be served to every later read,
+/// silently.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fetch_answered_before_a_fold_returns_and_leaves_no_stale_bytes() {
+    let store = Arc::new(LateAnswerStore {
+        inner: MemoryKvStore::new(),
+        hold_next: std::sync::atomic::AtomicBool::new(false),
+        held: tokio::sync::Notify::new(),
+        started: tokio::sync::Notify::new(),
+    });
+    let mut config = tiny_config();
+    config.readahead_chunks = 0;
+    {
+        let family = KvFamily::open(store.clone() as Arc<dyn KvStore>, config.clone())
+            .await
+            .unwrap();
+        let io = KvStorageProvider::open(family, "t.db").await.unwrap();
+        let a = io.begin_txn();
+        io.append_data_txn(a, &[b'a'; 4096]).await;
+        io.commit_durable(a).await.unwrap();
+        io.compact_now().await.unwrap();
+    }
+    let family = KvFamily::open(store.clone() as Arc<dyn KvStore>, config)
+        .await
+        .unwrap();
+    let io = KvStorageProvider::open(family, "t.db").await.unwrap();
+    let z = io.begin_txn();
+    io.write_data_txn(z, 100, b"zzzz").await;
+    io.commit_durable(z).await.unwrap();
+
+    store.hold_next.store(true, Ordering::SeqCst);
+    let started = store.started.notified();
+    let reader = {
+        let io = io.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 200];
+            let mut position = 0u64;
+            io.read_data_into_buffer(&mut position, &mut buf).await.map(|_| buf)
+        })
+    };
+    started.await;
+    io.compact_now().await.unwrap();
+    store.held.notify_one();
+    // The straddling read itself: its base bytes predate the fold, and the
+    // overlay that covered them was retired before it applied them.
+    let got = reader.await.unwrap().unwrap();
+    assert_eq!(&got[100..104], b"zzzz", "the read that straddled the fold");
+
+    let mut again = vec![0u8; 200];
+    let mut position = 0u64;
+    io.read_data_into_buffer(&mut position, &mut again)
+        .await
+        .unwrap();
+    assert_eq!(&again[100..104], b"zzzz", "a later read was served the pre-fold page");
+}
+
+/// Holds the first put whose key contains `pattern` once armed, until released.
+struct HoldPutStore {
+    inner: MemoryKvStore,
+    pattern: parking_lot::Mutex<Option<&'static str>>,
+    held: tokio::sync::Notify,
+    started: tokio::sync::Notify,
+}
+
+impl KvStore for HoldPutStore {
+    fn get<'a>(&'a self, key: &'a str) -> BoxFuture<'a, std::io::Result<Option<Vec<u8>>>> {
+        self.inner.get(key)
+    }
+    fn get_range<'a>(
+        &'a self,
+        key: &'a str,
+        offset: u64,
+        len: usize,
+    ) -> BoxFuture<'a, std::io::Result<Option<Vec<u8>>>> {
+        self.inner.get_range(key, offset, len)
+    }
+    fn put<'a>(&'a self, key: &'a str, body: Vec<u8>) -> BoxFuture<'a, std::io::Result<()>> {
+        Box::pin(async move {
+            let hold = {
+                let mut pattern = self.pattern.lock();
+                match *pattern {
+                    Some(p) if key.contains(p) => {
+                        *pattern = None;
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if hold {
+                self.started.notify_one();
+                self.held.notified().await;
+            }
+            self.inner.put(key, body).await
+        })
+    }
+    fn delete<'a>(&'a self, keys: Vec<String>) -> BoxFuture<'a, std::io::Result<()>> {
+        self.inner.delete(keys)
+    }
+    fn list<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, std::io::Result<Vec<ObjectInfo>>> {
+        self.inner.list(prefix)
+    }
+    fn describe(&self) -> String {
+        "hold-put".to_string()
+    }
+}
+
+/// While a compaction publishes — its leftovers going out, then its metadata —
+/// every committed byte must stay readable: the ones it folded into a chunk
+/// past the old end of the base, and the ones it could not fold.
+///
+/// The frozen overlay used to be emptied chunk by chunk as the folds landed and
+/// taken out entirely before the leftovers were written, so for those round
+/// trips a folded byte past the old `base_len` read as zero and a leftover read
+/// as whatever it had replaced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_committed_byte_stays_readable_while_a_compaction_publishes() {
+    for held in ["/d/", "/META"] {
+        let store = Arc::new(HoldPutStore {
+            inner: MemoryKvStore::new(),
+            pattern: parking_lot::Mutex::new(None),
+            held: tokio::sync::Notify::new(),
+            started: tokio::sync::Notify::new(),
+        });
+        let family = open_family(store.clone() as Arc<dyn KvStore>).await;
+        let io = open(&family, "rows.db").await;
+
+        // Committed, never compacted: chunk 0 and most of chunk 1.
+        let settled = io.begin_txn();
+        io.append_data_txn(settled, &[b'a'; 6000]).await;
+        io.commit_durable(settled).await.unwrap();
+        // Open while the compactor runs, inside chunk 1: chunk 0 folds, and
+        // the committed bytes of chunk 1 below it are leftovers.
+        let open_txn = io.begin_txn();
+        io.write_data_txn(open_txn, 5000, b"bbbbbbbbbb").await;
+
+        *store.pattern.lock() = Some(held);
+        let started = store.started.notified();
+        let compaction = {
+            let io = io.clone();
+            tokio::spawn(async move { io.compact_now().await })
+        };
+        started.await;
+
+        for (at, what) in [(0u64, "folded past the old base"), (4500, "a leftover")] {
+            let mut buffer = vec![0u8; 100];
+            let mut position = at;
+            io.read_data_into_buffer(&mut position, &mut buffer)
+                .await
+                .unwrap();
+            assert!(
+                buffer.iter().all(|&b| b == b'a'),
+                "holding the {held} put: {what} at {at} read back as {:?}",
+                &buffer[..8]
+            );
+        }
+
+        store.held.notify_one();
+        compaction.await.unwrap().unwrap();
+        let mut expected = vec![b'a'; 6000];
+        expected[5000..5010].copy_from_slice(b"bbbbbbbbbb");
+        assert_eq!(read_all(&io).await, expected, "after the compaction ({held})");
+    }
+}
+
+/// The synchronous batch path agrees byte for byte with the async one whenever
+/// it serves a batch, over generated batches: reads spanning pages and chunks,
+/// empty reads, reads past the base into appended bytes, reads past the end,
+/// committed and uncommitted overlay writes, and a cache only partly warm.
+#[tokio::test]
+async fn the_synchronous_batch_path_agrees_with_the_async_one() {
+    let store: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+    let mut config = tiny_config();
+    config.readahead_chunks = 0;
+    let family = KvFamily::open(store, config).await.unwrap();
+    let io = KvStorageProvider::open(family, "rows.db").await.unwrap();
+
+    let base: Vec<u8> = (0..4096u32 * 4).map(|i| (i * 7 % 251) as u8).collect();
+    let txn = io.begin_txn();
+    io.append_data_txn(txn, &base).await;
+    io.commit_durable(txn).await.unwrap();
+    io.compact_now().await.unwrap();
+
+    // Overlay on top of the base: committed rewrites, an uncommitted one, and
+    // bytes appended past the base.
+    let committed = io.begin_txn();
+    io.write_data_txn(committed, 1000, &[0xA1; 300]).await;
+    io.write_data_txn(committed, 4090, &[0xA2; 20]).await;
+    io.commit_durable(committed).await.unwrap();
+    let open_txn = io.begin_txn();
+    io.write_data_txn(open_txn, 9000, &[0xB1; 50]).await;
+    io.append_data(&[0xC1; 700], false).await;
+    let len = io.get_len().await;
+
+    // Part of the cache warm: pages 0, 5 and 9.
+    for page in [0u64, 5, 9] {
+        let mut warm = vec![0u8; 10];
+        io.read_vectored(&mut [(page * 1024 + 3, warm.as_mut_slice())])
+            .await
+            .unwrap();
+    }
+
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = |bound: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % bound.max(1)
+    };
+    let (mut served, mut declined) = (0usize, 0usize);
+    for round in 0..3000 {
+        let count = 1 + next(5) as usize;
+        let shape: Vec<(u64, usize)> = (0..count)
+            .map(|_| {
+                let position = next(len + 64);
+                let width = match next(4) {
+                    0 => 0,
+                    1 => next(16) as usize,
+                    2 => next(1500) as usize,
+                    _ => next(3000) as usize,
+                };
+                (position, width)
+            })
+            .collect();
+
+        let mut sync_buffers: Vec<Vec<u8>> = shape.iter().map(|&(_, w)| vec![0xEE; w]).collect();
+        let sync_served = {
+            let mut reads: Vec<(u64, &mut [u8])> = shape
+                .iter()
+                .zip(sync_buffers.iter_mut())
+                .map(|(&(p, _), b)| (p, b.as_mut_slice()))
+                .collect();
+            io.try_read_vectored_sync(&mut reads)
+        };
+
+        let mut async_buffers: Vec<Vec<u8>> = shape.iter().map(|&(_, w)| vec![0xDD; w]).collect();
+        let async_result = {
+            let mut reads: Vec<(u64, &mut [u8])> = shape
+                .iter()
+                .zip(async_buffers.iter_mut())
+                .map(|(&(p, _), b)| (p, b.as_mut_slice()))
+                .collect();
+            io.read_vectored(&mut reads).await
+        };
+
+        if sync_served {
+            served += 1;
+            assert!(
+                async_result.is_ok(),
+                "round {round}: the sync path served {shape:?}, which the async path refuses"
+            );
+            assert_eq!(sync_buffers, async_buffers, "round {round}: {shape:?}");
+        } else {
+            declined += 1;
+            // A decline leaves the caller's buffers untouched.
+            assert!(
+                sync_buffers.iter().all(|b| b.iter().all(|&x| x == 0xEE)),
+                "round {round}: a declined batch wrote into the buffers"
+            );
+        }
+    }
+    assert!(served > 500 && declined > 50, "served {served}, declined {declined}");
+}
+
+/// With no Tokio runtime to spawn on, a fetch is driven by whoever awaits it
+/// rather than panicking, and still fills the cache and clears its entry.
+#[test]
+fn a_fetch_outside_a_runtime_is_driven_by_its_waiter() {
+    use super::cache::{ChunkCache, ChunkId, FetchKey};
+
+    let cache = Arc::new(ChunkCache::new(1 << 20));
+    let key = FetchKey {
+        file: 3,
+        generation: 1,
+        index: 2,
+        whole: false,
+    };
+    let fetch = cache.fetch(key, async { Ok(vec![(2u64, Arc::new(b"page".to_vec()))]) });
+    let joined = cache.fetch(key, async { panic!("a second request was made") });
+    let pages = futures::executor::block_on(fetch).unwrap();
+    assert_eq!(pages[0].1.as_slice(), b"page");
+    assert_eq!(futures::executor::block_on(joined).unwrap()[0].1.as_slice(), b"page");
+    assert_eq!(cache.fetches_in_flight(), 0);
+    let id = ChunkId {
+        file: 3,
+        generation: 1,
+        index: 2,
+    };
+    assert_eq!(cache.get(id).unwrap().as_slice(), b"page");
+}
+
+/// A compaction whose publish fails leaves the file readable and compactable:
+/// its frozen bytes go back to the live overlay, and the next pass folds them.
+#[tokio::test]
+async fn a_failed_compaction_can_be_retried() {
+    // Every put in the publish, in order: the leftovers' delta, then the
+    // metadata. Each run fails one of them.
+    for allowed in 0..2usize {
+        let store = Arc::new(FailAfterStore::new(usize::MAX));
+        let family = open_family(store.clone() as Arc<dyn KvStore>).await;
+        let io = open(&family, "rows.db").await;
+
+        let settled = io.begin_txn();
+        io.append_data_txn(settled, &[b'a'; 6000]).await;
+        io.commit_durable(settled).await.unwrap();
+        // Leaves leftovers in chunk 1, so the publish writes a delta first.
+        let open_txn = io.begin_txn();
+        io.write_data_txn(open_txn, 5000, b"bbbbbbbbbb").await;
+
+        // The rewrite of chunk 0 is the first put; the publish comes after.
+        store.remaining.store(1 + allowed, Ordering::Relaxed);
+        store.arm();
+        assert!(io.compact_now().await.is_err(), "run {allowed}: the put did not fail");
+        store.armed.store(false, Ordering::Relaxed);
+
+        let mut expected = vec![b'a'; 6000];
+        expected[5000..5010].copy_from_slice(b"bbbbbbbbbb");
+        assert_eq!(read_all(&io).await, expected, "run {allowed}: after the failure");
+
+        io.commit_durable(open_txn).await.unwrap();
+        let deltas_before = store.inner.list("t/rows.db/d/").await.unwrap().len();
+        io.compact_now().await.unwrap();
+        assert_eq!(read_all(&io).await, expected, "run {allowed}: after the retry");
+        let deltas_after = store.inner.list("t/rows.db/d/").await.unwrap().len();
+        assert!(
+            deltas_after < deltas_before,
+            "run {allowed}: the retry folded nothing ({deltas_before} deltas before, {deltas_after} after)"
+        );
+
+        drop(io);
+        let family = open_family(store.clone() as Arc<dyn KvStore>).await;
+        assert_eq!(read_all(&open(&family, "rows.db").await).await, expected);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fetch benchmarks (ignored)
+// ---------------------------------------------------------------------------
+
+/// A memory store that answers reads after a fixed latency and counts them.
+///
+/// The latency is what makes duplicate fetches visible in wall time: against a
+/// real object store every GET is tens of milliseconds, and two GETs of one
+/// chunk are two of those. Run with
+/// `cargo test --release -p rasterizeddb_core --lib -- --ignored kv_bench --nocapture`.
+pub(super) struct SlowStore {
+    pub(super) inner: MemoryKvStore,
+    pub(super) latency: std::time::Duration,
+    pub(super) gets: AtomicUsize,
+    pub(super) ranges: AtomicUsize,
+}
+
+impl SlowStore {
+    pub(super) fn new(latency_ms: u64) -> Self {
+        Self {
+            inner: MemoryKvStore::new(),
+            latency: std::time::Duration::from_millis(latency_ms),
+            gets: AtomicUsize::new(0),
+            ranges: AtomicUsize::new(0),
+        }
+    }
+    pub(super) fn counts(&self) -> (usize, usize) {
+        (
+            self.gets.load(Ordering::Relaxed),
+            self.ranges.load(Ordering::Relaxed),
+        )
+    }
+}
+
+impl KvStore for SlowStore {
+    fn get<'a>(&'a self, key: &'a str) -> BoxFuture<'a, std::io::Result<Option<Vec<u8>>>> {
+        self.gets.fetch_add(1, Ordering::Relaxed);
+        let latency = self.latency;
+        Box::pin(async move {
+            if !latency.is_zero() {
+                tokio::time::sleep(latency).await;
+            }
+            self.inner.get(key).await
+        })
+    }
+    fn get_range<'a>(
+        &'a self,
+        key: &'a str,
+        offset: u64,
+        len: usize,
+    ) -> BoxFuture<'a, std::io::Result<Option<Vec<u8>>>> {
+        self.ranges.fetch_add(1, Ordering::Relaxed);
+        let latency = self.latency;
+        Box::pin(async move {
+            if !latency.is_zero() {
+                tokio::time::sleep(latency).await;
+            }
+            self.inner.get_range(key, offset, len).await
+        })
+    }
+    fn put<'a>(&'a self, key: &'a str, body: Vec<u8>) -> BoxFuture<'a, std::io::Result<()>> {
+        self.inner.put(key, body)
+    }
+    fn delete<'a>(&'a self, keys: Vec<String>) -> BoxFuture<'a, std::io::Result<()>> {
+        self.inner.delete(keys)
+    }
+    fn list<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, std::io::Result<Vec<ObjectInfo>>> {
+        self.inner.list(prefix)
+    }
+    fn concurrency(&self) -> usize {
+        16
+    }
+    fn describe(&self) -> String {
+        "slow".to_string()
+    }
+}
+
+mod bench {
+    use super::*;
+    use std::time::Instant;
+
+    const MIB: u64 = 1024 * 1024;
+
+    /// A file of `chunks` default-geometry chunks, compacted into base objects,
+    /// behind a fresh family so nothing is cached.
+    async fn cold_file(store: &Arc<SlowStore>, chunks: u64) -> (KvStorageProvider, Vec<u8>) {
+        let config = KvConfig::new("b");
+        let len = chunks * config.chunk_size;
+        let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8 ^ (i >> 16) as u8).collect();
+        {
+            let family = KvFamily::open(store.clone() as Arc<dyn KvStore>, config.clone())
+                .await
+                .unwrap();
+            let io = KvStorageProvider::open(family, "rows.db").await.unwrap();
+            io.append_data(&data, true).await;
+            io.flush().await.unwrap();
+            io.compact_now().await.unwrap();
+        }
+        let family = KvFamily::open(store.clone() as Arc<dyn KvStore>, config)
+            .await
+            .unwrap();
+        (
+            KvStorageProvider::open(family, "rows.db").await.unwrap(),
+            data,
+        )
+    }
+
+    /// `clients` tasks each read the whole file in vectored batches, all at
+    /// once — concurrent scans of one cold table.
+    async fn concurrent_vectored(clients: usize, latency_ms: u64) -> (usize, usize, f64) {
+        let store = Arc::new(SlowStore::new(latency_ms));
+        let (io, data) = cold_file(&store, 8).await;
+        let data = Arc::new(data);
+        let before = store.counts();
+        let started = Instant::now();
+        let mut tasks = Vec::new();
+        for _ in 0..clients {
+            let io = io.clone();
+            let data = data.clone();
+            tasks.push(tokio::spawn(async move {
+                let len = data.len() as u64;
+                let batch = 256 * 1024u64;
+                let mut buffers: Vec<Vec<u8>> = (0..16).map(|_| vec![0u8; 4096]).collect();
+                let mut at = 0u64;
+                while at < len {
+                    let mut reads: Vec<(u64, &mut [u8])> = buffers
+                        .iter_mut()
+                        .enumerate()
+                        .map(|(i, b)| (at + i as u64 * (batch / 16), b.as_mut_slice()))
+                        .collect();
+                    io.read_vectored(&mut reads).await.unwrap();
+                    for (pos, buf) in reads.iter() {
+                        let p = *pos as usize;
+                        assert_eq!(&buf[..], &data[p..p + buf.len()]);
+                    }
+                    at += batch;
+                }
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+        let after = store.counts();
+        (after.0 - before.0, after.1 - before.1, elapsed)
+    }
+
+    /// One sequential reader, 64 KiB at a time, so read-ahead runs ahead of it.
+    async fn sequential_with_readahead(latency_ms: u64) -> (usize, usize, f64) {
+        let store = Arc::new(SlowStore::new(latency_ms));
+        let (io, data) = cold_file(&store, 8).await;
+        let before = store.counts();
+        let started = Instant::now();
+        let mut buffer = vec![0u8; 64 * 1024];
+        let mut position = 0u64;
+        while position < data.len() as u64 {
+            let at = position as usize;
+            io.read_data_into_buffer(&mut position, &mut buffer)
+                .await
+                .unwrap();
+            assert_eq!(&buffer[..], &data[at..at + buffer.len()]);
+        }
+        let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+        let after = store.counts();
+        (after.0 - before.0, after.1 - before.1, elapsed)
+    }
+
+    /// Hot cache, no latency: the per-page lookup cost under `clients` readers.
+    async fn hot_vectored(clients: usize, rounds: usize) -> f64 {
+        let store = Arc::new(SlowStore::new(0));
+        let (io, data) = cold_file(&store, 8).await;
+        // Warm.
+        let mut warm = vec![0u8; data.len()];
+        io.read_vectored(&mut [(0u64, warm.as_mut_slice())]).await.unwrap();
+        let started = Instant::now();
+        let mut tasks = Vec::new();
+        for c in 0..clients {
+            let io = io.clone();
+            let len = data.len() as u64;
+            tasks.push(tokio::spawn(async move {
+                let mut buffers: Vec<Vec<u8>> = (0..64).map(|_| vec![0u8; 128]).collect();
+                let mut seed = c as u64 * 7919 + 1;
+                for _ in 0..rounds {
+                    let mut reads: Vec<(u64, &mut [u8])> = buffers
+                        .iter_mut()
+                        .map(|b| {
+                            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                            ((seed >> 20) % (len - 128), b.as_mut_slice())
+                        })
+                        .collect();
+                    io.read_vectored(&mut reads).await.unwrap();
+                }
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        started.elapsed().as_secs_f64() * 1000.0
+    }
+
+    /// Hot cache, no latency, shaped like the engine's row fetch: per row, a
+    /// vectored read of its columns, tried on the synchronous path first and
+    /// on the async one only if that declines (`row_pointer.rs`).
+    async fn hot_rows(clients: usize, rows: usize) -> f64 {
+        let store = Arc::new(SlowStore::new(0));
+        let (io, data) = cold_file(&store, 8).await;
+        let mut warm = vec![0u8; data.len()];
+        io.read_vectored(&mut [(0u64, warm.as_mut_slice())]).await.unwrap();
+        let started = Instant::now();
+        let mut tasks = Vec::new();
+        for c in 0..clients {
+            let io = io.clone();
+            let len = data.len() as u64;
+            tasks.push(tokio::spawn(async move {
+                let mut columns: Vec<Vec<u8>> = [8usize, 4, 12, 24]
+                    .into_iter()
+                    .map(|n| vec![0u8; n])
+                    .collect();
+                let mut seed = c as u64 * 7919 + 1;
+                let mut declined = 0usize;
+                for _ in 0..rows {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    let row = (seed >> 20) % (len - 64);
+                    let mut at = row;
+                    let mut reads: Vec<(u64, &mut [u8])> = columns
+                        .iter_mut()
+                        .map(|b| {
+                            let read = (at, b.as_mut_slice());
+                            at += read.1.len() as u64;
+                            read
+                        })
+                        .collect();
+                    if !io.try_read_vectored_sync(&mut reads) {
+                        declined += 1;
+                        io.read_vectored(&mut reads).await.unwrap();
+                    }
+                }
+                declined
+            }));
+        }
+        for t in tasks {
+            std::hint::black_box(t.await.unwrap());
+        }
+        started.elapsed().as_secs_f64() * 1000.0
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore]
+    async fn kv_bench_hot() {
+        for round in 0..5 {
+            for clients in [1usize, 8] {
+                let ms = hot_rows(clients, 200_000).await;
+                println!(
+                    "round {round} hot_rows clients={clients} 200000 rows each: {ms:.1}ms"
+                );
+                let ms = hot_vectored(clients, 2000).await;
+                println!(
+                    "round {round} hot_vectored clients={clients} 2000x64 reads each: {ms:.1}ms"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore]
+    async fn kv_bench_fetches() {
+        for round in 0..3 {
+            for clients in [1usize, 8] {
+                let (gets, ranges, ms) = concurrent_vectored(clients, 20).await;
+                println!(
+                    "round {round} concurrent_vectored clients={clients} latency=20ms: gets={gets} ranges={ranges} wall={ms:.1}ms (8 chunks of {} MiB)",
+                    KvConfig::new("x").chunk_size / MIB
+                );
+            }
+            let (gets, ranges, ms) = sequential_with_readahead(20).await;
+            println!(
+                "round {round} sequential_readahead latency=20ms: gets={gets} ranges={ranges} wall={ms:.1}ms"
+            );
+            for clients in [1usize, 8] {
+                let ms = hot_vectored(clients, 2000).await;
+                println!(
+                    "round {round} hot_vectored clients={clients} 2000x64 reads each: {ms:.1}ms"
+                );
+            }
+        }
+    }
+}
+
+/// A read whose base bytes were fetched from the generation `swap_temp`
+/// replaced, and whose overlays are applied after the swap, must read the new
+/// file — not the new file's writes patched over the old file's bytes, and not
+/// the old file's length.
+///
+/// The swap stored the generation and lengths, then swapped the overlays, all
+/// outside anything the read path checked, so the straddling read below came
+/// back as the replaced rows in the new file's hole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_that_straddles_a_swap_reads_only_the_new_file() {
+    let store = Arc::new(LateAnswerStore {
+        inner: MemoryKvStore::new(),
+        hold_next: std::sync::atomic::AtomicBool::new(false),
+        held: tokio::sync::Notify::new(),
+        started: tokio::sync::Notify::new(),
+    });
+    let mut config = tiny_config();
+    config.readahead_chunks = 0;
+    {
+        let family = KvFamily::open(store.clone() as Arc<dyn KvStore>, config.clone())
+            .await
+            .unwrap();
+        let io = KvStorageProvider::open(family, "t.db").await.unwrap();
+        let a = io.begin_txn();
+        io.append_data_txn(a, &[b'o'; 4096]).await;
+        io.commit_durable(a).await.unwrap();
+        io.compact_now().await.unwrap();
+    }
+    // Cold, so the read below has to ask the store for the old base.
+    let family = KvFamily::open(store.clone() as Arc<dyn KvStore>, config)
+        .await
+        .unwrap();
+    let io = KvStorageProvider::open(family, "t.db").await.unwrap();
+
+    // The replacement: 300 bytes, of which 0..100 is a hole and 100..300 is
+    // written. Nothing of it is in a base chunk.
+    let mut temp = io.create_temp().await;
+    temp.write_data(100, &[b'n'; 200]).await;
+    let mut expected = vec![0u8; 300];
+    expected[100..].fill(b'n');
+
+    store.hold_next.store(true, Ordering::SeqCst);
+    let started = store.started.notified();
+    let reader = {
+        let io = io.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 250];
+            let mut position = 0u64;
+            io.read_data_into_buffer(&mut position, &mut buf).await.map(|_| buf)
+        })
+    };
+    // The reader has its old-generation bytes in hand and is held there.
+    started.await;
+    io.swap_temp(&mut temp).await;
+    store.held.notify_one();
+
+    let got = reader.await.unwrap().unwrap();
+    let old_bytes = got[..100].iter().filter(|&&b| b == b'o').count();
+    assert_eq!(
+        old_bytes, 0,
+        "the read that straddled the swap returned {old_bytes} bytes of the replaced file"
+    );
+    assert_eq!(&got[..], &expected[..250]);
+    assert_eq!(read_all(&io).await, expected, "a read after the swap");
+}
+
+/// `swap_temp` while a compaction of the live file is between its freeze and
+/// its publish must leave the new file live — in this process and after a
+/// restart.
+///
+/// The compaction froze the old generation, the swap published the new one
+/// and deleted the old chunks, and then the compaction published a META naming
+/// the old generation (and its length) over it: the table read correctly
+/// until the restart and then came back as the replaced bytes over deleted
+/// chunks. In process, the compaction found the swapped-in state had no
+/// frozen overlay and panicked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_swap_during_a_compaction_leaves_the_new_file_live() {
+    let store = Arc::new(HoldPutStore {
+        inner: MemoryKvStore::new(),
+        pattern: parking_lot::Mutex::new(None),
+        held: tokio::sync::Notify::new(),
+        started: tokio::sync::Notify::new(),
+    });
+    {
+        let family = open_family(store.clone() as Arc<dyn KvStore>).await;
+        let io = open(&family, "rows.db").await;
+        let a = io.begin_txn();
+        io.append_data_txn(a, &[b'o'; 6000]).await;
+        io.commit_durable(a).await.unwrap();
+
+        // Hold the compaction at its first chunk put: frozen, not published.
+        *store.pattern.lock() = Some("/g");
+        let started = store.started.notified();
+        let compaction = {
+            let io = io.clone();
+            tokio::spawn(async move { io.compact_now().await })
+        };
+        started.await;
+
+        let mut temp = io.create_temp().await;
+        temp.append_data(&[b'n'; 1000], true).await;
+        let swap = {
+            let io = io.clone();
+            tokio::spawn(async move { io.swap_temp(&mut temp).await })
+        };
+        // Long enough for an unguarded swap to finish entirely.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        store.held.notify_one();
+        compaction
+            .await
+            .expect("the compaction panicked")
+            .unwrap();
+        swap.await.unwrap();
+
+        assert_eq!(io.get_len().await, 1000, "length in process");
+        assert_eq!(read_all(&io).await, vec![b'n'; 1000], "in process");
+    }
+    let family = open_family(store as Arc<dyn KvStore>).await;
+    let io = open(&family, "rows.db").await;
+    assert_eq!(io.get_len().await, 1000, "length after a restart");
+    assert_eq!(read_all(&io).await, vec![b'n'; 1000], "after a restart");
+}
+
+// ---------------------------------------------------------------------------
+// Durability across compaction, swap and failure
+// ---------------------------------------------------------------------------
+
+fn hold_put_store() -> Arc<HoldPutStore> {
+    Arc::new(HoldPutStore {
+        inner: MemoryKvStore::new(),
+        pattern: parking_lot::Mutex::new(None),
+        held: tokio::sync::Notify::new(),
+        started: tokio::sync::Notify::new(),
+    })
+}
+
+/// A transaction is declared committed in the file it was committed on, and
+/// its other half's records live in another file's delta. That file
+/// compacting — twice, so the declaration has to survive being carried — or
+/// being replaced by a swap must not take the declaration with it: the rows
+/// half of an INSERT used to vanish on the restart after the pointers file
+/// compacted, while the pointer survived.
+#[tokio::test]
+async fn a_declaration_another_file_needs_survives_compaction_and_swap() {
+    for how in ["compact once", "compact twice", "swap"] {
+        let store: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+        {
+            let family = open_family(store.clone()).await;
+            let rows = open(&family, "t.db").await;
+            let pointers = open(&family, "t_pointers.db").await;
+            let txn = rows.begin_txn();
+            rows.append_data_txn(txn, b"row bytes").await;
+            pointers.append_data_txn(txn, b"pointer").await;
+            pointers.commit_durable(txn).await.unwrap();
+            match how {
+                "compact once" => pointers.compact_now().await.unwrap(),
+                "compact twice" => {
+                    pointers.compact_now().await.unwrap();
+                    pointers.write_data(0, b"P").await;
+                    pointers.compact_now().await.unwrap();
+                }
+                _ => {
+                    let mut temp = pointers.create_temp().await;
+                    temp.append_data(b"pointer", true).await;
+                    pointers.swap_temp(&mut temp).await;
+                }
+            }
+        }
+        let family = open_family(store).await;
+        assert_eq!(
+            read_all(&open(&family, "t.db").await).await,
+            b"row bytes",
+            "{how}: the rows half of a committed transaction is gone after a restart"
+        );
+    }
+}
+
+/// Once the other file has folded its half, the declaration is no longer
+/// carried: the ledger forgets a delta when it is retired.
+#[tokio::test]
+async fn a_carried_declaration_is_dropped_once_nothing_needs_it() {
+    let store = Arc::new(MemoryKvStore::new());
+    let family = open_family(store.clone() as Arc<dyn KvStore>).await;
+    let rows = open(&family, "t.db").await;
+    let pointers = open(&family, "t_pointers.db").await;
+    let txn = rows.begin_txn();
+    rows.append_data_txn(txn, &[b'r'; 600]).await;
+    pointers.append_data_txn(txn, &[b'p'; 600]).await;
+    pointers.commit_durable(txn).await.unwrap();
+
+    pointers.compact_now().await.unwrap();
+    rows.compact_now().await.unwrap();
+    pointers.write_data(0, b"P").await;
+    pointers.compact_now().await.unwrap();
+
+    let deltas: Vec<String> = store
+        .list("t/t_pointers.db/d/")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|o| o.key)
+        .collect();
+    for key in &deltas {
+        let bytes = store.get(key).await.unwrap().unwrap();
+        let batch = super::layout::DeltaBatch::decode(&bytes).unwrap().unwrap();
+        assert!(
+            !batch.committed.contains(&txn),
+            "{key} still carries a declaration no record depends on"
+        );
+    }
+}
+
+/// A transaction open at the freeze keeps its bytes — and the committed bytes
+/// above it — in the live overlay, so the deltas holding them may not be
+/// retired by that pass, even if the transaction commits before it publishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_commit_during_a_compaction_does_not_let_it_retire_unfolded_deltas() {
+    let store = hold_put_store();
+    let mut expected = vec![b'a'; 10_000];
+    expected[9_000..9_010].copy_from_slice(b"bbbbbbbbbb");
+    {
+        let family = open_family(store.clone() as Arc<dyn KvStore>).await;
+        let io = open(&family, "t.db").await;
+        let a = io.begin_txn();
+        io.append_data_txn(a, &[b'a'; 10_000]).await;
+        io.commit_durable(a).await.unwrap();
+        let b = io.begin_txn();
+        io.write_data_txn(b, 9_000, b"bbbbbbbbbb").await;
+
+        *store.pattern.lock() = Some("/g");
+        let started = store.started.notified();
+        let compaction = {
+            let io = io.clone();
+            tokio::spawn(async move { io.compact_now().await })
+        };
+        started.await;
+        io.commit_durable(b).await.unwrap();
+        store.held.notify_one();
+        compaction.await.unwrap().unwrap();
+        assert_eq!(read_all(&io).await, expected, "in process");
+    }
+    let family = open_family(store as Arc<dyn KvStore>).await;
+    let io = open(&family, "t.db").await;
+    assert_eq!(io.get_len().await, 10_000, "length after a restart");
+    assert_eq!(read_all(&io).await, expected, "after a restart");
+}
+
+/// The startup scan's "next sequence" is not a compaction watermark. It used
+/// to be folded into one, so the first compaction after a restart that did not
+/// retire anything wrote a META claiming every existing delta was folded, and
+/// the restart after it skipped them.
+#[tokio::test]
+async fn a_compaction_after_a_restart_does_not_claim_unfolded_deltas() {
+    let store: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+    {
+        let family = open_family(store.clone()).await;
+        let io = open(&family, "t.db").await;
+        let a = io.begin_txn();
+        io.append_data_txn(a, &[b'a'; 100]).await;
+        io.commit_durable(a).await.unwrap();
+    }
+    {
+        let family = open_family(store.clone()).await;
+        let io = open(&family, "t.db").await;
+        // Open across the compaction, so nothing in its chunk folds and
+        // nothing is retired.
+        let b = io.begin_txn();
+        io.write_data_txn(b, 10, b"bbbbb").await;
+        io.compact_now().await.unwrap();
+    }
+    let family = open_family(store).await;
+    let io = open(&family, "t.db").await;
+    assert_eq!(io.get_len().await, 100);
+    assert_eq!(read_all(&io).await, vec![b'a'; 100]);
+}
+
+/// A scratch file abandoned with deltas in the store — the process died, or
+/// the handle was simply dropped — must not lend them to the next scratch file
+/// of the same table. They shared a generation, so adopting the second one
+/// replayed the first one's bytes into it on the next restart.
+#[tokio::test]
+async fn an_abandoned_scratch_file_does_not_replay_into_the_next_one() {
+    for restart_between in [true, false] {
+        let store: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+        {
+            let family = open_family(store.clone()).await;
+            let io = open(&family, "t.db").await;
+            io.append_data(&[b'o'; 100], true).await;
+            io.compact_now().await.unwrap();
+            let abandoned = io.create_temp().await;
+            abandoned.append_data(&[b'x'; 300], true).await;
+            if !restart_between {
+                let mut next = io.create_temp().await;
+                next.append_data(&[b'n'; 50], true).await;
+                io.swap_temp(&mut next).await;
+            }
+        }
+        if restart_between {
+            let family = open_family(store.clone()).await;
+            let io = open(&family, "t.db").await;
+            assert_eq!(read_all(&io).await, vec![b'o'; 100]);
+            let mut next = io.create_temp().await;
+            next.append_data(&[b'n'; 50], true).await;
+            io.swap_temp(&mut next).await;
+            assert_eq!(read_all(&io).await, vec![b'n'; 50]);
+        }
+        let family = open_family(store).await;
+        let io = open(&family, "t.db").await;
+        assert_eq!(io.get_len().await, 50, "restart_between={restart_between}");
+        assert_eq!(read_all(&io).await, vec![b'n'; 50], "restart_between={restart_between}");
+    }
+}
+
+/// A commit that returned an error stays uncommitted: the next flush does not
+/// declare it, and no compaction folds its bytes into a base chunk. Both used
+/// to make it durable after the caller had been told it was not.
+#[tokio::test]
+async fn a_failed_commit_is_not_made_durable_later() {
+    let store = Arc::new(FailAfterStore::new(1));
+    let handle: Arc<dyn KvStore> = store.clone();
+    {
+        let family = open_family(handle.clone()).await;
+        let rows = open(&family, "t.db").await;
+        let pointers = open(&family, "t_pointers.db").await;
+        let txn = rows.begin_txn();
+        rows.append_data_txn(txn, &[b'r'; 600]).await;
+        pointers.append_data_txn(txn, &[b'p'; 600]).await;
+        // The rows object lands; the declaring pointers object fails.
+        store.arm();
+        assert!(pointers.commit_durable(txn).await.is_err());
+        // What the background service does next.
+        pointers.flush().await.unwrap();
+        rows.flush().await.unwrap();
+        pointers.compact_now().await.unwrap();
+        rows.compact_now().await.unwrap();
+    }
+    let family = open_family(handle).await;
+    assert_eq!(
+        read_all(&open(&family, "t_pointers.db").await).await,
+        b"",
+        "a commit that returned an error became durable"
+    );
+    assert_eq!(read_all(&open(&family, "t.db").await).await, b"");
+}
+
+/// A truncate while a compaction is between its freeze and its publish: the
+/// publish must not restore the base length it computed before the cut, or
+/// the truncated tail reads back as base bytes once the file grows past it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_truncate_during_a_compaction_leaves_zeros_in_the_hole() {
+    let store = hold_put_store();
+    {
+        let family = open_family(store.clone() as Arc<dyn KvStore>).await;
+        let io = open(&family, "t.db").await;
+        let a = io.begin_txn();
+        io.append_data_txn(a, &[b'a'; 10_000]).await;
+        io.commit_durable(a).await.unwrap();
+
+        *store.pattern.lock() = Some("/g");
+        let started = store.started.notified();
+        let compaction = {
+            let io = io.clone();
+            tokio::spawn(async move { io.compact_now().await })
+        };
+        started.await;
+        io.truncate(100).await.unwrap();
+        store.held.notify_one();
+        compaction.await.unwrap().unwrap();
+        assert_eq!(io.get_len().await, 100);
+
+        io.write_data(2_000, b"Q").await;
+        let all = read_all(&io).await;
+        let stale = all[100..2_000].iter().filter(|&&b| b == b'a').count();
+        assert_eq!(stale, 0, "{stale} bytes of the truncated tail came back in process");
+        assert_eq!(&all[..100], &[b'a'; 100][..]);
+        assert_eq!(all[2_000], b'Q');
+    }
+    let family = open_family(store as Arc<dyn KvStore>).await;
+    let io = open(&family, "t.db").await;
+    assert_eq!(io.get_len().await, 2_001);
+    let all = read_all(&io).await;
+    let stale = all[100..2_000].iter().filter(|&&b| b == b'a').count();
+    assert_eq!(stale, 0, "{stale} bytes of the truncated tail came back after a restart");
+}
+
+// ---------------------------------------------------------------------------
+// Rolling back a failed commit
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq)]
+enum PutFault {
+    /// Store the object, then report failure: the answer was lost.
+    LandThenFail,
+    /// Report failure without storing it, keeping the body so the test can
+    /// land it later: a request the store finishes after the client gave up.
+    FailAndKeep,
+}
+
+/// Applies `fault` to the first put whose key contains `pattern`, once armed.
+struct PutFaultStore {
+    inner: MemoryKvStore,
+    armed: parking_lot::Mutex<Option<(&'static str, PutFault)>>,
+    kept: parking_lot::Mutex<Option<(String, Vec<u8>)>>,
+}
+
+impl PutFaultStore {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: MemoryKvStore::new(),
+            armed: parking_lot::Mutex::new(None),
+            kept: parking_lot::Mutex::new(None),
+        })
+    }
+    fn arm(&self, pattern: &'static str, fault: PutFault) {
+        *self.armed.lock() = Some((pattern, fault));
+    }
+    /// The put that "failed" arrives after all.
+    async fn land_late(&self) {
+        let (key, body) = self.kept.lock().take().expect("a put was kept");
+        self.inner.put(&key, body).await.unwrap();
+    }
+}
+
+impl KvStore for PutFaultStore {
+    fn get<'a>(&'a self, key: &'a str) -> BoxFuture<'a, std::io::Result<Option<Vec<u8>>>> {
+        self.inner.get(key)
+    }
+    fn get_range<'a>(
+        &'a self,
+        key: &'a str,
+        offset: u64,
+        len: usize,
+    ) -> BoxFuture<'a, std::io::Result<Option<Vec<u8>>>> {
+        self.inner.get_range(key, offset, len)
+    }
+    fn put<'a>(&'a self, key: &'a str, body: Vec<u8>) -> BoxFuture<'a, std::io::Result<()>> {
+        Box::pin(async move {
+            let fault = {
+                let mut armed = self.armed.lock();
+                match *armed {
+                    Some((pattern, fault)) if key.contains(pattern) => {
+                        *armed = None;
+                        Some(fault)
+                    }
+                    _ => None,
+                }
+            };
+            match fault {
+                None => self.inner.put(key, body).await,
+                Some(PutFault::LandThenFail) => {
+                    self.inner.put(key, body).await?;
+                    Err(std::io::Error::other("connection reset after the request"))
+                }
+                Some(PutFault::FailAndKeep) => {
+                    *self.kept.lock() = Some((key.to_string(), body));
+                    Err(std::io::Error::other("request timed out"))
+                }
+            }
+        })
+    }
+    fn delete<'a>(&'a self, keys: Vec<String>) -> BoxFuture<'a, std::io::Result<()>> {
+        self.inner.delete(keys)
+    }
+    fn list<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, std::io::Result<Vec<ObjectInfo>>> {
+        self.inner.list(prefix)
+    }
+    fn describe(&self) -> String {
+        "put-fault".to_string()
+    }
+}
+
+async fn delta_keys(store: &dyn KvStore, file: &str) -> Vec<String> {
+    store
+        .list(&format!("t/{file}/d/"))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|o| o.key)
+        .collect()
+}
+
+/// A commit whose declaring put failed, and is not in the store, is rolled
+/// back and forgotten: its bytes leave the overlay, and it no longer holds
+/// off retirement — the deltas written before it are retired by the next
+/// compaction rather than kept for the life of the process.
+#[tokio::test]
+async fn a_failed_commit_is_rolled_back_and_stops_holding_the_file() {
+    let store = PutFaultStore::new();
+    let handle: Arc<dyn KvStore> = store.clone();
+    {
+        let family = open_family(handle.clone()).await;
+        let rows = open(&family, "t.db").await;
+        let pointers = open(&family, "t_pointers.db").await;
+        let settled = rows.begin_txn();
+        rows.append_data_txn(settled, &[b's'; 100]).await;
+        pointers.append_data_txn(settled, &[b'S'; 100]).await;
+        pointers.commit_durable(settled).await.unwrap();
+
+        let txn = rows.begin_txn();
+        rows.append_data_txn(txn, &[b'r'; 600]).await;
+        pointers.write_data_txn(txn, 10, b"XXXX").await;
+        pointers.append_data_txn(txn, &[b'p'; 600]).await;
+        store.arm("t_pointers.db/d/", PutFault::FailAndKeep);
+        assert!(pointers.commit_durable(txn).await.is_err());
+        // Taken back out of both files, the in-place write included.
+        let ptrs = read_all(&pointers).await;
+        assert_eq!(&ptrs[..100], &[b'S'; 100][..], "the in-place write was not undone");
+        assert!(!ptrs.contains(&b'p'), "the rolled-back append is still readable");
+        assert!(!read_all(&rows).await.contains(&b'r'));
+
+        let before = delta_keys(&*handle, "t_pointers.db").await;
+        pointers.write_data(0, b"Q").await;
+        pointers.compact_now().await.unwrap();
+        let after = delta_keys(&*handle, "t_pointers.db").await;
+        let kept: Vec<&String> = before.iter().filter(|k| after.contains(k)).collect();
+        assert!(kept.is_empty(), "compaction still kept {kept:?} for a rolled-back transaction");
+    }
+    let family = open_family(handle).await;
+    let pointers = read_all(&open(&family, "t_pointers.db").await).await;
+    assert_eq!(pointers[0], b'Q');
+    assert_eq!(&pointers[1..100], &[b'S'; 99][..]);
+    assert!(!pointers.contains(&b'p'));
+    assert_eq!(read_all(&open(&family, "t.db").await).await, vec![b's'; 100]);
+}
+
+/// The put reported failure but the object is in the store: the transaction
+/// committed, and saying otherwise would lose it on the next restart.
+#[tokio::test]
+async fn a_commit_whose_put_landed_despite_an_error_is_committed() {
+    let store = PutFaultStore::new();
+    let handle: Arc<dyn KvStore> = store.clone();
+    {
+        let family = open_family(handle.clone()).await;
+        let rows = open(&family, "t.db").await;
+        let pointers = open(&family, "t_pointers.db").await;
+        let txn = rows.begin_txn();
+        rows.append_data_txn(txn, b"row bytes").await;
+        pointers.append_data_txn(txn, b"pointer").await;
+        store.arm("t_pointers.db/d/", PutFault::LandThenFail);
+        pointers
+            .commit_durable(txn)
+            .await
+            .expect("the declaration is in the store, so the commit happened");
+        assert_eq!(read_all(&pointers).await, b"pointer");
+    }
+    let family = open_family(handle).await;
+    assert_eq!(read_all(&open(&family, "t_pointers.db").await).await, b"pointer");
+    assert_eq!(read_all(&open(&family, "t.db").await).await, b"row bytes");
+}
+
+/// A declaring put that failed and then arrives after the rollback must not
+/// commit the transaction on the next restart: the caller was told it failed,
+/// and has reused its space since.
+#[tokio::test]
+async fn a_rolled_back_commit_stays_rolled_back_when_its_put_lands_late() {
+    let store = PutFaultStore::new();
+    let handle: Arc<dyn KvStore> = store.clone();
+    {
+        let family = open_family(handle.clone()).await;
+        let rows = open(&family, "t.db").await;
+        let pointers = open(&family, "t_pointers.db").await;
+        let txn = rows.begin_txn();
+        rows.append_data_txn(txn, b"row bytes").await;
+        pointers.append_data_txn(txn, b"pointer").await;
+        store.arm("t_pointers.db/d/", PutFault::FailAndKeep);
+        assert!(pointers.commit_durable(txn).await.is_err());
+        store.land_late().await;
+    }
+    let family = open_family(handle).await;
+    let pointers = read_all(&open(&family, "t_pointers.db").await).await;
+    assert!(
+        !pointers.windows(7).any(|w| w == b"pointer"),
+        "a transaction reported as failed came back after a restart"
+    );
+    assert!(!read_all(&open(&family, "t.db").await).await.windows(3).any(|w| w == b"row"));
+}
+
+/// `abort_txn` rolls back a transaction that was never committed, in every
+/// file it wrote, and lets compaction retire what it spilled.
+#[tokio::test]
+async fn abort_txn_rolls_back_an_uncommitted_transaction() {
+    let store: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+    let family = open_family(store.clone()).await;
+    let rows = open(&family, "t.db").await;
+    let pointers = open(&family, "t_pointers.db").await;
+    let settled = rows.begin_txn();
+    pointers.append_data_txn(settled, &[b'S'; 50]).await;
+    pointers.commit_durable(settled).await.unwrap();
+
+    let txn = rows.begin_txn();
+    rows.append_data_txn(txn, &[b'r'; 600]).await;
+    pointers.write_data_txn(txn, 0, b"XX").await;
+    pointers.flush().await.unwrap(); // spilled, undeclared
+    rows.abort_txn(txn).await;
+    assert_eq!(&read_all(&pointers).await[..50], &[b'S'; 50][..]);
+    assert!(!read_all(&rows).await.contains(&b'r'));
+
+    let before = delta_keys(&*store, "t_pointers.db").await;
+    pointers.write_data(49, b"Q").await;
+    pointers.compact_now().await.unwrap();
+    let after = delta_keys(&*store, "t_pointers.db").await;
+    assert!(before.iter().all(|k| !after.contains(k)), "{before:?} survived in {after:?}");
 }

@@ -533,17 +533,12 @@ fn integer_range(db_type: &DbType) -> (i128, i128) {
 /// engine's parser reads a doubled quote as one and treats every other byte —
 /// backslashes, parentheses, newlines, semicolons, comment markers — as data.
 /// Each of those was tried against the executor before this was written.
+///
+/// The same quoting the wire layer's parameter inlining does, so it is that
+/// function: the text between quotes is copied in runs rather than a
+/// character at a time, which matters for an import pushing wide rows.
 pub fn quote(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push('\'');
-    for c in value.chars() {
-        if c == '\'' {
-            out.push('\'');
-        }
-        out.push(c);
-    }
-    out.push('\'');
-    out
+    crate::pg_params::quote_literal(value)
 }
 
 /// Quotes an identifier for a statement this engine will parse.

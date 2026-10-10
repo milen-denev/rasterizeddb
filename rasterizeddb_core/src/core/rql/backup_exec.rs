@@ -24,21 +24,21 @@ pub fn result_fields(statement: &BackupStatement) -> Option<Vec<(String, DbType)
             ("kind".to_string(), DbType::STRING),
             ("id".to_string(), DbType::STRING),
             ("created_at".to_string(), DbType::STRING),
-            ("start_lsn".to_string(), DbType::U64),
-            ("end_lsn".to_string(), DbType::U64),
-            ("uncompressed_bytes".to_string(), DbType::U64),
-            ("compressed_bytes".to_string(), DbType::U64),
+            ("start_lsn".to_string(), DbType::I64),
+            ("end_lsn".to_string(), DbType::I64),
+            ("uncompressed_bytes".to_string(), DbType::I64),
+            ("compressed_bytes".to_string(), DbType::I64),
             ("detail".to_string(), DbType::STRING),
         ]),
         BackupStatement::Restore { .. } => Some(vec![
             ("snapshot_id".to_string(), DbType::STRING),
             ("target_dir".to_string(), DbType::STRING),
             ("recovered_to_lsn".to_string(), DbType::STRING),
-            ("files_restored".to_string(), DbType::U64),
-            ("bytes_restored".to_string(), DbType::U64),
-            ("segments_replayed".to_string(), DbType::U64),
-            ("records_applied".to_string(), DbType::U64),
-            ("records_discarded".to_string(), DbType::U64),
+            ("files_restored".to_string(), DbType::I64),
+            ("bytes_restored".to_string(), DbType::I64),
+            ("segments_replayed".to_string(), DbType::I64),
+            ("records_applied".to_string(), DbType::I64),
+            ("records_discarded".to_string(), DbType::I64),
         ]),
         _ => None,
     }
@@ -235,16 +235,19 @@ enum Cell {
 }
 
 fn row(cells: &[Cell]) -> Row {
-    let mut columns: SmallVec<[Column; 32]> = SmallVec::new();
+    let mut columns: crate::core::row::row::RowColumns = SmallVec::new();
     for (index, cell) in cells.iter().enumerate() {
         let (bytes, column_type): (Vec<u8>, DbType) = match cell {
             Cell::Text(text) => (text.as_bytes().to_vec(), DbType::STRING),
-            Cell::Number(n) => (n.to_le_bytes().to_vec(), DbType::U64),
+            Cell::Number(n) => (
+                crate::core::value_codec::count_as_bigint(*n).to_le_bytes().to_vec(),
+                DbType::I64,
+            ),
         };
         let mut block = MEMORY_POOL.acquire(bytes.len());
         block.into_slice_mut().copy_from_slice(&bytes);
         columns.push(Column {
-            schema_id: index as u64,
+            schema_id: crate::core::row::row::schema_id_of(index as u64),
             data: block,
             column_type,
         });
