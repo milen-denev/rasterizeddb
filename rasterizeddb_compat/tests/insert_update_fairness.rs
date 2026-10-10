@@ -240,8 +240,23 @@ async fn inserts_keep_their_pace_while_another_session_updates() {
     let ratio = with as f64 / without.max(1) as f64;
     println!("inserted {with} with updates running, {without} without ({ratio:.2}); {updates} updates");
     assert!(updates >= 10, "the update stream barely ran ({updates} updates): the test proves nothing");
+    // The floor was 0.3 until the primary key got an index (2026-10-10). The
+    // same run on the commit before and after it, quiet machine:
+    //
+    //   inserts, no update running:   7,600  ->  56,900   (7.5x)
+    //   inserts, updates running:     3,550  ->   7,700   (2.2x)
+    //   updates completed:              248  ->     373
+    //   ratio:                         0.47  ->    0.14
+    //
+    // Nothing got slower; the uncontended side got faster than the contended
+    // one could. The update's `WHERE id >= … AND id < …` became a range scan,
+    // so the unlocked phase of each update is now nearly free and the update
+    // stream holds the uniqueness lock for most of its cycle. The regression
+    // this test exists for, inserts queueing behind an update's *scan*,
+    // measured 0.06 against the old, much slower baseline and would measure
+    // lower against this one, so 0.10 still catches it.
     assert!(
-        ratio >= 0.3,
+        ratio >= 0.10,
         "inserts slowed to {:.0}% of their pace while another session updated other rows \
          ({with} rows against {without})",
         ratio * 100.0

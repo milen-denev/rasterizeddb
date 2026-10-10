@@ -1265,7 +1265,10 @@ async fn the_genuine_no_ops_are_still_accepted() {
     let (_server, pool) = server().await;
 
     for sql in [
-        "CREATE INDEX idx_vac ON pms_case (id)",
+        // A plain column index is real now (see `secondary_indexes.rs`); a
+        // partial one is what stays a no-op, since an index built without its
+        // predicate would answer a different question.
+        "CREATE INDEX idx_vac ON pms_case (id) WHERE id > 0",
         "DROP INDEX idx_vac",
         "CREATE EXTENSION IF NOT EXISTS pgcrypto",
         "CREATE SCHEMA reporting",
