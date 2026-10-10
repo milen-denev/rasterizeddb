@@ -279,6 +279,17 @@ impl StorageIO for DbStorageProvider {
         }
     }
 
+    async fn abort_txn(&self, token: u64) {
+        match self {
+            Self::File(p) => p.abort_txn(token).await,
+            Self::Memory(p) => p.abort_txn(token).await,
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.abort_txn(token).await,
+            #[cfg(feature = "storage_pools")]
+            Self::Mirror(p) => p.abort_txn(token).await,
+        }
+    }
+
     fn try_borrow_range(&self, position: u64, len: usize) -> Option<super::traits::BorrowedBytes> {
         match self {
             Self::File(p) => p.try_borrow_range(position, len),

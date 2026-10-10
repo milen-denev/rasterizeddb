@@ -219,6 +219,10 @@ pub struct FreeSpace {
     /// is `#[inline]` and runs per row, while `set_enabled` fires approximately
     /// never. It should sit in each scanning core's L1 undisturbed.
     enabled: CacheGuard<AtomicBool>,
+    /// Bumped by every [`FreeSpace::set_enabled`]. Reader tickets are inert
+    /// while disabled, so a wait for readers to drain proves nothing across a
+    /// toggle; the forget sweep compares this before and after.
+    toggles: AtomicU64,
 }
 
 impl FreeSpace {
@@ -232,7 +236,13 @@ impl FreeSpace {
             reused_rows: AtomicU64::new(0),
             leaked_loans: AtomicU64::new(0),
             enabled: AtomicBool::new(enabled).into(),
+            toggles: AtomicU64::new(0),
         }
+    }
+
+    /// How many times reclamation has been switched on or off.
+    pub fn toggles(&self) -> u64 {
+        self.toggles.load(Ordering::Acquire)
     }
 
     #[inline]
@@ -445,6 +455,7 @@ impl FreeSpace {
     /// direction only — extents already published were cleared by the same
     /// call, and no new ones can appear while it stays off.
     pub fn set_enabled(&self, enabled: bool) {
+        self.toggles.fetch_add(1, Ordering::AcqRel);
         self.enabled.store(enabled, Ordering::Relaxed);
         if !enabled {
             self.clear();
@@ -523,9 +534,22 @@ impl VersionHorizon {
 
     /// Takes the bound once, for the whole sweep.
     pub fn sample(manager: &Arc<TransactionManager>) -> Self {
+        // Bounded by the oldest live snapshot as well as the oldest running
+        // transaction. `oldest_active` alone let a version through that an
+        // open snapshot still saw: a snapshot keeps the transactions running
+        // when it was taken invisible after they commit, and once they retire
+        // `oldest_active` moves past them. Vacuum freed such versions, and a
+        // scan's skip gate dropped them from the very snapshot that could see
+        // them — `zz_audit_io` case A and `vacuum-frees-visible-versions`.
+        //
+        // Read in this order: a snapshot registered after `oldest_active` is
+        // read had, when taken, an `xmin` at or above it, so the first read
+        // already bounds it; one registered before is in the second.
+        let running = manager.oldest_active();
+        let snapshots = manager.oldest_snapshot_xmin().unwrap_or(TxId::MAX);
         Self {
             manager: Some(manager.clone()),
-            oldest_active: manager.oldest_active(),
+            oldest_active: running.min(snapshots),
         }
     }
 
@@ -662,6 +686,10 @@ pub struct CompactReport {
     /// Set when the provider cannot truncate: everything was still compacted
     /// into the front of the files, but the tail stays allocated.
     pub truncation_unsupported: bool,
+    /// Why the tails were kept although the provider could have truncated
+    /// them — the log could not be checkpointed. `VACUUM FULL` still succeeds
+    /// and tells its client with a WARNING (SQLSTATE 01000).
+    pub truncation_skipped: Option<&'static str>,
 }
 
 /// One live row's pointer, and where its record sits.
@@ -773,6 +801,15 @@ pub struct VacuumReport {
     /// Filter slots whose fingerprints this sweep cleared, having just
     /// established that no snapshot can reach their version.
     pub fingerprints_cleared: u64,
+    /// Versions a deleter has stamped that the horizon still protects: their
+    /// `xmax` is at or above `oldest_active`, so some transaction may yet see
+    /// them. They are dead stamps the next sweep can reclaim once the horizon
+    /// passes them, which is what lets the service re-sweep for them without
+    /// waiting for new writes.
+    pub held_rows: u64,
+    /// The lowest `xmax` among `held_rows`, or `NO_TX` if there are none. The
+    /// horizon passing it is the earliest point a re-sweep can find any of them.
+    pub held_min_xmax: TxId,
 }
 
 impl VacuumReport {
@@ -797,6 +834,9 @@ pub struct VacuumStats {
     pub last_live_bytes: AtomicU64,
     pub last_reclaimed_bytes: AtomicU64,
     pub total_reclaimed_bytes: AtomicU64,
+    /// `VACUUM FULL` runs that compacted but could not give the space back,
+    /// because the log could not be checkpointed.
+    pub full_untruncated: AtomicU64,
 }
 
 impl VacuumStats {
@@ -845,6 +885,8 @@ struct ScanResult {
     slots: u64,
     live_rows: u64,
     dead_rows: u64,
+    held_rows: u64,
+    held_min_xmax: TxId,
     live_bytes: u64,
     live: Vec<Extent>,
     /// Extents of tombstoned rows. Always collected: they are the starting
@@ -932,6 +974,8 @@ async fn scan_pointers<S: StorageIO>(
         slots: 0,
         live_rows: 0,
         dead_rows: 0,
+        held_rows: 0,
+        held_min_xmax: NO_TX,
         live_bytes: 0,
         live: Vec::new(),
         dead: Vec::new(),
@@ -963,7 +1007,7 @@ async fn scan_pointers<S: StorageIO>(
         if horizon.is_reclaimable(pointer.deleted, pointer.xmin, pointer.xmax) {
             result.dead_rows += 1;
             if let Some(extent) = extent {
-                result.dead.push(extent);
+                push_dead(&mut result.dead, extent);
             }
 
             // The filter keeps a dead version's fingerprints until nothing can
@@ -983,6 +1027,19 @@ async fn scan_pointers<S: StorageIO>(
                 result.fingerprints_cleared += 1;
             }
         } else {
+            // Stamped by a deleter the horizon has not passed — in flight, or
+            // committed while an older transaction runs. An aborted deleter
+            // below the horizon is a live row and is not counted, or a table
+            // with old aborted deletes would look permanently due.
+            if horizon.is_versioned()
+                && pointer.xmax != NO_TX
+                && pointer.xmax >= horizon.oldest_active()
+            {
+                result.held_rows += 1;
+                if result.held_min_xmax == NO_TX || pointer.xmax < result.held_min_xmax {
+                    result.held_min_xmax = pointer.xmax;
+                }
+            }
             result.live_rows += 1;
             result.live_bytes += pointer.length as u64;
             if !result.live_map_dropped {
@@ -999,6 +1056,35 @@ async fn scan_pointers<S: StorageIO>(
     .await?;
 
     Ok(result)
+}
+
+/// Appends a reclaimable extent to the sweep's dead list, coalescing as it
+/// goes.
+///
+/// The list used to take 16 bytes per reclaimable slot per run, unbounded — a
+/// table with ten million dead versions held a 160 MB vector for every sweep.
+/// Pointers are visited in slot order and rows are appended in roughly that
+/// order, so a bulk delete arrives as a run of adjacent extents and folds into
+/// one entry here. Extents that arrive out of order are coalesced by a full
+/// sort-and-merge whenever the list doubles past its last merged size, which
+/// bounds it by the number of *distinct* holes rather than dead rows.
+///
+/// The result is the same set of bytes `merge_overlapping` would produce from
+/// the unmerged list; `run_once` still merges it before use.
+fn push_dead(dead: &mut Vec<Extent>, extent: Extent) {
+    if let Some(last) = dead.last_mut() {
+        if extent.start >= last.start && extent.start <= last.end() {
+            let end = last.end().max(extent.end());
+            last.len = end - last.start;
+            return;
+        }
+    }
+    dead.push(extent);
+    const MERGE_FLOOR: usize = 1 << 16;
+    if dead.len() >= MERGE_FLOOR && dead.len().is_power_of_two() {
+        let merged = merge_overlapping(std::mem::take(dead));
+        *dead = merged;
+    }
 }
 
 /// Second pass for the capped path: the live extents that overlap `dead`.
@@ -1135,6 +1221,32 @@ pub struct VacuumConfig {
     /// dead space from tombstones instead. Exposed so the capped path can be
     /// exercised without building a table large enough to trip it naturally.
     pub max_tracked_live_extents: usize,
+    /// When the background service sweeps at all: once the dead stamps written
+    /// since its last sweep reach `min(base + ratio × slots, max)` — the shape
+    /// of PostgreSQL's `autovacuum_vacuum_threshold`, `…_scale_factor` and
+    /// (PG 18) `…_max_threshold`.
+    ///
+    /// The `min_dead_*` thresholds above gate only *publishing*, after a sweep
+    /// has already read every pointer record. Before this, any `DELETE` or
+    /// `UPDATE` at all made the next tick re-read the whole pointer file — a
+    /// ten-million-row table taking one update a minute re-read 370 MB every
+    /// 30 s to find one dead row.
+    ///
+    /// The ratio is lower than PostgreSQL's 0.2 because a sweep here reads 37
+    /// bytes per slot rather than a heap page per tuple, and because publishing
+    /// still waits for `min_dead_ratio`/`min_dead_bytes`: sweeping at 5 % costs
+    /// little and catches the 8 MiB case on large tables.
+    pub sweep_threshold_base: u64,
+    pub sweep_threshold_ratio: f64,
+    pub sweep_threshold_max: u64,
+}
+
+impl VacuumConfig {
+    /// Dead stamps that make a table of `slots` pointer records due.
+    pub fn sweep_threshold(&self, slots: u64) -> u64 {
+        let scaled = self.sweep_threshold_base as f64 + self.sweep_threshold_ratio * slots as f64;
+        (scaled as u64).min(self.sweep_threshold_max).max(1)
+    }
 }
 
 impl Default for VacuumConfig {
@@ -1145,6 +1257,9 @@ impl Default for VacuumConfig {
             min_dead_ratio: crate::vacuum_min_dead_ratio(),
             drain_timeout: std::time::Duration::from_secs(crate::vacuum_drain_timeout_secs()),
             max_tracked_live_extents: MAX_TRACKED_LIVE_EXTENTS,
+            sweep_threshold_base: 50,
+            sweep_threshold_ratio: 0.05,
+            sweep_threshold_max: 100_000,
         }
     }
 }
@@ -1222,6 +1337,8 @@ pub async fn run_once<S: StorageIO>(
         extents: candidates.len() as u64,
         deferred: false,
         fingerprints_cleared: scan.fingerprints_cleared,
+        held_rows: scan.held_rows,
+        held_min_xmax: scan.held_min_xmax,
     };
 
     if !force {
@@ -1306,6 +1423,10 @@ pub struct VacuumService<S: StorageIO> {
     /// Bumped by every committed `DELETE` and `UPDATE`. Nothing else can create
     /// dead space, so an unchanged value means there is nothing new to find.
     pub mutations: Arc<CacheGuard<AtomicU64>>,
+    /// Versions stamped dead by the write path — one per row a `DELETE`
+    /// removed or an `UPDATE` replaced. Monotonic; the service compares it with
+    /// its value at the last sweep against [`VacuumConfig::sweep_threshold`].
+    pub dead_stamps: Arc<AtomicU64>,
     /// Picked up whenever it is set: the service starts before versioning can
     /// be wired, so it cannot take a horizon once and keep it.
     pub versions: Arc<arc_swap::ArcSwapOption<TransactionManager>>,
@@ -1315,6 +1436,13 @@ pub struct VacuumService<S: StorageIO> {
     pub filters: Option<Arc<TableFilters>>,
     pub cleared_below: Arc<CacheGuard<AtomicU64>>,
     pub config: VacuumConfig,
+    /// The table's write lock, compaction gate and cache generation, for the
+    /// forget sweep. See [`neutralize_aborted`].
+    pub write_lock: Arc<tokio::sync::Mutex<()>>,
+    pub compaction_gate: Arc<tokio::sync::RwLock<()>>,
+    pub cache_generation: Arc<CacheGuard<AtomicU64>>,
+    /// Set when versioning is enabled.
+    pub forget: Arc<std::sync::OnceLock<crate::core::mvcc::transaction::ForgetHandle>>,
 }
 
 impl<S: StorageIO> VacuumService<S> {
@@ -1329,6 +1457,11 @@ impl<S: StorageIO> VacuumService<S> {
             // scans — a table opened with tombstones already on disk has dead
             // space that no mutation of ours will ever announce.
             let mut scanned_at_mutation = u64::MAX;
+            // The dead-stamp count as of the last completed sweep, and what that
+            // sweep found stamped but still protected by the horizon.
+            let mut stamps_at_sweep = 0u64;
+            let mut held_rows = 0u64;
+            let mut held_min_xmax: TxId = NO_TX;
 
             loop {
                 if !sleep_until_due(self.config.interval, &self.alive).await {
@@ -1338,15 +1471,88 @@ impl<S: StorageIO> VacuumService<S> {
                     continue;
                 }
 
+                // Forgetting: every FORGET_STEP ids, prove this table free of
+                // the non-committed ids below the settle bound. A table that
+                // never does pins the database's forgotten horizon.
+                if let (Some(manager), Some(handle)) =
+                    (self.versions.load_full(), self.forget.get())
+                {
+                    if manager.status().settles()
+                        && manager.settle_bound().saturating_sub(handle.horizon()) >= FORGET_STEP
+                    {
+                        if let Some(_permit) = sweep_scheduler().acquire(1.0, &self.alive).await {
+                            let parts = NeutralizeParts {
+                                io_pointers: &*self.io_pointers,
+                                write_lock: &self.write_lock,
+                                compaction_gate: &self.compaction_gate,
+                                readers: &self.readers,
+                                free_space: &self.free_space,
+                                cache_generation: &self.cache_generation,
+                                dead_stamps: &self.dead_stamps,
+                                drain_timeout: self.config.drain_timeout,
+                            };
+                            match neutralize_aborted(&parts, &manager, handle).await {
+                                Ok(report) if report.tombstoned + report.cleared > 0 => info!(
+                                    "Forget sweep on {}: {} tombstoned, {} cleared, horizon {:?}",
+                                    self.table_name,
+                                    report.tombstoned,
+                                    report.cleared,
+                                    report.advanced_to
+                                ),
+                                Ok(_) => {}
+                                Err(e) => log::error!(
+                                    "Forget sweep failed for {}: {}",
+                                    self.table_name,
+                                    e
+                                ),
+                            }
+                        }
+                    }
+                }
+
                 // A table that is only read, or only appended to, gains no dead
                 // space. Re-reading its whole pointer file every tick would be
                 // pure cost — and on a large table, not a small one. Outstanding
                 // loans still force a scan: they are what retires them.
                 let mutations_now = self.mutations.load(Ordering::Acquire);
-                if mutations_now == scanned_at_mutation && self.free_space.loans_outstanding() == 0
-                {
-                    continue;
+                let stamps_now = self.dead_stamps.load(Ordering::Acquire);
+                let first = scanned_at_mutation == u64::MAX;
+                let loans = self.free_space.loans_outstanding() > 0;
+                // How far over its threshold this table is, for the shared
+                // ordering below. A first sweep or outstanding loans are due
+                // regardless and rank as exactly due.
+                let mut priority = 1.0f64;
+                if !first && !loans {
+                    // Stamps the last sweep had to leave because the horizon
+                    // still protected them become findable once it passes the
+                    // oldest of them — with or without any new write.
+                    let released = held_rows > 0
+                        && self
+                            .versions
+                            .load_full()
+                            .is_some_and(|m| VersionHorizon::sample(&m).oldest_active() > held_min_xmax);
+                    if mutations_now == scanned_at_mutation && !released {
+                        continue;
+                    }
+                    // Is there enough dead space to be worth a full read of the
+                    // pointer file? Dead stamps since the last sweep, plus the
+                    // released ones.
+                    let slots = self.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
+                    let threshold = self.config.sweep_threshold(slots);
+                    let fresh = stamps_now.saturating_sub(stamps_at_sweep);
+                    let due = fresh >= threshold || (released && fresh + held_rows >= threshold);
+                    if !due {
+                        continue;
+                    }
+                    let counted = if released { fresh + held_rows } else { fresh };
+                    priority = counted as f64 / threshold as f64;
                 }
+
+                // One sweep at a time per few tables, furthest over threshold
+                // first. The permit is held for the sweep and released on drop.
+                let Some(_permit) = sweep_scheduler().acquire(priority, &self.alive).await else {
+                    break;
+                };
 
                 let horizon = match self.versions.load_full() {
                     Some(manager) => VersionHorizon::sample(&manager),
@@ -1386,6 +1592,9 @@ impl<S: StorageIO> VacuumService<S> {
                         // seen everything; a deferred one must try again.
                         if !report.deferred {
                             scanned_at_mutation = mutations_now;
+                            stamps_at_sweep = stamps_now;
+                            held_rows = report.held_rows;
+                            held_min_xmax = report.held_min_xmax;
                         }
                         if report.reclaimed_bytes > 0 {
                             info!(
@@ -1406,6 +1615,332 @@ impl<S: StorageIO> VacuumService<S> {
 
             log::debug!("Vacuum service for {} stopped", self.table_name);
         });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Forgetting aborted ids
+// ---------------------------------------------------------------------------
+
+/// Ids a table's forget horizon has to fall behind before its service sweeps
+/// for it again. A sweep reads the whole pointer file, like a reclamation
+/// sweep, so it is paced by transactions rather than by the clock.
+pub const FORGET_STEP: u64 = 1 << 20;
+
+/// What one forget sweep did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct NeutralizeReport {
+    /// Pointer records read.
+    pub scanned: u64,
+    /// Versions whose creator did not commit, tombstoned.
+    pub tombstoned: u64,
+    /// Live versions whose deleter did not commit, the stamp cleared.
+    pub cleared: u64,
+    /// The horizon the table advanced to, if it did.
+    pub advanced_to: Option<TxId>,
+}
+
+/// The pieces of a table a forget sweep needs.
+pub struct NeutralizeParts<'a, S: StorageIO> {
+    pub io_pointers: &'a S,
+    /// The table's write lock: every rewrite of an existing pointer record —
+    /// `DELETE`, `UPDATE`, a uniqueness check's read — holds it, so a stamp
+    /// cleared here can never race one being written.
+    pub write_lock: &'a tokio::sync::Mutex<()>,
+    /// Held shared for the sweep: compaction moves records.
+    pub compaction_gate: &'a tokio::sync::RwLock<()>,
+    pub readers: &'a ReaderRegistry,
+    pub free_space: &'a FreeSpace,
+    /// Bumped after a rewrite, so no cached answer built from the old records
+    /// is served.
+    pub cache_generation: &'a AtomicU64,
+    /// Tombstoned versions are dead space; counted so a reclamation sweep
+    /// follows. Aborted inserts were never counted anywhere else.
+    pub dead_stamps: &'a AtomicU64,
+    pub drain_timeout: std::time::Duration,
+}
+
+/// Whether `pointer` carries the id of a transaction below `bound` that did
+/// not commit, and so must be rewritten before that id can be forgotten.
+fn carries_unfinished(pointer: &RowPointer, bound: TxId, manager: &TransactionManager) -> (bool, bool) {
+    if pointer.deleted {
+        return (false, false);
+    }
+    let unfinished = |id: TxId| {
+        id != NO_TX && id != FROZEN_TX && id < bound && manager.outcome(id) != TxOutcome::Committed
+    };
+    (unfinished(pointer.xmin), unfinished(pointer.xmax))
+}
+
+/// Proves a table free of every non-committed id below the settle bound, so
+/// the status log may forget them — the vacuum half of [`TransactionManager`]'s
+/// forget registry.
+///
+/// 1. `bound` is read first: `TransactionManager::settle_bound`, at or below
+///    every running transaction. Every id under it is final, and every record
+///    written from now on carries an id at or above it — including records
+///    appended past the length this sweep reads.
+/// 2. A read pass finds the records carrying a non-committed id under it: a
+///    version whose creator aborted (or crashed) is tombstoned, and a live
+///    version whose deleter did not commit has `xmax` cleared. Both are what
+///    the visibility rule already concluded from the outcome; the rewrite
+///    makes it so without the outcome.
+/// 3. Each batch is rewritten under the table's write lock, re-reading the
+///    record there, in one storage transaction committed durably.
+/// 4. Readers that might hold a pointer read before the rewrite drain.
+/// 5. Only then does the table's horizon move, and the registry may forget.
+///
+/// Returns without advancing whenever that chain cannot be completed: the
+/// horizon pins, which is safe.
+pub async fn neutralize_aborted<S: StorageIO>(
+    parts: &NeutralizeParts<'_, S>,
+    manager: &Arc<TransactionManager>,
+    handle: &crate::core::mvcc::transaction::ForgetHandle,
+) -> std::io::Result<NeutralizeReport> {
+    let mut report = NeutralizeReport::default();
+    if !manager.status().settles() || !parts.free_space.is_enabled() {
+        return Ok(report);
+    }
+    let toggles = parts.free_space.toggles();
+    let bound = manager.settle_bound();
+    if bound <= handle.horizon() {
+        return Ok(report);
+    }
+    let _gate = parts.compaction_gate.read().await;
+
+    // 2. Find them.
+    let mut candidates: Vec<u64> = Vec::new();
+    let mut slot = 0u64;
+    sweep_pointers(parts.io_pointers, |pointer| {
+        let (bad_xmin, bad_xmax) = carries_unfinished(pointer, bound, manager);
+        if bad_xmin || bad_xmax {
+            candidates.push(slot * ROW_POINTER_RECORD_LEN as u64);
+        }
+        slot += 1;
+    })
+    .await?;
+    report.scanned = slot;
+
+    // 3. Rewrite them.
+    let mut record = vec![0u8; ROW_POINTER_RECORD_LEN];
+    for batch in candidates.chunks(1024) {
+        let _write = parts.write_lock.lock().await;
+        let txn = parts.io_pointers.begin_txn();
+        let mut token = txn;
+        let mut wrote = false;
+        for &position in batch {
+            let mut at = position;
+            parts.io_pointers.read_data_into_buffer(&mut at, &mut record).await?;
+            let mut pointer = RowPointer::from_slice_unknown(&record);
+            let (bad_xmin, bad_xmax) = carries_unfinished(&pointer, bound, manager);
+            if bad_xmin {
+                pointer.deleted = true;
+                pointer.xmax = NO_TX;
+                report.tombstoned += 1;
+            } else if bad_xmax {
+                pointer.xmax = NO_TX;
+                report.cleared += 1;
+            } else {
+                continue;
+            }
+            match pointer.save_at_in_txn(parts.io_pointers, position, txn).await {
+                Ok(t) => {
+                    token = t;
+                    wrote = true;
+                }
+                Err(e) => {
+                    parts.io_pointers.abort_txn(txn).await;
+                    return Err(std::io::Error::other(e.to_string()));
+                }
+            }
+        }
+        if wrote {
+            parts.io_pointers.commit_durable(token).await?;
+            parts.cache_generation.fetch_add(1, Ordering::AcqRel);
+        } else {
+            parts.io_pointers.abort_txn(txn).await;
+        }
+    }
+    parts
+        .dead_stamps
+        .fetch_add(report.tombstoned, Ordering::Relaxed);
+
+    // 4. Readers that could hold a pointer from before the rewrite.
+    let barrier = parts.readers.barrier();
+    let deadline = std::time::Instant::now() + parts.drain_timeout;
+    while !parts.readers.drained_past(barrier) {
+        if std::time::Instant::now() >= deadline {
+            return Ok(report);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    // Reader tickets mean nothing across a toggle of reclamation.
+    if !parts.free_space.is_enabled() || parts.free_space.toggles() != toggles {
+        return Ok(report);
+    }
+
+    // 5.
+    handle.advance(bound);
+    report.advanced_to = Some(bound);
+    manager.try_forget();
+    Ok(report)
+}
+
+/// How many tables may sweep at once, process-wide.
+///
+/// Every table runs its own service on the same interval, so a database with
+/// a few hundred tables opened together would otherwise read every pointer
+/// file at once each tick it had work for. Bounded, and ordered by how far
+/// over its threshold each table is (PostgreSQL d7965d65f), so the worst table
+/// goes first. Correctness does not depend on when a sweep runs — only on
+/// what it reads — so delaying one changes nothing but its timing.
+pub const DEFAULT_CONCURRENT_SWEEPS: usize = 2;
+
+static SWEEP_SCHEDULER: std::sync::OnceLock<SweepScheduler> = std::sync::OnceLock::new();
+
+/// The process-wide sweep scheduler.
+pub fn sweep_scheduler() -> &'static SweepScheduler {
+    SWEEP_SCHEDULER.get_or_init(|| SweepScheduler::new(DEFAULT_CONCURRENT_SWEEPS))
+}
+
+/// Grants sweep permits, at most `max` at once, highest priority first.
+pub struct SweepScheduler {
+    inner: Mutex<SchedulerState>,
+    max: usize,
+    /// Most permits ever out at once. Observability: what the bound bounds.
+    peak: AtomicUsize,
+    granted: AtomicU64,
+}
+
+struct SchedulerState {
+    running: usize,
+    seq: u64,
+    /// `(priority, arrival, wake)`. Few entries — one per table that is due —
+    /// so a linear scan for the best beats a heap's bookkeeping.
+    queue: Vec<(f64, u64, tokio::sync::oneshot::Sender<()>)>,
+}
+
+/// A granted sweep. Dropping it hands the slot to the best waiter.
+pub struct SweepPermit<'a> {
+    scheduler: &'a SweepScheduler,
+}
+
+impl SweepScheduler {
+    pub fn new(max: usize) -> Self {
+        SweepScheduler {
+            inner: Mutex::new(SchedulerState {
+                running: 0,
+                seq: 0,
+                queue: Vec::new(),
+            }),
+            max: max.max(1),
+            peak: AtomicUsize::new(0),
+            granted: AtomicU64::new(0),
+        }
+    }
+
+    fn note_grant(&self, running: usize) {
+        self.peak.fetch_max(running, Ordering::Relaxed);
+        self.granted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Waits for a permit. `None` if `alive` goes false while waiting — the
+    /// table was dropped and its service is stopping.
+    pub async fn acquire(&self, priority: f64, alive: &AtomicBool) -> Option<SweepPermit<'_>> {
+        let (seq, mut wake) = {
+            let mut state = self.inner.lock();
+            if state.running < self.max && state.queue.is_empty() {
+                state.running += 1;
+                self.note_grant(state.running);
+                return Some(SweepPermit { scheduler: self });
+            }
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            state.seq += 1;
+            let seq = state.seq;
+            state.queue.push((priority, seq, tx));
+            (seq, rx)
+        };
+        loop {
+            tokio::select! {
+                granted = &mut wake => {
+                    // A sender is only dropped unsent by `release` when it
+                    // failed to send, which needs this receiver gone; so here
+                    // it was sent.
+                    let _ = granted;
+                    return Some(SweepPermit { scheduler: self });
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
+                    if alive.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    let mut state = self.inner.lock();
+                    if let Some(at) = state.queue.iter().position(|(_, s, _)| *s == seq) {
+                        state.queue.remove(at);
+                        return None;
+                    }
+                    drop(state);
+                    // Granted in the meantime: take it and give it straight back.
+                    if wake.try_recv().is_ok() {
+                        drop(SweepPermit { scheduler: self });
+                    }
+                    return None;
+                }
+            }
+        }
+    }
+
+    fn release(&self) {
+        let mut state = self.inner.lock();
+        loop {
+            // Highest priority; among equals, the one that has waited longest.
+            let best = state
+                .queue
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| {
+                    a.0.partial_cmp(&b.0)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(b.1.cmp(&a.1))
+                })
+                .map(|(i, _)| i);
+            let Some(index) = best else {
+                state.running -= 1;
+                return;
+            };
+            let (_, _, wake) = state.queue.swap_remove(index);
+            if wake.send(()).is_ok() {
+                // The slot passes on; `running` is unchanged.
+                self.note_grant(state.running);
+                return;
+            }
+            // That waiter is gone; try the next.
+        }
+    }
+
+    /// Waiters in the queue now.
+    pub fn queued(&self) -> usize {
+        self.inner.lock().queue.len()
+    }
+
+    /// Permits out now.
+    pub fn running(&self) -> usize {
+        self.inner.lock().running
+    }
+
+    /// Most permits ever out at once.
+    pub fn peak(&self) -> usize {
+        self.peak.load(Ordering::Relaxed)
+    }
+
+    /// Permits granted since start.
+    pub fn granted(&self) -> u64 {
+        self.granted.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for SweepPermit<'_> {
+    fn drop(&mut self) {
+        self.scheduler.release();
     }
 }
 
@@ -2056,5 +2591,248 @@ mod tests {
         let _t = ReadTicket::inert();
         assert!(reg.drained_past(barrier));
         assert_eq!(reg.oldest_active(), None);
+    }
+
+    #[test]
+    fn the_sweep_threshold_scales_with_the_table_and_is_capped() {
+        let config = VacuumConfig::default();
+        assert_eq!(config.sweep_threshold(0), 50);
+        assert_eq!(config.sweep_threshold(1_000), 100);
+        assert_eq!(config.sweep_threshold(1_000_000), 50_050);
+        // Ten million slots would be half a million at 5 %; the cap holds it
+        // to a sweep per hundred thousand dead versions.
+        assert_eq!(config.sweep_threshold(10_000_000), 100_000);
+        let never_zero = VacuumConfig {
+            sweep_threshold_base: 0,
+            sweep_threshold_ratio: 0.0,
+            ..Default::default()
+        };
+        assert_eq!(never_zero.sweep_threshold(5), 1);
+    }
+
+    #[test]
+    fn coalescing_while_collecting_gives_the_same_bytes_as_merging_after() {
+        // Generated extent streams: runs of adjacent extents (a bulk delete),
+        // out-of-order ones (rows placed into reclaimed holes), duplicates and
+        // overlaps, with enough of them to cross the periodic full merge.
+        let mut rng = 0xD1B5_4A32_D192_ED03u64;
+        let mut next = |bound: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % bound
+        };
+        for round in 0..40 {
+            let n = if round % 4 == 0 { 200_000 } else { 2_000 };
+            let mut stream = Vec::with_capacity(n);
+            let mut cursor = 0u64;
+            for _ in 0..n {
+                let len = 1 + next(64);
+                let start = match next(10) {
+                    0..=5 => cursor,                 // adjacent
+                    6 => cursor + next(32),          // small gap
+                    7 => next(cursor.max(1)),        // out of order, earlier
+                    8 => cursor.saturating_sub(next(16)), // overlap
+                    _ => cursor + 1000 + next(5000), // far ahead
+                };
+                cursor = cursor.max(start + len);
+                stream.push(e(start, len));
+            }
+            let mut collected = Vec::new();
+            for extent in &stream {
+                push_dead(&mut collected, *extent);
+            }
+            assert_eq!(
+                merge_overlapping(collected),
+                merge_overlapping(stream),
+                "round {}",
+                round
+            );
+        }
+    }
+
+    #[test]
+    fn a_bulk_delete_collects_into_one_extent() {
+        let mut dead = Vec::new();
+        for i in 0..1_000_000u64 {
+            push_dead(&mut dead, e(i * 40, 40));
+        }
+        assert_eq!(dead, vec![e(0, 40_000_000)]);
+    }
+
+    /// No more than `max` sweeps at once, and a queue drains worst-first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_scheduler_bounds_sweeps_and_takes_the_worst_table_first() {
+        // One slot, so each grant waits for the previous holder to finish and
+        // the order they record is the order they were granted in.
+        let scheduler = std::sync::Arc::new(SweepScheduler::new(1));
+        let alive = std::sync::Arc::new(AtomicBool::new(true));
+        let order = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let concurrent = std::sync::Arc::new(AtomicUsize::new(0));
+        let max_seen = std::sync::Arc::new(AtomicUsize::new(0));
+
+        // One holds the slot first, so everything after queues.
+        let first = scheduler.acquire(1.0, &alive).await.unwrap();
+        let mut handles = Vec::new();
+        for (i, priority) in [1.5f64, 9.0, 3.0, 1.0, 6.0, 9.0].into_iter().enumerate() {
+            let (s, a, o, c, m) = (
+                scheduler.clone(),
+                alive.clone(),
+                order.clone(),
+                concurrent.clone(),
+                max_seen.clone(),
+            );
+            handles.push(tokio::spawn(async move {
+                let _permit = s.acquire(priority, &a).await.unwrap();
+                let now = c.fetch_add(1, Ordering::SeqCst) + 1;
+                m.fetch_max(now, Ordering::SeqCst);
+                o.lock().push((priority, i));
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                c.fetch_sub(1, Ordering::SeqCst);
+            }));
+            // Arrival order is part of the tie-break, so make it definite: the
+            // next waiter is not started until this one is in the queue.
+            while scheduler.queued() < i + 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        }
+        drop(first);
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert_eq!(max_seen.load(Ordering::SeqCst), 1);
+        assert_eq!(scheduler.peak(), 1);
+        assert_eq!(scheduler.running(), 0);
+        let order: Vec<(f64, usize)> = order.lock().clone();
+        // Descending priority; the two 9.0s earlier arrival first.
+        let priorities: Vec<f64> = order.iter().map(|(p, _)| *p).collect();
+        assert_eq!(priorities, vec![9.0, 9.0, 6.0, 3.0, 1.5, 1.0], "{:?}", order);
+        assert_eq!(order[0].1, 1, "ties go to the earlier arrival");
+    }
+
+    /// With more waiters than slots, no more than the bound ever sweep at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_scheduler_never_exceeds_its_bound() {
+        let scheduler = std::sync::Arc::new(SweepScheduler::new(2));
+        let alive = std::sync::Arc::new(AtomicBool::new(true));
+        let concurrent = std::sync::Arc::new(AtomicUsize::new(0));
+        let max_seen = std::sync::Arc::new(AtomicUsize::new(0));
+        let handles: Vec<_> = (0..12)
+            .map(|i| {
+                let (s, a, c, m) = (
+                    scheduler.clone(),
+                    alive.clone(),
+                    concurrent.clone(),
+                    max_seen.clone(),
+                );
+                tokio::spawn(async move {
+                    let _permit = s.acquire(i as f64, &a).await.unwrap();
+                    let now = c.fetch_add(1, Ordering::SeqCst) + 1;
+                    m.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    c.fetch_sub(1, Ordering::SeqCst);
+                })
+            })
+            .collect();
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert!(max_seen.load(Ordering::SeqCst) <= 2);
+        assert!(scheduler.peak() <= 2);
+        assert_eq!(scheduler.granted(), 12);
+        assert_eq!(scheduler.running(), 0);
+    }
+
+    /// A service whose table is dropped while it waits leaves the queue, and
+    /// its slot — if it was handed one meanwhile — goes to the next waiter.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_tables_wait_leaves_the_queue() {
+        let scheduler = std::sync::Arc::new(SweepScheduler::new(1));
+        let alive = AtomicBool::new(true);
+        let held = scheduler.acquire(1.0, &alive).await.unwrap();
+        let dead = std::sync::Arc::new(AtomicBool::new(true));
+        let (s, d) = (scheduler.clone(), dead.clone());
+        let waiter = tokio::spawn(async move { s.acquire(5.0, &d).await.is_some() });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        dead.store(false, Ordering::Release);
+        assert!(!waiter.await.unwrap(), "a stopped service gets no permit");
+        drop(held);
+        assert_eq!(scheduler.running(), 0);
+        assert!(scheduler.acquire(1.0, &alive).await.is_some());
+    }
+
+    /// The ordering in `vacuum-frees-visible-versions`: the deleter begins,
+    /// the reader begins and snapshots while the deleter runs, the deleter
+    /// commits. The reader's snapshot still sees the version; the horizon must
+    /// not call it reclaimable until that snapshot is gone.
+    #[test]
+    fn a_version_an_open_snapshot_sees_is_not_reclaimable() {
+        let m = Arc::new(TransactionManager::in_memory());
+        let deleter = m.begin();
+        let reader = m.begin();
+        let snapshot = m.snapshot(reader);
+        m.commit(deleter);
+        assert!(deleter < m.oldest_active(), "the deleter has retired");
+        assert!(
+            snapshot.sees(FROZEN_TX, deleter, &|id| m.outcome(id)),
+            "the reader's snapshot still sees the version"
+        );
+
+        let horizon = VersionHorizon::sample(&m);
+        assert!(
+            !horizon.is_reclaimable(false, FROZEN_TX, deleter),
+            "reclaimable while an open snapshot sees it (horizon {:?})",
+            horizon
+        );
+        // A plain statement's snapshot outside any transaction pins it too —
+        // it is in no running set, so `oldest_active` never knew of it.
+        let plain = m.snapshot(NO_TX);
+        drop(snapshot);
+        m.commit(reader);
+        let later = m.begin();
+        let stamped_after = later;
+        m.commit(later);
+        let horizon = VersionHorizon::sample(&m);
+        assert!(
+            !horizon.is_reclaimable(false, FROZEN_TX, stamped_after),
+            "a delete after the plain snapshot was taken is visible to it"
+        );
+        drop(plain);
+        // Every snapshot gone: now it is reclaimable.
+        let horizon = VersionHorizon::sample(&m);
+        assert!(horizon.is_reclaimable(false, FROZEN_TX, deleter));
+        assert!(horizon.is_reclaimable(false, FROZEN_TX, stamped_after));
+        assert_eq!(m.live_snapshots(), 0);
+    }
+
+    /// The horizon a scan samples never moves backwards, which the sweep's
+    /// `cleared_below` bookkeeping relies on.
+    #[test]
+    fn the_horizon_never_moves_backwards() {
+        let m = Arc::new(TransactionManager::in_memory());
+        let mut last = 0;
+        let mut held: Vec<crate::core::mvcc::transaction::Snapshot> = Vec::new();
+        let mut running: Vec<TxId> = Vec::new();
+        let mut rng = 0x1234_5678_9ABC_DEF1u64;
+        for _ in 0..20_000 {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            match rng % 6 {
+                0 | 1 => running.push(m.begin()),
+                2 if !running.is_empty() => {
+                    let tx = running.remove((rng as usize / 7) % running.len());
+                    m.commit(tx);
+                }
+                3 => held.push(m.snapshot(running.last().copied().unwrap_or(NO_TX))),
+                4 if !held.is_empty() => {
+                    held.remove((rng as usize / 11) % held.len());
+                }
+                _ => {}
+            }
+            let now = VersionHorizon::sample(&m).oldest_active();
+            assert!(now >= last, "horizon went from {} back to {}", last, now);
+            last = now;
+        }
     }
 }

@@ -173,6 +173,19 @@ pub trait StorageIO: Clone + Sync + Send + 'static {
         async move { Ok(()) }
     }
 
+    /// Rolls back `token`, a transaction that will not be committed: its
+    /// writes are taken back out and the provider stops holding anything for
+    /// it. The default does nothing, which is right for a provider whose
+    /// replay already discards a transaction that never reached its commit.
+    ///
+    /// For a transaction whose commit was never attempted. A failed
+    /// [`StorageIO::commit_durable`] has already settled the transaction one
+    /// way or the other; calling this afterwards could roll back one that in
+    /// fact committed.
+    fn abort_txn(&self, _token: u64) -> impl Future<Output = ()> + Send + Sync {
+        async move {}
+    }
+
     /// Borrows `len` bytes at `position` directly from the backing store.
     ///
     /// Returns `None` whenever the range cannot be served as one contiguous,
