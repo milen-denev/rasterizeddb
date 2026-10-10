@@ -50,8 +50,9 @@ does not carry its code, its dependencies, or its match arms. The current
 default set turns most of them on:
 
 ```toml
-default = ["memory_pool_reuse", "replication_compression",
-           "s3_backup", "pg_import", "storage_pools"]
+default = ["memory_pool_reuse", "replication_compression", "s3_backup",
+           "pg_import", "storage_pools", "kv_storage", "kv_storage_s3",
+           "query_stats", "kv_cache"]
 ```
 
 | Feature | Default | What it adds |
@@ -59,8 +60,10 @@ default = ["memory_pool_reuse", "replication_compression",
 | `s3_backup` | on | Backup, restore and PITR to an object store, and the `BACKUP`/`RESTORE` statements |
 | `pg_import` | on | The PostgreSQL frontend client and `IMPORT DATABASE FROM POSTGRES` |
 | `storage_pools` | on | Multi-directory placement, mirroring, and the `STORAGE` statements |
-| `kv_storage` | off | A table kept in a key/value store rather than in files, and the `kv:` placement spec |
-| `kv_storage_s3` | off | The S3 backing store for `kv_storage`. Implies `kv_storage` and `s3_backup` |
+| `kv_storage` | on | A table kept in a key/value store rather than in files, and the `kv:` placement spec |
+| `kv_storage_s3` | on | The S3 backing store for `kv_storage`. Implies `kv_storage` and `s3_backup` |
+| `kv_cache` | on | A Redis-compatible key/value store: `KV …` statements, and the Redis protocol on `--kv-port` |
+| `query_stats` | on | `SHOW QUERIES`, `SHOW QUERY STATS` and `pg_stat_statements` |
 | `replication_compression` | on | Zstd on replication links; a node without it still interoperates, uncompressed |
 | `memory_pool_reuse` | on | Thread-local free lists in the buffer pool |
 | `enable_long_row` | off | Rows above the standard width cap |
@@ -582,6 +585,27 @@ omissions — a snapshot logs what it excluded instead of quietly leaving it out
 See [docs/kv-storage.md](docs/kv-storage.md) for the object layout, the
 compactor, and the two limits stated rather than left implicit: one writer per
 store prefix, and no local disk cache tier.
+
+### Redis-compatible key/value store
+
+The `kv_cache` feature, in the default build and dormant until used. Any Redis
+client connects to `--kv-port` unchanged: RESP2 and RESP3, pipelining,
+`MULTI`/`EXEC`/`WATCH`, pub/sub, blocking list pops, 16 databases, and 157
+commands across strings, hashes, lists, sets and sorted sets. `AUTH` checks the
+database's own roles. The same store answers SQL on the PostgreSQL port:
+
+```sql
+KV SET session:42 '{"user":7}' EX 3600;
+KV GET session:42;
+KV ZRANGE board 0 9 REV WITHSCORES;   -- (member, score) rows
+```
+
+It runs every core where Redis runs one: 1024 lock-striped shards, each command
+atomic on its key, and multi-key commands and `EXEC` atomic across theirs.
+`maxmemory` and Redis's eviction policies bound it, and `SAVE` and
+`--kv-persist` snapshot it. See [docs/kv-cache.md](docs/kv-cache.md) for the
+command list, what is not implemented, the design, and measurements against
+Redis and Valkey.
 
 ### S3 backup and point-in-time recovery
 
