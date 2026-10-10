@@ -257,6 +257,26 @@ where
     }
 }
 
+/// What [`AtomicGenericCache::insert_evicting`] did with the value.
+///
+/// `insert` folds all of this into a `bool`, which is what a cache wants to
+/// know. A store built on the cache wants one more thing: whether storing this
+/// key cost some *other* key its slot, and which — so it can account for the
+/// bytes and count the eviction rather than discover the key missing later.
+#[derive(Debug)]
+pub enum Placed<T> {
+    /// The key was already present; its value was replaced.
+    Updated,
+    /// A free or tombstoned slot in the window took it.
+    Inserted,
+    /// The window was full of live entries and the oldest of them was
+    /// displaced. The displaced value is returned so the caller can release
+    /// whatever it accounted for it.
+    Evicted(T),
+    /// Every round lost a race to a concurrent writer; nothing was written.
+    Failed,
+}
+
 /// A high-performance, lock-free generic cache implementation.
 ///
 /// `AtomicGenericCache` provides thread-safe storage for any type implementing
@@ -420,7 +440,102 @@ where
         let key_hash = self.hash_key(&key);
         let now = Self::get_timestamp_nanos();
 
+        Ok(!matches!(self.place(key_hash, &value, now)?, Placed::Failed))
+    }
+
+    /// Inserts with the table itself as the only bound.
+    ///
+    /// `insert` refuses once `len()` reaches `max_capacity`, which is right for
+    /// a cache whose caller will scan on a miss. A store that would rather keep
+    /// serving than refuse wants the other policy: always place the key, and if
+    /// its probe window is full, at the cost of the oldest neighbour — which is
+    /// what `place` already does, and `force_insert` does by way of a whole-
+    /// table sort. This is that policy with the sort left out and the outcome
+    /// reported, so the caller can account for what it lost.
+    pub fn insert_evicting(&self, key: K, value: T) -> Result<Placed<T>, std::io::Error> {
+        let key_hash = self.hash_key(&key);
+        let now = Self::get_timestamp_nanos();
         self.place(key_hash, &value, now)
+    }
+
+    /// `get`, but one that waits out a writer instead of reporting a miss.
+    ///
+    /// A slot being rewritten sits in `STATE_WRITING` for the few nanoseconds
+    /// between the state change and the store, and `get` reads that as
+    /// "absent" — correct for a cache, where a miss is a scan, and wrong for a
+    /// store, where a miss is an answer. This spins on a slot whose hash is
+    /// ours while it is in a transient state, then reads it settled. It waits
+    /// only on *this* key's slot: a neighbour being written is skipped as
+    /// `get` would skip it.
+    pub fn get_settled(&self, key: &K) -> Option<T> {
+        let key_hash = self.hash_key(key);
+
+        'window: for slot in self.probe_window(key_hash) {
+            let mut spins = 0u32;
+            loop {
+                let state = slot.get_state();
+                if slot.key_hash.load(Ordering::Relaxed) != key_hash {
+                    continue 'window;
+                }
+                match state {
+                    STATE_WRITTEN => {
+                        let version_before = slot.get_version();
+                        let value = slot.load_value();
+                        if version_before == slot.get_version()
+                            && slot.get_state() == STATE_WRITTEN
+                            && slot.key_hash.load(Ordering::Relaxed) == key_hash
+                        {
+                            return Some(value);
+                        }
+                        // Changed underneath the read: go round again, and
+                        // let the hash check above decide whether it is
+                        // still ours.
+                    }
+                    STATE_WRITING | STATE_RESERVED => {}
+                    _ => continue 'window,
+                }
+                spins += 1;
+                if spins < 64 {
+                    std::hint::spin_loop();
+                } else {
+                    std::thread::yield_now();
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Visits the live entries in `count` slots starting at slot `start`.
+    ///
+    /// The unit is *slots*, not entries, so a caller can walk the whole table
+    /// in bounded pieces — an expiry sweep, a cursor-driven scan, a snapshot —
+    /// without `get_all`'s allocation of the whole thing. `start` past the end
+    /// visits nothing. Returns the number of slots examined, which is `count`
+    /// clipped to the table's end, so `start + examined` is the next cursor
+    /// and `examined < count` means the walk is over.
+    pub fn scan_slots<F>(&self, start: usize, count: usize, mut visit: F) -> usize
+    where
+        F: FnMut(u64, T, u64),
+    {
+        let capacity = self.capacity();
+        if start >= capacity {
+            return 0;
+        }
+        let end = start.saturating_add(count).min(capacity);
+        for slot in &self.entries[start..end] {
+            if slot.get_state() != STATE_WRITTEN {
+                continue;
+            }
+            let version_before = slot.get_version();
+            let key_hash = slot.key_hash.load(Ordering::Relaxed);
+            let value = slot.load_value();
+            let timestamp = slot.timestamp_nanos.load(Ordering::Relaxed);
+            if version_before == slot.get_version() && slot.get_state() == STATE_WRITTEN {
+                visit(key_hash, value, timestamp);
+            }
+        }
+        end - start
     }
 
     /// Places `value` into the probe window for `key_hash`.
@@ -430,18 +545,18 @@ where
     /// the window. The final step is what keeps the cache a *cache* — a key can
     /// always be stored, it just costs whichever neighbour was least recently
     /// written.
-    fn place(&self, key_hash: u64, value: &T, now: u64) -> Result<bool, std::io::Error> {
+    fn place(&self, key_hash: u64, value: &T, now: u64) -> Result<Placed<T>, std::io::Error> {
         // A handful of rounds absorbs losing a CAS race to a concurrent writer.
         for round in 0..4 {
             if self.try_update_existing(key_hash, value, now)? {
-                return Ok(true);
+                return Ok(Placed::Updated);
             }
 
             for slot in self.probe_window(key_hash) {
                 let state = slot.get_state();
                 if state == STATE_EMPTY || state == STATE_TOMBSTONE {
                     if self.try_acquire_slot(slot, key_hash, value, now)? {
-                        return Ok(true);
+                        return Ok(Placed::Inserted);
                     }
                 }
             }
@@ -462,9 +577,12 @@ where
                     .compare_exchange_state(STATE_WRITTEN, STATE_WRITING)
                     .is_ok()
                 {
+                    // Read before the overwrite: once `write_entry_data` has
+                    // run, the displaced value is unreachable.
+                    let displaced = slot.load_value();
                     self.write_entry_data(slot, key_hash, value.clone(), now)?;
                     slot.set_state(STATE_WRITTEN);
-                    return Ok(true);
+                    return Ok(Placed::Evicted(displaced));
                 }
             }
 
@@ -473,7 +591,7 @@ where
             }
         }
 
-        Ok(false)
+        Ok(Placed::Failed)
     }
 
     /// Forces insertion of a key-value pair into the cache.
@@ -511,7 +629,7 @@ where
         let key_hash = self.hash_key(&key);
         let now = Self::get_timestamp_nanos();
 
-        if self.place(key_hash, &value, now)? {
+        if !matches!(self.place(key_hash, &value, now)?, Placed::Failed) {
             return Ok((true, removed_entries));
         }
 
@@ -522,7 +640,7 @@ where
             let additional_removed = self.remove_oldest(3);
             removed_entries.extend(additional_removed);
 
-            if self.place(key_hash, &value, now)? {
+            if !matches!(self.place(key_hash, &value, now)?, Placed::Failed) {
                 return Ok((true, removed_entries));
             }
         }
