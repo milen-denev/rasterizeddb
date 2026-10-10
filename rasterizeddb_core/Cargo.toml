@@ -13,17 +13,30 @@ tokio = { version = "1", features = ["full"] }
 byteorder = "1.5"
 itertools = "0.15"
 ahash = "0.8"
+# `HashTable<u32>` for the hash-join build side: indices only, keys read back from the rows.
+hashbrown = { version = "0.16", default-features = false }
+# Bulk scanning of SQL text for the next quote/placeholder byte.
+memchr = "2"
 once_cell = "1.21.3"
 orx-concurrent-vec = "3.10"
 stopwatch = "0.0.7"
 futures = "0.3"
 async-lazy = { version = "0.1", features = ["parking_lot"] }
 dashmap = "6.1"
-log = "0.4"
+# Release builds compile `trace!` out entirely, so the hot-path level checks
+# cost nothing. `debug` is kept: `--log-level debug` is the documented way to
+# see statement text on a live node (pgwire's `Statement:` line). Production
+# defaults to `error`. Note this is unified across the dependency graph, so
+# `--log-level trace` in a release build shows at most debug.
+log = { version = "0.4", features = ["release_max_level_debug"] }
 libmimalloc-sys = "0.1"
 rastcp = { path = "../rastcp" }
 env_logger = "0.11"
 crc = "3.4"
+# CRC-32/ISO-HDLC with PCLMULQDQ: the WAL, replication log, backup archives and
+# KV layout checksums all run through it. Same polynomial as `crc`'s, ~30x the
+# throughput of its default byte-at-a-time table.
+crc32fast = "1.5"
 temp_testdir = "0.2"
 memmap2 = "0.9"
 rand = "0.10"

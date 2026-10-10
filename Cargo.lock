@@ -1331,6 +1331,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
 
 [[package]]
+name = "crc32fast"
+version = "1.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01a7799fd6b852db0e61728dde9a204c423b44d689dbd432522543614b490e78"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "criterion"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4366,8 +4375,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "851ca9db4932932d69f3ea811b1abe63087a0f740a47692619dd40d4899b68be"
 dependencies = [
  "bytes",
+ "chrono",
  "fallible-iterator",
  "postgres-protocol",
+ "serde_core",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]
@@ -4603,8 +4616,10 @@ name = "rasterizeddb_compat"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "chrono",
  "env_logger",
+ "postgres-types",
  "rasterizeddb_core",
  "rclite",
  "rust_decimal",
@@ -4613,6 +4628,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tokio",
+ "tokio-postgres",
  "uuid",
 ]
 
@@ -4629,11 +4645,13 @@ dependencies = [
  "cacheguard",
  "clap",
  "crc",
+ "crc32fast",
  "criterion",
  "dashmap",
  "env_logger",
  "fastrand",
  "futures",
+ "hashbrown 0.16.1",
  "hmac",
  "itertools 0.15.0",
  "kanal",
@@ -4641,6 +4659,7 @@ dependencies = [
  "libmimalloc-sys",
  "log",
  "md-5",
+ "memchr",
  "memmap2",
  "memory-stats",
  "once_cell",

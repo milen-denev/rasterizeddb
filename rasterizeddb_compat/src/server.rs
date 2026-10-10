@@ -99,6 +99,23 @@ impl TestServer {
         method: AuthMethod,
         password: Option<&str>,
     ) -> anyhow::Result<Self> {
+        Self::start_rooted(tls_mode, method, password, None).await
+    }
+
+    /// Starts a server whose catalogue lives in `root` on disk, for the tests
+    /// that must exercise the file-backed storage path (the WAL, fsync, the
+    /// mmap read path) rather than the in-memory one. The caller owns `root`
+    /// and removes it.
+    pub async fn start_file_backed(root: &str) -> anyhow::Result<Self> {
+        Self::start_rooted(TlsMode::Disable, AuthMethod::Trust, None, Some(root)).await
+    }
+
+    async fn start_rooted(
+        tls_mode: TlsMode,
+        method: AuthMethod,
+        password: Option<&str>,
+        root: Option<&str>,
+    ) -> anyhow::Result<Self> {
         init_globals();
 
         // Ask the OS for a free port, then hand the number to the server. The
@@ -108,9 +125,9 @@ impl TestServer {
         let port = probe.local_addr()?.port();
         drop(probe);
 
-        // In-memory, so the catalogue has no root and holds only what a test
-        // creates through it.
-        let catalog = DatabaseCatalog::open(None, DEFAULT_DATABASE_NAME)
+        // In-memory unless a root was given, so the catalogue holds only what
+        // a test creates through it.
+        let catalog = DatabaseCatalog::open(root, DEFAULT_DATABASE_NAME)
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
         // Kept so a test can look at engine-side counters that the wire does not

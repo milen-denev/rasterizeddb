@@ -188,19 +188,21 @@ fn hex_lower(bytes: &[u8]) -> String {
 }
 
 /// Random bytes for salts and nonces.
-fn fill_random(out: &mut [u8]) {
-    for chunk in out.chunks_mut(8) {
-        let value = fastrand::u64(..).to_le_bytes();
-        let len = chunk.len();
-        chunk.copy_from_slice(&value[..len]);
-    }
+///
+/// From a cryptographic generator — `rand`'s thread RNG, ChaCha reseeded from
+/// the OS. `fastrand` is a wyrand PRNG whose state is recoverable from its
+/// output, so a client that saw a few nonces could predict the next salt.
+pub(crate) fn fill_random(out: &mut [u8]) {
+    rand::fill(out);
 }
 
 /// A nonce built from the printable ASCII SCRAM allows, excluding `,`.
 fn make_nonce() -> String {
+    use rand::RngExt;
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut rng = rand::rng();
     (0..SCRAM_NONCE_LEN)
-        .map(|_| ALPHABET[fastrand::usize(..ALPHABET.len())] as char)
+        .map(|_| ALPHABET[rng.random_range(..ALPHABET.len())] as char)
         .collect()
 }
 

@@ -115,7 +115,9 @@ pub fn probes() -> Vec<Probe> {
         p("aggregate", "count_column", "SELECT COUNT(country) FROM users", FirstColumn(&["3"])),
         p("aggregate", "sum", "SELECT SUM(net_amount) FROM invoice", FirstColumn(&["1930.5"])),
         p("aggregate", "min_max", "SELECT MIN(invoice_number), MAX(invoice_number) FROM invoice", Grid(&["1001|1005"])),
-        p("aggregate", "avg", "SELECT AVG(invoice_number) FROM invoice", FirstColumn(&["1003"])),
+        // PostgreSQL's `avg(int)` is a numeric at sixteen places here, and its
+        // binary form keeps that display scale.
+        p("aggregate", "avg", "SELECT AVG(invoice_number) FROM invoice", FirstColumn(&["1003.0000000000000000"])),
         p("aggregate", "group_by", "SELECT status, COUNT(*) FROM invoice GROUP BY status ORDER BY status ASC", Grid(&["open|1", "paid|3", "void|1"])),
         p("aggregate", "group_by_having", "SELECT status, COUNT(*) FROM invoice GROUP BY status HAVING COUNT(*) > 1", Grid(&["paid|3"])),
         // A LIMIT on an aggregate applies to the *output*. If it reached the
@@ -386,7 +388,25 @@ fn render_cell(row: &sqlx::postgres::PgRow, idx: usize) -> String {
                 Err(e) => format!("<decode TIMESTAMP: {}>", first_line(&e.to_string())),
             };
         }
-        // TEXT, INET and anything else: the wire bytes are already text.
+        // Binary `inet`: family, prefix bits, is-cidr, length, address. It
+        // used to arrive as text under the `inet` OID, which this catch-all
+        // read; the server now sends PostgreSQL's binary form.
+        "INET" | "CIDR" => {
+            return match raw.as_bytes() {
+                Ok(b) if b.len() == 8 && b[3] == 4 => {
+                    let ip = std::net::Ipv4Addr::new(b[4], b[5], b[6], b[7]);
+                    if b[1] == 32 { ip.to_string() } else { format!("{}/{}", ip, b[1]) }
+                }
+                Ok(b) if b.len() == 20 && b[3] == 16 => {
+                    let octets: [u8; 16] = b[4..20].try_into().unwrap();
+                    let ip = std::net::Ipv6Addr::from(octets);
+                    if b[1] == 128 { ip.to_string() } else { format!("{}/{}", ip, b[1]) }
+                }
+                Ok(b) => format!("<decode {}: {} bytes>", type_name, b.len()),
+                Err(_) => "<unreadable>".to_string(),
+            };
+        }
+        // TEXT and anything else: the wire bytes are already text.
         _ => match raw.as_bytes() {
             Ok(b) => String::from_utf8_lossy(b).into_owned(),
             Err(_) => "<unreadable>".to_string(),
