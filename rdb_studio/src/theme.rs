@@ -14,7 +14,7 @@
 //! than prose. A database console is a dense instrument, and rounded cards with
 //! generous padding fit perhaps a third as many rows on a screen.
 
-use iced::widget::{button, container, rule, scrollable, text_input};
+use iced::widget::{button, container, rule, scrollable, text_editor, text_input};
 use iced::{Background, Border, Color, Font, Theme, border, color};
 
 /// Rust's brand orange. Everything accented is this or derived from it.
@@ -37,6 +37,26 @@ pub const TEXT_FAINT: Color = color!(0x6B625B);
 pub const OK: Color = color!(0x7FA65C);
 pub const WARN: Color = color!(0xD9A441);
 pub const BAD: Color = color!(0xCF4B3F);
+
+// --- SQL syntax -------------------------------------------------------------
+//
+// Picked against the panel colour so each reads at a glance and none is the
+// accent: the orange stays reserved for what the console itself is pointing
+// at. Keywords get the warmest hue because they are the skeleton a reader
+// scans for; names stay near plain text because they are most of the words.
+// No syntax colour is the warning amber or the error red, so a linted span
+// is never mistaken for a string or a number.
+
+pub const SYN_KEYWORD: Color = color!(0xE5895A);
+pub const SYN_TYPE: Color = color!(0x5FB8AA);
+pub const SYN_FUNCTION: Color = color!(0xB894E6);
+pub const SYN_STRING: Color = color!(0x9CC46B);
+pub const SYN_NUMBER: Color = color!(0xE590B8);
+pub const SYN_COMMENT: Color = color!(0x75806E);
+pub const SYN_TABLE: Color = color!(0x6FC3E2);
+pub const SYN_COLUMN: Color = color!(0xB9DCEB);
+pub const SYN_OPERATOR: Color = color!(0xD2BFB2);
+pub const SYN_PUNCT: Color = TEXT_DIM;
 
 /// Values, identifiers and SQL. Anything a person compares character by
 /// character is monospaced; prose is not.
@@ -316,6 +336,23 @@ pub fn input(_: &Theme, status: text_input::Status) -> text_input::Style {
         placeholder: TEXT_FAINT,
         value: TEXT,
         selection: RUST_DIM,
+    }
+}
+
+/// The SQL editor: the input look, a shade darker so the coloured text has
+/// the most contrast to sit on.
+pub fn editor(_: &Theme, status: text_editor::Status) -> text_editor::Style {
+    let border_color = match status {
+        text_editor::Status::Focused { .. } => RUST,
+        text_editor::Status::Hovered => LINE_BRIGHT,
+        _ => LINE,
+    };
+    text_editor::Style {
+        background: Background::Color(color!(0x0F0D0C)),
+        border: Border { color: border_color, width: 1.0, radius: border::radius(0) },
+        placeholder: TEXT_FAINT,
+        value: TEXT,
+        selection: color!(0x5A2A20),
     }
 }
 

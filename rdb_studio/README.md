@@ -80,6 +80,38 @@ Beyond running SQL:
   **copy or export results** as CSV, JSON, Markdown or `INSERT` statements.
 - **Export the session history** as a runnable script.
 
+### The editor
+
+SQL is coloured as you type: keywords, types, functions, strings, numbers and
+comments each get their own colour, and a name that is a table in the connected
+database — or a column of the selected one — is coloured as one, which is also
+the quickest way to notice that a name is *not*.
+
+It is checked as you type, too. What the checker finds is marked in the text and
+listed under the editor; clicking a finding puts the cursor on it. **Errors** are
+things the server will refuse anyway — an unclosed string, comment or bracket, a
+stray comma. **Warnings** are the ones the server will run happily:
+
+- `UPDATE` or `DELETE` with no `WHERE`, which touches every row;
+- `= NULL` / `<> NULL`, which is never true and so silently matches nothing;
+- a statement starting on a new line with no `;` after the one before it;
+- a near-miss keyword — `FORM`, `WHRE`, `SELCT`;
+- against RasterizedDB, a table name that is not in the database. (Not against
+  PostgreSQL, whose table list leaves out views.)
+
+Every rule is written to stay quiet when unsure, and none of them ever stops a
+statement from running — the server is the authority.
+
+| Keys | Does |
+|---|---|
+| Ctrl+Enter | runs everything |
+| Ctrl+Shift+Enter | runs only the statement the cursor is in |
+| Enter | a new line at the same indentation, one deeper after `(` |
+| Tab / Shift+Tab | indent / unindent — the selected lines, if any |
+| Ctrl+/ | comments the lines out, or back in |
+| Ctrl+Shift+F | formats |
+| Ctrl+S | saves to a `.sql` file |
+
 ### Copying and exporting
 
 Every result set can go to the clipboard or to a file, in four shapes. CSV keeps

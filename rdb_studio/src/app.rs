@@ -89,6 +89,9 @@ pub struct Studio {
     pub data_viewport: Option<(f32, f32)>,
 
     pub editor: text_editor::Content,
+    /// Whether the editor has been grown to take most of the screen, for a
+    /// long script, at the expense of the results under it.
+    pub editor_tall: bool,
     pub results: Vec<Outcome>,
     pub query_error: Option<String>,
     pub history: Vec<HistoryEntry>,
@@ -526,8 +529,17 @@ pub enum Message {
 
     // --- query editor
     EditorAction(text_editor::Action),
+    /// Enter, keeping the line's indentation.
+    EditorNewline,
+    /// Ctrl+/: comment the touched lines out, or back in.
+    ToggleComment,
     RunQuery,
     RunSelection,
+    /// Ctrl+Shift+Enter: the statement the cursor is in, and no other.
+    RunStatement,
+    /// Put the cursor on a finding from the problems list.
+    JumpTo(usize, usize),
+    ToggleEditorSize,
     FormatSql,
     ClearEditor,
     InsertTemplate(Template),
@@ -787,6 +799,7 @@ impl Studio {
                  -- Several statements are fine; each reports separately.\n\
                  SHOW TABLES;\n",
             ),
+            editor_tall: false,
             results: Vec::new(),
             query_error: None,
             history: Vec::new(),
@@ -1757,6 +1770,23 @@ impl Studio {
 
             // ---- query editor ----------------------------------------------
             Message::EditorAction(action) => { self.editor.perform(action); Task::none() }
+            Message::EditorNewline => { crate::sqledit::newline(&mut self.editor); Task::none() }
+            Message::ToggleComment => { crate::sqledit::toggle_comment(&mut self.editor); Task::none() }
+            Message::RunStatement => {
+                let cursor = self.editor.cursor().position;
+                match crate::sqllex::statement_at(&self.editor.text(), cursor.line, cursor.column) {
+                    Some(sql) => self.run_sql(sql),
+                    None => {
+                        self.status = Status::Failed("there is no statement under the cursor".into());
+                        Task::none()
+                    }
+                }
+            }
+            Message::JumpTo(line, column) => {
+                crate::sqledit::place_cursor(&mut self.editor, line, column);
+                iced::widget::operation::focus(crate::views::query::editor_id())
+            }
+            Message::ToggleEditorSize => { self.editor_tall = !self.editor_tall; Task::none() }
             Message::RunQuery => {
                 let sql = self.editor.text();
                 self.run_sql(sql)
