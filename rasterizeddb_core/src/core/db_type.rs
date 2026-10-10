@@ -371,7 +371,12 @@ impl DbType {
             DbType::I8 | DbType::I16 => 21, // int2
             DbType::I32 => 23,              // int4
             DbType::I64 => 20,              // int8
-            DbType::U8 | DbType::U16 | DbType::U32 | DbType::U64 => 20, // best-effort
+            // Every unsigned value below 2^32 fits `int8`.
+            DbType::U8 | DbType::U16 | DbType::U32 => 20,
+            // Wider than `bigint`, so `numeric` at scale 0 — PostgreSQL's own
+            // choice for such integers. Advertised as `int8`, a `UBIGINT`
+            // above `i64::MAX` reached a binary client as a negative number.
+            DbType::U64 | DbType::I128 | DbType::U128 => 1700,
             DbType::F32 => 700,
             DbType::F64 => 701,
             DbType::STRING => 25,     // TEXT
@@ -418,10 +423,10 @@ impl DbType {
             DbType::I16 => 2,
             DbType::I32 => 4,
             DbType::I64 => 8,
-            DbType::U8 => 1,
-            DbType::U16 => 2,
-            DbType::U32 => 4,
-            DbType::U64 => 8,
+            // Advertised as `int8`, so they declare its width.
+            DbType::U8 | DbType::U16 | DbType::U32 => 8,
+            // `numeric` is a varlena.
+            DbType::U64 | DbType::I128 | DbType::U128 => -1,
             DbType::F32 => 4,
             DbType::F64 => 8,
             DbType::STRING => -1,

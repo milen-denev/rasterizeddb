@@ -83,11 +83,13 @@ async fn integer_and_decimal_paths_agree() {
         .expect("v");
     assert_eq!(arithmetic, 65, "ten rows, each one greater");
 
-    let widened: i64 = sqlx::query(AssertSqlSafe("SELECT SUM(CAST(co AS BIGINT)) AS v FROM t"))
+    // `sum(bigint)` is a numeric (PostgreSQL's type), so the widened sum is
+    // decoded as one; it used to be an int8 like `sum(int4)`.
+    let widened: Decimal = sqlx::query(AssertSqlSafe("SELECT SUM(CAST(co AS BIGINT)) AS v FROM t"))
         .fetch_one(&mut conn)
         .await
         .expect("widening cast")
         .try_get("v")
         .expect("v");
-    assert_eq!(widened, plain, "a widening cast must not change the sum");
+    assert_eq!(widened, Decimal::from(plain), "a widening cast must not change the sum");
 }

@@ -129,6 +129,8 @@ pub enum EvalError {
     StatementTimeout,
     /// The client that asked for this statement is gone.
     ClientWentAway,
+    /// A `CancelRequest` with this session's key asked for it to stop.
+    UserCanceled,
     /// The `WHERE` clause has more comparisons than the compiled boolean
     /// program can index.
     ///
@@ -144,6 +146,12 @@ pub enum EvalError {
     /// A row's storage was handed to a writer between the scan reading its
     /// sort key and reading the rest of it.
     RowMovedUnderScan,
+    /// A `SIMILAR TO` pattern the matcher cannot use. Refused when the
+    /// predicate is planned; this is the safety net at evaluation time.
+    InvalidPattern,
+    /// Matching one value against a `SIMILAR TO` pattern would cost more than
+    /// the matcher allows. PostgreSQL's `54001`.
+    PatternTooComplex,
 }
 
 impl EvalError {
@@ -166,6 +174,9 @@ impl EvalError {
             EvalError::RowMovedUnderScan => {
                 "a row was reclaimed while the query was reading it; retry the statement"
             }
+            EvalError::InvalidPattern => "invalid regular expression in SIMILAR TO",
+            EvalError::PatternTooComplex => crate::core::similar_to::TOO_COMPLEX,
+            EvalError::UserCanceled => "canceling statement due to user request",
         }
     }
 
@@ -182,6 +193,9 @@ impl EvalError {
             EvalError::ClientWentAway => 7,
             EvalError::PredicateTooComplex => 8,
             EvalError::RowMovedUnderScan => 9,
+            EvalError::InvalidPattern => 10,
+            EvalError::PatternTooComplex => 11,
+            EvalError::UserCanceled => 12,
         }
     }
 
@@ -196,6 +210,9 @@ impl EvalError {
             7 => Some(EvalError::ClientWentAway),
             8 => Some(EvalError::PredicateTooComplex),
             9 => Some(EvalError::RowMovedUnderScan),
+            10 => Some(EvalError::InvalidPattern),
+            11 => Some(EvalError::PatternTooComplex),
+            12 => Some(EvalError::UserCanceled),
             _ => None,
         }
     }

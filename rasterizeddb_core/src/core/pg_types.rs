@@ -469,11 +469,35 @@ pub fn parse_macaddr<const WIDTH: usize>(text: &str) -> Option<[u8; WIDTH]> {
 
 /// The canonical `08:00:2b:01:02:03` form.
 pub fn format_macaddr(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect::<Vec<_>>()
-        .join(":")
+    // A nibble table into a buffer sized once, rather than a `String` per
+    // byte and a `Vec` to join them.
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 {
+            out.push(':');
+        }
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+#[cfg(test)]
+mod format_macaddr_tests {
+    #[test]
+    fn matches_the_per_byte_format() {
+        for len in [0usize, 1, 6, 8] {
+            let bytes: Vec<u8> = (0..len as u8).map(|i| i.wrapping_mul(53).wrapping_add(7)).collect();
+            let expected = bytes
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<Vec<_>>()
+                .join(":");
+            assert_eq!(super::format_macaddr(&bytes), expected);
+        }
+        assert_eq!(super::format_macaddr(&[0x08, 0x00, 0x2b, 0x01, 0x02, 0xff]), "08:00:2b:01:02:ff");
+    }
 }
 
 // -------------------------------------------------------------- BIT STRING
@@ -590,6 +614,10 @@ pub fn parse_date(text: &str) -> Option<i32> {
     let month: u32 = parts.next()?.parse().ok()?;
     let day: u32 = parts.next()?.parse().ok()?;
     if parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    // `2026-02-30` is refused, not rolled over to 2 March.
+    if day > crate::core::value_codec::days_in_month(year, month) {
         return None;
     }
     let days = days_from_civil(year, month, day);

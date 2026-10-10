@@ -25,6 +25,7 @@
 use crate::core::db_type::DbType;
 use crate::core::row::row::Row;
 use crate::core::row::schema::SchemaField;
+use crate::core::rql::aggregate::AggFunc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowFunc {
@@ -211,17 +212,35 @@ impl WindowSpec {
             | WindowFunc::NthValue
             | WindowFunc::Min
             | WindowFunc::Max => arg.unwrap_or(DbType::I64),
-            // The same widening the grouped aggregates use, so `SUM(x)` and
-            // `SUM(x) OVER ()` describe the same type to a client.
-            WindowFunc::Sum => match arg {
-                Some(DbType::F32) | Some(DbType::F64) => DbType::F64,
-                Some(DbType::DECIMAL) => DbType::DECIMAL,
-                _ => DbType::I64,
-            },
-            WindowFunc::Avg => match arg {
-                Some(DbType::F32) | Some(DbType::F64) => DbType::F64,
-                _ => DbType::DECIMAL,
-            },
+            // The grouped aggregates' own rule, so `SUM(x)` and
+            // `SUM(x) OVER ()` describe the same type to a client — they are
+            // folded by the same accumulator (`numeric_fold`).
+            WindowFunc::Sum => AggFunc::Sum.result_type(arg.as_ref()),
+            WindowFunc::Avg => AggFunc::Avg.result_type(arg.as_ref()),
+        }
+    }
+
+    /// The scale a `DECIMAL` result is stored at, which pgwire's
+    /// `select_scales` must render it at.
+    ///
+    /// The grouped aggregate's rule, [`AggFunc::decimal_output_scale`]: a value
+    /// read out of the column, and a `SUM`, `MIN` or `MAX` of its raw integers,
+    /// stay at the column's declared scale; `AVG` divides at the engine scale,
+    /// or the column's when wider. A non-decimal result has no scale and
+    /// reports the engine's.
+    pub fn decimal_output_scale(&self) -> u32 {
+        let arg = self.argument.as_ref();
+        match self.func {
+            WindowFunc::Avg => AggFunc::Avg.decimal_output_scale(arg),
+            WindowFunc::Sum
+            | WindowFunc::Min
+            | WindowFunc::Max
+            | WindowFunc::Lag
+            | WindowFunc::Lead
+            | WindowFunc::FirstValue
+            | WindowFunc::LastValue
+            | WindowFunc::NthValue => AggFunc::Sum.decimal_output_scale(arg),
+            _ => crate::core::value_codec::DECIMAL_SCALE,
         }
     }
 }
@@ -577,14 +596,18 @@ pub type WindowValue = Option<Vec<u8>>;
 /// Rows are ranked within their partition, and the result is placed back at the
 /// row's original position — the caller's row order is not disturbed, because
 /// the statement's own `ORDER BY` decides that and runs later.
-pub fn assign(rows: &[Row], spec: &WindowSpec) -> Vec<WindowValue> {
+///
+/// An error when an exact `SUM`/`AVG` leaves its result type — `bigint out of
+/// range`, `numeric field overflow`, the grouped aggregate's wording. It used
+/// to answer NULL, which a client cannot tell from an all-NULL frame.
+pub fn assign(rows: &[Row], spec: &WindowSpec) -> Result<Vec<WindowValue>, String> {
     let key_of = |row: &Row, fields: &[SchemaField]| -> Vec<Vec<u8>> {
         fields
             .iter()
             .map(|f| {
                 row.columns
                     .iter()
-                    .find(|c| c.schema_id == f.write_order)
+                    .find(|c| u64::from(c.schema_id) == f.write_order)
                     .map(|c| c.data.into_slice().to_vec())
                     .unwrap_or_default()
             })
@@ -690,53 +713,19 @@ pub fn assign(rows: &[Row], spec: &WindowSpec) -> Vec<WindowValue> {
                             _ => None,
                         }
                     } else {
-                        evaluate_over(rows, &members[lo..=hi], spec)
+                        evaluate_over(rows, &members[lo..=hi], spec)?
                     }
                 }
             };
         }
     }
 
-    // A `DECIMAL` column stores its values at *its own* declared scale, while
-    // everything downstream of a window renders at the engine default. A value
-    // taken straight out of such a column — a `MIN`, a `LAG`, the sum of a
-    // frame — would therefore print a power of ten away from what the column
-    // itself prints. Rescaling here, once, keeps that in one place rather than
-    // in each function above.
-    if let Some(argument) = &spec.argument {
-        if argument.db_type == DbType::DECIMAL {
-            if let Some(scale) = argument.scale {
-                if scale != crate::core::value_codec::DECIMAL_SCALE
-                    && spec.result_type() == DbType::DECIMAL
-                    // `AVG` divides at the default scale already, so rescaling
-                    // it here would shift it a second time.
-                    && spec.func != WindowFunc::Avg
-                {
-                    for value in out.iter_mut().flatten() {
-                        if let Some(rescaled) = rescale_decimal(value, scale) {
-                            *value = rescaled;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Lifts an unscaled decimal from `from_scale` to the engine's default scale.
-///
-/// Returns `None` when the value is not sixteen bytes or the shift overflows,
-/// which leaves the original in place rather than substituting a wrong number.
-fn rescale_decimal(bytes: &[u8], from_scale: u32) -> Option<Vec<u8>> {
-    let raw = i128::from_le_bytes(bytes.get(0..16)?.try_into().ok()?);
-    let target = crate::core::value_codec::DECIMAL_SCALE;
-    let shifted = if from_scale < target {
-        raw.checked_mul(10i128.checked_pow(target - from_scale)?)?
-    } else {
-        raw / 10i128.checked_pow(from_scale - target)?
-    };
-    Some(shifted.to_le_bytes().to_vec())
+    // A `DECIMAL` value stays at the scale `WindowSpec::decimal_output_scale`
+    // names — the column's for a value read out of it or a `SUM`, wider for an
+    // `AVG` — and pgwire renders it there. It used to be lifted to the engine
+    // scale here instead, which *truncated* a column wider than nine places,
+    // and the grouped aggregate over the same rows printed a different number.
+    Ok(out)
 }
 
 /// Compares two rows on a window's `ORDER BY` list.
@@ -750,13 +739,13 @@ fn compare_by_order(
         let lhs = rows[a]
             .columns
             .iter()
-            .find(|c| c.schema_id == field.write_order)
+            .find(|c| u64::from(c.schema_id) == field.write_order)
             .map(|c| c.data.into_slice())
             .unwrap_or(&[]);
         let rhs = rows[b]
             .columns
             .iter()
-            .find(|c| c.schema_id == field.write_order)
+            .find(|c| u64::from(c.schema_id) == field.write_order)
             .map(|c| c.data.into_slice())
             .unwrap_or(&[]);
         let ord = crate::core::processor::concurrent_processor::compare_bytes_as_type(
@@ -841,11 +830,16 @@ fn frame_range(
 /// The argument column's bytes for one row, or `None` when it holds nothing.
 fn argument_bytes(rows: &[Row], index: usize, spec: &WindowSpec) -> Option<Vec<u8>> {
     let field = spec.argument.as_ref()?;
-    let bytes = rows[index]
+    let column = rows[index]
         .columns
         .iter()
-        .find(|c| c.schema_id == field.write_order)
-        .map(|c| c.data.into_slice())?;
+        .find(|c| u64::from(c.schema_id) == field.write_order)?;
+    // A NULL is typed NULL by the per-row retyping, while its bytes are the
+    // type's zeroes: read as a value it was a 0 that counted towards an `AVG`.
+    if column.column_type == DbType::NULL {
+        return None;
+    }
+    let bytes = column.data.into_slice();
     // A variable-width column with no bytes is a NULL, not an empty value.
     if bytes.is_empty() && field.db_type.is_variable_width() {
         return None;
@@ -854,8 +848,12 @@ fn argument_bytes(rows: &[Row], index: usize, spec: &WindowSpec) -> Option<Vec<u
 }
 
 /// The aggregate and value functions, over the rows the frame selected.
-fn evaluate_over(rows: &[Row], frame: &[usize], spec: &WindowSpec) -> WindowValue {
-    match spec.func {
+fn evaluate_over(
+    rows: &[Row],
+    frame: &[usize],
+    spec: &WindowSpec,
+) -> Result<WindowValue, String> {
+    Ok(match spec.func {
         WindowFunc::Count => {
             let n = match spec.argument {
                 // `COUNT(*)` counts rows; `COUNT(x)` counts non-NULL values.
@@ -867,15 +865,22 @@ fn evaluate_over(rows: &[Row], frame: &[usize], spec: &WindowSpec) -> WindowValu
             };
             Some(n.to_le_bytes().to_vec())
         }
-        WindowFunc::FirstValue => argument_bytes(rows, *frame.first()?, spec),
-        WindowFunc::LastValue => argument_bytes(rows, *frame.last()?, spec),
+        WindowFunc::FirstValue => frame
+            .first()
+            .and_then(|at| argument_bytes(rows, *at, spec)),
+        WindowFunc::LastValue => frame.last().and_then(|at| argument_bytes(rows, *at, spec)),
         WindowFunc::NthValue => {
             // One-based, as in PostgreSQL.
-            let at = usize::try_from(spec.offset).ok()?.checked_sub(1)?;
-            argument_bytes(rows, *frame.get(at)?, spec)
+            usize::try_from(spec.offset)
+                .ok()
+                .and_then(|n| n.checked_sub(1))
+                .and_then(|at| frame.get(at))
+                .and_then(|at| argument_bytes(rows, *at, spec))
         }
         WindowFunc::Min | WindowFunc::Max => {
-            let field = spec.argument.as_ref()?;
+            let Some(field) = spec.argument.as_ref() else {
+                return Ok(None);
+            };
             let mut best: Option<Vec<u8>> = None;
             for index in frame {
                 let Some(bytes) = argument_bytes(rows, *index, spec) else {
@@ -901,103 +906,40 @@ fn evaluate_over(rows: &[Row], frame: &[usize], spec: &WindowSpec) -> WindowValu
             }
             best
         }
-        WindowFunc::Sum | WindowFunc::Avg => numeric_fold(rows, frame, spec),
+        WindowFunc::Sum | WindowFunc::Avg => numeric_fold(rows, frame, spec)?,
         // Handled by the caller, which addresses the partition rather than the
         // frame.
         _ => None,
-    }
+    })
 }
 
 /// `SUM` and `AVG` over a frame.
 ///
-/// Integers and decimals accumulate in an `i128` — exact, and the scale the
-/// column already stores in — while floats accumulate in an `f64`. Mixing the
-/// two would make the answer depend on the order the rows were scanned in.
-fn numeric_fold(rows: &[Row], frame: &[usize], spec: &WindowSpec) -> WindowValue {
-    let field = spec.argument.as_ref()?;
-    let is_float = matches!(field.db_type, DbType::F32 | DbType::F64);
-
-    let mut integral: i128 = 0;
-    let mut floating: f64 = 0.0;
-    let mut seen: i128 = 0;
-
+/// Folded by the grouped aggregate's own accumulator, so the two cannot
+/// disagree: exact types total in an `i128` and raise `bigint out of range` /
+/// `numeric field overflow` when the answer leaves the result type, an exact
+/// `AVG` rounds half away from zero at `AggFunc::decimal_output_scale`, and
+/// floats total in an `f64`. An all-NULL or empty frame is NULL.
+///
+/// This used to be a second implementation that answered NULL on overflow and
+/// truncated its average — two silent differences from `SUM(x)`/`AVG(x)`.
+fn numeric_fold(rows: &[Row], frame: &[usize], spec: &WindowSpec) -> Result<WindowValue, String> {
+    let Some(field) = spec.argument.as_ref() else {
+        return Ok(None);
+    };
+    let func = match spec.func {
+        WindowFunc::Sum => AggFunc::Sum,
+        WindowFunc::Avg => AggFunc::Avg,
+        _ => return Ok(None),
+    };
+    let mut acc = crate::core::rql::aggregate::Acc::new(func, Some(field));
     for index in frame {
         let Some(bytes) = argument_bytes(rows, *index, spec) else {
             continue;
         };
-        if is_float {
-            let Some(value) = read_float(&bytes, &field.db_type) else {
-                continue;
-            };
-            floating += value;
-        } else {
-            let Some(value) = read_integral(&bytes, &field.db_type) else {
-                continue;
-            };
-            integral = integral.checked_add(value)?;
-        }
-        seen += 1;
+        acc.accumulate(Some(&bytes), Some(&field.db_type));
     }
-
-    // An all-NULL frame is NULL, not zero — for `SUM` as well as `AVG`.
-    if seen == 0 {
-        return None;
-    }
-
-    match (spec.func, is_float) {
-        (WindowFunc::Sum, true) => Some(floating.to_le_bytes().to_vec()),
-        (WindowFunc::Avg, true) => Some((floating / seen as f64).to_le_bytes().to_vec()),
-        (WindowFunc::Sum, false) => match field.db_type {
-            DbType::DECIMAL => Some(integral.to_le_bytes().to_vec()),
-            _ => Some(i64::try_from(integral).ok()?.to_le_bytes().to_vec()),
-        },
-        (WindowFunc::Avg, false) => {
-            // The sum is lifted to the engine's decimal scale *before* it is
-            // divided, whatever scale it came in at. Dividing first throws the
-            // fraction away at the column's own precision — the average of 100,
-            // 100 and 300 over a `NUMERIC(12,2)` column came out as 166.66
-            // rather than 166.666666667.
-            //
-            // An `AVG` therefore already speaks the default scale, and is
-            // excluded from the rescaling pass in `assign`.
-            let target = crate::core::value_codec::DECIMAL_SCALE;
-            let from = match field.db_type {
-                DbType::DECIMAL => field.scale.unwrap_or(target),
-                _ => 0,
-            };
-            let scaled = if from < target {
-                integral.checked_mul(10i128.checked_pow(target - from)?)?
-            } else {
-                integral / 10i128.checked_pow(from - target)?
-            };
-            Some((scaled / seen).to_le_bytes().to_vec())
-        }
-        _ => None,
-    }
-}
-
-fn read_integral(bytes: &[u8], db_type: &DbType) -> Option<i128> {
-    Some(match db_type {
-        DbType::I8 => *bytes.first()? as i8 as i128,
-        DbType::I16 => i16::from_le_bytes(bytes.get(0..2)?.try_into().ok()?) as i128,
-        DbType::I32 => i32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?) as i128,
-        DbType::I64 => i64::from_le_bytes(bytes.get(0..8)?.try_into().ok()?) as i128,
-        DbType::I128 | DbType::DECIMAL => i128::from_le_bytes(bytes.get(0..16)?.try_into().ok()?),
-        DbType::U8 => *bytes.first()? as i128,
-        DbType::U16 => u16::from_le_bytes(bytes.get(0..2)?.try_into().ok()?) as i128,
-        DbType::U32 => u32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?) as i128,
-        DbType::U64 => u64::from_le_bytes(bytes.get(0..8)?.try_into().ok()?) as i128,
-        DbType::BOOL => *bytes.first()? as i128,
-        _ => return None,
-    })
-}
-
-fn read_float(bytes: &[u8], db_type: &DbType) -> Option<f64> {
-    Some(match db_type {
-        DbType::F32 => f32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?) as f64,
-        DbType::F64 => f64::from_le_bytes(bytes.get(0..8)?.try_into().ok()?),
-        _ => return None,
-    })
+    acc.finish_nullable(func, &spec.result_type())
 }
 
 /// Splits a trailing alias off a window item.

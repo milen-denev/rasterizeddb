@@ -32,6 +32,14 @@ pub fn perform_comparison_operation(
             .ok_or(EvalError::UnsupportedType);
     }
 
+    // `SIMILAR TO` can refuse a value (too costly to match), and a refusal has
+    // to fail the statement rather than read as "no match".
+    if matches!(operation, ComparerOperation::SimilarTo)
+        && matches!(db_type, DbType::STRING | DbType::JSONB)
+    {
+        return super::common::similar_to_compare(input1, input2);
+    }
+
     match db_type {
         DbType::I8 => generic_comparison::<i8>(input1, input2, operation),
         DbType::U8 => generic_comparison::<u8>(input1, input2, operation),
@@ -43,8 +51,13 @@ pub fn perform_comparison_operation(
         DbType::U64 => generic_comparison::<u64>(input1, input2, operation),
         DbType::I128 => generic_comparison::<i128>(input1, input2, operation),
         DbType::U128 => generic_comparison::<u128>(input1, input2, operation),
-        DbType::F32 => generic_comparison::<f32>(input1, input2, operation),
-        DbType::F64 => generic_comparison::<f64>(input1, input2, operation),
+        // PostgreSQL's float semantics, not IEEE's: NaN equals NaN and sorts
+        // above every other value, and -0 equals +0. Under IEEE `==`,
+        // `f = 'NaN'` matched nothing and `f > 1e308` never returned a NaN row,
+        // while the sort path (`pg_float_cmp`) already put NaN last — two
+        // answers to one question.
+        DbType::F32 => float_comparison::<4>(input1, input2, operation),
+        DbType::F64 => float_comparison::<8>(input1, input2, operation),
         DbType::STRING => Ok(string_comparison(input1, input2, operation)),
         // Stored as microseconds since the Unix epoch, so an instant comparison
         // is an `i64` comparison. Note this must NOT be a byte compare: the
@@ -224,6 +237,42 @@ where
     })
 }
 
+/// A float comparison in PostgreSQL's total order — see
+/// [`crate::core::processor::concurrent_processor::pg_float_cmp`].
+#[inline(always)]
+fn float_comparison<const N: usize>(
+    input1: &[u8],
+    input2: &[u8],
+    operation: &ComparerOperation,
+) -> std::result::Result<bool, EvalError> {
+    let (Ok(a), Ok(b)) = (<[u8; N]>::try_from(input1), <[u8; N]>::try_from(input2)) else {
+        return Err(EvalError::OperandSizeMismatch);
+    };
+    let (x, y) = if N == 4 {
+        (
+            f32::from_le_bytes([a[0], a[1], a[2], a[3]]) as f64,
+            f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64,
+        )
+    } else {
+        (
+            f64::from_le_bytes([a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]]),
+            f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
+        )
+    };
+    use std::cmp::Ordering;
+    let ordering = crate::core::processor::concurrent_processor::pg_float_cmp(x, y);
+    Ok(match operation {
+        ComparerOperation::Equals => ordering == Ordering::Equal,
+        ComparerOperation::NotEquals => ordering != Ordering::Equal,
+        ComparerOperation::Greater => ordering == Ordering::Greater,
+        ComparerOperation::GreaterOrEquals => ordering != Ordering::Less,
+        ComparerOperation::Less => ordering == Ordering::Less,
+        ComparerOperation::LessOrEquals => ordering != Ordering::Greater,
+        // String-shaped, as for the integers.
+        _ => return Err(EvalError::UnsupportedType),
+    })
+}
+
 #[inline(always)]
 fn string_comparison(input1: &[u8], input2: &[u8], operation: &ComparerOperation) -> bool {
     simd_compare_strings(input1, input2, operation)
@@ -287,6 +336,80 @@ mod tests {
                 &input1,
                 &DbType::I32,
                 &ComparerOperation::LessOrEquals
+            )
+            .unwrap()
+        );
+    }
+
+    /// PostgreSQL's float order over the special values: NaN = NaN and is
+    /// above +infinity; -0 = +0. IEEE `==` answered "no" to NaN = NaN, so
+    /// `WHERE f = 'NaN'` matched nothing.
+    #[test]
+    fn float_predicates_follow_postgres_not_ieee() {
+        use ComparerOperation::*;
+        let values = [
+            f64::NEG_INFINITY,
+            -1.5,
+            -0.0,
+            0.0,
+            2.0,
+            f64::INFINITY,
+            f64::NAN,
+        ];
+        // Rank in PostgreSQL's order; -0 and +0 share one.
+        let rank = |v: f64| -> i32 {
+            if v.is_nan() {
+                10
+            } else if v == f64::NEG_INFINITY {
+                0
+            } else if v == -1.5 {
+                1
+            } else if v == 0.0 {
+                2
+            } else if v == 2.0 {
+                3
+            } else {
+                4
+            }
+        };
+        for &a in &values {
+            for &b in &values {
+                let (ra, rb) = (rank(a), rank(b));
+                for (op, want) in [
+                    (Equals, ra == rb),
+                    (NotEquals, ra != rb),
+                    (Greater, ra > rb),
+                    (GreaterOrEquals, ra >= rb),
+                    (Less, ra < rb),
+                    (LessOrEquals, ra <= rb),
+                ] {
+                    let got64 = perform_comparison_operation(
+                        &a.to_le_bytes(),
+                        &b.to_le_bytes(),
+                        &DbType::F64,
+                        &op,
+                    )
+                    .unwrap();
+                    assert_eq!(got64, want, "f64 {a} {op:?} {b}");
+                    let got32 = perform_comparison_operation(
+                        &(a as f32).to_le_bytes(),
+                        &(b as f32).to_le_bytes(),
+                        &DbType::F32,
+                        &op,
+                    )
+                    .unwrap();
+                    assert_eq!(got32, want, "f32 {a} {op:?} {b}");
+                }
+            }
+        }
+        // A NaN with another payload is still NaN.
+        let other_nan = f64::from_bits(0xfff8_0000_0000_0001);
+        assert!(
+            perform_comparison_operation(
+                &other_nan.to_le_bytes(),
+                &f64::NAN.to_le_bytes(),
+                &DbType::F64,
+                &Equals
             )
             .unwrap()
         );
@@ -670,9 +793,12 @@ mod tests {
         assert!(!cmp("Acme", "ACME", ComparerOperation::Equals));
     }
 
-    /// Folding is ASCII-only, and the boundary bytes around the alphabet must
-    /// not be swept into it — `'_'` (0x5F) sits just below `'a'`-0x20, and
-    /// `'{'` (0x7B) just above `'z'`-0x20.
+    /// Folding is a letter's, never a neighbouring byte's: the boundary bytes
+    /// around the ASCII alphabet must not be swept into the ASCII fast path's
+    /// fold — `'_'` (0x5F) sits just below `'a'`-0x20, and `'{'` (0x7B) just
+    /// above `'z'`-0x20. Non-ASCII letters fold as `lower()` folds them, which
+    /// is PostgreSQL's definition of `ILIKE`; this test once pinned the
+    /// ASCII-only behaviour (`'É'` not matching `'é'`), which was the bug.
     #[test]
     fn case_folding_does_not_reach_beyond_the_ascii_alphabet() {
         let cmp = |a: &[u8], b: &[u8]| {
@@ -688,9 +814,17 @@ mod tests {
         assert!(!cmp(b"_", b"?"), "0x5F must not fold onto 0x3F");
         assert!(!cmp(b"{", b"["), "0x7B must not fold onto 0x5B");
         assert!(cmp(b"[", b"["));
-        // Non-ASCII bytes compare as themselves rather than being folded.
         assert!(cmp("\u{00c9}".as_bytes(), "\u{00c9}".as_bytes()));
-        assert!(!cmp("\u{00c9}".as_bytes(), "\u{00e9}".as_bytes()));
+        // `'É' ILIKE 'é'`: true in PostgreSQL, as `lower('É') = 'é'` is.
+        assert!(cmp("\u{00c9}".as_bytes(), "\u{00e9}".as_bytes()));
+        assert!(cmp("\u{00e9}".as_bytes(), "\u{00c9}".as_bytes()));
+        // A different letter still differs, accent or not.
+        assert!(!cmp("\u{00c9}".as_bytes(), b"e"));
+        assert!(!cmp("\u{00c9}".as_bytes(), "\u{00c8}".as_bytes()));
+        // Bytes that are not text fold ASCII only and otherwise compare as
+        // themselves: 0xC9 is not a letter in any encoding this reads.
+        assert!(!cmp(&[0xC9], &[0xE9]));
+        assert!(cmp(&[0xC9, b'A'], &[0xC9, b'a']));
     }
 
     /// Substring operations are meaningful for strings and meaningless for the

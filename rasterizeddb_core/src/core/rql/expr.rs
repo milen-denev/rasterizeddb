@@ -13,6 +13,7 @@
 //! characters `COALESCE(t, 'z')` into the column and reported success. A
 //! statement the engine cannot evaluate has to say so.
 
+#[cfg(test)]
 use smallvec::SmallVec;
 
 use crate::core::db_type::DbType;
@@ -55,6 +56,13 @@ pub enum Cmp {
     Ge,
     IsNull,
     IsNotNull,
+    /// `IS [NOT] TRUE` / `IS [NOT] FALSE` on a boolean, with SQL's third
+    /// value: a NULL is neither true nor false, so `IS NOT TRUE` holds for it.
+    /// (`IS [NOT] UNKNOWN` is `IS [NOT] NULL`.)
+    IsTrue,
+    IsNotTrue,
+    IsFalse,
+    IsNotFalse,
 }
 
 /// A condition: a comparison between two expressions, or a null test on one.
@@ -159,6 +167,15 @@ pub enum TextFunc {
     ArrayLength,
     /// `array_ndims(array)` — how many dimensions it has.
     ArrayNdims,
+    /// `uuid_extract_timestamp(uuid)` — the instant in a v1 or v7 UUID.
+    UuidExtractTimestamp,
+    /// `uuid_extract_version(uuid)` — the version nibble of an RFC 9562 UUID.
+    UuidExtractVersion,
+    /// `length` / `char_length` / `character_length` — characters in a text
+    /// value; for `bytea`, bytes (as PostgreSQL's `length(bytea)`).
+    Length,
+    /// `octet_length` — bytes in the stored value.
+    OctetLength,
 }
 
 /// How many elements an array's text form `{a,b,"c,d"}` holds.
@@ -462,16 +479,20 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
             if rhs.is_empty() {
                 return Err(format!("'{}' has no right operand", op.symbol()));
             }
-            return Ok(Expr::Arith(
+            return Ok(fold_float_literal_into_decimal(Expr::Arith(
                 Box::new(parse(lhs, schema)?),
                 op,
                 Box::new(parse(rhs, schema)?),
-            ));
+            )));
         }
     }
 
-    // A trailing cast binds loosest, so it is peeled first.
-    if let Some(at) = top_level_cast(text) {
+    // A trailing cast binds loosest, so it is peeled first — but not one
+    // inside a `CASE … END` block, whose arms sit at depth zero: `CASE … ELSE
+    // 1::text END` was split at that `::`, and the cast target came out as
+    // `text END`. A cast *after* the block leaves text that no longer ends in
+    // `END`, so it is still peeled.
+    if let Some(at) = top_level_cast(text).filter(|_| !is_case_block(text)) {
         let inner = &text[..at];
         let target = &text[at + 2..];
         let db_type = cast_target(target)
@@ -696,6 +717,7 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                     if args.is_empty() {
                         return Err("COALESCE needs at least one argument".to_string());
                     }
+                    check_branch_types("COALESCE", args.iter())?;
                     Ok(Expr::Coalesce(args))
                 }
                 "NULLIF" => {
@@ -712,12 +734,14 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                     if args.is_empty() {
                         return Err("LEAST needs at least one argument".to_string());
                     }
+                    check_branch_types("LEAST", args.iter())?;
                     Ok(Expr::Least(args))
                 }
                 "GREATEST" => {
                     if args.is_empty() {
                         return Err("GREATEST needs at least one argument".to_string());
                     }
+                    check_branch_types("GREATEST", args.iter())?;
                     Ok(Expr::Greatest(args))
                 }
                 "QUOTE_IDENT" | "LOWER" | "UPPER" => {
@@ -728,6 +752,17 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                         "QUOTE_IDENT" => TextFunc::QuoteIdent,
                         "LOWER" => TextFunc::Lower,
                         _ => TextFunc::Upper,
+                    };
+                    Ok(Expr::Call(func, args))
+                }
+                "LENGTH" | "CHAR_LENGTH" | "CHARACTER_LENGTH" | "OCTET_LENGTH" => {
+                    if args.len() != 1 {
+                        return Err(format!("{} takes exactly one argument", upper_name.to_lowercase()));
+                    }
+                    let func = if upper_name == "OCTET_LENGTH" {
+                        TextFunc::OctetLength
+                    } else {
+                        TextFunc::Length
                     };
                     Ok(Expr::Call(func, args))
                 }
@@ -780,6 +815,17 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                         return Err("array_ndims takes exactly one argument".to_string());
                     }
                     Ok(Expr::Call(TextFunc::ArrayNdims, args))
+                }
+                "UUID_EXTRACT_TIMESTAMP" | "UUID_EXTRACT_VERSION" => {
+                    if args.len() != 1 {
+                        return Err(format!("{} takes exactly one argument", upper_name));
+                    }
+                    let func = if upper_name == "UUID_EXTRACT_TIMESTAMP" {
+                        TextFunc::UuidExtractTimestamp
+                    } else {
+                        TextFunc::UuidExtractVersion
+                    };
+                    Ok(Expr::Call(func, args))
                 }
                 "PG_COLUMN_SIZE" => {
                     if args.len() != 1 {
@@ -972,6 +1018,13 @@ fn parse_case(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
         }
     }
 
+    check_branch_types(
+        "CASE",
+        whens
+            .iter()
+            .map(|(_, e)| e)
+            .chain(otherwise.iter().map(|b| b.as_ref())),
+    )?;
     Ok(Expr::Case { whens, otherwise })
 }
 
@@ -1082,6 +1135,25 @@ pub fn parse_condition(text: &str, schema: &[SchemaField]) -> Result<Condition, 
             return Ok(Condition {
                 left,
                 cmp: Cmp::IsNotNull,
+                right: None,
+            });
+        }
+        // Whitespace between the words is free, as anywhere else.
+        let words: Vec<&str> = tail.split_whitespace().collect();
+        let cmp = match words.as_slice() {
+            ["TRUE"] => Some(Cmp::IsTrue),
+            ["NOT", "TRUE"] => Some(Cmp::IsNotTrue),
+            ["FALSE"] => Some(Cmp::IsFalse),
+            ["NOT", "FALSE"] => Some(Cmp::IsNotFalse),
+            ["UNKNOWN"] => Some(Cmp::IsNull),
+            ["NOT", "UNKNOWN"] => Some(Cmp::IsNotNull),
+            ["NOT", "NULL"] => Some(Cmp::IsNotNull),
+            _ => None,
+        };
+        if let Some(cmp) = cmp {
+            return Ok(Condition {
+                left,
+                cmp,
                 right: None,
             });
         }
@@ -1378,6 +1450,7 @@ pub fn static_type(expr: &Expr) -> DbType {
             crate::core::rql::aggregate::ScalarFunc::Now => DbType::DATETIME,
             crate::core::rql::aggregate::ScalarFunc::CurrentDate => DbType::DATETIME,
             crate::core::rql::aggregate::ScalarFunc::GenRandomUuid => DbType::STRING,
+            crate::core::rql::aggregate::ScalarFunc::UuidV7 => DbType::UUID,
         },
         Expr::Cast(_, db_type) => db_type.clone(),
         Expr::Concat(_, _) => DbType::STRING,
@@ -1387,23 +1460,29 @@ pub fn static_type(expr: &Expr) -> DbType {
         // before it moved to `numeric`, and what every driver decodes without a
         // decimal type.
         Expr::Call(TextFunc::Extract, _) => DbType::F64,
+        Expr::Call(TextFunc::UuidExtractTimestamp, _) => DbType::DATETIME,
+        Expr::Call(TextFunc::UuidExtractVersion, _) => DbType::I16,
+        // `integer`, as PostgreSQL's length family returns.
+        Expr::Call(TextFunc::Length | TextFunc::OctetLength, _) => DbType::I32,
         Expr::Call(_, _) => DbType::STRING,
-        // The branches of these all have to agree in SQL, so the first one that
-        // is not a bare NULL decides.
-        Expr::Coalesce(args) | Expr::Least(args) | Expr::Greatest(args) => args
-            .iter()
-            .find(|a| !matches!(a, Expr::Null))
-            .map(static_type)
-            .unwrap_or(DbType::STRING),
-        Expr::NullIf(lhs, _) => static_type(lhs),
+        // The branches are resolved to one type the way PostgreSQL's
+        // `select_common_type` does — see `common_type`.
+        Expr::Coalesce(args) | Expr::Least(args) | Expr::Greatest(args) => {
+            common_type(args.iter()).0
+        }
+        // NULLIF's result is its first argument, typed as that argument
+        // resolves on its own.
+        Expr::NullIf(lhs, _) => common_type(std::iter::once(&**lhs)).0,
         Expr::Mod(lhs, _) => static_type(lhs),
-        Expr::Case { whens, otherwise } => whens
-            .iter()
-            .map(|(_, e)| e)
-            .chain(otherwise.iter().map(|b| b.as_ref()))
-            .find(|e| !matches!(e, Expr::Null))
-            .map(static_type)
-            .unwrap_or(DbType::STRING),
+        Expr::Case { whens, otherwise } => {
+            common_type(
+                whens
+                    .iter()
+                    .map(|(_, e)| e)
+                    .chain(otherwise.iter().map(|b| b.as_ref())),
+            )
+            .0
+        }
         // Mirrors `arith`: a float on either side makes the result a float,
         // and everything else is done in i64.
         Expr::Arith(lhs, op, rhs) => {
@@ -1603,6 +1682,17 @@ fn arith(a: &Value, op: ArithOp, b: &Value) -> Result<Value, String> {
         });
     }
 
+    // `NUMERIC` is an integer in scaled units, so it cannot share the plain
+    // integer path: adding two of them works, but multiplying leaves the
+    // product scaled twice and dividing loses the scale entirely.
+    //
+    // Ahead of the float path, as `static_type` already ranks it: `price * 1.5`
+    // pairs a NUMERIC with a float literal, and the float path cannot read a
+    // NUMERIC — it refused the expression as having non-numeric operands.
+    if is_decimal(a) || is_decimal(b) {
+        return decimal_arith(a, op, b);
+    }
+
     if float_operand(a) || float_operand(b) {
         let (Some(x), Some(y)) = (as_f64(a), as_f64(b)) else {
             return Err(format!("'{}' needs numeric operands", op.symbol()));
@@ -1628,13 +1718,6 @@ fn arith(a: &Value, op: ArithOp, b: &Value) -> Result<Value, String> {
             bytes: value.to_le_bytes().to_vec(),
             db_type: DbType::F64,
         });
-    }
-
-    // `NUMERIC` is an integer in scaled units, so it cannot share the plain
-    // integer path: adding two of them works, but multiplying leaves the
-    // product scaled twice and dividing loses the scale entirely.
-    if is_decimal(a) || is_decimal(b) {
-        return decimal_arith(a, op, b);
     }
 
     let (Some(x), Some(y)) = (as_i64(a), as_i64(b)) else {
@@ -1839,6 +1922,52 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
         // multi-dimensional array declared `DOUBLE PRECISION[][]` is stored and
         // reported as one-dimensional. Stated here rather than left to be
         // discovered — PostgreSQL would answer 2.
+        // NULL for a UUID of another version or variant, as in PostgreSQL. The
+        // argument is a `uuid` value, or text that parses as one.
+        TextFunc::UuidExtractTimestamp | TextFunc::UuidExtractVersion => {
+            let Value::Data { bytes, db_type } = &args[0] else {
+                return Ok(Value::Null);
+            };
+            let uuid: [u8; 16] = match db_type {
+                DbType::UUID => match bytes[..].try_into() {
+                    Ok(u) => u,
+                    Err(_) => return Ok(Value::Null),
+                },
+                _ => crate::core::value_codec::parse_uuid(&as_text(&args[0]))
+                    .ok_or_else(|| format!("invalid input syntax for type uuid: \"{}\"", as_text(&args[0])))?,
+            };
+            if func == TextFunc::UuidExtractVersion {
+                match crate::core::rql::aggregate::uuid_extract_version(&uuid) {
+                    Some(v) => Value::Data { bytes: v.to_le_bytes().to_vec(), db_type: DbType::I16 },
+                    None => Value::Null,
+                }
+            } else {
+                match crate::core::rql::aggregate::uuid_extract_timestamp_us(&uuid) {
+                    Some(us) => Value::Data { bytes: us.to_le_bytes().to_vec(), db_type: DbType::DATETIME },
+                    None => Value::Null,
+                }
+            }
+        }
+        TextFunc::Length | TextFunc::OctetLength => {
+            let Value::Data { bytes, db_type } = &args[0] else {
+                return Ok(Value::Null);
+            };
+            let n = match (func, db_type) {
+                // Characters, not bytes, for text; bytes for bytea and for
+                // octet_length. A text value that is not valid UTF-8 counts
+                // its bytes rather than inventing characters.
+                (TextFunc::Length, DbType::STRING | DbType::CHAR) => match std::str::from_utf8(bytes) {
+                    Ok(text) => text.chars().count(),
+                    Err(_) => bytes.len(),
+                },
+                (TextFunc::Length, _) if !matches!(db_type, DbType::BYTEA) => as_text(&args[0]).chars().count(),
+                _ => bytes.len(),
+            };
+            Value::Data {
+                bytes: (n as i32).to_le_bytes().to_vec(),
+                db_type: DbType::I32,
+            }
+        }
         TextFunc::ArrayNdims => {
             let Value::Data { bytes, .. } = &args[0] else {
                 return Ok(Value::Null);
@@ -1926,13 +2055,20 @@ fn is_decimal(value: &Value) -> bool {
     )
 }
 
-/// Arithmetic over `NUMERIC`, which is stored as an integer scaled by
-/// `DECIMAL_SCALE` decimal places.
+/// Arithmetic over `NUMERIC`, done at the engine scale, `DECIMAL_SCALE`.
+///
+/// A column declared `NUMERIC(p, s)` stores its integer scaled by its own `s`;
+/// [`eval`] lifts every such read to the engine scale first (see
+/// [`to_engine_scale`]), so both operands here share one scale. Mixing them
+/// was a silent wrong answer: `v + 1` over a `NUMERIC(10,2)` column holding 100
+/// returned 10000100.00, the column's 10000 plus a literal lifted to 10^9.
 ///
 /// Addition and subtraction work directly on the scaled integers. Multiplication
 /// produces a doubly-scaled product and has to be divided back down; division
 /// has to scale the numerator up first, or the fractional part is truncated
-/// away — the same rule `AVG` follows over an exact column.
+/// away — the same rule `AVG` follows over an exact column. Both intermediates
+/// can pass `i128` while the answer fits, so they fall back to a 256-bit
+/// product instead of reporting an overflow the result does not have.
 fn decimal_arith(a: &Value, op: ArithOp, b: &Value) -> Result<Value, String> {
     let factor = 10i128.pow(crate::core::value_codec::DECIMAL_SCALE);
 
@@ -1942,6 +2078,14 @@ fn decimal_arith(a: &Value, op: ArithOp, b: &Value) -> Result<Value, String> {
                 bytes,
                 db_type: DbType::DECIMAL,
             } => Some(i128::from_le_bytes(bytes.as_slice().try_into().ok()?)),
+            // A fractional literal arrives as a float — `price * 1.5`. A
+            // literal meeting a NUMERIC column was already converted when the
+            // expression was parsed (`fold_float_literal_into_decimal`); this
+            // is the same conversion for a float that is computed.
+            Value::Data {
+                db_type: DbType::F32 | DbType::F64,
+                ..
+            } => float_to_engine_decimal(as_f64(value)?),
             // A whole number written into a decimal expression is exact, so it
             // is lifted into scaled units rather than turned into a float.
             other => as_i64(other).map(|v| v as i128 * factor),
@@ -1955,12 +2099,12 @@ fn decimal_arith(a: &Value, op: ArithOp, b: &Value) -> Result<Value, String> {
     let value = match op {
         ArithOp::Add => x.checked_add(y),
         ArithOp::Sub => x.checked_sub(y),
-        ArithOp::Mul => x.checked_mul(y).map(|product| product / factor),
+        ArithOp::Mul => decimal_mul_engine(x, y),
         ArithOp::Div => {
             if y == 0 {
                 return Err("division by zero".to_string());
             }
-            x.checked_mul(factor).map(|lifted| lifted / y)
+            decimal_div_engine(x, y)
         }
         ArithOp::Rem => {
             if y == 0 {
@@ -1975,6 +2119,231 @@ fn decimal_arith(a: &Value, op: ArithOp, b: &Value) -> Result<Value, String> {
         bytes: value.to_le_bytes().to_vec(),
         db_type: DbType::DECIMAL,
     })
+}
+
+/// A float taken into `NUMERIC` at the engine scale, at the digits it was
+/// written with: the shortest text that round-trips the float is those digits,
+/// and parsing it is exact. A float with more places than the engine keeps is
+/// rounded. `None` for a non-finite float.
+fn float_to_engine_decimal(f: f64) -> Option<i128> {
+    if !f.is_finite() {
+        return None;
+    }
+    let factor = 10i128.pow(crate::core::value_codec::DECIMAL_SCALE);
+    crate::core::value_codec::parse_decimal(&format!("{}", f)).or_else(|| {
+        let lifted = (f * factor as f64).round();
+        (lifted.abs() < i128::MAX as f64).then_some(lifted as i128)
+    })
+}
+
+/// Whether `expr` evaluates to a `NUMERIC` whenever it is not NULL — so that
+/// arithmetic against it is certain to take the decimal path.
+///
+/// Deliberately narrow: a column or literal of that type, or arithmetic with
+/// one such operand (which `arith` sends down the decimal path, or refuses).
+/// A `CASE` or `COALESCE` whose static type is NUMERIC may still produce an
+/// integer at run time, and a float literal against an integer is float
+/// arithmetic — converting it there would change the answer's type.
+fn always_decimal(expr: &Expr) -> bool {
+    match expr {
+        Expr::Column(field) => field.db_type == DbType::DECIMAL,
+        Expr::Literal { db_type, .. } => *db_type == DbType::DECIMAL,
+        Expr::Arith(a, _, b) => always_decimal(a) || always_decimal(b),
+        _ => false,
+    }
+}
+
+/// `v * 1.5` over a NUMERIC `v`: the float literal is converted to NUMERIC
+/// once, here, instead of on every row. `decimal_arith` used to format the
+/// float as text and parse it back per row, and the result is the same bytes
+/// either way — the conversion is [`float_to_engine_decimal`] in both places.
+/// A float column, or a float against an integer, is left alone:
+/// `float_col * 1.5` stays float.
+fn fold_float_literal_into_decimal(expr: Expr) -> Expr {
+    let Expr::Arith(mut lhs, op, mut rhs) = expr else {
+        return expr;
+    };
+    let convert = |side: &mut Box<Expr>, other: &Expr| {
+        if let Expr::Literal {
+            bytes,
+            db_type: db_type @ (DbType::F32 | DbType::F64),
+        } = side.as_ref()
+        {
+            if !always_decimal(other) {
+                return;
+            }
+            let value = Value::Data {
+                bytes: bytes.clone(),
+                db_type: db_type.clone(),
+            };
+            if let Some(units) = as_f64(&value).and_then(float_to_engine_decimal) {
+                **side = Expr::Literal {
+                    bytes: units.to_le_bytes().to_vec(),
+                    db_type: DbType::DECIMAL,
+                };
+            }
+        }
+    };
+    convert(&mut rhs, &lhs);
+    convert(&mut lhs, &rhs);
+    Expr::Arith(lhs, op, rhs)
+}
+
+/// The product of two values at the engine scale, at the engine scale:
+/// truncated toward zero, `None` only when the answer does not fit.
+///
+/// Shared with the scan's predicate engine (`row::math`), so `WHERE v * 2 = 200`
+/// and `SELECT v * 2` cannot disagree about a single digit.
+pub(crate) fn decimal_mul_engine(x: i128, y: i128) -> Option<i128> {
+    let factor = 10i128.pow(crate::core::value_codec::DECIMAL_SCALE);
+    match x.checked_mul(y) {
+        Some(product) => Some(product / factor),
+        None => mul_div_i128(x, y, factor),
+    }
+}
+
+/// The quotient of two values at the engine scale, at the engine scale. The
+/// caller has refused a zero divisor.
+pub(crate) fn decimal_div_engine(x: i128, y: i128) -> Option<i128> {
+    let factor = 10i128.pow(crate::core::value_codec::DECIMAL_SCALE);
+    match x.checked_mul(factor) {
+        Some(lifted) => Some(lifted / y),
+        None => mul_div_i128(x, factor, y),
+    }
+}
+
+/// `a * b / d`, truncated toward zero as `i128` division is, through a 256-bit
+/// product. `None` only when the quotient itself does not fit an `i128`.
+fn mul_div_i128(a: i128, b: i128, d: i128) -> Option<i128> {
+    if d == 0 {
+        return None;
+    }
+    let negative = (a < 0) ^ (b < 0) ^ (d < 0);
+    let (hi, lo) = widening_mul_u128(a.unsigned_abs(), b.unsigned_abs());
+    let q = div_u256_by_u128(hi, lo, d.unsigned_abs())?;
+    if negative {
+        // `i128::MIN` has no positive twin, so it is the one extra value the
+        // negative side can hold.
+        if q == i128::MIN.unsigned_abs() {
+            Some(i128::MIN)
+        } else {
+            i128::try_from(q).ok().map(|v| -v)
+        }
+    } else {
+        i128::try_from(q).ok()
+    }
+}
+
+/// The full 256-bit product of two `u128`s, as (high, low) halves.
+fn widening_mul_u128(a: u128, b: u128) -> (u128, u128) {
+    const MASK: u128 = u64::MAX as u128;
+    let (a_hi, a_lo) = (a >> 64, a & MASK);
+    let (b_hi, b_lo) = (b >> 64, b & MASK);
+    let ll = a_lo * b_lo;
+    let lh = a_lo * b_hi;
+    let hl = a_hi * b_lo;
+    let hh = a_hi * b_hi;
+    // The middle column: three terms below 2^128 each, summed with carries.
+    let mid = (ll >> 64) + (lh & MASK) + (hl & MASK);
+    let lo = (ll & MASK) | (mid << 64);
+    let hi = hh + (lh >> 64) + (hl >> 64) + (mid >> 64);
+    (hi, lo)
+}
+
+/// `(hi:lo) / d` for a divisor no wider than 127 bits — every magnitude of an
+/// `i128` is — so the running remainder doubled always fits a `u128`. `None`
+/// when the quotient needs more than 128 bits.
+fn div_u256_by_u128(hi: u128, lo: u128, d: u128) -> Option<u128> {
+    debug_assert!(d != 0 && d <= 1u128 << 127);
+    if hi == 0 {
+        return Some(lo / d);
+    }
+    // The quotient fits 128 bits exactly when the high half is below `d`.
+    if hi >= d {
+        return None;
+    }
+    let mut rem = hi;
+    let mut q: u128 = 0;
+    for bit in (0..128).rev() {
+        rem = (rem << 1) | ((lo >> bit) & 1);
+        q <<= 1;
+        if rem >= d {
+            rem -= d;
+            q |= 1;
+        }
+    }
+    Some(q)
+}
+
+/// Lifts a `NUMERIC(p, s)` column's stored integer to the engine scale, so
+/// arithmetic and comparisons see one scale whatever each column declared.
+///
+/// A scale above the engine's is truncated to it — expressions compute at the
+/// engine scale, and a column that keeps more places only keeps them in
+/// storage. An up-scale that overflows is refused rather than wrapped.
+pub(crate) fn to_engine_scale(value: Value, field: &SchemaField) -> Result<Value, String> {
+    use crate::core::value_codec::DECIMAL_SCALE;
+    let Some(scale) = field.scale.filter(|s| *s != DECIMAL_SCALE) else {
+        return Ok(value);
+    };
+    match value {
+        Value::Data {
+            bytes,
+            db_type: DbType::DECIMAL,
+        } if bytes.len() == 16 => {
+            let raw = i128::from_le_bytes(bytes.as_slice().try_into().unwrap());
+            let lifted = rescale_decimal(raw, scale, DECIMAL_SCALE).ok_or_else(|| {
+                format!(
+                    "numeric value of column \"{}\" is out of range for arithmetic",
+                    field.name
+                )
+            })?;
+            Ok(Value::Data {
+                bytes: lifted.to_le_bytes().to_vec(),
+                db_type: DbType::DECIMAL,
+            })
+        }
+        other => Ok(other),
+    }
+}
+
+/// The inverse of [`to_engine_scale`], for an expression result about to be
+/// stored in a `NUMERIC(p, s)` column: `UPDATE … SET v = v + 1`.
+pub(crate) fn from_engine_scale(value: Value, field: &SchemaField) -> Result<Value, String> {
+    use crate::core::value_codec::DECIMAL_SCALE;
+    if field.db_type != DbType::DECIMAL {
+        return Ok(value);
+    }
+    let Some(scale) = field.scale.filter(|s| *s != DECIMAL_SCALE) else {
+        return Ok(value);
+    };
+    match value {
+        Value::Data {
+            bytes,
+            db_type: DbType::DECIMAL,
+        } if bytes.len() == 16 => {
+            let raw = i128::from_le_bytes(bytes.as_slice().try_into().unwrap());
+            let stored = rescale_decimal(raw, DECIMAL_SCALE, scale).ok_or_else(|| {
+                format!("numeric field overflow for column \"{}\"", field.name)
+            })?;
+            Ok(Value::Data {
+                bytes: stored.to_le_bytes().to_vec(),
+                db_type: DbType::DECIMAL,
+            })
+        }
+        other => Ok(other),
+    }
+}
+
+/// Moves a scaled integer from one scale to another: exact upward (or `None`
+/// on overflow), truncated toward zero downward, as a declared scale truncates.
+pub(crate) fn rescale_decimal(raw: i128, from: u32, to: u32) -> Option<i128> {
+    use std::cmp::Ordering;
+    match from.cmp(&to) {
+        Ordering::Equal => Some(raw),
+        Ordering::Less => raw.checked_mul(10i128.checked_pow(to - from)?),
+        Ordering::Greater => Some(raw / 10i128.checked_pow(from - to)?),
+    }
 }
 
 /// The type an integer result takes: the wider of the two operands.
@@ -2100,12 +2469,14 @@ fn top_level_arith(text: &str) -> Option<(usize, ArithOp)> {
 }
 
 fn column_value(field: &SchemaField, row: &Row, schema: &[SchemaField]) -> Value {
-    let sv: SmallVec<[SchemaField; 20]> = schema.iter().cloned().collect();
-    if let Some(flag) = crate::core::rql::nullable::flag_field(&field.name, &sv) {
+    // The schema is searched in place. This used to clone it into a SmallVec
+    // first — every field and every field's name, once per column reference
+    // per row — only to satisfy `flag_field`'s parameter type.
+    if let Some(flag) = crate::core::rql::nullable::flag_field(&field.name, schema) {
         let is_null = row
             .columns
             .iter()
-            .find(|c| c.schema_id == flag.write_order)
+            .find(|c| u64::from(c.schema_id) == flag.write_order)
             .map(|c| crate::core::rql::nullable::flag_is_set(c.data.into_slice()))
             .unwrap_or(false);
         if is_null {
@@ -2115,7 +2486,7 @@ fn column_value(field: &SchemaField, row: &Row, schema: &[SchemaField]) -> Value
     match row
         .columns
         .iter()
-        .find(|c| c.schema_id == field.write_order)
+        .find(|c| u64::from(c.schema_id) == field.write_order)
     {
         // A cell carrying `NULL` as its type *is* a NULL.
         //
@@ -2173,6 +2544,17 @@ pub(crate) fn compare(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     else {
         return None;
     };
+    // Two numeric types: widened to a common one rather than reading `b`'s
+    // bytes as `a`'s type, which made `compare(a, b)` and `compare(b, a)`
+    // disagree for mixed widths (`COALESCE(bigint, int)`, `LEAST`, `CASE`) —
+    // an inconsistent comparator, which the standard sort may panic on.
+    if let Value::Data { db_type: bt, .. } = b {
+        if at != bt {
+            if let (Some(x), Some(y)) = (numeric_key(at, ab), numeric_key(bt, bb)) {
+                return Some(x.cmp_exact(&y));
+            }
+        }
+    }
     if ab.is_empty() || bb.is_empty() {
         // An empty STRING is a real value — `''` equals `''` and precedes any
         // other text — while empty bytes of a fixed-width type mean "absent",
@@ -2188,6 +2570,140 @@ pub(crate) fn compare(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     Some(crate::core::processor::concurrent_processor::compare_bytes_as_type(at.clone(), ab, bb))
 }
 
+/// A numeric value in a form any two can be compared in exactly: an integer
+/// or engine-scale `NUMERIC` as sign, magnitude and decimal scale, or a float.
+///
+/// PostgreSQL resolves mixed operands to one type first — int2/int4/int8 to
+/// int8, an integer against `NUMERIC` to `NUMERIC`, anything against a float to
+/// float. Comparing exactly gives those answers wherever the conversion is
+/// exact, and stays a total order where it is not (an `int8` above 2^53 against
+/// a `float8`, which a lossy cast would call equal to its neighbour and so
+/// break transitivity).
+#[derive(Debug, Clone, Copy)]
+enum NumKey {
+    Exact { neg: bool, mag: u128, scale: u32 },
+    Float(f64),
+}
+
+fn numeric_key(db_type: &DbType, bytes: &[u8]) -> Option<NumKey> {
+    fn signed(v: i128, scale: u32) -> NumKey {
+        NumKey::Exact { neg: v < 0, mag: v.unsigned_abs(), scale }
+    }
+    let b = bytes;
+    Some(match db_type {
+        DbType::I8 => signed(i8::from_le_bytes(b.try_into().ok()?) as i128, 0),
+        DbType::I16 => signed(i16::from_le_bytes(b.try_into().ok()?) as i128, 0),
+        DbType::I32 => signed(i32::from_le_bytes(b.try_into().ok()?) as i128, 0),
+        DbType::I64 => signed(i64::from_le_bytes(b.try_into().ok()?) as i128, 0),
+        DbType::I128 => signed(i128::from_le_bytes(b.try_into().ok()?), 0),
+        DbType::U8 => signed(u8::from_le_bytes(b.try_into().ok()?) as i128, 0),
+        DbType::U16 => signed(u16::from_le_bytes(b.try_into().ok()?) as i128, 0),
+        DbType::U32 => signed(u32::from_le_bytes(b.try_into().ok()?) as i128, 0),
+        DbType::U64 => signed(u64::from_le_bytes(b.try_into().ok()?) as i128, 0),
+        DbType::U128 => NumKey::Exact {
+            neg: false,
+            mag: u128::from_le_bytes(b.try_into().ok()?),
+            scale: 0,
+        },
+        DbType::DECIMAL => signed(
+            i128::from_le_bytes(b.try_into().ok()?),
+            crate::core::value_codec::DECIMAL_SCALE,
+        ),
+        DbType::F32 => NumKey::Float(f32::from_le_bytes(b.try_into().ok()?) as f64),
+        DbType::F64 => NumKey::Float(f64::from_le_bytes(b.try_into().ok()?)),
+        _ => return None,
+    })
+}
+
+impl NumKey {
+    fn cmp_exact(&self, other: &NumKey) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        match (*self, *other) {
+            (NumKey::Float(x), NumKey::Float(y)) => {
+                crate::core::processor::concurrent_processor::pg_float_cmp(x, y)
+            }
+            (NumKey::Float(x), e @ NumKey::Exact { .. }) => float_vs_exact(x, &e),
+            (e @ NumKey::Exact { .. }, NumKey::Float(y)) => float_vs_exact(y, &e).reverse(),
+            (
+                NumKey::Exact { neg: an, mag: am, scale: asc },
+                NumKey::Exact { neg: bn, mag: bm, scale: bsc },
+            ) => {
+                let (an, bn) = (an && am != 0, bn && bm != 0);
+                if an != bn {
+                    return if an { Ordering::Less } else { Ordering::Greater };
+                }
+                // Same sign: compare magnitudes at the larger scale. A
+                // magnitude that overflows when rescaled is the larger one.
+                let up = |m: u128, by: u32| 10u128.checked_pow(by).and_then(|f| m.checked_mul(f));
+                let mags = if asc >= bsc {
+                    up(bm, asc - bsc).map(|b| am.cmp(&b)).unwrap_or(Ordering::Less)
+                } else {
+                    up(am, bsc - asc).map(|a| a.cmp(&bm)).unwrap_or(Ordering::Greater)
+                };
+                if an { mags.reverse() } else { mags }
+            }
+        }
+    }
+}
+
+/// `x` against an exact value, exactly. NaN sorts above everything, as in
+/// `pg_float_cmp`; `-0.0` equals zero.
+fn float_vs_exact(x: f64, e: &NumKey) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let NumKey::Exact { neg, mag, scale } = *e else {
+        unreachable!("called with an exact value")
+    };
+    let eneg = neg && mag != 0;
+    if x.is_nan() {
+        return Ordering::Greater;
+    }
+    if x.is_infinite() {
+        return if x > 0.0 { Ordering::Greater } else { Ordering::Less };
+    }
+    let xneg = x < 0.0;
+    if x == 0.0 || mag == 0 || xneg != eneg {
+        // Different signs, or either is zero: the signs alone decide.
+        let sx = if x == 0.0 { 0 } else if xneg { -1 } else { 1 };
+        let se = if mag == 0 { 0 } else if eneg { -1 } else { 1 };
+        return sx.cmp(&se);
+    }
+    // Same sign, both non-zero: compare |x| = m * 2^exp with mag / 10^scale,
+    // i.e. m * 10^scale * 2^exp against mag.
+    let bits = x.abs().to_bits();
+    let raw_exp = ((bits >> 52) & 0x7ff) as i32;
+    let frac = bits & ((1u64 << 52) - 1);
+    let (m, exp) = if raw_exp == 0 {
+        (frac, -1074)
+    } else {
+        (frac | (1u64 << 52), raw_exp - 1075)
+    };
+    let bitlen = |v: u128| 128 - v.leading_zeros() as i32;
+    let ord = match 10u128.checked_pow(scale).and_then(|f| (m as u128).checked_mul(f)) {
+        None => Ordering::Greater,
+        Some(a) => {
+            if exp >= 0 {
+                // a * 2^exp against mag.
+                let lo = bitlen(a) - 1 + exp; // a * 2^exp >= 2^lo
+                if lo >= bitlen(mag) {
+                    Ordering::Greater
+                } else {
+                    (a << exp).cmp(&mag)
+                }
+            } else {
+                // a against mag * 2^k.
+                let k = -exp;
+                let lo = bitlen(mag) - 1 + k; // mag * 2^k >= 2^lo
+                if lo >= bitlen(a) {
+                    Ordering::Less
+                } else {
+                    a.cmp(&(mag << k))
+                }
+            }
+        }
+    };
+    if xneg { ord.reverse() } else { ord }
+}
+
 /// Evaluates `expr` for one row.
 pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, String> {
     Ok(match expr {
@@ -2196,7 +2712,7 @@ pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, Str
             bytes: bytes.clone(),
             db_type: db_type.clone(),
         },
-        Expr::Column(field) => column_value(field, row, schema),
+        Expr::Column(field) => to_engine_scale(column_value(field, row, schema), field)?,
         Expr::JsonPath {
             column,
             steps,
@@ -2270,6 +2786,7 @@ pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, Str
                 crate::core::rql::aggregate::ScalarFunc::Now => "now",
                 crate::core::rql::aggregate::ScalarFunc::CurrentDate => "current_date",
                 crate::core::rql::aggregate::ScalarFunc::GenRandomUuid => "gen_random_uuid",
+                crate::core::rql::aggregate::ScalarFunc::UuidV7 => "uuidv7",
             })
             .expect("known function");
             Value::Data {
@@ -2281,7 +2798,7 @@ pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, Str
             for arg in args {
                 let value = eval(arg, row, schema)?;
                 if !value.is_null() {
-                    return Ok(value);
+                    return to_common_type(expr, value);
                 }
             }
             Value::Null
@@ -2292,7 +2809,7 @@ pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, Str
             if compare(&left, &right) == Some(std::cmp::Ordering::Equal) {
                 Value::Null
             } else {
-                left
+                to_common_type(expr, left)?
             }
         }
         Expr::Least(args) | Expr::Greatest(args) => {
@@ -2313,7 +2830,7 @@ pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, Str
                     },
                 });
             }
-            best.unwrap_or(Value::Null)
+            to_common_type(expr, best.unwrap_or(Value::Null))?
         }
         Expr::Mod(a, b) => {
             let left = eval(a, row, schema)?;
@@ -2335,11 +2852,11 @@ pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, Str
         Expr::Case { whens, otherwise } => {
             for (condition, result) in whens {
                 if eval_cond(condition, row, schema)? {
-                    return eval(result, row, schema);
+                    return to_common_type(expr, eval(result, row, schema)?);
                 }
             }
             match otherwise {
-                Some(e) => return eval(e, row, schema),
+                Some(e) => return to_common_type(expr, eval(e, row, schema)?),
                 None => Value::Null,
             }
         }
@@ -2348,6 +2865,172 @@ pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, Str
             cast(value, target)?
         }
     })
+}
+
+/// The type PostgreSQL's `select_common_type` gives the branches of a `CASE`,
+/// `COALESCE`, `GREATEST`/`LEAST` (and the argument of `NULLIF`), and whether
+/// every branch is a number — the case where values are converted to it.
+///
+/// * A bare `NULL` takes no part.
+/// * An integer literal is `int4` when it fits and `int8` when it does not; a
+///   literal with a fraction is `numeric`. (Every integer literal parses as
+///   `I64` here, so `CASE … THEN 1` used to come out `int8`, and a client
+///   that asked for `i32` refused it.)
+/// * A quoted literal is of unknown type and adopts the others'; only when
+///   every branch is one is the result `text`.
+/// * Numbers widen: `int2 < int4 < int8 < numeric < float4 < float8`.
+/// * Any other mix keeps the first typed branch, as this did before —
+///   PostgreSQL would refuse it, and refusing is left to a later change rather
+///   than introduced silently here.
+pub fn common_type<'a>(branches: impl Iterator<Item = &'a Expr>) -> (DbType, bool) {
+    fn rank(t: &DbType) -> Option<u8> {
+        Some(match t {
+            DbType::I8 | DbType::U8 | DbType::I16 => 1,
+            DbType::U16 | DbType::I32 => 2,
+            DbType::U32 | DbType::I64 => 3,
+            DbType::U64 | DbType::I128 | DbType::U128 | DbType::DECIMAL => 4,
+            DbType::F32 => 5,
+            DbType::F64 => 6,
+            _ => return None,
+        })
+    }
+    let mut known: Vec<DbType> = Vec::new();
+    for e in branches {
+        match e {
+            Expr::Null => {}
+            Expr::Literal {
+                db_type: DbType::STRING,
+                ..
+            } => {}
+            Expr::Literal {
+                db_type: DbType::I64,
+                bytes,
+            } => {
+                let v = <[u8; 8]>::try_from(bytes.as_slice())
+                    .map(i64::from_le_bytes)
+                    .unwrap_or(i64::MAX);
+                known.push(if i32::try_from(v).is_ok() {
+                    DbType::I32
+                } else {
+                    DbType::I64
+                });
+            }
+            Expr::Literal {
+                db_type: DbType::F64,
+                ..
+            } => known.push(DbType::DECIMAL),
+            other => known.push(static_type(other)),
+        }
+    }
+    let Some(first) = known.first().cloned() else {
+        return (DbType::STRING, false);
+    };
+    if known.iter().all(|t| rank(t).is_some()) {
+        let widest = known
+            .iter()
+            .max_by_key(|t| rank(t).expect("checked"))
+            .cloned()
+            .expect("non-empty");
+        return (widest, true);
+    }
+    if known.iter().all(|t| *t == first) {
+        return (first, false);
+    }
+    (first, false)
+}
+
+/// Refuses branches PostgreSQL's `select_common_type` cannot reconcile —
+/// `CASE types integer and text cannot be matched` (SQLSTATE 42804).
+///
+/// Branches must share a type category: every number is one category (and
+/// widens, see [`common_type`]), text is one, and every other type is its own
+/// (dates and timestamps share one). An untyped quoted literal and a bare
+/// `NULL` take no part — they adopt the other branches' type — so
+/// `CASE … THEN 1 ELSE '2' END` stays valid, as does `THEN 'a' ELSE 1::text`.
+/// Mixing categories used to resolve to whichever branch came first and send
+/// the others' bytes under that type.
+pub fn check_branch_types<'a>(
+    construct: &str,
+    branches: impl Iterator<Item = &'a Expr>,
+) -> Result<(), String> {
+    fn category(t: &DbType) -> DbType {
+        match t {
+            DbType::I8
+            | DbType::U8
+            | DbType::I16
+            | DbType::U16
+            | DbType::I32
+            | DbType::U32
+            | DbType::I64
+            | DbType::U64
+            | DbType::I128
+            | DbType::U128
+            | DbType::DECIMAL
+            | DbType::F32
+            | DbType::F64 => DbType::DECIMAL,
+            DbType::STRING | DbType::CHAR => DbType::STRING,
+            DbType::DATE | DbType::DATETIME => DbType::DATETIME,
+            other => other.clone(),
+        }
+    }
+    let mut first: Option<DbType> = None;
+    for e in branches {
+        let ty = match e {
+            Expr::Null
+            | Expr::Literal {
+                db_type: DbType::STRING,
+                ..
+            } => continue,
+            other => static_type(other),
+        };
+        match &first {
+            None => first = Some(ty),
+            Some(f) if category(f) == category(&ty) => {}
+            Some(f) => {
+                return Err(format!(
+                    "{} types {} and {} cannot be matched",
+                    construct,
+                    crate::core::value_codec::pg_input_type_name(f),
+                    crate::core::value_codec::pg_input_type_name(&ty)
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A branch's value converted to the type the whole expression resolved to,
+/// so the payload is what the row description announced. Only for an
+/// all-number resolution, where the conversion is a widening (or a literal
+/// read as a number); a value that cannot be converted fails the statement
+/// rather than going out under the wrong type.
+fn to_common_type(expr: &Expr, value: Value) -> Result<Value, String> {
+    if value.is_null() {
+        return Ok(value);
+    }
+    let (target, numeric) = match expr {
+        Expr::Coalesce(args) | Expr::Least(args) | Expr::Greatest(args) => common_type(args.iter()),
+        Expr::NullIf(lhs, _) => common_type(std::iter::once(&**lhs)),
+        Expr::Case { whens, otherwise } => common_type(
+            whens
+                .iter()
+                .map(|(_, e)| e)
+                .chain(otherwise.iter().map(|b| b.as_ref())),
+        ),
+        _ => return Ok(value),
+    };
+    if !numeric || value.db_type() == Some(&target) {
+        return Ok(value);
+    }
+    let from = value.db_type().cloned();
+    match cast(value, &target)? {
+        converted @ Value::Data { .. } if converted.db_type() == Some(&target) => Ok(converted),
+        _ => Err(format!(
+            "a {} branch cannot be read as the {} the expression resolves to",
+            from.map(|t| t.to_string()).unwrap_or_default(),
+            target
+        )),
+    }
 }
 
 /// Evaluates one comparison against a row.
@@ -2360,6 +3043,28 @@ pub fn eval_condition(
     match condition.cmp {
         Cmp::IsNull => return Ok(left.is_null()),
         Cmp::IsNotNull => return Ok(!left.is_null()),
+        Cmp::IsTrue | Cmp::IsNotTrue | Cmp::IsFalse | Cmp::IsNotFalse => {
+            // Three-valued: `None` is NULL, neither true nor false.
+            let truth = match &left {
+                Value::Null => None,
+                Value::Data {
+                    bytes,
+                    db_type: DbType::BOOL,
+                } => Some(bytes.first().copied().unwrap_or(0) != 0),
+                Value::Data { db_type, .. } => {
+                    return Err(format!(
+                        "argument of IS TRUE/FALSE must be type boolean, not {}",
+                        db_type
+                    ));
+                }
+            };
+            return Ok(match condition.cmp {
+                Cmp::IsTrue => truth == Some(true),
+                Cmp::IsNotTrue => truth != Some(true),
+                Cmp::IsFalse => truth == Some(false),
+                _ => truth != Some(false),
+            });
+        }
         _ => {}
     }
     let right = match &condition.right {
@@ -2405,7 +3110,12 @@ pub fn eval_condition(
         Cmp::Le => ordering.is_le(),
         Cmp::Gt => ordering.is_gt(),
         Cmp::Ge => ordering.is_ge(),
-        Cmp::IsNull | Cmp::IsNotNull => unreachable!("handled above"),
+        Cmp::IsNull
+        | Cmp::IsNotNull
+        | Cmp::IsTrue
+        | Cmp::IsNotTrue
+        | Cmp::IsFalse
+        | Cmp::IsNotFalse => unreachable!("handled above"),
     })
 }
 
@@ -2615,7 +3325,7 @@ mod tests {
             mb.into_slice_mut().copy_from_slice(bytes);
         }
         Column {
-            schema_id,
+            schema_id: crate::core::row::row::schema_id_of(schema_id),
             data: mb,
             column_type: ty,
         }
@@ -2631,7 +3341,7 @@ mod tests {
     }
 
     fn row_with(v: Option<i32>, t: &str) -> Row {
-        let mut columns: SmallVec<[Column; 32]> = SmallVec::new();
+        let mut columns: crate::core::row::row::RowColumns = SmallVec::new();
         match v {
             Some(n) => {
                 columns.push(column(0, DbType::I32, &n.to_le_bytes()));
@@ -2977,6 +3687,86 @@ mod tests {
         );
     }
 
+    /// The doubly-scaled product of two NUMERICs passes `i128` long before the
+    /// answer does: 1e11 * 1e10 = 1e21 is far inside NUMERIC's range, but its
+    /// intermediate is 1e39. That used to report "numeric overflow".
+    #[test]
+    fn numeric_products_and_quotients_past_the_i128_intermediate() {
+        use crate::core::value_codec::DECIMAL_SCALE;
+        let factor = 10i128.pow(DECIMAL_SCALE);
+        let dec = |v: i128| Value::Data {
+            bytes: v.to_le_bytes().to_vec(),
+            db_type: DbType::DECIMAL,
+        };
+        let arith = |a: i128, op, b: i128| decimal_arith(&dec(a), op, &dec(b));
+        let read = |v: Value| match v {
+            Value::Data { bytes, .. } => i128::from_le_bytes(bytes.as_slice().try_into().unwrap()),
+            Value::Null => panic!("null"),
+        };
+
+        let e11 = 100_000_000_000i128 * factor;
+        let e10 = 10_000_000_000i128 * factor;
+        let e21 = 1_000_000_000_000_000_000_000i128 * factor;
+        assert_eq!(read(arith(e11, ArithOp::Mul, e10).unwrap()), e21);
+        assert_eq!(read(arith(-e11, ArithOp::Mul, e10).unwrap()), -e21);
+        assert_eq!(read(arith(e21, ArithOp::Div, e10).unwrap()), e11);
+        assert_eq!(read(arith(e21, ArithOp::Div, -e11).unwrap()), -e10);
+
+        // Truncation toward zero, as the i128 fast path truncates: 1.000000001
+        // * 1.000000001 = 1.000000002000000001, kept to nine places.
+        let x = factor + 1;
+        assert_eq!(read(arith(x, ArithOp::Mul, x).unwrap()), factor + 2);
+        // The same answer through the wide path, scaled up past i128 squares.
+        let big = 10i128.pow(19) * factor + 1;
+        assert_eq!(
+            mul_div_i128(big, big, factor),
+            None,
+            "1e38 at scale 9 does not fit, and says so"
+        );
+        assert_eq!(mul_div_i128(big, factor, factor), Some(big));
+        assert_eq!(mul_div_i128(-big, factor, factor), Some(-big));
+
+        // A real overflow is still one.
+        let huge = i128::MAX / 2;
+        assert!(arith(huge, ArithOp::Mul, huge).is_err());
+    }
+
+    #[test]
+    fn a_fractional_literal_is_exact_in_numeric_arithmetic() {
+        use crate::core::value_codec::DECIMAL_SCALE;
+        let factor = 10i128.pow(DECIMAL_SCALE);
+        let dec = Value::Data {
+            bytes: (100 * factor).to_le_bytes().to_vec(),
+            db_type: DbType::DECIMAL,
+        };
+        let float = |f: f64| Value::Data {
+            bytes: f.to_le_bytes().to_vec(),
+            db_type: DbType::F64,
+        };
+        let read = |v: Value| match v {
+            Value::Data { bytes, db_type } => {
+                assert_eq!(db_type, DbType::DECIMAL);
+                i128::from_le_bytes(bytes.as_slice().try_into().unwrap())
+            }
+            Value::Null => panic!("null"),
+        };
+        assert_eq!(read(arith(&dec, ArithOp::Mul, &float(1.5)).unwrap()), 150 * factor);
+        // 0.1 is not exact as a float; it is exact as the digits written.
+        assert_eq!(
+            read(arith(&dec, ArithOp::Add, &float(0.1)).unwrap()),
+            100 * factor + factor / 10
+        );
+    }
+
+    #[test]
+    fn rescale_moves_between_declared_scales() {
+        assert_eq!(rescale_decimal(150, 2, 9), Some(1_500_000_000));
+        assert_eq!(rescale_decimal(1_500_000_000, 9, 2), Some(150));
+        // Down is truncation toward zero, as a declared scale truncates.
+        assert_eq!(rescale_decimal(-1_999, 3, 0), Some(-1));
+        assert_eq!(rescale_decimal(i128::MAX, 0, 9), None);
+    }
+
     #[test]
     fn arithmetic_precedence_and_grouping() {
         let s = schema();
@@ -3132,7 +3922,7 @@ mod tests {
         };
         assert_eq!(db_type, DbType::I16);
         assert_eq!(bytes.len(), 2);
-        assert_eq!(i16::from_le_bytes(bytes.try_into().unwrap()), 300);
+        assert_eq!(i16::from_le_bytes(bytes[..].try_into().unwrap()), 300);
 
         assert!(parse("v::nosuchtype", &s).is_err());
     }
@@ -3236,7 +4026,7 @@ mod tests {
             panic!("null")
         };
         assert_eq!(db_type, DbType::I32);
-        assert_eq!(i32::from_le_bytes(bytes.try_into().unwrap()), 42);
+        assert_eq!(i32::from_le_bytes(bytes[..].try_into().unwrap()), 42);
         // Out of range is an error, not a wrap.
         assert!(eval(&parse("'300'::smallint", &s).unwrap(), &r, &s).is_ok());
         assert!(eval(&parse("'70000'::smallint", &s).unwrap(), &r, &s).is_err());
@@ -3246,7 +4036,7 @@ mod tests {
             panic!("null")
         };
         assert_eq!(db_type, DbType::F32);
-        assert_eq!(f32::from_le_bytes(bytes.try_into().unwrap()), 1.0);
+        assert_eq!(f32::from_le_bytes(bytes[..].try_into().unwrap()), 1.0);
         // A fractional literal reaches a float target.
         let Value::Data { bytes, db_type } =
             eval(&parse("'2.5'::float8", &s).unwrap(), &r, &s).unwrap()
@@ -3254,7 +4044,7 @@ mod tests {
             panic!("null")
         };
         assert_eq!(db_type, DbType::F64);
-        assert_eq!(f64::from_le_bytes(bytes.try_into().unwrap()), 2.5);
+        assert_eq!(f64::from_le_bytes(bytes[..].try_into().unwrap()), 2.5);
         // A float SOURCE reaches another width through the text fallback —
         // the path `AVG(x)::real` takes, since no direct f64→f32 arm exists.
         let Value::Data { bytes, db_type } =
@@ -3263,7 +4053,7 @@ mod tests {
             panic!("null")
         };
         assert_eq!(db_type, DbType::F32);
-        assert_eq!(f32::from_le_bytes(bytes.try_into().unwrap()), 2.5);
+        assert_eq!(f32::from_le_bytes(bytes[..].try_into().unwrap()), 2.5);
         // A fractional value ROUNDS into an integer target, half away from
         // zero, as PostgreSQL's numeric cast does — the billing rollup hands
         // AVG's '1092.75' to ::bigint. Range still checked after rounding.
@@ -3272,13 +4062,13 @@ mod tests {
         else {
             panic!("null")
         };
-        assert_eq!(i64::from_le_bytes(bytes.try_into().unwrap()), 1093);
+        assert_eq!(i64::from_le_bytes(bytes[..].try_into().unwrap()), 1093);
         let Value::Data { bytes, .. } = eval(&parse("'2.5'::int", &s).unwrap(), &r, &s).unwrap()
         else {
             panic!("null")
         };
         assert_eq!(
-            i32::from_le_bytes(bytes.try_into().unwrap()),
+            i32::from_le_bytes(bytes[..].try_into().unwrap()),
             3,
             "half away from zero"
         );
@@ -3287,7 +4077,7 @@ mod tests {
             panic!("null")
         };
         assert_eq!(
-            i32::from_le_bytes(bytes.try_into().unwrap()),
+            i32::from_le_bytes(bytes[..].try_into().unwrap()),
             -3,
             "half away from zero"
         );
@@ -3303,9 +4093,24 @@ mod tests {
             else {
                 panic!("null")
             };
-            assert_eq!(bytes, vec![want], "{}", text);
+            assert_eq!(bytes.as_slice(), &[want][..], "{}", text);
         }
         assert!(eval(&parse("'maybe'::bool", &s).unwrap(), &r, &s).is_err());
+    }
+
+    #[test]
+    fn a_cast_inside_a_case_arm_stays_in_its_arm() {
+        let schema = vec![SchemaField::new("id".to_string(), DbType::I32, 4, 0, 0, false)];
+        let parsed = parse("CASE WHEN id = 1 THEN 'a' ELSE 1::text END", &schema)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(parsed, Expr::Case { .. }), "{parsed:?}");
+        assert_eq!(static_type(&parsed), DbType::STRING);
+        // A cast after the block still applies to the block.
+        let parsed = parse("CASE WHEN id = 1 THEN 1 ELSE 2 END::text", &schema).unwrap();
+        assert!(matches!(parsed, Expr::Cast(_, DbType::STRING)), "{parsed:?}");
+        // Mixed categories are refused.
+        let err = parse("CASE WHEN id = 1 THEN id ELSE 'x'::text END", &schema).unwrap_err();
+        assert!(err.ends_with("cannot be matched"), "{err}");
     }
 
     #[test]
@@ -3317,5 +4122,436 @@ mod tests {
         assert!(!needs_evaluation("42"));
         // A literal containing `::` is data, not a cast.
         assert!(!needs_evaluation("'a::b'"));
+    }
+}
+
+/// A float literal meeting a NUMERIC is converted once, at parse time, and the
+/// answer must be the one the per-row conversion gave.
+#[cfg(test)]
+mod float_literal_fold_tests {
+    use super::*;
+    use crate::core::row::row::Column;
+    use crate::memory_pool::MEMORY_POOL;
+
+    fn field(name: &str, ty: DbType, write_order: u64, scale: Option<u32>) -> SchemaField {
+        let mut f = SchemaField::new(name.to_string(), ty.clone(), ty.get_size(), 0, write_order, false);
+        f.scale = scale;
+        f
+    }
+
+    fn schema() -> Vec<SchemaField> {
+        vec![
+            field("d", DbType::DECIMAL, 0, Some(2)),
+            field("f", DbType::F64, 1, None),
+            field("i", DbType::I32, 2, None),
+            field("e", DbType::DECIMAL, 3, None),
+        ]
+    }
+
+    fn row(d: i128, f: f64, i: i32, e: i128) -> Row {
+        let mut columns: crate::core::row::row::RowColumns = SmallVec::new();
+        for (id, ty, bytes) in [
+            (0u64, DbType::DECIMAL, d.to_le_bytes().to_vec()),
+            (1, DbType::F64, f.to_le_bytes().to_vec()),
+            (2, DbType::I32, i.to_le_bytes().to_vec()),
+            (3, DbType::DECIMAL, e.to_le_bytes().to_vec()),
+        ] {
+            let mut mb = MEMORY_POOL.acquire(bytes.len());
+            mb.into_slice_mut().copy_from_slice(&bytes);
+            columns.push(Column {
+                schema_id: crate::core::row::row::schema_id_of(id),
+                data: mb,
+                column_type: ty,
+            });
+        }
+        Row {
+            position: 0,
+            length: 0,
+            columns,
+        }
+    }
+
+    /// The expression as `parse` built it before the fold: the same tree,
+    /// with every literal as written.
+    fn unfolded(text: &str, schema: &[SchemaField]) -> Expr {
+        match top_level_arith(text.trim()) {
+            Some((at, op)) if !is_number_literal(text.trim()) => Expr::Arith(
+                Box::new(unfolded(&text.trim()[..at], schema)),
+                op,
+                Box::new(unfolded(&text.trim()[at + 1..], schema)),
+            ),
+            _ => parse(text, schema).unwrap(),
+        }
+    }
+
+    fn literal_types(e: &Expr, out: &mut Vec<DbType>) {
+        match e {
+            Expr::Literal { db_type, .. } => out.push(db_type.clone()),
+            Expr::Arith(a, _, b) => {
+                literal_types(a, out);
+                literal_types(b, out);
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn a_folded_literal_answers_as_the_per_row_conversion_did() {
+        let s = schema();
+        let literals = [
+            "1.5", "0.1", "0.25", "1.0", "0.0025", "123456.789", "1.0000000005", "0.333333333333",
+            "0.000000000001", "99999999.99", "100000000000000000000.5", "1000000000000000000000000000000.0",
+            "3.14159265358979",
+        ];
+        let mut rng = fastrand::Rng::with_seed(0xf10a7);
+        let mut checked = 0;
+        for lit in literals {
+            for template in [
+                "d * {}", "d + {}", "d - {}", "d / {}", "{} * d", "{} - d", "e * {}", "d * {} + 1",
+                "d + e * {}", "f * {}", "i * {}", "f + {}", "{} * f", "d * 2 * {}",
+            ] {
+                let text = template.replace("{}", lit);
+                let folded = parse(&text, &s).unwrap();
+                let reference = unfolded(&text, &s);
+                for _ in 0..40 {
+                    let r = row(
+                        rng.i128(-10i128.pow(14)..10i128.pow(14)),
+                        (rng.f64() - 0.5) * 1e6,
+                        rng.i32(-100_000..100_000),
+                        rng.i128(-10i128.pow(20)..10i128.pow(20)),
+                    );
+                    let (a, b) = (eval(&folded, &r, &s), eval(&reference, &r, &s));
+                    match (&a, &b) {
+                        (Ok(x), Ok(y)) => assert_eq!(x, y, "{text}"),
+                        // Both refuse alike — overflow, division by zero.
+                        (Err(x), Err(y)) => assert_eq!(x, y, "{text}"),
+                        _ => panic!("{text}: folded {a:?}, per row {b:?}"),
+                    }
+                    checked += 1;
+                }
+                assert_eq!(static_type(&folded), static_type(&reference), "{text}");
+            }
+        }
+        assert!(checked > 5000);
+    }
+
+    #[test]
+    fn only_a_literal_meeting_a_numeric_is_converted() {
+        let s = schema();
+        for (text, want) in [
+            ("d * 1.5", vec![DbType::DECIMAL]),
+            ("1.5 * d", vec![DbType::DECIMAL]),
+            ("d * 2 * 1.5", vec![DbType::I32, DbType::DECIMAL]),
+            ("f * 1.5", vec![DbType::F64]),
+            ("i * 1.5", vec![DbType::F64]),
+            ("1.5 * 2.5", vec![DbType::F64, DbType::F64]),
+        ] {
+            let mut got = Vec::new();
+            literal_types(&parse(text, &s).unwrap(), &mut got);
+            // The integer literal's own width is whatever `parse` gives it.
+            got.iter_mut().for_each(|t| {
+                if !matches!(t, DbType::DECIMAL | DbType::F64 | DbType::F32) {
+                    *t = DbType::I32
+                }
+            });
+            assert_eq!(got, want, "{text}");
+        }
+        // `float_col * 1.5` is still float arithmetic.
+        let r = row(100, 2.0, 1, 0);
+        assert!(matches!(
+            eval(&parse("f * 1.5", &s).unwrap(), &r, &s).unwrap(),
+            Value::Data { db_type: DbType::F64, .. }
+        ));
+    }
+
+    /// `cargo test --release -p rasterizeddb_core --lib -- --ignored float_literal_fold_bench --nocapture`
+    #[test]
+    #[ignore]
+    fn float_literal_fold_bench() {
+        let s = schema();
+        let rows: Vec<Row> = (0..4096i128).map(|k| row(k * 137, 0.0, 0, 0)).collect();
+        for text in ["d * 1.5", "d + 0.25", "d * 1.5 + 0.25"] {
+            let folded = parse(text, &s).unwrap();
+            let reference = unfolded(text, &s);
+            for round in 0..4 {
+                let t = std::time::Instant::now();
+                for r in &rows {
+                    std::hint::black_box(eval(&reference, r, &s).unwrap());
+                }
+                let old = t.elapsed().as_nanos() as f64 / rows.len() as f64;
+                let t = std::time::Instant::now();
+                for r in &rows {
+                    std::hint::black_box(eval(&folded, r, &s).unwrap());
+                }
+                let new = t.elapsed().as_nanos() as f64 / rows.len() as f64;
+                println!("{text:16} round {round}: per-row conversion {old:.0} ns, folded {new:.0} ns ({:.2}x)", old / new);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod mixed_numeric_compare_tests {
+    use super::*;
+    use std::cmp::Ordering;
+
+    fn v(db_type: DbType, bytes: Vec<u8>) -> Value {
+        Value::Data { bytes, db_type }
+    }
+    fn i32v(x: i32) -> Value { v(DbType::I32, x.to_le_bytes().to_vec()) }
+    fn i64v(x: i64) -> Value { v(DbType::I64, x.to_le_bytes().to_vec()) }
+    fn i16v(x: i16) -> Value { v(DbType::I16, x.to_le_bytes().to_vec()) }
+    fn u128v(x: u128) -> Value { v(DbType::U128, x.to_le_bytes().to_vec()) }
+    fn i128v(x: i128) -> Value { v(DbType::I128, x.to_le_bytes().to_vec()) }
+    fn u64v(x: u64) -> Value { v(DbType::U64, x.to_le_bytes().to_vec()) }
+    fn f64v(x: f64) -> Value { v(DbType::F64, x.to_le_bytes().to_vec()) }
+    fn f32v(x: f32) -> Value { v(DbType::F32, x.to_le_bytes().to_vec()) }
+    /// Engine scale: `units` is the value times 10^9.
+    fn dec(units: i128) -> Value { v(DbType::DECIMAL, units.to_le_bytes().to_vec()) }
+
+    #[test]
+    fn mixed_widths_compare_as_numbers() {
+        let cases: Vec<(Value, Value, Ordering)> = vec![
+            (i64v(5), i32v(7), Ordering::Less),
+            (i32v(7), i64v(5), Ordering::Greater),
+            (i64v(-1), i32v(0), Ordering::Less),
+            (i16v(-300), i64v(-300), Ordering::Equal),
+            (i64v(i64::MAX), i32v(i32::MAX), Ordering::Greater),
+            (u64v(u64::MAX), i64v(-1), Ordering::Greater),
+            (u128v(u128::MAX), i128v(i128::MAX), Ordering::Greater),
+            (i128v(i128::MIN), u128v(0), Ordering::Less),
+            (dec(1_500_000_000), i32v(1), Ordering::Greater),
+            (dec(1_000_000_000), i64v(1), Ordering::Equal),
+            (dec(-1), i32v(0), Ordering::Less),
+            (dec(i128::MAX), i128v(i128::MAX), Ordering::Less),
+            (i64v((1 << 53) + 1), f64v((1u64 << 53) as f64), Ordering::Greater),
+            (i64v(1 << 53), f64v((1u64 << 53) as f64), Ordering::Equal),
+            (f64v(f64::NAN), u128v(u128::MAX), Ordering::Greater),
+            (f64v(f64::INFINITY), u128v(u128::MAX), Ordering::Greater),
+            (f64v(f64::NEG_INFINITY), i128v(i128::MIN), Ordering::Less),
+            (f64v(-0.0), i32v(0), Ordering::Equal),
+            (f64v(1e300), u128v(u128::MAX), Ordering::Greater),
+            (f64v(2.5), dec(2_500_000_000), Ordering::Equal),
+            (f64v(5e-324), dec(0), Ordering::Greater),
+            (f64v(5e-324), dec(1), Ordering::Less),
+            (f64v(-5e-324), i32v(0), Ordering::Less),
+            // 0.1f32 is 0.100000001490116…, above the decimal 0.1.
+            (f32v(0.1), dec(100_000_000), Ordering::Greater),
+            (f32v(0.5), f64v(0.5), Ordering::Equal),
+        ];
+        for (a, b, want) in cases {
+            assert_eq!(compare(&a, &b), Some(want), "{:?} vs {:?}", a, b);
+            assert_eq!(compare(&b, &a), Some(want.reverse()), "{:?} vs {:?}", b, a);
+        }
+    }
+
+    /// Antisymmetry over every pair and transitivity over every triple of a
+    /// pool mixing every numeric type, at the boundaries where widening or a
+    /// float conversion is lossy.
+    #[test]
+    fn mixed_numeric_compare_is_a_total_order() {
+        let mut pool: Vec<Value> = Vec::new();
+        let ints: [i64; 12] = [
+            0, 1, -1, 7, -7, 127, -128, 1 << 31, (1 << 53) - 1, 1 << 53, (1 << 53) + 1, i64::MAX,
+        ];
+        for &x in &ints {
+            pool.push(i64v(x));
+            if let Ok(y) = i32::try_from(x) { pool.push(i32v(y)); }
+            if let Ok(y) = i16::try_from(x) { pool.push(i16v(y)); }
+            if x >= 0 { pool.push(u64v(x as u64)); pool.push(u128v(x as u128)); }
+            pool.push(i128v(x as i128));
+            pool.push(f64v(x as f64));
+            pool.push(f32v(x as f32));
+            if let Some(u) = (x as i128).checked_mul(1_000_000_000) { pool.push(dec(u)); }
+            pool.push(dec(x as i128)); // x * 10^-9
+        }
+        for f in [0.5, -0.5, 0.1, 1e-9, 1.000000001, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.0, 1e30] {
+            pool.push(f64v(f));
+            pool.push(f32v(f as f32));
+        }
+        pool.push(u128v(u128::MAX));
+        pool.push(i128v(i128::MIN));
+        pool.push(dec(i128::MAX));
+        pool.push(dec(i128::MIN));
+        pool.push(dec(100_000_000));
+        pool.push(dec(1_000_000_001));
+
+        let c = |a: &Value, b: &Value| compare(a, b).expect("numbers always compare");
+        for a in &pool {
+            for b in &pool {
+                assert_eq!(c(a, b), c(b, a).reverse(), "antisymmetry {:?} {:?}", a, b);
+            }
+        }
+        for a in &pool {
+            for b in &pool {
+                let ab = c(a, b);
+                for x in &pool {
+                    let bx = c(b, x);
+                    if ab == bx || bx == Ordering::Equal {
+                        assert_eq!(c(a, x), ab, "transitivity {:?} {:?} {:?}", a, b, x);
+                    } else if ab == Ordering::Equal {
+                        assert_eq!(c(a, x), bx, "transitivity {:?} {:?} {:?}", a, b, x);
+                    }
+                }
+            }
+        }
+        // And a sort with this comparator is consistent: sorted twice from
+        // different starting orders, the keys come out in the same sequence.
+        let mut forward = pool.clone();
+        let mut backward: Vec<Value> = pool.iter().rev().cloned().collect();
+        forward.sort_by(|a, b| c(a, b));
+        backward.sort_by(|a, b| c(a, b));
+        for (a, b) in forward.iter().zip(&backward) {
+            assert_eq!(c(a, b), Ordering::Equal);
+        }
+    }
+}
+
+#[cfg(test)]
+mod column_value_bench {
+    use super::*;
+    use crate::core::row::row::Column;
+    use crate::memory_pool::MEMORY_POOL;
+
+    /// `column_value` as it was: the schema cloned into a SmallVec and the
+    /// companion's name built with `format!`, once per call.
+    fn column_value_reference(field: &SchemaField, row: &Row, schema: &[SchemaField]) -> Value {
+        let sv: SmallVec<[SchemaField; 20]> = schema.iter().cloned().collect();
+        let name = crate::core::rql::nullable::flag_column_name(&field.name);
+        let flag = sv.iter().find(|f| f.name.eq_ignore_ascii_case(&name) && !f.is_deleted);
+        if let Some(flag) = flag {
+            let is_null = row
+                .columns
+                .iter()
+                .find(|c| u64::from(c.schema_id) == flag.write_order)
+                .map(|c| crate::core::rql::nullable::flag_is_set(c.data.into_slice()))
+                .unwrap_or(false);
+            if is_null {
+                return Value::Null;
+            }
+        }
+        match row.columns.iter().find(|c| u64::from(c.schema_id) == field.write_order) {
+            Some(column) if column.column_type == DbType::NULL => Value::Null,
+            Some(column) => Value::Data {
+                bytes: column.data.into_slice().to_vec(),
+                db_type: field.db_type.clone(),
+            },
+            None => Value::Null,
+        }
+    }
+
+    fn fixture(rows: usize) -> (Vec<SchemaField>, Vec<Row>) {
+        let names: Vec<(String, DbType)> = vec![
+            ("id".into(), DbType::I64),
+            ("customer_name".into(), DbType::STRING),
+            ("a".into(), DbType::I64),
+            ("__null_a".into(), DbType::BOOL),
+            ("b".into(), DbType::I64),
+            ("__null_b".into(), DbType::BOOL),
+            ("shipping_address".into(), DbType::STRING),
+            ("created_at".into(), DbType::DATETIME),
+            ("status_description".into(), DbType::STRING),
+            ("updated_by_user".into(), DbType::STRING),
+        ];
+        let schema: Vec<SchemaField> = names
+            .iter()
+            .enumerate()
+            .map(|(i, (n, t))| SchemaField::new(n.clone(), t.clone(), t.get_size(), 0, i as u64, false))
+            .collect();
+        let col = |id: u64, ty: DbType, bytes: &[u8]| {
+            let mut mb = MEMORY_POOL.acquire(bytes.len());
+            mb.into_slice_mut().copy_from_slice(bytes);
+            Column { schema_id: crate::core::row::row::schema_id_of(id), data: mb, column_type: ty }
+        };
+        let rows = (0..rows as i64)
+            .map(|i| {
+                let mut columns: crate::core::row::row::RowColumns = smallvec::SmallVec::new();
+                columns.push(col(2, DbType::I64, &(i % 1000).to_le_bytes()));
+                columns.push(col(3, DbType::BOOL, &[0]));
+                columns.push(col(4, DbType::I64, &(i % 7).to_le_bytes()));
+                columns.push(col(5, DbType::BOOL, &[0]));
+                Row { position: 0, length: 0, columns }
+            })
+            .collect();
+        (schema, rows)
+    }
+
+    /// Expression-heavy projections over 1M rows.
+    ///
+    /// Kept for the next attempt at cheaper value bytes. Backing
+    /// `Value::Data` with `SmallVec<[u8; 16]>` (no allocation for a number, a
+    /// UUID or short text) measured no win against the same build with every
+    /// value on the heap, interleaved 3x on 2026-10-08: allocation is not where
+    /// these per-row costs are, and the inline/heap branch on every access ate
+    /// the rest. So `Vec<u8>` stays. `cargo test --release -p rasterizeddb_core --lib --
+    /// --ignored expression_projection_bench --nocapture`.
+    #[test]
+    #[ignore]
+    fn expression_projection_bench() {
+        use std::hint::black_box;
+        let (schema, rows) = fixture(1_000_000);
+        let exprs = [
+            "a * b + 1",
+            "COALESCE(a, 0) * 2 - b",
+            "CASE WHEN a > 500 THEN a ELSE b END",
+            "GREATEST(a, b, 7) + LEAST(a, b)",
+        ];
+        for round in 0..5 {
+            let mut line = format!("round {round}:");
+            for text in exprs {
+                let expr = parse(text, &schema).unwrap();
+                let t = std::time::Instant::now();
+                let mut n = 0usize;
+                for row in &rows {
+                    if let Value::Data { bytes, .. } = eval(&expr, black_box(row), &schema).unwrap() {
+                        n += bytes.len();
+                    }
+                }
+                black_box(n);
+                line.push_str(&format!("  [{text}] {:>8.2?}", t.elapsed()));
+            }
+            println!("{line}");
+        }
+    }
+
+    /// `SUM(a * b)`'s per-row work over 1M rows, old `column_value` against
+    /// new, interleaved. `cargo test --release -p rasterizeddb_core --lib --
+    /// --ignored column_value_sum_bench --nocapture`.
+    #[test]
+    #[ignore]
+    fn column_value_sum_bench() {
+        use std::hint::black_box;
+        let (schema, rows) = fixture(1_000_000);
+        let a = schema[2].clone();
+        let b = schema[4].clone();
+        let expr = parse("a * b", &schema).unwrap();
+        let sum = |v: Value| as_i64(&v).unwrap_or(0) as i128;
+        for round in 0..5 {
+            let t = std::time::Instant::now();
+            let mut s_old = 0i128;
+            for row in &rows {
+                let x = column_value_reference(&a, black_box(row), &schema);
+                let y = column_value_reference(&b, row, &schema);
+                s_old += sum(arith(&x, ArithOp::Mul, &y).unwrap());
+            }
+            let old = t.elapsed();
+            let t = std::time::Instant::now();
+            let mut s_new = 0i128;
+            for row in &rows {
+                let x = column_value(&a, black_box(row), &schema);
+                let y = column_value(&b, row, &schema);
+                s_new += sum(arith(&x, ArithOp::Mul, &y).unwrap());
+            }
+            let new = t.elapsed();
+            let t = std::time::Instant::now();
+            let mut s_eval = 0i128;
+            for row in &rows {
+                s_eval += sum(eval(&expr, black_box(row), &schema).unwrap());
+            }
+            let full = t.elapsed();
+            assert_eq!(s_old, s_new);
+            assert_eq!(s_old, s_eval);
+            println!("round {round}: old {old:>9.2?}  new {new:>9.2?}  eval(a*b) {full:>9.2?}");
+        }
     }
 }

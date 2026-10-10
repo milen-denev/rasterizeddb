@@ -133,10 +133,50 @@ pub fn perform_math_operation(
         DbType::U128 => generic_operation::<u128>(input1, input2, operation),
         DbType::F32 => generic_operation::<f32>(input1, input2, operation),
         DbType::F64 => generic_operation::<f64>(input1, input2, operation),
+        DbType::DECIMAL => decimal_operation(input1, input2, operation),
         // Reported, not panicked: the type comes from a client's query, and a
         // panic here takes down the worker thread evaluating the row.
         _ => Err(EvalError::UnsupportedType),
     }
+}
+
+/// Arithmetic over two `NUMERIC` values, both at the engine scale.
+///
+/// The planner lifts a column read at its declared scale to the engine scale
+/// before it gets here (see `ColumnTransformer::column_1_scale`) and encodes a
+/// literal at the engine scale, so both operands share one. The product and
+/// quotient are the expression evaluator's own (`expr::decimal_mul_engine`),
+/// so `WHERE v * 2 = 200` and `SELECT v * 2` agree to the last digit.
+///
+/// Integer arithmetic on the raw `i128`s was the wrong answer this replaces in
+/// principle — `v * 2` of two scaled values is scaled twice — though in
+/// practice every such predicate was refused before reaching it, the literal
+/// arriving at a different width.
+fn decimal_operation(
+    input1: &[u8],
+    input2: &[u8],
+    operation: &MathOperation,
+) -> std::result::Result<MemoryBlock, EvalError> {
+    let (Ok(a), Ok(b)) = (<[u8; 16]>::try_from(input1), <[u8; 16]>::try_from(input2)) else {
+        return Err(EvalError::OperandSizeMismatch);
+    };
+    let (x, y) = (i128::from_le_bytes(a), i128::from_le_bytes(b));
+    let value = match operation {
+        MathOperation::Add => x.checked_add(y),
+        MathOperation::Subtract => x.checked_sub(y),
+        MathOperation::Multiply => crate::core::rql::expr::decimal_mul_engine(x, y),
+        MathOperation::Divide => {
+            if y == 0 {
+                return Err(EvalError::DivisionByZero);
+            }
+            crate::core::rql::expr::decimal_div_engine(x, y)
+        }
+        // `^` and `|/` over NUMERIC would go through a float here and lose
+        // digits silently; refused instead.
+        _ => return Err(EvalError::UnsupportedType),
+    }
+    .ok_or(EvalError::ArithmeticOverflow)?;
+    Ok(block_of(&value.to_le_bytes()))
 }
 
 #[inline(always)]
