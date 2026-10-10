@@ -187,6 +187,27 @@ struct Args {
     )]
     json_shadow_tables: Option<bool>,
 
+    /// Settle long-finished transaction outcomes, at open and while running.
+    /// Default: on. `false` (or `RASTERIZEDDB_SETTLE_STATUS=0`) is the kill
+    /// switch.
+    ///
+    /// The status log keeps two bits per transaction in memory. Settling
+    /// replaces everything below the oldest running transaction and the oldest
+    /// open snapshot with a compact record of the transactions that did *not*
+    /// commit, and keeps a bitmap only for the window still in play — so
+    /// memory stops growing with every transaction ever run (≈ 120 KiB instead
+    /// of 4 MiB at 12 million). Answers are identical either way. A summary is
+    /// kept in a sidecar file (`db_transactions.status.settled`) so the next
+    /// open need not reread the history. The status file itself is never
+    /// rewritten or truncated: builds without settling, and older builds,
+    /// ignore the sidecar and read the file as always.
+    #[arg(
+        long = "settle-status-at-open",
+        alias = "settle_status_at_open",
+        value_name = "BOOL"
+    )]
+    settle_status_at_open: Option<bool>,
+
     #[arg(long = "in-memory", alias = "in_memory", default_value_t = false)]
     in_memory: bool,
 
@@ -700,7 +721,10 @@ fn main() -> std::io::Result<()> {
         storage_min_free: args.storage_min_free.clone(),
         #[cfg(not(feature = "storage_pools"))]
         storage_min_free: None,
+        settle_status_at_open: args.settle_status_at_open,
     };
+    // Before any database opens: the status log reads it at open.
+    config.apply_runtime_switches();
 
     MAX_PERMITS_THREADS
         .set(config.concurrent_threads.unwrap_or(16))

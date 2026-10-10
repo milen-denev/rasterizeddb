@@ -207,10 +207,16 @@ async fn a_conflict_inside_an_explicit_block_is_reported() {
 /// instrumentation has to be near-free — cache the flag in a `OnceLock` and
 /// push to a buffer rather than printing — or the bug hides.
 ///
-/// Ignored because it is a live defect, not a pinned behaviour: run it with
-/// `-- --ignored` while working on this. Remove the attribute when a reader
-/// can no longer miss a row it should see.
-#[ignore = "open defect: a concurrent reader can transiently miss an existing row"]
+/// FOUND (2026-10-09), and the trace above was right — the pointer *was*
+/// visible: the scan's reclaimable gate bounded its horizon by `oldest_active`
+/// alone, so once an updater the reader's snapshot still treats as running had
+/// committed and retired, the reader's visible (old) version was skipped as
+/// reclaimable while the new one was rightly invisible. Fixed by bounding the
+/// horizon by the oldest live snapshot (`VersionHorizon::sample`); pinned at
+/// scale by `rasterizeddb_core/tests/reader_miss_stress.rs`.
+/// The gate runs in the scan itself, which is why disabling vacuum changed
+/// nothing. This test is a weak reproducer (0/10 on the old code; the two in
+/// `query_cache_staleness.rs` and `extended_protocol_recovery.rs` caught it).
 #[tokio::test]
 async fn a_concurrent_reader_never_misses_an_existing_row() {
     let (_s, pool) = server().await;

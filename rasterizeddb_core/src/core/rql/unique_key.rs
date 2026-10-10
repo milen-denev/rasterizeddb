@@ -26,7 +26,6 @@
 use std::io;
 
 use rclite::Arc;
-use smallvec::SmallVec;
 
 use crate::core::storage_providers::traits::StorageIO;
 
@@ -130,11 +129,11 @@ fn sidecar_name<S: StorageIO>(schema_io: &Arc<S>) -> String {
 }
 
 /// Reads a table's unique constraints.
-pub async fn load<S: StorageIO>(schema_io: Arc<S>) -> SmallVec<[UniqueKey; 4]> {
+pub async fn load<S: StorageIO>(schema_io: Arc<S>) -> Vec<UniqueKey> {
     let io = schema_io.create_new(sidecar_name(&schema_io)).await;
     let len = io.get_len().await;
 
-    let mut out: SmallVec<[UniqueKey; 4]> = SmallVec::new();
+    let mut out: Vec<UniqueKey> = Vec::new();
     if len < UNIQUE_KEY_SIZE {
         return out;
     }

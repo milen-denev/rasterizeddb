@@ -139,7 +139,29 @@ pub struct Table<S: StorageIO> {
     /// concurrent; only the rewrite is serialized, and every rewrite re-reads
     /// the pointer record under the lock so a stale snapshot is caught rather
     /// than acted on.
-    write_lock: tokio::sync::Mutex<()>,
+    write_lock: StdArc<tokio::sync::Mutex<()>>,
+    /// Makes a uniqueness check atomic with the write it guards.
+    ///
+    /// Taken by every `INSERT` into a table with a UNIQUE constraint, and by an
+    /// `UPDATE` of such a table for its rewrite — but not for its scan.
+    ///
+    /// It used to be `write_lock`, which an `UPDATE` holds across its whole
+    /// scan. A multi-row `INSERT` takes the lock once per tuple, so each tuple
+    /// queued behind a full update scan: under one session running 500-row
+    /// range updates, three inserters spent ~87% of their time waiting for it,
+    /// and a 50,000-row statement sat for minutes. An insert does not need to
+    /// exclude the scan — on a table without a constraint it never did.
+    ///
+    /// It does need to exclude the rewrite, even one that assigns no UNIQUE
+    /// column. A relocated row's new version gets its filter entry only once
+    /// the batch is durable (`PendingFilterOp`), while the old version keeps
+    /// the value. A check that sampled the filter in that window, then read the
+    /// old version after the update committed, would find neither version and
+    /// admit a duplicate of a key nobody changed. Holding this across the
+    /// rewrite and the filter application closes the window. Past it, the
+    /// in-flight rule in `find_row_with_value` covers the transaction's
+    /// remaining life, lock or no lock. Order: `write_lock`, then this.
+    unique_lock: StdArc<tokio::sync::Mutex<()>>,
     /// Held shared by every read and write, exclusively by full compaction.
     ///
     /// Incremental reclamation needs no such gate — it only ever hands out
@@ -147,7 +169,10 @@ pub struct Table<S: StorageIO> {
     /// other operation stopped, not merely drained: a query that started after
     /// the drain would still be holding a pointer that compaction is about to
     /// invalidate.
-    compaction_gate: tokio::sync::RwLock<()>,
+    compaction_gate: StdArc<tokio::sync::RwLock<()>>,
+    /// This table's place in the forget registry, set when versioning is
+    /// enabled; shared with the vacuum service, which advances it.
+    forget: StdArc<std::sync::OnceLock<crate::core::mvcc::transaction::ForgetHandle>>,
     /// Bumped once per completed `DELETE` or `UPDATE`, under the write lock.
     ///
     /// Lets a statement tell whether anything could have changed under it
@@ -170,6 +195,14 @@ pub struct Table<S: StorageIO> {
     /// every query loads to validate a cache entry: readers and writers of two
     /// deliberately separated values contending as if they were one.
     write_generation: StdArc<CacheGuard<AtomicU64>>,
+    /// Row versions the write path has stamped dead: one per row a `DELETE`
+    /// removed and per row an `UPDATE` replaced. The vacuum service sweeps only
+    /// once enough have accrued since its last sweep
+    /// (`VacuumConfig::sweep_threshold`), rather than on every mutation.
+    ///
+    /// Plain, not padded: it is bumped once per statement beside
+    /// `write_generation`, and padding contended counters measured a loss here.
+    dead_stamps: StdArc<AtomicU64>,
     /// Bumped once per committed mutation, and stamped onto every query-cache
     /// entry the table produces. A reader compares the two, so a mutation
     /// strands every entry built before it — including one from a scan still in
@@ -665,6 +698,7 @@ impl<S: StorageIO> Table<S> {
         // caller should ever find itself waiting behind.
         let vacuum_stats = StdArc::new(VacuumStats::default());
         let write_generation = StdArc::new(CacheGuard::new(AtomicU64::new(0)));
+        let dead_stamps = StdArc::new(AtomicU64::new(0));
         let versions: StdArc<ArcSwapOption<TransactionManager>> =
             StdArc::new(ArcSwapOption::empty());
         let cleared_below = StdArc::new(CacheGuard::new(AtomicU64::new(0)));
@@ -676,6 +710,9 @@ impl<S: StorageIO> Table<S> {
         let cache_generation =
             StdArc::new(CacheGuard::new(AtomicU64::new(next_cache_generation())));
         let schema_name_for_cache = schema.name.clone();
+        let write_lock = StdArc::new(tokio::sync::Mutex::new(()));
+        let compaction_gate = StdArc::new(tokio::sync::RwLock::new(()));
+        let forget = StdArc::new(std::sync::OnceLock::new());
 
         if crate::vacuum_enabled() {
             VacuumService {
@@ -687,10 +724,15 @@ impl<S: StorageIO> Table<S> {
                 stats: vacuum_stats.clone(),
                 alive: maintenance_alive.clone(),
                 mutations: write_generation.clone(),
+                dead_stamps: dead_stamps.clone(),
                 versions: versions.clone(),
                 filters: filters.clone(),
                 cleared_below: cleared_below.clone(),
                 config: VacuumConfig::default(),
+                write_lock: write_lock.clone(),
+                compaction_gate: compaction_gate.clone(),
+                cache_generation: cache_generation.clone(),
+                forget: forget.clone(),
             }
             .spawn();
         }
@@ -717,9 +759,12 @@ impl<S: StorageIO> Table<S> {
             free_space,
             readers,
             vacuum_stats,
-            write_lock: tokio::sync::Mutex::new(()),
-            compaction_gate: tokio::sync::RwLock::new(()),
+            write_lock,
+            unique_lock: StdArc::new(tokio::sync::Mutex::new(())),
+            compaction_gate,
+            forget,
             write_generation,
+            dead_stamps,
             cache_generation,
             filters_ready,
             maintenance_alive,
@@ -801,7 +846,35 @@ impl<S: StorageIO> Table<S> {
     /// transaction is about to read. The two changes belong in one step; this is
     /// not a switch to flip ahead of the write path.
     pub fn enable_versioning(&self, manager: StdArc<TransactionManager>) {
+        // Registered with the manager's forget registry at the horizon already
+        // forgotten — which the files this table opens satisfy, having been
+        // part of a registered table when that horizon was reached. Once per
+        // table object: a second call would register a second handle.
+        let _ = self.forget.set(manager.register_table());
         self.versions.store(Some(manager));
+    }
+
+    /// This table's forget horizon, once versioning is enabled.
+    pub fn forget_horizon(&self) -> Option<TxId> {
+        self.forget.get().map(|h| h.horizon())
+    }
+
+    /// Runs a forget sweep now. See [`crate::core::vacuum::neutralize_aborted`].
+    pub async fn neutralize_aborted_now(&self) -> std::io::Result<crate::core::vacuum::NeutralizeReport> {
+        let (Some(manager), Some(handle)) = (self.versions.load_full(), self.forget.get()) else {
+            return Ok(Default::default());
+        };
+        let parts = crate::core::vacuum::NeutralizeParts {
+            io_pointers: &*self.io_pointers,
+            write_lock: &self.write_lock,
+            compaction_gate: &self.compaction_gate,
+            readers: &self.readers,
+            free_space: &self.free_space,
+            cache_generation: &self.cache_generation,
+            dead_stamps: &self.dead_stamps,
+            drain_timeout: std::time::Duration::from_secs(crate::vacuum_drain_timeout_secs()),
+        };
+        crate::core::vacuum::neutralize_aborted(&parts, &manager, handle).await
     }
 
     /// Notes that `written_by` has stamped a version here.
@@ -1006,6 +1079,22 @@ impl<S: StorageIO> Table<S> {
         let (moves, compacted_rows_len) = plan_row_moves(&live);
         let mut pointers = live;
 
+        // Every way out of the two move phases ends the open storage
+        // transaction. One left open after a failed write holds the log's
+        // pending count up, and the log can then never be checkpointed again —
+        // which is how a deployed node's log grew without bound.
+        macro_rules! or_abort {
+            ($result:expr, $txn:expr) => {
+                match $result {
+                    Ok(value) => value,
+                    Err(e) => {
+                        self.io_pointers.abort_txn($txn).await;
+                        return Err(e.into());
+                    }
+                }
+            };
+        }
+
         // --- Phase 1: pack the row bytes ---
         let mut buffer: Vec<u8> = Vec::new();
         let mut txn = self.io_rows.begin_txn();
@@ -1033,14 +1122,17 @@ impl<S: StorageIO> Table<S> {
             // without its bytes would name someone else's row.
             let _ = self.io_rows.write_data_txn(txn, target, &buffer).await;
             record.pointer.position = target;
-            let token = record
-                .pointer
-                .save_at_in_txn(
-                    &*self.io_pointers,
-                    record.slot * ROW_POINTER_RECORD_LEN as u64,
-                    txn,
-                )
-                .await?;
+            let token = or_abort!(
+                record
+                    .pointer
+                    .save_at_in_txn(
+                        &*self.io_pointers,
+                        record.slot * ROW_POINTER_RECORD_LEN as u64,
+                        txn,
+                    )
+                    .await,
+                txn
+            );
             let _ = token;
 
             report.rows_moved += 1;
@@ -1052,11 +1144,11 @@ impl<S: StorageIO> Table<S> {
             // pointer naming bytes that were overwritten. Interrupting is safe;
             // continuing past a failure is not.
             if crate::core::wal::should_break_transaction(&*self.io_rows) {
-                self.io_pointers.commit_durable(txn).await?;
+                or_abort!(self.io_pointers.commit_durable(txn).await, txn);
                 txn = self.io_rows.begin_txn();
             }
         }
-        self.io_pointers.commit_durable(txn).await?;
+        or_abort!(self.io_pointers.commit_durable(txn).await, txn);
 
         // --- Phase 2: pack the pointer records ---
         //
@@ -1086,10 +1178,13 @@ impl<S: StorageIO> Table<S> {
             // half-applied on disk; without a log the two land separately, but
             // nothing can observe the gap — compaction holds the gate
             // exclusively — and a crash without a log has no atomicity anywhere.
-            let _ = record
-                .pointer
-                .save_at_in_txn(&*self.io_pointers, destination, txn)
-                .await?;
+            let _ = or_abort!(
+                record
+                    .pointer
+                    .save_at_in_txn(&*self.io_pointers, destination, txn)
+                    .await,
+                txn
+            );
 
             let mut tombstone = record.pointer.clone();
             tombstone.deleted = true;
@@ -1097,21 +1192,24 @@ impl<S: StorageIO> Table<S> {
             {
                 tombstone.is_active = false;
             }
-            let _ = tombstone
-                .save_at_in_txn(&*self.io_pointers, source, txn)
-                .await?;
+            let _ = or_abort!(
+                tombstone
+                    .save_at_in_txn(&*self.io_pointers, source, txn)
+                    .await,
+                txn
+            );
 
             record.slot = target_slot;
             target_slot += 1;
             report.slots_moved += 1;
 
             if crate::core::wal::should_break_transaction(&*self.io_pointers) {
-                self.io_pointers.commit_durable(txn).await?;
+                or_abort!(self.io_pointers.commit_durable(txn).await, txn);
                 txn = self.io_pointers.begin_txn();
             }
         }
         // Nothing is truncated past this point unless every move is durable.
-        self.io_pointers.commit_durable(txn).await?;
+        or_abort!(self.io_pointers.commit_durable(txn).await, txn);
 
         // --- Phase 3: give the tails back ---
         //
@@ -1123,10 +1221,29 @@ impl<S: StorageIO> Table<S> {
             .and_then(|location| crate::core::wal::wal_for(&location))
         {
             {
-                match tokio::task::spawn_blocking(move || wal.checkpoint())
-                    .await
-                    .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
-                {
+                // A checkpoint declines while another is running or while any
+                // transaction holds an in-place write — both routine under
+                // write load, where one declined attempt used to make the whole
+                // VACUUM FULL a silent no-op. So it is retried for a while
+                // before the tails are kept.
+                const ATTEMPTS: u32 = 40;
+                let mut outcome = Ok(false);
+                for attempt in 0..ATTEMPTS {
+                    let w = wal.clone();
+                    outcome = tokio::task::spawn_blocking(move || w.checkpoint())
+                        .await
+                        .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
+                    if !matches!(outcome, Ok(false)) {
+                        break;
+                    }
+                    if attempt + 1 < ATTEMPTS {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            25 * (attempt as u64 + 1).min(8),
+                        ))
+                        .await;
+                    }
+                }
+                match outcome {
                     // Only a checkpoint that actually ran makes truncation safe.
                     // A declined one (`Ok(false)`) leaves live records that
                     // still name offsets past the cut, so a crash would replay
@@ -1137,6 +1254,10 @@ impl<S: StorageIO> Table<S> {
                             "Compaction: checkpoint declined (log still active); keeping both tails"
                         );
                         report.truncation_unsupported = true;
+                        report.truncation_skipped = Some(
+                            "the write-ahead log could not be checkpointed: other \
+                             transactions kept it busy for the whole attempt",
+                        );
                     }
                     Err(e) => {
                         error!(
@@ -1144,12 +1265,21 @@ impl<S: StorageIO> Table<S> {
                             e
                         );
                         report.truncation_unsupported = true;
+                        report.truncation_skipped =
+                            Some("the write-ahead log could not be checkpointed (see the server log)");
                     }
                 }
             }
         }
 
         let compacted_pointer_len = target_slot * ROW_POINTER_RECORD_LEN as u64;
+        if report.truncation_skipped.is_some() {
+            // Counted where `SHOW TABLE STATS` reads it: the statement reports
+            // it too, but a scheduled run has no client to tell.
+            self.vacuum_stats
+                .full_untruncated
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        }
         if !report.truncation_unsupported {
             report.rows_bytes_freed = self
                 .truncate_tail(&self.io_rows, compacted_rows_len, &mut report)
@@ -1228,6 +1358,12 @@ impl<S: StorageIO> Table<S> {
     #[inline]
     pub fn vacuum_stats(&self) -> &VacuumStats {
         &self.vacuum_stats
+    }
+
+    /// Row versions the write path has stamped dead since the table opened.
+    /// See the field for what counts.
+    pub fn dead_stamps(&self) -> u64 {
+        self.dead_stamps.load(AtomicOrdering::Relaxed)
     }
 
     /// Bytes currently on the free list, waiting to be written into.
@@ -1370,26 +1506,34 @@ impl<S: StorageIO> Table<S> {
         self.has_unique = true;
     }
 
-    /// Whether the row being written marks `column` as NULL.
-    ///
-    /// Read from the row's own `__null_` companion payload rather than from the
-    /// value, because a fixed-width NULL is indistinguishable from a real zero
-    /// by its bytes alone.
-    fn null_flag_is_set(&self, row_write: &RowWrite, column: &str) -> bool {
-        let flag_name = crate::core::rql::nullable::flag_column_name(column);
-        let Some(flag) = self
-            .schema
+    /// The `__null_` companion of `field`, when the column is nullable.
+    fn null_companion(&self, field: &SchemaField) -> Option<&SchemaField> {
+        let flag_name = crate::core::rql::nullable::flag_column_name(&field.name);
+        self.schema
             .fields
             .iter()
             .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(&flag_name))
-        else {
+    }
+
+    /// Whether the value a write carries for a UNIQUE column is SQL NULL.
+    ///
+    /// Decided by the companion, never by the bytes alone. Emptiness used to
+    /// decide it, and an empty *string* is a value: a UNIQUE text column took
+    /// `''` any number of times. A NOT NULL column has no companion and no
+    /// NULL. Only a nullable column whose write carries no companion falls back
+    /// on emptiness — there it is the only evidence there is.
+    fn written_value_is_null(&self, row_write: &RowWrite, field: &SchemaField, value: &[u8]) -> bool {
+        let Some(flag) = self.null_companion(field) else {
             return false;
         };
-        row_write
+        match row_write
             .columns_writing_data
             .iter()
             .find(|c| c.write_order == flag.write_order as u32)
-            .is_some_and(|c| crate::core::rql::nullable::flag_is_set(c.data.into_slice()))
+        {
+            Some(c) => crate::core::rql::nullable::flag_is_set(c.data.into_slice()),
+            None => value.is_empty(),
+        }
     }
 
     async fn check_unique(
@@ -1444,7 +1588,7 @@ impl<S: StorageIO> Table<S> {
             // to emptiness alone, a second row with a NULL uuid collided with
             // the first — they share sixteen zero bytes — and a nullable
             // UNIQUE column could hold exactly one NULL.
-            if value.is_empty() || self.null_flag_is_set(row_write, &field.name) {
+            if self.written_value_is_null(row_write, field, value) {
                 continue;
             }
 
@@ -1528,7 +1672,7 @@ impl<S: StorageIO> Table<S> {
                 // like a repeat of the first and a nullable `UNIQUE (col)` could
                 // hold exactly one NULL — which is what stopped an import of a
                 // table PostgreSQL was perfectly happy with.
-                if value.is_empty() || self.null_flag_is_set(row_write, &field.name) {
+                if self.written_value_is_null(row_write, field, value) {
                     skip = true;
                     break;
                 }
@@ -1541,10 +1685,23 @@ impl<S: StorageIO> Table<S> {
                 continue;
             }
 
-            if let Some(existing) = self
-                .find_row_with_tuple(&tuple, exclude_id, visibility)
+            if let Some((existing, in_flight)) = self
+                .find_row_with_tuple(&tuple, exclude_id, visibility, written_by)
                 .await?
             {
+                // Another transaction's unfinished write: replayed, not
+                // guessed at — the single-column rule above, for the reason
+                // given there.
+                if in_flight {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        format!(
+                            "UNIQUE constraint {} is being written by another transaction{}",
+                            key.describe(),
+                            Self::CONFLICT_RETRYABLE
+                        ),
+                    ));
+                }
                 // The value is named, not just the rows. A report of "row 634
                 // duplicates row 625" is unfalsifiable from outside: it cannot
                 // be told apart from data that really does hold a duplicate,
@@ -1594,7 +1751,10 @@ impl<S: StorageIO> Table<S> {
         // flag clear until reclamation, and would otherwise go on reserving the
         // value it held.
         visibility: &Visibility,
-    ) -> Result<Option<u64>> {
+        // Whose write this is: see `find_row_with_value`, whose in-flight rule
+        // this applies to a whole tuple.
+        written_by: TxId,
+    ) -> Result<Option<(u64, bool)>> {
         use crate::core::filter::sarg::{MaskExpr, SargPredicate, SargProgram};
         use crate::core::filter::zonemap::SargOp;
 
@@ -1642,6 +1802,22 @@ impl<S: StorageIO> Table<S> {
         // Kept alongside the fetch so the comparison below can match columns by
         // schema id rather than by position.
         let schema_ids: Vec<u64> = columns_fetching_data.iter().map(|c| c.schema_id).collect();
+        // A stored NULL holds the type's zeroes — empty bytes for text — so a
+        // row whose companion says NULL must not match a written `''`.
+        let mut flag_ids: Vec<u64> = Vec::new();
+        for (field, _) in tuple.iter() {
+            if let Some(flag) = self.null_companion(field) {
+                let (column_offset, schema_id) =
+                    calc.calculate_schema_offset(&flag.name, &self.schema.fields);
+                columns_fetching_data.push(ColumnFetchingData {
+                    column_offset,
+                    column_type: flag.db_type.clone(),
+                    size: flag.size,
+                    schema_id,
+                });
+                flag_ids.push(schema_id);
+            }
+        }
         let fetch = RowFetch {
             columns_fetching_data,
         };
@@ -1651,9 +1827,35 @@ impl<S: StorageIO> Table<S> {
             if Some(pointer.row_id()) == exclude_id {
                 continue;
             }
-            if !visibility.visible(pointer.deleted, pointer.xmin, pointer.xmax) {
-                continue;
-            }
+            // The same occupancy rule as a single column's (see
+            // `find_row_with_value`): a row another transaction has written but
+            // not committed is invisible to every snapshot, so judging a
+            // composite key by the snapshot let concurrent inserts of one tuple
+            // each find nothing and each write — 950 rows for 300 pairs from
+            // four connections, with no error.
+            let manager = self.versions.load_full();
+            let in_flight = match (&manager, written_by) {
+                (Some(manager), writer) if writer != crate::core::mvcc::transaction::NO_TX => {
+                    use crate::core::mvcc::transaction::{NO_TX, TxOutcome};
+                    let creator = manager.outcome(pointer.xmin);
+                    let occupied = !pointer.deleted
+                        && creator != TxOutcome::Aborted
+                        && (pointer.xmax == NO_TX
+                            || manager.outcome(pointer.xmax) != TxOutcome::Committed);
+                    if !occupied {
+                        continue;
+                    }
+                    // Our own uncommitted row is a real duplicate; only another
+                    // transaction's unfinished write is worth waiting out.
+                    creator == TxOutcome::InProgress && pointer.xmin != writer
+                }
+                _ => {
+                    if !visibility.visible(pointer.deleted, pointer.xmin, pointer.xmax) {
+                        continue;
+                    }
+                    false
+                }
+            };
             if pointer
                 .fetch_row_reuse_async(&*self.io_rows, &fetch, &mut row)
                 .await
@@ -1665,14 +1867,21 @@ impl<S: StorageIO> Table<S> {
             // A tuple conflicts only when every column matches. Columns are
             // matched by `schema_id` rather than by position, so the comparison
             // does not depend on the fetch preserving the requested order.
-            let all_match = tuple.iter().zip(schema_ids.iter()).all(|((_, value), id)| {
+            let stored_null = flag_ids.iter().any(|id| {
                 row.columns
                     .iter()
-                    .find(|c| c.schema_id == *id)
-                    .is_some_and(|c| c.data.into_slice() == *value)
+                    .find(|c| u64::from(c.schema_id) == *id)
+                    .is_some_and(|c| crate::core::rql::nullable::flag_is_set(c.data.into_slice()))
             });
+            let all_match = !stored_null
+                && tuple.iter().zip(schema_ids.iter()).all(|((_, value), id)| {
+                    row.columns
+                        .iter()
+                        .find(|c| u64::from(c.schema_id) == *id)
+                        .is_some_and(|c| c.data.into_slice() == *value)
+                });
             if all_match {
-                return Ok(Some(pointer.row_id()));
+                return Ok(Some((pointer.row_id(), in_flight)));
             }
         }
 
@@ -1700,7 +1909,20 @@ impl<S: StorageIO> Table<S> {
 
         let mut iterator = RowPointerIterator::new(self.io_pointers.clone())
             .await
-            .unwrap();
+            .map_err(std::io::Error::from)?;
+
+        // The slots to probe directly, when the filter narrows the table to
+        // few enough of them. `None` walks the pointer file instead.
+        //
+        // Handing the mask to the iterator was correct but no faster than not
+        // having one: the iterator still steps through every record of the
+        // pointer file, copying each chunk, to test one bit per record. This
+        // check runs once per inserted row, so loading a table with a primary
+        // key was quadratic — a 5,000-row INSERT took 67 ms into an empty
+        // table and 9.3 s into one of 200k rows, and a 2M-row load ran for
+        // over half an hour. Reading the few candidate records by slot makes
+        // the check O(candidates), plus a pass over the bitmap's words.
+        let mut probe_slots: Option<std::vec::IntoIter<u64>> = None;
 
         // The mask is a superset, so a slot it clears genuinely cannot hold the
         // value; every slot it keeps is still compared byte for byte below.
@@ -1715,7 +1937,30 @@ impl<S: StorageIO> Table<S> {
                 };
                 let n_slots = self.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
                 if let Some(bitmap) = filters.evaluate(&program, n_slots) {
-                    iterator.set_candidates(Some(Arc::new(bitmap)));
+                    // Past `n_slots` the bitmap says nothing, so every slot
+                    // appended since it was sampled is a candidate too.
+                    let now = self.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
+                    let mut slots: Vec<u64> = Vec::new();
+                    if !bitmap.is_nothing() {
+                        for (w, &word) in bitmap.words().iter().enumerate() {
+                            let mut bits = word;
+                            while bits != 0 {
+                                let slot = w as u64 * 64 + bits.trailing_zeros() as u64;
+                                if slot < n_slots {
+                                    slots.push(slot);
+                                }
+                                bits &= bits - 1;
+                            }
+                        }
+                        slots.extend(n_slots..now);
+                    }
+                    // Many candidates: the sequential walk reads them in
+                    // order and is the cheaper of the two.
+                    if (slots.len() as u64) <= now / 64 + 64 {
+                        probe_slots = Some(slots.into_iter());
+                    } else {
+                        iterator.set_candidates(Some(Arc::new(bitmap)));
+                    }
                 }
             } else {
                 log::debug!(
@@ -1728,17 +1973,59 @@ impl<S: StorageIO> Table<S> {
         let calc = SchemaCalculator;
         let (column_offset, schema_id) =
             calc.calculate_schema_offset(&field.name, &self.schema.fields);
-        let fetch = RowFetch {
-            columns_fetching_data: smallvec::smallvec![ColumnFetchingData {
+        let mut columns_fetching_data: SmallVec<[ColumnFetchingData; 32]> =
+            smallvec::smallvec![ColumnFetchingData {
                 column_offset,
                 column_type: field.db_type.clone(),
                 size: field.size,
                 schema_id,
-            }],
+            }];
+        // A stored NULL holds the type's zeroes — empty bytes for text — and
+        // must not match a written `''`: the companion tells them apart.
+        let flag_id = self.null_companion(field).map(|flag| {
+            let (column_offset, flag_schema_id) =
+                calc.calculate_schema_offset(&flag.name, &self.schema.fields);
+            columns_fetching_data.push(ColumnFetchingData {
+                column_offset,
+                column_type: flag.db_type.clone(),
+                size: flag.size,
+                schema_id: flag_schema_id,
+            });
+            flag_schema_id
+        });
+        let fetch = RowFetch {
+            columns_fetching_data,
         };
 
         let mut row = Row::default();
-        while let Ok(Some(pointer)) = iterator.next_row_pointer().await {
+        let mut record = [0u8; ROW_POINTER_RECORD_LEN];
+        loop {
+            // A read that fails is an error, never the end of the table: ending
+            // early answers "no duplicate" for a value that may be there.
+            let pointer = match probe_slots.as_mut() {
+                Some(slots) => {
+                    let Some(slot) = slots.next() else { break };
+                    let mut at = slot * ROW_POINTER_RECORD_LEN as u64;
+                    match self.io_pointers.read_data_into_buffer(&mut at, &mut record).await {
+                        Ok(()) => {}
+                        // A slot past the end: an append reserved it and has
+                        // not written it yet, exactly what the sequential walk
+                        // stops short of too.
+                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => continue,
+                        Err(e) => return Err(e),
+                    }
+                    let pointer = RowPointer::from_slice(&record);
+                    if pointer.deleted {
+                        continue;
+                    }
+                    pointer
+                }
+                None => match iterator.next_row_pointer().await {
+                    Ok(Some(pointer)) => pointer,
+                    Ok(None) => break,
+                    Err(e) => return Err(e.into()),
+                },
+            };
             if Some(pointer.row_id()) == exclude_id {
                 continue;
             }
@@ -1786,10 +2073,18 @@ impl<S: StorageIO> Table<S> {
             {
                 continue;
             }
-            if row
-                .columns
-                .first()
-                .is_some_and(|column| column.data.into_slice() == value)
+            let stored_null = flag_id.is_some_and(|id| {
+                row.columns
+                    .iter()
+                    .find(|c| u64::from(c.schema_id) == id)
+                    .is_some_and(|c| crate::core::rql::nullable::flag_is_set(c.data.into_slice()))
+            });
+            if !stored_null
+                && row
+                    .columns
+                    .iter()
+                    .find(|c| u64::from(c.schema_id) == schema_id)
+                    .is_some_and(|column| column.data.into_slice() == value)
             {
                 return Ok(Some((pointer.row_id(), in_flight)));
             }
@@ -1993,6 +2288,16 @@ impl<S: StorageIO> Table<S> {
             return None;
         }
 
+        // Rounded up to whole zones. Ascending zone bounds order the zones
+        // against each other and say nothing about the rows inside one, so the
+        // `k` smallest values are only known to lie within the first
+        // `ceil(k / ZONE_ROWS)` zones — not in the first `k` slots. Bounded at
+        // `k` slots, a column ascending across zones but not within them
+        // (timestamps inserted out of order inside a batch) returned the wrong
+        // rows: `ORDER BY f LIMIT 3` over values descending within each zone
+        // answered slots 0, 1, 2 instead of 511, 510, 509.
+        let zone = crate::core::filter::kernels::ZONE_ROWS as u64;
+        let wanted = wanted.div_ceil(zone).saturating_mul(zone);
         // Already scanning everything: the bound would only add a mask.
         if wanted >= n_slots {
             return None;
@@ -2011,6 +2316,12 @@ impl<S: StorageIO> Table<S> {
         where_clause: &str,
         limit: Option<u64>,
     ) -> Option<Arc<CandidateBitmap>> {
+        // A clause no row can satisfy — `1 = 0`, `notnull IS NULL`, `x IN ()`,
+        // `id != id` — needs no index and no scan. Decided before the index is
+        // consulted, so it holds on a table with no filters too.
+        if crate::core::filter::sarg::clause_is_constant_false(where_clause, &self.schema.fields) {
+            return Some(Arc::new(CandidateBitmap::nothing()));
+        }
         let filters = self.filters.as_ref()?;
         if where_clause.trim().is_empty() {
             return None;
@@ -2025,7 +2336,20 @@ impl<S: StorageIO> Table<S> {
             &self.schema.fields,
         )
         .ok()?;
-        let program = sarg::extract(&tokens, filters)?;
+        // Each `NUMERIC(p, s)` column's scale, so a literal is bounded where
+        // the column stores it — see `sarg::extract_with_scales`.
+        let scales: smallvec::SmallVec<[(u32, u32); 4]> = self
+            .schema
+            .fields
+            .iter()
+            .filter(|f| f.db_type == crate::core::db_type::DbType::DECIMAL)
+            .filter_map(|f| {
+                f.scale
+                    .filter(|s| *s != crate::core::value_codec::DECIMAL_SCALE)
+                    .map(|s| (f.write_order as u32, s))
+            })
+            .collect();
+        let program = sarg::extract_with_scales(&tokens, filters, &scales)?;
 
         let n_slots = self.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
         if n_slots == 0 {
@@ -2107,8 +2431,11 @@ impl<S: StorageIO> Table<S> {
         // A uniqueness check that is not atomic with the write it guards is not
         // a check: two concurrent inserts would each look, each find nothing,
         // and each write. Tables without a constraint never take this.
+        //
+        // Not `write_lock`: see `unique_lock` for why an insert must not queue
+        // behind an update's scan.
         let _write = if self.has_unique {
-            Some(self.write_lock.lock().await)
+            Some(self.unique_lock.lock().await)
         } else {
             None
         };
@@ -2456,7 +2783,7 @@ impl<S: StorageIO> Table<S> {
         Ok(bytes)
     }
 
-    fn build_full_row_fetch(schema_fields: &SmallVec<[SchemaField; 20]>) -> RowFetch {
+    pub(crate) fn build_full_row_fetch(schema_fields: &SmallVec<[SchemaField; 20]>) -> RowFetch {
         let schema_calc = SchemaCalculator::default();
         let mut columns_fetching_data = smallvec::SmallVec::new();
         for field in schema_fields
@@ -2499,6 +2826,27 @@ impl<S: StorageIO> Table<S> {
         query_row_fetch: RowFetch,
         limit: Option<u64>,
         deleted_by: TxId,
+    ) -> Result<u64> {
+        self.delete_rows_as_of(where_clause, query_row_fetch, limit, deleted_by, None)
+            .await
+    }
+
+    /// [`Self::delete_rows_in_txn`], matching rows through `visibility` rather
+    /// than a snapshot taken here.
+    ///
+    /// For a statement that has to know, before it deletes, exactly which rows
+    /// it will delete: a `DELETE` of a parent table collects the keys it is
+    /// removing to apply its foreign keys' actions, and that collection and
+    /// this scan must see the same rows. Taken separately, a parent row
+    /// committed between the two was deleted without its children ever being
+    /// considered. One snapshot for the statement is also what PostgreSQL does.
+    pub async fn delete_rows_as_of(
+        &self,
+        where_clause: &str,
+        query_row_fetch: RowFetch,
+        limit: Option<u64>,
+        deleted_by: TxId,
+        visibility: Option<Visibility>,
     ) -> Result<u64> {
         info!("Deleting rows");
 
@@ -2545,7 +2893,7 @@ impl<S: StorageIO> Table<S> {
                 limit,
                 // A statement may only remove rows it can see. Without this a
                 // DELETE would match another transaction's uncommitted rows.
-                self.visibility_for(deleted_by),
+                visibility.unwrap_or_else(|| self.visibility_for(deleted_by)),
             )
             .await?;
 
@@ -2570,6 +2918,11 @@ impl<S: StorageIO> Table<S> {
             // silently left a row behind would report a count the caller cannot
             // act on.
             if let Err(e) = self.check_write_conflict(&pointer, deleted_by) {
+                // The storage transaction is given up, not left open: one that
+                // logged an in-place stamp and never commits holds the log's
+                // pending count up, and the log cannot be checkpointed again
+                // for the life of the process.
+                self.io_pointers.abort_txn(txn).await;
                 return Err(if deleted_count == 0 {
                     std::io::Error::new(
                         std::io::ErrorKind::WouldBlock,
@@ -2627,6 +2980,8 @@ impl<S: StorageIO> Table<S> {
 
         // Published before the lock is released, so anyone who takes it next
         // sees a generation that already accounts for everything above.
+        self.dead_stamps
+            .fetch_add(deleted_count, AtomicOrdering::Relaxed);
         self.write_generation.fetch_add(1, AtomicOrdering::AcqRel);
 
         if deleted_count > 0 {
@@ -2690,7 +3045,39 @@ impl<S: StorageIO> Table<S> {
         limit: Option<u64>,
         written_by: TxId,
     ) -> Result<u64> {
+        self.update_rows_as_of(
+            where_clause,
+            query_row_fetch,
+            updates,
+            expressions,
+            limit,
+            written_by,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::update_rows_with_expressions`], matching rows through
+    /// `visibility` rather than a snapshot taken here — see
+    /// [`Self::delete_rows_as_of`] for why a statement needs that.
+    pub async fn update_rows_as_of(
+        &self,
+        where_clause: &str,
+        query_row_fetch: RowFetch,
+        updates: smallvec::SmallVec<[ColumnWritePayload; 32]>,
+        expressions: &[(u32, crate::core::rql::expr::Expr)],
+        limit: Option<u64>,
+        written_by: TxId,
+        visibility: Option<Visibility>,
+    ) -> Result<u64> {
         info!("Updating rows");
+
+        // A caller that brings its own snapshot is a statement with work left
+        // to do after this write — foreign-key actions — and that work can
+        // fail it. An in-place overwrite keeps no previous version, so a
+        // failure there would leave the new bytes standing in a statement
+        // reported as failed. Such a statement always writes a new version.
+        let may_fail_after_write = visibility.is_some();
 
         self.note_write(written_by);
 
@@ -2724,11 +3111,19 @@ impl<S: StorageIO> Table<S> {
                 limit,
                 // As in `delete_rows_in_txn`: a statement may only change rows
                 // it can see.
-                self.visibility_for(written_by),
+                visibility.unwrap_or_else(|| self.visibility_for(written_by)),
             )
             .await?;
 
         let full_fetch = Self::build_full_row_fetch(&self.schema.fields);
+
+        // The rewrite runs under the lock inserts check uniqueness under; the
+        // scan above does not. See `unique_lock` for both halves of that.
+        let _unique = if self.has_unique {
+            Some(self.unique_lock.lock().await)
+        } else {
+            None
+        };
 
         // A relocation allocates from the id counter even though it hands the
         // row back its own id, so the reservation on disk has to cover it.
@@ -2753,6 +3148,9 @@ impl<S: StorageIO> Table<S> {
             let row_id = pointer.row_id();
 
             if let Err(e) = self.check_write_conflict(&pointer, written_by) {
+                // As in the DELETE: an abandoned storage transaction would hold
+                // the log's checkpoint off for good.
+                self.io_pointers.abort_txn(txn).await;
                 return Err(if updated_count == 0 {
                     std::io::Error::new(
                         std::io::ErrorKind::WouldBlock,
@@ -2825,9 +3223,24 @@ impl<S: StorageIO> Table<S> {
             // statement touched it, which is what `COALESCE(c, x)` means, and
             // then overwrite the placeholder their assignment left behind.
             for (write_order, expression) in expressions.iter() {
+                // Expressions compute at the engine scale; a `NUMERIC(p, s)`
+                // target stores at its own, so the result is put back there.
                 let value =
-                    crate::core::rql::expr::eval(expression, &row, self.schema.fields.as_slice())
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+                    match crate::core::rql::expr::eval(expression, &row, self.schema.fields.as_slice())
+                        .and_then(|value| {
+                            match self.schema.fields.iter().find(|f| f.write_order as u32 == *write_order as u32) {
+                                Some(target) => crate::core::rql::expr::from_engine_scale(value, target),
+                                None => Ok(value),
+                            }
+                        }) {
+                        Ok(value) => value,
+                        Err(e) => {
+                            self.io_pointers.abort_txn(txn).await;
+                            return Err(
+                                std::io::Error::new(std::io::ErrorKind::InvalidInput, e).into()
+                            );
+                        }
+                    };
 
                 let Some(slot_index) = row_write
                     .columns_writing_data
@@ -2920,6 +3333,8 @@ impl<S: StorageIO> Table<S> {
                 // do anything about rows it was told had landed and had not.
                 self.io_pointers.commit_durable(txn).await?;
                 self.apply_pending_filters(&mut pending_filters);
+                self.dead_stamps
+                    .fetch_add(updated_count, AtomicOrdering::Relaxed);
                 self.write_generation.fetch_add(1, AtomicOrdering::AcqRel);
                 if updated_count > 0 {
                     self.invalidate_query_caches();
@@ -2967,6 +3382,7 @@ impl<S: StorageIO> Table<S> {
             // The filter is fed the same full `row_write` either way, so this
             // needs nothing from it that the general path does not.
             if !updates.is_empty()
+                && !may_fail_after_write
                 && updates.iter().all(|u| u.column_type != DbType::STRING)
                 && self
                     .write_columns_in_place(&pointer, &updates, txn, written_by)
@@ -3053,6 +3469,8 @@ impl<S: StorageIO> Table<S> {
 
         self.io_pointers.commit_durable(txn).await?;
         self.apply_pending_filters(&mut pending_filters);
+        self.dead_stamps
+            .fetch_add(updated_count, AtomicOrdering::Relaxed);
         self.write_generation.fetch_add(1, AtomicOrdering::AcqRel);
 
         if updated_count > 0 {

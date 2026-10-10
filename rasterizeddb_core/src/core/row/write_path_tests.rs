@@ -105,11 +105,11 @@ async fn run(t: &Table<LocalStorageProvider>, w: &str) -> Vec<Row> {
 }
 
 fn u64_of(r: &Row, sid: u64) -> u64 {
-    let c = r.columns.iter().find(|c| c.schema_id == sid).unwrap();
+    let c = r.columns.iter().find(|c| u64::from(c.schema_id) == sid).unwrap();
     u64::from_le_bytes(c.data.into_slice().try_into().unwrap())
 }
 fn str_of(r: &Row, sid: u64) -> String {
-    let c = r.columns.iter().find(|c| c.schema_id == sid).unwrap();
+    let c = r.columns.iter().find(|c| u64::from(c.schema_id) == sid).unwrap();
     String::from_utf8_lossy(c.data.into_slice()).to_string()
 }
 
@@ -3625,7 +3625,7 @@ fn column_lookup_uses_write_order_not_position() {
     let mut mb_b = MEMORY_POOL.acquire(4);
     mb_b.into_slice_mut().copy_from_slice(&9i32.to_le_bytes());
 
-    let mut columns: SmallVec<[Column; 32]> = SmallVec::new();
+    let mut columns: crate::core::row::row::RowColumns = SmallVec::new();
     columns.push(Column {
         schema_id: 21,
         data: mb_a.clone(),
@@ -3686,7 +3686,7 @@ fn a_row_view_returns_absent_for_a_column_the_fetch_skipped() {
     mb.into_slice_mut().copy_from_slice(&5i32.to_le_bytes());
 
     // Only write_order 0 was fetched.
-    let mut columns: SmallVec<[Column; 32]> = SmallVec::new();
+    let mut columns: crate::core::row::row::RowColumns = SmallVec::new();
     columns.push(Column {
         schema_id: 0,
         data: mb,
@@ -3785,4 +3785,531 @@ async fn a_table_whose_schema_will_not_load_is_flagged_rather_than_emptied() {
         0,
         "the failed load must not have written a schema of its own"
     );
+}
+
+/// The vacuum service sweeps on dead stamps, not on "something changed", so
+/// the write path must count one per row a DELETE removes and per row an
+/// UPDATE replaces — and nothing for an insert or a statement matching nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn deletes_and_updates_count_their_dead_stamps() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_table(dir.path(), "wp_dead_stamps").await;
+    for i in 0..10u64 {
+        insert(&t, i, i as i32, "s").await;
+    }
+    assert_eq!(t.dead_stamps(), 0, "inserts stamp nothing dead");
+
+    t.delete_rows("id < 3", full_fetch(&t.schema.fields), None)
+        .await
+        .unwrap();
+    assert_eq!(t.dead_stamps(), 3);
+
+    t.delete_rows("id = 999", full_fetch(&t.schema.fields), None)
+        .await
+        .unwrap();
+    assert_eq!(t.dead_stamps(), 3, "a delete matching nothing stamps nothing");
+
+    t.update_rows(
+        "id >= 8",
+        full_fetch(&t.schema.fields),
+        upd(&t.schema.fields, "label", b"a much longer label than before"),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(t.dead_stamps(), 5);
+}
+
+/// A DELETE that stamps some rows and then meets a write conflict fails — and
+/// must give its storage transaction up. It used to return with that
+/// transaction open: the in-place stamps it had logged stayed registered as
+/// pending in the WAL, which keeps `checkpoint` declining for the life of the
+/// process, so the log grew without bound after a single conflict.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_conflicting_write_leaves_no_storage_transaction_open() {
+    use crate::core::mvcc::TransactionManager;
+
+    let dir = tempfile::tempdir().unwrap();
+    let dir_str = dir.path().to_string_lossy().to_string();
+    let wal_path = dir.path().join(crate::core::wal::DEFAULT_WAL_NAME);
+    let wal = std::sync::Arc::new(crate::core::wal::Wal::open(&wal_path).unwrap());
+    crate::core::wal::install_for(&dir_str, wal.clone());
+
+    let t = open_table(dir.path(), "wp_abort_txn").await;
+    let manager = std::sync::Arc::new(TransactionManager::in_memory());
+    t.enable_versioning(manager.clone());
+    for i in 0..8u64 {
+        let tx = manager.begin_autocommit();
+        let mut rw = RowWrite {
+            columns_writing_data: SmallVec::new(),
+        };
+        rw.columns_writing_data
+            .push(payload(&i.to_le_bytes(), 0, DbType::U64));
+        rw.columns_writing_data
+            .push(payload(&(i as i32).to_le_bytes(), 1, DbType::I32));
+        rw.columns_writing_data.push(payload(b"s", 2, DbType::STRING));
+        t.insert_row_in_txn(rw, tx).await.unwrap();
+        manager.commit(tx);
+    }
+    assert_eq!(wal.pending_transactions(), 0);
+
+    // Another transaction holds the last row.
+    let holder = manager.begin();
+    t.delete_rows_in_txn("id = 7", full_fetch(&t.schema.fields), None, holder)
+        .await
+        .unwrap();
+
+    // This one stamps rows 0..6 and then conflicts on row 7.
+    let loser = manager.begin_autocommit();
+    let outcome = t
+        .delete_rows_in_txn("id >= 0", full_fetch(&t.schema.fields), None, loser)
+        .await;
+    assert!(outcome.is_err(), "the delete must conflict on the held row");
+    manager.abort(loser);
+    manager.commit(holder);
+
+    assert_eq!(
+        wal.pending_transactions(),
+        0,
+        "the failed statement's storage transaction is still open in the log"
+    );
+    assert!(wal.checkpoint().unwrap(), "the log can be checkpointed again");
+
+    // And the update path, conflicting mid-scan after rewriting earlier rows.
+    let rows_before = run(&t, "").await.len();
+    let tx = manager.begin_autocommit();
+    let holder = manager.begin();
+    t.delete_rows_in_txn("id = 6", full_fetch(&t.schema.fields), None, holder)
+        .await
+        .unwrap();
+    let r = t
+        .update_rows_in_txn(
+            "id >= 0",
+            full_fetch(&t.schema.fields),
+            upd(&t.schema.fields, "label", b"a label long enough to relocate the row"),
+            None,
+            tx,
+        )
+        .await;
+    assert!(r.is_err());
+    manager.abort(tx);
+    manager.abort(holder);
+    assert_eq!(wal.pending_transactions(), 0, "the failed UPDATE left its transaction open");
+    assert_eq!(run(&t, "").await.len(), rows_before, "nothing the failed statements did is visible");
+}
+
+/// COUNT(*) over a million rows written by many transactions, with the status
+/// log settled and not: what the settled lookup costs a scan.
+///
+/// `cargo test --release -p rasterizeddb_core --lib -- --ignored count_scan_with_settled_outcomes --nocapture`
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn count_scan_with_settled_outcomes() {
+    use crate::core::mvcc::TransactionManager;
+    use crate::core::mvcc::status::StatusLog;
+
+    const ROWS: u64 = 1_000_000;
+    for settle in [false, true, false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open_table(dir.path(), "wp_count_settled").await;
+        let manager = std::sync::Arc::new(TransactionManager::new(StatusLog::in_memory_with(settle)));
+        t.enable_versioning(manager.clone());
+        // Rows in batches of 100 per transaction, with a few hundred thousand
+        // read-only transactions between, as a server's ids go.
+        let mut i = 0u64;
+        while i < ROWS {
+            let tx = manager.begin();
+            for _ in 0..100 {
+                let mut rw = RowWrite {
+                    columns_writing_data: SmallVec::new(),
+                };
+                rw.columns_writing_data
+                    .push(payload(&i.to_le_bytes(), 0, DbType::U64));
+                rw.columns_writing_data
+                    .push(payload(&(i as i32).to_le_bytes(), 1, DbType::I32));
+                rw.columns_writing_data.push(payload(b"x", 2, DbType::STRING));
+                t.insert_row_in_txn(rw, tx).await.unwrap();
+                i += 1;
+            }
+            manager.commit(tx);
+            for _ in 0..30 {
+                let r = manager.begin();
+                manager.commit(r);
+            }
+        }
+        let settled = manager.settle_now();
+        let empty = full_fetch(&smallvec::SmallVec::new());
+        for round in 0..3 {
+            let reader = manager.begin();
+            let start = std::time::Instant::now();
+            let n = t
+                .count_rows_in_txn("", &t.schema.fields.to_vec(), empty.clone(), reader)
+                .await
+                .unwrap();
+            let took = start.elapsed();
+            manager.commit(reader);
+            assert_eq!(n, ROWS);
+            println!(
+                "settle {:>5} (below {:>8} of {:>8}) round {}: COUNT(*) {:?} ({:.1} ns/row)",
+                settle,
+                settled,
+                manager.next_id(),
+                round,
+                took,
+                took.as_nanos() as f64 / ROWS as f64
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Forgetting aborted ids
+// ---------------------------------------------------------------------------
+
+fn forget_row(id: u64) -> RowWrite {
+    let mut rw = RowWrite {
+        columns_writing_data: SmallVec::new(),
+    };
+    rw.columns_writing_data
+        .push(payload(&id.to_le_bytes(), 0, DbType::U64));
+    rw.columns_writing_data
+        .push(payload(&(id as i32).to_le_bytes(), 1, DbType::I32));
+    rw.columns_writing_data.push(payload(b"v", 2, DbType::STRING));
+    rw
+}
+
+async fn visible_ids(t: &Table<LocalStorageProvider>) -> Vec<u64> {
+    let mut ids: Vec<u64> = run(t, "").await.iter().map(|r| u64_of(r, 0)).collect();
+    ids.sort();
+    ids
+}
+
+/// Inserts `n` rows from `from`, one transaction each: every third aborts.
+/// Then, for some committed rows, a delete that aborts. Returns the ids that
+/// must stay visible.
+async fn forget_history(
+    t: &Table<LocalStorageProvider>,
+    manager: &std::sync::Arc<crate::core::mvcc::TransactionManager>,
+    from: u64,
+    n: u64,
+) -> Vec<u64> {
+    let mut committed = Vec::new();
+    for id in from..from + n {
+        let tx = manager.begin();
+        t.insert_row_in_txn(forget_row(id), tx).await.unwrap();
+        if id % 3 == 0 {
+            manager.abort(tx);
+        } else {
+            manager.commit(tx);
+            committed.push(id);
+        }
+    }
+    for id in committed.iter().copied().filter(|id| id % 10 == 1) {
+        let tx = manager.begin();
+        let n = t
+            .delete_rows_in_txn(&format!("id = {}", id), full_fetch(&t.schema.fields), None, tx)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        manager.abort(tx);
+    }
+    committed
+}
+
+/// Aborted inserts and aborted deletes, swept and forgotten: the ids answer
+/// "committed" now, and still no aborted row is visible and no row an aborted
+/// delete touched has gone — live, and after a reopen of both the table and
+/// the status log, with the forgotten horizon read back from the sidecar.
+#[tokio::test(flavor = "multi_thread")]
+async fn forgetting_aborted_ids_never_makes_a_row_visible_or_invisible() {
+    use crate::core::mvcc::TransactionManager;
+    use crate::core::mvcc::status::StatusLog;
+    use crate::core::mvcc::TxOutcome;
+
+    let dir = tempfile::tempdir().unwrap();
+    let status_path = dir.path().join("tx.status");
+    let committed;
+    let aborted_id;
+    {
+        let t = open_table(dir.path(), "wp_forget").await;
+        let manager = std::sync::Arc::new(TransactionManager::new(
+            StatusLog::open_with(&status_path, true).unwrap(),
+        ));
+        manager.status().set_persist_step(4096);
+        t.enable_versioning(manager.clone());
+        let before = manager.next_id();
+        committed = forget_history(&t, &manager, 0, 3_000).await;
+        // An aborted inserter's id, for the outcome check below.
+        aborted_id = before;
+        assert_eq!(manager.outcome(aborted_id), TxOutcome::Aborted);
+        // Push past a block so the history is settled.
+        for _ in 0..9_000 {
+            let tx = manager.begin();
+            manager.commit(tx);
+        }
+        // As every writing commit does: outcomes reach the file.
+        manager.flush().unwrap();
+        manager.settle_now();
+        assert_eq!(visible_ids(&t).await, committed, "before any sweep");
+
+        let report = t.neutralize_aborted_now().await.unwrap();
+        assert_eq!(report.tombstoned, 1_000, "{:?}", report);
+        assert_eq!(report.cleared, (committed.iter().filter(|id| *id % 10 == 1).count()) as u64);
+        assert!(report.advanced_to.is_some(), "{:?}", report);
+        let forgotten = manager.status().forgotten_below();
+        assert!(forgotten > aborted_id, "forgotten {} of {}", forgotten, manager.next_id());
+        assert_eq!(
+            manager.outcome(aborted_id),
+            TxOutcome::Committed,
+            "a forgotten id reads as committed"
+        );
+        assert_eq!(visible_ids(&t).await, committed, "after forgetting");
+        // A second sweep finds nothing left to rewrite.
+        for _ in 0..9_000 {
+            let tx = manager.begin();
+            manager.commit(tx);
+        }
+        manager.settle_now();
+        let again = t.neutralize_aborted_now().await.unwrap();
+        assert_eq!((again.tombstoned, again.cleared), (0, 0));
+        manager.flush().unwrap();
+        t.io_pointers.commit_durable(t.io_pointers.begin_txn()).await.unwrap();
+    }
+
+    // Reopened: the sidecar carries the forgotten horizon, and the rows
+    // still read as they did.
+    let manager = std::sync::Arc::new(TransactionManager::new(
+        StatusLog::open_with(&status_path, true).unwrap(),
+    ));
+    assert!(manager.status().forgotten_below() > aborted_id, "forgotten horizon persisted");
+    let t = open_table(dir.path(), "wp_forget").await;
+    t.enable_versioning(manager.clone());
+    assert_eq!(visible_ids(&t).await, committed, "after reopen");
+    // And with forgetting off: the status file still names every abort.
+    let plain = std::sync::Arc::new(TransactionManager::new(
+        StatusLog::open_with(&status_path, false).unwrap(),
+    ));
+    assert_eq!(plain.outcome(aborted_id), TxOutcome::Aborted);
+}
+
+/// A table that has never been swept pins the database's forgotten horizon,
+/// however far another has got.
+#[tokio::test(flavor = "multi_thread")]
+async fn forgetting_is_pinned_by_a_table_never_swept() {
+    use crate::core::mvcc::TransactionManager;
+    use crate::core::mvcc::status::StatusLog;
+
+    let dir = tempfile::tempdir().unwrap();
+    let manager = std::sync::Arc::new(TransactionManager::new(StatusLog::in_memory_with(true)));
+    let a = open_table(dir.path(), "wp_forget_a").await;
+    let b = open_table(dir.path(), "wp_forget_b").await;
+    a.enable_versioning(manager.clone());
+    b.enable_versioning(manager.clone());
+    let committed_a = forget_history(&a, &manager, 0, 600).await;
+    let committed_b = forget_history(&b, &manager, 0, 600).await;
+    for _ in 0..9_000 {
+        let tx = manager.begin();
+        manager.commit(tx);
+    }
+    manager.settle_now();
+
+    let swept = a.neutralize_aborted_now().await.unwrap();
+    assert!(swept.advanced_to.is_some());
+    assert_eq!(
+        manager.status().forgotten_below(),
+        0,
+        "b has never been swept, so nothing may be forgotten"
+    );
+    assert_eq!(b.forget_horizon(), Some(0));
+    assert_eq!(visible_ids(&b).await, committed_b);
+
+    b.neutralize_aborted_now().await.unwrap();
+    assert!(manager.status().forgotten_below() > 0, "both swept: it moves");
+    assert_eq!(visible_ids(&a).await, committed_a);
+    assert_eq!(visible_ids(&b).await, committed_b);
+
+    // A table registered later starts at the forgotten horizon and pins any
+    // further advance until it, too, is swept.
+    let floor = manager.status().forgotten_below();
+    let c = open_table(dir.path(), "wp_forget_c").await;
+    c.enable_versioning(manager.clone());
+    assert_eq!(c.forget_horizon(), Some(floor));
+    for _ in 0..9_000 {
+        let tx = manager.begin();
+        manager.commit(tx);
+    }
+    manager.settle_now();
+    a.neutralize_aborted_now().await.unwrap();
+    b.neutralize_aborted_now().await.unwrap();
+    assert_eq!(manager.status().forgotten_below(), floor, "c pins it");
+    // And a dropped table no longer does — once its vacuum service, which
+    // shares the registration, has noticed the drop and stopped.
+    drop(c);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while manager.try_forget() <= floor {
+        assert!(std::time::Instant::now() < deadline, "a dropped table still pins the horizon");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Heavy aborts, sweeps and forgets running against readers, checked against
+/// a reference model: a reader never sees a row whose insert aborted, never
+/// misses one committed before it started, and never loses a row to an
+/// aborted delete — before and after forgets, and after a reopen.
+///
+/// `RDB_FORGET_STRESS_SECS` sets the duration (default 3 s).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn forgetting_under_concurrent_writes_and_reads_matches_a_reference_model() {
+    use crate::core::mvcc::TransactionManager;
+    use crate::core::mvcc::status::StatusLog;
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+    use std::sync::Arc;
+
+    let secs: u64 = std::env::var("RDB_FORGET_STRESS_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+    const CAP: usize = 4_000_000;
+    let dir = tempfile::tempdir().unwrap();
+    let status_path = dir.path().join("tx.status");
+    let manager = Arc::new(TransactionManager::new(StatusLog::open_with(&status_path, true).unwrap()));
+    manager.set_settle_window(4096);
+    manager.status().set_persist_step(4096);
+    let t = Arc::new(open_table(dir.path(), "wp_forget_stress").await);
+    t.enable_versioning(manager.clone());
+
+    // Row id -> 0 not yet decided, 1 committed, 2 aborted.
+    let model: Arc<Vec<AtomicU8>> = Arc::new((0..CAP).map(|_| AtomicU8::new(0)).collect());
+    let next_row = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let forgets = Arc::new(AtomicU64::new(0));
+    let reads = Arc::new(AtomicU64::new(0));
+    let mut tasks = Vec::new();
+
+    for w in 0..3u64 {
+        let (t, m, model, next_row, stop) =
+            (t.clone(), manager.clone(), model.clone(), next_row.clone(), stop.clone());
+        tasks.push(tokio::spawn(async move {
+            let mut rng = 0x9E37_79B9_7F4A_7C15u64 ^ (w + 1);
+            let mut xs = || {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng
+            };
+            while !stop.load(Ordering::Relaxed) {
+                let id = next_row.fetch_add(1, Ordering::Relaxed);
+                if id as usize >= CAP {
+                    break;
+                }
+                let tx = m.begin();
+                t.insert_row_in_txn(forget_row(id), tx).await.unwrap();
+                if xs() % 10 < 3 {
+                    m.abort(tx);
+                    model[id as usize].store(2, Ordering::Release);
+                } else {
+                    m.commit(tx);
+                    model[id as usize].store(1, Ordering::Release);
+                }
+                // An aborted delete of some committed row.
+                if xs() % 20 == 0 && id > 10 {
+                    let victim = xs() % id;
+                    if model[victim as usize].load(Ordering::Acquire) == 1 {
+                        let tx = m.begin();
+                        match t
+                            .delete_rows_in_txn(
+                                &format!("id = {}", victim),
+                                full_fetch(&t.schema.fields),
+                                None,
+                                tx,
+                            )
+                            .await
+                        {
+                            Ok(_) | Err(_) => m.abort(tx),
+                        }
+                    }
+                }
+                // Read-only transactions, as a server's ids go.
+                for _ in 0..(xs() % 8) {
+                    let r = m.begin();
+                    m.commit(r);
+                }
+            }
+        }));
+    }
+    {
+        let (t, m, stop, forgets) = (t.clone(), manager.clone(), stop.clone(), forgets.clone());
+        tasks.push(tokio::spawn(async move {
+            while !stop.load(Ordering::Relaxed) {
+                m.settle_now();
+                if let Ok(report) = t.neutralize_aborted_now().await {
+                    if report.advanced_to.is_some() {
+                        forgets.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                m.flush().unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }));
+    }
+    for _ in 0..2 {
+        let (t, model, next_row, stop, reads) =
+            (t.clone(), model.clone(), next_row.clone(), stop.clone(), reads.clone());
+        tasks.push(tokio::spawn(async move {
+            while !stop.load(Ordering::Relaxed) {
+                // Committed before the read starts: must all be there.
+                let upto = next_row.load(Ordering::Relaxed).min(CAP as u64);
+                let before: Vec<u64> = (0..upto)
+                    .filter(|id| model[*id as usize].load(Ordering::Acquire) == 1)
+                    .collect();
+                let seen = visible_ids(&t).await;
+                let seen_set: std::collections::HashSet<u64> = seen.iter().copied().collect();
+                for id in &before {
+                    assert!(seen_set.contains(id), "committed row {} is missing", id);
+                }
+                for id in &seen {
+                    // Decided as aborted is never visible. Undecided rows are
+                    // checked again at the end.
+                    assert_ne!(
+                        model[*id as usize].load(Ordering::Acquire),
+                        2,
+                        "aborted row {} is visible",
+                        id
+                    );
+                }
+                reads.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+    }
+
+    tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+    stop.store(true, Ordering::Relaxed);
+    for task in tasks {
+        task.await.unwrap();
+    }
+    manager.settle_now();
+    t.neutralize_aborted_now().await.unwrap();
+    let rows = next_row.load(Ordering::Relaxed).min(CAP as u64);
+    let expected: Vec<u64> = (0..rows)
+        .filter(|id| model[*id as usize].load(Ordering::Acquire) == 1)
+        .collect();
+    assert_eq!(visible_ids(&t).await, expected, "final, live");
+    eprintln!(
+        "forget stress: {} rows, {} forgets, {} reads, forgotten below {} of {}",
+        rows,
+        forgets.load(Ordering::Relaxed),
+        reads.load(Ordering::Relaxed),
+        manager.status().forgotten_below(),
+        manager.next_id()
+    );
+    assert!(forgets.load(Ordering::Relaxed) > 0, "no forget ever happened");
+    assert!(manager.status().forgotten_below() > 0);
+
+    manager.flush().unwrap();
+    drop(t);
+    drop(manager);
+    let manager = Arc::new(TransactionManager::new(StatusLog::open_with(&status_path, true).unwrap()));
+    let t = open_table(dir.path(), "wp_forget_stress").await;
+    t.enable_versioning(manager.clone());
+    assert_eq!(visible_ids(&t).await, expected, "final, reopened");
 }

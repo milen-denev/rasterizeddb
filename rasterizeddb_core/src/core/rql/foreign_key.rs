@@ -22,7 +22,6 @@
 use std::io;
 
 use rclite::Arc;
-use smallvec::SmallVec;
 
 use crate::core::storage_providers::traits::StorageIO;
 
@@ -162,11 +161,11 @@ fn sidecar_name<S: StorageIO>(schema_io: &Arc<S>) -> String {
 }
 
 /// Reads a table's foreign keys.
-pub async fn load<S: StorageIO>(schema_io: Arc<S>) -> SmallVec<[ForeignKey; 4]> {
+pub async fn load<S: StorageIO>(schema_io: Arc<S>) -> Vec<ForeignKey> {
     let io = schema_io.create_new(sidecar_name(&schema_io)).await;
     let len = io.get_len().await;
 
-    let mut out: SmallVec<[ForeignKey; 4]> = SmallVec::new();
+    let mut out: Vec<ForeignKey> = Vec::new();
     if len < FOREIGN_KEY_SIZE {
         return out;
     }
@@ -520,5 +519,80 @@ mod tests {
         assert!(ReferentialAction::Restrict.blocks());
         assert!(!ReferentialAction::Cascade.blocks());
         assert!(!ReferentialAction::SetNull.blocks());
+    }
+}
+
+/// End-to-end cost of foreign-key enforcement on a bulk insert.
+///
+/// `cargo test --release -p rasterizeddb_core --lib -- --ignored fk_bulk_insert_cost --nocapture`
+#[cfg(test)]
+mod bench {
+    use crate::core::rql::executor;
+    use crate::core::rql::lexer_s1::recognize_query_purpose;
+
+    async fn exec(db: &rclite::Arc<crate::core::database::Database>, sql: &str) -> Vec<u8> {
+        let purpose = recognize_query_purpose(sql).expect("parse");
+        executor::execute(purpose, db.clone()).await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn fk_bulk_insert_cost() {
+        let _ = crate::MAX_PERMITS_THREADS.get_or_init(|| 8);
+        let _ = crate::BATCH_SIZE.get_or_init(|| 1024 * 8);
+        let _ = crate::core::processor::concurrent_processor::ENABLE_CACHE.get_or_init(|| false);
+
+        const PARENTS: usize = 1_000;
+        const CHILDREN: usize = 10_000;
+        const PER_STATEMENT: usize = 1_000;
+
+        for round in 0..3 {
+            let catalog = crate::core::database::catalog::DatabaseCatalog::open(None, "fkbench")
+                .await
+                .unwrap();
+            let db = catalog.get("fkbench").unwrap();
+            assert_eq!(exec(&db, "CREATE TABLE p (id INT PRIMARY KEY, name TEXT)").await[0], 0);
+            let values: Vec<String> = (0..PARENTS).map(|i| format!("({}, 'p{}')", i, i)).collect();
+            assert_ne!(
+                exec(&db, &format!("INSERT INTO p (id, name) VALUES {}", values.join(", "))).await[0],
+                3
+            );
+            assert_eq!(
+                exec(
+                    &db,
+                    "CREATE TABLE c (id INT PRIMARY KEY, pid INT, \
+                     CONSTRAINT fk_c FOREIGN KEY (pid) REFERENCES p (id))"
+                )
+                .await[0],
+                0
+            );
+            assert_eq!(exec(&db, "CREATE TABLE n (id INT PRIMARY KEY, pid INT)").await[0], 0);
+
+            for (table, label) in [("n", "no foreign key"), ("c", "foreign key")] {
+                let t = std::time::Instant::now();
+                for chunk in 0..CHILDREN / PER_STATEMENT {
+                    let values: Vec<String> = (0..PER_STATEMENT)
+                        .map(|i| {
+                            let id = chunk * PER_STATEMENT + i;
+                            format!("({}, {})", id, (id * 7) % PARENTS)
+                        })
+                        .collect();
+                    let r = exec(
+                        &db,
+                        &format!("INSERT INTO {} (id, pid) VALUES {}", table, values.join(", ")),
+                    )
+                    .await;
+                    assert_ne!(r[0], 3, "{}", String::from_utf8_lossy(&r[1..]));
+                }
+                println!(
+                    "round {} {:>15}: {} rows in {:?} ({:.1} us/row)",
+                    round,
+                    label,
+                    CHILDREN,
+                    t.elapsed(),
+                    t.elapsed().as_micros() as f64 / CHILDREN as f64
+                );
+            }
+        }
     }
 }

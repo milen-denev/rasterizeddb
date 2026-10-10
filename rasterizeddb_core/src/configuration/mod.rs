@@ -15,4 +15,19 @@ pub struct Configuration {
     pub storage_policy: Option<String>,
     /// Free-space floor below which a location stops being chosen, e.g. `2GiB`.
     pub storage_min_free: Option<String>,
+    /// Settle transaction outcomes, at open and while running
+    /// (`--settle-status-at-open`). `None` leaves the default: on, unless
+    /// `RASTERIZEDDB_SETTLE_STATUS=0`. See
+    /// [`crate::core::mvcc::status::set_settle_on_open`].
+    pub settle_status_at_open: Option<bool>,
+}
+
+impl Configuration {
+    /// Applies the knobs that are process-wide switches rather than values a
+    /// component reads at construction. Call before any database is opened.
+    pub fn apply_runtime_switches(&self) {
+        if let Some(settle) = self.settle_status_at_open {
+            crate::core::mvcc::status::set_settle_on_open(settle);
+        }
+    }
 }

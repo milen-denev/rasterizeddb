@@ -966,8 +966,12 @@ impl Database {
             db_io_pointers: io_pointers,
             db_io_rows: io_rows,
             db_io_schema: io_schema,
-            transactions,
-            row_locks: StdArc::new(crate::core::mvcc::row_locks::RowLocks::default()),
+            transactions: StdArc::clone(&transactions),
+            // Resolves a savepoint's locks to its transaction, which is what
+            // releases them.
+            row_locks: StdArc::new(crate::core::mvcc::row_locks::RowLocks::for_transactions(
+                StdArc::clone(&transactions),
+            )),
             schema_generation: StdArc::new(std::sync::atomic::AtomicU64::new(0).into()),
             replication: StdArc::new(crate::replication::Replication::new()),
             location: (!in_memory).then(|| location.to_string()),
@@ -1213,6 +1217,7 @@ impl Database {
     /// really were released. Schema comes back, rows do not, and nothing
     /// reports an error at any point.
     pub async fn drop_table(&self, table_name: &str) -> io::Result<bool> {
+        let _changed = SchemaChanged::unless_internal(&self.schema_generation, table_name);
         self.drop_table_to_depth(table_name, 0).await
     }
 
@@ -1371,6 +1376,12 @@ impl Database {
     /// no more correct and briefly much less so. The names read as stale; the
     /// data resolves.
     pub async fn rename_table(&self, old_name: &str, new_name: &str) -> io::Result<()> {
+        // The table's handle is dropped before the reopened one registers;
+        // the database's forgotten horizon must not move in that gap, or the
+        // reopened files could carry ids it forgot. See `ForgetRegistry`.
+        let _forget_pause = self.transactions.forget_pause();
+        let _changed = SchemaChanged::unless_internal(&self.schema_generation, old_name)
+            .or_else(|| SchemaChanged::unless_internal(&self.schema_generation, new_name));
         if old_name == new_name {
             return Ok(());
         }
@@ -1620,6 +1631,10 @@ impl Database {
         destination: &crate::core::storage::TableBackend,
     ) -> io::Result<u64> {
         use crate::core::storage::{LocationRole, TableBackend};
+        // The table's handle is dropped before the reopened one registers;
+        // the database's forgotten horizon must not move in that gap, or the
+        // reopened files could carry ids it forgot. See `ForgetRegistry`.
+        let _forget_pause = self.transactions.forget_pause();
 
         let root = self
             .storage
@@ -2062,6 +2077,8 @@ impl Database {
     }
 
     pub async fn add_table(&self, create_table: CreateTable) -> io::Result<()> {
+        let _changed =
+            SchemaChanged::unless_internal(&self.schema_generation, &create_table.table_name);
         let table_name = &create_table.table_name;
         let columns = create_table.columns;
         let unique_columns = create_table.unique_columns;
@@ -2460,11 +2477,17 @@ impl Database {
     }
 
     pub async fn reload_table(&self, table_name: &str) -> io::Result<()> {
+        // The table's handle is dropped before the reopened one registers;
+        // the database's forgotten horizon must not move in that gap, or the
+        // reopened files could carry ids it forgot. See `ForgetRegistry`.
+        let _forget_pause = self.transactions.forget_pause();
         if !self.tables.contains_key(table_name) {
             return Err(io::Error::new(io::ErrorKind::NotFound, "Table not found"));
         }
+        let _changed = SchemaChanged(&self.schema_generation);
         // Every schema change comes through here, so this is where a client's
         // cached column list becomes stale. See `schema_generation`.
+        // Bumped again once the reload is done: see `SchemaChanged`.
         self.schema_generation
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         // The previous handle is dropped first so its maintenance task stops
@@ -3027,5 +3050,42 @@ fn rows_of(response: &[u8]) -> u64 {
         }
         Some(2) => crate::core::row::row::count_serialized_rows(&response[1..]),
         _ => 0,
+    }
+}
+
+/// Bumps the schema generation when dropped — that is, once the change it
+/// guards has finished, on every path out of it.
+///
+/// The bump at the *start* of `reload_table` is what tells a prepared
+/// statement's next `Execute` to look again. It is not enough for anything that
+/// caches a description keyed by the generation (`pgwire`'s describe cache):
+/// a describe that reads the generation after that first bump but the table
+/// before it is replaced would file the old shape under the new generation.
+/// A bump after the change closes that, since nothing computed during the
+/// change can match a lookup made after it.
+///
+/// Creating, dropping and renaming a table bump it too. None of them alters a
+/// table's shape, but each changes what a name resolves to — `DROP` then
+/// `CREATE` under the same name gives a statement a different column list
+/// without any `ALTER`. The engine's own temporary relations (a CTE's
+/// `__cte_…` tables, a JSON column's shadow tables) are created and dropped by
+/// ordinary statements constantly and are never named by a client, so they do
+/// not count.
+struct SchemaChanged<'a>(&'a CacheGuard<std::sync::atomic::AtomicU64>);
+
+impl<'a> SchemaChanged<'a> {
+    fn unless_internal(
+        generation: &'a CacheGuard<std::sync::atomic::AtomicU64>,
+        table_name: &str,
+    ) -> Option<Self> {
+        let internal = table_name.starts_with(crate::core::rql::cte::TEMP_TABLE_PREFIX)
+            || crate::core::rql::json_map::is_shadow_table(table_name);
+        (!internal).then(|| SchemaChanged(generation))
+    }
+}
+
+impl Drop for SchemaChanged<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 }

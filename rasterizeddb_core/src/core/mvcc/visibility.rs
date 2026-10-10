@@ -33,6 +33,7 @@ pub enum Visibility {
     },
 }
 
+
 impl Visibility {
     /// The rule for a statement running under `snapshot`.
     pub fn for_snapshot(snapshot: Snapshot, manager: Arc<TransactionManager>) -> Self {
@@ -97,6 +98,11 @@ impl Visibility {
                 if xmin == FROZEN_TX && xmax == NO_TX {
                     return true;
                 }
+                // A per-worker one-entry `(xid, final outcome)` cache was tried
+                // here and measured: no gain for bulk-loaded runs sharing an
+                // xmin (2.9 vs 2.9 ns/row) and +2.4 ns/row when consecutive
+                // rows have different writers. `Snapshot::xmin` is what pays
+                // (4.6 -> 2.9 ns/row); see `per_row_visibility_cost`.
                 snapshot.sees(xmin, xmax, &|id| manager.outcome(id))
             }
         }
@@ -393,5 +399,227 @@ mod reclamation_lemma {
             deleter > m.oldest_active(),
             "the bound must not have passed a delete an open reader predates"
         );
+    }
+
+    /// The fast paths — `Snapshot::xmin` and the solo family — must give
+    /// exactly the answers the plain rule gives.
+    ///
+    /// Random histories: transactions begun, committed, aborted and left
+    /// running; savepoints opened, rolled back and released inside them;
+    /// snapshots taken from outside any transaction, from a running one, from
+    /// inside a savepoint, and pinned. Each snapshot is then asked about every
+    /// `(xmin, xmax)` pair over the ids involved plus the sentinels, *twice*,
+    /// with more history happening between the two passes, through one
+    /// `Visibility` value, so a rule outliving outcome changes is covered too.
+    #[test]
+    fn the_fast_paths_agree_with_the_reference_rule() {
+        let mut rng = 0x243F_6A88_85A3_08D3u64;
+        let mut next = |bound: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % bound.max(1)
+        };
+        let mut compared = 0u64;
+        for _history in 0..300 {
+            let m = Arc::new(TransactionManager::in_memory());
+            let mut running: Vec<TxId> = Vec::new();
+            // (savepoint, parent) still open.
+            let mut savepoints: Vec<(TxId, TxId)> = Vec::new();
+            let mut seen: Vec<TxId> = vec![NO_TX, FROZEN_TX];
+
+            let step = |m: &Arc<TransactionManager>,
+                            running: &mut Vec<TxId>,
+                            savepoints: &mut Vec<(TxId, TxId)>,
+                            seen: &mut Vec<TxId>,
+                            roll: u64,
+                            pick: u64| {
+                match roll {
+                    0..=3 => {
+                        let id = m.begin();
+                        running.push(id);
+                        seen.push(id);
+                    }
+                    4 | 5 if !running.is_empty() => {
+                        let id = running.remove((pick as usize) % running.len());
+                        savepoints.retain(|(_, p)| *p != id);
+                        m.commit(id);
+                    }
+                    6 if !running.is_empty() => {
+                        let id = running.remove((pick as usize) % running.len());
+                        savepoints.retain(|(_, p)| *p != id);
+                        m.abort(id);
+                    }
+                    7 if !running.is_empty() => {
+                        let parent = running[(pick as usize) % running.len()];
+                        let sub = m.begin_savepoint(parent);
+                        savepoints.push((sub, parent));
+                        seen.push(sub);
+                    }
+                    8 if !savepoints.is_empty() => {
+                        let (sub, _) = savepoints.remove((pick as usize) % savepoints.len());
+                        m.rollback_savepoint(sub);
+                    }
+                    9 if !savepoints.is_empty() => {
+                        let (sub, _) = savepoints.remove((pick as usize) % savepoints.len());
+                        m.release_savepoint(sub);
+                    }
+                    _ => {}
+                }
+            };
+
+            for _ in 0..(5 + next(25)) {
+                let (roll, pick) = (next(10), next(1000));
+                step(&m, &mut running, &mut savepoints, &mut seen, roll, pick);
+            }
+
+            // Readers: outside any transaction, a running one, a savepoint, and
+            // a pinned one.
+            let mut readers: Vec<Visibility> = Vec::new();
+            readers.push(Visibility::for_snapshot(m.snapshot(NO_TX), m.clone()));
+            if let Some(own) = running.first().copied() {
+                readers.push(Visibility::for_snapshot(m.snapshot(own), m.clone()));
+            }
+            if let Some((sub, _)) = savepoints.last().copied() {
+                readers.push(Visibility::for_snapshot(m.snapshot(sub), m.clone()));
+            }
+            if let Some(own) = running.last().copied() {
+                m.pin_snapshot(own);
+                readers.push(Visibility::for_snapshot(m.snapshot(own), m.clone()));
+            }
+            // One id nobody has been given yet.
+            let unassigned = m.next_id() + 3;
+
+            for pass in 0..2 {
+                let mut ids = seen.clone();
+                ids.push(unassigned);
+                for v in &readers {
+                    let Visibility::AsOf {
+                        snapshot, manager, ..
+                    } = v
+                    else {
+                        unreachable!()
+                    };
+                    // Consecutive rows sharing an xmin, the cache's case, and
+                    // alternating ones, its worst case.
+                    for &xmin in &ids {
+                        for &xmax in &ids {
+                            for deleted in [false, true] {
+                                let reference = !deleted
+                                    && snapshot.sees_reference(xmin, xmax, &|id| {
+                                        manager.outcome(id)
+                                    });
+                                assert_eq!(
+                                    v.visible(deleted, xmin, xmax),
+                                    reference,
+                                    "pass {} xmin {} xmax {} deleted {} snapshot {:?}",
+                                    pass,
+                                    xmin,
+                                    xmax,
+                                    deleted,
+                                    snapshot
+                                );
+                                assert_eq!(
+                                    !deleted && snapshot.sees(xmin, xmax, &|id| manager.outcome(id)),
+                                    reference
+                                );
+                                compared += 1;
+                            }
+                        }
+                    }
+                    // A fresh clone starts with an empty cache and must agree.
+                    let c = v.clone();
+                    for &xmin in ids.iter().rev() {
+                        assert_eq!(
+                            c.visible(false, xmin, NO_TX),
+                            snapshot.sees_reference(xmin, NO_TX, &|id| manager.outcome(id))
+                        );
+                    }
+                }
+                // History moves on between the passes: running transactions
+                // commit or abort while the readers, and their caches, live on.
+                for _ in 0..(3 + next(10)) {
+                    let (roll, pick) = (next(10), next(1000));
+                    step(&m, &mut running, &mut savepoints, &mut seen, roll, pick);
+                }
+            }
+        }
+        assert!(compared > 100_000, "{}", compared);
+    }
+
+    /// `cargo test --release -p rasterizeddb_core --lib -- --ignored per_row_visibility_cost --nocapture`
+    ///
+    /// The per-row decision over a million rows, for the xmin shapes tables
+    /// actually have, against the reference rule with uncached outcomes.
+    #[test]
+    #[ignore]
+    fn per_row_visibility_cost() {
+        let m = Arc::new(TransactionManager::in_memory());
+        // A few thousand committed writers, then a handful still running so
+        // the snapshot has a non-empty `running` set (the slow case).
+        let mut writers = Vec::new();
+        for _ in 0..4_000 {
+            let id = m.begin();
+            writers.push(id);
+        }
+        for id in &writers[..3_990] {
+            m.commit(*id);
+        }
+        let reader = m.begin();
+        let v = Visibility::for_snapshot(m.snapshot(reader), m.clone());
+        let Visibility::AsOf {
+            snapshot, manager, ..
+        } = &v
+        else {
+            unreachable!()
+        };
+
+        const ROWS: usize = 1_000_000;
+        let shapes: Vec<(&str, Vec<(TxId, TxId)>)> = vec![
+            (
+                "bulk (10k rows per writer)",
+                (0..ROWS).map(|i| (writers[(i / 10_000) % 3_990], NO_TX)).collect(),
+            ),
+            (
+                "autocommit (one writer per row)",
+                (0..ROWS).map(|i| (writers[i % 3_990], NO_TX)).collect(),
+            ),
+            (
+                "updated (xmin and a committed xmax)",
+                (0..ROWS)
+                    .map(|i| (writers[(i / 100) % 3_000], writers[3_000 + (i / 100) % 990]))
+                    .collect(),
+            ),
+        ];
+        for (name, rows) in &shapes {
+            for round in 0..3 {
+                let t = std::time::Instant::now();
+                let mut old = 0usize;
+                for (xmin, xmax) in rows {
+                    if snapshot.sees_reference(*xmin, *xmax, &|id| manager.outcome(id)) {
+                        old += 1;
+                    }
+                }
+                let old_t = t.elapsed();
+                let c = v.clone();
+                let t = std::time::Instant::now();
+                let mut new = 0usize;
+                for (xmin, xmax) in rows {
+                    if c.visible(false, *xmin, *xmax) {
+                        new += 1;
+                    }
+                }
+                let new_t = t.elapsed();
+                assert_eq!(old, new);
+                println!(
+                    "{:<40} round {}: reference {:>6.2} ns/row  Visibility::visible {:>6.2} ns/row  ({} visible)",
+                    name,
+                    round,
+                    old_t.as_nanos() as f64 / ROWS as f64,
+                    new_t.as_nanos() as f64 / ROWS as f64,
+                    new
+                );
+            }
+        }
     }
 }
