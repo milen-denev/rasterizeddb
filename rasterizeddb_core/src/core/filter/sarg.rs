@@ -157,7 +157,7 @@ fn op_of(tok: &Token) -> Option<SargOp> {
 /// can prove sound.
 fn conjunct_to_pred(
     toks: &[Token],
-    filters: &TableFilters,
+    gate: &dyn Fn(u32) -> bool,
     scales: &[(u32, u32)],
 ) -> Option<SargPredicate> {
     if toks.len() != 3 {
@@ -178,7 +178,7 @@ fn conjunct_to_pred(
 
     let (_name, db_type, write_order) = ident;
     let write_order = *write_order as u32;
-    if !filters.indexes(write_order) {
+    if !gate(write_order) {
         return None;
     }
 
@@ -264,7 +264,7 @@ pub(crate) static REFUSE_FLOAT_RANGES: std::sync::atomic::AtomicBool =
 /// - Any column that is not `STRING`. `perform_comparison_operation` returns
 ///   `UnsupportedType` for a prefix test on a number, which fails the query; the
 ///   filter must not prune on an error the evaluator is about to raise.
-fn starts_with_to_range(toks: &[Token], filters: &TableFilters) -> Option<MaskExpr> {
+fn starts_with_to_range(toks: &[Token], gate: &dyn Fn(u32) -> bool) -> Option<MaskExpr> {
     if toks.len() != 3 {
         return None;
     }
@@ -286,7 +286,7 @@ fn starts_with_to_range(toks: &[Token], filters: &TableFilters) -> Option<MaskEx
     };
 
     let write_order = *write_order as u32;
-    if !filters.indexes(write_order) {
+    if !gate(write_order) {
         return None;
     }
 
@@ -319,11 +319,11 @@ fn starts_with_to_range(toks: &[Token], filters: &TableFilters) -> Option<MaskEx
 
 /// One conjunct, as whatever shape it lowers to: a single predicate, a pair of
 /// bounds, or `All` for something we cannot prove sound.
-fn conjunct_to_expr(toks: &[Token], filters: &TableFilters, scales: &[(u32, u32)]) -> MaskExpr {
-    if let Some(e) = starts_with_to_range(toks, filters) {
+fn conjunct_to_expr(toks: &[Token], gate: &dyn Fn(u32) -> bool, scales: &[(u32, u32)]) -> MaskExpr {
+    if let Some(e) = starts_with_to_range(toks, gate) {
         return e;
     }
-    match conjunct_to_pred(toks, filters, scales) {
+    match conjunct_to_pred(toks, gate, scales) {
         Some(p) => MaskExpr::Pred(p),
         None => MaskExpr::All,
     }
@@ -334,7 +334,9 @@ fn conjunct_to_expr(toks: &[Token], filters: &TableFilters, scales: &[(u32, u32)
 struct Parser<'a> {
     toks: &'a [Token],
     pos: usize,
-    filters: &'a TableFilters,
+    /// Which columns a predicate may name: the filter's indexed columns, or
+    /// a secondary index's.
+    gate: &'a dyn Fn(u32) -> bool,
     /// `(write_order, scale)` of each `NUMERIC(p, s)` column whose scale is
     /// not the engine default. See [`extract_with_scales`].
     scales: &'a [(u32, u32)],
@@ -436,7 +438,7 @@ impl<'a> Parser<'a> {
 
         let start = self.pos;
         self.skip_to_separator();
-        conjunct_to_expr(&self.toks[start..self.pos], self.filters, self.scales)
+        conjunct_to_expr(&self.toks[start..self.pos], self.gate, self.scales)
     }
 }
 
@@ -458,14 +460,29 @@ pub fn extract_with_scales(
     filters: &TableFilters,
     scales: &[(u32, u32)],
 ) -> Option<SargProgram> {
-    if tokens.is_empty() || filters.is_empty() {
+    if filters.is_empty() {
+        return None;
+    }
+    extract_gated(tokens, &|wo| filters.indexes(wo), scales)
+}
+
+/// [`extract_with_scales`] for any set of usable columns: `gate` says which.
+/// The secondary-index planner uses it with the indexed columns, so a
+/// predicate is read the same way, literal coercion and `NUMERIC` scale
+/// included, whichever structure answers it.
+pub fn extract_gated(
+    tokens: &[Token],
+    gate: &dyn Fn(u32) -> bool,
+    scales: &[(u32, u32)],
+) -> Option<SargProgram> {
+    if tokens.is_empty() {
         return None;
     }
 
     let mut p = Parser {
         toks: tokens,
         pos: 0,
-        filters,
+        gate,
         scales,
         bad: false,
     };

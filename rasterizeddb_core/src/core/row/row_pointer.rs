@@ -155,6 +155,33 @@ impl<S: StorageIO> RowPointerIterator<S> {
         Ok(iterator)
     }
 
+    /// Like [`Self::new`], but reads nothing until the first record is asked
+    /// for.
+    ///
+    /// For the query paths, which attach a candidate mask and then `reset`
+    /// before scanning: the chunk `new` loads up front is thrown away by
+    /// that reset and read again, and with a slot list from an index the
+    /// first read should be the chunk holding a candidate, not slot 0. A
+    /// point lookup paid for two whole chunks to read one record.
+    pub async fn new_deferred(io: Arc<S>) -> Result<Self> {
+        let total_length = {
+            let len = io.get_len().await as usize;
+            len - (len % TOTAL_LENGTH)
+        };
+        Ok(RowPointerIterator {
+            io,
+            position: 0,
+            buffer: MemoryBlock::default(),
+            buffer_index: 0,
+            buffer_valid_length: 0,
+            total_length,
+            end_of_data: false,
+            chunk_start_position: 0,
+            borrowed_chunk: None,
+            candidates: None,
+        })
+    }
+
     /// Attach (or clear) a candidate mask for the scan about to run.
     ///
     /// Deliberately survives [`Self::reset`], which the processor calls before
@@ -192,6 +219,20 @@ impl<S: StorageIO> RowPointerIterator<S> {
     #[inline]
     pub fn total_records(&self) -> u64 {
         (self.total_length / TOTAL_LENGTH) as u64
+    }
+
+    /// Records the scan will actually hand out at most: the whole table, or
+    /// with a slot list from an index, its candidates plus whatever was
+    /// appended after the list was made. What the dispatcher sizes its
+    /// workers by, so a point lookup does not spawn a worker per core to
+    /// read one row.
+    pub fn expected_records(&self) -> u64 {
+        let total = self.total_records();
+        match self.candidates.as_ref() {
+            Some(c) if c.is_nothing() => 0,
+            Some(c) if c.is_sparse() => c.count() + total.saturating_sub(c.n_slots()),
+            _ => total,
+        }
     }
 
     pub fn reset(&mut self) {
@@ -307,6 +348,18 @@ impl<S: StorageIO> RowPointerIterator<S> {
         self.buffer_valid_length = 0;
         self.borrowed_chunk = None;
 
+        // A slot list from a secondary index names the few slots worth
+        // reading. Jump to the chunk holding the next one rather than loading
+        // every chunk in between only to skip all of its records: a point
+        // lookup over a million rows reads one chunk, not three hundred.
+        if let Some(c) = self.candidates.as_ref().filter(|c| c.is_sparse()) {
+            let slot = self.position / TOTAL_LENGTH as u64;
+            let target = c.next_candidate(slot).saturating_mul(TOTAL_LENGTH as u64);
+            if target > self.position {
+                self.position = target.min(self.total_length as u64);
+            }
+        }
+
         // Check if we've reached the end of the storage
         if self.position >= self.total_length as u64 {
             self.end_of_data = true;
@@ -321,7 +374,17 @@ impl<S: StorageIO> RowPointerIterator<S> {
             return Ok(());
         }
 
-        let bytes_to_read_raw = std::cmp::min(bytes_remaining, CHUNK_SIZE as u64);
+        let mut bytes_to_read_raw = std::cmp::min(bytes_remaining, CHUNK_SIZE as u64);
+        // With a slot list, read from this candidate to the last one this
+        // chunk would reach, and stop there: the records past it would only
+        // be skipped, and the next load jumps straight to the next candidate.
+        if let Some(c) = self.candidates.as_ref().filter(|c| c.is_sparse()) {
+            let first = self.position / TOTAL_LENGTH as u64;
+            let reach = first + (bytes_to_read_raw / TOTAL_LENGTH as u64);
+            if let Some(last) = c.last_candidate_below(reach).filter(|l| *l >= first) {
+                bytes_to_read_raw = (last - first + 1) * TOTAL_LENGTH as u64;
+            }
+        }
         let bytes_to_read = bytes_to_read_raw - (bytes_to_read_raw % (TOTAL_LENGTH as u64));
         if bytes_to_read == 0 {
             self.end_of_data = true;

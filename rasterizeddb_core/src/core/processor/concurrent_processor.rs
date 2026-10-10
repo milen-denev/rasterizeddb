@@ -877,7 +877,7 @@ impl ConcurrentProcessor {
         // Large scans are unaffected: once there are at least as many batches
         // as threads this is exactly what it was.
         let batches = iterator
-            .total_records()
+            .expected_records()
             .div_ceil(crate::batch_size().max(1) as u64)
             .max(1);
         let n_workers = crate::max_permits_threads().min(batches as usize).max(1);

@@ -65,6 +65,12 @@ pub struct CandidateBitmap {
     /// false predicate excludes every row there will ever be. See
     /// [`CandidateBitmap::nothing`].
     nothing: bool,
+    /// The candidates as a sorted slot list, from a secondary index, in place
+    /// of `words`. A point lookup over a large table is a handful of slots,
+    /// and a dense bitmap for it would be one bit per row allocated and
+    /// zeroed for every query. Slots at or past `n_slots` are candidates
+    /// either way.
+    sparse: Option<Box<[u64]>>,
 }
 
 impl CandidateBitmap {
@@ -76,7 +82,64 @@ impl CandidateBitmap {
             words,
             n_slots,
             nothing: false,
+            sparse: None,
         }
+    }
+
+    /// Candidates named slot by slot: `slots` sorted and distinct, every one
+    /// below `n_slots`, which is the table length sampled *before* the index
+    /// was asked, so a version appended since stays a candidate.
+    pub fn sparse(slots: Vec<u64>, n_slots: u64) -> Self {
+        debug_assert!(slots.windows(2).all(|w| w[0] < w[1]));
+        Self {
+            words: Vec::new(),
+            n_slots,
+            nothing: false,
+            sparse: Some(slots.into_boxed_slice()),
+        }
+    }
+
+    #[inline]
+    pub fn is_sparse(&self) -> bool {
+        self.sparse.is_some()
+    }
+
+    /// The first candidate slot at or after `from`. Past `n_slots` every slot
+    /// is a candidate, so this is never more than `max(from, n_slots)`.
+    pub fn next_candidate(&self, from: u64) -> u64 {
+        if self.nothing {
+            return u64::MAX;
+        }
+        if from >= self.n_slots {
+            return from;
+        }
+        match &self.sparse {
+            Some(slots) => {
+                let i = slots.partition_point(|s| *s < from);
+                slots.get(i).copied().unwrap_or(self.n_slots)
+            }
+            None => {
+                let mut slot = from;
+                while slot < self.n_slots {
+                    let w = (slot / 64) as usize;
+                    let word = self.word(w) & (u64::MAX << (slot % 64));
+                    if word != 0 {
+                        return (w as u64) * 64 + word.trailing_zeros() as u64;
+                    }
+                    slot = (w as u64 + 1) * 64;
+                }
+                self.n_slots.max(from)
+            }
+        }
+    }
+
+    /// For a slot list: the last listed candidate below `limit`, so the
+    /// iterator can read from one candidate to the last one a chunk would
+    /// reach, and not a byte further. `None` for a dense mask.
+    pub fn last_candidate_below(&self, limit: u64) -> Option<u64> {
+        let slots = self.sparse.as_ref()?;
+        let i = slots.partition_point(|s| *s < limit.min(self.n_slots));
+        i.checked_sub(1).map(|i| slots[i])
     }
 
     /// The mask for a clause no row can satisfy — `1 = 0`, `notnull IS NULL`,
@@ -87,6 +150,7 @@ impl CandidateBitmap {
             words: Vec::new(),
             n_slots: 0,
             nothing: true,
+            sparse: None,
         }
     }
 
@@ -124,6 +188,7 @@ impl CandidateBitmap {
             words,
             n_slots,
             nothing: false,
+            sparse: None,
         };
         column::mask_tail_pub(&mut me.words, n_slots);
         me
@@ -134,6 +199,22 @@ impl CandidateBitmap {
     /// `other` shorter than `self` clears the uncovered tail rather than
     /// leaving it set: a mask that does not reach a slot has not admitted it.
     pub fn intersect(&mut self, other: &CandidateBitmap) {
+        // A slot list on either side: the answer is a slot list, each slot
+        // kept when the other side admits it.
+        if self.sparse.is_some() || other.sparse.is_some() {
+            let (list, keep_by) = match (&self.sparse, &other.sparse) {
+                (Some(mine), _) => (mine.to_vec(), other),
+                (None, Some(theirs)) => (theirs.to_vec(), &*self),
+                _ => unreachable!(),
+            };
+            let n_slots = self.n_slots;
+            let kept: Vec<u64> = list
+                .into_iter()
+                .filter(|s| *s < n_slots && keep_by.get(*s))
+                .collect();
+            *self = CandidateBitmap::sparse(kept, n_slots);
+            return;
+        }
         for (i, w) in self.words.iter_mut().enumerate() {
             *w &= other.words.get(i).copied().unwrap_or(0);
         }
@@ -167,6 +248,9 @@ impl CandidateBitmap {
         if slot >= self.n_slots {
             return true;
         }
+        if let Some(slots) = &self.sparse {
+            return slots.binary_search(&slot).is_ok();
+        }
         let w = (slot / 64) as usize;
         match self.words.get(w) {
             // Past the end of what the bitmap covers: be conservative.
@@ -185,6 +269,16 @@ impl CandidateBitmap {
     pub fn word(&self, w: usize) -> u64 {
         if self.nothing {
             return 0;
+        }
+        let first = (w as u64) * 64;
+        if let Some(slots) = &self.sparse {
+            let mut word = 0u64;
+            let start = slots.partition_point(|s| *s < first);
+            for s in slots[start..].iter().take_while(|s| **s < first + 64) {
+                word |= 1 << (s - first);
+            }
+            let covered = self.n_slots.saturating_sub(first);
+            return if covered >= 64 { word } else { word | (u64::MAX << covered) };
         }
         match self.words.get(w) {
             None => u64::MAX,
@@ -208,11 +302,18 @@ impl CandidateBitmap {
 
     /// Number of candidate slots. Useful for deciding whether pruning paid off.
     pub fn count(&self) -> u64 {
+        if let Some(slots) = &self.sparse {
+            return slots.len() as u64;
+        }
         self.words.iter().map(|w| w.count_ones() as u64).sum()
     }
 
+    /// The dense words. Empty for a slot list, which only a secondary index
+    /// produces and none of this method's callers (the filter's own
+    /// persistence and ratio tests) ever receives.
     #[inline]
     pub fn words(&self) -> &[u64] {
+        debug_assert!(self.sparse.is_none(), "words() of a sparse candidate list");
         &self.words
     }
 }
@@ -788,6 +889,7 @@ impl TableFilters {
                 words,
                 n_slots,
                 nothing: false,
+                sparse: None,
             })
     }
 
