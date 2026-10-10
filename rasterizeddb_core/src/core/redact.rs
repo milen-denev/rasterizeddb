@@ -54,6 +54,9 @@ pub const SECRET_BEARING: &[&str] = &[
 /// Returns the statement unchanged when it carries none, which is every
 /// ordinary one — the cost is a scan of the text per surface that stores it.
 pub fn statement(sql: &str) -> String {
+    if let Some(kept) = kv_command(sql) {
+        return kept;
+    }
     match earliest_secret(sql.as_bytes()) {
         Some((at, word)) => format!("{}{} <redacted>", &sql[..at], word),
         None => sql.to_string(),
@@ -73,6 +76,9 @@ pub fn statement(sql: &str) -> String {
 /// from the keyword onwards. So no secret can straddle the cut: either its
 /// keyword is before it and the text is cut there, or none of it is kept.
 pub fn statement_bounded(sql: &str, max_chars: usize) -> String {
+    if let Some(kept) = kv_command(sql) {
+        return cut_chars(kept, max_chars);
+    }
     // The byte where the `max_chars`-th character starts, if there is one.
     let cut = sql.char_indices().nth(max_chars).map(|(i, _)| i);
     let window_end = match cut {
@@ -97,6 +103,32 @@ pub fn statement_bounded(sql: &str, max_chars: usize) -> String {
             }
         },
     }
+}
+
+/// A `KV …` statement (the key/value store's commands) reduced to its
+/// command: `KV SET <redacted>`. `None` for anything else.
+///
+/// Keyword cutting cannot protect these. Their arguments are the
+/// application's own keys and values, and a key is as likely as a value to be
+/// a secret: `session:<token>`, `reset:<one-time-code>`. What stays still says
+/// what ran, which is what an operator reading the log needs. Checked here
+/// rather than in the store's module because that module is behind a feature
+/// and this must not be.
+fn kv_command(sql: &str) -> Option<String> {
+    let t = sql.trim_start();
+    let b = t.as_bytes();
+    if b.len() < 3 || !b[..2].eq_ignore_ascii_case(b"KV") || !b[2].is_ascii_whitespace() {
+        return None;
+    }
+    let rest = t[2..].trim_start();
+    let command_end = rest.find(|c: char| c.is_ascii_whitespace() || c == ';').unwrap_or(rest.len());
+    let command = &rest[..command_end];
+    let has_arguments = !rest[command_end..].trim_matches(|c: char| c.is_ascii_whitespace() || c == ';').is_empty();
+    Some(if has_arguments {
+        format!("KV {command} <redacted>")
+    } else {
+        format!("KV {command}")
+    })
 }
 
 /// `text` kept to its first `max_chars` characters, `…` marking a cut.
@@ -430,6 +462,18 @@ mod tests {
         text.truncate(cut);
         text.push('…');
         text
+    }
+
+    #[test]
+    fn kv_statements_keep_only_their_command() {
+        assert_eq!(statement("KV SET session:abc123 'tok' EX 60"), "KV SET <redacted>");
+        assert_eq!(statement("  kv get session:abc123;"), "KV get <redacted>");
+        assert_eq!(statement("KV DBSIZE"), "KV DBSIZE");
+        assert_eq!(statement("KV INFO;"), "KV INFO");
+        assert_eq!(statement_bounded("KV HSET user:1 password hunter2", 5), "KV HS…");
+        // Not a KV statement: unchanged rules apply.
+        assert_eq!(statement("SELECT kv FROM t"), "SELECT kv FROM t");
+        assert_eq!(statement("KVX SET a"), "KVX SET a");
     }
 
     /// Bounded redaction must equal redact-then-truncate byte for byte, for
