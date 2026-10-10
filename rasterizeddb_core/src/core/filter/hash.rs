@@ -22,8 +22,9 @@
 //!    `BOOL` is comparable and therefore indexable, but carries zone bounds
 //!    only and is never hashed; see [`is_fingerprintable`].
 //!
-//! The only type where distinct byte patterns compare equal is float `±0.0`,
-//! which [`canonical_hash`] normalises explicitly.
+//! The only types where distinct byte patterns compare equal are floats:
+//! `±0.0`, and every NaN payload (PostgreSQL's NaN = NaN), both of which
+//! [`canonical_hash`] normalises explicitly.
 
 use crate::core::db_type::DbType;
 
@@ -186,18 +187,20 @@ pub fn canonical_hash(db_type: &DbType, bytes: &[u8], seed: HashSeed) -> Option<
         // IEEE-754: `-0.0 == +0.0` is true, so the two bit patterns MUST hash
         // alike or `WHERE x = 0.0` would prune rows storing `-0.0`.
         //
-        // NaN needs no special handling: `NaN == NaN` is false, so a row holding
-        // NaN can never be a true match and *any* fingerprint for it is safe.
+        // NaN: the evaluator follows PostgreSQL, where every NaN equals every
+        // other, so all NaN bit patterns hash as the canonical one. (The sarg
+        // builder never probes with a NaN literal either, so a fingerprint
+        // persisted before this canonicalisation is never asked about.)
         DbType::F32 => {
             let v = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-            let v = if v == 0.0 { 0.0f32 } else { v };
+            let v = if v == 0.0 { 0.0f32 } else if v.is_nan() { f32::NAN } else { v };
             Some(mix(seed.k0 ^ u64::from(v.to_bits())))
         }
         DbType::F64 => {
             let mut a = [0u8; 8];
             a.copy_from_slice(bytes);
             let v = f64::from_le_bytes(a);
-            let v = if v == 0.0 { 0.0f64 } else { v };
+            let v = if v == 0.0 { 0.0f64 } else if v.is_nan() { f64::NAN } else { v };
             Some(mix(seed.k0 ^ v.to_bits()))
         }
         // Everything else — integers, `DATETIME`/`CHAR`/`DECIMAL` (compared as

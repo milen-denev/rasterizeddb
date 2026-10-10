@@ -1084,8 +1084,13 @@ fn ordered_data_prunes_hard() {
 fn equality_combines_fingerprint_and_bounds() {
     let mut col = i64_col_with_zonemap();
     let n = 10_000u64;
+    // Not quite clustered: each zone's first row reaches into the next zone's
+    // range. A fully clustered column stops writing planes (its bounds already
+    // isolate one zone — see `column::Generation`), so it could not show the
+    // two structures compounding.
     for slot in 0..n {
-        col.set(slot, Some(&(slot as i64).to_le_bytes()));
+        let v = if slot % 512 == 0 { slot + 600 } else { slot };
+        col.set(slot, Some(&(v as i64).to_le_bytes()));
     }
     let mut bm = vec![0u64; bitmap_words(n)];
     col.probe_pred_into(SargOp::Eq, &7777i64.to_le_bytes(), n, &mut bm);

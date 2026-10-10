@@ -38,8 +38,18 @@ const MAGIC: &[u8; 8] = b"RDBFLT01";
 // v2 added per-column zone min/max bounds; v3 brought `BOOL` into the index as
 // a bounds-only column, which changes *which* columns a file describes. Older
 // files are rejected rather than upgraded: rebuilding costs one scan and keeps
-// a single code path.
-const FORMAT_VER: u16 = 3;
+// a single code path. v4 records NaN in a float column's zone bounds (as the
+// largest value, PostgreSQL's order); a v3 file's bounds leave NaN out and
+// would prune NaN rows from `f > x`, so it must not be read.
+//
+// v5 adds plane-less generations (`f == 0`, see `column::Generation`), whose
+// length field holds a zone count where a width-`f` generation holds a word
+// count. A v4 file has none, so it reads exactly as before and is accepted —
+// an upgrade costs nothing. A v4 reader refuses a v5 file by its version and
+// rebuilds, which is the safe direction.
+const FORMAT_VER: u16 = 5;
+/// The oldest version this reader accepts unchanged.
+const OLDEST_READABLE_VER: u16 = 4;
 
 /// Fixed-size superblock. `dirty` lives at a known offset so it can be flipped
 /// with an 8-byte positioned write, without rewriting anything else.
@@ -210,7 +220,8 @@ pub fn serialize(columns: &[&ColumnFilter], seed: HashSeed, n_slots: u64) -> Vec
             w.u64(g.start_zone);
             w.u8(g.f);
             w.pad(7);
-            w.u64(g.words.len() as u64);
+            // A plane-less generation has no words; its extent is its zone count.
+            w.u64(if g.is_planeless() { g.zones } else { g.words.len() as u64 });
             w.words(&g.words);
         }
 
@@ -280,12 +291,12 @@ pub fn serialize_delta(columns: &[&ColumnFilter], from_zones: &[u64], n_slots: u
 
         w.u32(d.gens.len() as u32);
         w.u32(0);
-        for (start_zone, f, first_zone, words) in &d.gens {
+        for (start_zone, f, first_zone, zones, words) in &d.gens {
             w.u64(*start_zone);
             w.u8(*f);
             w.pad(7);
             w.u64(*first_zone);
-            w.u64(words.len() as u64);
+            w.u64(if *f == 0 { *zones } else { words.len() as u64 });
             w.words(words);
         }
 
@@ -407,7 +418,7 @@ pub fn deserialize(
         return Err(LoadReject::BadMagic);
     }
     let ver = r.u16().ok_or(LoadReject::Truncated)?;
-    if ver != FORMAT_VER {
+    if !(OLDEST_READABLE_VER..=FORMAT_VER).contains(&ver) {
         return Err(LoadReject::Version(ver));
     }
     if r.u16().ok_or(LoadReject::Truncated)? as usize != ZONE_ROWS {
@@ -494,16 +505,21 @@ pub fn deserialize(
             r.skip(7).ok_or(LoadReject::Truncated)?;
             let word_count = r.u64().ok_or(LoadReject::Truncated)? as usize;
 
+            if f == 0 {
+                // Plane-less (v5): the length is a zone count and no words
+                // follow. Never in a v4 file, so one there is corruption.
+                if ver < 5 || word_count > u32::MAX as usize {
+                    return Err(LoadReject::Truncated);
+                }
+                gens.push(Generation::new(start_zone, 0, Vec::new(), word_count as u64));
+                continue;
+            }
             // A corrupt length must not drive a huge allocation.
-            if f == 0 || word_count % (super::kernels::ZONE_WORDS * f as usize) != 0 {
+            if word_count % (super::kernels::ZONE_WORDS * f as usize) != 0 {
                 return Err(LoadReject::Truncated);
             }
             let words = r.words(word_count).ok_or(LoadReject::Truncated)?;
-            gens.push(Generation {
-                start_zone,
-                f,
-                words,
-            });
+            gens.push(Generation::new(start_zone, f, words, 0));
         }
 
         let zonemap = match r.u8().ok_or(LoadReject::Truncated)? {
@@ -600,7 +616,8 @@ fn read_delta(buf: &[u8], at: &mut usize, columns: &mut [ColumnFilter]) -> Optio
     if &header[0..4] != DELTA_MAGIC {
         return None;
     }
-    if u16::from_le_bytes(header[4..6].try_into().ok()?) != FORMAT_VER {
+    let ver = u16::from_le_bytes(header[4..6].try_into().ok()?);
+    if !(OLDEST_READABLE_VER..=FORMAT_VER).contains(&ver) {
         return None;
     }
     let payload_len = u64::from_le_bytes(header[8..16].try_into().ok()?) as usize;
@@ -640,10 +657,17 @@ fn read_delta(buf: &[u8], at: &mut usize, columns: &mut [ColumnFilter]) -> Optio
             r.skip(7)?;
             let first_zone = r.u64()?;
             let word_count = r.u64()? as usize;
-            if f == 0 || word_count % (super::kernels::ZONE_WORDS * f as usize) != 0 {
+            if f == 0 {
+                if ver < 5 || word_count > u32::MAX as usize {
+                    return None;
+                }
+                gens.push((start_zone, 0, first_zone, word_count as u64, Vec::new()));
+                continue;
+            }
+            if word_count % (super::kernels::ZONE_WORDS * f as usize) != 0 {
                 return None;
             }
-            gens.push((start_zone, f, first_zone, r.words(word_count)?));
+            gens.push((start_zone, f, first_zone, 0, r.words(word_count)?));
         }
 
         let zonemap = match r.u8()? {

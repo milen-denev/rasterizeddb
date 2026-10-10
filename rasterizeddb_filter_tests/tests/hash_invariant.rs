@@ -63,18 +63,33 @@ fn float_signed_zeros_hash_alike() {
 }
 
 #[test]
-fn nan_is_never_equal_so_any_fingerprint_is_safe() {
-    // NaN != NaN, so a row holding NaN can never be a true match and whatever
-    // fingerprint it gets cannot cause a false negative.
-    for (ty, a) in [
-        (DbType::F32, f32::NAN.to_le_bytes().to_vec()),
-        (DbType::F64, f64::NAN.to_le_bytes().to_vec()),
+fn every_nan_payload_shares_one_fingerprint() {
+    // PostgreSQL semantics: NaN = NaN, and every NaN equals every other NaN
+    // whatever its payload or sign bit. A row holding NaN can therefore be a
+    // true match for `f = 'NaN'`, so the invariant that keeps the index from
+    // pruning it is that all NaN bit patterns hash alike.
+    let seed = HashSeed::default();
+    let f32s = [f32::NAN, -f32::NAN, f32::from_bits(0x7fc0_0001), f32::from_bits(0xffff_ffff)];
+    let f64s = [f64::NAN, -f64::NAN, f64::from_bits(0x7ff8_0000_0000_0001), f64::from_bits(u64::MAX)];
+    for (ty, values) in [
+        (DbType::F32, f32s.iter().map(|v| v.to_le_bytes().to_vec()).collect::<Vec<_>>()),
+        (DbType::F64, f64s.iter().map(|v| v.to_le_bytes().to_vec()).collect::<Vec<_>>()),
     ] {
-        assert!(
-            !perform_comparison_operation(&a, &a, &ty, &ComparerOperation::Equals).unwrap(),
-            "{:?}: NaN must not compare equal to itself",
-            ty
-        );
+        for a in &values {
+            for b in &values {
+                assert!(
+                    perform_comparison_operation(a, b, &ty, &ComparerOperation::Equals).unwrap(),
+                    "{:?}: NaN must equal NaN, as in PostgreSQL",
+                    ty
+                );
+                assert_eq!(
+                    canonical_hash(&ty, a, seed),
+                    canonical_hash(&ty, b, seed),
+                    "{:?}: equal NaNs must share a fingerprint",
+                    ty
+                );
+            }
+        }
     }
 }
 

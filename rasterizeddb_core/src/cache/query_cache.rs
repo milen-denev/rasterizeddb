@@ -25,13 +25,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use cacheguard::CacheGuard;
 
-use crc::{CRC_64_ECMA_182, Crc};
+use crc::{CRC_64_ECMA_182, Crc, Table};
 use rclite::Arc;
 
 use crate::cache::atomic_cache::AtomicGenericCache;
 use crate::core::row::row_pointer::RowPointer;
 
-const CRC_64: Crc<u64> = Crc::<u64>::new(&CRC_64_ECMA_182);
+/// Slice-by-16 rather than `crc`'s default byte-at-a-time table: the same
+/// values (pinned by `slot_hash_matches_the_byte_table`), several times the
+/// throughput on clauses longer than a few words. In-memory only, so the
+/// implementation can change freely; the value never did.
+const CRC_64: Crc<u64, Table<16>> = Crc::<u64, Table<16>>::new(&CRC_64_ECMA_182);
 
 /// One cached answer. Shared behind an `Arc` so a hit is a refcount bump
 /// rather than a copy of the pointer vector.
@@ -52,15 +56,98 @@ pub struct QueryCacheEntry {
     /// under the bare clause would answer the unlimited form with a truncated
     /// result.
     pub limit: Option<u64>,
+    /// Whether this entry's bytes were added to the cache's total.
+    counted: bool,
     /// Every pointer that matched, or the first `limit` of them.
-    pub pointers: Vec<RowPointer>,
+    ///
+    /// A boxed slice rather than the scan's `Vec`: the accumulating vector has
+    /// up to half its capacity spare, which an entry kept for the life of the
+    /// process would hold for nothing.
+    pub pointers: Box<[RowPointer]>,
 }
 
-pub type QueryCacheValue = Arc<QueryCacheEntry>;
-pub type QueryCache = AtomicGenericCache<u64, QueryCacheValue>;
+impl QueryCacheEntry {
+    /// Heap bytes this entry holds, as counted against [`byte_budget`].
+    pub fn heap_bytes(&self) -> u64 {
+        (self.pointers.len() * std::mem::size_of::<RowPointer>()
+            + self.table.len()
+            + self.where_clause.len()
+            + std::mem::size_of::<Self>()) as u64
+    }
+}
+
+impl Drop for QueryCacheEntry {
+    // Counted down when the last reference goes — eviction, replacement,
+    // `clear`, or a reader that held a hit past its eviction — so the total is
+    // what is really resident, whichever path let go of it. Only entries that
+    // were counted in (`store`) are counted out.
+    fn drop(&mut self) {
+        if self.counted {
+            CACHED_BYTES.fetch_sub(self.heap_bytes(), Ordering::Relaxed);
+        }
+    }
+}
+
+pub type QueryCacheValue = std::sync::Arc<QueryCacheEntry>;
+
+/// What a cache slot holds: the entry behind a swappable pointer.
+///
+/// The slot array never drops a value it removes — `remove`, `remove_oldest`,
+/// `clear` and a stranded generation all leave the old value in the slot until
+/// the slot is reused — so an entry held directly kept its whole pointer set
+/// resident after eviction, and no byte budget could be enforced. Emptying the
+/// holder frees the entry as soon as no reader holds it, whatever the slot
+/// array does with the holder.
+#[derive(Default)]
+pub struct CacheSlot {
+    entry: arc_swap::ArcSwapOption<QueryCacheEntry>,
+}
+
+impl CacheSlot {
+    /// Lets go of the entry; a reader already holding it keeps its copy.
+    fn release(&self) {
+        self.entry.store(None);
+    }
+}
+
+pub type QueryCache = AtomicGenericCache<u64, Arc<CacheSlot>>;
 
 pub static QUERY_CACHE: OnceLock<std::sync::Arc<QueryCache>> = OnceLock::new();
 pub static ENABLE_CACHE: OnceLock<bool> = OnceLock::new();
+
+/// Heap bytes held by live entries.
+static CACHED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// The byte budget, when one was set; [`DEFAULT_BYTE_BUDGET`] otherwise.
+static BYTE_BUDGET: AtomicU64 = AtomicU64::new(0);
+
+/// 256 MiB. The entry-count bound alone (100 000 by default) let a cache of
+/// large match sets grow without limit: a pointer is 48 bytes, so one cached
+/// 5M-row match is 240 MB, and a handful of them was gigabytes.
+pub const DEFAULT_BYTE_BUDGET: u64 = 256 * 1024 * 1024;
+
+/// An entry larger than this share of the budget is not cached at all. Its
+/// rescan is long anyway, and admitting it would evict most of the cache to
+/// keep one answer.
+const MAX_ENTRY_SHARE: u64 = 8;
+
+/// Sets the cache's byte budget. `0` restores the default.
+pub fn set_byte_budget(bytes: u64) {
+    BYTE_BUDGET.store(bytes, Ordering::Relaxed);
+}
+
+/// The byte budget in force.
+pub fn byte_budget() -> u64 {
+    match BYTE_BUDGET.load(Ordering::Relaxed) {
+        0 => DEFAULT_BYTE_BUDGET,
+        b => b,
+    }
+}
+
+/// Heap bytes held by live entries now.
+pub fn cached_bytes() -> u64 {
+    CACHED_BYTES.load(Ordering::Relaxed)
+}
 
 /// Answered from the cache.
 ///
@@ -154,15 +241,21 @@ pub fn lookup(
     }
 
     let probe = |key_limit: Option<u64>| {
-        QUERY_CACHE
+        let slot = QUERY_CACHE
             .get()
-            .and_then(|c| c.get(&slot_hash(table, where_clause, key_limit)))
-            .filter(|entry: &QueryCacheValue| {
-                entry.generation == generation
-                    && &*entry.table == table
-                    && &*entry.where_clause == where_clause
-                    && entry.limit == key_limit
-            })
+            .and_then(|c| c.get(&slot_hash(table, where_clause, key_limit)))?;
+        let entry = slot.entry.load_full()?;
+        let same_key = &*entry.table == table
+            && &*entry.where_clause == where_clause
+            && entry.limit == key_limit;
+        if same_key && entry.generation < generation {
+            // Stranded by a write: generations only grow, so nothing can be
+            // answered from it again. Freed now rather than when the slot is
+            // reused, which may be never.
+            slot.release();
+            return None;
+        }
+        (same_key && entry.generation == generation).then_some(entry)
     };
 
     // The complete set first: it answers any limit by truncation, and is the
@@ -200,20 +293,46 @@ pub fn store(
     let Some(cache) = QUERY_CACHE.get() else {
         return;
     };
+    store_into(cache, table, where_clause, generation, limit, pointers, byte_budget());
+}
 
-    let entry = Arc::new(QueryCacheEntry {
+/// [`store`] into a given cache under a given budget.
+fn store_into(
+    cache: &QueryCache,
+    table: &str,
+    where_clause: &str,
+    generation: u64,
+    limit: Option<u64>,
+    pointers: Vec<RowPointer>,
+    budget: u64,
+) {
+    let mut entry = QueryCacheEntry {
         table: table.into(),
         where_clause: where_clause.into(),
         generation,
         limit,
-        pointers,
+        counted: false,
+        pointers: pointers.into_boxed_slice(),
+    };
+    let bytes = entry.heap_bytes();
+    if bytes > budget / MAX_ENTRY_SHARE {
+        return;
+    }
+    CACHED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    entry.counted = true;
+    let slot = Arc::new(CacheSlot {
+        entry: arc_swap::ArcSwapOption::new(Some(std::sync::Arc::new(entry))),
     });
 
-    match cache.force_insert(slot_hash(table, where_clause, limit), entry) {
-        Ok((true, _evicted)) => {
+    match cache.force_insert(slot_hash(table, where_clause, limit), slot.clone()) {
+        Ok((true, evicted)) => {
             STORES.fetch_add(1, Ordering::Relaxed);
+            for (_, old, _, _) in evicted {
+                old.release();
+            }
         }
         Ok((false, _)) => {
+            slot.release();
             log::warn!(
                 "Query cache refused an entry for '{}' even after eviction",
                 table
@@ -221,12 +340,147 @@ pub fn store(
         }
         Err(e) => log::error!("Failed to insert entries into the query cache: {}", e),
     }
+
+    // Over budget: drop the oldest entries until under it. Bounded by the
+    // entry count, so a cache whose total cannot fall (every entry still held
+    // by a reader) stops rather than spins.
+    let mut rounds = 0;
+    while CACHED_BYTES.load(Ordering::Relaxed) > budget && rounds < 64 {
+        let live = cache.len();
+        if live == 0 {
+            break;
+        }
+        let removed = cache.remove_oldest((live / 16).max(1));
+        if removed.is_empty() {
+            break;
+        }
+        for (_, old, _, _) in removed {
+            old.release();
+        }
+        rounds += 1;
+    }
 }
 
 /// Drops every entry. Correctness never depends on this — generations already
 /// strand stale entries — but tests and benchmarks need a cold cache on demand.
 pub fn clear() {
     if let Some(cache) = QUERY_CACHE.get() {
-        let _ = cache.clear();
+        clear_cache(cache);
+    }
+}
+
+/// Empties `cache`, releasing every entry rather than leaving each resident in
+/// its slot.
+pub fn clear_cache(cache: &QueryCache) {
+    for (_, slot, _, _) in cache.drain() {
+        slot.release();
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    fn pointers(n: usize) -> Vec<RowPointer> {
+        let mut v = Vec::with_capacity(n * 2);
+        let blank = [0u8; crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN];
+        v.resize_with(n, || RowPointer::from_slice(&blank));
+        v
+    }
+
+    /// The only test in the library that stores entries, so the process-wide
+    /// byte counter is this test's alone (library tests run with the global
+    /// cache off).
+    #[test]
+    fn the_byte_budget_bounds_what_is_cached() {
+        let per = std::mem::size_of::<RowPointer>() as u64;
+        let cache = QueryCache::new(2048, 1024);
+        let base = cached_bytes();
+        // Budget: room for about four 10 000-pointer entries.
+        let budget = 4 * 10_000 * per + 4096;
+
+        // An entry over 1/8 of the budget is refused outright.
+        store_into(&cache, "t", "a = 1", 1, None, pointers(10_000), budget);
+        assert_eq!(cache.len(), 0, "an entry above budget/8 is not cached");
+        assert_eq!(cached_bytes(), base);
+
+        // Entries within the share are admitted, and the total never stays
+        // above the budget: the oldest go first.
+        for i in 0..40 {
+            store_into(&cache, "t", &format!("b = {}", i), 1, None, pointers(4_000), budget);
+            assert!(cached_bytes() - base <= budget, "over budget after {} stores", i);
+        }
+        assert!(cache.len() > 0 && cache.len() < 40, "len {}", cache.len());
+        // The newest survived.
+        let newest = cache
+            .get(&slot_hash("t", "b = 39", None))
+            .and_then(|slot| slot.entry.load_full())
+            .expect("newest kept");
+        // Spare capacity is not kept: the scan's Vec had room for 8 000.
+        assert_eq!(newest.pointers.len(), 4_000);
+        assert_eq!(newest.heap_bytes(), 4_000 * per + 1 + 6 + std::mem::size_of::<QueryCacheEntry>() as u64);
+        drop(newest);
+
+        // Every path out counts the bytes back down — and frees them, which the
+        // slot array's own `clear` alone did not.
+        clear_cache(&cache);
+        assert_eq!(cached_bytes(), base);
+        assert_eq!(cache.len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod slot_hash_tests {
+    use super::*;
+
+    /// The byte-at-a-time table this used, as the reference.
+    const BYTE_TABLE: Crc<u64> = Crc::<u64>::new(&CRC_64_ECMA_182);
+
+    #[test]
+    fn slot_hash_matches_the_byte_table() {
+        let mut rng = 0x2545_F491_4F6C_DD1Du64;
+        for len in 0..=1024usize {
+            let data: Vec<u8> = (0..len)
+                .map(|_| {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    rng as u8
+                })
+                .collect();
+            assert_eq!(CRC_64.checksum(&data), BYTE_TABLE.checksum(&data), "len {}", len);
+        }
+        assert_eq!(CRC_64.checksum(b"123456789"), 0x6C40_DF5F_0B49_7347);
+    }
+
+    /// `cargo test --release -p rasterizeddb_core --lib -- --ignored slot_hash_throughput --nocapture`
+    #[test]
+    #[ignore]
+    fn slot_hash_throughput() {
+        for size in [24usize, 64, 256] {
+            let data: Vec<u8> = (0..size).map(|i| (i * 13 + 1) as u8).collect();
+            let rounds = 20_000_000 / size.max(1) * 8;
+            for round in 0..3 {
+                let mut sink = 0u64;
+                let t = std::time::Instant::now();
+                for _ in 0..rounds {
+                    sink ^= BYTE_TABLE.checksum(std::hint::black_box(&data));
+                }
+                let old = t.elapsed();
+                let t = std::time::Instant::now();
+                for _ in 0..rounds {
+                    sink ^= CRC_64.checksum(std::hint::black_box(&data));
+                }
+                let new = t.elapsed();
+                println!(
+                    "size {:>4} round {}: table1 {:>6.1} ns/hash  table16 {:>6.1} ns/hash ({})",
+                    size,
+                    round,
+                    old.as_nanos() as f64 / rounds as f64,
+                    new.as_nanos() as f64 / rounds as f64,
+                    sink
+                );
+            }
+        }
     }
 }

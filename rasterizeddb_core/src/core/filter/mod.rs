@@ -34,6 +34,8 @@ mod tests;
 
 #[cfg(test)]
 mod integration_tests;
+#[cfg(test)]
+mod nan_bounds_tests;
 
 use parking_lot::RwLock;
 use smallvec::SmallVec;
@@ -57,6 +59,12 @@ use column::ColumnFilter;
 pub struct CandidateBitmap {
     words: Vec<u64>,
     n_slots: u64,
+    /// Admits no slot at all — not even one appended after `n_slots` was
+    /// sampled. Only a `WHERE` clause that no row can satisfy earns this: a
+    /// pruning *index* may exclude only what it has indexed, but a constant
+    /// false predicate excludes every row there will ever be. See
+    /// [`CandidateBitmap::nothing`].
+    nothing: bool,
 }
 
 impl CandidateBitmap {
@@ -64,7 +72,28 @@ impl CandidateBitmap {
     pub fn all_candidates(n_slots: u64) -> Self {
         let mut words = vec![u64::MAX; bitmap_words(n_slots)];
         column::mask_tail_pub(&mut words, n_slots);
-        Self { words, n_slots }
+        Self {
+            words,
+            n_slots,
+            nothing: false,
+        }
+    }
+
+    /// The mask for a clause no row can satisfy — `1 = 0`, `notnull IS NULL`,
+    /// `x IN ()`. The pointer iterator ends at once on it, so the scan reads
+    /// nothing; see `sarg::constant_truth`.
+    pub fn nothing() -> Self {
+        Self {
+            words: Vec::new(),
+            n_slots: 0,
+            nothing: true,
+        }
+    }
+
+    /// Whether this is [`CandidateBitmap::nothing`].
+    #[inline]
+    pub fn is_nothing(&self) -> bool {
+        self.nothing
     }
 
     /// A mask admitting only slots `[0, upto)`.
@@ -91,7 +120,11 @@ impl CandidateBitmap {
                 *w = (1u64 << rem) - 1;
             }
         }
-        let mut me = Self { words, n_slots };
+        let mut me = Self {
+            words,
+            n_slots,
+            nothing: false,
+        };
         column::mask_tail_pub(&mut me.words, n_slots);
         me
     }
@@ -109,6 +142,9 @@ impl CandidateBitmap {
 
     #[inline]
     pub fn get(&self, slot: u64) -> bool {
+        if self.nothing {
+            return false;
+        }
         // Past what this bitmap was built to cover: be conservative.
         //
         // Two ways a slot can be uncovered, and only one of them used to be
@@ -147,6 +183,9 @@ impl CandidateBitmap {
     /// slots the bitmap never covered.
     #[inline]
     pub fn word(&self, w: usize) -> u64 {
+        if self.nothing {
+            return 0;
+        }
         match self.words.get(w) {
             None => u64::MAX,
             Some(word) => {
@@ -745,7 +784,11 @@ impl TableFilters {
         let words = bitmap_words(n_slots);
         let mut scratch = vec![0u64; words];
         self.eval(&program.root, n_slots, &mut scratch)
-            .map(|words| CandidateBitmap { words, n_slots })
+            .map(|words| CandidateBitmap {
+                words,
+                n_slots,
+                nothing: false,
+            })
     }
 
     /// Evaluate one node. `None` means "all ones" — no information — which is
@@ -788,6 +831,12 @@ impl TableFilters {
 
             // Union: a single unknown branch makes the whole union unknown, so
             // bail as soon as one appears rather than building a full bitmap.
+            //
+            // An `IN` list arrives as an `Or` of equalities on one column, and
+            // gets a path of its own — see `eval_in_list`.
+            MaskExpr::Or(branches) if in_list_column(branches).is_some() => {
+                self.eval_in_list(branches, n_slots, scratch)
+            }
             MaskExpr::Or(branches) => {
                 let mut acc: Option<Vec<u64>> = None;
                 for b in branches {
@@ -804,6 +853,84 @@ impl TableFilters {
                 acc
             }
         }
+    }
+
+    /// The mask for `col IN (v1, …, vN)`: an `Or` whose every branch is
+    /// `col = v` on the same column.
+    ///
+    /// The general `Or` evaluates each branch into a fresh bitmap — a probe and
+    /// a full-bitmap copy per value, so a 50,000-value list over a million rows
+    /// copied ~6 GB to build one mask. Here a short list ORs its probes into
+    /// one accumulator with no copies, and a long one (more than
+    /// [`IN_LIST_PROBE_MAX`] values) is bounded by the list's `[min, max]`
+    /// instead: every matching row lies in that range, so the zones the range
+    /// rules out hold no match. Coarser than the probes, never unsound — and
+    /// any value or column the index cannot speak for makes the whole list
+    /// "no information", as one unknown branch does for `Or`.
+    fn eval_in_list(
+        &self,
+        branches: &[sarg::MaskExpr],
+        n_slots: u64,
+        scratch: &mut [u64],
+    ) -> Option<Vec<u64>> {
+        let write_order = in_list_column(branches)?;
+        let values: Vec<&[u8]> = branches
+            .iter()
+            .filter_map(|b| match b {
+                sarg::MaskExpr::Pred(p) => Some(p.value.as_slice()),
+                _ => None,
+            })
+            .collect();
+        let idx = self.index_of(write_order)?;
+        let guard = self.columns[idx].read();
+
+        if values.len() <= IN_LIST_PROBE_MAX {
+            let mut acc = vec![0u64; scratch.len()];
+            for v in &values {
+                if !guard.probe_pred_into(SargOp::Eq, v, n_slots, scratch) {
+                    return None;
+                }
+                for (d, s) in acc.iter_mut().zip(scratch.iter()) {
+                    *d |= *s;
+                }
+            }
+            return Some(acc);
+        }
+
+        // The list's bounds in the column's own order — the order the zone
+        // bounds were maintained in. A pair the evaluator cannot order gives
+        // up rather than guess.
+        let ty = guard.db_type.clone();
+        let less = |a: &[u8], b: &[u8]| {
+            crate::core::row::logical::perform_comparison_operation(
+                a,
+                b,
+                &ty,
+                &crate::core::processor::transformer::ComparerOperation::Less,
+            )
+            .ok()
+        };
+        let mut lo = values[0];
+        let mut hi = values[0];
+        for v in &values[1..] {
+            if less(v, lo)? {
+                lo = v;
+            }
+            if less(hi, v)? {
+                hi = v;
+            }
+        }
+        if !guard.probe_pred_into(SargOp::Ge, lo, n_slots, scratch) {
+            return None;
+        }
+        let mut acc = scratch.to_vec();
+        if !guard.probe_pred_into(SargOp::Le, hi, n_slots, scratch) {
+            return None;
+        }
+        for (d, s) in acc.iter_mut().zip(scratch.iter()) {
+            *d &= *s;
+        }
+        Some(acc)
     }
 
     /// Index a row read back from storage, for backfill. `columns` are
@@ -838,6 +965,29 @@ impl TableFilters {
             }
         }
     }
+}
+
+/// The longest `IN` list whose values are probed one by one; past it the
+/// list's `[min, max]` range is used. See `TableFilters::eval_in_list`.
+pub const IN_LIST_PROBE_MAX: usize = 64;
+
+/// The column an `Or` tests when every branch is `col = v` on that one column
+/// — the shape `x IN (…)` lowers to — with at least two branches.
+fn in_list_column(branches: &[sarg::MaskExpr]) -> Option<u32> {
+    if branches.len() < 2 {
+        return None;
+    }
+    let mut column = None;
+    for b in branches {
+        let sarg::MaskExpr::Pred(p) = b else {
+            return None;
+        };
+        if p.op != SargOp::Eq || column.is_some_and(|c| c != p.write_order) {
+            return None;
+        }
+        column = Some(p.write_order);
+    }
+    column
 }
 
 #[cfg(test)]
@@ -932,5 +1082,88 @@ mod leading_mask_tests {
         predicate.intersect(&ceiling);
         assert_eq!(predicate.count(), 64);
         assert!(predicate.get(63) && !predicate.get(64));
+    }
+}
+
+/// The `IN`-list mask: the general `Or` (a probe and a full-bitmap copy per
+/// value — the path every list took before) against `eval_in_list`.
+///
+/// `cargo test --release -p rasterizeddb_core --lib -- --ignored in_list_mask_bench --nocapture`
+#[cfg(test)]
+mod in_list_mask_bench {
+    use super::*;
+    use smallvec::SmallVec;
+
+    impl TableFilters {
+        /// The `Or` arm as it was, kept as the reference for the measurement
+        /// and the agreement check below.
+        fn eval_general_or(&self, branches: &[sarg::MaskExpr], n_slots: u64) -> Option<Vec<u64>> {
+            let mut scratch = vec![0u64; bitmap_words(n_slots)];
+            let mut acc: Option<Vec<u64>> = None;
+            for b in branches {
+                let m = self.eval(b, n_slots, &mut scratch)?;
+                match acc.as_mut() {
+                    Some(a) => {
+                        for (d, s) in a.iter_mut().zip(m.iter()) {
+                            *d |= *s;
+                        }
+                    }
+                    None => acc = Some(m),
+                }
+            }
+            acc
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn in_list_mask_bench() {
+        const N: u64 = 1_000_000;
+        let field = SchemaField::new("x".to_string(), DbType::I64, 8, 0, 0, false);
+        let filters = TableFilters::new(&[field], FilterConfig::default());
+        // Clustered values (the common case of an id), so ranges can prune.
+        let rows: Vec<(u64, SmallVec<[(u32, Vec<u8>); 32]>)> = (0..N)
+            .map(|slot| {
+                let mut c: SmallVec<[(u32, Vec<u8>); 32]> = SmallVec::new();
+                c.push((0, (slot as i64).to_le_bytes().to_vec()));
+                (slot, c)
+            })
+            .collect();
+        filters.backfill_batch(&rows);
+        filters.clear_unindexed_prefix();
+        for n in [10usize, 1_000, 50_000] {
+            // Values spread over a tenth of the table.
+            let branches: Vec<sarg::MaskExpr> = (0..n)
+                .map(|i| {
+                    sarg::MaskExpr::Pred(sarg::SargPredicate {
+                        write_order: 0,
+                        op: SargOp::Eq,
+                        value: (((i as u64 * 100_003) % (N / 10)) as i64).to_le_bytes().to_vec(),
+                    })
+                })
+                .collect();
+            // The general Or at 50,000 values takes many seconds; once is enough.
+            let rounds = if n >= 50_000 { 1 } else { 3 };
+            for round in 0..rounds {
+                let t = std::time::Instant::now();
+                let old = self::TableFilters::eval_general_or(&filters, &branches, N);
+                let old_t = t.elapsed();
+                let t = std::time::Instant::now();
+                let mut scratch = vec![0u64; bitmap_words(N)];
+                let new = filters.eval_in_list(&branches, N, &mut scratch);
+                let new_t = t.elapsed();
+                let (o, w) = (old.unwrap(), new.unwrap());
+                // Sound: everything the old mask admitted, the new one does.
+                for (a, b) in o.iter().zip(w.iter()) {
+                    assert_eq!(a & !b, 0, "the new mask dropped a candidate");
+                }
+                let ones = |v: &[u64]| v.iter().map(|w| w.count_ones() as u64).sum::<u64>();
+                println!(
+                    "IN of {n:>6} over {N} slots, round {round}: general Or {old_t:>10.2?} ({} candidates), in-list {new_t:>10.2?} ({} candidates)",
+                    ones(&o),
+                    ones(&w)
+                );
+            }
+        }
     }
 }

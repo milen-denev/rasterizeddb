@@ -351,10 +351,14 @@ fn a_stricter_selectivity_gate_declines_more_columns() {
     // Out of service means probing narrows nothing — not that rows go missing.
     let toks = rasterizeddb_core::core::tokenizer::query_tokenizer::tokenize("v = 7", &fields);
     let p = rasterizeddb_core::core::filter::sarg::extract(&toks, &strict).unwrap();
-    assert!(
-        strict.evaluate(&p, n).is_none(),
-        "a gated-out column must narrow nothing"
-    );
+    // A gated-out column has no fingerprints in service, but its zone bounds
+    // still hold, so it may narrow by bounds alone. What it must never do is
+    // drop a matching row.
+    if let Some(bm) = strict.evaluate(&p, n) {
+        for slot in (0..n).filter(|i| (i % 40) == 7) {
+            assert!(bm.get(slot), "slot {} pruned by a gated-out column", slot);
+        }
+    }
 
     // The permissive one still prunes the same predicate.
     let p2 = rasterizeddb_core::core::filter::sarg::extract(&toks, &permissive).unwrap();

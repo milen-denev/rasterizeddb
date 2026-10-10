@@ -54,7 +54,7 @@ fn make_row(n_string_cols: usize, string_len: usize) -> Row {
     let filler: Vec<u8> = std::iter::repeat(b'x').take(string_len).collect();
     for i in 0..n_string_cols {
         columns.push(Column {
-            schema_id: 4 + i as u64,
+            schema_id: 4 + i as u32,
             data: mb(&filler),
             column_type: DbType::STRING,
         });

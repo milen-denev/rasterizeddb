@@ -23,15 +23,20 @@ fn cache_on() {
     rasterizeddb_core::cache::query_cache::init(10_000);
 }
 
-/// Ignored: it FAILS, reproducing the open concurrent-reader defect in the
-/// configuration production actually runs. Run with `-- --ignored`.
+/// The concurrent-reader miss, in the configuration production actually runs.
+/// It was not the cache: the scan's reclaimable gate bounded its horizon by `oldest_active`
+/// alone, so once an updater the reader's snapshot still treats as running had
+/// committed and retired, the reader's visible (old) version was skipped as
+/// reclaimable while the new one was rightly invisible. Fixed by bounding the
+/// horizon by the oldest live snapshot (`VersionHorizon::sample`); pinned at
+/// scale by `rasterizeddb_core/tests/reader_miss_stress.rs`.
+/// With the old bound this failed 10/10 runs (24 misses in 60 reads); 0/15
+/// with the fix.
 ///
-/// Measured with the cache ON: ~8 misses in 60 reads — the same rate as with
-/// it off, which is how the cache was ruled out as the cause. Its value is
+/// Its other value is
 /// that it makes the production configuration testable at all: nothing else
 /// in the suite turns `ENABLE_CACHE` on, so the whole cache fast path
 /// (`query_cache::lookup` and the pointer sets it serves) has no coverage.
-#[ignore = "open defect: reader misses an existing row (reproduced with the cache on)"]
 #[tokio::test]
 async fn a_reader_never_misses_a_row_while_others_update_it() {
     cache_on();

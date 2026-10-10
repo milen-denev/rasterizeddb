@@ -318,7 +318,8 @@ pub fn col_bytes(rows: &[Row], schema_id: u64) -> Vec<Vec<u8>> {
         .map(|r| {
             r.columns
                 .iter()
-                .find(|c| c.schema_id == schema_id)
+                // Widened, not narrowed: `schema_id` is a u32 on the row now.
+                .find(|c| u64::from(c.schema_id) == schema_id)
                 .expect("column present")
                 .data
                 .into_slice()

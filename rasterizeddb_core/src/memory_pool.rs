@@ -15,14 +15,20 @@ use libmimalloc_sys::{mi_free, mi_malloc};
 #[cfg(feature = "memory_pool_reuse")]
 const MAX_REUSE_BYTES: usize = 1024 * 128; // 128 KiB
 
-/// Smallest heap size class. `INLINE_CAPACITY` bytes and below never reach the
-/// heap, so the first class is the next power of two above it.
+/// Heap size classes are quarter powers of two: `2^k × {1.25, 1.5, 1.75, 2}`.
+/// `INLINE_CAPACITY` (16) bytes and below never reach the heap, so the first
+/// class is 20 and the series runs 20, 24, 28, 32, 40, 48, 56, 64, 80, … up to
+/// 128 KiB: four classes per doubling, from `2^4` to `2^17`.
+///
+/// Rounding to the next power of two wasted up to half of every cell — a
+/// 17-byte value took 32, a 1025-byte one 2048. A quarter step wastes under
+/// 25% at worst and ~11% on average for uniformly spread lengths.
 #[cfg(feature = "memory_pool_reuse")]
-const MIN_CLASS_SHIFT: u32 = 5; // 32 bytes
+const MIN_CLASS_SHIFT: u32 = 4; // classes (16, 32]
 #[cfg(feature = "memory_pool_reuse")]
-const MAX_CLASS_SHIFT: u32 = 17; // 128 KiB
+const MAX_CLASS_SHIFT: u32 = 17; // up to 128 KiB
 #[cfg(feature = "memory_pool_reuse")]
-const N_CLASSES: usize = (MAX_CLASS_SHIFT - MIN_CLASS_SHIFT + 1) as usize;
+const N_CLASSES: usize = ((MAX_CLASS_SHIFT - MIN_CLASS_SHIFT) * 4) as usize;
 
 /// Blocks cached per size class. Deep enough that a row holding several columns
 /// of the same class is fully served from cache, shallow enough for the large
@@ -30,20 +36,49 @@ const N_CLASSES: usize = (MAX_CLASS_SHIFT - MIN_CLASS_SHIFT + 1) as usize;
 #[cfg(feature = "memory_pool_reuse")]
 const MAX_DEPTH: usize = 8;
 
+/// Index of the class of a 4 KiB block: the last one that keeps eight.
+#[cfg(feature = "memory_pool_reuse")]
+const LAST_DEEP_CLASS: usize = ((12 - MIN_CLASS_SHIFT) * 4 - 1) as usize;
+
 #[cfg(feature = "memory_pool_reuse")]
 #[inline(always)]
-const fn class_depth(shift: u32) -> usize {
+const fn class_depth(class: usize) -> usize {
     // <= 4 KiB: keep 8. Above that, keep 2 — worst-case retained bytes per
-    // thread stay under ~600 KiB.
-    if shift <= 12 { MAX_DEPTH } else { 2 }
+    // thread stay under ~1.2 MiB with four classes per doubling.
+    if class <= LAST_DEEP_CLASS { MAX_DEPTH } else { 2 }
+}
+
+/// The class a request of `size` bytes (17 ..= 128 KiB) falls in, as an
+/// index, and that class's byte size.
+///
+/// A pure function of the size, so a block's class can always be recomputed
+/// from its length: `heap_size_class(len)` is the allocation behind every
+/// pooled block of that length. Applied to a class size it returns that size,
+/// which is what `class_index` relies on when a block comes back.
+#[cfg(feature = "memory_pool_reuse")]
+#[inline(always)]
+fn quarter_class(size: usize) -> (usize, usize) {
+    debug_assert!(size > (1 << MIN_CLASS_SHIFT) && size <= MAX_REUSE_BYTES);
+    let s = size - 1;
+    // `s >= 16`, so the top bit is at position 4 or above, and the two bits
+    // below it pick the quarter.
+    let top = usize::BITS - 1 - s.leading_zeros();
+    let quarter = (s >> (top - 2)) & 3;
+    let class = ((top - MIN_CLASS_SHIFT) as usize) * 4 + quarter;
+    let bytes = (4 + quarter + 1) << (top - 2);
+    (class, bytes)
 }
 
 #[cfg(feature = "memory_pool_reuse")]
 #[inline(always)]
 fn heap_size_class(size: usize) -> usize {
-    // Power-of-two size classes keep the number of buckets tiny and stable.
-    // This intentionally trades some internal fragmentation for speed.
-    size.next_power_of_two()
+    #[cfg(test)]
+    if tests::POW2_CLASSES.load(std::sync::atomic::Ordering::Relaxed) {
+        // The previous policy, for the A/B bench only. Every power of two from
+        // 32 up is also a quarter class, so the free lists serve it unchanged.
+        return size.next_power_of_two();
+    }
+    quarter_class(size).1
 }
 
 /// Per-thread free lists, indexed directly by size class.
@@ -54,6 +89,26 @@ fn heap_size_class(size: usize) -> usize {
 /// `Arc` per probe, and funnelled every thread through one atomic per class.
 /// Here the class index is a shift, the lookup is an array index, and no thread
 /// touches another thread's list — so there is no shared atomic at all.
+/// The size class a heap block of logical length `len` is recycled under —
+/// a pure function of `len`, which is what lets a block not store its
+/// allocation size.
+///
+/// Deliberately the quarter class even while the test-only `POW2_CLASSES`
+/// switch makes `acquire` allocate powers of two: a power of two is never
+/// smaller than the quarter class of the same length, so a block filed here
+/// is always at least as large as its class promises. The reverse (filing a
+/// quarter-class block under its power of two) could hand out a block too
+/// small for its class, so the free side must not follow the switch.
+#[cfg(feature = "memory_pool_reuse")]
+#[inline(always)]
+fn recycle_class_size(len: usize) -> usize {
+    if len <= MAX_REUSE_BYTES {
+        quarter_class(len).1
+    } else {
+        len
+    }
+}
+
 #[cfg(feature = "memory_pool_reuse")]
 struct ThreadFreeLists {
     slots: [[*mut u8; MAX_DEPTH]; N_CLASSES],
@@ -98,16 +153,12 @@ thread_local! {
 #[cfg(feature = "memory_pool_reuse")]
 #[inline(always)]
 fn class_index(alloc_size: usize) -> Option<usize> {
-    if alloc_size < (1 << MIN_CLASS_SHIFT) || alloc_size > MAX_REUSE_BYTES {
+    if alloc_size <= (1 << MIN_CLASS_SHIFT) || alloc_size > MAX_REUSE_BYTES {
         return None;
     }
-    let shift = alloc_size.trailing_zeros();
-    debug_assert_eq!(
-        1usize << shift,
-        alloc_size,
-        "size class must be a power of two"
-    );
-    Some((shift - MIN_CLASS_SHIFT) as usize)
+    let (class, bytes) = quarter_class(alloc_size);
+    debug_assert_eq!(bytes, alloc_size, "a pooled block's size must be a class size");
+    Some(class)
 }
 
 /// Pops a cached block of `alloc_size` bytes from this thread's free list.
@@ -146,7 +197,7 @@ fn reuse_push(ptr: *mut u8, alloc_size: usize) -> bool {
         .try_with(|cell| {
             let lists = unsafe { &mut *cell.get() };
             let n = lists.len[class] as usize;
-            if n >= class_depth(alloc_size.trailing_zeros()) {
+            if n >= class_depth(class) {
                 return false;
             }
             lists.slots[class][n] = ptr;
@@ -183,10 +234,8 @@ impl MemoryPool {
             // without more `unsafe` unless we take a `&[u8]` argument to `acquire`.
             // For now, we'll just initialize to zeros.
             MemoryBlock {
-                //hash: 0, // Default hash value
                 data: MemoryBlockData { inline_data: data },
                 len: size,
-                is_heap: false,
             }
         } else {
             self.acquire_heap(size)
@@ -216,11 +265,8 @@ impl MemoryPool {
             let reused = reuse_pop(alloc_size);
             if !reused.is_null() {
                 return MemoryBlock {
-                    data: MemoryBlockData {
-                        heap_data: (reused, alloc_size),
-                    },
+                    data: MemoryBlockData { heap_ptr: reused },
                     len: size,
-                    is_heap: true,
                 };
             }
         }
@@ -232,12 +278,8 @@ impl MemoryPool {
         }
 
         MemoryBlock {
-            //hash: 0, // Default hash value
-            data: MemoryBlockData {
-                heap_data: (ptr, alloc_size),
-            },
+            data: MemoryBlockData { heap_ptr: ptr },
             len: size, // len is the logical size; allocation may be larger
-            is_heap: true,
         }
     }
 
@@ -269,22 +311,29 @@ impl MemoryPool {
     }
 }
 
-// The union to hold either the inline buffer or the heap pointer/size
+// The union to hold either the inline buffer or the heap pointer.
 #[repr(C)] // Ensure a consistent memory layout, critical for unions
 union MemoryBlockData {
     inline_data: [u8; INLINE_CAPACITY],
-    heap_data: (*mut u8, usize), // Tuple for pointer and size
+    heap_ptr: *mut u8,
 }
 
 // Remove the manual Clone implementation since we're using derive
 
-// The main MemoryBlock struct that manages the union
+/// A value's bytes: inline up to `INLINE_CAPACITY`, on the heap beyond it.
+///
+/// 24 bytes. It was 32: the heap arm also stored its allocation size and a
+/// separate `is_heap` flag padded out a word. Both are functions of `len` —
+/// a block is on the heap exactly when `len > INLINE_CAPACITY` (`acquire`
+/// decides by that and nothing changes `len` afterwards), and the size it is
+/// recycled under is `recycle_class_size(len)` — so neither is stored. It is
+/// most of what took `Column` from 48 bytes to 32.
 pub struct MemoryBlock {
-    //hash: u64, // Hash for the block, if needed
     data: MemoryBlockData,
-    len: usize,    // Actual length of the data
-    is_heap: bool, // Discriminant for the union: true if heap, false if inline
+    len: usize, // Actual length of the data; also decides inline vs heap
 }
+
+const _: () = assert!(std::mem::size_of::<MemoryBlock>() == 24);
 
 unsafe impl Send for MemoryBlock {}
 unsafe impl Sync for MemoryBlock {}
@@ -294,12 +343,10 @@ impl Default for MemoryBlock {
     fn default() -> Self {
         // A default MemoryBlock will be an empty, inline block
         MemoryBlock {
-            //hash: 0, // Default hash value
             data: MemoryBlockData {
                 inline_data: [0; INLINE_CAPACITY],
             },
             len: 0,
-            is_heap: false,
         }
     }
 }
@@ -308,13 +355,12 @@ impl fmt::Debug for MemoryBlock {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut debug_struct = f.debug_struct("MemoryBlock");
         debug_struct.field("len", &self.len);
-        debug_struct.field("is_heap", &self.is_heap);
+        debug_struct.field("is_heap", &self.is_heap());
 
-        if self.is_heap {
-            // For heap-allocated, show the pointer and the full allocated size
-            let (ptr, allocated_size) = unsafe { self.data.heap_data };
+        if self.is_heap() {
+            // For heap-allocated, show the pointer
+            let ptr = unsafe { self.data.heap_ptr };
             debug_struct.field("ptr", &ptr);
-            debug_struct.field("allocated_size", &allocated_size);
             // Optionally, show a preview of the data (be careful with large sizes)
             let inline_data = &self.into_slice();
             let mut str_buffer = String::new();
@@ -342,14 +388,12 @@ impl Drop for MemoryBlock {
     #[inline(always)]
     #[track_caller]
     fn drop(&mut self) {
-        if self.is_heap {
-            // `allocated_size` is only consulted by the recycling path.
-            #[cfg_attr(not(feature = "memory_pool_reuse"), allow(unused_variables))]
-            let (ptr, allocated_size) = unsafe { self.data.heap_data };
+        if self.is_heap() {
+            let ptr = unsafe { self.data.heap_ptr };
 
             #[cfg(feature = "memory_pool_reuse")]
             {
-                MEMORY_POOL.recycle_or_free(ptr, allocated_size);
+                MEMORY_POOL.recycle_or_free(ptr, recycle_class_size(self.len));
                 return;
             }
 
@@ -376,25 +420,20 @@ impl Clone for MemoryBlock {
         // a pair of moves instead of the `acquire` + variable-length
         // `copy_from_slice` the general path would emit — and this is the case
         // every numeric column takes.
-        if !self.is_heap {
+        if !self.is_heap() {
             return MemoryBlock {
                 data: MemoryBlockData {
                     inline_data: unsafe { self.data.inline_data },
                 },
                 len: self.len,
-                is_heap: false,
             };
-        }
-
-        if self.len == 0 {
-            return MEMORY_POOL.acquire(0);
         }
 
         let new_block = MEMORY_POOL.acquire(self.len);
 
-        debug_assert!(new_block.is_heap, "heap clone must allocate on heap");
-        let src_ptr = unsafe { self.data.heap_data.0 };
-        let dst_ptr = unsafe { new_block.data.heap_data.0 };
+        debug_assert!(new_block.is_heap(), "heap clone must allocate on heap");
+        let src_ptr = unsafe { self.data.heap_ptr };
+        let dst_ptr = unsafe { new_block.data.heap_ptr };
         unsafe {
             copy_ptr_to_ptr(src_ptr, dst_ptr, self.len);
         }
@@ -409,10 +448,17 @@ impl MemoryBlock {
         self.len
     }
 
+    /// Whether the bytes live on the heap. Decided by length alone: `acquire`
+    /// puts anything longer than `INLINE_CAPACITY` there and nothing else.
+    #[inline(always)]
+    fn is_heap(&self) -> bool {
+        self.len > INLINE_CAPACITY
+    }
+
     #[inline(always)]
     pub fn as_ptr(&self) -> *const u8 {
-        if self.is_heap {
-            unsafe { self.data.heap_data.0 as *const u8 }
+        if self.is_heap() {
+            unsafe { self.data.heap_ptr as *const u8 }
         } else {
             unsafe { self.data.inline_data.as_ptr() }
         }
@@ -420,8 +466,8 @@ impl MemoryBlock {
 
     #[inline(always)]
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
-        if self.is_heap {
-            unsafe { self.data.heap_data.0 }
+        if self.is_heap() {
+            unsafe { self.data.heap_ptr }
         } else {
             unsafe { self.data.inline_data.as_mut_ptr() }
         }
@@ -429,9 +475,9 @@ impl MemoryBlock {
 
     #[inline(always)]
     pub fn prefetch_to_lcache(&self) {
-        if self.is_heap {
+        if self.is_heap() {
             // Prefetch the heap data to the L1 cache
-            unsafe { _mm_prefetch::<_MM_HINT_T0>(self.data.heap_data.0 as *const i8) };
+            unsafe { _mm_prefetch::<_MM_HINT_T0>(self.data.heap_ptr as *const i8) };
         } else {
             // Prefetch the inline data to the L1 cache
             unsafe { _mm_prefetch::<_MM_HINT_T0>(self.data.inline_data.as_ptr() as *const i8) };
@@ -446,8 +492,8 @@ impl MemoryBlock {
 
         // Handle empty vectors - no copying needed
         if len > 0 {
-            if memory_chunk.is_heap {
-                copy_vec_to_ptr(vec.as_slice(), unsafe { memory_chunk.data.heap_data.0 });
+            if memory_chunk.is_heap() {
+                copy_vec_to_ptr(vec.as_slice(), unsafe { memory_chunk.data.heap_ptr });
             } else {
                 copy_vec_to_ptr(vec.as_slice(), unsafe {
                     memory_chunk.data.inline_data.as_ptr() as *mut u8
@@ -461,8 +507,8 @@ impl MemoryBlock {
 
     #[inline(always)]
     pub fn into_slice(&self) -> &[u8] {
-        if self.is_heap {
-            let ptr = unsafe { self.data.heap_data.0 };
+        if self.is_heap() {
+            let ptr = unsafe { self.data.heap_ptr };
             debug_assert!(!ptr.is_null(), "heap pointer must not be null");
             unsafe { std::slice::from_raw_parts(ptr as *const u8, self.len) }
         } else {
@@ -472,8 +518,8 @@ impl MemoryBlock {
 
     #[inline(always)]
     pub fn into_slice_mut(&mut self) -> &mut [u8] {
-        if self.is_heap {
-            let ptr = unsafe { self.data.heap_data.0 };
+        if self.is_heap() {
+            let ptr = unsafe { self.data.heap_ptr };
             debug_assert!(!ptr.is_null(), "heap pointer must not be null");
             unsafe { std::slice::from_raw_parts_mut(ptr, self.len) }
         } else {
@@ -482,11 +528,11 @@ impl MemoryBlock {
     }
 
     pub fn deep_clone(&self) -> Self {
-        if self.is_heap {
+        if self.is_heap() {
             // Allocate on the heap
             let new_block = MEMORY_POOL.acquire(self.len);
             unsafe {
-                copy_ptr_to_ptr(self.data.heap_data.0, new_block.data.heap_data.0, self.len);
+                copy_ptr_to_ptr(self.data.heap_ptr, new_block.data.heap_ptr, self.len);
             }
             new_block
         } else {
@@ -496,7 +542,6 @@ impl MemoryBlock {
                     inline_data: unsafe { self.data.inline_data },
                 },
                 len: self.len,
-                is_heap: false,
             }
         }
     }
@@ -504,6 +549,129 @@ impl MemoryBlock {
 
 #[cfg(test)]
 mod tests {
+    /// Switches `heap_size_class` back to powers of two, for the A/B bench.
+    #[cfg(feature = "memory_pool_reuse")]
+    pub(super) static POW2_CLASSES: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    #[cfg(feature = "memory_pool_reuse")]
+    #[test]
+    fn quarter_classes_are_tight_and_stable() {
+        let mut last_class = 0usize;
+        for size in 17..=super::MAX_REUSE_BYTES {
+            let (class, bytes) = super::quarter_class(size);
+            assert!(bytes >= size, "{size} -> {bytes}");
+            // Never more than a quarter of the class above the request.
+            assert!((bytes - size) * 5 < bytes + 5, "{size} -> {bytes}");
+            assert!(class < super::N_CLASSES);
+            assert!(class >= last_class, "classes are monotone in size");
+            last_class = class;
+            // The class of a class size is itself: a block coming back is filed
+            // where one of that length is looked for.
+            assert_eq!(super::quarter_class(bytes), (class, bytes));
+            assert_eq!(super::class_index(bytes), Some(class));
+        }
+        assert_eq!(super::quarter_class(17), (0, 20));
+        assert_eq!(super::quarter_class(33), (4, 40));
+        assert_eq!(super::quarter_class(1025), (24, 1280));
+        assert_eq!(super::quarter_class(4096), (super::LAST_DEEP_CLASS, 4096));
+        assert_eq!(super::quarter_class(super::MAX_REUSE_BYTES).0, super::N_CLASSES - 1);
+        // Every class size is distinct.
+        let mut sizes: Vec<usize> = (17..=super::MAX_REUSE_BYTES)
+            .map(|s| super::quarter_class(s).1)
+            .collect();
+        sizes.dedup();
+        assert_eq!(sizes.len(), super::N_CLASSES);
+    }
+
+    /// Bytes the allocator really hands out for 1M text cells, and the RSS a
+    /// million live blocks cost, quarter classes against powers of two.
+    /// Lengths: 70% short text (17-64 B), 25% medium (65-512), 5% long
+    /// (513-4096). `cargo test --release -p rasterizeddb_core --lib --
+    /// --ignored text_cell_footprint_bench --nocapture`.
+    #[cfg(feature = "memory_pool_reuse")]
+    #[test]
+    #[ignore]
+    fn text_cell_footprint_bench() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        let lens: Vec<usize> = (0..1_000_000)
+            .map(|_| match next(100) {
+                0..70 => 17 + next(48) as usize,
+                70..95 => 65 + next(448) as usize,
+                _ => 513 + next(3584) as usize,
+            })
+            .collect();
+        let logical: usize = lens.iter().sum();
+        // Declared here: `libmimalloc_sys` only exposes it with its `extended`
+        // feature, which this crate does not enable, but the C library always
+        // has the symbol.
+        unsafe extern "C" {
+            fn mi_usable_size(p: *const std::ffi::c_void) -> usize;
+        }
+        let rss = || {
+            let statm = std::fs::read_to_string("/proc/self/statm").unwrap();
+            statm.split_whitespace().nth(1).unwrap().parse::<usize>().unwrap() * 4096
+        };
+        // `POOL_POLICY=pow2` or `=quarter` runs that policy once, so its RSS
+        // is measured in a fresh process: the allocator keeps freed pages, so
+        // a second policy in the same process reuses the first one's RSS.
+        let only = std::env::var("POOL_POLICY").ok();
+        let policies: Vec<bool> = match only.as_deref() {
+            Some("pow2") => vec![true],
+            Some("quarter") => vec![false],
+            _ => vec![true, false],
+        };
+        let rounds = if only.is_some() { 1 } else { 3 };
+        for round in 0..rounds {
+            for &pow2 in &policies {
+                POW2_CLASSES.store(pow2, Relaxed);
+                let usable: usize = lens
+                    .iter()
+                    .map(|&l| {
+                        let a = super::heap_size_class(l);
+                        unsafe {
+                            let p = libmimalloc_sys::mi_malloc(a);
+                            let u = mi_usable_size(p as *const std::ffi::c_void);
+                            libmimalloc_sys::mi_free(p);
+                            u
+                        }
+                    })
+                    .sum();
+                let before = rss();
+                let t = std::time::Instant::now();
+                let blocks: Vec<MemoryBlock> = lens.iter().map(|&l| MEMORY_POOL.acquire(l)).collect();
+                let took = t.elapsed();
+                // Touch every block so its pages are resident.
+                let mut blocks = blocks;
+                for b in blocks.iter_mut() {
+                    b.into_slice_mut().fill(1);
+                }
+                let grew = rss().saturating_sub(before);
+                let t = std::time::Instant::now();
+                drop(blocks);
+                let freed = t.elapsed();
+                println!(
+                    "round {round} {:<7} logical {:>6.1} MB  allocator {:>6.1} MB ({:+.0}%)  RSS +{:>6.1} MB  acquire {:>8.2?} drop {:>8.2?}",
+                    if pow2 { "pow2" } else { "quarter" },
+                    logical as f64 / 1e6,
+                    usable as f64 / 1e6,
+                    (usable as f64 / logical as f64 - 1.0) * 100.0,
+                    grew as f64 / 1e6,
+                    took,
+                    freed
+                );
+            }
+        }
+        POW2_CLASSES.store(false, Relaxed);
+    }
+
     use std::{
         ptr,
         sync::{
@@ -519,7 +687,7 @@ mod tests {
     fn test_memory_pool_acquire_inline() {
         let pool = MemoryPool::new();
         let block = pool.acquire(10);
-        assert!(!block.is_heap);
+        assert!(!block.is_heap());
         assert_eq!(block.len, 10);
     }
 
@@ -527,7 +695,7 @@ mod tests {
     fn test_memory_pool_acquire_heap() {
         let pool = MemoryPool::new();
         let block = pool.acquire(100);
-        assert!(block.is_heap);
+        assert!(block.is_heap());
         assert_eq!(block.len, 100);
     }
 
@@ -535,7 +703,7 @@ mod tests {
     fn test_memory_block_from_vec_inline() {
         let vec = vec![1, 2, 3, 4, 5];
         let block = MemoryBlock::from_vec(vec);
-        assert!(!block.is_heap);
+        assert!(!block.is_heap());
         let slice = block.into_slice();
         assert_eq!(slice, &[1, 2, 3, 4, 5]);
     }
@@ -544,7 +712,7 @@ mod tests {
     fn test_memory_block_from_vec_heap() {
         let vec = vec![1; 100];
         let block = MemoryBlock::from_vec(vec);
-        assert!(block.is_heap);
+        assert!(block.is_heap());
         let slice = block.into_slice();
         assert_eq!(slice.len(), 100);
         assert!(slice.iter().all(|&x| x == 1));
@@ -557,7 +725,7 @@ mod tests {
         assert_eq!(block.len, 5);
         assert_eq!(block.into_slice(), &[1, 2, 3, 4, 5]);
         let clone = block.clone();
-        assert!(!clone.is_heap);
+        assert!(!clone.is_heap());
         let slice = clone.into_slice();
         assert_eq!(slice, &[1, 2, 3, 4, 5]);
     }
@@ -567,7 +735,7 @@ mod tests {
         let vec = vec![1; 100];
         let block = MemoryBlock::from_vec(vec);
         let clone = block.clone();
-        assert!(clone.is_heap);
+        assert!(clone.is_heap());
         let slice = clone.into_slice();
         assert_eq!(slice.len(), 100);
         assert!(slice.iter().all(|&x| x == 1));
@@ -582,7 +750,7 @@ mod tests {
         }
 
         let block = MemoryBlock::from_vec(vec.clone());
-        assert!(block.is_heap);
+        assert!(block.is_heap());
 
         // Verify data integrity
         let slice = block.into_slice();
@@ -600,7 +768,7 @@ mod tests {
         }
 
         let block = MemoryBlock::from_vec(vec.clone());
-        assert!(!block.is_heap);
+        assert!(!block.is_heap());
 
         // Verify data integrity
         let slice = block.into_slice();
@@ -640,17 +808,17 @@ mod tests {
 
         // Test exactly at INLINE_CAPACITY
         let block_inline = pool.acquire(INLINE_CAPACITY);
-        assert!(!block_inline.is_heap);
+        assert!(!block_inline.is_heap());
 
         // Test one byte over INLINE_CAPACITY
         let block_heap = pool.acquire(INLINE_CAPACITY + 1);
-        assert!(block_heap.is_heap);
+        assert!(block_heap.is_heap());
     }
 
     #[test]
     fn test_zero_size_allocation() {
         let block = MEMORY_POOL.acquire(0);
-        assert!(!block.is_heap); // Should use inline storage for zero-size
+        assert!(!block.is_heap()); // Should use inline storage for zero-size
         assert_eq!(block.len, 0);
     }
 
@@ -659,7 +827,7 @@ mod tests {
         // Test with a large allocation (1MB)
         let size = 1024 * 1024;
         let mut block = MEMORY_POOL.acquire(size);
-        assert!(block.is_heap);
+        assert!(block.is_heap());
         assert_eq!(block.len, size);
 
         // Make sure we can write to all of it
@@ -699,7 +867,7 @@ mod tests {
                     let mut block = MEMORY_POOL.acquire(size);
 
                     // Check if allocation was successful
-                    if block.is_heap && size > INLINE_CAPACITY {
+                    if block.is_heap() && size > INLINE_CAPACITY {
                         let slice = block.into_slice_mut();
                         if slice.len() != size {
                             let mut error_log = errors.lock().unwrap();
@@ -728,7 +896,7 @@ mod tests {
                                 break;
                             }
                         }
-                    } else if !block.is_heap && size <= INLINE_CAPACITY {
+                    } else if !block.is_heap() && size <= INLINE_CAPACITY {
                         // Inline allocation checks
                         let slice = block.into_slice_mut();
                         if slice.len() != size {
@@ -768,7 +936,7 @@ mod tests {
     fn test_memory_block_from_vec_empty() {
         let vec = Vec::<u8>::new();
         let block = MemoryBlock::from_vec(vec);
-        assert!(!block.is_heap); // Should use inline for empty vec
+        assert!(!block.is_heap()); // Should use inline for empty vec
         let slice = block.into_slice();
         assert_eq!(slice.len(), 0);
     }
@@ -900,7 +1068,7 @@ mod tests {
     #[test]
     fn test_large_allocation_and_drop() {
         let block = MemoryBlock::from_vec(vec![1; 10_000]);
-        assert!(block.is_heap);
+        assert!(block.is_heap());
         let slice = block.into_slice();
         assert_eq!(slice.len(), 10_000);
         drop(block);
@@ -926,9 +1094,9 @@ mod tests {
     fn test_deep_clone_inline() {
         let data = vec![10, 20, 30, 40, 50];
         let mut block = MemoryBlock::from_vec(data.clone());
-        assert!(!block.is_heap);
+        assert!(!block.is_heap());
         let deep = block.deep_clone();
-        assert!(!deep.is_heap);
+        assert!(!deep.is_heap());
         assert_eq!(deep.len, block.len);
         assert_eq!(deep.into_slice(), block.into_slice());
         // Mutate original, deep clone should not change
@@ -942,9 +1110,9 @@ mod tests {
     fn test_deep_clone_heap() {
         let data = vec![7; 128];
         let mut block = MemoryBlock::from_vec(data.clone());
-        assert!(block.is_heap);
+        assert!(block.is_heap());
         let deep = block.deep_clone();
-        assert!(deep.is_heap);
+        assert!(deep.is_heap());
         assert_eq!(deep.len, block.len);
         assert_eq!(deep.into_slice(), block.into_slice());
         // Mutate original, deep clone should not change

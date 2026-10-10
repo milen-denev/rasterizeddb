@@ -369,40 +369,44 @@ impl<'a, S: StorageIO> SchemaFieldIterator<'a, S> {
     }
 }
 
+/// Every declaration list but `fields` is a `Vec`, not an inline `SmallVec`:
+/// almost every table has none of them, and inline they were 2.4 KB of empty
+/// slots in every schema — one per open table, and in every clone. See the
+/// `table_schema_stays_small` test.
 #[derive(Debug, Clone)]
 pub struct TableSchema {
     pub name: String,
     pub fields: SmallVec<[SchemaField; 20]>,
     pub primary_key: Option<String>,
-    pub indexes: SmallVec<[TableIndex; 4]>,
+    pub indexes: Vec<TableIndex>,
     pub is_immutable: bool,
     /// Foreign keys this table declares, loaded from its sidecar.
-    pub foreign_keys: SmallVec<[crate::core::rql::foreign_key::ForeignKey; 4]>,
+    pub foreign_keys: Vec<crate::core::rql::foreign_key::ForeignKey>,
     /// `DEFAULT` expressions, loaded from their sidecar.
-    pub defaults: SmallVec<[crate::core::rql::column_default::ColumnDefault; 8]>,
+    pub defaults: Vec<crate::core::rql::column_default::ColumnDefault>,
     /// Columns declared `JSON`/`JSONB`, each backed by its own table.
-    pub json_columns: SmallVec<[crate::core::rql::json_map::JsonColumn; 4]>,
+    pub json_columns: Vec<crate::core::rql::json_map::JsonColumn>,
     /// Indexes declared over a path into a document column.
     ///
     /// Read from a sidecar like the other declarations. Unlike them it changes
     /// no row layout — it says which paths the filter index should carry, and
     /// nothing else about the table depends on it.
-    pub path_indexes: SmallVec<[crate::core::rql::path_index::PathIndex; 4]>,
+    pub path_indexes: Vec<crate::core::rql::path_index::PathIndex>,
     /// Table-level `UNIQUE` constraints, composite ones included, loaded from
     /// their sidecar. A single-column `UNIQUE` written inline on a column is
     /// recorded on the field instead, as `SchemaField::is_unique`.
-    pub unique_keys: SmallVec<[crate::core::rql::unique_key::UniqueKey; 4]>,
+    pub unique_keys: Vec<crate::core::rql::unique_key::UniqueKey>,
     /// Declared precision and scale per column — the `(p, s)` of
     /// `NUMERIC(p, s)`, loaded from their sidecar. A column with no entry keeps
     /// the engine's default scale, which is what its rows were written with.
-    pub type_modifiers: SmallVec<[crate::core::rql::type_modifier::TypeModifier; 8]>,
+    pub type_modifiers: Vec<crate::core::rql::type_modifier::TypeModifier>,
     /// `CHECK` constraints, loaded from their sidecar.
-    pub checks: SmallVec<[crate::core::rql::check::CheckConstraint; 4]>,
+    pub checks: Vec<crate::core::rql::check::CheckConstraint>,
     /// `GENERATED ALWAYS AS (…) STORED` expressions, loaded from their sidecar.
     ///
     /// Separate from `defaults` because the two differ in when they apply — see
     /// [`crate::core::rql::generated`].
-    pub generated: SmallVec<[crate::core::rql::generated::GeneratedColumn; 4]>,
+    pub generated: Vec<crate::core::rql::generated::GeneratedColumn>,
 }
 
 #[derive(Debug, Clone)]
@@ -418,16 +422,16 @@ impl TableSchema {
             name,
             fields: SmallVec::new(),
             primary_key: None,
-            indexes: SmallVec::new(),
+            indexes: Vec::new(),
             is_immutable,
-            foreign_keys: SmallVec::new(),
-            defaults: SmallVec::new(),
-            json_columns: SmallVec::new(),
-            path_indexes: SmallVec::new(),
-            unique_keys: SmallVec::new(),
-            type_modifiers: SmallVec::new(),
-            generated: SmallVec::new(),
-            checks: SmallVec::new(),
+            foreign_keys: Vec::new(),
+            defaults: Vec::new(),
+            json_columns: Vec::new(),
+            path_indexes: Vec::new(),
+            unique_keys: Vec::new(),
+            type_modifiers: Vec::new(),
+            generated: Vec::new(),
+            checks: Vec::new(),
         }
     }
 
@@ -606,18 +610,18 @@ impl TableSchema {
             name,
             fields: SmallVec::new(), // Fields are stored separately
             primary_key,
-            indexes: SmallVec::new(), // Indexes are stored separately,
+            indexes: Vec::new(), // Indexes are stored separately,
             is_immutable: immutable,
             // Foreign keys and defaults live in their own sidecars; `load`
             // fills them in.
-            foreign_keys: SmallVec::new(),
-            defaults: SmallVec::new(),
-            json_columns: SmallVec::new(),
-            path_indexes: SmallVec::new(),
-            unique_keys: SmallVec::new(),
-            type_modifiers: SmallVec::new(),
-            generated: SmallVec::new(),
-            checks: SmallVec::new(),
+            foreign_keys: Vec::new(),
+            defaults: Vec::new(),
+            json_columns: Vec::new(),
+            path_indexes: Vec::new(),
+            unique_keys: Vec::new(),
+            type_modifiers: Vec::new(),
+            generated: Vec::new(),
+            checks: Vec::new(),
         })
     }
 
@@ -1051,6 +1055,15 @@ impl<S: StorageIO> TableSchemaIterator<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One `TableSchema` per open table, and one more in every clone. With
+    /// nine inline `SmallVec`s of declarations it was 3720 bytes, about 2.4 KB
+    /// of that empty slots, since almost no table declares any of them.
+    #[test]
+    fn table_schema_stays_small() {
+        let size = std::mem::size_of::<TableSchema>();
+        assert!(size <= 1408, "TableSchema grew to {size} bytes");
+    }
     use crate::core::{db_type::DbType, storage_providers::file_sync::LocalStorageProvider};
     use std::{fs, io, path::Path};
 

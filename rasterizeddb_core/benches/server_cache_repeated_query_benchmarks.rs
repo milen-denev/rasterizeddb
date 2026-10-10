@@ -8,10 +8,8 @@ use rastcp::{
     client::{TcpClient, TcpClientBuilder},
     server::TcpServerBuilder,
 };
-use rasterizeddb_core::cache::query_cache::QueryCacheEntry;
 use rasterizeddb_core::{
     BATCH_SIZE, MAX_PERMITS_THREADS,
-    cache::atomic_cache::AtomicGenericCache,
     core::{
         database::Database,
         db_type::DbType,
@@ -57,7 +55,7 @@ fn build_context() -> BenchContext {
         // The cache now stores a `QueryCacheEntry`, which carries the table,
         // the clause and the generation alongside the pointers so a stale
         // entry is detectable rather than merely unlikely.
-        AtomicGenericCache::<u64, Arc<QueryCacheEntry>>::new(1024, 10240)
+        rasterizeddb_core::cache::query_cache::QueryCache::new(1024, 10240)
     });
 
     ENABLE_CACHE.get_or_init(|| true);
@@ -326,7 +324,7 @@ fn memory_block_from_bytes(bytes: &[u8]) -> MemoryBlock {
 
 fn clear_query_cache() {
     if let Some(cache) = ATOMIC_CACHE.get() {
-        let _ = cache.clear();
+        rasterizeddb_core::cache::query_cache::clear_cache(cache);
     }
 }
 

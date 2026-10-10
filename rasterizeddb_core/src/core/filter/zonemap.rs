@@ -206,28 +206,6 @@ pub fn successor(prefix: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-/// NaN must never enter a zone's bounds.
-///
-/// Every IEEE comparison against NaN is false, so a NaN that seeded `min`/`max`
-/// would stick there forever — no later value could displace it — and then every
-/// range test on that zone would answer "cannot match" and prune rows that do.
-/// Excluding NaN is also free of false negatives in the other direction: a row
-/// holding NaN can never satisfy a range predicate anyway.
-#[inline]
-fn is_nan(db_type: &DbType, bytes: &[u8]) -> bool {
-    match db_type {
-        DbType::F32 if bytes.len() == 4 => {
-            f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]).is_nan()
-        }
-        DbType::F64 if bytes.len() == 8 => {
-            let mut a = [0u8; 8];
-            a.copy_from_slice(bytes);
-            f64::from_le_bytes(a).is_nan()
-        }
-        _ => false,
-    }
-}
-
 /// Comparison for *probing*. An error fails the query in the evaluator anyway,
 /// so the filter must not prune on it: answer "possible" and let the evaluator
 /// decide.
@@ -256,7 +234,7 @@ pub struct ZoneMap {
     kind: BoundKind,
     /// `zone_count * kind.stride()`: min then max, per zone.
     data: Vec<u8>,
-    /// One bit per zone: whether any non-NaN value has been recorded.
+    /// One bit per zone: whether any value has been recorded (NaN included).
     valid: Vec<u64>,
 }
 
@@ -413,6 +391,40 @@ impl ZoneMap {
         true
     }
 
+    /// Whether zones `[first, end)` ascend without overlapping, under the same
+    /// conservative rules as [`Self::is_monotonic_ascending`]: fixed-width
+    /// bounds only, every zone valid and bounded, adjacent zones may touch.
+    ///
+    /// Used to decide whether a column's bounds are clustered enough to stand in
+    /// for fingerprint planes. A wrong `true` there costs only selectivity, but
+    /// the rules are kept identical so there is one notion of "ascending".
+    pub fn is_ascending_between(&self, first: u64, end: u64) -> bool {
+        if !matches!(self.kind, BoundKind::Fixed { .. }) {
+            return false;
+        }
+        if first >= end || end > self.zone_count() {
+            return false;
+        }
+        let mut previous_max: Option<&[u8]> = None;
+        for zone in first..end {
+            if !self.is_valid(zone) {
+                return false;
+            }
+            let min = self.min_of(zone);
+            let Some(max) = self.max_of(zone) else {
+                return false;
+            };
+            if let Some(prev) = previous_max {
+                match cmp_strict(prev, min, &self.db_type, ComparerOperation::LessOrEquals) {
+                    Some(true) => {}
+                    _ => return false,
+                }
+            }
+            previous_max = Some(max);
+        }
+        true
+    }
+
     /// The zone's upper bound, or `None` when it has none — see [`UNBOUNDED`].
     #[inline]
     fn max_of(&self, zone: u64) -> Option<&[u8]> {
@@ -476,8 +488,20 @@ impl ZoneMap {
     }
 
     /// Widen the zone's bounds to include `value`.
+    ///
+    /// NaN *is* recorded in the bounds, as the largest value. The comparisons here
+    /// go through `perform_comparison_operation`, which orders floats as
+    /// PostgreSQL does — NaN equal to NaN and above +Infinity — so a NaN is an
+    /// ordinary maximum: `f > x` keeps its zone, `f = 'NaN'` keeps only zones whose
+    /// maximum is NaN, and a zone holding NaN never looks ascending against the
+    /// next one. It used to be left out, which was right only while comparisons
+    /// were IEEE's (where NaN satisfies nothing); under PostgreSQL's order it
+    /// pruned NaN rows from `f > x` and let `ORDER BY f LIMIT k` return a NaN among
+    /// the smallest values. Sidecars written before this carry NaN-blind bounds,
+    /// which is why the persisted format version moved to 4: an older file is
+    /// rejected and rebuilt rather than trusted.
     pub fn observe(&mut self, zone: u64, value: &[u8]) {
-        if !self.accepts(value) || is_nan(&self.db_type, value) {
+        if !self.accepts(value) {
             return;
         }
         self.ensure_zone(zone);
@@ -599,8 +623,9 @@ impl ZoneMap {
         let above_min = |op| max.is_none_or(|m| cmp(m, value, ty, op));
 
         match op {
-            // A NaN probe makes every test false and prunes the zone, which is
-            // right: `x = NaN` and `x > NaN` are false for every x.
+            // A NaN probe compares as the largest value, which is what
+            // PostgreSQL's order makes it: `x = 'NaN'` keeps the zones whose
+            // maximum is NaN, `x > 'NaN'` keeps none.
             SargOp::Eq => {
                 cmp(min, value, ty, ComparerOperation::LessOrEquals)
                     && above_min(ComparerOperation::GreaterOrEquals)

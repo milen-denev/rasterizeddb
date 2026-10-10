@@ -6,7 +6,7 @@ use super::{error::Result, row::RowWrite};
 use byteorder::{LittleEndian, WriteBytesExt};
 
 #[cfg(feature = "enable_long_row")]
-use crc::{CRC_32_ISO_HDLC, Crc};
+use crate::core::storage_providers::CRC;
 
 use itertools::Itertools;
 use smallvec::SmallVec;
@@ -70,9 +70,6 @@ const CHUNK_SIZE: usize = TOTAL_LENGTH * 2; // 92 * 2 bytes chunks for debugging
 #[cfg(not(feature = "enable_long_row"))]
 const CHUNK_SIZE: usize = TOTAL_LENGTH * 3047; // ~64KB chunks
 
-// TODO replace with fastcrc32
-#[cfg(feature = "enable_long_row")]
-const CRC: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
 
 /// Iterates over RowPointers from a StorageIO in 64KB chunks
 pub struct RowPointerIterator<S: StorageIO> {
@@ -165,6 +162,16 @@ impl<S: StorageIO> RowPointerIterator<S> {
     #[inline]
     pub fn set_candidates(&mut self, candidates: Option<Arc<CandidateBitmap>>) {
         self.candidates = candidates;
+        self.end_if_nothing();
+    }
+
+    /// A mask admitting nothing (a constant-false `WHERE`) ends the scan before
+    /// a single pointer is read.
+    #[inline]
+    fn end_if_nothing(&mut self) {
+        if self.candidates.as_ref().is_some_and(|c| c.is_nothing()) {
+            self.end_of_data = true;
+        }
     }
 
     #[inline]
@@ -194,6 +201,7 @@ impl<S: StorageIO> RowPointerIterator<S> {
         self.end_of_data = false;
         self.chunk_start_position = 0;
         self.borrowed_chunk = None;
+        self.end_if_nothing();
     }
 
     /// Bytes of the currently loaded chunk, from the borrowed mapping when the
@@ -253,9 +261,13 @@ impl<S: StorageIO> RowPointerIterator<S> {
     /// Used only when a read has already failed short. Reads the candidate
     /// prefix rather than asking for a length, because the length is the thing
     /// that turned out to be wrong.
-    async fn readable_record_prefix(&mut self, max_records: u64) -> u64 {
+    ///
+    /// Only a *short* read (`UnexpectedEof`) narrows the search. Any other
+    /// failure is an I/O error and is returned: counting it as "not readable"
+    /// shrank the chunk, and with it the scan, without anything reporting it.
+    async fn readable_record_prefix(&mut self, max_records: u64) -> std::io::Result<u64> {
         if max_records == 0 {
-            return 0;
+            return Ok(0);
         }
         // Invariant: `lo` records are readable, `hi` records are not.
         let mut lo = 0u64;
@@ -267,7 +279,8 @@ impl<S: StorageIO> RowPointerIterator<S> {
             let slice = &mut self.buffer.into_slice_mut()[..bytes];
             match self.io.read_data_into_buffer(&mut probe_at, slice).await {
                 Ok(()) => lo = mid,
-                Err(_) => hi = mid,
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => hi = mid,
+                Err(e) => return Err(e),
             }
         }
         // `lo` was proven readable by the probe that set it; a `lo` still at 0
@@ -277,16 +290,13 @@ impl<S: StorageIO> RowPointerIterator<S> {
             let bytes = TOTAL_LENGTH;
             let mut probe_at = self.position;
             let slice = &mut self.buffer.into_slice_mut()[..bytes];
-            if self
-                .io
-                .read_data_into_buffer(&mut probe_at, slice)
-                .await
-                .is_ok()
-            {
-                lo = 1;
+            match self.io.read_data_into_buffer(&mut probe_at, slice).await {
+                Ok(()) => lo = 1,
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
+                Err(e) => return Err(e),
             }
         }
-        lo
+        Ok(lo)
     }
 
     /// Load the next chunk of data into the buffer
@@ -370,7 +380,7 @@ impl<S: StorageIO> RowPointerIterator<S> {
                 // read, rather than trusting any length. Binary search costs at
                 // most ~12 reads and only on this path.
                 let max_records = bytes_to_read / TOTAL_LENGTH as u64;
-                let readable = self.readable_record_prefix(max_records).await;
+                let readable = self.readable_record_prefix(max_records).await?;
                 if readable == 0 {
                     self.end_of_data = true;
                     self.buffer_valid_length = 0;
@@ -380,18 +390,17 @@ impl<S: StorageIO> RowPointerIterator<S> {
                 // Re-read the prefix we proved readable. The probe that ended the
                 // search may have been a *failure*, which can leave the buffer
                 // holding part of a read that did not complete.
+                //
+                // A failure here is an error, not the end of the table. These
+                // records were read successfully a moment ago, so nothing benign
+                // explains losing them — and reporting the end of data here
+                // returned every record before this chunk as the whole answer.
                 let usable = readable * TOTAL_LENGTH as u64;
                 let mut read_at = self.position;
                 let slice = &mut self.buffer.into_slice_mut()[..usable as usize];
-                if self
-                    .io
-                    .read_data_into_buffer(&mut read_at, slice)
-                    .await
-                    .is_err()
-                {
-                    self.end_of_data = true;
+                if let Err(e) = self.io.read_data_into_buffer(&mut read_at, slice).await {
                     self.buffer_valid_length = 0;
-                    return Ok(());
+                    return Err(e.into());
                 }
 
                 self.buffer_valid_length = usable as usize;
@@ -1005,14 +1014,29 @@ impl RowPointer {
 
         let owns_txn = txn.is_none();
         let txn = txn.unwrap_or_else(|| pointers_io.begin_txn());
-        let token = self
+        // A transaction opened here is ended here on every path: one left open
+        // with a logged in-place stamp holds the log's pending count up, and
+        // the log cannot be checkpointed again for the life of the process.
+        let token = match self
             .save_at_in_txn(&*pointers_io, pointer_record_pos, txn)
-            .await?;
+            .await
+        {
+            Ok(token) => token,
+            Err(e) => {
+                if owns_txn {
+                    pointers_io.abort_txn(txn).await;
+                }
+                return Err(e);
+            }
+        };
         if owns_txn {
             // The tombstone is not a tombstone until it is durable. Reporting a
             // row deleted whose deletion may not survive a restart is how a
             // deleted row comes back.
-            pointers_io.commit_durable(token).await?;
+            if let Err(e) = pointers_io.commit_durable(token).await {
+                pointers_io.abort_txn(txn).await;
+                return Err(e.into());
+            }
         }
         Ok(())
     }
@@ -1271,6 +1295,51 @@ impl RowPointer {
         written_by: TxId,
     ) -> Result<(RowPointer, Option<u64>)> {
         Self::validate(row_write)?;
+
+        // A transaction opened here is ended here, on every path. The body
+        // below has half a dozen ways out, and any of them taken with an
+        // in-place write already logged left the transaction open — holding
+        // the log's pending count up so it could never be checkpointed again.
+        // So the body runs inside the transaction as if a caller had supplied
+        // it, and this level commits or aborts.
+        if txn.is_none() {
+            let txn = rows_io.begin_txn();
+            let result = Box::pin(self.update_with_pointer_record_pos(
+                pointers_io.clone(),
+                rows_io.clone(),
+                pointer_record_pos,
+                last_id,
+                table_length,
+                #[cfg(feature = "enable_long_row")]
+                cluster,
+                row_write,
+                Some(txn),
+                free_space,
+                written_by,
+            ))
+            .await;
+            return match result {
+                Err(e) => {
+                    pointers_io.abort_txn(txn).await;
+                    Err(e)
+                }
+                Ok((pointer, moved_to)) => {
+                    if let Err(e) = pointers_io.commit_durable(txn).await {
+                        // A relocation that is not durable owns no extent that
+                        // survives a restart; leaving the loan out would shield
+                        // those bytes from every future sweep.
+                        if moved_to.is_some() {
+                            if let Some(free_space) = free_space {
+                                free_space.release_failed_loan(pointer.position);
+                            }
+                        }
+                        pointers_io.abort_txn(txn).await;
+                        return Err(e.into());
+                    }
+                    Ok((pointer, moved_to))
+                }
+            };
+        }
 
         let (new_total_bytes_u64, new_total_string_size) = Self::calculate_total_bytes(row_write);
         let old_len_u64 = self.length as u64;
@@ -1648,7 +1717,7 @@ impl RowPointer {
         }
 
         // Create a vector to hold all the columns
-        let mut columns: SmallVec<[Column; 32]> =
+        let mut columns: crate::core::row::row::RowColumns =
             SmallVec::with_capacity(row_fetch.columns_fetching_data.len());
 
         // Pre-allocate columns with placeholders
@@ -1674,7 +1743,7 @@ impl RowPointer {
                 let block = MEMORY_POOL.acquire(c_size);
                 let col = &mut columns[i];
                 col.data = block;
-                col.schema_id = column_data.schema_id;
+                col.schema_id = crate::core::row::row::schema_id_of(column_data.schema_id);
                 col.column_type = column_data.column_type.clone();
 
                 let ptr = col.data.as_mut_ptr();
@@ -1724,7 +1793,7 @@ impl RowPointer {
                 let string_size = u32::from_le_bytes(chunk[8..12].try_into().unwrap()) as usize;
 
                 let col = &mut columns[col_idx];
-                col.schema_id = row_fetch.columns_fetching_data[col_idx].schema_id;
+                col.schema_id = crate::core::row::row::schema_id_of(row_fetch.columns_fetching_data[col_idx].schema_id);
                 col.column_type = DbType::STRING;
 
                 if string_size == 0 {
@@ -1830,7 +1899,7 @@ impl RowPointer {
                     col.data = MEMORY_POOL.acquire(c_size);
                 }
 
-                col.schema_id = column_data.schema_id;
+                col.schema_id = crate::core::row::row::schema_id_of(column_data.schema_id);
                 col.column_type = column_data.column_type.clone();
 
                 let ptr = col.data.as_mut_ptr();
@@ -1880,7 +1949,7 @@ impl RowPointer {
 
                 if string_size == 0 {
                     col.data = MemoryBlock::default();
-                    col.schema_id = row_fetch.columns_fetching_data[col_idx].schema_id;
+                    col.schema_id = crate::core::row::row::schema_id_of(row_fetch.columns_fetching_data[col_idx].schema_id);
                     col.column_type = DbType::STRING;
                     continue;
                 }
@@ -1909,7 +1978,7 @@ impl RowPointer {
                     col.data = MEMORY_POOL.acquire(string_size);
                 }
 
-                col.schema_id = row_fetch.columns_fetching_data[col_idx].schema_id;
+                col.schema_id = crate::core::row::row::schema_id_of(row_fetch.columns_fetching_data[col_idx].schema_id);
                 col.column_type = DbType::STRING;
 
                 let ptr = col.data.as_mut_ptr();
@@ -2166,6 +2235,11 @@ impl RowPointer {
                 if let (Some(free_space), Some(position)) = (free_space, reclaimed) {
                     free_space.release_failed_loan(position);
                 }
+                // A reclaimed extent was an in-place write: the transaction
+                // holds a pending payload until it ends, and pins the log.
+                if owns_txn {
+                    rows_io.abort_txn(txn).await;
+                }
                 return Err(e);
             }
         };
@@ -2180,6 +2254,7 @@ impl RowPointer {
                 if let (Some(free_space), Some(position)) = (free_space, reclaimed) {
                     free_space.release_failed_loan(position);
                 }
+                pointers_io.abort_txn(txn).await;
                 return Err(e.into());
             }
         }
@@ -3207,5 +3282,151 @@ mod over_reported_length {
     #[tokio::test]
     async fn a_wholly_absent_file_yields_nothing() {
         assert_eq!(iterator_over(0, 4).await.len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod failed_prefix_reads {
+    //! A chunk whose declared length runs past the bytes there is recovered by
+    //! probing for the readable prefix and re-reading it. A *failed* read on
+    //! that path — as opposed to a short one — must fail the iteration. It used
+    //! to count as "not readable" (a probe) or as the end of the table (the
+    //! re-read), and either way the scan came back short and successful.
+    use super::*;
+    use rclite::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// `data` holds whole records and the length reported is one more record.
+    /// Reads past `data` are short (`UnexpectedEof`). Once the first short read
+    /// has happened, the `fail_at`-th read after it fails outright.
+    #[derive(Clone)]
+    struct FlakyIo {
+        data: std::sync::Arc<Vec<u8>>,
+        reads_since_eof: std::sync::Arc<AtomicU32>,
+        fail_at: u32,
+    }
+
+    impl crate::core::storage_providers::traits::StorageIO for FlakyIo {
+        async fn verify_data(&self, _position: u64, _buffer: &[u8]) -> bool {
+            true
+        }
+        async fn write_data(&self, _position: u64, _buffer: &[u8]) {}
+        async fn write_data_seek(&self, _seek: std::io::SeekFrom, _buffer: &[u8]) {}
+        async fn read_data_into_buffer(
+            &self,
+            position: &mut u64,
+            buffer: &mut [u8],
+        ) -> std::result::Result<(), std::io::Error> {
+            let seen = self.reads_since_eof.load(Ordering::SeqCst);
+            if seen > 0 {
+                self.reads_since_eof.store(seen + 1, Ordering::SeqCst);
+                if seen == self.fail_at {
+                    return Err(std::io::Error::other("injected read failure"));
+                }
+            }
+            let start = *position as usize;
+            let end = start.saturating_add(buffer.len());
+            if end > self.data.len() {
+                if seen == 0 {
+                    self.reads_since_eof.store(1, Ordering::SeqCst);
+                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "short read",
+                ));
+            }
+            buffer.copy_from_slice(&self.data[start..end]);
+            *position += buffer.len() as u64;
+            Ok(())
+        }
+        async fn read_vectored(
+            &self,
+            reads: &mut [(u64, &mut [u8])],
+        ) -> std::result::Result<(), std::io::Error> {
+            for (pos, buf) in reads {
+                let mut p = *pos;
+                self.read_data_into_buffer(&mut p, buf).await?;
+            }
+            Ok(())
+        }
+        async fn append_data(&self, _buffer: &[u8], _immediate: bool) {}
+        async fn append_data_returning_offset(&self, _buffer: &[u8], _immediate: bool) -> u64 {
+            self.data.len() as u64
+        }
+        async fn get_len(&self) -> u64 {
+            (self.data.len() + TOTAL_LENGTH) as u64
+        }
+        fn exists(_location: &str, _table_name: &str) -> bool {
+            false
+        }
+        async fn create_temp(&self) -> Self {
+            self.clone()
+        }
+        async fn swap_temp(&self, _temp_io_sync: &mut Self) {}
+        fn get_location(&self) -> Option<String> {
+            None
+        }
+        async fn create_new(&self, _name: String) -> Self {
+            self.clone()
+        }
+        fn drop_io(&self) {}
+        fn get_hash(&self) -> u32 {
+            0
+        }
+        async fn start_service(&self) {}
+        fn get_name(&self) -> String {
+            "FlakyIo".to_string()
+        }
+    }
+
+    async fn scan(n: usize, fail_at: u32) -> Result<Vec<RowPointer>> {
+        let _ = crate::BATCH_SIZE.get_or_init(|| 1024);
+        let mut bytes = Vec::with_capacity(n * TOTAL_LENGTH);
+        for id in 0..n {
+            let mut p = RowPointer::from_slice(&[0u8; TOTAL_LENGTH]);
+            p.id = (id as u64 + 1).into();
+            p.position = (id * 16) as u64;
+            p.length = 16;
+            p.xmin = FROZEN_TX;
+            bytes.extend_from_slice(p.into_memory_block().into_slice());
+        }
+        let io = Arc::new(FlakyIo {
+            data: std::sync::Arc::new(bytes),
+            reads_since_eof: std::sync::Arc::new(AtomicU32::new(0)),
+            fail_at,
+        });
+        let mut it = RowPointerIterator::new(io).await?;
+        let mut out = Vec::new();
+        loop {
+            let batch = it.next_row_pointers().await?;
+            if batch.is_empty() {
+                return Ok(out);
+            }
+            out.extend(batch);
+        }
+    }
+
+    /// Every position a failure can land on — each probe of the search and the
+    /// re-read after it — gives either the whole table or an error.
+    #[tokio::test]
+    async fn a_failed_read_while_recovering_a_short_chunk_is_an_error() {
+        let n = 320;
+        let mut errors = 0;
+        for fail_at in 1..=24 {
+            match scan(n, fail_at).await {
+                Ok(rows) => assert_eq!(
+                    rows.len(),
+                    n,
+                    "fail_at {fail_at}: a failed read returned {} of {n} records as success",
+                    rows.len()
+                ),
+                Err(e) => {
+                    assert!(e.to_string().contains("injected"), "fail_at {fail_at}: {e}");
+                    errors += 1;
+                }
+            }
+        }
+        // Some positions must actually have hit the recovery path.
+        assert!(errors >= 5, "only {errors} injected failures were reached");
     }
 }
