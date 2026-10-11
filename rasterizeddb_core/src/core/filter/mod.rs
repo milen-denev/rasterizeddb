@@ -352,6 +352,9 @@ pub struct TableFilters {
     /// Whether the on-disk copy is known to be stale. Set before a delete or
     /// update, cleared by a checkpoint.
     disk_dirty: AtomicBool,
+    /// Held while the dirty byte is written, so a second mutation waits for
+    /// the byte rather than seeing the flag set and writing rows first.
+    dirty_marking: tokio::sync::Mutex<()>,
     /// Set by mutations that need a checkpoint sooner than the write threshold
     /// would trigger one.
     checkpoint_requested: AtomicBool,
@@ -440,6 +443,7 @@ impl TableFilters {
             writes_since_checkpoint: AtomicU64::new(0),
             slots_at_checkpoint: AtomicU64::new(0),
             disk_dirty: AtomicBool::new(false),
+            dirty_marking: tokio::sync::Mutex::new(()),
             checkpoint_requested: AtomicBool::new(false),
             has_checkpoint: AtomicBool::new(false),
             disk_len: AtomicU64::new(0),
@@ -491,6 +495,7 @@ impl TableFilters {
             writes_since_checkpoint: AtomicU64::new(0),
             slots_at_checkpoint: AtomicU64::new(loaded.n_slots),
             disk_dirty: AtomicBool::new(false),
+            dirty_marking: tokio::sync::Mutex::new(()),
             checkpoint_requested: AtomicBool::new(false),
             has_checkpoint: AtomicBool::new(true),
             disk_len: AtomicU64::new(loaded.valid_len),
@@ -645,10 +650,18 @@ impl TableFilters {
         if !self.has_checkpoint.load(Ordering::Acquire) {
             return;
         }
-        if self.disk_dirty.swap(true, Ordering::Relaxed) {
+        // Set only once the byte is written. Updates no longer all take
+        // turns: one that found the flag set before the byte landed would
+        // write rows a crash could pair with a checkpoint still marked clean.
+        if self.disk_dirty.load(Ordering::Acquire) {
+            return;
+        }
+        let _marking = self.dirty_marking.lock().await;
+        if self.disk_dirty.load(Ordering::Acquire) {
             return;
         }
         persist::mark_dirty_on_disk(io).await;
+        self.disk_dirty.store(true, Ordering::Release);
     }
 
     /// Ask the maintenance task to checkpoint at its next tick.

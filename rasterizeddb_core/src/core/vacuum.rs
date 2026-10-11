@@ -1487,7 +1487,7 @@ pub struct VacuumService<S: StorageIO> {
     pub config: VacuumConfig,
     /// The table's write lock, compaction gate and cache generation, for the
     /// forget sweep. See [`neutralize_aborted`].
-    pub write_lock: Arc<tokio::sync::Mutex<()>>,
+    pub write_lock: Arc<tokio::sync::RwLock<()>>,
     pub compaction_gate: Arc<tokio::sync::RwLock<()>>,
     pub cache_generation: Arc<CacheGuard<AtomicU64>>,
     /// Set when versioning is enabled.
@@ -1696,7 +1696,7 @@ pub struct NeutralizeParts<'a, S: StorageIO> {
     /// The table's write lock: every rewrite of an existing pointer record —
     /// `DELETE`, `UPDATE`, a uniqueness check's read — holds it, so a stamp
     /// cleared here can never race one being written.
-    pub write_lock: &'a tokio::sync::Mutex<()>,
+    pub write_lock: &'a tokio::sync::RwLock<()>,
     /// Held shared for the sweep: compaction moves records.
     pub compaction_gate: &'a tokio::sync::RwLock<()>,
     pub readers: &'a ReaderRegistry,
@@ -1774,7 +1774,7 @@ pub async fn neutralize_aborted<S: StorageIO>(
     // 3. Rewrite them.
     let mut record = vec![0u8; ROW_POINTER_RECORD_LEN];
     for batch in candidates.chunks(1024) {
-        let _write = parts.write_lock.lock().await;
+        let _write = parts.write_lock.write().await;
         let txn = parts.io_pointers.begin_txn();
         let mut token = txn;
         let mut wrote = false;

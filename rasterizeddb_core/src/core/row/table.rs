@@ -143,11 +143,24 @@ pub struct Table<S: StorageIO> {
     /// concurrent; only the rewrite is serialized, and every rewrite re-reads
     /// the pointer record under the lock so a stale snapshot is caught rather
     /// than acted on.
-    write_lock: StdArc<tokio::sync::Mutex<()>>,
+    ///
+    /// Held exclusively by `DELETE`, by an `UPDATE` and by the aborted-write
+    /// sweep. A *point* update, one naming its row by a unique key, holds it
+    /// shared together with that key's stripe of `unique_lock`: every other
+    /// writer of a row with that key holds the same stripe or this lock
+    /// exclusively, so the guarantee above holds for the rows it can match,
+    /// and point updates of different keys run side by side.
+    write_lock: StdArc<tokio::sync::RwLock<()>>,
     /// Makes a uniqueness check atomic with the write it guards.
     ///
     /// Taken by every `INSERT` into a table with a UNIQUE constraint, and by an
     /// `UPDATE` of such a table for its rewrite — but not for its scan.
+    ///
+    /// Striped by key (`KeyLocks`): an insert takes the stripe of each key it
+    /// writes, so inserts of different keys no longer take turns. An `UPDATE`
+    /// takes every stripe, since it learns its rows' keys only as it rewrites
+    /// them, except a point update, which takes its key's stripe *before* its
+    /// scan and the stripes of the row's other keys before its rewrite.
     ///
     /// It used to be `write_lock`, which an `UPDATE` holds across its whole
     /// scan. A multi-row `INSERT` takes the lock once per tuple, so each tuple
@@ -165,7 +178,7 @@ pub struct Table<S: StorageIO> {
     /// rewrite and the filter application closes the window. Past it, the
     /// in-flight rule in `find_row_with_value` covers the transaction's
     /// remaining life, lock or no lock. Order: `write_lock`, then this.
-    unique_lock: StdArc<tokio::sync::Mutex<()>>,
+    unique_lock: StdArc<crate::core::row::key_locks::KeyLocks>,
     /// Held shared by every read and write, exclusively by full compaction.
     ///
     /// Incremental reclamation needs no such gate — it only ever hands out
@@ -766,7 +779,7 @@ impl<S: StorageIO> Table<S> {
         let cache_generation =
             StdArc::new(CacheGuard::new(AtomicU64::new(next_cache_generation())));
         let schema_name_for_cache = schema.name.clone();
-        let write_lock = StdArc::new(tokio::sync::Mutex::new(()));
+        let write_lock = StdArc::new(tokio::sync::RwLock::new(()));
         let compaction_gate = StdArc::new(tokio::sync::RwLock::new(()));
         let forget = StdArc::new(std::sync::OnceLock::new());
 
@@ -823,7 +836,7 @@ impl<S: StorageIO> Table<S> {
             readers,
             vacuum_stats,
             write_lock,
-            unique_lock: StdArc::new(tokio::sync::Mutex::new(())),
+            unique_lock: StdArc::new(crate::core::row::key_locks::KeyLocks::new()),
             compaction_gate,
             forget,
             write_generation,
@@ -1994,10 +2007,10 @@ impl<S: StorageIO> Table<S> {
     /// asked. A slot at or past that length was appended since and must be
     /// treated as a candidate too; the caller does.
     ///
-    /// Sound for a uniqueness check because the check runs under
-    /// `unique_lock`, as does every write that could put a key under these
-    /// columns: an earlier writer has finished, its index entry included,
-    /// before this one looks.
+    /// Sound for a uniqueness check because the check runs under the key's
+    /// stripe of `unique_lock`, as does every write that could put that key
+    /// under these columns: an earlier writer has finished, its index entry
+    /// included, before this one looks.
     async fn index_probe(&self, columns: &[(&SchemaField, &[u8])]) -> Option<(Vec<u64>, u64)> {
         let indexes = self.indexes.as_ref()?;
         let wos: SmallVec<[u32; 4]> = columns.iter().map(|(f, _)| f.write_order as u32).collect();
@@ -2010,6 +2023,164 @@ impl<S: StorageIO> Table<S> {
                 .map(|(_, v)| *v)
         })?;
         Some((index.slots_for_key(&key), n_slots))
+    }
+
+    /// The `unique_lock` stripe for one constraint's key.
+    ///
+    /// Two values the uniqueness check calls equal must land on one stripe,
+    /// so the key is hashed in the canonical form a hash index is proven to
+    /// share with the evaluator's equality. A type without one puts its whole
+    /// constraint on a single stripe, which is what the one lock was.
+    fn constraint_stripe<'a>(constraint: usize, values: impl Iterator<Item = (&'a SchemaField, &'a [u8])>) -> usize {
+        let mut canonical = Vec::with_capacity(32);
+        let mut one = Vec::with_capacity(16);
+        for (field, value) in values {
+            one.clear();
+            if crate::core::index::key::encode_canonical(&field.db_type, value, &mut one).is_none() {
+                return crate::core::row::key_locks::KeyLocks::stripe_of(constraint, None);
+            }
+            canonical.extend_from_slice(&(one.len() as u32).to_le_bytes());
+            canonical.extend_from_slice(&one);
+        }
+        crate::core::row::key_locks::KeyLocks::stripe_of(constraint, Some(&canonical))
+    }
+
+    /// The constraint id `constraint_stripe` takes for a table-level key.
+    /// Column constraints use their column's `write_order`.
+    fn unique_key_constraint(position: usize) -> usize {
+        usize::MAX - position
+    }
+
+    /// The columns of a table-level unique key, or `None` when one was
+    /// dropped (and the constraint is no longer enforced; see `check_unique`).
+    fn unique_key_fields(&self, key: &crate::core::rql::unique_key::UniqueKey) -> Option<SmallVec<[&SchemaField; 4]>> {
+        key.columns
+            .iter()
+            .map(|name| {
+                self.schema
+                    .fields
+                    .iter()
+                    .find(|f| f.name.eq_ignore_ascii_case(name) && !f.is_deleted)
+            })
+            .collect()
+    }
+
+    /// The `unique_lock` stripes a row's keys fall on: one per constraint it
+    /// holds a key for. A NULL key conflicts with nothing, so it needs none.
+    fn unique_stripes(&self, row_write: &RowWrite) -> SmallVec<[usize; 4]> {
+        let value_of = |wo: u32| {
+            row_write
+                .columns_writing_data
+                .iter()
+                .find(|c| c.write_order == wo)
+                .map(|c| c.data.into_slice())
+        };
+        let mut stripes = SmallVec::new();
+        for field in self.schema.fields.iter().filter(|f| f.is_unique && !f.is_deleted) {
+            let Some(value) = value_of(field.write_order as u32) else {
+                continue;
+            };
+            if self.written_value_is_null(row_write, field, value) {
+                continue;
+            }
+            stripes.push(Self::constraint_stripe(
+                field.write_order as usize,
+                std::iter::once((field, value)),
+            ));
+        }
+        for (position, key) in self.schema.unique_keys.iter().enumerate() {
+            let Some(fields) = self.unique_key_fields(key) else {
+                continue;
+            };
+            let values: Option<SmallVec<[(&SchemaField, &[u8]); 4]>> = fields
+                .iter()
+                .map(|f| value_of(f.write_order as u32).map(|v| (*f, v)))
+                .collect();
+            let Some(values) = values else {
+                continue;
+            };
+            if values.iter().any(|(f, v)| self.written_value_is_null(row_write, f, v)) {
+                continue;
+            }
+            stripes.push(Self::constraint_stripe(
+                Self::unique_key_constraint(position),
+                values.into_iter(),
+            ));
+        }
+        stripes
+    }
+
+    /// When an `UPDATE` names its rows by one unique key's value and assigns
+    /// no column of any unique key: the `unique_lock` stripe of that key.
+    ///
+    /// Every row such a statement can match holds that key, since the
+    /// extracted equality is implied by its `WHERE` (the same promise an index
+    /// lookup rests on). So holding the stripe from before the scan to after
+    /// the rewrite excludes every other writer of the rows it can touch:
+    /// inserts and point updates of the key take the stripe, and a statement
+    /// that could give some other row this key takes them all.
+    fn point_update_stripe(
+        &self,
+        where_clause: &str,
+        updates: &[ColumnWritePayload],
+        expressions: &[(u32, crate::core::rql::expr::Expr)],
+    ) -> Option<usize> {
+        use crate::core::filter::sarg::MaskExpr;
+        use crate::core::filter::zonemap::SargOp;
+
+        if !self.has_unique || where_clause.trim().is_empty() {
+            return None;
+        }
+        let mut keyed: SmallVec<[u32; 8]> = self
+            .schema
+            .fields
+            .iter()
+            .filter(|f| f.is_unique && !f.is_deleted)
+            .map(|f| f.write_order as u32)
+            .collect();
+        for key in self.schema.unique_keys.iter() {
+            keyed.extend(self.unique_key_fields(key)?.iter().map(|f| f.write_order as u32));
+        }
+        if updates.iter().any(|u| keyed.contains(&u.write_order))
+            || expressions.iter().any(|(wo, _)| keyed.contains(wo))
+        {
+            return None;
+        }
+
+        let tokens = crate::core::tokenizer::query_tokenizer::try_tokenize(where_clause, &self.schema.fields).ok()?;
+        let program = sarg::extract_gated(&tokens, &|wo| keyed.contains(&wo), &self.decimal_scales())?;
+        let conjuncts: &[MaskExpr] = match &program.root {
+            MaskExpr::And(children) => children,
+            single @ MaskExpr::Pred(_) => std::slice::from_ref(single),
+            _ => return None,
+        };
+        let eq = |wo: u32| {
+            conjuncts.iter().find_map(|c| match c {
+                MaskExpr::Pred(p) if p.op == SargOp::Eq && p.write_order == wo => Some(p.value.as_slice()),
+                _ => None,
+            })
+        };
+
+        for field in self.schema.fields.iter().filter(|f| f.is_unique && !f.is_deleted) {
+            if let Some(value) = eq(field.write_order as u32) {
+                return Some(Self::constraint_stripe(
+                    field.write_order as usize,
+                    std::iter::once((field, value)),
+                ));
+            }
+        }
+        for (position, key) in self.schema.unique_keys.iter().enumerate() {
+            let fields = self.unique_key_fields(key)?;
+            let values: Option<SmallVec<[(&SchemaField, &[u8]); 4]>> =
+                fields.iter().map(|f| eq(f.write_order as u32).map(|v| (*f, v))).collect();
+            if let Some(values) = values {
+                return Some(Self::constraint_stripe(
+                    Self::unique_key_constraint(position),
+                    values.into_iter(),
+                ));
+            }
+        }
+        None
     }
 
     /// Id of a live row whose `field` equals `value`, other than `exclude_id`.
@@ -2618,9 +2789,10 @@ impl<S: StorageIO> Table<S> {
         // and each write. Tables without a constraint never take this.
         //
         // Not `write_lock`: see `unique_lock` for why an insert must not queue
-        // behind an update's scan.
+        // behind an update's scan. Only this row's keys' stripes: inserts of
+        // other keys cannot conflict with it.
         let _write = if self.has_unique {
-            Some(self.unique_lock.lock().await)
+            Some(self.unique_lock.lock(&self.unique_stripes(&row_write)).await)
         } else {
             None
         };
@@ -3081,7 +3253,7 @@ impl<S: StorageIO> Table<S> {
         // already serialized for their rewrites; this extends it over the scan,
         // which is the expensive half. `SELECT` and `INSERT` are unaffected —
         // neither rewrites an existing record, and neither takes this lock.
-        let _write = self.write_lock.lock().await;
+        let _write = self.write_lock.write().await;
 
         let mut iterator = RowPointerIterator::new_deferred(self.io_pointers.clone())
             .await
@@ -3285,6 +3457,86 @@ impl<S: StorageIO> Table<S> {
     ) -> Result<u64> {
         info!("Updating rows");
 
+        // A statement naming its row by a unique key tries the point path
+        // first, which lets updates of different keys run side by side. It
+        // falls back here, having written nothing, only when another key of
+        // the row it found is on a stripe it could not take in order.
+        if let Some(stripe) = self.point_update_stripe(where_clause, &updates, expressions) {
+            if let Some(n) = self
+                .update_rows_locked(
+                    where_clause,
+                    query_row_fetch.clone(),
+                    &updates,
+                    expressions,
+                    limit,
+                    written_by,
+                    visibility.clone(),
+                    Some(stripe),
+                )
+                .await?
+            {
+                return Ok(n);
+            }
+        }
+        self.update_rows_locked(
+            where_clause,
+            query_row_fetch,
+            &updates,
+            expressions,
+            limit,
+            written_by,
+            visibility,
+            None,
+        )
+        .await
+        .map(|n| n.unwrap_or_default())
+    }
+
+    /// A row's columns as a write, every column keyed by `write_order`.
+    fn row_write_of(&self, row: &Row) -> RowWrite {
+        let mut row_write = RowWrite {
+            columns_writing_data: smallvec::SmallVec::new(),
+        };
+        for field in self
+            .schema
+            .fields
+            .iter()
+            .sorted_by(|a, b| a.write_order.cmp(&b.write_order))
+        {
+            let write_order = field.write_order as u32;
+            let col = row
+                .columns
+                .iter()
+                .find(|c| c.schema_id as u32 == write_order);
+
+            row_write.columns_writing_data.push(ColumnWritePayload {
+                // Missing columns shouldn't normally happen for a full fetch;
+                // treat as empty.
+                data: col.map(|c| c.data.clone()).unwrap_or_default(),
+                write_order,
+                column_type: field.db_type.physical(),
+                size: field.size,
+            });
+        }
+        row_write
+    }
+
+    /// The body of [`Self::update_rows_as_of`], under the locks `point`
+    /// chooses: with `Some(stripe)`, the write lock shared and that key's
+    /// stripe; with `None`, the write lock exclusively and, for the rewrite,
+    /// every stripe. `Ok(None)` when a point update gave up before writing.
+    #[allow(clippy::too_many_arguments)]
+    async fn update_rows_locked(
+        &self,
+        where_clause: &str,
+        query_row_fetch: RowFetch,
+        updates: &smallvec::SmallVec<[ColumnWritePayload; 32]>,
+        expressions: &[(u32, crate::core::rql::expr::Expr)],
+        limit: Option<u64>,
+        written_by: TxId,
+        visibility: Option<Visibility>,
+        point: Option<usize>,
+    ) -> Result<Option<u64>> {
         // A caller that brings its own snapshot is a statement with work left
         // to do after this write — foreign-key actions — and that work can
         // fail it. An in-place overwrite keeps no previous version, so a
@@ -3300,8 +3552,16 @@ impl<S: StorageIO> Table<S> {
         // Before the scan. See the note in `delete_rows`: a relocation by a
         // concurrent statement leaves nothing at the old record for a later
         // re-read to find, so a snapshot taken outside this lock can silently
-        // match nothing.
-        let _write = self.write_lock.lock().await;
+        // match nothing. A point update takes its key's stripe instead, which
+        // every writer of a row it could match takes too (see `write_lock`).
+        let (_write_exclusive, _write_shared) = match point {
+            Some(_) => (None, Some(self.write_lock.read().await)),
+            None => (Some(self.write_lock.write().await), None),
+        };
+        let point_keys = match point {
+            Some(stripe) => Some(self.unique_lock.lock(&[stripe]).await),
+            None => None,
+        };
 
         let mut iterator = RowPointerIterator::new_deferred(self.io_pointers.clone())
             .await
@@ -3332,10 +3592,44 @@ impl<S: StorageIO> Table<S> {
 
         // The rewrite runs under the lock inserts check uniqueness under; the
         // scan above does not. See `unique_lock` for both halves of that.
-        let _unique = if self.has_unique {
-            Some(self.unique_lock.lock().await)
-        } else {
-            None
+        //
+        // A point update already holds its key's stripe. It needs the
+        // stripes of the row's *other* keys too, for two reasons:
+        // - a point update through another key of the same row (`WHERE id`
+        //   here, `WHERE email` there) holds only that key's stripe. Without
+        //   this both scan the same version and both relocate it, and the row
+        //   forks into two live versions;
+        // - a relocated row's other keys reach the index only after the
+        //   rewrite, so an insert checking one of them in that window would
+        //   find neither version.
+        // The row cannot change those keys under the stripe held, since
+        // giving a row a key takes every stripe. Mutation-tested: without
+        // this, `point_update_concurrency.rs` forks rows until it stalls.
+        let _unique = match point_keys {
+            None if self.has_unique => Some(self.unique_lock.lock_all().await),
+            None => None,
+            Some(mut keys) => {
+                let constraints = self.schema.fields.iter().filter(|f| f.is_unique && !f.is_deleted).count()
+                    + self.schema.unique_keys.len();
+                if constraints > 1 {
+                    let mut more: SmallVec<[usize; 8]> = SmallVec::new();
+                    let mut row = Row::default();
+                    for pwo in matches.iter().filter(|m| !m.pointer.deleted) {
+                        if pwo
+                            .pointer
+                            .fetch_row_reuse_async(&*self.io_rows, &full_fetch, &mut row)
+                            .await
+                            .is_ok()
+                        {
+                            more.extend(self.unique_stripes(&self.row_write_of(&row)));
+                        }
+                    }
+                    if !self.unique_lock.lock_more(&mut keys, &more).await {
+                        return Ok(None);
+                    }
+                }
+                Some(keys)
+            }
         };
 
         // A relocation allocates from the id counter even though it hands the
@@ -3385,39 +3679,7 @@ impl<S: StorageIO> Table<S> {
             }
 
             // Build RowWrite from the existing row (all columns), keyed by write_order.
-            let mut row_write = RowWrite {
-                columns_writing_data: smallvec::SmallVec::new(),
-            };
-
-            for field in self
-                .schema
-                .fields
-                .iter()
-                .sorted_by(|a, b| a.write_order.cmp(&b.write_order))
-            {
-                let write_order = field.write_order as u32;
-                let col = row
-                    .columns
-                    .iter()
-                    .find(|c| c.schema_id as u32 == write_order);
-
-                if let Some(col) = col {
-                    row_write.columns_writing_data.push(ColumnWritePayload {
-                        data: col.data.clone(),
-                        write_order,
-                        column_type: field.db_type.physical(),
-                        size: field.size,
-                    });
-                } else {
-                    // Missing columns shouldn't normally happen for a full fetch; treat as empty.
-                    row_write.columns_writing_data.push(ColumnWritePayload {
-                        data: crate::memory_pool::MemoryBlock::default(),
-                        write_order,
-                        column_type: field.db_type.physical(),
-                        size: field.size,
-                    });
-                }
-            }
+            let mut row_write = self.row_write_of(&row);
 
             // The version's index keys as it stands, before the assignments:
             // an in-place overwrite has to take the slot out from under them.
@@ -3602,7 +3864,7 @@ impl<S: StorageIO> Table<S> {
                 && !may_fail_after_write
                 && updates.iter().all(|u| u.column_type != DbType::STRING)
                 && self
-                    .write_columns_in_place(&pointer, &updates, txn, written_by)
+                    .write_columns_in_place(&pointer, updates, txn, written_by)
                     .await
             {
                 if self.maintains_indexes() {
@@ -3700,7 +3962,7 @@ impl<S: StorageIO> Table<S> {
             }
         }
 
-        Ok(updated_count)
+        Ok(Some(updated_count))
     }
 }
 
