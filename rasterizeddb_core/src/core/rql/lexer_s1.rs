@@ -56,6 +56,9 @@ pub enum QueryPurpose {
     /// wrong instead of a bare syntax error.
     #[cfg(feature = "s3_backup")]
     BackupError(String),
+    /// A single-table `SELECT` already parsed: a prepared statement run with
+    /// the parse it cached (see [`crate::core::rql::prepared`]).
+    PreparedRows(Box<crate::core::rql::prepared::PreparedRows>),
 }
 
 /// A `VACUUM` statement.
@@ -302,8 +305,6 @@ pub fn strip_sql_comments(sql: &str) -> String {
 }
 
 pub fn recognize_query_purpose(query: &str) -> Option<QueryPurpose> {
-    use ComparerOperation::StartsWith;
-    use QueryPurpose::*;
     // Every SQL client terminates a statement with a semicolon. Stripping it
     // once here covers every statement kind, rather than each clause parser
     // having to tolerate one — the `WHERE` lexer rejected it as an unexpected
@@ -337,6 +338,32 @@ pub fn recognize_query_purpose(query: &str) -> Option<QueryPurpose> {
     let query_upper = query_trimmed.to_ascii_uppercase();
     let query_bytes = query_upper.as_bytes();
 
+    // Every surface below, up to `VACUUM`, owns statements opening with its
+    // own word (`SET`, `SHOW`, `RESET`, `DESCRIBE`, `DESC`, `KV`,
+    // `REPLICATION`, `STORAGE`, `BACKUP`, `RESTORE`), and each copies or
+    // splits the whole text to find out. Queries and DML are most statements
+    // and none of theirs, so they skip the lot.
+    let opening = query_bytes
+        .iter()
+        .position(|b| !b.is_ascii_alphabetic())
+        .map_or(query_bytes, |end| &query_bytes[..end]);
+    let plain = matches!(
+        opening,
+        b"SELECT" | b"INSERT" | b"UPDATE" | b"DELETE" | b"WITH" | b"VALUES"
+    );
+    if !plain {
+        if let Some(purpose) = recognize_surface_statement(query_trimmed) {
+            return Some(purpose);
+        }
+    }
+
+    recognize_core_statement(query_trimmed, query_bytes)
+}
+
+/// The statements of the engine's own surfaces, which share no opening word
+/// with SQL's.
+fn recognize_surface_statement(query_trimmed: &str) -> Option<QueryPurpose> {
+    use QueryPurpose::*;
     // Recognised before the DDL/DML prefixes: `SET`/`SHOW`/`RESET` are not
     // otherwise statement keywords here, and the filter surface owns the whole
     // `... FILTER ...` shape.
@@ -384,7 +411,13 @@ pub fn recognize_query_purpose(query: &str) -> Option<QueryPurpose> {
         Ok(None) => {}
         Err(message) => return Some(BackupError(message)),
     }
+    None
+}
 
+/// SQL's own statements, by their opening keywords.
+fn recognize_core_statement(query_trimmed: &str, query_bytes: &[u8]) -> Option<QueryPurpose> {
+    use ComparerOperation::StartsWith;
+    use QueryPurpose::*;
     if simd_compare_strings(query_bytes, b"VACUUM", &StartsWith) {
         // `VACUUM`, `VACUUM FULL`, `VACUUM t`, `VACUUM FULL t`. Postgres also
         // accepts a parenthesised option list and a column list; neither adds

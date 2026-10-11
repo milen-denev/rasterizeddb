@@ -8121,6 +8121,8 @@ fn query_sql(query: &QueryPurpose) -> String {
         QueryPurpose::LockTable(_) => String::new(),
         QueryPurpose::InsertRow(d) => d.query.clone(),
         QueryPurpose::QueryRows(d) => d.query.clone(),
+        // A read: nothing to retry or replicate.
+        QueryPurpose::PreparedRows(_) => String::new(),
         QueryPurpose::CreateIndex(s) | QueryPurpose::DropIndex(s) => s.clone(),
         QueryPurpose::CreateTable(s)
         | QueryPurpose::DropTable(s)
@@ -9582,7 +9584,25 @@ pub(crate) async fn execute_with_need(
     tx: TxId,
     need: SubqueryNeed,
 ) -> Vec<u8> {
+    // A cached parse goes straight to the scan: it is the parse the plain
+    // branch below made for this statement, and was only cached because that
+    // branch is all the statement ever took.
+    let query = match query {
+        QueryPurpose::PreparedRows(prepared) => {
+            let prepared = *prepared;
+            let table = database.tables.get(&prepared.table_name).map(|t| t.value().clone());
+            let Some(table) = table else {
+                return ddl_error("Table not found");
+            };
+            let mut query_row = prepared.query_row;
+            apply_subquery_need(&mut query_row, need);
+            return Box::pin(execute_query_rows(query_row, table, &database, tx)).await;
+        }
+        other => other,
+    };
     match &query {
+        // Taken above, before the borrow.
+        QueryPurpose::PreparedRows(_) => ddl_error("internal error: a prepared parse reached the text dispatch"),
         // An index over a document path. Recorded in the table's sidecar, which
         // is read when the table is opened.
         QueryPurpose::CreateIndex(sql) => {
@@ -10845,6 +10865,7 @@ pub(crate) async fn execute_with_need(
             }
         }
         QueryPurpose::QueryRows(query_rows) => {
+            crate::core::rql::prepared::note_select_entry();
             // `A UNION [ALL] B` is run branch by branch and the rows combined.
             // Kept out of this frame — see `execute_union`.
             if crate::core::rql::join::split_union(&query_rows.query).is_some() {
@@ -10921,897 +10942,942 @@ pub(crate) async fn execute_with_need(
                 }
             };
 
-            // An aggregate query folds the scanned rows into groups, so it
-            // takes the row-mode path: the bytes path never materialises a
-            // `Vec<Row>` for the fold to read.
-            if let Some(plan) = query_row.aggregate.clone() {
-                // `SELECT COUNT(*)` and nothing else: the scan counts matches
-                // and never builds a row. The general path below fetches every
-                // matching row into a `Vec<Row>` for the fold to walk, which is
-                // ~1.5 GB of `Row` for a million-row count and measured four
-                // times the cost of *sorting* the same table.
-                //
-                // `is_row_count_only` is where the safety lives — in particular
-                // it rejects `COUNT(*) FILTER (WHERE …)`, whose `arg` is `None`
-                // exactly like a bare `COUNT(*)` and which would otherwise be
-                // answered with the unfiltered count.
-                if crate::core::rql::aggregate::is_row_count_only(&plan) {
-                    match table
-                        .count_rows_in_txn(
-                            &query_row.where_clause,
-                            &schema.fields.to_vec(),
-                            query_row.query_row_fetch,
-                            tx,
-                        )
-                        .await
+            crate::core::rql::prepared::note_plain(table_name, &query_row);
+            Box::pin(execute_query_rows(query_row, table.value().clone(), &database, tx)).await
+        }
+    }
+}
+
+/// A prepared plain read outside any transaction block, run on a snapshot
+/// of its own rather than inside an autocommit transaction.
+///
+/// A read writes nothing, so the transaction around it only cost: an id,
+/// an outcome recorded in the status log, the active set updated twice, and
+/// the commit path. `FROZEN_TX` takes the same snapshot, registered the same
+/// way, so reclamation holds off exactly as it does for a transaction.
+/// Locking reads (`FOR UPDATE`) still need a transaction and do not come here.
+pub async fn execute_prepared_read(
+    prepared: Box<crate::core::rql::prepared::PreparedRows>,
+    database: Arc<Database>,
+) -> Vec<u8> {
+    use futures::FutureExt;
+    let prepared = *prepared;
+    let table = database.tables.get(&prepared.table_name).map(|t| t.value().clone());
+    let Some(table) = table else {
+        return ddl_error("Table not found");
+    };
+    let tx = crate::core::mvcc::transaction::FROZEN_TX;
+    match std::panic::AssertUnwindSafe(Box::pin(execute_query_rows(prepared.query_row, table, &database, tx)))
+        .catch_unwind()
+        .await
+    {
+        Ok(response) => response,
+        Err(_) => {
+            error!("a prepared read panicked");
+            ddl_error("internal error: the statement panicked")
+        }
+    }
+}
+
+/// A parsed single-table `SELECT`, run: the half of the `QueryRows` arm that
+/// reads only the parse, never the statement text. A prepared statement
+/// enters here with a parse it cached at its first execution.
+pub(crate) async fn execute_query_rows(
+    query_row: crate::core::rql::lexer_query::QueryRows,
+    table: Arc<crate::core::row::table::Table<crate::core::storage_providers::backend::DbStorageProvider>>,
+    database: &Arc<Database>,
+    tx: TxId,
+) -> Vec<u8> {
+    let schema = &table.schema;
+    // An aggregate query folds the scanned rows into groups, so it
+    // takes the row-mode path: the bytes path never materialises a
+    // `Vec<Row>` for the fold to read.
+    if let Some(plan) = query_row.aggregate.clone() {
+        // `SELECT COUNT(*)` and nothing else: the scan counts matches
+        // and never builds a row. The general path below fetches every
+        // matching row into a `Vec<Row>` for the fold to walk, which is
+        // ~1.5 GB of `Row` for a million-row count and measured four
+        // times the cost of *sorting* the same table.
+        //
+        // `is_row_count_only` is where the safety lives — in particular
+        // it rejects `COUNT(*) FILTER (WHERE …)`, whose `arg` is `None`
+        // exactly like a bare `COUNT(*)` and which would otherwise be
+        // answered with the unfiltered count.
+        if crate::core::rql::aggregate::is_row_count_only(&plan) {
+            match table
+                .count_rows_in_txn(
+                    &query_row.where_clause,
+                    &schema.fields.to_vec(),
+                    query_row.query_row_fetch,
+                    tx,
+                )
+                .await
+            {
+                Ok(count) => {
+                    let mut result = vec![2u8];
+                    for row in &crate::core::rql::aggregate::row_count_result(&plan, count)
                     {
-                        Ok(count) => {
-                            let mut result = vec![2u8];
-                            for row in &crate::core::rql::aggregate::row_count_result(&plan, count)
-                            {
-                                row.extend_serialized(&mut result);
-                            }
-                            return result;
+                        row.extend_serialized(&mut result);
+                    }
+                    return result;
+                }
+                Err(e) => {
+                    error!("Failed to execute count query: {}", e);
+                    let mut result = vec![3u8];
+                    result.extend_from_slice(e.to_string().as_bytes());
+                    return result;
+                }
+            }
+        }
+
+        // The fold has to see the `__null_` companions of every column
+        // it reads, or a NULL is indistinguishable from the zeros its
+        // value column holds. The select path fetches them because the
+        // projection needs them; the aggregate fetch asks only for the
+        // value columns, so they are added here.
+        let aggregate_fetch = {
+            let mut wanted: Vec<crate::core::row::schema::SchemaField> = Vec::new();
+            for c in &query_row.requested_row_fetch.columns_fetching_data {
+                if let Some(f) = schema.fields.iter().find(|f| f.write_order == c.schema_id)
+                {
+                    wanted.push(f.clone());
+                }
+            }
+            for f in wanted.clone() {
+                if let Some(flag) =
+                    crate::core::rql::nullable::flag_field(&f.name, &schema.fields)
+                {
+                    if !wanted.iter().any(|w| w.name == flag.name) {
+                        wanted.push(flag.clone());
+                    }
+                }
+            }
+            crate::core::rql::join::fetch_for(&wanted, &schema.fields)
+        };
+        // Folded straight from the scan's serialized rows, one decoded
+        // row at a time: the `Vec<Row>` the path below builds is
+        // 1.5 KB per matched row (1.56 GB for a million) before the
+        // fold reads any of it. A shredded JSON column still takes
+        // that path, because its documents are hydrated (async, per
+        // row) before grouping. `RDB_FOLD_ROWS=1` forces it, for A/B.
+        if schema.json_columns.is_empty() && !legacy_row_fold() {
+            let folded = match table
+                .query_row_bytes_in_txn(
+                    &query_row.where_clause,
+                    &schema.fields.to_vec(),
+                    query_row.query_row_fetch.clone(),
+                    aggregate_fetch.clone(),
+                    // No limit and no ordering, as below.
+                    None,
+                    None,
+                    tx,
+                )
+                .await
+            {
+                Ok(bytes) => {
+                    let mut result = vec![2u8];
+                    fold_serialized(&schema, &plan, &bytes, &mut result).map(|()| result)
+                }
+                Err(e) => Err(e.to_string()),
+            };
+            return match folded {
+                Ok(result) => result,
+                Err(e) => {
+                    error!("Aggregate failed: {}", e);
+                    let mut result = vec![3u8];
+                    result.extend_from_slice(e.as_bytes());
+                    result
+                }
+            };
+        }
+        match table
+            .query_row_in_txn(
+                &query_row.where_clause,
+                &schema.fields.to_vec(),
+                query_row.query_row_fetch,
+                aggregate_fetch,
+                // Deliberately no limit and no ordering: both apply to
+                // the aggregated output, and a limit here would also
+                // enable early scan termination and truncate the input.
+                None,
+                None,
+                tx,
+            )
+            .await
+        {
+            Ok(mut rows) => {
+                retype_nulls_from_flags(&schema, &mut rows);
+                hydrate_json_columns(&database, &schema, &mut rows, tx).await;
+                let grouped = match crate::core::rql::aggregate::fold(&plan, &rows) {
+                    Ok(folded) => folded,
+                    Err(e) => {
+                        error!("Aggregate failed: {}", e);
+                        let mut result = vec![3u8];
+                        result.extend_from_slice(e.as_bytes());
+                        return result;
+                    }
+                };
+                let mut result = vec![2u8];
+                for row in &grouped {
+                    row.extend_serialized(&mut result);
+                }
+                return result;
+            }
+            Err(e) => {
+                error!("Failed to execute aggregate query: {}", e);
+                let mut result = vec![3u8];
+                result.extend_from_slice(e.to_string().as_bytes());
+                return result;
+            }
+        }
+    }
+
+    let offset = query_row.offset.unwrap_or(0);
+    // A sort key that was not selected is fetched anyway and trimmed
+    // here, so the client never sees the extra column.
+    let visible_columns = query_row.visible_columns;
+    let trim_sort_key =
+        visible_columns < query_row.requested_row_fetch.columns_fetching_data.len();
+    // A predicate the scan cannot answer from the requested columns
+    // alone makes it fetch the ones it needs, and those came back in
+    // the row. Without decoding it there is nothing to trim them from,
+    // so the extra column went out to the client — which counted the
+    // fields against the RowDescription and dropped the connection
+    // with "unexpected field count in D message". Only shapes the
+    // scan actually over-fetches for set this, so the ordinary path
+    // still skips the decode.
+    let may_overfetch = query_row.predicate_needs_extra_columns;
+    // `FOR UPDATE` has to see the rows to lock them, so it forces the
+    // decode the same way the other row-level steps do.
+    // Window functions are computed after the scan, over every row
+    // that survived `WHERE` — which is where SQL puts them, and why
+    // they need the whole result set rather than one row at a time.
+    let window_slots = query_row.window_slots.clone();
+    let has_windows = !window_slots.is_empty();
+    // Expression sort keys: evaluated per fetched row, sorted here,
+    // because the scan can only sort by stored columns.
+    let order_exprs = query_row.order_expressions.clone();
+    let has_order_exprs = !order_exprs.is_empty();
+    let row_lock = query_row.row_lock;
+    let lock_table_name = table.schema.name.clone();
+    let skip_locked = matches!(
+        row_lock,
+        Some(crate::core::rql::row_lock::RowLock {
+            behaviour: crate::core::rql::row_lock::LockWait::Skip,
+            ..
+        })
+    );
+    let distinct = query_row.distinct;
+    let written_limit = query_row.written_limit;
+    let null_flags = query_row.null_flag_positions.clone();
+    let has_nullable = null_flags.iter().any(Option::is_some);
+
+    // Which output positions hold a JSON reference, and the table to
+    // rebuild each from. A JSON column stores a UUID; the client is
+    // owed the document.
+    // Keyed by `schema_id`, which names the column, rather than by
+    // output position.
+    //
+    // A position is not stable: a constant or a row expression fills an
+    // output slot no fetched column occupies, and the select list may
+    // put it first. Indexing by position then rewrote the wrong slot
+    // and the document came back NULL — `SELECT sb FROM t` and
+    // `SELECT sb, title FROM t` were right while `SELECT sb, 1` and
+    // `SELECT sb, title || 'x'` silently lost the value. A schema id
+    // cannot drift, whatever the select list does.
+    let json_positions: Vec<(u64, String)> = if schema.json_columns.is_empty() {
+        Vec::new()
+    } else {
+        query_row
+            .requested_row_fetch
+            .columns_fetching_data
+            .iter()
+            .take(query_row.visible_columns)
+            .filter_map(|c| {
+                let field = schema
+                    .fields
+                    .iter()
+                    .find(|f| f.write_order == c.schema_id)?;
+                crate::core::rql::json_map::shadow_for(&field.name, &schema.json_columns)
+                    .map(|t| (c.schema_id, t.to_string()))
+            })
+            .collect()
+    };
+    let has_json = !json_positions.is_empty();
+    // Constants and per-row scalars both fill output positions that no
+    // fetched column occupies. Merged into one ordered list so the
+    // splice below stays index-correct whichever kind comes first.
+    let mut value_slots: Vec<(usize, SlotValue, crate::core::db_type::DbType)> = query_row
+        .literal_slots
+        .iter()
+        .map(|(position, bytes, db_type)| {
+            (
+                *position,
+                SlotValue::Constant(bytes.clone()),
+                db_type.clone(),
+            )
+        })
+        .chain(
+            query_row
+                .scalar_slots
+                .iter()
+                .map(|(position, func, db_type)| {
+                    (*position, SlotValue::Scalar(*func), db_type.clone())
+                }),
+        )
+        .chain(
+            query_row
+                .expr_slots
+                .iter()
+                .map(|(position, expr, db_type)| {
+                    (
+                        *position,
+                        SlotValue::RowExpression(expr.clone()),
+                        db_type.clone(),
+                    )
+                }),
+        )
+        .collect();
+    value_slots.sort_by_key(|(position, ..)| *position);
+    let slot_schema = schema.fields.to_vec();
+    let has_literals = !value_slots.is_empty();
+
+    {
+        match table
+            .query_row_bytes_in_txn(
+                &query_row.where_clause,
+                &schema.fields.to_vec(),
+                query_row.query_row_fetch,
+                query_row.requested_row_fetch,
+                // `SKIP LOCKED` filters *after* the scan, so a limit
+                // pushed down would be spent on rows that are then
+                // skipped — two workers claiming from the head of the
+                // same queue would leave the second with nothing, which
+                // is the opposite of what the clause is for. The limit
+                // is applied below instead, once the skipping is done.
+                // A window is computed over every row `WHERE` kept,
+                // before paging, so a limit pushed into the scan made
+                // `SUM(v) OVER ()` the sum of the page. Paged below.
+                if skip_locked || has_windows { None } else { query_row.limit },
+                query_row.order_by,
+                tx,
+            )
+            .await
+        {
+            Ok(rows_bytes) => {
+                info!(
+                    "Query executed successfully, returning {} bytes",
+                    rows_bytes.len()
+                );
+
+                // Everything below that needs a row decoded. `OFFSET`
+                // is deliberately not in it: on its own it only drops
+                // rows from the front, which the length headers can do
+                // without decoding anything (below).
+                let needs_rows = trim_sort_key
+                    || distinct
+                    || has_nullable
+                    || has_literals
+                    || has_json
+                    || may_overfetch
+                    || row_lock.is_some()
+                    || has_windows
+                    || has_order_exprs;
+
+                // How many rows of an expression sort's output the
+                // steps below can use, when that is fewer than all of
+                // them. Cutting there lets the sort select rather than
+                // sort, and keeps the page's rows — and only those —
+                // for the per-row work (NULL retyping, trimming, JSON
+                // hydration with its document loads, slot evaluation).
+                //
+                // An allowlist over `QueryRows`; each field is here
+                // because of what it does with the rows past the page:
+                //  * `distinct` — duplicates are removed after this
+                //    point, so the page is not known until they are:
+                //    blocks.
+                //  * `window_slots` — a window is computed over every
+                //    row that survived WHERE: blocks.
+                //  * `row_lock` (any, including `SKIP LOCKED`) — rows
+                //    the lock skips are replaced by later ones: blocks.
+                //  * `written_limit` — no limit, no cap.
+                //  * `offset` — part of the cap; the skip below still
+                //    runs over the capped rows.
+                //  * `aggregate` — returned above, never reaches here.
+                //  * `limit`/`order_by` — what the scan was given; an
+                //    expression sort runs over an unbounded, unsorted
+                //    scan (`lexer_query`'s expression branch).
+                //  * `literal_slots`, `scalar_slots`, `expr_slots`,
+                //    `null_flag_positions`, `predicate_needs_extra_
+                //    columns`, `visible_columns`, `select_items`, JSON
+                //    columns — per row, nothing reads another row. A
+                //    select expression that would fail on a row outside
+                //    the page is therefore not evaluated there, which is
+                //    what every LIMIT pushed into the scan already does.
+                //  * `where_clause`, the fetches, `table_name` — spent
+                //    by the scan.
+                // A field added to `QueryRows` that looks at more than
+                // one row has to be added here as a blocker.
+                let expr_sort_cap: Option<usize> =
+                    if !distinct && !has_windows && row_lock.is_none() && !skip_locked {
+                        written_limit.map(|limit| {
+                            usize::try_from(limit.saturating_add(offset))
+                                .unwrap_or(usize::MAX)
+                        })
+                    } else {
+                        None
+                    };
+
+                // Where the page starts in `rows_bytes`. Non-zero only
+                // when `OFFSET` is the one thing to do here.
+                let mut page_start = 0usize;
+
+                // `OFFSET` drops rows from the front. The scan already
+                // fetched `limit + offset` of them, so the skip happens
+                // here rather than costing another pass over the table.
+                let rows_bytes = if offset > 0 && !needs_rows {
+                    // The rows it drops are walked past by their
+                    // headers, never decoded; what remains is already
+                    // in the wire format.
+                    match crate::core::row::row::skip_serialized_rows(&rows_bytes, offset) {
+                        Ok(page) => {
+                            page_start = rows_bytes.len() - page.len();
+                            rows_bytes
                         }
                         Err(e) => {
-                            error!("Failed to execute count query: {}", e);
+                            error!("Failed to page the result set: {}", e);
                             let mut result = vec![3u8];
                             result.extend_from_slice(e.to_string().as_bytes());
                             return result;
                         }
                     }
-                }
-
-                // The fold has to see the `__null_` companions of every column
-                // it reads, or a NULL is indistinguishable from the zeros its
-                // value column holds. The select path fetches them because the
-                // projection needs them; the aggregate fetch asks only for the
-                // value columns, so they are added here.
-                let aggregate_fetch = {
-                    let mut wanted: Vec<crate::core::row::schema::SchemaField> = Vec::new();
-                    for c in &query_row.requested_row_fetch.columns_fetching_data {
-                        if let Some(f) = schema.fields.iter().find(|f| f.write_order == c.schema_id)
-                        {
-                            wanted.push(f.clone());
-                        }
-                    }
-                    for f in wanted.clone() {
-                        if let Some(flag) =
-                            crate::core::rql::nullable::flag_field(&f.name, &schema.fields)
-                        {
-                            if !wanted.iter().any(|w| w.name == flag.name) {
-                                wanted.push(flag.clone());
-                            }
-                        }
-                    }
-                    crate::core::rql::join::fetch_for(&wanted, &schema.fields)
-                };
-                // Folded straight from the scan's serialized rows, one decoded
-                // row at a time: the `Vec<Row>` the path below builds is
-                // 1.5 KB per matched row (1.56 GB for a million) before the
-                // fold reads any of it. A shredded JSON column still takes
-                // that path, because its documents are hydrated (async, per
-                // row) before grouping. `RDB_FOLD_ROWS=1` forces it, for A/B.
-                if schema.json_columns.is_empty() && !legacy_row_fold() {
-                    let folded = match table
-                        .query_row_bytes_in_txn(
-                            &query_row.where_clause,
-                            &schema.fields.to_vec(),
-                            query_row.query_row_fetch.clone(),
-                            aggregate_fetch.clone(),
-                            // No limit and no ordering, as below.
-                            None,
-                            None,
-                            tx,
-                        )
-                        .await
-                    {
-                        Ok(bytes) => {
-                            let mut result = vec![2u8];
-                            fold_serialized(&schema, &plan, &bytes, &mut result).map(|()| result)
-                        }
-                        Err(e) => Err(e.to_string()),
-                    };
-                    return match folded {
-                        Ok(result) => result,
-                        Err(e) => {
-                            error!("Aggregate failed: {}", e);
-                            let mut result = vec![3u8];
-                            result.extend_from_slice(e.as_bytes());
-                            result
-                        }
-                    };
-                }
-                match table
-                    .query_row_in_txn(
-                        &query_row.where_clause,
-                        &schema.fields.to_vec(),
-                        query_row.query_row_fetch,
-                        aggregate_fetch,
-                        // Deliberately no limit and no ordering: both apply to
-                        // the aggregated output, and a limit here would also
-                        // enable early scan termination and truncate the input.
-                        None,
-                        None,
-                        tx,
-                    )
-                    .await
-                {
-                    Ok(mut rows) => {
-                        retype_nulls_from_flags(&schema, &mut rows);
-                        hydrate_json_columns(&database, &schema, &mut rows, tx).await;
-                        let grouped = match crate::core::rql::aggregate::fold(&plan, &rows) {
-                            Ok(folded) => folded,
-                            Err(e) => {
-                                error!("Aggregate failed: {}", e);
+                } else if needs_rows || offset > 0 {
+                    let decoded: Result<PageRows<'_>, String> =
+                        if has_order_exprs {
+                            // A key reaching into a *shredded* JSON
+                            // column would read a stored UUID, evaluate
+                            // to NULL on every row, and quietly not sort
+                            // at all.
+                            let shadowed = order_exprs.iter().any(|(expr, ..)| {
+                                crate::core::rql::expr::columns_of(expr).iter().any(|f| {
+                                    crate::core::rql::json_map::shadow_for(
+                                        &f.name,
+                                        &schema.json_columns,
+                                    )
+                                    .is_some()
+                                })
+                            });
+                            if shadowed {
+                                let e = "ORDER BY into a JSON column stored as shadow tables is not supported; store the column as native JSONB";
+                                error!("{}", e);
                                 let mut result = vec![3u8];
                                 result.extend_from_slice(e.as_bytes());
                                 return result;
                             }
-                        };
-                        let mut result = vec![2u8];
-                        for row in &grouped {
-                            row.extend_serialized(&mut result);
-                        }
-                        return result;
-                    }
-                    Err(e) => {
-                        error!("Failed to execute aggregate query: {}", e);
-                        let mut result = vec![3u8];
-                        result.extend_from_slice(e.to_string().as_bytes());
-                        return result;
-                    }
-                }
-            }
-
-            let offset = query_row.offset.unwrap_or(0);
-            // A sort key that was not selected is fetched anyway and trimmed
-            // here, so the client never sees the extra column.
-            let visible_columns = query_row.visible_columns;
-            let trim_sort_key =
-                visible_columns < query_row.requested_row_fetch.columns_fetching_data.len();
-            // A predicate the scan cannot answer from the requested columns
-            // alone makes it fetch the ones it needs, and those came back in
-            // the row. Without decoding it there is nothing to trim them from,
-            // so the extra column went out to the client — which counted the
-            // fields against the RowDescription and dropped the connection
-            // with "unexpected field count in D message". Only shapes the
-            // scan actually over-fetches for set this, so the ordinary path
-            // still skips the decode.
-            let may_overfetch = query_row.predicate_needs_extra_columns;
-            // `FOR UPDATE` has to see the rows to lock them, so it forces the
-            // decode the same way the other row-level steps do.
-            // Window functions are computed after the scan, over every row
-            // that survived `WHERE` — which is where SQL puts them, and why
-            // they need the whole result set rather than one row at a time.
-            let window_slots = query_row.window_slots.clone();
-            let has_windows = !window_slots.is_empty();
-            // Expression sort keys: evaluated per fetched row, sorted here,
-            // because the scan can only sort by stored columns.
-            let order_exprs = query_row.order_expressions.clone();
-            let has_order_exprs = !order_exprs.is_empty();
-            let row_lock = query_row.row_lock;
-            let lock_table_name = table.schema.name.clone();
-            let skip_locked = matches!(
-                row_lock,
-                Some(crate::core::rql::row_lock::RowLock {
-                    behaviour: crate::core::rql::row_lock::LockWait::Skip,
-                    ..
-                })
-            );
-            let distinct = query_row.distinct;
-            let written_limit = query_row.written_limit;
-            let null_flags = query_row.null_flag_positions.clone();
-            let has_nullable = null_flags.iter().any(Option::is_some);
-
-            // Which output positions hold a JSON reference, and the table to
-            // rebuild each from. A JSON column stores a UUID; the client is
-            // owed the document.
-            // Keyed by `schema_id`, which names the column, rather than by
-            // output position.
-            //
-            // A position is not stable: a constant or a row expression fills an
-            // output slot no fetched column occupies, and the select list may
-            // put it first. Indexing by position then rewrote the wrong slot
-            // and the document came back NULL — `SELECT sb FROM t` and
-            // `SELECT sb, title FROM t` were right while `SELECT sb, 1` and
-            // `SELECT sb, title || 'x'` silently lost the value. A schema id
-            // cannot drift, whatever the select list does.
-            let json_positions: Vec<(u64, String)> = if schema.json_columns.is_empty() {
-                Vec::new()
-            } else {
-                query_row
-                    .requested_row_fetch
-                    .columns_fetching_data
-                    .iter()
-                    .take(query_row.visible_columns)
-                    .filter_map(|c| {
-                        let field = schema
-                            .fields
-                            .iter()
-                            .find(|f| f.write_order == c.schema_id)?;
-                        crate::core::rql::json_map::shadow_for(&field.name, &schema.json_columns)
-                            .map(|t| (c.schema_id, t.to_string()))
-                    })
-                    .collect()
-            };
-            let has_json = !json_positions.is_empty();
-            // Constants and per-row scalars both fill output positions that no
-            // fetched column occupies. Merged into one ordered list so the
-            // splice below stays index-correct whichever kind comes first.
-            let mut value_slots: Vec<(usize, SlotValue, crate::core::db_type::DbType)> = query_row
-                .literal_slots
-                .iter()
-                .map(|(position, bytes, db_type)| {
-                    (
-                        *position,
-                        SlotValue::Constant(bytes.clone()),
-                        db_type.clone(),
-                    )
-                })
-                .chain(
-                    query_row
-                        .scalar_slots
-                        .iter()
-                        .map(|(position, func, db_type)| {
-                            (*position, SlotValue::Scalar(*func), db_type.clone())
-                        }),
-                )
-                .chain(
-                    query_row
-                        .expr_slots
-                        .iter()
-                        .map(|(position, expr, db_type)| {
-                            (
-                                *position,
-                                SlotValue::RowExpression(expr.clone()),
-                                db_type.clone(),
-                            )
-                        }),
-                )
-                .collect();
-            value_slots.sort_by_key(|(position, ..)| *position);
-            let slot_schema = schema.fields.to_vec();
-            let has_literals = !value_slots.is_empty();
-
-            {
-                match table
-                    .query_row_bytes_in_txn(
-                        &query_row.where_clause,
-                        &schema.fields.to_vec(),
-                        query_row.query_row_fetch,
-                        query_row.requested_row_fetch,
-                        // `SKIP LOCKED` filters *after* the scan, so a limit
-                        // pushed down would be spent on rows that are then
-                        // skipped — two workers claiming from the head of the
-                        // same queue would leave the second with nothing, which
-                        // is the opposite of what the clause is for. The limit
-                        // is applied below instead, once the skipping is done.
-                        // A window is computed over every row `WHERE` kept,
-                        // before paging, so a limit pushed into the scan made
-                        // `SUM(v) OVER ()` the sum of the page. Paged below.
-                        if skip_locked || has_windows { None } else { query_row.limit },
-                        query_row.order_by,
-                        tx,
-                    )
-                    .await
-                {
-                    Ok(rows_bytes) => {
-                        info!(
-                            "Query executed successfully, returning {} bytes",
-                            rows_bytes.len()
-                        );
-
-                        // Everything below that needs a row decoded. `OFFSET`
-                        // is deliberately not in it: on its own it only drops
-                        // rows from the front, which the length headers can do
-                        // without decoding anything (below).
-                        let needs_rows = trim_sort_key
-                            || distinct
-                            || has_nullable
-                            || has_literals
-                            || has_json
-                            || may_overfetch
-                            || row_lock.is_some()
-                            || has_windows
-                            || has_order_exprs;
-
-                        // How many rows of an expression sort's output the
-                        // steps below can use, when that is fewer than all of
-                        // them. Cutting there lets the sort select rather than
-                        // sort, and keeps the page's rows — and only those —
-                        // for the per-row work (NULL retyping, trimming, JSON
-                        // hydration with its document loads, slot evaluation).
-                        //
-                        // An allowlist over `QueryRows`; each field is here
-                        // because of what it does with the rows past the page:
-                        //  * `distinct` — duplicates are removed after this
-                        //    point, so the page is not known until they are:
-                        //    blocks.
-                        //  * `window_slots` — a window is computed over every
-                        //    row that survived WHERE: blocks.
-                        //  * `row_lock` (any, including `SKIP LOCKED`) — rows
-                        //    the lock skips are replaced by later ones: blocks.
-                        //  * `written_limit` — no limit, no cap.
-                        //  * `offset` — part of the cap; the skip below still
-                        //    runs over the capped rows.
-                        //  * `aggregate` — returned above, never reaches here.
-                        //  * `limit`/`order_by` — what the scan was given; an
-                        //    expression sort runs over an unbounded, unsorted
-                        //    scan (`lexer_query`'s expression branch).
-                        //  * `literal_slots`, `scalar_slots`, `expr_slots`,
-                        //    `null_flag_positions`, `predicate_needs_extra_
-                        //    columns`, `visible_columns`, `select_items`, JSON
-                        //    columns — per row, nothing reads another row. A
-                        //    select expression that would fail on a row outside
-                        //    the page is therefore not evaluated there, which is
-                        //    what every LIMIT pushed into the scan already does.
-                        //  * `where_clause`, the fetches, `table_name` — spent
-                        //    by the scan.
-                        // A field added to `QueryRows` that looks at more than
-                        // one row has to be added here as a blocker.
-                        let expr_sort_cap: Option<usize> =
-                            if !distinct && !has_windows && row_lock.is_none() && !skip_locked {
-                                written_limit.map(|limit| {
-                                    usize::try_from(limit.saturating_add(offset))
-                                        .unwrap_or(usize::MAX)
-                                })
+                            // Sorted before anything is trimmed: the
+                            // keys read columns that ride after the
+                            // visible ones, and `column_value` finds
+                            // NULL companions in the same row.
+                            // Decoding every row, evaluating its keys
+                            // and sorting is CPU with no await in it;
+                            // above a size it leaves the async worker
+                            // so other sessions' tasks queued on that
+                            // thread keep running (as the scan's own
+                            // sort does).
+                            let sort = || {
+                                sort_rows_by_expressions(
+                                    &rows_bytes,
+                                    &order_exprs,
+                                    &slot_schema,
+                                    expr_sort_cap,
+                                )
+                            };
+                            let large = crate::core::row::row::count_serialized_rows(&rows_bytes)
+                                >= crate::core::processor::concurrent_processor::SORT_OFF_RUNTIME_ROWS
+                                    as u64;
+                            let multi_thread = tokio::runtime::Handle::try_current()
+                                .is_ok_and(|h| {
+                                    h.runtime_flavor()
+                                        == tokio::runtime::RuntimeFlavor::MultiThread
+                                });
+                            let sorted = if large
+                                && multi_thread
+                                && crate::core::processor::concurrent_processor::latency_guards_on()
+                            {
+                                tokio::task::block_in_place(sort)
                             } else {
-                                None
+                                sort()
+                            };
+                            sorted
+                            .map(|rows| PageRows::Sorted(rows.into_iter()))
+                            .map_err(|e| {
+                                error!("ORDER BY failed: {}", e);
+                                e
+                            })
+                        } else {
+                            // Decoded one at a time as the loop below
+                            // asks for them, never as a `Vec<Row>`.
+                            Ok(PageRows::Serialized(
+                                crate::core::row::row::serialized_rows(&rows_bytes),
+                            ))
+                        };
+                    match decoded {
+                        Ok(mut source) => {
+                            // The page boundaries, decided before the
+                            // loop so a streaming pass can apply them
+                            // as it goes. `DISTINCT` removes rows, so
+                            // paging has to run over what survived
+                            // rather than over the scan's output. An
+                            // expression sort ran over an unbounded
+                            // scan, so the page is cut here too.
+                            let (skip, take) = if distinct
+                                || skip_locked
+                                || has_order_exprs
+                                || has_windows
+                            {
+                                (offset as usize, written_limit)
+                            } else {
+                                (offset as usize, None)
                             };
 
-                        // Where the page starts in `rows_bytes`. Non-zero only
-                        // when `OFFSET` is the one thing to do here.
-                        let mut page_start = 0usize;
+                            // Rows go straight from decode through the
+                            // per-row steps into the output buffer, one
+                            // at a time, unless a later step needs all
+                            // of them together: a window is computed
+                            // over the whole result, and a lock claims
+                            // rows before any is handed over (and with
+                            // SKIP LOCKED decides which rows the page
+                            // holds). Holding a decoded copy of every
+                            // row as well as the bytes it came from was
+                            // ~1.5 KB a row on top of the result.
+                            let streaming = !has_windows && row_lock.is_none();
+                            let mut out: Vec<u8> = Vec::new();
+                            let mut skipped = 0usize;
+                            let mut emitted = 0u64;
 
-                        // `OFFSET` drops rows from the front. The scan already
-                        // fetched `limit + offset` of them, so the skip happens
-                        // here rather than costing another pass over the table.
-                        let rows_bytes = if offset > 0 && !needs_rows {
-                            // The rows it drops are walked past by their
-                            // headers, never decoded; what remains is already
-                            // in the wire format.
-                            match crate::core::row::row::skip_serialized_rows(&rows_bytes, offset) {
-                                Ok(page) => {
-                                    page_start = rows_bytes.len() - page.len();
-                                    rows_bytes
+                            // Trim first, so `DISTINCT` compares only
+                            // the columns the client asked for and does
+                            // not treat rows as distinct because of a
+                            // sort key it cannot see.
+                            let mut kept: Vec<crate::core::row::row::Row> = if streaming {
+                                Vec::new()
+                            } else {
+                                Vec::with_capacity(source.remaining_hint(&rows_bytes))
+                            };
+                            // Sized only when `DISTINCT` will use it:
+                            // a hash table with room for every row is
+                            // tens of megabytes on a large result.
+                            let mut seen: ahash::HashSet<Vec<u8>> =
+                                ahash::HashSet::with_capacity_and_hasher(
+                                    if distinct {
+                                        source.remaining_hint(&rows_bytes)
+                                    } else {
+                                        0
+                                    },
+                                    Default::default(),
+                                );
+
+                            let mut processed = 0usize;
+                            loop {
+                                // The page is full: nothing after this
+                                // can reach the client, so it is not
+                                // decoded either.
+                                if streaming && take.is_some_and(|cap| emitted >= cap) {
+                                    break;
                                 }
-                                Err(e) => {
-                                    error!("Failed to page the result set: {}", e);
-                                    let mut result = vec![3u8];
-                                    result.extend_from_slice(e.to_string().as_bytes());
-                                    return result;
+                                // Nothing in this loop suspends unless
+                                // a row needs a JSON document loaded,
+                                // so a large result would hold the
+                                // worker thread from first row to last
+                                // and every task queued behind it —
+                                // other sessions' point reads — would
+                                // wait. One yield per 1024 rows.
+                                processed += 1;
+                                if processed % 1024 == 0
+                                    && crate::core::processor::concurrent_processor::latency_guards_on()
+                                {
+                                    tokio::task::yield_now().await;
                                 }
-                            }
-                        } else if needs_rows || offset > 0 {
-                            let decoded: Result<PageRows<'_>, String> =
-                                if has_order_exprs {
-                                    // A key reaching into a *shredded* JSON
-                                    // column would read a stored UUID, evaluate
-                                    // to NULL on every row, and quietly not sort
-                                    // at all.
-                                    let shadowed = order_exprs.iter().any(|(expr, ..)| {
-                                        crate::core::rql::expr::columns_of(expr).iter().any(|f| {
-                                            crate::core::rql::json_map::shadow_for(
-                                                &f.name,
-                                                &schema.json_columns,
-                                            )
-                                            .is_some()
-                                        })
-                                    });
-                                    if shadowed {
-                                        let e = "ORDER BY into a JSON column stored as shadow tables is not supported; store the column as native JSONB";
-                                        error!("{}", e);
+                                let mut row = match source.next_row() {
+                                    None => break,
+                                    Some(Ok(row)) => row,
+                                    Some(Err(e)) => {
+                                        error!("Failed to trim the result set: {}", e);
                                         let mut result = vec![3u8];
                                         result.extend_from_slice(e.as_bytes());
                                         return result;
                                     }
-                                    // Sorted before anything is trimmed: the
-                                    // keys read columns that ride after the
-                                    // visible ones, and `column_value` finds
-                                    // NULL companions in the same row.
-                                    // Decoding every row, evaluating its keys
-                                    // and sorting is CPU with no await in it;
-                                    // above a size it leaves the async worker
-                                    // so other sessions' tasks queued on that
-                                    // thread keep running (as the scan's own
-                                    // sort does).
-                                    let sort = || {
-                                        sort_rows_by_expressions(
-                                            &rows_bytes,
-                                            &order_exprs,
-                                            &slot_schema,
-                                            expr_sort_cap,
-                                        )
-                                    };
-                                    let large = crate::core::row::row::count_serialized_rows(&rows_bytes)
-                                        >= crate::core::processor::concurrent_processor::SORT_OFF_RUNTIME_ROWS
-                                            as u64;
-                                    let multi_thread = tokio::runtime::Handle::try_current()
-                                        .is_ok_and(|h| {
-                                            h.runtime_flavor()
-                                                == tokio::runtime::RuntimeFlavor::MultiThread
-                                        });
-                                    let sorted = if large
-                                        && multi_thread
-                                        && crate::core::processor::concurrent_processor::latency_guards_on()
-                                    {
-                                        tokio::task::block_in_place(sort)
-                                    } else {
-                                        sort()
-                                    };
-                                    sorted
-                                    .map(|rows| PageRows::Sorted(rows.into_iter()))
-                                    .map_err(|e| {
-                                        error!("ORDER BY failed: {}", e);
-                                        e
-                                    })
-                                } else {
-                                    // Decoded one at a time as the loop below
-                                    // asks for them, never as a `Vec<Row>`.
-                                    Ok(PageRows::Serialized(
-                                        crate::core::row::row::serialized_rows(&rows_bytes),
-                                    ))
                                 };
-                            match decoded {
-                                Ok(mut source) => {
-                                    // The page boundaries, decided before the
-                                    // loop so a streaming pass can apply them
-                                    // as it goes. `DISTINCT` removes rows, so
-                                    // paging has to run over what survived
-                                    // rather than over the scan's output. An
-                                    // expression sort ran over an unbounded
-                                    // scan, so the page is cut here too.
-                                    let (skip, take) = if distinct
-                                        || skip_locked
-                                        || has_order_exprs
-                                        || has_windows
-                                    {
-                                        (offset as usize, written_limit)
-                                    } else {
-                                        (offset as usize, None)
-                                    };
-
-                                    // Rows go straight from decode through the
-                                    // per-row steps into the output buffer, one
-                                    // at a time, unless a later step needs all
-                                    // of them together: a window is computed
-                                    // over the whole result, and a lock claims
-                                    // rows before any is handed over (and with
-                                    // SKIP LOCKED decides which rows the page
-                                    // holds). Holding a decoded copy of every
-                                    // row as well as the bytes it came from was
-                                    // ~1.5 KB a row on top of the result.
-                                    let streaming = !has_windows && row_lock.is_none();
-                                    let mut out: Vec<u8> = Vec::new();
-                                    let mut skipped = 0usize;
-                                    let mut emitted = 0u64;
-
-                                    // Trim first, so `DISTINCT` compares only
-                                    // the columns the client asked for and does
-                                    // not treat rows as distinct because of a
-                                    // sort key it cannot see.
-                                    let mut kept: Vec<crate::core::row::row::Row> = if streaming {
-                                        Vec::new()
-                                    } else {
-                                        Vec::with_capacity(source.remaining_hint(&rows_bytes))
-                                    };
-                                    // Sized only when `DISTINCT` will use it:
-                                    // a hash table with room for every row is
-                                    // tens of megabytes on a large result.
-                                    let mut seen: ahash::HashSet<Vec<u8>> =
-                                        ahash::HashSet::with_capacity_and_hasher(
-                                            if distinct {
-                                                source.remaining_hint(&rows_bytes)
-                                            } else {
-                                                0
-                                            },
-                                            Default::default(),
-                                        );
-
-                                    let mut processed = 0usize;
-                                    loop {
-                                        // The page is full: nothing after this
-                                        // can reach the client, so it is not
-                                        // decoded either.
-                                        if streaming && take.is_some_and(|cap| emitted >= cap) {
-                                            break;
-                                        }
-                                        // Nothing in this loop suspends unless
-                                        // a row needs a JSON document loaded,
-                                        // so a large result would hold the
-                                        // worker thread from first row to last
-                                        // and every task queued behind it —
-                                        // other sessions' point reads — would
-                                        // wait. One yield per 1024 rows.
-                                        processed += 1;
-                                        if processed % 1024 == 0
-                                            && crate::core::processor::concurrent_processor::latency_guards_on()
-                                        {
-                                            tokio::task::yield_now().await;
-                                        }
-                                        let mut row = match source.next_row() {
-                                            None => break,
-                                            Some(Ok(row)) => row,
-                                            Some(Err(e)) => {
-                                                error!("Failed to trim the result set: {}", e);
-                                                let mut result = vec![3u8];
-                                                result.extend_from_slice(e.as_bytes());
-                                                return result;
+                                // Retyping a `NULL` column as
+                                // `DbType::NULL` is what makes the wire
+                                // layer send an actual NULL: its
+                                // formatters yield no value for that
+                                // type. It must happen before the
+                                // companions are trimmed away.
+                                if has_nullable {
+                                    for (i, flag_pos) in null_flags.iter().enumerate() {
+                                        let Some(p) = flag_pos else { continue };
+                                        let is_null = row
+                                            .columns
+                                            .get(*p)
+                                            .map(|c| {
+                                                crate::core::rql::nullable::flag_is_set(
+                                                    c.data.into_slice(),
+                                                )
+                                            })
+                                            .unwrap_or(false);
+                                        if is_null {
+                                            if let Some(c) = row.columns.get_mut(i) {
+                                                c.column_type =
+                                                    crate::core::db_type::DbType::NULL;
                                             }
+                                        }
+                                    }
+                                }
+
+                                // Trimming is driven by the row itself
+                                // rather than by the plan: the scan may
+                                // return more columns than were asked
+                                // for, and `visible_columns` is how
+                                // many the client is owed.
+                                let overfetched = row.columns.len() > visible_columns
+                                    && (visible_columns > 0 || has_literals);
+                                let mut row =
+                                    if trim_sort_key || has_nullable || overfetched {
+                                        let mut trimmed = row;
+                                        trimmed.columns.truncate(visible_columns);
+                                        trimmed
+                                    } else {
+                                        row
+                                    };
+
+                                // A JSON column's stored UUID is
+                                // replaced by the document it refers
+                                // to, rendered as text — which is what
+                                // a client asked for when it declared
+                                // the column JSON.
+                                if has_json {
+                                    for (schema_id, shadow_table) in &json_positions {
+                                        let Some(index) = row
+                                            .columns
+                                            .iter()
+                                            .position(|c| u64::from(c.schema_id) == *schema_id)
+                                        else {
+                                            continue;
                                         };
-                                        // Retyping a `NULL` column as
-                                        // `DbType::NULL` is what makes the wire
-                                        // layer send an actual NULL: its
-                                        // formatters yield no value for that
-                                        // type. It must happen before the
-                                        // companions are trimmed away.
-                                        if has_nullable {
-                                            for (i, flag_pos) in null_flags.iter().enumerate() {
-                                                let Some(p) = flag_pos else { continue };
-                                                let is_null = row
-                                                    .columns
-                                                    .get(*p)
-                                                    .map(|c| {
-                                                        crate::core::rql::nullable::flag_is_set(
-                                                            c.data.into_slice(),
-                                                        )
-                                                    })
-                                                    .unwrap_or(false);
-                                                if is_null {
-                                                    if let Some(c) = row.columns.get_mut(i) {
-                                                        c.column_type =
-                                                            crate::core::db_type::DbType::NULL;
-                                                    }
-                                                }
-                                            }
-                                        }
-
-                                        // Trimming is driven by the row itself
-                                        // rather than by the plan: the scan may
-                                        // return more columns than were asked
-                                        // for, and `visible_columns` is how
-                                        // many the client is owed.
-                                        let overfetched = row.columns.len() > visible_columns
-                                            && (visible_columns > 0 || has_literals);
-                                        let mut row =
-                                            if trim_sort_key || has_nullable || overfetched {
-                                                let mut trimmed = row;
-                                                trimmed.columns.truncate(visible_columns);
-                                                trimmed
-                                            } else {
-                                                row
-                                            };
-
-                                        // A JSON column's stored UUID is
-                                        // replaced by the document it refers
-                                        // to, rendered as text — which is what
-                                        // a client asked for when it declared
-                                        // the column JSON.
-                                        if has_json {
-                                            for (schema_id, shadow_table) in &json_positions {
-                                                let Some(index) = row
-                                                    .columns
-                                                    .iter()
-                                                    .position(|c| u64::from(c.schema_id) == *schema_id)
-                                                else {
-                                                    continue;
-                                                };
-                                                let Some(cell) = row.columns.get(index) else {
-                                                    continue;
-                                                };
-                                                if cell.column_type
-                                                    == crate::core::db_type::DbType::NULL
-                                                {
-                                                    continue;
-                                                }
-                                                let reference =
-                                                    crate::core::value_codec::format_uuid(
-                                                        cell.data.into_slice(),
-                                                    );
-                                                let rendered = Box::pin(load_json_document(
-                                                    &database,
-                                                    shadow_table,
-                                                    &reference,
-                                                    0,
-                                                    tx,
-                                                ))
-                                                .await
-                                                .map(|v| v.to_string())
-                                                .unwrap_or_else(|| "{}".to_string());
-
-                                                if let Some(cell) = row.columns.get_mut(index) {
-                                                    let bytes = rendered.as_bytes();
-                                                    let mut mb = crate::memory_pool::MEMORY_POOL
-                                                        .acquire(bytes.len());
-                                                    mb.into_slice_mut().copy_from_slice(bytes);
-                                                    cell.data = mb;
-                                                    cell.column_type =
-                                                        crate::core::db_type::DbType::JSON;
-                                                }
-                                            }
-                                        }
-
-                                        // Constants occupy output positions
-                                        // that no fetched column fills, so they
-                                        // are spliced in at their index. Going
-                                        // in ascending order keeps the later
-                                        // positions correct as earlier ones
-                                        // shift.
-                                        if has_literals {
-                                            // Every slot's value is computed
-                                            // before any is spliced in: a row
-                                            // expression reads its columns by
-                                            // write order, and inserting a slot
-                                            // column shifts what those lookups
-                                            // find.
-                                            let mut computed: Vec<(
-                                                usize,
-                                                Vec<u8>,
-                                                crate::core::db_type::DbType,
-                                            )> = Vec::with_capacity(value_slots.len());
-                                            for (position, slot, db_type) in &value_slots {
-                                                // A scalar is evaluated *here*,
-                                                // inside the per-row loop:
-                                                // `gen_random_uuid()` has to
-                                                // differ in every row, and
-                                                // hoisting it would write one
-                                                // value into all of them.
-                                                let (value, ty) = match slot {
-                                                    SlotValue::Scalar(func) => {
-                                                        (func.evaluate(), db_type.clone())
-                                                    }
-                                                    SlotValue::Constant(bytes) => {
-                                                        (bytes.clone(), db_type.clone())
-                                                    }
-                                                    SlotValue::RowExpression(expr) => {
-                                                        // Same rule as
-                                                        // `RETURNING`: the
-                                                        // value is re-encoded
-                                                        // as the type the row
-                                                        // description already
-                                                        // announced for this
-                                                        // slot.
-                                                        match crate::core::rql::expr::eval(
-                                                            expr,
-                                                            &row,
-                                                            &slot_schema,
-                                                        )
-                                                        .map(|v| {
-                                                            crate::core::rql::expr::coerce_to(
-                                                                v, db_type,
-                                                            )
-                                                        }) {
-                                                            Ok(crate::core::rql::expr::Value::Data {
-                                                                bytes,
-                                                                db_type: ty,
-                                                            }) => (bytes, ty),
-                                                            // A NULL is typed as
-                                                            // such so the wire
-                                                            // layer sends one
-                                                            // rather than an
-                                                            // empty value.
-                                                            Ok(crate::core::rql::expr::Value::Null) => (
-                                                                Vec::new(),
-                                                                crate::core::db_type::DbType::NULL,
-                                                            ),
-                                                            Err(e) => {
-                                                                error!(
-                                                                    "Cannot evaluate select expression: {}",
-                                                                    e
-                                                                );
-                                                                let mut result = vec![3u8];
-                                                                result.extend_from_slice(e.as_bytes());
-                                                                return result;
-                                                            }
-                                                        }
-                                                    }
-                                                };
-                                                computed.push((*position, value, ty));
-                                            }
-                                            for (position, value, db_type) in &computed {
-                                                let mut mb = crate::memory_pool::MEMORY_POOL
-                                                    .acquire(value.len());
-                                                if !value.is_empty() {
-                                                    mb.into_slice_mut().copy_from_slice(value);
-                                                }
-                                                let column = crate::core::row::row::Column {
-                                                    schema_id: crate::core::row::row::schema_id_of(*position as u64),
-                                                    data: mb,
-                                                    column_type: db_type.clone(),
-                                                };
-                                                let at = (*position).min(row.columns.len());
-                                                row.columns.insert(at, column);
-                                            }
-                                            // One output column per select
-                                            // item. `visible_columns` counts
-                                            // only *fetched* columns, so
-                                            // `max(slots)` gave 1 for
-                                            // `SELECT 1, name` — where the
-                                            // answer is 2 — and the row went
-                                            // out one field short of the
-                                            // RowDescription, which a client
-                                            // rejects as "unexpected field
-                                            // count in D message".
-                                            let output_columns =
-                                                query_row.select_items.len().max(value_slots.len());
-                                            row.columns.truncate(output_columns);
-                                        }
-                                        let row = row;
-
-                                        if distinct {
-                                            // Compare the serialized value
-                                            // bytes, which is the same identity
-                                            // the client sees — and whether
-                                            // the cell is NULL. A NULL's value
-                                            // bytes are its type's zeroes,
-                                            // empty for TEXT and BYTEA, so a
-                                            // key of bytes alone merged NULL
-                                            // with '' and answered two rows
-                                            // for {NULL, '', 'a'}.
-                                            let mut key = Vec::new();
-                                            for c in &row.columns {
-                                                key.push(
-                                                    (c.column_type
-                                                        == crate::core::db_type::DbType::NULL)
-                                                        as u8,
-                                                );
-                                                key.extend_from_slice(
-                                                    &(c.data.into_slice().len() as u32)
-                                                        .to_le_bytes(),
-                                                );
-                                                key.extend_from_slice(c.data.into_slice());
-                                            }
-                                            if !seen.insert(key) {
-                                                continue;
-                                            }
-                                        }
-
-                                        if streaming {
-                                            if skipped < skip {
-                                                skipped += 1;
-                                                continue;
-                                            }
-                                            row.extend_serialized(&mut out);
-                                            emitted += 1;
+                                        let Some(cell) = row.columns.get(index) else {
+                                            continue;
+                                        };
+                                        if cell.column_type
+                                            == crate::core::db_type::DbType::NULL
+                                        {
                                             continue;
                                         }
-                                        kept.push(row);
-                                    }
-                                    if streaming {
-                                        out
-                                    } else {
-
-                                    // Numbered over the rows that survived the
-                                    // predicate, before any paging: PostgreSQL
-                                    // computes a window before `LIMIT`, so
-                                    // trimming first would number a page rather
-                                    // than the result.
-                                    let mut kept = kept;
-                                    if has_windows {
-                                        for (position, spec) in &window_slots {
-                                            // An exact SUM/AVG that overflows
-                                            // is an error, as the grouped
-                                            // aggregate's is — never a NULL.
-                                            let values = match crate::core::rql::window::assign(
-                                                &kept, spec,
-                                            ) {
-                                                Ok(values) => values,
-                                                Err(e) => {
-                                                    error!("Window function failed: {}", e);
-                                                    let mut result = vec![3u8];
-                                                    result.extend_from_slice(e.as_bytes());
-                                                    return result;
-                                                }
-                                            };
-                                            // The type the window produces, not
-                                            // `I64`: an `AVG` is a decimal and
-                                            // a `LAG(created_at)` is a
-                                            // timestamp, and describing either
-                                            // as a bigint sends the client
-                                            // eight bytes it decodes as the
-                                            // wrong thing.
-                                            let column_type = spec.result_type();
-                                            for (row, value) in
-                                                kept.iter_mut().zip(values.into_iter())
-                                            {
-                                                // A NULL window value — no
-                                                // preceding row for a `LAG`, an
-                                                // empty frame for an `AVG` —
-                                                // is an empty block, which is
-                                                // how a NULL travels here.
-                                                let bytes = value.unwrap_or_default();
-                                                let mut mb = crate::memory_pool::MEMORY_POOL
-                                                    .acquire(bytes.len());
-                                                mb.into_slice_mut().copy_from_slice(&bytes);
-                                                let at = (*position).min(row.columns.len());
-                                                row.columns.insert(
-                                                    at,
-                                                    crate::core::row::row::Column {
-                                                        schema_id: crate::core::row::row::schema_id_of(*position as u64),
-                                                        data: mb,
-                                                        column_type: column_type.clone(),
-                                                    },
-                                                );
-                                            }
-                                        }
-                                        for row in kept.iter_mut() {
-                                            row.columns
-                                                .truncate(query_row.select_items.len().max(1));
-                                        }
-                                    }
-
-                                    // `FOR UPDATE` claims the rows before they
-                                    // are handed over, so a row this
-                                    // transaction could not lock never reaches
-                                    // the client. With `SKIP LOCKED` this can
-                                    // return fewer rows than `LIMIT` asked
-                                    // for — which is the point: the missing
-                                    // ones belong to somebody else's claim.
-                                    let kept = match row_lock {
-                                        None => kept,
-                                        Some(lock) => match Box::pin(lock_selected_rows(
+                                        let reference =
+                                            crate::core::value_codec::format_uuid(
+                                                cell.data.into_slice(),
+                                            );
+                                        let rendered = Box::pin(load_json_document(
                                             &database,
-                                            &lock_table_name,
-                                            kept,
-                                            lock,
-                                            // Everything the client will see:
-                                            // the page plus whatever OFFSET
-                                            // discards ahead of it.
-                                            written_limit.map(|l| l as usize + offset as usize),
+                                            shadow_table,
+                                            &reference,
+                                            0,
                                             tx,
                                         ))
                                         .await
-                                        {
-                                            Ok(locked) => locked,
-                                            Err(e) => {
-                                                error!("Cannot lock rows: {}", e);
-                                                let mut result = vec![3u8];
-                                                result.extend_from_slice(e.as_bytes());
-                                                return result;
-                                            }
-                                        },
-                                    };
+                                        .map(|v| v.to_string())
+                                        .unwrap_or_else(|| "{}".to_string());
 
-                                    for row in kept.iter().skip(skip) {
-                                        if let Some(cap) = take {
-                                            if emitted >= cap {
-                                                break;
-                                            }
+                                        if let Some(cell) = row.columns.get_mut(index) {
+                                            let bytes = rendered.as_bytes();
+                                            let mut mb = crate::memory_pool::MEMORY_POOL
+                                                .acquire(bytes.len());
+                                            mb.into_slice_mut().copy_from_slice(bytes);
+                                            cell.data = mb;
+                                            cell.column_type =
+                                                crate::core::db_type::DbType::JSON;
                                         }
-                                        row.extend_serialized(&mut out);
-                                        emitted += 1;
-                                    }
-                                    out
                                     }
                                 }
-                                Err(e) => {
-                                    let mut result = vec![3u8];
-                                    result.extend_from_slice(e.as_bytes());
-                                    return result;
+
+                                // Constants occupy output positions
+                                // that no fetched column fills, so they
+                                // are spliced in at their index. Going
+                                // in ascending order keeps the later
+                                // positions correct as earlier ones
+                                // shift.
+                                if has_literals {
+                                    // Every slot's value is computed
+                                    // before any is spliced in: a row
+                                    // expression reads its columns by
+                                    // write order, and inserting a slot
+                                    // column shifts what those lookups
+                                    // find.
+                                    let mut computed: Vec<(
+                                        usize,
+                                        Vec<u8>,
+                                        crate::core::db_type::DbType,
+                                    )> = Vec::with_capacity(value_slots.len());
+                                    for (position, slot, db_type) in &value_slots {
+                                        // A scalar is evaluated *here*,
+                                        // inside the per-row loop:
+                                        // `gen_random_uuid()` has to
+                                        // differ in every row, and
+                                        // hoisting it would write one
+                                        // value into all of them.
+                                        let (value, ty) = match slot {
+                                            SlotValue::Scalar(func) => {
+                                                (func.evaluate(), db_type.clone())
+                                            }
+                                            SlotValue::Constant(bytes) => {
+                                                (bytes.clone(), db_type.clone())
+                                            }
+                                            SlotValue::RowExpression(expr) => {
+                                                // Same rule as
+                                                // `RETURNING`: the
+                                                // value is re-encoded
+                                                // as the type the row
+                                                // description already
+                                                // announced for this
+                                                // slot.
+                                                match crate::core::rql::expr::eval(
+                                                    expr,
+                                                    &row,
+                                                    &slot_schema,
+                                                )
+                                                .map(|v| {
+                                                    crate::core::rql::expr::coerce_to(
+                                                        v, db_type,
+                                                    )
+                                                }) {
+                                                    Ok(crate::core::rql::expr::Value::Data {
+                                                        bytes,
+                                                        db_type: ty,
+                                                    }) => (bytes, ty),
+                                                    // A NULL is typed as
+                                                    // such so the wire
+                                                    // layer sends one
+                                                    // rather than an
+                                                    // empty value.
+                                                    Ok(crate::core::rql::expr::Value::Null) => (
+                                                        Vec::new(),
+                                                        crate::core::db_type::DbType::NULL,
+                                                    ),
+                                                    Err(e) => {
+                                                        error!(
+                                                            "Cannot evaluate select expression: {}",
+                                                            e
+                                                        );
+                                                        let mut result = vec![3u8];
+                                                        result.extend_from_slice(e.as_bytes());
+                                                        return result;
+                                                    }
+                                                }
+                                            }
+                                        };
+                                        computed.push((*position, value, ty));
+                                    }
+                                    for (position, value, db_type) in &computed {
+                                        let mut mb = crate::memory_pool::MEMORY_POOL
+                                            .acquire(value.len());
+                                        if !value.is_empty() {
+                                            mb.into_slice_mut().copy_from_slice(value);
+                                        }
+                                        let column = crate::core::row::row::Column {
+                                            schema_id: crate::core::row::row::schema_id_of(*position as u64),
+                                            data: mb,
+                                            column_type: db_type.clone(),
+                                        };
+                                        let at = (*position).min(row.columns.len());
+                                        row.columns.insert(at, column);
+                                    }
+                                    // One output column per select
+                                    // item. `visible_columns` counts
+                                    // only *fetched* columns, so
+                                    // `max(slots)` gave 1 for
+                                    // `SELECT 1, name` — where the
+                                    // answer is 2 — and the row went
+                                    // out one field short of the
+                                    // RowDescription, which a client
+                                    // rejects as "unexpected field
+                                    // count in D message".
+                                    let output_columns =
+                                        query_row.select_items.len().max(value_slots.len());
+                                    row.columns.truncate(output_columns);
+                                }
+                                let row = row;
+
+                                if distinct {
+                                    // Compare the serialized value
+                                    // bytes, which is the same identity
+                                    // the client sees — and whether
+                                    // the cell is NULL. A NULL's value
+                                    // bytes are its type's zeroes,
+                                    // empty for TEXT and BYTEA, so a
+                                    // key of bytes alone merged NULL
+                                    // with '' and answered two rows
+                                    // for {NULL, '', 'a'}.
+                                    let mut key = Vec::new();
+                                    for c in &row.columns {
+                                        key.push(
+                                            (c.column_type
+                                                == crate::core::db_type::DbType::NULL)
+                                                as u8,
+                                        );
+                                        key.extend_from_slice(
+                                            &(c.data.into_slice().len() as u32)
+                                                .to_le_bytes(),
+                                        );
+                                        key.extend_from_slice(c.data.into_slice());
+                                    }
+                                    if !seen.insert(key) {
+                                        continue;
+                                    }
+                                }
+
+                                if streaming {
+                                    if skipped < skip {
+                                        skipped += 1;
+                                        continue;
+                                    }
+                                    row.extend_serialized(&mut out);
+                                    emitted += 1;
+                                    continue;
+                                }
+                                kept.push(row);
+                            }
+                            if streaming {
+                                out
+                            } else {
+
+                            // Numbered over the rows that survived the
+                            // predicate, before any paging: PostgreSQL
+                            // computes a window before `LIMIT`, so
+                            // trimming first would number a page rather
+                            // than the result.
+                            let mut kept = kept;
+                            if has_windows {
+                                for (position, spec) in &window_slots {
+                                    // An exact SUM/AVG that overflows
+                                    // is an error, as the grouped
+                                    // aggregate's is — never a NULL.
+                                    let values = match crate::core::rql::window::assign(
+                                        &kept, spec,
+                                    ) {
+                                        Ok(values) => values,
+                                        Err(e) => {
+                                            error!("Window function failed: {}", e);
+                                            let mut result = vec![3u8];
+                                            result.extend_from_slice(e.as_bytes());
+                                            return result;
+                                        }
+                                    };
+                                    // The type the window produces, not
+                                    // `I64`: an `AVG` is a decimal and
+                                    // a `LAG(created_at)` is a
+                                    // timestamp, and describing either
+                                    // as a bigint sends the client
+                                    // eight bytes it decodes as the
+                                    // wrong thing.
+                                    let column_type = spec.result_type();
+                                    for (row, value) in
+                                        kept.iter_mut().zip(values.into_iter())
+                                    {
+                                        // A NULL window value — no
+                                        // preceding row for a `LAG`, an
+                                        // empty frame for an `AVG` —
+                                        // is an empty block, which is
+                                        // how a NULL travels here.
+                                        let bytes = value.unwrap_or_default();
+                                        let mut mb = crate::memory_pool::MEMORY_POOL
+                                            .acquire(bytes.len());
+                                        mb.into_slice_mut().copy_from_slice(&bytes);
+                                        let at = (*position).min(row.columns.len());
+                                        row.columns.insert(
+                                            at,
+                                            crate::core::row::row::Column {
+                                                schema_id: crate::core::row::row::schema_id_of(*position as u64),
+                                                data: mb,
+                                                column_type: column_type.clone(),
+                                            },
+                                        );
+                                    }
+                                }
+                                for row in kept.iter_mut() {
+                                    row.columns
+                                        .truncate(query_row.select_items.len().max(1));
                                 }
                             }
-                        } else {
-                            rows_bytes
-                        };
 
-                        let page = &rows_bytes[page_start..];
-                        let mut final_vec = Vec::with_capacity(1 + page.len());
-                        final_vec.push(2u8);
-                        final_vec.extend_from_slice(page);
-                        return final_vec;
+                            // `FOR UPDATE` claims the rows before they
+                            // are handed over, so a row this
+                            // transaction could not lock never reaches
+                            // the client. With `SKIP LOCKED` this can
+                            // return fewer rows than `LIMIT` asked
+                            // for — which is the point: the missing
+                            // ones belong to somebody else's claim.
+                            let kept = match row_lock {
+                                None => kept,
+                                Some(lock) => match Box::pin(lock_selected_rows(
+                                    &database,
+                                    &lock_table_name,
+                                    kept,
+                                    lock,
+                                    // Everything the client will see:
+                                    // the page plus whatever OFFSET
+                                    // discards ahead of it.
+                                    written_limit.map(|l| l as usize + offset as usize),
+                                    tx,
+                                ))
+                                .await
+                                {
+                                    Ok(locked) => locked,
+                                    Err(e) => {
+                                        error!("Cannot lock rows: {}", e);
+                                        let mut result = vec![3u8];
+                                        result.extend_from_slice(e.as_bytes());
+                                        return result;
+                                    }
+                                },
+                            };
+
+                            for row in kept.iter().skip(skip) {
+                                if let Some(cap) = take {
+                                    if emitted >= cap {
+                                        break;
+                                    }
+                                }
+                                row.extend_serialized(&mut out);
+                                emitted += 1;
+                            }
+                            out
+                            }
+                        }
+                        Err(e) => {
+                            let mut result = vec![3u8];
+                            result.extend_from_slice(e.as_bytes());
+                            return result;
+                        }
                     }
-                    Err(e) => {
-                        // Report what actually went wrong. Evaluation failures
-                        // like `WHERE x / 0` carry a specific message, and a
-                        // generic "Error occurred" would leave the client
-                        // unable to tell a bad expression from a dead server.
-                        error!("Failed to execute query: {}", e);
-                        let mut result = vec![3u8];
-                        result.extend_from_slice(e.to_string().as_bytes());
-                        return result;
-                    }
-                }
+                } else {
+                    rows_bytes
+                };
+
+                let page = &rows_bytes[page_start..];
+                let mut final_vec = Vec::with_capacity(1 + page.len());
+                final_vec.push(2u8);
+                final_vec.extend_from_slice(page);
+                return final_vec;
+            }
+            Err(e) => {
+                // Report what actually went wrong. Evaluation failures
+                // like `WHERE x / 0` carry a specific message, and a
+                // generic "Error occurred" would leave the client
+                // unable to tell a bad expression from a dead server.
+                error!("Failed to execute query: {}", e);
+                let mut result = vec![3u8];
+                result.extend_from_slice(e.to_string().as_bytes());
+                return result;
             }
         }
     }

@@ -1315,6 +1315,48 @@ impl SessionState {
     }
 }
 
+/// Where a prepared `SELECT` stands on the way to skipping the text path.
+/// See `core::rql::prepared` for why it takes two observed executions.
+#[derive(Default)]
+enum PreparedSelect {
+    /// Not yet looked at, or a schema change since.
+    #[default]
+    Unknown,
+    /// Watched once; the next execution with different values checks it.
+    Candidate(Box<PreparedLearned>),
+    /// Checked: executions with values of the same classes use the parse.
+    Ready(Box<PreparedLearned>),
+    /// The text path is the only path for this statement.
+    Ineligible,
+}
+
+struct PreparedLearned {
+    /// Schema generation it was learned at. Any schema change starts over.
+    generation: u64,
+    table_name: String,
+    /// The parse, `WHERE` clause blanked; the template supplies it.
+    query_row: crate::core::rql::lexer_query::QueryRows,
+    shape: String,
+    template: crate::core::rql::prepared::WhereTemplate,
+    /// Each value's literal as first seen, so the check runs with different
+    /// ones, and the class every value must keep.
+    literals: Vec<String>,
+    classes: Vec<u8>,
+    fields: Option<Vec<(String, DbType)>>,
+    scales: Option<Vec<u32>>,
+    /// Watched executions that could not teach anything (repeated values, a
+    /// literal seen twice). Past a few, the statement stops being watched.
+    misses: u8,
+}
+
+/// A cached parse to run instead of the statement text, and the description
+/// the text path sent its rows under.
+struct PreparedRun {
+    rows: Box<crate::core::rql::prepared::PreparedRows>,
+    fields: Option<Vec<(String, DbType)>>,
+    scales: Option<Vec<u32>>,
+}
+
 struct StatementInfo {
     /// Shared rather than owned: every `Execute` and `Describe` needs the text
     /// while also needing `state` mutably, and a deep copy per message was the
@@ -1337,6 +1379,12 @@ struct StatementInfo {
     /// Remembered `Describe` answers, at most one per kind. See
     /// [`DescribeCacheEntry`].
     describe_cache: Vec<DescribeCacheEntry>,
+    /// The cached parse of a prepared `SELECT`, once two executions have
+    /// shown the text path makes it. See [`PreparedSelect`].
+    prepared: PreparedSelect,
+    /// `value_free_shape` of `sql`, read once at Parse rather than on every
+    /// describe.
+    value_free: Option<ValueFreeShape>,
     /// The parameter types the last statement describe reported, where the
     /// client declared none (`param_infer`). Bind decodes values as these: a
     /// client encodes each one as the type it was told.
@@ -1558,9 +1606,9 @@ where
     // Re-preparing the identical text with the identical parameter types — an
     // unnamed statement re-sent with every command — keeps what was learned
     // describing it. Anything else starts afresh.
-    let describe_cache = match state.statements.remove(&stmt_name) {
-        Some(old) if *old.sql == *query && old.param_oids == param_oids => old.describe_cache,
-        _ => Vec::new(),
+    let (describe_cache, prepared) = match state.statements.remove(&stmt_name) {
+        Some(old) if *old.sql == *query && old.param_oids == param_oids => (old.describe_cache, old.prepared),
+        _ => (Vec::new(), PreparedSelect::Unknown),
     };
     state.statements.insert(
         stmt_name,
@@ -1569,8 +1617,10 @@ where
             // Shared with every other session that prepared the same text.
             sql: statement_intern::sql(&query),
             param_oids,
+            value_free: value_free_shape(&query),
             describe_cache,
             inferred_oids: None,
+            prepared,
         },
     );
     // ParseComplete
@@ -1735,28 +1785,41 @@ where
     // parse — the placeholder is not a literal — so `describe_query` gave up
     // and the portal was answered with `NoData`. `Execute` then sent the rows
     // anyway, and the client reported "D message without prior T".
-    let inlined = if bound.is_empty() {
-        None
-    } else {
-        inline_params(&sql, &bound).ok()
-    };
-    let query: &str = inlined.as_deref().unwrap_or(&sql);
-
     // Read before describing, never after: a schema change that lands while
     // the describe runs then leaves the entry under a generation no later
     // lookup will see. See `DescribeCacheEntry`.
     let generation = database
         .schema_generation
         .load(std::sync::atomic::Ordering::Acquire);
-    let cached = state.statements.get(&stmt_name).and_then(|info| {
-        info.describe_cache
-            .iter()
-            .find(|e| e.answers(kind, generation, inlined.as_deref()))
-            .map(|e| e.fields.clone())
-    });
+    let lookup = |state: &SessionState, text: Option<&str>| {
+        state.statements.get(&stmt_name).and_then(|info| {
+            info.describe_cache
+                .iter()
+                .find(|e| e.answers(kind, generation, text))
+                .map(|e| e.fields.clone())
+        })
+    };
+    // Decided once, at Parse: whether the values can change the answer.
+    let value_free = state.statements.get(&stmt_name).and_then(|s| s.value_free);
+    let same_shape = value_free == Some(ValueFreeShape::SameShape);
+    // A shape the values cannot change is answered before they are inlined:
+    // the inlined text is needed only to describe it afresh.
+    let early = if same_shape { lookup(state, None) } else { None };
+    let inlined = if bound.is_empty() || early.is_some() {
+        None
+    } else {
+        inline_params(&sql, &bound).ok()
+    };
+    let query: &str = inlined.as_deref().unwrap_or(&sql);
+    // What the answer is remembered under: the inlined text, unless the
+    // values cannot change it.
+    let cache_text = if same_shape { None } else { inlined.as_deref() };
+    let cached = early.or_else(|| lookup(state, cache_text));
 
     let description = match cached {
         Some(fields) => Some((fields, true)),
+        // Nothing to describe: the reply is `NoData` whatever the tables hold.
+        None if value_free == Some(ValueFreeShape::NoRows) => None,
         None => describe_for_wire(database, query)
             .await?
             .map(|(fields, is_select)| (statement_intern::fields(&fields), is_select)),
@@ -1788,13 +1851,13 @@ where
                 && !info
                     .describe_cache
                     .iter()
-                    .any(|e| e.answers(kind, generation, inlined.as_deref()))
+                    .any(|e| e.answers(kind, generation, cache_text))
             {
                 info.describe_cache.retain(|e| e.kind != kind);
                 info.describe_cache.push(DescribeCacheEntry {
                     kind,
                     generation,
-                    text: inlined.as_deref().map(Box::from),
+                    text: cache_text.map(Box::from),
                     fields: fields.clone(),
                 });
             }
@@ -2000,6 +2063,20 @@ where
         .get(..4)
         .is_some_and(|w| w.eq_ignore_ascii_case("COPY"));
     if max_rows <= 0 || is_copy {
+        // A prepared `SELECT` may run from its cached parse. Not after a
+        // schema change, whose fresh description only the text path sends.
+        if !is_copy && !schema_changed && !params.is_empty() {
+            return execute_watched(
+                database,
+                state,
+                stream,
+                &stmt_name,
+                &query,
+                &params,
+                &result_formats,
+            )
+            .await;
+        }
         return execute_recorded(
             database,
             state,
@@ -2007,6 +2084,7 @@ where
             &query,
             &result_formats,
             !schema_changed,
+            None,
         )
         .await;
     }
@@ -2026,6 +2104,7 @@ where
         &query,
         &result_formats,
         !schema_changed,
+        None,
     )
     .await?;
     let mut result = SuspendedResult {
@@ -2129,6 +2208,52 @@ fn substitute_placeholders(sql: &str, stand_in: &str) -> String {
 }
 
 #[cfg(test)]
+mod value_free_shape_tests {
+    use super::{ValueFreeShape, value_free_shape};
+
+    #[test]
+    fn filter_only_placeholders_share_one_shape() {
+        for sql in [
+            "SELECT * FROM t WHERE id = $1",
+            "select a, b from t join u on u.x = t.x where t.k = $1 and u.v > $2 order by a limit $3",
+            "SELECT a FROM t WHERE s = 'no $1 here' AND id = $1",
+            "SELECT a FROM t -- $1 in a comment\nWHERE id = $1",
+            "SELECT a FROM t WHERE id = $1 FOR UPDATE",
+        ] {
+            assert_eq!(value_free_shape(sql), Some(ValueFreeShape::SameShape), "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_placeholder_that_can_reach_a_column_is_keyed_by_value() {
+        for sql in [
+            "SELECT $1 AS v FROM t",
+            "SELECT a, $1 FROM t WHERE id = $2",
+            "SELECT $1",
+            "SELECT x FROM (SELECT $1 AS x) s",
+            "SELECT (SELECT max(x) FROM u WHERE y = $1) FROM t",
+            "SELECT a FROM t WHERE id = $1 UNION SELECT $2",
+            "SELECT a FROM t WHERE id IN ($1, $2)",
+            "SELECT * FROM generate_series(1, $1)",
+            "WITH c AS (SELECT 1) SELECT * FROM c WHERE x = $1",
+            "SELECT a FROM t WHERE b = $tag$x$tag$ AND id = $1",
+            "SELECT a FROM t WHERE s = E'\\' , (' AND id = $1",
+        ] {
+            assert_eq!(value_free_shape(sql), None, "{sql}");
+        }
+    }
+
+    #[test]
+    fn writes_without_returning_have_no_rows() {
+        assert_eq!(value_free_shape("INSERT INTO t (k, v) VALUES ($1, $2) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v"), Some(ValueFreeShape::NoRows));
+        assert_eq!(value_free_shape("update t set v = $1 where id = $2"), Some(ValueFreeShape::NoRows));
+        assert_eq!(value_free_shape("DELETE FROM t WHERE id = $1"), Some(ValueFreeShape::NoRows));
+        assert_eq!(value_free_shape("INSERT INTO t (v) VALUES ($1) RETURNING id"), None);
+        assert_eq!(value_free_shape("UPDATE t SET v = $1 RETURNING v, $2"), None);
+    }
+}
+
+#[cfg(test)]
 mod substitute_placeholder_tests {
     #[test]
     fn non_ascii_text_survives_the_stand_in() {
@@ -2141,6 +2266,113 @@ mod substitute_placeholder_tests {
 }
 
 /// Whether the statement still carries an unbound placeholder.
+/// Why a statement's `Describe` answer cannot depend on its bound values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValueFreeShape {
+    /// `INSERT`, `UPDATE` or `DELETE` without `RETURNING`: no columns, ever.
+    NoRows,
+    /// A plain `SELECT` whose placeholders all stand at the top level after
+    /// its `FROM`: in the filter, join conditions, ordering or limit, never in
+    /// the select list or a derived table. Its columns are the same for every
+    /// binding.
+    SameShape,
+}
+
+/// Whether one `Describe` answer serves every binding of `sql`, and why.
+///
+/// The portal describe is keyed by the text with its values inlined, since
+/// `SELECT $1 AS v` is an integer column for one value and text for another.
+/// A client that describes the portal on every execute, as libpq's
+/// `PQsendQueryPrepared` does, then described again for every new value.
+/// `None` keeps that keying; anything this cannot read, including any
+/// placeholder inside parentheses, is `None`.
+fn value_free_shape(sql: &str) -> Option<ValueFreeShape> {
+    let bytes = sql.as_bytes();
+    // An `E'…'` string escapes its quote with a backslash, which the scan
+    // below would read as the string's end.
+    if bytes.contains(&b'\\') {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut i = 0usize;
+    // Top-level words in order, and whether every placeholder so far stood
+    // at the top level after a top-level FROM.
+    let mut first: Option<&str> = None;
+    let mut seen_from = false;
+    let mut placeholders_ok = true;
+    let mut set_op = false;
+    let mut returning = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match c {
+            b'\'' | b'"' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != c {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 2;
+            }
+            // A dollar-quoted body is not read; nor is anything after one.
+            b'$' if bytes.get(i + 1).is_some_and(|d| !d.is_ascii_digit()) => return None,
+            b'$' => {
+                if depth != 0 || !seen_from {
+                    placeholders_ok = false;
+                }
+                i += 1;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+            }
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                i += 1;
+            }
+            _ if c.is_ascii_alphabetic() || c == b'_' => {
+                let start = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'$') {
+                    i += 1;
+                }
+                let word = &sql[start..i];
+                if word.eq_ignore_ascii_case("RETURNING") {
+                    returning = true;
+                }
+                if depth == 0 {
+                    if first.is_none() {
+                        first = Some(word);
+                    } else if word.eq_ignore_ascii_case("FROM") {
+                        seen_from = true;
+                    } else if ["UNION", "INTERSECT", "EXCEPT"].iter().any(|k| word.eq_ignore_ascii_case(k)) {
+                        set_op = true;
+                    }
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    let first = first?;
+    if ["INSERT", "UPDATE", "DELETE"].iter().any(|k| first.eq_ignore_ascii_case(k)) {
+        return (!returning).then_some(ValueFreeShape::NoRows);
+    }
+    (first.eq_ignore_ascii_case("SELECT") && seen_from && placeholders_ok && !set_op && !returning && depth == 0)
+        .then_some(ValueFreeShape::SameShape)
+}
+
 fn has_placeholder(sql: &str) -> bool {
     let bytes = sql.as_bytes();
     let mut quote: Option<u8> = None;
@@ -3040,6 +3272,7 @@ async fn execute_recorded<S>(
     stmt: &str,
     result_formats: &[i16],
     omit_description: bool,
+    prepared: Option<PreparedRun>,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -3089,9 +3322,305 @@ where
                 stmt,
                 result_formats,
                 omit_description,
+                prepared,
             )),
         )
         .await
+}
+
+/// Runs a prepared statement's execution from its cached parse when it has
+/// one, and otherwise by its text, watching the text path while it learns
+/// whether it can have one. See [`PreparedSelect`].
+async fn execute_watched<S>(
+    database: &Arc<Database>,
+    state: &mut SessionState,
+    stream: &mut S,
+    stmt_name: &str,
+    query: &str,
+    params: &[BoundParam],
+    result_formats: &[i16],
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    use crate::core::rql::prepared as pr;
+
+    enum Step {
+        Run(PreparedRun),
+        Watch,
+        Text,
+    }
+
+    let generation = database
+        .schema_generation
+        .load(std::sync::atomic::Ordering::Acquire);
+    // Each value as `inline_params` wrote it into `query`, and its class.
+    let literals: Option<Vec<String>> = params
+        .iter()
+        .map(|p| crate::pg_params::param_literal(p).ok())
+        .collect();
+    let classes: Option<Vec<u8>> = literals
+        .as_ref()
+        .and_then(|l| l.iter().map(|x| pr::literal_class(x)).collect());
+
+    let step = match state.statements.get_mut(stmt_name) {
+        None => Step::Text,
+        Some(info) => {
+            if let PreparedSelect::Ready(l) | PreparedSelect::Candidate(l) = &info.prepared {
+                if l.generation != generation {
+                    info.prepared = PreparedSelect::Unknown;
+                }
+            }
+            match &info.prepared {
+                PreparedSelect::Ineligible => Step::Text,
+                PreparedSelect::Ready(l) => match (&literals, &classes) {
+                    (Some(lits), Some(cls)) if *cls == l.classes => {
+                        let mut query_row = l.query_row.clone();
+                        query_row.where_clause = l.template.render(lits);
+                        Step::Run(PreparedRun {
+                            rows: Box::new(pr::PreparedRows {
+                                table_name: l.table_name.clone(),
+                                query_row,
+                            }),
+                            fields: l.fields.clone(),
+                            scales: l.scales.clone(),
+                        })
+                    }
+                    _ => Step::Text,
+                },
+                PreparedSelect::Candidate(_) => {
+                    if classes.is_some() { Step::Watch } else { Step::Text }
+                }
+                PreparedSelect::Unknown => {
+                    let sql = info.sql.clone();
+                    let shaped = value_free_shape(&sql) == Some(ValueFreeShape::SameShape)
+                        && pr::compared_columns(&sql).is_some_and(|c| c.len() == params.len());
+                    if !shaped {
+                        info.prepared = PreparedSelect::Ineligible;
+                        Step::Text
+                    } else if classes.is_some() {
+                        Step::Watch
+                    } else {
+                        Step::Text
+                    }
+                }
+            }
+        }
+    };
+
+    match step {
+        Step::Run(run) => {
+            PREPARED_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            execute_recorded(database, state, stream, query, result_formats, true, Some(run)).await
+        }
+        Step::Text => execute_recorded(database, state, stream, query, result_formats, true, None).await,
+        Step::Watch => {
+            let (result, capture) = pr::capturing(execute_recorded(
+                database,
+                state,
+                stream,
+                query,
+                result_formats,
+                true,
+                None,
+            ))
+            .await;
+            if result.is_ok() && !state.statement_failed {
+                if let (Some(literals), Some(classes)) = (literals, classes) {
+                    learn_prepared(database, state, stmt_name, generation, literals, classes, capture);
+                }
+            }
+            result
+        }
+    }
+}
+
+/// Executions of a prepared `SELECT` that ran from a cached parse. For tests
+/// and diagnostics: it is how a test tells the fast path ran at all.
+pub static PREPARED_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What a watched execution teaches. The first yields a candidate; the next
+/// with different values either confirms it, exactly, or rules the statement
+/// out for good.
+fn learn_prepared(
+    database: &Arc<Database>,
+    state: &mut SessionState,
+    stmt_name: &str,
+    generation: u64,
+    literals: Vec<String>,
+    classes: Vec<u8>,
+    capture: crate::core::rql::prepared::Capture,
+) {
+    use crate::core::rql::prepared as pr;
+
+    let Some(info) = state.statements.get_mut(stmt_name) else {
+        return;
+    };
+    // A schema change while it ran: what it saw may describe neither shape.
+    if database.schema_generation.load(std::sync::atomic::Ordering::Acquire) != generation {
+        return;
+    }
+    let Some((table_name, query_row, fields, scales)) = capture.plain_only() else {
+        info.prepared = PreparedSelect::Ineligible;
+        return;
+    };
+    // Every value is compared with a column whose literals no rewrite
+    // reinterprets, and has that column's class.
+    let Some(columns) = pr::compared_columns(&info.sql) else {
+        info.prepared = PreparedSelect::Ineligible;
+        return;
+    };
+    let Some(table) = database.tables.get(&table_name).map(|t| t.value().clone()) else {
+        return;
+    };
+    let mut wanted = Vec::with_capacity(columns.len());
+    for c in &columns {
+        let class = table
+            .schema
+            .fields
+            .iter()
+            .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(c))
+            .and_then(|f| pr::class_for(&f.db_type));
+        match class {
+            Some(k) => wanted.push(k),
+            None => {
+                info.prepared = PreparedSelect::Ineligible;
+                return;
+            }
+        }
+    }
+    if classes != wanted {
+        // These values cannot teach (a number for a text column, say); the
+        // next ones may.
+        return;
+    }
+    let shape = pr::shape_of(&query_row);
+    info.prepared = match std::mem::take(&mut info.prepared) {
+        PreparedSelect::Unknown => match pr::WhereTemplate::derive(&query_row.where_clause, &literals) {
+            Some(template) => PreparedSelect::Candidate(Box::new(PreparedLearned {
+                generation,
+                table_name,
+                query_row,
+                shape,
+                template,
+                literals,
+                classes,
+                fields,
+                scales,
+                misses: 0,
+            })),
+            // A value that also occurs elsewhere in the clause; another
+            // execution may place it unambiguously.
+            None => PreparedSelect::Unknown,
+        },
+        PreparedSelect::Candidate(mut l) => {
+            if literals.iter().zip(&l.literals).any(|(a, b)| a == b) {
+                // A value the same as last time checks nothing about where it
+                // goes. Give up watching after a few.
+                l.misses += 1;
+                if l.misses > 8 {
+                    PreparedSelect::Ineligible
+                } else {
+                    PreparedSelect::Candidate(l)
+                }
+            } else if l.table_name == table_name
+                && l.shape == shape
+                && l.fields == fields
+                && l.scales == scales
+                && l.classes == classes
+                && l.template.render(&literals) == query_row.where_clause
+            {
+                let mut query_row = query_row;
+                query_row.where_clause = String::new();
+                l.query_row = query_row;
+                PreparedSelect::Ready(l)
+            } else {
+                // The text path made something the template would not have:
+                // a value rewritten by what it holds. Text path for good.
+                PreparedSelect::Ineligible
+            }
+        }
+        other => other,
+    };
+}
+
+/// One statement: its cached parse when it has one, its text otherwise.
+async fn run_statement<S>(
+    database: &Arc<Database>,
+    state: &mut SessionState,
+    stream: &mut S,
+    stmt: &str,
+    result_formats: &[i16],
+    omit_description: bool,
+    prepared: Option<PreparedRun>,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    match prepared {
+        Some(run) => execute_prepared(database, state, stream, stmt, run, result_formats, omit_description).await,
+        None => execute_single_statement(database, state, stream, stmt, result_formats, omit_description).await,
+    }
+}
+
+/// Runs a prepared `SELECT` from its cached parse. What it skips is the
+/// statement text's parsing; what it keeps is everything the text path does
+/// around a plain `SELECT`: the aborted-block refusal, the transaction it runs
+/// in, and the reply.
+async fn execute_prepared<S>(
+    database: &Arc<Database>,
+    state: &mut SessionState,
+    stream: &mut S,
+    stmt: &str,
+    run: PreparedRun,
+    result_formats: &[i16],
+    omit_description: bool,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if state.transaction.as_ref().is_some_and(|t| t.failed) {
+        send_error_response(
+            stream,
+            "25P02",
+            "current transaction is aborted, commands ignored until end of transaction block",
+        )
+        .await?;
+        return Ok(());
+    }
+    let resp = match state.current_tx() {
+        Some(tx) => {
+            let purpose = QueryPurpose::PreparedRows(run.rows);
+            crate::core::rql::executor::execute_in_txn(purpose, database.clone(), tx).await
+        }
+        // A plain read needs a snapshot, not a transaction.
+        None if run.rows.query_row.row_lock.is_none() => {
+            crate::core::rql::executor::execute_prepared_read(run.rows, database.clone()).await
+        }
+        None => {
+            let purpose = QueryPurpose::PreparedRows(run.rows);
+            crate::core::rql::executor::execute_with_sync(purpose, database.clone(), state.synchronous_commit())
+                .await
+        }
+    };
+    let result = send_engine_response(
+        state,
+        stream,
+        resp,
+        PurposeKind::QueryRows,
+        run.fields,
+        run.scales,
+        result_formats,
+        omit_description,
+    )
+    .await;
+    if state.statement_failed {
+        match state.statement_error.as_deref() {
+            Some(reason) => log::error!("Statement failed ({}): {}", reason, crate::core::redact::statement(stmt)),
+            None => log::error!("Statement failed: {}", crate::core::redact::statement(stmt)),
+        }
+    }
+    result
 }
 
 async fn execute_recorded_inner<S>(
@@ -3101,6 +3630,7 @@ async fn execute_recorded_inner<S>(
     stmt: &str,
     result_formats: &[i16],
     omit_description: bool,
+    prepared: Option<PreparedRun>,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -3113,13 +3643,14 @@ where
 
     #[cfg(not(feature = "query_stats"))]
     {
-        return execute_single_statement(
+        return run_statement(
             database,
             state,
             stream,
             stmt,
             result_formats,
             omit_description,
+            prepared,
         )
         .await;
     }
@@ -3127,26 +3658,28 @@ where
     #[cfg(feature = "query_stats")]
     {
         let Some(recording) = crate::core::query_stats::begin() else {
-            return execute_single_statement(
+            return run_statement(
                 database,
                 state,
                 stream,
                 stmt,
                 result_formats,
                 omit_description,
+                prepared,
             )
             .await;
         };
 
         // Boxed for the same reason the inner call is: this path is deep, and
         // the future of a statement is the largest one in the process.
-        let running = Box::pin(execute_single_statement(
+        let running = Box::pin(run_statement(
             database,
             state,
             stream,
             stmt,
             result_formats,
             omit_description,
+            prepared,
         ));
         let result = crate::core::query_stats::observe(recording.probe(), running).await;
 
@@ -3349,6 +3882,11 @@ where
         .as_ref()
         .map(|c| c.rewritten.as_str())
         .unwrap_or(after_derived);
+    // Materialised relations are per execution, so a parse of the rewritten
+    // text names relations the next execution will not have.
+    if materialized.is_some() || derived.is_some() || catalog.is_some() {
+        crate::core::rql::prepared::note_rewritten();
+    }
 
     // The outer statement runs in the same transaction as its CTE bodies.
     let restore_tx = state.statement_tx;
@@ -3611,6 +4149,8 @@ where
         .await
         {
             Ok(s) => {
+                // The subquery's answer is now literal text in the statement.
+                crate::core::rql::prepared::note_rewritten();
                 flattened = s;
                 flattened.as_str()
             }
@@ -3868,6 +4408,8 @@ where
         _ => None,
     };
 
+    crate::core::rql::prepared::note_description(&select_fields, &select_scales);
+
     // `execute` consumes QueryPurpose, but we still want `purpose_kind`/`select_fields`.
     // Re-recognize the query to get an owned QueryPurpose to pass into the engine.
     //
@@ -3896,6 +4438,35 @@ where
             .await
         }
     };
+    send_engine_response(
+        state,
+        stream,
+        resp,
+        purpose_kind,
+        select_fields,
+        select_scales,
+        result_formats,
+        omit_description,
+    )
+    .await
+}
+
+/// Turns the engine's answer to a statement into the wire messages that
+/// answer the client.
+#[allow(clippy::too_many_arguments)]
+async fn send_engine_response<S>(
+    state: &mut SessionState,
+    stream: &mut S,
+    resp: Vec<u8>,
+    purpose_kind: PurposeKind,
+    select_fields: Option<Vec<(String, DbType)>>,
+    select_scales: Option<Vec<u32>>,
+    result_formats: &[i16],
+    omit_description: bool,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     if resp.is_empty() {
         fail_statement(state, stream, "XX000", "empty engine response").await?;
         return Ok(());
@@ -4186,7 +4757,7 @@ where
     let statements = split_statements(&normalized);
 
     for stmt in statements {
-        execute_recorded(database, state, stream, &stmt, &[], false).await?;
+        execute_recorded(database, state, stream, &stmt, &[], false, None).await?;
         // PostgreSQL stops a multi-statement string at the first failure.
         // Inside a block the poisoning refuses the rest; outside one nothing
         // did, so a migration sent as one string had its first statement fail

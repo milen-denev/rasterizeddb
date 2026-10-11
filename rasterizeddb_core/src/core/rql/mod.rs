@@ -41,6 +41,7 @@ pub mod foreign_key;
 pub mod join;
 pub mod json_map;
 pub mod path_index;
+pub mod prepared;
 
 pub mod catalog_views;
 pub mod check;

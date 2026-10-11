@@ -364,6 +364,13 @@ pub fn param_to_literal(p: &BoundParam) -> Result<String, String> {
 /// [`param_to_literal`], appended to `out` — the form `inline_params` uses, so
 /// the common text and string parameters are quoted straight into the
 /// statement rather than into a `String` of their own first.
+/// One bound value as `inline_params` writes it into the statement text.
+pub fn param_literal(p: &BoundParam) -> Result<String, String> {
+    let mut out = String::new();
+    push_param_literal(&mut out, p)?;
+    Ok(out)
+}
+
 fn push_param_literal(out: &mut String, p: &BoundParam) -> Result<(), String> {
     let Some(raw) = p.value.as_deref() else {
         out.push_str("NULL");

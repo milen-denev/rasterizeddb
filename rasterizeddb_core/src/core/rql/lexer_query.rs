@@ -13,7 +13,7 @@ use crate::core::{
     rql::lexer_s1::QueryPurpose,
 };
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct QueryRows {
     pub table_name: String,
     pub query_row_fetch: RowFetch,

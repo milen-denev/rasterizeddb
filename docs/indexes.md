@@ -155,9 +155,50 @@ Three changes produced these figures:
 `UNIQUE` checks probe the index rather than evaluating a filter over the
 whole table, which is the upsert gain.
 
+After that, upserts were bound by locks rather than by work: every insert
+into a keyed table and every update took one table-wide lock. The uniqueness
+lock is now striped by key, and an update naming its row by a unique key runs
+beside updates of other keys (see [MVCC](mvcc.md), "Which writers take
+turns"). Measured the same way, the upsert row went from 16.9k/s to
+31–35k/s, and the server is now CPU-bound rather than waiting on a lock.
+
 Filtered queries over unindexed columns, the engine's existing strength, are
 unchanged: still 4.6–9× ahead of PostgreSQL without an index there.
 
-What remains is per-statement work outside the index. The statement text is
-parsed again on every execution, even when prepared, and results pass through
-the general scan machinery. That is where the next gains are.
+### Prepared statements
+
+A prepared statement used to be parsed again on every execution. The bound
+values were written into its text, and the text then went through the whole
+pipeline: classified twice, its select list parsed three times, its `WHERE`
+clause tokenized three times. Nearly all of that produced the same result
+every time.
+
+A prepared `SELECT` now keeps its parse (`core::rql::prepared`). That parse is
+never derived, only observed:
+- **First execution.** The text path runs as before while recording what it
+  did. Each value's literal is located in the parsed `WHERE` clause, which
+  becomes a template.
+- **Second execution, with different values.** It must produce exactly that
+  template rendered with its own values, and everything else it records must
+  match the first.
+- **From the third on,** executions write their values into the template and
+  go straight to the scan.
+
+Anything that would make the shortcut answer differently keeps a statement on
+the text path:
+- a value used other than as `column <op> $n` (`LIKE` turns `'ab%'` into a
+  prefix test and `'ab'` into an equality, so its rewrite depends on the
+  value);
+- a column type whose literals a rewrite may interpret (dates, booleans,
+  JSON);
+- a `NULL`, or a string holding a quote;
+- a rewrite around the statement (a CTE, a view, a subquery);
+- a schema change since the parse was learned.
+
+Measured the same way as above, point reads by primary key went from 16.3k
+to 25.9k/s with one client, and from 72.9k to 98.7k/s with sixteen. The gap
+to PostgreSQL went from 3.2× to 2.0× and 2.4×.
+
+What remains per execution is text work around the parse: the values are
+still written into the statement for logging and statistics, and the
+rendered `WHERE` clause is still tokenized and compiled at the table.
