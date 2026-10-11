@@ -1,5 +1,4 @@
 use smallvec::SmallVec;
-use std::collections::HashMap;
 use std::{arch::x86_64::*, borrow::Cow};
 
 use crate::core::row::schema::SchemaField;
@@ -274,57 +273,43 @@ unsafe fn scan_identifier_simd(bytes: &[u8], mut pos: usize) -> usize {
     pos
 }
 
-// Pre-compute field lookup map for better cache locality
-struct FieldLookup<'a> {
-    map: HashMap<Cow<'a, String>, (Cow<'a, String>, DbType, u64)>,
-    logical_ops: HashMap<String, String>,
-    string_ops: HashMap<String, String>,
+/// The column a name in a predicate refers to: matched exactly, and the
+/// last of that name in schema order when several share it (a dropped column
+/// keeps its name). A linear scan: schemas are short, and building a map per
+/// tokenization cost more than every lookup it served.
+fn field_named<'a>(schema: &'a SmallVec<[SchemaField; 20]>, name: &str) -> Option<&'a SchemaField> {
+    schema.iter().rev().find(|f| f.name == name)
 }
 
-impl<'a> FieldLookup<'a> {
-    fn new(schema: &'a SmallVec<[SchemaField; 20]>) -> Self {
-        let mut map =
-            HashMap::<Cow<'a, String>, (Cow<'a, String>, DbType, u64)>::with_capacity(schema.len());
-
-        for field in schema.iter() {
-            map.insert(
-                Cow::Borrowed(&field.name),
-                (
-                    Cow::Borrowed(&field.name),
-                    field.db_type.clone(),
-                    field.write_order.clone(),
-                ),
-            );
-        }
-
-        let mut logical_ops = HashMap::new();
-        logical_ops.insert("and".to_string(), "AND".to_string());
-        logical_ops.insert("or".to_string(), "OR".to_string());
-
-        let mut string_ops = HashMap::new();
-        string_ops.insert("contains".to_string(), "CONTAINS".to_string());
-        string_ops.insert("startswith".to_string(), "STARTSWITH".to_string());
-        string_ops.insert("endswith".to_string(), "ENDSWITH".to_string());
+/// The operators the tokenizer reads as words, by their lowercase spelling.
+fn string_op(lower: &str) -> Option<&'static str> {
+    Some(match lower {
+        "contains" => "CONTAINS",
+        "startswith" => "STARTSWITH",
+        "endswith" => "ENDSWITH",
         // The case-insensitive counterparts that `ILIKE` lowers to. Without
         // these the tokenizer would treat them as unknown identifiers, which it
         // panics on.
-        string_ops.insert("icontains".to_string(), "ICONTAINS".to_string());
-        string_ops.insert("istartswith".to_string(), "ISTARTSWITH".to_string());
-        string_ops.insert("iendswith".to_string(), "IENDSWITH".to_string());
-        string_ops.insert("iequals".to_string(), "IEQUALS".to_string());
+        "icontains" => "ICONTAINS",
+        "istartswith" => "ISTARTSWITH",
+        "iendswith" => "IENDSWITH",
+        "iequals" => "IEQUALS",
         // `LIKE`/`ILIKE` reach the tokenizer only for patterns the rewrite could
         // not reduce to one of the above — an interior `%`, or a `_`.
-        string_ops.insert("like".to_string(), "LIKE".to_string());
-        string_ops.insert("ilike".to_string(), "ILIKE".to_string());
+        "like" => "LIKE",
+        "ilike" => "ILIKE",
         // `SIMILAR TO`, folded to one word by `predicate_rewrite` so it fits
         // this table — the tokenizer reads one identifier at a time.
-        string_ops.insert("similarto".to_string(), "SIMILARTO".to_string());
+        "similarto" => "SIMILARTO",
+        _ => return None,
+    })
+}
 
-        Self {
-            map,
-            logical_ops,
-            string_ops,
-        }
+fn logical_op(lower: &str) -> Option<&'static str> {
+    match lower {
+        "and" => Some("AND"),
+        "or" => Some("OR"),
+        _ => None,
     }
 }
 
@@ -424,9 +409,6 @@ fn tokenize_inner<'a>(
     let mut out = SmallVec::new();
     let bytes = s.as_bytes();
     let mut i = 0;
-
-    // Pre-compute lookup structures
-    let field_lookup = FieldLookup::new(schema);
 
     // Track context for field association to maintain type consistency
     let mut current_field_context: Option<(Cow<'a, String>, DbType, u64)> = None;
@@ -549,10 +531,19 @@ fn tokenize_inner<'a>(
 
                 let id = unsafe { std::str::from_utf8_unchecked(&bytes[start..i]) };
 
-                let id_lower: String = id.to_lowercase();
+                // ASCII, the common case, needs no lowered copy. Anything else
+                // is lowered as Unicode lowers it, as it always was: a
+                // non-ASCII letter can lower to an ASCII one.
+                let lowered;
+                let id_lower: &str = if id.is_ascii() && !id.bytes().any(|b| b.is_ascii_uppercase()) {
+                    id
+                } else {
+                    lowered = id.to_lowercase();
+                    &lowered
+                };
 
-                // Check for special operators using pre-computed maps
-                if let Some(normalized) = field_lookup.string_ops.get(&id_lower) {
+                // Check for special operators
+                if let Some(normalized) = string_op(id_lower) {
                     // For string operations, we need to determine the type from context or schema
                     // Since these are operators, we might want to use the current expression type
                     // A string operator with nothing before it — `WHERE like 'x'`,
@@ -561,21 +552,21 @@ fn tokenize_inner<'a>(
                     let Some(op_type) = expression_type_context.clone() else {
                         return Err(format!("operator {} has no left-hand operand", normalized));
                     };
-                    out.push(Token::Ident((normalized.clone(), op_type, 0)));
+                    out.push(Token::Ident((normalized.to_string(), op_type, 0)));
                     continue;
                 }
 
-                if let Some(normalized) = field_lookup.logical_ops.get(&id_lower) {
-                    out.push(Token::Next(normalized.clone()));
+                if let Some(normalized) = logical_op(id_lower) {
+                    out.push(Token::Next(normalized.to_string()));
                     expression_type_context = None;
                     current_field_context = None;
                     continue;
                 }
 
                 // Check if this is a field name in the schema
-                if let Some((canonical_name, field_type, write_order)) =
-                    field_lookup.map.get(&id.to_string())
-                {
+                if let Some(field) = field_named(schema, id) {
+                    let (canonical_name, field_type, write_order) =
+                        (Cow::Borrowed(&field.name), &field.db_type, &field.write_order);
                     current_field_context = Some((
                         canonical_name.clone(),
                         field_type.clone(),
