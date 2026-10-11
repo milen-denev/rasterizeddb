@@ -389,6 +389,10 @@ pub(crate) fn latency_guards_on() -> bool {
 
 pub struct ConcurrentProcessor;
 
+/// The fewest index candidates a scan worker is given. Below this the
+/// cost of another worker outweighs the fetches it would take over.
+const SPARSE_MIN_BATCH: usize = 512;
+
 impl ConcurrentProcessor {
     pub fn new() -> Self {
         Self {}
@@ -876,11 +880,24 @@ impl ConcurrentProcessor {
         //
         // Large scans are unaffected: once there are at least as many batches
         // as threads this is exactly what it was.
-        let batches = iterator
-            .expected_records()
-            .div_ceil(crate::batch_size().max(1) as u64)
-            .max(1);
-        let n_workers = crate::max_permits_threads().min(batches as usize).max(1);
+        //
+        // A slot list from an index is cut finer. Its every pointer is a row
+        // to fetch rather than a bit to test, so a few thousand of them are
+        // milliseconds of work, and at `batch_size()` per batch all of it fell
+        // to one worker: an index answer of 5,000 rows ran slower than the
+        // filter's scan of the whole table, which spread across every worker.
+        // Small answers still get one worker; a point lookup is one batch.
+        let threads = crate::max_permits_threads().max(1);
+        let expected = iterator.expected_records();
+        let per_batch = if iterator.has_sparse_candidates() {
+            let per = (expected.div_ceil(threads as u64) as usize).clamp(SPARSE_MIN_BATCH, crate::batch_size().max(1));
+            iterator.set_batch_limit(per);
+            per
+        } else {
+            crate::batch_size().max(1)
+        };
+        let batches = expected.div_ceil(per_batch as u64).max(1);
+        let n_workers = threads.min(batches as usize).max(1);
 
         // Bounded MPMC channel for batch dispatch. Capacity = n_workers gives
         // natural backpressure: the iterator stops reading ahead when every

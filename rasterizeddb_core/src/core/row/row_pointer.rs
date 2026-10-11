@@ -102,6 +102,10 @@ pub struct RowPointerIterator<S: StorageIO> {
     /// decoded and its row bytes are never fetched. The mask is always a
     /// *superset* of true matches, so ignoring it costs only performance.
     candidates: Option<Arc<CandidateBitmap>>,
+    /// Pointers handed out per batch, when not `batch_size()`. A slot list
+    /// of a few thousand candidates is cut finer so several workers share it;
+    /// see `ConcurrentProcessor::spawn_batch_tasks`.
+    batch_limit: Option<usize>,
 }
 
 /// The pointer-record length before MVCC stamps were added.
@@ -147,6 +151,7 @@ impl<S: StorageIO> RowPointerIterator<S> {
             chunk_start_position: 0,
             borrowed_chunk: None,
             candidates: None,
+            batch_limit: None,
         };
 
         // Load the first chunk of data
@@ -179,6 +184,7 @@ impl<S: StorageIO> RowPointerIterator<S> {
             chunk_start_position: 0,
             borrowed_chunk: None,
             candidates: None,
+            batch_limit: None,
         })
     }
 
@@ -190,6 +196,16 @@ impl<S: StorageIO> RowPointerIterator<S> {
     pub fn set_candidates(&mut self, candidates: Option<Arc<CandidateBitmap>>) {
         self.candidates = candidates;
         self.end_if_nothing();
+    }
+
+    /// Hands out at most `limit` pointers per batch.
+    pub fn set_batch_limit(&mut self, limit: usize) {
+        self.batch_limit = Some(limit.max(1));
+    }
+
+    /// Whether the candidates are a slot list rather than a mask.
+    pub fn has_sparse_candidates(&self) -> bool {
+        self.candidates.as_ref().is_some_and(|c| c.is_sparse())
     }
 
     /// A mask admitting nothing (a constant-false `WHERE`) ends the scan before
@@ -558,7 +574,7 @@ impl<S: StorageIO> RowPointerIterator<S> {
     pub async fn next_row_pointers_into(&mut self, out: &mut Vec<RowPointer>) -> Result<()> {
         out.clear();
 
-        let batch_size = crate::batch_size();
+        let batch_size = self.batch_limit.unwrap_or_else(crate::batch_size);
         out.reserve(batch_size.saturating_sub(out.capacity()));
 
         // Inline the synchronous fast-path of `next_row_pointer_with_offset` so we avoid
@@ -588,6 +604,20 @@ impl<S: StorageIO> RowPointerIterator<S> {
                 if let Some(ref bm) = candidates {
                     let slot = self.current_slot();
                     if !bm.get(slot) {
+                        // A slot list: straight to the next listed slot. Walking
+                        // there record by record asked the list about every
+                        // record in between, a binary search each, and an index
+                        // answer of a few thousand rows spread over a million
+                        // became a million searches: slower than the filter's
+                        // scan of the whole table.
+                        if bm.is_sparse() {
+                            let next = bm.next_candidate(slot + 1);
+                            let skip = (next - slot).saturating_mul(TOTAL_LENGTH as u64);
+                            self.buffer_index = (self.buffer_index as u64)
+                                .saturating_add(skip)
+                                .min(self.buffer_valid_length as u64) as usize;
+                            continue;
+                        }
                         // Whole-word skip: when no slot in this 64-row group can
                         // match, 64 pointer records are dismissed without
                         // decoding any of them. Both operands are multiples of

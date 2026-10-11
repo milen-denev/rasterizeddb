@@ -246,3 +246,46 @@ fn method_choice() {
     assert!(choose_method(Some(Method::Hash), &[DbType::INTERVAL]).is_err());
     assert!(choose_method(None, &[DbType::INTERVAL]).is_err());
 }
+
+#[test]
+fn a_composite_btree_ranges_inside_its_equality_prefix() {
+    let strings = ["a", "b", "b\0", "c", "d"];
+    let slot_of = |n: i64, j: usize| (n as u64) * strings.len() as u64 + j as u64;
+    for (name, cols) in [("ns", [0u32, 1]), ("sn", [1, 0])] {
+        let ix = index(name, Method::BTree, &cols);
+        let indexes = TableIndexes::new(vec![ix.clone()]);
+        for n in 0..10i64 {
+            for (j, s) in strings.iter().enumerate() {
+                let nb = n.to_le_bytes();
+                let key = ix.key_of(|wo| Some(if wo == 0 { &nb[..] } else { s.as_bytes() }));
+                ix.insert(slot_of(n, j), key);
+            }
+        }
+        let p = |wo: u32, op: SargOp, v: &[u8]| {
+            MaskExpr::Pred(SargPredicate {
+                write_order: wo,
+                op,
+                value: v.to_vec(),
+            })
+        };
+        let three = 3i64.to_le_bytes();
+        let five = 5i64.to_le_bytes();
+        // Leading column fixed, a range on the next: only that slice.
+        let (expr, want): (MaskExpr, Vec<u64>) = if cols[0] == 0 {
+            (
+                MaskExpr::And(vec![p(0, SargOp::Eq, &three), p(1, SargOp::Gt, b"b")]),
+                vec![slot_of(3, 2), slot_of(3, 3), slot_of(3, 4)],
+            )
+        } else {
+            (
+                MaskExpr::And(vec![p(1, SargOp::Eq, b"b"), p(0, SargOp::Lt, &five)]),
+                (0..5).map(|n| slot_of(n, 1)).collect(),
+            )
+        };
+        assert_eq!(indexes.plan(&expr, &fields(), usize::MAX), Some(want), "{name}");
+        // The prefix alone still narrows to it.
+        let only_prefix = if cols[0] == 0 { p(0, SargOp::Eq, &three) } else { p(1, SargOp::Eq, b"b") };
+        let got = indexes.plan(&only_prefix, &fields(), usize::MAX).unwrap();
+        assert_eq!(got.len(), if cols[0] == 0 { strings.len() } else { 10 }, "{name}");
+    }
+}

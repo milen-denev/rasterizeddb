@@ -340,8 +340,16 @@ impl MapLike for HashMap<KeyBuf, Slots, RandomState> {
     }
 }
 
-/// Byte bounds on a B-tree for constraints on its leading column.
+/// Byte bounds on a B-tree for an equality prefix and the constraints on
+/// the column after it.
+///
+/// `prefix` is the encoding of the first `k` columns, each fixed by an
+/// equality. Every component encoding is prefix-free (fixed width, or a
+/// terminated string), so the keys holding those `k` values are exactly the
+/// keys that start with `prefix`, and the bounds on column `k` are its own
+/// bounds with `prefix` in front.
 struct LeadingRange {
+    prefix: Vec<u8>,
     lo: Option<(Vec<u8>, bool)>, // (bytes, inclusive)
     hi: Option<(Vec<u8>, bool)>,
 }
@@ -371,14 +379,32 @@ fn prefix_bounds(ty: &DbType, v: &[u8], whole_key: bool) -> Option<(Vec<u8>, Opt
 }
 
 impl LeadingRange {
-    fn new() -> Self {
-        LeadingRange { lo: None, hi: None }
+    /// The keys that start with `prefix`: all of them when it is empty.
+    fn within(prefix: Vec<u8>) -> Self {
+        if prefix.is_empty() {
+            return LeadingRange { prefix, lo: None, hi: None };
+        }
+        let hi = key::prefix_successor(&prefix).map(|h| (h, false));
+        LeadingRange {
+            lo: Some((prefix.clone(), true)),
+            hi,
+            prefix,
+        }
     }
 
-    /// Narrows by one predicate on the leading column. `whole_key` is true
-    /// for a one-column index, whose keys are the plain encoding.
+    /// Narrows by one predicate on the column after the prefix. `whole_key`
+    /// is true when that column is the key's last, whose encoding is then
+    /// not a prefix of anything longer.
     fn narrow(&mut self, ty: &DbType, p: &SargPredicate, whole_key: bool) -> Option<()> {
         let (plo, phi) = prefix_bounds(ty, &p.value, whole_key)?;
+        let with_prefix = |b: Vec<u8>| {
+            let mut out = Vec::with_capacity(self.prefix.len() + b.len());
+            out.extend_from_slice(&self.prefix);
+            out.extend_from_slice(&b);
+            out
+        };
+        let plo = with_prefix(plo);
+        let phi = phi.map(with_prefix);
         // For a whole key, "equal to v" is [enc, enc]; for a prefix,
         // [plo, phi) with phi exclusive (or unbounded).
         let (eq_lo, eq_hi): ((Vec<u8>, bool), Option<(Vec<u8>, bool)>) = if whole_key {
@@ -623,19 +649,37 @@ impl TableIndexes {
             }
         }
 
-        // 2. A B-tree whose leading column is constrained: one range scan.
-        //    Equality on the leading column first (tighter), then ranges.
+        // 2. A B-tree constrained on a leading run of its columns: equality
+        //    on the first `k`, and any bounds on column `k`, as one range
+        //    scan. `cat = 5 AND price > 990` over `(cat, price)` reads the
+        //    `cat = 5` keys above `990` and no others.
         let mut best: Option<Vec<u64>> = None;
-        for index in self.list.iter().filter(|i| i.method() == Method::BTree) {
-            let lead = index.leading();
-            let on_lead: Vec<&&SargPredicate> = preds.iter().filter(|p| p.write_order == lead).collect();
-            if on_lead.is_empty() {
+        'index: for index in self.list.iter().filter(|i| i.method() == Method::BTree) {
+            let n = index.columns.len();
+            let mut prefix = Vec::new();
+            let mut k = 0;
+            while k < n {
+                let (wo, _) = &index.columns[k];
+                let Some(p) = eq_of(*wo) else { break };
+                let Some(ty) = Self::type_of(fields, *wo) else { continue 'index };
+                if key::encode_ordered(&ty, &p.value, k + 1 == n, &mut prefix).is_none() {
+                    continue 'index;
+                }
+                k += 1;
+            }
+            // Every column fixed is a whole key, which step 1 asked.
+            if k == n {
                 continue;
             }
-            let Some(ty) = Self::type_of(fields, lead) else { continue };
-            let whole_key = index.columns.len() == 1;
-            let mut range = LeadingRange::new();
-            if on_lead.iter().any(|p| range.narrow(&ty, p, whole_key).is_none()) {
+            let next = index.columns[k].0;
+            let on_next: Vec<&&SargPredicate> = preds.iter().filter(|p| p.write_order == next).collect();
+            if k == 0 && on_next.is_empty() {
+                continue;
+            }
+            let Some(ty) = Self::type_of(fields, next) else { continue };
+            let whole_key = k + 1 == n;
+            let mut range = LeadingRange::within(prefix);
+            if on_next.iter().any(|p| range.narrow(&ty, p, whole_key).is_none()) {
                 continue;
             }
             let (lo, hi) = range.bounds();
@@ -675,7 +719,7 @@ pub fn for_schema(schema: &crate::core::row::schema::TableSchema) -> Vec<Arc<Liv
             .map(|f| f.write_order as u32)
     };
     let mut out: Vec<Arc<LiveIndex>> = Vec::new();
-    let mut add = |decl: IndexDecl, implicit: bool, out: &mut Vec<Arc<LiveIndex>>| {
+    let add = |decl: IndexDecl, implicit: bool, out: &mut Vec<Arc<LiveIndex>>| {
         if out.iter().any(|i| i.decl.columns == decl.columns && i.decl.method == decl.method) {
             return;
         }

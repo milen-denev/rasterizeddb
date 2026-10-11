@@ -2655,6 +2655,32 @@ impl<S: StorageIO> Table<S> {
         Some(Arc::new(CandidateBitmap::sparse(slots, n_slots)))
     }
 
+    /// The filter index's mask for a clause, and the table length it covers:
+    /// every slot that may match, before any judgement of whether a scan is
+    /// better off with it.
+    async fn filter_mask(&self, where_clause: &str) -> Option<(CandidateBitmap, u64)> {
+        let filters = self.filters.as_ref()?;
+        if where_clause.trim().is_empty() {
+            return None;
+        }
+        // A predicate the tokenizer cannot read is not a reason to abandon the
+        // query: the filter index is an optimisation, so an unreadable clause
+        // just means no candidate set and a full scan, which the evaluator will
+        // then reject with a proper message.
+        let tokens = crate::core::tokenizer::query_tokenizer::try_tokenize(where_clause, &self.schema.fields).ok()?;
+        // Each `NUMERIC(p, s)` column's scale, so a literal is bounded where
+        // the column stores it — see `sarg::extract_with_scales`.
+        let scales = self.decimal_scales();
+        let program = sarg::extract_with_scales(&tokens, filters, &scales)?;
+        let n_slots = self.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
+        if n_slots == 0 {
+            return None;
+        }
+        let bitmap = filters.evaluate(&program, n_slots)?;
+        Some((bitmap, n_slots))
+    }
+
+
     /// Build a candidate mask for a WHERE clause, or `None` to scan normally.
     ///
     /// `pub(crate)` only so `write_path_tests` can assert on what it declines.
@@ -2675,42 +2701,27 @@ impl<S: StorageIO> Table<S> {
         // A secondary index names the candidate slots outright, so it is
         // asked first. When none can answer the clause, or the answer is too
         // broad to be worth a slot list, the filter's mask is the next best.
-        if let Some(found) = self.index_candidates(where_clause).await {
-            return Some(found);
+        //
+        // A short answer is taken as it is. A long one is narrowed by the
+        // filter as well: an index over `(cat, price)` asked `cat = 5 AND
+        // price > 990` without a range on `price` names every `cat = 5` row,
+        // while the filter's mask already excludes most of them on `price`.
+        // Both are supersets of the matches, so their intersection is too.
+        let from_index = self.index_candidates(where_clause).await;
+        if let Some(found) = &from_index {
+            if found.count() <= INDEX_ANSWER_TAKEN_AS_IS || self.filters.is_none() {
+                return from_index;
+            }
+            let Some((mask, _)) = self.filter_mask(where_clause).await else {
+                return from_index;
+            };
+            let mut narrowed = (**found).clone();
+            narrowed.intersect(&mask);
+            info!("Filter narrowed {} index candidates to {}", found.count(), narrowed.count());
+            return Some(Arc::new(narrowed));
         }
         let filters = self.filters.as_ref()?;
-        if where_clause.trim().is_empty() {
-            return None;
-        }
-
-        // A predicate the tokenizer cannot read is not a reason to abandon the
-        // query: the filter index is an optimisation, so an unreadable clause
-        // just means no candidate set and a full scan, which the evaluator will
-        // then reject with a proper message.
-        let tokens = crate::core::tokenizer::query_tokenizer::try_tokenize(
-            where_clause,
-            &self.schema.fields,
-        )
-        .ok()?;
-        // Each `NUMERIC(p, s)` column's scale, so a literal is bounded where
-        // the column stores it — see `sarg::extract_with_scales`.
-        let scales: smallvec::SmallVec<[(u32, u32); 4]> = self
-            .schema
-            .fields
-            .iter()
-            .filter(|f| f.db_type == crate::core::db_type::DbType::DECIMAL)
-            .filter_map(|f| {
-                f.scale
-                    .filter(|s| *s != crate::core::value_codec::DECIMAL_SCALE)
-                    .map(|s| (f.write_order as u32, s))
-            })
-            .collect();
-        let program = sarg::extract_with_scales(&tokens, filters, &scales)?;
-
-        let n_slots = self.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
-        if n_slots == 0 {
-            return None;
-        }
+        let (bitmap, n_slots) = self.filter_mask(where_clause).await?;
 
         // A table small enough to scan outright gains nothing from a mask: the
         // bitmap test per record costs more than the fetches it saves, and
@@ -2724,8 +2735,6 @@ impl<S: StorageIO> Table<S> {
         if n_slots < filters.config().min_table_rows {
             return None;
         }
-
-        let bitmap = filters.evaluate(&program, n_slots)?;
 
         // A mask that barely prunes costs more (a bitmap test per record) than
         // the fetches it avoids — *when the scan reads everything*. That is the
@@ -3965,6 +3974,11 @@ impl<S: StorageIO> Table<S> {
         Ok(Some(updated_count))
     }
 }
+
+/// An index answer at most this long is scanned as it is; a longer one is
+/// intersected with the filter's mask first. Below it, evaluating the mask
+/// costs more than the fetches it could save.
+const INDEX_ANSWER_TAKEN_AS_IS: u64 = 256;
 
 /// Index rows `[start_slot, ..)` from authoritative storage.
 ///
