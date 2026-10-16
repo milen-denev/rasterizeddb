@@ -4581,6 +4581,14 @@ fn sqlstate_for(message: &str) -> &'static str {
     let m = message.to_ascii_lowercase();
     let has = |needle: &str| m.contains(needle);
 
+    // A literal that is not JSON. Decided first, because the message quotes
+    // the literal and the parser's reason, and either can contain the words
+    // the branches below look for: `'{"relation x does not exist":'` would
+    // otherwise come back as 42P01. Not a prefix test: the plan compiler
+    // wraps the message ("could not compile the query plan: …").
+    if has("invalid input syntax for type json") {
+        return "22P02";
+    }
     // `57014` is `query_canceled`, which is what a driver watches for to tell
     // "the server gave up on this" apart from "this statement is wrong".
     if has("canceling statement") {

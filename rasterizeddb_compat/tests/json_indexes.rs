@@ -38,10 +38,9 @@ fn number(r: &mut Lcg, n: u64) -> String {
     }
 }
 
-/// Whether documents may be `NULL`. Off only until `@>`/`?|` over a `NULL`
-/// document stop failing the statement (wf/json-rowpath); the twin itself
-/// errors today, with or without indexes.
-const NULL_DOCS: bool = false;
+/// Whether documents may be `NULL`: they match no JSON operator, indexed or
+/// not.
+const NULL_DOCS: bool = true;
 
 /// A random document, or `NULL`.
 fn document(r: &mut Lcg) -> String {

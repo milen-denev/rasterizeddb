@@ -62,6 +62,11 @@ async fn null_documents_and_missing_paths_match_nothing() {
         (r#"doc->'tags' @> '["y"]' OR id = 3"#, "1,3,5"),
         (r#"doc->'tags' <@ '["x","y","q"]'"#, "1,5"),
         (r#"doc->'o'->'k' @> '1'"#, "1"),
+        // A JSON string on the right: the usual way to ask whether an array
+        // holds a string. Its double quotes are JSON, not SQL.
+        (r#"doc->'tags' @> '"x"'"#, "1"),
+        (r#"doc->'s' @> '"str"'"#, "1"),
+        (r#"doc @> '"x"'"#, ""),
         ("doc ? 'a'", "1,3"),
         ("doc ?| '{a,tags}'", "1,3,5"),
         ("doc ?| array['q','tags']", "1,5"),
@@ -126,6 +131,9 @@ async fn an_invalid_json_literal_is_refused_with_22p02() {
         "SELECT id FROM objs WHERE doc <@ 'not json'",
         "SELECT id FROM d WHERE doc @> '{bad'",
         "SELECT id FROM d WHERE doc->'tags' @> '[1,'",
+        // The literal's own words must not choose the code: this one reads
+        // like a missing relation, and like an out-of-range value.
+        r#"SELECT id FROM d WHERE doc @> '{"relation x does not exist, out of range":'"#,
     ] {
         let err = sqlx::query(AssertSqlSafe(sql))
             .fetch_all(&pool)
