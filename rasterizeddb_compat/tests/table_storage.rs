@@ -102,4 +102,40 @@ async fn a_table_reports_what_is_holding_it() {
     assert_eq!(metric("vacuum_enabled"), "true");
     assert_eq!(metric("check_constraints"), "0");
     assert_eq!(metric("path_indexes"), "0");
+    assert_eq!(metric("vacuum_panics"), "0");
+}
+
+/// `SHOW STATS` answers whether this database's commits can still be trusted.
+///
+/// A poisoned log, a failed data-file flush and a panicking vacuum service
+/// were each visible only as one log line at the moment they happened; these
+/// metrics are how an operator asks afterwards. The failure states themselves
+/// are driven in `core::introspect`'s tests — this pins that they reach the
+/// statement a client runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn database_stats_report_durability_health() {
+    let server = TestServer::start().await.expect("server should start");
+    let pool = server.connect_sqlx().await.expect("should connect");
+    run(&pool, "CREATE TABLE health (id INT PRIMARY KEY)").await.expect("create");
+
+    let stats: Vec<(String, String)> = rows(&pool, "SHOW STATS")
+        .await
+        .iter()
+        .map(|r| (r.get::<String, _>("metric"), r.get::<String, _>("value")))
+        .collect();
+    let metric = |name: &str| {
+        stats
+            .iter()
+            .find(|(m, _)| m == name)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| panic!("no `{}` in {:?}", name, stats.iter().map(|(m, _)| m).collect::<Vec<_>>()))
+    };
+
+    assert_eq!(metric("wal_poisoned"), "false");
+    assert_eq!(metric("wal_poison_reason"), "");
+    assert_eq!(metric("wal_checkpoints_declined"), "0");
+    assert_eq!(metric("wal_checkpoint_failures"), "0");
+    assert_eq!(metric("wal_last_checkpoint_error"), "");
+    assert_eq!(metric("data_flush_failure"), "");
+    assert_eq!(metric("vacuum_panics"), "0");
 }

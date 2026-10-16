@@ -536,6 +536,7 @@ async fn database_stats(database: &Arc<Database>) -> Vec<Row> {
         sequence: 0,
     };
     let mut reclaimable = 0u64;
+    let mut vacuum_panics = 0u64;
     let mut foreign_keys = 0usize;
     let mut unique_keys = 0usize;
     let mut json_columns = 0usize;
@@ -555,6 +556,7 @@ async fn database_stats(database: &Arc<Database>) -> Vec<Row> {
         total.filters += sizes.filters;
         total.sequence += sizes.sequence;
         reclaimable += table.reclaimable_bytes();
+        vacuum_panics += table.vacuum_stats().panics.load(Ordering::Relaxed);
 
         if name.starts_with("__") {
             continue;
@@ -712,6 +714,15 @@ async fn database_stats(database: &Arc<Database>) -> Vec<Row> {
         "no transaction is running",
     );
 
+    for (metric, value, detail) in durability_metrics(database.location.as_deref()) {
+        push(metric, value, detail);
+    }
+    push(
+        "vacuum_panics",
+        vacuum_panics.to_string(),
+        "background reclamation ticks that panicked and were caught",
+    );
+
     // The page cache in front of an object store, which is the difference
     // between a scan that reads memory and one that pays for a request per
     // chunk. Reported for the database because the cache is the family's and is
@@ -781,6 +792,47 @@ async fn database_stats(database: &Arc<Database>) -> Vec<Row> {
     );
 
     out
+}
+
+/// Whether this database's commits can still be trusted, for `SHOW STATS`.
+///
+/// Each of these used to be visible only as one `error!` line at the moment it
+/// happened. A poisoned log refuses every commit for the rest of the process,
+/// and a log whose checkpoints keep declining or failing never shrinks, so
+/// both are states an operator needs to be able to ask about afterwards.
+fn durability_metrics(location: Option<&str>) -> Vec<(&'static str, String, &'static str)> {
+    let wal = location.and_then(crate::core::wal::wal_for);
+    let (declined, failed) = wal.as_ref().map(|w| w.checkpoint_counts()).unwrap_or((0, 0));
+    vec![
+        (
+            "wal_poisoned",
+            wal.as_ref().is_some_and(|w| w.is_poisoned()).to_string(),
+            "a flush, apply or log write failed; every commit is refused until restart",
+        ),
+        (
+            "wal_poison_reason",
+            wal.as_ref().and_then(|w| w.poison_reason()).unwrap_or_default(),
+            "",
+        ),
+        (
+            "wal_checkpoints_declined",
+            declined.to_string(),
+            "skipped while a transaction was open or another checkpoint ran",
+        ),
+        ("wal_checkpoint_failures", failed.to_string(), ""),
+        (
+            "wal_last_checkpoint_error",
+            wal.as_ref().and_then(|w| w.last_checkpoint_error()).unwrap_or_default(),
+            "",
+        ),
+        (
+            "data_flush_failure",
+            location
+                .and_then(crate::core::storage_providers::file_sync::directory_flush_failure)
+                .unwrap_or_default(),
+            "a data file here failed a flush; commits here are refused until restart",
+        ),
+    ]
 }
 
 async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, String> {
@@ -1010,6 +1062,11 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
             .load(Ordering::Relaxed)
             .to_string(),
         "",
+    );
+    push(
+        "vacuum_panics",
+        vacuum.panics.load(Ordering::Relaxed).to_string(),
+        "background ticks that panicked and were caught",
     );
 
     push(
@@ -2377,6 +2434,47 @@ mod tests {
             database.tables.len() >= 2,
             "the fixture did not actually create the shadow table"
         );
+    }
+
+    /// A poisoned log has to show up in `SHOW STATS`, with its reason and the
+    /// checkpoint it broke; until it did, the one place it was visible was a
+    /// log line from the moment it happened. `/dev/null` fails `fdatasync`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_poisoned_log_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let location = dir.path().to_str().unwrap().to_string();
+        let metric = |name: &str| {
+            durability_metrics(Some(&location))
+                .into_iter()
+                .find(|(m, _, _)| *m == name)
+                .map(|(_, v, _)| v)
+                .unwrap_or_else(|| panic!("{} is not reported", name))
+        };
+
+        let wal = std::sync::Arc::new(
+            crate::core::wal::Wal::open(dir.path().join(crate::core::wal::DEFAULT_WAL_NAME))
+                .unwrap(),
+        );
+        crate::core::wal::install_for(&location, wal.clone());
+        assert_eq!(metric("wal_poisoned"), "false");
+        assert_eq!(metric("data_flush_failure"), "");
+
+        // A checkpoint syncs the files records name, so one names it.
+        wal.register_file(7, "/dev/null");
+        wal.log(wal.begin(), 7, 0, b"x").unwrap();
+        assert!(wal.checkpoint().is_err());
+
+        let poisoned = metric("wal_poisoned");
+        let reason = metric("wal_poison_reason");
+        let failures = metric("wal_checkpoint_failures");
+        let last_error = metric("wal_last_checkpoint_error");
+        crate::core::wal::remove_for(&location);
+
+        assert_eq!(poisoned, "true");
+        assert!(reason.contains("/dev/null"), "the reason names the file: {:?}", reason);
+        assert_eq!(failures, "1");
+        assert!(!last_error.is_empty());
     }
 
     /// Result metadata is sent before the rows, so a mismatch is a protocol
