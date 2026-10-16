@@ -986,16 +986,22 @@ async fn build(
                 // Indexes `CREATE INDEX` declared, each with its own
                 // identity and its column count.
                 if let Some(indexes) = table.indexes.as_ref() {
-                    for index in indexes.list.iter().filter(|i| !i.implicit) {
+                    let declared = indexes
+                        .list
+                        .iter()
+                        .filter(|i| !i.implicit)
+                        .map(|i| (i.decl.name.clone(), i.columns.len()))
+                        .chain(indexes.gin.iter().map(|g| (g.decl.name.clone(), 1)));
+                    for (index_name, columns) in declared {
                         rows.push(format!(
                             "INSERT INTO {} (indexrelid, indrelid, indnatts, indisunique, \
                              indisprimary, indisvalid, indisready, indislive, \
                              indpred, indexprs) \
                              VALUES ({}, {}, {}, 'f', 'f', 't', '{}', 't', '', '')",
                             temp,
-                            oid_of(&format!("{}.{}", name, index.decl.name)),
+                            oid_of(&format!("{}.{}", name, index_name)),
                             relid,
-                            index.columns.len(),
+                            columns,
                             if indexes.is_ready() { "t" } else { "f" },
                         ));
                     }
@@ -1047,35 +1053,64 @@ async fn build(
                 let Some(indexes) = table.indexes.as_ref() else {
                     continue;
                 };
-                for index in indexes.list.iter() {
-                    let columns: Vec<String> = index
-                        .columns
+                let column_name = |wo: u32| {
+                    table
+                        .schema
+                        .fields
                         .iter()
-                        .filter_map(|(wo, _)| {
-                            table
-                                .schema
-                                .fields
-                                .iter()
-                                .find(|f| f.write_order as u32 == *wo && !f.is_deleted)
-                                .map(|f| f.name.clone())
-                        })
-                        .collect();
-                    let def = format!(
-                        "CREATE {}INDEX {} ON {}.{} USING {} ({})",
-                        if index.decl.unique { "UNIQUE " } else { "" },
-                        index.decl.name,
-                        SCHEMA,
-                        name,
-                        index.method().name(),
-                        columns.join(", ")
-                    );
+                        .find(|f| f.write_order as u32 == wo && !f.is_deleted)
+                        .map(|f| f.name.clone())
+                };
+                let mut defs: Vec<(String, String)> = Vec::new();
+                for index in indexes.list.iter() {
+                    let columns: Vec<String> = match &index.path {
+                        // An index over `doc->>'k'`, written as PostgreSQL
+                        // writes an expression index: the expression in its
+                        // own parentheses.
+                        Some((document, steps)) => vec![format!(
+                            "(({}))",
+                            crate::core::jsonb::path_text(&column_name(*document).unwrap_or_default(), steps, true)
+                        )],
+                        None => index.columns.iter().filter_map(|(wo, _)| column_name(*wo)).collect(),
+                    };
+                    defs.push((
+                        index.decl.name.clone(),
+                        format!(
+                            "CREATE {}INDEX {} ON {}.{} USING {} ({})",
+                            if index.decl.unique { "UNIQUE " } else { "" },
+                            index.decl.name,
+                            SCHEMA,
+                            name,
+                            index.method().name(),
+                            columns.join(", ")
+                        ),
+                    ));
+                }
+                for g in indexes.gin.iter() {
+                    let class = match g.opclass {
+                        crate::core::jsonb::GinOpclass::Ops => "",
+                        crate::core::jsonb::GinOpclass::PathOps => " jsonb_path_ops",
+                    };
+                    defs.push((
+                        g.decl.name.clone(),
+                        format!(
+                            "CREATE INDEX {} ON {}.{} USING gin ({}{})",
+                            g.decl.name,
+                            SCHEMA,
+                            name,
+                            column_name(g.column).unwrap_or_default(),
+                            class
+                        ),
+                    ));
+                }
+                for (index_name, def) in defs {
                     rows.push(format!(
                         "INSERT INTO {} (schemaname, tablename, indexname, tablespace, indexdef) \
                          VALUES ('{}', '{}', '{}', '', '{}')",
                         temp,
                         SCHEMA,
                         escape(name),
-                        escape(&index.decl.name),
+                        escape(&index_name),
                         escape(&def),
                     ));
                 }

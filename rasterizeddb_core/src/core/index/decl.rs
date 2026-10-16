@@ -20,6 +20,13 @@ pub enum Method {
     /// Unordered: answers `=` and `IN` on every column of the key, in one
     /// probe.
     Hash,
+    /// Inverted, over one `jsonb` column, keeping keys and scalars
+    /// (PostgreSQL's `gin` with `jsonb_ops`, its default): answers `@>`, `?`,
+    /// `?|` and `?&`. See [`super::gin`].
+    GinOps,
+    /// Inverted, over one `jsonb` column, keeping leaf paths
+    /// (`gin (doc jsonb_path_ops)`): answers `@>` only, more selectively.
+    GinPathOps,
 }
 
 impl Method {
@@ -27,13 +34,31 @@ impl Method {
         match self {
             Method::BTree => "btree",
             Method::Hash => "hash",
+            Method::GinOps | Method::GinPathOps => "gin",
         }
+    }
+
+    /// The operator class an inverted index was declared with.
+    pub fn opclass(self) -> Option<crate::core::jsonb::GinOpclass> {
+        match self {
+            Method::GinOps => Some(crate::core::jsonb::GinOpclass::Ops),
+            Method::GinPathOps => Some(crate::core::jsonb::GinOpclass::PathOps),
+            _ => None,
+        }
+    }
+
+    /// Whether this is an inverted index rather than one key per row.
+    pub fn is_gin(self) -> bool {
+        self.opclass().is_some()
     }
 
     pub fn parse(text: &str) -> Option<Method> {
         match text.trim().to_ascii_lowercase().as_str() {
             "btree" | "b-tree" => Some(Method::BTree),
             "hash" => Some(Method::Hash),
+            // The operator class, which picks between the two, follows the
+            // column; `jsonb_ops` is PostgreSQL's default.
+            "gin" => Some(Method::GinOps),
             _ => None,
         }
     }
@@ -42,6 +67,8 @@ impl Method {
         match self {
             Method::BTree => 1,
             Method::Hash => 2,
+            Method::GinOps => 3,
+            Method::GinPathOps => 4,
         }
     }
 
@@ -49,6 +76,8 @@ impl Method {
         match code {
             1 => Some(Method::BTree),
             2 => Some(Method::Hash),
+            3 => Some(Method::GinOps),
+            4 => Some(Method::GinPathOps),
             _ => None,
         }
     }

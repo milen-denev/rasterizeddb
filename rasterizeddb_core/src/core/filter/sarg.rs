@@ -319,7 +319,38 @@ fn starts_with_to_range(toks: &[Token], gate: &dyn Fn(u32) -> bool) -> Option<Ma
 
 /// One conjunct, as whatever shape it lowers to: a single predicate, a pair of
 /// bounds, or `All` for something we cannot prove sound.
-fn conjunct_to_expr(toks: &[Token], gate: &dyn Fn(u32) -> bool, scales: &[(u32, u32)]) -> MaskExpr {
+fn conjunct_to_expr(
+    toks: &[Token],
+    gate: &dyn Fn(u32) -> bool,
+    scales: &[(u32, u32)],
+    paths: Option<&PathResolver>,
+) -> MaskExpr {
+    // `doc->>'k' = 'v'` (or mirrored, or a LIKE prefix) over a path some index
+    // keys: read as the comparison of a STRING column, the index's virtual
+    // one, which is what `->>` yields and what the index stores.
+    if let (Some(resolve), 3) = (paths, toks.len()) {
+        let as_column = |t: &Token| match t {
+            Token::JsonPath {
+                write_order,
+                steps,
+                as_text: true,
+            } => resolve(*write_order as u32, steps)
+                .map(|wo| Token::Ident((String::new(), DbType::STRING, wo as u64))),
+            _ => None,
+        };
+        let rewritten = match (&toks[0], &toks[2]) {
+            (path @ Token::JsonPath { .. }, Token::StringLit(_)) => {
+                as_column(path).map(|c| vec![c, toks[1].clone(), toks[2].clone()])
+            }
+            (Token::StringLit(_), path @ Token::JsonPath { .. }) => {
+                as_column(path).map(|c| vec![toks[0].clone(), toks[1].clone(), c])
+            }
+            _ => None,
+        };
+        if let Some(toks) = rewritten {
+            return conjunct_to_expr(&toks, gate, scales, None);
+        }
+    }
     if let Some(e) = starts_with_to_range(toks, gate) {
         return e;
     }
@@ -328,6 +359,10 @@ fn conjunct_to_expr(toks: &[Token], gate: &dyn Fn(u32) -> bool, scales: &[(u32, 
         None => MaskExpr::All,
     }
 }
+
+/// Maps a `->>` path over a document column to the virtual column an index
+/// keys it under, when one does.
+pub type PathResolver<'a> = dyn Fn(u32, &[crate::core::jsonb::Step]) -> Option<u32> + 'a;
 
 /// Recursive-descent parser over the token stream, mirroring the precedence the
 /// engine implements: `AND` binds tighter than `OR`, parentheses group.
@@ -340,6 +375,9 @@ struct Parser<'a> {
     /// `(write_order, scale)` of each `NUMERIC(p, s)` column whose scale is
     /// not the engine default. See [`extract_with_scales`].
     scales: &'a [(u32, u32)],
+    /// Path indexes, for the secondary-index planner only. See
+    /// [`extract_gated_with_paths`].
+    paths: Option<&'a PathResolver<'a>>,
     /// Set when the token stream is malformed (unbalanced parens). The caller
     /// declines to filter rather than acting on a structure it misread.
     bad: bool,
@@ -438,7 +476,7 @@ impl<'a> Parser<'a> {
 
         let start = self.pos;
         self.skip_to_separator();
-        conjunct_to_expr(&self.toks[start..self.pos], self.gate, self.scales)
+        conjunct_to_expr(&self.toks[start..self.pos], self.gate, self.scales, self.paths)
     }
 }
 
@@ -475,6 +513,28 @@ pub fn extract_gated(
     gate: &dyn Fn(u32) -> bool,
     scales: &[(u32, u32)],
 ) -> Option<SargProgram> {
+    extract_parsed(tokens, gate, scales, None)
+}
+
+/// [`extract_gated`], also reading `doc->>'k' <op> 'text'` as a comparison of
+/// the virtual column `paths` names for that path. For the secondary-index
+/// planner: the filter index has no such column, and its gate would refuse
+/// one anyway.
+pub fn extract_gated_with_paths(
+    tokens: &[Token],
+    gate: &dyn Fn(u32) -> bool,
+    scales: &[(u32, u32)],
+    paths: &PathResolver,
+) -> Option<SargProgram> {
+    extract_parsed(tokens, gate, scales, Some(paths))
+}
+
+fn extract_parsed(
+    tokens: &[Token],
+    gate: &dyn Fn(u32) -> bool,
+    scales: &[(u32, u32)],
+    paths: Option<&PathResolver>,
+) -> Option<SargProgram> {
     if tokens.is_empty() {
         return None;
     }
@@ -484,6 +544,7 @@ pub fn extract_gated(
         pos: 0,
         gate,
         scales,
+        paths,
         bad: false,
     };
     let root = p.parse_or();

@@ -106,9 +106,9 @@ fn split_top(text: &str) -> Vec<&str> {
     parts
 }
 
-/// One entry of the column list: the column, or `None` when it is an
-/// expression rather than a column.
-fn column_of(part: &str) -> Option<String> {
+/// One entry of the column list: the column and its operator class, or
+/// `None` when it is an expression rather than a column.
+fn column_of(part: &str) -> Option<(String, Option<String>)> {
     let words: Vec<&str> = part.split_whitespace().collect();
     let first = *words.first()?;
     if !is_plain_identifier(first) {
@@ -116,6 +116,7 @@ fn column_of(part: &str) -> Option<String> {
     }
     // What may follow a column: ordering, null placement, a collation, an
     // operator class. Anything else is an expression this does not read.
+    let mut opclass = None;
     let mut i = 1;
     while i < words.len() {
         let w = words[i].to_ascii_uppercase();
@@ -123,12 +124,15 @@ fn column_of(part: &str) -> Option<String> {
             "ASC" | "DESC" => i += 1,
             "NULLS" if i + 1 < words.len() => i += 2,
             "COLLATE" if i + 1 < words.len() => i += 2,
-            // An operator class (`text_pattern_ops`).
-            _ if is_plain_identifier(words[i]) => i += 1,
+            // An operator class (`text_pattern_ops`, `jsonb_path_ops`).
+            _ if is_plain_identifier(words[i]) => {
+                opclass = Some(words[i].trim_matches('"').to_ascii_lowercase());
+                i += 1
+            }
             _ => return None,
         }
     }
-    Some(first.trim_matches('"').to_string())
+    Some((first.trim_matches('"').to_string(), opclass))
 }
 
 /// Recognises a plain-column `CREATE INDEX`. `None` when the statement is not
@@ -187,15 +191,34 @@ pub fn parse_create(sql: &str) -> Option<Result<CreateIndex, String>> {
         return None;
     }
     let mut columns = Vec::new();
+    let mut opclasses = Vec::new();
     for part in split_top(&after_on[open + 1..close]) {
         match column_of(part) {
-            Some(c) => columns.push(c),
+            Some((c, opclass)) => {
+                columns.push(c);
+                opclasses.push(opclass);
+            }
             // An expression index: not this module's.
             None => return None,
         }
     }
     if columns.is_empty() {
         return None;
+    }
+    // A B-tree or hash orders by the engine's own comparison whatever class
+    // is named, so the class is set aside. For gin the class decides what is
+    // indexed, and one that is not a jsonb class is refused rather than
+    // quietly read as the default.
+    if method == Some(Method::GinOps) {
+        method = match opclasses.first().cloned().flatten().as_deref() {
+            None | Some("jsonb_ops") => Some(Method::GinOps),
+            Some("jsonb_path_ops") => Some(Method::GinPathOps),
+            Some(other) => {
+                return Some(Err(format!(
+                    "operator class \"{other}\" is not supported for gin; use jsonb_ops or jsonb_path_ops"
+                )));
+            }
+        };
     }
     if columns.len() > super::decl::MAX_COLUMNS {
         return Some(Err(format!(
@@ -255,6 +278,16 @@ mod tests {
         assert!(parse_create("CREATE INDEX ix ON t ((doc->>'k'))").is_none());
         assert!(parse_create("CREATE UNIQUE INDEX ix ON t (a)").is_none());
         assert!(parse_create("CREATE TABLE t (a INT)").is_none());
-        assert!(matches!(parse_create("CREATE INDEX ix ON t USING gin (a)"), Some(Err(_))));
+        assert!(matches!(parse_create("CREATE INDEX ix ON t USING brin (a)"), Some(Err(_))));
+    }
+
+    #[test]
+    fn gin_and_its_operator_classes() {
+        assert_eq!(ok("CREATE INDEX g ON docs USING gin (doc)").method, Some(Method::GinOps));
+        assert_eq!(ok("CREATE INDEX g ON docs USING GIN (doc jsonb_ops)").method, Some(Method::GinOps));
+        assert_eq!(ok("CREATE INDEX g ON docs USING gin (doc jsonb_path_ops)").method, Some(Method::GinPathOps));
+        assert!(matches!(parse_create("CREATE INDEX g ON docs USING gin (doc gin_trgm_ops)"), Some(Err(_))));
+        // A B-tree still sets its class aside.
+        assert_eq!(ok("CREATE INDEX b ON t (name text_pattern_ops)").method, None);
     }
 }

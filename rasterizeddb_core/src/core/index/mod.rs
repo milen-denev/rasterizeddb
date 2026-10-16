@@ -48,6 +48,7 @@
 //! would without it.
 
 pub mod ddl;
+pub mod gin;
 pub mod decl;
 pub mod key;
 
@@ -99,13 +100,20 @@ pub struct LiveIndex {
     present: RwLock<Vec<u64>>,
     /// Slots whose key could not be built. Returned with every lookup.
     unkeyed: RwLock<Vec<u64>>,
+    /// For an index over a path into a document (`((doc->>'k'))`): the
+    /// document column and the path. Its one key column is then a virtual
+    /// one (see [`TableIndexes::path_column`]), whose value is the path's
+    /// text, read out of the document.
+    pub path: Option<(u32, Vec<crate::core::jsonb::Step>)>,
 }
 
 impl LiveIndex {
     pub fn new(decl: IndexDecl, columns: Vec<(u32, DbType)>, implicit: bool) -> LiveIndex {
         let data = match decl.method {
             Method::BTree => Data::BTree(RwLock::new(BTreeMap::new())),
-            Method::Hash => Data::Hash(
+            // An inverted index is a `gin::GinIndex`, never one of these;
+            // `for_schema` routes it there. A hash is the harmless reading.
+            Method::Hash | Method::GinOps | Method::GinPathOps => Data::Hash(
                 (0..HASH_SHARDS)
                     .map(|_| RwLock::new(HashMap::with_hasher(RandomState::new())))
                     .collect(),
@@ -119,7 +127,21 @@ impl LiveIndex {
             data,
             present: RwLock::new(Vec::new()),
             unkeyed: RwLock::new(Vec::new()),
+            path: None,
         }
+    }
+
+    /// An index over `doc->>'path'`: one virtual `STRING` key column,
+    /// `virtual_column`, read out of the document in `document_column`.
+    pub fn over_path(
+        decl: IndexDecl,
+        virtual_column: u32,
+        document_column: u32,
+        steps: Vec<crate::core::jsonb::Step>,
+    ) -> LiveIndex {
+        let mut index = LiveIndex::new(decl, vec![(virtual_column, DbType::STRING)], false);
+        index.path = Some((document_column, steps));
+        index
     }
 
     pub fn method(&self) -> Method {
@@ -132,13 +154,37 @@ impl LiveIndex {
 
     /// The key for a version, from a lookup of its column bytes.
     pub fn key_of<'a>(&self, get: impl Fn(u32) -> Option<&'a [u8]>) -> Option<KeyBuf> {
+        if let Some((document, steps)) = &self.path {
+            // `->>` of a missing path, or of a JSON null, is SQL NULL, which
+            // no comparison matches. It is kept under an empty key rather than
+            // as unkeyed: a range from below may return it, an equality never
+            // asks for it, and either way it is rechecked.
+            let text = get(*document)
+                .and_then(|doc| crate::core::jsonb::get_path(doc, steps))
+                .and_then(crate::core::jsonb::as_text);
+            let Some(text) = text else {
+                return Some(KeyBuf::new());
+            };
+            let mut out = Vec::with_capacity(text.len() + 2);
+            key::encode_ordered(&DbType::STRING, text.as_bytes(), true, &mut out)?;
+            return Some(KeyBuf::from_vec(out));
+        }
+        self.key_of_values(get)
+    }
+
+    /// The key for values given per key column, as the planner has them from
+    /// a predicate. For a path index that is the path's text under its
+    /// virtual column, not a document: reading it through [`Self::key_of`]
+    /// would find no document and look up the empty key that `NULL` paths
+    /// are kept under, missing every row with a value.
+    pub fn key_of_values<'a>(&self, get: impl Fn(u32) -> Option<&'a [u8]>) -> Option<KeyBuf> {
         let mut out = Vec::with_capacity(24);
         let n = self.columns.len();
         for (i, (wo, ty)) in self.columns.iter().enumerate() {
             let value = get(*wo)?;
             match self.decl.method {
                 Method::BTree => key::encode_ordered(ty, value, i + 1 == n, &mut out)?,
-                Method::Hash => key::encode_canonical(ty, value, &mut out)?,
+                Method::Hash | Method::GinOps | Method::GinPathOps => key::encode_canonical(ty, value, &mut out)?,
             }
         }
         Some(KeyBuf::from_vec(out))
@@ -473,25 +519,85 @@ impl LeadingRange {
     }
 }
 
+/// Lookups an inverted index answered, and lookups a path index answered,
+/// process-wide. For tests: an index that is never consulted is invisible in
+/// query results by design.
+pub static GIN_LOOKUPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PATH_LOOKUPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The slots in both sorted, distinct lists.
+pub fn intersect_sorted(a: &[u64], b: &[u64]) -> Vec<u64> {
+    let (mut i, mut j) = (0, 0);
+    let mut out = Vec::with_capacity(a.len().min(b.len()));
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                out.push(a[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    out
+}
+
+/// The bytes a write holds for one column, if it writes it.
+fn document_of(row: &RowWrite, column: u32) -> Option<&[u8]> {
+    row.columns_writing_data
+        .iter()
+        .find(|c| c.write_order == column)
+        .map(|c| c.data.into_slice())
+}
+
 /// Every index a table has, built or building.
 pub struct TableIndexes {
     pub list: Vec<Arc<LiveIndex>>,
+    /// Inverted indexes over document columns. Kept apart from `list`: they
+    /// hold many keys per row, and nothing that asks `list` for a whole-key
+    /// lookup (a uniqueness probe, an equality plan) may ever be answered by
+    /// one.
+    pub gin: Vec<Arc<gin::GinIndex>>,
     /// Set once the build that follows open (or compaction) has finished.
     /// Until then a lookup would miss rows the build has not reached, so
     /// queries do not ask, and scan instead.
     ready: AtomicBool,
 }
 
+/// The `write_order`s handed to the virtual key columns of path indexes,
+/// counting down from here. No table has that many columns.
+const FIRST_PATH_COLUMN: u32 = u32::MAX - 1;
+
 impl TableIndexes {
     pub fn new(list: Vec<Arc<LiveIndex>>) -> TableIndexes {
+        TableIndexes::with_gin(list, Vec::new())
+    }
+
+    pub fn with_gin(list: Vec<Arc<LiveIndex>>, gin: Vec<Arc<gin::GinIndex>>) -> TableIndexes {
         TableIndexes {
             list,
+            gin,
             ready: AtomicBool::new(false),
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.list.is_empty()
+        self.list.is_empty() && self.gin.is_empty()
+    }
+
+    /// How many indexes there are, of either kind.
+    pub fn len(&self) -> usize {
+        self.list.len() + self.gin.len()
+    }
+
+    /// The virtual column a path index keys `doc->>…` under, when one
+    /// indexes exactly this path of this document column.
+    pub fn path_column(&self, document: u32, steps: &[crate::core::jsonb::Step]) -> Option<u32> {
+        self.list.iter().find_map(|i| match &i.path {
+            Some((d, s)) if *d == document && s.as_slice() == steps => Some(i.columns[0].0),
+            _ => None,
+        })
     }
 
     pub fn is_ready(&self) -> bool {
@@ -518,8 +624,17 @@ impl TableIndexes {
     }
 
     /// Every column some index reads, for the fetch vacuum and the build use.
+    /// A path index reads its document column, not its virtual one.
     pub fn columns(&self) -> Vec<u32> {
-        let mut cols: Vec<u32> = self.list.iter().flat_map(|i| i.columns.iter().map(|c| c.0)).collect();
+        let mut cols: Vec<u32> = self
+            .list
+            .iter()
+            .flat_map(|i| match &i.path {
+                Some((document, _)) => vec![*document],
+                None => i.columns.iter().map(|c| c.0).collect(),
+            })
+            .chain(self.gin.iter().map(|g| g.column))
+            .collect();
         cols.sort_unstable();
         cols.dedup();
         cols
@@ -529,6 +644,29 @@ impl TableIndexes {
     pub fn on_insert(&self, slot: u64, row: &RowWrite) {
         for index in &self.list {
             index.insert(slot, index.key_of_row(row));
+        }
+        for g in &self.gin {
+            g.insert(slot, document_of(row, g.column));
+        }
+    }
+
+    /// Indexes a version read back from the table (the build).
+    pub fn index_row<'a>(&self, slot: u64, get: &dyn Fn(u32) -> Option<&'a [u8]>) {
+        for index in &self.list {
+            index.insert(slot, index.key_of(get));
+        }
+        for g in &self.gin {
+            g.insert(slot, get(g.column));
+        }
+    }
+
+    /// A version whose columns could not be read: a candidate everywhere.
+    pub fn index_unreadable(&self, slot: u64) {
+        for index in &self.list {
+            index.insert(slot, None);
+        }
+        for g in &self.gin {
+            g.insert(slot, None);
         }
     }
 
@@ -552,11 +690,16 @@ impl TableIndexes {
                 index.insert(slot, new);
             }
         }
+        // The new document's items are added; the old ones stay, a stale
+        // candidate rather than a missed row (see `gin`).
+        for g in &self.gin {
+            g.insert(slot, document_of(row, g.column));
+        }
     }
 
     /// Whether any index holds this slot (vacuum asks, per reclaimable slot).
     pub fn holds(&self, slot: u64) -> bool {
-        self.list.iter().any(|i| i.holds(slot))
+        self.list.iter().any(|i| i.holds(slot)) || self.gin.iter().any(|g| g.holds(slot))
     }
 
     /// Forgets a reclaimed slot, given its column bytes read back from the row
@@ -567,10 +710,14 @@ impl TableIndexes {
             let key = get.and_then(|g| index.key_of(g));
             index.forget(slot, key.as_deref());
         }
+        for g in &self.gin {
+            g.forget(slot);
+        }
     }
 
     pub fn clear(&self) {
         self.list.iter().for_each(|i| i.clear());
+        self.gin.iter().for_each(|g| g.clear());
     }
 
     /// Candidate slots for a predicate tree, sorted and distinct, or `None`
@@ -582,7 +729,61 @@ impl TableIndexes {
         Some(out)
     }
 
-    fn type_of(fields: &[SchemaField], wo: u32) -> Option<DbType> {
+    /// Candidate slots an inverted index gives for a clause's JSON operators,
+    /// sorted and distinct, or `None` when none can narrow it within `cap`.
+    ///
+    /// `AND` narrows by every answerable child (the intersection of supersets
+    /// is a superset); `OR` needs every branch answerable.
+    pub fn plan_json(&self, expr: &gin::JsonExpr, cap: usize) -> Option<Vec<u64>> {
+        use gin::JsonExpr;
+        if self.gin.is_empty() || !self.is_ready() {
+            return None;
+        }
+        match expr {
+            JsonExpr::Opaque => None,
+            JsonExpr::Leaf { column, op } => {
+                let answer = self
+                    .gin
+                    .iter()
+                    .filter(|g| g.column == *column && g.answers(op))
+                    .filter_map(|g| g.lookup(&g.query_for(op)?, cap))
+                    .min_by_key(|answer| answer.len());
+                if answer.is_some() {
+                    GIN_LOOKUPS.fetch_add(1, Ordering::Relaxed);
+                }
+                answer
+            }
+            JsonExpr::And(children) => {
+                let mut answers: Vec<Vec<u64>> = children.iter().filter_map(|c| self.plan_json(c, cap)).collect();
+                answers.sort_by_key(|a| a.len());
+                let mut it = answers.into_iter();
+                let mut acc = it.next()?;
+                for next in it {
+                    acc = intersect_sorted(&acc, &next);
+                }
+                Some(acc)
+            }
+            JsonExpr::Or(children) => {
+                let mut out = Vec::new();
+                for c in children {
+                    out.extend(self.plan_json(c, cap)?);
+                    if out.len() > cap {
+                        return None;
+                    }
+                }
+                out.sort_unstable();
+                out.dedup();
+                Some(out)
+            }
+        }
+    }
+
+    /// A key column's type: the field's, or `STRING` for a path index's
+    /// virtual column, since `->>` yields text.
+    fn type_of(&self, fields: &[SchemaField], wo: u32) -> Option<DbType> {
+        if self.list.iter().any(|i| i.path.is_some() && i.columns[0].0 == wo) {
+            return Some(DbType::STRING);
+        }
         fields.iter().find(|f| f.write_order as u32 == wo && !f.is_deleted).map(|f| f.db_type.clone())
     }
 
@@ -639,11 +840,14 @@ impl TableIndexes {
             .collect();
         whole.sort_by_key(|i| std::cmp::Reverse(i.columns.len()));
         for index in whole {
-            let key = index.key_of(|wo| eq_of(wo).map(|p| p.value.as_slice()));
+            let key = index.key_of_values(|wo| eq_of(wo).map(|p| p.value.as_slice()));
             if let Some(key) = key {
                 let mut out = Vec::new();
                 if index.lookup_eq(&key, &mut out, cap) {
                     index.append_unkeyed(&mut out);
+                    if index.path.is_some() {
+                        PATH_LOOKUPS.fetch_add(1, Ordering::Relaxed);
+                    }
                     return Some(out);
                 }
             }
@@ -661,7 +865,7 @@ impl TableIndexes {
             while k < n {
                 let (wo, _) = &index.columns[k];
                 let Some(p) = eq_of(*wo) else { break };
-                let Some(ty) = Self::type_of(fields, *wo) else { continue 'index };
+                let Some(ty) = self.type_of(fields, *wo) else { continue 'index };
                 if key::encode_ordered(&ty, &p.value, k + 1 == n, &mut prefix).is_none() {
                     continue 'index;
                 }
@@ -676,7 +880,7 @@ impl TableIndexes {
             if k == 0 && on_next.is_empty() {
                 continue;
             }
-            let Some(ty) = Self::type_of(fields, next) else { continue };
+            let Some(ty) = self.type_of(fields, next) else { continue };
             let whole_key = k + 1 == n;
             let mut range = LeadingRange::within(prefix);
             if on_next.iter().any(|p| range.narrow(&ty, p, whole_key).is_none()) {
@@ -689,6 +893,9 @@ impl TableIndexes {
             }
             index.append_unkeyed(&mut out);
             if best.as_ref().is_none_or(|b| out.len() < b.len()) {
+                if index.path.is_some() {
+                    PATH_LOOKUPS.fetch_add(1, Ordering::Relaxed);
+                }
                 best = Some(out);
             }
         }
@@ -704,7 +911,7 @@ impl TableIndexes {
 /// A declaration whose column has since been dropped, or whose types no
 /// longer allow its method, is left out with a warning rather than built
 /// wrongly.
-pub fn for_schema(schema: &crate::core::row::schema::TableSchema) -> Vec<Arc<LiveIndex>> {
+pub fn for_schema(schema: &crate::core::row::schema::TableSchema) -> TableIndexes {
     let live = |wo: u32| {
         schema
             .fields
@@ -753,8 +960,59 @@ pub fn for_schema(schema: &crate::core::row::schema::TableSchema) -> Vec<Arc<Liv
             }
         }
     };
+    let mut gins: Vec<Arc<gin::GinIndex>> = Vec::new();
     for decl in &schema.secondary_indexes {
+        if let Some(opclass) = decl.method.opclass() {
+            let column = decl.columns.first().copied();
+            match column.and_then(live) {
+                Some(f) if decl.columns.len() == 1 && f.db_type == DbType::JSONB => {
+                    gins.push(Arc::new(gin::GinIndex::new(decl.clone(), f.write_order as u32, opclass)));
+                }
+                _ => log::warn!(
+                    "gin index {} on {} no longer names one jsonb column; not built",
+                    decl.name,
+                    schema.name
+                ),
+            }
+            continue;
+        }
         add(decl.clone(), false, &mut out);
+    }
+    // Paths declared with `CREATE INDEX ((doc->>'k'))`: a B-tree over the
+    // text each path reads, under a virtual column of its own.
+    let mut next_path_column = FIRST_PATH_COLUMN;
+    for declared in schema.path_indexes.iter().filter(|p| !p.is_deleted) {
+        let Some(path) = crate::core::jsonb::parse_path_expression(&declared.path) else {
+            log::warn!("path index {} on {} has an unreadable path; not built", declared.name, schema.name);
+            continue;
+        };
+        let document = schema
+            .fields
+            .iter()
+            .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(&path.column) && f.db_type == DbType::JSONB);
+        let Some(document) = document else {
+            log::warn!(
+                "path index {} on {} names no jsonb column {}; not built",
+                declared.name,
+                schema.name,
+                path.column
+            );
+            continue;
+        };
+        let decl = IndexDecl {
+            name: declared.name.clone(),
+            method: Method::BTree,
+            unique: false,
+            columns: vec![next_path_column],
+            is_deleted: false,
+        };
+        out.push(Arc::new(LiveIndex::over_path(
+            decl,
+            next_path_column,
+            document.write_order as u32,
+            path.steps,
+        )));
+        next_path_column -= 1;
     }
     let implicit = |name: String, columns: Vec<u32>| IndexDecl {
         name,
@@ -779,7 +1037,7 @@ pub fn for_schema(schema: &crate::core::row::schema::TableSchema) -> Vec<Arc<Liv
             add(implicit(uk.name.clone(), columns), true, &mut out);
         }
     }
-    out
+    TableIndexes::with_gin(out, gins)
 }
 
 /// How the method is chosen when `CREATE INDEX` names none, and whether the
@@ -787,6 +1045,13 @@ pub fn for_schema(schema: &crate::core::row::schema::TableSchema) -> Vec<Arc<Liv
 pub fn choose_method(requested: Option<Method>, types: &[DbType]) -> Result<Method, String> {
     let all = |f: fn(&DbType) -> bool| types.iter().all(f);
     match requested {
+        Some(m @ (Method::GinOps | Method::GinPathOps)) => {
+            if types.len() == 1 && types[0] == DbType::JSONB {
+                Ok(m)
+            } else {
+                Err("a gin index covers exactly one jsonb column".to_string())
+            }
+        }
         Some(Method::BTree) => {
             if let Some(t) = types.iter().find(|t| !key::btree_supported(t)) {
                 return Err(format!(

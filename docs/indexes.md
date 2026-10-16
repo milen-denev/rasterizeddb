@@ -52,13 +52,58 @@ Refused, with the reason:
   is accepted and *not* built, as all index DDL was before this feature. An
   index built without its predicate or expression would answer different
   questions from the ones it was declared for. An index over a document path,
-  `((doc->>'k'))`, is the path index described in [JSON documents](../README.md).
+  `((doc->>'k'))`, is built: see [Documents](#documents).
 - `DROP INDEX` of a name never built (a partial index, or one declared before
   indexes existed) succeeds, so existing migrations keep running.
 
 `pg_indexes` lists every index with its `indexdef`, and `pg_index` lists the
 declared ones beside the constraint indexes, so a migration tool sees what
 exists.
+
+## Documents
+
+Two kinds of index serve `jsonb` columns.
+
+```sql
+CREATE INDEX docs_gin  ON docs USING gin (doc);                 -- jsonb_ops
+CREATE INDEX docs_path ON docs USING gin (doc jsonb_path_ops);  -- path ops
+CREATE INDEX docs_status ON docs ((doc->>'status'));            -- one path
+```
+
+**A `gin` index** keeps, for each document, a set of 64-bit items. The two
+operator classes match PostgreSQL's:
+- **`jsonb_ops`**, the default, keeps every object key and every string
+  array element as a *key* item, and every scalar as a *value* item. It
+  answers `@>`, `?`, `?|` and `?&`.
+- **`jsonb_path_ops`** keeps one item per scalar, hashing the object keys on
+  its path with it. It answers `@>` only, with fewer and more selective items.
+
+`doc @> 'q'` intersects the lists of `q`'s items, and `?|` takes their union.
+A query with no items, such as `doc @> '{}'`, cannot be narrowed, and the
+table is scanned.
+
+Two rules keep a `gin` answer a superset of the matches:
+- **Every item of a contained query is an item of the document.** This is
+  pinned by a property test over random documents and queries. Numbers are
+  hashed by value, not spelling, exactly as containment compares them: `1`,
+  `1.0` and `1e0` are one item, and every zero is the same zero. Array
+  nesting never adds a path step, which is what lets `[1,2] @> 2` and
+  `{"a":[1]} @> {"a":[1]}` find their documents.
+- **Removal is lazy.** A common item (`"status": "shipped"`) is listed under a
+  large share of the table. Vacuum therefore stops returning a forgotten slot
+  rather than finding it in every list, and the lists are compacted once
+  forgotten entries are numerous.
+
+**A path index** is a B-tree over the text `->>` reads, which is always text
+whatever the value is. It answers `=`, ranges and `LIKE 'prefix%'` on that
+path. A missing path or a JSON `null` is SQL `NULL`, which no comparison
+matches.
+
+An index over `->` (a document rather than text) is refused. A path index
+serves both `->>` and `->` spellings of the same path, but answers only `->>`
+comparisons.
+
+`pg_indexes` lists both kinds with the definition PostgreSQL would print.
 
 ## How a query uses one
 

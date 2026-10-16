@@ -670,8 +670,8 @@ impl<S: StorageIO> Table<S> {
         // maintain the indexes from this moment, and queries use them once the
         // build has covered every row that was already there.
         let indexes = {
-            let list = crate::core::index::for_schema(&schema);
-            (!list.is_empty()).then(|| StdArc::new(crate::core::index::TableIndexes::new(list)))
+            let indexes = crate::core::index::for_schema(&schema);
+            (!indexes.is_empty()).then(|| StdArc::new(indexes))
         };
         if let Some(indexes) = indexes.clone() {
             let io_pointers_task = io_pointers.clone();
@@ -687,7 +687,7 @@ impl<S: StorageIO> Table<S> {
                 match build_indexes(&indexes, &io_pointers_task, &io_rows_task, &fields, Some(&readers_task)).await {
                     Ok(n) => {
                         indexes.set_ready(true);
-                        info!("Built {} index(es) on {} over {} rows", indexes.list.len(), table_name_task, n);
+                        info!("Built {} index(es) on {} over {} rows", indexes.len(), table_name_task, n);
                     }
                     Err(e) => error!(
                         "Index build on {} failed; queries scan instead: {}",
@@ -2680,12 +2680,25 @@ impl<S: StorageIO> Table<S> {
         let n_slots = self.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
         let tokens = crate::core::tokenizer::query_tokenizer::try_tokenize(where_clause, &self.schema.fields).ok()?;
         let scales = self.decimal_scales();
-        let program = sarg::extract_gated(&tokens, &|wo| indexes.covers(wo), &scales)?;
-        let mut slots = indexes.plan(
-            &program.root,
-            &self.schema.fields,
-            crate::core::index::candidate_cap(n_slots),
-        )?;
+        let cap = crate::core::index::candidate_cap(n_slots);
+        // Key indexes, with `doc->>'k'` read as the virtual column of a path
+        // index that keys that path.
+        let resolve = |document: u32, steps: &[crate::core::jsonb::Step]| indexes.path_column(document, steps);
+        let from_keys = sarg::extract_gated_with_paths(&tokens, &|wo| indexes.covers(wo), &scales, &resolve)
+            .and_then(|program| indexes.plan(&program.root, &self.schema.fields, cap));
+        // Inverted indexes, for `@>`, `?`, `?|`, `?&` on a document column.
+        let from_gin = if indexes.gin.is_empty() {
+            None
+        } else {
+            crate::core::index::gin::parse_json_where(&tokens).and_then(|e| indexes.plan_json(&e, cap))
+        };
+        // Both are supersets of the matches, so where both narrow, so does
+        // their intersection.
+        let mut slots = match (from_keys, from_gin) {
+            (Some(a), Some(b)) => crate::core::index::intersect_sorted(&a, &b),
+            (Some(a), None) | (None, Some(a)) => a,
+            (None, None) => return None,
+        };
         slots.retain(|s| *s < n_slots);
         info!(
             "Index narrowed {} slots to {} candidates",
@@ -4167,20 +4180,15 @@ async fn build_indexes<S: StorageIO>(
         {
             // Unreadable here is not unreadable to the query, which may
             // succeed later: kept as a candidate in every index.
-            for index in &indexes.list {
-                index.insert(slot, None);
-            }
+            indexes.index_unreadable(slot);
             continue;
         }
-        for index in &indexes.list {
-            let key = index.key_of(|wo| {
-                row.columns
-                    .iter()
-                    .find(|c| c.schema_id as u32 == wo)
-                    .map(|c| c.data.into_slice())
-            });
-            index.insert(slot, key);
-        }
+        indexes.index_row(slot, &|wo| {
+            row.columns
+                .iter()
+                .find(|c| c.schema_id as u32 == wo)
+                .map(|c| c.data.into_slice())
+        });
         built += 1;
     }
     Ok(built)

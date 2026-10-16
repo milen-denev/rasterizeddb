@@ -46,8 +46,11 @@ async fn index_ddl() {
     // Refusals say why.
     let bad = sqlx::query("CREATE INDEX t_x ON t (nope)").execute(&pool).await.unwrap_err();
     assert!(bad.to_string().contains("does not exist"), "{bad}");
+    // gin indexes documents only.
     let gin = sqlx::query("CREATE INDEX t_g ON t USING gin (s)").execute(&pool).await.unwrap_err();
-    assert!(gin.to_string().contains("btree or hash"), "{gin}");
+    assert!(gin.to_string().contains("one jsonb column"), "{gin}");
+    let brin = sqlx::query("CREATE INDEX t_b ON t USING brin (s)").execute(&pool).await.unwrap_err();
+    assert!(brin.to_string().contains("btree or hash"), "{brin}");
     // Partial and expression indexes are still accepted and not built.
     exec(&pool, "CREATE INDEX t_partial ON t (n) WHERE n > 0").await;
     exec(&pool, "CREATE INDEX t_expr ON t (lower(s))").await;

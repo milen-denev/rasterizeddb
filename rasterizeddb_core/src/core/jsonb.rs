@@ -1065,6 +1065,188 @@ fn numbers_equal(a: &[u8], b: &[u8]) -> bool {
     }
 }
 
+/// `doc->'a'->>'b'`: a path written out, the last step with `->>` when
+/// `as_text`.
+pub fn path_text(column: &str, steps: &[Step], as_text: bool) -> String {
+    let mut out = column.to_string();
+    for (i, step) in steps.iter().enumerate() {
+        out.push_str(if as_text && i + 1 == steps.len() { "->>" } else { "->" });
+        match step {
+            Step::Key(k) => {
+                out.push('\'');
+                out.push_str(&k.replace('\'', "''"));
+                out.push('\'');
+            }
+            Step::Index(n) => out.push_str(&n.to_string()),
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// inverted-index items
+// ---------------------------------------------------------------------------
+
+/// What an inverted index over documents keeps per document, PostgreSQL's two
+/// GIN operator classes for `jsonb`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GinOpclass {
+    /// `jsonb_ops`: every object key and every string array element as a
+    /// *key* item, and every scalar as a *value* item, with no path. Answers
+    /// `@>`, `?`, `?|` and `?&`.
+    Ops,
+    /// `jsonb_path_ops`: one item per scalar, hashing the object keys on its
+    /// path with it. Fewer, more selective items; answers `@>` only.
+    PathOps,
+}
+
+const ITEM_KEY: u8 = 1;
+const ITEM_VALUE: u8 = 2;
+const ITEM_PATH: u8 = 3;
+
+fn item_hasher() -> impl std::hash::Hasher {
+    use std::hash::BuildHasher;
+    // Fixed seeds: an item must hash the same in every process, since a query
+    // built here is matched against items built when the rows were indexed.
+    ahash::RandomState::with_seeds(0x6a73_6f6e, 0x6769_6e00, 0x7061_7468, 0x6f70_7300).build_hasher()
+}
+
+/// Feeds a scalar into `h` in a form two scalars [`scalar_eq`] calls equal
+/// always share, so equal values always produce equal items.
+///
+/// Numbers are hashed by value, not spelling: `1`, `1.0` and `1e0` agree, and
+/// every zero is the same zero, exactly as `numbers_equal` decides. A number
+/// whose text does not parse is equal only to the same text, so its text is
+/// hashed as it stands, under a different class.
+fn hash_scalar(bytes: &[u8], h: &mut impl std::hash::Hasher) -> Option<()> {
+    match *bytes.first()? {
+        TAG_NULL => h.write_u8(0),
+        TAG_FALSE => h.write_u8(1),
+        TAG_TRUE => h.write_u8(2),
+        TAG_INT | TAG_NUM => {
+            let mut buf = [0u8; 20];
+            let text = number_text(bytes, &mut buf)?;
+            match NumberParts::parse(text) {
+                Some(parts) if parts.len == 0 => h.write_u8(3),
+                Some(parts) => {
+                    h.write_u8(4);
+                    h.write_u8(parts.negative as u8);
+                    h.write_i64(parts.point);
+                    for d in parts.digits() {
+                        h.write_u8(d);
+                    }
+                    h.write_usize(parts.len);
+                }
+                None => {
+                    h.write_u8(5);
+                    h.write(text);
+                    h.write_usize(text.len());
+                }
+            }
+        }
+        TAG_STR => {
+            let (raw, _) = read_len_prefixed(bytes).ok()?;
+            h.write_u8(6);
+            h.write(raw);
+            h.write_usize(raw.len());
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
+/// The key item for `key`: an object key, a string array element, or the
+/// operand of `?`.
+pub fn gin_key_item(key: &[u8]) -> u64 {
+    use std::hash::Hasher;
+    let mut h = item_hasher();
+    h.write_u8(ITEM_KEY);
+    h.write(key);
+    h.write_usize(key.len());
+    h.finish()
+}
+
+/// Every item `doc` produces under `opclass`, appended to `out` (unsorted,
+/// possibly repeated). `None` when the document is malformed; an empty input
+/// (a SQL `NULL`) has no items.
+///
+/// The property the index rests on: when `contains(doc, query)` is true, every
+/// item of `query` is an item of `doc`. Each rule of [`contains`] keeps it:
+/// - a key of the query is a key at the matching place in the document;
+/// - a scalar of the query equals a scalar at the matching place, and equal
+///   scalars hash alike ([`hash_scalar`]);
+/// - array nesting never adds a path step, so an element found anywhere in a
+///   matching array, and a top-level scalar found among a top-level array's
+///   elements, sit on the same path as in the query;
+/// - a string array element is a key item too, so the query's string elements
+///   and `?` operands match it under `jsonb_ops`.
+pub fn gin_items(doc: &[u8], opclass: GinOpclass, out: &mut Vec<u64>) -> Option<()> {
+    if doc.is_empty() {
+        return Some(());
+    }
+    let mut path: Vec<&[u8]> = Vec::new();
+    gin_walk(doc, opclass, &mut path, true, out)
+}
+
+fn gin_walk<'a>(
+    bytes: &'a [u8],
+    opclass: GinOpclass,
+    path: &mut Vec<&'a [u8]>,
+    top: bool,
+    out: &mut Vec<u64>,
+) -> Option<()> {
+    use std::hash::Hasher;
+    match *bytes.first()? {
+        TAG_OBJ => {
+            let o = Composite::of(bytes, OBJ_ENTRY)?;
+            for at in 0..o.count {
+                let (key, value) = o.entry(bytes, at)?;
+                if opclass == GinOpclass::Ops {
+                    out.push(gin_key_item(key));
+                }
+                path.push(key);
+                let walked = gin_walk(value, opclass, path, false, out);
+                path.pop();
+                walked?;
+            }
+        }
+        TAG_ARR => {
+            let a = Composite::of(bytes, ARR_ENTRY)?;
+            for at in 0..a.count {
+                let element = a.element(bytes, at)?;
+                if opclass == GinOpclass::Ops && element.first() == Some(&TAG_STR) {
+                    out.push(gin_key_item(read_len_prefixed(element).ok()?.0));
+                }
+                gin_walk(element, opclass, path, false, out)?;
+            }
+        }
+        tag if tag < TAG_ARR => {
+            let mut h = item_hasher();
+            match opclass {
+                GinOpclass::Ops => {
+                    h.write_u8(ITEM_VALUE);
+                    // A document that is one string answers `?` for it.
+                    if top && tag == TAG_STR {
+                        out.push(gin_key_item(read_len_prefixed(bytes).ok()?.0));
+                    }
+                }
+                GinOpclass::PathOps => {
+                    h.write_u8(ITEM_PATH);
+                    h.write_usize(path.len());
+                    for step in path.iter() {
+                        h.write(step);
+                        h.write_usize(step.len());
+                    }
+                }
+            }
+            hash_scalar(bytes, &mut h)?;
+            out.push(h.finish());
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
 /// Whether two JSON numbers are equal as numbers — `1.0` and `1` are. Used
 /// by [`crate::core::pg_ops::json_contains`], the decoded-tree reference that
 /// [`contains`] is checked against.
@@ -2273,5 +2455,146 @@ mod encode_text_tests {
                 bytes / docs.len()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod gin_item_tests {
+    use super::*;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// A random scalar, spelled several ways so equal values meet unequal
+    /// bytes: `1`, `1.0`, `1e0`, `-0.0` and `0` all occur.
+    fn scalar(r: &mut Rng) -> String {
+        match r.below(12) {
+            0 => "null".into(),
+            1 => "true".into(),
+            2 => "false".into(),
+            3 => "1".into(),
+            4 => "1.0".into(),
+            5 => "1e0".into(),
+            6 => "0".into(),
+            7 => "-0.0".into(),
+            8 => "2.50".into(),
+            9 => "\"a\"".into(),
+            10 => "\"b\"".into(),
+            _ => "\"\"".into(),
+        }
+    }
+
+    fn value(r: &mut Rng, depth: u32) -> String {
+        if depth == 0 || r.below(3) == 0 {
+            return scalar(r);
+        }
+        let n = r.below(4) as usize;
+        if r.below(2) == 0 {
+            let items: Vec<String> = (0..n).map(|_| value(r, depth - 1)).collect();
+            format!("[{}]", items.join(","))
+        } else {
+            let keys = ["a", "b", "c", "d"];
+            let items: Vec<String> = (0..n)
+                .map(|_| format!("\"{}\":{}", keys[r.below(4) as usize], value(r, depth - 1)))
+                .collect();
+            format!("{{{}}}", items.join(","))
+        }
+    }
+
+    /// A query likely to be contained in `doc`: a random piece of it, with
+    /// numbers respelled, so the property is exercised on true containments
+    /// rather than on the random pairs that almost never contain.
+    fn carve(v: &serde_json::Value, r: &mut Rng) -> serde_json::Value {
+        use serde_json::Value;
+        match v {
+            Value::Object(m) => {
+                let mut out = serde_json::Map::new();
+                for (k, x) in m {
+                    if r.below(2) == 0 {
+                        out.insert(k.clone(), carve(x, r));
+                    }
+                }
+                Value::Object(out)
+            }
+            Value::Array(a) => {
+                let mut out = Vec::new();
+                for x in a {
+                    if r.below(2) == 0 {
+                        out.push(carve(x, r));
+                    }
+                }
+                Value::Array(out)
+            }
+            Value::Number(n) if n.as_f64() == Some(1.0) && r.below(2) == 0 => serde_json::json!(1.0),
+            other => other.clone(),
+        }
+    }
+
+    fn items(doc: &[u8], opclass: GinOpclass) -> std::collections::HashSet<u64> {
+        let mut out = Vec::new();
+        gin_items(doc, opclass, &mut out).expect("well-formed");
+        out.into_iter().collect()
+    }
+
+    #[test]
+    fn a_contained_query_has_only_items_the_document_has() {
+        let mut r = Rng(0x5eed_9e37);
+        let mut contained = 0;
+        for _ in 0..20_000 {
+            let doc_text = value(&mut r, 4);
+            let doc = encode_text(&doc_text).unwrap();
+            let doc_value: serde_json::Value = serde_json::from_str(&doc_text).unwrap();
+            let query_text = match r.below(3) {
+                0 => value(&mut r, 3),
+                1 => scalar(&mut r),
+                _ => carve(&doc_value, &mut r).to_string(),
+            };
+            let query = encode_text(&query_text).unwrap();
+            if contains(&doc, &query) != Some(true) {
+                continue;
+            }
+            contained += 1;
+            for opclass in [GinOpclass::Ops, GinOpclass::PathOps] {
+                let have = items(&doc, opclass);
+                let want = items(&query, opclass);
+                assert!(
+                    want.is_subset(&have),
+                    "{doc_text} @> {query_text} under {opclass:?}, but the query has an item the document lacks"
+                );
+            }
+        }
+        assert!(contained > 2_000, "too few containments to test ({contained})");
+    }
+
+    #[test]
+    fn equal_numbers_make_equal_items_and_kinds_do_not_mix() {
+        let one = |t: &str| items(&encode_text(t).unwrap(), GinOpclass::PathOps);
+        assert_eq!(one(r#"{"a":1}"#), one(r#"{"a":1.0}"#));
+        assert_eq!(one(r#"{"a":1}"#), one(r#"{"a":1e0}"#));
+        assert_eq!(one(r#"{"a":0}"#), one(r#"{"a":-0.0}"#));
+        assert_ne!(one(r#"{"a":1}"#), one(r#"{"a":"1"}"#));
+        assert_ne!(one(r#"{"a":1}"#), one(r#"{"b":1}"#));
+        // Array nesting is not a path step.
+        assert_eq!(one(r#"{"a":[1]}"#), one(r#"{"a":1}"#));
+        // `?` finds top-level keys and string elements, and a bare string.
+        let ops = |t: &str| items(&encode_text(t).unwrap(), GinOpclass::Ops);
+        assert!(ops(r#"{"k":1}"#).contains(&gin_key_item(b"k")));
+        assert!(ops(r#"["k",2]"#).contains(&gin_key_item(b"k")));
+        assert!(ops(r#""k""#).contains(&gin_key_item(b"k")));
+        assert!(!ops(r#"[1]"#).contains(&gin_key_item(b"1")));
+        // NULL (no bytes) has no items.
+        let mut out = Vec::new();
+        gin_items(&[], GinOpclass::Ops, &mut out).unwrap();
+        assert!(out.is_empty());
     }
 }
