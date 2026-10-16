@@ -125,20 +125,39 @@ fn candidates_are_always_a_superset_of_the_matches() {
         vec![index("ns_bt", Method::BTree, &[0, 1])],
         vec![index("sn_bt", Method::BTree, &[1, 0]), index("n_h", Method::Hash, &[0])],
         vec![index("fs_bt", Method::BTree, &[2, 1]), index("nsf_h", Method::Hash, &[0, 1, 2])],
+        // Whole keys on every column, so a conjunction's answer from one is
+        // filtered by the others (step 3).
+        vec![
+            index("n_h", Method::Hash, &[0]),
+            index("s_bt", Method::BTree, &[1]),
+            index("f_h", Method::Hash, &[2]),
+            index("n_bt", Method::BTree, &[0]),
+        ],
     ];
     for layout in layouts {
         let indexes = TableIndexes::new(layout);
         let rows: Vec<Vec<Vec<u8>>> = (0..400).map(|_| (0..3).map(|c| value(&mut r, c)).collect()).collect();
-        for (slot, row) in rows.iter().enumerate() {
+        // Slots in a shuffled order, as concurrent writers deliver them, and
+        // one in twenty unkeyed in each index: a slot whose key could not be
+        // built must come back from every lookup of that index.
+        let mut order: Vec<usize> = (0..rows.len()).collect();
+        for i in (1..order.len()).rev() {
+            order.swap(i, r.below(i as u64 + 1) as usize);
+        }
+        for &slot in &order {
+            let row = &rows[slot];
             for ix in &indexes.list {
-                let key = ix.key_of(|wo| Some(row[wo as usize].as_slice()));
+                let key = if r.below(20) == 0 { None } else { ix.key_of(|wo| Some(row[wo as usize].as_slice())) };
                 ix.insert(slot as u64, key);
             }
         }
         let mut used = 0;
         for _ in 0..3_000 {
             let e = expr(&mut r, 3);
-            let Some(candidates) = indexes.plan(&e, &schema, usize::MAX) else {
+            // A small cap as well: a broad key declined in step 1 is still a
+            // filter in step 3.
+            let cap = if r.below(3) == 0 { 60 } else { usize::MAX };
+            let Some(candidates) = indexes.plan(&e, &schema, cap) else {
                 continue;
             };
             used += 1;
@@ -311,20 +330,85 @@ fn a_broad_whole_key_loses_to_a_narrow_range() {
             value: v.to_vec(),
         })
     };
-    let five = 5i64.to_le_bytes();
-    let both = MaskExpr::And(vec![p(1, SargOp::Eq, b"paid"), p(0, SargOp::Lt, &five)]);
-    let want: Vec<u64> = (0..5).collect();
+    let fifty = 50i64.to_le_bytes();
+    let both = MaskExpr::And(vec![p(1, SargOp::Eq, b"paid"), p(0, SargOp::Lt, &fifty)]);
+    // The range, filtered by the broad key without reading its list: slots
+    // under fifty that are 'paid'.
+    let want: Vec<u64> = (0..50).filter(|s| s % 5 == 0).collect();
     // The broad key fits: still the range.
     assert_eq!(indexes.plan(&both, &fields(), usize::MAX), Some(want.clone()));
     // The broad key is over the cap: the range.
-    assert_eq!(indexes.plan(&both, &fields(), 100), Some(want));
+    assert_eq!(indexes.plan(&both, &fields(), 100), Some(want.clone()));
+    // A slot whose key could not be built may hold anything: the filter
+    // keeps it.
+    by_s.insert(7, None);
+    let mut with_unkeyed = want.clone();
+    with_unkeyed.push(7);
+    with_unkeyed.sort_unstable();
+    assert_eq!(indexes.plan(&both, &fields(), 100), Some(with_unkeyed));
     // A selective key beats a broad range.
     let wide = 900i64.to_le_bytes();
     let rare = MaskExpr::And(vec![p(1, SargOp::Eq, b"paid"), p(0, SargOp::Lt, &wide)]);
-    assert_eq!(indexes.plan(&rare, &fields(), usize::MAX).map(|v| v.len()), Some(200));
+    // 200 'paid' slots, and slot 7, unkeyed above.
+    assert_eq!(indexes.plan(&rare, &fields(), usize::MAX).map(|v| v.len()), Some(201));
     // The key alone, over the cap: declined, not copied and then refused.
     let mut out = Vec::new();
     let key = by_s.key_of(|_| Some(&b"paid"[..])).unwrap();
     assert!(!by_s.lookup_eq(&key, &mut out, 100));
     assert!(out.is_empty(), "{} slots copied before the cap was checked", out.len());
+}
+
+/// A posting list stays sorted and distinct whatever order slots arrive in,
+/// and a removal finds its slot by search.
+#[test]
+fn posting_lists_stay_sorted_and_distinct() {
+    let ix = index("n", Method::BTree, &[0]);
+    let hx = index("h", Method::Hash, &[0]);
+    let indexes = TableIndexes::new(vec![ix.clone()]);
+    let hashes = TableIndexes::new(vec![hx.clone()]);
+    let seven = 7i64.to_le_bytes();
+    let mut r = Rng(0x5107);
+    let mut model = std::collections::BTreeSet::new();
+    for _ in 0..2000 {
+        let slot = r.below(500);
+        if r.below(4) == 0 {
+            ix.remove(slot, &ix.key_of(|_| Some(&seven[..])).unwrap());
+            hx.remove(slot, &hx.key_of(|_| Some(&seven[..])).unwrap());
+            model.remove(&slot);
+        } else {
+            ix.insert(slot, ix.key_of(|_| Some(&seven[..])));
+            hx.insert(slot, hx.key_of(|_| Some(&seven[..])));
+            model.insert(slot);
+        }
+    }
+    let eq = MaskExpr::Pred(SargPredicate {
+        write_order: 0,
+        op: SargOp::Eq,
+        value: seven.to_vec(),
+    });
+    let want: Vec<u64> = model.into_iter().collect();
+    for (name, ix, set) in [("btree", &ix, &indexes), ("hash", &hx, &hashes)] {
+        let mut raw = Vec::new();
+        assert!(ix.lookup_eq(&ix.key_of(|_| Some(&seven[..])).unwrap(), &mut raw, usize::MAX));
+        assert_eq!(raw, want, "{name}: the list itself, unsorted by the planner");
+        assert_eq!(set.plan(&eq, &fields(), usize::MAX), Some(want.clone()), "{name}");
+    }
+}
+
+/// `gallop_to` is `partition_point` from a starting position, for every
+/// start at or before the answer.
+#[test]
+fn galloping_finds_what_a_binary_search_finds() {
+    let mut r = Rng(0x6a11);
+    for _ in 0..2_000 {
+        let n = r.below(80) as usize;
+        let mut v: Vec<u64> = (0..n).map(|_| r.below(200)).collect();
+        v.sort_unstable();
+        v.dedup();
+        let target = r.below(210);
+        let want = v.partition_point(|x| *x < target);
+        for from in 0..=want {
+            assert_eq!(gallop_to(&v, from, target), want, "{v:?} from {from} to {target}");
+        }
+    }
 }

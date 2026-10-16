@@ -259,6 +259,20 @@ impl GinIndex {
         Some(out)
     }
 
+    /// An upper bound on what [`lookup`](Self::lookup) would return, from
+    /// the lists' lengths alone: the shortest list for `All`, their sum for
+    /// `Any`. One hash probe per item, and nothing copied.
+    pub fn estimate(&self, query: &GinQuery) -> usize {
+        let len = |i: &u64| self.shards[Self::shard(*i)].read().get(i).map_or(0, |l| l.len());
+        let unkeyed = self.unkeyed.read().len();
+        match query {
+            GinQuery::All(items) if items.is_empty() => usize::MAX,
+            GinQuery::All(items) => items.iter().map(len).min().unwrap_or(0) + unkeyed,
+            GinQuery::Any(items) if items.is_empty() => usize::MAX,
+            GinQuery::Any(items) => items.iter().map(len).fold(unkeyed, usize::saturating_add),
+        }
+    }
+
     /// Distinct items, and entries under them.
     pub fn sizes(&self) -> (usize, usize) {
         self.shards.iter().fold((0, 0), |(k, e), s| {
@@ -544,5 +558,45 @@ mod tests {
         let mut toks = vec![T::LPar];
         toks.extend(contains("{}"));
         assert_eq!(parse_json_where(&toks), None);
+    }
+
+    /// The planner asks the index with the smallest estimate first and takes
+    /// its answer, so an estimate below the answer would only misorder, but
+    /// an estimate that is not a bound makes the order meaningless.
+    #[test]
+    fn an_estimate_bounds_its_lookup() {
+        for opclass in [GinOpclass::Ops, GinOpclass::PathOps] {
+            let g = GinIndex::new(decl("e"), 0, opclass);
+            for slot in 0..300u64 {
+                let d = format!(
+                    r#"{{"user":{{"id":{}}},"status":"s{}","tags":["t{}"]}}"#,
+                    slot % 37,
+                    slot % 5,
+                    slot % 3
+                );
+                g.insert(slot, Some(&doc(&d)));
+            }
+            g.insert(300, None);
+            g.forget(7);
+            for q in [r#"{"user":{"id":3}}"#, r#"{"status":"s1","tags":["t2"]}"#, r#"{"user":{}}"#, r#"{"nope":1}"#] {
+                let query = contains_query(&doc(q), opclass).unwrap();
+                let got = g.lookup(&query, usize::MAX).map_or(0, |a| a.len());
+                assert!(g.estimate(&query) >= got, "{opclass:?} {q}: estimate {} < {got}", g.estimate(&query));
+            }
+            if opclass == GinOpclass::Ops {
+                let keys = ["status".to_string(), "nope".to_string()];
+                for all in [true, false] {
+                    let query = keys_query(&keys, all);
+                    let got = g.lookup(&query, usize::MAX).map_or(0, |a| a.len());
+                    assert!(g.estimate(&query) >= got, "keys all={all}");
+                }
+            }
+            // `{"user":{"id":3}}` under path ops is one list: its estimate is
+            // the answer's size, which is what lets it win over `jsonb_ops`.
+            if opclass == GinOpclass::PathOps {
+                let query = contains_query(&doc(r#"{"user":{"id":3}}"#), opclass).unwrap();
+                assert_eq!(g.estimate(&query), 9 + 1, "nine documents and the unreadable one");
+            }
+        }
     }
 }

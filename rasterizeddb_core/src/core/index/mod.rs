@@ -238,20 +238,8 @@ impl LiveIndex {
                 }
             }
             Some(key) => match &self.data {
-                Data::BTree(map) => {
-                    let mut map = map.write();
-                    let slots = map.entry(key).or_default();
-                    if !slots.contains(&slot) {
-                        slots.push(slot);
-                    }
-                }
-                Data::Hash(shards, _) => {
-                    let mut map = shards[self.shard(&key)].write();
-                    let slots = map.entry(key).or_default();
-                    if !slots.contains(&slot) {
-                        slots.push(slot);
-                    }
-                }
+                Data::BTree(map) => add_sorted(map.write().entry(key).or_default(), slot),
+                Data::Hash(shards, _) => add_sorted(shards[self.shard(&key)].write().entry(key).or_default(), slot),
             },
         }
         self.set_present(slot, true);
@@ -263,7 +251,9 @@ impl LiveIndex {
         fn drop_slot<M: MapLike>(map: &mut M, key: &[u8], slot: u64) {
             let empty = match map.slots_mut(key) {
                 Some(slots) => {
-                    slots.retain(|s| *s != slot);
+                    if let Ok(at) = slots.binary_search(&slot) {
+                        slots.remove(at);
+                    }
                     slots.is_empty()
                 }
                 None => false,
@@ -366,6 +356,89 @@ impl LiveIndex {
 
     fn append_unkeyed(&self, out: &mut Vec<u64>) {
         out.extend_from_slice(&self.unkeyed.read());
+    }
+
+    /// How many slots are listed under `key`, without reading them.
+    fn listed_under(&self, key: &[u8]) -> usize {
+        match &self.data {
+            Data::BTree(map) => map.read().get(key).map_or(0, |s| s.len()),
+            Data::Hash(shards, _) => shards[self.shard(key)].read().get(key).map_or(0, |s| s.len()),
+        }
+    }
+
+    /// Keeps the candidates that may hold exactly `key`: those listed under
+    /// it, and the unkeyed ones. `candidates` must be sorted and distinct.
+    ///
+    /// Both lists are sorted, so this walks them together, galloping ahead
+    /// in the posting list: sequential reads, and a few thousand candidates
+    /// against a list of a fifth of the table cost microseconds, never a
+    /// random probe per candidate into megabytes. The index's lock is held
+    /// only for that walk.
+    fn retain_under(&self, key: &[u8], candidates: &mut Vec<u64>) {
+        // Almost always empty; otherwise unsorted, so sorted once here.
+        let unkeyed: Vec<u64> = {
+            let unkeyed = self.unkeyed.read();
+            let mut copy = unkeyed.clone();
+            copy.sort_unstable();
+            copy
+        };
+        let keep = |slots: Option<&Slots>, candidates: &mut Vec<u64>| {
+            let slots: &[u64] = slots.map_or(&[], |s| s.as_slice());
+            let (mut at, mut at_unkeyed) = (0usize, 0usize);
+            candidates.retain(|&c| {
+                at = gallop_to(slots, at, c);
+                if slots.get(at) == Some(&c) {
+                    return true;
+                }
+                if unkeyed.is_empty() {
+                    return false;
+                }
+                at_unkeyed = gallop_to(&unkeyed, at_unkeyed, c);
+                unkeyed.get(at_unkeyed) == Some(&c)
+            });
+        };
+        match &self.data {
+            Data::BTree(map) => keep(map.read().get(key), candidates),
+            Data::Hash(shards, _) => keep(shards[self.shard(key)].read().get(key), candidates),
+        }
+    }
+}
+
+/// The first position at or after `from` whose value is not below `target`,
+/// in a sorted slice: doubling steps from `from`, then a binary search
+/// inside the last step. `O(log d)` for a distance `d`, so a sweep over
+/// ascending targets reads the slice front to back once.
+fn gallop_to(sorted: &[u64], from: usize, target: u64) -> usize {
+    if from >= sorted.len() || sorted[from] >= target {
+        return from;
+    }
+    let mut step = 1;
+    let mut lo = from;
+    while lo + step < sorted.len() && sorted[lo + step] < target {
+        lo += step;
+        step *= 2;
+    }
+    let hi = (lo + step).min(sorted.len());
+    lo + 1 + sorted[lo + 1..hi].partition_point(|v| *v < target)
+}
+
+/// Adds `slot` to a posting list, which is kept sorted and distinct.
+///
+/// Sorted so that membership is a binary search: a duplicate check by scan
+/// cost a list's length per insert, which made building an index on a
+/// column of five values quadratic (a million rows, five lists of 200k), and
+/// every later insert into it read 1.6 MB. Slots almost always arrive in
+/// ascending order, a new version being appended, so the common case is a
+/// push.
+fn add_sorted(slots: &mut Slots, slot: u64) {
+    match slots.last() {
+        None => slots.push(slot),
+        Some(&last) if last < slot => slots.push(slot),
+        Some(_) => {
+            if let Err(at) = slots.binary_search(&slot) {
+                slots.insert(at, slot);
+            }
+        }
     }
 }
 
@@ -749,12 +822,24 @@ impl TableIndexes {
         match expr {
             JsonExpr::Opaque => None,
             JsonExpr::Leaf { column, op } => {
-                let answer = self
+                // With both operator classes declared, the two answers differ
+                // in cost far more than in size: `{"user":{"id":7}}` is one
+                // short list under `jsonb_path_ops`, and under `jsonb_ops` a
+                // value list filtered through the key lists of `user` and
+                // `id`, which every document has. The index whose shortest
+                // list is shortest is asked first; another is asked only if
+                // that one declines.
+                let mut asked: Vec<(usize, &gin::GinIndex, gin::GinQuery)> = self
                     .gin
                     .iter()
                     .filter(|g| g.column == *column && g.answers(op))
-                    .filter_map(|g| g.lookup(&g.query_for(op)?, cap))
-                    .min_by_key(|answer| answer.len());
+                    .filter_map(|g| {
+                        let q = g.query_for(op)?;
+                        Some((g.estimate(&q), g.as_ref(), q))
+                    })
+                    .collect();
+                asked.sort_by_key(|(estimate, ..)| *estimate);
+                let answer = asked.iter().find_map(|(_, g, q)| g.lookup(q, cap));
                 if answer.is_some() {
                     GIN_LOOKUPS.fetch_add(1, Ordering::Relaxed);
                 }
@@ -846,19 +931,23 @@ impl TableIndexes {
             .filter(|i| i.columns.iter().all(|(wo, _)| eq_of(*wo).is_some()))
             .collect();
         whole.sort_by_key(|i| std::cmp::Reverse(i.columns.len()));
+        let keyed: Vec<(&Arc<LiveIndex>, KeyBuf)> = whole
+            .into_iter()
+            .filter_map(|index| Some((index, index.key_of_values(|wo| eq_of(wo).map(|p| p.value.as_slice()))?)))
+            .collect();
         let mut best: Option<Vec<u64>> = None;
-        for index in whole {
-            let key = index.key_of_values(|wo| eq_of(wo).map(|p| p.value.as_slice()));
-            if let Some(key) = key {
-                let mut out = Vec::new();
-                if index.lookup_eq(&key, &mut out, cap) {
-                    index.append_unkeyed(&mut out);
-                    if index.path.is_some() {
-                        PATH_LOOKUPS.fetch_add(1, Ordering::Relaxed);
-                    }
-                    best = Some(out);
-                    break;
+        // Which of `keyed` gave `best`, so it is not asked to filter itself.
+        let mut best_from: Option<usize> = None;
+        for (i, (index, key)) in keyed.iter().enumerate() {
+            let mut out = Vec::new();
+            if index.lookup_eq(key, &mut out, cap) {
+                index.append_unkeyed(&mut out);
+                if index.path.is_some() {
+                    PATH_LOOKUPS.fetch_add(1, Ordering::Relaxed);
                 }
+                best = Some(out);
+                best_from = Some(i);
+                break;
             }
         }
         // A whole key is usually one row, and then nothing can beat it. It
@@ -914,6 +1003,38 @@ impl TableIndexes {
                     PATH_LOOKUPS.fetch_add(1, Ordering::Relaxed);
                 }
                 best = Some(out);
+                best_from = None;
+            }
+        }
+
+        // 3. Every other whole key the conjunction fixes still narrows the
+        //    answer: a row matching all of it is listed under each such key
+        //    (or unkeyed), so a candidate under none of them cannot match.
+        //    `status = 'paid' AND id < 2000` reads the two thousand from the
+        //    primary key and keeps the fifth of them listed under 'paid'
+        //    rather than fetching every one.
+        //    Shortest list first, so each narrows what the next is walked
+        //    against. A list of half the table or more keeps too much to pay
+        //    for the walk (`cap` is an eighth of the table), and is skipped.
+        if let Some(found) = best.as_mut() {
+            let mut filters: Vec<(usize, usize)> = keyed
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| best_from != Some(*i))
+                .map(|(i, (index, key))| (index.listed_under(key), i))
+                .filter(|(listed, _)| *listed < cap.saturating_mul(4))
+                .collect();
+            if !filters.is_empty() && found.len() > 1 {
+                found.sort_unstable();
+                found.dedup();
+                filters.sort_unstable();
+                for (_, i) in filters {
+                    if found.len() <= 1 {
+                        break;
+                    }
+                    let (index, key) = &keyed[i];
+                    index.retain_under(key, found);
+                }
             }
         }
         best

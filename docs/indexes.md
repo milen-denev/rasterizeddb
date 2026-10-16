@@ -82,6 +82,13 @@ operator classes match PostgreSQL's:
 A query with no items, such as `doc @> '{}'`, cannot be narrowed, and the
 table is scanned.
 
+With both operator classes on a column, the cheaper index is asked first,
+judged by the length of its shortest list, which bounds its answer.
+`{"user":{"id":7}}` is one short list under `jsonb_path_ops`. Under
+`jsonb_ops` it is a value list filtered through the `user` and `id` key
+lists, which list every document. The other index is asked only if the
+first declines.
+
 Two rules keep a `gin` answer a superset of the matches:
 - **Every item of a contained query is an item of the document.** This is
   pinned by a property test over random documents and queries. Numbers are
@@ -119,7 +126,14 @@ same literal coercion and `NUMERIC` scale handling. The planner then picks:
    (`doc->>'status' = 'paid'` is a fifth of the table) is only the answer to
    beat: each range stops reading once it is no longer smaller, so
    `… AND id < 2000` is answered from the primary key;
-3. `AND` narrows by any answerable branch, and `OR` unions its branches only
+3. every **other whole key** the conjunction fixes then filters that answer,
+   shortest list first. A candidate listed under none of them, and not
+   unkeyed, cannot match. The lists are sorted, so this is one forward walk
+   that gallops through the posting list. Nothing is copied: `status =
+   'paid' AND id < 2000` keeps a fifth of the two thousand without reading
+   the 200k slots under `'paid'`. A list of half the table or more is
+   skipped, because it would keep nearly everything;
+4. `AND` narrows by any answerable branch, and `OR` unions its branches only
    when every branch is answerable.
 
 The answer is a sorted list of candidate slots. The scan reads only the
@@ -172,6 +186,12 @@ memory:
   same exclusive gate.
 - **An `ALTER TABLE` that rewrites the table** carries the declarations
   across, matched by column name; an index on a dropped column goes with it.
+
+Each key's slots are kept sorted. A new version is appended, so an insert
+is almost always a push, and a duplicate check or a removal is a binary
+search. The check used to scan the key's whole list, which made an index on
+a column of five values quadratic to build: 14 s for a million documents'
+`->>'status'`, now 0.85 s.
 
 Because the index is derived from the data the WAL already made durable, it
 cannot disagree with the table after a crash. The cost is the rebuild at
