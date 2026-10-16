@@ -313,14 +313,21 @@ impl LiveIndex {
 
     /// Appends the slots under exactly `key`. `false` when `cap` was exceeded.
     fn lookup_eq(&self, key: &[u8], out: &mut Vec<u64>, cap: usize) -> bool {
-        let slots: Option<Slots> = match &self.data {
-            Data::BTree(map) => map.read().get(key).cloned(),
-            Data::Hash(shards, _) => shards[self.shard(key)].read().get(key).cloned(),
+        // Measured before copying: a common key (`status = 'shipped'`) lists
+        // a fifth of the table, and copying it only to find it over `cap`
+        // cost more than the scan the answer was meant to save.
+        let mut take = |slots: Option<&Slots>| match slots {
+            Some(slots) if out.len() + slots.len() > cap => false,
+            Some(slots) => {
+                out.extend_from_slice(slots);
+                true
+            }
+            None => out.len() <= cap,
         };
-        if let Some(slots) = slots {
-            out.extend_from_slice(&slots);
+        match &self.data {
+            Data::BTree(map) => take(map.read().get(key)),
+            Data::Hash(shards, _) => take(shards[self.shard(key)].read().get(key)),
         }
-        out.len() <= cap
     }
 
     /// Appends the slots with keys in a range (B-tree only). `false` when `cap`
@@ -839,6 +846,7 @@ impl TableIndexes {
             .filter(|i| i.columns.iter().all(|(wo, _)| eq_of(*wo).is_some()))
             .collect();
         whole.sort_by_key(|i| std::cmp::Reverse(i.columns.len()));
+        let mut best: Option<Vec<u64>> = None;
         for index in whole {
             let key = index.key_of_values(|wo| eq_of(wo).map(|p| p.value.as_slice()));
             if let Some(key) = key {
@@ -848,16 +856,24 @@ impl TableIndexes {
                     if index.path.is_some() {
                         PATH_LOOKUPS.fetch_add(1, Ordering::Relaxed);
                     }
-                    return Some(out);
+                    best = Some(out);
+                    break;
                 }
             }
+        }
+        // A whole key is usually one row, and then nothing can beat it. It
+        // can also be a fifth of the table (`doc->>'status' = 'paid'`), when
+        // a range on another index (`id < 2000`) is far smaller: so it is
+        // only the answer to beat, and each range below stops reading once
+        // it is no longer smaller.
+        if best.as_ref().is_some_and(|b| b.len() <= 1) {
+            return best;
         }
 
         // 2. A B-tree constrained on a leading run of its columns: equality
         //    on the first `k`, and any bounds on column `k`, as one range
         //    scan. `cat = 5 AND price > 990` over `(cat, price)` reads the
         //    `cat = 5` keys above `990` and no others.
-        let mut best: Option<Vec<u64>> = None;
         'index: for index in self.list.iter().filter(|i| i.method() == Method::BTree) {
             let n = index.columns.len();
             let mut prefix = Vec::new();
@@ -888,7 +904,8 @@ impl TableIndexes {
             }
             let (lo, hi) = range.bounds();
             let mut out = Vec::new();
-            if !index.lookup_range(lo, hi, &mut out, cap) {
+            let limit = best.as_ref().map_or(cap, |b| b.len().saturating_sub(1));
+            if !index.lookup_range(lo, hi, &mut out, limit) {
                 continue;
             }
             index.append_unkeyed(&mut out);

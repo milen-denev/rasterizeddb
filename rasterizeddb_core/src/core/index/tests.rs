@@ -289,3 +289,42 @@ fn a_composite_btree_ranges_inside_its_equality_prefix() {
         assert_eq!(got.len(), if cols[0] == 0 { strings.len() } else { 10 }, "{name}");
     }
 }
+
+/// `doc->>'status' = 'paid' AND id < 5`: the equality is a whole key, but a
+/// fifth of the table, and the range on another index is five rows. The
+/// smaller answer wins, whether or not the broad one fits under the cap.
+#[test]
+fn a_broad_whole_key_loses_to_a_narrow_range() {
+    let by_n = index("n", Method::BTree, &[0]);
+    let by_s = index("s", Method::BTree, &[1]);
+    let indexes = TableIndexes::new(vec![by_n.clone(), by_s.clone()]);
+    for slot in 0..1000u64 {
+        let nb = (slot as i64).to_le_bytes();
+        by_n.insert(slot, by_n.key_of(|_| Some(&nb[..])));
+        let s: &[u8] = if slot % 5 == 0 { b"paid" } else { b"new" };
+        by_s.insert(slot, by_s.key_of(|_| Some(s)));
+    }
+    let p = |wo: u32, op: SargOp, v: &[u8]| {
+        MaskExpr::Pred(SargPredicate {
+            write_order: wo,
+            op,
+            value: v.to_vec(),
+        })
+    };
+    let five = 5i64.to_le_bytes();
+    let both = MaskExpr::And(vec![p(1, SargOp::Eq, b"paid"), p(0, SargOp::Lt, &five)]);
+    let want: Vec<u64> = (0..5).collect();
+    // The broad key fits: still the range.
+    assert_eq!(indexes.plan(&both, &fields(), usize::MAX), Some(want.clone()));
+    // The broad key is over the cap: the range.
+    assert_eq!(indexes.plan(&both, &fields(), 100), Some(want));
+    // A selective key beats a broad range.
+    let wide = 900i64.to_le_bytes();
+    let rare = MaskExpr::And(vec![p(1, SargOp::Eq, b"paid"), p(0, SargOp::Lt, &wide)]);
+    assert_eq!(indexes.plan(&rare, &fields(), usize::MAX).map(|v| v.len()), Some(200));
+    // The key alone, over the cap: declined, not copied and then refused.
+    let mut out = Vec::new();
+    let key = by_s.key_of(|_| Some(&b"paid"[..])).unwrap();
+    assert!(!by_s.lookup_eq(&key, &mut out, 100));
+    assert!(out.is_empty(), "{} slots copied before the cap was checked", out.len());
+}

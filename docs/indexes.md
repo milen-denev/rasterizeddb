@@ -113,8 +113,12 @@ same literal coercion and `NUMERIC` scale handling. The planner then picks:
 
 1. an index whose **whole key** is matched by equalities (a hash probe, or a
    B-tree point lookup), the one with the most columns first;
-2. otherwise a **B-tree whose leading column** is constrained: one range scan,
-   with every bound on that column within the conjunction merged into it;
+2. a **B-tree whose leading column** is constrained: one range scan, with
+   every bound on that column within the conjunction merged into it. A
+   whole-key answer of one row is taken outright. A larger one
+   (`doc->>'status' = 'paid'` is a fifth of the table) is only the answer to
+   beat: each range stops reading once it is no longer smaller, so
+   `… AND id < 2000` is answered from the primary key;
 3. `AND` narrows by any answerable branch, and `OR` unions its branches only
    when every branch is answerable.
 
