@@ -1740,6 +1740,17 @@ mod quote_sql_reference {
 }
 
 /// Strips one layer of matching single or double quotes, if present.
+/// One matching pair of SQL string quotes, and only those.
+pub fn strip_single_quotes(s: &str) -> &str {
+    let t = s.trim();
+    let bytes = t.as_bytes();
+    if bytes.len() >= 2 && bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\'' {
+        &t[1..t.len() - 1]
+    } else {
+        t
+    }
+}
+
 pub fn strip_quotes(s: &str) -> &str {
     let t = s.trim();
     let bytes = t.as_bytes();
@@ -1975,7 +1986,15 @@ pub fn encode_literal(db_type: &crate::core::db_type::DbType, literal: &str) -> 
         return encode_bytea_sql(literal).ok();
     }
     let literal = strip_type_prefix(literal);
-    let text = strip_quotes(literal);
+    // A document keeps its double quotes: `"t1"` is the JSON string `t1`,
+    // not an identifier quoting. Stripping them handed `t1` to the encoder,
+    // which is not JSON, so `doc @> '"t1"'` failed every row it was tested
+    // against.
+    let text = if matches!(db_type, DbType::JSONB | DbType::JSON) {
+        strip_single_quotes(literal)
+    } else {
+        strip_quotes(literal)
+    };
     match db_type {
         DbType::UUID => parse_uuid(text).map(|b| b.to_vec()),
         DbType::INET => parse_inet(text).map(|b| b.to_vec()),
@@ -2448,6 +2467,17 @@ mod tests {
                 to
             );
         }
+    }
+
+    #[test]
+    fn a_json_string_literal_keeps_its_quotes() {
+        use crate::core::db_type::DbType;
+        // The WHERE path hands the literal over unquoted; the INSERT path
+        // with its SQL quotes. Both are the JSON string `t1`.
+        let want = crate::core::jsonb::encode_text("\"t1\"").unwrap();
+        assert_eq!(encode_literal(&DbType::JSONB, "\"t1\""), Some(want.clone()));
+        assert_eq!(encode_literal(&DbType::JSONB, "'\"t1\"'"), Some(want));
+        assert_eq!(encode_literal(&DbType::JSONB, "t1"), None);
     }
 
     #[test]
