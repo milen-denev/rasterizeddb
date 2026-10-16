@@ -842,6 +842,22 @@ impl<'a, 'b> QueryParser<'a, 'b> {
             Ok(mb)
         }
 
+        // A text literal read as a document, refused with PostgreSQL's
+        // message when it is not JSON.
+        fn json_literal(literal: &MemoryBlock) -> Result<MemoryBlock, String> {
+            let text = String::from_utf8_lossy(literal.into_slice());
+            let bytes = crate::core::jsonb::encode_text(&text).map_err(|reason| {
+                format!(
+                    "invalid input syntax for type json: {} ({})",
+                    crate::core::value_codec::quote_sql(&text),
+                    reason
+                )
+            })?;
+            let mut mb = MEMORY_POOL.acquire(bytes.len());
+            mb.into_slice_mut().copy_from_slice(&bytes);
+            Ok(mb)
+        }
+
         // A fractional literal against an integer column has no exact integer
         // form; it is left as it is for `promote_numeric`, which compares the
         // two as floats, rather than refused.
@@ -900,10 +916,6 @@ impl<'a, 'b> QueryParser<'a, 'b> {
             // what says which type to compare in, so the literal is re-encoded
             // in it exactly as it would be for a column of that type.
             //
-            // Only when a cast set the type. An *uncast* path keeps the older
-            // behaviour of comparing raw bytes, which is what `data->'k' <> ''`
-            // relies on — coercing the empty string into JSONB there fails, and
-            // that pair is how key-existence is answered.
             (ComparisonOperand::Direct(lit), ComparisonOperand::PathWithIndex(_, _, path))
                 if left_type != right_type && path.cast.is_some() =>
             {
@@ -917,6 +929,29 @@ impl<'a, 'b> QueryParser<'a, 'b> {
                 let mb = coerce(lit, &right_type, &left_type)?;
                 let t = left_type.clone();
                 Ok((left_op, ComparisonOperand::Direct(mb), t.clone(), t))
+            }
+            // An uncast `->` or `#>` yields a document, and PostgreSQL resolves
+            // a quoted literal compared with one as a document too, `::jsonb`
+            // or not — the rewrite drops a cast written on a literal anyway.
+            // So `doc->'a' = '1'` compares two documents, by value. The text
+            // used to be left as it was and compared with the encoded bytes,
+            // which could never be equal: `=` matched nothing and `<>` matched
+            // every row.
+            //
+            // Text that is not JSON is refused, as PostgreSQL refuses it. That
+            // includes `doc->'k' <> ''`, which this engine once used to ask
+            // whether a key exists; `?` is the operator for that.
+            (ComparisonOperand::Direct(lit), ComparisonOperand::PathWithIndex(..))
+                if left_type == DbType::STRING && right_type == DbType::JSONB =>
+            {
+                let mb = json_literal(lit)?;
+                Ok((ComparisonOperand::Direct(mb), right_op, DbType::JSONB, DbType::JSONB))
+            }
+            (ComparisonOperand::PathWithIndex(..), ComparisonOperand::Direct(lit))
+                if left_type == DbType::JSONB && right_type == DbType::STRING =>
+            {
+                let mb = json_literal(lit)?;
+                Ok((left_op, ComparisonOperand::Direct(mb), DbType::JSONB, DbType::JSONB))
             }
             _ => Ok((left_op, right_op, left_type, right_type)),
         }

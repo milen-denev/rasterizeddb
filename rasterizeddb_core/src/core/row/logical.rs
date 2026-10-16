@@ -72,11 +72,21 @@ pub fn perform_comparison_operation(
         // equality and the canonical ordering with no decoding step.
         DbType::UUID => bytes_comparison(input1, input2, UUID_LEN, operation),
         DbType::INET => bytes_comparison(input1, input2, INET_LEN, operation),
-        // Encoding a document is canonical — keys sorted, duplicates resolved
-        // — so two documents that are equal encode identically and a byte
-        // compare decides equality correctly. The *ordering* it yields is
-        // stable but is not the one PostgreSQL defines for `jsonb`.
-        DbType::JSONB => Ok(string_comparison(input1, input2, operation)),
+        // Equality is between values, not bytes: a number keeps its spelling
+        // when it is encoded, so `1` and `1.0` differ as bytes and PostgreSQL
+        // calls them equal, at any depth. A byte compare matched `doc = '1'`
+        // against only one of the two. Bytes that are not an encoded document
+        // fall back to the byte compare, which is all they ever had. The
+        // *ordering* is still the bytes': stable, but not the one PostgreSQL
+        // defines for `jsonb`.
+        DbType::JSONB => match operation {
+            ComparerOperation::Equals | ComparerOperation::NotEquals => {
+                let equal = crate::core::jsonb::values_equal(input1, input2)
+                    .unwrap_or_else(|| input1 == input2);
+                Ok(equal == matches!(operation, ComparerOperation::Equals))
+            }
+            _ => Ok(string_comparison(input1, input2, operation)),
+        },
         // The types stored in PostgreSQL's own wire layout. Their ordering is
         // defined once, in `compare_bytes_as_type`, and reused here rather than
         // written a second time — the sort path and the filter path disagreeing

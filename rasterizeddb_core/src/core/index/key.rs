@@ -235,6 +235,20 @@ pub fn encode_canonical(t: &DbType, v: &[u8], out: &mut Vec<u8>) -> Option<()> {
             out.extend_from_slice(&f.to_bits().to_le_bytes());
         }
         DbType::F32 | DbType::F64 => return None,
+        // Documents are equal as values (`1` = `1.0`), not as bytes; one the
+        // walk cannot read is compared, and so keyed, by its bytes.
+        DbType::JSONB => {
+            let start = out.len();
+            out.extend_from_slice(&[0u8; 4]);
+            if crate::core::jsonb::canonical_key(v, out).is_some() {
+                let len = (out.len() - start - 4) as u32;
+                out[start..start + 4].copy_from_slice(&len.to_le_bytes());
+            } else {
+                out.truncate(start);
+                out.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                out.extend_from_slice(v);
+            }
+        }
         _ => {
             out.extend_from_slice(&(v.len() as u32).to_le_bytes());
             out.extend_from_slice(v);

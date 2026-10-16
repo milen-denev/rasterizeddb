@@ -2072,16 +2072,26 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
                                 .get(i - 3)
                                 .map(|t| t.is_keyword("and") || t.is_keyword("or"))
                                 .unwrap_or(false));
+                    // A path after the column is part of the operand, and
+                    // has to be inside the guard with it: left outside, it
+                    // trailed the closing parenthesis, as `( … 'true' = doc )
+                    // -> 'a'`, and the plan was refused.
+                    let operand_end = path_end(&toks, i + 1).unwrap_or(i + 1);
+                    let mut operand = col.clone();
+                    for tok in &toks[i + 1..operand_end] {
+                        operand.push(' ');
+                        operand.push_str(&tok.render());
+                    }
                     if nullable::is_nullable(&col, schema) && term_starts_at_value && out.len() >= 2
                     {
                         let op = out.pop().expect("two entries");
                         let lhs = out.pop().expect("two entries");
-                        let fragment = format!("{} {} {}", lhs, op, col);
+                        let fragment = format!("{} {} {}", lhs, op, operand);
                         out.push(guard_null(&col, &fragment, schema));
                     } else {
-                        out.push(col);
+                        out.push(operand);
                     }
-                    i += 1;
+                    i = operand_end;
                     continue;
                 }
 
@@ -2272,6 +2282,28 @@ fn opens_boolean_group(toks: &[Tok], at: usize) -> bool {
         }
     }
     false
+}
+
+/// Where the JSON path steps after the column at `at - 1` end — `->>'a'`,
+/// `->'b'->>'c'`, `#>>'{b,c}'`, `->0` — or `None` when no step follows.
+fn path_end(toks: &[Tok], at: usize) -> Option<usize> {
+    let mut i = at;
+    while let Some(Tok::Sym(sym)) = toks.get(i) {
+        if !matches!(sym.as_str(), "->" | "->>" | "#>" | "#>>") {
+            break;
+        }
+        i += match (toks.get(i + 1), toks.get(i + 2)) {
+            (Some(Tok::Str(_)), _) => 2,
+            (Some(Tok::Word(w)), _) if w.bytes().all(|b| b.is_ascii_digit()) => 2,
+            (Some(Tok::Sym(sign)), Some(Tok::Word(w)))
+                if sign == "-" && w.bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                3
+            }
+            _ => return None,
+        };
+    }
+    (i > at).then_some(i)
 }
 
 /// Whether a symbol is an arithmetic operator rather than a comparison.
@@ -2745,6 +2777,29 @@ mod tests {
 
     fn rwn(clause: &str) -> String {
         rewrite_where(clause, &nullable_schema()).unwrap()
+    }
+
+    fn document_schema() -> SmallVec<[SchemaField; 20]> {
+        let mut s = schema();
+        s.push(SchemaField::new("doc".to_string(), DbType::JSONB, 0, 0, s.len() as u64, false));
+        s.push(SchemaField::new(
+            nullable::flag_column_name("doc"),
+            DbType::BOOL,
+            1,
+            0,
+            s.len() as u64,
+            false,
+        ));
+        s
+    }
+
+    /// A path after a column on the right of the operator is part of the
+    /// operand and stays inside the column's guard.
+    #[test]
+    fn a_path_on_the_right_stays_inside_the_guard() {
+        let rd = |clause: &str| rewrite_where(clause, &document_schema()).unwrap();
+        let flag = nullable::flag_column_name("doc");
+        assert_eq!(rd("'1' = doc->'n'"), format!("({flag} = 0 AND '1' = doc -> 'n')"));
     }
 
     #[test]

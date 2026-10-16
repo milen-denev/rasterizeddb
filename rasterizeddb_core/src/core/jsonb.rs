@@ -1088,6 +1088,125 @@ fn numbers_equal(a: &[u8], b: &[u8]) -> bool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// equality
+// ---------------------------------------------------------------------------
+
+/// PostgreSQL's `jsonb = jsonb`, answered on the encoded bytes of both
+/// documents.
+///
+/// Equal bytes are not the test. The encoder keeps a number's spelling, so
+/// `1` and `1.0` are different bytes and the same value, and PostgreSQL calls
+/// them equal at every depth: `'[1.0]' = '[1]'` and `'{"a":1e0}' = '{"a":1}'`
+/// are both true. Everything else follows `scalar_eq`, which containment
+/// already uses: the same kind, then the same value. Arrays compare in order;
+/// object keys are sorted when a document is encoded, so two objects with the
+/// same keys list them at the same positions. A bare scalar is not equal to
+/// the one-element array holding it.
+///
+/// `None` means a document is malformed, or is not an encoded document at
+/// all.
+pub fn values_equal(a: &[u8], b: &[u8]) -> Option<bool> {
+    let (ta, tb) = (*a.first()?, *b.first()?);
+    if ta > TAG_OBJ || tb > TAG_OBJ {
+        return None;
+    }
+    match (ta, tb) {
+        (TAG_ARR, TAG_ARR) => {
+            let (x, y) = (Composite::of(a, ARR_ENTRY)?, Composite::of(b, ARR_ENTRY)?);
+            if x.count != y.count {
+                return Some(false);
+            }
+            for at in 0..x.count {
+                if !values_equal(x.element(a, at)?, y.element(b, at)?)? {
+                    return Some(false);
+                }
+            }
+            Some(true)
+        }
+        (TAG_OBJ, TAG_OBJ) => {
+            let (x, y) = (Composite::of(a, OBJ_ENTRY)?, Composite::of(b, OBJ_ENTRY)?);
+            if x.count != y.count {
+                return Some(false);
+            }
+            for at in 0..x.count {
+                let ((key_a, value_a), (key_b, value_b)) = (x.entry(a, at)?, y.entry(b, at)?);
+                if key_a != key_b || !values_equal(value_a, value_b)? {
+                    return Some(false);
+                }
+            }
+            Some(true)
+        }
+        _ if is_container(ta) || is_container(tb) => Some(false),
+        _ => scalar_eq(a, b),
+    }
+}
+
+/// Bytes that are equal exactly when [`values_equal`] calls two documents
+/// equal, for a hash index to key a document by.
+///
+/// A hash index keyed on the stored bytes would file `1.0` and `1` apart, and
+/// a lookup for `doc = '1'` would then miss the row the scan returns, which is
+/// a row silently missing from an indexed answer. So a number is written as
+/// its value, the way `numbers_equal` reads it: zero as one byte whatever its
+/// sign, anything else as its sign, decimal point and significant digits. A
+/// number whose text cannot be read is kept as that text, which only the same
+/// text equals, as in `numbers_equal`.
+///
+/// `None` when the document is malformed.
+pub fn canonical_key(bytes: &[u8], out: &mut Vec<u8>) -> Option<()> {
+    let tag = *bytes.first()?;
+    match tag {
+        TAG_NULL | TAG_FALSE | TAG_TRUE => out.push(tag),
+        TAG_INT | TAG_NUM => {
+            let mut buf = [0u8; 20];
+            let text = number_text(bytes, &mut buf)?;
+            out.push(TAG_NUM);
+            match NumberParts::parse(text) {
+                Some(parts) if parts.len == 0 => out.push(0),
+                Some(parts) => {
+                    out.push(if parts.negative { 1 } else { 2 });
+                    out.extend_from_slice(&parts.point.to_le_bytes());
+                    out.extend_from_slice(&(parts.len as u64).to_le_bytes());
+                    out.extend(parts.digits());
+                }
+                None => {
+                    out.push(3);
+                    out.extend_from_slice(&(text.len() as u32).to_le_bytes());
+                    out.extend_from_slice(text);
+                }
+            }
+        }
+        TAG_STR => {
+            let (raw, _) = read_len_prefixed(bytes).ok()?;
+            out.push(TAG_STR);
+            out.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+            out.extend_from_slice(raw);
+        }
+        TAG_ARR => {
+            let a = Composite::of(bytes, ARR_ENTRY)?;
+            out.push(TAG_ARR);
+            out.extend_from_slice(&(a.count as u32).to_le_bytes());
+            for at in 0..a.count {
+                canonical_key(a.element(bytes, at)?, out)?;
+            }
+        }
+        TAG_OBJ => {
+            let o = Composite::of(bytes, OBJ_ENTRY)?;
+            out.push(TAG_OBJ);
+            out.extend_from_slice(&(o.count as u32).to_le_bytes());
+            for at in 0..o.count {
+                let (key, value) = o.entry(bytes, at)?;
+                out.extend_from_slice(&(key.len() as u32).to_le_bytes());
+                out.extend_from_slice(key);
+                canonical_key(value, out)?;
+            }
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
 /// `doc->'a'->>'b'`: a path written out, the last step with `->>` when
 /// `as_text`.
 pub fn path_text(column: &str, steps: &[Step], as_text: bool) -> String {
@@ -2619,5 +2738,117 @@ mod gin_item_tests {
         let mut out = Vec::new();
         gin_items(&[], GinOpclass::Ops, &mut out).unwrap();
         assert!(out.is_empty());
+    }
+
+    /// `v` written out again with each number spelled another way it can be
+    /// spelled, so an equal document arrives as different bytes.
+    fn respell(v: &serde_json::Value, r: &mut Rng) -> String {
+        use serde_json::Value;
+        match v {
+            Value::Object(m) => {
+                let items: Vec<String> = m
+                    .iter()
+                    .map(|(k, x)| format!("{}:{}", Value::String(k.clone()), respell(x, r)))
+                    .collect();
+                format!("{{{}}}", items.join(","))
+            }
+            Value::Array(a) => {
+                let items: Vec<String> = a.iter().map(|x| respell(x, r)).collect();
+                format!("[{}]", items.join(","))
+            }
+            Value::Number(n) => {
+                let spellings: &[&str] = match n.as_f64() {
+                    Some(f) if f == 1.0 => &["1", "1.0", "1e0", "10e-1"],
+                    Some(f) if f == 0.0 => &["0", "-0.0", "0e3", "0.00"],
+                    Some(f) if f == 2.5 => &["2.50", "2.5", "25e-1"],
+                    _ => return n.to_string(),
+                };
+                spellings[r.below(spellings.len() as u64) as usize].to_string()
+            }
+            other => other.to_string(),
+        }
+    }
+
+    /// PostgreSQL's jsonb equality, on parsed values: numbers by value,
+    /// arrays in order, objects by key.
+    fn reference_equal(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+        use serde_json::Value;
+        match (a, b) {
+            (Value::Number(x), Value::Number(y)) => json_numbers_equal(x, y),
+            (Value::Array(x), Value::Array(y)) => {
+                x.len() == y.len() && x.iter().zip(y).all(|(p, q)| reference_equal(p, q))
+            }
+            (Value::Object(x), Value::Object(y)) => {
+                x.len() == y.len()
+                    && x.iter().all(|(k, p)| y.get(k).is_some_and(|q| reference_equal(p, q)))
+            }
+            _ => a == b,
+        }
+    }
+
+    /// `values_equal` is jsonb value equality, `canonical_key` is equal
+    /// exactly when it is, and a hash index key built from it agrees with the
+    /// evaluator's `=` — the agreement `index::key` requires of every type it
+    /// keys, or a lookup misses a row the scan returns.
+    #[test]
+    fn document_equality_is_value_equality_and_keys_agree_with_it() {
+        use crate::core::db_type::DbType;
+        use crate::core::processor::transformer::ComparerOperation;
+        use crate::core::row::logical::perform_comparison_operation;
+        let mut r = Rng(0x0e9a_1172);
+        let mut equal = 0;
+        for _ in 0..20_000 {
+            let a_text = value(&mut r, 3);
+            let a_value: serde_json::Value = serde_json::from_str(&a_text).unwrap();
+            let b_text = match r.below(3) {
+                0 => value(&mut r, 3),
+                _ => respell(&a_value, &mut r),
+            };
+            let b_value: serde_json::Value = serde_json::from_str(&b_text).unwrap();
+            let (a, b) = (encode_text(&a_text).unwrap(), encode_text(&b_text).unwrap());
+            let want = reference_equal(&a_value, &b_value);
+            equal += usize::from(want);
+            assert_eq!(values_equal(&a, &b), Some(want), "{a_text} = {b_text}");
+
+            let (mut ka, mut kb) = (Vec::new(), Vec::new());
+            canonical_key(&a, &mut ka).unwrap();
+            canonical_key(&b, &mut kb).unwrap();
+            assert_eq!(ka == kb, want, "keys of {a_text} and {b_text}");
+
+            let (mut ha, mut hb) = (Vec::new(), Vec::new());
+            crate::core::index::key::encode_canonical(&DbType::JSONB, &a, &mut ha).unwrap();
+            crate::core::index::key::encode_canonical(&DbType::JSONB, &b, &mut hb).unwrap();
+            let evaluator =
+                perform_comparison_operation(&a, &b, &DbType::JSONB, &ComparerOperation::Equals).unwrap();
+            assert_eq!(evaluator, want, "{a_text} = {b_text}");
+            assert_eq!(ha == hb, evaluator, "hash keys of {a_text} and {b_text}");
+            let unequal =
+                perform_comparison_operation(&a, &b, &DbType::JSONB, &ComparerOperation::NotEquals).unwrap();
+            assert_eq!(unequal, !want, "{a_text} <> {b_text}");
+        }
+        assert!(equal > 5_000, "too few equal pairs to test ({equal})");
+    }
+
+    /// PostgreSQL 17's answers for the cases a byte compare got wrong, and the
+    /// ones that must stay unequal.
+    #[test]
+    fn document_equality_matches_postgresql() {
+        let eq = |a: &str, b: &str| values_equal(&encode_text(a).unwrap(), &encode_text(b).unwrap());
+        // `SELECT '1'::jsonb = '[1]'::jsonb, '[]'::jsonb = '{}'::jsonb,
+        //  '{"a":[1,2]}'::jsonb = '{"a":[1.0,2e0]}'::jsonb,
+        //  '[1,2]'::jsonb = '[2,1]'::jsonb, '-0'::jsonb = '0'::jsonb`
+        // gives f, f, t, f, t.
+        assert_eq!(eq("1", "[1]"), Some(false));
+        assert_eq!(eq("[]", "{}"), Some(false));
+        assert_eq!(eq(r#"{"a":[1,2]}"#, r#"{"a":[1.0,2e0]}"#), Some(true));
+        assert_eq!(eq("[1,2]", "[2,1]"), Some(false));
+        assert_eq!(eq("-0", "0"), Some(true));
+        assert_eq!(eq("1", "1.0"), Some(true));
+        assert_eq!(eq(r#"{"n":1.0,"a":1}"#, r#"{"a":1,"n":1}"#), Some(true));
+        assert_eq!(eq(r#"{"a":1}"#, r#"{"a":1,"b":null}"#), Some(false));
+        assert_eq!(eq("null", "null"), Some(true));
+        assert_eq!(eq(r#""1""#, "1"), Some(false));
+        // Bytes that are not a document are not compared as one.
+        assert_eq!(values_equal(br#"{"a":1}"#, &encode_text(r#"{"a":1}"#).unwrap()), None);
     }
 }

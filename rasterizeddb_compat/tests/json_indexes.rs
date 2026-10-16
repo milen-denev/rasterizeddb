@@ -75,8 +75,25 @@ fn document(r: &mut Lcg) -> String {
 }
 
 /// A random predicate over the document.
+///
+/// Beside the shapes the indexes answer, it writes the ones they must treat as
+/// opaque or answer only as a superset: `NOT` over any atom (an index that
+/// read a negated comparison as the comparison would return its complement),
+/// `IN` / `NOT IN` / `BETWEEN` and `IS [NOT] NULL` over a path, comparisons
+/// against the empty string (a path that reaches nothing is NULL, which the
+/// path index keeps under the same empty key), and whole-document equality
+/// against numbers spelled another way (the hash index must key `1` and `1.0`
+/// alike, since they are equal).
 fn predicate(r: &mut Lcg) -> String {
-    let atom = |r: &mut Lcg| -> String {
+    fn atom(r: &mut Lcg) -> String {
+        match r.below(24) {
+            18 => format!("doc->'cat' = '{}'", { let n = r.below(10); number(r, n) }),
+            19 => format!("doc = '[\"t{}\", {}]'", r.below(6), { let n = r.below(4); number(r, n) }),
+            20 => format!("doc = '\"{}\"'", STATUSES[r.below(5) as usize]),
+            _ => old_atom(r),
+        }
+    }
+    fn old_atom(r: &mut Lcg) -> String {
         match r.below(14) {
             0 => format!("doc @> '{{\"status\":\"{}\"}}'", STATUSES[r.below(5) as usize]),
             1 => format!("doc @> '{{\"cat\":{}}}'", { let n = r.below(10); number(r, n) }),
@@ -93,7 +110,7 @@ fn predicate(r: &mut Lcg) -> String {
             12 => format!("doc->>'label' = '{}'", r.below(3)),
             _ => format!("id < {}", r.below(400)),
         }
-    };
+    }
     match r.below(4) {
         0 => format!("{} AND {}", atom(r), atom(r)),
         1 => format!("({} OR {})", atom(r), atom(r)),
@@ -130,11 +147,12 @@ async fn compare(pool: &sqlx::PgPool, r: &mut Lcg, rounds: usize, stage: &str) {
     }
 }
 
-const INDEXES: [&str; 4] = [
+const INDEXES: [&str; 5] = [
     "CREATE INDEX ix_ops ON ix USING gin (doc)",
     "CREATE INDEX ix_path ON ix USING gin (doc jsonb_path_ops)",
     "CREATE INDEX ix_status ON ix ((doc->>'status'))",
     "CREATE INDEX ix_uname ON ix ((doc->'user'->>'name'))",
+    "CREATE INDEX ix_whole ON ix USING hash (doc)",
 ];
 
 #[tokio::test(flavor = "multi_thread")]
