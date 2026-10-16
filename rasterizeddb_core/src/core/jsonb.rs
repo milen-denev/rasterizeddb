@@ -720,16 +720,33 @@ pub fn get_index(bytes: &[u8], index: i64) -> Option<&[u8]> {
 /// value *as text*, so quoting a string would be handing back a JSON document
 /// where a value was asked for.
 pub fn as_text(bytes: &[u8]) -> Option<String> {
+    let mut scratch = Vec::new();
+    let text = as_text_into(bytes, &mut scratch)?;
+    // Both branches of `as_text_into` hand back UTF-8: a string's bytes are
+    // checked there, and rendering writes only `str`s and ASCII.
+    Some(std::str::from_utf8(text).ok()?.to_string())
+}
+
+/// [`as_text`] without the `String`: a string value's UTF-8 is borrowed
+/// straight from the document, and anything else is rendered into `scratch`
+/// (cleared first) and borrowed from there.
+///
+/// This is what a `->>` predicate runs once per row, where the owned form cost
+/// an allocation and a copy before the bytes were copied again into the
+/// comparison's block. The answers are `as_text`'s, which is defined on top of
+/// this so the two cannot drift.
+pub fn as_text_into<'a>(bytes: &'a [u8], scratch: &'a mut Vec<u8>) -> Option<&'a [u8]> {
     match bytes.first()? {
         &TAG_NULL => None,
         &TAG_STR => {
             let (raw, _) = read_len_prefixed(bytes).ok()?;
-            Some(std::str::from_utf8(raw).ok()?.to_string())
+            std::str::from_utf8(raw).ok()?;
+            Some(raw)
         }
         _ => {
-            let mut out = Vec::with_capacity(bytes.len());
-            render_text_into(bytes, &mut out).ok()?;
-            String::from_utf8(out).ok()
+            scratch.clear();
+            render_text_into(bytes, scratch).ok()?;
+            Some(&scratch[..])
         }
     }
 }

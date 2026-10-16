@@ -75,6 +75,12 @@ pub struct ColumnTransformer {
     /// comparisons ORed together (or `col <> v` ANDed). See [`InSet`]: when set,
     /// the comparison answers by one lookup of the left operand.
     pub in_set: Option<std::sync::Arc<InSet>>,
+
+    /// The key list of a `?|` / `?&` whose right operand is a literal, split
+    /// once when the predicate is planned. Without it every row re-parsed the
+    /// `'{a,b}'` text and allocated a `String` per key. Never set when the
+    /// list is read from a column, since that one differs per row.
+    pub key_list: Option<std::sync::Arc<crate::core::pg_ops::KeyList>>,
 }
 
 impl Clone for ColumnTransformer {
@@ -99,6 +105,7 @@ impl Clone for ColumnTransformer {
             group_opens: self.group_opens,
             group_closes: self.group_closes,
             in_set: self.in_set.clone(),
+            key_list: self.key_list.clone(),
         }
     }
 }
@@ -253,6 +260,7 @@ impl ColumnTransformer {
             group_opens: 0,
             group_closes: 0,
             in_set: None,
+            key_list: None,
         }
     }
 
@@ -387,6 +395,15 @@ impl ColumnTransformer {
                         .is_some_and(|p| p.cast.is_some() && input2.is_empty());
                 if unreadable {
                     return Ok(Either::Right((false, self.next.clone())));
+                }
+                // `?|` / `?&` against a literal list split at plan time; the
+                // same answer `pg_ops::evaluate` gives from the text, including
+                // `None` for a malformed document becoming an error.
+                if let (Some(keys), ComparerOperation::Pg { op, .. }) = (&self.key_list, operation)
+                {
+                    let found = crate::core::pg_ops::key_exists_in_list(*op, input1, keys)
+                        .ok_or(EvalError::UnsupportedType)?;
+                    return Ok(Either::Right((found, self.next.clone())));
                 }
                 Ok(Either::Right((
                     perform_comparison_operation(input1, input2, &self.column_type, operation)?,
@@ -594,6 +611,29 @@ impl JsonPathRef {
         let Some(found) = crate::core::jsonb::get_path(document, &self.steps) else {
             return MemoryBlock::default();
         };
+        // The uncast forms run once per row of a `doc->>'k' = 'v'` scan, so
+        // they copy once, from the document (or the rendered text) straight
+        // into the pooled block. They used to build a `Vec` — or a `String`
+        // for `->>` — and then copy that again.
+        if self.cast.is_none() {
+            if !self.as_text {
+                return pooled_copy(found);
+            }
+            return EXTRACT_SCRATCH.with(|scratch| {
+                let mut scratch = scratch.borrow_mut();
+                let block = match crate::core::jsonb::as_text_into(found, &mut scratch) {
+                    Some(text) => pooled_copy(text),
+                    // JSON `null` under `->>` is SQL NULL.
+                    None => MemoryBlock::default(),
+                };
+                // One huge rendered container must not pin its buffer to this
+                // worker for the rest of the process.
+                if scratch.capacity() > EXTRACT_SCRATCH_KEEP {
+                    *scratch = Vec::new();
+                }
+                block
+            });
+        }
         let bytes: Vec<u8> = if self.as_text {
             match crate::core::jsonb::as_text(found) {
                 Some(text) => text.into_bytes(),
@@ -625,10 +665,24 @@ impl JsonPathRef {
                 }
             }
         };
-        let mut mb = crate::memory_pool::MEMORY_POOL.acquire(bytes.len());
-        mb.into_slice_mut().copy_from_slice(&bytes);
-        mb
+        pooled_copy(&bytes)
     }
+}
+
+thread_local! {
+    /// Where `->>` renders a non-string value before it is copied into the
+    /// comparison's block; reused across rows rather than allocated per row.
+    static EXTRACT_SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The most [`EXTRACT_SCRATCH`] keeps between rows.
+const EXTRACT_SCRATCH_KEEP: usize = 64 * 1024;
+
+#[inline]
+fn pooled_copy(bytes: &[u8]) -> MemoryBlock {
+    let mut mb = crate::memory_pool::MEMORY_POOL.acquire(bytes.len());
+    mb.into_slice_mut().copy_from_slice(bytes);
+    mb
 }
 
 impl From<MemoryBlock> for ComparisonOperand {
@@ -1230,6 +1284,13 @@ impl<'a> TransformerProcessor<'a> {
     /// Says that the operands of the transformer just added are `NUMERIC`
     /// columns stored at these declared scales, to be lifted to the engine
     /// scale before use. `None` leaves an operand as it is.
+    /// Attaches a pre-split `?|` / `?&` key list to the comparison just added.
+    pub fn set_last_key_list(&mut self, keys: crate::core::pg_ops::KeyList) {
+        if let Some(t) = self.transformers.last_mut() {
+            t.key_list = Some(std::sync::Arc::new(keys));
+        }
+    }
+
     pub fn set_last_operand_scales(&mut self, left: Option<u32>, right: Option<u32>) {
         if let Some(t) = self.transformers.last_mut() {
             t.column_1_scale = left;
@@ -2411,6 +2472,315 @@ mod in_set_bench {
                     "IN of {n:>6} values, {rows} rows, round {round}: chain {chain:>10.1} ns/row, set {set:>6.1} ns/row ({:.0}x), {h1} matches",
                     chain / set
                 );
+            }
+        }
+    }
+}
+
+/// Per-row JSON predicates through the real planner: NULL documents, missing
+/// paths, the `?|` / `?&` key list split at plan time, and the `->` / `->>`
+/// extraction that runs once per row.
+#[cfg(test)]
+mod json_row_path {
+    use super::*;
+    use crate::core::row::schema::SchemaField;
+    use crate::core::tokenizer::query_parser::QueryParser;
+    use crate::core::tokenizer::query_tokenizer::tokenize;
+    use crate::memory_pool::MEMORY_POOL;
+    use std::borrow::Cow;
+    use std::cell::UnsafeCell;
+
+    fn mb(b: &[u8]) -> MemoryBlock {
+        let mut m = MEMORY_POOL.acquire(b.len());
+        m.into_slice_mut().copy_from_slice(b);
+        m
+    }
+
+    fn doc(text: &str) -> Vec<u8> {
+        crate::core::jsonb::encode_text(text).expect("test document")
+    }
+
+    /// `id`, a nullable `doc` and its `__null_doc` companion, in that order.
+    fn schema() -> SmallVec<[SchemaField; 20]> {
+        smallvec::smallvec![
+            SchemaField::new("id".to_string(), DbType::I32, 4, 0, 0, false),
+            SchemaField::new("doc".to_string(), DbType::JSONB, 12, 4, 1, false),
+            SchemaField::new("__null_doc".to_string(), DbType::U8, 1, 16, 2, false),
+        ]
+    }
+
+    /// A row: `None` is a NULL document, stored as nothing with the companion
+    /// set, which is how an `INSERT … NULL` lays it out.
+    fn row(id: i32, document: Option<&str>) -> [MemoryBlock; 3] {
+        match document {
+            Some(text) => [mb(&id.to_le_bytes()), mb(&doc(text)), mb(&[0])],
+            None => [mb(&id.to_le_bytes()), MemoryBlock::default(), mb(&[1])],
+        }
+    }
+
+    /// Plans `clause` against [`schema`], with `sample` as the row the
+    /// planner sees.
+    fn plan<'a>(
+        clause: &str,
+        sample: &[MemoryBlock; 3],
+        transformers: &'a mut SmallVec<[ColumnTransformer; 36]>,
+        inter: &'a mut SmallVec<[MemoryBlock; 20]>,
+    ) -> Result<TransformerProcessor<'a>, String> {
+        let schema = schema();
+        let rewritten = crate::core::tokenizer::predicate_rewrite::rewrite_where(clause, &schema)?;
+        let tokens = tokenize(&rewritten, &schema);
+        let processor = UnsafeCell::new(TransformerProcessor::new(transformers, inter));
+        let mut cols: SmallVec<[(Cow<'static, str>, MemoryBlock); 20]> = SmallVec::new();
+        for (field, value) in schema.iter().zip(sample.iter()) {
+            cols.push((field.name.clone().into(), value.clone()));
+        }
+        {
+            let mut parser = QueryParser::new(&tokens, unsafe { &mut *processor.get() });
+            parser.execute(&cols)?;
+        }
+        Ok(processor.into_inner())
+    }
+
+    /// The ids of the rows `clause` matches, or the plan or row error.
+    fn select(clause: &str, rows: &[[MemoryBlock; 3]]) -> Result<Vec<i32>, String> {
+        let mut transformers: SmallVec<[ColumnTransformer; 36]> = SmallVec::new();
+        let mut inter: SmallVec<[MemoryBlock; 20]> = SmallVec::new();
+        let mut p = plan(clause, &rows[0], &mut transformers, &mut inter)?;
+        let mut results: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
+        let mut out = Vec::new();
+        for r in rows {
+            if p.execute_row(&r[..], &mut results).map_err(|e| format!("{:?}", e))? {
+                out.push(i32::from_le_bytes(r[0].into_slice().try_into().unwrap()));
+            }
+        }
+        Ok(out)
+    }
+
+    fn table() -> Vec<[MemoryBlock; 3]> {
+        vec![
+            row(1, Some(r#"{"a":1,"tags":["x","y"],"s":"str","n":5,"z":null,"o":{"k":1}}"#)),
+            row(2, None),
+            row(3, Some(r#"{"a":2}"#)),
+            row(4, Some(r#"[1,2]"#)),
+            row(5, Some(r#"{"tags":["y"],"s":""}"#)),
+        ]
+    }
+
+    /// PostgreSQL: NULL `@>` anything is NULL, and a `->` that reaches nothing
+    /// is NULL too — neither row matches, and neither fails the statement.
+    /// The containment cases were an "operation is not supported" error
+    /// before, because the NULL row's empty bytes reached the blob walk.
+    #[test]
+    fn a_null_document_or_missing_path_does_not_match_and_does_not_fail() {
+        let t = table();
+        let mut wrong = Vec::new();
+        for (clause, want) in [
+            (r#"doc @> '{"a":1}'"#, vec![1]),
+            (r#"doc @> '{"a":1}' OR id = 3"#, vec![1, 3]),
+            (r#"id = 2 OR doc @> '{"a":2}'"#, vec![2, 3]),
+            (r#"doc <@ '{"a":2,"b":3}'"#, vec![3]),
+            (r#"doc->'tags' @> '["x"]'"#, vec![1]),
+            (r#"doc->'tags' @> '["y"]' OR id = 3"#, vec![1, 3, 5]),
+            (r#"doc->'tags' <@ '["x","y","q"]'"#, vec![1, 5]),
+            (r#"doc ? 'a'"#, vec![1, 3]),
+            (r#"doc ?| '{a,tags}'"#, vec![1, 3, 5]),
+            (r#"doc ?& '{a,tags}'"#, vec![1]),
+            (r#"doc ?& '{}'"#, vec![1, 3, 4, 5]),
+            (r#"doc->'o' ?| '{k}'"#, vec![1]),
+        ] {
+            let got = select(clause, &t);
+            if got != Ok(want.clone()) {
+                wrong.push(format!("{}: got {:?}, want {:?}", clause, got, want));
+            }
+        }
+        assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+    }
+
+    /// `NOT` over a structural operator is refused before planning rather than
+    /// complemented. That is what makes answering `false` for NULL sound: were
+    /// it ever rendered as a complement, a NULL row would start matching
+    /// `NOT (doc @> x)`, where PostgreSQL returns no row.
+    #[test]
+    fn not_over_a_structural_operator_is_refused_rather_than_complemented() {
+        let t = table();
+        for clause in [r#"NOT (doc @> '{"a":1}')"#, r#"NOT (doc->'tags' @> '["x"]')"#] {
+            let got = select(clause, &t);
+            assert!(
+                got.as_ref().is_err_and(|e| e.contains("NOT")),
+                "{}: {:?} — if this now plans, check that the NULL row is excluded",
+                clause,
+                got
+            );
+        }
+    }
+
+    /// PostgreSQL refuses a right operand that is not JSON with 22P02 before
+    /// it reads a row. It used to be kept as raw text, so the answer depended
+    /// on the row: no match against an object, an error against an array.
+    #[test]
+    fn an_invalid_json_literal_is_refused_at_plan_time() {
+        let only_objects = vec![row(1, Some(r#"{"a":1}"#)), row(3, Some(r#"{"b":1}"#))];
+        for clause in [r#"doc @> '{bad'"#, r#"doc <@ 'nope'"#, r#"doc->'tags' @> '[1,'"#] {
+            let got = select(clause, &only_objects);
+            assert!(
+                got.as_ref().is_err_and(|e| e.contains("invalid input syntax for type json")),
+                "{}: {:?}",
+                clause,
+                got
+            );
+        }
+    }
+
+    /// Refused before a row is read — by the rewrite, which validates the
+    /// list; the planner's own check behind it is a second line, for a plan
+    /// that does not come through the rewrite.
+    #[test]
+    fn a_malformed_key_list_is_refused_at_plan_time() {
+        let got = select("doc ?| 'a,b'", &[row(2, None)]);
+        assert!(got.as_ref().is_err_and(|e| e.contains("array of keys")), "{:?}", got);
+    }
+
+    /// The list is split once, when the predicate is planned.
+    #[test]
+    fn a_literal_key_list_is_split_when_planned() {
+        let mut transformers: SmallVec<[ColumnTransformer; 36]> = SmallVec::new();
+        let mut inter: SmallVec<[MemoryBlock; 20]> = SmallVec::new();
+        let sample = row(1, Some("{}"));
+        drop(plan("doc ?| '{a,\"b c\",NULL}'", &sample, &mut transformers, &mut inter).unwrap());
+        let lists: Vec<_> = transformers.iter().filter_map(|t| t.key_list.clone()).collect();
+        assert_eq!(lists.len(), 1, "{:?}", transformers);
+        assert_eq!(*lists[0], vec![Some("a".to_string()), Some("b c".to_string()), None]);
+    }
+
+    /// What `extract` returned before it stopped copying twice: the owned
+    /// `as_text` / `to_vec` forms.
+    fn reference_extract(path: &JsonPathRef, document: &[u8]) -> Option<Vec<u8>> {
+        let found = crate::core::jsonb::get_path(document, &path.steps)?;
+        if path.as_text {
+            crate::core::jsonb::as_text(found).map(String::into_bytes)
+        } else {
+            Some(found.to_vec())
+        }
+    }
+
+    fn text_path(key: &str) -> JsonPathRef {
+        JsonPathRef {
+            steps: std::sync::Arc::new(vec![crate::core::jsonb::Step::Key(key.to_string())]),
+            as_text: true,
+            cast: None,
+        }
+    }
+
+    #[test]
+    fn extract_returns_what_the_owned_forms_did() {
+        use crate::core::jsonb::Step;
+        let documents = [
+            r#"{"s":"str","e":"","u":"ünï","n":5,"f":1.50,"big":18446744073709551615,"t":true,"z":null,"o":{"k":1,"j":[1,"a"]},"a":[1,"two",null,{"x":"y"}],"q":"say \"hi\"\n"}"#,
+            r#"[1,"a",null]"#,
+            r#""bare""#,
+            r#"null"#,
+            r#"7"#,
+        ];
+        let paths: Vec<Vec<Step>> = ["s", "e", "u", "n", "f", "big", "t", "z", "o", "a", "q", "missing"]
+            .iter()
+            .map(|k| vec![Step::Key(k.to_string())])
+            .chain([
+                vec![Step::Key("o".into()), Step::Key("j".into())],
+                vec![Step::Key("a".into()), Step::Index(1)],
+                vec![Step::Key("a".into()), Step::Index(-1)],
+                vec![Step::Key("a".into()), Step::Index(2)],
+                vec![Step::Index(0)],
+                vec![Step::Index(1)],
+                vec![Step::Index(9)],
+                vec![],
+            ])
+            .collect();
+        let mut checked = 0;
+        for d in documents {
+            let encoded = doc(d);
+            for steps in &paths {
+                for as_text in [false, true] {
+                    let path = JsonPathRef {
+                        steps: std::sync::Arc::new(steps.clone()),
+                        as_text,
+                        cast: None,
+                    };
+                    let got = path.extract(&encoded);
+                    let want = reference_extract(&path, &encoded).unwrap_or_default();
+                    assert_eq!(got.into_slice(), &want[..], "{} {:?} as_text={}", d, steps, as_text);
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 100);
+
+        // `->>` against PostgreSQL, case by case. One divergence is pinned
+        // rather than hidden: PostgreSQL prints a container as `{"j": [1,
+        // "a"], "k": 1}`, with a space after each `:` and `,`, and this
+        // engine prints it compact.
+        let d = doc(documents[0]);
+        let text = |k: &str| text_path(k).extract(&d).into_slice().to_vec();
+        assert_eq!(text("s"), b"str");
+        assert_eq!(text("u"), "ünï".as_bytes());
+        assert_eq!(text("q"), b"say \"hi\"\n");
+        assert_eq!(text("n"), b"5");
+        assert_eq!(text("f"), b"1.5");
+        assert_eq!(text("t"), b"true");
+        // JSON null is SQL NULL, which is empty bytes here.
+        assert_eq!(text("z"), b"");
+        assert_eq!(text("o"), br#"{"j":[1,"a"],"k":1}"#);
+
+        // A rendered container larger than the scratch keeps must still come
+        // out whole, and the next row must not see its leftovers.
+        let huge = format!(r#"{{"o":[{}]}}"#, vec!["\"xxxxxxxxxxxxxxxx\""; 10_000].join(","));
+        let h = doc(&huge);
+        let path = text_path("o");
+        assert_eq!(path.extract(&h).into_slice(), &reference_extract(&path, &h).unwrap()[..]);
+        assert_eq!(text("n"), b"5");
+        assert_eq!(text("o"), br#"{"j":[1,"a"],"k":1}"#);
+    }
+
+    /// Per-row cost of JSON predicates through `execute_row`.
+    /// `cargo test --release -p rasterizeddb_core --lib -- --ignored json_text_path_bench --nocapture`
+    #[test]
+    #[ignore]
+    fn json_text_path_bench() {
+        let rows: Vec<[MemoryBlock; 3]> = (0..4096)
+            .map(|i| {
+                row(
+                    i,
+                    Some(&format!(
+                        r#"{{"id":{i},"status":"{}","tags":["a","t{}"],"meta":{{"owner":"u{}","score":{}}}}}"#,
+                        ["open", "closed", "pending"][i as usize % 3],
+                        i % 7,
+                        i % 13,
+                        i % 100
+                    )),
+                )
+            })
+            .collect();
+        for (label, clause) in [
+            ("->> string leaf", "doc->>'status' = 'open'"),
+            ("->> number leaf", "doc->>'id' = '7'"),
+            ("->> object", r#"doc->>'meta' = '{"owner":"u3","score":3}'"#),
+            ("-> object @>", r#"doc->'meta' @> '{"owner":"u3"}'"#),
+            ("?| two keys", "doc ?| '{missing,status}'"),
+        ] {
+            let mut transformers: SmallVec<[ColumnTransformer; 36]> = SmallVec::new();
+            let mut inter: SmallVec<[MemoryBlock; 20]> = SmallVec::new();
+            let mut p = plan(clause, &rows[0], &mut transformers, &mut inter).unwrap();
+            let mut results: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
+            let n = 1_000_000usize;
+            for round in 0..3 {
+                let mut hits = 0usize;
+                let start = std::time::Instant::now();
+                for i in 0..n {
+                    hits += p
+                        .execute_row(&rows[i % rows.len()][..], &mut results)
+                        .unwrap() as usize;
+                }
+                let ns = start.elapsed().as_nanos() as f64 / n as f64;
+                println!("{label:<16} round {round}: {ns:>6.1} ns/row, {hits} matches");
             }
         }
     }

@@ -164,6 +164,25 @@ pub fn evaluate(
             let _ = (left_type, right_type);
             key_exists(op, left, right)
         }
+        PgOp::Contains | PgOp::ContainedBy | PgOp::Overlaps
+            if matches!(left_type, DbType::JSONB | DbType::JSON)
+                && (left.is_empty() || right.is_empty()) =>
+        {
+            // An empty document is SQL NULL: a NULL column stores nothing, and
+            // a `->` path that reaches nothing extracts nothing. No encoded
+            // document is empty — even JSON `null` is a tag byte — so this
+            // cannot swallow a malformed one. PostgreSQL's answer is NULL, which
+            // a WHERE clause treats as not matching; the evaluator here is
+            // two-valued, so that is `false`. Answering `None` instead failed
+            // the whole statement over one NULL row, even under the
+            // `__null_doc = 0 AND …` guard, because every comparison is
+            // evaluated before the guard's AND is applied.
+            //
+            // `false` is only sound because no rewrite negates a structural
+            // operator: `NOT (doc @> x)` is refused before planning rather
+            // than complemented, so a NULL never turns into a match.
+            Some(false)
+        }
         PgOp::Contains | PgOp::ContainedBy | PgOp::Overlaps => {
             // `a <@ b` is `b @> a`, so containment is written once.
             let (op, lt, l, rt, r) = if op == PgOp::ContainedBy {
@@ -190,8 +209,31 @@ fn key_exists(op: PgOp, doc: &[u8], right: &[u8]) -> Option<bool> {
     if op == PgOp::KeyExists {
         return crate::core::jsonb::key_exists(doc, text);
     }
-    let keys = crate::core::tokenizer::predicate_rewrite::text_array_elements(text)?;
-    for key in &keys {
+    let keys = parse_key_list(text)?;
+    key_exists_in_list(op, doc, &keys)
+}
+
+/// The key list of `?|` / `?&`, split once.
+///
+/// A literal list is split when the predicate is planned and kept beside the
+/// comparison (see `ColumnTransformer::key_list`), so a scan does not re-parse
+/// `'{a,b}'` and allocate a `String` per key for every row. Only a list read
+/// from a column per row comes through [`key_exists`]'s text form.
+pub type KeyList = Vec<Option<String>>;
+
+/// Splits a `'{a,b}'` key list, or `None` when it is not one.
+pub fn parse_key_list(text: &str) -> Option<KeyList> {
+    crate::core::tokenizer::predicate_rewrite::text_array_elements(text)
+}
+
+/// `?|` / `?&` against an already-split key list. `op` must be one of the two.
+pub fn key_exists_in_list(op: PgOp, doc: &[u8], keys: &[Option<String>]) -> Option<bool> {
+    debug_assert!(matches!(op, PgOp::KeyExistsAny | PgOp::KeyExistsAll));
+    // A NULL document; see `key_exists`.
+    if doc.is_empty() {
+        return Some(false);
+    }
+    for key in keys {
         // A NULL element of the key list is skipped, by both operators — as
         // PostgreSQL's `jsonb_exists_any` / `jsonb_exists_all` skip it.
         let Some(key) = key else { continue };
@@ -744,7 +786,6 @@ mod tests {
     #[test]
     fn a_malformed_document_has_no_answer() {
         assert_eq!(evaluate(PgOp::Contains, &DbType::JSONB, &[0x09], &DbType::JSONB, &doc("1")), None);
-        assert_eq!(evaluate(PgOp::Contains, &DbType::JSONB, &[], &DbType::JSONB, &doc("1")), None);
         // A composite whose table claims more than the bytes hold.
         let mut cut = doc(r#"{"a":[1,2,3]}"#);
         cut.truncate(cut.len() - 3);
@@ -752,6 +793,84 @@ mod tests {
             evaluate(PgOp::Contains, &DbType::JSONB, &cut, &DbType::JSONB, &doc(r#"{"a":[3]}"#)),
             None
         );
+    }
+
+    /// Empty bytes are SQL NULL — a NULL column, or a `->` path that reached
+    /// nothing — and NULL never matches. Every one of these was `None` for
+    /// containment, which the scan reports as an error, so one NULL row failed
+    /// the whole statement where PostgreSQL returns the other rows.
+    #[test]
+    fn a_null_document_matches_nothing_rather_than_failing() {
+        let some = doc(r#"{"a":1}"#);
+        for op in [PgOp::Contains, PgOp::ContainedBy, PgOp::Overlaps] {
+            for (l, r) in [(&[][..], &some[..]), (&some[..], &[][..]), (&[][..], &[][..])] {
+                assert_eq!(
+                    evaluate(op, &DbType::JSONB, l, &DbType::JSONB, r),
+                    Some(false),
+                    "{:?} with an empty operand",
+                    op
+                );
+            }
+        }
+        for (op, keys) in [
+            (PgOp::KeyExists, "a"),
+            (PgOp::KeyExistsAny, "{a,b}"),
+            (PgOp::KeyExistsAll, "{a,b}"),
+            // `?&` of no keys is true for a document, but still not for NULL.
+            (PgOp::KeyExistsAll, "{}"),
+        ] {
+            assert_eq!(
+                evaluate(op, &DbType::JSONB, &[], &DbType::STRING, keys.as_bytes()),
+                Some(false),
+                "{:?} {}",
+                op,
+                keys
+            );
+        }
+    }
+
+    /// The pre-split list answers exactly as the text form does.
+    #[test]
+    fn a_split_key_list_answers_as_the_text_form() {
+        let docs = [
+            r#"{"a":1,"b":2}"#,
+            r#"{"a":1}"#,
+            r#"{"c":null}"#,
+            r#"["a","x"]"#,
+            r#"[1,"b"]"#,
+            r#""a""#,
+            r#"{}"#,
+            r#"[]"#,
+            r#"7"#,
+        ];
+        let lists = ["{a,b}", "{a}", "{}", "{NULL,a}", r#"{"a",b}"#, "{x,y,z}", r#"{"a b",c}"#];
+        for d in docs {
+            let d = doc(d);
+            for list in lists {
+                let keys = parse_key_list(list).expect(list);
+                for op in [PgOp::KeyExistsAny, PgOp::KeyExistsAll] {
+                    assert_eq!(
+                        key_exists_in_list(op, &d, &keys),
+                        evaluate(op, &DbType::JSONB, &d, &DbType::STRING, list.as_bytes()),
+                        "{:?} {}",
+                        op,
+                        list
+                    );
+                }
+            }
+        }
+        // And against PostgreSQL's answers for the common shapes.
+        let d = doc(r#"{"a":1,"b":2}"#);
+        let any = |l: &str| key_exists_in_list(PgOp::KeyExistsAny, &d, &parse_key_list(l).unwrap());
+        let all = |l: &str| key_exists_in_list(PgOp::KeyExistsAll, &d, &parse_key_list(l).unwrap());
+        assert_eq!(any("{q,b}"), Some(true));
+        assert_eq!(any("{q,r}"), Some(false));
+        assert_eq!(any("{}"), Some(false));
+        assert_eq!(all("{a,b}"), Some(true));
+        assert_eq!(all("{a,q}"), Some(false));
+        assert_eq!(all("{}"), Some(true));
+        assert_eq!(all("{a,NULL}"), Some(true));
+        assert!(parse_key_list("a,b").is_none());
     }
 
     /// Generated documents, small enough that containment is often true:

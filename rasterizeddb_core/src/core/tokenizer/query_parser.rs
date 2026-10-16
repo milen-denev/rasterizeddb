@@ -674,18 +674,62 @@ impl<'a, 'b> QueryParser<'a, 'b> {
                             mb.into_slice_mut().copy_from_slice(&bytes);
                             (ComparisonOperand::Direct(mb), left_type.clone())
                         }
+                        // Except for a document. Text that is not JSON was
+                        // kept as raw text and handed to the blob walk as if
+                        // it were an encoding, so the answer depended on the
+                        // row: `false` against an object, an error against an
+                        // array. PostgreSQL refuses the literal before reading
+                        // a row, and so does this.
+                        None if left_type == DbType::JSONB => {
+                            let text = String::from_utf8_lossy(literal.into_slice());
+                            let reason = crate::core::jsonb::encode_text(&text)
+                                .err()
+                                .unwrap_or_default();
+                            return Err(format!(
+                                "invalid input syntax for type json: {} ({})",
+                                crate::core::value_codec::quote_sql(&text),
+                                reason
+                            ));
+                        }
                         None => (right_op, right_type),
                     }
                 }
                 _ => (right_op, right_type),
             };
 
-            return self.push_comparison(
+            // A literal `?|` / `?&` key list is split now rather than per row.
+            // `rewrite_where` has already refused a list that is not `'{…}'`;
+            // the refusal here covers a plan that did not come through it,
+            // which would otherwise fail per row, and only on non-NULL rows.
+            let key_list = match (&right_op, op) {
+                (
+                    ComparisonOperand::Direct(literal),
+                    crate::core::pg_ops::PgOp::KeyExistsAny | crate::core::pg_ops::PgOp::KeyExistsAll,
+                ) => {
+                    let text = std::str::from_utf8(literal.into_slice()).map_err(|_| {
+                        format!("the key list of {} is not valid UTF-8", op.symbol())
+                    })?;
+                    Some(crate::core::pg_ops::parse_key_list(text).ok_or_else(|| {
+                        format!(
+                            "malformed array literal: {} (the right operand of {} is a text array, as in '{{a,b}}')",
+                            crate::core::value_codec::quote_sql(text),
+                            op.symbol()
+                        )
+                    })?)
+                }
+                _ => None,
+            };
+
+            self.push_comparison(
                 left_op,
                 right_op,
                 left_type,
                 crate::core::processor::transformer::ComparerOperation::Pg { op, right_type },
-            );
+            )?;
+            if let Some(keys) = key_list {
+                self.query_transformer.set_last_key_list(keys);
+            }
+            return Ok(());
         }
 
         // A literal's type comes from how it was written, not from what it is
