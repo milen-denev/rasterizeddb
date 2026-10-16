@@ -183,6 +183,45 @@ async fn the_cache_is_used_and_refused_where_it_should_be() {
     }
     assert!(runs() - before >= 18, "a point query never ran from its parse ({} runs)", runs() - before);
 
+    // A statement with no parameters is the same text every time: cached,
+    // LIKE and IN included, and still answering exactly as the text path.
+    let fixed = [
+        "SELECT k, s FROM items WHERE k = 7",
+        "SELECT k FROM items WHERE s LIKE 'name1%' AND k < 150",
+        "SELECT k FROM items WHERE k IN (3, 30, 199)",
+    ];
+    let before = runs();
+    for sql in fixed {
+        for _ in 0..4 {
+            same(&mut conn, sql, &[]).await;
+        }
+    }
+    assert!(runs() - before >= 6, "parameter-less statements never ran from a cached parse");
+
+    // `doc @> $1` on a document column.
+    conn.execute("CREATE TABLE docs (id BIGINT PRIMARY KEY, doc JSONB NOT NULL)").await.unwrap();
+    conn.execute(
+        "INSERT INTO docs (id, doc) VALUES (1, '{\"a\":1,\"t\":[\"x\"]}'), (2, '{\"a\":2}'), (3, '{\"a\":1.0}')",
+    )
+    .await
+    .unwrap();
+    let before = runs();
+    for lit in [r#"{"a":1}"#, r#"{"a":2}"#, r#"{"t":["x"]}"#, r#"{"a":1}"#, r#"{}"#, r#"{"a":3}"#] {
+        let p: Vec<String> = sqlx::query("SELECT id FROM docs WHERE doc @> $1")
+            .bind(lit)
+            .fetch_all(&mut conn)
+            .await
+            .unwrap()
+            .iter()
+            .map(render)
+            .collect();
+        let t = text_rows(&mut conn, "SELECT id FROM docs WHERE doc @> $1", &[Value::S(lit.to_string())]).await;
+        let mut p = p;
+        p.sort();
+        assert_eq!(p, t, "doc @> {lit}");
+    }
+    assert!(runs() - before >= 2, "`doc @> $1` never ran from a cached parse");
+
     // A value read from the clock is never cached. The text path evaluates
     // it into the statement before parsing, so a cached parse would keep the
     // first execution's date for every later one, the next day included.

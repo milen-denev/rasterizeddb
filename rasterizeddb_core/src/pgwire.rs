@@ -2065,7 +2065,7 @@ where
     if max_rows <= 0 || is_copy {
         // A prepared `SELECT` may run from its cached parse. Not after a
         // schema change, whose fresh description only the text path sends.
-        if !is_copy && !schema_changed && !params.is_empty() {
+        if !is_copy && !schema_changed {
             return execute_watched(
                 database,
                 state,

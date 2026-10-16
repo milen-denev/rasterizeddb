@@ -145,6 +145,31 @@ pub fn literal_class(literal: &str) -> Option<u8> {
 /// rewrite that only some values trigger; this leaves no rewrite to trigger.
 pub fn compared_columns(sql: &str) -> Option<Vec<String>> {
     let b = sql.as_bytes();
+    // A statement with no placeholders is the same text every time, so no
+    // value can steer a rewrite and the rules below that exist for values do
+    // not apply; the clock and function rules still do.
+    let has_params = {
+        let mut i = 0usize;
+        let mut found = false;
+        while i < b.len() {
+            match b[i] {
+                b'\'' | b'"' => {
+                    let q = b[i];
+                    i += 1;
+                    while i < b.len() && b[i] != q {
+                        i += 1;
+                    }
+                }
+                b'$' if b.get(i + 1).is_some_and(|d| d.is_ascii_digit()) => {
+                    found = true;
+                    break;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        found
+    };
     // At any depth, outside quotes: a `LIKE` inside parentheses rewrites by
     // value as much as one outside.
     let mut i = 0usize;
@@ -164,9 +189,10 @@ pub fn compared_columns(sql: &str) -> Option<Vec<String>> {
                     i += 1;
                 }
                 let word = &sql[start..i];
-                if ["LIKE", "ILIKE", "SIMILAR", "IN", "BETWEEN", "ANY", "ALL", "ESCAPE", "SOME"]
-                    .iter()
-                    .any(|w| word.eq_ignore_ascii_case(w))
+                if has_params
+                    && ["LIKE", "ILIKE", "SIMILAR", "IN", "BETWEEN", "ANY", "ALL", "ESCAPE", "SOME"]
+                        .iter()
+                        .any(|w| word.eq_ignore_ascii_case(w))
                 {
                     return None;
                 }
@@ -199,7 +225,13 @@ pub fn compared_columns(sql: &str) -> Option<Vec<String>> {
                     after += 1;
                 }
                 if b.get(after) == Some(&b'(')
-                    && !["COUNT", "SUM", "AVG", "MIN", "MAX"].iter().any(|w| word.eq_ignore_ascii_case(w))
+                    && ![
+                        "COUNT", "SUM", "AVG", "MIN", "MAX",
+                        // Keywords a parenthesis follows, not calls.
+                        "IN", "ANY", "ALL", "SOME", "AND", "OR", "NOT", "ON", "USING", "WHERE", "FROM",
+                    ]
+                    .iter()
+                    .any(|w| word.eq_ignore_ascii_case(w))
                 {
                     return None;
                 }
@@ -219,7 +251,7 @@ pub fn compared_columns(sql: &str) -> Option<Vec<String>> {
                 }
                 i += 1;
             }
-            b'~' => return None,
+            b'~' if has_params => return None,
             b'$' => {
                 let mut j = i + 1;
                 while j < b.len() && b[j].is_ascii_digit() {
@@ -247,11 +279,14 @@ pub fn compared_columns(sql: &str) -> Option<Vec<String>> {
                     k -= 1;
                 }
                 let op_end = k;
-                while k > 0 && matches!(b[k - 1], b'=' | b'<' | b'>' | b'!') {
+                while k > 0 && matches!(b[k - 1], b'=' | b'<' | b'>' | b'!' | b'@') {
                     k -= 1;
                 }
                 let op = &sql[k..op_end];
-                if !matches!(op, "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") {
+                // `@>` against a document: the literal is encoded, never
+                // rewritten by what it holds (`class_for` admits it only for
+                // `jsonb`).
+                if !matches!(op, "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" | "@>") {
                     return None;
                 }
                 while k > 0 && b[k - 1].is_ascii_whitespace() {
@@ -279,7 +314,7 @@ pub fn compared_columns(sql: &str) -> Option<Vec<String>> {
         }
     }
     if columns.is_empty() {
-        return None;
+        return (!has_params).then(Vec::new);
     }
     columns.into_iter().collect()
 }
@@ -291,7 +326,9 @@ pub fn class_for(ty: &DbType) -> Option<u8> {
     use DbType::*;
     match ty {
         I8 | I16 | I32 | I64 | I128 | U8 | U16 | U32 | U64 | U128 | F32 | F64 | DECIMAL => Some(0),
-        STRING => Some(1),
+        // Text, and a document's text: both a single-quoted literal the
+        // parser encodes as it stands.
+        STRING | JSONB => Some(1),
         _ => None,
     }
 }
@@ -398,6 +435,13 @@ mod tests {
     fn only_plain_comparisons_qualify() {
         assert_eq!(compared_columns("SELECT v FROM kv WHERE k = $1"), Some(vec!["k".to_string()]));
         assert_eq!(compared_columns("SELECT count(*), max(v) FROM kv WHERE k = $1"), Some(vec!["k".to_string()]));
+        assert_eq!(compared_columns("SELECT id FROM docs WHERE doc @> $1"), Some(vec!["doc".to_string()]));
+        // No placeholders: the same text every time, LIKE and IN included.
+        assert_eq!(compared_columns("SELECT * FROM t WHERE a = 1"), Some(vec![]));
+        assert_eq!(compared_columns("SELECT * FROM t WHERE s LIKE 'ab%' AND a IN (1, 2)"), Some(vec![]));
+        // ... but never the clock.
+        assert_eq!(compared_columns("SELECT * FROM t WHERE at < now()"), None);
+        assert_eq!(compared_columns("SELECT * FROM t WHERE at < CURRENT_DATE"), None);
         assert_eq!(
             compared_columns("SELECT * FROM t WHERE t.a >= $2 AND b<>$1 ORDER BY a LIMIT 5"),
             Some(vec!["b".to_string(), "a".to_string()])
@@ -420,7 +464,6 @@ mod tests {
             "SELECT * FROM t WHERE a = $1 OR b = $1",
             "SELECT * FROM t WHERE a = $1 LIMIT $2",
             "SELECT * FROM t WHERE a ~ $1",
-            "SELECT * FROM t WHERE a = 1",
         ] {
             assert_eq!(compared_columns(sql), None, "{sql}");
         }
