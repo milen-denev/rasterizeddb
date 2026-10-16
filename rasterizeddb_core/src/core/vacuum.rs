@@ -46,6 +46,7 @@
 use branches::likely;
 use cacheguard::CacheGuard;
 use std::collections::{BTreeSet, HashMap};
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -841,6 +842,13 @@ pub struct VacuumStats {
     /// `VACUUM FULL` runs that compacted but could not give the space back,
     /// because the log could not be checkpointed.
     pub full_untruncated: AtomicU64,
+    /// Ticks of the background service that panicked and were caught. Each
+    /// one is a scan that did not happen; a count that keeps rising means the
+    /// table's dead space is not being reclaimed at all.
+    pub panics: AtomicU64,
+    /// Makes the next this-many service ticks panic. Tests only.
+    #[cfg(test)]
+    pub inject_panics: AtomicU64,
 }
 
 impl VacuumStats {
@@ -1502,169 +1510,252 @@ impl<S: StorageIO> VacuumService<S> {
     /// scans.
     pub fn spawn(self) {
         tokio::spawn(async move {
-            // No value of the counter can equal this, so the first tick always
-            // scans — a table opened with tombstones already on disk has dead
-            // space that no mutation of ours will ever announce.
-            let mut scanned_at_mutation = u64::MAX;
-            // The dead-stamp count as of the last completed sweep, and what that
-            // sweep found stamped but still protected by the horizon.
-            let mut stamps_at_sweep = 0u64;
-            let mut held_rows = 0u64;
-            let mut held_min_xmax: TxId = NO_TX;
+            let mut state = TickState {
+                // No value of the counter can equal this, so the first tick
+                // always scans — a table opened with tombstones already on disk
+                // has dead space that no mutation of ours will ever announce.
+                scanned_at_mutation: u64::MAX,
+                stamps_at_sweep: 0,
+                held_rows: 0,
+                held_min_xmax: NO_TX,
+            };
+            let mut consecutive_panics = 0u32;
 
             loop {
-                if !sleep_until_due(self.config.interval, &self.alive).await {
-                    break;
-                }
-                if !self.free_space.is_enabled() {
-                    continue;
-                }
-
-                // Forgetting: every FORGET_STEP ids, prove this table free of
-                // the non-committed ids below the settle bound. A table that
-                // never does pins the database's forgotten horizon.
-                if let (Some(manager), Some(handle)) =
-                    (self.versions.load_full(), self.forget.get())
-                {
-                    if manager.status().settles()
-                        && manager.settle_bound().saturating_sub(handle.horizon()) >= FORGET_STEP
-                    {
-                        if let Some(_permit) = sweep_scheduler().acquire(1.0, &self.alive).await {
-                            let parts = NeutralizeParts {
-                                io_pointers: &*self.io_pointers,
-                                write_lock: &self.write_lock,
-                                compaction_gate: &self.compaction_gate,
-                                readers: &self.readers,
-                                free_space: &self.free_space,
-                                cache_generation: &self.cache_generation,
-                                dead_stamps: &self.dead_stamps,
-                                drain_timeout: self.config.drain_timeout,
-                            };
-                            match neutralize_aborted(&parts, &manager, handle).await {
-                                Ok(report) if report.tombstoned + report.cleared > 0 => info!(
-                                    "Forget sweep on {}: {} tombstoned, {} cleared, horizon {:?}",
-                                    self.table_name,
-                                    report.tombstoned,
-                                    report.cleared,
-                                    report.advanced_to
-                                ),
-                                Ok(_) => {}
-                                Err(e) => log::error!(
-                                    "Forget sweep failed for {}: {}",
-                                    self.table_name,
-                                    e
-                                ),
-                            }
-                        }
-                    }
-                }
-
-                // A table that is only read, or only appended to, gains no dead
-                // space. Re-reading its whole pointer file every tick would be
-                // pure cost — and on a large table, not a small one. Outstanding
-                // loans still force a scan: they are what retires them.
-                let mutations_now = self.mutations.load(Ordering::Acquire);
-                let stamps_now = self.dead_stamps.load(Ordering::Acquire);
-                let first = scanned_at_mutation == u64::MAX;
-                let loans = self.free_space.loans_outstanding() > 0;
-                // How far over its threshold this table is, for the shared
-                // ordering below. A first sweep or outstanding loans are due
-                // regardless and rank as exactly due.
-                let mut priority = 1.0f64;
-                if !first && !loans {
-                    // Stamps the last sweep had to leave because the horizon
-                    // still protected them become findable once it passes the
-                    // oldest of them — with or without any new write.
-                    let released = held_rows > 0
-                        && self
-                            .versions
-                            .load_full()
-                            .is_some_and(|m| VersionHorizon::sample(&m).oldest_active() > held_min_xmax);
-                    if mutations_now == scanned_at_mutation && !released {
-                        continue;
-                    }
-                    // Is there enough dead space to be worth a full read of the
-                    // pointer file? Dead stamps since the last sweep, plus the
-                    // released ones.
-                    let slots = self.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
-                    let threshold = self.config.sweep_threshold(slots);
-                    let fresh = stamps_now.saturating_sub(stamps_at_sweep);
-                    let due = fresh >= threshold || (released && fresh + held_rows >= threshold);
-                    if !due {
-                        continue;
-                    }
-                    let counted = if released { fresh + held_rows } else { fresh };
-                    priority = counted as f64 / threshold as f64;
-                }
-
-                // One sweep at a time per few tables, furthest over threshold
-                // first. The permit is held for the sweep and released on drop.
-                let Some(_permit) = sweep_scheduler().acquire(priority, &self.alive).await else {
-                    break;
-                };
-
-                let horizon = match self.versions.load_full() {
-                    Some(manager) => VersionHorizon::sample(&manager),
-                    None => VersionHorizon::unversioned(),
-                };
-                let ctx = ReclaimContext {
-                    horizon: &horizon,
-                    filters: self.filters.as_deref(),
-                    cleared_below: &self.cleared_below,
-                    indexes: self.indexes.as_ref().map(|(ix, fetch)| (&**ix, fetch)),
-                };
-
-                match run_once(
-                    &*self.io_pointers,
-                    &*self.io_rows,
-                    &self.free_space,
-                    &self.readers,
-                    &ctx,
-                    &self.config,
-                    false,
+                if !sleep_until_due(
+                    panic_backoff(self.config.interval, consecutive_panics),
+                    &self.alive,
                 )
                 .await
                 {
-                    Ok(report) => {
-                        self.stats.record(&report);
-                        // Losing this to a crash costs pruning quality, never
-                        // correctness: the mask stays a superset, so a
-                        // checkpoint predating the clearing is merely less
-                        // selective.
-                        if let Some(filters) = self
-                            .filters
-                            .as_ref()
-                            .filter(|_| report.fingerprints_cleared > 0)
-                        {
-                            filters.request_checkpoint();
-                        }
-                        // Only a run that got as far as publishing has actually
-                        // seen everything; a deferred one must try again.
-                        if !report.deferred {
-                            scanned_at_mutation = mutations_now;
-                            stamps_at_sweep = stamps_now;
-                            held_rows = report.held_rows;
-                            held_min_xmax = report.held_min_xmax;
-                        }
-                        if report.reclaimed_bytes > 0 {
-                            info!(
-                                "Vacuum on {}: {} dead rows, {} bytes reclaimable across {} extents ({:.1}% of heap)",
-                                self.table_name,
-                                report.dead_rows,
-                                report.reclaimed_bytes,
-                                report.extents,
-                                report.dead_ratio() * 100.0
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("Vacuum scan failed for {}: {}", self.table_name, e);
+                    break;
+                }
+
+                // Supervised, because this task is the table's only reclaimer.
+                // A panic used to end it silently: the table went on working,
+                // and its dead space simply stopped being given back, with
+                // nothing anywhere saying so. Catching it per tick keeps the
+                // service alive. What a tick leaves behind is the free list,
+                // whose locks do not poison, and the permits and guards it
+                // held, which unwinding drops; and a tick that died before
+                // publishing has not advanced `state`, so the next one rescans
+                // what it missed.
+                let tick = std::panic::AssertUnwindSafe(self.tick(&mut state));
+                match futures::FutureExt::catch_unwind(tick).await {
+                    Ok(ControlFlow::Continue(())) => consecutive_panics = 0,
+                    Ok(ControlFlow::Break(())) => break,
+                    Err(payload) => {
+                        consecutive_panics = consecutive_panics.saturating_add(1);
+                        let total = self.stats.panics.fetch_add(1, Ordering::Relaxed) + 1;
+                        log::error!(
+                            "Vacuum service for {} panicked ({} so far): {}; retrying after {:?}",
+                            self.table_name,
+                            total,
+                            panic_message(&*payload),
+                            panic_backoff(self.config.interval, consecutive_panics)
+                        );
                     }
                 }
             }
 
             log::debug!("Vacuum service for {} stopped", self.table_name);
         });
+    }
+
+    /// One pass of the service: a forget sweep if one is due, then a
+    /// reclamation sweep if one is due. `Break` when the table has gone.
+    async fn tick(&self, state: &mut TickState) -> ControlFlow<()> {
+        #[cfg(test)]
+        if self
+            .stats
+            .inject_panics
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            panic!("injected vacuum panic");
+        }
+
+        if !self.free_space.is_enabled() {
+            return ControlFlow::Continue(());
+        }
+
+        // Forgetting: every FORGET_STEP ids, prove this table free of
+        // the non-committed ids below the settle bound. A table that
+        // never does pins the database's forgotten horizon.
+        if let (Some(manager), Some(handle)) = (self.versions.load_full(), self.forget.get()) {
+            if manager.status().settles()
+                && manager.settle_bound().saturating_sub(handle.horizon()) >= FORGET_STEP
+            {
+                if let Some(_permit) = sweep_scheduler().acquire(1.0, &self.alive).await {
+                    let parts = NeutralizeParts {
+                        io_pointers: &*self.io_pointers,
+                        write_lock: &self.write_lock,
+                        compaction_gate: &self.compaction_gate,
+                        readers: &self.readers,
+                        free_space: &self.free_space,
+                        cache_generation: &self.cache_generation,
+                        dead_stamps: &self.dead_stamps,
+                        drain_timeout: self.config.drain_timeout,
+                    };
+                    match neutralize_aborted(&parts, &manager, handle).await {
+                        Ok(report) if report.tombstoned + report.cleared > 0 => info!(
+                            "Forget sweep on {}: {} tombstoned, {} cleared, horizon {:?}",
+                            self.table_name,
+                            report.tombstoned,
+                            report.cleared,
+                            report.advanced_to
+                        ),
+                        Ok(_) => {}
+                        Err(e) => log::error!(
+                            "Forget sweep failed for {}: {}",
+                            self.table_name,
+                            e
+                        ),
+                    }
+                }
+            }
+        }
+
+        // A table that is only read, or only appended to, gains no dead
+        // space. Re-reading its whole pointer file every tick would be
+        // pure cost — and on a large table, not a small one. Outstanding
+        // loans still force a scan: they are what retires them.
+        let mutations_now = self.mutations.load(Ordering::Acquire);
+        let stamps_now = self.dead_stamps.load(Ordering::Acquire);
+        let first = state.scanned_at_mutation == u64::MAX;
+        let loans = self.free_space.loans_outstanding() > 0;
+        // How far over its threshold this table is, for the shared
+        // ordering below. A first sweep or outstanding loans are due
+        // regardless and rank as exactly due.
+        let mut priority = 1.0f64;
+        if !first && !loans {
+            // Stamps the last sweep had to leave because the horizon
+            // still protected them become findable once it passes the
+            // oldest of them — with or without any new write.
+            let released = state.held_rows > 0
+                && self.versions.load_full().is_some_and(|m| {
+                    VersionHorizon::sample(&m).oldest_active() > state.held_min_xmax
+                });
+            if mutations_now == state.scanned_at_mutation && !released {
+                return ControlFlow::Continue(());
+            }
+            // Is there enough dead space to be worth a full read of the
+            // pointer file? Dead stamps since the last sweep, plus the
+            // released ones.
+            let slots = self.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
+            let threshold = self.config.sweep_threshold(slots);
+            let fresh = stamps_now.saturating_sub(state.stamps_at_sweep);
+            let due = fresh >= threshold || (released && fresh + state.held_rows >= threshold);
+            if !due {
+                return ControlFlow::Continue(());
+            }
+            let counted = if released { fresh + state.held_rows } else { fresh };
+            priority = counted as f64 / threshold as f64;
+        }
+
+        // One sweep at a time per few tables, furthest over threshold
+        // first. The permit is held for the sweep and released on drop.
+        let Some(_permit) = sweep_scheduler().acquire(priority, &self.alive).await else {
+            return ControlFlow::Break(());
+        };
+
+        let horizon = match self.versions.load_full() {
+            Some(manager) => VersionHorizon::sample(&manager),
+            None => VersionHorizon::unversioned(),
+        };
+        let ctx = ReclaimContext {
+            horizon: &horizon,
+            filters: self.filters.as_deref(),
+            cleared_below: &self.cleared_below,
+            indexes: self.indexes.as_ref().map(|(ix, fetch)| (&**ix, fetch)),
+        };
+
+        match run_once(
+            &*self.io_pointers,
+            &*self.io_rows,
+            &self.free_space,
+            &self.readers,
+            &ctx,
+            &self.config,
+            false,
+        )
+        .await
+        {
+            Ok(report) => {
+                self.stats.record(&report);
+                // Losing this to a crash costs pruning quality, never
+                // correctness: the mask stays a superset, so a
+                // checkpoint predating the clearing is merely less
+                // selective.
+                if let Some(filters) = self
+                    .filters
+                    .as_ref()
+                    .filter(|_| report.fingerprints_cleared > 0)
+                {
+                    filters.request_checkpoint();
+                }
+                // Only a run that got as far as publishing has actually
+                // seen everything; a deferred one must try again.
+                if !report.deferred {
+                    state.scanned_at_mutation = mutations_now;
+                    state.stamps_at_sweep = stamps_now;
+                    state.held_rows = report.held_rows;
+                    state.held_min_xmax = report.held_min_xmax;
+                }
+                if report.reclaimed_bytes > 0 {
+                    info!(
+                        "Vacuum on {}: {} dead rows, {} bytes reclaimable across {} extents ({:.1}% of heap)",
+                        self.table_name,
+                        report.dead_rows,
+                        report.reclaimed_bytes,
+                        report.extents,
+                        report.dead_ratio() * 100.0
+                    );
+                }
+            }
+            Err(e) => {
+                log::error!("Vacuum scan failed for {}: {}", self.table_name, e);
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// What the service carries from one tick to the next.
+struct TickState {
+    /// The mutation count as of the last completed sweep.
+    scanned_at_mutation: u64,
+    /// The dead-stamp count as of the last completed sweep, and what that
+    /// sweep found stamped but still protected by the horizon.
+    stamps_at_sweep: u64,
+    held_rows: u64,
+    held_min_xmax: TxId,
+}
+
+/// How long the service waits before its next tick.
+///
+/// The ordinary interval, doubled for each panic in a row and capped at ten
+/// minutes: a tick that panics deterministically would otherwise fill the log
+/// at the scan interval, and one that panicked once should not slow the
+/// service down afterwards.
+fn panic_backoff(interval: std::time::Duration, consecutive_panics: u32) -> std::time::Duration {
+    const CAP: std::time::Duration = std::time::Duration::from_secs(600);
+    if consecutive_panics == 0 {
+        return interval;
+    }
+    interval
+        .saturating_mul(1u32 << consecutive_panics.min(16))
+        .min(CAP.max(interval))
+}
+
+/// The text a panic was raised with, when it was raised with text.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        s
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.as_str()
+    } else {
+        "non-string panic payload"
     }
 }
 
@@ -2021,6 +2112,65 @@ mod tests {
 
     fn e(start: u64, len: u64) -> Extent {
         Extent { start, len }
+    }
+
+    /// A panicking tick must be caught, counted and survived: the service is
+    /// the table's only reclaimer, and a panic used to end it without a word.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_panicking_tick_is_counted_and_the_service_keeps_running() {
+        use crate::core::storage_providers::memory::MemoryStorageProvider;
+
+        let stats = Arc::new(VacuumStats::default());
+        stats.inject_panics.store(2, Ordering::Release);
+        let alive = Arc::new(CacheGuard::new(AtomicBool::new(true)));
+
+        VacuumService {
+            table_name: "supervised".to_string(),
+            io_pointers: rclite::Arc::new(MemoryStorageProvider::new("supervised_pointers")),
+            io_rows: rclite::Arc::new(MemoryStorageProvider::new("supervised_rows")),
+            free_space: Arc::new(FreeSpace::new(true)),
+            readers: Arc::new(ReaderRegistry::new()),
+            stats: stats.clone(),
+            alive: alive.clone(),
+            mutations: Arc::new(CacheGuard::new(AtomicU64::new(0))),
+            dead_stamps: Arc::new(AtomicU64::new(0)),
+            versions: Arc::new(arc_swap::ArcSwapOption::empty()),
+            filters: None,
+            indexes: None,
+            cleared_below: Arc::new(CacheGuard::new(AtomicU64::new(0))),
+            config: VacuumConfig {
+                interval: std::time::Duration::from_millis(5),
+                ..VacuumConfig::default()
+            },
+            write_lock: Arc::new(tokio::sync::RwLock::new(())),
+            compaction_gate: Arc::new(tokio::sync::RwLock::new(())),
+            cache_generation: Arc::new(CacheGuard::new(AtomicU64::new(0))),
+            forget: Arc::new(std::sync::OnceLock::new()),
+        }
+        .spawn();
+
+        // Bounded: two panics back off 10 ms and 20 ms, so a scan should
+        // follow well inside this.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while stats.runs.load(Ordering::Acquire) == 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        alive.store(false, Ordering::Release);
+
+        assert_eq!(stats.panics.load(Ordering::Acquire), 2, "each caught panic is counted");
+        assert!(
+            stats.runs.load(Ordering::Acquire) >= 1,
+            "the service must keep scanning after a panicking tick"
+        );
+    }
+
+    #[test]
+    fn panic_backoff_doubles_and_is_capped() {
+        let base = std::time::Duration::from_secs(1);
+        assert_eq!(panic_backoff(base, 0), base);
+        assert_eq!(panic_backoff(base, 1), base * 2);
+        assert_eq!(panic_backoff(base, 3), base * 8);
+        assert_eq!(panic_backoff(base, 40), std::time::Duration::from_secs(600));
     }
 
     #[test]
