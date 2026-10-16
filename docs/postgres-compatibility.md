@@ -439,7 +439,9 @@ These follow PostgreSQL's settings of the same names:
   statement, and not between `Parse` and `Sync`. Sessions `SET`, `SET LOCAL`,
   `SHOW` and `RESET` them, with PostgreSQL's units (`us`, `ms`, `s`, `min`,
   `h`, `d`); `RESET` returns to the server's flag. `SET LOCAL` is undone when
-  the block ends, but not by `ROLLBACK TO SAVEPOINT`.
+  the block ends, but not by `ROLLBACK TO SAVEPOINT`. It undoes only the
+  setting it named, and a plain `SET` of that setting later in the block
+  supersedes it, so the plain `SET` outlives the block as in PostgreSQL.
 - A session that is ending gives the client 2 s to take its last bytes — the
   `FATAL`, any output still buffered, a TLS `close_notify` — and closes
   without them after that, so a client that has stopped reading cannot keep a

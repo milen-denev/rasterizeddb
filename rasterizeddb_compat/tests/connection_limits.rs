@@ -525,6 +525,45 @@ async fn set_local_ends_with_the_block() {
     assert_eq!(after, "0");
 }
 
+/// A `SET LOCAL` of one idle timeout puts back only that one. A session `SET`
+/// of the other in the same block outlives the block, as in PostgreSQL; and a
+/// session `SET` of the same one after its `SET LOCAL` supersedes it. Either
+/// reverted at `COMMIT` would leave a timeout the client set silently
+/// unenforced.
+#[tokio::test(flavor = "multi_thread")]
+async fn set_local_restores_only_its_own_timeout() {
+    let server = TestServer::start().await.expect("server should start");
+    let mut c = connect_admitted(&server.url()).await;
+
+    async fn show(c: &mut PgConnection, key: &str) -> String {
+        sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(format!("SHOW {}", key)))
+            .fetch_one(c)
+            .await
+            .unwrap()
+    }
+
+    c.execute("BEGIN").await.unwrap();
+    c.execute("SET LOCAL idle_session_timeout = '1s'").await.unwrap();
+    c.execute("SET idle_in_transaction_session_timeout = '10s'").await.unwrap();
+    c.execute("COMMIT").await.unwrap();
+    assert_eq!(show(&mut c, "idle_session_timeout").await, "0", "SET LOCAL ends with its block");
+    assert_eq!(
+        show(&mut c, "idle_in_transaction_session_timeout").await,
+        "10s",
+        "a session SET of the other timeout must survive the block"
+    );
+
+    c.execute("BEGIN").await.unwrap();
+    c.execute("SET LOCAL idle_session_timeout = '1s'").await.unwrap();
+    c.execute("SET idle_session_timeout = '20s'").await.unwrap();
+    c.execute("COMMIT").await.unwrap();
+    assert_eq!(
+        show(&mut c, "idle_session_timeout").await,
+        "20s",
+        "a session SET after SET LOCAL of the same timeout must survive the block"
+    );
+}
+
 /// A value that is not a time is refused, not read as zero — which would
 /// quietly disable the bound the client asked for.
 #[tokio::test(flavor = "multi_thread")]

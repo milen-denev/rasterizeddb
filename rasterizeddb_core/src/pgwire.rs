@@ -1818,10 +1818,16 @@ struct SessionTransaction {
     /// the same block does not overwrite the restore target with its
     /// predecessor's value.
     local_synchronous_commit: Option<Option<bool>>,
-    /// The session's idle timeouts from before the first `SET LOCAL` of
-    /// either in this block, to be put back when it ends. Same shape and
+    /// `idle_in_transaction_session_timeout` from before the first `SET
+    /// LOCAL` of it in this block, to be put back when it ends. Same shape and
     /// reason as `local_synchronous_commit`.
-    local_idle_timeouts: Option<(Duration, Duration)>,
+    ///
+    /// One record per setting rather than one for the pair: a shared record
+    /// would make a `SET LOCAL` of one timeout also restore the other, and so
+    /// silently undo a plain session `SET` of it made later in the block.
+    local_idle_in_transaction: Option<Duration>,
+    /// The same for `idle_session_timeout`.
+    local_idle_session: Option<Duration>,
     /// The level this block runs at.
     level: IsolationLevel,
     /// `BEGIN READ ONLY` / `SET TRANSACTION READ ONLY`: writes in this block
@@ -1892,9 +1898,11 @@ impl SessionState {
         if let Some(previous) = t.local_synchronous_commit {
             self.synchronous_commit = previous;
         }
-        if let Some((in_transaction, session)) = t.local_idle_timeouts {
-            self.idle_in_transaction_timeout = in_transaction;
-            self.idle_session_timeout = session;
+        if let Some(previous) = t.local_idle_in_transaction {
+            self.idle_in_transaction_timeout = previous;
+        }
+        if let Some(previous) = t.local_idle_session {
+            self.idle_session_timeout = previous;
         }
     }
 
@@ -5537,7 +5545,8 @@ fn open_block(
         // ran it, and `COMMIT AND CHAIN` carries the characteristics over, not
         // the settings.
         local_synchronous_commit: None,
-        local_idle_timeouts: None,
+        local_idle_in_transaction: None,
+        local_idle_session: None,
         level,
         read_only,
         savepoints: Vec::new(),
@@ -6127,9 +6136,14 @@ where
     };
 
     // As for `synchronous_commit`: `SET LOCAL` outside a block changes
-    // nothing and says so, and inside one records the values to put back.
+    // nothing and says so, and inside one records the value to put back —
+    // only this setting's, so the other timeout is left to whatever its own
+    // statements in the block decide.
+    let previous = match kind {
+        IdleKind::InTransaction => state.idle_in_transaction_timeout,
+        IdleKind::Session => state.idle_session_timeout,
+    };
     if is_set_local(lower) {
-        let previous = (state.idle_in_transaction_timeout, state.idle_session_timeout);
         match state.transaction.as_mut() {
             None => {
                 send_notice(
@@ -6141,8 +6155,21 @@ where
                 return send_command_complete(stream, "SET").await;
             }
             Some(t) => {
-                t.local_idle_timeouts.get_or_insert(previous);
+                let record = match kind {
+                    IdleKind::InTransaction => &mut t.local_idle_in_transaction,
+                    IdleKind::Session => &mut t.local_idle_session,
+                };
+                record.get_or_insert(previous);
             }
+        }
+    } else if let Some(t) = state.transaction.as_mut() {
+        // A plain `SET` (or `RESET`) after a `SET LOCAL` of the same setting
+        // supersedes it: PostgreSQL keeps the session value once the block
+        // commits. Leaving the record would put the pre-block value back and
+        // silently drop the timeout the client just asked for.
+        match kind {
+            IdleKind::InTransaction => t.local_idle_in_transaction = None,
+            IdleKind::Session => t.local_idle_session = None,
         }
     }
 
