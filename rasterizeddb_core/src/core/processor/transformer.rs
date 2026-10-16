@@ -2740,12 +2740,10 @@ mod json_row_path {
         assert_eq!(text("o"), br#"{"j":[1,"a"],"k":1}"#);
     }
 
-    /// Per-row cost of JSON predicates through `execute_row`.
-    /// `cargo test --release -p rasterizeddb_core --lib -- --ignored json_text_path_bench --nocapture`
-    #[test]
-    #[ignore]
-    fn json_text_path_bench() {
-        let rows: Vec<[MemoryBlock; 3]> = (0..4096)
+
+    /// The bench's documents: four kinds of leaf, one nested object.
+    fn bench_rows() -> Vec<[MemoryBlock; 3]> {
+        (0..4096)
             .map(|i| {
                 row(
                     i,
@@ -2758,29 +2756,98 @@ mod json_row_path {
                     )),
                 )
             })
-            .collect();
+            .collect()
+    }
+
+    /// Per-row cost of JSON predicates, the new form against the old one in
+    /// the same process, interleaved round by round — this box is shared and
+    /// drifts by 2x between runs, so separate before/after runs said little.
+    ///
+    /// `extract`: one `->` / `->>` extraction, against `reference_extract`
+    /// plus the pool copy the old code made after it. `execute_row`: a whole
+    /// predicate, with `?|` run once with its plan-time key list and once with
+    /// the list removed, which is the old per-row parse.
+    ///
+    /// `cargo test --release -p rasterizeddb_core --lib -- --ignored json_text_path_bench --nocapture`
+    #[test]
+    #[ignore]
+    fn json_text_path_bench() {
+        use crate::core::jsonb::Step;
+        use std::hint::black_box;
+        let rows = bench_rows();
+        let docs: Vec<&[u8]> = rows.iter().map(|r| r[1].into_slice()).collect();
+        let n = 2_000_000usize;
+
+        for (label, key, as_text) in [
+            ("->> string", "status", true),
+            ("->> number", "id", true),
+            ("->> object", "meta", true),
+            ("->  object", "meta", false),
+        ] {
+            let path = JsonPathRef {
+                steps: std::sync::Arc::new(vec![Step::Key(key.to_string())]),
+                as_text,
+                cast: None,
+            };
+            for round in 0..4 {
+                let start = std::time::Instant::now();
+                let mut len = 0usize;
+                for i in 0..n {
+                    let old = reference_extract(&path, black_box(docs[i % docs.len()]))
+                        .unwrap_or_default();
+                    len += pooled_copy(&old).into_slice().len();
+                }
+                let old_ns = start.elapsed().as_nanos() as f64 / n as f64;
+                let start = std::time::Instant::now();
+                let mut len2 = 0usize;
+                for i in 0..n {
+                    len2 += path.extract(black_box(docs[i % docs.len()])).into_slice().len();
+                }
+                let new_ns = start.elapsed().as_nanos() as f64 / n as f64;
+                assert_eq!(len, len2);
+                println!(
+                    "extract {label:<11} round {round}: old {old_ns:>6.1} ns, new {new_ns:>6.1} ns ({:.2}x)",
+                    old_ns / new_ns
+                );
+            }
+        }
+
         for (label, clause) in [
-            ("->> string leaf", "doc->>'status' = 'open'"),
-            ("->> number leaf", "doc->>'id' = '7'"),
-            ("->> object", r#"doc->>'meta' = '{"owner":"u3","score":3}'"#),
-            ("-> object @>", r#"doc->'meta' @> '{"owner":"u3"}'"#),
-            ("?| two keys", "doc ?| '{missing,status}'"),
+            // A control: no key list, so the two columns must agree, and the
+            // gap between them is the box's noise.
+            ("control: doc->>'status' = 'open'", "doc->>'status' = 'open'"),
+            ("doc ?| '{missing,status}'", "doc ?| '{missing,status}'"),
+            ("doc ?& '{id,meta,status,tags}'", "doc ?& '{id,meta,status,tags}'"),
         ] {
             let mut transformers: SmallVec<[ColumnTransformer; 36]> = SmallVec::new();
             let mut inter: SmallVec<[MemoryBlock; 20]> = SmallVec::new();
             let mut p = plan(clause, &rows[0], &mut transformers, &mut inter).unwrap();
+            let lists: Vec<_> = p.transformers.iter().map(|t| t.key_list.clone()).collect();
             let mut results: SmallVec<[(bool, Option<Next>); 20]> = SmallVec::new();
-            let n = 1_000_000usize;
-            for round in 0..3 {
-                let mut hits = 0usize;
-                let start = std::time::Instant::now();
-                for i in 0..n {
-                    hits += p
-                        .execute_row(&rows[i % rows.len()][..], &mut results)
-                        .unwrap() as usize;
+            for round in 0..4 {
+                let mut timed = [0f64; 2];
+                let mut hits = [0usize; 2];
+                // 0: the key list removed (the old per-row parse); 1: as planned.
+                for (slot, keep) in [(0usize, false), (1, true)] {
+                    for (t, list) in p.transformers.iter_mut().zip(&lists) {
+                        t.key_list = if keep { list.clone() } else { None };
+                    }
+                    let start = std::time::Instant::now();
+                    for i in 0..n {
+                        hits[slot] += p
+                            .execute_row(&rows[i % rows.len()][..], &mut results)
+                            .unwrap() as usize;
+                    }
+                    timed[slot] = start.elapsed().as_nanos() as f64 / n as f64;
                 }
-                let ns = start.elapsed().as_nanos() as f64 / n as f64;
-                println!("{label:<16} round {round}: {ns:>6.1} ns/row, {hits} matches");
+                assert_eq!(hits[0], hits[1]);
+                println!(
+                    "row {label:<34} round {round}: per-row parse {:>6.1} ns, planned {:>6.1} ns ({:.2}x), {} matches",
+                    timed[0],
+                    timed[1],
+                    timed[0] / timed[1],
+                    hits[1]
+                );
             }
         }
     }

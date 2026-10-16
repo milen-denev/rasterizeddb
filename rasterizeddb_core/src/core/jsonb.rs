@@ -720,11 +720,17 @@ pub fn get_index(bytes: &[u8], index: i64) -> Option<&[u8]> {
 /// value *as text*, so quoting a string would be handing back a JSON document
 /// where a value was asked for.
 pub fn as_text(bytes: &[u8]) -> Option<String> {
-    let mut scratch = Vec::new();
-    let text = as_text_into(bytes, &mut scratch)?;
-    // Both branches of `as_text_into` hand back UTF-8: a string's bytes are
-    // checked there, and rendering writes only `str`s and ASCII.
-    Some(std::str::from_utf8(text).ok()?.to_string())
+    // A string is copied out of the document once; anything else is rendered
+    // into the buffer that becomes the `String`, so neither form pays for a
+    // second copy.
+    if bytes.first() == Some(&TAG_STR) {
+        let mut unused = Vec::new();
+        let text = as_text_into(bytes, &mut unused)?;
+        return Some(std::str::from_utf8(text).ok()?.to_string());
+    }
+    let mut out = Vec::with_capacity(bytes.len());
+    as_text_into(bytes, &mut out)?;
+    String::from_utf8(out).ok()
 }
 
 /// [`as_text`] without the `String`: a string value's UTF-8 is borrowed
