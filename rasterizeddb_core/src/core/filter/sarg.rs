@@ -34,7 +34,12 @@
 //! `(a >= lo AND a <= hi)`: refusing parens meant refusing every `IN` and
 //! `BETWEEN` an ORM generates.
 //!
-//! There is no `NOT` in the tokenizer, so the negation case cannot arise.
+//! `NOT` never reaches a group: `predicate_rewrite` pushes it down to single
+//! comparisons, complementing the operator where one exists (`a != 1`, which
+//! is opaque here like any `!=`). Where none does it leaves a `NOT` token
+//! before that one comparison, and such a conjunct is opaque too — reading
+//! it as the comparison without its `NOT` would be the complement, which is
+//! the one answer a mask may never give.
 //!
 //! # Not every predicate is a comparison
 //!
@@ -325,6 +330,12 @@ fn conjunct_to_expr(
     scales: &[(u32, u32)],
     paths: Option<&PathResolver>,
 ) -> MaskExpr {
+    // A negated comparison says nothing a mask can use. Every shape below
+    // also needs exactly three tokens, which a `NOT` makes four; this says so
+    // rather than leaving it to the count.
+    if toks.iter().any(|t| matches!(t, Token::Ident((n, _, _)) if n == "NOT")) {
+        return MaskExpr::All;
+    }
     // `doc->>'k' = 'v'` (or mirrored, or a LIKE prefix) over a path some index
     // keys: read as the comparison of a STRING column, the index's virtual
     // one, which is what `->>` yields and what the index stores.

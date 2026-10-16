@@ -492,9 +492,10 @@ impl<'a, 'b> QueryParser<'a, 'b> {
 
         const CMP_OPS: [&str; 7] = ["=", "!=", "<>", ">", ">=", "<", "<="];
         const LOGIC_KWS: [&str; 2] = ["AND", "OR"];
-        const TEXT_CMPS: [&str; 12] = [
+        const TEXT_CMPS: [&str; 13] = [
             "ISNULL",
             "NOTNULL",
+            "NOT",
             "CONTAINS",
             "STARTSWITH",
             "ENDSWITH",
@@ -522,7 +523,9 @@ impl<'a, 'b> QueryParser<'a, 'b> {
                 }
                 Token::Op(o) if depth >= 1 => {
                     let s = o.as_str();
-                    if CMP_OPS.contains(&s) {
+                    // A structural operator is a comparison too: `(doc ? 'k')`
+                    // is a condition, not an operand.
+                    if CMP_OPS.contains(&s) || crate::core::pg_ops::PgOp::from_symbol(s).is_some() {
                         has_comp = true;
                         if has_logic {
                             return true;
@@ -563,6 +566,13 @@ impl<'a, 'b> QueryParser<'a, 'b> {
         &mut self,
         cols: &SmallVec<[(Cow<'c, str>, MemoryBlock); 20]>,
     ) -> Result<(), String> {
+        // `NOT` before a comparison, which `rewrite_where` leaves only where
+        // the operator has no complement to be rewritten to: `NOT t
+        // STARTSWITH 'p'`, `NOT doc ? 'k'`. It negates this one comparison.
+        let negated = matches!(self.toks.get(self.pos), Some(Token::Ident((n, _, _))) if n == "NOT");
+        if negated {
+            self.pos += 1;
+        }
         let (left_op, left_type) = self.parse_expr(cols)?;
         let op_token = self
             .next()
@@ -592,7 +602,7 @@ impl<'a, 'b> QueryParser<'a, 'b> {
                 ComparerOperation::Equals,
                 None,
             );
-            self.query_transformer.set_last_null_test(want_null);
+            self.query_transformer.set_last_null_test(want_null != negated);
             return Ok(());
         }
 
@@ -753,6 +763,9 @@ impl<'a, 'b> QueryParser<'a, 'b> {
             if let Some(keys) = key_list {
                 self.query_transformer.set_last_key_list(keys);
             }
+            if negated {
+                self.query_transformer.set_last_negated();
+            }
             return Ok(());
         }
 
@@ -820,6 +833,9 @@ impl<'a, 'b> QueryParser<'a, 'b> {
         if operand_scales != (None, None) {
             self.query_transformer
                 .set_last_operand_scales(operand_scales.0, operand_scales.1);
+        }
+        if negated {
+            self.query_transformer.set_last_negated();
         }
         Ok(())
     }

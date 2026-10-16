@@ -641,6 +641,356 @@ fn render_tokens(toks: &[Tok]) -> String {
     toks.iter().map(|t| t.render()).collect::<Vec<_>>().join(" ")
 }
 
+/// Rewrites every prefix `NOT <condition>` in the clause into a condition
+/// with no `NOT` over a group, leaving everything else as it was.
+///
+/// SQL's `NOT` is three-valued: NOT of NULL is NULL, and a WHERE clause keeps
+/// only the rows where the whole condition is true. So `WHERE NOT X` keeps
+/// exactly the rows where `X` is *false*, never those where it is NULL —
+/// `NOT (doc->>'a' = 'x')` drops a row with no `a` at all, in PostgreSQL. The
+/// evaluator is two-valued and cannot negate a group, so the negation is
+/// pushed down to the comparisons, where "false" can be said directly:
+///
+/// ```text
+///   F(A AND B) = F(A) OR F(B)      F(A OR B) = F(A) AND F(B)      F(NOT A) = T(A)
+/// ```
+///
+/// and for one comparison, F is the comparison that holds exactly where it is
+/// false and not NULL (see `negate_atom`). This is sound only because every
+/// comparison already answers false on a NULL operand: a nullable column
+/// through its guard, a JSON path in the evaluator.
+fn expand_not<'c>(
+    clause: &'c str,
+    schema: &SmallVec<[SchemaField; 20]>,
+) -> Result<std::borrow::Cow<'c, str>, String> {
+    if !clause.to_ascii_uppercase().contains("NOT") {
+        return Ok(std::borrow::Cow::Borrowed(clause));
+    }
+    let toks = lex(clause)?;
+    let mut out: Vec<String> = Vec::with_capacity(toks.len());
+    let mut changed = false;
+    let mut i = 0usize;
+    while i < toks.len() {
+        if toks[i].is_keyword("not") && starts_term(&toks, i) {
+            let mut parser = NotParser {
+                toks: &toks,
+                pos: i,
+                end: toks.len(),
+                schema,
+            };
+            let node = parser.not()?;
+            out.push(node.render(true, schema)?);
+            i = parser.pos;
+            changed = true;
+            continue;
+        }
+        out.push(toks[i].render());
+        i += 1;
+    }
+    Ok(if changed {
+        std::borrow::Cow::Owned(out.join(" "))
+    } else {
+        std::borrow::Cow::Borrowed(clause)
+    })
+}
+
+/// Whether the token at `at` begins a condition: the clause's start, or just
+/// after `(`, a connective or a prefix `NOT`. A `NOT` anywhere else is part
+/// of `NOT IN`, `NOT LIKE`, `IS NOT` and the like.
+fn starts_term(toks: &[Tok], at: usize) -> bool {
+    at == 0
+        || matches!(toks[at - 1], Tok::LPar)
+        || toks[at - 1].is_keyword("and")
+        || toks[at - 1].is_keyword("or")
+        || (toks[at - 1].is_keyword("not") && starts_term(toks, at - 1))
+}
+
+/// A condition under a `NOT`, as far as negating it needs: its connectives,
+/// and its comparisons as they were written.
+enum NotNode {
+    Atom(Vec<Tok>),
+    Not(Box<NotNode>),
+    And(Box<NotNode>, Box<NotNode>),
+    Or(Box<NotNode>, Box<NotNode>),
+}
+
+impl NotNode {
+    /// The condition when `holds`, else the condition that holds exactly where
+    /// it is false.
+    fn render(&self, holds: bool, schema: &SmallVec<[SchemaField; 20]>) -> Result<String, String> {
+        Ok(match self {
+            NotNode::Atom(toks) if holds => render_tokens(toks),
+            NotNode::Atom(toks) => negate_atom(toks, schema)?,
+            NotNode::Not(inner) => inner.render(!holds, schema)?,
+            NotNode::And(a, b) | NotNode::Or(a, b) => {
+                let joiner = match (self, holds) {
+                    (NotNode::And(..), true) | (NotNode::Or(..), false) => "AND",
+                    _ => "OR",
+                };
+                format!("( {} {} {} )", a.render(holds, schema)?, joiner, b.render(holds, schema)?)
+            }
+        })
+    }
+}
+
+/// Reads `NOT`'s operand: `NOT` binds tighter than `AND` and `OR` and looser
+/// than every comparison, so `NOT a = 1 AND b = 2` is `(NOT a = 1) AND b = 2`
+/// and `NOT x IS NULL` is `NOT (x IS NULL)`.
+struct NotParser<'a> {
+    toks: &'a [Tok],
+    pos: usize,
+    /// The end of the group being read.
+    end: usize,
+    schema: &'a SmallVec<[SchemaField; 20]>,
+}
+
+impl NotParser<'_> {
+    fn or(&mut self) -> Result<NotNode, String> {
+        let mut left = self.and()?;
+        while self.pos < self.end && self.toks[self.pos].is_keyword("or") {
+            self.pos += 1;
+            left = NotNode::Or(Box::new(left), Box::new(self.and()?));
+        }
+        Ok(left)
+    }
+
+    fn and(&mut self) -> Result<NotNode, String> {
+        let mut left = self.not()?;
+        while self.pos < self.end && self.toks[self.pos].is_keyword("and") {
+            self.pos += 1;
+            left = NotNode::And(Box::new(left), Box::new(self.not()?));
+        }
+        Ok(left)
+    }
+
+    fn not(&mut self) -> Result<NotNode, String> {
+        if self.pos < self.end && self.toks[self.pos].is_keyword("not") {
+            self.pos += 1;
+            return Ok(NotNode::Not(Box::new(self.not()?)));
+        }
+        // A parenthesis opening a condition, rather than an operand: one
+        // whose group is followed by nothing a comparison could continue with.
+        if self.pos < self.end && matches!(self.toks[self.pos], Tok::LPar) {
+            let close = self.closing(self.pos)?;
+            let after = self.toks.get(close + 1).filter(|_| close + 1 < self.end);
+            let condition = match after {
+                None | Some(Tok::RPar) => true,
+                Some(t) => t.is_keyword("and") || t.is_keyword("or"),
+            };
+            if condition {
+                let mut inner = NotParser {
+                    toks: self.toks,
+                    pos: self.pos + 1,
+                    end: close,
+                    schema: self.schema,
+                };
+                let node = inner.or()?;
+                if inner.pos != close {
+                    return Err(format!(
+                        "NOT over this condition is not supported: unexpected '{}'",
+                        self.toks[inner.pos].render()
+                    ));
+                }
+                self.pos = close + 1;
+                return Ok(node);
+            }
+        }
+        self.atom()
+    }
+
+    fn closing(&self, open: usize) -> Result<usize, String> {
+        let mut depth = 0usize;
+        for (i, t) in self.toks.iter().enumerate().take(self.end).skip(open) {
+            match t {
+                Tok::LPar => depth += 1,
+                Tok::RPar => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Ok(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Err("unbalanced parentheses after NOT".to_string())
+    }
+
+    /// One comparison: up to the next `AND` / `OR` outside parentheses — the
+    /// `AND` of a `BETWEEN` excepted — or the end of the group.
+    fn atom(&mut self) -> Result<NotNode, String> {
+        let start = self.pos;
+        let mut depth = 0usize;
+        let mut between = false;
+        while self.pos < self.end {
+            let t = &self.toks[self.pos];
+            match t {
+                Tok::LPar => depth += 1,
+                Tok::RPar if depth == 0 => break,
+                Tok::RPar => depth -= 1,
+                _ if depth == 0 && t.is_keyword("between") => between = true,
+                _ if depth == 0 && t.is_keyword("and") && between => between = false,
+                _ if depth == 0 && (t.is_keyword("and") || t.is_keyword("or")) => break,
+                _ => {}
+            }
+            self.pos += 1;
+        }
+        if self.pos == start {
+            return Err("NOT is missing the condition it negates".to_string());
+        }
+        Ok(NotNode::Atom(self.toks[start..self.pos].to_vec()))
+    }
+}
+
+/// The comparison that holds exactly where `toks` is false — not where it is
+/// NULL.
+///
+/// - An ordered comparison takes the complementary operator: every order the
+///   evaluator uses is total, and a NULL operand fails both.
+/// - `= ANY` and `<> ALL` trade places, as do `IN` and `NOT IN`, `BETWEEN`
+///   and `NOT BETWEEN`, `IS` and `IS NOT`, `ISNULL` and `NOTNULL`, and `NOT
+///   LIKE` and `LIKE`. Each form already excludes the NULL rows its meaning
+///   excludes, and `IS` never yields NULL.
+/// - What has no complement — `LIKE`, `SIMILAR TO`, `?`, `@>` and the other
+///   structural operators — is negated by the evaluator: a `NOT` handed to it
+///   before that one comparison, with the NULL guards of the columns it reads
+///   placed outside the `NOT`, where they keep a NULL row out.
+fn negate_atom(toks: &[Tok], schema: &SmallVec<[SchemaField; 20]>) -> Result<String, String> {
+    let refuse = || format!("NOT over '{}' is not supported", render_tokens(toks));
+    if let [Tok::Word(w)] = toks {
+        if w.eq_ignore_ascii_case("true") {
+            return Ok(CONSTANT_FALSE.to_string());
+        }
+        if w.eq_ignore_ascii_case("false") {
+            return Ok(CONSTANT_TRUE.to_string());
+        }
+        // A boolean column standing alone.
+        let col = resolve_column(w, schema)
+            .filter(|c| {
+                schema
+                    .iter()
+                    .any(|f| f.name == *c && f.db_type == crate::core::db_type::DbType::BOOL)
+            })
+            .ok_or_else(refuse)?;
+        return Ok(format!("{} = 0", col));
+    }
+
+    // The tokens outside parentheses, by position.
+    let mut top: Vec<usize> = Vec::new();
+    let mut depth = 0usize;
+    for (i, t) in toks.iter().enumerate() {
+        match t {
+            Tok::LPar => depth += 1,
+            Tok::RPar => depth = depth.saturating_sub(1),
+            _ if depth == 0 => top.push(i),
+            _ => {}
+        }
+    }
+    let keyword_at = |kw: &str| top.iter().copied().find(|&i| toks[i].is_keyword(kw));
+    let with = |at: usize, replace: usize, insert: &[Tok]| {
+        let mut v: Vec<Tok> = toks[..at].to_vec();
+        v.extend_from_slice(insert);
+        v.extend_from_slice(&toks[at + replace..]);
+        render_tokens(&v)
+    };
+    let not = Tok::Word("NOT".to_string());
+    let preceded_by_not = |at: usize| at > 0 && toks[at - 1].is_keyword("not");
+
+    if keyword_at("exists").is_some() {
+        return Err(refuse());
+    }
+    if let Some(at) = keyword_at("is") {
+        return Ok(match toks.get(at + 1) {
+            Some(t) if t.is_keyword("not") => with(at + 1, 1, &[]),
+            _ => with(at + 1, 0, std::slice::from_ref(&not)),
+        });
+    }
+    if let Some(at) = keyword_at("isnull") {
+        return Ok(with(at, 1, &[Tok::Word("NOTNULL".to_string())]));
+    }
+    if let Some(at) = keyword_at("notnull") {
+        return Ok(with(at, 1, &[Tok::Word("ISNULL".to_string())]));
+    }
+    for kw in ["in", "between"] {
+        if let Some(at) = keyword_at(kw) {
+            return Ok(if preceded_by_not(at) {
+                with(at - 1, 1, &[])
+            } else {
+                with(at, 0, std::slice::from_ref(&not))
+            });
+        }
+    }
+    // `NOT LIKE` and friends: dropping the `NOT` is the complement.
+    for kw in ["like", "ilike", "similar"] {
+        if let Some(at) = keyword_at(kw) {
+            if preceded_by_not(at) {
+                return Ok(with(at - 1, 1, &[]));
+            }
+        }
+    }
+
+    let comparison: Vec<usize> = top
+        .iter()
+        .copied()
+        .filter(|&i| matches!(&toks[i], Tok::Sym(s) if negated_operator(s).is_some()))
+        .collect();
+    let structural = top.iter().any(|&i| {
+        matches!(&toks[i], Tok::Sym(s) if PG_OPERATORS.contains(&s.as_str()))
+    });
+    let pattern = top.iter().any(|&i| {
+        [
+            "like", "ilike", "similar", "similarto", "contains", "startswith", "endswith",
+            "icontains", "istartswith", "iendswith", "iequals",
+        ]
+        .iter()
+        .any(|kw| toks[i].is_keyword(kw))
+    });
+
+    if let ([at], false, false) = (comparison.as_slice(), structural, pattern) {
+        let Tok::Sym(op) = &toks[*at] else {
+            unreachable!("filtered above")
+        };
+        // `x = ANY('{…}')` and `x <> ALL('{…}')`: the complement of the one is
+        // the other, never the operator flipped alone.
+        if let Some(q) = toks.get(at + 1).filter(|t| t.is_keyword("any") || t.is_keyword("all")) {
+            let swapped = match (op.as_str(), q.is_keyword("any")) {
+                ("=", true) => ["<>", "ALL"],
+                ("!=" | "<>", false) => ["=", "ANY"],
+                _ => return Err(refuse()),
+            };
+            return Ok(with(
+                *at,
+                2,
+                &[Tok::Sym(swapped[0].to_string()), Tok::Word(swapped[1].to_string())],
+            ));
+        }
+        let flipped = negated_operator(op).expect("filtered above");
+        return Ok(with(*at, 1, &[Tok::Sym(flipped.to_string())]));
+    }
+    if !(structural || pattern) {
+        return Err(refuse());
+    }
+
+    // No complement: the evaluator negates it, inside the guards of every
+    // nullable column it reads.
+    let mut flags: Vec<String> = Vec::new();
+    for t in toks {
+        if let Tok::Word(w) = t {
+            if let Some(flag) = resolve_column(w, schema).and_then(|c| nullable::flag_field(&c, schema)) {
+                if !flags.contains(&flag.name) {
+                    flags.push(flag.name.clone());
+                }
+            }
+        }
+    }
+    let negated = format!("NOT {}", render_tokens(toks));
+    Ok(if flags.is_empty() {
+        negated
+    } else {
+        let guards: Vec<String> = flags.iter().map(|f| format!("{} = 0", f)).collect();
+        format!("( {} AND {} )", guards.join(" AND "), negated)
+    })
+}
+
 /// Wraps a comparison so a `NULL` row cannot satisfy it.
 ///
 /// SQL evaluates any comparison against `NULL` to *unknown*, and returns a row
@@ -1686,6 +2036,11 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
     // row. See `parenthesised_truth_test`.
     let clause = &expand_truth_tests(clause, schema)?;
 
+    // `NOT <condition>` is pushed down to its comparisons, three-valued, and
+    // before the NULL fold for the same reason as the truth tests. See
+    // `expand_not`.
+    let clause = &expand_not(clause, schema)?;
+
     // `x = NULL` is never true in SQL — NULL is not a value anything equals,
     // which is why `IS NULL` exists. Folded to a false predicate here so the
     // comparison never reaches the tokenizer, where an untyped NULL against a
@@ -1704,9 +2059,22 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
     // comparison outside the guard's parentheses. The whole term has to be
     // wrapped, and this is where it starts.
     let mut term_start = 0usize;
+    // The comparison after a `NOT` that `expand_not` left is read without
+    // NULL guards up to here: `expand_not` already put them outside the `NOT`,
+    // where they belong. A guard inside it would be negated with the
+    // comparison, and a NULL row would match.
+    let mut unguarded_until = 0usize;
 
     while i < toks.len() {
         let tok = &toks[i];
+        let guarding = i >= unguarded_until;
+        let guard = |column: &str, fragment: &str, schema: &SmallVec<[SchemaField; 20]>| {
+            if guarding {
+                guard_null(column, fragment, schema)
+            } else {
+                fragment.to_string()
+            }
+        };
 
         // A term begins after each connective, and after a parenthesis that
         // opens a *boolean* group.
@@ -1721,9 +2089,10 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
             term_start = out.len() + 1;
         }
 
-        // `IS [NOT] NULL` over a path into a document, also with the path
-        // in parentheses: it needs the whole operand, not the column.
-        if let Some((rewritten, after)) = path_sugar(&toks, i, schema)? {
+        // A path into a document followed by a form that needs the whole
+        // operand rather than the column: `doc->>'a' IN (…)`, `IS NULL`,
+        // `BETWEEN`, `NOT LIKE`, also with the path in parentheses.
+        if let Some((rewritten, after)) = path_sugar(&toks, i, schema, guarding)? {
             out.push(rewritten);
             i = after;
             continue;
@@ -1923,7 +2292,7 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
                         .iter()
                         .map(|v| format!("{} {} {}", col, op, v))
                         .collect();
-                    out.push(guard_null(
+                    out.push(guard(
                         &col,
                         &format!("({})", parts.join(joiner)),
                         schema,
@@ -1957,7 +2326,7 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
                     } else {
                         format!("({} >= {} AND {} <= {})", col, lo, col, hi)
                     };
-                    out.push(guard_null(&col, &fragment, schema));
+                    out.push(guard(&col, &fragment, schema));
                     i = after_hi;
                     continue;
                 }
@@ -1992,9 +2361,6 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
                     let Tok::Str(literal) = pattern else {
                         return Err("SIMILAR TO needs a quoted pattern".to_string());
                     };
-                    if negated {
-                        return Err("NOT SIMILAR TO is not supported yet".to_string());
-                    }
                     // A pattern the matcher cannot use fails the statement here
                     // rather than matching nothing on every row.
                     if let Some(inner) = literal
@@ -2007,9 +2373,11 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
                     // literal is emitted as-is. Adding a pair around it made
                     // `''101%''`, which the tokenizer read as an empty string
                     // followed by a bare `101%`.
-                    out.push(guard_null(
+                    // `NOT SIMILAR TO` negates the match inside the guard, so
+                    // a NULL row matches neither form.
+                    out.push(guard(
                         &col,
-                        &format!("{} SIMILARTO {}", col, literal),
+                        &format!("{}{} SIMILARTO {}", if negated { "NOT " } else { "" }, col, literal),
                         schema,
                     ));
                     i = kw_at + 3;
@@ -2052,12 +2420,11 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
                     }
                     let (op, literal) =
                         like_to_operator(&pattern_text(pattern), escape, case_insensitive)?;
-                    if negated {
-                        return Err("NOT LIKE is not supported yet".to_string());
-                    }
-                    out.push(guard_null(
+                    // `NOT LIKE` likewise, inside the guard: NOT of NULL is
+                    // NULL, so a NULL row is in neither answer.
+                    out.push(guard(
                         &col,
-                        &format!("{} {} {}", col, op, literal),
+                        &format!("{}{} {} {}", if negated { "NOT " } else { "" }, col, op, literal),
                         schema,
                     ));
                     i = next;
@@ -2073,7 +2440,7 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
                     i > 0 && matches!(toks.get(i - 1), Some(Tok::Sym(sym)) if is_arithmetic(sym));
                 if preceded_by_arithmetic {
                     if nullable::is_nullable(&col, schema) {
-                        if let Some(flag) = nullable::flag_field(&col, schema) {
+                        if let Some(flag) = nullable::flag_field(&col, schema).filter(|_| guarding) {
                             let at = term_start.min(out.len());
                             out.insert(at, format!("{} = 0 AND", flag.name));
                         }
@@ -2116,7 +2483,7 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
                         let op = out.pop().expect("two entries");
                         let lhs = out.pop().expect("two entries");
                         let fragment = format!("{} {} {}", lhs, op, operand);
-                        out.push(guard_null(&col, &fragment, schema));
+                        out.push(guard(&col, &fragment, schema));
                     } else {
                         out.push(operand);
                     }
@@ -2147,7 +2514,7 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
                     } else {
                         format!("{} = 1", col)
                     };
-                    out.push(guard_null(&col, &fragment, schema));
+                    out.push(guard(&col, &fragment, schema));
                     i += 1;
                     continue;
                 }
@@ -2179,7 +2546,7 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
                             || t.is_keyword("similarto")
                     });
                     if !holds_comparison {
-                        if let Some(flag) = nullable::flag_field(&col, schema) {
+                        if let Some(flag) = nullable::flag_field(&col, schema).filter(|_| guarding) {
                             let at = term_start.min(out.len());
                             out.insert(at, format!("{} = 0 AND", flag.name));
                         }
@@ -2198,7 +2565,7 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
                             other => other.render(),
                         });
                     }
-                    out.push(guard_null(&col, &fragment.join(" "), schema));
+                    out.push(guard(&col, &fragment.join(" "), schema));
                     i = end;
                     continue;
                 }
@@ -2215,10 +2582,25 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
                 return Err("NULL literals are not supported yet in WHERE clauses".to_string());
             }
 
-            // `NOT` is recorded and resolved by whatever follows it. Only the
-            // `NOT <boolean column>` form has an equivalent; `NOT (a AND b)`
-            // would need the evaluator to negate a subtree.
+            // A `NOT` starting a term is one `expand_not` left before a single
+            // comparison it could not complement — `NOT t LIKE 'p%'`, `NOT doc
+            // ? 'k'` — with that comparison's NULL guards already outside it.
+            // It is handed to the evaluator, which negates that comparison
+            // alone, and the comparison is read without guards of its own.
+            //
+            // Anywhere else `NOT` is recorded and resolved by whatever follows
+            // it, which only `NOT <boolean column>` can do.
             if raw.eq_ignore_ascii_case("not") {
+                let term_starts_here = i == 0
+                    || matches!(toks.get(i - 1), Some(Tok::LPar))
+                    || toks[i - 1].is_keyword("and")
+                    || toks[i - 1].is_keyword("or");
+                if term_starts_here && toks.get(i + 1).is_some_and(|t| !t.is_keyword("not")) {
+                    out.push("NOT".to_string());
+                    unguarded_until = comparison_end(&toks, i + 1);
+                    i += 1;
+                    continue;
+                }
                 out.push("\u{1}NOT".to_string());
                 i += 1;
                 continue;
@@ -2366,49 +2748,122 @@ fn path_operand(
     Some((col, text, end))
 }
 
-/// `IS [NOT] NULL`, `ISNULL` and `NOTNULL` over a JSON path at `at`: the
-/// rewritten term and the index past it, or `None` when the tokens are not
-/// one of those.
+/// `<path> [NOT] IN (…)`, `[NOT] BETWEEN`, `IS [NOT] NULL`, `ISNULL`,
+/// `NOTNULL` and `NOT LIKE` / `NOT ILIKE` / `NOT SIMILAR TO` over a JSON path
+/// at `at`: the rewritten term and the index past it, or `None` when the
+/// tokens are not one of those.
 ///
-/// The column form reads one word on the left, and a path is several tokens,
-/// so `doc->>'a' IS NULL` reached the engine with its `IS` intact and was
-/// refused as an unknown identifier. Here it becomes a test the evaluator
-/// answers from the path itself: whether it reached a value. The document
-/// column's own NULL is an alternative to that, since a NULL document has no
-/// path either.
+/// The column forms of these read one word on the left, and a path is several
+/// tokens, so `doc->>'a' IN ('x')` reached the engine with its `IN` intact and
+/// was refused as an unknown identifier. They expand here into the
+/// comparisons they mean. Each comparison with a path that reaches nothing is
+/// not true — the path is SQL NULL — so `NOT IN` and `NOT BETWEEN` need no
+/// guard of their own, and `IS NULL` is a test the evaluator answers from the
+/// path itself. The document column's own NULL is guarded as usual.
 fn path_sugar(
     toks: &[Tok],
     at: usize,
     schema: &SmallVec<[SchemaField; 20]>,
+    guarding: bool,
 ) -> Result<Option<(String, usize)>, String> {
     let Some((col, operand, end)) = path_operand(toks, at, schema) else {
         return Ok(None);
     };
-    let Some(keyword) = toks.get(end) else {
+    let guard = |fragment: String| {
+        if guarding {
+            guard_null(&col, &fragment, schema)
+        } else {
+            fragment
+        }
+    };
+    let negated = toks.get(end).is_some_and(|t| t.is_keyword("not"));
+    let kw_at = end + usize::from(negated);
+    let Some(keyword) = toks.get(kw_at) else {
         return Ok(None);
     };
+
+    if keyword.is_keyword("in") {
+        let (values, after) = parse_in_list(toks, kw_at + 1)?;
+        // The same constants the column form folds to: `IN ()` never holds,
+        // `NOT IN ()` always does, and a NULL in a `NOT IN` list makes the
+        // whole test unknown for every row.
+        let has_null = values.iter().any(|v| v.eq_ignore_ascii_case("null"));
+        let values: Vec<&String> = values.iter().filter(|v| !v.eq_ignore_ascii_case("null")).collect();
+        if values.is_empty() && !has_null {
+            let constant = if negated { CONSTANT_TRUE } else { CONSTANT_FALSE };
+            return Ok(Some((constant.to_string(), after)));
+        }
+        if (negated && has_null) || values.is_empty() {
+            return Ok(Some((CONSTANT_FALSE.to_string(), after)));
+        }
+        let (op, joiner) = if negated { ("!=", " AND ") } else { ("=", " OR ") };
+        let parts: Vec<String> = values.iter().map(|v| format!("{} {} {}", operand, op, v)).collect();
+        return Ok(Some((guard(format!("({})", parts.join(joiner))), after)));
+    }
+
+    if keyword.is_keyword("between") {
+        let (lo, after_lo) = bound_at(toks, kw_at + 1).ok_or("BETWEEN is missing its lower bound")?;
+        if !toks.get(after_lo).is_some_and(|t| t.is_keyword("and")) {
+            return Err("BETWEEN bounds must be separated by AND".to_string());
+        }
+        let (hi, after) = bound_at(toks, after_lo + 1).ok_or("BETWEEN is missing its upper bound")?;
+        let fragment = if negated {
+            format!("({0} < {1} OR {0} > {2})", operand, lo, hi)
+        } else {
+            format!("({0} >= {1} AND {0} <= {2})", operand, lo, hi)
+        };
+        return Ok(Some((guard(fragment), after)));
+    }
+
+    // `IS [NOT] NULL` and its one-word spellings. NULL is never unknown, so
+    // the document's companion is an alternative rather than a guard: a NULL
+    // document has no path either.
     let null_test = match keyword {
-        t if t.is_keyword("isnull") => Some((true, end + 1)),
-        t if t.is_keyword("notnull") => Some((false, end + 1)),
+        _ if negated => None,
+        t if t.is_keyword("isnull") => Some((true, kw_at + 1)),
+        t if t.is_keyword("notnull") => Some((false, kw_at + 1)),
         t if t.is_keyword("is") => {
-            let not = toks.get(end + 1).is_some_and(|t| t.is_keyword("not"));
-            let null_at = end + 1 + usize::from(not);
+            let not = toks.get(kw_at + 1).is_some_and(|t| t.is_keyword("not"));
+            let null_at = kw_at + 1 + usize::from(not);
             toks.get(null_at)
                 .is_some_and(|t| t.is_keyword("null"))
                 .then_some((!not, null_at + 1))
         }
         _ => None,
     };
-    let Some((want_null, after)) = null_test else {
-        return Ok(None);
-    };
-    let test = format!("{} {}", operand, if want_null { "ISNULL" } else { "NOTNULL" });
-    let text = match nullable::flag_field(&col, schema) {
-        Some(flag) if want_null => format!("({} = 1 OR {})", flag.name, test),
-        Some(flag) => format!("({} = 0 AND {})", flag.name, test),
-        None => test,
-    };
-    Ok(Some((text, after)))
+    if let Some((want_null, after)) = null_test {
+        let test = format!("{} {}", operand, if want_null { "ISNULL" } else { "NOTNULL" });
+        let flag = nullable::flag_field(&col, schema).filter(|_| guarding);
+        let text = match flag {
+            Some(flag) if want_null => format!("({} = 1 OR {})", flag.name, test),
+            Some(flag) => format!("({} = 0 AND {})", flag.name, test),
+            None => test,
+        };
+        return Ok(Some((text, after)));
+    }
+
+    // `NOT LIKE`, `NOT ILIKE`, `NOT SIMILAR TO`: the match, negated inside
+    // the guard. The positive forms read through the ordinary comparison.
+    if negated {
+        let similar = keyword.is_keyword("similar")
+            && toks.get(kw_at + 1).is_some_and(|t| t.is_keyword("to"));
+        let op = if similar {
+            "SIMILARTO"
+        } else if keyword.is_keyword("like") {
+            "LIKE"
+        } else if keyword.is_keyword("ilike") {
+            "ILIKE"
+        } else {
+            return Ok(None);
+        };
+        let pattern_at = kw_at + if similar { 2 } else { 1 };
+        let Some(pattern @ Tok::Str(_)) = toks.get(pattern_at) else {
+            return Err(format!("NOT {} needs a quoted pattern", keyword.render().to_ascii_uppercase()));
+        };
+        let fragment = format!("NOT {} {} {}", operand, op, pattern.render());
+        return Ok(Some((guard(fragment), pattern_at + 1)));
+    }
+    Ok(None)
 }
 
 /// Whether a symbol is an arithmetic operator rather than a comparison.
@@ -2836,13 +3291,94 @@ mod tests {
     fn unknown_identifiers_are_rejected_rather_than_passed_on() {
         assert!(err("nosuchcolumn = 1").contains("unknown column"));
         assert!(err("EXISTS (SELECT 1)").contains("unknown column"));
-        assert!(err("NOT (id = 1 AND age = 2)").contains("NOT is only supported"));
+        assert!(err("NOT EXISTS (SELECT 1)").contains("NOT over"));
     }
 
     #[test]
     fn unsupported_forms_name_the_missing_feature() {
         assert!(err("id IN (SELECT id FROM t)").contains("subqueries"));
-        assert!(err("name NOT LIKE 'a%'").contains("NOT LIKE"));
+    }
+
+    /// `NOT` over a group is pushed down to the comparisons, each written as
+    /// the comparison that holds where it is false. These used to be refused
+    /// with "NOT is only supported directly before a boolean column", and
+    /// `NOT LIKE` with "not supported yet"; PostgreSQL 17 answers all of them
+    /// (`jsonb_pg_semantics.rs` holds its answers).
+    #[test]
+    fn not_is_pushed_down_to_the_comparisons() {
+        assert_eq!(rw("NOT (id = 1 AND age = 2)"), "( id != 1 OR age != 2 )");
+        assert_eq!(rw("NOT id = 1 AND age = 2"), "id != 1 AND age = 2");
+        assert_eq!(rw("NOT (id = 1 OR NOT age < 2)"), "( id != 1 AND age < 2 )");
+        assert_eq!(rw("NOT NOT (id = 1)"), "id = 1");
+        assert_eq!(rw("NOT (id IN (1, 2))"), "(id != 1 AND id != 2)");
+        assert_eq!(rw("NOT (id NOT IN (1, 2))"), "(id = 1 OR id = 2)");
+        assert_eq!(rw("NOT (age BETWEEN 1 AND 3) OR id = 1"), "(age < 1 OR age > 3) OR id = 1");
+        assert_eq!(rw("NOT (id + 1 > 2)"), "id + 1 <= 2");
+        assert_eq!(rw("(NOT (id = 1)) OR id = 3"), "( id != 1 ) OR id = 3");
+        // No complement: the evaluator negates the one comparison.
+        assert_eq!(rw("NOT (name LIKE 'a%')"), "NOT name STARTSWITH 'a'");
+        assert_eq!(rw("name NOT LIKE 'a%'"), "NOT name STARTSWITH 'a'");
+        assert_eq!(rw("NOT (name NOT LIKE 'a%')"), "name STARTSWITH 'a'");
+        // `= ANY` and `<> ALL` trade places; flipping the operator alone would
+        // write `<> ANY`, which means something else.
+        assert_eq!(rw("NOT (id = ANY('{1,2}'))"), rw("id <> ALL('{1,2}')"));
+        assert!(err("NOT (id <> ANY('{1,2}'))").contains("NOT over"));
+    }
+
+    /// NOT of NULL is NULL, so a NULL row is in neither `x` nor `NOT x`: each
+    /// negated comparison keeps its column's guard outside the negation.
+    #[test]
+    fn not_keeps_a_null_row_out_of_both_answers() {
+        let flag = nullable::flag_column_name("country");
+        assert_eq!(rwn("NOT (country = 'x')"), format!("({flag} = 0 AND country != 'x')"));
+        assert_eq!(
+            rwn("NOT (country LIKE 'x%')"),
+            format!("( {flag} = 0 AND NOT country STARTSWITH 'x' )")
+        );
+        assert_eq!(rwn("country NOT LIKE 'x%'"), format!("({flag} = 0 AND NOT country STARTSWITH 'x')"));
+        assert_eq!(rwn("NOT (country IS NULL)"), format!("{flag} = 0"));
+        assert_eq!(rwn("country NOTNULL"), format!("{flag} = 0"));
+    }
+
+    fn document_schema() -> SmallVec<[SchemaField; 20]> {
+        let mut s = schema();
+        s.push(SchemaField::new("doc".to_string(), DbType::JSONB, 0, 0, s.len() as u64, false));
+        s.push(SchemaField::new(
+            nullable::flag_column_name("doc"),
+            DbType::BOOL,
+            1,
+            0,
+            s.len() as u64,
+            false,
+        ));
+        s
+    }
+
+    /// `IN`, `IS NULL`, `BETWEEN` and `NOT LIKE` over a JSON path read the
+    /// whole path as their operand; they used to see only `doc` and leave the
+    /// keyword for the engine to refuse.
+    #[test]
+    fn sugar_over_a_json_path_reads_the_whole_path() {
+        let rd = |clause: &str| rewrite_where(clause, &document_schema()).unwrap();
+        let flag = nullable::flag_column_name("doc");
+        assert_eq!(
+            rd("doc->>'a' IN ('x','y')"),
+            format!("({flag} = 0 AND (doc ->> 'a' = 'x' OR doc ->> 'a' = 'y'))")
+        );
+        assert_eq!(rd("(doc->>'a') NOT IN ('x')"), format!("({flag} = 0 AND (doc ->> 'a' != 'x'))"));
+        assert_eq!(rd("doc->>'a' NOT IN ('x', NULL)"), CONSTANT_FALSE);
+        assert_eq!(rd("doc->>'a' IN ()"), CONSTANT_FALSE);
+        assert_eq!(rd("doc->'b'->>'c' IS NULL"), format!("({flag} = 1 OR doc -> 'b' ->> 'c' ISNULL)"));
+        assert_eq!(rd("doc #>> '{b,c}' NOTNULL"), format!("({flag} = 0 AND doc #>> '{{b,c}}' NOTNULL)"));
+        assert_eq!(
+            rd("doc->>'a' BETWEEN 'a' AND 'x'"),
+            format!("({flag} = 0 AND (doc ->> 'a' >= 'a' AND doc ->> 'a' <= 'x'))")
+        );
+        assert_eq!(rd("doc->>'a' NOT LIKE 'x%'"), format!("({flag} = 0 AND NOT doc ->> 'a' LIKE 'x%')"));
+        assert_eq!(rd("NOT (doc ? 'k')"), format!("( {flag} = 0 AND NOT doc ? 'k' )"));
+        assert_eq!(rd("NOT (doc->>'a' IS NULL)"), format!("({flag} = 0 AND doc ->> 'a' NOTNULL)"));
+        // A path on the right of the operator stays inside the guard.
+        assert_eq!(rd("'1' = doc->'n'"), format!("({flag} = 0 AND '1' = doc -> 'n')"));
     }
 
     #[test]
@@ -2882,41 +3418,6 @@ mod tests {
 
     fn rwn(clause: &str) -> String {
         rewrite_where(clause, &nullable_schema()).unwrap()
-    }
-
-    fn document_schema() -> SmallVec<[SchemaField; 20]> {
-        let mut s = schema();
-        s.push(SchemaField::new("doc".to_string(), DbType::JSONB, 0, 0, s.len() as u64, false));
-        s.push(SchemaField::new(
-            nullable::flag_column_name("doc"),
-            DbType::BOOL,
-            1,
-            0,
-            s.len() as u64,
-            false,
-        ));
-        s
-    }
-
-    /// A path after a column on the right of the operator is part of the
-    /// operand and stays inside the column's guard.
-    #[test]
-    fn a_path_on_the_right_stays_inside_the_guard() {
-        let rd = |clause: &str| rewrite_where(clause, &document_schema()).unwrap();
-        let flag = nullable::flag_column_name("doc");
-        assert_eq!(rd("'1' = doc->'n'"), format!("({flag} = 0 AND '1' = doc -> 'n')"));
-    }
-
-    /// `IS [NOT] NULL` over a JSON path reads the whole path as its operand;
-    /// it used to see only `doc` and leave the `IS` for the engine to refuse.
-    #[test]
-    fn is_null_over_a_json_path_reads_the_whole_path() {
-        let rd = |clause: &str| rewrite_where(clause, &document_schema()).unwrap();
-        let flag = nullable::flag_column_name("doc");
-        assert_eq!(rd("doc->'b'->>'c' IS NULL"), format!("({flag} = 1 OR doc -> 'b' ->> 'c' ISNULL)"));
-        assert_eq!(rd("(doc->>'a') IS NOT NULL"), format!("({flag} = 0 AND doc ->> 'a' NOTNULL)"));
-        assert_eq!(rd("doc #>> '{b,c}' NOTNULL"), format!("({flag} = 0 AND doc #>> '{{b,c}}' NOTNULL)"));
-        assert_eq!(rd("doc ISNULL"), format!("{flag} = 1"));
     }
 
     #[test]

@@ -87,6 +87,13 @@ fn document(r: &mut Lcg) -> String {
 fn predicate(r: &mut Lcg) -> String {
     fn atom(r: &mut Lcg) -> String {
         match r.below(24) {
+            14 => format!("NOT ({})", atom(r)),
+            15 => format!(
+                "doc->>'status' {}IN ('{}', '{}')",
+                if r.below(2) == 0 { "NOT " } else { "" },
+                STATUSES[r.below(5) as usize],
+                STATUSES[r.below(5) as usize]
+            ),
             16 => format!(
                 "{} IS {}NULL",
                 ["doc->>'label'", "doc->'label'", "doc->>'promo'", "doc->'user'->>'name'"][r.below(4) as usize],
@@ -96,6 +103,9 @@ fn predicate(r: &mut Lcg) -> String {
             18 => format!("doc->'cat' = '{}'", { let n = r.below(10); number(r, n) }),
             19 => format!("doc = '[\"t{}\", {}]'", r.below(6), { let n = r.below(4); number(r, n) }),
             20 => format!("doc = '\"{}\"'", STATUSES[r.below(5) as usize]),
+            21 => "doc->>'status' BETWEEN 'd' AND 'p'".into(),
+            22 => format!("doc->>'status' NOT LIKE '{}%'", &STATUSES[r.below(5) as usize][..1]),
+            23 => format!("NOT doc->>'status' = '{}'", STATUSES[r.below(5) as usize]),
             _ => old_atom(r),
         }
     }

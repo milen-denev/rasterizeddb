@@ -82,6 +82,14 @@ pub struct ColumnTransformer {
     /// list is read from a column, since that one differs per row.
     pub key_list: Option<std::sync::Arc<crate::core::pg_ops::KeyList>>,
 
+    /// `NOT` over this comparison: true where the comparison is false.
+    ///
+    /// Only for an operator that has no complement to rewrite it to — `NOT
+    /// (t LIKE 'p%')`, `NOT (doc ? 'k')` — since `NOT (a = 1)` is written
+    /// `a != 1` before it gets here. NULL stays NULL: a path that reaches
+    /// nothing answers false whether or not this is set, and a nullable
+    /// column is guarded by its companion in the rewritten clause.
+    pub negated: bool,
     /// `IS NULL` (`Some(true)`) or `IS NOT NULL` (`Some(false)`) over a
     /// path, which answers by whether the path reached a value rather than by
     /// comparing one. A column's NULL is its companion's, so this is never set
@@ -112,6 +120,7 @@ impl Clone for ColumnTransformer {
             group_closes: self.group_closes,
             in_set: self.in_set.clone(),
             key_list: self.key_list.clone(),
+            negated: self.negated,
             null_test: self.null_test,
         }
     }
@@ -268,6 +277,7 @@ impl ColumnTransformer {
             group_closes: 0,
             in_set: None,
             key_list: None,
+            negated: false,
             null_test: None,
         }
     }
@@ -388,8 +398,9 @@ impl ColumnTransformer {
                 Ok(Either::Right((null_operand == want_null, self.next.clone())))
             }
             // A comparison with SQL NULL is NULL, and a WHERE clause keeps only
-            // the rows where it is true — so the row does not match. That one
-            // rule covers `=`, `<>`, the ordered operators, LIKE and
+            // the rows where it is true — so the row does not match, and a
+            // negated comparison does not match either: NOT of NULL is NULL.
+            // That one rule covers `=`, `<>`, the ordered operators, LIKE and
             // the structural operators alike. An absent key used to read as
             // the empty string, so `doc->>'a' <> 'z'` and `doc->>'a' LIKE '%'`
             // returned every row with no `a` at all.
@@ -404,7 +415,7 @@ impl ColumnTransformer {
             }
             ColumnTransformerType::ComparerOperation(_) if self.in_set.is_some() => {
                 let set = self.in_set.as_ref().expect("guarded");
-                Ok(Either::Right((set.matches(input1)?, self.next.clone())))
+                Ok(Either::Right((set.matches(input1)? != self.negated, self.next.clone())))
             }
             ColumnTransformerType::ComparerOperation(ref operation) => {
                 // `?|` / `?&` against a literal list split at plan time; the
@@ -418,7 +429,10 @@ impl ColumnTransformer {
                 } else {
                     perform_comparison_operation(input1, input2, &self.column_type, operation)?
                 };
-                Ok(Either::Right((holds, self.next.clone())))
+                // `NOT` over an operator with no complementary operator —
+                // LIKE, `?`, `@>` — is applied here, after the NULL test
+                // above, so it negates only a true or false answer.
+                Ok(Either::Right((holds != self.negated, self.next.clone())))
             }
         }
     }
@@ -991,6 +1005,7 @@ fn in_set_member(t: &ColumnTransformer) -> Option<(bool, usize, &DbType)> {
         _ => return None,
     };
     if t.in_set.is_some()
+        || t.negated
         || t.null_test.is_some()
         || t.result_index_1.is_some()
         || t.column_1_path.is_some()
@@ -1295,6 +1310,13 @@ impl<'a> TransformerProcessor<'a> {
     pub fn set_last_key_list(&mut self, keys: crate::core::pg_ops::KeyList) {
         if let Some(t) = self.transformers.last_mut() {
             t.key_list = Some(std::sync::Arc::new(keys));
+        }
+    }
+
+    /// Negates the comparison just added; see [`ColumnTransformer::negated`].
+    pub fn set_last_negated(&mut self) {
+        if let Some(t) = self.transformers.last_mut() {
+            t.negated = true;
         }
     }
 
@@ -2611,21 +2633,21 @@ mod json_row_path {
         assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
     }
 
-    /// `NOT` over a structural operator is refused before planning rather than
-    /// complemented. That is what makes answering `false` for NULL sound: were
-    /// it ever rendered as a complement, a NULL row would start matching
-    /// `NOT (doc @> x)`, where PostgreSQL returns no row.
+    /// `NOT` over a structural operator negates only a true or false answer.
+    /// It used to be refused, because answering `false` for NULL is sound only
+    /// while nothing complements that answer: a NULL row would otherwise start
+    /// matching `NOT (doc @> x)`, where PostgreSQL returns no row. It plans
+    /// now, with the NULL document guarded outside the negation and a path
+    /// that reaches nothing left NULL by the evaluator. PostgreSQL 17 returns
+    /// 3, 4, 5 and 5 for these over the same rows.
     #[test]
-    fn not_over_a_structural_operator_is_refused_rather_than_complemented() {
+    fn not_over_a_structural_operator_leaves_null_rows_out() {
         let t = table();
-        for clause in [r#"NOT (doc @> '{"a":1}')"#, r#"NOT (doc->'tags' @> '["x"]')"#] {
-            let got = select(clause, &t);
-            assert!(
-                got.as_ref().is_err_and(|e| e.contains("NOT")),
-                "{}: {:?} — if this now plans, check that the NULL row is excluded",
-                clause,
-                got
-            );
+        for (clause, want) in [
+            (r#"NOT (doc @> '{"a":1}')"#, vec![3, 4, 5]),
+            (r#"NOT (doc->'tags' @> '["x"]')"#, vec![5]),
+        ] {
+            assert_eq!(select(clause, &t), Ok(want), "{}", clause);
         }
     }
 

@@ -567,6 +567,18 @@ fn tokenize_inner<'a>(
                     continue;
                 }
 
+                // `NOT` before one comparison, which the rewrite emits only
+                // where an operator has no complement to become. An `Ident`
+                // rather than a `Next`, so the index extractors read it as part
+                // of the comparison it negates — an opaque one — rather than
+                // as a connective they do not know.
+                if id_lower == "not" && field_named(schema, id).is_none() {
+                    out.push(Token::Ident(("NOT".to_string(), DbType::BOOL, 0)));
+                    expression_type_context = None;
+                    current_field_context = None;
+                    continue;
+                }
+
                 // Check if this is a field name in the schema
                 if let Some(field) = field_named(schema, id) {
                     let (canonical_name, field_type, write_order) =
