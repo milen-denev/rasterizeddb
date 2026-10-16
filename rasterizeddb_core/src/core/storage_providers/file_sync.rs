@@ -67,11 +67,29 @@ struct CommitState {
     /// does not cover them. The failure used to be discarded and the sequence
     /// published as durable anyway, which on the no-log path is the only
     /// durability mechanism reporting a success it did not have.
-    poisoned: OnceLock<String>,
+    poisoned: OnceLock<Poison>,
     /// Makes the next flush fail as a failed `fdatasync` would. Tests only:
     /// there is no portable way to make a real file's flush fail on demand.
     #[cfg(test)]
     fail_next_flush: AtomicBool,
+}
+
+/// Why a file stopped being durable.
+struct Poison {
+    why: String,
+    /// The file was no longer at its path when the first flush tried to open
+    /// it: unlinked by `DROP TABLE` or `DROP DATABASE` while a writer still
+    /// held its handle. Such a failure poisons the file, so its own commits
+    /// are refused, but it is not recorded against the directory — the
+    /// unlinked bytes are unreachable whether or not they were flushed, so
+    /// no commit of a sibling can name lost data. Recording it did harm: a
+    /// dropped database's maintenance tasks keep writing after the drop has
+    /// forgotten its failures, and the record they left refused every commit
+    /// of a database recreated under the same name.
+    ///
+    /// Inside the `OnceLock` with the reason, not beside it, so whoever sees
+    /// the poison sees whether it was this kind.
+    file_gone: bool,
 }
 
 /// Database directories in which some data file has failed a flush.
@@ -144,8 +162,8 @@ impl CommitState {
     /// Returns once every append up to `seq` is on stable storage, or the
     /// error that means it never will be.
     fn flush_through(&self, seq: u64, path: &str) -> io::Result<()> {
-        if let Some(why) = self.poisoned.get() {
-            return Err(Self::poisoned_error(why));
+        if let Some(poison) = self.poisoned.get() {
+            return Err(Self::poisoned_error(&poison.why));
         }
         if self.durable.load(Ordering::Acquire) >= seq {
             return Ok(()); // an earlier flush already covered us
@@ -168,7 +186,13 @@ impl CommitState {
                 Ok(file) => {
                     let _ = self.handle.set(file);
                 }
-                Err(e) => return Err(self.poison(format!("open {} for flush: {}", path, e))),
+                Err(e) => {
+                    let file_gone = e.kind() == io::ErrorKind::NotFound;
+                    return Err(self.poison_with(
+                        format!("open {} for flush: {}", path, e),
+                        file_gone,
+                    ));
+                }
             }
         }
         let file = self.handle.get().expect("set just above");
@@ -195,9 +219,21 @@ impl CommitState {
 
     /// Records the first failure and returns it as the permanent kind.
     fn poison(&self, why: String) -> io::Error {
+        self.poison_with(why, false)
+    }
+
+    /// [`Self::poison`], saying whether the cause was the file being gone.
+    fn poison_with(&self, why: String, file_gone: bool) -> io::Error {
         error!("flush failed; file is no longer durable: {}", why);
-        let why = self.poisoned.get_or_init(|| why);
-        Self::poisoned_error(why)
+        let poison = self.poisoned.get_or_init(|| Poison { why, file_gone });
+        Self::poisoned_error(&poison.why)
+    }
+
+    /// Whether this file's failure belongs to its directory too: every
+    /// failure except a file that had already been unlinked (see
+    /// [`Poison::file_gone`]).
+    fn poison_concerns_directory(&self) -> bool {
+        self.poisoned.get().is_some_and(|p| !p.file_gone)
     }
 
     fn poisoned_error(why: &str) -> io::Error {
@@ -206,7 +242,7 @@ impl CommitState {
 
     /// The failure that stopped this file being durable, if one happened.
     fn poison_error(&self) -> Option<io::Error> {
-        self.poisoned.get().map(|why| Self::poisoned_error(why))
+        self.poisoned.get().map(|p| Self::poisoned_error(&p.why))
     }
 }
 
@@ -1234,10 +1270,13 @@ impl LocalStorageProvider {
     /// every statement runs before it reports success.
     ///
     /// Recorded against the directory as well as the file — see
-    /// [`FAILED_DIRECTORIES`] for why the file alone is not enough.
+    /// [`FAILED_DIRECTORIES`] for why the file alone is not enough — unless
+    /// the file had been unlinked, which loses nothing a sibling could name.
     #[inline]
     fn flush_self(&self, seq: u64) {
-        if let Err(e) = self.commit.flush_through(seq, &self.file_str) {
+        if let Err(e) = self.commit.flush_through(seq, &self.file_str)
+            && self.commit.poison_concerns_directory()
+        {
             record_directory_failure(&self.location, e.to_string());
         }
     }
@@ -3115,6 +3154,52 @@ mod test {
 
         forget_directory_failure(&location);
         assert_eq!(directory_flush_failure(&location), None);
+    }
+
+    /// A file unlinked under a writer — `DROP TABLE` with a task still
+    /// holding its handle — fails its own commits but not its siblings'.
+    ///
+    /// Its bytes are unreachable whether or not they were flushed, so no
+    /// pointer elsewhere can name lost data. Charging the directory with it
+    /// refused every commit in a healthy database.
+    #[tokio::test]
+    async fn an_unlinked_file_s_failed_flush_is_not_the_directory_s() {
+        use super::directory_flush_failure;
+        use crate::core::storage_providers::traits::is_poisoned;
+
+        let dir = tempfile::tempdir().unwrap();
+        let location = dir.path().to_str().unwrap().to_string();
+        assert!(crate::core::wal::wal_for(&location).is_none());
+        let dropped = LocalStorageProvider::new(&location, Some("dropped.db")).await;
+        let sibling = LocalStorageProvider::new(&location, Some("sibling.db")).await;
+
+        std::fs::remove_file(dir.path().join("dropped.db")).unwrap();
+        let (_, token) = dropped.append_data_txn(dropped.begin_txn(), b"late").await;
+        let err = dropped
+            .commit_durable(token)
+            .await
+            .expect_err("a write to an unlinked file was acknowledged as durable");
+        assert!(is_poisoned(&err), "{err}");
+        assert_eq!(directory_flush_failure(&location), None);
+
+        let (_, token) = sibling.append_data_txn(sibling.begin_txn(), b"row").await;
+        sibling
+            .commit_durable(token)
+            .await
+            .expect("a sibling's commit was refused for an unlinked file's flush");
+
+        // Only a missing file is excused. Any other failure to open it may
+        // leave bytes a sibling names unflushed, and stays the directory's.
+        let blocked = LocalStorageProvider::new(&location, Some("blocked.db")).await;
+        std::fs::remove_file(dir.path().join("blocked.db")).unwrap();
+        std::fs::create_dir(dir.path().join("blocked.db")).unwrap();
+        let (_, token) = blocked.append_data_txn(blocked.begin_txn(), b"row").await;
+        assert!(blocked.commit_durable(token).await.is_err());
+        assert!(
+            directory_flush_failure(&location).is_some(),
+            "a flush that failed with the file still there was not charged to its directory"
+        );
+        super::forget_directory_failure(&location);
     }
 
     #[tokio::test]

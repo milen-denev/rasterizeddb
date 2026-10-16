@@ -792,6 +792,65 @@ mod tests {
             .await
             .expect("a commit in the recreated database was refused for the dropped one's failure");
     }
+
+    /// The same, for a failure the dropped database records *after* the drop.
+    ///
+    /// The drop does not stop the database's vacuum or filter-checkpoint
+    /// tasks, and once its log is out of the registry their writes take the
+    /// no-log path and flush by opening the file's path — which the drop has
+    /// deleted. That failed open was recorded against the directory after the
+    /// drop had forgotten it, so the recreated database refused every commit
+    /// for files nobody could read any more.
+    #[tokio::test]
+    async fn a_late_write_from_a_dropped_database_does_not_poison_its_successor() {
+        use crate::core::storage_providers::file_sync::{
+            LocalStorageProvider, directory_flush_failure,
+        };
+        use crate::core::storage_providers::traits::{StorageIO, is_poisoned};
+
+        init_globals();
+        let root = tempfile::tempdir().unwrap();
+        let catalogue =
+            DatabaseCatalog::open(Some(root.path().to_str().unwrap()), DEFAULT_DATABASE_NAME)
+                .await
+                .unwrap();
+        catalogue.create("late").await.unwrap();
+        let dir = root.path().join("late").to_string_lossy().to_string();
+
+        // A maintenance task's handle on one of the database's files, opened
+        // while it existed and never flushed directly.
+        let survivor = LocalStorageProvider::new(&dir, Some("late_vacuum.db")).await;
+
+        catalogue
+            .drop_database("late", DEFAULT_DATABASE_NAME)
+            .await
+            .unwrap();
+        assert!(!root.path().join("late").exists(), "the drop removes the directory");
+
+        // Two late writes: the first finds the file gone, the second finds
+        // the file already poisoned. Neither may reach the directory.
+        for _ in 0..2 {
+            let (_, token) = survivor
+                .append_data_txn(survivor.begin_txn(), b"late")
+                .await;
+            // The dead file's own commits stay refused: they are not durable.
+            let err = survivor
+                .commit_durable(token)
+                .await
+                .expect_err("a write to an unlinked file was acknowledged as durable");
+            assert!(is_poisoned(&err), "{err}");
+        }
+        assert_eq!(directory_flush_failure(&dir), None);
+
+        catalogue.create("late").await.unwrap();
+        assert_eq!(directory_flush_failure(&dir), None);
+        let provider = LocalStorageProvider::new(&dir, Some("fresh.db")).await;
+        let (_, token) = provider.append_data_txn(provider.begin_txn(), b"row").await;
+        provider
+            .commit_durable(token)
+            .await
+            .expect("a commit in the recreated database was refused for the dropped one's late write");
+    }
 }
 
 #[cfg(test)]
