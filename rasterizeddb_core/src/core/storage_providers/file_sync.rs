@@ -68,6 +68,70 @@ struct CommitState {
     /// published as durable anyway, which on the no-log path is the only
     /// durability mechanism reporting a success it did not have.
     poisoned: OnceLock<String>,
+    /// Makes the next flush fail as a failed `fdatasync` would. Tests only:
+    /// there is no portable way to make a real file's flush fail on demand.
+    #[cfg(test)]
+    fail_next_flush: AtomicBool,
+}
+
+/// Database directories in which some data file has failed a flush.
+///
+/// A flush failure poisons the file it happened on, but that file is often
+/// not the one whose commit decides whether a statement succeeded. An INSERT
+/// writes its row bytes to one file and commits through the *pointers* file,
+/// so a rows file that could not be flushed went unnoticed: the pointer became
+/// durable and named row bytes that were not. The failure is therefore also
+/// recorded against the directory, and every commit in that directory checks
+/// it — the same scope the log's own poisoning has.
+static FAILED_DIRECTORIES: OnceLock<Mutex<std::collections::HashMap<String, String>>> =
+    OnceLock::new();
+
+/// Set once anything is in [`FAILED_DIRECTORIES`], so a commit in a healthy
+/// process pays one load rather than a lock.
+static ANY_DIRECTORY_FAILED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn record_directory_failure(location: &str, why: String) {
+    let mut failed = FAILED_DIRECTORIES
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock();
+    failed
+        .entry(crate::core::wal::dir_key(location))
+        .or_insert(why);
+    ANY_DIRECTORY_FAILED.store(true, Ordering::Release);
+}
+
+/// Forgets a recorded flush failure for `location`, whose files are going away.
+///
+/// For `DROP DATABASE` only. The failure describes files in that directory,
+/// and once they are unlinked it describes nothing — but `CREATE DATABASE`
+/// reuses the same path, and a remembered failure would refuse every commit
+/// of the new, healthy database until the process restarted. The log registry
+/// forgets a dropped database's poisoned log for the same reason, and the two
+/// must agree.
+pub fn forget_directory_failure(location: &str) {
+    let Some(failed) = FAILED_DIRECTORIES.get() else {
+        return;
+    };
+    let mut failed = failed.lock();
+    failed.remove(&crate::core::wal::dir_key(location));
+    // Under the lock that `record_directory_failure` raises it under, so a
+    // failure recorded concurrently elsewhere cannot be hidden by this.
+    ANY_DIRECTORY_FAILED.store(!failed.is_empty(), Ordering::Release);
+}
+
+/// The first flush failure of any data file in `location`, if there was one.
+///
+/// Permanent for the life of the process, like the poisoning it reports,
+/// unless the database is dropped (see [`forget_directory_failure`]).
+pub fn directory_flush_failure(location: &str) -> Option<String> {
+    if !ANY_DIRECTORY_FAILED.load(Ordering::Acquire) {
+        return None;
+    }
+    FAILED_DIRECTORIES
+        .get()?
+        .lock()
+        .get(&crate::core::wal::dir_key(location))
+        .cloned()
 }
 
 impl CommitState {
@@ -113,7 +177,15 @@ impl CommitState {
         // needs its bytes and the new file size durable to be readable after a
         // crash. Forcing out mtime/ctime costs an extra journal transaction and
         // buys nothing here.
-        if let Err(e) = file.sync_data() {
+        #[cfg(test)]
+        let flushed = if self.fail_next_flush.swap(false, Ordering::AcqRel) {
+            Err(io::Error::other("injected fdatasync failure"))
+        } else {
+            file.sync_data()
+        };
+        #[cfg(not(test))]
+        let flushed = file.sync_data();
+        if let Err(e) = flushed {
             return Err(self.poison(format!("fdatasync {}: {}", path, e)));
         }
 
@@ -223,8 +295,40 @@ impl LocalStorageProvider {
         if let Some(e) = self.commit.poison_error() {
             return Err(e);
         }
-        // An append in this transaction failed and was rolled back.
-        if let Some(e) = failed_appends::take(&self.file_str, token) {
+        // An append in this transaction failed and was rolled back. Taken
+        // before the refusals below, which would otherwise leave it recorded.
+        let failed = failed_appends::take(&self.file_str, token);
+        // A sibling file in the same directory failing its flush is this
+        // commit's failure too: the pointer committed here may name bytes in
+        // that file which never reached the disk.
+        if let Some(why) = directory_flush_failure(&self.location) {
+            return Err(io::Error::other(format!(
+                "{}: a data file in {} could not be flushed ({})",
+                super::traits::POISONED_LOG,
+                self.location,
+                why
+            )));
+        }
+        // A poisoned log refuses every commit, and a non-zero token is refused
+        // by the log itself below. Asked here for the rest, because `0` does
+        // not mean "nothing to do with the log": it is also what a bulk load
+        // or an append that fell back to a direct flush hands back. A poisoned
+        // log is never dropped again, so a restart replays every committed
+        // record still in it — over whatever was written directly since.
+        // Acknowledging such a write is a revert waiting for the next restart.
+        // A failed write is reported as the permanent kind too, since retrying
+        // it on this log cannot succeed.
+        if (token == 0 || failed.is_some())
+            && let Some(why) = self.wal_poison_reason()
+        {
+            return Err(io::Error::other(format!(
+                "{}: the log of {} is poisoned ({})",
+                super::traits::POISONED_LOG,
+                self.location,
+                why
+            )));
+        }
+        if let Some(e) = failed {
             return Err(e);
         }
         // Staged appends (`append_data(.., false)`) sit in the `.tmp` sidecar,
@@ -1128,9 +1232,28 @@ impl LocalStorageProvider {
     /// The failure is recorded rather than returned — the append paths that
     /// call this cannot report one — and surfaces from `commit_durable`, which
     /// every statement runs before it reports success.
+    ///
+    /// Recorded against the directory as well as the file — see
+    /// [`FAILED_DIRECTORIES`] for why the file alone is not enough.
     #[inline]
     fn flush_self(&self, seq: u64) {
-        let _ = self.commit.flush_through(seq, &self.file_str);
+        if let Err(e) = self.commit.flush_through(seq, &self.file_str) {
+            record_directory_failure(&self.location, e.to_string());
+        }
+    }
+
+    /// Makes this file's next flush fail. Tests only.
+    #[cfg(test)]
+    pub(crate) fn fail_next_flush_for_tests(&self) {
+        self.commit.fail_next_flush.store(true, Ordering::Release);
+    }
+
+    /// The reason this directory's log is poisoned, if it has one and it is.
+    fn wal_poison_reason(&self) -> Option<String> {
+        crate::core::wal::with_wal_for(&self.location, |w| {
+            w.filter(|w| w.is_poisoned())
+                .map(|w| w.poison_reason().unwrap_or_else(|| "reason not recorded".into()))
+        })
     }
 
     /// Publishes this file so a replay can find it by path.
@@ -1529,6 +1652,8 @@ impl StorageIO for LocalStorageProvider {
             crate::core::wal::with_wal_for(&self.location, |w| match w {
                 Some(w) => match w.log(txn, self.wal_file_id(), offset, buffer) {
                     Ok(_) => txn,
+                    // The `0` this falls back to is refused by
+                    // `commit_durable` when the failure poisoned the log.
                     Err(e) => {
                         error!(
                             "WAL append failed ({}); flushing {} directly",
@@ -2897,6 +3022,99 @@ mod test {
             .await
             .expect("the writer must be able to read back what it just wrote");
         assert_eq!(buf, payload);
+    }
+
+    /// Once the log is poisoned, no write may be acknowledged — whatever token
+    /// it hands to `commit_durable`.
+    ///
+    /// The poisoned log is never dropped again, so a restart replays every
+    /// committed record in it. A write that fell back to the data file, or a
+    /// direct write that returned `0`, and reported success was therefore
+    /// reverted at the next restart by the older record for the same offset:
+    /// an acknowledged UPDATE or DELETE silently undone.
+    #[tokio::test]
+    async fn a_write_after_the_log_is_poisoned_is_refused_not_reverted_later() {
+        use crate::core::wal::test_hooks;
+
+        let dir = tempfile::tempdir().unwrap();
+        let location = dir.path().to_str().unwrap().to_string();
+        let wal = std::sync::Arc::new(
+            crate::core::wal::Wal::open(dir.path().join("rastdb.wal")).unwrap(),
+        );
+        crate::core::wal::install_for(&location, wal.clone());
+
+        let provider = LocalStorageProvider::new(&location, Some("revert.db")).await;
+
+        // T1: committed and applied, and still in the log.
+        let txn = provider.begin_txn();
+        let token = provider.write_data_txn(txn, 0, b"committed").await;
+        provider.commit_durable(token).await.unwrap();
+
+        // T2: same offset, and its log append fails partway and cannot be cut
+        // back, which poisons the log.
+        test_hooks::SHORT_WAL_WRITE.with(|h| h.set(Some(3)));
+        test_hooks::FAIL_WAL_ROLLBACK.with(|f| f.set(true));
+        let txn = provider.begin_txn();
+        let token = provider.write_data_txn(txn, 0, b"refused!!").await;
+        test_hooks::SHORT_WAL_WRITE.with(|h| h.set(None));
+        test_hooks::FAIL_WAL_ROLLBACK.with(|f| f.set(false));
+        let outcome = provider.commit_durable(token).await;
+        assert!(wal.is_poisoned());
+        let err = outcome.expect_err(
+            "an in-place write that could not be logged was acknowledged over a poisoned log",
+        );
+        assert!(crate::core::storage_providers::traits::is_poisoned(&err), "{err}");
+        // Nor may the refused bytes be in the file: a failed statement must not
+        // be visible to every later read in this process.
+        assert_eq!(std::fs::read(dir.path().join("revert.db")).unwrap(), b"committed");
+
+        // An append whose record the poisoned log will not take falls back to
+        // a direct flush, and must be refused rather than acknowledged.
+        test_hooks::SHORT_WAL_WRITE.with(|h| h.set(Some(3)));
+        let txn = provider.begin_txn();
+        let (_, token) = provider.append_data_txn(txn, b"appended").await;
+        test_hooks::SHORT_WAL_WRITE.with(|h| h.set(None));
+        let err = provider.commit_durable(token).await.expect_err(
+            "an append that could not be logged was acknowledged over a poisoned log",
+        );
+        assert!(crate::core::storage_providers::traits::is_poisoned(&err), "{err}");
+
+        // And `0`, which a bulk load or any other direct write hands back,
+        // is no way around it.
+        let err = provider
+            .commit_durable(0)
+            .await
+            .expect_err("a token of 0 was acknowledged over a poisoned log");
+        assert!(crate::core::storage_providers::traits::is_poisoned(&err), "{err}");
+
+        crate::core::wal::remove_for(&location);
+    }
+
+    /// A data-file flush failure is the whole directory's: a commit through
+    /// another file there may name the bytes that were lost.
+    #[tokio::test]
+    async fn a_flush_failure_refuses_commits_on_every_file_in_its_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let location = dir.path().to_str().unwrap().to_string();
+        assert!(crate::core::wal::wal_for(&location).is_none());
+        let rows = LocalStorageProvider::new(&location, Some("rows.db")).await;
+        let pointers = LocalStorageProvider::new(&location, Some("pointers.db")).await;
+
+        rows.fail_next_flush_for_tests();
+        let (_, token) = rows.append_data_txn(rows.begin_txn(), b"row bytes").await;
+        assert!(rows.commit_durable(token).await.is_err());
+
+        let (_, token) = pointers.append_data_txn(pointers.begin_txn(), b"pointer").await;
+        let err = pointers
+            .commit_durable(token)
+            .await
+            .expect_err("a pointer committed beside row bytes that never reached the disk");
+        assert!(crate::core::storage_providers::traits::is_poisoned(&err), "{err}");
+        use super::{directory_flush_failure, forget_directory_failure};
+        assert!(directory_flush_failure(&location).is_some());
+
+        forget_directory_failure(&location);
+        assert_eq!(directory_flush_failure(&location), None);
     }
 
     #[tokio::test]

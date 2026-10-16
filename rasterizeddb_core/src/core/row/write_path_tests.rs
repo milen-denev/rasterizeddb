@@ -4387,3 +4387,48 @@ async fn two_inserts_at_the_reservation_boundary_are_both_covered() {
     );
     drop((first, second));
 }
+
+/// An INSERT whose row bytes could not be flushed must fail, not commit a
+/// pointer naming bytes that never reached the disk.
+///
+/// The row bytes and the pointer live in different files, and the statement's
+/// success is decided by the *pointers* file's commit alone. A flush failure
+/// on the rows file poisoned only the rows file, so the pointer committed and
+/// the INSERT reported success. No log is installed for this directory, which
+/// is the path where each append flushes its own file.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_row_bytes_flush_fails_the_insert() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_table(dir.path(), "flush_fail").await;
+    let location = dir.path().to_str().unwrap();
+    assert!(
+        crate::core::wal::wal_for(location).is_none(),
+        "this test exercises the path without a log"
+    );
+    insert(&t, 1, 10, "before").await;
+
+    t.io_rows.fail_next_flush_for_tests();
+    let mut rw = RowWrite { columns_writing_data: SmallVec::new() };
+    rw.columns_writing_data.push(payload(&2u64.to_le_bytes(), 0, DbType::U64));
+    rw.columns_writing_data.push(payload(&20i32.to_le_bytes(), 1, DbType::I32));
+    rw.columns_writing_data.push(payload(b"lost", 2, DbType::STRING));
+    assert!(
+        t.insert_row(rw).await.is_err(),
+        "an insert whose row bytes failed to flush reported success"
+    );
+
+    // And every later write in the directory refuses too, for the reason the
+    // log refuses after its own flush fails: a retry can succeed over pages
+    // the kernel already dropped.
+    let mut rw = RowWrite { columns_writing_data: SmallVec::new() };
+    rw.columns_writing_data.push(payload(&3u64.to_le_bytes(), 0, DbType::U64));
+    rw.columns_writing_data.push(payload(&30i32.to_le_bytes(), 1, DbType::I32));
+    rw.columns_writing_data.push(payload(b"after", 2, DbType::STRING));
+    assert!(t.insert_row(rw).await.is_err());
+    assert!(
+        crate::core::storage_providers::file_sync::directory_flush_failure(location).is_some()
+    );
+    // Process-wide state: forgotten so nothing else that reuses the path
+    // inherits it.
+    crate::core::storage_providers::file_sync::forget_directory_failure(location);
+}

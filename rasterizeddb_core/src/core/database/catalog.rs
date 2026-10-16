@@ -389,6 +389,13 @@ impl DatabaseCatalog {
             // keep it, and its open handle to the now-unlinked log file, for the
             // life of the process. Nothing else removes registry entries.
             let _ = crate::core::wal::remove_for(&path.to_string_lossy());
+            // And for the same reason, any data-file flush failure recorded
+            // against it: a database recreated under this name reuses the path,
+            // and would otherwise refuse every commit for a failure in files
+            // that no longer exist.
+            crate::core::storage_providers::file_sync::forget_directory_failure(
+                &path.to_string_lossy(),
+            );
 
             if let Err(e) = tokio::fs::remove_dir_all(&path).await {
                 // The database is gone as far as clients are concerned, so this
@@ -743,6 +750,47 @@ mod tests {
             .drop_database("staging", DEFAULT_DATABASE_NAME)
             .await
             .expect("dropping should succeed once the session has gone");
+    }
+
+    /// A database recreated under a dropped one's name starts healthy.
+    ///
+    /// A data-file flush failure is recorded against the directory, and the
+    /// recreated database reuses that directory's path. Remembered across the
+    /// drop, it refused every commit of the new database — for files that had
+    /// been unlinked — until the process restarted.
+    #[tokio::test]
+    async fn a_recreated_database_does_not_inherit_a_dropped_one_s_flush_failure() {
+        use crate::core::storage_providers::file_sync::{
+            LocalStorageProvider, directory_flush_failure, record_directory_failure,
+        };
+        use crate::core::storage_providers::traits::StorageIO;
+
+        init_globals();
+        let root = tempfile::tempdir().unwrap();
+        let catalogue =
+            DatabaseCatalog::open(Some(root.path().to_str().unwrap()), DEFAULT_DATABASE_NAME)
+                .await
+                .unwrap();
+        catalogue.create("reused").await.unwrap();
+        let dir = root.path().join("reused").to_string_lossy().to_string();
+
+        record_directory_failure(&dir, "injected fdatasync failure".to_string());
+        assert!(directory_flush_failure(&dir).is_some());
+
+        catalogue
+            .drop_database("reused", DEFAULT_DATABASE_NAME)
+            .await
+            .unwrap();
+        catalogue.create("reused").await.unwrap();
+
+        assert_eq!(directory_flush_failure(&dir), None);
+        let provider = LocalStorageProvider::new(&dir, Some("fresh.db")).await;
+        let txn = provider.begin_txn();
+        let (_, token) = provider.append_data_txn(txn, b"row").await;
+        provider
+            .commit_durable(token)
+            .await
+            .expect("a commit in the recreated database was refused for the dropped one's failure");
     }
 }
 
