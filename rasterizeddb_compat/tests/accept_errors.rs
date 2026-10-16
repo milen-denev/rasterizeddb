@@ -88,6 +88,26 @@ fn startup_packet() -> Vec<u8> {
 async fn running_out_of_descriptors_does_not_stop_the_listener() {
     let server = TestServer::start().await.expect("server should start");
 
+    // `TestServer::start` probes the port with a bare connect, and the server
+    // holds that probe's socket and its watch duplicate until it reads the
+    // EOF. Exhausting descriptors before then races the teardown: the two it
+    // frees break the "out of descriptors" premise, or the server's late
+    // accept of the probe takes the one left for the client. Wait for the
+    // count to stop moving, bounded so a server that never settles fails here.
+    let open = || std::fs::read_dir("/proc/self/fd").expect("list descriptors").count();
+    let mut last = open();
+    let mut steady = 0;
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let now = open();
+        steady = if now == last { steady + 1 } else { 0 };
+        last = now;
+        if steady == 10 {
+            break;
+        }
+    }
+    assert_eq!(steady, 10, "the server's descriptors never settled after start");
+
     let mut exhausted = Exhausted::new();
     // One descriptor free, for the client's own socket. The kernel completes
     // the TCP handshake from the backlog, so the connect succeeds; the
