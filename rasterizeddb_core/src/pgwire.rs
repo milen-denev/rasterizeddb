@@ -156,6 +156,130 @@ impl ConnectionLimits {
         }
         Ok(())
     }
+
+    /// These limits with `max_connections` brought within the process's
+    /// descriptor limit, raising the soft limit first if the hard one allows.
+    ///
+    /// The cap exists so that a flood of clients is told `53300` instead of
+    /// running the process out of descriptors. A cap the descriptor limit
+    /// cannot hold defeats that twice over: `accept()` starts failing with
+    /// `EMFILE` before anyone is refused, so new clients wait in the backlog,
+    /// and the engine's own opens — a new table file, a WAL rollover, a
+    /// checkpoint — fail inside sessions that were already admitted. A
+    /// systemd unit's usual soft limit of 1024 runs out at about 480 sessions,
+    /// under the default cap of 500 and before the engine's files are counted.
+    ///
+    /// Lowering the cap is logged as a warning, and `SHOW max_connections`
+    /// reports the value in effect, so an operator can see they did not get
+    /// what they asked for.
+    fn fit_to_descriptor_limit(self) -> Self {
+        #[cfg(unix)]
+        {
+            let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            // SAFETY: a valid out-pointer to an `rlimit`.
+            if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+                log::warn!(
+                    "pgwire could not read the descriptor limit ({}); max_connections {} \
+                     is not checked against it",
+                    io::Error::last_os_error(),
+                    self.max_connections
+                );
+                return self;
+            }
+            let (soft, hard) = (limit.rlim_cur as u64, limit.rlim_max as u64);
+            let plan = plan_descriptors(self.max_connections, soft, hard);
+            let mut in_effect = soft;
+            if let Some(raise_to) = plan.raise_soft_to {
+                let raised = libc::rlimit {
+                    rlim_cur: raise_to as libc::rlim_t,
+                    rlim_max: limit.rlim_max,
+                };
+                // SAFETY: a valid pointer to an `rlimit`; a soft limit at or
+                // below the hard one is always permitted.
+                if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+                    log::info!(
+                        "pgwire raised the open-file soft limit from {} to {} for \
+                         max_connections {}",
+                        soft,
+                        raise_to,
+                        self.max_connections
+                    );
+                    in_effect = raise_to;
+                } else {
+                    log::warn!(
+                        "pgwire could not raise the open-file soft limit from {} to {}: {}",
+                        soft,
+                        raise_to,
+                        io::Error::last_os_error()
+                    );
+                }
+            }
+            let max_connections = connections_within(self.max_connections, in_effect);
+            if max_connections < self.max_connections {
+                log::warn!(
+                    "pgwire max_connections lowered from {} to {}: the open-file limit is {} \
+                     (hard {}), and each connection can hold {} descriptors with {} kept for \
+                     the engine. Raise LimitNOFILE / ulimit -n to serve more.",
+                    self.max_connections,
+                    max_connections,
+                    in_effect,
+                    hard,
+                    FDS_PER_CONNECTION,
+                    RESERVED_SERVER_FDS
+                );
+            }
+            Self { max_connections, ..self }
+        }
+        #[cfg(not(unix))]
+        {
+            self
+        }
+    }
+}
+
+/// Descriptors kept out of the connection budget for everything else the
+/// process opens: table files and their sidecars, the WAL, checkpoint files,
+/// the listener. The same reserve `rastcp`'s server keeps.
+const RESERVED_SERVER_FDS: u64 = 256;
+
+/// What one unit of `max_connections` can cost in descriptors. An admitted
+/// session holds its socket and the duplicate `PEER_WATCH` peeks on, and the
+/// refusals in flight, capped at the same count, each hold the same two.
+const FDS_PER_CONNECTION: u64 = 4;
+
+/// How [`ConnectionLimits::fit_to_descriptor_limit`] meets a requested cap.
+#[derive(Debug, PartialEq, Eq)]
+struct DescriptorPlan {
+    /// The soft limit to ask for, when the current one is short and the hard
+    /// one leaves room to raise it.
+    raise_soft_to: Option<u64>,
+    /// The cap if that raise succeeds (or none was needed).
+    max_connections: usize,
+}
+
+/// The descriptors `requested` connections need, and what to do about a soft
+/// limit that is short of them.
+///
+/// The soft limit is raised only as far as the cap needs, never to the hard
+/// limit wholesale: anything else in the process that still uses `select()`
+/// breaks on a descriptor above 1024, so a larger table is not free.
+fn plan_descriptors(requested: usize, soft: u64, hard: u64) -> DescriptorPlan {
+    let needed = (requested as u64)
+        .saturating_mul(FDS_PER_CONNECTION)
+        .saturating_add(RESERVED_SERVER_FDS);
+    let raise_soft_to = (soft < needed && hard > soft).then(|| needed.min(hard));
+    DescriptorPlan {
+        raise_soft_to,
+        max_connections: connections_within(requested, raise_soft_to.unwrap_or(soft)),
+    }
+}
+
+/// `requested`, lowered to what a soft limit of `soft` descriptors can hold,
+/// and never below one: a server that admits nobody is not a working server,
+/// and the warning says why it may still run short.
+fn connections_within(requested: usize, soft: u64) -> usize {
+    let budget = soft.saturating_sub(RESERVED_SERVER_FDS) / FDS_PER_CONNECTION;
+    (requested as u64).min(budget).max(1) as usize
 }
 
 pub async fn start_pgwire(
@@ -222,6 +346,8 @@ pub async fn start_pgwire_with_limits(
     limits: ConnectionLimits,
 ) -> io::Result<()> {
     limits.validate()?;
+    // From here on `limits` is what is enforced and what `SHOW` reports.
+    let limits = limits.fit_to_descriptor_limit();
 
     // Every database needs its roles before the first connection tries to
     // authenticate: they are per database, so one seeded catalogue does not
@@ -8579,6 +8705,65 @@ fn load_tls_from_pem(
 fn read_cstring(bytes: &[u8]) -> &str {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     std::str::from_utf8(&bytes[..end]).unwrap_or("")
+}
+
+#[cfg(test)]
+mod descriptor_budget_tests {
+    use super::*;
+
+    /// A soft limit short of the cap is raised as far as the cap needs, and
+    /// the cap then stands.
+    #[test]
+    fn a_short_soft_limit_is_raised_to_what_the_cap_needs() {
+        assert_eq!(
+            plan_descriptors(500, 1024, 524_288),
+            DescriptorPlan {
+                raise_soft_to: Some(500 * FDS_PER_CONNECTION + RESERVED_SERVER_FDS),
+                max_connections: 500,
+            }
+        );
+    }
+
+    /// A hard limit the cap cannot fit in lowers the cap, rather than leaving
+    /// a cap that runs the process out of descriptors before it refuses
+    /// anyone.
+    #[test]
+    fn a_hard_limit_too_low_for_the_cap_lowers_it() {
+        assert_eq!(
+            plan_descriptors(500, 1024, 1024),
+            DescriptorPlan {
+                raise_soft_to: None,
+                max_connections: (1024 - RESERVED_SERVER_FDS as usize) / 4,
+            }
+        );
+        assert_eq!(
+            plan_descriptors(500, 1024, 2048),
+            DescriptorPlan {
+                raise_soft_to: Some(2048),
+                max_connections: (2048 - RESERVED_SERVER_FDS as usize) / 4,
+            }
+        );
+    }
+
+    /// Enough descriptors already: nothing is raised and nothing lowered,
+    /// including under an unlimited soft limit.
+    #[test]
+    fn a_sufficient_limit_changes_nothing() {
+        assert_eq!(
+            plan_descriptors(500, 65_536, 65_536),
+            DescriptorPlan { raise_soft_to: None, max_connections: 500 }
+        );
+        assert_eq!(
+            plan_descriptors(usize::MAX, u64::MAX, u64::MAX).raise_soft_to,
+            None
+        );
+    }
+
+    /// A limit below the reserve still admits one session rather than none.
+    #[test]
+    fn the_cap_never_falls_below_one() {
+        assert_eq!(connections_within(500, 64), 1);
+    }
 }
 
 #[cfg(test)]

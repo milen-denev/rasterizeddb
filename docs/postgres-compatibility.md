@@ -421,8 +421,18 @@ These follow PostgreSQL's settings of the same names:
 - **Over `max_connections`** a connection is answered, after its startup
   packet and any TLS negotiation, with `FATAL 53300` "sorry, too many clients
   already". Connections still being refused are capped at the same number
-  again; past that a socket is closed unanswered, so a storm costs at most
-  twice `max_connections` descriptors. There is no unlimited setting.
+  again; past that a socket is closed unanswered. Each connection, admitted
+  or being refused, holds two descriptors, so a storm costs at most four per
+  unit of `max_connections`. There is no unlimited setting.
+- **`max_connections` must fit the open-file limit.** At start-up the server
+  needs `4 × max_connections + 256` descriptors (256 kept for table files, the
+  WAL and checkpoints). If the soft `RLIMIT_NOFILE` is short of that, it is
+  raised as far as needed, up to the hard limit. If the hard limit is short
+  too, `max_connections` is lowered to fit, a warning is logged, and
+  `SHOW max_connections` reports the lowered value. Without this, a cap the
+  limit could not hold ran the process out of descriptors before anyone was
+  refused: `accept()` failed with `EMFILE` and the engine's own file opens
+  failed inside sessions already admitted.
 - **`authentication_timeout`** bounds everything before the session exists —
   the startup packet, TLS and the password exchange. A silent socket is
   closed; one that stalls mid-authentication is told `FATAL 57014`

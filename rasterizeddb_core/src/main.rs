@@ -265,7 +265,9 @@ struct Args {
 
     /// Most pgwire sessions served at once (default: 500). A connection over
     /// it is refused with SQLSTATE 53300, "sorry, too many clients already".
-    /// Must be at least 1: there is no unlimited setting.
+    /// Must be at least 1: there is no unlimited setting. Needs 4n + 256 open
+    /// files: the soft limit is raised to that if the hard limit allows, and
+    /// otherwise the cap is lowered to fit, with a warning.
     #[arg(
         long = "max-connections",
         alias = "max_connections",
