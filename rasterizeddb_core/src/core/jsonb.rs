@@ -1655,12 +1655,16 @@ pub fn json_numbers_equal(a: &serde_json::Number, b: &serde_json::Number) -> boo
 // rendering
 // ---------------------------------------------------------------------------
 
-/// Appends the JSON text of the document `bytes` encodes to `out`.
+/// Appends the text PostgreSQL's `jsonb` output gives the document `bytes`
+/// encodes to `out`.
 ///
-/// Built straight from the encoding: no map inserts, no `String` per key and
-/// value, and string contents copied in runs between the bytes that need
-/// escaping. Numbers print as `numeric` prints them ([`write_numeric_text`]),
-/// which is what PostgreSQL's `->>`, `::text` and `SELECT doc` show.
+/// That is `jsonb_out`'s format, which clients see and compare against: a
+/// space after every `:` and `,` (`{"a": 1, "b": [1, 2]}`), object keys
+/// shorter first and then bytewise (`{"y": 1, "it's": 2}`), and numbers as
+/// `numeric` prints them ([`write_numeric_text`]). The order is only for
+/// printing: keys are stored bytewise because the lookups binary-search them.
+/// The same text answers `->>` of a container, `::text` and `SELECT doc`,
+/// so a predicate on it sees what the client is shown.
 ///
 /// An object whose keys are not strictly ascending, which this module never
 /// writes, is put through `decode` and `encode` first, which re-sort and
@@ -1668,17 +1672,21 @@ pub fn json_numbers_equal(a: &serde_json::Number, b: &serde_json::Number) -> boo
 /// is `decode`'s.
 pub fn render_text_into(bytes: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
     let start = out.len();
-    if render_value(bytes, out).is_ok() {
+    let mut order = Vec::new();
+    if render_value(bytes, out, &mut order).is_ok() {
         return Ok(());
     }
     out.truncate(start);
     let canonical = encode(&decode(bytes)?);
-    render_value(&canonical, out).map_err(|()| "a document could not be rendered as text".to_string())
+    order.clear();
+    render_value(&canonical, out, &mut order)
+        .map_err(|()| "a document could not be rendered as text".to_string())
 }
 
 /// `Err(())` means "render this through `decode` instead", not that the
-/// document is bad.
-fn render_value(bytes: &[u8], out: &mut Vec<u8>) -> Result<(), ()> {
+/// document is bad. `order` is scratch for the objects' printing order, a
+/// stack each object pushes its entries onto and truncates back off.
+fn render_value(bytes: &[u8], out: &mut Vec<u8>, order: &mut Vec<u32>) -> Result<(), ()> {
     match *bytes.first().ok_or(())? {
         TAG_NULL => out.extend_from_slice(b"null"),
         TAG_FALSE => out.extend_from_slice(b"false"),
@@ -1708,34 +1716,54 @@ fn render_value(bytes: &[u8], out: &mut Vec<u8>) -> Result<(), ()> {
             out.push(b'[');
             for index in 0..count {
                 if index > 0 {
-                    out.push(b',');
+                    out.extend_from_slice(b", ");
                 }
                 let entry = table_at + index * ARR_ENTRY;
                 let slice = slice_at(bytes, body_at, entry, entry + 4).map_err(|_| ())?;
-                render_value(slice, out)?;
+                render_value(slice, out, order)?;
             }
             out.push(b']');
         }
         TAG_OBJ => {
             let (count, table_at, body_at) = composite_header(bytes, OBJ_ENTRY).map_err(|_| ())?;
-            out.push(b'{');
+            let key_at = |index: usize| {
+                let entry = table_at + index * OBJ_ENTRY;
+                slice_at(bytes, body_at, entry, entry + 4).map_err(|_| ())
+            };
+            let base = order.len();
             let mut previous: Option<&[u8]> = None;
             for index in 0..count {
-                let entry = table_at + index * OBJ_ENTRY;
-                let key = slice_at(bytes, body_at, entry, entry + 4).map_err(|_| ())?;
+                let key = key_at(index)?;
                 // A map would reorder or merge these; let `decode` do it.
                 if previous.is_some_and(|p| p >= key) {
+                    order.truncate(base);
                     return Err(());
                 }
                 previous = Some(key);
-                if index > 0 {
-                    out.push(b',');
-                }
-                write_json_string(out, std::str::from_utf8(key).map_err(|_| ())?);
-                out.push(b':');
-                let value = slice_at(bytes, body_at, entry + 8, entry + 12).map_err(|_| ())?;
-                render_value(value, out)?;
+                order.push(index as u32);
             }
+            // PostgreSQL's order is by length, then bytewise. Stored order is
+            // bytewise, so among keys of one length it already is theirs, and
+            // sorting by (length, stored position) gives the whole of it.
+            let key_len = |index: u32| {
+                let entry = table_at + index as usize * OBJ_ENTRY + 4;
+                read_u32(bytes, entry).unwrap_or(0)
+            };
+            order[base..].sort_unstable_by_key(|&index| (key_len(index), index));
+            out.push(b'{');
+            for at in 0..count {
+                let index = order[base + at] as usize;
+                if at > 0 {
+                    out.extend_from_slice(b", ");
+                }
+                let key = key_at(index)?;
+                write_json_string(out, std::str::from_utf8(key).map_err(|_| ())?);
+                out.extend_from_slice(b": ");
+                let entry = table_at + index * OBJ_ENTRY;
+                let value = slice_at(bytes, body_at, entry + 8, entry + 12).map_err(|_| ())?;
+                render_value(value, out, order)?;
+            }
+            order.truncate(base);
             out.push(b'}');
         }
         _ => return Err(()),
@@ -2020,13 +2048,14 @@ mod tests {
             Some("true")
         );
         assert_eq!(as_text(get_key(&encoded, "z").unwrap()), None);
+        // PostgreSQL's `jsonb` text: a space after `,` and `:`.
         assert_eq!(
             as_text(get_key(&encoded, "a").unwrap()).as_deref(),
-            Some("[1,2]")
+            Some("[1, 2]")
         );
         assert_eq!(
             as_text(get_key(&encoded, "o").unwrap()).as_deref(),
-            Some("{\"k\":1}")
+            Some("{\"k\": 1}")
         );
     }
 
@@ -2087,7 +2116,7 @@ mod tests {
     /// sits: `encode_text` reads them from the text in step with serde_json,
     /// so strings holding quotes, backslashes and digits, keys, nesting and
     /// re-sorted objects must not put it out of step. The expected text is
-    /// built from PostgreSQL's answers in [`PG_NUMBERS`].
+    /// built from PostgreSQL's answers in [`PG_NUMBERS`], and in its format.
     #[test]
     fn numbers_keep_their_digits_anywhere_in_a_document() {
         const STRINGS: &[(&str, &str)] = &[
@@ -2100,9 +2129,9 @@ mod tests {
             ("true", "true"),
             ("null", "null"),
         ];
-        // Distinct keys, listed in stored order, which is bytewise. Some
-        // hold digits and quotes to tempt a misread.
-        const KEYS: &[&str] = &["", "-1", "1", "a", r#"a\"9"#, "e5", "zz9.5", "é"];
+        // Distinct keys, listed in PostgreSQL's order: shorter first, then
+        // bytewise. Some hold digits and quotes to tempt a misread.
+        const KEYS: &[&str] = &["", "1", "a", "-1", "e5", "é", r#"a\"9"#, "zz9.5"];
         fn generate(rng: &mut fastrand::Rng, depth: u32, text: &mut String, pg: &mut String) {
             let ws = |rng: &mut fastrand::Rng, text: &mut String| {
                 if rng.u8(0..4) == 0 {
@@ -2127,7 +2156,7 @@ mod tests {
                     for i in 0..rng.usize(0..4) {
                         if i > 0 {
                             text.push(',');
-                            pg.push(',');
+                            pg.push_str(", ");
                         }
                         generate(rng, depth - 1, text, pg);
                     }
@@ -2147,9 +2176,9 @@ mod tests {
                     pg.push('{');
                     for (i, (k, (_, p))) in picked.iter().zip(&values).enumerate() {
                         if i > 0 {
-                            pg.push(',');
+                            pg.push_str(", ");
                         }
-                        pg.push_str(&format!("\"{}\":{}", KEYS[*k], p));
+                        pg.push_str(&format!("\"{}\": {}", KEYS[*k], p));
                     }
                     pg.push('}');
                     let mut order: Vec<usize> = (0..picked.len()).collect();
@@ -2740,22 +2769,24 @@ mod render_tests {
         }
     }
 
-    /// The text of a document, written independently of the renderer: no
-    /// spaces, keys bytewise, strings escaped as serde_json escapes them.
+    /// PostgreSQL's `jsonb` text for a document, written independently of
+    /// the renderer: `, ` and `: ` separators, keys shorter first and then
+    /// bytewise, strings escaped as serde_json escapes them (which is what
+    /// `escape_json` does too).
     fn reference(value: &Value) -> String {
         match value {
             Value::Array(items) => {
                 let parts: Vec<String> = items.iter().map(reference).collect();
-                format!("[{}]", parts.join(","))
+                format!("[{}]", parts.join(", "))
             }
             Value::Object(fields) => {
                 let mut keys: Vec<&String> = fields.keys().collect();
-                keys.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+                keys.sort_by(|a, b| a.len().cmp(&b.len()).then(a.as_bytes().cmp(b.as_bytes())));
                 let parts: Vec<String> = keys
                     .iter()
-                    .map(|k| format!("{}:{}", Value::String(k.to_string()), reference(&fields[*k])))
+                    .map(|k| format!("{}: {}", Value::String(k.to_string()), reference(&fields[*k])))
                     .collect();
-                format!("{{{}}}", parts.join(","))
+                format!("{{{}}}", parts.join(", "))
             }
             other => other.to_string(),
         }
@@ -2811,6 +2842,30 @@ mod render_tests {
             assert_eq!(new(&bytes), Ok(reference(&doc)), "{doc}");
             // The text path stores the same document.
             assert_eq!(encode_text(&doc.to_string()), Ok(bytes), "{doc}");
+        }
+    }
+
+    /// PostgreSQL 17's own output for documents that exercise the format:
+    /// `SELECT '<input>'::jsonb::text`.
+    #[test]
+    fn documents_print_as_postgres_prints_them() {
+        for (input, pg) in [
+            (
+                r#"{"b":1,"aa":2,"a":3,"ab":{"y":[1,2,{}],"x":[]},"":null,"é":"x","z":"a\"b\nc"}"#,
+                r#"{"": null, "a": 3, "b": 1, "z": "a\"b\nc", "aa": 2, "ab": {"x": [], "y": [1, 2, {}]}, "é": "x"}"#,
+            ),
+            (r#"{"a":{"y":1,"it's":2}}"#, r#"{"a": {"y": 1, "it's": 2}}"#),
+            (r#"{"y":1.50,"bb":1e2}"#, r#"{"y": 1.50, "bb": 100}"#),
+            (r#"[1, [2,3], {"k":1.50,"jj":[]}]"#, r#"[1, [2, 3], {"k": 1.50, "jj": []}]"#),
+            ("{}", "{}"),
+            ("[]", "[]"),
+            ("[{}]", "[{}]"),
+            (r#"{"a":{}}"#, r#"{"a": {}}"#),
+            ("\"x\\u0001y\u{7f}/\"", "\"x\\u0001y\u{7f}/\""),
+        ] {
+            let mut out = Vec::new();
+            render_text_into(&encode_text(input).unwrap(), &mut out).unwrap();
+            assert_eq!(String::from_utf8(out).unwrap(), pg, "{input}");
         }
     }
 
@@ -2920,7 +2975,7 @@ mod render_tests {
         // A number stored in a form this build would not write prints as
         // PostgreSQL prints its value; `decode` would go through a `f64`.
         for (blob, want) in [
-            (obj(&[(b"a", one.clone()), (b"b", num("1.50"))]), r#"{"a":1,"b":1.50}"#),
+            (obj(&[(b"a", one.clone()), (b"b", num("1.50"))]), r#"{"a": 1, "b": 1.50}"#),
             (num("1e2"), "100"),
             (num("-0"), "0"),
             (num("12345678901234567890123"), "12345678901234567890123"),

@@ -2751,11 +2751,9 @@ mod json_row_path {
         }
         assert!(checked > 100);
 
-        // `->>` against PostgreSQL, case by case. A number keeps the scale
-        // it was written with, as PostgreSQL 17 prints `1.50`. One divergence
-        // is pinned rather than hidden: PostgreSQL prints a container as
-        // `{"j": [1, "a"], "k": 1}`, with a space after each `:` and `,`, and
-        // this engine prints it compact.
+        // `->>` against PostgreSQL 17, case by case: a number keeps the
+        // scale it was written with, and a container prints as `jsonb_out`
+        // prints it, with a space after each `:` and `,`.
         let d = doc(documents[0]);
         let text = |k: &str| text_path(k).extract(&d).map(|b| b.into_slice().to_vec()).unwrap_or_default();
         assert_eq!(text("s"), b"str");
@@ -2769,7 +2767,7 @@ mod json_row_path {
         assert!(text_path("z").extract(&d).is_none());
         assert!(text_path("missing").extract(&d).is_none());
         assert_eq!(text_path("e").extract(&d).map(|b| b.into_slice().to_vec()), Some(Vec::new()));
-        assert_eq!(text("o"), br#"{"j":[1,"a"],"k":1}"#);
+        assert_eq!(text("o"), br#"{"j": [1, "a"], "k": 1}"#);
 
         // A rendered container larger than the scratch keeps must still come
         // out whole, and the next row must not see its leftovers.
@@ -2778,7 +2776,7 @@ mod json_row_path {
         let path = text_path("o");
         assert_eq!(path.extract(&h).unwrap().into_slice(), &reference_extract(&path, &h).unwrap()[..]);
         assert_eq!(text("n"), b"5");
-        assert_eq!(text("o"), br#"{"j":[1,"a"],"k":1}"#);
+        assert_eq!(text("o"), br#"{"j": [1, "a"], "k": 1}"#);
     }
 
 
