@@ -586,6 +586,13 @@ impl BackupService {
         // DATABASE` has one of its own and the copy below excludes live logs at
         // any depth — records left in one would be in neither the copy nor the
         // archive.
+        //
+        // A failure here fails the snapshot, though every healthy log has been
+        // cut by then. A snapshot is one restore point for the whole location,
+        // and a database whose log cannot be cut is one whose data files may
+        // not hold what its log says was committed: published, the snapshot
+        // would restore that database wrong and report nothing amiss. The
+        // error names the database, so the others are not left guessing.
         self.checkpoint_all_logs().await?;
         let opened_at: HashMap<String, u64> = streams
             .iter()
@@ -1340,30 +1347,53 @@ impl BackupService {
         // Every log, not only the root's: a database created with `CREATE
         // DATABASE` keeps its own, and records left in it are recoverable from
         // nowhere. A checkpoint with nothing to do is cheap.
-        self.checkpoint_all_logs().await?;
-        self.flush_staged_segments().await
+        //
+        // The upload runs even when a cut failed. One database's log refusing
+        // to be cut — a poisoned log refuses until restart — says nothing about
+        // the segments every other database has already staged, and stopping
+        // here stopped point-in-time recovery for all of them. The failure is
+        // still the result, so the caller learns which database is not covered.
+        let cut = self.checkpoint_all_logs().await;
+        let uploaded = self.flush_staged_segments().await;
+        match (cut, uploaded) {
+            (Ok(()), uploaded) => uploaded,
+            (Err(cut), Ok(_)) => Err(cut),
+            (Err(cut), Err(upload)) => Err(io::Error::other(format!(
+                "{cut}; and uploading the segments that were staged failed too: {upload}"
+            ))),
+        }
     }
 
     /// Cuts every log under this location, so its records reach staging.
+    ///
+    /// Every log is attempted even after one fails, and the error names each
+    /// that failed. Returning at the first one left every log sorted after it
+    /// uncut, so a single poisoned sub-database stopped the archiving of every
+    /// healthy database beside it until the process restarted.
     async fn checkpoint_all_logs(self: &Arc<Self>) -> io::Result<()> {
+        let mut failed: Vec<String> = Vec::new();
         for (key, wal) in self.log_streams() {
             let w = wal.clone();
-            tokio::task::spawn_blocking(move || w.checkpoint())
+            let outcome = tokio::task::spawn_blocking(move || w.checkpoint())
                 .await
                 .map_err(|e| io::Error::other(e.to_string()))
-                .and_then(|r| r)
-                .map_err(|e| {
-                    io::Error::other(format!(
-                        "the log of database {} could not be cut: {e}",
-                        if key.is_empty() {
-                            "<default>"
-                        } else {
-                            key.as_str()
-                        }
-                    ))
-                })?;
+                .and_then(|r| r);
+            if let Err(e) = outcome {
+                failed.push(format!(
+                    "the log of database {} could not be cut: {e}",
+                    if key.is_empty() {
+                        "<default>"
+                    } else {
+                        key.as_str()
+                    }
+                ));
+            }
         }
-        Ok(())
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(io::Error::other(failed.join("; ")))
+        }
     }
 
     /// Uploads staged segments without cutting the live log first.
@@ -2463,5 +2493,164 @@ mod tests {
         // into — worse than not archiving it, because the catalogue would
         // claim coverage it does not have.
         assert_eq!(stream_key("/var/lib/rdb", "/mnt/fast/rdb"), None);
+    }
+
+    /// An S3 stand-in on loopback: answers every request with an empty `200`
+    /// and records its request line, which is all the archive path reads.
+    async fn fake_s3() -> (Endpoint, Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            // Bounded: an archive makes a handful of requests, one per
+            // connection because every reply closes it.
+            for _ in 0..64 {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let log = log.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 8192];
+                    let head_end = loop {
+                        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break i + 4;
+                        }
+                        match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                    let body_len = head
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.trim()
+                                .eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    while buf.len() < head_end + body_len {
+                        match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    log.lock()
+                        .unwrap()
+                        .push(head.lines().next().unwrap_or("").to_string());
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                        )
+                        .await;
+                });
+            }
+        });
+        (
+            Endpoint {
+                host: "127.0.0.1".to_string(),
+                port,
+                tls: false,
+            },
+            seen,
+        )
+    }
+
+    /// One database's poisoned log must not stop the others being archived.
+    ///
+    /// A poisoned log refuses every checkpoint until restart. The archive used
+    /// to stop at the first log that failed to cut — logs are walked in name
+    /// order — so every database sorted after it went uncut, and the segments
+    /// already staged by every database went un-uploaded: point-in-time
+    /// recovery ended for databases that were working normally.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_poisoned_log_does_not_stop_the_other_databases_being_archived() {
+        let root = tempfile::tempdir().unwrap();
+        let location = root.path().to_str().unwrap().to_string();
+        let mut logs = Vec::new();
+        for name in ["a", "b"] {
+            let dir = root.path().join(name);
+            std::fs::create_dir(&dir).unwrap();
+            let wal = Arc::new(
+                crate::core::wal::Wal::open(dir.join(crate::core::wal::DEFAULT_WAL_NAME)).unwrap(),
+            );
+            crate::core::wal::install_for(dir.to_str().unwrap(), wal.clone());
+            logs.push((dir, wal));
+        }
+        let (poisoned, healthy) = (logs[0].1.clone(), logs[1].1.clone());
+
+        let (endpoint, requests) = fake_s3().await;
+        let mut config = test_config();
+        config.endpoint = endpoint;
+        config.path_style = true;
+        config.max_attempts = 1;
+        let client = Arc::new(
+            S3Client::new(S3Config {
+                endpoint: config.endpoint.clone(),
+                region: config.region.clone(),
+                bucket: config.bucket.clone(),
+                credentials: config.credentials.clone(),
+                path_style: config.path_style,
+                max_attempts: config.max_attempts,
+            })
+            .unwrap(),
+        );
+        let service = Arc::new(BackupService {
+            config,
+            client,
+            location: location.clone(),
+            instance_id: "rdb-test".to_string(),
+            manifest: tokio::sync::Mutex::new(Manifest::new("rdb-test".to_string())),
+            snapshot_lock: tokio::sync::Mutex::new(()),
+            archive_lock: tokio::sync::Mutex::new(()),
+            shutting_down: CacheGuard::new(AtomicBool::new(false)),
+            archiving_suspended: CacheGuard::new(AtomicBool::new(false)),
+        });
+        service.attach_to_logs().unwrap();
+
+        // "b" commits normally; "a" — sorted first — has one append that
+        // failed and could not be cut back, which poisons it.
+        let txn = healthy.begin();
+        healthy.log(txn, 7, 0, b"healthy").unwrap();
+        healthy.commit_txn(txn).unwrap();
+        crate::core::wal::test_hooks::SHORT_WAL_WRITE.with(|h| h.set(Some(3)));
+        crate::core::wal::test_hooks::FAIL_WAL_ROLLBACK.with(|f| f.set(true));
+        let failed = poisoned.log(poisoned.begin(), 7, 0, b"lost");
+        crate::core::wal::test_hooks::SHORT_WAL_WRITE.with(|h| h.set(None));
+        crate::core::wal::test_hooks::FAIL_WAL_ROLLBACK.with(|f| f.set(false));
+        assert!(failed.is_err());
+        assert!(poisoned.is_poisoned());
+
+        let outcome = service.archive_wal_now().await;
+        for (dir, _) in &logs {
+            crate::core::wal::remove_for(dir.to_str().unwrap());
+        }
+        let err = outcome.expect_err("a log that cannot be cut must still be reported");
+        assert!(err.to_string().contains("database a"), "{err}");
+
+        assert_eq!(
+            healthy.bytes_since_checkpoint(),
+            0,
+            "the healthy database's log was not cut because another database's was poisoned"
+        );
+        let staged_b = service.staging_dir_for("b");
+        let left = std::fs::read_dir(&staged_b)
+            .map(|d| d.flatten().count())
+            .unwrap_or(0);
+        assert_eq!(left, 0, "the healthy database's staged segments were not uploaded");
+        let requests = requests.lock().unwrap().clone();
+        assert!(
+            requests
+                .iter()
+                .any(|line| line.starts_with("PUT") && line.contains("/wal/b/")),
+            "no segment of the healthy database reached the bucket: {:?}",
+            requests
+        );
     }
 }
