@@ -108,6 +108,13 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
         if words.next()? != "TABLE" {
             return None;
         }
+        // Before anything reads a body: the body below runs to the *last* `)`,
+        // which swallowed a `PARTITION BY HASH (k)` trailer as constraint text
+        // and created an ordinary table, reporting success.
+        if let Some(reason) = partitioning_refusal(sql) {
+            rejection.replace(reason);
+            return None;
+        }
         // Find the start of the table name in the original string
         let mut after_create_table = sql;
         for _ in 0..2 {
@@ -165,7 +172,13 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
             table_name = &table_name[..ws_idx];
         }
         let table_name = table_name.trim_matches('"').to_string();
-        // Find the part between the first '(' and the last ')'
+        // Find the part between the first '(' and the last ')'.
+        //
+        // Not the column list's matching `)`, though `top_level_pieces` could
+        // find it: the other trailers (`WITH (…)`, `TABLESPACE`, `ON
+        // COMMIT`) keep what this has always done with them, which for a
+        // parenthesised one is a separate latent bug, pinned by
+        // `other_trailers_behave_as_they_did_before`.
         let start = sql.find('(')?;
         let end = sql.rfind(')')?;
         let columns_str = &sql[start + 1..end];
@@ -475,6 +488,206 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
     } else {
         None
     }
+}
+
+/// A piece of a `CREATE TABLE` at paren depth zero. Nothing inside a quote, a
+/// comment or a parenthesised group is a word here, which is what keeps a
+/// column called `partition` or a string saying `INHERITS` from counting.
+#[derive(Debug, PartialEq)]
+enum TopLevel {
+    /// A bare word, uppercased.
+    Word(String),
+    /// A double-quoted identifier: always a name, never a keyword.
+    Quoted,
+    /// A parenthesised group, once it has closed.
+    Group,
+    /// A string literal, dollar-quoted or not.
+    Str,
+    /// Any other single character.
+    Punct(u8),
+}
+
+/// The statement's top-level pieces, tracking nesting, quotes and comments the
+/// way PostgreSQL's lexer does: a doubled quote is an escaped one, a backslash
+/// escapes inside `E'…'`, `$tag$…$tag$` is a quote, and block comments nest.
+///
+/// The flag says whether the scan ended balanced: depth zero, no stray `)`, no
+/// quote or comment left open. When it did not, what the scanner thinks is
+/// top-level is a guess — a `(` it counted that PostgreSQL would not hides the
+/// whole trailer — so the caller must not read "no trailer" from it.
+fn top_level_pieces(sql: &str) -> (Vec<TopLevel>, bool) {
+    let bytes = sql.as_bytes();
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut balanced = true;
+    let mut i = 0usize;
+    // Bytes rather than chars: every delimiter is ASCII, and UTF-8 never puts
+    // an ASCII byte inside a multi-byte sequence, so the word slices below
+    // always fall on character boundaries.
+    let is_word_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80;
+    // Only a `$` that does not continue a word opens a dollar quote: `a$$b`
+    // is one identifier.
+    let starts_word = |at: usize| at == 0 || !is_word_byte(bytes[at - 1]);
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'\'' || c == b'"' {
+            // `E'…'`, the E a word of its own: `typE'…'` is a type and a
+            // plain literal, where a backslash is just a byte.
+            let escapes =
+                c == b'\'' && i > 0 && matches!(bytes[i - 1], b'E' | b'e') && starts_word(i - 1);
+            i += 1;
+            let mut closed = false;
+            while i < bytes.len() {
+                if escapes && bytes[i] == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == c {
+                    if bytes.get(i + 1) == Some(&c) {
+                        i += 2;
+                        continue;
+                    }
+                    closed = true;
+                    break;
+                }
+                i += 1;
+            }
+            balanced &= closed;
+            i += 1;
+            if depth == 0 {
+                out.push(if c == b'"' {
+                    TopLevel::Quoted
+                } else {
+                    TopLevel::Str
+                });
+            }
+        } else if let Some(tag_len) = (c == b'$' && starts_word(i))
+            .then(|| dollar_tag_len(&bytes[i..]))
+            .flatten()
+        {
+            let tag = &bytes[i..i + tag_len];
+            let body = i + tag_len;
+            match bytes[body..].windows(tag_len).position(|w| w == tag) {
+                Some(end) => i = body + end + tag_len,
+                None => {
+                    balanced = false;
+                    i = bytes.len();
+                }
+            }
+            if depth == 0 {
+                out.push(TopLevel::Str);
+            }
+        } else if c == b'-' && bytes.get(i + 1) == Some(&b'-') {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+        } else if c == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            // Nested, as PostgreSQL's are: `/* /* */ ( */` is all comment.
+            let mut nest = 1usize;
+            i += 2;
+            while i < bytes.len() && nest > 0 {
+                match (bytes[i], bytes.get(i + 1)) {
+                    (b'/', Some(b'*')) => {
+                        nest += 1;
+                        i += 2;
+                    }
+                    (b'*', Some(b'/')) => {
+                        nest -= 1;
+                        i += 2;
+                    }
+                    _ => i += 1,
+                }
+            }
+            balanced &= nest == 0;
+        } else if c == b'(' {
+            depth += 1;
+            i += 1;
+        } else if c == b')' {
+            match depth {
+                0 => {
+                    balanced = false;
+                    out.push(TopLevel::Punct(c));
+                }
+                1 => out.push(TopLevel::Group),
+                _ => {}
+            }
+            depth = depth.saturating_sub(1);
+            i += 1;
+        } else if depth > 0 || c.is_ascii_whitespace() {
+            i += 1;
+        } else if is_word_byte(c) {
+            let start = i;
+            while i < bytes.len() && is_word_byte(bytes[i]) {
+                i += 1;
+            }
+            out.push(TopLevel::Word(sql[start..i].to_ascii_uppercase()));
+        } else {
+            out.push(TopLevel::Punct(c));
+            i += 1;
+        }
+    }
+    (out, balanced && depth == 0)
+}
+
+/// The length of the dollar-quote delimiter `$tag$` (or `$$`) at the start of
+/// `rest`, or `None` when `rest` does not start with one. The tag follows
+/// identifier rules without `$`, so `$1` is a parameter, not a quote.
+fn dollar_tag_len(rest: &[u8]) -> Option<usize> {
+    let tag_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80;
+    if rest.get(1).is_some_and(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let tag = rest[1..].iter().take_while(|&&b| tag_byte(b)).count();
+    (rest.get(1 + tag) == Some(&b'$')).then_some(tag + 2)
+}
+
+/// Why a `CREATE TABLE` asking for partitioning or inheritance is refused, or
+/// `None` when it does not ask for either.
+///
+/// Matched on whole words at depth zero, anywhere after `CREATE TABLE`:
+/// `PARTITION BY` and `PARTITION OF` cannot be anything else there (`PARTITION
+/// OF` may have no column list at all, so its `FOR VALUES (…)` would otherwise
+/// be read as one), and neither can `INHERITS (…)` once a group has closed
+/// before it, since a table may be named `inherits`. Not anchored on the name:
+/// the parser below accepts names this could not shape-match (`t-1`, `'t'`),
+/// and a missed shape would let the trailer be swallowed. Worded "not
+/// supported" so the wire reports `0A000`, as for every other feature the
+/// engine lacks.
+///
+/// A statement the scan cannot balance is refused as a syntax error, as
+/// PostgreSQL refuses it: the parser below would take its body to the last
+/// `)` whatever it was, swallowing a trailer this scan never saw.
+fn partitioning_refusal(sql: &str) -> Option<String> {
+    let (pieces, balanced) = top_level_pieces(sql);
+    if !balanced {
+        return Some(
+            "syntax error in CREATE TABLE: an unclosed or unmatched parenthesis, quote or comment"
+                .to_string(),
+        );
+    }
+    let word = |at: usize, w: &str| matches!(pieces.get(at), Some(TopLevel::Word(x)) if x == w);
+    let refuse = |clause: &str, what: &str| {
+        Some(format!(
+            "CREATE TABLE ... {} is not supported yet: RasterizedDB has no table {}",
+            clause, what
+        ))
+    };
+    let first_group = pieces.iter().position(|p| *p == TopLevel::Group);
+    for at in 2..pieces.len() {
+        if word(at, "PARTITION") && word(at + 1, "BY") {
+            return refuse("PARTITION BY", "partitioning");
+        }
+        if word(at, "PARTITION") && word(at + 1, "OF") {
+            return refuse("PARTITION OF", "partitioning");
+        }
+        if word(at, "INHERITS")
+            && first_group.is_some_and(|g| g < at)
+            && pieces.get(at + 1) == Some(&TopLevel::Group)
+        {
+            return refuse("INHERITS", "inheritance");
+        }
+    }
+    None
 }
 
 /// Splits a `CREATE TABLE` body on commas that separate definitions, ignoring
@@ -894,5 +1107,431 @@ mod constraint_keyword_tests {
         ] {
             assert!(is_table_constraint(def), "{} was not recognised", def);
         }
+    }
+}
+
+#[cfg(test)]
+mod partitioning_refusal_tests {
+    use super::*;
+
+    fn parse(sql: &str) -> (Option<CreateTable>, Option<String>) {
+        create_table_with_reason(&QueryPurpose::CreateTable(sql.to_string()))
+    }
+
+    /// Every column, companions included, as `name:TYPE`: the whole shape a
+    /// create registers, so a body cut in the wrong place shows up here.
+    fn columns(sql: &str) -> Vec<String> {
+        let (parsed, rejection) = parse(sql);
+        let parsed = parsed.unwrap_or_else(|| panic!("{} did not parse: {:?}", sql, rejection));
+        parsed
+            .columns
+            .iter()
+            .map(|c| format!("{}:{:?}", c.name, c.data_type))
+            .collect()
+    }
+
+    fn refusal(sql: &str) -> String {
+        let (parsed, rejection) = parse(sql);
+        assert!(parsed.is_none(), "{} produced a table", sql);
+        rejection.unwrap_or_else(|| panic!("{} was rejected without a reason", sql))
+    }
+
+    /// Each of these was taken as an ordinary table, or failed on a type it
+    /// never declared. The first, fourth and fifth reported success: the body
+    /// ran to the *last* `)`, so the trailer became constraint text on the last
+    /// column and was ignored.
+    #[test]
+    fn partitioning_and_inheritance_clauses_are_refused() {
+        for (sql, clause) in [
+            (
+                "CREATE TABLE t (id INT, k INT NOT NULL) PARTITION BY HASH (k)",
+                "PARTITION BY",
+            ),
+            (
+                "CREATE TABLE t (id INT, k INT) PARTITION BY HASH (k)",
+                "PARTITION BY",
+            ),
+            (
+                "CREATE TABLE p PARTITION OF parent FOR VALUES WITH (MODULUS 4, REMAINDER 0)",
+                "PARTITION OF",
+            ),
+            (
+                "CREATE TABLE t (id INT, k INT, PRIMARY KEY (id)) PARTITION BY HASH (k)",
+                "PARTITION BY",
+            ),
+            (
+                "CREATE TABLE t (id INT NOT NULL) INHERITS (parent)",
+                "INHERITS",
+            ),
+            (
+                "CREATE TABLE t (id INT, k INT NOT NULL) PARTITION BY RANGE (k)",
+                "PARTITION BY",
+            ),
+            (
+                "create table if not exists t (id int not null) partition by list (id)",
+                "PARTITION BY",
+            ),
+            (
+                "CREATE TABLE IF NOT EXISTS p PARTITION OF parent (id NOT NULL) \
+                 FOR VALUES WITH (MODULUS 4, REMAINDER 1)",
+                "PARTITION OF",
+            ),
+            (
+                "CREATE TABLE \"public\".\"t\"(id INT NOT NULL)\nPARTITION\n  BY HASH(id)",
+                "PARTITION BY",
+            ),
+            (
+                "CREATE TABLE t (id INT NOT NULL) INHERITS(parent) PARTITION BY HASH (id)",
+                "INHERITS",
+            ),
+            // Names the parser below accepts but no name grammar would: the
+            // refusal is not anchored on the name, so it cannot miss one.
+            (
+                "CREATE TABLE t-1 (id INT, k INT NOT NULL) PARTITION BY HASH (k)",
+                "PARTITION BY",
+            ),
+            (
+                "CREATE TABLE t#1 (k INT NOT NULL) PARTITION BY HASH (k)",
+                "PARTITION BY",
+            ),
+            (
+                "CREATE TABLE t@x (k INT NOT NULL) PARTITION BY HASH (k)",
+                "PARTITION BY",
+            ),
+            (
+                "CREATE TABLE 't' (k INT NOT NULL) PARTITION BY HASH (k)",
+                "PARTITION BY",
+            ),
+            (
+                "CREATE TABLE a.b.t (k INT NOT NULL) PARTITION BY HASH (k)",
+                "PARTITION BY",
+            ),
+            (
+                "CREATE TABLE tablé (k INT NOT NULL) PARTITION BY HASH (k)",
+                "PARTITION BY",
+            ),
+            (
+                "CREATE TABLE t-1 PARTITION OF parent FOR VALUES WITH (MODULUS 4, REMAINDER 0)",
+                "PARTITION OF",
+            ),
+            // Not straight after the column list: every top-level word counts.
+            (
+                "CREATE TABLE t (k INT NOT NULL) USING heap PARTITION BY HASH (k)",
+                "PARTITION BY",
+            ),
+            (
+                "CREATE TABLE t (k INT NOT NULL) WITH (fillfactor = 70) PARTITION BY HASH (k)",
+                "PARTITION BY",
+            ),
+            (
+                "CREATE TABLE t (k INT NOT NULL) WITH (fillfactor = 70) INHERITS (parent)",
+                "INHERITS",
+            ),
+        ] {
+            let reason = refusal(sql);
+            assert!(
+                reason.contains(clause) && reason.contains("not supported"),
+                "{} was refused for the wrong reason: {}",
+                sql,
+                reason
+            );
+        }
+    }
+
+    /// The scan that finds the column list's end has to see past every `)`
+    /// that is not the one closing it: in a quoted name, in a string, in a
+    /// nested group.
+    #[test]
+    fn the_refusal_finds_the_trailer_past_quotes_and_nested_parens() {
+        for sql in [
+            "CREATE TABLE t (\"x)\" INT, k INT NOT NULL) PARTITION BY HASH (k)",
+            // An open paren in a quote would otherwise hold the list open to
+            // the end of the statement, hiding the trailer.
+            "CREATE TABLE t (\"x(\" INT, k INT NOT NULL) PARTITION BY HASH (k)",
+            "CREATE TABLE t (k INT NOT NULL, s TEXT DEFAULT '(') PARTITION BY HASH (k)",
+            "CREATE TABLE t (k INT NOT NULL, s TEXT DEFAULT 'a)b') PARTITION BY HASH (k)",
+            "CREATE TABLE t (k INT NOT NULL, s TEXT DEFAULT 'it''s ) (') PARTITION BY HASH (k)",
+            "CREATE TABLE t (k INT NOT NULL, CHECK (k > (0))) PARTITION BY HASH (k)",
+            "CREATE TABLE t (k INT NOT NULL, n NUMERIC(10, 2)) PARTITION BY HASH (k)",
+            "CREATE TABLE t (k INT NOT NULL /* ) */) /* ( */ PARTITION BY HASH (k)",
+            "CREATE TABLE t (k INT NOT NULL) -- (\n PARTITION BY HASH (k)",
+            // A backslash escapes the quote in an E string, so `'(` is inside it.
+            "CREATE TABLE t (k INT NOT NULL, s TEXT NOT NULL, CHECK (s <> E'\\'(')) PARTITION BY HASH (k)",
+            "CREATE TABLE t (k INT NOT NULL, s TEXT NOT NULL, CHECK (s <> e'\\\\')) PARTITION BY HASH (k)",
+            // Dollar quotes, tagged or not, hold a paren and a quote.
+            "CREATE TABLE t (k INT NOT NULL, s TEXT NOT NULL, CHECK (s <> $$($$)) PARTITION BY HASH (k)",
+            "CREATE TABLE t (k INT NOT NULL, s TEXT DEFAULT $x$ ' ( $$ $x$) PARTITION BY HASH (k)",
+            // Block comments nest: the `(` is still inside the outer one.
+            "CREATE TABLE t (k INT NOT NULL) /* /* */ ( */ PARTITION BY HASH (k)",
+            // `$` continues a word, non-ASCII included: neither `a$$` nor
+            // `é$$` opens a quote, so the `'$$'` string is the only one.
+            "CREATE TABLE t (k INT NOT NULL, a$$ INT, s TEXT DEFAULT '$$') PARTITION BY HASH (k)",
+            "CREATE TABLE t (k INT NOT NULL, é$$ INT, s TEXT DEFAULT '$$') PARTITION BY HASH (k)",
+            // `E` ending a longer word is no prefix, so `\\` is a plain byte.
+            "CREATE TABLE t (k INT NOT NULL, s TEXT NOT NULL, CHECK (s <> nonE'\\')) PARTITION BY HASH (k)",
+            // A positional parameter is not a dollar quote: a tag cannot start
+            // with a digit, so `$1$1` is two parameters, as PostgreSQL lexes it.
+            "CREATE TABLE t (k INT NOT NULL, CHECK (k <> $1)) PARTITION BY HASH (k)",
+            "CREATE TABLE t (k INT NOT NULL, CHECK (k <> $1$1)) PARTITION BY HASH (k)",
+        ] {
+            assert!(
+                refusal(sql).contains("PARTITION BY"),
+                "{} was not refused as partitioned",
+                sql
+            );
+        }
+    }
+
+    /// The words are matched whole, outside quotes and outside the column
+    /// list. A column called `partition` or a table called `inherits` is data.
+    #[test]
+    fn names_and_strings_that_only_contain_the_words_are_not_refused() {
+        assert_eq!(
+            columns("CREATE TABLE t (id INT, partition INT)"),
+            [
+                "id:I32",
+                "partition:I32",
+                "__null_id:BOOL",
+                "__null_partition:BOOL"
+            ]
+        );
+        assert_eq!(
+            columns("CREATE TABLE t (id INT, \"partition\" INT, \"by\" INT)"),
+            [
+                "id:I32",
+                "partition:I32",
+                "by:I32",
+                "__null_id:BOOL",
+                "__null_partition:BOOL",
+                "__null_by:BOOL"
+            ]
+        );
+        assert_eq!(
+            columns("CREATE TABLE partition_log (id INT NOT NULL)"),
+            ["id:I32"]
+        );
+        assert_eq!(
+            columns("CREATE TABLE inherits (id INT NOT NULL)"),
+            ["id:I32"]
+        );
+        assert_eq!(
+            columns("CREATE TABLE partition (id INT NOT NULL)"),
+            ["id:I32"]
+        );
+        let (parsed, _) =
+            parse("CREATE TABLE t (id INT NOT NULL, s TEXT DEFAULT 'PARTITION BY HASH (id)')");
+        let parsed = parsed.expect("a string that says PARTITION BY is a string");
+        assert_eq!(parsed.defaults[0].expression, "'PARTITION BY HASH (id)'");
+        assert_eq!(
+            columns("CREATE TABLE t (id INT NOT NULL) TABLESPACE partition"),
+            ["id:I32"]
+        );
+        assert_eq!(
+            columns("CREATE TABLE t (id INT NOT NULL) TABLESPACE \"inherits\""),
+            ["id:I32"]
+        );
+        // One word, not two: `partition_by` is not `PARTITION BY`.
+        assert_eq!(
+            columns("CREATE TABLE t (id INT NOT NULL) TABLESPACE partition_by"),
+            ["id:I32"]
+        );
+        assert_eq!(
+            columns("CREATE TABLE t (id INT NOT NULL) TABLESPACE inherits"),
+            ["id:I32"]
+        );
+        // Inside the column list, a word followed by a group is an expression,
+        // however deeply the groups before it nested.
+        let (parsed, _) =
+            parse("CREATE TABLE t (n NUMERIC(10,2) NOT NULL, CHECK ((n) > 0 OR inherits (n)))");
+        let parsed = parsed.expect("a check calling a function named inherits");
+        assert_eq!(parsed.checks[0].expression, "(n) > 0 OR inherits (n)");
+        let (parsed, _) = parse("CREATE TABLE t (id INT NOT NULL, CHECK (inherits (id) > 0))");
+        let parsed = parsed.expect("a check calling a function named inherits");
+        assert_eq!(parsed.checks[0].expression, "inherits (id) > 0");
+    }
+
+    /// Trailers other than partitioning keep exactly what they did before the
+    /// refusal was added, latent bugs included: a `WITH (…)` group still ends
+    /// the body at the *last* `)`, so it is swallowed when the last column has
+    /// a constraint and breaks the type when it does not. Pinned so the fix,
+    /// when it comes, is a decision rather than a side effect.
+    #[test]
+    fn other_trailers_behave_as_they_did_before() {
+        assert_eq!(
+            columns("CREATE TABLE t (id INT NOT NULL) WITH (fillfactor = 70)"),
+            ["id:I32"]
+        );
+        assert_eq!(
+            refusal("CREATE TABLE t (id INT) WITH (fillfactor = 70)"),
+            "column type 'INT)' is not supported yet"
+        );
+        assert_eq!(
+            columns("CREATE TABLE t (id INT NOT NULL) TABLESPACE pg_default"),
+            ["id:I32"]
+        );
+        assert_eq!(
+            columns("CREATE TABLE t (id INT) TABLESPACE pg_default"),
+            ["id:I32", "__null_id:BOOL"]
+        );
+        assert_eq!(
+            columns("CREATE TABLE t (id INT NOT NULL) ON COMMIT DROP"),
+            ["id:I32"]
+        );
+        assert_eq!(
+            columns("CREATE TABLE t (id INT) ON COMMIT DROP"),
+            ["id:I32", "__null_id:BOOL"]
+        );
+        assert_eq!(
+            columns("CREATE TABLE t (id INT) WITHOUT OIDS"),
+            ["id:I32", "__null_id:BOOL"]
+        );
+        // Not a table definition at all; still nothing, and no reason.
+        assert!(matches!(
+            parse("CREATE TABLE t AS SELECT * FROM u"),
+            (None, None)
+        ));
+    }
+
+    /// A statement the scan cannot balance used to skip the refusal: no group
+    /// closed, so no trailer was seen, and the body ran from the first `(` to
+    /// the last `)`, swallowing whatever followed. Each is a syntax error in
+    /// PostgreSQL, and is one here.
+    #[test]
+    fn an_unbalanced_statement_is_a_syntax_error_not_a_table() {
+        for sql in [
+            "CREATE TABLE t (id INT NOT NULL PARTITION BY HASH (id)",
+            "CREATE TABLE t (id INT NOT NULL, k INT NOT NULL PARTITION BY HASH (k)",
+            "CREATE TABLE t (id INT NOT NULL, CHECK (id > 0) PARTITION BY HASH (id)",
+            "CREATE TABLE t (id INT",
+            "CREATE TABLE t (id INT NOT NULL)) PARTITION BY HASH (id)",
+            "CREATE TABLE t (id INT NOT NULL, s TEXT DEFAULT 'x) PARTITION BY HASH (id)",
+            "CREATE TABLE t (id INT NOT NULL) /* /* */ PARTITION BY HASH (id)",
+            "CREATE TABLE t (id INT NOT NULL, s TEXT DEFAULT $$x) PARTITION BY HASH (id)",
+            "CREATE TABLE t (id INT NOT NULL, s TEXT DEFAULT E'\\') PARTITION BY HASH (id)",
+            // Open at depth zero, where only the open quote hides the trailer.
+            "CREATE TABLE t (id INT NOT NULL) 'x PARTITION BY HASH (id)",
+            "CREATE TABLE t (id INT NOT NULL) \"x PARTITION BY HASH (id)",
+            "CREATE TABLE t (id INT NOT NULL) $$x PARTITION BY HASH (id)",
+            "CREATE TABLE t (id INT NOT NULL) /* x PARTITION BY HASH (id)",
+        ] {
+            let reason = refusal(sql);
+            assert!(
+                reason.starts_with("syntax error"),
+                "{} was refused for the wrong reason: {}",
+                sql,
+                reason
+            );
+        }
+        // Closed once each comment is: the trailer is comment, as in PostgreSQL.
+        assert_eq!(
+            columns("CREATE TABLE t (id INT NOT NULL) /* /* */ PARTITION BY HASH (id) */"),
+            ["id:I32"]
+        );
+        // A backslash in a plain literal is a byte: the string closes at its
+        // second quote.
+        assert_eq!(
+            columns("CREATE TABLE t (id INT NOT NULL, s TEXT DEFAULT 'a\\')"),
+            ["id:I32", "s:STRING", "__null_s:BOOL"]
+        );
+    }
+
+    /// Bodies whose parentheses and quotes nest parse exactly as before.
+    #[test]
+    fn bodies_with_nested_parens_and_quotes_parse_as_before() {
+        let (ct, _) = parse("CREATE TABLE t (a INT, CHECK (a > 0))");
+        let ct = ct.expect("trailing CHECK");
+        assert_eq!(
+            ct.columns
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "__null_a"]
+        );
+        assert_eq!(ct.checks.len(), 1);
+        assert_eq!(ct.checks[0].expression, "a > 0");
+
+        // Refused before and after, for its expression, not its parentheses.
+        assert!(
+            refusal("CREATE TABLE t (a INT, ts TIMESTAMP DEFAULT (now()))")
+                .starts_with("DEFAULT (now()) is not supported")
+        );
+
+        for (sql, expression) in [
+            ("CREATE TABLE t (a INT, s TEXT DEFAULT 'a)b')", "'a)b'"),
+            (
+                "CREATE TABLE t (a INT, s TEXT DEFAULT 'it''s )')",
+                "'it''s )'",
+            ),
+        ] {
+            let (ct, _) = parse(sql);
+            let ct = ct.expect(sql);
+            assert_eq!(
+                ct.columns
+                    .iter()
+                    .map(|c| format!("{}:{:?}", c.name, c.data_type))
+                    .collect::<Vec<_>>(),
+                ["a:I32", "s:STRING", "__null_a:BOOL", "__null_s:BOOL"]
+            );
+            assert_eq!(ct.defaults.len(), 1);
+            assert_eq!(ct.defaults[0].column, "s");
+            assert_eq!(ct.defaults[0].expression, expression);
+        }
+
+        assert_eq!(
+            columns("CREATE TABLE t (\"x)\" INT, b INT)"),
+            ["x):I32", "b:I32", "__null_x):BOOL", "__null_b:BOOL"]
+        );
+
+        let (ct, _) = parse("CREATE TABLE t (a INT, n NUMERIC(10,2))");
+        let ct = ct.expect("numeric");
+        assert_eq!(
+            ct.columns
+                .iter()
+                .map(|c| format!("{}:{:?}", c.name, c.data_type))
+                .collect::<Vec<_>>(),
+            ["a:I32", "n:DECIMAL", "__null_a:BOOL", "__null_n:BOOL"]
+        );
+        assert_eq!(ct.type_modifiers.len(), 1);
+        assert_eq!(
+            (ct.type_modifiers[0].precision, ct.type_modifiers[0].scale),
+            (10, 2)
+        );
+
+        let (ct, _) = parse("CREATE TABLE t (a INT, b INT, PRIMARY KEY (a, b))");
+        let ct = ct.expect("composite key");
+        assert_eq!(ct.unique_keys.len(), 1);
+        assert_eq!(ct.unique_keys[0].columns, ["a", "b"]);
+        assert_eq!(ct.primary_key, None);
+
+        for sql in [
+            "CREATE TABLE t (a INT, b INT, FOREIGN KEY (b) REFERENCES u(id))",
+            "CREATE TABLE t (a INT, b INT REFERENCES u(id))",
+        ] {
+            let (ct, _) = parse(sql);
+            let ct = ct.expect(sql);
+            assert_eq!(ct.foreign_keys.len(), 1, "{}", sql);
+            assert_eq!(ct.foreign_keys[0].column, "b");
+            assert_eq!(ct.foreign_keys[0].parent_table, "u");
+            assert_eq!(ct.foreign_keys[0].parent_column, "id");
+        }
+
+        let (ct, _) =
+            parse("CREATE TABLE t (a INT, b INT, c INT GENERATED ALWAYS AS (a + b) STORED)");
+        let ct = ct.expect("generated");
+        assert_eq!(
+            ct.columns
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c", "__null_a", "__null_b", "__null_c"]
+        );
+        assert_eq!(ct.generated.len(), 1);
+        assert_eq!(ct.generated[0].column, "c");
+        assert_eq!(ct.generated[0].expression, "a + b");
+
+        assert_eq!(
+            columns("CREATE TABLE t(id INT)"),
+            ["id:I32", "__null_id:BOOL"]
+        );
     }
 }
