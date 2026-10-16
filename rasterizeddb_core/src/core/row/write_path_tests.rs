@@ -4316,3 +4316,74 @@ async fn forgetting_under_concurrent_writes_and_reads_matches_a_reference_model(
     t.enable_versioning(manager.clone());
     assert_eq!(visible_ids(&t).await, expected, "final, reopened");
 }
+
+/// Concurrent inserts into a keyed table must never take an id the sequence
+/// on disk does not cover.
+///
+/// Inserts into a table with a UNIQUE key used to take turns under one lock;
+/// striped by key, they check the reservation and draw ids side by side, and
+/// checking only `next < reserved` let two of them take `reserved - 1` and
+/// `reserved`. After a crash the uncovered id was handed out again.
+///
+/// The invariant read here, after each insert returns: the highest id handed
+/// out is covered by the reservation, which is raised only once the sequence
+/// is written and only ever rises, so a reading below the counter is a gap.
+/// The window is a few instructions wide, so this rarely lands in it;
+/// `two_inserts_at_the_reservation_boundary_are_both_covered` pins the rule
+/// deterministically.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_keyed_inserts_never_outrun_the_id_reservation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut t = open_table(dir.path(), "wp_id_reservation").await;
+    t.register_unique_key(crate::core::rql::unique_key::UniqueKey {
+        name: "wp_id_reservation_id_key".into(),
+        columns: vec!["id".into()],
+        is_deleted: false,
+    });
+    let t = Arc::new(t);
+    let mut tasks = Vec::new();
+    for task in 0..16u64 {
+        let t = t.clone();
+        tasks.push(tokio::spawn(async move {
+            for i in 0..300u64 {
+                insert(&t, task * 1_000_000 + i, 0, "s").await;
+                let handed_out = t.last_row_id.load(std::sync::atomic::Ordering::Acquire);
+                // Raised only after the sequence is written, and only ever up.
+                let covered = t.ids_reserved_upto();
+                assert!(
+                    covered >= handed_out,
+                    "ids up to {} were handed out but the disk covers only {}",
+                    handed_out,
+                    covered
+                );
+            }
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+}
+
+/// The same invariant without depending on a thread race: two inserts at the
+/// boundary of the reservation, each between its check and its id, must leave
+/// both of their ids covered. Checking `next < reserved` alone covered one.
+#[tokio::test]
+async fn two_inserts_at_the_reservation_boundary_are_both_covered() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_table(dir.path(), "wp_id_boundary").await;
+    insert(&t, 1, 0, "s").await;
+    let reserved = t.ids_reserved_upto();
+    // The next id is the last one the reservation covers.
+    t.last_row_id.store(reserved - 1, std::sync::atomic::Ordering::Release);
+    let first = t.reserve_insert_id().await;
+    let second = t.reserve_insert_id().await;
+    let next = t.last_row_id.load(std::sync::atomic::Ordering::Acquire);
+    // The two will take `next` and `next + 1`.
+    assert!(
+        t.ids_reserved_upto() >= next + 2,
+        "two inserts in flight from id {} but only {} is covered",
+        next,
+        t.ids_reserved_upto()
+    );
+    drop((first, second));
+}

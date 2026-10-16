@@ -170,6 +170,39 @@ pub fn compared_columns(sql: &str) -> Option<Vec<String>> {
                 {
                     return None;
                 }
+                // A value read from the clock or the session: the parse would
+                // keep the first execution's answer for every later one.
+                if [
+                    "CURRENT_DATE",
+                    "CURRENT_TIME",
+                    "CURRENT_TIMESTAMP",
+                    "LOCALTIME",
+                    "LOCALTIMESTAMP",
+                    "TRANSACTION_TIMESTAMP",
+                    "CURRENT_USER",
+                    "SESSION_USER",
+                    "USER",
+                    "CURRENT_SCHEMA",
+                    "CURRENT_CATALOG",
+                    "CURRENT_ROLE",
+                ]
+                .iter()
+                .any(|w| word.eq_ignore_ascii_case(w))
+                {
+                    return None;
+                }
+                // A call. Aggregates fold the rows, which are read afresh each
+                // time; anything else (`now()`, `random()`, `date_trunc(...)`)
+                // may be evaluated into the parse.
+                let mut after = i;
+                while after < b.len() && b[after].is_ascii_whitespace() {
+                    after += 1;
+                }
+                if b.get(after) == Some(&b'(')
+                    && !["COUNT", "SUM", "AVG", "MIN", "MAX"].iter().any(|w| word.eq_ignore_ascii_case(w))
+                {
+                    return None;
+                }
             }
             _ => i += 1,
         }
@@ -364,6 +397,7 @@ mod tests {
     #[test]
     fn only_plain_comparisons_qualify() {
         assert_eq!(compared_columns("SELECT v FROM kv WHERE k = $1"), Some(vec!["k".to_string()]));
+        assert_eq!(compared_columns("SELECT count(*), max(v) FROM kv WHERE k = $1"), Some(vec!["k".to_string()]));
         assert_eq!(
             compared_columns("SELECT * FROM t WHERE t.a >= $2 AND b<>$1 ORDER BY a LIMIT 5"),
             Some(vec!["b".to_string(), "a".to_string()])
@@ -377,6 +411,11 @@ mod tests {
             "SELECT * FROM t WHERE a = $1 + 1",
             "SELECT * FROM t WHERE a = $1::bigint",
             "SELECT * FROM t WHERE a = $1 || 'x'",
+            "SELECT * FROM t WHERE a = $1 AND created >= CURRENT_DATE",
+            "SELECT * FROM t WHERE a = $1 AND created >= now()",
+            "SELECT * FROM t WHERE a = $1 AND created >= date_trunc('hour', created)",
+            "SELECT now(), a FROM t WHERE a = $1",
+            "SELECT a FROM t WHERE a = $1 AND owner = current_user",
             "SELECT * FROM t WHERE $1 = a",
             "SELECT * FROM t WHERE a = $1 OR b = $1",
             "SELECT * FROM t WHERE a = $1 LIMIT $2",

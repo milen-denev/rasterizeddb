@@ -3593,10 +3593,10 @@ where
             let purpose = QueryPurpose::PreparedRows(run.rows);
             crate::core::rql::executor::execute_in_txn(purpose, database.clone(), tx).await
         }
-        // A plain read needs a snapshot, not a transaction.
-        None if run.rows.query_row.row_lock.is_none() => {
-            crate::core::rql::executor::execute_prepared_read(run.rows, database.clone()).await
-        }
+        // Inside an autocommit transaction even though it writes nothing: the
+        // in-place overwrite gate sees readers only in `running`, so a read
+        // on a bare snapshot could observe half of an in-place UPDATE, or an
+        // overwrite whose transaction then aborted.
         None => {
             let purpose = QueryPurpose::PreparedRows(run.rows);
             crate::core::rql::executor::execute_with_sync(purpose, database.clone(), state.synchronous_commit())
@@ -3818,6 +3818,12 @@ where
     // column `NOW`, so the constant parts are evaluated once here, before
     // anything parses the clause.
     let folded_where = crate::core::rql::executor::fold_where_constants(stmt);
+    // A fold evaluated something into the text (`CURRENT_DATE`, `now()`,
+    // `1 + 1`). Its answer may not hold next time, so a parse made from it is
+    // not one to keep.
+    if folded_where != stmt {
+        crate::core::rql::prepared::note_rewritten();
+    }
     let stmt = folded_where.as_str();
 
     let materialized = match crate::core::rql::cte::materialize(stmt, database, effective_tx).await

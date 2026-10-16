@@ -100,6 +100,15 @@ pub struct Table<S: StorageIO> {
     /// Highest id reserved on disk. Ids past this need a fresh reservation
     /// before they are handed out.
     id_reserved_upto: CacheGuard<AtomicU64>,
+    /// Inserts between their reservation check and the id they take. Each
+    /// takes at most one, so the reservation must reach past the next id by
+    /// this many: two inserts checking at once both see the next id covered
+    /// and take it and the one after, and the second is not covered.
+    ids_in_flight: AtomicU64,
+    /// Serialises raising the reservation, so it only ever goes up: two
+    /// writers could otherwise leave the smaller of their values on disk and
+    /// the larger in memory.
+    reserving: tokio::sync::Mutex<()>,
     pub hard_locked: CacheGuard<AtomicBool>,
     pub len: CacheGuard<AtomicU64>,
     pub last_row_id: CacheGuard<AtomicU64>,
@@ -825,6 +834,8 @@ impl<S: StorageIO> Table<S> {
             has_unique,
             in_place_column_updates: AtomicU64::new(0).into(),
             id_reserved_upto: id_reserved_upto.into(),
+            ids_in_flight: AtomicU64::new(0),
+            reserving: tokio::sync::Mutex::new(()),
             hard_locked: AtomicBool::new(false).into(),
             len: atomic_table_length.into(),
             last_row_id: atomic_last_id.into(),
@@ -879,20 +890,49 @@ impl<S: StorageIO> Table<S> {
     /// Written before any id in the block is used, so a crash can only ever skip
     /// ids, never repeat one. Ids need to be unique, not gapless.
     async fn reserve_ids(&self, upto: u64) {
+        let _one = self.reserving.lock().await;
+        if upto <= self.id_reserved_upto.load(AtomicOrdering::Acquire) {
+            return;
+        }
         self.io_sequence.write_data(0, &upto.to_le_bytes()).await;
         self.id_reserved_upto.store(upto, AtomicOrdering::Release);
     }
 
     /// Makes sure the sequence on disk covers the ids about to be handed out.
     ///
-    /// Called before an insert allocates, so the reservation is always ahead of
-    /// use. The common case is a relaxed load and a comparison.
+    /// Called before an update relocates, whose new versions draw from the
+    /// counter but keep their row's own id, so a gap there is harmless. An
+    /// insert, which keeps the id it draws, uses [`Self::reserve_insert_id`].
     async fn ensure_ids_reserved(&self) {
         let next = self.last_row_id.load(AtomicOrdering::Acquire);
         if next < self.id_reserved_upto.load(AtomicOrdering::Acquire) {
             return;
         }
         self.reserve_ids(next + ID_RESERVATION_CHUNK).await;
+    }
+
+    /// The highest id the sequence reservation covers, for tests.
+    #[cfg(test)]
+    pub(crate) fn ids_reserved_upto(&self) -> u64 {
+        self.id_reserved_upto.load(AtomicOrdering::Acquire)
+    }
+
+    /// Covers on disk the id an insert is about to take, counting every other
+    /// insert that has checked but not yet taken one. Hold the guard until the
+    /// id is taken.
+    ///
+    /// Inserts used to take turns here under the table's one uniqueness lock;
+    /// with that lock striped by key, two of them check and allocate side by
+    /// side, and checking `next < reserved` alone let the second take an id the
+    /// disk did not cover, which a crash then handed out twice.
+    pub(crate) async fn reserve_insert_id(&self) -> IdsInFlight<'_> {
+        let in_flight = self.ids_in_flight.fetch_add(1, AtomicOrdering::AcqRel) + 1;
+        let guard = IdsInFlight(&self.ids_in_flight);
+        let next = self.last_row_id.load(AtomicOrdering::Acquire);
+        if next + in_flight > self.id_reserved_upto.load(AtomicOrdering::Acquire) {
+            self.reserve_ids(next + in_flight + ID_RESERVATION_CHUNK).await;
+        }
+        guard
     }
 
     /// Registers this read with the epoch registry, so reclamation cannot hand
@@ -2816,7 +2856,7 @@ impl<S: StorageIO> Table<S> {
 
         // The id this row is about to take must already be covered by the
         // reservation on disk, or a crash could hand it out again.
-        self.ensure_ids_reserved().await;
+        let _id = self.reserve_insert_id().await;
 
         info!(
             "Inserting row with {} columns",
@@ -3972,6 +4012,15 @@ impl<S: StorageIO> Table<S> {
         }
 
         Ok(Some(updated_count))
+    }
+}
+
+/// One insert counted in `Table::ids_in_flight` until its id is taken.
+pub(crate) struct IdsInFlight<'a>(&'a AtomicU64);
+
+impl Drop for IdsInFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, AtomicOrdering::AcqRel);
     }
 }
 

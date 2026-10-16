@@ -890,7 +890,12 @@ impl ConcurrentProcessor {
         let threads = crate::max_permits_threads().max(1);
         let expected = iterator.expected_records();
         let per_batch = if iterator.has_sparse_candidates() {
-            let per = (expected.div_ceil(threads as u64) as usize).clamp(SPARSE_MIN_BATCH, crate::batch_size().max(1));
+            // Not `clamp`: it panics when the floor is above the ceiling, which
+            // `--batch-size` below the floor makes it.
+            let ceiling = crate::batch_size().max(1);
+            let per = (expected.div_ceil(threads as u64) as usize)
+                .max(SPARSE_MIN_BATCH)
+                .min(ceiling);
             iterator.set_batch_limit(per);
             per
         } else {

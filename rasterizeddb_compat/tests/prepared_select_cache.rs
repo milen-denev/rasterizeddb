@@ -14,6 +14,10 @@ use rasterizeddb_core::pgwire::PREPARED_RUNS;
 use sqlx::{AssertSqlSafe, Connection, Executor, PgConnection, Row};
 use std::sync::atomic::Ordering;
 
+/// The count of cached runs is global to the process, so tests that read it
+/// do not run beside tests that move it.
+static COUNTED: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn runs() -> u64 {
     PREPARED_RUNS.load(Ordering::Relaxed)
 }
@@ -131,6 +135,7 @@ async fn setup() -> (TestServer, PgConnection) {
 
 #[tokio::test]
 async fn cached_answers_match_the_text_path() {
+    let _counted = COUNTED.lock().await;
     let (_server, mut conn) = setup().await;
 
     let point = "SELECT k, s, f, n FROM items WHERE k = $1";
@@ -167,6 +172,7 @@ async fn cached_answers_match_the_text_path() {
 /// Counter-sensitive, so all in one test: the count is global to the process.
 #[tokio::test]
 async fn the_cache_is_used_and_refused_where_it_should_be() {
+    let _counted = COUNTED.lock().await;
     let (_server, mut conn) = setup().await;
 
     // Learned in two executions with different values, used from the third.
@@ -176,6 +182,26 @@ async fn the_cache_is_used_and_refused_where_it_should_be() {
         same(&mut conn, point, &[Value::I(k)]).await;
     }
     assert!(runs() - before >= 18, "a point query never ran from its parse ({} runs)", runs() - before);
+
+    // A value read from the clock is never cached. The text path evaluates
+    // it into the statement before parsing, so a cached parse would keep the
+    // first execution's date for every later one, the next day included.
+    conn.execute("CREATE TABLE events (k BIGINT NOT NULL, at TIMESTAMP NOT NULL)").await.unwrap();
+    conn.execute("INSERT INTO events (k, at) VALUES (777, '2001-01-01 00:00:00'), (888, '2999-01-01 00:00:00')")
+        .await
+        .unwrap();
+    for clocked in [
+        "SELECT k FROM events WHERE k = $1 AND at < CURRENT_DATE",
+        "SELECT k FROM events WHERE k = $1 AND at < now()",
+    ] {
+        let before = runs();
+        // Digits no date contains, so each value's place in the folded clause
+        // is unambiguous and a template could be learned from it.
+        for k in [777i64, 888].repeat(3) {
+            same(&mut conn, clocked, &[Value::I(k)]).await;
+        }
+        assert_eq!(runs(), before, "{clocked} ran from a cached parse");
+    }
 
     // A NULL value is answered by the text path, and correctly.
     same(&mut conn, "SELECT k FROM items WHERE n = $1", &[Value::I(4)]).await;
@@ -223,6 +249,7 @@ async fn the_cache_is_used_and_refused_where_it_should_be() {
 
 #[tokio::test]
 async fn a_cached_parse_reads_through_the_transaction() {
+    let _counted = COUNTED.lock().await;
     let (_server, mut conn) = setup().await;
     let point = "SELECT k, s FROM items WHERE k = $1";
     for k in [1i64, 2, 3, 4] {

@@ -10948,37 +10948,6 @@ pub(crate) async fn execute_with_need(
     }
 }
 
-/// A prepared plain read outside any transaction block, run on a snapshot
-/// of its own rather than inside an autocommit transaction.
-///
-/// A read writes nothing, so the transaction around it only cost: an id,
-/// an outcome recorded in the status log, the active set updated twice, and
-/// the commit path. `FROZEN_TX` takes the same snapshot, registered the same
-/// way, so reclamation holds off exactly as it does for a transaction.
-/// Locking reads (`FOR UPDATE`) still need a transaction and do not come here.
-pub async fn execute_prepared_read(
-    prepared: Box<crate::core::rql::prepared::PreparedRows>,
-    database: Arc<Database>,
-) -> Vec<u8> {
-    use futures::FutureExt;
-    let prepared = *prepared;
-    let table = database.tables.get(&prepared.table_name).map(|t| t.value().clone());
-    let Some(table) = table else {
-        return ddl_error("Table not found");
-    };
-    let tx = crate::core::mvcc::transaction::FROZEN_TX;
-    match std::panic::AssertUnwindSafe(Box::pin(execute_query_rows(prepared.query_row, table, &database, tx)))
-        .catch_unwind()
-        .await
-    {
-        Ok(response) => response,
-        Err(_) => {
-            error!("a prepared read panicked");
-            ddl_error("internal error: the statement panicked")
-        }
-    }
-}
-
 /// A parsed single-table `SELECT`, run: the half of the `QueryRows` arm that
 /// reads only the parse, never the statement text. A prepared statement
 /// enters here with a parse it cached at its first execution.

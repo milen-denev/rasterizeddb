@@ -1,6 +1,5 @@
 use log::debug;
 use smallvec::SmallVec;
-use std::collections::HashSet;
 
 use crate::core::rql::aggregate::{AggFunc, SelectItem};
 use crate::core::{
@@ -1195,12 +1194,16 @@ fn split_select_items(list: &str) -> Vec<String> {
 /// * `schema` - Vec<SchemaField> representing the table schema
 ///
 /// # Returns
-/// HashSet<String> - Set of column names found in the WHERE clause
+/// The column names found in the WHERE clause, in a fixed order
 pub(crate) fn extract_where_columns(
     where_clause: &str,
     schema: &SmallVec<[SchemaField; 20]>,
-) -> HashSet<String> {
-    let mut where_columns = HashSet::new();
+) -> std::collections::BTreeSet<String> {
+    // Ordered, not hashed: the fetch built from this set came out in a
+    // different column order on every parse of the same statement, so two
+    // parses of one statement never compared equal reliably, and a prepared
+    // statement's cached parse was refused at random.
+    let mut where_columns = std::collections::BTreeSet::new();
     if where_clause.is_empty() {
         return where_columns;
     }
