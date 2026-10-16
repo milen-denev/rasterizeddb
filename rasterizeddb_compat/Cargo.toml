@@ -53,3 +53,7 @@ tokio-postgres = { version = "0.7.18", features = ["with-uuid-1", "with-chrono-0
 # Encoding a `numeric` parameter by hand in `param_inference.rs`.
 postgres-types = "0.2.14"
 bytes = "1"
+# Already in the tree through rasterizeddb_core. The accept-error test lowers
+# the process's descriptor limit to make `accept()` fail with EMFILE, which
+# nothing in std or tokio can do.
+libc = "0.2"

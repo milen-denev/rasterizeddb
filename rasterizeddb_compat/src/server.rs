@@ -9,7 +9,7 @@ use rasterizeddb_core::{
         database::{DEFAULT_DATABASE_NAME, Database, catalog::DatabaseCatalog},
         processor::concurrent_processor::ENABLE_CACHE,
     },
-    pgwire::{AuthConfig, TlsConfig, TlsMode, start_pgwire_with_catalog},
+    pgwire::{AuthConfig, ConnectionLimits, TlsConfig, TlsMode, start_pgwire_with_limits},
 };
 use rclite::Arc;
 
@@ -19,7 +19,7 @@ pub struct TestServer {
     tls: bool,
     /// Fires when the harness is dropped, ending the server's `block_on`.
     ///
-    /// Without it the server runs forever: `start_pgwire_with_catalog` never
+    /// Without it the server runs forever: `start_pgwire_with_limits` never
     /// returns, so the thread, its runtime's four workers and the listening
     /// socket all outlive the test that made them.
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
@@ -99,7 +99,24 @@ impl TestServer {
         method: AuthMethod,
         password: Option<&str>,
     ) -> anyhow::Result<Self> {
-        Self::start_rooted(tls_mode, method, password, None).await
+        Self::start_configured(tls_mode, method, password, ConnectionLimits::default()).await
+    }
+
+    /// Starts a plain server (no TLS, `trust`) with specific connection
+    /// limits, for the tests of the limits themselves.
+    pub async fn start_with_limits(limits: ConnectionLimits) -> anyhow::Result<Self> {
+        Self::start_configured(TlsMode::Disable, AuthMethod::Trust, None, limits).await
+    }
+
+    /// Starts a server with every knob given: transport, authentication and
+    /// connection limits.
+    pub async fn start_configured(
+        tls_mode: TlsMode,
+        method: AuthMethod,
+        password: Option<&str>,
+        limits: ConnectionLimits,
+    ) -> anyhow::Result<Self> {
+        Self::start_rooted(tls_mode, method, password, None, limits).await
     }
 
     /// Starts a server whose catalogue lives in `root` on disk, for the tests
@@ -107,7 +124,14 @@ impl TestServer {
     /// mmap read path) rather than the in-memory one. The caller owns `root`
     /// and removes it.
     pub async fn start_file_backed(root: &str) -> anyhow::Result<Self> {
-        Self::start_rooted(TlsMode::Disable, AuthMethod::Trust, None, Some(root)).await
+        Self::start_rooted(
+            TlsMode::Disable,
+            AuthMethod::Trust,
+            None,
+            Some(root),
+            ConnectionLimits::default(),
+        )
+        .await
     }
 
     async fn start_rooted(
@@ -115,6 +139,7 @@ impl TestServer {
         method: AuthMethod,
         password: Option<&str>,
         root: Option<&str>,
+        limits: ConnectionLimits,
     ) -> anyhow::Result<Self> {
         init_globals();
 
@@ -174,7 +199,7 @@ impl TestServer {
                     // dropped is what ends it. Dropping the accept loop's future
                     // is what closes the listener.
                     tokio::select! {
-                        _ = start_pgwire_with_catalog(catalog, "127.0.0.1", port, tls, auth) => {}
+                        _ = start_pgwire_with_limits(catalog, "127.0.0.1", port, tls, auth, limits) => {}
                         _ = shutdown_rx => {}
                     }
                 });

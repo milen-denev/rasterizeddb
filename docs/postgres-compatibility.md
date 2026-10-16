@@ -407,6 +407,54 @@ row pointers. Each table's cache key is now qualified by the id of the database
 that owns it — an id rather than the name, so a database recreated under a name
 does not inherit what its namesake left behind.
 
+## Connection limits and timeouts
+
+```
+--max-connections <n>                          (default: 500; must be >= 1)
+--authentication-timeout <time>                (default: 60s; bare number = seconds)
+--idle-in-transaction-session-timeout <time>   (default: 0 = off; bare number = ms)
+--idle-session-timeout <time>                  (default: 0 = off; bare number = ms)
+```
+
+These follow PostgreSQL's settings of the same names:
+
+- **Over `max_connections`** a connection is answered, after its startup
+  packet and any TLS negotiation, with `FATAL 53300` "sorry, too many clients
+  already". Connections still being refused are capped at the same number
+  again; past that a socket is closed unanswered, so a storm costs at most
+  twice `max_connections` descriptors. There is no unlimited setting.
+- **`authentication_timeout`** bounds everything before the session exists —
+  the startup packet, TLS and the password exchange. A silent socket is
+  closed; one that stalls mid-authentication is told `FATAL 57014`
+  "canceling authentication due to timeout".
+- **A startup packet** longer than 10,000 bytes (PostgreSQL's
+  `MAX_STARTUP_PACKET_LENGTH`), or shorter than 8, is refused before anything
+  is allocated, with `FATAL 08P01` "invalid length of startup packet", and the
+  connection is closed.
+- **`idle_in_transaction_session_timeout`** ends a session that sits inside an
+  open block (failed or not) for longer, with `FATAL 25P03`; the block is
+  rolled back before the error is sent. **`idle_session_timeout`** does the
+  same outside a block, with `FATAL 57P05`. Both run only while the server
+  waits for a client that has been sent `ReadyForQuery` — never during a
+  statement, and not between `Parse` and `Sync`. Sessions `SET`, `SET LOCAL`,
+  `SHOW` and `RESET` them, with PostgreSQL's units (`us`, `ms`, `s`, `min`,
+  `h`, `d`); `RESET` returns to the server's flag. `SET LOCAL` is undone when
+  the block ends, but not by `ROLLBACK TO SAVEPOINT`.
+- A session that is ending gives the client 2 s to take its last bytes — the
+  `FATAL`, any output still buffered, a TLS `close_notify` — and closes
+  without them after that, so a client that has stopped reading cannot keep a
+  terminated session's slot.
+- `max_connections` and `authentication_timeout` are shown by `SHOW` and
+  refused by `SET` (`55P02`).
+
+A failed `accept()` — `EMFILE` when the process is out of descriptors, for
+one — is logged and retried with a backoff of 50 ms growing to 1 s; it never
+stops the listener, and a listener that cannot start at all (port taken,
+certificate unreadable) exits the process with status 2 rather than 0.
+Accepted sockets get TCP keepalive (on Linux: first probe after 60 s idle,
+then every 15 s, dead after 4 unanswered), so a peer that vanished without
+closing its socket stops holding a slot.
+
 ## Authentication and encrypted transport
 
 ```

@@ -263,6 +263,54 @@ struct Args {
     #[arg(long = "pg-password", value_name = "PASSWORD")]
     pg_password: Option<String>,
 
+    /// Most pgwire sessions served at once (default: 500). A connection over
+    /// it is refused with SQLSTATE 53300, "sorry, too many clients already".
+    /// Must be at least 1: there is no unlimited setting.
+    #[arg(
+        long = "max-connections",
+        alias = "max_connections",
+        default_value_t = 500,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    max_connections: u32,
+
+    /// How long a pgwire connection has to send its startup packet, finish
+    /// TLS and authenticate before it is closed (default: 60s). A bare number
+    /// is seconds; `500ms`, `30s` and `2min` are accepted too.
+    #[arg(
+        long = "authentication-timeout",
+        alias = "authentication_timeout",
+        value_name = "TIME",
+        default_value = "60s",
+        value_parser = parse_authentication_timeout
+    )]
+    authentication_timeout: std::time::Duration,
+
+    /// Default `idle_in_transaction_session_timeout` for pgwire sessions: a
+    /// session idle inside an open transaction for longer is ended with
+    /// SQLSTATE 25P03 and its transaction rolled back. A bare number is
+    /// milliseconds. 0 (the default) disables it; sessions may `SET` their own.
+    #[arg(
+        long = "idle-in-transaction-session-timeout",
+        alias = "idle_in_transaction_session_timeout",
+        value_name = "TIME",
+        default_value = "0",
+        value_parser = parse_idle_timeout
+    )]
+    idle_in_transaction_session_timeout: std::time::Duration,
+
+    /// Default `idle_session_timeout` for pgwire sessions: a session idle
+    /// outside a transaction for longer is ended with SQLSTATE 57P05. A bare
+    /// number is milliseconds. 0 (the default) disables it.
+    #[arg(
+        long = "idle-session-timeout",
+        alias = "idle_session_timeout",
+        value_name = "TIME",
+        default_value = "0",
+        value_parser = parse_idle_timeout
+    )]
+    idle_session_timeout: std::time::Duration,
+
     // --- native (rastcp) protocol authentication --------------------------
     /// How native connections authenticate: `scram-sha-256` (default) or
     /// `trust`.
@@ -652,6 +700,22 @@ fn replication_config(
 
     config.validate()?;
     Ok(config)
+}
+
+/// `--authentication-timeout`: PostgreSQL's unit for it is seconds, and zero
+/// would remove the bound rather than set one, so it is refused.
+fn parse_authentication_timeout(value: &str) -> Result<std::time::Duration, String> {
+    let timeout = rasterizeddb_core::pgwire::parse_time_setting(value, 1_000)?;
+    if timeout.is_zero() {
+        return Err("must be greater than zero".to_string());
+    }
+    Ok(timeout)
+}
+
+/// The idle timeouts: milliseconds when bare, as in PostgreSQL, and 0 to
+/// disable.
+fn parse_idle_timeout(value: &str) -> Result<std::time::Duration, String> {
+    rasterizeddb_core::pgwire::parse_time_setting(value, 1)
 }
 
 fn main() -> std::io::Result<()> {
@@ -1142,14 +1206,33 @@ fn main() -> std::io::Result<()> {
                     );
                 }
 
-                _ = rasterizeddb_core::pgwire::start_pgwire_with_catalog(
+                let limits = rasterizeddb_core::pgwire::ConnectionLimits {
+                    max_connections: args.max_connections as usize,
+                    handshake_timeout: args.authentication_timeout,
+                    idle_in_transaction_session_timeout: args.idle_in_transaction_session_timeout,
+                    idle_session_timeout: args.idle_session_timeout,
+                };
+
+                // The listener returns an error only when it could not start —
+                // the port taken, the certificate unreadable — since a failed
+                // accept is retried rather than returned. That used to be
+                // discarded here, and the process exited 0 having served
+                // nothing, which a supervisor reads as a clean stop.
+                if let Err(e) = rasterizeddb_core::pgwire::start_pgwire_with_limits(
                     catalog,
                     &args.pg_addr,
                     args.pg_port,
                     tls,
                     auth,
+                    limits,
                 )
-                .await;
+                .await
+                {
+                    log::error!("pgwire server failed: {}", e);
+                    eprintln!("pgwire server failed: {e}");
+                    rasterizeddb_core::shutdown::finalize();
+                    std::process::exit(2);
+                }
             }
         }
 

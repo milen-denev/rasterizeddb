@@ -1,8 +1,11 @@
 use std::{
     collections::HashMap,
+    future::Future,
     io,
+    pin::Pin,
     sync::Arc as StdArc,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    task::{Context, Poll},
     time::Duration,
 };
 
@@ -12,7 +15,7 @@ use rclite::Arc;
 use std::io::BufReader;
 
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::{TcpListener, TcpStream},
 };
 
@@ -81,6 +84,80 @@ pub struct TlsConfig {
     pub key_path: Option<String>,
 }
 
+/// Server-wide bounds on connections, and the defaults a new session's idle
+/// timeouts start from.
+///
+/// Every limit here exists because the absence of it let one misbehaving
+/// client take something from all the others: file descriptors held by
+/// sockets that never finish their handshake, a connection count with no
+/// ceiling, or a transaction left open by a client that went away without
+/// closing its socket — which holds back reclamation for the whole database.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConnectionLimits {
+    /// Sessions served at once. A connection over this answers its startup
+    /// with `53300` ("sorry, too many clients already"), as PostgreSQL's
+    /// does. Zero is refused at start-up rather than read as "unlimited": an
+    /// unbounded count is the failure this exists to prevent.
+    pub max_connections: usize,
+    /// How long a connection has, from accept, to finish its startup packet,
+    /// any TLS negotiation and authentication. PostgreSQL's
+    /// `authentication_timeout`. Zero is refused at start-up.
+    pub handshake_timeout: Duration,
+    /// The `idle_in_transaction_session_timeout` a session starts with and
+    /// `RESET` returns to. Zero disables it, as in PostgreSQL.
+    pub idle_in_transaction_session_timeout: Duration,
+    /// The `idle_session_timeout` a session starts with and `RESET` returns
+    /// to. Zero disables it, as in PostgreSQL.
+    pub idle_session_timeout: Duration,
+}
+
+impl Default for ConnectionLimits {
+    fn default() -> Self {
+        Self {
+            // PostgreSQL's 100, with headroom: pools here are commonly sized
+            // per service, and several services share one server.
+            max_connections: 500,
+            // PostgreSQL's `authentication_timeout` default.
+            handshake_timeout: Duration::from_secs(60),
+            idle_in_transaction_session_timeout: Duration::ZERO,
+            idle_session_timeout: Duration::ZERO,
+        }
+    }
+}
+
+impl ConnectionLimits {
+    /// Refuses the settings that would quietly remove a bound.
+    fn validate(&self) -> io::Result<()> {
+        if self.max_connections == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "max_connections must be at least 1 (an unlimited connection count is not supported)",
+            ));
+        }
+        if self.handshake_timeout.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the handshake (authentication) timeout must be greater than zero",
+            ));
+        }
+        for (name, value) in [
+            (
+                "idle_in_transaction_session_timeout",
+                self.idle_in_transaction_session_timeout,
+            ),
+            ("idle_session_timeout", self.idle_session_timeout),
+        ] {
+            if value.as_millis() > i32::MAX as u128 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{} is larger than {} ms", name, i32::MAX),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 pub async fn start_pgwire(
     database: Arc<Database>,
     addr: &str,
@@ -114,6 +191,38 @@ pub async fn start_pgwire_with_catalog(
     tls: TlsConfig,
     auth: AuthConfig,
 ) -> io::Result<()> {
+    start_pgwire_with_limits(catalog, addr, port, tls, auth, ConnectionLimits::default()).await
+}
+
+/// The shortest and longest pause after a failed `accept()`.
+///
+/// The failures worth pausing for are the process or the system running out
+/// of descriptors or memory, which a retry in the same instant cannot fix and
+/// which a tight retry loop makes worse by spinning a core while the sessions
+/// that would free a descriptor need it.
+const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(50);
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
+
+/// How often the accept loop repeats a warning about the same condition. A
+/// connection storm can produce one per accepted socket, and a log line per
+/// socket is how a storm fills the root disk with syslog.
+const ACCEPT_WARN_INTERVAL: Duration = Duration::from_secs(10);
+
+/// [`start_pgwire_with_catalog`], with explicit connection limits.
+///
+/// Returns an error only when the listener could not start — the limits are
+/// invalid, the port is taken, the certificate is unreadable. A failed
+/// `accept()` is retried, never returned.
+pub async fn start_pgwire_with_limits(
+    catalog: Arc<DatabaseCatalog>,
+    addr: &str,
+    port: u16,
+    tls: TlsConfig,
+    auth: AuthConfig,
+    limits: ConnectionLimits,
+) -> io::Result<()> {
+    limits.validate()?;
+
     // Every database needs its roles before the first connection tries to
     // authenticate: they are per database, so one seeded catalogue does not
     // make the others reachable.
@@ -148,15 +257,108 @@ pub async fn start_pgwire_with_catalog(
         shutdown_tx.send_replace(true);
     });
 
+    // Sessions admitted, against `max_connections`.
     let active = StdArc::new(AtomicUsize::new(0));
+    // Connections over the cap that are still being told so. They need their
+    // startup packet read before the refusal can be sent — over TLS, if that
+    // is what they asked for — so they hold a socket for up to the handshake
+    // timeout. Capped too, at the same number, so a storm costs at most twice
+    // `max_connections` descriptors rather than whatever the storm sends.
+    let rejecting = StdArc::new(AtomicUsize::new(0));
+
+    let mut backoff = ACCEPT_BACKOFF_MIN;
+    let mut failed_accepts: u64 = 0;
+    let mut last_capacity_warning: Option<tokio::time::Instant> = None;
 
     loop {
-        let (stream, peer) = tokio::select! {
+        let accepted = tokio::select! {
             biased;
 
             _ = shutdown_rx.changed() => break,
 
-            accepted = listener.accept() => accepted?,
+            accepted = listener.accept() => accepted,
+        };
+
+        // An accept error is about this process or this one connection, never
+        // about the listener, so it must not end the server. It used to: the
+        // error was returned with `?`, the caller discarded it, and the process
+        // exited — so the `EMFILE` a connection storm produces shut the
+        // database down for everyone, including the sessions already running.
+        let (stream, peer) = match accepted {
+            Ok(accepted) => {
+                if failed_accepts > 0 {
+                    log::info!(
+                        "pgwire accepting again after {} failed accept(s)",
+                        failed_accepts
+                    );
+                }
+                failed_accepts = 0;
+                backoff = ACCEPT_BACKOFF_MIN;
+                accepted
+            }
+            Err(e) if is_per_connection_accept_error(&e) => {
+                // The peer gave up between SYN and accept. Nothing is short;
+                // the next connection can be taken at once.
+                log::debug!("pgwire accept: {}", e);
+                continue;
+            }
+            Err(e) => {
+                failed_accepts += 1;
+                if failed_accepts == 1 {
+                    log::warn!(
+                        "pgwire accept failed: {}; retrying with backoff (up to {:?})",
+                        e,
+                        ACCEPT_BACKOFF_MAX
+                    );
+                } else {
+                    log::debug!("pgwire accept failed again ({}): {}", failed_accepts, e);
+                }
+                tokio::select! {
+                    biased;
+
+                    _ = shutdown_rx.changed() => break,
+
+                    _ = tokio::time::sleep(backoff) => {}
+                }
+                backoff = (backoff * 2).min(ACCEPT_BACKOFF_MAX);
+                continue;
+            }
+        };
+
+        // Admission is decided here, when the socket exists, as PostgreSQL's
+        // postmaster decides it at fork. The slot is a guard so every way a
+        // connection ends — a clean Terminate, an error, a timeout, a panic
+        // unwinding the task — gives it back; a counter decremented at the end
+        // of the task leaked a slot on every panic.
+        let admission = match ConnectionSlot::try_acquire(&active, limits.max_connections) {
+            Some(slot) => Admission::Admitted(slot),
+            None => {
+                let warn_due =
+                    last_capacity_warning.is_none_or(|at| at.elapsed() >= ACCEPT_WARN_INTERVAL);
+                if warn_due {
+                    log::warn!(
+                        "pgwire connection limit reached ({} sessions); refusing new \
+                         connections with 53300",
+                        limits.max_connections
+                    );
+                    last_capacity_warning = Some(tokio::time::Instant::now());
+                }
+                match ConnectionSlot::try_acquire(&rejecting, limits.max_connections) {
+                    Some(slot) => Admission::TooMany(slot),
+                    None => {
+                        // Even the refusals are at their bound. Closing without
+                        // a word is the only response left that costs nothing;
+                        // the client sees the connection reset.
+                        log::debug!(
+                            "pgwire closing {} unanswered: {} refusals already in flight",
+                            peer,
+                            limits.max_connections
+                        );
+                        drop(stream);
+                        continue;
+                    }
+                }
+            }
         };
 
         // Disable Nagle's algorithm on the accepted connection. Linux does NOT
@@ -174,20 +376,32 @@ pub async fn start_pgwire_with_catalog(
         // pgwire was simply missed.
         let _ = stream.set_nodelay(true);
 
+        // Without keepalive a peer that vanishes — a client host powered off,
+        // a NAT entry expiring — leaves the socket established forever, still
+        // holding a connection slot and, if it was inside a block, an open
+        // transaction. Best-effort: a socket that refuses it still works.
+        if let Err(e) = enable_keepalive(&stream) {
+            log::debug!("pgwire could not enable TCP keepalive for {}: {}", peer, e);
+        }
+
         let catalog = catalog.clone();
         let tls_mode = tls.mode;
         let acceptor = acceptor.clone();
-        let active = active.clone();
         let auth = auth.clone();
 
-        active.fetch_add(1, Ordering::Relaxed);
-
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(catalog, stream, acceptor, tls_mode, auth).await {
+            let context = ConnectionContext {
+                too_many: matches!(admission, Admission::TooMany(_)),
+                handshake_finished: StdArc::new(AtomicBool::new(false)),
+                limits,
+            };
+            if let Err(e) =
+                handle_connection(catalog, stream, acceptor, tls_mode, auth, &context).await
+            {
                 log::debug!("pgwire connection {} ended: {}", peer, e);
             }
-
-            active.fetch_sub(1, Ordering::Relaxed);
+            // Released here at the latest; on a panic, by the unwind.
+            drop(admission);
         });
     }
 
@@ -266,6 +480,245 @@ async fn drain_pgwire_connections(active: &AtomicUsize) {
         }
 
         tokio::time::sleep(DRAIN_POLL).await;
+    }
+}
+
+/// Whether an `accept()` error concerns one connection rather than the
+/// process, so the listener can carry straight on without pausing.
+fn is_per_connection_accept_error(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::ConnectionAborted | io::ErrorKind::ConnectionReset
+    )
+}
+
+/// One unit of a connection counter, given back when dropped.
+struct ConnectionSlot(StdArc<AtomicUsize>);
+
+impl ConnectionSlot {
+    /// Takes a unit if the counter is below `cap`. A compare-and-swap rather
+    /// than an increment followed by a check, so two connections arriving
+    /// together cannot both see room for one.
+    fn try_acquire(counter: &StdArc<AtomicUsize>, cap: usize) -> Option<Self> {
+        counter
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < cap).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| Self(counter.clone()))
+    }
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Whether a connection was admitted as a session, or is over the cap and is
+/// only being told so. Either way it holds a slot in its own counter.
+enum Admission {
+    Admitted(#[allow(dead_code)] ConnectionSlot),
+    TooMany(#[allow(dead_code)] ConnectionSlot),
+}
+
+/// What the accept loop decided about a connection, carried into it.
+struct ConnectionContext {
+    /// Over `max_connections`: answer the startup packet with `53300`.
+    too_many: bool,
+    /// Set once the session is established, which disarms the handshake
+    /// deadline on the stream.
+    handshake_finished: StdArc<AtomicBool>,
+    limits: ConnectionLimits,
+}
+
+/// A stream that fails with `TimedOut` once the handshake deadline passes,
+/// until the handshake is marked finished.
+///
+/// The deadline is enforced on the socket rather than by dropping the
+/// connection's future, because the handshake is not only waiting on the
+/// client: authentication runs a catalogue query, and a statement future
+/// dropped mid-flight can leave its autocommit transaction in progress for
+/// good. Here only a wait on the client can time out; the engine's work is
+/// never interrupted. Every read and write, the TLS handshake included, sits
+/// under it, so a socket that sends nothing, half a startup packet, or a
+/// startup packet and then no password is closed alike.
+struct HandshakeDeadline<S> {
+    inner: S,
+    deadline: Pin<Box<tokio::time::Sleep>>,
+    finished: StdArc<AtomicBool>,
+}
+
+impl<S> HandshakeDeadline<S> {
+    fn new(inner: S, timeout: Duration, finished: StdArc<AtomicBool>) -> Self {
+        Self {
+            inner,
+            deadline: Box::pin(tokio::time::sleep(timeout)),
+            finished,
+        }
+    }
+
+    /// Whether the deadline has passed with the handshake still unfinished.
+    ///
+    /// Polling the timer registers this task to be woken when it fires, which
+    /// is what turns a read blocked forever into one that returns an error.
+    fn expired(&mut self, cx: &mut Context<'_>) -> bool {
+        !self.finished.load(Ordering::Acquire) && self.deadline.as_mut().poll(cx).is_ready()
+    }
+}
+
+fn handshake_timed_out() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        "connection did not complete its startup and authentication within the handshake timeout",
+    )
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for HandshakeDeadline<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_read(cx, buf) {
+            Poll::Pending if this.expired(cx) => Poll::Ready(Err(handshake_timed_out())),
+            other => other,
+        }
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for HandshakeDeadline<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_write(cx, buf) {
+            Poll::Pending if this.expired(cx) => Poll::Ready(Err(handshake_timed_out())),
+            other => other,
+        }
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_write_vectored(cx, bufs) {
+            Poll::Pending if this.expired(cx) => Poll::Ready(Err(handshake_timed_out())),
+            other => other,
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_flush(cx) {
+            Poll::Pending if this.expired(cx) => Poll::Ready(Err(handshake_timed_out())),
+            other => other,
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+/// How long an accepted socket may sit silent before the kernel starts
+/// probing it, how far apart the probes are, and how many go unanswered
+/// before the connection is declared dead: about two minutes from the last
+/// traffic to a closed socket. The system defaults wait two hours before the
+/// first probe, which is long enough for a dead peer's open transaction to
+/// hold back reclamation through a whole working day of churn.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const KEEPALIVE_IDLE_SECS: libc::c_int = 60;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const KEEPALIVE_INTERVAL_SECS: libc::c_int = 15;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const KEEPALIVE_PROBES: libc::c_int = 4;
+
+/// Turns on TCP keepalive for an accepted socket.
+///
+/// Through `libc` because tokio's `TcpStream` exposes no keepalive setter and
+/// `socket2` is not a dependency of this crate.
+#[cfg(unix)]
+fn enable_keepalive(stream: &TcpStream) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    fn set(
+        fd: libc::c_int,
+        level: libc::c_int,
+        name: libc::c_int,
+        value: libc::c_int,
+    ) -> io::Result<()> {
+        // SAFETY: `fd` is a live socket owned by the caller's `TcpStream` for
+        // the duration of the call, and the option value is a `c_int` passed
+        // with its exact size, which is what every option set here expects.
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                level,
+                name,
+                &value as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    let fd = stream.as_raw_fd();
+    set(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1)?;
+    // Elsewhere the timings stay at the system's defaults: the option names
+    // differ per platform, and keepalive with slow timings still bounds a
+    // dead peer where none bounded it at all.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        set(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, KEEPALIVE_IDLE_SECS)?;
+        set(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, KEEPALIVE_INTERVAL_SECS)?;
+        set(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT, KEEPALIVE_PROBES)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn enable_keepalive(_stream: &TcpStream) -> io::Result<()> {
+    Ok(())
+}
+
+/// How long a session that is ending waits to hand the client its last
+/// bytes: the `FATAL` that says why, whatever output is still buffered, a TLS
+/// `close_notify`.
+///
+/// None of it changes the outcome, because the session ends either way. A
+/// client that has stopped reading — its receive window shut, the kernel's
+/// send buffer full — would otherwise park that write for as long as it
+/// keeps its socket open, and an idle timeout that ends a session only to
+/// wait forever on its goodbye frees nothing: the connection slot, the
+/// descriptor and the task all stay held. Keepalive does not catch it either:
+/// a peer that is alive and simply not reading answers its probes.
+const SESSION_END_WRITE_BOUND: Duration = Duration::from_secs(2);
+
+/// Runs one of a session's final writes, giving up after `bound`.
+async fn bounded_final_write<F>(bound: Duration, write: F) -> io::Result<()>
+where
+    F: Future<Output = io::Result<()>>,
+{
+    match tokio::time::timeout(bound, write).await {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "the client did not take the session's final bytes; closing without them",
+        )),
     }
 }
 
@@ -376,28 +829,37 @@ async fn handle_connection(
     acceptor: Option<TlsAcceptor>,
     tls_mode: TlsMode,
     auth: AuthConfig,
+    context: &ConnectionContext,
 ) -> io::Result<()> {
     let (tcp, watch) = duplicate_for_watch(tcp)?;
+    // The deadline sits underneath everything, TLS included, and is disarmed
+    // once the session is established (`finish_startup`).
+    let tcp = HandshakeDeadline::new(
+        tcp,
+        context.limits.handshake_timeout,
+        context.handshake_finished.clone(),
+    );
     PEER_WATCH
         .scope(
             watch,
-            handle_connection_inner(catalog, tcp, acceptor, tls_mode, auth),
+            handle_connection_inner(catalog, tcp, acceptor, tls_mode, auth, context),
         )
         .await
 }
 
 async fn handle_connection_inner(
     catalog: Arc<DatabaseCatalog>,
-    mut tcp: TcpStream,
+    mut tcp: HandshakeDeadline<TcpStream>,
     acceptor: Option<TlsAcceptor>,
     tls_mode: TlsMode,
     auth: AuthConfig,
+    context: &ConnectionContext,
 ) -> io::Result<()> {
     // PostgreSQL clients may send one or more 8-byte startup *requests* before the
     // real StartupMessage (e.g., GSSENCRequest, SSLRequest). If we don't answer
     // them correctly, many clients will hang during connect and pools will time out.
     loop {
-        let (first_len, first_buf) = read_startup_packet(&mut tcp).await?;
+        let (first_len, first_buf) = read_startup_packet_or_refuse(&mut tcp).await?;
         let first_code = i32::from_be_bytes(first_buf[0..4].try_into().unwrap());
 
         // CancelRequest: length 16, the code, then the process id and secret
@@ -434,7 +896,8 @@ async fn handle_connection_inner(
                             })?;
                             // After TLS handshake, client sends a fresh StartupMessage.
                             let result =
-                                run_session_after_ssl(catalog, &mut tls_stream, &auth).await;
+                                run_session_after_ssl(catalog, &mut tls_stream, &auth, context)
+                                    .await;
 
                             // Close the TLS session before dropping it. Dropping
                             // the stream closes the socket without sending
@@ -443,8 +906,14 @@ async fn handle_connection_inner(
                             // truncated one, and sqlx logs a warning every time
                             // it returns a connection to the pool. Best-effort —
                             // the session is over either way, and a client that
-                            // has already gone will fail this write.
-                            if let Err(e) = tls_stream.shutdown().await {
+                            // has already gone will fail this write. Bounded,
+                            // because one that has stopped reading never would.
+                            let shutdown = bounded_final_write(
+                                SESSION_END_WRITE_BOUND,
+                                tls_stream.shutdown(),
+                            )
+                            .await;
+                            if let Err(e) = shutdown {
                                 log::debug!("TLS shutdown: {}", e);
                             }
                             return result;
@@ -492,7 +961,7 @@ async fn handle_connection_inner(
         // name, so they are parsed rather than discarded.
         let _ = first_len;
         let parameters = parse_startup_parameters(&first_buf);
-        return run_session_after_startup(catalog, &mut tcp, &parameters, &auth).await;
+        return finish_startup(catalog, &mut tcp, &parameters, &auth, context).await;
     }
 }
 
@@ -500,23 +969,15 @@ async fn run_session_after_ssl<S>(
     catalog: Arc<DatabaseCatalog>,
     stream: &mut S,
     auth: &AuthConfig,
+    context: &ConnectionContext,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     // After SSL negotiation (either accepted or denied), the client sends StartupMessage.
-    let (_, payload) = read_startup_packet(stream).await?;
+    let (_, payload) = read_startup_packet_or_refuse(stream).await?;
     let parameters = parse_startup_parameters(&payload);
-    finish_startup(catalog, stream, &parameters, auth).await
-}
-
-async fn run_session_after_startup(
-    catalog: Arc<DatabaseCatalog>,
-    stream: &mut TcpStream,
-    parameters: &HashMap<String, String>,
-    auth: &AuthConfig,
-) -> io::Result<()> {
-    finish_startup(catalog, stream, parameters, auth).await
+    finish_startup(catalog, stream, &parameters, auth, context).await
 }
 
 /// Authenticates, then reports the session parameters and enters the loop.
@@ -528,10 +989,24 @@ async fn finish_startup<S>(
     stream: &mut S,
     parameters: &HashMap<String, String>,
     auth: &AuthConfig,
+    context: &ConnectionContext,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // Over the cap. Refused only now, after the startup packet and any TLS
+    // negotiation, because that is where a client is able to read an error:
+    // one written in reply to an `SSLRequest` would be taken for the server's
+    // answer to it. PostgreSQL refuses at the same point, with the same code.
+    if context.too_many {
+        log::debug!(
+            "connection refused: max_connections ({}) reached",
+            context.limits.max_connections
+        );
+        send_fatal_error_response(stream, "53300", "sorry, too many clients already").await?;
+        return Ok(());
+    }
+
     // The database is resolved before the password is checked, because roles
     // are per database: which catalogue answers for this user depends on which
     // database was asked for. A name that does not exist is therefore reported
@@ -584,10 +1059,13 @@ where
     // after this, which is what lets the read buffer run ahead safely.
     let watch = PEER_WATCH.try_with(|w| w.clone()).ok().flatten();
     let mut conn = wire_out::WireStream::new(stream, watch);
-    let result = authenticate_and_serve(catalog, &database, &mut conn, parameters, auth).await;
+    let result =
+        authenticate_and_serve(catalog, &database, &mut conn, parameters, auth, context).await;
     // Whatever is still buffered was owed to the client. Best-effort: on an
-    // error path the socket may already be gone.
-    let _ = conn.flush().await;
+    // error path the socket may already be gone, and bounded, because a
+    // client that stopped reading would otherwise hold the session open here
+    // after it has ended.
+    let _ = bounded_final_write(SESSION_END_WRITE_BOUND, conn.flush()).await;
     result
 }
 
@@ -597,6 +1075,7 @@ async fn authenticate_and_serve<S>(
     stream: &mut S,
     parameters: &HashMap<String, String>,
     auth: &AuthConfig,
+    context: &ConnectionContext,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -609,6 +1088,21 @@ where
                 auth.method.name()
             );
             principal
+        }
+        // Out of time is not a wrong password, and saying `28P01` would send
+        // whoever reads the log looking for a credential problem. PostgreSQL's
+        // words and code for it. Best-effort: the client that let the
+        // deadline pass may not be reading, and the deadline still bounds
+        // this write.
+        Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+            log::info!("authentication timed out");
+            let _ = send_fatal_error_response(
+                stream,
+                "57014",
+                "canceling authentication due to timeout",
+            )
+            .await;
+            return Ok(());
         }
         Err(e) => {
             log::info!("authentication refused: {}", e);
@@ -624,6 +1118,9 @@ where
     crate::auth::fill_random(&mut key);
     let registration = crate::core::cancel::register_session(key);
     send_startup_responses(stream, registration.pid, registration.key).await?;
+    // The session is established; from here a quiet client is an idle
+    // session, bounded (if at all) by the idle timeouts instead.
+    context.handshake_finished.store(true, Ordering::Release);
     let startup_timeout = startup_statement_timeout(parameters);
     SESSION_CANCEL
         .scope(
@@ -633,6 +1130,7 @@ where
                 database,
                 auth.clone(),
                 principal,
+                context.limits,
                 stream,
                 startup_timeout,
             ),
@@ -825,13 +1323,14 @@ async fn run_message_loop<S>(
     database: &Arc<Database>,
     auth: AuthConfig,
     principal: Principal,
+    limits: ConnectionLimits,
     stream: &mut S,
     startup_statement_timeout: Option<u64>,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut state = SessionState::new(catalog, database.name.clone(), auth, principal);
+    let mut state = SessionState::new(catalog, database.name.clone(), auth, principal, limits);
     // Applied before the first statement, so a driver that set it at connection
     // time is protected by it from the very first query rather than from
     // whenever it happens to issue a `SET`.
@@ -923,13 +1422,49 @@ async fn run_message_loop_inner<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // Whether the last thing sent was a `ReadyForQuery`, i.e. the session is
+    // waiting for the client to start something rather than in the middle of
+    // an extended-query batch. The idle timeouts run only then, as in
+    // PostgreSQL, which arms them where it sends `ReadyForQuery`: a client
+    // between `Parse` and `Sync` is mid-request, not idle. Startup ended with
+    // one, so the session begins idle.
+    let mut ready = true;
+
     loop {
         let mut tag = [0u8; 1];
-        match stream.read_exact(&mut tag).await {
+        // The timer covers only this wait — the read of the first byte of the
+        // next message. A statement that runs for an hour is never subject to
+        // it, because nothing is being read while it runs. Output is already
+        // flushed here (`ReadyForQuery` flushes), so the timer is not spent
+        // waiting on a slow reader either.
+        //
+        // Cancelling the read is safe: a one-byte `read_exact` that has not
+        // completed has consumed nothing, so a message arriving as the timer
+        // fires is not torn.
+        let idle = if ready { state.idle_limit() } else { None };
+        let read = match idle {
+            None => stream.read_exact(&mut tag).await,
+            Some((limit, kind)) => {
+                match tokio::time::timeout(limit, stream.read_exact(&mut tag)).await {
+                    Ok(read) => read,
+                    Err(_) => return terminate_idle_session(database, state, stream, kind).await,
+                }
+            }
+        };
+        match read {
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e),
         }
+        // Whether handling this message ends with a `ReadyForQuery`: a simple
+        // query and a `Sync` always do, the batch messages never do, and an
+        // unknown message does unless it falls in a discard window, where it
+        // is dropped without a reply.
+        ready = match tag[0] {
+            b'Q' | b'S' => true,
+            b'P' | b'B' | b'D' | b'E' | b'C' | b'H' => false,
+            _ => !state.error_in_batch,
+        };
 
         let len = read_i32_be(stream).await?;
         // Checked against the type's limit before anything is allocated, as
@@ -1027,6 +1562,62 @@ where
     }
 }
 
+/// Which idle timeout is running while a session waits for its next message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IdleKind {
+    /// `idle_in_transaction_session_timeout`: a block is open, failed or not.
+    InTransaction,
+    /// `idle_session_timeout`: no block is open.
+    Session,
+}
+
+/// Ends a session whose idle timeout expired, the way PostgreSQL does: the
+/// open block, if any, is rolled back, then a `FATAL` says why, then the
+/// connection closes.
+///
+/// The rollback comes first, so a client that has read the error can rely on
+/// the transaction being gone — not still in progress for however long the
+/// connection's teardown takes.
+async fn terminate_idle_session<S>(
+    database: &Arc<Database>,
+    state: &mut SessionState,
+    stream: &mut S,
+    kind: IdleKind,
+) -> io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let (sqlstate, message) = match kind {
+        IdleKind::InTransaction => (
+            "25P03",
+            "terminating connection due to idle-in-transaction timeout",
+        ),
+        IdleKind::Session => ("57P05", "terminating connection due to idle-session timeout"),
+    };
+    if let Some(t) = state.transaction.take() {
+        log::info!("{}; rolling back transaction {}", message, t.id);
+        state.end_block_settings(&t);
+        // What `ROLLBACK` does, row locks and replication buffers included:
+        // releasing what the idle block holds is the point of the timeout.
+        let wrote = database.transactions.wrote_family(t.id);
+        database.abort_transaction(t.id);
+        if wrote {
+            flush_outcomes(database);
+        }
+    } else {
+        log::info!("{}", message);
+    }
+    // Bounded: the client may be the reason the session went idle, and one
+    // that has stopped reading would otherwise keep this session — and its
+    // connection slot — for as long as it keeps the socket. An error here is
+    // returned only to be logged; the connection closes either way.
+    bounded_final_write(
+        SESSION_END_WRITE_BOUND,
+        send_fatal_error_response(stream, sqlstate, message),
+    )
+    .await
+}
+
 struct SessionState {
     /// Every database this process serves.
     ///
@@ -1108,6 +1699,14 @@ struct SessionState {
     /// own transaction state) leaves the journal with a statement and no
     /// reason.
     statement_error: Option<String>,
+    /// The server's connection limits: what `RESET` returns the idle timeouts
+    /// to, and what `SHOW max_connections` reports.
+    limits: ConnectionLimits,
+    /// `idle_in_transaction_session_timeout` for this session. Zero disables
+    /// it.
+    idle_in_transaction_timeout: Duration,
+    /// `idle_session_timeout` for this session. Zero disables it.
+    idle_session_timeout: Duration,
 }
 
 impl Default for IsolationLevel {
@@ -1219,6 +1818,10 @@ struct SessionTransaction {
     /// the same block does not overwrite the restore target with its
     /// predecessor's value.
     local_synchronous_commit: Option<Option<bool>>,
+    /// The session's idle timeouts from before the first `SET LOCAL` of
+    /// either in this block, to be put back when it ends. Same shape and
+    /// reason as `local_synchronous_commit`.
+    local_idle_timeouts: Option<(Duration, Duration)>,
     /// The level this block runs at.
     level: IsolationLevel,
     /// `BEGIN READ ONLY` / `SET TRANSACTION READ ONLY`: writes in this block
@@ -1245,8 +1848,12 @@ impl SessionState {
         database_name: String,
         auth: AuthConfig,
         principal: Principal,
+        limits: ConnectionLimits,
     ) -> Self {
         Self {
+            limits,
+            idle_in_transaction_timeout: limits.idle_in_transaction_session_timeout,
+            idle_session_timeout: limits.idle_session_timeout,
             catalog,
             database_name,
             auth,
@@ -1285,6 +1892,26 @@ impl SessionState {
         if let Some(previous) = t.local_synchronous_commit {
             self.synchronous_commit = previous;
         }
+        if let Some((in_transaction, session)) = t.local_idle_timeouts {
+            self.idle_in_transaction_timeout = in_transaction;
+            self.idle_session_timeout = session;
+        }
+    }
+
+    /// The idle timeout to run while waiting for the next message, if one is
+    /// set for the state the session is in.
+    ///
+    /// Inside a block — including one that has failed and is waiting for its
+    /// `ROLLBACK`, which still pins its snapshot — that is
+    /// `idle_in_transaction_session_timeout`; outside one,
+    /// `idle_session_timeout`. PostgreSQL draws the same line.
+    fn idle_limit(&self) -> Option<(Duration, IdleKind)> {
+        let (limit, kind) = if self.transaction.is_some() {
+            (self.idle_in_transaction_timeout, IdleKind::InTransaction)
+        } else {
+            (self.idle_session_timeout, IdleKind::Session)
+        };
+        (!limit.is_zero()).then_some((limit, kind))
     }
 
     /// The transaction status byte for `ReadyForQuery`.
@@ -4910,6 +5537,7 @@ fn open_block(
         // ran it, and `COMMIT AND CHAIN` carries the characteristics over, not
         // the settings.
         local_synchronous_commit: None,
+        local_idle_timeouts: None,
         level,
         read_only,
         savepoints: Vec::new(),
@@ -5464,6 +6092,148 @@ fn strip_setting(lower: &str, key: &str) -> Option<Option<String>> {
     Some(Some(value.to_string()))
 }
 
+/// Applies `SET`/`RESET` of one of the idle timeouts.
+///
+/// `value` is what [`strip_setting`] returned: `None` for `RESET` or
+/// `DEFAULT`, which go back to the server's default rather than to zero.
+async fn set_idle_timeout<S>(
+    state: &mut SessionState,
+    stream: &mut S,
+    lower: &str,
+    key: &str,
+    kind: IdleKind,
+    value: Option<String>,
+) -> io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let new = match value {
+        None => match kind {
+            IdleKind::InTransaction => state.limits.idle_in_transaction_session_timeout,
+            IdleKind::Session => state.limits.idle_session_timeout,
+        },
+        Some(value) => match parse_time_setting(&value, 1) {
+            Ok(d) => d,
+            Err(e) => {
+                return fail_statement(
+                    state,
+                    stream,
+                    "22023",
+                    &format!("invalid value for parameter \"{}\": {}", key, e),
+                )
+                .await;
+            }
+        },
+    };
+
+    // As for `synchronous_commit`: `SET LOCAL` outside a block changes
+    // nothing and says so, and inside one records the values to put back.
+    if is_set_local(lower) {
+        let previous = (state.idle_in_transaction_timeout, state.idle_session_timeout);
+        match state.transaction.as_mut() {
+            None => {
+                send_notice(
+                    stream,
+                    "25P01",
+                    "SET LOCAL can only be used in transaction blocks",
+                )
+                .await?;
+                return send_command_complete(stream, "SET").await;
+            }
+            Some(t) => {
+                t.local_idle_timeouts.get_or_insert(previous);
+            }
+        }
+    }
+
+    match kind {
+        IdleKind::InTransaction => state.idle_in_transaction_timeout = new,
+        IdleKind::Session => state.idle_session_timeout = new,
+    }
+    let tag = if lower.trim_start().starts_with("reset") {
+        "RESET"
+    } else {
+        "SET"
+    };
+    send_command_complete(stream, tag).await
+}
+
+/// Parses a time-valued setting as PostgreSQL does: a number, optionally
+/// followed by one of `us`, `ms`, `s`, `min`, `h` or `d`, optionally quoted.
+/// A bare number is in `base_unit_ms` milliseconds — `1` for the idle
+/// timeouts, whose unit is milliseconds, and `1000` for
+/// `authentication_timeout`, whose unit is seconds.
+///
+/// The result must fit PostgreSQL's range for these settings, 0 to
+/// `i32::MAX` milliseconds. A positive value too small to round to a whole
+/// millisecond is refused rather than rounded to zero, because zero means
+/// "disabled" and a client that asked for a bound must not silently get none.
+pub fn parse_time_setting(raw: &str, base_unit_ms: u64) -> Result<Duration, String> {
+    let trimmed = raw.trim();
+    let text = trimmed
+        .strip_prefix('\'')
+        .and_then(|v| v.strip_suffix('\''))
+        .unwrap_or(trimmed)
+        .trim();
+    let split = text
+        .find(|c: char| !(c.is_ascii_digit() || matches!(c, '.' | '-' | '+')))
+        .unwrap_or(text.len());
+    let (number, unit) = text.split_at(split);
+    let number: f64 = number
+        .parse()
+        .map_err(|_| format!("\"{}\" is not a number with an optional time unit", trimmed))?;
+    let unit_ms = match unit.trim() {
+        "" => base_unit_ms as f64,
+        "us" => 0.001,
+        "ms" => 1.0,
+        "s" => 1_000.0,
+        "min" => 60_000.0,
+        "h" => 3_600_000.0,
+        "d" => 86_400_000.0,
+        other => {
+            return Err(format!(
+                "\"{}\" is not a valid unit; valid units are \"us\", \"ms\", \"s\", \"min\", \"h\" and \"d\"",
+                other
+            ));
+        }
+    };
+    let ms = (number * unit_ms).round();
+    if !ms.is_finite() || ms < 0.0 || ms > i32::MAX as f64 {
+        return Err(format!(
+            "\"{}\" is outside the valid range (0 .. {} ms)",
+            trimmed,
+            i32::MAX
+        ));
+    }
+    if ms == 0.0 && number > 0.0 {
+        return Err(format!(
+            "\"{}\" is less than one millisecond; use 0 to disable",
+            trimmed
+        ));
+    }
+    Ok(Duration::from_millis(ms as u64))
+}
+
+/// Renders a time setting as PostgreSQL's `SHOW` does: in the largest unit
+/// that represents it exactly, and `0` for zero.
+pub fn format_time_setting(value: Duration) -> String {
+    let ms = value.as_millis();
+    if ms == 0 {
+        return "0".to_string();
+    }
+    for (unit, size) in [
+        ("d", 86_400_000),
+        ("h", 3_600_000),
+        ("min", 60_000),
+        ("s", 1_000),
+    ] {
+        if ms % size == 0 {
+            return format!("{}{}", ms / size, unit);
+        }
+    }
+    format!("{}ms", ms)
+}
+
 async fn handle_builtin_query<S>(
     state: &mut SessionState,
     stream: &mut S,
@@ -5566,6 +6336,37 @@ where
             },
         }
         return Ok(true);
+    }
+
+    // The idle timeouts are enforced, so they are real settings too: a `SET`
+    // acknowledged and dropped would let a pool believe its sessions are
+    // bounded when nothing bounds them.
+    for (key, kind) in [
+        ("idle_in_transaction_session_timeout", IdleKind::InTransaction),
+        ("idle_session_timeout", IdleKind::Session),
+    ] {
+        if let Some(value) = strip_setting(&s_lower, key) {
+            set_idle_timeout(state, stream, &s_lower, key, kind, value).await?;
+            return Ok(true);
+        }
+    }
+
+    // Server-wide, fixed at start-up. `SHOW` reports them, so a `SET` that
+    // was acknowledged would leave the two disagreeing; PostgreSQL refuses it.
+    for key in ["max_connections", "authentication_timeout"] {
+        if strip_setting(&s_lower, key).is_some() {
+            fail_statement(
+                state,
+                stream,
+                "55P02",
+                &format!(
+                    "parameter \"{}\" cannot be changed without restarting the server",
+                    key
+                ),
+            )
+            .await?;
+            return Ok(true);
+        }
     }
 
     // `SET`/`SHOW` are two things at once: PostgreSQL runtime parameters, which
@@ -5764,10 +6565,18 @@ fn show_parameter(state: &SessionState, key: &str) -> Option<String> {
             Some(ms) => format!("{}ms", ms),
             None => "0".to_string(),
         },
-        // Still unenforced, and still answered as disabled, which is what they
-        // are. Not grouped with `statement_timeout` any more precisely because
+        // Still unenforced, and still answered as disabled, which is what it
+        // is. Not grouped with `statement_timeout` any more precisely because
         // that one now means something.
-        "lock_timeout" | "idle_in_transaction_session_timeout" => "0".to_string(),
+        "lock_timeout" => "0".to_string(),
+        // Enforced per session (see `idle_limit`), and reported as this
+        // session has them.
+        "idle_in_transaction_session_timeout" => {
+            format_time_setting(state.idle_in_transaction_timeout)
+        }
+        "idle_session_timeout" => format_time_setting(state.idle_session_timeout),
+        "max_connections" => state.limits.max_connections.to_string(),
+        "authentication_timeout" => format_time_setting(state.limits.handshake_timeout),
         _ => return None,
     };
     Some(value)
@@ -7628,6 +8437,29 @@ where
     Ok((len, buf))
 }
 
+/// [`read_startup_packet`], telling the client why before the connection is
+/// closed over a length out of range.
+///
+/// The refusal used to be silent — the socket simply closed — so a client
+/// with a broken framing layer saw a reset and nothing to say what it had
+/// sent wrong. `08P01` with PostgreSQL's wording for it. Best-effort, and
+/// bounded by the handshake deadline underneath: the client that sent a
+/// nonsense length may not be reading at all.
+async fn read_startup_packet_or_refuse<S>(stream: &mut S) -> io::Result<(i32, Vec<u8>)>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    match read_startup_packet(stream).await {
+        Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+            let _ =
+                send_fatal_error_response(stream, "08P01", "invalid length of startup packet")
+                    .await;
+            Err(e)
+        }
+        other => other,
+    }
+}
+
 async fn send_fatal_error_response<S>(
     stream: &mut S,
     sqlstate: &str,
@@ -7819,6 +8651,128 @@ mod pre_auth_length_tests {
         let err = read_message(&mut stream).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         });
+    }
+}
+
+#[cfg(test)]
+mod session_end_tests {
+    use super::*;
+    use crate::core::database::DEFAULT_DATABASE_NAME;
+
+    /// A session ended by its idle timeout must close even when the client
+    /// has stopped reading, rather than wait forever on its goodbye.
+    ///
+    /// A 16-byte pipe stands in for a client whose receive window has shut:
+    /// it reads the startup replies, then nothing more, so the `FATAL` —
+    /// longer than the pipe — can never be written in full. Both the error and
+    /// the final flush behind it must give up, or the session keeps its
+    /// connection slot for as long as the client keeps the socket. Over TCP
+    /// the same state needs the kernel's send buffer filled to within a few
+    /// bytes of its auto-tuned size, which no test can arrange reliably.
+    #[tokio::test]
+    async fn an_idle_session_ends_even_when_the_client_is_not_reading() {
+        let _ = crate::MAX_PERMITS_THREADS.set(4);
+        let _ = crate::BATCH_SIZE.set(10_000);
+        let catalog = DatabaseCatalog::open(None, DEFAULT_DATABASE_NAME)
+            .await
+            .expect("in-memory catalogue");
+        let auth = AuthConfig {
+            method: crate::auth::AuthMethod::Trust,
+            ..AuthConfig::default()
+        };
+        let context = ConnectionContext {
+            too_many: false,
+            handshake_finished: StdArc::new(AtomicBool::new(false)),
+            limits: ConnectionLimits {
+                idle_session_timeout: Duration::from_millis(100),
+                ..ConnectionLimits::default()
+            },
+        };
+        let parameters = HashMap::from([("user".to_string(), "rasterized".to_string())]);
+
+        let (mut server_end, mut client_end) = tokio::io::duplex(16);
+        // Boxed: the session future holds the whole statement path.
+        let session = Box::pin(finish_startup(
+            catalog,
+            &mut server_end,
+            &parameters,
+            &auth,
+            &context,
+        ));
+        let client = async {
+            // The startup replies, through ReadyForQuery; then silence, with
+            // the pipe still open.
+            loop {
+                let mut header = [0u8; 5];
+                client_end.read_exact(&mut header).await.expect("startup reply");
+                let len = i32::from_be_bytes(header[1..5].try_into().unwrap()) as usize;
+                let mut body = vec![0u8; len - 4];
+                client_end.read_exact(&mut body).await.expect("startup reply body");
+                if header[0] == b'Z' {
+                    break;
+                }
+            }
+        };
+        let (ended, ()) =
+            tokio::join!(tokio::time::timeout(Duration::from_secs(15), session), client);
+        let result = ended.expect("the session must end by itself although the client stopped reading");
+        // Ended by the bound on its last write, not by anything else.
+        assert_eq!(result.expect_err("the FATAL could not be delivered").kind(), io::ErrorKind::TimedOut);
+        drop(client_end);
+    }
+}
+
+#[cfg(test)]
+mod time_setting_tests {
+    use super::{format_time_setting, parse_time_setting};
+    use std::time::Duration;
+
+    #[test]
+    fn units_and_bare_numbers_parse_as_postgresql_reads_them() {
+        let ms = |v: u64| Ok(Duration::from_millis(v));
+        assert_eq!(parse_time_setting("250", 1), ms(250));
+        assert_eq!(parse_time_setting("'250'", 1), ms(250));
+        assert_eq!(parse_time_setting("5s", 1), ms(5_000));
+        assert_eq!(parse_time_setting("'5 s'", 1), ms(5_000));
+        assert_eq!(parse_time_setting("1.5s", 1), ms(1_500));
+        assert_eq!(parse_time_setting("2min", 1), ms(120_000));
+        assert_eq!(parse_time_setting("1h", 1), ms(3_600_000));
+        assert_eq!(parse_time_setting("1d", 1), ms(86_400_000));
+        assert_eq!(parse_time_setting("1500us", 1), ms(2));
+        assert_eq!(parse_time_setting("0", 1), ms(0));
+        // A bare number for `authentication_timeout` is seconds.
+        assert_eq!(parse_time_setting("60", 1_000), ms(60_000));
+    }
+
+    /// Each of these used to be — or could easily become — a zero, which
+    /// disables the timeout instead of setting it.
+    #[test]
+    fn anything_else_is_refused_rather_than_read_as_zero() {
+        for bad in ["", "soon", "-1", "5 parsecs", "1us", "nan", "inf", "99999999999", "1e3"] {
+            assert!(parse_time_setting(bad, 1).is_err(), "{:?} must be refused", bad);
+        }
+    }
+
+    #[test]
+    fn show_uses_the_largest_exact_unit() {
+        let show = |v: u64| format_time_setting(Duration::from_millis(v));
+        assert_eq!(show(0), "0");
+        assert_eq!(show(200), "200ms");
+        assert_eq!(show(1_500), "1500ms");
+        assert_eq!(show(5_000), "5s");
+        assert_eq!(show(60_000), "1min");
+        assert_eq!(show(90_000), "90s");
+        assert_eq!(show(7_200_000), "2h");
+        assert_eq!(show(86_400_000), "1d");
+    }
+
+    /// What `SHOW` prints, `SET` reads back to the same value.
+    #[test]
+    fn show_output_round_trips() {
+        for v in [1u64, 200, 1_500, 5_000, 60_000, 90_000, 7_200_000, 86_400_000] {
+            let d = Duration::from_millis(v);
+            assert_eq!(parse_time_setting(&format_time_setting(d), 1), Ok(d));
+        }
     }
 }
 

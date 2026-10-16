@@ -4619,6 +4619,7 @@ dependencies = [
  "bytes",
  "chrono",
  "env_logger",
+ "libc",
  "postgres-types",
  "rasterizeddb_core",
  "rclite",
