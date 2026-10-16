@@ -296,6 +296,17 @@ pub struct Wal {
     /// Set when a flush has failed. Durability can no longer be promised, so
     /// every later commit reports an error rather than lying about it.
     poisoned: AtomicBool,
+    /// What poisoned the log, kept so an operator can see it without having
+    /// caught the one log line that announced it. Set once, by the first
+    /// failure; later ones are consequences of it.
+    poison_reason: OnceLock<String>,
+    /// Checkpoints that returned without discarding the log because a
+    /// transaction was open or another checkpoint was running. Expected in
+    /// small numbers; one that only ever grows means the log never shrinks.
+    checkpoints_declined: AtomicU64,
+    /// Checkpoints that returned an error, and the most recent such error.
+    checkpoint_failures: AtomicU64,
+    last_checkpoint_error: Mutex<Option<String>>,
     /// In-place overwrites waiting for their transaction to commit.
     ///
     /// Only overwrites appear here; appends never take this lock, which keeps
@@ -446,6 +457,10 @@ impl Wal {
             bytes_since_checkpoint: AtomicU64::new(end),
             checkpointing: AtomicBool::new(false),
             poisoned: AtomicBool::new(false),
+            poison_reason: OnceLock::new(),
+            checkpoints_declined: AtomicU64::new(0),
+            checkpoint_failures: AtomicU64::new(0),
+            last_checkpoint_error: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
             pending_count: AtomicU64::new(0),
             pending_sync: AtomicU64::new(0),
@@ -472,6 +487,64 @@ impl Wal {
     /// True once a flush has failed and durability can no longer be promised.
     pub fn is_poisoned(&self) -> bool {
         self.poisoned.load(Ordering::Acquire)
+    }
+
+    /// The failure that poisoned the log, if one has.
+    pub fn poison_reason(&self) -> Option<String> {
+        self.poison_reason.get().cloned()
+    }
+
+    /// How many checkpoints declined to discard the log, and how many failed.
+    pub fn checkpoint_counts(&self) -> (u64, u64) {
+        (
+            self.checkpoints_declined.load(Ordering::Relaxed),
+            self.checkpoint_failures.load(Ordering::Relaxed),
+        )
+    }
+
+    /// The most recent checkpoint error, if any checkpoint has failed.
+    pub fn last_checkpoint_error(&self) -> Option<String> {
+        self.last_checkpoint_error.lock().clone()
+    }
+
+    /// Stops the log promising durability for the rest of the process.
+    ///
+    /// For any failure after which the log or the data files may no longer
+    /// hold what a commit was told they hold. The reason is recorded before
+    /// the flag is raised, so anyone who sees the flag can also read why.
+    fn poison(&self, why: String) {
+        log::error!(
+            "WAL {} is poisoned and refuses every further commit: {}",
+            self.path.display(),
+            why
+        );
+        let _ = self.poison_reason.set(why);
+        self.poisoned.store(true, Ordering::Release);
+    }
+
+    fn poisoned_error(&self) -> io::Error {
+        io::Error::other(format!(
+            "WAL is poisoned by an earlier failure ({}); durability cannot be guaranteed",
+            self.poison_reason
+                .get()
+                .map(String::as_str)
+                .unwrap_or("reason not recorded")
+        ))
+    }
+
+    /// Refuses to drop any record from a poisoned log.
+    ///
+    /// A poisoned log may be the only place some committed bytes still exist:
+    /// a data-file flush or an in-place apply failed, so the data files cannot
+    /// be trusted to hold what the log describes. Dropping records would throw
+    /// away the copy a restart replays from. Called under the writer lock, as
+    /// late as possible before the drop, rather than only by the callers: a
+    /// commit can poison the log between a caller's check and the drop.
+    fn refuse_if_poisoned(&self) -> io::Result<()> {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(self.poisoned_error());
+        }
+        Ok(())
     }
 
     /// Highest record sequence known to be on stable storage.
@@ -666,9 +739,7 @@ impl Wal {
         // padding on `poisoned` — the load stays in L1, and the branch that
         // follows it stays out of the fall-through path.
         if unlikely(self.poisoned.load(Ordering::Acquire)) {
-            return Err(io::Error::other(
-                "WAL is poisoned by an earlier flush failure; durability cannot be guaranteed",
-            ));
+            return Err(self.poisoned_error());
         }
 
         let seq = self.log_commit_marker(txn)?;
@@ -734,13 +805,37 @@ impl Wal {
 
         // Only now is it safe to disturb the old bytes: the record describing
         // them is durable, so if we die partway replay finishes the job.
+        //
+        // A failure here is past the point of no return. The commit marker is
+        // durable, so the transaction *is* committed, and the log is now the
+        // only copy of these bytes: the data file has some, none or a torn
+        // part of them. Returning the error alone left the log free to be
+        // checkpointed — and a checkpoint drops the only redo copy, after
+        // which the data file keeps whatever the failed apply left behind.
+        // Poisoning keeps the log, so a restart replays it, and refuses every
+        // later commit rather than building on bytes that are not there.
+        if let Err(e) = self.apply_held(held) {
+            self.poison(format!(
+                "applying a committed in-place write of transaction {} failed: {}",
+                txn, e
+            ));
+            return Err(e);
+        }
+
+        Ok(seq)
+    }
+
+    /// Copies each held overwrite's payload from the log into its data file.
+    fn apply_held(&self, held: Vec<PendingWrite>) -> io::Result<()> {
+        // Released up front for every entry, so an apply that fails partway
+        // does not leave the remainder counted forever.
+        let held_bytes: u64 = held.iter().map(|w| w.len as u64).sum();
+        self.pending_bytes.fetch_sub(held_bytes, Ordering::Relaxed);
+
         let mut log_reader: Option<File> = None;
         let mut buf: Vec<u8> = Vec::new();
 
         for w in held {
-            self.pending_bytes
-                .fetch_sub(w.len as u64, Ordering::Relaxed);
-
             // The payload is already on stable storage in the log, so read it
             // back from there rather than having kept a second copy in memory.
             let reader = match log_reader {
@@ -780,7 +875,7 @@ impl Wal {
             }
         }
 
-        Ok(seq)
+        Ok(())
     }
 
     /// Returns once every record up to `seq` is on stable storage.
@@ -790,9 +885,7 @@ impl Wal {
     /// every record written so far rather than only its own.
     pub fn commit_through(&self, seq: u64) -> io::Result<()> {
         if unlikely(self.poisoned.load(Ordering::Acquire)) {
-            return Err(io::Error::other(
-                "WAL is poisoned by an earlier flush failure; durability cannot be guaranteed",
-            ));
+            return Err(self.poisoned_error());
         }
 
         if self.durable.load(Ordering::Acquire) >= seq {
@@ -840,7 +933,7 @@ impl Wal {
         // fail loudly rather than silently downgrading durability.
         crate::core::sync_audit::note("wal.log", &self.path);
         if let Err(e) = handle.sync_data() {
-            self.poisoned.store(true, Ordering::Release);
+            self.poison(format!("fdatasync of the log failed: {}", e));
             return Err(e);
         }
 
@@ -886,7 +979,13 @@ impl Wal {
     /// offset `write_pos` hands out (an in-place payload's `log_offset`)
     /// points at the wrong bytes. So the file is cut back to `write_pos` and
     /// the cursor moved there, and the caller's statement fails. If even that
-    /// fails the log can no longer be trusted, and it is poisoned.
+    /// fails the log can no longer be trusted, and it is poisoned: the torn
+    /// record would hide every later commit from recovery, including ones
+    /// already acknowledged, and nothing here can repair that.
+    ///
+    /// A failure that *was* cut back does not poison. The log is then exactly
+    /// as it was before the write, every record in it still replays, and only
+    /// the statement that wrote it has lost anything.
     fn append_locked(&self, file: &mut File, bufs: &mut [io::IoSlice<'_>]) -> io::Result<()> {
         let at = self.write_pos.load(Ordering::Relaxed);
         #[cfg(test)]
@@ -901,17 +1000,23 @@ impl Wal {
         #[cfg(not(test))]
         let written = write_all_vectored(file, bufs);
         if let Err(e) = written {
+            #[cfg(test)]
+            let rolled_back = if test_hooks::FAIL_WAL_ROLLBACK.with(|f| f.replace(false)) {
+                Err(io::Error::other("injected failure to cut the log back"))
+            } else {
+                file.set_len(at)
+                    .and_then(|()| file.seek(SeekFrom::Start(at)).map(|_| ()))
+            };
+            #[cfg(not(test))]
             let rolled_back = file
                 .set_len(at)
                 .and_then(|()| file.seek(SeekFrom::Start(at)).map(|_| ()));
             if let Err(cut) = rolled_back {
-                self.poisoned.store(true, Ordering::Release);
-                log::error!(
-                    "WAL {} could not be cut back after a failed write ({}): {}; the log is                      poisoned",
-                    self.path.display(),
-                    e,
-                    cut
-                );
+                self.poison(format!(
+                    "appending to the log failed ({}) and the partial record could not be cut \
+                     back: {}",
+                    e, cut
+                ));
             }
             return Err(e);
         }
@@ -991,9 +1096,7 @@ impl Wal {
         // `finish_txn` refuses a poisoned log before writing its marker; this
         // refuses before writing either half, which leaves less behind.
         if unlikely(self.poisoned.load(Ordering::Acquire)) {
-            return Err(io::Error::other(
-                "WAL is poisoned by an earlier flush failure; durability cannot be guaranteed",
-            ));
+            return Err(self.poisoned_error());
         }
         if bytes.len() > MAX_RECORD_PAYLOAD {
             return Err(io::Error::new(
@@ -1068,6 +1171,9 @@ impl Wal {
     /// [`Wal::checkpoint`].
     pub fn truncate(&self) -> io::Result<()> {
         let mut file = self.writer.lock();
+        // Before the mark below, which would otherwise record as dropped
+        // records a refused truncation kept.
+        self.refuse_if_poisoned()?;
         // Not staged: whatever this drops is not in any archive.
         self.unstaged_through_lsn
             .fetch_max(self.commit_lsn.load(Ordering::Acquire), Ordering::AcqRel);
@@ -1086,6 +1192,8 @@ impl Wal {
     /// appended between the copy and the `set_len` would be discarded without
     /// ever having been archived.
     fn truncate_locked(&self, file: &mut File) -> io::Result<()> {
+        self.refuse_if_poisoned()?;
+
         // Before the log is dropped, never after. A crash in between then
         // leaves a mark that is merely ahead of the log, which the next open
         // reconciles by taking the higher of the two. The other order would
@@ -1261,7 +1369,29 @@ impl Wal {
     /// Compaction does, and truncated a data file with live records still
     /// describing offsets past the cut, so a crash re-materialised bytes beyond
     /// the new end. `Ok(true)` means the log is gone and the files are flushed.
+    ///
+    /// A poisoned log is never checkpointed; that is an error, not a decline,
+    /// because it will not change until the process restarts.
     pub fn checkpoint(&self) -> io::Result<bool> {
+        let outcome = self.checkpoint_inner();
+        match &outcome {
+            Ok(true) => {}
+            Ok(false) => {
+                self.checkpoints_declined.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => {
+                self.checkpoint_failures.fetch_add(1, Ordering::Relaxed);
+                *self.last_checkpoint_error.lock() = Some(e.to_string());
+            }
+        }
+        outcome
+    }
+
+    fn checkpoint_inner(&self) -> io::Result<bool> {
+        // Refused before any data file is touched: nothing a checkpoint does
+        // can be finished on a poisoned log, and the drop refuses too.
+        self.refuse_if_poisoned()?;
+
         // Never while a transaction is still open. Checkpointing discards the
         // log, and a pending overwrite points *into* the log for its payload —
         // truncating underneath it would leave the transaction unable to apply.
@@ -1339,10 +1469,26 @@ impl Wal {
                     #[cfg(test)]
                     test_hooks::CHECKPOINT_SYNCS.with(|n| n.set(n.get() + 1));
                     crate::core::sync_audit::note("wal.checkpoint.data_file", &path);
-                    f.sync_data()?
+                    // A failed flush is not something the next checkpoint can
+                    // retry. On Linux the kernel reports the writeback error
+                    // once and may drop the dirty pages with it, so a second
+                    // `fdatasync` can succeed over data that never reached the
+                    // disk — and that success would drop the log, the only
+                    // remaining copy. Poisoning keeps the log for replay and
+                    // stops commits pretending to be durable.
+                    if let Err(e) = f.sync_data() {
+                        self.poison(format!(
+                            "checkpoint could not flush {}: {}",
+                            path.display(),
+                            e
+                        ));
+                        return Err(e);
+                    }
                 }
                 // A file that no longer exists cannot need flushing.
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                // Failing to *open* loses nothing — no flush was attempted, so
+                // no error was consumed — and the next checkpoint may retry.
                 Err(e) => return Err(e),
             }
         }
@@ -1364,6 +1510,10 @@ impl Wal {
         if self.pending_count.load(Ordering::Acquire) != 0 {
             return Ok(false);
         }
+        // Again before staging, since a commit can poison the log while the
+        // sync pass runs: a checkpoint that will not drop the records has no
+        // business staging them and advancing what the archive claims.
+        self.refuse_if_poisoned()?;
 
         // Staged before the truncation and under the same lock: the records are
         // in the data files by now, which is what makes them safe to *drop*,
@@ -1422,6 +1572,9 @@ impl Wal {
         end: u64,
         covered_issued: u64,
     ) -> io::Result<()> {
+        // Drops the head of the log just as a truncation drops all of it.
+        self.refuse_if_poisoned()?;
+
         self.write_lsn_mark_best_effort();
         file.flush()?;
         let tail_len = end - from;
@@ -1760,6 +1913,11 @@ pub(crate) mod test_hooks {
         /// in the file and then fail, as a full disk or EIO would.
         pub static SHORT_WAL_WRITE: std::cell::Cell<Option<usize>> =
             const { std::cell::Cell::new(None) };
+
+        /// Makes the next failed WAL write on this thread also fail to be cut
+        /// back, leaving its partial record in the log: the failure that
+        /// poisons. No real file fails `ftruncate` on demand.
+        pub static FAIL_WAL_ROLLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 
         /// Data files a checkpoint on this thread has synced.
         pub static CHECKPOINT_SYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -2553,6 +2711,167 @@ mod tests {
             assert_eq!(&bytes[..4], b"GOOD", "site {site}");
             assert_eq!(&bytes[8..13], b"PRIOR", "site {site}");
         }
+    }
+
+    /// A failed write that cannot be cut back leaves a torn record, which
+    /// hides every later commit from recovery: the log must be poisoned, with
+    /// a reason, at each write site.
+    #[test]
+    fn a_failed_write_that_cannot_be_cut_back_poisons_the_log() {
+        for site in 0..3 {
+            let dir = temp_dir();
+            let wal = Wal::open(dir.path().join(DEFAULT_WAL_NAME)).unwrap();
+            let t = wal.begin();
+            if site == 1 {
+                wal.log(t, 1, 0, &[2u8; 30]).unwrap();
+            }
+            test_hooks::SHORT_WAL_WRITE.with(|h| h.set(Some(HEADER_LEN + 2)));
+            test_hooks::FAIL_WAL_ROLLBACK.with(|f| f.set(true));
+            let failed = match site {
+                0 => wal.log(t, 1, 0, &[2u8; 300]).map(|_| ()),
+                1 => wal.commit_txn(t),
+                _ => wal.log_and_commit(1, 0, &[2u8; 300]),
+            };
+            test_hooks::SHORT_WAL_WRITE.with(|h| h.set(None));
+            test_hooks::FAIL_WAL_ROLLBACK.with(|f| f.set(false));
+            assert!(failed.is_err(), "site {site}: the injected failure was swallowed");
+            assert!(wal.is_poisoned(), "site {site}: a torn record was left in a live log");
+            assert!(
+                wal.poison_reason().is_some_and(|r| r.contains("cut back")),
+                "site {site}: {:?}",
+                wal.poison_reason()
+            );
+            assert!(wal.log_and_commit(1, 0, b"later").is_err(), "site {site}");
+        }
+    }
+
+    /// A failed append to a real file that cannot be cut back must poison
+    /// the log. `/dev/full` refuses every write with `ENOSPC`, and `ftruncate`
+    /// on it fails too.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_log_append_poisons_the_log() {
+        let wal = Wal::open("/dev/full").unwrap();
+        let txn = wal.begin();
+        assert!(wal.log(txn, 1, 0, b"bytes").is_err());
+        assert!(wal.is_poisoned(), "a failed log append must poison the log");
+        assert!(wal.commit_txn(wal.begin()).is_err());
+    }
+
+    /// fsyncgate: a data file that fails its flush at checkpoint must poison
+    /// the log, and no later checkpoint may drop it.
+    ///
+    /// `/dev/null` stands in for the failing file — `fdatasync` on it fails
+    /// with `EINVAL` every time, the way a writeback error fails it once.
+    /// Re-pointing the id at a healthy file afterwards models what Linux does
+    /// next: the retry succeeds, because the dirty pages that failed are gone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_data_file_flush_at_checkpoint_keeps_the_log() {
+        let dir = temp_dir();
+        let wal_path = dir.path().join(DEFAULT_WAL_NAME);
+        let data = dir.path().join("table.db");
+        std::fs::write(&data, b"").unwrap();
+
+        let wal = Wal::open(&wal_path).unwrap();
+        let id = file_id_for_name("table.db");
+        wal.register_file(id, &data);
+        wal.log_and_commit(id, 0, b"committed").unwrap();
+
+        // A checkpoint syncs only the files records name, so the flaky file
+        // gets one. Never committed, so replay leaves it out.
+        let flaky = file_id_for_name("flaky.db");
+        wal.register_file(flaky, "/dev/null");
+        wal.log(wal.begin(), flaky, 0, b"flaky").unwrap();
+        let logged = std::fs::metadata(&wal_path).unwrap().len();
+        assert!(logged > 0);
+
+        assert!(wal.checkpoint().is_err(), "the failed flush must be reported");
+        assert!(wal.is_poisoned(), "a failed data-file flush must poison the log");
+        assert!(wal.poison_reason().unwrap().contains("/dev/null"));
+
+        wal.register_file(flaky, &data);
+        assert!(
+            wal.checkpoint().is_err(),
+            "a retried checkpoint must not succeed over the failed flush"
+        );
+        assert_eq!(
+            std::fs::metadata(&wal_path).unwrap().len(),
+            logged,
+            "the log is the only copy of what the failed flush lost; it must not be dropped"
+        );
+        assert_eq!(wal.checkpoint_counts().1, 2);
+        assert!(wal.last_checkpoint_error().is_some());
+        assert!(wal.truncate().is_err(), "a poisoned log was truncated directly");
+        assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), logged);
+
+        let txn = wal.begin();
+        wal.log(txn, id, 9, b"later").unwrap();
+        assert!(wal.commit_txn(txn).is_err(), "later commits must fail loudly");
+
+        // And the record the data file may have lost is still there to replay.
+        drop(wal);
+        let stats = Wal::recover(&wal_path, resolver(data.clone())).unwrap();
+        assert_eq!(stats.applied, 1);
+        assert_eq!(read_file(&data), b"committed");
+    }
+
+    /// A committed in-place write whose apply fails must poison the log.
+    ///
+    /// The commit marker is durable by then, so the log holds the only correct
+    /// copy of the bytes; a checkpoint dropping it would leave the data file
+    /// with whatever the failed apply did not write. A directory where the
+    /// data file should be makes the apply's `open` fail.
+    #[test]
+    fn a_failed_in_place_apply_poisons_the_log_and_keeps_it() {
+        let dir = temp_dir();
+        let wal_path = dir.path().join(DEFAULT_WAL_NAME);
+        let target = dir.path().join("not_a_file");
+        std::fs::create_dir(&target).unwrap();
+
+        let wal = Wal::open(&wal_path).unwrap();
+        let id = file_id_for_name("not_a_file");
+        wal.register_file(id, &target);
+
+        let txn = wal.begin();
+        wal.log_in_place(txn, id, 0, b"OVERWRITE").unwrap();
+        assert!(wal.commit_txn(txn).is_err(), "the failed apply must be reported");
+        assert!(wal.is_poisoned(), "a failed apply after the commit marker must poison the log");
+        assert_eq!(wal.pending_bytes(), 0);
+        assert_eq!(wal.pending_transactions(), 0);
+
+        let logged = std::fs::metadata(&wal_path).unwrap().len();
+        // The directory is replaced by a file a checkpoint could flush, so
+        // only the poisoning stands between it and dropping the log.
+        std::fs::remove_dir(&target).unwrap();
+        std::fs::write(&target, b"").unwrap();
+        assert!(wal.checkpoint().is_err());
+        assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), logged);
+
+        drop(wal);
+        let stats = Wal::recover(&wal_path, resolver(target.clone())).unwrap();
+        assert_eq!(stats.applied, 1);
+        assert_eq!(read_file(&target), b"OVERWRITE");
+    }
+
+    /// Declines and failures are counted apart: a decline is expected and
+    /// transient, a failure is not.
+    #[test]
+    fn checkpoint_declines_are_counted() {
+        let dir = temp_dir();
+        let wal = Wal::open(dir.path().join(DEFAULT_WAL_NAME)).unwrap();
+        let data = dir.path().join("t.db");
+        std::fs::write(&data, b"").unwrap();
+        let id = file_id_for_name("t.db");
+        wal.register_file(id, &data);
+        let txn = wal.begin();
+        wal.log_in_place(txn, id, 0, b"held").unwrap();
+        assert!(!wal.checkpoint().unwrap(), "a pending overwrite must hold the log");
+        assert_eq!(wal.checkpoint_counts(), (1, 0));
+        wal.abort_txn(txn);
+        assert!(wal.checkpoint().unwrap());
+        assert_eq!(wal.checkpoint_counts(), (1, 0));
+        assert_eq!(wal.last_checkpoint_error(), None);
     }
 
     /// A record logged while a checkpoint is syncing the data files may
