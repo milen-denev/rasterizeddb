@@ -301,6 +301,10 @@ fn string_op(lower: &str) -> Option<&'static str> {
         // `SIMILAR TO`, folded to one word by `predicate_rewrite` so it fits
         // this table — the tokenizer reads one identifier at a time.
         "similarto" => "SIMILARTO",
+        // `IS NULL` / `IS NOT NULL` over a JSON path, in PostgreSQL's own
+        // one-word spellings. Postfix: nothing follows them.
+        "isnull" => "ISNULL",
+        "notnull" => "NOTNULL",
         _ => return None,
     })
 }

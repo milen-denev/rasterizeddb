@@ -397,6 +397,23 @@ fn parse_select_items(
             return Err("SELECT DISTINCT is not supported yet".to_string());
         }
 
+        // `x IS [NOT] NULL` is a boolean. The alias split below read the `IS`
+        // as an alias, so `doc->>'a' IS NULL` came back as the extracted text
+        // in a column named `IS`. It is answered as the CASE it means, by the
+        // expression evaluator, which reads a path's NULL as PostgreSQL does.
+        if let Some((test, alias)) = null_test_item(item) {
+            let parsed = crate::core::rql::expr::parse(
+                &format!("CASE WHEN {} THEN TRUE ELSE FALSE END", test),
+                schema,
+            )?;
+            out.push(SelectItem::RowExpr {
+                db_type: crate::core::rql::expr::static_type(&parsed),
+                expr: parsed,
+                label: alias.unwrap_or_else(|| "?column?".to_string()),
+            });
+            continue;
+        }
+
         // Split off a trailing alias. Only a bare `name` or `AS name` after the
         // expression counts, and the expression may itself contain spaces
         // inside its parentheses.
@@ -776,6 +793,33 @@ fn find_top_level_as(item: &str) -> Option<usize> {
         i += 1;
     }
     None
+}
+
+/// A select item `<expr> IS [NOT] NULL [[AS] alias]`, as the test's text and
+/// the alias, or `None` when the item is not that shape. A `CASE` block holds
+/// its own `IS` and is left to the expression parser.
+fn null_test_item(item: &str) -> Option<(String, Option<String>)> {
+    if item.trim_start().to_ascii_uppercase().starts_with("CASE") {
+        return None;
+    }
+    let at = crate::core::rql::join::find_keyword(item, "IS", 0)?;
+    let operand = item[..at].trim();
+    if operand.is_empty() {
+        return None;
+    }
+    let words: Vec<&str> = item[at + 2..].split_whitespace().collect();
+    let test_len = match words.as_slice() {
+        [null, ..] if null.eq_ignore_ascii_case("NULL") => 1,
+        [not, null, ..] if not.eq_ignore_ascii_case("NOT") && null.eq_ignore_ascii_case("NULL") => 2,
+        _ => return None,
+    };
+    let alias = match &words[test_len..] {
+        [] => None,
+        [as_kw, name] if as_kw.eq_ignore_ascii_case("AS") => Some(name.trim_matches('"').to_string()),
+        [name] if is_identifier(name.trim_matches('"')) => Some(name.trim_matches('"').to_string()),
+        _ => return None,
+    };
+    Some((format!("{} IS {}", operand, words[..test_len].join(" ")), alias))
 }
 
 pub(crate) fn split_alias(item: &str) -> (&str, Option<String>) {

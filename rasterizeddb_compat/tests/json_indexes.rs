@@ -87,6 +87,12 @@ fn document(r: &mut Lcg) -> String {
 fn predicate(r: &mut Lcg) -> String {
     fn atom(r: &mut Lcg) -> String {
         match r.below(24) {
+            16 => format!(
+                "{} IS {}NULL",
+                ["doc->>'label'", "doc->'label'", "doc->>'promo'", "doc->'user'->>'name'"][r.below(4) as usize],
+                if r.below(2) == 0 { "NOT " } else { "" }
+            ),
+            17 => format!("doc->>'label' {} ''", ["=", "<>", ">="][r.below(3) as usize]),
             18 => format!("doc->'cat' = '{}'", { let n = r.below(10); number(r, n) }),
             19 => format!("doc = '[\"t{}\", {}]'", r.below(6), { let n = r.below(4); number(r, n) }),
             20 => format!("doc = '\"{}\"'", STATUSES[r.below(5) as usize]),
@@ -147,11 +153,12 @@ async fn compare(pool: &sqlx::PgPool, r: &mut Lcg, rounds: usize, stage: &str) {
     }
 }
 
-const INDEXES: [&str; 5] = [
+const INDEXES: [&str; 6] = [
     "CREATE INDEX ix_ops ON ix USING gin (doc)",
     "CREATE INDEX ix_path ON ix USING gin (doc jsonb_path_ops)",
     "CREATE INDEX ix_status ON ix ((doc->>'status'))",
     "CREATE INDEX ix_uname ON ix ((doc->'user'->>'name'))",
+    "CREATE INDEX ix_label ON ix ((doc->>'label'))",
     "CREATE INDEX ix_whole ON ix USING hash (doc)",
 ];
 

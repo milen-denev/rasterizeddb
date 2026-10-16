@@ -492,7 +492,9 @@ impl<'a, 'b> QueryParser<'a, 'b> {
 
         const CMP_OPS: [&str; 7] = ["=", "!=", "<>", ">", ">=", "<", "<="];
         const LOGIC_KWS: [&str; 2] = ["AND", "OR"];
-        const TEXT_CMPS: [&str; 10] = [
+        const TEXT_CMPS: [&str; 12] = [
+            "ISNULL",
+            "NOTNULL",
             "CONTAINS",
             "STARTSWITH",
             "ENDSWITH",
@@ -571,6 +573,28 @@ impl<'a, 'b> QueryParser<'a, 'b> {
             Token::Ident((o, _, _)) => o.as_str(),
             _ => return Err(format!("expected comparison operator, got {:?}", op_token)),
         };
+
+        // `doc->>'a' ISNULL` / `NOTNULL`: a test of the path's value, with no
+        // right operand. A column's NULL is its companion's, which the rewrite
+        // tests instead, so only a path comes here.
+        if op_str == "ISNULL" || op_str == "NOTNULL" {
+            let want_null = op_str == "ISNULL";
+            if !matches!(left_op, ComparisonOperand::PathWithIndex(..)) {
+                return Err(format!(
+                    "IS {}NULL is only supported over a column or a JSON path here",
+                    if want_null { "" } else { "NOT " }
+                ));
+            }
+            self.query_transformer.add_comparison(
+                left_type,
+                left_op,
+                ComparisonOperand::Direct(MemoryBlock::default()),
+                ComparerOperation::Equals,
+                None,
+            );
+            self.query_transformer.set_last_null_test(want_null);
+            return Ok(());
+        }
 
         let (right_op, right_type) = self.parse_expr(cols)?;
 
@@ -1218,7 +1242,7 @@ impl<'a, 'b> QueryParser<'a, 'b> {
                 // Resolved once here so the first comparison has a value of the
                 // right width; every row after it goes through
                 // `update_column_data_by_index`.
-                let mb = path.extract(cols[idx].1.into_slice());
+                let mb = path.extract(cols[idx].1.into_slice()).unwrap_or_default();
                 let db_type = match cast {
                     Some(t) => t,
                     None if as_text => DbType::STRING,
@@ -1248,7 +1272,9 @@ impl<'a, 'b> QueryParser<'a, 'b> {
                                                 as_text: path.as_text,
                                                 cast: Some(target.clone()),
                                             };
-                                        let mb = recast.extract(cols[idx].1.into_slice());
+                                        let mb = recast
+                                            .extract(cols[idx].1.into_slice())
+                                            .unwrap_or_default();
                                         Ok((
                                             ComparisonOperand::PathWithIndex(mb, idx, recast),
                                             target,

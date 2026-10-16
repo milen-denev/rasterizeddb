@@ -81,6 +81,12 @@ pub struct ColumnTransformer {
     /// `'{a,b}'` text and allocated a `String` per key. Never set when the
     /// list is read from a column, since that one differs per row.
     pub key_list: Option<std::sync::Arc<crate::core::pg_ops::KeyList>>,
+
+    /// `IS NULL` (`Some(true)`) or `IS NOT NULL` (`Some(false)`) over a
+    /// path, which answers by whether the path reached a value rather than by
+    /// comparing one. A column's NULL is its companion's, so this is never set
+    /// over a column.
+    pub null_test: Option<bool>,
 }
 
 impl Clone for ColumnTransformer {
@@ -106,6 +112,7 @@ impl Clone for ColumnTransformer {
             group_closes: self.group_closes,
             in_set: self.in_set.clone(),
             key_list: self.key_list.clone(),
+            null_test: self.null_test,
         }
     }
 }
@@ -261,6 +268,7 @@ impl ColumnTransformer {
             group_closes: 0,
             in_set: None,
             key_list: None,
+            null_test: None,
         }
     }
 
@@ -307,12 +315,22 @@ impl ColumnTransformer {
         // `resolve_inputs` borrows straight out of the row, so this is the only
         // point where a value that has to be *computed* can live long enough to
         // be compared.
+        //
+        // A path that reaches nothing is SQL NULL, noted here and handed on as
+        // empty bytes, which is what the arithmetic below always received.
+        let mut null_operand = false;
         let left_owned;
         let input1 = match (&self.column_1_path, &self.column_1_cast) {
-            (Some(path), _) => {
-                left_owned = path.extract(left_mb.into_slice());
-                left_owned.into_slice()
-            }
+            (Some(path), _) => match path.extract(left_mb.into_slice()) {
+                Some(found) => {
+                    left_owned = found;
+                    left_owned.into_slice()
+                }
+                None => {
+                    null_operand = true;
+                    &[][..]
+                }
+            },
             (None, Some((from, to))) => {
                 left_owned = cast_block(left_mb, from, to);
                 left_owned.into_slice()
@@ -321,10 +339,16 @@ impl ColumnTransformer {
         };
         let right_owned;
         let input2 = match (&self.column_2_path, &self.column_2_cast) {
-            (Some(path), _) => {
-                right_owned = path.extract(right_mb.into_slice());
-                right_owned.into_slice()
-            }
+            (Some(path), _) => match path.extract(right_mb.into_slice()) {
+                Some(found) => {
+                    right_owned = found;
+                    right_owned.into_slice()
+                }
+                None => {
+                    null_operand = true;
+                    &[][..]
+                }
+            },
             (None, Some((from, to))) => {
                 right_owned = cast_block(right_mb, from, to);
                 right_owned.into_slice()
@@ -357,58 +381,44 @@ impl ColumnTransformer {
                     operation,
                 )?))
             }
+            // `IS [NOT] NULL` over a path: the one comparison whose answer
+            // is about the NULL rather than spoiled by it.
+            ColumnTransformerType::ComparerOperation(_) if self.null_test.is_some() => {
+                let want_null = self.null_test.expect("guarded");
+                Ok(Either::Right((null_operand == want_null, self.next.clone())))
+            }
+            // A comparison with SQL NULL is NULL, and a WHERE clause keeps only
+            // the rows where it is true — so the row does not match. That one
+            // rule covers `=`, `<>`, the ordered operators, LIKE and
+            // the structural operators alike. An absent key used to read as
+            // the empty string, so `doc->>'a' <> 'z'` and `doc->>'a' LIKE '%'`
+            // returned every row with no `a` at all.
+            //
+            // A cast path that cannot be read is NULL too: `(doc->>'code')::
+            // bigint = 3` on a `code` that is absent, JSON `null`, or text
+            // that is not a number. Answering false, rather than failing the
+            // statement with an operand-size error, keeps one unreadable row
+            // from failing a query every other row answered.
+            ColumnTransformerType::ComparerOperation(_) if null_operand => {
+                Ok(Either::Right((false, self.next.clone())))
+            }
             ColumnTransformerType::ComparerOperation(_) if self.in_set.is_some() => {
                 let set = self.in_set.as_ref().expect("guarded");
                 Ok(Either::Right((set.matches(input1)?, self.next.clone())))
             }
             ColumnTransformerType::ComparerOperation(ref operation) => {
-                // A cast path with nothing to read is SQL NULL, and a
-                // comparison with NULL is false.
-                //
-                // `(doc->>'code')::bigint = 3` has to answer *something* for a
-                // row whose `code` is absent, or is JSON `null`, or holds text
-                // that is not a number. The extract has no value to give, so it
-                // yields empty bytes — and a fixed-width comparison refuses a
-                // zero-length operand outright, failing the whole statement
-                // with "operand size does not match the column type being
-                // evaluated". One unreadable row killed a query that every
-                // other row answered fine.
-                //
-                // PostgreSQL's answer for the first two is NULL, and a
-                // comparison against NULL is false — the row simply does not
-                // match. It errors only on the third, which is a narrower
-                // divergence than failing all three, and far narrower than the
-                // alternative of substituting the type's zeroes: an absent key
-                // would then *match* `= 0`, quietly pulling rows into a result
-                // they have nothing to do with.
-                //
-                // Only for a **cast** path. An uncast one compares its bytes as
-                // they are, and empty is a meaningful value there — it is how
-                // `data->'k' <> ''` answers key existence.
-                let unreadable = self
-                    .column_1_path
-                    .as_ref()
-                    .is_some_and(|p| p.cast.is_some() && input1.is_empty())
-                    || self
-                        .column_2_path
-                        .as_ref()
-                        .is_some_and(|p| p.cast.is_some() && input2.is_empty());
-                if unreadable {
-                    return Ok(Either::Right((false, self.next.clone())));
-                }
                 // `?|` / `?&` against a literal list split at plan time; the
                 // same answer `pg_ops::evaluate` gives from the text, including
                 // `None` for a malformed document becoming an error.
-                if let (Some(keys), ComparerOperation::Pg { op, .. }) = (&self.key_list, operation)
+                let holds = if let (Some(keys), ComparerOperation::Pg { op, .. }) =
+                    (&self.key_list, operation)
                 {
-                    let found = crate::core::pg_ops::key_exists_in_list(*op, input1, keys)
-                        .ok_or(EvalError::UnsupportedType)?;
-                    return Ok(Either::Right((found, self.next.clone())));
-                }
-                Ok(Either::Right((
-                    perform_comparison_operation(input1, input2, &self.column_type, operation)?,
-                    self.next.clone(),
-                )))
+                    crate::core::pg_ops::key_exists_in_list(*op, input1, keys)
+                        .ok_or(EvalError::UnsupportedType)?
+                } else {
+                    perform_comparison_operation(input1, input2, &self.column_type, operation)?
+                };
+                Ok(Either::Right((holds, self.next.clone())))
             }
         }
     }
@@ -441,7 +451,7 @@ impl ColumnTransformer {
                     .get(idx1)
                     .unwrap_or_else(|| panic!("Column index {} out of bounds", idx1));
                 self.column_1 = match (&self.column_1_path, &self.column_1_cast) {
-                    (Some(path), _) => path.extract(document.into_slice()),
+                    (Some(path), _) => path.extract(document.into_slice()).unwrap_or_default(),
                     (None, Some((from, to))) => cast_block(document, from, to),
                     (None, None) => document.clone(),
                 };
@@ -453,7 +463,7 @@ impl ColumnTransformer {
                     .get(idx2)
                     .unwrap_or_else(|| panic!("Column index {} out of bounds", idx2));
                 let mb = match &self.column_2_path {
-                    Some(path) => path.extract(document.into_slice()),
+                    Some(path) => path.extract(document.into_slice()).unwrap_or_default(),
                     None => document.clone(),
                 };
                 self.column_2 = Some(mb);
@@ -510,14 +520,14 @@ impl ColumnTransformer {
     pub fn update_column_by_index(&mut self, column_index: usize, new_data: MemoryBlock) {
         if self.column_1_index == Some(column_index) && self.result_index_1.is_none() {
             self.column_1 = match (&self.column_1_path, &self.column_1_cast) {
-                (Some(path), _) => path.extract(new_data.into_slice()),
+                (Some(path), _) => path.extract(new_data.into_slice()).unwrap_or_default(),
                 (None, Some((from, to))) => cast_block(&new_data, from, to),
                 (None, None) => new_data.clone(),
             };
         }
         if self.column_2_index == Some(column_index) && self.result_index_2.is_none() {
             self.column_2 = Some(match (&self.column_2_path, &self.column_2_cast) {
-                (Some(path), _) => path.extract(new_data.into_slice()),
+                (Some(path), _) => path.extract(new_data.into_slice()).unwrap_or_default(),
                 (None, Some((from, to))) => cast_block(&new_data, from, to),
                 (None, None) => new_data,
             });
@@ -602,30 +612,29 @@ pub struct JsonPathRef {
 
 impl JsonPathRef {
     /// The value this path reaches in `document`, as the bytes a comparison
-    /// should use.
+    /// should use, or `None` for SQL NULL.
     ///
-    /// An absent path gives empty bytes, which is what a NULL column gives —
-    /// so `doc->>'missing' = 'x'` is false rather than an error, as it is in
-    /// PostgreSQL.
-    pub fn extract(&self, document: &[u8]) -> MemoryBlock {
-        let Some(found) = crate::core::jsonb::get_path(document, &self.steps) else {
-            return MemoryBlock::default();
-        };
+    /// NULL is a separate answer, not empty bytes. `->>` yields NULL for an
+    /// absent path, for a JSON `null`, and for a step into the wrong kind of
+    /// container, and every comparison with NULL is not true. Empty bytes
+    /// cannot carry that: the JSON string `""` also extracts to them, and
+    /// `{"a":""}` must still match `doc->>'a' = ''` while `{}` must not.
+    /// `->` yields NULL only for an absent path; a JSON `null` there is the
+    /// document `null`, a value like any other.
+    pub fn extract(&self, document: &[u8]) -> Option<MemoryBlock> {
+        let found = crate::core::jsonb::get_path(document, &self.steps)?;
         // The uncast forms run once per row of a `doc->>'k' = 'v'` scan, so
         // they copy once, from the document (or the rendered text) straight
         // into the pooled block. They used to build a `Vec` — or a `String`
         // for `->>` — and then copy that again.
         if self.cast.is_none() {
             if !self.as_text {
-                return pooled_copy(found);
+                return Some(pooled_copy(found));
             }
             return EXTRACT_SCRATCH.with(|scratch| {
                 let mut scratch = scratch.borrow_mut();
-                let block = match crate::core::jsonb::as_text_into(found, &mut scratch) {
-                    Some(text) => pooled_copy(text),
-                    // JSON `null` under `->>` is SQL NULL.
-                    None => MemoryBlock::default(),
-                };
+                // JSON `null` under `->>` is SQL NULL.
+                let block = crate::core::jsonb::as_text_into(found, &mut scratch).map(pooled_copy);
                 // One huge rendered container must not pin its buffer to this
                 // worker for the rest of the process.
                 if scratch.capacity() > EXTRACT_SCRATCH_KEEP {
@@ -635,19 +644,16 @@ impl JsonPathRef {
             });
         }
         let bytes: Vec<u8> = if self.as_text {
-            match crate::core::jsonb::as_text(found) {
-                Some(text) => text.into_bytes(),
-                None => return MemoryBlock::default(),
-            }
+            crate::core::jsonb::as_text(found)?.into_bytes()
         } else {
             found.to_vec()
         };
         // Re-read as the cast's type, so the comparison happens in it.
         //
-        // An unreadable value gives empty bytes, which is what an absent path
-        // gives — `(doc->>'k')::bigint = 3` on a `k` that is not a number is
-        // then false rather than an error, matching how the uncast path treats
-        // a missing key.
+        // A value that does not read as that type is NULL as well — so
+        // `(doc->>'k')::bigint = 3` on a `k` that is not a number is false
+        // rather than an error. PostgreSQL raises an error there; failing a
+        // whole scan over one row's value was judged the worse divergence.
         let bytes = match &self.cast {
             None => bytes,
             Some(target) => {
@@ -661,11 +667,11 @@ impl JsonPathRef {
                     {
                         bytes
                     }
-                    _ => return MemoryBlock::default(),
+                    _ => return None,
                 }
             }
         };
-        pooled_copy(&bytes)
+        Some(pooled_copy(&bytes))
     }
 }
 
@@ -985,6 +991,7 @@ fn in_set_member(t: &ColumnTransformer) -> Option<(bool, usize, &DbType)> {
         _ => return None,
     };
     if t.in_set.is_some()
+        || t.null_test.is_some()
         || t.result_index_1.is_some()
         || t.column_1_path.is_some()
         || t.column_1_cast.is_some()
@@ -1288,6 +1295,14 @@ impl<'a> TransformerProcessor<'a> {
     pub fn set_last_key_list(&mut self, keys: crate::core::pg_ops::KeyList) {
         if let Some(t) = self.transformers.last_mut() {
             t.key_list = Some(std::sync::Arc::new(keys));
+        }
+    }
+
+    /// Makes the comparison just added an `IS [NOT] NULL` test of its left
+    /// operand; see [`ColumnTransformer::null_test`].
+    pub fn set_last_null_test(&mut self, want_null: bool) {
+        if let Some(t) = self.transformers.last_mut() {
+            t.null_test = Some(want_null);
         }
     }
 
@@ -2705,9 +2720,9 @@ mod json_row_path {
                         as_text,
                         cast: None,
                     };
-                    let got = path.extract(&encoded);
-                    let want = reference_extract(&path, &encoded).unwrap_or_default();
-                    assert_eq!(got.into_slice(), &want[..], "{} {:?} as_text={}", d, steps, as_text);
+                    let got = path.extract(&encoded).map(|b| b.into_slice().to_vec());
+                    let want = reference_extract(&path, &encoded);
+                    assert_eq!(got, want, "{} {:?} as_text={}", d, steps, as_text);
                     checked += 1;
                 }
             }
@@ -2719,15 +2734,18 @@ mod json_row_path {
         // "a"], "k": 1}`, with a space after each `:` and `,`, and this
         // engine prints it compact.
         let d = doc(documents[0]);
-        let text = |k: &str| text_path(k).extract(&d).into_slice().to_vec();
+        let text = |k: &str| text_path(k).extract(&d).map(|b| b.into_slice().to_vec()).unwrap_or_default();
         assert_eq!(text("s"), b"str");
         assert_eq!(text("u"), "ünï".as_bytes());
         assert_eq!(text("q"), b"say \"hi\"\n");
         assert_eq!(text("n"), b"5");
         assert_eq!(text("f"), b"1.5");
         assert_eq!(text("t"), b"true");
-        // JSON null is SQL NULL, which is empty bytes here.
-        assert_eq!(text("z"), b"");
+        // JSON null is SQL NULL, and so is an absent key: no value at all,
+        // which is not the empty string `"e"` holds.
+        assert!(text_path("z").extract(&d).is_none());
+        assert!(text_path("missing").extract(&d).is_none());
+        assert_eq!(text_path("e").extract(&d).map(|b| b.into_slice().to_vec()), Some(Vec::new()));
         assert_eq!(text("o"), br#"{"j":[1,"a"],"k":1}"#);
 
         // A rendered container larger than the scratch keeps must still come
@@ -2735,7 +2753,7 @@ mod json_row_path {
         let huge = format!(r#"{{"o":[{}]}}"#, vec!["\"xxxxxxxxxxxxxxxx\""; 10_000].join(","));
         let h = doc(&huge);
         let path = text_path("o");
-        assert_eq!(path.extract(&h).into_slice(), &reference_extract(&path, &h).unwrap()[..]);
+        assert_eq!(path.extract(&h).unwrap().into_slice(), &reference_extract(&path, &h).unwrap()[..]);
         assert_eq!(text("n"), b"5");
         assert_eq!(text("o"), br#"{"j":[1,"a"],"k":1}"#);
     }
@@ -2801,7 +2819,7 @@ mod json_row_path {
                 let start = std::time::Instant::now();
                 let mut len2 = 0usize;
                 for i in 0..n {
-                    len2 += path.extract(black_box(docs[i % docs.len()])).into_slice().len();
+                    len2 += path.extract(black_box(docs[i % docs.len()])).map_or(0, |b| b.into_slice().len());
                 }
                 let new_ns = start.elapsed().as_nanos() as f64 / n as f64;
                 assert_eq!(len, len2);

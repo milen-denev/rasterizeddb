@@ -1721,11 +1721,40 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
             term_start = out.len() + 1;
         }
 
+        // `IS [NOT] NULL` over a path into a document, also with the path
+        // in parentheses: it needs the whole operand, not the column.
+        if let Some((rewritten, after)) = path_sugar(&toks, i, schema)? {
+            out.push(rewritten);
+            i = after;
+            continue;
+        }
+
         // A word that names a column may start one of the sugar forms.
         if let Tok::Word(raw) = tok {
             if let Some(col) = resolve_column(raw, schema) {
                 // Look past the column at what follows.
                 let next = toks.get(i + 1);
+
+                // `col ISNULL` / `col NOTNULL`, PostgreSQL's one-word
+                // spellings of `IS NULL` and `IS NOT NULL`.
+                let one_word_null_test = next.and_then(|t| {
+                    if t.is_keyword("isnull") {
+                        Some(true)
+                    } else if t.is_keyword("notnull") {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                });
+                if let Some(want_null) = one_word_null_test {
+                    out.push(match nullable::flag_field(&col, schema) {
+                        Some(flag) => format!("{} = {}", flag.name, u8::from(want_null)),
+                        None if want_null => CONSTANT_FALSE.to_string(),
+                        None => CONSTANT_TRUE.to_string(),
+                    });
+                    i += 2;
+                    continue;
+                }
 
                 // `col IS [NOT] NULL` and `col IS [NOT] DISTINCT FROM x`
                 if next.map(|t| t.is_keyword("is")).unwrap_or(false) {
@@ -2306,6 +2335,82 @@ fn path_end(toks: &[Tok], at: usize) -> Option<usize> {
     (i > at).then_some(i)
 }
 
+/// A path operand starting at `at` — `doc->>'a'`, optionally cast, or the
+/// same in parentheses — as `(document column, operand text, index past it)`.
+fn path_operand(
+    toks: &[Tok],
+    at: usize,
+    schema: &SmallVec<[SchemaField; 20]>,
+) -> Option<(String, String, usize)> {
+    let parenthesised = matches!(toks.get(at), Some(Tok::LPar));
+    let start = at + usize::from(parenthesised);
+    let Some(Tok::Word(raw)) = toks.get(start) else {
+        return None;
+    };
+    let col = resolve_column(raw, schema)?;
+    let mut end = path_end(toks, start + 1)?;
+    if matches!(toks.get(end), Some(Tok::Sym(sym)) if sym.starts_with("::")) {
+        end += 1;
+    }
+    let mut text = col.clone();
+    for tok in &toks[start + 1..end] {
+        text.push(' ');
+        text.push_str(&tok.render());
+    }
+    if parenthesised {
+        if !matches!(toks.get(end), Some(Tok::RPar)) {
+            return None;
+        }
+        end += 1;
+    }
+    Some((col, text, end))
+}
+
+/// `IS [NOT] NULL`, `ISNULL` and `NOTNULL` over a JSON path at `at`: the
+/// rewritten term and the index past it, or `None` when the tokens are not
+/// one of those.
+///
+/// The column form reads one word on the left, and a path is several tokens,
+/// so `doc->>'a' IS NULL` reached the engine with its `IS` intact and was
+/// refused as an unknown identifier. Here it becomes a test the evaluator
+/// answers from the path itself: whether it reached a value. The document
+/// column's own NULL is an alternative to that, since a NULL document has no
+/// path either.
+fn path_sugar(
+    toks: &[Tok],
+    at: usize,
+    schema: &SmallVec<[SchemaField; 20]>,
+) -> Result<Option<(String, usize)>, String> {
+    let Some((col, operand, end)) = path_operand(toks, at, schema) else {
+        return Ok(None);
+    };
+    let Some(keyword) = toks.get(end) else {
+        return Ok(None);
+    };
+    let null_test = match keyword {
+        t if t.is_keyword("isnull") => Some((true, end + 1)),
+        t if t.is_keyword("notnull") => Some((false, end + 1)),
+        t if t.is_keyword("is") => {
+            let not = toks.get(end + 1).is_some_and(|t| t.is_keyword("not"));
+            let null_at = end + 1 + usize::from(not);
+            toks.get(null_at)
+                .is_some_and(|t| t.is_keyword("null"))
+                .then_some((!not, null_at + 1))
+        }
+        _ => None,
+    };
+    let Some((want_null, after)) = null_test else {
+        return Ok(None);
+    };
+    let test = format!("{} {}", operand, if want_null { "ISNULL" } else { "NOTNULL" });
+    let text = match nullable::flag_field(&col, schema) {
+        Some(flag) if want_null => format!("({} = 1 OR {})", flag.name, test),
+        Some(flag) => format!("({} = 0 AND {})", flag.name, test),
+        None => test,
+    };
+    Ok(Some((text, after)))
+}
+
 /// Whether a symbol is an arithmetic operator rather than a comparison.
 fn is_arithmetic(symbol: &str) -> bool {
     matches!(symbol, "+" | "-" | "*" | "/" | "%" | "^")
@@ -2800,6 +2905,18 @@ mod tests {
         let rd = |clause: &str| rewrite_where(clause, &document_schema()).unwrap();
         let flag = nullable::flag_column_name("doc");
         assert_eq!(rd("'1' = doc->'n'"), format!("({flag} = 0 AND '1' = doc -> 'n')"));
+    }
+
+    /// `IS [NOT] NULL` over a JSON path reads the whole path as its operand;
+    /// it used to see only `doc` and leave the `IS` for the engine to refuse.
+    #[test]
+    fn is_null_over_a_json_path_reads_the_whole_path() {
+        let rd = |clause: &str| rewrite_where(clause, &document_schema()).unwrap();
+        let flag = nullable::flag_column_name("doc");
+        assert_eq!(rd("doc->'b'->>'c' IS NULL"), format!("({flag} = 1 OR doc -> 'b' ->> 'c' ISNULL)"));
+        assert_eq!(rd("(doc->>'a') IS NOT NULL"), format!("({flag} = 0 AND doc ->> 'a' NOTNULL)"));
+        assert_eq!(rd("doc #>> '{b,c}' NOTNULL"), format!("({flag} = 0 AND doc #>> '{{b,c}}' NOTNULL)"));
+        assert_eq!(rd("doc ISNULL"), format!("{flag} = 1"));
     }
 
     #[test]

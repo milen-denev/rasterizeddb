@@ -40,14 +40,33 @@ const ROWS: &[&str] = &[
 
 /// `(predicate, ids PostgreSQL 17 returned)`.
 const CASES: &[(&str, &str)] = &[
+    // A NULL from `->>` / `#>>` makes every comparison and LIKE not true.
+    ("doc->>'a' = ''", "3"),
+    ("doc->>'a' <> 'z'", "1,2,3,9,10,13"),
+    ("doc->>'a' != 'z'", "1,2,3,9,10,13"),
+    ("doc->>'a' < 'z'", "1,2,3,9,10,13"),
+    ("doc->>'a' >= ''", "1,2,3,9,10,13"),
+    ("doc->>'a' LIKE '%'", "1,2,3,9,10,13"),
+    ("doc->>'a' LIKE 'x%'", "1,13"),
+    ("doc->>'a' ILIKE 'X'", "1,13"),
+    ("doc #>> '{b,c}' <> 'q'", "1,10"),
+    ("doc #>> '{b,c}' = 'x'", "1"),
+    ("doc->'b'->>'c' = ''", ""),
+    ("doc->'b'->>'c' <> ''", "1,10"),
+    ("doc->>'a' = 'x'", "1,13"),
+    ("doc->>'zz' >= ''", ""),
+    ("doc->>'a' = 'true'", "9"),
     // `->` and `#>` compare as jsonb values, literal cast or not.
     (r#"doc->'a' = '"x"'"#, "1,13"),
     ("doc->'a' = 'true'", "9"),
     ("doc->'a' = 'true'::jsonb", "9"),
     (r#"doc->'a' = '"x"'::jsonb"#, "1,13"),
     ("doc->'a' = 'null'", "4"),
+    ("doc->'a' <> 'null'", "1,2,3,9,10,13"),
+    (r#"doc->'a' <> '"x"'"#, "2,3,4,9,10"),
     ("doc->'n' = '1'", "1,2,10"),
     ("doc->'n' = '1.0'", "1,2,10"),
+    ("doc->'n' <> '1'", "3,9"),
     ("doc->'n' = '0'", "9"),
     (r#"doc #> '{b,c}' = '"x"'"#, "1"),
     (r#"doc #> '{b,c}' = '"x"'::jsonb"#, "1"),
@@ -64,6 +83,21 @@ const CASES: &[(&str, &str)] = &[
     (r#"doc = '[1,"a"]'"#, "6"),
     (r#"doc = '[1.0,"a"]'"#, "6"),
     (r#"doc IN ('1', '"x"')"#, "7,11,12"),
+    // IS [NOT] NULL over a path.
+    ("doc->>'a' IS NULL", "4,5,6,7,8,11,12"),
+    ("doc->>'a' IS NOT NULL", "1,2,3,9,10,13"),
+    ("doc->'a' IS NULL", "5,6,7,8,11,12"),
+    ("doc->'a' IS NOT NULL", "1,2,3,4,9,10,13"),
+    ("doc #>> '{b,c}' IS NULL", "2,3,4,5,6,7,8,9,11,12,13"),
+    ("doc #> '{b,c}' IS NULL", "2,3,4,5,6,7,8,9,11,12"),
+    ("doc->'b'->>'c' IS NOT NULL", "1,10"),
+    ("doc->>'a' ISNULL", "4,5,6,7,8,11,12"),
+    ("doc->>'a' NOTNULL", "1,2,3,9,10,13"),
+    ("id > 0 AND doc->>'a' IS NULL", "4,5,6,7,8,11,12"),
+    ("(doc->>'a') IS NULL", "4,5,6,7,8,11,12"),
+    ("(doc->>'a') IS NOT NULL", "1,2,3,9,10,13"),
+    ("doc IS NULL", "8"),
+    ("doc IS NOT NULL", "1,2,3,4,5,6,7,9,10,11,12,13"),
 ];
 
 async fn server() -> (TestServer, sqlx::PgPool) {
@@ -122,4 +156,48 @@ async fn a_literal_that_is_not_json_is_refused_against_a_document_path() {
             Ok(rows) => panic!("{clause}: PostgreSQL refuses this, got rows {rows:?}"),
         }
     }
+}
+
+/// `IS NULL` over a path in the select list is a boolean, not the extracted
+/// text. PostgreSQL 17: `SELECT id, doc->>'a' IS NULL FROM s ORDER BY id`.
+#[tokio::test(flavor = "multi_thread")]
+async fn is_null_over_a_path_in_the_select_list_is_a_boolean() {
+    let (_s, pool) = server().await;
+    let want = "1|f 2|f 3|f 4|t 5|t 6|t 7|t 8|t 9|f 10|f 11|t 12|t 13|f";
+    let rows = sqlx::query("SELECT id, doc->>'a' IS NULL AS missing FROM s ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .expect("query");
+    let got = rows
+        .iter()
+        .map(|r| {
+            let missing: bool = r.get("missing");
+            format!("{}|{}", r.get::<i64, _>("id"), if missing { "t" } else { "f" })
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert_eq!(got, want);
+
+    let want = "1|t|f 2|t|f 3|t|f 4|t|t 5|f|t";
+    let rows = sqlx::query(
+        "SELECT id, doc->'a' IS NOT NULL AS present, (doc->>'a') IS NULL AS missing \
+         FROM s WHERE id < 6 ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("query");
+    let got = rows
+        .iter()
+        .map(|r| {
+            let flag = |b: bool| if b { "t" } else { "f" };
+            format!(
+                "{}|{}|{}",
+                r.get::<i64, _>("id"),
+                flag(r.get("present")),
+                flag(r.get("missing"))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert_eq!(got, want);
 }
