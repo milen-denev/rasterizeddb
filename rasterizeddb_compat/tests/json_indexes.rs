@@ -3,7 +3,10 @@
 //!
 //! Two tables get the same random documents and the same writes: inserts,
 //! replacements, deletes, `NULL` documents, documents that are arrays or bare
-//! scalars, numbers spelled several ways (`3`, `3.0`, `3e0`). Only one has
+//! scalars, numbers spelled several ways (`3`, `3.0`, `3e0`, `3.00`, and
+//! values past the `f64` range or precision such as `1e400` and
+//! `1.000000000000000000001`), with predicates on both their value (`@>`)
+//! and their text (`->>`, which prints the scale as written). Only one has
 //! indexes. Every query must return the same ids from both, through
 //! `VACUUM`, `VACUUM FULL` and a restart that rebuilds the indexes from the
 //! rows. An index may only ever return too much; a row missing from the
@@ -31,12 +34,32 @@ impl Lcg {
 const STATUSES: [&str; 5] = ["new", "paid", "shipped", "delivered", "cancelled"];
 
 fn number(r: &mut Lcg, n: u64) -> String {
-    match r.below(3) {
+    match r.below(6) {
         0 => format!("{n}"),
         1 => format!("{n}.0"),
-        _ => format!("{n}e0"),
+        2 => format!("{n}e0"),
+        // The scale is kept as written, so `->>` prints these as `3.00` and
+        // `3.0`, while `@>` still calls them equal to `3`.
+        3 => format!("{n}.00"),
+        4 => format!("{}e-1", n * 10),
+        _ => format!("0.{n}e1"),
     }
 }
+
+/// Values that are equal as numbers but not as text, past the `f64` range
+/// and past its precision: the containment index hashes them by value and
+/// the path index keys them by text, and both must agree with the scan.
+const BIG: [&str; 14] = [
+    "1e400", "10e399", "1E+400", "1.000000000000000000001", "1.0000000000000000000010", "1", "1.0",
+    "9007199254740993", "9007199254740993.0", "9.007199254740993e15", "9007199254740992", "-0", "0.0",
+    "1e-400",
+];
+
+/// What `->>` prints for some of those, and some text no number prints as.
+const BIG_TEXT: [&str; 9] = [
+    "1", "1.0", "0", "0.0", "-0", "9007199254740993", "9007199254740993.0", "1.000000000000000000001",
+    "1e400",
+];
 
 /// Whether documents may be `NULL`: they match no JSON operator, indexed or
 /// not.
@@ -65,6 +88,9 @@ fn document(r: &mut Lcg) -> String {
     if r.below(10) == 0 {
         fields.push("\"promo\":true".into());
     }
+    if r.below(3) == 0 {
+        fields.push(format!("\"big\":{}", BIG[r.below(BIG.len() as u64) as usize]));
+    }
     if r.below(8) == 0 {
         // A key whose value is not a string: `->>` renders it as text.
         fields.push(format!("\"label\":{}", r.below(3)));
@@ -86,7 +112,7 @@ fn document(r: &mut Lcg) -> String {
 /// alike, since they are equal).
 fn predicate(r: &mut Lcg) -> String {
     fn atom(r: &mut Lcg) -> String {
-        match r.below(28) {
+        match r.below(34) {
             14 => format!("NOT ({})", atom(r)),
             15 => format!(
                 "doc->>'status' {}IN ('{}', '{}')",
@@ -115,6 +141,16 @@ fn predicate(r: &mut Lcg) -> String {
             ),
             26 => format!("id {}IN (id, {})", if r.below(2) == 0 { "NOT " } else { "" }, r.below(400)),
             27 => format!("{}(id BETWEEN id AND {})", if r.below(2) == 0 { "NOT " } else { "" }, r.below(400)),
+            28 => format!("doc @> '{{\"big\":{}}}'", BIG[r.below(BIG.len() as u64) as usize]),
+            29 => format!("doc->>'big' = '{}'", BIG_TEXT[r.below(BIG_TEXT.len() as u64) as usize]),
+            // Text equality on a number: only the spelling `->>` prints
+            // matches, so `3.0` and `3` select different rows.
+            30 => format!("doc->>'cat' = '{}'", { let n = r.below(10); number(r, n) }),
+            31 => format!("doc->>'cat' > '{}'", { let n = r.below(10); number(r, n) }),
+            // A container's text is PostgreSQL's `jsonb` output: spaced, keys
+            // shorter first.
+            32 => format!("doc->>'user' = '{{\"id\": {}, \"name\": \"u{}\"}}'", r.below(30), r.below(30)),
+            33 => format!("doc->>'tags' = '[\"t{}\", \"t{}\"]'", r.below(6), r.below(6)),
             _ => old_atom(r),
         }
     }
@@ -172,13 +208,17 @@ async fn compare(pool: &sqlx::PgPool, r: &mut Lcg, rounds: usize, stage: &str) {
     }
 }
 
-const INDEXES: [&str; 6] = [
+const INDEXES: [&str; 10] = [
     "CREATE INDEX ix_ops ON ix USING gin (doc)",
     "CREATE INDEX ix_path ON ix USING gin (doc jsonb_path_ops)",
     "CREATE INDEX ix_status ON ix ((doc->>'status'))",
     "CREATE INDEX ix_uname ON ix ((doc->'user'->>'name'))",
     "CREATE INDEX ix_label ON ix ((doc->>'label'))",
     "CREATE INDEX ix_whole ON ix USING hash (doc)",
+    "CREATE INDEX ix_cat ON ix ((doc->>'cat'))",
+    "CREATE INDEX ix_big ON ix ((doc->>'big'))",
+    "CREATE INDEX ix_user ON ix ((doc->>'user'))",
+    "CREATE INDEX ix_tags ON ix ((doc->>'tags'))",
 ];
 
 #[tokio::test(flavor = "multi_thread")]

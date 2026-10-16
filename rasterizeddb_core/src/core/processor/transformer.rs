@@ -2751,17 +2751,18 @@ mod json_row_path {
         }
         assert!(checked > 100);
 
-        // `->>` against PostgreSQL, case by case. One divergence is pinned
-        // rather than hidden: PostgreSQL prints a container as `{"j": [1,
-        // "a"], "k": 1}`, with a space after each `:` and `,`, and this
-        // engine prints it compact.
+        // `->>` against PostgreSQL, case by case. A number keeps the scale
+        // it was written with, as PostgreSQL 17 prints `1.50`. One divergence
+        // is pinned rather than hidden: PostgreSQL prints a container as
+        // `{"j": [1, "a"], "k": 1}`, with a space after each `:` and `,`, and
+        // this engine prints it compact.
         let d = doc(documents[0]);
         let text = |k: &str| text_path(k).extract(&d).map(|b| b.into_slice().to_vec()).unwrap_or_default();
         assert_eq!(text("s"), b"str");
         assert_eq!(text("u"), "ünï".as_bytes());
         assert_eq!(text("q"), b"say \"hi\"\n");
         assert_eq!(text("n"), b"5");
-        assert_eq!(text("f"), b"1.5");
+        assert_eq!(text("f"), b"1.50");
         assert_eq!(text("t"), b"true");
         // JSON null is SQL NULL, and so is an absent key: no value at all,
         // which is not the empty string `"e"` holds.

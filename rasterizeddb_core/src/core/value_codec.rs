@@ -1950,6 +1950,11 @@ pub fn refusal_message(db_type: &crate::core::db_type::DbType, literal: &str) ->
             .err()
             .unwrap_or_else(|| "invalid input syntax for type bytea".to_string()),
         DbType::JSONB | DbType::JSON => match crate::core::jsonb::encode_text(text) {
+            // Well-formed JSON whose number `numeric` cannot hold: PostgreSQL
+            // reports that as an overflow, not as bad syntax.
+            Err(e) if e.starts_with(crate::core::jsonb::NUMERIC_OVERFLOW) => {
+                crate::core::jsonb::NUMERIC_OVERFLOW.to_string()
+            }
             Err(e) => format!("invalid input syntax for type json: {}", e),
             Ok(_) => syntax(),
         },

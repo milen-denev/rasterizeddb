@@ -1053,7 +1053,12 @@ pub fn value_to_literal(db_type: &DbType, bytes: &[u8]) -> Option<String> {
             if bytes.is_empty() {
                 "NULL".to_string()
             } else {
-                value_codec::quote_sql(&crate::core::jsonb::decode(bytes).ok()?.to_string())
+                // Rendered, not decoded: a decoded `Value` holds a fraction
+                // as a `f64`, so `1.000000000000000000001` came back as `1.0`,
+                // and a number past the `f64` range had no literal at all.
+                let mut text = Vec::with_capacity(bytes.len());
+                crate::core::jsonb::render_text_into(bytes, &mut text).ok()?;
+                value_codec::quote_sql(std::str::from_utf8(&text).ok()?)
             }
         }
         // The types stored in PostgreSQL's own wire layout. Their literal form

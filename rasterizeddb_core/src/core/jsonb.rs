@@ -52,10 +52,14 @@
 //! Offsets are relative to the start of the body, so a nested value's bytes are
 //! a plain subslice and navigating into one copies nothing.
 //!
-//! **Numbers that are not integers keep their text.** A `f64` would round-trip
-//! most values and silently change the rest, and "silently changed the value
-//! and reported success" is the failure this engine keeps having to hunt. The
-//! text a number arrived as is exactly what it leaves as.
+//! **Numbers that are not integers keep their digits.** A `f64` would
+//! round-trip most values and silently change the rest, and "silently changed
+//! the value and reported success" is the failure this engine keeps having to
+//! hunt. PostgreSQL stores a JSON number as `numeric`, so the text kept is
+//! what `numeric` would print for it: every digit and the scale as written
+//! (`1.10` stays `1.10`), an exponent written out (`1e2` is `100`, `1.5e-1`
+//! is `0.15`), and no negative zero. Only the lexeme is read, never a float
+//! serde_json made of it; see [`write_numeric_text`].
 //!
 //! **Object keys are sorted, and a duplicate key keeps the last value.** Sorted
 //! because a binary search needs it; last-wins because that is what
@@ -117,18 +121,253 @@ fn write_value(out: &mut Vec<u8>, value: &Value) {
 }
 
 fn write_number(out: &mut Vec<u8>, n: &serde_json::Number) {
-    // An integer that fits is stored as one, because that is the common case
-    // and it compares and extracts without parsing. Everything else — a
-    // fraction, an exponent, an integer too large for `i64` — keeps the text it
-    // arrived as, which is the only representation guaranteed to give back the
-    // value that was written.
+    // A `Number` that is not an integer already went through a `f64`, so its
+    // digits are whatever that float prints as; this path cannot do better
+    // than store those. `encode_text` reads the digits from the text instead.
     if let Some(i) = n.as_i64() {
         out.push(TAG_INT);
         out.extend_from_slice(&i.to_le_bytes());
     } else {
-        out.push(TAG_NUM);
-        write_len_prefixed(out, n.to_string().as_bytes());
+        let text = n.to_string();
+        // A finite `f64` is always inside `numeric`'s range, so the fallback
+        // is never taken; it keeps the old form rather than lose the value.
+        if write_number_lexeme(out, text.as_bytes()).is_err() {
+            out.push(TAG_NUM);
+            write_len_prefixed(out, text.as_bytes());
+        }
     }
+}
+
+/// PostgreSQL's refusal of a number `numeric` cannot hold.
+pub const NUMERIC_OVERFLOW: &str = "value overflows numeric format";
+/// The most digits `numeric` keeps before the decimal point: a weight of
+/// 32767 base-10000 digits.
+const NUMERIC_MAX_INT_DIGITS: i64 = 131_072;
+/// The most digits `numeric` keeps after it, its `dscale` field's limit.
+const NUMERIC_MAX_SCALE: i64 = 16_383;
+/// The largest exponent `numeric_in` reads before refusing, `INT_MAX / 2`.
+const NUMERIC_MAX_EXPONENT: i64 = 1_073_741_823;
+
+/// Stores the number spelled by `lexeme`: as an integer when its `numeric`
+/// text is one that fits `i64`, otherwise as that text.
+///
+/// `1e2` and `100` therefore encode to the same bytes, as they print the same;
+/// `1.0` keeps its scale and so stays text.
+fn write_number_lexeme(out: &mut Vec<u8>, lexeme: &[u8]) -> Result<(), &'static str> {
+    // The common case, a short integer, needs no rewriting: it cannot carry
+    // an exponent, a scale or more digits than an `i64` holds.
+    let digits = lexeme.strip_prefix(b"-").unwrap_or(lexeme);
+    if !digits.is_empty() && digits.len() <= 18 && digits.iter().all(u8::is_ascii_digit) {
+        let mut v: i64 = 0;
+        for d in digits {
+            v = v * 10 + (d - b'0') as i64;
+        }
+        out.push(TAG_INT);
+        let v = if digits.len() < lexeme.len() { -v } else { v };
+        out.extend_from_slice(&v.to_le_bytes());
+        return Ok(());
+    }
+    let tag_at = out.len();
+    out.push(TAG_NUM);
+    let len_at = out.len();
+    out.extend_from_slice(&[0u8; 4]);
+    if let Err(e) = write_numeric_text(lexeme, out) {
+        out.truncate(tag_at);
+        return Err(e);
+    }
+    let text = &out[len_at + 4..];
+    if text.len() <= 20 && !text.contains(&b'.') {
+        if let Some(v) = std::str::from_utf8(text).ok().and_then(|t| t.parse::<i64>().ok()) {
+            out.truncate(tag_at);
+            out.push(TAG_INT);
+            out.extend_from_slice(&v.to_le_bytes());
+            return Ok(());
+        }
+    }
+    let len = (out.len() - len_at - 4) as u32;
+    out[len_at..len_at + 4].copy_from_slice(&len.to_le_bytes());
+    Ok(())
+}
+
+/// Appends what PostgreSQL's `numeric` prints for the JSON number `lexeme`.
+///
+/// `numeric_in` keeps every digit and a display scale of the fraction digits
+/// written less the exponent, never below zero; `numeric_out` prints the value
+/// in plain positional notation at that scale and has no negative zero. So
+/// `1.50` is `1.50`, `1.50e1` is `15.0`, `1e-2` is `0.01`, `1e2` is `100` and
+/// `-0.0` is `0.0`. A value outside `numeric`'s range is refused with
+/// PostgreSQL's own message, which also bounds how long the text can get.
+///
+/// It also accepts what earlier builds stored, which is a float's `Display`
+/// (`1e+20`, `-0.0`), so a stored number prints the same however old it is.
+fn write_numeric_text(lexeme: &[u8], out: &mut Vec<u8>) -> Result<(), &'static str> {
+    const MALFORMED: &str = "a stored number is not a JSON number";
+    let (negative, rest) = match lexeme.split_first() {
+        Some((b'-', rest)) => (true, rest),
+        _ => (false, lexeme),
+    };
+    let mantissa_end = rest
+        .iter()
+        .position(|b| *b == b'e' || *b == b'E')
+        .unwrap_or(rest.len());
+    let (int, frac) = match rest[..mantissa_end].iter().position(|b| *b == b'.') {
+        Some(dot) => (&rest[..dot], &rest[dot + 1..mantissa_end]),
+        None => (&rest[..mantissa_end], &rest[..0]),
+    };
+    if int.is_empty() || !int.iter().chain(frac).all(u8::is_ascii_digit) {
+        return Err(MALFORMED);
+    }
+    if frac.is_empty() && mantissa_end > int.len() {
+        // A point with nothing after it.
+        return Err(MALFORMED);
+    }
+    let mut exponent: i64 = 0;
+    if mantissa_end < rest.len() {
+        let mut e = &rest[mantissa_end + 1..];
+        let negative_exp = match e.first() {
+            Some(b'-') => {
+                e = &e[1..];
+                true
+            }
+            Some(b'+') => {
+                e = &e[1..];
+                false
+            }
+            _ => false,
+        };
+        if e.is_empty() || !e.iter().all(u8::is_ascii_digit) {
+            return Err(MALFORMED);
+        }
+        for d in e {
+            exponent = exponent * 10 + (d - b'0') as i64;
+            // Checked per digit, as `numeric_in` does, so a long exponent is
+            // refused before it can overflow.
+            if exponent > NUMERIC_MAX_EXPONENT {
+                return Err(NUMERIC_OVERFLOW);
+            }
+        }
+        if negative_exp {
+            exponent = -exponent;
+        }
+    }
+
+    // The digits as one run, `int` then `frac`, with the decimal point
+    // `point` digits in once the exponent has moved it.
+    let total = (int.len() + frac.len()) as i64;
+    let digit = |i: i64| -> u8 {
+        if i < 0 || i >= total {
+            b'0'
+        } else if (i as usize) < int.len() {
+            int[i as usize]
+        } else {
+            frac[i as usize - int.len()]
+        }
+    };
+    let point = int.len() as i64 + exponent;
+    let scale = (frac.len() as i64 - exponent).max(0);
+    if scale > NUMERIC_MAX_SCALE {
+        return Err(NUMERIC_OVERFLOW);
+    }
+    let lead = (0..total).take_while(|&i| digit(i) == b'0').count() as i64;
+    let zero = lead == total;
+    if !zero && point - lead > NUMERIC_MAX_INT_DIGITS {
+        return Err(NUMERIC_OVERFLOW);
+    }
+
+    out.reserve((point - lead).max(1) as usize + scale as usize + 2);
+    if negative && !zero {
+        out.push(b'-');
+    }
+    if !zero && point > lead {
+        out.extend((lead..point).map(digit));
+    } else {
+        out.push(b'0');
+    }
+    if scale > 0 {
+        out.push(b'.');
+        out.extend((point..point + scale).map(digit));
+    }
+    Ok(())
+}
+
+/// The span of the next JSON number in `text` at or after `from`, skipping
+/// strings, as serde_json's lexer would read it.
+///
+/// [`encode_text`] calls this once per number serde_json hands it, so the two
+/// must agree on where numbers are. They do because serde_json only reaches
+/// a number where a value starts with `-` or a digit, outside a string, and
+/// reads the same greedy grammar: an optional `-`, `0` or a run of digits, a
+/// `.` with digits, an exponent with digits. Text serde_json would refuse is
+/// refused before a misread lexeme could be used.
+fn next_number_lexeme(text: &[u8], mut at: usize) -> Option<(usize, usize)> {
+    let digits_from = |mut i: usize| {
+        while i < text.len() && text[i].is_ascii_digit() {
+            i += 1;
+        }
+        i
+    };
+    while at < text.len() {
+        match text[at] {
+            b'"' => {
+                at += 1;
+                loop {
+                    at += memchr::memchr2(b'"', b'\\', text.get(at..)?)?;
+                    if text[at] == b'"' {
+                        at += 1;
+                        break;
+                    }
+                    // An escape: the byte after the backslash cannot end the
+                    // string.
+                    at += 2;
+                }
+            }
+            b'-' | b'0'..=b'9' => {
+                let start = at;
+                let mut i = at + (text[at] == b'-') as usize;
+                if text.get(i) == Some(&b'0') {
+                    i += 1;
+                } else {
+                    i = digits_from(i);
+                }
+                if text.get(i) == Some(&b'.') && text.get(i + 1).is_some_and(u8::is_ascii_digit) {
+                    i = digits_from(i + 1);
+                }
+                if matches!(text.get(i), Some(b'e' | b'E')) {
+                    let mut j = i + 1;
+                    if matches!(text.get(j), Some(b'+' | b'-')) {
+                        j += 1;
+                    }
+                    if text.get(j).is_some_and(u8::is_ascii_digit) {
+                        i = digits_from(j);
+                    }
+                }
+                return Some((start, i));
+            }
+            _ => at += 1,
+        }
+    }
+    None
+}
+
+/// `text` with every number replaced by a `0` and spaces of the same length,
+/// for serde_json to lex when a number would overflow its `f64`.
+///
+/// The lengths are kept so that every error serde_json still finds is
+/// reported at the same line and column.
+fn mask_numbers(text: &str) -> String {
+    let mut masked = text.as_bytes().to_vec();
+    let mut at = 0;
+    while let Some((start, end)) = next_number_lexeme(text.as_bytes(), at) {
+        // A lone `-` is not a number, and serde_json's complaint about it
+        // must stay its own.
+        if end > start + (masked[start] == b'-') as usize {
+            masked[start] = b'0';
+            masked[start + 1..end].fill(b' ');
+        }
+        at = end;
+    }
+    // Only ASCII bytes outside strings were replaced, by ASCII.
+    String::from_utf8(masked).expect("masking keeps UTF-8")
 }
 
 fn write_len_prefixed(out: &mut Vec<u8>, bytes: &[u8]) {
@@ -213,13 +452,35 @@ fn write_object(out: &mut Vec<u8>, fields: &Map<String, Value>) {
 /// `"$serde_json::private::RawValue"` as a *raw value* and stores the document
 /// its string holds instead of the object. That is a serde_json internal
 /// leaking into user data; here the object is stored as written.
+///
+/// Numbers are the other: serde_json without `arbitrary_precision` hands a
+/// fraction, an exponent or a wide integer over as a `f64`, already rounded
+/// (`1.000000000000000000001` is `1.0`), and refuses one past the `f64` range
+/// that `numeric` holds (`1e400`). So the value serde_json reports is ignored
+/// and the number's lexeme is read from `text` instead, by
+/// [`next_number_lexeme`] stepping along in step with the parse. When
+/// serde_json refuses a number as out of range, the parse is run again over
+/// the text with its numbers masked, which serde_json cannot overflow on.
+/// That feature is not turned on because it would change `Number` for every
+/// other user of serde_json in the build.
 pub fn encode_text(text: &str) -> Result<Vec<u8>, String> {
+    match encode_text_from(text, text) {
+        Err(e) if e.starts_with("number out of range") => encode_text_from(&mask_numbers(text), text),
+        result => result,
+    }
+}
+
+/// [`encode_text`]'s parse of `lexed`, taking each number's lexeme from
+/// `text`, which differs from `lexed` at most in its numbers.
+fn encode_text_from(lexed: &str, text: &str) -> Result<Vec<u8>, String> {
     let mut builder = Builder {
         out: Vec::with_capacity(text.len() + 16),
         slots: Vec::new(),
         order: Vec::new(),
+        text: text.as_bytes(),
+        cursor: 0,
     };
-    let mut de = serde_json::Deserializer::from_str(text);
+    let mut de = serde_json::Deserializer::from_str(lexed);
     serde::de::DeserializeSeed::deserialize(ValueSeed(&mut builder), &mut de)
         .map_err(|e| e.to_string())?;
     de.end().map_err(|e| e.to_string())?;
@@ -227,8 +488,11 @@ pub fn encode_text(text: &str) -> Result<Vec<u8>, String> {
 }
 
 /// The output of [`encode_text`] and the scratch its composites share.
-struct Builder {
+struct Builder<'t> {
     out: Vec<u8>,
+    /// The document's text, and how far into it numbers have been read.
+    text: &'t [u8],
+    cursor: usize,
     /// For each open composite, its children: `(key_off, key_len, val_off,
     /// val_len)` as absolute positions in `out` (keys are zero-length for an
     /// array). A stack — a composite pushes its own above its parent's and
@@ -238,36 +502,21 @@ struct Builder {
     order: Vec<u32>,
 }
 
-impl Builder {
-    fn begin_len_prefixed(&mut self, tag: u8) -> usize {
-        self.out.push(tag);
-        let at = self.out.len();
-        self.out.extend_from_slice(&[0u8; 4]);
-        at
-    }
-
-    fn end_len_prefixed(&mut self, at: usize) {
-        let len = (self.out.len() - at - 4) as u32;
-        self.out[at..at + 4].copy_from_slice(&len.to_le_bytes());
-    }
-
+impl Builder<'_> {
     fn string(&mut self, text: &str) {
         self.out.push(TAG_STR);
         write_len_prefixed(&mut self.out, text.as_bytes());
     }
 
-    fn integer(&mut self, v: i64) {
-        self.out.push(TAG_INT);
-        self.out.extend_from_slice(&v.to_le_bytes());
-    }
-
-    /// A number `write_number` would store as text: `Number`'s own `Display`,
-    /// written in place.
-    fn number_text(&mut self, n: &serde_json::Number) {
-        use std::io::Write;
-        let at = self.begin_len_prefixed(TAG_NUM);
-        let _ = write!(self.out, "{}", n);
-        self.end_len_prefixed(at);
+    /// The number serde_json has just read, from its lexeme in the text.
+    fn number<E: serde::de::Error>(&mut self) -> Result<(), E> {
+        let Some((start, end)) = next_number_lexeme(self.text, self.cursor) else {
+            // Cannot happen while the two lexers agree; refused rather than
+            // stored as some other number.
+            return Err(E::custom("a number could not be located in the document text"));
+        };
+        self.cursor = end;
+        write_number_lexeme(&mut self.out, &self.text[start..end]).map_err(E::custom)
     }
 
     /// Puts a composite's header and offset table in front of its children,
@@ -368,9 +617,9 @@ impl Builder {
 }
 
 /// Writes one JSON value into a [`Builder`]; see [`encode_text`].
-struct ValueSeed<'b>(&'b mut Builder);
+struct ValueSeed<'b, 't>(&'b mut Builder<'t>);
 
-impl<'de> serde::de::DeserializeSeed<'de> for ValueSeed<'_> {
+impl<'de> serde::de::DeserializeSeed<'de> for ValueSeed<'_, '_> {
     type Value = ();
 
     fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
@@ -378,7 +627,7 @@ impl<'de> serde::de::DeserializeSeed<'de> for ValueSeed<'_> {
     }
 }
 
-impl<'de> serde::de::Visitor<'de> for ValueSeed<'_> {
+impl<'de> serde::de::Visitor<'de> for ValueSeed<'_, '_> {
     type Value = ();
 
     fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -390,46 +639,28 @@ impl<'de> serde::de::Visitor<'de> for ValueSeed<'_> {
         Ok(())
     }
 
-    fn visit_i64<E>(self, v: i64) -> Result<(), E> {
-        self.0.integer(v);
-        Ok(())
+    // Every number arm ignores the value serde_json made and reads the
+    // lexeme; see `encode_text`. Only the first three are reached from JSON
+    // text, the wide ones are here so no number could bypass the lexeme.
+
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<(), E> {
+        self.0.number()
     }
 
-    fn visit_u64<E>(self, v: u64) -> Result<(), E> {
-        // `Number::as_i64` holds exactly the `u64`s up to `i64::MAX`.
-        match i64::try_from(v) {
-            Ok(i) => self.0.integer(i),
-            Err(_) => self.0.number_text(&serde_json::Number::from(v)),
-        }
-        Ok(())
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<(), E> {
+        self.0.number()
     }
 
-    fn visit_i128<E: serde::de::Error>(self, v: i128) -> Result<(), E> {
-        if let Ok(i) = i64::try_from(v) {
-            self.0.integer(i);
-        } else if let Ok(u) = u64::try_from(v) {
-            self.0.number_text(&serde_json::Number::from(u));
-        } else {
-            return Err(E::custom("JSON number out of range"));
-        }
-        Ok(())
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<(), E> {
+        self.0.number()
     }
 
-    fn visit_u128<E: serde::de::Error>(self, v: u128) -> Result<(), E> {
-        match u64::try_from(v) {
-            Ok(u) => self.visit_u64(u),
-            Err(_) => Err(E::custom("JSON number out of range")),
-        }
+    fn visit_i128<E: serde::de::Error>(self, _: i128) -> Result<(), E> {
+        self.0.number()
     }
 
-    fn visit_f64<E>(self, v: f64) -> Result<(), E> {
-        // `Value`'s visitor turns a non-finite float into `null`; JSON text
-        // cannot spell one, but the rule is kept.
-        match serde_json::Number::from_f64(v) {
-            Some(n) => self.0.number_text(&n),
-            None => self.0.out.push(TAG_NULL),
-        }
-        Ok(())
+    fn visit_u128<E: serde::de::Error>(self, _: u128) -> Result<(), E> {
+        self.0.number()
     }
 
     fn visit_str<E>(self, v: &str) -> Result<(), E> {
@@ -489,9 +720,9 @@ impl<'de> serde::de::Visitor<'de> for ValueSeed<'_> {
 }
 
 /// Writes an object key's bytes, bare, into a [`Builder`].
-struct KeySeed<'b>(&'b mut Builder);
+struct KeySeed<'b, 't>(&'b mut Builder<'t>);
 
-impl<'de> serde::de::DeserializeSeed<'de> for KeySeed<'_> {
+impl<'de> serde::de::DeserializeSeed<'de> for KeySeed<'_, '_> {
     type Value = ();
 
     fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
@@ -499,7 +730,7 @@ impl<'de> serde::de::DeserializeSeed<'de> for KeySeed<'_> {
     }
 }
 
-impl<'de> serde::de::Visitor<'de> for KeySeed<'_> {
+impl<'de> serde::de::Visitor<'de> for KeySeed<'_, '_> {
     type Value = ();
 
     fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -539,8 +770,10 @@ fn read_value(bytes: &[u8]) -> Result<(Value, usize), String> {
         TAG_NUM => {
             let (text, used) = read_len_prefixed(bytes)?;
             let text = std::str::from_utf8(text).map_err(|_| "a number was not text")?;
-            // Through serde_json's own parser, so the `Number` produced is the
-            // one the document would have parsed to — and prints back the same.
+            // A `Value` holds a non-integer only as a `f64`, so this is where
+            // a decoded document loses digits, and a number past the `f64`
+            // range does not decode at all. Nothing that answers a client
+            // goes through here: text comes from `render_text_into`.
             let value: Value = serde_json::from_str(text)
                 .map_err(|e| format!("a stored number is not valid JSON: {}", e))?;
             Ok((value, used))
@@ -1424,24 +1657,23 @@ pub fn json_numbers_equal(a: &serde_json::Number, b: &serde_json::Number) -> boo
 
 /// Appends the JSON text of the document `bytes` encodes to `out`.
 ///
-/// Byte-for-byte what `decode(bytes)?.to_string()` produces, without building
-/// the `Value` first: no map inserts, no `String` per key and value, and string
-/// contents copied in runs between the bytes that need escaping.
+/// Built straight from the encoding: no map inserts, no `String` per key and
+/// value, and string contents copied in runs between the bytes that need
+/// escaping. Numbers print as `numeric` prints them ([`write_numeric_text`]),
+/// which is what PostgreSQL's `->>`, `::text` and `SELECT doc` show.
 ///
-/// Two shapes are handed to that original path instead of rendered here, so
-/// that what comes out never depends on which path ran: a number stored as
-/// text whose canonical form only `serde_json` knows (it is parsed and printed
-/// exactly as before), and an object whose keys are not strictly ascending —
-/// which this module never writes, but `decode` would re-sort and deduplicate.
-/// Anything malformed also goes that way, so the error is the same one.
+/// An object whose keys are not strictly ascending, which this module never
+/// writes, is put through `decode` and `encode` first, which re-sort and
+/// deduplicate it. Anything malformed goes that way too, so that the error
+/// is `decode`'s.
 pub fn render_text_into(bytes: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
     let start = out.len();
     if render_value(bytes, out).is_ok() {
         return Ok(());
     }
     out.truncate(start);
-    let value = decode(bytes)?;
-    serde_json::to_writer(&mut *out, &value).map_err(|e| e.to_string())
+    let canonical = encode(&decode(bytes)?);
+    render_value(&canonical, out).map_err(|()| "a document could not be rendered as text".to_string())
 }
 
 /// `Err(())` means "render this through `decode` instead", not that the
@@ -1457,13 +1689,15 @@ fn render_value(bytes: &[u8], out: &mut Vec<u8>) -> Result<(), ()> {
             crate::core::value_codec::write_i64(out, value);
         }
         TAG_NUM => {
-            // Parsed and printed by serde_json, as `decode` does: `1.50`
-            // prints as `1.5`, `1e2` as `100.0`, and only serde_json's own
-            // float printer says exactly how.
+            // Already `numeric`'s text for anything this build wrote; an
+            // older build stored a float's `Display` (`1e+20`, `-0.0`), which
+            // this rewrites to what PostgreSQL prints for the same value.
             let (text, _) = read_len_prefixed(bytes).map_err(|_| ())?;
-            let text = std::str::from_utf8(text).map_err(|_| ())?;
-            let value: Value = serde_json::from_str(text).map_err(|_| ())?;
-            serde_json::to_writer(&mut *out, &value).map_err(|_| ())?;
+            let start = out.len();
+            if write_numeric_text(text, out).is_err() {
+                out.truncate(start);
+                return Err(());
+            }
         }
         TAG_STR => {
             let (raw, _) = read_len_prefixed(bytes).map_err(|_| ())?;
@@ -1797,23 +2031,267 @@ mod tests {
     }
 
     /// A large integer and a high-precision decimal both have to come back as
-    /// they went in — this is why a non-integer keeps its text.
+    /// they went in — this is why a non-integer keeps its digits. Each answer
+    /// is what PostgreSQL 17 printed for `'<text>'::jsonb::text`.
     #[test]
     fn precision_is_not_quietly_lost() {
-        for text in [
-            "123456789012345678901234567890",
-            "0.12345678901234567890123",
-            "1.000000000000000000001",
-            "-0.0",
+        for (text, pg) in [
+            ("123456789012345678901234567890", "123456789012345678901234567890"),
+            ("0.12345678901234567890123", "0.12345678901234567890123"),
+            ("1.000000000000000000001", "1.000000000000000000001"),
+            ("-0.0", "0.0"),
+            ("[1.000000000000000000001]", "[1.000000000000000000001]"),
         ] {
-            let value: Value = serde_json::from_str(text).unwrap();
-            let decoded = decode(&encode(&value)).unwrap();
-            assert_eq!(
-                decoded.to_string(),
-                value.to_string(),
-                "{} did not survive",
-                text
-            );
+            let mut out = Vec::new();
+            render_text_into(&encode_text(text).unwrap(), &mut out).unwrap();
+            assert_eq!(String::from_utf8(out).unwrap(), pg, "{} did not survive", text);
+        }
+    }
+
+    fn pg_text(text: &str) -> Result<String, String> {
+        let mut out = Vec::new();
+        render_text_into(&encode_text(text)?, &mut out)?;
+        Ok(String::from_utf8(out).unwrap())
+    }
+
+    /// Every spelling here was put through PostgreSQL 17 as `'<x>'::jsonb::text`,
+    /// `'{"a":<x>}'::jsonb->>'a'` and `'[<x>]'::jsonb::text`; the three agreed,
+    /// and the right-hand column is what they printed. `numeric` keeps the
+    /// scale as written, writes an exponent out, and has no negative zero.
+    #[test]
+    fn numbers_print_as_postgres_numeric() {
+        let table = PG_NUMBERS;
+        let long = [
+            ("1e308", format!("1{}", "0".repeat(308))),
+            ("1e309", format!("1{}", "0".repeat(309))),
+            ("1e400", format!("1{}", "0".repeat(400))),
+            ("-1e400", format!("-1{}", "0".repeat(400))),
+            ("1e-320", format!("0.{}1", "0".repeat(319))),
+            ("5e-324", format!("0.{}5", "0".repeat(323))),
+            ("1.5E-400", format!("0.{}15", "0".repeat(399))),
+            ("1e-400", format!("0.{}1", "0".repeat(399))),
+        ];
+        let all = table
+            .iter()
+            .map(|(t, p)| (*t, p.to_string()))
+            .chain(long.iter().map(|(t, p)| (*t, p.clone())));
+        for (text, pg) in all {
+            assert_eq!(pg_text(text).as_deref(), Ok(pg.as_str()), "{text}");
+            assert_eq!(pg_text(&format!("[{text}]")), Ok(format!("[{pg}]")), "[{text}]");
+            let doc = encode_text(&format!("{{\"a\":{text}}}")).unwrap();
+            assert_eq!(as_text(get_key(&doc, "a").unwrap()), Some(pg.clone()), "->> of {text}");
+        }
+    }
+
+    /// The digits of every number in a document are its own, wherever it
+    /// sits: `encode_text` reads them from the text in step with serde_json,
+    /// so strings holding quotes, backslashes and digits, keys, nesting and
+    /// re-sorted objects must not put it out of step. The expected text is
+    /// built from PostgreSQL's answers in [`PG_NUMBERS`].
+    #[test]
+    fn numbers_keep_their_digits_anywhere_in_a_document() {
+        const STRINGS: &[(&str, &str)] = &[
+            (r#""1e5""#, r#""1e5""#),
+            (r#""a\"1.5\"b""#, r#""a\"1.5\"b""#),
+            (r#""\\""#, r#""\\""#),
+            (r#""\\\"-0""#, r#""\\\"-0""#),
+            (r#""1""#, r#""1""#),
+            (r#""x,2]""#, r#""x,2]""#),
+            ("true", "true"),
+            ("null", "null"),
+        ];
+        // Distinct keys, listed in stored order, which is bytewise. Some
+        // hold digits and quotes to tempt a misread.
+        const KEYS: &[&str] = &["", "-1", "1", "a", r#"a\"9"#, "e5", "zz9.5", "é"];
+        fn generate(rng: &mut fastrand::Rng, depth: u32, text: &mut String, pg: &mut String) {
+            let ws = |rng: &mut fastrand::Rng, text: &mut String| {
+                if rng.u8(0..4) == 0 {
+                    text.push_str([" ", "\n", "\t", "\r\n "][rng.usize(0..4)]);
+                }
+            };
+            ws(rng, text);
+            match if depth == 0 { rng.u8(0..2) } else { rng.u8(0..4) } {
+                0 => {
+                    let (t, p) = PG_NUMBERS[rng.usize(0..PG_NUMBERS.len())];
+                    text.push_str(t);
+                    pg.push_str(p);
+                }
+                1 => {
+                    let (t, p) = STRINGS[rng.usize(0..STRINGS.len())];
+                    text.push_str(t);
+                    pg.push_str(p);
+                }
+                2 => {
+                    text.push('[');
+                    pg.push('[');
+                    for i in 0..rng.usize(0..4) {
+                        if i > 0 {
+                            text.push(',');
+                            pg.push(',');
+                        }
+                        generate(rng, depth - 1, text, pg);
+                    }
+                    ws(rng, text);
+                    text.push(']');
+                    pg.push(']');
+                }
+                _ => {
+                    let mut picked: Vec<usize> = (0..KEYS.len()).filter(|_| rng.bool()).collect();
+                    let mut values = Vec::new();
+                    for _ in &picked {
+                        let (mut t, mut p) = (String::new(), String::new());
+                        generate(rng, depth - 1, &mut t, &mut p);
+                        values.push((t, p));
+                    }
+                    // Written in the expected order, sent shuffled.
+                    pg.push('{');
+                    for (i, (k, (_, p))) in picked.iter().zip(&values).enumerate() {
+                        if i > 0 {
+                            pg.push(',');
+                        }
+                        pg.push_str(&format!("\"{}\":{}", KEYS[*k], p));
+                    }
+                    pg.push('}');
+                    let mut order: Vec<usize> = (0..picked.len()).collect();
+                    rng.shuffle(&mut order);
+                    text.push('{');
+                    for (i, at) in order.iter().enumerate() {
+                        if i > 0 {
+                            text.push(',');
+                        }
+                        ws(rng, text);
+                        text.push_str(&format!("\"{}\":", KEYS[picked[*at]]));
+                        text.push_str(&values[*at].0);
+                    }
+                    ws(rng, text);
+                    text.push('}');
+                    picked.clear();
+                }
+            }
+            ws(rng, text);
+        }
+        let mut rng = fastrand::Rng::with_seed(0x6e75_6d73);
+        for _ in 0..20_000 {
+            let (mut text, mut pg) = (String::new(), String::new());
+            generate(&mut rng, 4, &mut text, &mut pg);
+            assert_eq!(pg_text(&text).as_deref(), Ok(pg.as_str()), "{text:?}");
+        }
+    }
+
+    /// PostgreSQL 17's text for each spelling; see
+    /// `numbers_print_as_postgres_numeric`.
+    const PG_NUMBERS: &[(&str, &str)] = &[
+        ("0", "0"),
+        ("-0", "0"),
+        ("0.0", "0.0"),
+        ("-0.0", "0.0"),
+        ("0.00", "0.00"),
+        ("0e10", "0"),
+        ("0E+5", "0"),
+        ("-0e-3", "0.000"),
+        ("1", "1"),
+        ("-1", "-1"),
+        ("1.0", "1.0"),
+        ("1.10", "1.10"),
+        ("1.50", "1.50"),
+        ("100.00", "100.00"),
+        ("1e0", "1"),
+        ("1E-0", "1"),
+        ("1e2", "100"),
+        ("1E+2", "100"),
+        ("1e+2", "100"),
+        ("1.5e1", "15"),
+        ("1.50e1", "15.0"),
+        ("15e-1", "1.5"),
+        ("0.15e1", "1.5"),
+        ("1e-2", "0.01"),
+        ("1.0e-2", "0.010"),
+        ("4.2E1", "42"),
+        ("10e-1", "1.0"),
+        ("12.345e1", "123.45"),
+        ("-1.5E-1", "-0.15"),
+        ("0.1", "0.1"),
+        ("0.10", "0.10"),
+        ("1e-1", "0.1"),
+        ("5e-1", "0.5"),
+        ("2.50", "2.50"),
+        ("25E-1", "2.5"),
+        ("1e20", "100000000000000000000"),
+        ("1e+20", "100000000000000000000"),
+        ("100000000000000000000", "100000000000000000000"),
+        ("99999999999999999999.5", "99999999999999999999.5"),
+        ("1.000000000000000000001", "1.000000000000000000001"),
+        ("3.14159265358979323846264338327950288", "3.14159265358979323846264338327950288"),
+        ("123456789012345678901234567890", "123456789012345678901234567890"),
+        ("-123456789012345678901234567890", "-123456789012345678901234567890"),
+        ("9007199254740993", "9007199254740993"),
+        ("9007199254740993.0", "9007199254740993.0"),
+        ("9.007199254740993e15", "9007199254740993"),
+        ("9223372036854775807", "9223372036854775807"),
+        ("9223372036854775808", "9223372036854775808"),
+        ("-9223372036854775808", "-9223372036854775808"),
+        ("-9223372036854775809", "-9223372036854775809"),
+        ("18446744073709551615", "18446744073709551615"),
+        ("18446744073709551616", "18446744073709551616"),
+        ("0.30000000000000004", "0.30000000000000004"),
+        ("1.23456789012345678901", "1.23456789012345678901"),
+        ("0.000001", "0.000001"),
+        ("1e-7", "0.0000001"),
+        ("123e-10", "0.0000000123"),
+        ("0.0000000000000000000000000000000000000000000000000000000000000001e64", "1"),
+        ("7e0", "7"),
+        ("-7.000", "-7.000"),
+    ];
+
+    /// `numeric`'s limits, as PostgreSQL 17 enforces them on `jsonb` input:
+    /// 131072 digits before the point, a scale of 16383, and an exponent of
+    /// at most 1073741823 even on a zero. Each refused spelling was refused
+    /// there with "value overflows numeric format", and each accepted one
+    /// accepted (`'1e131071'::jsonb::text` is 131072 characters long).
+    #[test]
+    fn numbers_beyond_numeric_are_refused_as_postgres_refuses_them() {
+        for text in ["1e131072", "10e131071", "1e-16384", "1.5e-16383", "0e-20000", "0e1073741824", "1e2000000000", "{\"a\":1e2000000000}", "1e-1000000", "1e99999999999999999999", "1e-99999999999999999999"] {
+            let err = encode_text(text).unwrap_err();
+            assert!(err.starts_with(NUMERIC_OVERFLOW), "{text}: {err}");
+        }
+        assert_eq!(pg_text("1e131071").unwrap().len(), 131_072);
+        assert_eq!(pg_text("0.1e131072").unwrap().len(), 131_072);
+        assert_eq!(pg_text("1e-16383").unwrap().len(), 16_385);
+        assert_eq!(pg_text("0e1000000").unwrap(), "0");
+        assert_eq!(pg_text("0e1073741823").unwrap(), "0");
+    }
+
+    /// Documents an earlier build wrote kept a float's `Display` as the
+    /// number's text. They print as PostgreSQL prints the same value, and
+    /// compare and hash as the value they hold.
+    #[test]
+    fn numbers_stored_by_older_builds_read_correctly() {
+        fn legacy(text: &str) -> Vec<u8> {
+            let mut out = vec![TAG_NUM];
+            write_len_prefixed(&mut out, text.as_bytes());
+            out
+        }
+        for (old, pg, same_as) in [
+            ("1e+20", "100000000000000000000", "1e20"),
+            ("1e20", "100000000000000000000", "100000000000000000000"),
+            ("-0.0", "0.0", "0"),
+            ("1.0", "1.0", "1"),
+            ("1.2345678901234568e+29", "123456789012345680000000000000", "123456789012345680000000000000"),
+            ("1e-7", "0.0000001", "0.0000001"),
+            ("9007199254740994.0", "9007199254740994.0", "9007199254740994"),
+        ] {
+            let stored = legacy(old);
+            let mut out = Vec::new();
+            render_text_into(&stored, &mut out).unwrap();
+            assert_eq!(std::str::from_utf8(&out).unwrap(), pg, "{old}");
+            let fresh = encode_text(same_as).unwrap();
+            assert_eq!(scalar_eq(&stored, &fresh), Some(true), "{old} = {same_as}");
+            assert_eq!(contains(&stored, &fresh), Some(true), "{old} @> {same_as}");
+            let mut a = Vec::new();
+            let mut b = Vec::new();
+            gin_items(&stored, GinOpclass::PathOps, &mut a).unwrap();
+            gin_items(&fresh, GinOpclass::PathOps, &mut b).unwrap();
+            assert_eq!(a, b, "{old} and {same_as} hash apart");
         }
     }
 
@@ -2248,19 +2726,38 @@ mod render_tests {
         s
     }
 
+    /// Numbers whose `Display` is already PostgreSQL's text for them, so the
+    /// reference below can print them as they are. How every other spelling
+    /// prints is pinned by `numbers_print_as_postgres_numeric`.
     fn random_number(rng: &mut Rng) -> Value {
-        match rng.below(8) {
+        match rng.below(6) {
             0 => json!(rng.next() as i64),
             1 => json!(rng.next()),
-            2 => json!(f64::from_bits(rng.next()) % 1e6),
-            3 => {
-                let f = f64::from_bits(rng.next());
-                if f.is_finite() { json!(f) } else { json!(0.5) }
+            2 => json!((rng.next() % 2_000_000) as f64 / 4.0 - 250_000.25),
+            3 => json!(i64::MIN),
+            4 => json!(0.5),
+            _ => json!(11203.75),
+        }
+    }
+
+    /// The text of a document, written independently of the renderer: no
+    /// spaces, keys bytewise, strings escaped as serde_json escapes them.
+    fn reference(value: &Value) -> String {
+        match value {
+            Value::Array(items) => {
+                let parts: Vec<String> = items.iter().map(reference).collect();
+                format!("[{}]", parts.join(","))
             }
-            4 => json!(i64::MIN),
-            5 => json!(-0.0),
-            6 => serde_json::from_str("1.50").unwrap(),
-            _ => serde_json::from_str("123456789012345678901234567890").unwrap(),
+            Value::Object(fields) => {
+                let mut keys: Vec<&String> = fields.keys().collect();
+                keys.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+                let parts: Vec<String> = keys
+                    .iter()
+                    .map(|k| format!("{}:{}", Value::String(k.to_string()), reference(&fields[*k])))
+                    .collect();
+                format!("{{{}}}", parts.join(","))
+            }
+            other => other.to_string(),
         }
     }
 
@@ -2283,7 +2780,7 @@ mod render_tests {
     }
 
     fn old(bytes: &[u8]) -> Result<String, String> {
-        decode(bytes).map(|v| v.to_string())
+        decode(bytes).map(|v| reference(&v))
     }
 
     fn new(bytes: &[u8]) -> Result<String, String> {
@@ -2303,7 +2800,7 @@ mod render_tests {
             json!([[], {}, [[]], {"a": {}}]),
             json!("\u{0}\u{1}\u{2}\u{3}\u{4}\u{5}\u{6}\u{7}\u{8}\u{9}\u{a}\u{b}\u{c}\u{d}\u{e}\u{f}\u{10}\u{1f}\"\\"),
             json!({"b": 1, "a": 2, "aa": 3, "B": 4, "é": 5}),
-            json!([1.0, 1e300, -1e-300, 0.1, 100.0, -0.0, 9007199254740993u64]),
+            json!([1.5, 0.1, 9007199254740993u64, 18446744073709551615u64]),
         ];
         let mut docs: Vec<Value> = fixed.to_vec();
         for _ in 0..5000 {
@@ -2311,7 +2808,9 @@ mod render_tests {
         }
         for doc in docs {
             let bytes = encode(&doc);
-            assert_eq!(new(&bytes), old(&bytes), "{doc}");
+            assert_eq!(new(&bytes), Ok(reference(&doc)), "{doc}");
+            // The text path stores the same document.
+            assert_eq!(encode_text(&doc.to_string()), Ok(bytes), "{doc}");
         }
     }
 
@@ -2366,8 +2865,8 @@ mod render_tests {
         }
     }
 
-    /// Blobs this module never writes still render as `decode` would, error
-    /// included: out-of-order and duplicate keys, a number stored as text in a
+    /// Blobs this module never writes still render, or fail with `decode`'s
+    /// error: out-of-order and duplicate keys, a number stored as text in a
     /// non-canonical form, truncation, bad tags and bad UTF-8.
     #[test]
     fn unusual_blobs_render_identically() {
@@ -2401,12 +2900,8 @@ mod render_tests {
         let blobs: Vec<Vec<u8>> = vec![
             obj(&[(b"b", one.clone()), (b"a", two.clone())]),
             obj(&[(b"a", one.clone()), (b"a", two.clone())]),
-            obj(&[(b"a", one.clone()), (b"b", num("1.50"))]),
             obj(&[(b"\xff", one.clone())]),
-            num("1e2"),
-            num("-0"),
             num("1.0"),
-            num("12345678901234567890123"),
             num("not a number"),
             num("\"a string\""),
             vec![],
@@ -2421,6 +2916,16 @@ mod render_tests {
         ];
         for blob in blobs {
             assert_eq!(new(&blob), old(&blob), "{blob:?}");
+        }
+        // A number stored in a form this build would not write prints as
+        // PostgreSQL prints its value; `decode` would go through a `f64`.
+        for (blob, want) in [
+            (obj(&[(b"a", one.clone()), (b"b", num("1.50"))]), r#"{"a":1,"b":1.50}"#),
+            (num("1e2"), "100"),
+            (num("-0"), "0"),
+            (num("12345678901234567890123"), "12345678901234567890123"),
+        ] {
+            assert_eq!(new(&blob).as_deref(), Ok(want), "{blob:?}");
         }
     }
 }
@@ -2437,8 +2942,51 @@ mod encode_text_tests {
             .map_err(|e| e.to_string())
     }
 
+    /// Whether two encodings hold the same document, numbers allowed to
+    /// differ by the reference's rounding: the reference reads a number
+    /// through a `f64` (not even a correctly rounded one), while
+    /// `encode_text` keeps its digits, so only the `f64`s can be compared.
+    /// The digits themselves are pinned against PostgreSQL by
+    /// `numbers_print_as_postgres_numeric`. Everything else must be equal.
+    fn same_document(ours: &[u8], reference: &[u8]) -> bool {
+        let (Some(&a), Some(&b)) = (ours.first(), reference.first()) else {
+            return false;
+        };
+        let number = |t: u8| t == TAG_INT || t == TAG_NUM;
+        if number(a) && number(b) {
+            let (mut buf_a, mut buf_b) = ([0u8; 20], [0u8; 20]);
+            let x: f64 = std::str::from_utf8(number_text(ours, &mut buf_a).unwrap()).unwrap().parse().unwrap();
+            let y: f64 = std::str::from_utf8(number_text(reference, &mut buf_b).unwrap()).unwrap().parse().unwrap();
+            // A few units in the last place: serde_json's fast path is off
+            // by more than one on some long fractions.
+            return x == y || (x - y).abs() <= x.abs().max(y.abs()) * 1e-15;
+        }
+        if a != b {
+            return false;
+        }
+        match a {
+            TAG_ARR => {
+                let (x, y) = (Composite::of(ours, ARR_ENTRY).unwrap(), Composite::of(reference, ARR_ENTRY).unwrap());
+                x.count == y.count
+                    && (0..x.count).all(|i| same_document(x.element(ours, i).unwrap(), y.element(reference, i).unwrap()))
+            }
+            TAG_OBJ => {
+                let (x, y) = (Composite::of(ours, OBJ_ENTRY).unwrap(), Composite::of(reference, OBJ_ENTRY).unwrap());
+                x.count == y.count
+                    && (0..x.count).all(|i| {
+                        let ((ka, va), (kb, vb)) = (x.entry(ours, i).unwrap(), y.entry(reference, i).unwrap());
+                        ka == kb && same_document(va, vb)
+                    })
+            }
+            _ => ours == reference,
+        }
+    }
+
     fn check(text: &str) {
-        assert_eq!(encode_text(text), reference(text), "{text:?}");
+        match (encode_text(text), reference(text)) {
+            (Ok(ours), Ok(theirs)) => assert!(same_document(&ours, &theirs), "{text:?}"),
+            (ours, theirs) => assert_eq!(ours, theirs, "{text:?}"),
+        }
     }
 
     #[test]
@@ -2467,16 +3015,26 @@ mod encode_text_tests {
         for text in [
             "", " ", "{", "}", "[1,]", "[1 2]", "{\"a\"}", "{\"a\":}", "{a:1}", "{\"a\":1,}",
             "nul", "tru", "01", "1.", ".5", "1e", "+1", "--1", "\"unterminated", "\"\\x\"",
-            "\"\\ud800\"", "[1] x", "1 2", "{\"a\":1}}", "\u{0}", "1e400", "-1e400", "[1e999]",
-            "\"tab\tin string\"", "NaN", "Infinity",
+            "\"\\ud800\"", "[1] x", "1 2", "{\"a\":1}}", "\u{0}", "\"tab\tin string\"", "NaN",
+            "Infinity",
+            // After a number serde_json could not hold, so the masked second
+            // parse has to report these exactly where the first would have.
+            "[1e400,]", "[1e400 2]", "{\"a\":1e400,}", "[1e400,-]", "[1e400,01]", "[1e400,1.]",
+            "[1e400,\"\\x\"]", "[1e400] x",
         ] {
-            let (new, old) = (encode_text(text), reference(text));
+            let (new, old) = (encode_text(text), reference(&text.replace("1e400", "1e300")));
             assert!(old.is_err(), "reference accepted {text:?}");
             assert_eq!(new, old, "{text:?}");
         }
         check(&deep_ok);
         assert_eq!(encode_text(&too_deep), reference(&too_deep));
         assert!(encode_text(&too_deep).is_err());
+        // serde_json refuses these as out of range; `numeric` holds them, and
+        // PostgreSQL stores them.
+        for text in ["1e400", "-1e400", "[1e999]", "{\"a\":[1e309,\"x\"],\"b\":-1E+400}"] {
+            assert!(reference(text).is_err(), "{text:?}");
+            assert!(encode_text(text).is_ok(), "{text:?}");
+        }
     }
 
     /// The one place the two differ, on purpose: serde_json's `raw_value`
@@ -2573,9 +3131,8 @@ mod encode_text_tests {
                     text.insert(at, [',', ']', '}', '"', ':', 'x'][rng.usize(0..6)]);
                 }
             }
-            let (new, old) = (encode_text(&text), reference(&text));
-            broken += old.is_err() as usize;
-            assert_eq!(new, old, "{text:?}");
+            broken += reference(&text).is_err() as usize;
+            check(&text);
         }
         assert!(broken > 1000, "only {broken} malformed documents were exercised");
     }
@@ -2642,7 +3199,7 @@ mod gin_item_tests {
     /// A random scalar, spelled several ways so equal values meet unequal
     /// bytes: `1`, `1.0`, `1e0`, `-0.0` and `0` all occur.
     fn scalar(r: &mut Rng) -> String {
-        match r.below(12) {
+        match r.below(16) {
             0 => "null".into(),
             1 => "true".into(),
             2 => "false".into(),
@@ -2654,9 +3211,21 @@ mod gin_item_tests {
             8 => "2.50".into(),
             9 => "\"a\"".into(),
             10 => "\"b\"".into(),
+            11 | 12 => NUMBERS[r.below(NUMBERS.len() as u64) as usize].into(),
             _ => "\"\"".into(),
         }
     }
+
+    /// Spellings that meet as equal values with different digits, scale or
+    /// exponent, past the `f64` range and past its precision, so that
+    /// containment between them is exercised and not just random misses.
+    const NUMBERS: &[&str] = &[
+        "1", "1.0", "1.00", "1e0", "10e-1", "0.1e1", "-0", "0e5", "-0.000", "100", "1e2", "100.00",
+        "1E+2", "1e400", "1E+400", "10e399", "-1e400", "1e-400", "0.1e-399", "1e-401",
+        "1.000000000000000000001", "1.0000000000000000000010", "1.000000000000000000002",
+        "9007199254740993", "9007199254740993.0", "9.007199254740993e15", "9007199254740992",
+        "123456789012345678901234567890", "1.2345678901234567890123456789e29", "0.1", "0.10000000000000001",
+    ];
 
     fn value(r: &mut Rng, depth: u32) -> String {
         if depth == 0 || r.below(3) == 0 {
@@ -2717,7 +3286,12 @@ mod gin_item_tests {
         for _ in 0..20_000 {
             let doc_text = value(&mut r, 4);
             let doc = encode_text(&doc_text).unwrap();
-            let doc_value: serde_json::Value = serde_json::from_str(&doc_text).unwrap();
+            // serde_json cannot read a number past the `f64` range, so such a
+            // document is carved from with its numbers masked; its query then
+            // holds 0s there, which is still a containment to test.
+            let doc_value: serde_json::Value = serde_json::from_str(&doc_text)
+                .or_else(|_| serde_json::from_str(&mask_numbers(&doc_text)))
+                .unwrap();
             let query_text = match r.below(3) {
                 0 => value(&mut r, 3),
                 1 => scalar(&mut r),
@@ -2738,6 +3312,42 @@ mod gin_item_tests {
             }
         }
         assert!(contained > 2_000, "too few containments to test ({contained})");
+    }
+
+    /// The index rests on this: two scalars hash alike exactly when
+    /// `scalar_eq` calls them equal. Hashing apart what compares equal drops
+    /// a matching row; the converse only costs a recheck, but is asserted too
+    /// since here it would mean the hash ignores part of the value. Every
+    /// pair is tried, encoded as this build writes it and as an older build
+    /// stored a float's text, so stored documents of either age meet queries
+    /// of the other.
+    #[test]
+    fn numbers_hash_alike_exactly_when_they_compare_equal() {
+        fn legacy(text: &str) -> Vec<u8> {
+            let mut out = vec![TAG_NUM];
+            write_len_prefixed(&mut out, text.as_bytes());
+            out
+        }
+        let hash = |bytes: &[u8]| {
+            use std::hash::Hasher;
+            let mut h = item_hasher();
+            hash_scalar(bytes, &mut h).unwrap();
+            h.finish()
+        };
+        let mut encoded: Vec<(String, Vec<u8>)> = Vec::new();
+        for text in NUMBERS.iter().chain(["1e+20", "1e20", "-0.0", "0.0", "1.2345678901234568e+29", "5e-324", "1e-7"].iter()) {
+            encoded.push((text.to_string(), encode_text(text).unwrap()));
+            encoded.push((format!("legacy {text}"), legacy(text)));
+        }
+        let mut equal_pairs = 0;
+        for (ta, a) in &encoded {
+            for (tb, b) in &encoded {
+                let eq = scalar_eq(a, b).unwrap();
+                equal_pairs += eq as usize;
+                assert_eq!(hash(a) == hash(b), eq, "{ta} vs {tb}: scalar_eq says {eq}");
+            }
+        }
+        assert!(equal_pairs > 4 * encoded.len(), "too few equal pairs ({equal_pairs})");
     }
 
     #[test]
