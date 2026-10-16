@@ -9158,17 +9158,36 @@ pub async fn execute_with_sync(
         // aborted like any failed statement's. Unwinding past this point used
         // to leave it `InProgress` — invisible writes nobody would resolve, and
         // `oldest_active` pinned below it for the life of the process.
+        //
+        // A prepared `SELECT` is boxed on its own. Boxing it through
+        // `execute_with_context` allocated and copied a future sized for every
+        // statement arm, on the per-execution path of a statement whose whole
+        // dispatch is a table lookup and the scan.
         let response = {
             use futures::FutureExt;
-            match std::panic::AssertUnwindSafe(Box::pin(execute_with_context(
-                purpose,
-                database.clone(),
-                0,
-                tx,
-            )))
-            .catch_unwind()
-            .await
-            {
+            let caught = match purpose {
+                QueryPurpose::PreparedRows(prepared) => {
+                    std::panic::AssertUnwindSafe(Box::pin(execute_prepared_rows(
+                        prepared,
+                        database.clone(),
+                        tx,
+                        SubqueryNeed::All,
+                    )))
+                    .catch_unwind()
+                    .await
+                }
+                purpose => {
+                    std::panic::AssertUnwindSafe(Box::pin(execute_with_context(
+                        purpose,
+                        database.clone(),
+                        0,
+                        tx,
+                    )))
+                    .catch_unwind()
+                    .await
+                }
+            };
+            match caught {
                 Ok(response) => response,
                 Err(_) => {
                     error!("statement panicked; its transaction {} is aborted", tx);
@@ -9465,7 +9484,15 @@ pub async fn execute_in_txn(query: QueryPurpose, database: Arc<Database>, tx: Tx
     let mut query = query;
     let mut attempt = 0usize;
     loop {
-        let response = Box::pin(execute_with_context(query, database.clone(), 0, tx)).await;
+        // See `execute_with_sync`: a prepared `SELECT` skips the box sized for
+        // every statement arm.
+        let response = match query {
+            QueryPurpose::PreparedRows(prepared) => {
+                Box::pin(execute_prepared_rows(prepared, database.clone(), tx, SubqueryNeed::All))
+                    .await
+            }
+            query => Box::pin(execute_with_context(query, database.clone(), 0, tx)).await,
+        };
         if !retryable || attempt >= MAX_CONFLICT_RETRIES || !is_retryable_conflict(&response) {
             return strip_conflict_marker(response);
         }
@@ -9575,6 +9602,28 @@ pub(crate) fn apply_subquery_need(
     }
 }
 
+/// A prepared `SELECT`'s whole dispatch: its table, the parse narrowed to what
+/// the caller needs, the scan.
+///
+/// One function for every entry point, so the statement wrappers can box just
+/// this instead of [`execute_with_context`]'s future, and none of them can
+/// drift from what [`execute_with_need`] does with the same statement.
+async fn execute_prepared_rows(
+    prepared: Box<crate::core::rql::prepared::PreparedRows>,
+    database: Arc<Database>,
+    tx: TxId,
+    need: SubqueryNeed,
+) -> Vec<u8> {
+    let prepared = *prepared;
+    let table = database.tables.get(&prepared.table_name).map(|t| t.value().clone());
+    let Some(table) = table else {
+        return ddl_error("Table not found");
+    };
+    let mut query_row = prepared.query_row;
+    apply_subquery_need(&mut query_row, need);
+    execute_query_rows(query_row, table, &database, tx).await
+}
+
 /// [`execute_with_context`] for a statement whose caller needs only part of
 /// its result. See [`SubqueryNeed`].
 pub(crate) async fn execute_with_need(
@@ -9589,14 +9638,7 @@ pub(crate) async fn execute_with_need(
     // branch is all the statement ever took.
     let query = match query {
         QueryPurpose::PreparedRows(prepared) => {
-            let prepared = *prepared;
-            let table = database.tables.get(&prepared.table_name).map(|t| t.value().clone());
-            let Some(table) = table else {
-                return ddl_error("Table not found");
-            };
-            let mut query_row = prepared.query_row;
-            apply_subquery_need(&mut query_row, need);
-            return Box::pin(execute_query_rows(query_row, table, &database, tx)).await;
+            return Box::pin(execute_prepared_rows(prepared, database, tx, need)).await;
         }
         other => other,
     };
@@ -11033,7 +11075,7 @@ pub(crate) async fn execute_query_rows(
             let folded = match table
                 .query_row_bytes_in_txn(
                     &query_row.where_clause,
-                    &schema.fields.to_vec(),
+                    &schema.fields,
                     query_row.query_row_fetch.clone(),
                     aggregate_fetch.clone(),
                     // No limit and no ordering, as below.
@@ -11114,8 +11156,10 @@ pub(crate) async fn execute_query_rows(
     // fields against the RowDescription and dropped the connection
     // with "unexpected field count in D message". Only shapes the
     // scan actually over-fetches for set this, so the ordinary path
-    // still skips the decode.
-    let may_overfetch = query_row.predicate_needs_extra_columns;
+    // still skips the decode. The parse can only say the predicate
+    // reads another column; whether the rows came back holding it is
+    // the scan's answer, combined with this once it returns.
+    let predicate_needs_extra_columns = query_row.predicate_needs_extra_columns;
     // `FOR UPDATE` has to see the rows to lock them, so it forces the
     // decode the same way the other row-level steps do.
     // Window functions are computed after the scan, over every row
@@ -11208,14 +11252,16 @@ pub(crate) async fn execute_query_rows(
         )
         .collect();
     value_slots.sort_by_key(|(position, ..)| *position);
-    let slot_schema = schema.fields.to_vec();
+    // Borrowed: the schema cannot change under this statement, and a copy
+    // here was a `Vec` and a `String` per column on every execution.
+    let slot_schema: &[crate::core::row::schema::SchemaField] = &schema.fields;
     let has_literals = !value_slots.is_empty();
 
     {
         match table
-            .query_row_bytes_in_txn(
+            .query_row_bytes_reporting_in_txn(
                 &query_row.where_clause,
-                &schema.fields.to_vec(),
+                slot_schema,
                 query_row.query_row_fetch,
                 query_row.requested_row_fetch,
                 // `SKIP LOCKED` filters *after* the scan, so a limit
@@ -11233,11 +11279,19 @@ pub(crate) async fn execute_query_rows(
             )
             .await
         {
-            Ok(rows_bytes) => {
+            Ok((rows_bytes, scan_overfetched)) => {
                 info!(
                     "Query executed successfully, returning {} bytes",
                     rows_bytes.len()
                 );
+
+                // There is something to trim only when both hold. A
+                // predicate reading only selected columns adds none, and
+                // a scan that re-fetched just the requested columns for
+                // each matched row sent none of the predicate's, so its
+                // bytes are already the projection: decoding them only
+                // to re-encode the same bytes was wasted work.
+                let may_overfetch = predicate_needs_extra_columns && scan_overfetched;
 
                 // Everything below that needs a row decoded. `OFFSET`
                 // is deliberately not in it: on its own it only drops

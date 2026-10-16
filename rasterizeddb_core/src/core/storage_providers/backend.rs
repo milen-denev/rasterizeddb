@@ -213,6 +213,24 @@ impl StorageIO for DbStorageProvider {
         }
     }
 
+    // Forwarded like every other method. Without it this enum took the trait's
+    // default `false`, so every row fetch went through the async
+    // `read_vectored` chain and the providers' own synchronous mmap and
+    // resident-page paths were never reached. Each provider's fast path keeps
+    // its own refusal rules (staged temp data, pages not resident), and a
+    // `false` still sends the caller to `read_vectored` for the same reads.
+    #[inline(always)]
+    fn try_read_vectored_sync(&self, reads: &mut [(u64, &mut [u8])]) -> bool {
+        match self {
+            Self::File(p) => p.try_read_vectored_sync(reads),
+            Self::Memory(p) => p.try_read_vectored_sync(reads),
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.try_read_vectored_sync(reads),
+            #[cfg(feature = "storage_pools")]
+            Self::Mirror(p) => p.try_read_vectored_sync(reads),
+        }
+    }
+
     async fn append_data(&self, buffer: &[u8], immediate: bool) {
         match self {
             Self::File(p) => p.append_data(buffer, immediate).await,
@@ -430,5 +448,49 @@ impl StorageIO for DbStorageProvider {
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => p.get_name(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A row fetch asks for the synchronous copy first and only awaits
+    /// `read_vectored` when that says no. Through this enum the answer was
+    /// always no, so the file provider's mmap copy was dead code on every
+    /// table. This pins that the backend now reaches it, and that what it
+    /// copies is what the async path reads.
+    #[tokio::test]
+    async fn a_file_backend_serves_resident_reads_synchronously() {
+        // Written before the provider opens it, so its map covers every byte:
+        // a small append is served from the file rather than remapped (see
+        // `REMAP_GROWTH_THRESHOLD`), and the fast path rightly refuses those.
+        let dir = tempfile::tempdir().unwrap();
+        let data: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(dir.path().join("sync.db"), &data).unwrap();
+        let io = DbStorageProvider::new_file(dir.path().to_str().unwrap(), Some("sync.db")).await;
+        assert_eq!(io.get_len().await, data.len() as u64);
+
+        let mut header = [0u8; 12];
+        let mut body = [0u8; 150];
+        let mut reads = [(40u64, &mut header[..]), (5000u64, &mut body[..])];
+        assert!(
+            io.try_read_vectored_sync(&mut reads),
+            "a resident read on a file backend was refused"
+        );
+        assert_eq!(&header[..], &data[40..52]);
+        assert_eq!(&body[..], &data[5000..5150]);
+
+        let mut header_async = [0u8; 12];
+        let mut body_async = [0u8; 150];
+        let mut reads = [(40u64, &mut header_async[..]), (5000u64, &mut body_async[..])];
+        io.read_vectored(&mut reads).await.unwrap();
+        assert_eq!(header, header_async);
+        assert_eq!(body, body_async);
+
+        // A read running past the end is still refused, which sends the
+        // caller to `read_vectored` and its error rather than a short copy.
+        let mut tail = [0u8; 16];
+        assert!(!io.try_read_vectored_sync(&mut [(8190u64, &mut tail[..])]));
     }
 }

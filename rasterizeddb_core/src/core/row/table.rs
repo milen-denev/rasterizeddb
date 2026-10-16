@@ -3146,13 +3146,41 @@ impl<S: StorageIO> Table<S> {
     pub async fn query_row_bytes_in_txn(
         &self,
         query: &str,
-        schema_fields: &Vec<SchemaField>,
+        schema_fields: &[SchemaField],
         query_row_fetch: RowFetch,
         requested_row_fetch: RowFetch,
         limit: Option<u64>,
         order_by: Option<String>,
         reader: TxId,
     ) -> Result<Vec<u8>> {
+        self.query_row_bytes_reporting_in_txn(
+            query,
+            schema_fields,
+            query_row_fetch,
+            requested_row_fetch,
+            limit,
+            order_by,
+            reader,
+        )
+        .await
+        .map(|(bytes, _)| bytes)
+    }
+
+    /// [`Table::query_row_bytes_in_txn`], also saying whether any row may hold
+    /// columns beyond `requested_row_fetch` (see
+    /// `ConcurrentProcessor::process_into_bytes`). A caller that skips trimming
+    /// on `false` must take the flag from here, never work it out from the
+    /// parse: only the scan knows which fetch it emitted.
+    pub async fn query_row_bytes_reporting_in_txn(
+        &self,
+        query: &str,
+        schema_fields: &[SchemaField],
+        query_row_fetch: RowFetch,
+        requested_row_fetch: RowFetch,
+        limit: Option<u64>,
+        order_by: Option<String>,
+        reader: TxId,
+    ) -> Result<(Vec<u8>, bool)> {
         info!("Querying row (bytes mode)");
 
         let _gate = self.compaction_gate.read().await;
@@ -3182,7 +3210,7 @@ impl<S: StorageIO> Table<S> {
             .unwrap();
         iterator.set_candidates(self.build_candidates(query, limit).await);
 
-        let bytes = self
+        let (bytes, overfetched) = self
             .concurrent_processor
             .process_into_bytes(
                 &self.cache_scope,
@@ -3204,7 +3232,7 @@ impl<S: StorageIO> Table<S> {
             bytes.len(),
             limit
         );
-        Ok(bytes)
+        Ok((bytes, overfetched))
     }
 
     /// A fetch of just the columns named by write order, for the index build

@@ -1990,7 +1990,7 @@ impl ConcurrentProcessor {
         where_query: &str,
         query_row_fetch: RowFetch,
         requested_row_fetch: RowFetch,
-        table_schema: &Vec<SchemaField>,
+        table_schema: &[SchemaField],
         io_rows: Arc<S>,
         iterator: &mut RowPointerIterator<S>,
         limit: Option<u64>,
@@ -2208,13 +2208,20 @@ impl ConcurrentProcessor {
     ///
     /// Falls back to row-mode internally when ORDER BY is requested (rows
     /// must be sorted before serialization).
+    ///
+    /// The flag beside the bytes says whether any row may carry columns beyond
+    /// `requested_row_fetch`. Only the path that built the rows can know that,
+    /// so it is reported from here rather than guessed from the parse: the
+    /// executor skips its decode-and-trim pass on `false`, and a `false` over
+    /// rows holding a WHERE-only column sends that column to the client, which
+    /// then drops the connection with "unexpected field count in D message".
     pub async fn process_into_bytes<'a, S: StorageIO>(
         &self,
         table_name: &str,
         where_query: &str,
         query_row_fetch: RowFetch,
         requested_row_fetch: RowFetch,
-        table_schema: &Vec<SchemaField>,
+        table_schema: &[SchemaField],
         io_rows: Arc<S>,
         iterator: &mut RowPointerIterator<S>,
         limit: Option<u64>,
@@ -2222,7 +2229,7 @@ impl ConcurrentProcessor {
         // See [`Self::process`].
         generation: Option<u64>,
         visibility: Visibility,
-    ) -> std::io::Result<Vec<u8>> {
+    ) -> std::io::Result<(Vec<u8>, bool)> {
         // ORDER BY requires materialized Row structs to sort by column value;
         // fall back to the row-mode path and serialize at the end.
         if order_by.is_some() {
@@ -2241,7 +2248,9 @@ impl ConcurrentProcessor {
                     visibility,
                 )
                 .await?;
-            return Ok(crate::core::row::row::rows_into_vec(rows));
+            // Row mode decides for itself which fetch it emits, so nothing
+            // here can promise the rows are only the requested columns.
+            return Ok((crate::core::row::row::rows_into_vec(rows), true));
         }
 
         let prep_stopwatch = std::time::Instant::now();
@@ -2264,7 +2273,8 @@ impl ConcurrentProcessor {
         )
         .await
         {
-            return Ok(bytes);
+            // The cached path fetches `requested_row_fetch` and nothing else.
+            return Ok((bytes, false));
         }
 
         let (tx_b, rx_b) = kanal::unbounded_async::<Vec<u8>>();
@@ -2316,6 +2326,13 @@ impl ConcurrentProcessor {
                     .zip(q.iter())
                     .all(|(rc, qc)| qc.schema_id == rc.schema_id)
         };
+        // The only emit that is not exactly `requested_row_fetch`: a covered
+        // query sends the WHERE buffer as it is, requested columns first and
+        // the predicate's own after them. The unfiltered path and the
+        // re-fetch of a matched row both serialize the requested fetch.
+        let overfetched = query_covers_requested
+            && shared_tuple.0.columns_fetching_data.len()
+                > shared_tuple.1.columns_fetching_data.len();
 
         log::info!(
             "Preperation for bytes-mode query completed in {:.2?}",
@@ -2416,7 +2433,7 @@ impl ConcurrentProcessor {
             bytes.len()
         );
 
-        Ok(bytes)
+        Ok((bytes, overfetched))
     }
 
     /// Concurrently evaluates a WHERE clause and returns matching row pointers (with their pointer-record offsets).
