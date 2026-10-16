@@ -727,21 +727,31 @@ pub fn clause_is_constant_false(
     where_clause: &str,
     schema: &smallvec::SmallVec<[crate::core::row::schema::SchemaField; 20]>,
 ) -> bool {
-    if where_clause.trim().is_empty() {
-        return false;
-    }
-    // This tokenizes the clause a second time, which for a 70,000-value `IN`
-    // list is real work. A long clause is only examined when it carries the
-    // rewriter's constant; a self-comparison inside one is merely not skipped.
-    if where_clause.len() > 4096
-        && !where_clause.contains(crate::core::tokenizer::predicate_rewrite::CONSTANT_FALSE)
-    {
+    if !worth_judging_constant(where_clause) {
         return false;
     }
     match crate::core::tokenizer::query_tokenizer::try_tokenize(where_clause, schema) {
-        Ok(tokens) => constant_truth(&tokens) == Some(false),
+        Ok(tokens) => clause_tokens_are_constant_false(where_clause, &tokens),
         Err(_) => false,
     }
+}
+
+/// [`clause_is_constant_false`] for a clause already tokenized, so a query
+/// that needs the tokens for its indexes too tokenizes once.
+pub fn clause_tokens_are_constant_false(where_clause: &str, tokens: &[Token]) -> bool {
+    worth_judging_constant(where_clause) && constant_truth(tokens) == Some(false)
+}
+
+/// Whether a clause is examined for a constant at all. Tokenizing it is the
+/// cost, which for a 70,000-value `IN` list is real work. A long clause is
+/// only examined when it carries the rewriter's constant; a self-comparison
+/// inside one is merely not skipped.
+pub fn worth_judging_constant(where_clause: &str) -> bool {
+    if where_clause.trim().is_empty() {
+        return false;
+    }
+    where_clause.len() <= 4096
+        || where_clause.contains(crate::core::tokenizer::predicate_rewrite::CONSTANT_FALSE)
 }
 
 #[cfg(test)]

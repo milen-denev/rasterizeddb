@@ -21,6 +21,7 @@ use crate::core::{
 };
 
 use crate::core::row::row::{ColumnFetchingData, ColumnWritePayload};
+use crate::core::tokenizer::query_tokenizer::Token;
 
 use crate::core::db_type::DbType;
 use crate::core::filter::{CandidateBitmap, FilterConfig, TableFilters, is_indexable, sarg};
@@ -2666,11 +2667,11 @@ impl<S: StorageIO> Table<S> {
             .collect()
     }
 
-    /// The candidate slots a secondary index gives for a WHERE clause, or
-    /// `None` when no index can narrow it, or none is built yet.
-    pub(crate) async fn index_candidates(&self, where_clause: &str) -> Option<Arc<CandidateBitmap>> {
+    /// The candidate slots a secondary index gives for a tokenized WHERE
+    /// clause, or `None` when no index can narrow it, or none is built yet.
+    pub(crate) async fn index_candidates(&self, tokens: &[Token]) -> Option<Arc<CandidateBitmap>> {
         let indexes = self.indexes.as_ref().filter(|i| i.is_ready())?;
-        if where_clause.trim().is_empty() {
+        if tokens.is_empty() {
             return None;
         }
         // Sampled before the index is asked. A version appended after this
@@ -2678,26 +2679,36 @@ impl<S: StorageIO> Table<S> {
         // one appended before it was indexed by its writer before it could
         // commit, so a snapshot that can see it finds it here.
         let n_slots = self.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
-        let tokens = crate::core::tokenizer::query_tokenizer::try_tokenize(where_clause, &self.schema.fields).ok()?;
         let scales = self.decimal_scales();
         let cap = crate::core::index::candidate_cap(n_slots);
         // Key indexes, with `doc->>'k'` read as the virtual column of a path
         // index that keys that path.
         let resolve = |document: u32, steps: &[crate::core::jsonb::Step]| indexes.path_column(document, steps);
-        let from_keys = sarg::extract_gated_with_paths(&tokens, &|wo| indexes.covers(wo), &scales, &resolve)
+        let from_keys = sarg::extract_gated_with_paths(tokens, &|wo| indexes.covers(wo), &scales, &resolve)
             .and_then(|program| indexes.plan(&program.root, &self.schema.fields, cap));
         // Inverted indexes, for `@>`, `?`, `?|`, `?&` on a document column.
-        let from_gin = if indexes.gin.is_empty() {
+        let json = if indexes.gin.is_empty() {
             None
         } else {
-            crate::core::index::gin::parse_json_where(&tokens).and_then(|e| indexes.plan_json(&e, cap))
+            crate::core::index::gin::parse_json_where(tokens)
         };
+        let from_gin = json.as_ref().and_then(|e| indexes.plan_json(e, cap));
         // Both are supersets of the matches, so where both narrow, so does
         // their intersection.
         let mut slots = match (from_keys, from_gin) {
             (Some(a), Some(b)) => crate::core::index::intersect_sorted(&a, &b),
             (Some(a), None) | (None, Some(a)) => a,
-            (None, None) => return None,
+            (None, None) => {
+                // Too broad for a slot list (`doc @> '{"status":"paid"}'`, a
+                // fifth of the table) but still most of it left out: a bitmap
+                // straight from the posting lists. It covers `n_slots`, so
+                // the rule for slots appended since holds as for a list.
+                let limit = crate::core::index::dense_cap(n_slots);
+                let words = json.as_ref().and_then(|e| indexes.plan_json_dense(e, n_slots, limit))?;
+                let bitmap = CandidateBitmap::dense(words, n_slots);
+                info!("Index narrowed {} slots to {} candidates, as a bitmap", n_slots, bitmap.count());
+                return Some(Arc::new(bitmap));
+            }
         };
         slots.retain(|s| *s < n_slots);
         info!(
@@ -2711,20 +2722,15 @@ impl<S: StorageIO> Table<S> {
     /// The filter index's mask for a clause, and the table length it covers:
     /// every slot that may match, before any judgement of whether a scan is
     /// better off with it.
-    async fn filter_mask(&self, where_clause: &str) -> Option<(CandidateBitmap, u64)> {
+    async fn filter_mask(&self, tokens: &[Token]) -> Option<(CandidateBitmap, u64)> {
         let filters = self.filters.as_ref()?;
-        if where_clause.trim().is_empty() {
+        if tokens.is_empty() {
             return None;
         }
-        // A predicate the tokenizer cannot read is not a reason to abandon the
-        // query: the filter index is an optimisation, so an unreadable clause
-        // just means no candidate set and a full scan, which the evaluator will
-        // then reject with a proper message.
-        let tokens = crate::core::tokenizer::query_tokenizer::try_tokenize(where_clause, &self.schema.fields).ok()?;
         // Each `NUMERIC(p, s)` column's scale, so a literal is bounded where
         // the column stores it — see `sarg::extract_with_scales`.
         let scales = self.decimal_scales();
-        let program = sarg::extract_with_scales(&tokens, filters, &scales)?;
+        let program = sarg::extract_with_scales(tokens, filters, &scales)?;
         let n_slots = self.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
         if n_slots == 0 {
             return None;
@@ -2745,10 +2751,25 @@ impl<S: StorageIO> Table<S> {
         where_clause: &str,
         limit: Option<u64>,
     ) -> Option<Arc<CandidateBitmap>> {
+        // The constant judgement, the indexes and the filter all read the
+        // clause as tokens, so it is tokenized once here for all three, and
+        // only when one of them will look. A clause the tokenizer cannot read
+        // is not a reason to abandon the query: each of the three is an
+        // optimisation, so it just means a full scan, which the evaluator
+        // will then reject with a proper message.
+        if where_clause.trim().is_empty() {
+            return None;
+        }
+        let judge_constant = sarg::worth_judging_constant(where_clause);
+        let indexes_ready = self.indexes.as_ref().is_some_and(|i| i.is_ready());
+        if !judge_constant && !indexes_ready && self.filters.is_none() {
+            return None;
+        }
+        let tokens = crate::core::tokenizer::query_tokenizer::try_tokenize(where_clause, &self.schema.fields).ok()?;
         // A clause no row can satisfy — `1 = 0`, `notnull IS NULL`, `x IN ()`,
         // `id != id` — needs no index and no scan. Decided before the index is
         // consulted, so it holds on a table with no filters too.
-        if crate::core::filter::sarg::clause_is_constant_false(where_clause, &self.schema.fields) {
+        if sarg::clause_tokens_are_constant_false(where_clause, &tokens) {
             return Some(Arc::new(CandidateBitmap::nothing()));
         }
         // A secondary index names the candidate slots outright, so it is
@@ -2760,21 +2781,28 @@ impl<S: StorageIO> Table<S> {
         // price > 990` without a range on `price` names every `cat = 5` row,
         // while the filter's mask already excludes most of them on `price`.
         // Both are supersets of the matches, so their intersection is too.
-        let from_index = self.index_candidates(where_clause).await;
+        let from_index = self.index_candidates(&tokens).await;
         if let Some(found) = &from_index {
             if found.count() <= INDEX_ANSWER_TAKEN_AS_IS || self.filters.is_none() {
                 return from_index;
             }
-            let Some((mask, _)) = self.filter_mask(where_clause).await else {
+            let Some((mask, _)) = self.filter_mask(&tokens).await else {
                 return from_index;
             };
+            // Two bitmaps intersect word by word, and a slot past the
+            // shorter one's length would read as excluded. The mask is
+            // sampled after the index answer, and the table only grows under
+            // a query, so it is never the shorter; this keeps it that way.
+            if !found.is_sparse() && mask.n_slots() < found.n_slots() {
+                return from_index;
+            }
             let mut narrowed = (**found).clone();
             narrowed.intersect(&mask);
             info!("Filter narrowed {} index candidates to {}", found.count(), narrowed.count());
             return Some(Arc::new(narrowed));
         }
         let filters = self.filters.as_ref()?;
-        let (bitmap, n_slots) = self.filter_mask(where_clause).await?;
+        let (bitmap, n_slots) = self.filter_mask(&tokens).await?;
 
         // A table small enough to scan outright gains nothing from a mask: the
         // bitmap test per record costs more than the fetches it saves, and

@@ -871,6 +871,39 @@ async fn a_small_table_is_scanned_rather_than_masked() {
     assert_eq!(u64_of(&rows[0], 0), 300);
 }
 
+/// `build_candidates` tokenizes a clause once and hands the tokens to the
+/// constant judgement, the indexes and the filter. Each must still see them:
+/// a constant false clause reads nothing, a long one only when it carries
+/// the rewriter's constant, and the filter still prunes either way.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_tokenization_serves_the_constant_and_the_filter() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_table(dir.path(), "wp_tokens_once").await;
+    for i in 0..5000u64 {
+        insert(&t, i, (i % 8) as i32, "s").await;
+    }
+    t.wait_filters_ready().await;
+    let n_slots = t.io_pointers.get_len().await / crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN as u64;
+    assert!(n_slots >= t.filters.as_ref().unwrap().config().min_table_rows, "under the size gate");
+
+    let nothing = t.build_candidates("1 = 0", None).await.expect("a constant false clause");
+    assert!(nothing.is_nothing());
+
+    let point = t.build_candidates("id = 300", None).await.expect("the filter prunes a point lookup");
+    assert!(point.get(300) && point.count() < n_slots / 2, "{} of {n_slots}", point.count());
+
+    // Past 4096 characters a clause is judged only when it carries the
+    // rewriter's constant, and the filter reads it either way.
+    let long = vec!["id = 300"; 600].join(" OR ");
+    assert!(long.len() > 4096);
+    let filtered = t.build_candidates(&long, None).await.expect("the filter reads a long clause");
+    assert!(filtered.get(300) && !filtered.is_nothing() && filtered.count() < n_slots / 2);
+    let long_false = format!("({long}) AND 1 = 0");
+    assert!(t.build_candidates(&long_false, None).await.expect("constant").is_nothing());
+    assert!(run(&t, &long_false).await.is_empty());
+    assert_eq!(run(&t, &long).await.len(), 1);
+}
+
 /// An `UPDATE` writes a new version of an existing row, so it must not draw a
 /// fresh id from the sequence.
 ///

@@ -412,3 +412,136 @@ fn galloping_finds_what_a_binary_search_finds() {
         }
     }
 }
+
+fn gin_pair() -> (Arc<gin::GinIndex>, Arc<gin::GinIndex>, TableIndexes) {
+    let decl = |name: &str, method| IndexDecl {
+        name: name.into(),
+        method,
+        unique: false,
+        columns: vec![0],
+        is_deleted: false,
+    };
+    let ops = Arc::new(gin::GinIndex::new(decl("ops", Method::GinOps), 0, crate::core::jsonb::GinOpclass::Ops));
+    let path = Arc::new(gin::GinIndex::new(decl("path", Method::GinPathOps), 0, crate::core::jsonb::GinOpclass::PathOps));
+    // `jsonb_ops` declared first, so a stable sort on the estimate alone
+    // would ask it first on a tie.
+    let indexes = TableIndexes::with_gin(Vec::new(), vec![ops.clone(), path.clone()]);
+    indexes.set_ready(true);
+    (ops, path, indexes)
+}
+
+fn contains_leaf(q: &str) -> gin::JsonExpr {
+    gin::JsonExpr::Leaf {
+        column: 0,
+        op: gin::JsonOp::Contains(crate::core::jsonb::encode_text(q).unwrap()),
+    }
+}
+
+/// `{"status":"paid"}` bounds both answers at the `paid` list, but under
+/// `jsonb_ops` the walk also has the `status` key list every document is
+/// on. Between equal bounds the index with less to read is asked first.
+#[test]
+fn ties_go_to_the_index_with_less_to_read() {
+    let (_, _, indexes) = gin_pair();
+    for slot in 0..500u64 {
+        let d = format!(r#"{{"status":"{}","n":{}}}"#, ["paid", "new", "shipped"][(slot % 3) as usize], slot);
+        let bytes = crate::core::jsonb::encode_text(&d).unwrap();
+        indexes.index_row(slot, &|_| Some(&bytes[..]));
+    }
+    let gin::JsonExpr::Leaf { op, .. } = contains_leaf(r#"{"status":"paid"}"#) else { unreachable!() };
+    let order = indexes.ask_order(0, &op);
+    assert_eq!(order[0].0.0, order[1].0.0, "the bounds tie");
+    assert_eq!(order[0].1.decl.name, "path", "{:?}", order.iter().map(|o| (o.0, &o.1.decl.name)).collect::<Vec<_>>());
+}
+
+/// An answer too broad for a slot list comes back as a bitmap holding the
+/// same slots, for one operator and for operators `AND`ed together, and is
+/// declined when it would name more than its limit, or when the clause's
+/// shape is one the bitmap path does not take.
+#[test]
+fn broad_gin_answers_come_back_as_bitmaps() {
+    let (_, _, indexes) = gin_pair();
+    let n = 2_000u64;
+    let mut docs = Vec::new();
+    for slot in 0..n {
+        let d = match slot % 50 {
+            0 => None,
+            _ => Some(format!(
+                r#"{{"status":"s{}","tags":["t{}"],"n":{}}}"#,
+                slot % 5,
+                slot % 3,
+                slot
+            )),
+        };
+        match &d {
+            Some(d) => {
+                let bytes = crate::core::jsonb::encode_text(d).unwrap();
+                indexes.index_row(slot, &|_| Some(&bytes[..]));
+            }
+            None => indexes.index_unreadable(slot),
+        }
+        docs.push(d);
+    }
+    let bits = |words: &[u64]| -> Vec<u64> {
+        let mut out = Vec::new();
+        for (w, word) in words.iter().enumerate() {
+            let mut b = *word;
+            while b != 0 {
+                out.push(w as u64 * 64 + b.trailing_zeros() as u64);
+                b &= b - 1;
+            }
+        }
+        out
+    };
+    let contains = |slot: u64, q: &str| -> bool {
+        match &docs[slot as usize] {
+            None => true, // unreadable: always a candidate
+            Some(d) => crate::core::jsonb::contains(
+                &crate::core::jsonb::encode_text(d).unwrap(),
+                &crate::core::jsonb::encode_text(q).unwrap(),
+            )
+            .unwrap(),
+        }
+    };
+    let paid = contains_leaf(r#"{"status":"s1"}"#);
+    let tagged = contains_leaf(r#"{"tags":["t2"]}"#);
+    let cap = 100;
+    let cases: Vec<(gin::JsonExpr, Box<dyn Fn(u64) -> bool + '_>)> = vec![
+        (paid.clone(), Box::new(|s| contains(s, r#"{"status":"s1"}"#))),
+        (
+            gin::JsonExpr::And(vec![paid.clone(), tagged.clone()]),
+            Box::new(|s| contains(s, r#"{"status":"s1"}"#) && contains(s, r#"{"tags":["t2"]}"#)),
+        ),
+        (
+            gin::JsonExpr::And(vec![gin::JsonExpr::Opaque, tagged.clone()]),
+            Box::new(|s| contains(s, r#"{"tags":["t2"]}"#)),
+        ),
+        // As the rewriter's `NULL` guards leave it.
+        (
+            gin::JsonExpr::And(vec![
+                gin::JsonExpr::And(vec![gin::JsonExpr::Opaque, paid.clone()]),
+                gin::JsonExpr::And(vec![gin::JsonExpr::Opaque, tagged.clone()]),
+            ]),
+            Box::new(|s| contains(s, r#"{"status":"s1"}"#) && contains(s, r#"{"tags":["t2"]}"#)),
+        ),
+    ];
+    for (expr, matches) in cases {
+        assert_eq!(indexes.plan_json(&expr, cap), None, "{expr:?} is past the slot-list cap");
+        let words = indexes.plan_json_dense(&expr, n, dense_cap(n)).expect("answered as a bitmap");
+        let got = bits(&words);
+        let all = indexes.plan_json(&expr, usize::MAX).unwrap();
+        assert_eq!(got, all, "{expr:?}: the bitmap holds what the slot list holds");
+        for slot in 0..n {
+            if matches(slot) {
+                assert!(got.contains(&slot), "{expr:?} dropped slot {slot}");
+            }
+        }
+    }
+    // Most of the table: declined, the scan reads it about as cheaply.
+    let most = contains_leaf(r#"{"tags":[]}"#);
+    assert!(indexes.plan_json(&most, usize::MAX).is_none_or(|a| a.len() as u64 > n / 2));
+    assert_eq!(indexes.plan_json_dense(&most, n, dense_cap(n)), None);
+    // A union is not taken as a bitmap.
+    let either = gin::JsonExpr::Or(vec![paid.clone(), tagged.clone()]);
+    assert_eq!(indexes.plan_json_dense(&either, n, dense_cap(n)), None);
+}

@@ -99,6 +99,23 @@ impl CandidateBitmap {
         }
     }
 
+    /// Candidates as one bit per slot below `n_slots`, from a secondary
+    /// index whose answer is too broad for a slot list. `n_slots` is the
+    /// table length sampled *before* the index was asked, as for
+    /// [`CandidateBitmap::sparse`]: past it every slot is a candidate.
+    pub fn dense(mut words: Vec<u64>, n_slots: u64) -> Self {
+        debug_assert_eq!(words.len(), bitmap_words(n_slots));
+        // Words it did not provide are candidates, never exclusions.
+        words.resize(bitmap_words(n_slots), u64::MAX);
+        column::mask_tail_pub(&mut words, n_slots);
+        Self {
+            words,
+            n_slots,
+            nothing: false,
+            sparse: None,
+        }
+    }
+
     #[inline]
     pub fn is_sparse(&self) -> bool {
         self.sparse.is_some()

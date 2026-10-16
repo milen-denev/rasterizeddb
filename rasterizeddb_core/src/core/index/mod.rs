@@ -82,6 +82,21 @@ pub fn candidate_cap(n_slots: u64) -> usize {
     ((n_slots / 8) as usize).max(4096)
 }
 
+/// Above this many candidates an inverted index's answer is declined even as
+/// a bitmap, which is how an answer past [`candidate_cap`] is returned.
+///
+/// A bitmap costs the scan a bit test per slot instead of a slot list's
+/// jumps, and at a random scatter almost no 64-slot word is empty, so every
+/// pointer record is still read. A fetched row costs 12-50 ns, against well
+/// under a nanosecond for a masked one (the filter's measured ratio), so even
+/// half the table left out pays for the bitmap many times over. The filter's
+/// own gate sits at nine tenths, measured on contiguous masks. A scattered
+/// mask mispredicts more and has not been measured, so this stays well short
+/// of that.
+pub fn dense_cap(n_slots: u64) -> usize {
+    (n_slots / 2) as usize
+}
+
 enum Data {
     BTree(RwLock<BTreeMap<KeyBuf, Slots>>),
     Hash(Box<[RwLock<HashMap<KeyBuf, Slots, RandomState>>]>, RandomState),
@@ -607,6 +622,8 @@ impl LeadingRange {
 /// query results by design.
 pub static GIN_LOOKUPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static PATH_LOOKUPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Of `GIN_LOOKUPS`, those answered as a bitmap (see [`dense_cap`]).
+pub static GIN_DENSE_LOOKUPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The slots in both sorted, distinct lists.
 pub fn intersect_sorted(a: &[u64], b: &[u64]) -> Vec<u64> {
@@ -825,24 +842,11 @@ impl TableIndexes {
         match expr {
             JsonExpr::Opaque => None,
             JsonExpr::Leaf { column, op } => {
-                // With both operator classes declared, the two answers differ
-                // in cost far more than in size: `{"user":{"id":7}}` is one
-                // short list under `jsonb_path_ops`, and under `jsonb_ops` a
-                // value list filtered through the key lists of `user` and
-                // `id`, which every document has. The index whose shortest
-                // list is shortest is asked first; another is asked only if
-                // that one declines.
-                let mut asked: Vec<(usize, &gin::GinIndex, gin::GinQuery)> = self
-                    .gin
-                    .iter()
-                    .filter(|g| g.column == *column && g.answers(op))
-                    .filter_map(|g| {
-                        let q = g.query_for(op)?;
-                        Some((g.estimate(&q), g.as_ref(), q))
-                    })
-                    .collect();
-                asked.sort_by_key(|(estimate, ..)| *estimate);
-                let answer = asked.iter().find_map(|(_, g, q)| g.lookup(q, cap));
+                // Each index is asked in turn until one answers. One that
+                // declines says nothing about another's answer: a `jsonb_ops`
+                // query with an empty container (`{"a":{}}`) has a key item
+                // where `jsonb_path_ops` has none at all.
+                let answer = self.ask_order(*column, op).iter().find_map(|(_, g, q)| g.lookup(q, cap));
                 if answer.is_some() {
                     GIN_LOOKUPS.fetch_add(1, Ordering::Relaxed);
                 }
@@ -870,6 +874,82 @@ impl TableIndexes {
                 out.dedup();
                 Some(out)
             }
+        }
+    }
+
+    /// The inverted indexes that can answer `op` on `column`, each with its
+    /// query, in the order to ask them.
+    ///
+    /// With both operator classes declared, the two answers differ in cost
+    /// far more than in size: `{"user":{"id":7}}` is one short list under
+    /// `jsonb_path_ops`, and under `jsonb_ops` a value list filtered through
+    /// the key lists of `user` and `id`, which every document has. The index
+    /// whose shortest list is shortest is asked first, and between equal
+    /// bounds the one with less to read.
+    fn ask_order(&self, column: u32, op: &gin::JsonOp) -> Vec<((usize, usize), &gin::GinIndex, gin::GinQuery)> {
+        let mut asked: Vec<((usize, usize), &gin::GinIndex, gin::GinQuery)> = self
+            .gin
+            .iter()
+            .filter(|g| g.column == column && g.answers(op))
+            .filter_map(|g| {
+                let q = g.query_for(op)?;
+                Some((g.estimate_and_cost(&q), g.as_ref(), q))
+            })
+            .collect();
+        asked.sort_by_key(|(order, ..)| *order);
+        asked
+    }
+
+    /// The answer [`plan_json`](Self::plan_json) declines as too broad for a
+    /// slot list, as one bit per slot below `n_slots` (the table length
+    /// sampled before asking), or `None` past `limit` slots.
+    ///
+    /// Only for a single operator, or for operators `AND`ed together: a
+    /// `doc @> '{"status":"paid"}'` that names a fifth of the table is the
+    /// case this exists for. Everything else stays as `plan_json` left it, so
+    /// bitmaps are never mixed with slot lists or unioned. Any child of an
+    /// `AND` may be left out, since the intersection of the rest is still a
+    /// superset. The caller asks only after `plan_json` declined every one.
+    ///
+    /// `AND`s nest: the rewriter guards each operator with its column's
+    /// `NULL` companion, so `a @> x AND a @> y` arrives as
+    /// `(__null_a = 0 AND a @> x) AND (__null_a = 0 AND a @> y)`.
+    pub fn plan_json_dense(&self, expr: &gin::JsonExpr, n_slots: u64, limit: usize) -> Option<Vec<u64>> {
+        use gin::JsonExpr;
+        if self.gin.is_empty() || !self.is_ready() {
+            return None;
+        }
+        match expr {
+            JsonExpr::Leaf { column, op } => {
+                let answer = self
+                    .ask_order(*column, op)
+                    .iter()
+                    .find_map(|(_, g, q)| g.lookup_dense(q, n_slots, limit));
+                if answer.is_some() {
+                    GIN_LOOKUPS.fetch_add(1, Ordering::Relaxed);
+                    GIN_DENSE_LOOKUPS.fetch_add(1, Ordering::Relaxed);
+                }
+                answer
+            }
+            JsonExpr::And(children) => {
+                let mut acc: Option<Vec<u64>> = None;
+                for child in children.iter().filter(|c| matches!(c, JsonExpr::Leaf { .. } | JsonExpr::And(_))) {
+                    let Some(words) = self.plan_json_dense(child, n_slots, limit) else {
+                        continue;
+                    };
+                    acc = Some(match acc {
+                        None => words,
+                        Some(mut acc) => {
+                            for (a, w) in acc.iter_mut().zip(&words) {
+                                *a &= *w;
+                            }
+                            acc
+                        }
+                    });
+                }
+                acc
+            }
+            JsonExpr::Opaque | JsonExpr::Or(_) => None,
         }
     }
 

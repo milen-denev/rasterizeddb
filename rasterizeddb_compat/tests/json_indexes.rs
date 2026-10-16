@@ -215,6 +215,141 @@ async fn indexed_documents_answer_exactly_like_their_unindexed_twin() {
     assert!(path > 30, "the path indexes answered only {path} lookups");
 }
 
+async fn count(pool: &sqlx::PgPool, table: &str, clause: &str) -> i64 {
+    let sql = format!("SELECT count(*) FROM {table} WHERE {clause}");
+    let row = sqlx::raw_sql(AssertSqlSafe(sql.clone()))
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    row.try_get_unchecked::<String, _>(0).unwrap().parse().unwrap()
+}
+
+/// A predicate too broad for a slot list but far short of the table
+/// (`doc @> '{"status":"paid"}'`, about a sixth of it) is answered by the
+/// gin indexes as a bitmap, and must still answer exactly like the
+/// unindexed twin: rows listed, rows counted, before and after deletes,
+/// replacements and `VACUUM`.
+///
+/// Thirty thousand rows, because below `candidate_cap`'s floor of 4096
+/// every answer fits a slot list and the bitmap path is never taken. Each
+/// broad query checks the bitmap counter moved, so the comparison cannot
+/// pass by scanning. Only this test's tables are big enough for a bitmap,
+/// so the other tests in this binary cannot move that counter.
+#[tokio::test(flavor = "multi_thread")]
+async fn broad_gin_answers_scan_a_bitmap_and_match_the_twin() {
+    use rasterizeddb_core::core::index::GIN_DENSE_LOOKUPS;
+    let server = TestServer::start().await.expect("server");
+    let pool = server.connect_sqlx().await.expect("connect");
+    for t in ["ix", "tw"] {
+        exec(&pool, &format!("CREATE TABLE {t} (id BIGINT PRIMARY KEY, doc JSONB)")).await;
+    }
+    const ROWS: i64 = 30_000;
+    let mut r = Lcg(0x6272_6f61);
+    // Half before the indexes, so the build reads them back, and half
+    // after, so the write path adds them.
+    let mut next_id = 0i64;
+    while next_id < ROWS {
+        if next_id == ROWS / 2 {
+            exec(&pool, INDEXES[0]).await;
+            exec(&pool, INDEXES[1]).await;
+        }
+        let values: Vec<String> = (next_id..next_id + 1_000)
+            .map(|id| format!("({id}, {})", document(&mut r)))
+            .collect();
+        for t in ["ix", "tw"] {
+            exec(&pool, &format!("INSERT INTO {t} (id, doc) VALUES {}", values.join(", "))).await;
+        }
+        next_id += 1_000;
+    }
+
+    let paid = r#"doc @> '{"status":"paid"}'"#;
+    // The build runs in the background; until it is done queries scan.
+    let mut ready = false;
+    for _ in 0..300 {
+        let before = GIN_DENSE_LOOKUPS.load(Ordering::Relaxed);
+        count(&pool, "ix", paid).await;
+        if GIN_DENSE_LOOKUPS.load(Ordering::Relaxed) > before {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(ready, "the gin indexes never answered `{paid}` as a bitmap");
+
+    // (predicate, whether it must be answered as a bitmap)
+    let mut broad: Vec<(String, bool)> = Vec::new();
+    for s in STATUSES {
+        broad.push((format!(r#"doc @> '{{"status":"{s}"}}'"#), true));
+    }
+    for t in 0..6 {
+        broad.push((format!(r#"doc @> '{{"tags":["t{t}"]}}'"#), true));
+    }
+    broad.extend([
+        // Both too broad for a list, each as a bitmap, intersected.
+        (r#"doc @> '{"status":"paid"}' AND doc @> '{"tags":["t1"]}'"#.to_string(), true),
+        // The primary key's range is too broad as well.
+        (r#"doc @> '{"status":"paid"}' AND id < 20000"#.to_string(), true),
+        (r#"id >= 7000 AND doc @> '{"status":"new"}'"#.to_string(), true),
+        // A union of keys.
+        ("doc ?| array['promo', 't1']".to_string(), true),
+        // Narrow enough for a slot list.
+        (r#"doc @> '{"status":"paid","cat":3}'"#.to_string(), false),
+        // Most of the table: declined, and scanned.
+        ("doc ? 'status'".to_string(), false),
+        ("doc ?& array['status', 'tags']".to_string(), false),
+        (r#"doc @> '{"tags":[]}'"#.to_string(), false),
+        ("doc @> '{}'".to_string(), false),
+        // A union of broad answers is not taken as a bitmap.
+        (r#"(doc @> '{"status":"paid"}' OR doc @> '{"status":"new"}')"#.to_string(), false),
+    ]);
+
+    async fn check(pool: &sqlx::PgPool, broad: &[(String, bool)], stage: &str) {
+        for (p, dense) in broad {
+            let at = || GIN_DENSE_LOOKUPS.load(Ordering::Relaxed);
+            let before = at();
+            let indexed = ids(pool, "ix", p).await;
+            let listed_moved = at() - before;
+            let before = at();
+            let counted = count(pool, "ix", p).await;
+            let counted_moved = at() - before;
+            let plain = ids(pool, "tw", p).await;
+            assert_eq!(indexed, plain, "{stage}: `{p}` answered differently with indexes");
+            assert_eq!(counted, plain.len() as i64, "{stage}: `{p}` counted differently with indexes");
+            for (what, moved) in [("listing", listed_moved), ("count", counted_moved)] {
+                match dense {
+                    true => assert!(moved >= 1, "{stage}: `{p}` {what} was not answered as a bitmap"),
+                    false => assert_eq!(moved, 0, "{stage}: `{p}` {what} was answered as a bitmap"),
+                }
+            }
+        }
+    }
+    check(&pool, &broad, "after inserts").await;
+    compare(&pool, &mut r, 60, "after inserts").await;
+
+    // Deletes and replacements, the same on both: stale items on replaced
+    // slots, dead versions, and after `VACUUM` forgotten slots.
+    for _ in 0..30 {
+        let lo = r.below(ROWS as u64);
+        let stmt = if r.below(3) == 0 {
+            format!("DELETE FROM {{t}} WHERE id >= {lo} AND id < {}", lo + 50)
+        } else {
+            format!(
+                "UPDATE {{t}} SET doc = {} WHERE id >= {lo} AND id < {}",
+                document(&mut r),
+                lo + 50
+            )
+        };
+        for t in ["ix", "tw"] {
+            exec(&pool, &stmt.replace("{t}", t)).await;
+        }
+    }
+    check(&pool, &broad, "after updates and deletes").await;
+    exec(&pool, "VACUUM ix").await;
+    exec(&pool, "VACUUM tw").await;
+    check(&pool, &broad, "after VACUUM").await;
+    compare(&pool, &mut r, 60, "after VACUUM").await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn gin_ddl_is_validated_and_listed() {
     let server = TestServer::start().await.expect("server");
