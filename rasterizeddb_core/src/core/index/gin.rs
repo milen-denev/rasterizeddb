@@ -30,7 +30,12 @@
 //! are never reused until a rebuild renumbers them (`VACUUM FULL`), so a
 //! forgotten slot only has to stop being *returned*: its presence bit is
 //! cleared and lookups skip it. The lists are compacted once forgotten
-//! entries outnumber a quarter of them.
+//! slots are a quarter of the slots the lists hold.
+//!
+//! A compaction removes only slots it was told were forgotten, never every
+//! slot whose presence bit is clear: an insert writes a new slot's entries
+//! before it sets the slot's bit, and a compaction in between would take
+//! that slot off its lists for good.
 //!
 //! An in-place overwrite adds the new document's items and leaves the old
 //! ones: a stale item on a live slot costs a candidate, never an answer.
@@ -39,7 +44,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ahash::RandomState;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use smallvec::SmallVec;
 
 use crate::core::index::IndexDecl;
@@ -60,9 +65,13 @@ pub struct GinIndex {
     /// Slots whose document could not be read into items. Returned with
     /// every lookup.
     unkeyed: RwLock<Vec<u64>>,
-    /// Entries in the lists, and how many of them belong to forgotten slots.
+    /// Entries in the lists, and how many slots were forgotten since the
+    /// last compaction. A forgotten slot is on a list at most once, so a
+    /// list's length less `forgotten` bounds the live slots on it.
     entries: AtomicU64,
     forgotten: AtomicU64,
+    /// The slots `forgotten` counts: what the next compaction removes.
+    forgotten_slots: Mutex<Vec<u64>>,
     /// Set bits in `present`, kept under its lock: what a list is measured
     /// against to tell whether it filters anything at all.
     live: AtomicU64,
@@ -88,6 +97,7 @@ impl GinIndex {
             unkeyed: RwLock::new(Vec::new()),
             entries: AtomicU64::new(0),
             forgotten: AtomicU64::new(0),
+            forgotten_slots: Mutex::new(Vec::new()),
             live: AtomicU64::new(0),
         }
     }
@@ -174,29 +184,54 @@ impl GinIndex {
         }
         self.unkeyed.write().retain(|s| *s != slot);
         self.set_present(slot, false);
+        // Counted before it is listed, so a compaction that takes the slot
+        // never subtracts it before it was added: the count stays at least
+        // the forgotten entries on any one list, which lookups rely on.
         let forgotten = self.forgotten.fetch_add(1, Ordering::Relaxed) + 1;
-        // Each forgotten slot averages a handful of entries; compact once
-        // they are a sizeable share of the lists.
-        if forgotten.saturating_mul(8) > self.entries.load(Ordering::Relaxed).max(1024) {
+        self.forgotten_slots.lock().push(slot);
+        // Compact once forgotten slots are a quarter of the slots the lists
+        // hold. Counted in slots on both sides: a slot leaves as many
+        // entries as its document had items, and a slot count measured
+        // against entries never fired for documents of eight items or more,
+        // so their lists grew until a rebuild.
+        let held = self.live.load(Ordering::Relaxed) + forgotten;
+        if forgotten.saturating_mul(4) > held.max(512) {
             self.compact();
         }
     }
 
-    /// Drops every entry of a forgotten slot from every list.
+    /// Drops every entry of the slots forgotten so far from every list.
+    ///
+    /// Only those slots: a clear presence bit does not mean forgotten, it is
+    /// also a slot whose insert has written its entries and not yet set its
+    /// bit, and removing those would drop a live row from every answer.
     pub fn compact(&self) {
-        let present = self.present.read().clone();
-        let live = |s: u64| present.get((s / 64) as usize).is_some_and(|w| w & (1 << (s % 64)) != 0);
-        let mut kept = 0u64;
+        let gone = std::mem::take(&mut *self.forgotten_slots.lock());
+        let Some(&max) = gone.iter().max() else {
+            return;
+        };
+        let mut bits = vec![0u64; (max / 64) as usize + 1];
+        for &s in &gone {
+            bits[(s / 64) as usize] |= 1 << (s % 64);
+        }
+        let mut removed = 0u64;
         for shard in self.shards.iter() {
             let mut shard = shard.write();
             shard.retain(|_, list| {
-                list.retain(|s| live(*s));
-                kept += list.len() as u64;
+                let before = list.len();
+                list.retain(|s| bits.get((*s / 64) as usize).is_none_or(|w| w & (1 << (s % 64)) == 0));
+                removed += (before - list.len()) as u64;
                 !list.is_empty()
             });
         }
-        self.entries.store(kept, Ordering::Relaxed);
-        self.forgotten.store(0, Ordering::Relaxed);
+        // Subtracted, not reset: inserts and forgets that ran beside this
+        // were counted and are not part of what it removed. Saturating, as a
+        // `clear` beside it may already have zeroed them.
+        let sub = |counter: &AtomicU64, n: u64| {
+            let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| Some(c.saturating_sub(n)));
+        };
+        sub(&self.entries, removed);
+        sub(&self.forgotten, gone.len() as u64);
     }
 
     pub fn clear(&self) {
@@ -210,6 +245,7 @@ impl GinIndex {
         self.unkeyed.write().clear();
         self.entries.store(0, Ordering::Relaxed);
         self.forgotten.store(0, Ordering::Relaxed);
+        self.forgotten_slots.lock().clear();
     }
 
     /// The lists an `All` query walks, as `(length, item)`: the shortest
@@ -219,7 +255,16 @@ impl GinIndex {
     /// `status`, which every document has) removes almost nothing, and
     /// walking it costs a probe per candidate. Leaving a list out only keeps
     /// candidates it would have removed, so the answer stays a superset.
-    fn walked_lists(&self, items: &[u64]) -> SmallVec<[(usize, u64); 8]> {
+    ///
+    /// A list's length still counts the entries of forgotten slots, and a
+    /// `jsonb_ops` index whose documents have many items may go a long time
+    /// between compactions, while `live` counts only present slots. So a
+    /// list is measured by the live slots it is sure to hold, its length
+    /// less `forgotten` (read by the caller before any list), as the
+    /// single-list decline in `lookup` does. Measured by raw length, an
+    /// update-heavy table's lists outgrow `live` and a list of two fifths of
+    /// the table would be left out as if it held all of it.
+    fn walked_lists(&self, items: &[u64], forgotten: usize) -> SmallVec<[(usize, u64); 8]> {
         let mut lists: SmallVec<[(usize, u64); 8]> = items
             .iter()
             .map(|i| (self.shards[Self::shard(*i)].read().get(i).map_or(0, |l| l.len()), *i))
@@ -228,7 +273,9 @@ impl GinIndex {
         let live = self.live.load(Ordering::Relaxed) as usize;
         let universal = live - live / 10;
         let mut first = true;
-        lists.retain(|(len, _)| std::mem::take(&mut first) || live < 64 || *len < universal);
+        lists.retain(|(len, _)| {
+            std::mem::take(&mut first) || live < 64 || len.saturating_sub(forgotten) < universal
+        });
         lists
     }
 
@@ -251,7 +298,7 @@ impl GinIndex {
                 if items.is_empty() {
                     return None;
                 }
-                let lists = self.walked_lists(items);
+                let lists = self.walked_lists(items, forgotten);
                 // A forgotten slot is on a list at most once, so a list holds
                 // at least its length less the forgotten count of live slots.
                 // With one list those are the answer.
@@ -357,7 +404,7 @@ impl GinIndex {
                 if items.is_empty() {
                     return None;
                 }
-                let lists = self.walked_lists(items);
+                let lists = self.walked_lists(items, forgotten);
                 let (_, shortest) = lists[0];
                 if let Some(list) = self.shards[Self::shard(shortest)].read().get(&shortest) {
                     let listed = set(list, &mut words);
@@ -851,7 +898,7 @@ mod tests {
                     continue;
                 };
                 // The old walk, over the lists the new one walks.
-                let lists = g.walked_lists(items);
+                let lists = g.walked_lists(items, g.forgotten.load(Ordering::Relaxed) as usize);
                 let list = |i: u64| g.shards[GinIndex::shard(i)].read().get(&i).cloned().unwrap_or_default();
                 let mut want: Vec<u64> = list(lists[0].1).into_iter().filter(|s| live(*s)).collect();
                 for &(_, item) in &lists[1..] {
@@ -943,6 +990,164 @@ mod tests {
                 }
                 assert!(g.lookup_dense(&query, n, size).is_some(), "{query:?} dense at its size");
             }
+        }
+    }
+
+    /// An update-heavy table: the old versions were forgotten, and are
+    /// fewer than a quarter of the slots, so no compaction has run and the
+    /// lists still hold them. `paid` and `eu` each hold seven tenths of the
+    /// live rows, but by raw length more than nine tenths of `live`. They
+    /// must still be walked as filters, and only the key lists every
+    /// document is on left out, or the answer is the whole `paid` list and
+    /// passes a cap the intersection fits under.
+    #[test]
+    fn forgotten_entries_do_not_make_a_list_look_universal() {
+        for opclass in [GinOpclass::Ops, GinOpclass::PathOps] {
+            let g = GinIndex::new(decl("u"), 0, opclass);
+            let d = |status: &str, region: &str, n: u64| {
+                doc(&format!(
+                    r#"{{"status":"{status}","region":"{region}","user":{{"id":{n}}},"tags":["x","y"],"n":{n}}}"#
+                ))
+            };
+            // 300 old versions, all paid in eu.
+            for slot in 0..300u64 {
+                g.insert(slot, Some(&d("paid", "eu", slot)));
+            }
+            // 1000 live rows: paid where slot % 10 < 7, eu where >= 3.
+            let mut want = Vec::new();
+            for slot in 300..1300u64 {
+                let paid = slot % 10 < 7;
+                let eu = slot % 10 >= 3;
+                g.insert(slot, Some(&d(if paid { "paid" } else { "open" }, if eu { "eu" } else { "us" }, slot)));
+                if paid && eu {
+                    want.push(slot);
+                }
+            }
+            assert_eq!(want.len(), 400);
+            // Vacuum forgets the old versions.
+            for slot in 0..300u64 {
+                g.forget(slot);
+            }
+            assert_eq!(g.forgotten.load(Ordering::Relaxed), 300, "no compaction ran");
+            let query = contains_query(&doc(r#"{"status":"paid","region":"eu"}"#), opclass).unwrap();
+            let GinQuery::All(items) = &query else { unreachable!() };
+            // Under a cap the intersection fits and `paid` alone does not.
+            assert_eq!(g.lookup(&query, 500), Some(want.clone()), "{opclass:?}");
+            let words = g.lookup_dense(&query, 1300, 500).expect("the intersection fits the limit");
+            let mut from_words = Vec::new();
+            for (w, word) in words.iter().enumerate() {
+                let mut bits = *word;
+                while bits != 0 {
+                    from_words.push(w as u64 * 64 + bits.trailing_zeros() as u64);
+                    bits &= bits - 1;
+                }
+            }
+            assert_eq!(from_words, want, "{opclass:?} dense");
+            // The key lists every document is on are still left out.
+            let walked = g.walked_lists(items, g.forgotten.load(Ordering::Relaxed) as usize);
+            assert_eq!(walked.len(), 2, "{opclass:?}: paid and eu walked, the key lists left out: {walked:?}");
+        }
+    }
+
+    /// Documents of ten items each, as `jsonb_ops` makes of an ordinary
+    /// object, and most of them forgotten. The lists are compacted once a
+    /// quarter of the slots they hold are forgotten, so they stay within a
+    /// third of the live slots, and every live document is still found.
+    #[test]
+    fn many_item_documents_are_compacted() {
+        let g = GinIndex::new(decl("c"), 0, GinOpclass::Ops);
+        let d = |n: u64| {
+            doc(&format!(
+                r#"{{"status":"s{}","region":"r{}","user":{{"id":{n}}},"tags":["x","y"],"n":{n}}}"#,
+                n % 5,
+                n % 3
+            ))
+        };
+        for slot in 0..4000u64 {
+            g.insert(slot, Some(&d(slot)));
+        }
+        let (_, full) = g.sizes();
+        assert!(full >= 4000 * 9, "{full} entries: fewer items than this test means");
+        // Every slot but each fourth, as vacuum reclaims old versions.
+        for slot in (0..4000u64).filter(|s| s % 4 != 0) {
+            g.forget(slot);
+        }
+        let live = 1000u64;
+        let forgotten = g.forgotten.load(Ordering::Relaxed);
+        assert!(forgotten * 3 <= live, "{forgotten} forgotten slots still on the lists of {live} live");
+        let (_, entries) = g.sizes();
+        assert!(entries < full / 2, "{entries} of {full} entries left: the lists were not compacted");
+        assert_eq!(g.entries.load(Ordering::Relaxed) as usize, entries);
+        for status in 0..5u64 {
+            let q = contains_query(&doc(&format!(r#"{{"status":"s{status}"}}"#)), GinOpclass::Ops).unwrap();
+            let want: Vec<u64> = (0..4000u64).filter(|s| s % 4 == 0 && s % 5 == status).collect();
+            assert_eq!(g.lookup(&q, usize::MAX), Some(want), "s{status}");
+        }
+    }
+
+    /// An insert writes a new slot's entries and then sets its presence
+    /// bit. A compaction between the two must leave the entries: the slot
+    /// is live, and off its lists it would be dropped from every answer.
+    #[test]
+    fn a_compaction_keeps_a_slot_whose_insert_is_under_way() {
+        for opclass in [GinOpclass::Ops, GinOpclass::PathOps] {
+            let g = GinIndex::new(decl("w"), 0, opclass);
+            let d = doc(r#"{"k":1}"#);
+            for slot in 0..10u64 {
+                g.insert(slot, Some(&d));
+            }
+            g.forget(3);
+            // Slot 10's insert, stopped after its entries are written.
+            let mut items = Vec::new();
+            jsonb::gin_items(&d, opclass, &mut items).unwrap();
+            for item in &items {
+                g.shards[GinIndex::shard(*item)].write().entry(*item).or_default().push(10);
+            }
+            g.compact();
+            // The insert finishes.
+            g.set_present(10, true);
+            let q = contains_query(&d, opclass).unwrap();
+            let want: Vec<u64> = (0..11u64).filter(|s| *s != 3).collect();
+            assert_eq!(g.lookup(&q, usize::MAX), Some(want), "{opclass:?}");
+        }
+    }
+
+    /// The same, with real threads: inserts of new slots while vacuum
+    /// forgets the old ones and compactions run.
+    #[test]
+    fn compactions_beside_inserts_drop_no_live_slot() {
+        use std::sync::Arc;
+        for round in 0..8 {
+            let g = Arc::new(GinIndex::new(decl("t"), 0, GinOpclass::PathOps));
+            let d = doc(r#"{"k":1}"#);
+            for slot in 0..2000u64 {
+                g.insert(slot, Some(&d));
+            }
+            let writer = {
+                let (g, d) = (g.clone(), d.clone());
+                std::thread::spawn(move || {
+                    for slot in 10_000..30_000u64 {
+                        g.insert(slot, Some(&d));
+                    }
+                })
+            };
+            let vacuum = {
+                let g = g.clone();
+                std::thread::spawn(move || {
+                    for slot in 0..2000u64 {
+                        g.forget(slot);
+                    }
+                    for _ in 0..100 {
+                        g.compact();
+                    }
+                })
+            };
+            writer.join().unwrap();
+            vacuum.join().unwrap();
+            let got = g.lookup(&contains_query(&d, GinOpclass::PathOps).unwrap(), usize::MAX).unwrap();
+            let missing = (10_000..30_000u64).filter(|s| got.binary_search(s).is_err()).count();
+            assert_eq!(missing, 0, "round {round}: {missing} live slots dropped");
+            assert!(got.iter().all(|s| *s >= 10_000), "a forgotten slot returned");
         }
     }
 }
