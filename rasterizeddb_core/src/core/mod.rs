@@ -3,6 +3,8 @@ pub mod backup;
 pub mod bulk_load;
 pub mod cancel;
 pub mod notice;
+/// Hash partitioning's routing hash and range map; not wired in yet.
+pub mod partition;
 pub mod sync_audit;
 /// Crash images, failpoints and the index twin suites through restarts
 /// and power cuts (persistent-indexes design §11).
