@@ -16,6 +16,7 @@ use crate::{
     core::{
         db_type::DbType,
         filter::CandidateBitmap,
+        index::gallop_to,
         row::row::{Column, Row, RowFetch},
         storage_providers::traits::{BorrowedBytes, StorageIO},
         vacuum::FreeSpace,
@@ -529,12 +530,28 @@ impl<S: StorageIO> RowPointerIterator<S> {
             // record examined*, paid on the one path where the mask is supposed
             // to be cheaper than the fetch it replaces — the batch path at
             // `next_row_pointers_into` already hoists it for the same reason.
-            let excluded = match self.candidates.as_ref() {
-                Some(bm) => !bm.get(self.current_slot()),
-                None => false,
+            //
+            // The answer is how many records to pass over before the next one
+            // worth decoding. A slot list answers it with one search that
+            // lands on the next listed slot, so every record between two
+            // candidates is passed in one step instead of a search each, and a
+            // candidate costs one search instead of a `get` and then another.
+            // `next_candidate` never returns less than the slot it was given,
+            // and returns that slot itself past `n_slots`, so an appended row
+            // is still decoded.
+            let skip = match self.candidates.as_ref() {
+                Some(bm) if bm.is_sparse() => {
+                    let slot = self.current_slot();
+                    bm.next_candidate(slot) - slot
+                }
+                Some(bm) => u64::from(!bm.get(self.current_slot())),
+                None => 0,
             };
-            if excluded {
-                self.buffer_index += TOTAL_LENGTH;
+            if skip > 0 {
+                // Clamped to the chunk: the next load jumps to the candidate.
+                self.buffer_index = (self.buffer_index as u64)
+                    .saturating_add(skip.saturating_mul(TOTAL_LENGTH as u64))
+                    .min(self.buffer_valid_length as u64) as usize;
                 continue;
             }
 
@@ -598,26 +615,65 @@ impl<S: StorageIO> RowPointerIterator<S> {
             // Cloned once per chunk: holding a borrow of `self.candidates` would
             // conflict with mutating `buffer_index` inside the loop.
             let candidates = self.candidates.clone();
-            while produced < batch_size
-                && self.buffer_index + TOTAL_LENGTH <= self.buffer_valid_length
+
+            // A slot list is walked with a cursor into it. Asking the list
+            // about each record cost about three binary searches per candidate
+            // (`get` on the candidate, `get` missing on the record after it,
+            // then `next_candidate`), all in the one dispatcher task, which at
+            // 40k candidates is milliseconds of serial work per query.
+            //
+            // The cursor lives only for this drain of this chunk, so nothing
+            // has to be kept in step with `reset`, `seek_to_byte_position`,
+            // `load_next_chunk`, a batch limit or a call to the single-record
+            // path: each drain finds its place again with one search. Within
+            // it the slot only moves forward, so every listed slot before the
+            // cursor is below the current slot, which is what `gallop_to`
+            // needs to land where a fresh search would.
+            if let Some((slots, n_slots)) = candidates
+                .as_deref()
+                .and_then(|bm| bm.sparse_slots().map(|s| (s, bm.n_slots())))
             {
-                if let Some(ref bm) = candidates {
+                let current = self.current_slot();
+                let mut at = slots.partition_point(|s| *s < current);
+                while produced < batch_size
+                    && self.buffer_index + TOTAL_LENGTH <= self.buffer_valid_length
+                {
                     let slot = self.current_slot();
-                    if !bm.get(slot) {
-                        // A slot list: straight to the next listed slot. Walking
-                        // there record by record asked the list about every
-                        // record in between, a binary search each, and an index
-                        // answer of a few thousand rows spread over a million
-                        // became a million searches: slower than the filter's
-                        // scan of the whole table.
-                        if bm.is_sparse() {
-                            let next = bm.next_candidate(slot + 1);
+                    // Past `n_slots` every record is a candidate: a row
+                    // appended after the list was made was never indexed.
+                    if slot < n_slots {
+                        at = gallop_to(slots, at, slot);
+                        let next = slots.get(at).copied().unwrap_or(n_slots);
+                        if next != slot {
                             let skip = (next - slot).saturating_mul(TOTAL_LENGTH as u64);
                             self.buffer_index = (self.buffer_index as u64)
                                 .saturating_add(skip)
                                 .min(self.buffer_valid_length as u64) as usize;
                             continue;
                         }
+                    }
+                    let arr_ref: &[u8; TOTAL_LENGTH] = unsafe {
+                        &*(buf_ptr.add(self.buffer_index) as *const [u8; TOTAL_LENGTH])
+                    };
+                    let row_pointer = RowPointer::from_slice(arr_ref);
+                    self.buffer_index += TOTAL_LENGTH;
+                    if unlikely(row_pointer.deleted) {
+                        continue;
+                    }
+                    out.push(row_pointer);
+                    produced += 1;
+                }
+                continue;
+            }
+
+            while produced < batch_size
+                && self.buffer_index + TOTAL_LENGTH <= self.buffer_valid_length
+            {
+                if let Some(ref bm) = candidates {
+                    let slot = self.current_slot();
+                    if !bm.get(slot) {
+                        // A slot list never gets here: it was walked above.
+                        //
                         // Whole-word skip: when no slot in this 64-row group can
                         // match, 64 pointer records are dismissed without
                         // decoding any of them. Both operands are multiples of
@@ -3521,5 +3577,319 @@ mod failed_prefix_reads {
         }
         // Some positions must actually have hit the recovery path.
         assert!(errors >= 5, "only {errors} injected failures were reached");
+    }
+}
+
+#[cfg(test)]
+mod sparse_candidate_walk {
+    //! The iterator walks a slot list from an index with a cursor that lives
+    //! for one drain of one chunk. A cursor that lands one candidate late is a
+    //! row silently dropped from a result, so this drives the iterator through
+    //! everything that repositions it — `reset`, `seek_to_byte_position`, a
+    //! batch limit changed mid-scan, the single-record path interleaved with
+    //! batches, chunk reloads, rows appended and picked up by
+    //! `refresh_total_length` — and checks every record it hands out against a
+    //! model of what the candidates admit.
+    use super::*;
+    use rclite::Arc;
+    use std::sync::atomic::Ordering;
+
+    /// Every record of the table is present in `data`; `len` is how many
+    /// bytes the provider currently reports, so rows can be "appended" by
+    /// raising it. With `borrow` the chunks come from the provider's own
+    /// bytes, the path a memory map takes.
+    #[derive(Clone)]
+    struct GrowingIo {
+        data: std::sync::Arc<Vec<u8>>,
+        len: std::sync::Arc<AtomicU64>,
+        borrow: bool,
+    }
+
+    impl crate::core::storage_providers::traits::StorageIO for GrowingIo {
+        async fn verify_data(&self, _position: u64, _buffer: &[u8]) -> bool {
+            true
+        }
+        async fn write_data(&self, _position: u64, _buffer: &[u8]) {}
+        async fn write_data_seek(&self, _seek: std::io::SeekFrom, _buffer: &[u8]) {}
+        async fn read_data_into_buffer(
+            &self,
+            position: &mut u64,
+            buffer: &mut [u8],
+        ) -> std::result::Result<(), std::io::Error> {
+            let start = *position as usize;
+            let end = start.saturating_add(buffer.len());
+            if end > self.len.load(Ordering::SeqCst) as usize {
+                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "EOF"));
+            }
+            buffer.copy_from_slice(&self.data[start..end]);
+            *position += buffer.len() as u64;
+            Ok(())
+        }
+        async fn read_vectored(
+            &self,
+            reads: &mut [(u64, &mut [u8])],
+        ) -> std::result::Result<(), std::io::Error> {
+            for (pos, buf) in reads {
+                let mut p = *pos;
+                self.read_data_into_buffer(&mut p, buf).await?;
+            }
+            Ok(())
+        }
+        fn try_borrow_range(&self, position: u64, len: usize) -> Option<BorrowedBytes> {
+            let end = (position as usize).checked_add(len)?;
+            if !self.borrow || end > self.len.load(Ordering::SeqCst) as usize {
+                return None;
+            }
+            let owner: std::sync::Arc<dyn std::any::Any + Send + Sync> = self.data.clone();
+            // SAFETY: `owner` keeps the vector alive and it is never mutated.
+            Some(unsafe { BorrowedBytes::new(owner, self.data.as_ptr().add(position as usize), len) })
+        }
+        async fn append_data(&self, _buffer: &[u8], _immediate: bool) {}
+        async fn append_data_returning_offset(&self, _buffer: &[u8], _immediate: bool) -> u64 {
+            self.len.load(Ordering::SeqCst)
+        }
+        async fn get_len(&self) -> u64 {
+            self.len.load(Ordering::SeqCst)
+        }
+        fn exists(_location: &str, _table_name: &str) -> bool {
+            false
+        }
+        async fn create_temp(&self) -> Self {
+            self.clone()
+        }
+        async fn swap_temp(&self, _temp_io_sync: &mut Self) {}
+        fn get_location(&self) -> Option<String> {
+            None
+        }
+        async fn create_new(&self, _name: String) -> Self {
+            self.clone()
+        }
+        fn drop_io(&self) {}
+        fn get_hash(&self) -> u32 {
+            0
+        }
+        async fn start_service(&self) {}
+        fn get_name(&self) -> String {
+            "GrowingIo".to_string()
+        }
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            if n == 0 { 0 } else { self.next() % n }
+        }
+    }
+
+    /// Records per chunk, so candidates can be placed on chunk edges.
+    const CHUNK_RECORDS: u64 = (CHUNK_SIZE / TOTAL_LENGTH) as u64;
+
+    /// What the candidates admit at a slot.
+    enum Model {
+        Sparse { listed: std::collections::HashSet<u64>, n_slots: u64 },
+        Leading { upto: u64, n_slots: u64 },
+        Unfiltered,
+    }
+
+    impl Model {
+        fn admits(&self, slot: u64) -> bool {
+            match self {
+                Model::Sparse { listed, n_slots } => slot >= *n_slots || listed.contains(&slot),
+                Model::Leading { upto, n_slots } => slot >= *n_slots || slot < *upto,
+                Model::Unfiltered => true,
+            }
+        }
+    }
+
+    fn slot_of(p: &RowPointer) -> u64 {
+        // `id` is `u128` under `enable_long_row`; ids here are small.
+        p.id as u64 - 1
+    }
+
+    /// One random table, candidate set and script of iterator calls.
+    async fn run_case(seed: u64) {
+        let mut r = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+
+        // Mostly within one or two chunks, sometimes across several.
+        let max_records = match r.below(4) {
+            0 => 1 + r.below(40),
+            1 => 1 + r.below(CHUNK_RECORDS * 2),
+            _ => CHUNK_RECORDS + r.below(CHUNK_RECORDS * 3),
+        };
+        let deleted_one_in = [0u64, 2, 7, 50][r.below(4) as usize];
+        let mut deleted = vec![false; max_records as usize];
+        let mut bytes = Vec::with_capacity(max_records as usize * TOTAL_LENGTH);
+        for slot in 0..max_records {
+            let mut p = RowPointer::from_slice(&[0u8; TOTAL_LENGTH]);
+            p.id = (slot + 1).into();
+            p.position = slot * 16;
+            p.length = 16;
+            p.xmin = FROZEN_TX;
+            p.deleted = deleted_one_in != 0 && r.below(deleted_one_in) == 0;
+            deleted[slot as usize] = p.deleted;
+            bytes.extend_from_slice(p.into_memory_block().into_slice());
+        }
+
+        // The table as it was when the iterator was made; the rest arrives
+        // later. `n_slots` is when the index was asked, which may be a little
+        // before or after that.
+        let mut visible = if r.below(3) == 0 { r.below(max_records + 1) } else { max_records };
+        let n_slots = (visible + r.below(4)).saturating_sub(r.below(4) * r.below(visible / 4 + 1));
+
+        let model = match r.below(6) {
+            0 => Model::Unfiltered,
+            1 => Model::Leading { upto: r.below(n_slots + 1), n_slots },
+            _ => {
+                // Densities from a handful of slots to all of them, plus the
+                // slots where a chunk or the list begins and ends.
+                let one_in = [1u64, 2, 3, 40, 500, 5000][r.below(6) as usize];
+                let mut listed = std::collections::HashSet::new();
+                for slot in 0..n_slots {
+                    if r.below(one_in) == 0 {
+                        listed.insert(slot);
+                    }
+                }
+                let edges = [
+                    0,
+                    1,
+                    CHUNK_RECORDS - 1,
+                    CHUNK_RECORDS,
+                    CHUNK_RECORDS + 1,
+                    2 * CHUNK_RECORDS - 1,
+                    2 * CHUNK_RECORDS,
+                    n_slots.saturating_sub(1),
+                ];
+                for edge in edges {
+                    if edge < n_slots && r.below(2) == 0 {
+                        listed.insert(edge);
+                    }
+                }
+                Model::Sparse { listed, n_slots }
+            }
+        };
+        let bitmap = match &model {
+            Model::Sparse { listed, n_slots } => {
+                let mut slots: Vec<u64> = listed.iter().copied().collect();
+                slots.sort_unstable();
+                Some(Arc::new(CandidateBitmap::sparse(slots, *n_slots)))
+            }
+            Model::Leading { upto, n_slots } => {
+                Some(Arc::new(CandidateBitmap::leading(*n_slots, *upto)))
+            }
+            Model::Unfiltered => None,
+        };
+
+        let io = Arc::new(GrowingIo {
+            data: std::sync::Arc::new(bytes),
+            len: std::sync::Arc::new(AtomicU64::new(visible * TOTAL_LENGTH as u64)),
+            borrow: r.below(2) == 0,
+        });
+        let mut it = if r.below(2) == 0 {
+            RowPointerIterator::new_deferred(Arc::clone(&io)).await.unwrap()
+        } else {
+            RowPointerIterator::new(Arc::clone(&io)).await.unwrap()
+        };
+        it.set_candidates(bitmap);
+        it.reset();
+        if r.below(2) == 0 {
+            it.set_batch_limit(1 + r.below(64) as usize);
+        }
+
+        // Where the current pass started, and what it has handed out.
+        let mut start = 0u64;
+        let mut got: Vec<u64> = Vec::new();
+        let mut out = Vec::new();
+        let ctx = |start: u64, visible: u64| {
+            format!("seed {seed}: pass from slot {start}, {visible} of {max_records} records")
+        };
+        // Repositionings are capped so a pass always gets to finish.
+        let mut moves = 0;
+        loop {
+            let op = r.below(40);
+            if op <= 1 {
+                moves += 1;
+            }
+            match op {
+                // Start over, as the processor does before driving a scan.
+                0 if moves <= 4 => {
+                    it.reset();
+                    start = 0;
+                    got.clear();
+                }
+                // Jump to a slot, as a ranged scan does.
+                1 if moves <= 4 => {
+                    start = r.below(visible + 1);
+                    it.seek_to_byte_position(start * TOTAL_LENGTH as u64).await.unwrap();
+                    got.clear();
+                }
+                // Rows appended since the iterator was made.
+                2 => {
+                    visible = (visible + 1 + r.below(CHUNK_RECORDS / 2)).min(max_records);
+                    io.len.store(visible * TOTAL_LENGTH as u64, Ordering::SeqCst);
+                    it.refresh_total_length().await;
+                }
+                3 => it.set_batch_limit(1 + r.below(300) as usize),
+                0 | 1 => {}
+                // The single-record path, between batches.
+                4..=11 => match it.next_row_pointer_with_offset().await.unwrap() {
+                    Some((offset, p)) => {
+                        let slot = slot_of(&p);
+                        assert_eq!(offset, slot * TOTAL_LENGTH as u64, "{}", ctx(start, visible));
+                        got.push(slot);
+                    }
+                    // Rows may still be appended after the end was seen.
+                    None if r.below(3) != 0 => break,
+                    None => {}
+                },
+                _ => {
+                    it.next_row_pointers_into(&mut out).await.unwrap();
+                    if out.is_empty() && r.below(3) != 0 {
+                        break;
+                    }
+                    got.extend(out.iter().map(slot_of));
+                }
+            }
+        }
+        // Drained: nothing more on either path.
+        assert!(
+            it.next_row_pointer_with_offset().await.unwrap().is_none(),
+            "{}",
+            ctx(start, visible)
+        );
+        it.next_row_pointers_into(&mut out).await.unwrap();
+        assert!(out.is_empty(), "{}", ctx(start, visible));
+
+        let want: Vec<u64> = (start..visible)
+            .filter(|s| model.admits(*s) && !deleted[*s as usize])
+            .collect();
+        if got != want {
+            let dropped: Vec<u64> =
+                want.iter().filter(|s| !got.contains(s)).copied().take(10).collect();
+            let extra: Vec<u64> =
+                got.iter().filter(|s| !want.contains(s)).copied().take(10).collect();
+            panic!(
+                "{}: handed out {} records, expected {}; first dropped {dropped:?}, first unexpected {extra:?}",
+                ctx(start, visible),
+                got.len(),
+                want.len()
+            );
+        }
+    }
+
+    /// The iterator hands out exactly the records the candidates admit, in
+    /// slot order: every listed slot that is not deleted, and every slot at
+    /// or past `n_slots`, whatever repositioned it along the way.
+    #[tokio::test]
+    async fn the_walk_yields_exactly_the_candidates() {
+        let _ = crate::BATCH_SIZE.get_or_init(|| 1024);
+        for seed in 1..=600u64 {
+            run_case(seed).await;
+        }
     }
 }

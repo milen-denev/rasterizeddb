@@ -104,6 +104,15 @@ impl CandidateBitmap {
         self.sparse.is_some()
     }
 
+    /// The slot list itself, sorted and distinct, for a caller that walks it
+    /// in order with a cursor of its own rather than searching it once per
+    /// slot. `None` for a dense mask. It says nothing about slots at or past
+    /// `n_slots`, which are candidates whether listed or not.
+    #[inline]
+    pub fn sparse_slots(&self) -> Option<&[u64]> {
+        self.sparse.as_deref()
+    }
+
     /// The first candidate slot at or after `from`. Past `n_slots` every slot
     /// is a candidate, so this is never more than `max(from, n_slots)`.
     pub fn next_candidate(&self, from: u64) -> u64 {

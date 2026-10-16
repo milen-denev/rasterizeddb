@@ -408,7 +408,10 @@ impl LiveIndex {
 /// in a sorted slice: doubling steps from `from`, then a binary search
 /// inside the last step. `O(log d)` for a distance `d`, so a sweep over
 /// ascending targets reads the slice front to back once.
-fn gallop_to(sorted: &[u64], from: usize, target: u64) -> usize {
+///
+/// Correct only when every value before `from` is below `target`; the
+/// pointer iterator's walk over a candidate list relies on the same rule.
+pub(crate) fn gallop_to(sorted: &[u64], from: usize, target: u64) -> usize {
     if from >= sorted.len() || sorted[from] >= target {
         return from;
     }
