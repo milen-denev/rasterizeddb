@@ -605,14 +605,15 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
     }
     // A constant with a point or an exponent is `numeric`, not `float8`, so
     // arithmetic on it is exact: `14 * 1.37 + 0.99` is 20.17, where the float
-    // it used to be gave 20.169999999999998. A constant past nine places is
-    // rounded to the engine scale, and one too large for it stays a float.
+    // it used to be gave 20.169999999999998. Only a constant the engine scale
+    // holds exactly is one, though; past nine places, or too large, it stays a
+    // float. Rounding it to nine places lost what a float would have kept —
+    // `1e-10` became 0 in a float column, and `f * 0.0000000001` was 0 — and
+    // rounded it a second time when it was then stored at a column's scale,
+    // so 20.1649999999 became 20.165 and then 20.17.
     if let Ok(v) = text.parse::<f64>() {
         if text.starts_with(|c: char| c.is_ascii_digit() || matches!(c, '.' | '-' | '+')) {
-            if let Some(units) = crate::core::value_codec::parse_decimal_rounded(
-                text,
-                crate::core::value_codec::DECIMAL_SCALE,
-            ) {
+            if let Some(units) = exact_engine_decimal(text) {
                 return Ok(Expr::Literal {
                     bytes: units.to_le_bytes().to_vec(),
                     db_type: DbType::DECIMAL,
@@ -2374,6 +2375,22 @@ fn float_to_engine_decimal(f: f64) -> Option<i128> {
     })
 }
 
+/// A written constant as a `NUMERIC` at the engine scale, or `None` when that
+/// scale cannot hold it exactly: more places than nine, or too large. Zeros
+/// at the end of the fraction are not places it needs, so `1.5000000000` is
+/// 1.5 and not a float.
+fn exact_engine_decimal(text: &str) -> Option<i128> {
+    let at = text.find(['e', 'E']).unwrap_or(text.len());
+    let (mantissa, exponent) = text.split_at(at);
+    let mantissa = if mantissa.contains('.') { mantissa.trim_end_matches('0') } else { mantissa };
+    // `parse_decimal_scaled` at the engine scale refuses the places past it
+    // rather than dropping them.
+    crate::core::value_codec::parse_decimal_scaled(
+        &format!("{}{}{}", mantissa, if mantissa.ends_with('.') { "0" } else { "" }, exponent),
+        crate::core::value_codec::DECIMAL_SCALE,
+    )
+}
+
 /// Whether `expr` evaluates to a `NUMERIC` whenever it is not NULL — so that
 /// arithmetic against it is certain to take the decimal path.
 ///
@@ -2609,6 +2626,20 @@ pub(crate) fn from_engine_scale(value: Value, field: &SchemaField) -> Result<Val
     // number at all.
     let value = match &value {
         Value::Data { db_type, .. } if number(&value) && *db_type != DbType::DECIMAL => {
+            // A float meets a declared scale once, from the digits that
+            // round-trip it. Rounding it to the engine scale first and then to
+            // the column's rounded twice: 20.1649999999 became 20.165, then
+            // 20.17, where PostgreSQL stores 20.16.
+            if let (DbType::F32 | DbType::F64, Some(scale)) = (db_type, field.scale) {
+                let stored = as_f64(&value)
+                    .filter(|f| f.is_finite())
+                    .and_then(|f| crate::core::value_codec::parse_decimal_rounded(&format!("{}", f), scale))
+                    .ok_or_else(|| format!("numeric field overflow for column \"{}\"", field.name))?;
+                return Ok(Value::Data {
+                    bytes: stored.to_le_bytes().to_vec(),
+                    db_type: DbType::DECIMAL,
+                });
+            }
             let units = match db_type {
                 DbType::F32 | DbType::F64 => as_f64(&value).and_then(float_to_engine_decimal),
                 _ => as_i64(&value).and_then(|v| (v as i128).checked_mul(10i128.pow(DECIMAL_SCALE))),
@@ -4875,6 +4906,13 @@ mod float_literal_fold_tests {
                 "d * {}", "d + {}", "d - {}", "d / {}", "{} * d", "{} - d", "e * {}", "d * {} + 1",
                 "d + e * {}", "f * {}", "i * {}", "f + {}", "{} * f", "d * 2 * {}",
             ] {
+                // A literal the engine scale cannot hold exactly is a float
+                // now, and a float meets a NUMERIC as float arithmetic row by
+                // row; the fold is what keeps it NUMERIC, so there is no
+                // per-row conversion left to compare it with.
+                if exact_engine_decimal(lit).is_none() && (template.contains('d') || template.contains('e')) {
+                    continue;
+                }
                 let text = template.replace("{}", lit);
                 let folded = parse(&text, &s).unwrap();
                 let reference = unfolded(&text, &s);
@@ -4913,6 +4951,12 @@ mod float_literal_fold_tests {
             ("f * 1.5", vec![DbType::DECIMAL]),
             ("i * 1.5", vec![DbType::DECIMAL]),
             ("1.5 * 2.5", vec![DbType::DECIMAL, DbType::DECIMAL]),
+            // Only while the engine scale holds it exactly; trailing zeros
+            // past it are not places. Past it, a float keeps what rounding to
+            // nine places threw away.
+            ("f * 1.5000000000", vec![DbType::DECIMAL]),
+            ("f * 0.0000000001", vec![DbType::F64]),
+            ("i * (1e-10)", vec![DbType::F64]),
         ] {
             let mut got = Vec::new();
             literal_types(&parse(text, &s).unwrap(), &mut got);

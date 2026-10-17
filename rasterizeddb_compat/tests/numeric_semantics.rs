@@ -598,3 +598,96 @@ async fn expression_assignments_convert_dates_and_timestamps() {
         .await;
     verdict(wrong);
 }
+
+/// The rows a statement returned, each field read as a float, against
+/// PostgreSQL's shortest round-trip text for the same double. Comparing the
+/// doubles, not the text, leaves the renderer out of the question.
+async fn expect_floats(db: &mut Db, wrong: &mut Vec<String>, cases: &[(&str, &[&str])]) {
+    for (sql, expected) in cases {
+        let parse = |rows: &[String]| -> Vec<Vec<Option<f64>>> {
+            rows.iter().map(|r| r.split('|').map(|f| f.parse::<f64>().ok()).collect()).collect()
+        };
+        let want: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
+        match db.text(sql).await {
+            Ok(got) if parse(&got) == parse(&want) => {}
+            Ok(got) => wrong.push(format!("{}\n    got  {:?}\n    want {:?}", sql, got, expected)),
+            Err(e) => wrong.push(format!("{}\n    error {}\n    want {:?}", sql, e, expected)),
+        }
+    }
+}
+
+/// A written fraction with more places than the engine scale keeps its value
+/// when it meets a float. It was rounded to nine places first, so `1e-10`
+/// into a float column stored 0 and `f * 0.0000000001` was 0 for every row.
+#[tokio::test(flavor = "multi_thread")]
+async fn small_fractions_reach_a_float_unrounded() {
+    let mut db = db(&[
+        "CREATE TABLE ft (id INT, f FLOAT8)",
+        "INSERT INTO ft (id, f) VALUES (1, 2.5)",
+        "UPDATE ft SET f = 1e-10 WHERE id = 1",
+        "INSERT INTO ft (id, f) VALUES (2, 1.5e-12)",
+        "INSERT INTO ft (id, f) VALUES (3, 0)",
+        "UPDATE ft SET f = 1.2345678901234e-3 WHERE id = 3",
+    ])
+    .await;
+    let mut wrong = Vec::new();
+    expect_floats(
+        &mut db,
+        &mut wrong,
+        &[(
+            "SELECT id, f, f * 0.0000000001 FROM ft ORDER BY id",
+            &[
+                "1|1e-10|1.0000000000000001e-20",
+                "2|1.5e-12|1.5000000000000002e-22",
+                "3|0.0012345678901234|1.2345678901233998e-13",
+            ],
+        )],
+    )
+    .await;
+    expect_rows(
+        &mut db,
+        &mut wrong,
+        &[
+            // Folded to `f > 0`, which kept every row with a value.
+            ("SELECT id FROM ft WHERE f > (1e-10) ORDER BY id", &["3"]),
+            ("SELECT id FROM ft WHERE f >= (1e-10) ORDER BY id", &["1", "3"]),
+            ("SELECT id FROM ft WHERE f > (1e-13) ORDER BY id", &["1", "2", "3"]),
+            ("SELECT id FROM ft WHERE f < (1.5000001e-12) ORDER BY id", &["2"]),
+            // Nine places or fewer is still an exact NUMERIC.
+            ("SELECT 0.5e-8 + 0, 14 * 1.37 + 0.99 FROM ft WHERE id = 1", &["0.000000005|20.17"]),
+        ],
+    )
+    .await;
+    verdict(wrong);
+}
+
+/// A literal with more places than the engine scale is rounded once, to the
+/// column. It was rounded to nine places and then to the column's two, so
+/// 20.1649999999 became 20.165 and then 20.17 wherever an expression carried
+/// it, while the plain literal stored 20.16: a generated `p * 15` of 302.55
+/// beside a stored p of 20.16.
+#[tokio::test(flavor = "multi_thread")]
+async fn literals_past_nine_places_round_once() {
+    let mut db = db(&[
+        "CREATE TABLE g10 (id INT, p NUMERIC(12,2), g NUMERIC(14,2) GENERATED ALWAYS AS (p * 15) STORED)",
+        // The second has more digits than a double holds, so only the written
+        // text rounds it right.
+        "INSERT INTO g10 (id, p) VALUES (1, 20.1649999999), (2, 20.16499999999999999)",
+        "CREATE TABLE p10 (id INT, p NUMERIC(12,2))",
+        "INSERT INTO p10 (id, p) VALUES (1, 0), (2, 20.1649999999 * 1)",
+        "UPDATE p10 SET p = 20.1649999999 * 1 WHERE id = 1",
+    ])
+    .await;
+    let mut wrong = Vec::new();
+    expect_rows(
+        &mut db,
+        &mut wrong,
+        &[
+            ("SELECT id, p, g FROM g10 ORDER BY id", &["1|20.16|302.40", "2|20.16|302.40"]),
+            ("SELECT id FROM g10 WHERE g <> p * 15", &[]),
+            ("SELECT id, p FROM p10 ORDER BY id", &["1|20.16", "2|20.16"]),
+        ],
+    )
+    .await;
+    verdict(wrong);
+}

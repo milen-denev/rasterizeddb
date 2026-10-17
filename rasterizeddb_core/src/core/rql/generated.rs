@@ -199,6 +199,15 @@ pub fn as_stored(literal: &str, field: &crate::core::row::schema::SchemaField) -
         return literal.to_string();
     }
     let unquoted = text.strip_prefix('\'').and_then(|t| t.strip_suffix('\'')).unwrap_or(text);
+    // A plain number bound for a NUMERIC(p, s) is read the way the insert
+    // reads it, rounded once at `s` from the digits as written. Evaluated, a
+    // constant past nine places is a float, which keeps only the digits a
+    // double does.
+    if let (DbType::DECIMAL, Some(scale)) = (&field.db_type, field.scale) {
+        if let Some(stored) = crate::core::value_codec::parse_decimal_rounded(unquoted, scale) {
+            return crate::core::value_codec::format_decimal_scaled(stored, scale);
+        }
+    }
     let empty = crate::core::row::row::Row::default();
     let Ok(Value::Data { bytes, db_type }) = expr::parse(unquoted, &[])
         .and_then(|e| expr::eval(&e, &empty, &[]))
