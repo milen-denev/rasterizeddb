@@ -384,6 +384,33 @@ async fn forms_over_a_computed_where_operand() {
             "1,6",
         ),
         ("SELECT id FROM pn WHERE (n % 2 = 0) IS NOT TRUE ORDER BY id", "1,3,4,6"),
+        // `IS TRUE` and `IS FALSE` are never NULL, so a NOT over one keeps
+        // the rows whose operand is NULL, and so does a test of the group's
+        // falsity. Spelled as the bare comparison, a NULL operand was false
+        // negated or not, and these dropped rows 2 and 3.
+        ("SELECT id FROM pn WHERE NOT (CASE WHEN n > 5 THEN true END IS TRUE) ORDER BY id", "1,2,3,6"),
+        (
+            "SELECT id FROM pn WHERE NOT (CASE WHEN n > 5 THEN true WHEN n < 2 THEN false END IS FALSE) ORDER BY id",
+            "2,3,4,5",
+        ),
+        ("SELECT id FROM pn WHERE NOT CASE WHEN n > 5 THEN true END IS TRUE ORDER BY id", "1,2,3,6"),
+        (
+            "SELECT id FROM pn WHERE NOT CASE WHEN n > 5 THEN true WHEN n < 2 THEN false END IS FALSE ORDER BY id",
+            "2,3,4,5",
+        ),
+        ("SELECT id FROM pn WHERE (CASE WHEN n > 5 THEN true END IS TRUE) IS FALSE ORDER BY id", "1,2,3,6"),
+        (
+            "SELECT id FROM pn WHERE (CASE WHEN n > 5 THEN true WHEN n < 2 THEN false END IS FALSE) IS FALSE ORDER BY id",
+            "2,3,4,5",
+        ),
+        ("SELECT id FROM pn WHERE (CASE WHEN n > 5 THEN true END IS TRUE) IS NOT TRUE ORDER BY id", "1,2,3,6"),
+        ("SELECT id FROM pn WHERE (CASE WHEN n > 5 THEN true END IS NOT TRUE) IS FALSE ORDER BY id", "4,5"),
+        ("SELECT id FROM pn WHERE NOT (CASE WHEN n > 5 THEN true END IS NOT TRUE) ORDER BY id", "4,5"),
+        ("SELECT id FROM pn WHERE (CASE WHEN n > 5 THEN 'x' END IS NULL) IS FALSE ORDER BY id", "4,5"),
+        (
+            "SELECT id FROM pn WHERE id > 1 AND NOT (CASE WHEN n > 5 THEN true END IS TRUE OR s = 'f') ORDER BY id",
+            "3",
+        ),
         ("SELECT n FROM digit WHERE n = CASE WHEN n > 5 THEN n END ORDER BY n", "6,7,8,9"),
         ("SELECT n FROM digit WHERE CASE WHEN n > 5 THEN 1 ELSE 0 END = one ORDER BY n", "6,7,8,9"),
         (
@@ -458,6 +485,13 @@ async fn case_and_operators_in_update_and_delete_where() {
     assert_eq!(joined(&pool, "SELECT n FROM dg ORDER BY n").await.unwrap(), "1,2,4,5,7,8");
     assert_eq!(run(&pool, "DELETE FROM dg WHERE 'x' || n = 'x5' RETURNING n").await, Ok(1));
     assert_eq!(joined(&pool, "SELECT n FROM dg ORDER BY n").await.unwrap(), "1,2,4,7,8");
+    // A NOT over a truth test holds where the operand is NULL, in a DELETE
+    // too: the CASE is NULL for 1, 2 and 4, and PostgreSQL deletes them.
+    assert_eq!(
+        run(&pool, "DELETE FROM dg WHERE NOT (CASE WHEN n > 6 THEN true END IS TRUE)").await,
+        Ok(3)
+    );
+    assert_eq!(joined(&pool, "SELECT n FROM dg ORDER BY n").await.unwrap(), "7,8");
 }
 
 // -------------------------------------------- #13 IS DISTINCT FROM, row values

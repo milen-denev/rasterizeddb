@@ -553,6 +553,23 @@ impl TruthParser<'_> {
         if toks.is_empty() {
             return Err("a condition is missing".to_string());
         }
+        // A computed operand's NULL test, which is how its own `IS [NOT]
+        // NULL` and truth tests are spelled: never NULL itself, so it needs
+        // no guard and its complement is the other test.
+        if let [Tok::Lifted(text), Tok::Word(w)] = toks {
+            let (holds, fails) = if w.eq_ignore_ascii_case("notnull") {
+                ("NOTNULL", "ISNULL")
+            } else if w.eq_ignore_ascii_case("isnull") {
+                ("ISNULL", "NOTNULL")
+            } else {
+                return Err(format!("'{}' is not a condition", render_tokens(toks)));
+            };
+            return Ok(TruthNode::Atom {
+                holds: format!("{} {}", text, holds),
+                fails: format!("{} {}", text, fails),
+                flags: Vec::new(),
+            });
+        }
 
         let mut flags: Vec<String> = Vec::new();
         let mut rendered: Vec<String> = Vec::with_capacity(toks.len());
@@ -2585,8 +2602,12 @@ fn lift_comparison(
             truth("true")?;
             return Ok(null_test(false));
         }
-        ["IS", "TRUE"] => return truth("true"),
-        ["IS", "FALSE"] => return truth("false"),
+        // `IS TRUE` and `IS FALSE` are never NULL, and the comparison alone
+        // is NULL for a NULL operand. Without the NULL test, `expand_not`
+        // negated `x = true` to `x != true`, which a NULL operand also fails,
+        // so `NOT (x IS TRUE)` dropped the very rows it should keep.
+        ["IS", "TRUE"] => return Ok(format!("({} AND {})", null_test(false), truth("true")?)),
+        ["IS", "FALSE"] => return Ok(format!("({} AND {})", null_test(false), truth("false")?)),
         ["IS", "NOT", "TRUE"] => return Ok(format!("({} OR {})", null_test(true), truth("false")?)),
         ["IS", "NOT", "FALSE"] => return Ok(format!("({} OR {})", null_test(true), truth("true")?)),
         _ => {}
@@ -4754,6 +4775,19 @@ mod lifted_operand_tests {
         let b = lifted("CASE WHEN age > 1 THEN true END");
         let out = lift_evaluated_operands("CASE WHEN age > 1 THEN true END IS NOT TRUE", &schema()).unwrap();
         assert_eq!(out, format!("({b} ISNULL OR {b} = false)"));
+        // The positive truth tests carry their NULL test too, so that a NOT
+        // over one holds for a NULL operand.
+        let out = lift_evaluated_operands("CASE WHEN age > 1 THEN true END IS TRUE", &schema()).unwrap();
+        assert_eq!(out, format!("({b} NOTNULL AND {b} = true)"));
+        let out = lift_evaluated_operands("CASE WHEN age > 1 THEN true END IS FALSE", &schema()).unwrap();
+        assert_eq!(out, format!("({b} NOTNULL AND {b} = false)"));
+        let lifted_not = lift_evaluated_operands("NOT (CASE WHEN age > 1 THEN true END IS TRUE)", &schema()).unwrap();
+        let out = expand_not(&lifted_not, &schema()).unwrap().into_owned();
+        assert_eq!(out, format!("( {b} ISNULL OR {b} != true )"));
+        // A computed operand's null test is a condition an enclosing truth
+        // test can read.
+        let out = rewrite_scan_where("(CASE WHEN age > 1 THEN true END IS TRUE) IS FALSE", &schema()).unwrap();
+        assert!(out.contains(&format!("{b} ISNULL")), "{out}");
         let out = lift_evaluated_operands("CASE WHEN age > 1 THEN true END", &schema()).unwrap();
         assert_eq!(out, format!("{b} = true"));
         let e = lift_evaluated_operands("age % 2", &schema()).unwrap_err();
