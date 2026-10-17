@@ -2568,6 +2568,33 @@ pub(crate) fn from_engine_scale(value: Value, field: &SchemaField) -> Result<Val
             )
         )
     };
+    // A date, a timestamp and an interval each have their own layout, so one
+    // bound for a column of another type is converted, as PostgreSQL's
+    // assignment cast does, or refused. Its bytes used to be copied into the
+    // slot as they were: `SET ts = '2024-01-01'::date` put a four-byte day
+    // count in a timestamp and read back as 1970-01-01 00:17:22, and a
+    // timestamp in a date column kept half of itself. A number and a date
+    // have no assignment cast either way.
+    let temporal = |t: &DbType| matches!(t, DbType::DATE | DbType::DATETIME | DbType::INTERVAL);
+    if let Value::Data { db_type: from, .. } = &value {
+        if *from != field.db_type && (temporal(from) || temporal(&field.db_type)) {
+            let mismatch = || {
+                format!(
+                    "column \"{}\" is of type {} but expression is of type {}",
+                    field.name,
+                    crate::core::value_codec::pg_input_type_name(&field.db_type),
+                    crate::core::value_codec::pg_input_type_name(from)
+                )
+            };
+            let convertible = (temporal(from) && temporal(&field.db_type))
+                || *from == DbType::STRING
+                || field.db_type == DbType::STRING;
+            if !convertible {
+                return Err(mismatch());
+            }
+            return cast(value.clone(), &field.db_type).map_err(|_| mismatch());
+        }
+    }
     // A float column takes any number as a float, as the assignment cast does.
     // A written fraction is a NUMERIC now, and its sixteen bytes in an
     // eight-byte slot would be read back as an unrelated float.

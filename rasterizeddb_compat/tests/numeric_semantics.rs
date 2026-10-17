@@ -541,3 +541,60 @@ async fn cast_and_cte_keep_the_declared_scale() {
     .await;
     verdict(wrong);
 }
+
+// ------------------------------------------------- review of the fixes above
+
+/// An expression assigned to a date or a timestamp column is converted to the
+/// column's type. A `::date` is a real four-byte date now, and the UPDATE
+/// copied its bytes into the eight-byte timestamp slot: 1970-01-01 00:17:22,
+/// reported as success. A timestamp into a date column kept its low half.
+#[tokio::test(flavor = "multi_thread")]
+async fn expression_assignments_convert_dates_and_timestamps() {
+    let mut db = db(&[
+        "CREATE TABLE ta (id INT, ts TIMESTAMPTZ, d DATE)",
+        "INSERT INTO ta (id, ts, d) VALUES (1, '2020-05-05 10:00:00+00', '2024-01-01'), \
+         (2, '2020-05-05 10:00:00+00', '2024-01-01')",
+    ])
+    .await;
+    let mut wrong = Vec::new();
+    for sql in [
+        "UPDATE ta SET ts = '2024-01-01'::date WHERE id = 1",
+        "UPDATE ta SET d = d + INTERVAL '1 day' WHERE id = 1",
+        "UPDATE ta SET ts = '2024-01-01'::date + 2, d = '2024-03-05 13:00:00'::timestamp WHERE id = 2",
+    ] {
+        if let Err(e) = db.pool.execute(sql).await {
+            wrong.push(format!("{}: {}", sql, e));
+        }
+    }
+    expect_rows(
+        &mut db,
+        &mut wrong,
+        &[
+            (
+                "SELECT id, ts, d FROM ta ORDER BY id",
+                &["1|2024-01-01 00:00:00+00|2024-01-02", "2|2024-01-03 00:00:00+00|2024-03-05"],
+            ),
+            // The RETURNING overlay converts through the same function.
+            (
+                "UPDATE ta SET ts = '2024-06-01'::date WHERE id = 2 RETURNING ts, d",
+                &["2024-06-01 00:00:00+00|2024-03-05"],
+            ),
+        ],
+    )
+    .await;
+    if let Err(e) = db.pool.execute("UPDATE ta SET ts = CURRENT_DATE + 1 WHERE id = 1").await {
+        wrong.push(format!("SET ts = CURRENT_DATE + 1: {}", e));
+    }
+    expect_rows(&mut db, &mut wrong, &[("SELECT ts::date - CURRENT_DATE FROM ta WHERE id = 1", &["1"])]).await;
+    // PostgreSQL refuses an integer for a date and a date for an integer
+    // (42804); both stored the other type's bytes and reported success.
+    for sql in ["UPDATE ta SET d = id + 1", "UPDATE ta SET id = d"] {
+        let got = db.sqlstate(sql).await;
+        if got.starts_with("succeeded") {
+            wrong.push(format!("{}: {}, want an error", sql, got));
+        }
+    }
+    expect_rows(&mut db, &mut wrong, &[("SELECT id, d FROM ta ORDER BY id", &["1|2024-01-02", "2|2024-03-05"])])
+        .await;
+    verdict(wrong);
+}
