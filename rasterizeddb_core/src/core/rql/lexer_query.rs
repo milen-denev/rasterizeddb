@@ -1562,7 +1562,7 @@ pub fn row_fetch_from_select_query(
         }
     }
     let where_raw = where_combined.as_deref().unwrap_or(where_raw);
-    let where_owned = crate::core::tokenizer::predicate_rewrite::rewrite_where(where_raw, schema)?;
+    let where_owned = crate::core::tokenizer::predicate_rewrite::rewrite_scan_where(where_raw, schema)?;
     let where_part = where_owned.as_str();
 
     // ORDER BY: every sort key, in the order written. Resolution is deferred,

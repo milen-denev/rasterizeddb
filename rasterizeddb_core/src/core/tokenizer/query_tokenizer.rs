@@ -32,6 +32,13 @@ pub enum Token {
     /// applies to may be a parenthesised group whose extent the parser knows
     /// and the tokenizer does not.
     Cast(DbType),
+    /// An operand the expression evaluator computes per row — a `CASE`, a
+    /// `||` chain, a `%` — which the rewrite lifted out of the clause whole.
+    /// See `predicate_rewrite::lift_evaluated_operands`.
+    ///
+    /// Neither a column nor a literal, so every extractor that plans from
+    /// tokens treats the comparison holding it as opaque.
+    Evaluated(std::sync::Arc<crate::core::processor::transformer::EvaluatedOperand>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -448,6 +455,20 @@ fn tokenize_inner<'a>(
         let c = bytes[i];
 
         match c {
+            // An operand the rewrite lifted for the expression evaluator.
+            crate::core::tokenizer::predicate_rewrite::LIFTED_OPEN => {
+                let (text, end) = crate::core::tokenizer::predicate_rewrite::read_lifted(s, i)
+                    .ok_or_else(|| {
+                        "a lifted expression in the WHERE clause is malformed".to_string()
+                    })?;
+                let operand =
+                    crate::core::processor::transformer::EvaluatedOperand::new(&text, schema)?;
+                expression_type_context = Some(operand.db_type.clone());
+                current_field_context = None;
+                out.push(Token::Evaluated(std::sync::Arc::new(operand)));
+                i = end;
+            }
+
             b'\'' => {
                 // A string literal. `''` inside one is an escaped quote, not
                 // the end: `'O''Brien'` is one literal, and reading it as two

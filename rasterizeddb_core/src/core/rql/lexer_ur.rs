@@ -679,7 +679,7 @@ fn parse_update_row(
     // satisfying a comparison. Without it an ORM's `"users"."id" = …` reaches a
     // tokenizer that panics on the quote character.
     let where_clause: String =
-        match crate::core::tokenizer::predicate_rewrite::rewrite_where(where_clause, schema) {
+        match crate::core::tokenizer::predicate_rewrite::rewrite_scan_where(where_clause, schema) {
             Ok(clause) => clause,
             Err(reason) => {
                 rejection.replace(reason);

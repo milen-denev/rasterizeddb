@@ -117,8 +117,36 @@ fn document(r: &mut Lcg) -> String {
 /// alike, since they are equal).
 fn predicate(r: &mut Lcg) -> String {
     fn atom(r: &mut Lcg) -> String {
-        match r.below(34) {
+        match r.below(40) {
             14 => format!("NOT ({})", atom(r)),
+            // An operand the expression evaluator computes from an indexed
+            // path. Read as the bare path it holds, any of these would let
+            // an index prune rows the evaluator returns.
+            34 => format!(
+                "CASE WHEN doc->>'status' = '{}' THEN doc->>'label' ELSE 'none' END = '{}'",
+                STATUSES[r.below(5) as usize],
+                ["none", "0", "1", "2"][r.below(4) as usize]
+            ),
+            35 => format!("doc->>'status' || '!' = '{}!'", STATUSES[r.below(5) as usize]),
+            36 => format!(
+                "CASE WHEN doc->>'label' IS NULL THEN 'none' ELSE doc->>'label' END {} '{}'",
+                ["=", "<>"][r.below(2) as usize],
+                ["none", "0", "1"][r.below(3) as usize]
+            ),
+            37 => format!(
+                "(doc->>'status', doc->'user'->>'name') = ('{}', 'u{}')",
+                STATUSES[r.below(5) as usize],
+                r.below(30)
+            ),
+            38 => format!(
+                "(doc->>'status', id % 2) IN (('{}', 0), ('{}', 1))",
+                STATUSES[r.below(5) as usize],
+                STATUSES[r.below(5) as usize]
+            ),
+            39 => format!(
+                "doc->>'status' || doc->>'cat' {}IN ('paid1', 'new2', 'shipped3')",
+                if r.below(2) == 0 { "NOT " } else { "" }
+            ),
             15 => format!(
                 "doc->>'status' {}IN ('{}', '{}')",
                 if r.below(2) == 0 { "NOT " } else { "" },

@@ -414,9 +414,17 @@ impl TruthNode {
                 if flags.is_empty() {
                     return format!("( {} )", test);
                 }
+                // A lifted operand is its own NULL test: it has no companion,
+                // and the evaluator says whether it yielded a value.
                 let mut parts: Vec<String> = flags
                     .iter()
-                    .map(|f| format!("{} = {}", f, if guarded { 0 } else { 1 }))
+                    .map(|f| {
+                        if f.as_bytes().first() == Some(&LIFTED_OPEN) {
+                            format!("{} {}", f, if guarded { "NOTNULL" } else { "ISNULL" })
+                        } else {
+                            format!("{} = {}", f, if guarded { 0 } else { 1 })
+                        }
+                    })
                     .collect();
                 parts.push(test.clone());
                 format!("( {} )", parts.join(if guarded { " AND " } else { " OR " }))
@@ -589,6 +597,15 @@ impl TruthParser<'_> {
                     } else {
                         return Err(format!("'{}' cannot be evaluated here", w));
                     }
+                }
+                // An operand the evaluator computes is NULL exactly when it
+                // yields none, which it can be asked directly: it stands in
+                // the flags for its own NULL test.
+                Tok::Lifted(text) => {
+                    if !flags.contains(text) {
+                        flags.push(text.clone());
+                    }
+                    rendered.push(text.clone());
                 }
                 other => return Err(format!("'{}' cannot be evaluated here", other.render())),
             }
@@ -1094,6 +1111,9 @@ enum Tok {
     LPar,
     RPar,
     Comma,
+    /// An operand [`lift_evaluated_operands`] encoded for the expression
+    /// evaluator, carried whole and rendered back exactly as it came.
+    Lifted(String),
 }
 
 impl Tok {
@@ -1109,6 +1129,7 @@ impl Tok {
             Tok::LPar => "(".to_string(),
             Tok::RPar => ")".to_string(),
             Tok::Comma => ",".to_string(),
+            Tok::Lifted(text) => text.clone(),
         }
     }
 }
@@ -1143,6 +1164,13 @@ fn lex(clause: &str) -> Result<Vec<Tok>, String> {
         }
 
         match c {
+            LIFTED_OPEN => {
+                let (_, end) = read_lifted(clause, i).ok_or_else(|| {
+                    "a lifted expression in the WHERE clause is malformed".to_string()
+                })?;
+                out.push(Tok::Lifted(clause[i..end].to_string()));
+                i = end;
+            }
             b'\'' | b'"' => {
                 let quote = c;
                 let start = i;
@@ -2185,6 +2213,496 @@ fn fold_null_comparisons(clause: &str) -> String {
     out
 }
 
+/// Opens an operand lifted for the expression evaluator; see
+/// [`lift_evaluated_operands`].
+pub const LIFTED_OPEN: u8 = 0x02;
+/// Separates a lifted operand's encoded text from the columns it reads.
+const LIFTED_READS: u8 = 0x1f;
+/// Closes a lifted operand.
+const LIFTED_CLOSE: u8 = 0x03;
+
+/// An operand for the expression evaluator, wrapped so that nothing between
+/// the lift and the tokenizer can read into it.
+///
+/// Every stage after the lift rewrites the clause as text — the NULL fold, the
+/// `NOT` push-down, the guards — and each would rewrite inside a `CASE` it was
+/// never meant to see. So the text is spelled in the sixteen letters `g` to
+/// `v`, two per byte: no quote, digit or operator, so no stage finds a
+/// comparison in it, and a prepared statement's template can never find one
+/// of its literals inside it and substitute there. The columns it reads follow
+/// in plain text, because the scan's fetch is worked out by finding column
+/// names in the clause, and a NULL companion it does not fetch reads as a
+/// present zero.
+fn encode_lifted(text: &str, reads: &[String]) -> String {
+    let mut out = String::with_capacity(text.len() * 2 + reads.len() * 8 + 4);
+    out.push(LIFTED_OPEN as char);
+    for b in text.bytes() {
+        out.push((b'g' + (b >> 4)) as char);
+        out.push((b'g' + (b & 0x0f)) as char);
+    }
+    out.push(LIFTED_READS as char);
+    out.push(' ');
+    out.push_str(&reads.join(" "));
+    out.push(' ');
+    out.push(LIFTED_CLOSE as char);
+    out
+}
+
+/// The expression text of the lifted operand opening at `at`, and the offset
+/// just past it. `None` when the bytes there are not one.
+pub fn read_lifted(s: &str, at: usize) -> Option<(String, usize)> {
+    let bytes = s.as_bytes();
+    if bytes.get(at) != Some(&LIFTED_OPEN) {
+        return None;
+    }
+    let reads = at + 1 + bytes[at + 1..].iter().position(|b| *b == LIFTED_READS)?;
+    let close = reads + bytes[reads..].iter().position(|b| *b == LIFTED_CLOSE)?;
+    let encoded = &bytes[at + 1..reads];
+    if encoded.len() % 2 != 0 {
+        return None;
+    }
+    let mut raw = Vec::with_capacity(encoded.len() / 2);
+    for pair in encoded.chunks(2) {
+        let (hi, lo) = (pair[0].checked_sub(b'g')?, pair[1].checked_sub(b'g')?);
+        if hi > 15 || lo > 15 {
+            return None;
+        }
+        raw.push((hi << 4) | lo);
+    }
+    Some((String::from_utf8(raw).ok()?, close + 1))
+}
+
+/// [`rewrite_where`] for a clause a single-table scan evaluates, with the
+/// operands only the expression evaluator can compute lifted out first.
+///
+/// Kept apart from `rewrite_where` because that one has other callers — the
+/// `CHECK` compiler and the join's post-filter — which read its output with the
+/// expression parser, and could not read a lifted operand.
+pub fn rewrite_scan_where(
+    clause: &str,
+    schema: &SmallVec<[SchemaField; 20]>,
+) -> Result<String, String> {
+    // Row values first, as `rewrite_where` does them first: `(a, n % 2) =
+    // (…)` is two comparisons, and only after it is split can each side be
+    // lifted on its own. Expanding again inside `rewrite_where` finds nothing.
+    let expanded = expand_row_value_comparisons(clause)?;
+    let lifted = lift_evaluated_operands(&expanded, schema)?;
+    rewrite_where(&lifted, schema)
+}
+
+/// Whether `text` holds something only the expression evaluator can compute:
+/// a `CASE`, `||`, `%`, or a bit-string literal. Outside quotes, and `?|` is
+/// the JSONB operator, not half a concatenation.
+fn needs_evaluator(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b == b'.';
+    let mut quote: Option<u8> = None;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\'' | b'"' => quote = Some(c),
+            b'%' => return true,
+            b'|' if bytes.get(i + 1) == Some(&b'|') && (i == 0 || bytes[i - 1] != b'?') => {
+                return true;
+            }
+            _ if is_word(c) && (i == 0 || !is_word(bytes[i - 1])) => {
+                let mut end = i;
+                while end < bytes.len() && is_word(bytes[end]) {
+                    end += 1;
+                }
+                let word = &text[i..end];
+                if word.eq_ignore_ascii_case("CASE")
+                    || (word.eq_ignore_ascii_case("B") || word.eq_ignore_ascii_case("X"))
+                        && bytes.get(end) == Some(&b'\'')
+                {
+                    return true;
+                }
+                i = end;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+/// The words of `text` outside quotes, parentheses and `CASE` blocks, as
+/// `(start, end)`.
+fn top_level_words(text: &str) -> Vec<(usize, usize)> {
+    let nesting = crate::core::rql::expr::Nesting::of(text);
+    let bytes = text.as_bytes();
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b == b'.';
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if is_word(bytes[i]) && (i == 0 || !is_word(bytes[i - 1])) {
+            let mut end = i;
+            while end < bytes.len() && is_word(bytes[end]) {
+                end += 1;
+            }
+            if nesting.top_level(i) {
+                out.push((i, end));
+            }
+            i = end;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Lifts every operand of `clause` that only the expression evaluator can
+/// compute — a `CASE`, a `||` chain, `%`, a bit-string literal — into one
+/// opaque token, leaving the comparison around it to the ordinary machinery.
+///
+/// The predicate tokenizer reads columns, literals and `+ - * /`, and a `CASE`
+/// in a `WHERE` was refused outright ("unknown column or unsupported keyword
+/// 'CASE'"), as were `||` and `%` anywhere in one — while the same expressions
+/// worked in the select list. Lifting the whole operand, rather than teaching
+/// the tokenizer each construct, gives a `WHERE` the select list's evaluator,
+/// so the two cannot disagree about what an expression means.
+///
+/// Only the operand is lifted, never the comparison. The comparison stays an
+/// ordinary one, so a NULL the operand yields leaves it not true whether or
+/// not it is negated — the property `expand_not` relies on to push `NOT` onto
+/// it — and `IN`, `BETWEEN` and `IS [NOT] NULL` over a lifted operand are
+/// spelled out here into the comparisons they mean.
+///
+/// A clause with nothing to lift comes back unchanged.
+pub fn lift_evaluated_operands(
+    clause: &str,
+    schema: &SmallVec<[SchemaField; 20]>,
+) -> Result<String, String> {
+    if !needs_evaluator(clause) {
+        return Ok(clause.to_string());
+    }
+    lift_condition(clause, schema, 0)
+}
+
+/// Lifts within a boolean group: each `AND`/`OR` term on its own. The `AND`
+/// of a `BETWEEN` belongs to its term.
+fn lift_condition(
+    text: &str,
+    schema: &SmallVec<[SchemaField; 20]>,
+    depth: usize,
+) -> Result<String, String> {
+    if depth > MAX_NOT_NESTING {
+        return Err(format!(
+            "conditions nested more than {MAX_NOT_NESTING} parentheses deep are not supported"
+        ));
+    }
+    let mut out = String::with_capacity(text.len() * 2);
+    let mut start = 0usize;
+    let mut between = false;
+    for (s, e) in top_level_words(text) {
+        let word = &text[s..e];
+        if word.eq_ignore_ascii_case("BETWEEN") {
+            between = true;
+            continue;
+        }
+        let and = word.eq_ignore_ascii_case("AND");
+        if and && between {
+            between = false;
+            continue;
+        }
+        if and || word.eq_ignore_ascii_case("OR") {
+            out.push_str(&lift_term(&text[start..s], schema, depth)?);
+            out.push_str(word);
+            start = e;
+        }
+    }
+    out.push_str(&lift_term(&text[start..], schema, depth)?);
+    Ok(out)
+}
+
+/// One `AND`/`OR` term: `NOT`s, then a parenthesised group or a comparison.
+fn lift_term(
+    term: &str,
+    schema: &SmallVec<[SchemaField; 20]>,
+    depth: usize,
+) -> Result<String, String> {
+    if !needs_evaluator(term) {
+        return Ok(term.to_string());
+    }
+    let lead = &term[..term.len() - term.trim_start().len()];
+    let tail = &term[term.trim_end().len()..];
+    let mut body = term.trim();
+    let mut nots = String::new();
+    while body.len() > 3
+        && body.as_bytes()[..3].eq_ignore_ascii_case(b"NOT")
+        && !(body.as_bytes()[3].is_ascii_alphanumeric() || body.as_bytes()[3] == b'_')
+    {
+        nots.push_str("NOT ");
+        body = body[3..].trim_start();
+    }
+    let lifted = if body.starts_with('(') && matching_paren_at(body, 0) == Some(body.len() - 1) {
+        format!("({})", lift_condition(&body[1..body.len() - 1], schema, depth + 1)?)
+    } else {
+        lift_comparison(body, schema, depth)?
+    };
+    Ok(format!("{lead}{nots}{lifted}{tail}"))
+}
+
+/// The operator a comparison splits at: its offset, its end, and whether it is
+/// a keyword (`IS`, `IN`, `BETWEEN`, `LIKE` …) rather than a symbol.
+fn comparison_operator(body: &str) -> Option<(usize, usize, bool)> {
+    let nesting = crate::core::rql::expr::Nesting::of(body);
+    let bytes = body.as_bytes();
+    let keyword_at = top_level_words(body);
+    let is_operator_word = |w: &str| {
+        [
+            "IS", "ISNULL", "NOTNULL", "IN", "BETWEEN", "LIKE", "ILIKE", "SIMILAR",
+        ]
+        .iter()
+        .any(|k| w.eq_ignore_ascii_case(k))
+    };
+    let mut keyword: Option<(usize, usize)> = None;
+    for (n, &(s, e)) in keyword_at.iter().enumerate() {
+        let word = &body[s..e];
+        // `NOT LIKE`, `NOT IN`, `NOT BETWEEN`: the operator begins at `NOT`.
+        if word.eq_ignore_ascii_case("NOT")
+            && keyword_at
+                .get(n + 1)
+                .is_some_and(|&(s2, e2)| is_operator_word(&body[s2..e2]))
+        {
+            keyword = Some((s, e));
+            break;
+        }
+        if is_operator_word(word) {
+            keyword = Some((s, e));
+            break;
+        }
+    }
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if keyword.is_some_and(|(s, _)| i >= s) {
+            break;
+        }
+        if !nesting.top_level(i) {
+            i += 1;
+            continue;
+        }
+        // Compared as bytes: `i` may sit inside a multi-byte character of an
+        // identifier, where slicing the text would panic.
+        let here = &bytes[i..];
+        // A path into a document is part of its operand.
+        if here.starts_with(b"->") || here.starts_with(b"#>") {
+            i += if here.get(2) == Some(&b'>') { 3 } else { 2 };
+            continue;
+        }
+        if let Some(sym) = PG_OPERATORS.iter().find(|s| here.starts_with(s.as_bytes())) {
+            return Some((i, i + sym.len(), false));
+        }
+        if matches!(bytes[i], b'<' | b'>' | b'=' | b'!') {
+            let width = match (bytes[i], bytes.get(i + 1)) {
+                (b'<', Some(b'=' | b'>')) | (b'>' | b'!', Some(b'=')) => 2,
+                _ => 1,
+            };
+            return Some((i, i + width, false));
+        }
+        i += 1;
+    }
+    keyword.map(|(s, e)| (s, e, true))
+}
+
+/// One comparison, with each side that needs the evaluator lifted.
+fn lift_comparison(
+    body: &str,
+    schema: &SmallVec<[SchemaField; 20]>,
+    depth: usize,
+) -> Result<String, String> {
+    let Some((at, op_end, keyword)) = comparison_operator(body) else {
+        // A condition standing alone, as a boolean `CASE` is.
+        return Ok(format!("{} = true", lift_operand(body, schema, true)?));
+    };
+    if !keyword {
+        return Ok(format!(
+            "{}{}{}",
+            lift_side(&body[..at], schema)?,
+            &body[at..op_end],
+            lift_side(&body[op_end..], schema)?
+        ));
+    }
+
+    let left_text = &body[..at];
+    let rest = &body[at..];
+    if !needs_evaluator(left_text) {
+        // The operand is the tokenizer's own, and whatever follows is left
+        // for the ordinary rewrite to read or refuse.
+        return Ok(body.to_string());
+    }
+    // `(n % 2 = 0) IS NOT TRUE` tests a condition, not a value: the lift goes
+    // inside the group, and the truth test is expanded over it as over any
+    // other condition.
+    let group = left_text.trim();
+    if group.starts_with('(') && matching_paren_at(group, 0) == Some(group.len() - 1) {
+        let inner = &group[1..group.len() - 1];
+        let connective = top_level_words(inner).iter().any(|(s, e)| {
+            inner[*s..*e].eq_ignore_ascii_case("AND") || inner[*s..*e].eq_ignore_ascii_case("OR")
+        });
+        if connective || comparison_operator(inner).is_some() {
+            let lifted = lift_condition(inner, schema, depth + 1)?;
+            return Ok(format!("({}) {}", lifted, rest.trim_start()));
+        }
+    }
+    let (left, left_type) = lift_operand_typed(left_text, schema)?;
+    let upper: Vec<String> = rest.split_whitespace().map(|w| w.to_ascii_uppercase()).collect();
+    let upper: Vec<&str> = upper.iter().map(|w| w.as_str()).collect();
+
+    // The null tests, in the one-word spellings the tokenizer reads, and the
+    // truth tests, which a NULL operand answers through them: `x IS NOT TRUE`
+    // holds for a NULL `x`, so it is "NULL, or false" and not merely `<> true`.
+    let null_test = |want_null: bool| {
+        format!("{} {}", left, if want_null { "ISNULL" } else { "NOTNULL" })
+    };
+    let truth = |value: &str| -> Result<String, String> {
+        if left_type != crate::core::db_type::DbType::BOOL {
+            return Err(format!(
+                "argument of IS {} must be type boolean, not type {}",
+                upper[1..].join(" "),
+                crate::core::value_codec::pg_input_type_name(&left_type)
+            ));
+        }
+        Ok(format!("{} = {}", left, value))
+    };
+    match upper.as_slice() {
+        ["ISNULL"] | ["IS", "NULL"] => return Ok(null_test(true)),
+        ["NOTNULL"] | ["IS", "NOT", "NULL"] => return Ok(null_test(false)),
+        ["IS", "UNKNOWN"] => {
+            truth("true")?;
+            return Ok(null_test(true));
+        }
+        ["IS", "NOT", "UNKNOWN"] => {
+            truth("true")?;
+            return Ok(null_test(false));
+        }
+        ["IS", "TRUE"] => return truth("true"),
+        ["IS", "FALSE"] => return truth("false"),
+        ["IS", "NOT", "TRUE"] => return Ok(format!("({} OR {})", null_test(true), truth("false")?)),
+        ["IS", "NOT", "FALSE"] => return Ok(format!("({} OR {})", null_test(true), truth("true")?)),
+        _ => {}
+    }
+
+    // `[NOT] IN (a, b)` and `[NOT] BETWEEN a AND b`, as the comparisons they
+    // mean. Each comparison with the operand is NULL when it is, so the forms
+    // keep PostgreSQL's three-valued answers: a NULL operand is in no list and
+    // outside none.
+    let negated = upper.first() == Some(&"NOT");
+    let after_not = if negated {
+        rest.trim_start()[3..].trim_start()
+    } else {
+        rest.trim_start()
+    };
+    let after_upper = after_not.to_ascii_uppercase();
+    if after_upper.starts_with("IN") && after_not[2..].trim_start().starts_with('(') {
+        let open = after_not.len() - after_not[2..].trim_start().len();
+        if matching_paren_at(after_not, open) == Some(after_not.len() - 1) {
+            let items = split_row_items(&after_not[open + 1..after_not.len() - 1]);
+            if !items.is_empty()
+                && !items.iter().any(|item| item.to_ascii_uppercase().starts_with("SELECT"))
+            {
+                let (each, join) = if negated { ("<>", " AND ") } else { ("=", " OR ") };
+                let mut parts = Vec::with_capacity(items.len());
+                for item in items {
+                    parts.push(format!("{} {} {}", left, each, lift_side(item, schema)?));
+                }
+                return Ok(format!("({})", parts.join(join)));
+            }
+        }
+    }
+    if after_upper.starts_with("BETWEEN") {
+        let bounds = &after_not["BETWEEN".len()..];
+        if let Some(&(s, e)) = top_level_words(bounds)
+            .iter()
+            .find(|(s, e)| bounds[*s..*e].eq_ignore_ascii_case("AND"))
+        {
+            let low = lift_side(&bounds[..s], schema)?;
+            let high = lift_side(&bounds[e..], schema)?;
+            return Ok(if negated {
+                format!("({} < {} OR {} > {})", left, low.trim(), left, high.trim())
+            } else {
+                format!("({} >= {} AND {} <= {})", left, low.trim(), left, high.trim())
+            });
+        }
+    }
+    // `NOT LIKE` is `NOT` over the match, which the evaluator applies after
+    // its NULL test: a NULL operand matches neither form.
+    if negated
+        && ["LIKE", "ILIKE", "SIMILAR"]
+            .iter()
+            .any(|k| upper.get(1) == Some(k))
+    {
+        return Ok(format!("NOT {} {}", left, after_not));
+    }
+    // `LIKE` and the rest compare the operand's value like any other.
+    Ok(format!("{} {}", left, rest.trim_start()))
+}
+
+/// One side of a comparison: lifted when it needs the evaluator, and a bare
+/// bit-string literal rewritten as the quoted bits the tokenizer reads.
+fn lift_side(side: &str, schema: &SmallVec<[SchemaField; 20]>) -> Result<String, String> {
+    if !needs_evaluator(side) {
+        return Ok(side.to_string());
+    }
+    let lead = &side[..side.len() - side.trim_start().len()];
+    let tail = &side[side.trim_end().len()..];
+    let trimmed = side.trim();
+    let bit_literal = trimmed.len() >= 3
+        && matches!(trimmed.as_bytes()[0], b'B' | b'b' | b'X' | b'x')
+        && trimmed.as_bytes()[1] == b'\''
+        && trimmed.ends_with('\'')
+        && !trimmed[2..trimmed.len() - 1].contains('\'');
+    if bit_literal {
+        let bits = crate::core::pg_types::parse_bit_string(trimmed, None)
+            .and_then(|bytes| crate::core::pg_types::format_bit_string(&bytes))
+            .ok_or_else(|| format!("{} is not a valid bit string", trimmed))?;
+        return Ok(format!("{lead}'{bits}'{tail}"));
+    }
+    Ok(format!("{lead}{}{tail}", lift_operand(side, schema, false)?))
+}
+
+/// `text` as a lifted operand, after checking the evaluator can read it — so
+/// an unsupported function is refused by name here, not later as a malformed
+/// token. `boolean` for a condition standing alone, which has to be one.
+fn lift_operand(
+    text: &str,
+    schema: &SmallVec<[SchemaField; 20]>,
+    boolean: bool,
+) -> Result<String, String> {
+    let (lifted, db_type) = lift_operand_typed(text, schema)?;
+    if boolean && db_type != crate::core::db_type::DbType::BOOL {
+        return Err(format!(
+            "argument of WHERE must be type boolean, not type {}",
+            crate::core::value_codec::pg_input_type_name(&db_type)
+        ));
+    }
+    Ok(lifted)
+}
+
+/// [`lift_operand`], with the type the operand yields.
+fn lift_operand_typed(
+    text: &str,
+    schema: &SmallVec<[SchemaField; 20]>,
+) -> Result<(String, crate::core::db_type::DbType), String> {
+    let trimmed = text.trim();
+    let operand = crate::core::processor::transformer::EvaluatedOperand::new(trimmed, schema)?;
+    let reads: Vec<String> = operand
+        .reads
+        .iter()
+        .filter_map(|(at, _)| schema.iter().find(|f| f.write_order == *at).map(|f| f.name.clone()))
+        .collect();
+    Ok((encode_lifted(trimmed, &reads), operand.db_type))
+}
+
 pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Result<String, String> {
     if clause.trim().is_empty() {
         return Ok(String::new());
@@ -2252,6 +2770,24 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
             term_start = out.len() + 1;
         } else if matches!(tok, Tok::LPar) && opens_boolean_group(&toks, i) {
             term_start = out.len() + 1;
+        }
+
+        // A lifted operand goes on as it is. It needs no NULL guard: the
+        // evaluator answers NULL for it, and the comparison holding it is then
+        // not true, negated or not.
+        if let Tok::Lifted(text) = tok {
+            out.push(text.clone());
+            i += 1;
+            // Its `IS [NOT] NULL`, which the lift spelled as one word, is a
+            // test the evaluator answers rather than a column's companion.
+            if let Some(test) = toks
+                .get(i)
+                .filter(|t| t.is_keyword("isnull") || t.is_keyword("notnull"))
+            {
+                out.push(test.render().to_ascii_uppercase());
+                i += 1;
+            }
+            continue;
         }
 
         // A path into a document followed by a form that needs the whole
@@ -4131,5 +4667,114 @@ mod cast_path_under_not_tests {
             let casts = again.iter().filter(|t| matches!(t, Tok::Sym(s) if s.starts_with("::"))).count();
             assert!(casts >= 1, "{clause} -> {once}: the cast was lost");
         }
+    }
+}
+
+#[cfg(test)]
+mod lifted_operand_tests {
+    use super::*;
+    use crate::core::db_type::DbType;
+
+    fn schema() -> SmallVec<[SchemaField; 20]> {
+        let mut s = SmallVec::new();
+        for (i, (name, ty)) in [
+            ("id", DbType::I32),
+            ("name", DbType::STRING),
+            ("age", DbType::I32),
+            ("active", DbType::BOOL),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            s.push(SchemaField::new(name.to_string(), ty.clone(), ty.get_size(), 0, i as u64, false));
+        }
+        s
+    }
+
+    /// The scan's entry point must not change a clause it has nothing to lift
+    /// in: every shape below already worked, and quotes hide `||` and `%`.
+    #[test]
+    fn a_clause_with_nothing_to_lift_is_rewritten_as_before() {
+        for clause in [
+            "id = 1",
+            "name LIKE 'a%'",
+            "name = 'a || b' AND age > 3",
+            "name LIKE '%x%'",
+            "id IN (1, 2, 3)",
+            "age BETWEEN 1 AND 5 OR NOT (age > 3)",
+            "(id, age) > (1, 2)",
+            "active = true",
+            "id IS DISTINCT FROM 4",
+        ] {
+            assert_eq!(
+                rewrite_scan_where(clause, &schema()),
+                rewrite_where(clause, &schema()),
+                "{clause}"
+            );
+        }
+    }
+
+    /// No stage after the lift may find a value, a comparison or a keyword
+    /// inside a lifted operand: its text has no digit, quote or operator.
+    #[test]
+    fn a_lifted_operand_hides_its_text_and_round_trips() {
+        let text = "CASE WHEN age % 2 = 0 THEN 'e' || name ELSE NULL END";
+        let marker = encode_lifted(text, &["age".to_string(), "name".to_string()]);
+        let (encoded, _) = marker[1..].split_once(LIFTED_READS as char).expect("separator");
+        assert!(encoded.bytes().all(|b| (b'g'..=b'v').contains(&b)), "{encoded}");
+        assert_eq!(read_lifted(&marker, 0), Some((text.to_string(), marker.len())));
+        assert_eq!(read_lifted("id = 1", 0), None);
+    }
+
+    /// What reaches the tokenizer: the operand as one token, the comparison
+    /// around it as it was, and the columns it reads named in the clause so
+    /// the scan fetches them.
+    #[test]
+    fn the_tokenizer_reads_a_lifted_operand_as_one_token() {
+        let out = rewrite_scan_where("age % 2 = 1 AND id > 3", &schema()).unwrap();
+        assert!(out.contains(" age "), "{out:?}");
+        let tokens = crate::core::tokenizer::query_tokenizer::try_tokenize(&out, &schema()).unwrap();
+        assert!(
+            matches!(tokens[0], crate::core::tokenizer::query_tokenizer::Token::Evaluated(_)),
+            "{tokens:?}"
+        );
+        assert_eq!(tokens.len(), 7, "{tokens:?}");
+    }
+
+    #[test]
+    fn forms_over_a_lifted_operand_are_spelled_out() {
+        let lifted = |text: &str| encode_lifted(text, &["age".to_string()]);
+        let m = lifted("age % 3");
+        let out = lift_evaluated_operands("age % 3 IN (0, 2)", &schema()).unwrap();
+        assert_eq!(out, format!("({m} = 0 OR {m} = 2)"));
+        let out = lift_evaluated_operands("age % 3 NOT BETWEEN 1 AND 2", &schema()).unwrap();
+        assert_eq!(out, format!("({m} < 1 OR {m} > 2)"));
+        let out = lift_evaluated_operands("age % 3 IS NOT NULL", &schema()).unwrap();
+        assert_eq!(out, format!("{m} NOTNULL"));
+        let b = lifted("CASE WHEN age > 1 THEN true END");
+        let out = lift_evaluated_operands("CASE WHEN age > 1 THEN true END IS NOT TRUE", &schema()).unwrap();
+        assert_eq!(out, format!("({b} ISNULL OR {b} = false)"));
+        let out = lift_evaluated_operands("CASE WHEN age > 1 THEN true END", &schema()).unwrap();
+        assert_eq!(out, format!("{b} = true"));
+        let e = lift_evaluated_operands("age % 2", &schema()).unwrap_err();
+        assert!(e.contains("must be type boolean"), "{e}");
+        let e = lift_evaluated_operands("age % 2 IS TRUE", &schema()).unwrap_err();
+        assert!(e.contains("must be type boolean"), "{e}");
+    }
+
+    /// A bit-string literal alone is the text of its bits, which the
+    /// comparison encodes at the other side's type.
+    #[test]
+    fn a_bare_bit_literal_becomes_its_bits() {
+        assert_eq!(lift_side(" B'1010'", &schema()).unwrap(), " '1010'");
+        assert_eq!(lift_side("X'1f'", &schema()).unwrap(), "'00011111'");
+    }
+
+    #[test]
+    fn deep_parentheses_around_a_lifted_operand_are_refused_not_a_crash() {
+        let deep = |n: usize| format!("{}age % 2 = 0{}", "(".repeat(n), ")".repeat(n));
+        assert!(lift_evaluated_operands(&deep(10), &schema()).is_ok());
+        let e = lift_evaluated_operands(&deep(100_000), &schema()).unwrap_err();
+        assert!(e.contains("nested more than"), "{e}");
     }
 }

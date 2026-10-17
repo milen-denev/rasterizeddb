@@ -152,6 +152,9 @@ pub enum EvalError {
     /// Matching one value against a `SIMILAR TO` pattern would cost more than
     /// the matcher allows. PostgreSQL's `54001`.
     PatternTooComplex,
+    /// An expression evaluated per row in a `WHERE` — a `CASE`, a `||`, a
+    /// `%` — failed for a reason none of the variants above names.
+    ExpressionFailed,
 }
 
 impl EvalError {
@@ -177,6 +180,7 @@ impl EvalError {
             EvalError::InvalidPattern => "invalid regular expression in SIMILAR TO",
             EvalError::PatternTooComplex => crate::core::similar_to::TOO_COMPLEX,
             EvalError::UserCanceled => "canceling statement due to user request",
+            EvalError::ExpressionFailed => "an expression in the WHERE clause could not be evaluated",
         }
     }
 
@@ -196,6 +200,7 @@ impl EvalError {
             EvalError::InvalidPattern => 10,
             EvalError::PatternTooComplex => 11,
             EvalError::UserCanceled => 12,
+            EvalError::ExpressionFailed => 13,
         }
     }
 
@@ -213,7 +218,25 @@ impl EvalError {
             10 => Some(EvalError::InvalidPattern),
             11 => Some(EvalError::PatternTooComplex),
             12 => Some(EvalError::UserCanceled),
+            13 => Some(EvalError::ExpressionFailed),
             _ => None,
+        }
+    }
+}
+
+impl EvalError {
+    /// The variant for an expression evaluator's message, so a division by
+    /// zero inside a `CASE` reports as one rather than as a generic failure.
+    /// The evaluator's errors are text, and only one code crosses the shared
+    /// atomic the scan workers report through.
+    pub fn from_expression(message: &str) -> Self {
+        let lower = message.to_ascii_lowercase();
+        if lower.contains("division by zero") {
+            EvalError::DivisionByZero
+        } else if lower.contains("out of range") || lower.contains("overflow") {
+            EvalError::ArithmeticOverflow
+        } else {
+            EvalError::ExpressionFailed
         }
     }
 }

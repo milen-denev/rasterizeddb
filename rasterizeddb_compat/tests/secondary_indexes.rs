@@ -106,7 +106,7 @@ fn word(r: &mut Rng) -> String {
 fn predicate(r: &mut Rng) -> String {
     let n = r.below(30) as i64 - 5;
     let atom = |r: &mut Rng| -> String {
-        match r.below(9) {
+        match r.below(19) {
             0 => format!("n = {}", r.below(30) as i64 - 5),
             1 => format!("n > {}", r.below(30) as i64 - 5),
             2 => format!("n <= {}", r.below(30) as i64 - 5),
@@ -118,6 +118,21 @@ fn predicate(r: &mut Rng) -> String {
                 let w = word(r);
                 format!("s LIKE '{}%'", w.chars().next().map(String::from).unwrap_or_default())
             }
+            // Shapes the index extractors must leave opaque: an operand the
+            // expression evaluator computes, on either side of a comparison
+            // with an indexed column, alone, negated and in a list.
+            9 => format!("n % 7 = {}", r.below(7)),
+            10 => format!("CASE WHEN n > {} THEN 'hi' ELSE s END = '{}'", n, word(r)),
+            11 => format!("s || 'x' = '{}x'", word(r)),
+            12 => format!("n = CASE WHEN s >= '{}' THEN {} ELSE n END", word(r), n),
+            13 => format!("NOT (n % 3 = {})", r.below(3)),
+            14 => format!("n % 5 IN ({}, {})", r.below(5), r.below(5)),
+            // Row values and the null-safe comparison, which expand into the
+            // comparisons an index does answer.
+            15 => format!("(n, s) = ({}, '{}')", n, word(r)),
+            16 => format!("(s, n) IN (('{}', {}), ('{}', {}))", word(r), n, word(r), n + 1),
+            17 => format!("(n, s) <> ({}, '{}')", n, word(r)),
+            18 => format!("n IS NOT DISTINCT FROM {}", n),
             _ => format!("id = {}", r.below(600)),
         }
     };

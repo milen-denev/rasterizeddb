@@ -3104,6 +3104,11 @@ impl<'a> RowBlocks for RowView<'a> {
     fn len(&self) -> usize {
         self.idx_map.len()
     }
+
+    #[inline]
+    fn row(&self) -> Option<&Row> {
+        Some(self.row)
+    }
 }
 
 /// Build / refresh the `write_order -> row column position` map for the columns currently

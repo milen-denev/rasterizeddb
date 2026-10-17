@@ -281,6 +281,185 @@ async fn case_branches_hold_any_expression_in_the_select_list() {
     assert!(wrong.is_empty(), "{} wrong answers:\n{}", wrong.len(), wrong.join("\n"));
 }
 
+/// The same expressions in a `WHERE`: a `CASE` compared with a value, a
+/// boolean `CASE` standing alone, `%` and `||` outside any `CASE`, under
+/// `NOT`, and inside a function call. Each was refused before ("unknown column
+/// or unsupported keyword 'CASE'", "unexpected character '|'", "unexpected
+/// character '%'"). The NULL rows pin three-valued logic: a `CASE` with no
+/// `ELSE` is NULL, and neither it nor its negation holds.
+#[tokio::test(flavor = "multi_thread")]
+async fn case_and_operators_in_where() {
+    let (_s, pool) = server().await;
+    digits(&pool, "digit").await;
+    nullable_numbers(&pool).await;
+
+    let cases: &[(&str, &str)] = &[
+        ("SELECT n FROM digit WHERE CASE WHEN n % 2 = 0 THEN 'e' || n ELSE 'o' END = 'e4' ORDER BY n", "4"),
+        ("SELECT n FROM digit WHERE CASE WHEN n % 3 = 0 THEN NULL ELSE 'r' || n % 8 END = 'r1' ORDER BY n", "1"),
+        (
+            "SELECT n FROM digit WHERE CASE WHEN n > 4 THEN B'1010' ELSE B'0101' END = B'1010' ORDER BY n",
+            "5,6,7,8,9",
+        ),
+        ("SELECT n FROM digit WHERE n % 3 = 1 ORDER BY n", "1,4,7"),
+        ("SELECT n FROM digit WHERE 'r' || n % 8 = 'r1' ORDER BY n", "1,9"),
+        (
+            "SELECT n FROM digit WHERE NOT (CASE WHEN n > 4 THEN 'big' ELSE 'small' END = 'big') ORDER BY n",
+            "0,1,2,3,4",
+        ),
+        ("SELECT n FROM digit WHERE (CASE WHEN n > 4 THEN 'x' END) = 'x' ORDER BY n", "5,6,7,8,9"),
+        (
+            "SELECT n FROM digit WHERE n > 2 AND CASE WHEN n % 2 = 0 THEN true ELSE false END ORDER BY n",
+            "4,6,8",
+        ),
+        (
+            "SELECT n FROM digit WHERE upper(CASE WHEN n % 2 = 0 THEN 'e' || n ELSE 'o' END) = 'E4' ORDER BY n",
+            "4",
+        ),
+        ("SELECT count(*) FROM digit WHERE CASE WHEN n < 5 THEN n ELSE 10 - n END >= 3", "5"),
+        (
+            "SELECT n FROM digit WHERE CASE WHEN n > 4 THEN CASE WHEN n > 7 THEN 'huge' ELSE 'big' END ELSE 'small' END = 'big' ORDER BY n",
+            "5,6,7",
+        ),
+        ("SELECT n FROM digit WHERE CASE WHEN n % 2 = 0 THEN n ELSE 0 END + 1 > 5 ORDER BY n", "6,8"),
+        (
+            "SELECT id FROM pn WHERE CASE WHEN n IS NULL THEN 'null' ELSE 'v' || n END <> 'null' ORDER BY id",
+            "1,2,4,5,6",
+        ),
+        ("SELECT id FROM pn WHERE CASE WHEN n > 5 THEN 'big' END = 'big' ORDER BY id", "4,5"),
+        ("SELECT id FROM pn WHERE NOT (CASE WHEN n > 5 THEN 'big' END = 'big') ORDER BY id", ""),
+        ("SELECT id FROM pn WHERE CASE WHEN n > 5 THEN 'big' END <> 'big' ORDER BY id", ""),
+        ("SELECT id FROM pn WHERE s || 'x' = 'ax' ORDER BY id", "1"),
+        ("SELECT id FROM pn WHERE n % 2 = 1 OR s = 'c' ORDER BY id", "1,3,4"),
+        ("SELECT id FROM pn WHERE n % 2 = -1 ORDER BY id", "6"),
+        ("SELECT id FROM pn WHERE NOT (n % 2 = 0) ORDER BY id", "1,4,6"),
+        ("SELECT id FROM pn WHERE s || '-' || id LIKE 'd%' ORDER BY id", "4"),
+        ("SELECT id FROM pn WHERE id > 1 AND (s || 'z' = 'cz' OR n % 5 = 2) ORDER BY id", "2,3,4,5"),
+        ("SELECT n FROM digit WHERE n % 2 = 0 AND n % 3 = 0 ORDER BY n", "0,6"),
+    ];
+    let wrong = wrong_answers(&pool, cases).await;
+    assert!(wrong.is_empty(), "{} wrong answers:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// The forms around a computed operand: `IS [NOT] NULL`, `[NOT] IN`, `[NOT]
+/// BETWEEN`, `[NOT] LIKE`, the truth tests, and a column on the other side.
+/// Each is spelled out into comparisons on the operand, and each keeps
+/// PostgreSQL's NULL answers: `IS NOT TRUE` holds for a NULL, `NOT IN` a list
+/// holding NULL holds for nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn forms_over_a_computed_where_operand() {
+    let (_s, pool) = server().await;
+    digits(&pool, "digit").await;
+    nullable_numbers(&pool).await;
+    run(&pool, "CREATE TABLE sn (s TEXT NOT NULL)").await.unwrap();
+    run(&pool, "INSERT INTO sn (s) VALUES ('a'),('b'),('c'),('d'),('e')").await.unwrap();
+
+    let cases: &[(&str, &str)] = &[
+        ("SELECT id FROM pn WHERE CASE WHEN n > 5 THEN 'big' END IS NULL ORDER BY id", "1,2,3,6"),
+        ("SELECT id FROM pn WHERE CASE WHEN n > 5 THEN 'big' END IS NOT NULL ORDER BY id", "4,5"),
+        ("SELECT id FROM pn WHERE n % 2 IS NULL ORDER BY id", "3"),
+        ("SELECT n FROM digit WHERE n % 3 IN (0, 2) ORDER BY n", "0,2,3,5,6,8,9"),
+        ("SELECT n FROM digit WHERE n % 3 NOT IN (0, 2) ORDER BY n", "1,4,7"),
+        ("SELECT id FROM pn WHERE n % 3 NOT IN (0, NULL) ORDER BY id", ""),
+        ("SELECT n FROM digit WHERE n * 3 % 10 BETWEEN 2 AND 6 ORDER BY n", "1,2,4,5,8"),
+        ("SELECT n FROM digit WHERE n * 3 % 10 NOT BETWEEN 2 AND 6 ORDER BY n", "0,3,6,7,9"),
+        ("SELECT id FROM pn WHERE s || 'x' NOT LIKE 'a%' ORDER BY id", "3,4,5,6"),
+        ("SELECT id FROM pn WHERE s || 'x' ILIKE 'D%' ORDER BY id", "4"),
+        ("SELECT id FROM pn WHERE CASE WHEN n > 5 THEN true END IS NOT TRUE ORDER BY id", "1,2,3,6"),
+        ("SELECT id FROM pn WHERE CASE WHEN n > 5 THEN true END IS TRUE ORDER BY id", "4,5"),
+        (
+            "SELECT id FROM pn WHERE CASE WHEN n > 5 THEN true WHEN n < 2 THEN false END IS FALSE ORDER BY id",
+            "1,6",
+        ),
+        (
+            "SELECT id FROM pn WHERE CASE WHEN n > 5 THEN true WHEN n < 2 THEN false END IS NOT FALSE ORDER BY id",
+            "2,3,4,5",
+        ),
+        (
+            "SELECT id FROM pn WHERE CASE WHEN n > 5 THEN true WHEN n < 2 THEN false END IS UNKNOWN ORDER BY id",
+            "2,3",
+        ),
+        ("SELECT id FROM pn WHERE NOT (CASE WHEN n > 5 THEN true END) ORDER BY id", ""),
+        (
+            "SELECT id FROM pn WHERE NOT CASE WHEN n > 5 THEN true WHEN n < 2 THEN false END ORDER BY id",
+            "1,6",
+        ),
+        ("SELECT id FROM pn WHERE (n % 2 = 0) IS NOT TRUE ORDER BY id", "1,3,4,6"),
+        ("SELECT n FROM digit WHERE n = CASE WHEN n > 5 THEN n END ORDER BY n", "6,7,8,9"),
+        ("SELECT n FROM digit WHERE CASE WHEN n > 5 THEN 1 ELSE 0 END = one ORDER BY n", "6,7,8,9"),
+        (
+            "SELECT n FROM digit WHERE (n = CASE WHEN n > 7 THEN n END OR n = CASE WHEN n < 1 THEN n END \
+             OR n = CASE WHEN n = 4 THEN n END OR n = CASE WHEN n = 5 THEN 5 END OR n = 2 + 0 * one) ORDER BY n",
+            "0,2,4,5,8,9",
+        ),
+        // A run of `col = <expression>` making up one group over a NOT NULL
+        // text column: the shape the planner folds into a hashed set when the
+        // right-hand sides are constants. Folded here, it would test the
+        // placeholder each computed side stands on.
+        (
+            "SELECT s FROM sn WHERE (s = CASE WHEN s > 'c' THEN s END OR s = CASE WHEN s = 'a' THEN 'a' END \
+             OR s = CASE WHEN s = 'b' THEN s END OR s = CASE WHEN s < 'a' THEN s END) ORDER BY s",
+            "a,b,d,e",
+        ),
+    ];
+    let wrong = wrong_answers(&pool, cases).await;
+    assert!(wrong.is_empty(), "{} wrong answers:\n{}", wrong.len(), wrong.join("\n"));
+
+    // Not a boolean: PostgreSQL's "argument of WHERE must be type boolean".
+    let err = joined(&pool, "SELECT n FROM digit WHERE n % 2").await.expect_err("integer WHERE");
+    assert!(err.contains("must be type boolean"), "{err}");
+}
+
+/// A parameter inside a computed operand, bound over the extended protocol
+/// with different values in turn. A prepared statement's parse is reused for
+/// new values by finding each value in the rewritten clause, so this pins that
+/// a value inside a lifted operand is never found there and swapped.
+#[tokio::test(flavor = "multi_thread")]
+async fn parameters_inside_a_computed_where_operand() {
+    let (_s, pool) = server().await;
+    digits(&pool, "digit").await;
+    for (modulus, label, want) in [
+        (2, "e", vec![0, 2, 4, 6, 8]),
+        (3, "e", vec![0, 3, 6, 9]),
+        (3, "o", vec![1, 2, 4, 5, 7, 8]),
+        (5, "e", vec![0, 5]),
+        (2, "o", vec![1, 3, 5, 7, 9]),
+        (4, "e", vec![0, 4, 8]),
+    ] {
+        let got: Vec<i32> = sqlx::query(
+            "SELECT n FROM digit WHERE CASE WHEN n % $1 = 0 THEN 'e' ELSE 'o' END = $2 ORDER BY n",
+        )
+        .bind(modulus)
+        .bind(label)
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("% {modulus} = {label}: {e}"))
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+        assert_eq!(got, want, "n % {modulus} labelled {label}");
+    }
+}
+
+/// `UPDATE` and `DELETE` read their `WHERE` through the same machinery, so
+/// they take the same shapes and touch exactly the rows a `SELECT` returns.
+#[tokio::test(flavor = "multi_thread")]
+async fn case_and_operators_in_update_and_delete_where() {
+    let (_s, pool) = server().await;
+    digits(&pool, "dg").await;
+    assert_eq!(
+        run(&pool, "UPDATE dg SET one = 2 WHERE CASE WHEN n % 2 = 0 THEN 'e' ELSE 'o' END = 'e'").await,
+        Ok(5)
+    );
+    assert_eq!(
+        joined(&pool, "SELECT n FROM dg WHERE one = 2 ORDER BY n").await.unwrap(),
+        "0,2,4,6,8"
+    );
+    assert_eq!(run(&pool, "DELETE FROM dg WHERE n % 3 = 0").await, Ok(4));
+    assert_eq!(joined(&pool, "SELECT n FROM dg ORDER BY n").await.unwrap(), "1,2,4,5,7,8");
+    assert_eq!(run(&pool, "DELETE FROM dg WHERE 'x' || n = 'x5' RETURNING n").await, Ok(1));
+    assert_eq!(joined(&pool, "SELECT n FROM dg ORDER BY n").await.unwrap(), "1,2,4,7,8");
+}
+
 // -------------------------------------------- #13 IS DISTINCT FROM, row values
 
 async fn flags(pool: &sqlx::PgPool) {
@@ -354,6 +533,11 @@ async fn row_value_equality_inequality_and_in() {
         ),
         ("SELECT id FROM fl WHERE NOT ((country, grade) = ('DE', 'A')) ORDER BY id", "2,3"),
         ("SELECT id FROM fl WHERE (country, grade) IN (('DE', 'A')) ORDER BY id", "1"),
+        // Elements the expression evaluator computes: the row is split into
+        // its comparisons before any of them is lifted.
+        ("SELECT id FROM fl WHERE (country, k % 2) IN (('DE', 1), ('FR', 0)) ORDER BY id", "1"),
+        ("SELECT id FROM fl WHERE (country, k % 2) = ('DE', -1) ORDER BY id", "2,5"),
+        ("SELECT id FROM fl WHERE (grade || '!', id) <> ('A!', 1) ORDER BY id", "2,3,4,5"),
     ];
     let wrong = wrong_answers(&pool, cases).await;
     assert!(wrong.is_empty(), "{} wrong answers:\n{}", wrong.len(), wrong.join("\n"));

@@ -170,7 +170,7 @@ fn parse_delete_row(
         // row satisfying a comparison — which for a `DELETE` decides whether a
         // row is destroyed.
         let where_clause =
-            match crate::core::tokenizer::predicate_rewrite::rewrite_where(&where_clause, schema) {
+            match crate::core::tokenizer::predicate_rewrite::rewrite_scan_where(&where_clause, schema) {
                 Ok(clause) => clause,
                 Err(reason) => {
                     rejection.replace(reason);

@@ -309,6 +309,7 @@ impl<'a, 'b> QueryParser<'a, 'b> {
                     | ComparisonOperand::DirectWithIndex(..)
                     | ComparisonOperand::Intermediate(_)
                     | ComparisonOperand::IntermediateCast(..)
+                    | ComparisonOperand::Evaluated(..)
             )
         };
         if !convertible(&left) || !convertible(&right) {
@@ -344,6 +345,10 @@ impl<'a, 'b> QueryParser<'a, 'b> {
                 ComparisonOperand::IntermediateCast(idx, original, _) => Some(
                     ComparisonOperand::IntermediateCast(*idx, original.clone(), to.clone()),
                 ),
+                // Converted as it is evaluated, per row.
+                ComparisonOperand::Evaluated(operand, _) => {
+                    Some(ComparisonOperand::Evaluated(operand.clone(), to.clone()))
+                }
                 _ => None,
             }
         };
@@ -663,7 +668,12 @@ impl<'a, 'b> QueryParser<'a, 'b> {
         // tests instead, so only a path comes here.
         if op_str == "ISNULL" || op_str == "NOTNULL" {
             let want_null = op_str == "ISNULL";
-            if !matches!(left_op, ComparisonOperand::PathWithIndex(..)) {
+            // An evaluated operand answers it the same way a path does: by
+            // whether a value came back at all.
+            if !matches!(
+                left_op,
+                ComparisonOperand::PathWithIndex(..) | ComparisonOperand::Evaluated(..)
+            ) {
                 return Err(format!(
                     "IS {}NULL is only supported over a column or a JSON path here",
                     if want_null { "" } else { "NOT " }
@@ -1145,6 +1155,24 @@ impl<'a, 'b> QueryParser<'a, 'b> {
                 let mb = json_literal(lit)?;
                 Ok((left_op, ComparisonOperand::Direct(mb), DbType::JSONB, DbType::JSONB))
             }
+            // A literal meeting an evaluated expression takes the expression's
+            // type, as it would a column's: `CASE … END = 1` over a boolean,
+            // `… = '1010'` over a bit string. Except a fraction against an
+            // integer, which `promote_numeric` compares as floats instead.
+            (ComparisonOperand::Direct(lit), ComparisonOperand::Evaluated(..))
+                if left_type != right_type && !keeps_fraction(lit, &left_type, &right_type) =>
+            {
+                let mb = coerce(lit, &left_type, &right_type)?;
+                let t = right_type.clone();
+                Ok((ComparisonOperand::Direct(mb), right_op, t.clone(), t))
+            }
+            (ComparisonOperand::Evaluated(..), ComparisonOperand::Direct(lit))
+                if left_type != right_type && !keeps_fraction(lit, &right_type, &left_type) =>
+            {
+                let mb = coerce(lit, &right_type, &left_type)?;
+                let t = left_type.clone();
+                Ok((left_op, ComparisonOperand::Direct(mb), t.clone(), t))
+            }
             _ => Ok((left_op, right_op, left_type, right_type)),
         }
     }
@@ -1309,6 +1337,12 @@ impl<'a, 'b> QueryParser<'a, 'b> {
                 let db_type = numeric_value_to_db_type(&n);
                 let mb = numeric_to_mb(&n);
                 Ok((ComparisonOperand::Direct(mb), db_type))
+            }
+            // Computed per row by the expression evaluator, in its own type
+            // unless the comparison asks for another.
+            Token::Evaluated(operand) => {
+                let db_type = operand.db_type.clone();
+                Ok((ComparisonOperand::Evaluated(operand, db_type.clone()), db_type))
             }
             Token::StringLit(s) => {
                 // `'…'::type`, and the typed-literal form `TYPE '…'` the

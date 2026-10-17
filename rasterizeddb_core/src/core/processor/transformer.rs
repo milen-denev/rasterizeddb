@@ -44,6 +44,13 @@ pub struct ColumnTransformer {
     /// A `::` cast applied to the right operand — see [`Self::column_1_cast`].
     pub column_2_cast: Option<(DbType, DbType)>,
 
+    /// Set when the left operand is an expression the expression evaluator
+    /// computes per row — a `CASE`, `||`, `%` — and the type its value is
+    /// compared as. See [`EvaluatedOperand`].
+    pub column_1_eval: Option<(std::sync::Arc<EvaluatedOperand>, DbType)>,
+    /// The same for the right operand.
+    pub column_2_eval: Option<(std::sync::Arc<EvaluatedOperand>, DbType)>,
+
     /// The declared scale of a `NUMERIC(p, s)` column read as the left
     /// operand, when the operation needs it at the engine scale instead.
     ///
@@ -114,6 +121,8 @@ impl Clone for ColumnTransformer {
             column_1_cast: self.column_1_cast.clone(),
             column_2_cast: self.column_2_cast.clone(),
             column_2_path: self.column_2_path.clone(),
+            column_1_eval: self.column_1_eval.clone(),
+            column_2_eval: self.column_2_eval.clone(),
             column_1_scale: self.column_1_scale,
             column_2_scale: self.column_2_scale,
             group_opens: self.group_opens,
@@ -213,6 +222,13 @@ pub enum MathOperation {
 pub trait RowBlocks {
     fn mb_at(&self, idx: usize) -> &MemoryBlock;
     fn len(&self) -> usize;
+    /// The row these blocks were read from, when there is one.
+    ///
+    /// An [`EvaluatedOperand`] hands it to the expression evaluator as it
+    /// stands. A view with no row behind it has one built from its blocks.
+    fn row(&self) -> Option<&crate::core::row::row::Row> {
+        None
+    }
 }
 
 impl RowBlocks for [MemoryBlock] {
@@ -269,6 +285,8 @@ impl ColumnTransformer {
             column_1_cast: None,
             column_2_cast: None,
             column_2_path: None,
+            column_1_eval: None,
+            column_2_eval: None,
             column_1_index: None,
             column_2_index: None,
             column_1_scale: None,
@@ -329,41 +347,70 @@ impl ColumnTransformer {
         // A path that reaches nothing is SQL NULL, noted here and handed on as
         // empty bytes, which is what the arithmetic below always received.
         let mut null_operand = false;
+        // An evaluated operand computes its value from the whole row, and a
+        // NULL it yields is the same NULL a path that reaches nothing is: the
+        // comparison is not true, negated or not.
         let left_owned;
-        let input1 = match (&self.column_1_path, &self.column_1_cast) {
-            (Some(path), _) => match path.extract(left_mb.into_slice()) {
-                Some(found) => {
-                    left_owned = found;
+        let left_eval;
+        let right_eval;
+        let input1 = match &self.column_1_eval {
+            Some((operand, as_type)) => match operand.evaluate(row, as_type)? {
+                Some(value) => {
+                    left_eval = value;
+                    left_eval.into_slice()
+                }
+                None => {
+                    null_operand = true;
+                    &[][..]
+                }
+            },
+            None => match (&self.column_1_path, &self.column_1_cast) {
+                (Some(path), _) => match path.extract(left_mb.into_slice()) {
+                    Some(found) => {
+                        left_owned = found;
+                        left_owned.into_slice()
+                    }
+                    None => {
+                        null_operand = true;
+                        &[][..]
+                    }
+                },
+                (None, Some((from, to))) => {
+                    left_owned = cast_block(left_mb, from, to);
                     left_owned.into_slice()
                 }
-                None => {
-                    null_operand = true;
-                    &[][..]
-                }
+                (None, None) => left_mb.into_slice(),
             },
-            (None, Some((from, to))) => {
-                left_owned = cast_block(left_mb, from, to);
-                left_owned.into_slice()
-            }
-            (None, None) => left_mb.into_slice(),
         };
         let right_owned;
-        let input2 = match (&self.column_2_path, &self.column_2_cast) {
-            (Some(path), _) => match path.extract(right_mb.into_slice()) {
-                Some(found) => {
-                    right_owned = found;
-                    right_owned.into_slice()
+        let input2 = match &self.column_2_eval {
+            Some((operand, as_type)) => match operand.evaluate(row, as_type)? {
+                Some(value) => {
+                    right_eval = value;
+                    right_eval.into_slice()
                 }
                 None => {
                     null_operand = true;
                     &[][..]
                 }
             },
-            (None, Some((from, to))) => {
-                right_owned = cast_block(right_mb, from, to);
-                right_owned.into_slice()
-            }
-            (None, None) => right_mb.into_slice(),
+            None => match (&self.column_2_path, &self.column_2_cast) {
+                (Some(path), _) => match path.extract(right_mb.into_slice()) {
+                    Some(found) => {
+                        right_owned = found;
+                        right_owned.into_slice()
+                    }
+                    None => {
+                        null_operand = true;
+                        &[][..]
+                    }
+                },
+                (None, Some((from, to))) => {
+                    right_owned = cast_block(right_mb, from, to);
+                    right_owned.into_slice()
+                }
+                (None, None) => right_mb.into_slice(),
+            },
         };
 
         // A `NUMERIC(p, s)` operand lifted to the engine scale, where the
@@ -605,6 +652,143 @@ pub enum ComparisonOperand {
     /// scale. Without it the pair was refused: "a I32 operand cannot be
     /// combined with a NUMERIC one here".
     IntermediateCast(usize, DbType, DbType),
+    /// An expression the evaluator computes from the row, and the type its
+    /// value is compared as. See [`EvaluatedOperand`].
+    Evaluated(std::sync::Arc<EvaluatedOperand>, DbType),
+}
+
+/// One side of a comparison that this module cannot compute itself — a
+/// `CASE`, a `||` chain, a `%` — handed to the expression evaluator once per
+/// row, so a `WHERE` reads it exactly as a select list does.
+///
+/// It is opaque to everything that plans from tokens: the filter and index
+/// extractors see neither a column nor a literal, and leave the comparison to
+/// the evaluator. Its value is compared by the ordinary comparison code, so a
+/// NULL it yields makes the comparison not true under `NOT` as well, which is
+/// what lets `expand_not` push a negation onto it.
+#[derive(Debug)]
+pub struct EvaluatedOperand {
+    /// The expression as written, which identifies it.
+    pub text: String,
+    pub expr: crate::core::rql::expr::Expr,
+    /// The type the expression yields.
+    pub db_type: DbType,
+    /// The table's schema, which the evaluator resolves NULL companions in.
+    pub schema: Vec<crate::core::row::schema::SchemaField>,
+    /// Every column the expression reads, NULL companions included, as
+    /// `(write_order, type)`: what a row built from bare blocks must carry.
+    pub reads: Vec<(u64, DbType)>,
+}
+
+impl PartialEq for EvaluatedOperand {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text
+    }
+}
+
+impl EvaluatedOperand {
+    /// Reads `text` as an expression over `schema`.
+    ///
+    /// Only the types whose comparison here is what PostgreSQL's is are
+    /// accepted. A `NUMERIC` is refused in particular: the evaluator carries a
+    /// column's value at the column's own scale and arithmetic at the engine's,
+    /// and a literal compared with either at the wrong one answers by a power
+    /// of ten — wrongly, and without an error.
+    pub fn new(
+        text: &str,
+        schema: &[crate::core::row::schema::SchemaField],
+    ) -> Result<Self, String> {
+        let expr = crate::core::rql::expr::parse(text, schema)?;
+        let db_type = crate::core::rql::expr::static_type(&expr);
+        let comparable = matches!(
+            db_type,
+            DbType::STRING
+                | DbType::BOOL
+                | DbType::I8
+                | DbType::I16
+                | DbType::I32
+                | DbType::I64
+                | DbType::I128
+                | DbType::U8
+                | DbType::U16
+                | DbType::U32
+                | DbType::U64
+                | DbType::U128
+                | DbType::F32
+                | DbType::F64
+                | DbType::BIT
+                | DbType::VARBIT
+        );
+        if !comparable {
+            return Err(format!(
+                "'{}' yields a {} value, which a WHERE clause cannot compare yet",
+                text.trim(),
+                db_type
+            ));
+        }
+        let mut reads: Vec<(u64, DbType)> = Vec::new();
+        for field in crate::core::rql::expr::columns_of(&expr) {
+            let companion = crate::core::rql::nullable::flag_field(&field.name, schema);
+            for f in std::iter::once(&field).chain(companion) {
+                if !reads.iter().any(|(at, _)| *at == f.write_order) {
+                    reads.push((f.write_order, f.db_type.clone()));
+                }
+            }
+        }
+        Ok(Self {
+            text: text.to_string(),
+            expr,
+            db_type,
+            schema: schema.to_vec(),
+            reads,
+        })
+    }
+
+    /// The value in `row`, as bytes of `as_type`, or `None` for SQL NULL.
+    pub fn evaluate<R: RowBlocks + ?Sized>(
+        &self,
+        row: &R,
+        as_type: &DbType,
+    ) -> Result<Option<MemoryBlock>, EvalError> {
+        let value = match row.row() {
+            Some(row) => crate::core::rql::expr::eval(&self.expr, row, &self.schema),
+            None => {
+                let columns = self
+                    .reads
+                    .iter()
+                    .filter(|(at, _)| (*at as usize) < row.len())
+                    .map(|(at, db_type)| crate::core::row::row::Column {
+                        schema_id: *at as u32,
+                        data: row.mb_at(*at as usize).clone(),
+                        column_type: db_type.clone(),
+                    })
+                    .collect();
+                let built = crate::core::row::row::Row {
+                    position: 0,
+                    length: 0,
+                    columns,
+                };
+                crate::core::rql::expr::eval(&self.expr, &built, &self.schema)
+            }
+        }
+        .map_err(|e| EvalError::from_expression(&e))?;
+        let (bytes, db_type) = match value {
+            crate::core::rql::expr::Value::Null => return Ok(None),
+            crate::core::rql::expr::Value::Data { bytes, db_type } => (bytes, db_type),
+        };
+        if db_type == *as_type {
+            return Ok(Some(pooled_copy(&bytes)));
+        }
+        // Compared at another width than the expression yields — an `int4`
+        // result against a `bigint` column — so it is converted, and a value
+        // that does not fit fails the statement rather than comparing wrapped.
+        let value = crate::core::rql::expr::Value::Data { bytes, db_type };
+        match crate::core::rql::expr::cast(value, as_type) {
+            Ok(crate::core::rql::expr::Value::Data { bytes, .. }) => Ok(Some(pooled_copy(&bytes))),
+            Ok(crate::core::rql::expr::Value::Null) => Ok(None),
+            Err(e) => Err(EvalError::from_expression(&e)),
+        }
+    }
 }
 
 /// A path taken from a document column, resolved per row.
@@ -744,6 +928,10 @@ impl ComparisonOperand {
                 transformer.result_index_1 = Some(*idx);
                 transformer.column_1_cast = Some((from.clone(), to.clone()));
             }
+            ComparisonOperand::Evaluated(operand, as_type) => {
+                transformer.column_1 = MemoryBlock::default();
+                transformer.column_1_eval = Some((operand.clone(), as_type.clone()));
+            }
         }
     }
 
@@ -769,6 +957,10 @@ impl ComparisonOperand {
             ComparisonOperand::IntermediateCast(idx, from, to) => {
                 transformer.result_index_2 = Some(*idx);
                 transformer.column_2_cast = Some((from.clone(), to.clone()));
+            }
+            ComparisonOperand::Evaluated(operand, as_type) => {
+                transformer.setup_column_2(MemoryBlock::default());
+                transformer.column_2_eval = Some((operand.clone(), as_type.clone()));
             }
         }
     }
@@ -1017,6 +1209,10 @@ fn in_set_member(t: &ColumnTransformer) -> Option<(bool, usize, &DbType)> {
         || t.column_2_cast.is_some()
         || t.column_2_scale.is_some()
         || t.column_2.is_none()
+        // An evaluated operand has a placeholder for its bytes, so a run of
+        // `col = <expression>` would be folded into a set of placeholders.
+        || t.column_1_eval.is_some()
+        || t.column_2_eval.is_some()
     {
         return None;
     }
@@ -1121,6 +1317,9 @@ impl ComparisonOperand {
             ComparisonOperand::CastWithIndex(mb, _, _, _) => mb,
             ComparisonOperand::Intermediate(_) | ComparisonOperand::IntermediateCast(..) => {
                 panic!("Intermediate has no direct memory block")
+            }
+            ComparisonOperand::Evaluated(..) => {
+                panic!("an evaluated operand has no direct memory block")
             }
         }
     }
