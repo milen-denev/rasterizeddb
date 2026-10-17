@@ -691,3 +691,51 @@ async fn literals_past_nine_places_round_once() {
     .await;
     verdict(wrong);
 }
+
+/// `date_trunc` and `EXTRACT(EPOCH …)` take a date as its midnight. Both
+/// returned NULL for anything that was not eight bytes, which since `::date`
+/// became a real date included every `x::date` and `CURRENT_DATE - n`.
+#[tokio::test(flavor = "multi_thread")]
+async fn date_trunc_and_epoch_take_a_date() {
+    let mut db = db(&[
+        DIGITS[0],
+        DIGITS[1],
+        "CREATE TABLE dt (id INT, d DATE, ts TIMESTAMP)",
+        "INSERT INTO dt (id, d, ts) VALUES (1, '2024-01-15', '2024-01-01 10:30:00'), \
+         (2, '2024-02-28', '2024-02-29 00:00:00'), (3, '2024-02-03', '2024-02-10 05:00:00')",
+    ])
+    .await;
+    let mut wrong = Vec::new();
+    expect_rows(
+        &mut db,
+        &mut wrong,
+        &[
+            (
+                "SELECT date_trunc('month', '2024-01-15'::date), date_trunc('day', '2024-01-15'::date), \
+                 EXTRACT(EPOCH FROM '2024-01-01'::date) FROM dg WHERE n = 1",
+                &["2024-01-01 00:00:00+00|2024-01-15 00:00:00+00|1704067200"],
+            ),
+            (
+                "SELECT date_trunc('week', '2024-01-17'::date - 7) FROM dg WHERE n = 1",
+                &["2024-01-08 00:00:00+00"],
+            ),
+            (
+                "SELECT id, date_trunc('month', d), date_trunc('month', ts::date), EXTRACT(EPOCH FROM d) \
+                 FROM dt ORDER BY id",
+                &[
+                    "1|2024-01-01 00:00:00+00|2024-01-01 00:00:00+00|1705276800",
+                    "2|2024-02-01 00:00:00+00|2024-02-01 00:00:00+00|1709078400",
+                    "3|2024-02-01 00:00:00+00|2024-02-01 00:00:00+00|1706918400",
+                ],
+            ),
+            // Every row went to one NULL group.
+            (
+                "SELECT date_trunc('month', ts::date) AS m, count(*) FROM dt \
+                 GROUP BY date_trunc('month', ts::date) ORDER BY m",
+                &["2024-01-01 00:00:00+00|1", "2024-02-01 00:00:00+00|2"],
+            ),
+        ],
+    )
+    .await;
+    verdict(wrong);
+}

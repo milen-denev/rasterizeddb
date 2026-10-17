@@ -2028,6 +2028,12 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
                         + span.days as f64 * 86_400.0
                         + span.months as f64 * 30.0 * 86_400.0
                 }
+                // A date is its midnight, as PostgreSQL casts it. Its four
+                // bytes failed the width check below and came back NULL.
+                DbType::DATE => match instant_of(db_type, bytes) {
+                    Some(us) => us as f64 / 1_000_000.0,
+                    None => return Ok(Value::Null),
+                },
                 _ => {
                     if bytes.len() != 8 {
                         return Ok(Value::Null);
@@ -2044,15 +2050,20 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
         }
         TextFunc::DateTrunc => {
             let unit = as_text(&args[0]).trim().to_ascii_lowercase();
-            let Value::Data { bytes, .. } = &args[1] else {
+            let Value::Data { bytes, db_type } = &args[1] else {
                 return Ok(Value::Null);
             };
-            if bytes.len() != 8 {
+            // A date is truncated as its midnight, the timestamp PostgreSQL
+            // casts it to. Only eight bytes were read, so every date —
+            // `x::date`, `CURRENT_DATE - 7` — came back NULL, and a GROUP BY
+            // over it put every row in one NULL bucket.
+            let us = match db_type {
+                DbType::DATE => instant_of(db_type, bytes),
+                _ => <[u8; 8]>::try_from(bytes.as_slice()).ok().map(i64::from_le_bytes),
+            };
+            let Some(us) = us else {
                 return Ok(Value::Null);
-            }
-            let mut raw = [0u8; 8];
-            raw.copy_from_slice(bytes);
-            let us = i64::from_le_bytes(raw);
+            };
             let Some(truncated) = crate::core::value_codec::truncate_timestamp_us(us, &unit) else {
                 return Err(format!(
                     "date_trunc does not know the unit '{}'; it takes microseconds, \
