@@ -378,7 +378,7 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
 
             if let Some(expression) = default_expression {
                 if let Err(reason) =
-                    crate::core::rql::column_default::evaluate(&expression, &data_type)
+                    crate::core::rql::column_default::validate(&expression, &data_type)
                 {
                     rejection.replace(reason);
                     return None;

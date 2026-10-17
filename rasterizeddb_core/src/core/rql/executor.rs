@@ -1280,7 +1280,7 @@ fn default_literal_for(database: &Arc<Database>, table: &str, column: &str) -> S
         .find(|f| f.name.eq_ignore_ascii_case(column))
         .map(|f| f.db_type.clone())
         .unwrap_or(crate::core::db_type::DbType::STRING);
-    crate::core::rql::column_default::evaluate(expression, &db_type)
+    crate::core::rql::column_default::evaluate(expression, &db_type, database.id)
         .unwrap_or_else(|_| "NULL".to_string())
 }
 
@@ -2377,7 +2377,8 @@ async fn rewrite_table_with_columns(
                         &table.schema.defaults,
                     )
                     .and_then(|e| {
-                        crate::core::rql::column_default::evaluate(e, &field.db_type).ok()
+                        crate::core::rql::column_default::evaluate(e, &field.db_type, database.id)
+                            .ok()
                     })
                     .filter(|literal| literal != "NULL")
                     .and_then(|literal| {
@@ -5418,7 +5419,9 @@ async fn supply_generated_values(
             continue;
         }
         let literal = crate::core::rql::column_default::expression_for(&field.name, &defaults)
-            .and_then(|e| crate::core::rql::column_default::evaluate(e, &field.db_type).ok())
+            .and_then(|e| {
+                crate::core::rql::column_default::evaluate(e, &field.db_type, database.id).ok()
+            })
             .unwrap_or_else(|| "NULL".to_string());
         values.push((field.name.clone(), literal));
     }
@@ -6905,7 +6908,7 @@ async fn seed_sequences(database: &Arc<Database>, table_name: &str) {
         let Some(name) = crate::core::rql::sequence::parse_nextval(expression) else {
             continue;
         };
-        if !crate::core::rql::sequence::is_seeded(&name) {
+        if !crate::core::rql::sequence::is_seeded(database.id, &name) {
             wanted.push((name, field.clone()));
         }
     }
@@ -6940,7 +6943,7 @@ async fn seed_sequences(database: &Arc<Database>, table_name: &str) {
         let last =
             crate::core::rql::sequence::max_of_column(&rows, field.write_order, &field.db_type)
                 .unwrap_or(0);
-        crate::core::rql::sequence::seed(&name, last);
+        crate::core::rql::sequence::seed(database.id, &name, last);
     }
 }
 
@@ -7164,6 +7167,25 @@ async fn retire_tombstoned_name<S: crate::core::storage_providers::traits::Stora
     }
 }
 
+/// Every sequence a `nextval` default of a table in `database` other than
+/// `except` names, as [`crate::core::rql::sequence::named_by`] spells them.
+///
+/// What a table may not take with it when it is dropped or renamed: something
+/// else still counts on these.
+fn sequences_named_elsewhere(
+    database: &Arc<Database>,
+    except: &str,
+) -> std::collections::HashSet<String> {
+    database
+        .tables
+        .iter()
+        .filter(|table| table.key().as_str() != except)
+        .flat_map(|table| {
+            crate::core::rql::sequence::named_by(&table.value().schema.defaults).collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 async fn execute_alter_table_action(
     plan: crate::core::rql::lexer_alter::AlterTable,
     database: &Arc<Database>,
@@ -7229,7 +7251,7 @@ async fn execute_alter_table_action(
             // A default is validated before anything is written, so a bad
             // expression fails the statement rather than half of it.
             if let Some(expression) = default.as_deref() {
-                if let Err(e) = crate::core::rql::column_default::evaluate(expression, &db_type) {
+                if let Err(e) = crate::core::rql::column_default::validate(expression, &db_type) {
                     return ddl_error(&e);
                 }
                 // A JSON column stores a *document*: its fields become columns
@@ -7507,12 +7529,46 @@ async fn execute_alter_table_action(
             // Now it is carried out: the name is part of the on-disk layout, so
             // this moves files and re-keys the catalogue rather than editing a
             // record, and `Database::rename_table` owns that ordering.
-            return match database.rename_table(&plan.table_name, &to).await {
-                Ok(()) => ddl_ok(0),
-                Err(e) => ddl_error(&format!(
+            //
+            // Its `SERIAL` sequences follow it, as `<new>_<column>_seq`. Left
+            // reading the old name, a new table created under the old name
+            // generated the same one and the two tables shared a counter.
+            let followed = crate::core::rql::sequence::follow_rename(
+                &plan.table_name,
+                &to,
+                &schema.defaults,
+                &sequences_named_elsewhere(database, &plan.table_name),
+            );
+            if let Err(e) = database.rename_table(&plan.table_name, &to).await {
+                return ddl_error(&format!(
                     "could not rename {} to {}: {}",
                     plan.table_name, to, e
-                )),
+                ));
+            }
+            if followed.is_empty() {
+                return ddl_ok(0);
+            }
+            let renamed_io = {
+                let entry = database.tables.get(&to);
+                let Some(table) = entry.as_ref() else {
+                    return ddl_error(&format!("relation '{}' vanished during rename", to));
+                };
+                table.io_schema.clone()
+            };
+            for (entry, from, to) in &followed {
+                if let Err(e) =
+                    crate::core::rql::column_default::append(renamed_io.clone(), entry).await
+                {
+                    return ddl_error(&format!(
+                        "renamed, but sequence {} could not follow as {}: {}",
+                        from, to, e
+                    ));
+                }
+                crate::core::rql::sequence::rename(database.id, from, to);
+            }
+            return match database.reload_table(&to).await {
+                Ok(()) => ddl_ok(0),
+                Err(e) => ddl_error(&e.to_string()),
             };
         }
         AlterAction::ConstraintClause { drop, description } => {
@@ -9420,6 +9476,7 @@ pub(crate) async fn insert_loaded_row(
         &schema.fields,
         &schema.defaults,
         &schema.type_modifiers,
+        database.id,
     )?;
     check_constraints_hold(table_name, schema, &insert_row.columns_writing_data).ok()?;
     table.insert_row_in_txn(insert_row, tx).await.ok()?;
@@ -9860,14 +9917,34 @@ pub(crate) async fn execute_with_need(
         // Each of these is boxed for the same reason: keeping a branch's
         // locals out of the enclosing future.
         QueryPurpose::DropTable(sql) => {
+            // Which sequences the table owns, read before the drop takes the
+            // schema that says so.
+            let owned = crate::core::rql::lexer_alter::parse_drop_table(sql)
+                .ok()
+                .and_then(|(name, _)| {
+                    // Copied out so no map guard is held across the scan of
+                    // the other tables below.
+                    let (fields, defaults) = {
+                        let table = database.tables.get(&name)?;
+                        let schema = &table.value().schema;
+                        (schema.fields.clone(), schema.defaults.clone())
+                    };
+                    Some(crate::core::rql::sequence::owned_by(
+                        &name,
+                        &fields,
+                        &defaults,
+                        &sequences_named_elsewhere(&database, &name),
+                    ))
+                })
+                .unwrap_or_default();
             let response = Box::pin(execute_drop_table(sql, &database)).await;
             if response.first() != Some(&3) {
                 // The sequences go with the table. Without this a table dropped
                 // and recreated under the same name kept counting from where
                 // the old one stopped, so its first row got a key well above 1.
-                if let Ok((name, _)) = crate::core::rql::lexer_alter::parse_drop_table(sql) {
-                    crate::core::rql::sequence::forget_table(&name);
-                }
+                // This database's only: another database's table of the same
+                // name is a different table.
+                crate::core::rql::sequence::forget(database.id, &owned);
                 note_write(&database, tx, depth, sql, None);
             }
             response
@@ -10081,6 +10158,7 @@ pub(crate) async fn execute_with_need(
                 &schema.fields,
                 &schema.defaults,
                 &schema.type_modifiers,
+                database.id,
             ) {
                 // Every `CHECK` the table declares, evaluated against the row
                 // as it will be stored. Before the write, so a violation

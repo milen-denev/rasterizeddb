@@ -893,7 +893,9 @@ pub fn insert_row_from_query_purpose(
     qp: &QueryPurpose,
     schema: &[SchemaField],
 ) -> Option<RowWrite> {
-    insert_row_with_defaults(qp, schema, &[], &[])
+    // No defaults, so no `nextval` can be reached and no database's sequence
+    // is consulted: the id is never read.
+    insert_row_with_defaults(qp, schema, &[], &[], 0)
 }
 
 /// As `insert_row_from_query_purpose`, but filling omitted columns from their
@@ -912,11 +914,15 @@ fn declared_scale(
         .map(|m| m.scale as u32)
 }
 
+/// `database` is the id of the database the row is written into
+/// ([`crate::core::database::Database::id`]): a `SERIAL` default draws from that
+/// database's sequence, and from no other's.
 pub fn insert_row_with_defaults(
     qp: &QueryPurpose,
     schema: &[SchemaField],
     defaults: &[crate::core::rql::column_default::ColumnDefault],
     modifiers: &[crate::core::rql::type_modifier::TypeModifier],
+    database: u64,
 ) -> Option<RowWrite> {
     REFUSAL.with(|r| *r.borrow_mut() = None);
     if let QueryPurpose::InsertRow(sql) = qp {
@@ -1110,8 +1116,12 @@ pub fn insert_row_with_defaults(
                 default_owned =
                     crate::core::rql::column_default::expression_for(col_name, defaults)
                         .and_then(|e| {
-                            crate::core::rql::column_default::evaluate(e, &schema_field.db_type)
-                                .ok()
+                            crate::core::rql::column_default::evaluate(
+                                e,
+                                &schema_field.db_type,
+                                database,
+                            )
+                            .ok()
                         })
                         .unwrap_or_else(|| "NULL".to_string());
                 &default_owned
@@ -1228,7 +1238,7 @@ pub fn insert_row_with_defaults(
             } else if let Some(data) =
                 crate::core::rql::column_default::expression_for(&field.name, defaults)
                     .and_then(|e| {
-                        crate::core::rql::column_default::evaluate(e, &field.db_type).ok()
+                        crate::core::rql::column_default::evaluate(e, &field.db_type, database).ok()
                     })
                     .filter(|literal| literal != "NULL")
                     .and_then(|literal| {
@@ -2531,7 +2541,7 @@ mod insert_parse_bench {
             })
             .collect();
         for qp in &purposes {
-            assert!(insert_row_with_defaults(qp, &schema, &[], &[]).is_some());
+            assert!(insert_row_with_defaults(qp, &schema, &[], &[], 0).is_some());
         }
         let iters = 50u32;
         for round in 0..4 {
@@ -2543,6 +2553,7 @@ mod insert_parse_bench {
                         &schema,
                         &[],
                         &[],
+                        0,
                     ));
                 }
             }

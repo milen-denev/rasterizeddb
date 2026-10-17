@@ -185,7 +185,34 @@ pub fn strip_redundant_cast(text: &str) -> &str {
     }
 }
 
-pub fn evaluate(expression: &str, db_type: &DbType) -> Result<String, String> {
+/// The literal a default expression produces for one row about to be written
+/// into a table of database `database` ([`crate::core::database::Database::id`]).
+///
+/// The database is needed only by `nextval`, whose sequence belongs to one
+/// database: this is the point at which a row consumes from it. Anything that
+/// only wants to know whether an expression is acceptable calls [`validate`],
+/// which consumes nothing.
+pub fn evaluate(expression: &str, db_type: &DbType, database: u64) -> Result<String, String> {
+    evaluate_in(expression, db_type, Some(database))
+}
+
+/// Whether a default expression is one [`evaluate`] understands, without
+/// evaluating it for a row.
+///
+/// The difference is `nextval`: checking a `DEFAULT nextval('s')` at `CREATE
+/// TABLE` or `ADD COLUMN` used to take a value from `s`, so the table's first
+/// row got 2 — and the declaration has no database whose sequence it could
+/// rightly take one from anyway.
+pub fn validate(expression: &str, db_type: &DbType) -> Result<(), String> {
+    evaluate_in(expression, db_type, None).map(|_| ())
+}
+
+/// [`evaluate`], or with `database` absent [`validate`].
+fn evaluate_in(
+    expression: &str,
+    db_type: &DbType,
+    database: Option<u64>,
+) -> Result<String, String> {
     let text = strip_redundant_cast(expression.trim());
     let upper = text.to_ascii_uppercase();
 
@@ -252,7 +279,12 @@ pub fn evaluate(expression: &str, db_type: &DbType) -> Result<String, String> {
     // `crate::core::rql::sequence`; this is the point at which a row consumes
     // from it, so a row that is never written never takes a value.
     if let Some(name) = crate::core::rql::sequence::parse_nextval(text) {
-        return Ok(crate::core::rql::sequence::next(&name).to_string());
+        return Ok(match database {
+            Some(database) => crate::core::rql::sequence::next(database, &name).to_string(),
+            // Validation: the shape is all that is being checked, and nothing
+            // reads this value.
+            None => String::new(),
+        });
     }
 
     if upper == "UUIDV7()" {
@@ -433,6 +465,22 @@ fn find_keyword(upper: &str, keyword: &str) -> Option<usize> {
 mod tests {
     use super::*;
 
+    /// No database has this id, so a `nextval` reached by mistake here counts
+    /// on a sequence nothing else reads.
+    const NO_DB: u64 = u64::MAX;
+
+    /// Checking a `DEFAULT nextval('…')` takes no value from the sequence:
+    /// it used to, so a table declared with one wrote 2 into its first row.
+    #[test]
+    fn validating_a_nextval_default_consumes_nothing() {
+        let name = "validate_only_seq";
+        let expression = format!("nextval('{}')", name);
+        validate(&expression, &DbType::I64).expect("nextval is understood");
+        validate(&expression, &DbType::I64).expect("nextval is understood");
+        assert!(!crate::core::rql::sequence::is_seeded(NO_DB - 1, name));
+        assert_eq!(evaluate(&expression, &DbType::I64, NO_DB - 1).unwrap(), "1");
+    }
+
     #[test]
     fn a_record_round_trips_through_its_bytes() {
         let entry = ColumnDefault {
@@ -489,18 +537,18 @@ mod tests {
 
     #[test]
     fn literals_evaluate_to_themselves() {
-        assert_eq!(evaluate("0", &DbType::I32).unwrap(), "0");
-        assert_eq!(evaluate("-3.5", &DbType::F64).unwrap(), "-3.5");
-        assert_eq!(evaluate("'EUR'", &DbType::STRING).unwrap(), "'EUR'");
-        assert_eq!(evaluate("TRUE", &DbType::BOOL).unwrap(), "1");
-        assert_eq!(evaluate("false", &DbType::BOOL).unwrap(), "0");
-        assert_eq!(evaluate("NULL", &DbType::STRING).unwrap(), "NULL");
+        assert_eq!(evaluate("0", &DbType::I32, NO_DB).unwrap(), "0");
+        assert_eq!(evaluate("-3.5", &DbType::F64, NO_DB).unwrap(), "-3.5");
+        assert_eq!(evaluate("'EUR'", &DbType::STRING, NO_DB).unwrap(), "'EUR'");
+        assert_eq!(evaluate("TRUE", &DbType::BOOL, NO_DB).unwrap(), "1");
+        assert_eq!(evaluate("false", &DbType::BOOL, NO_DB).unwrap(), "0");
+        assert_eq!(evaluate("NULL", &DbType::STRING, NO_DB).unwrap(), "NULL");
     }
 
     /// A number defaulting a text column is text, not a number.
     #[test]
     fn a_numeric_default_on_a_text_column_is_quoted() {
-        assert_eq!(evaluate("0", &DbType::STRING).unwrap(), "'0'");
+        assert_eq!(evaluate("0", &DbType::STRING, NO_DB).unwrap(), "'0'");
     }
 
     /// The point of storing the expression rather than a value: the timestamp
@@ -510,7 +558,7 @@ mod tests {
     #[test]
     fn current_timestamp_evaluates_at_call_time() {
         for expression in ["CURRENT_TIMESTAMP", "now()", "LOCALTIMESTAMP"] {
-            let rendered = evaluate(expression, &DbType::DATETIME).unwrap();
+            let rendered = evaluate(expression, &DbType::DATETIME, NO_DB).unwrap();
             let literal = rendered.trim_matches('\'');
             let parsed = crate::core::value_codec::parse_timestamp_us(literal)
                 .unwrap_or_else(|| panic!("{} produced {:?}", expression, rendered));
@@ -529,8 +577,8 @@ mod tests {
 
     #[test]
     fn generated_uuids_are_version_four_and_differ() {
-        let a = evaluate("gen_random_uuid()", &DbType::UUID).unwrap();
-        let b = evaluate("gen_random_uuid()", &DbType::UUID).unwrap();
+        let a = evaluate("gen_random_uuid()", &DbType::UUID, NO_DB).unwrap();
+        let b = evaluate("gen_random_uuid()", &DbType::UUID, NO_DB).unwrap();
         assert_ne!(a, b);
         // Version nibble of a v4 UUID.
         assert_eq!(a.as_bytes()[15] as char, '4', "{}", a);
@@ -538,7 +586,7 @@ mod tests {
 
     #[test]
     fn an_expression_that_cannot_be_understood_is_refused() {
-        let e = evaluate("some_function(a, b)", &DbType::I32).unwrap_err();
+        let e = evaluate("some_function(a, b)", &DbType::I32, NO_DB).unwrap_err();
         assert!(e.contains("not supported"), "{}", e);
     }
 

@@ -367,6 +367,7 @@ impl DatabaseCatalog {
             return Err(format!("database \"{}\" does not exist", name));
         };
 
+        let database_id = entry.database.id;
         let attached = entry.sessions.load(Ordering::Acquire);
         if attached > 0 {
             return Err(format!(
@@ -379,6 +380,9 @@ impl DatabaseCatalog {
         // Out of the map first: a session that resolves the name after this
         // point must not be handed files that are about to be unlinked.
         self.databases.remove(name);
+        // Its sequences' counters. A recreated database has a new id and would
+        // never read them, so this only releases them.
+        crate::core::rql::sequence::forget_database(database_id);
 
         if let Some(root) = &self.root {
             let path = std::path::Path::new(root).join(name);
