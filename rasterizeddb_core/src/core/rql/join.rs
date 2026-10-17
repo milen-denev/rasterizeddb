@@ -3290,7 +3290,13 @@ pub fn plan(
             String::new()
         } else {
             let joined = predicates[i].join(" AND ");
-            crate::core::tokenizer::predicate_rewrite::rewrite_where(&joined, &schemas[i])?
+            // The relation's scan reads this, as a single table's scan reads
+            // its `WHERE`, so it gets the scan's rewrite: the operands only
+            // the evaluator computes are lifted. Without it a cast on a
+            // literal in arithmetic was dropped, and `a.n / 2::numeric = 1.5`
+            // divided integers and matched nothing; `%`, `||` and a column
+            // cast were refused.
+            crate::core::tokenizer::predicate_rewrite::rewrite_scan_where(&joined, &schemas[i])?
         };
 
         // Read against the relation's own schema: the qualifier is stripped,
@@ -3741,7 +3747,16 @@ fn build_post_join_filter(
             rewritten = replace_qualified(&rewritten, from, to);
         }
 
-        if touches_optional || too_wide_for_tokenizer {
+        // A term holding what only the evaluator computes goes there whole,
+        // as a scan would lift it. The tokenizer can read some such terms
+        // and not answer them: `a.n / 2::numeric = b.m` tokenized, then
+        // failed to plan on the cast the rewrite keeps for the evaluator.
+        let needs_evaluator = crate::core::tokenizer::predicate_rewrite::lift_evaluated_operands(
+            &rewritten,
+            &schema_sv,
+        )
+        .is_ok_and(|lifted| lifted != rewritten);
+        if touches_optional || too_wide_for_tokenizer || needs_evaluator {
             expr_terms.push(crate::core::rql::expr::parse_cond(&rewritten, &schema)?);
             continue;
         }

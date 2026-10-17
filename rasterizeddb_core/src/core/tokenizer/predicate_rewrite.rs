@@ -1317,6 +1317,14 @@ fn lex(clause: &str) -> Result<Vec<Tok>, String> {
                 {
                     i += 1;
                 }
+                // `au."Price"`: a quoted column after a bare qualifier is the
+                // same one reference, as `"au"."Price"` already is. Split in
+                // two, the qualifier was refused as an unknown column `au.`.
+                if bytes[i - 1] == b'.' && bytes.get(i) == Some(&b'"') {
+                    if let Some(close) = bytes[i + 1..].iter().position(|b| *b == b'"') {
+                        i += close + 2;
+                    }
+                }
                 out.push(Tok::Word(clause[start..i].to_string()));
             }
             // `?`, `?|` and `?&` are JSONB key existence: `data ? 'k'` asks
@@ -1390,6 +1398,16 @@ fn lex(clause: &str) -> Result<Vec<Tok>, String> {
                             if !w.is_empty()
                                 && w.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '-')
                     );
+                // Except as an operand of arithmetic, where no column says what
+                // the literal is and the cast does: `n / 2::numeric` divides
+                // NUMERICs, and without the cast integers, so a CHECK compiled
+                // from this text accepted `n = 5` under `n / 2::numeric < 2.2`.
+                // A scan never reaches here with one, having lifted the operand
+                // to the evaluator; this text is the expression parser's.
+                let arithmetic_operand = (out.len() >= 2
+                    && matches!(&out[out.len() - 2], Tok::Sym(sym) if is_arithmetic(sym)))
+                    || literal_cast_in_arithmetic(clause, i, i);
+                let over_literal = over_literal && !arithmetic_operand;
                 // Over anything else the cast is *kept*, as one symbol, and
                 // carried to the stages that can act on it.
                 //
@@ -2289,8 +2307,9 @@ pub fn read_lifted(s: &str, at: usize) -> Option<(String, usize)> {
     Some((String::from_utf8(raw).ok()?, close + 1))
 }
 
-/// [`rewrite_where`] for a clause a single-table scan evaluates, with the
-/// operands only the expression evaluator can compute lifted out first.
+/// [`rewrite_where`] for a clause a scan evaluates — a single table's, or one
+/// relation's of a join — with the operands only the expression evaluator can
+/// compute lifted out first.
 ///
 /// Kept apart from `rewrite_where` because that one has other callers — the
 /// `CHECK` compiler and the join's post-filter — which read its output with the
@@ -2315,18 +2334,32 @@ fn needs_evaluator(text: &str) -> bool {
     let bytes = text.as_bytes();
     let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b == b'.';
     let mut quote: Option<u8> = None;
+    let mut quote_at = 0usize;
     let mut i = 0usize;
     while i < bytes.len() {
         let c = bytes[i];
         if let Some(q) = quote {
             if c == q {
                 quote = None;
+                // `"Price"::int` is a column cast like `price::int`, and
+                // `'1.5'::numeric * 2` a literal cast that has to be kept.
+                let cast = if q == b'"' {
+                    evaluated_cast_after(&text[i + 1..])
+                } else {
+                    literal_cast_in_arithmetic(text, quote_at, i + 1)
+                };
+                if cast {
+                    return true;
+                }
             }
             i += 1;
             continue;
         }
         match c {
-            b'\'' | b'"' => quote = Some(c),
+            b'\'' | b'"' => {
+                quote = Some(c);
+                quote_at = i;
+            }
             b'%' => return true,
             b'|' if bytes.get(i + 1) == Some(&b'|') && (i == 0 || bytes[i - 1] != b'?') => {
                 return true;
@@ -2353,6 +2386,8 @@ fn needs_evaluator(text: &str) -> bool {
                     // `CAST(qty AS bigint)`, the standard spelling of a cast,
                     // which the rewrite has no form for.
                     || word.eq_ignore_ascii_case("CAST") && text[end..].trim_start().starts_with('(')
+                    || word.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+                        && literal_cast_in_arithmetic(text, i, end)
                 {
                     return true;
                 }
@@ -2385,6 +2420,33 @@ fn column_cast_at(text: &str, word: &str, end: usize) -> bool {
         return false;
     }
     evaluated_cast_after(&text[end..])
+}
+
+/// Whether the literal spanning `start..end` of `text` carries a `::` cast and
+/// is an operand of arithmetic: `n / 2::numeric`, `'1.5'::numeric * 2`,
+/// `'2024-01-01'::date + 1`.
+///
+/// The rewrite drops a cast on a literal, since the column it is compared
+/// with says what type the literal is. An arithmetic operand is compared with
+/// nothing, and there the cast is the type: without it `n / 2::numeric` was an
+/// integer division, so `n / 2::numeric > 1.2` dropped the row where `n` is 3,
+/// and a quoted operand was read as text and refused. The evaluator keeps it.
+fn literal_cast_in_arithmetic(text: &str, start: usize, end: usize) -> bool {
+    let Some(target) = text[end..].trim_start().strip_prefix("::") else {
+        return false;
+    };
+    // Past the type name, its modifier and any array brackets.
+    let target = target.trim_start();
+    let mut past = target
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(target.len());
+    let rest = &target[past..];
+    if rest.starts_with('(') {
+        past += rest.find(')').map_or(rest.len(), |close| close + 1);
+    }
+    let after = target[past..].trim_start().trim_start_matches("[]").trim_start();
+    let arithmetic = |c: Option<char>| matches!(c, Some('+' | '-' | '*' | '/' | '%' | '^'));
+    arithmetic(after.chars().next()) || arithmetic(text[..start].trim_end().chars().last())
 }
 
 /// Where the group that the `)` at `close` ends opens, found backwards, with

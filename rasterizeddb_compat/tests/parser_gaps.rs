@@ -801,3 +801,107 @@ async fn column_casts_in_where() {
     assert_eq!(joined(&pool, "SELECT id FROM od WHERE qty::int = 0 ORDER BY id").await.unwrap(), "2");
     assert_eq!(joined(&pool, "SELECT id FROM od ORDER BY id").await.unwrap(), "2,3,4,5,6");
 }
+
+// ------------------------------------- what a rewrite renders and lexes again
+
+/// Rows whose text holds the characters the rewrites split and re-lex on: a
+/// quote, `%`, ` AND `, a backslash, parentheses; and a quoted column name.
+async fn awkward_text(pool: &sqlx::PgPool) {
+    run(pool, r#"CREATE TABLE au (id INT NOT NULL, t TEXT, n INT, "MixedCase" TEXT, q NUMERIC(6,2), d DATE)"#)
+        .await
+        .unwrap();
+    run(
+        pool,
+        r#"INSERT INTO au VALUES (1, 'it''s', 1, 'A', 1.50, '2024-01-01'), (2, 'a%b', 2, 'B', 2.25, '2024-01-02'),
+           (3, 'x AND y', 3, 'C', NULL, '2024-01-03'), (4, 'a\b', 4, NULL, 4.00, NULL),
+           (5, '(p)', 5, 'E', 0.10, '2024-01-05'), (6, NULL, NULL, 'F', 6.00, '2024-01-06')"#,
+    )
+    .await
+    .unwrap();
+}
+
+/// The `WHERE` rewrite lexes the clause, renders it back to text, and the
+/// tokenizer lexes that again, several times over. What the first lex read has
+/// to survive each pass. Two things did not:
+///
+/// - A cast on a literal is dropped, the column it is compared with saying the
+///   type. An arithmetic operand is compared with nothing, so the cast was the
+///   type: `n / 2::numeric > 1.2` divided integers and dropped the row where
+///   `n` is 3, and `q > '1.5'::numeric * 2` read the literal as text and was
+///   refused. A join's relations dropped it the same way, and refused `%`,
+///   `||` and a column cast, because their scans did not lift what only the
+///   evaluator computes.
+/// - `au."MixedCase"`, a bare qualifier on a quoted column, was split into
+///   the qualifier and the name, and the qualifier refused as a column.
+///
+/// The rest pin what already survived: quotes, escapes, dollar quoting and
+/// keywords inside literals, and parentheses the rewrite must not drop.
+#[tokio::test(flavor = "multi_thread")]
+async fn rewrites_keep_what_the_first_lex_read() {
+    let (_s, pool) = server().await;
+    awkward_text(&pool).await;
+    let cases: &[(&str, &str)] = &[
+        // A literal's cast in arithmetic is its type.
+        ("SELECT id FROM au WHERE n / 2::numeric > 1.2 ORDER BY id", "3,4,5"),
+        ("SELECT id FROM au WHERE n / 2::numeric = 1.5 ORDER BY id", "3"),
+        ("SELECT id FROM au WHERE NOT (n / 2::numeric > 1.2) ORDER BY id", "1,2"),
+        ("SELECT id FROM au WHERE n / '2'::numeric = 2.5 ORDER BY id", "5"),
+        ("SELECT id FROM au WHERE n * 1::numeric / 4 = 0.75 ORDER BY id", "3"),
+        ("SELECT id FROM au WHERE q * '2'::int > 4 ORDER BY id", "2,4,6"),
+        ("SELECT id FROM au WHERE n + '1'::int = 3 ORDER BY id", "2"),
+        ("SELECT id FROM au WHERE q > '1.5'::numeric * 2 ORDER BY id", "4,6"),
+        ("SELECT id FROM au WHERE d = '2024-01-01'::date + 1 ORDER BY id", "2"),
+        ("SELECT id FROM au WHERE d > '2024-01-01'::date + 2 ORDER BY id", "5,6"),
+        // Compared directly, the column's type is the literal's, as before.
+        ("SELECT id FROM au WHERE n / 2 > 1.2 ORDER BY id", "4,5"),
+        ("SELECT id FROM au WHERE n = 2::bigint ORDER BY id", "2"),
+        ("SELECT id FROM au WHERE n = '2'::bigint ORDER BY id", "2"),
+        ("SELECT id FROM au WHERE q = 2.25::numeric(6,2) ORDER BY id", "2"),
+        // Quoted column names, qualified or cast.
+        (r#"SELECT id FROM au WHERE au."MixedCase" = 'A' ORDER BY id"#, "1"),
+        (r#"SELECT id FROM au WHERE "au"."MixedCase" = 'A' ORDER BY id"#, "1"),
+        (r#"SELECT id FROM au WHERE "q"::int = 2 ORDER BY id"#, "1,2"),
+        (r#"SELECT id FROM au WHERE "MixedCase"::text || '!' = 'E!' ORDER BY id"#, "5"),
+        (r#"SELECT id FROM au WHERE NOT ("MixedCase"::text = 'E') ORDER BY id"#, "1,2,3,6"),
+        (r#"SELECT id FROM au WHERE ("MixedCase", n) = ('A', 1) ORDER BY id"#, "1"),
+        // Quotes, escapes and dollar quoting through a lift and a NOT.
+        (r#"SELECT id FROM au WHERE t = E'it\'s' AND n % 2 = 1 ORDER BY id"#, "1"),
+        (r#"SELECT id FROM au WHERE NOT (t = E'it\'s' OR n = 2) ORDER BY id"#, "3,4,5"),
+        (r#"SELECT id FROM au WHERE NOT (t = E'a\\b') ORDER BY id"#, "1,2,3,5"),
+        (r#"SELECT id FROM au WHERE t = $$it's$$ AND n % 2 = 1 ORDER BY id"#, "1"),
+        (r#"SELECT id FROM au WHERE t = $q$x AND y$q$ ORDER BY id"#, "3"),
+        ("SELECT id FROM au WHERE t = 'x AND y' OR n % 2 = 0 ORDER BY id", "2,3,4"),
+        ("SELECT id FROM au WHERE t || '::int' = 'a%b::int' ORDER BY id", "2"),
+        ("SELECT id FROM au WHERE (t || 'x', n) = ('it''sx', 1) ORDER BY id", "1"),
+        // Parentheses that hold.
+        ("SELECT id FROM au WHERE (n + 1)::text = '3' ORDER BY id", "2"),
+        ("SELECT id FROM au WHERE ('a' || t)::text = 'a(p)' ORDER BY id", "5"),
+        ("SELECT id FROM au WHERE NOT ((n + 1) * 2 = 6) ORDER BY id", "1,3,4,5"),
+        ("SELECT id FROM au WHERE (10 - n) % 4 = 1 ORDER BY id", "1,5"),
+        // One relation's conditions in a join.
+        ("SELECT a.id FROM au a JOIN au b ON b.id = a.id WHERE a.n / 2::numeric = 1.5 ORDER BY a.id", "3"),
+        ("SELECT a.id FROM au a JOIN au b ON b.id = a.id WHERE b.d = '2024-01-01'::date + 1 ORDER BY a.id", "2"),
+        ("SELECT a.id FROM au a JOIN au b ON b.id = a.id WHERE a.q::int = 2 ORDER BY a.id", "1,2"),
+        ("SELECT a.id FROM au a JOIN au b ON b.id = a.id WHERE a.n % 2 = 0 ORDER BY a.id", "2,4"),
+        ("SELECT a.id FROM au a JOIN au b ON b.id = a.id WHERE b.t || 'x' = 'x AND yx' ORDER BY a.id", "3"),
+        (r#"SELECT a.id FROM au a JOIN au b ON b.id = a.id WHERE a."MixedCase" = 'B' ORDER BY a.id"#, "2"),
+        (r#"SELECT a.id FROM au a JOIN au b ON b.id = a.id WHERE a.t = E'it\'s' ORDER BY a.id"#, "1"),
+        (
+            "SELECT a.id FROM au a JOIN au b ON b.id = a.id WHERE NOT (a.t = 'x AND y') AND b.n % 2 = 1 ORDER BY a.id",
+            "1,5",
+        ),
+        // A condition across both relations.
+        ("SELECT a.id FROM au a JOIN au b ON b.id = a.id WHERE a.n / 2::numeric = b.q ORDER BY a.id", ""),
+        ("SELECT a.id FROM au a JOIN au b ON b.id = a.id WHERE a.n / 2::numeric > b.q ORDER BY a.id", "5"),
+        ("SELECT a.id FROM au a JOIN au b ON b.id = a.id WHERE a.n * 1.5::numeric = b.q * 1 ORDER BY a.id", "1"),
+    ];
+    let wrong = wrong_answers(&pool, cases).await;
+    assert!(wrong.is_empty(), "{} wrong answers:\n{}", wrong.len(), wrong.join("\n"));
+
+    // A CHECK is compiled from the same rewrite, and dropping the cast
+    // divided integers: 5 / 2 = 2 passed `< 2.2` and the row was stored.
+    run(&pool, "CREATE TABLE ck (id INT, n INT CHECK (n / 2::numeric < 2.2))").await.unwrap();
+    assert_eq!(run(&pool, "INSERT INTO ck VALUES (1, 4)").await, Ok(1));
+    let err = run(&pool, "INSERT INTO ck VALUES (2, 5)").await.expect_err("5 / 2.0 is 2.5");
+    assert!(err.contains("violates check constraint"), "{err}");
+}
