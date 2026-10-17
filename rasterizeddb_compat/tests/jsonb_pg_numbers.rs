@@ -263,3 +263,92 @@ async fn a_document_through_a_subquery_keeps_its_digits() {
     let got: Vec<_> = rows.into_iter().map(|(id, t)| (id, t.unwrap())).collect();
     assert_eq!(got, vec![(4, pg_document(4)), (7, pg_document(7)), (9, pg_document(9))]);
 }
+
+/// Numbers whose positional text is long are stored in a short exponent
+/// form and written out only when printed, as PostgreSQL does: it stores
+/// `1e131071` in 22 bytes. Each must still print, compare and index as the
+/// value it is, and two spellings of one value must still be one document.
+/// Every expected answer is PostgreSQL 17's for the same rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn long_numbers_are_stored_short_and_read_back_whole() {
+    let zeros = |n: usize| "0".repeat(n);
+    let e60 = format!("1{}", zeros(60));
+    let docs = [
+        (1, r#"{"a":1e60}"#.to_string()),
+        (2, format!(r#"{{"a":{e60}}}"#)),
+        (3, r#"{"a":1.000e-45}"#.to_string()),
+        (4, r#"{"a":0e-45}"#.to_string()),
+        (5, r#"{"a":-3.10e-30}"#.to_string()),
+        (6, "[1e131071, 0e-16383]".to_string()),
+    ];
+    let printed = |id: i64| match id {
+        1 | 2 => format!(r#"{{"a": {e60}}}"#),
+        3 => format!(r#"{{"a": 0.{}1000}}"#, zeros(44)),
+        4 => format!(r#"{{"a": 0.{}}}"#, zeros(45)),
+        5 => format!(r#"{{"a": -0.{}310}}"#, zeros(29)),
+        _ => format!("[1{}, 0.{}]", zeros(131_071), zeros(16_383)),
+    };
+    let cases: Vec<(String, Vec<i64>)> = vec![
+        (r#"doc @> '{"a":1e60}'"#.into(), vec![1, 2]),
+        (r#"doc @> '{"a":10e59}'"#.into(), vec![1, 2]),
+        (r#"doc = '{"a":1e60}'"#.into(), vec![1, 2]),
+        (format!("doc->>'a' = '{e60}'"), vec![1, 2]),
+        (r#"doc @> '{"a":1.0e-45}'"#.into(), vec![3]),
+        (format!("doc->>'a' LIKE '0.{}1000'", zeros(44)), vec![3]),
+        (r#"doc @> '{"a":0}'"#.into(), vec![4]),
+        (format!("doc->>'a' = '0.{}'", zeros(45)), vec![4]),
+        (format!("doc->>'a' = '-0.{}310'", zeros(29)), vec![5]),
+        ("doc @> '[1e131071]'".into(), vec![6]),
+        ("doc @> '[0]'".into(), vec![6]),
+        ("doc @> '[1e131070]'".into(), vec![]),
+    ];
+    for indexed in [false, true] {
+        let server = TestServer::start().await.expect("server should start");
+        let pool = server.connect_sqlx().await.expect("should connect");
+        pool.execute(sqlx::raw_sql("CREATE TABLE n1 (id BIGINT PRIMARY KEY, doc JSONB)"))
+            .await
+            .expect("create");
+        for (id, doc) in &docs {
+            pool.execute(sqlx::raw_sql(AssertSqlSafe(format!("INSERT INTO n1 VALUES ({id}, '{doc}')"))))
+                .await
+                .unwrap_or_else(|e| panic!("seed {id}: {e}"));
+        }
+        if indexed {
+            for ddl in [
+                "CREATE INDEX n1_gin ON n1 USING gin (doc)",
+                "CREATE INDEX n1_path ON n1 ((doc->>'a'))",
+            ] {
+                pool.execute(sqlx::raw_sql(ddl)).await.expect(ddl);
+            }
+        }
+        let mut wrong = Vec::new();
+        for (predicate, want) in &cases {
+            match ids(&pool, predicate).await {
+                Ok(got) if got == *want => {}
+                Ok(got) => wrong.push(format!("{predicate}: got {got:?}, PostgreSQL {want:?}")),
+                Err(e) => wrong.push(format!("{predicate}: {e}")),
+            }
+        }
+        for (id, got) in texts(&pool, "SELECT id, doc::text FROM n1 ORDER BY id").await.unwrap() {
+            if got.as_deref() != Some(printed(id).as_str()) {
+                let head = got.map(|t| t.chars().take(80).collect::<String>());
+                wrong.push(format!("doc::text of {id}: got {head:?}..."));
+            }
+        }
+        // PostgreSQL: 131072 and 16385 characters, and a document of 147461
+        // after a derived table writes it back as a literal.
+        let rows = texts(&pool, "SELECT id, doc->>0 FROM n1 WHERE id = 6").await.unwrap();
+        assert_eq!(rows[0].1.as_deref().map(str::len), Some(131_072));
+        let rows = texts(&pool, "SELECT id, doc->>1 FROM n1 WHERE id = 6").await.unwrap();
+        assert_eq!(rows[0].1.as_deref().map(str::len), Some(16_385));
+        let rows = texts(
+            &pool,
+            "SELECT id, doc FROM (SELECT id, doc FROM n1 WHERE id IN (1, 6) ORDER BY id LIMIT 2) s ORDER BY id",
+        )
+        .await
+        .unwrap();
+        let got: Vec<_> = rows.into_iter().map(|(id, t)| (id, t.map(|t| t.len()))).collect();
+        assert_eq!(got, vec![(1, Some(68)), (6, Some(147_461))]);
+        assert!(wrong.is_empty(), "indexed={indexed}: {} wrong:\n{}", wrong.len(), wrong.join("\n"));
+    }
+}

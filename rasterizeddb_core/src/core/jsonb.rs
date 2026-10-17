@@ -59,7 +59,16 @@
 //! what `numeric` would print for it: every digit and the scale as written
 //! (`1.10` stays `1.10`), an exponent written out (`1e2` is `100`, `1.5e-1`
 //! is `0.15`), and no negative zero. Only the lexeme is read, never a float
-//! serde_json made of it; see [`write_numeric_text`].
+//! serde_json made of it; see [`write_numeric_text`]. A number whose written
+//! out text would be long is stored in a short exponent form with the same
+//! value and scale (`1e131071`, not 131072 digits), and written out only
+//! when it is printed, as PostgreSQL does; see `Numeric::write_stored`.
+//!
+//! Documents written before this format kept a float's `Display` as a
+//! number's text (`100.0` for `1e2`, `1.5` for `1.50`). They print, contain
+//! and hash by the value they hold, but they are not the same bytes as the
+//! same literal encoded now, so anything that compares documents as bytes
+//! (`=`, grouping, hash keys) keeps the two apart until it compares values.
 //!
 //! **Object keys are sorted, and a duplicate key keeps the last value.** Sorted
 //! because a binary search needs it; last-wins because that is what
@@ -149,7 +158,8 @@ const NUMERIC_MAX_SCALE: i64 = 16_383;
 const NUMERIC_MAX_EXPONENT: i64 = 1_073_741_823;
 
 /// Stores the number spelled by `lexeme`: as an integer when its `numeric`
-/// text is one that fits `i64`, otherwise as that text.
+/// value is an integer with no scale that fits `i64`, otherwise as text in
+/// [`Numeric::write_stored`]'s form.
 ///
 /// `1e2` and `100` therefore encode to the same bytes, as they print the same;
 /// `1.0` keeps its scale and so stays text.
@@ -167,23 +177,16 @@ fn write_number_lexeme(out: &mut Vec<u8>, lexeme: &[u8]) -> Result<(), &'static 
         out.extend_from_slice(&v.to_le_bytes());
         return Ok(());
     }
-    let tag_at = out.len();
+    let number = Numeric::parse(lexeme)?;
+    if let Some(v) = number.as_i64() {
+        out.push(TAG_INT);
+        out.extend_from_slice(&v.to_le_bytes());
+        return Ok(());
+    }
     out.push(TAG_NUM);
     let len_at = out.len();
     out.extend_from_slice(&[0u8; 4]);
-    if let Err(e) = write_numeric_text(lexeme, out) {
-        out.truncate(tag_at);
-        return Err(e);
-    }
-    let text = &out[len_at + 4..];
-    if text.len() <= 20 && !text.contains(&b'.') {
-        if let Some(v) = std::str::from_utf8(text).ok().and_then(|t| t.parse::<i64>().ok()) {
-            out.truncate(tag_at);
-            out.push(TAG_INT);
-            out.extend_from_slice(&v.to_le_bytes());
-            return Ok(());
-        }
-    }
+    number.write_stored(out);
     let len = (out.len() - len_at - 4) as u32;
     out[len_at..len_at + 4].copy_from_slice(&len.to_le_bytes());
     Ok(())
@@ -198,96 +201,250 @@ fn write_number_lexeme(out: &mut Vec<u8>, lexeme: &[u8]) -> Result<(), &'static 
 /// `-0.0` is `0.0`. A value outside `numeric`'s range is refused with
 /// PostgreSQL's own message, which also bounds how long the text can get.
 ///
-/// It also accepts what earlier builds stored, which is a float's `Display`
-/// (`1e+20`, `-0.0`), so a stored number prints the same however old it is.
+/// It accepts every form a number has been stored in: the exponent form this
+/// build stores a long number in, positional text, and what earlier builds
+/// stored, which is a float's `Display` (`1e+20`, `-0.0`). So a stored number
+/// prints the same however it was kept.
 fn write_numeric_text(lexeme: &[u8], out: &mut Vec<u8>) -> Result<(), &'static str> {
-    const MALFORMED: &str = "a stored number is not a JSON number";
-    let (negative, rest) = match lexeme.split_first() {
-        Some((b'-', rest)) => (true, rest),
-        _ => (false, lexeme),
-    };
-    let mantissa_end = rest
-        .iter()
-        .position(|b| *b == b'e' || *b == b'E')
-        .unwrap_or(rest.len());
-    let (int, frac) = match rest[..mantissa_end].iter().position(|b| *b == b'.') {
-        Some(dot) => (&rest[..dot], &rest[dot + 1..mantissa_end]),
-        None => (&rest[..mantissa_end], &rest[..0]),
-    };
-    if int.is_empty() || !int.iter().chain(frac).all(u8::is_ascii_digit) {
-        return Err(MALFORMED);
-    }
-    if frac.is_empty() && mantissa_end > int.len() {
-        // A point with nothing after it.
-        return Err(MALFORMED);
-    }
-    let mut exponent: i64 = 0;
-    if mantissa_end < rest.len() {
-        let mut e = &rest[mantissa_end + 1..];
-        let negative_exp = match e.first() {
-            Some(b'-') => {
-                e = &e[1..];
-                true
-            }
-            Some(b'+') => {
-                e = &e[1..];
-                false
-            }
-            _ => false,
+    Numeric::parse(lexeme)?.write_positional(out);
+    Ok(())
+}
+
+/// The longest positional text a number is always stored as. Past it, the
+/// exponent form is stored when it is shorter; see [`Numeric::write_stored`].
+const POSITIONAL_UP_TO: i64 = 40;
+
+/// A JSON number as `numeric_in` reads it, before anything is written out:
+/// the digits as written, where the exponent puts the decimal point among
+/// them, and the display scale.
+struct Numeric<'a> {
+    /// Never set for zero, which has no sign in `numeric`.
+    negative: bool,
+    /// The digits before and after the decimal point as written. Together
+    /// they are the run that the positions below count in.
+    int: &'a [u8],
+    frac: &'a [u8],
+    /// The first nonzero digit of the run.
+    lead: i64,
+    /// One past the last nonzero digit of the run; `lead` when it is zero.
+    end: i64,
+    /// Where the decimal point falls in the run once the exponent has moved
+    /// it, which may be outside the run.
+    point: i64,
+    /// How many digits print after the point.
+    scale: i64,
+}
+
+impl<'a> Numeric<'a> {
+    fn parse(lexeme: &'a [u8]) -> Result<Numeric<'a>, &'static str> {
+        const MALFORMED: &str = "a stored number is not a JSON number";
+        let (negative, rest) = match lexeme.split_first() {
+            Some((b'-', rest)) => (true, rest),
+            _ => (false, lexeme),
         };
-        if e.is_empty() || !e.iter().all(u8::is_ascii_digit) {
+        let mantissa_end = rest
+            .iter()
+            .position(|b| *b == b'e' || *b == b'E')
+            .unwrap_or(rest.len());
+        let (int, frac) = match rest[..mantissa_end].iter().position(|b| *b == b'.') {
+            Some(dot) => (&rest[..dot], &rest[dot + 1..mantissa_end]),
+            None => (&rest[..mantissa_end], &rest[..0]),
+        };
+        if int.is_empty() || !int.iter().chain(frac).all(u8::is_ascii_digit) {
             return Err(MALFORMED);
         }
-        for d in e {
-            exponent = exponent * 10 + (d - b'0') as i64;
-            // Checked per digit, as `numeric_in` does, so a long exponent is
-            // refused before it can overflow.
-            if exponent > NUMERIC_MAX_EXPONENT {
-                return Err(NUMERIC_OVERFLOW);
+        if frac.is_empty() && mantissa_end > int.len() {
+            // A point with nothing after it.
+            return Err(MALFORMED);
+        }
+        let mut exponent: i64 = 0;
+        if mantissa_end < rest.len() {
+            let mut e = &rest[mantissa_end + 1..];
+            let negative_exp = match e.first() {
+                Some(b'-') => {
+                    e = &e[1..];
+                    true
+                }
+                Some(b'+') => {
+                    e = &e[1..];
+                    false
+                }
+                _ => false,
+            };
+            if e.is_empty() || !e.iter().all(u8::is_ascii_digit) {
+                return Err(MALFORMED);
+            }
+            for d in e {
+                exponent = exponent * 10 + (d - b'0') as i64;
+                // Checked per digit, as `numeric_in` does, so a long exponent
+                // is refused before it can overflow.
+                if exponent > NUMERIC_MAX_EXPONENT {
+                    return Err(NUMERIC_OVERFLOW);
+                }
+            }
+            if negative_exp {
+                exponent = -exponent;
             }
         }
-        if negative_exp {
-            exponent = -exponent;
+
+        let mut number = Numeric {
+            negative: false,
+            int,
+            frac,
+            lead: 0,
+            end: 0,
+            point: int.len() as i64 + exponent,
+            scale: (frac.len() as i64 - exponent).max(0),
+        };
+        if number.scale > NUMERIC_MAX_SCALE {
+            return Err(NUMERIC_OVERFLOW);
         }
+        let total = (int.len() + frac.len()) as i64;
+        number.lead = (0..total).take_while(|&i| number.digit(i) == b'0').count() as i64;
+        let trailing = (number.lead..total)
+            .rev()
+            .take_while(|&i| number.digit(i) == b'0')
+            .count() as i64;
+        number.end = total - trailing;
+        if !number.is_zero() && number.point - number.lead > NUMERIC_MAX_INT_DIGITS {
+            return Err(NUMERIC_OVERFLOW);
+        }
+        number.negative = negative && !number.is_zero();
+        Ok(number)
     }
 
-    // The digits as one run, `int` then `frac`, with the decimal point
-    // `point` digits in once the exponent has moved it.
-    let total = (int.len() + frac.len()) as i64;
-    let digit = |i: i64| -> u8 {
-        if i < 0 || i >= total {
+    fn is_zero(&self) -> bool {
+        self.lead == self.end
+    }
+
+    /// The digit at position `i` of the run, and zero outside it.
+    fn digit(&self, i: i64) -> u8 {
+        let int = self.int.len() as i64;
+        if i < 0 || i >= int + self.frac.len() as i64 {
             b'0'
-        } else if (i as usize) < int.len() {
-            int[i as usize]
+        } else if i < int {
+            self.int[i as usize]
         } else {
-            frac[i as usize - int.len()]
+            self.frac[(i - int) as usize]
         }
-    };
-    let point = int.len() as i64 + exponent;
-    let scale = (frac.len() as i64 - exponent).max(0);
-    if scale > NUMERIC_MAX_SCALE {
-        return Err(NUMERIC_OVERFLOW);
-    }
-    let lead = (0..total).take_while(|&i| digit(i) == b'0').count() as i64;
-    let zero = lead == total;
-    if !zero && point - lead > NUMERIC_MAX_INT_DIGITS {
-        return Err(NUMERIC_OVERFLOW);
     }
 
-    out.reserve((point - lead).max(1) as usize + scale as usize + 2);
-    if negative && !zero {
-        out.push(b'-');
+    /// The value, when it is an integer with no scale that fits `i64`.
+    fn as_i64(&self) -> Option<i64> {
+        if self.scale > 0 {
+            return None;
+        }
+        if self.is_zero() {
+            return Some(0);
+        }
+        if self.point - self.lead > 19 {
+            return None;
+        }
+        let mut v: i128 = 0;
+        for i in self.lead..self.point {
+            v = v * 10 + (self.digit(i) - b'0') as i128;
+        }
+        i64::try_from(if self.negative { -v } else { v }).ok()
     }
-    if !zero && point > lead {
-        out.extend((lead..point).map(digit));
-    } else {
-        out.push(b'0');
+
+    /// How long [`Numeric::write_positional`]'s text is.
+    fn positional_len(&self) -> i64 {
+        let int = if !self.is_zero() && self.point > self.lead {
+            self.point - self.lead
+        } else {
+            1
+        };
+        let frac = if self.scale > 0 { 1 + self.scale } else { 0 };
+        self.negative as i64 + int + frac
     }
-    if scale > 0 {
-        out.push(b'.');
-        out.extend((point..point + scale).map(digit));
+
+    /// `numeric_out`'s text: plain positional notation at the display scale.
+    fn write_positional(&self, out: &mut Vec<u8>) {
+        out.reserve(self.positional_len() as usize);
+        if self.negative {
+            out.push(b'-');
+        }
+        if !self.is_zero() && self.point > self.lead {
+            out.extend((self.lead..self.point).map(|i| self.digit(i)));
+        } else {
+            out.push(b'0');
+        }
+        if self.scale > 0 {
+            out.push(b'.');
+            out.extend((self.point..self.point + self.scale).map(|i| self.digit(i)));
+        }
     }
-    Ok(())
+
+    /// One past the last digit the exponent form writes. With a scale that is
+    /// the last digit printed, so `1.000e-45` keeps its zeros; without one it
+    /// is the last nonzero digit, and the exponent stands for the rest.
+    fn compact_end(&self) -> i64 {
+        if self.scale > 0 {
+            self.point + self.scale
+        } else {
+            self.end
+        }
+    }
+
+    /// The exponent [`Numeric::write_compact`] writes after its first digit.
+    fn compact_exponent(&self) -> i64 {
+        self.point - self.lead - 1
+    }
+
+    /// How long [`Numeric::write_compact`]'s text is.
+    fn compact_len(&self) -> i64 {
+        let decimal_len =
+            |v: i64| (v < 0) as i64 + v.unsigned_abs().checked_ilog10().unwrap_or(0) as i64 + 1;
+        if self.is_zero() {
+            return if self.scale > 0 { 3 + decimal_len(self.scale) } else { 1 };
+        }
+        let digits = self.compact_end() - self.lead;
+        self.negative as i64 + digits + (digits > 1) as i64 + 1 + decimal_len(self.compact_exponent())
+    }
+
+    /// One digit, the point and the rest of the digits, then the exponent:
+    /// `1e131071`, `1.000e-45`, or `0e-16383` for a zero with a scale.
+    /// `numeric_in` reads it back as the same value at the same scale, so it
+    /// prints as the positional text does.
+    fn write_compact(&self, out: &mut Vec<u8>) {
+        if self.is_zero() {
+            out.push(b'0');
+            if self.scale > 0 {
+                out.extend_from_slice(b"e-");
+                crate::core::value_codec::write_i64(out, self.scale);
+            }
+            return;
+        }
+        if self.negative {
+            out.push(b'-');
+        }
+        out.push(self.digit(self.lead));
+        let end = self.compact_end();
+        if end - self.lead > 1 {
+            out.push(b'.');
+            out.extend((self.lead + 1..end).map(|i| self.digit(i)));
+        }
+        out.push(b'e');
+        crate::core::value_codec::write_i64(out, self.compact_exponent());
+    }
+
+    /// The text a `TAG_NUM` holds. A number keeps its positional text, which
+    /// is what it prints as, unless that is long and the exponent form is
+    /// shorter. `numeric` allows 131072 digits before the point and 16383
+    /// after it, so expanding at encode time stored `1e131071`, eight bytes
+    /// of input, as 131072, and a short literal could build a document of
+    /// gigabytes. PostgreSQL expands only when printing, and so does
+    /// [`render_text_into`].
+    ///
+    /// The choice depends only on the value and its scale, never on how the
+    /// number was spelled, so spellings that print alike are stored alike.
+    fn write_stored(&self, out: &mut Vec<u8>) {
+        if self.positional_len() <= self.compact_len().max(POSITIONAL_UP_TO) {
+            self.write_positional(out);
+        } else {
+            self.write_compact(out);
+        }
+    }
 }
 
 /// The span of the next JSON number in `text` at or after `from`, skipping
@@ -464,21 +621,35 @@ fn write_object(out: &mut Vec<u8>, fields: &Map<String, Value>) {
 /// That feature is not turned on because it would change `Number` for every
 /// other user of serde_json in the build.
 pub fn encode_text(text: &str) -> Result<Vec<u8>, String> {
-    match encode_text_from(text, text) {
-        Err(e) if e.starts_with("number out of range") => encode_text_from(&mask_numbers(text), text),
+    match encode_text_from(text, text, MAX_DOCUMENT_BYTES) {
+        Err(e) if e.starts_with("number out of range") => {
+            encode_text_from(&mask_numbers(text), text, MAX_DOCUMENT_BYTES)
+        }
         result => result,
     }
 }
 
+/// The largest encoded document. Every offset in a document is a `u32`, so
+/// one past 4 GiB would be written with truncated offsets and read back as
+/// other values. The bound is half that because an object whose keys arrive
+/// out of order is re-laid in scratch after its children while those are
+/// still in place.
+const MAX_DOCUMENT_BYTES: usize = i32::MAX as usize;
+
+/// The refusal of a document past [`MAX_DOCUMENT_BYTES`].
+const DOCUMENT_TOO_LARGE: &str = "total size of jsonb document exceeds the maximum of 2147483647 bytes";
+
 /// [`encode_text`]'s parse of `lexed`, taking each number's lexeme from
-/// `text`, which differs from `lexed` at most in its numbers.
-fn encode_text_from(lexed: &str, text: &str) -> Result<Vec<u8>, String> {
+/// `text`, which differs from `lexed` at most in its numbers, and refusing
+/// to grow the encoding past `limit` bytes.
+fn encode_text_from(lexed: &str, text: &str, limit: usize) -> Result<Vec<u8>, String> {
     let mut builder = Builder {
         out: Vec::with_capacity(text.len() + 16),
         slots: Vec::new(),
         order: Vec::new(),
         text: text.as_bytes(),
         cursor: 0,
+        limit,
     };
     let mut de = serde_json::Deserializer::from_str(lexed);
     serde::de::DeserializeSeed::deserialize(ValueSeed(&mut builder), &mut de)
@@ -500,9 +671,24 @@ struct Builder<'t> {
     slots: Vec<[u32; 4]>,
     /// Scratch for sorting an object's entries when it closes.
     order: Vec<u32>,
+    /// How large `out` may grow, scratch included; see
+    /// [`MAX_DOCUMENT_BYTES`].
+    limit: usize,
 }
 
 impl Builder<'_> {
+    /// Refuses the document when `out` and `more` bytes after it would pass
+    /// the limit. A composite checks it when it closes, before it writes its
+    /// offset table, so no offset past the limit is ever written. Only a
+    /// composite can grow the document much past its text: a scalar is
+    /// stored about as long as it was written.
+    fn room<E: serde::de::Error>(&self, more: usize) -> Result<(), E> {
+        if self.out.len().saturating_add(more) > self.limit {
+            return Err(E::custom(DOCUMENT_TOO_LARGE));
+        }
+        Ok(())
+    }
+
     fn string(&mut self, text: &str) {
         self.out.push(TAG_STR);
         write_len_prefixed(&mut self.out, text.as_bytes());
@@ -521,7 +707,7 @@ impl Builder<'_> {
 
     /// Puts a composite's header and offset table in front of its children,
     /// which occupy `out[start..]`, described by `slots[base..]`.
-    fn close(&mut self, tag: u8, start: usize, base: usize) {
+    fn close<E: serde::de::Error>(&mut self, tag: u8, start: usize, base: usize) -> Result<(), E> {
         let count = self.slots.len() - base;
         let stride = if tag == TAG_ARR { ARR_ENTRY } else { OBJ_ENTRY };
         let header = 5 + count * stride;
@@ -536,6 +722,7 @@ impl Builder<'_> {
             });
 
         if in_order {
+            self.room(header)?;
             let end = self.out.len();
             self.out.resize(end + header, 0);
             self.out.copy_within(start..end, start + header);
@@ -559,7 +746,7 @@ impl Builder<'_> {
             }
             debug_assert_eq!(body_at + (end - start), self.out.len());
             self.slots.truncate(base);
-            return;
+            return Ok(());
         }
 
         // Sorted by key, ties by arrival, then each run of equal keys reduced
@@ -590,6 +777,7 @@ impl Builder<'_> {
         // Laid out after the scratch, then moved down over it.
         let kept = self.order.len();
         let table = 5 + kept * OBJ_ENTRY;
+        self.room(table + (self.out.len() - start))?;
         let final_at = self.out.len();
         self.out.resize(final_at + table, 0);
         self.out[final_at] = TAG_OBJ;
@@ -613,6 +801,7 @@ impl Builder<'_> {
         self.out.copy_within(final_at..end, start);
         self.out.truncate(start + (end - final_at));
         self.slots.truncate(base);
+        Ok(())
     }
 }
 
@@ -693,8 +882,7 @@ impl<'de> serde::de::Visitor<'de> for ValueSeed<'_, '_> {
             let len = (b.out.len() - at) as u32;
             b.slots.push([0, 0, at as u32, len]);
         }
-        b.close(TAG_ARR, start, base);
-        Ok(())
+        b.close(TAG_ARR, start, base)
     }
 
     fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
@@ -714,8 +902,7 @@ impl<'de> serde::de::Visitor<'de> for ValueSeed<'_, '_> {
                 (b.out.len() - val_at) as u32,
             ]);
         }
-        b.close(TAG_OBJ, start, base);
-        Ok(())
+        b.close(TAG_OBJ, start, base)
     }
 }
 
@@ -2288,6 +2475,129 @@ mod tests {
         assert_eq!(pg_text("1e-16383").unwrap().len(), 16_385);
         assert_eq!(pg_text("0e1000000").unwrap(), "0");
         assert_eq!(pg_text("0e1073741823").unwrap(), "0");
+    }
+
+    /// A number is stored about as long as it was written, not as long as it
+    /// prints. `1e131071` prints 131072 characters, and PostgreSQL 17 stores
+    /// it in 22 bytes (`pg_column_size('1e131071'::jsonb)`), and
+    /// `'0e-16383'::jsonb` in 20. Expanding at encode time made a literal of
+    /// 40 such numbers, 360 bytes of text, a 5 MB document, and 40,000 of
+    /// them a 5 GB one.
+    #[test]
+    fn a_number_is_stored_compactly_and_prints_in_full() {
+        for (text, printed) in [
+            ("1e131071", 131_072),
+            ("-1e131071", 131_073),
+            ("0e-16383", 16_385),
+            ("1e-16383", 16_385),
+            ("-9.5e-16382", 16_386),
+            ("1.000e-16380", 16_385),
+            ("12.50e40", 42),
+        ] {
+            let stored = encode_text(text).unwrap();
+            assert!(stored.len() <= 5 + text.len() + 2, "{text} stored in {} bytes", stored.len());
+            assert_eq!(pg_text(text).unwrap().len(), printed, "{text}");
+        }
+        let many = format!("[{}1e131071]", "1e131071,".repeat(999));
+        let stored = encode_text(&many).unwrap();
+        assert!(stored.len() < 32 * 1000, "1000 numbers stored in {} bytes", stored.len());
+        // PostgreSQL 17: `length(('[' || repeat('1e131071,', 39) ||
+        // '1e131071]')::jsonb::text)` is 5242960.
+        let forty = format!("[{}1e131071]", "1e131071,".repeat(39));
+        assert_eq!(pg_text(&forty).unwrap().len(), 5_242_960);
+    }
+
+    /// Random numbers, many of them past the length where the exponent form
+    /// is stored: each must print exactly as its own lexeme does, be stored
+    /// no longer than it was written (or than short positional text), and be
+    /// stored as the same bytes as another spelling of the same value and
+    /// scale, `0.<all the digits>` with the exponent moved to match.
+    #[test]
+    fn the_stored_form_keeps_value_and_scale() {
+        let mut rng = fastrand::Rng::with_seed(0x636f_6d70);
+        for _ in 0..50_000 {
+            let negative = rng.bool();
+            let int: String = match rng.u8(0..3) {
+                0 => "0".into(),
+                _ => {
+                    let mut s = rng.u8(1..10).to_string();
+                    for _ in 0..rng.usize(0..6) {
+                        s.push(['0', '0', '5', '9'][rng.usize(0..4)]);
+                    }
+                    s
+                }
+            };
+            let frac: String = (0..rng.usize(0..6)).map(|_| ['0', '0', '3', '7'][rng.usize(0..4)]).collect();
+            let exponent: i64 = match rng.u8(0..4) {
+                0 => 0,
+                1 => rng.i64(-10..10),
+                _ => rng.i64(-300..300),
+            };
+            let sign = if negative { "-" } else { "" };
+            let dot = if frac.is_empty() { "" } else { "." };
+            let lexeme = format!("{sign}{int}{dot}{frac}e{exponent}");
+            let respelled = format!("{sign}0.{int}{frac}e{}", exponent + int.len() as i64);
+
+            let mut want = Vec::new();
+            write_numeric_text(lexeme.as_bytes(), &mut want).unwrap();
+            let stored = encode_text(&lexeme).unwrap();
+            assert_eq!(pg_text(&lexeme).unwrap().as_bytes(), &want[..], "{lexeme}");
+            assert!(
+                stored.len() <= 5 + lexeme.len().max(POSITIONAL_UP_TO as usize),
+                "{lexeme} stored in {} bytes",
+                stored.len()
+            );
+            assert_eq!(encode_text(&respelled).unwrap(), stored, "{lexeme} and {respelled}");
+            assert_eq!(scalar_eq(&stored, &encode_text(&respelled).unwrap()), Some(true));
+        }
+    }
+
+    /// A document whose encoding would pass the size limit is refused, not
+    /// written with offsets truncated to `u32`. The real limit is 2 GiB;
+    /// the same checks are run here against a small one, at each place the
+    /// encoding grows: an array, an object in order, and an object re-laid
+    /// in scratch because its keys arrived out of order.
+    #[test]
+    fn a_document_past_the_size_limit_is_refused() {
+        for text in [
+            "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]",
+            r#"{"a":0,"b":0,"c":0,"d":0,"e":0,"f":0,"g":0,"h":0}"#,
+            r#"{"h":0,"g":0,"f":0,"e":0,"d":0,"c":0,"b":0,"a":0}"#,
+            r#"[[[["a long string that alone is past the limit of this test"]]]]"#,
+        ] {
+            let size = encode_text(text).unwrap().len();
+            // Out of order, the object needs its scratch copy as well.
+            let needed = if text.starts_with(r#"{"h""#) { 2 * size } else { size };
+            assert!(encode_text_from(text, text, needed).is_ok(), "{text} within {needed}");
+            let err = encode_text_from(text, text, size - 1).unwrap_err();
+            assert!(err.starts_with(DOCUMENT_TOO_LARGE), "{text}: {err}");
+        }
+    }
+
+    /// A value and scale have one stored form, however they were spelled, so
+    /// that spellings PostgreSQL prints alike stay alike as bytes. Each
+    /// printed form is PostgreSQL 17's, from
+    /// `SELECT '[1e50, 1e-50, 1.000e-45, 12.50e40, -3.10e-30, 0e-45]'::jsonb`.
+    #[test]
+    fn spellings_that_print_alike_are_stored_alike() {
+        let zeros = |n: usize| "0".repeat(n);
+        for (spellings, pg) in [
+            (vec!["1e50".to_string(), format!("1{}", zeros(50)), "10e49".into(), "0.1e51".into()], format!("1{}", zeros(50))),
+            (vec!["1e-50".to_string(), format!("0.{}1", zeros(49)), "0.1e-49".into(), "0.01e-48".into()], format!("0.{}1", zeros(49))),
+            (vec!["1.000e-45".to_string(), format!("0.{}1000", zeros(44)), "1000e-48".into()], format!("0.{}1000", zeros(44))),
+            (vec!["12.50e40".to_string(), "1.250e41".into(), format!("125{}", zeros(39))], format!("125{}", zeros(39))),
+            (vec!["-3.10e-30".to_string(), "-310e-32".into(), format!("-0.{}310", zeros(29))], format!("-0.{}310", zeros(29))),
+            (vec!["0e-45".to_string(), "-0e-45".into(), "0.000e-42".into(), format!("0.{}", zeros(45))], format!("0.{}", zeros(45))),
+            (vec!["1.5e1".to_string(), "15".into(), "0.15e2".into()], "15".to_string()),
+            (vec!["1.50e1".to_string(), "15.0".into(), "150e-1".into()], "15.0".to_string()),
+            (vec!["1e20".to_string(), format!("1{}", zeros(20))], format!("1{}", zeros(20))),
+        ] {
+            let first = encode_text(&spellings[0]).unwrap();
+            for s in &spellings {
+                assert_eq!(pg_text(s).unwrap(), pg, "{s}");
+                assert_eq!(encode_text(s).unwrap(), first, "{s} and {} are stored apart", spellings[0]);
+            }
+        }
     }
 
     /// Documents an earlier build wrote kept a float's `Display` as the

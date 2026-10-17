@@ -49,16 +49,21 @@ fn number(r: &mut Lcg, n: u64) -> String {
 /// Values that are equal as numbers but not as text, past the `f64` range
 /// and past its precision: the containment index hashes them by value and
 /// the path index keys them by text, and both must agree with the scan.
-const BIG: [&str; 14] = [
+/// The last seven have long positional text and are stored in a short
+/// exponent form instead, which is written out only when printed.
+const BIG: [&str; 21] = [
     "1e400", "10e399", "1E+400", "1.000000000000000000001", "1.0000000000000000000010", "1", "1.0",
     "9007199254740993", "9007199254740993.0", "9.007199254740993e15", "9007199254740992", "-0", "0.0",
-    "1e-400",
+    "1e-400", "1e60", "10e59", "1000000000000000000000000000000000000000000000000000000000000",
+    "1.000e-45", "1000e-48", "0e-45", "-0.0e-44",
 ];
 
 /// What `->>` prints for some of those, and some text no number prints as.
-const BIG_TEXT: [&str; 9] = [
+const BIG_TEXT: [&str; 13] = [
     "1", "1.0", "0", "0.0", "-0", "9007199254740993", "9007199254740993.0", "1.000000000000000000001",
-    "1e400",
+    "1e400", "1000000000000000000000000000000000000000000000000000000000000",
+    "0.000000000000000000000000000000000000000000001000", "0.000000000000000000000000000000000000000000000",
+    "1e60",
 ];
 
 /// Whether documents may be `NULL`: they match no JSON operator, indexed or
