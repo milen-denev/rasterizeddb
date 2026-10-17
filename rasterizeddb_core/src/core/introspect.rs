@@ -714,8 +714,8 @@ async fn database_stats(database: &Arc<Database>) -> Vec<Row> {
         "no transaction is running",
     );
 
-    for (metric, value, detail) in durability_metrics(database.location.as_deref()) {
-        push(metric, value, detail);
+    for (metric, value, detail) in durability_metrics(&durability_locations(database)) {
+        push(&metric, value, &detail);
     }
     push(
         "vacuum_panics",
@@ -794,45 +794,143 @@ async fn database_stats(database: &Arc<Database>) -> Vec<Row> {
     out
 }
 
+/// Every directory with a write-ahead log of its own, root first.
+///
+/// A storage pool gives each extra location its own log (see
+/// `StorageManager::prepare_locations`), and a commit that touched a table
+/// there is refused when *that* log is poisoned, so reading only the root's
+/// reported a healthy database whose second disk refused every commit.
+fn durability_locations(database: &Database) -> Vec<String> {
+    let mut locations: Vec<String> = database.location.iter().cloned().collect();
+    #[cfg(feature = "storage_pools")]
+    for path in database.storage.all_paths() {
+        let key = crate::core::wal::dir_key(&path);
+        if !locations
+            .iter()
+            .any(|known| crate::core::wal::dir_key(known) == key)
+        {
+            locations.push(path);
+        }
+    }
+    locations
+}
+
 /// Whether this database's commits can still be trusted, for `SHOW STATS`.
 ///
 /// Each of these used to be visible only as one `error!` line at the moment it
 /// happened. A poisoned log refuses every commit for the rest of the process,
 /// and a log whose checkpoints keep declining or failing never shrinks, so
 /// both are states an operator needs to be able to ask about afterwards.
-fn durability_metrics(location: Option<&str>) -> Vec<(&'static str, String, &'static str)> {
-    let wal = location.and_then(crate::core::wal::wal_for);
-    let (declined, failed) = wal.as_ref().map(|w| w.checkpoint_counts()).unwrap_or((0, 0));
-    vec![
+///
+/// `locations` is root first. The long-standing metric names are totals over
+/// all of them — any poisoned, counts summed — so a client that reads
+/// `wal_poisoned` cannot be told "false" while a second disk's log is
+/// poisoned. With more than one location the text values name the directory
+/// they came from, and a `wal_location:<path>` row per location says which
+/// one is in trouble. A single-directory database reports exactly what it
+/// always did.
+fn durability_metrics(locations: &[String]) -> Vec<(String, String, String)> {
+    let labelled = locations.len() > 1;
+    let mut poisoned = false;
+    let mut declined = 0u64;
+    let mut failed = 0u64;
+    let mut poison_reasons = Vec::new();
+    let mut checkpoint_errors = Vec::new();
+    let mut flush_failures = Vec::new();
+    let mut per_location = Vec::new();
+
+    let label = |path: &str, text: String| {
+        if labelled { format!("{}: {}", path, text) } else { text }
+    };
+
+    for (index, path) in locations.iter().enumerate() {
+        let wal = crate::core::wal::wal_for(path);
+        let here_poisoned = wal.as_ref().is_some_and(|w| w.is_poisoned());
+        let (here_declined, here_failed) =
+            wal.as_ref().map(|w| w.checkpoint_counts()).unwrap_or((0, 0));
+        let flush_failure =
+            crate::core::storage_providers::file_sync::directory_flush_failure(path);
+
+        poisoned |= here_poisoned;
+        declined += here_declined;
+        failed += here_failed;
+        if let Some(reason) = wal.as_ref().and_then(|w| w.poison_reason()) {
+            poison_reasons.push(label(path, reason));
+        }
+        if let Some(error) = wal.as_ref().and_then(|w| w.last_checkpoint_error()) {
+            checkpoint_errors.push(label(path, error));
+        }
+        let flush_failed = flush_failure.is_some();
+        if let Some(failure) = flush_failure {
+            flush_failures.push(label(path, failure));
+        }
+
+        if labelled {
+            let state = if here_poisoned {
+                "poisoned"
+            } else if flush_failed {
+                "data flush failed"
+            } else if wal.is_none() {
+                "no log"
+            } else {
+                "ok"
+            };
+            per_location.push((
+                format!("wal_location:{}", path),
+                state.to_string(),
+                format!(
+                    "{}checkpoints declined {}, failed {}",
+                    if index == 0 { "root; " } else { "" },
+                    here_declined,
+                    here_failed
+                ),
+            ));
+        }
+    }
+
+    // Poison is per directory: each location has its own log, and a commit is
+    // refused only by the logs it touches, so with several the old wording
+    // told an operator the whole database had stopped when one disk had.
+    let poisoned_detail = if labelled {
+        "a flush, apply or log write failed in at least one location; commits \
+         touching that location are refused until restart (see wal_location rows)"
+    } else {
+        "a flush, apply or log write failed; every commit is refused until restart"
+    };
+    let mut out = vec![
         (
-            "wal_poisoned",
-            wal.as_ref().is_some_and(|w| w.is_poisoned()).to_string(),
-            "a flush, apply or log write failed; every commit is refused until restart",
+            "wal_poisoned".to_string(),
+            poisoned.to_string(),
+            poisoned_detail.to_string(),
         ),
         (
-            "wal_poison_reason",
-            wal.as_ref().and_then(|w| w.poison_reason()).unwrap_or_default(),
-            "",
+            "wal_poison_reason".to_string(),
+            poison_reasons.join("; "),
+            String::new(),
         ),
         (
-            "wal_checkpoints_declined",
+            "wal_checkpoints_declined".to_string(),
             declined.to_string(),
-            "skipped while a transaction was open or another checkpoint ran",
-        ),
-        ("wal_checkpoint_failures", failed.to_string(), ""),
-        (
-            "wal_last_checkpoint_error",
-            wal.as_ref().and_then(|w| w.last_checkpoint_error()).unwrap_or_default(),
-            "",
+            "skipped while a transaction was open or another checkpoint ran".to_string(),
         ),
         (
-            "data_flush_failure",
-            location
-                .and_then(crate::core::storage_providers::file_sync::directory_flush_failure)
-                .unwrap_or_default(),
-            "a data file here failed a flush; commits here are refused until restart",
+            "wal_checkpoint_failures".to_string(),
+            failed.to_string(),
+            String::new(),
         ),
-    ]
+        (
+            "wal_last_checkpoint_error".to_string(),
+            checkpoint_errors.join("; "),
+            String::new(),
+        ),
+        (
+            "data_flush_failure".to_string(),
+            flush_failures.join("; "),
+            "a data file here failed a flush; commits here are refused until restart".to_string(),
+        ),
+    ];
+    out.extend(per_location);
+    out
 }
 
 async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, String> {
@@ -2394,6 +2492,17 @@ mod tests {
                 kept
             );
         }
+
+        // A single-directory database reports what it always did. The pool
+        // manager lists the root among its locations too, so without the
+        // de-duplication the root is counted twice and every value gains a
+        // path prefix.
+        assert_eq!(durability_locations(&database).len(), 1);
+        assert!(
+            !metrics.iter().any(|m| m.starts_with("wal_location:")),
+            "a single-directory database grew per-location rows: {:?}",
+            metrics
+        );
     }
 
     /// The count has to be the set `SHOW TABLES` lists, or a console's front
@@ -2445,7 +2554,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let location = dir.path().to_str().unwrap().to_string();
         let metric = |name: &str| {
-            durability_metrics(Some(&location))
+            durability_metrics(std::slice::from_ref(&location))
                 .into_iter()
                 .find(|(m, _, _)| *m == name)
                 .map(|(_, v, _)| v)
@@ -2469,12 +2578,275 @@ mod tests {
         let reason = metric("wal_poison_reason");
         let failures = metric("wal_checkpoint_failures");
         let last_error = metric("wal_last_checkpoint_error");
+        let detail = durability_metrics(std::slice::from_ref(&location))
+            .into_iter()
+            .find(|(m, _, _)| m == "wal_poisoned")
+            .map(|(_, _, d)| d)
+            .expect("wal_poisoned is reported");
         crate::core::wal::remove_for(&location);
 
         assert_eq!(poisoned, "true");
         assert!(reason.contains("/dev/null"), "the reason names the file: {:?}", reason);
         assert_eq!(failures, "1");
         assert!(!last_error.is_empty());
+        // One directory, one log: here a poisoned log does stop every commit.
+        assert_eq!(detail, "a flush, apply or log write failed; every commit is refused until restart");
+    }
+
+    /// Forgets the logs and flush failures a test registered for these
+    /// directories, on panic too: both registries are process-global, and a
+    /// poisoned entry left behind describes a deleted directory to every test
+    /// that runs after.
+    struct Registered(Vec<String>);
+
+    impl Drop for Registered {
+        fn drop(&mut self) {
+            for location in &self.0 {
+                crate::core::wal::remove_for(location);
+                crate::core::storage_providers::file_sync::forget_directory_failure(location);
+            }
+        }
+    }
+
+    /// Every location's trouble reaches the totals. Each count is summed, not
+    /// overwritten or maxed, and each text value collects every location,
+    /// labelled with it — a total taken from one location reads healthy while
+    /// another disk refuses commits, which is the bug these metrics fix.
+    ///
+    /// root: poisoned, one decline and a recorded flush failure (poison wins);
+    /// `poisoned`: poisoned; `flushed`: two declines and a flush failure;
+    /// `bare`: no log at all.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn every_location_is_summed_and_labelled() {
+        let dirs: Vec<_> = (0..4).map(|_| tempfile::tempdir().unwrap()).collect();
+        let paths: Vec<String> =
+            dirs.iter().map(|d| d.path().to_str().unwrap().to_string()).collect();
+        let _registered = Registered(paths.clone());
+        let (root, poisoned, flushed, bare) = (&paths[0], &paths[1], &paths[2], &paths[3]);
+
+        let install = |path: &String| {
+            let wal = std::sync::Arc::new(
+                crate::core::wal::Wal::open(
+                    std::path::Path::new(path).join(crate::core::wal::DEFAULT_WAL_NAME),
+                )
+                .unwrap(),
+            );
+            crate::core::wal::install_for(path, wal.clone());
+            wal
+        };
+        // `/dev/null` fails `fdatasync`, and a checkpoint syncs what records name.
+        let poison = |wal: &crate::core::wal::Wal| {
+            wal.register_file(0xDEAD_BEEF, "/dev/null").expect("register the file");
+            wal.log(wal.begin(), 0xDEAD_BEEF, 0, b"x").unwrap();
+            assert!(wal.checkpoint().is_err());
+        };
+        // A pending overwrite holds the log, so a checkpoint declines.
+        let decline = |wal: &crate::core::wal::Wal, path: &String| {
+            let data = std::path::Path::new(path).join("t.db");
+            std::fs::write(&data, b"").unwrap();
+            let id = crate::core::wal::file_id_for_name("t.db");
+            wal.register_file(id, &data).unwrap();
+            let txn = wal.begin();
+            wal.log_in_place(txn, id, 0, b"held").unwrap();
+            assert!(!wal.checkpoint().unwrap(), "the checkpoint was not declined");
+            wal.abort_txn(txn);
+        };
+
+        let root_wal = install(root);
+        decline(&root_wal, root);
+        poison(&root_wal);
+        poison(&install(poisoned));
+        let flushed_wal = install(flushed);
+        decline(&flushed_wal, flushed);
+        decline(&flushed_wal, flushed);
+        use crate::core::storage_providers::file_sync::record_directory_failure;
+        record_directory_failure(root, "root flush".to_string());
+        record_directory_failure(flushed, "flushed flush".to_string());
+
+        let metrics = durability_metrics(&paths);
+        let value_of = |name: &str| {
+            metrics
+                .iter()
+                .find(|(m, _, _)| m == name)
+                .map(|(_, v, _)| v.clone())
+                .unwrap_or_else(|| panic!("{} is not reported", name))
+        };
+
+        assert_eq!(value_of("wal_poisoned"), "true");
+        assert_eq!(value_of("wal_checkpoints_declined"), "3");
+        assert_eq!(value_of("wal_checkpoint_failures"), "2");
+
+        let reason = value_of("wal_poison_reason");
+        let parts: Vec<&str> = reason.split("; ").collect();
+        assert_eq!(parts.len(), 2, "one reason per poisoned location: {:?}", reason);
+        assert!(parts[0].starts_with(&format!("{}: ", root)), "{:?}", reason);
+        assert!(parts[1].starts_with(&format!("{}: ", poisoned)), "{:?}", reason);
+
+        let errors = value_of("wal_last_checkpoint_error");
+        assert!(errors.starts_with(&format!("{}: ", root)), "{:?}", errors);
+        assert!(errors.contains(&format!("; {}: ", poisoned)), "{:?}", errors);
+
+        assert_eq!(
+            value_of("data_flush_failure"),
+            format!("{}: root flush; {}: flushed flush", root, flushed)
+        );
+
+        assert_eq!(value_of(&format!("wal_location:{}", root)), "poisoned");
+        assert_eq!(value_of(&format!("wal_location:{}", poisoned)), "poisoned");
+        assert_eq!(value_of(&format!("wal_location:{}", flushed)), "data flush failed");
+        assert_eq!(value_of(&format!("wal_location:{}", bare)), "no log");
+
+        // Poison is scoped to a location's log; the summary must not claim the
+        // whole database stopped.
+        let detail = metrics
+            .iter()
+            .find(|(m, _, _)| m == "wal_poisoned")
+            .map(|(_, _, d)| d.clone())
+            .unwrap();
+        assert!(!detail.contains("every commit"), "{:?}", detail);
+    }
+
+    /// A database with no pool reports its root once. The pool manager seeds
+    /// its locations with the root, so without the de-duplication one root
+    /// failure is counted twice and every value gains a path prefix — a wrong
+    /// number on every database, with nothing looking wrong.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_single_directory_database_reports_its_root_once() {
+        let _ = crate::MAX_PERMITS_THREADS.get_or_init(|| 8);
+        let _ = crate::BATCH_SIZE.get_or_init(|| 1024 * 8);
+
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().to_str().unwrap().to_string();
+        let database = Arc::new(Database::new(&root_path).await);
+        let _registered = Registered(vec![root_path.clone()]);
+
+        let value_of = |stats: &[Row], metric: &str| -> String {
+            let index = stats
+                .iter()
+                .position(|row| row.columns[0].data.into_slice() == metric.as_bytes())
+                .unwrap_or_else(|| panic!("no `{}` row", metric));
+            String::from_utf8(stats[index].columns[1].data.into_slice().to_vec())
+                .expect("a value is text")
+        };
+
+        let wal = crate::core::wal::wal_for(&root_path).expect("the root has a log");
+        wal.register_file(0xDEAD_BEEF, "/dev/null").expect("register the file");
+        wal.log(wal.begin(), 0xDEAD_BEEF, 0, b"x").unwrap();
+        assert!(wal.checkpoint().is_err());
+
+        let stats = database_stats(&database).await;
+        let names: Vec<String> = stats
+            .iter()
+            .map(|row| String::from_utf8(row.columns[0].data.into_slice().to_vec()).unwrap())
+            .collect();
+        assert!(
+            !names.iter().any(|m| m.starts_with("wal_location:")),
+            "a single-directory database grew per-location rows: {:?}",
+            names
+        );
+        assert_eq!(value_of(&stats, "wal_poisoned"), "true");
+        assert_eq!(value_of(&stats, "wal_checkpoint_failures"), "1", "the root was counted twice");
+        let reason = value_of(&stats, "wal_poison_reason");
+        assert!(
+            reason.contains("/dev/null") && !reason.contains(&format!("{}: ", root_path)),
+            "a single-directory reason is unlabelled: {:?}",
+            reason
+        );
+    }
+
+    /// A storage location has a log of its own, and a commit that touched a
+    /// table there is refused when that log is poisoned. `SHOW STATS` read only
+    /// the root's, so it reported `wal_poisoned = false` for a database whose
+    /// second disk refused every write.
+    #[cfg(all(target_os = "linux", feature = "storage_pools"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_poisoned_log_on_a_second_location_is_reported() {
+        let _ = crate::MAX_PERMITS_THREADS.get_or_init(|| 8);
+        let _ = crate::BATCH_SIZE.get_or_init(|| 1024 * 8);
+
+        let root = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let database = Arc::new(Database::new(root.path().to_str().unwrap()).await);
+
+        let run = |sql: String| {
+            let database = database.clone();
+            async move {
+                let purpose = crate::core::rql::lexer_s1::recognize_query_purpose(&sql)
+                    .unwrap_or_else(|| panic!("unrecognised: {sql}"));
+                let response = crate::core::rql::executor::execute(purpose, database).await;
+                assert_ne!(response.first(), Some(&3u8), "{sql} failed");
+            }
+        };
+        let second_path = second.path().to_str().unwrap().to_string();
+        run(format!("STORAGE ADD LOCATION '{}'", second_path)).await;
+        run("CREATE TABLE remote (id INT, label VARCHAR)".to_string()).await;
+        run(format!("STORAGE MOVE TABLE remote TO '{}'", second_path)).await;
+        for id in 0..8 {
+            run(format!("INSERT INTO remote (id, label) VALUES ({id}, 'row {id}')")).await;
+        }
+        database.sync_durable().expect("sync");
+
+        let located = database
+            .storage
+            .location_of("remote")
+            .expect("the table was placed on the second location");
+        assert!(
+            std::path::Path::new(&located).join("remote.db").exists(),
+            "the writes did not land in {located}"
+        );
+        let _registered = Registered(vec![root.path().to_str().unwrap().to_string(), located.clone()]);
+        let wal = crate::core::wal::wal_for(&located).expect("the second location has a log");
+        assert!(
+            crate::core::wal::wal_for(root.path().to_str().unwrap()).is_some(),
+            "the root has a log of its own"
+        );
+        // The root once, however the pool manager spells it.
+        assert_eq!(durability_locations(&database).len(), 2);
+
+        let stats = || async {
+            let stats = database_stats(&database).await;
+            move |metric: &str| -> String {
+                let index = stats
+                    .iter()
+                    .position(|row| row.columns[0].data.into_slice() == metric.as_bytes())
+                    .unwrap_or_else(|| panic!("no `{}` row", metric));
+                String::from_utf8(stats[index].columns[1].data.into_slice().to_vec())
+                    .expect("a value is text")
+            }
+        };
+        let location_row = format!("wal_location:{}", located);
+        let healthy = stats().await;
+        assert_eq!(healthy("wal_poisoned"), "false");
+        assert_eq!(healthy(&location_row), "ok");
+
+        // Poisons only the second location's log; the root's stays healthy.
+        // A checkpoint syncs the files records name, and `/dev/null` fails
+        // `fdatasync`.
+        wal.register_file(0xDEAD_BEEF, "/dev/null").expect("register the file");
+        wal.log(wal.begin(), 0xDEAD_BEEF, 0, b"x").unwrap();
+        assert!(wal.checkpoint().is_err());
+
+        let value_of = stats().await;
+        let poisoned = value_of("wal_poisoned");
+        let reason = value_of("wal_poison_reason");
+        let failures = value_of("wal_checkpoint_failures");
+        let second_state = value_of(&location_row);
+        let root_state = value_of(&format!(
+            "wal_location:{}",
+            crate::core::storage::normalize(root.path().to_str().unwrap())
+        ));
+
+        assert_eq!(poisoned, "true", "a poisoned pool log was reported healthy");
+        assert!(
+            reason.starts_with(&format!("{}: ", located)) && reason.contains("/dev/null"),
+            "the reason names the location and the file: {:?}",
+            reason
+        );
+        assert_eq!(failures, "1");
+        assert_eq!(second_state, "poisoned");
+        assert_eq!(root_state, "ok");
     }
 
     /// Result metadata is sent before the rows, so a mismatch is a protocol
