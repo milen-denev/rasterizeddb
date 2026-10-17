@@ -37,6 +37,8 @@ use crate::pg_params::{BoundParam, inline_params};
 
 mod param_infer;
 mod statement_intern;
+#[cfg(test)]
+mod temp_relation_tests;
 mod wire_out;
 
 /// Start a minimal PostgreSQL wire-protocol server (pgwire).
