@@ -59,6 +59,9 @@ pub mod type_modifier;
 pub mod unique_key;
 pub mod window;
 
+#[cfg(test)]
+mod rename_column_tests;
+
 #[cfg(feature = "s3_backup")]
 pub mod backup_exec;
 /// `BACKUP`, `RESTORE` and `SHOW BACKUPS`, behind the `s3_backup` feature.

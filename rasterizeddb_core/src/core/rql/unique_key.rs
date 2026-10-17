@@ -197,8 +197,10 @@ pub async fn remove<S: StorageIO>(schema_io: Arc<S>, name: &str) -> io::Result<b
             continue;
         }
         key.is_deleted = true;
-        io.write_data_seek(io::SeekFrom::Start(position), &key.into_vec())
-            .await;
+        // Through the log, not `write_data_seek`: the record went in as a
+        // logged append, and the replay at every open put an unlogged
+        // overwrite back — the dropped constraint was enforced again.
+        io.write_data(position, &key.into_vec()).await;
         return Ok(true);
     }
 

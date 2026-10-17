@@ -158,11 +158,16 @@ pub fn forget_database(database: u64) {
 ///
 /// Every column the table has ever had is a candidate, not only the ones whose
 /// current default still reads that name. The default is not a reliable
-/// witness: `DROP COLUMN` tombstones the field and leaves its default, `RENAME
-/// COLUMN` moves the field and leaves its default keyed by the old name, and
-/// `DROP DEFAULT` removes the default outright. Asking only live fields whose
-/// default reads the name missed all three, so the counter outlived the table
-/// and the next `CREATE TABLE` of the same name started above 1.
+/// witness: `DROP COLUMN` tombstones the field, and `DROP DEFAULT` removes the
+/// default outright. Asking only live fields whose default reads the name
+/// missed both, so the counter outlived the table and the next `CREATE TABLE`
+/// of the same name started above 1.
+///
+/// Nor is a column's *name*: `RENAME COLUMN a TO c` moves the field and its
+/// default to `c`, and the default goes on reading `nextval('t_a_seq')`, as it
+/// does in PostgreSQL — so no column is called `a` any more. Every sequence of
+/// the `<table>_…_seq` shape that one of this table's own defaults reads is a
+/// candidate too.
 ///
 /// What keeps a wide candidate set from taking another table's counter is
 /// `named_elsewhere`: every sequence a `nextval` default of *another* table in
@@ -182,11 +187,30 @@ pub fn owned_by(
         .map(|f| f.name.as_str())
         .chain(defaults.iter().map(|d| d.column.as_str()))
         .map(|column| sequence_name(table, column))
+        .chain(
+            defaults
+                .iter()
+                .filter(|d| !d.is_deleted)
+                .filter_map(|d| parse_nextval(&d.expression))
+                .map(|name| name.to_ascii_lowercase())
+                .filter(|name| serial_column_of(table, name).is_some()),
+        )
         .filter(|name| !named_elsewhere.contains(name))
         .collect();
     owned.sort_unstable();
     owned.dedup();
     owned
+}
+
+/// The `<column>` of a sequence spelled `<table>_<column>_seq`, the shape a
+/// `SERIAL` on `table` creates, or `None` when `name` is not of that shape.
+///
+/// The column part is whatever the column was called when the `SERIAL` was
+/// declared, which a later `RENAME COLUMN` does not change.
+fn serial_column_of<'a>(table: &str, name: &'a str) -> Option<&'a str> {
+    let rest = name.strip_prefix(table.to_ascii_lowercase().as_str())?;
+    let column = rest.strip_prefix('_')?.strip_suffix("_seq")?;
+    (!column.is_empty()).then_some(column)
 }
 
 /// Every sequence a `nextval` default in `defaults` names, lowercased as
@@ -231,10 +255,14 @@ pub fn follow_rename(
         .filter(|d| !d.is_deleted)
         .filter_map(|d| {
             let from = parse_nextval(&d.expression)?;
-            if from != sequence_name(old_table, &d.column) || named_elsewhere.contains(&from) {
+            // By the sequence's own spelling, not by the column the default
+            // is filed under: a column renamed since its `SERIAL` was declared
+            // still reads `<old_table>_<its first name>_seq`.
+            let column = serial_column_of(old_table, &from)?;
+            if named_elsewhere.contains(&from) {
                 return None;
             }
-            let to = sequence_name(new_table, &d.column);
+            let to = sequence_name(new_table, column);
             if named_elsewhere.contains(&to) {
                 log::warn!(
                     "sequence {} stays with renamed table {}: {} is already in use",
@@ -483,10 +511,13 @@ mod tests {
                 .contains(&"t_id_seq".to_string())
         );
 
-        // `RENAME COLUMN id TO ident`: the default stays keyed `id`.
+        // `RENAME COLUMN id TO ident`: the default moves to `ident` and,
+        // as in PostgreSQL, still names `t_id_seq` — which no column is called
+        // any more, so only the `nextval` itself says the sequence is `t`'s.
         let fields = vec![field("ident", 0), field("n", 1)];
+        let renamed = vec![default("ident", "nextval('t_id_seq')")];
         assert!(
-            owned_by("t", &fields, &defaults, &nothing_elsewhere())
+            owned_by("t", &fields, &renamed, &nothing_elsewhere())
                 .contains(&"t_id_seq".to_string())
         );
 
@@ -529,6 +560,20 @@ mod tests {
         assert_eq!(rewritten.column, "id");
         assert_eq!(rewritten.expression, "nextval('u_id_seq')");
         assert_eq!((from.as_str(), to.as_str()), ("t_id_seq", "u_id_seq"));
+
+        // A column renamed before the table: the default is filed under the
+        // new column name and still reads the sequence its SERIAL created.
+        let renamed = vec![default("ident", "nextval('t_id_seq')")];
+        let moved = follow_rename("t", "u", &renamed, &nothing_elsewhere());
+        assert_eq!(moved.len(), 1, "{:?}", moved);
+        let (rewritten, from, to) = &moved[0];
+        assert_eq!(rewritten.column, "ident");
+        assert_eq!(rewritten.expression, "nextval('u_id_seq')");
+        assert_eq!((from.as_str(), to.as_str()), ("t_id_seq", "u_id_seq"));
+        // A sequence that only shares the prefix of a *longer* table name is
+        // another table's spelling and stays where it is.
+        let foreign = vec![default("k", "nextval('tx_k_seq')")];
+        assert!(follow_rename("t", "u", &foreign, &nothing_elsewhere()).is_empty());
 
         let name = sequence_name("renamed_from", "id");
         let target = sequence_name("renamed_to", "id");

@@ -746,10 +746,14 @@ impl TableSchema {
         for field in all_fields.iter_mut() {
             if field.name.eq_ignore_ascii_case(from) {
                 field.name = to.to_string();
-                let mut vec = field.into_vec();
-                field_io
-                    .write_data_seek(io::SeekFrom::Start(position), &mut vec)
-                    .await;
+                let vec = field.into_vec();
+                // Through the log, not `write_data_seek`. The record being
+                // overwritten went in as a logged append, and every open
+                // replays the log: an unlogged overwrite was undone by that
+                // replay, so a rename came back under the old name after a
+                // restart — with the defaults, scale and companion already
+                // moved to the new one.
+                field_io.write_data(position, &vec).await;
                 found = true;
                 break;
             }
@@ -804,10 +808,11 @@ impl TableSchema {
         for field in all_fields.iter_mut() {
             if field.name.eq_ignore_ascii_case(field_name) {
                 field.is_unique = unique;
-                let mut vec = field.into_vec();
-                field_io
-                    .write_data_seek(io::SeekFrom::Start(position), &mut vec)
-                    .await;
+                let vec = field.into_vec();
+                // Logged, as `rename_field` explains: unlogged, the replay at
+                // the next open restored the flag and the dropped UNIQUE was
+                // enforced again.
+                field_io.write_data(position, &vec).await;
                 break;
             }
             position += SCHEMA_FIELD_SIZE;
@@ -840,10 +845,11 @@ impl TableSchema {
         for field in all_fields.iter_mut() {
             if field.name == field_name {
                 field.is_deleted = true;
-                let mut vec = field.into_vec();
-                field_io
-                    .write_data_seek(io::SeekFrom::Start(position), &mut vec)
-                    .await;
+                let vec = field.into_vec();
+                // Logged, as `rename_field` explains: unlogged, the replay at
+                // the next open put the original record back and the dropped
+                // column returned.
+                field_io.write_data(position, &vec).await;
                 break;
             }
             position += SCHEMA_FIELD_SIZE;

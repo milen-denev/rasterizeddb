@@ -7601,6 +7601,557 @@ async fn retire_tombstoned_name<S: crate::core::storage_providers::traits::Stora
     }
 }
 
+/// Moves a column's by-name declarations — its `DEFAULT`, its generation
+/// expression and its NUMERIC scale — from `from` to `to`, or retires them when
+/// `to` is `None` (the column was dropped).
+///
+/// Each lives in an append-only sidecar where the newest record for a name
+/// wins, so moving is two appends: the declaration under the new name, then a
+/// tombstone under the old. A declaration still filed under `to` with nothing
+/// to replace it — left by a dropped column before drops retired theirs — is
+/// tombstoned too, so the renamed column does not inherit it.
+///
+/// `schema` is the table as loaded, whose lists hold only live records.
+/// Returns whether anything was written.
+async fn move_column_declarations<S: crate::core::storage_providers::traits::StorageIO>(
+    schema: &crate::core::row::schema::TableSchema,
+    from: &str,
+    to: Option<&str>,
+    io_schema: Arc<S>,
+) -> Result<bool, String> {
+    use crate::core::rql::{column_default, generated, type_modifier};
+    let named = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
+
+    let default_of = |name: &str| schema.defaults.iter().find(|d| named(&d.column, name));
+    let mut defaults = Vec::new();
+    if let Some(to) = to {
+        match default_of(from) {
+            Some(d) => defaults.push(column_default::ColumnDefault {
+                column: to.to_string(),
+                expression: d.expression.clone(),
+                is_deleted: false,
+            }),
+            None if default_of(to).is_some() => defaults.push(column_default::ColumnDefault {
+                column: to.to_string(),
+                expression: String::new(),
+                is_deleted: true,
+            }),
+            None => {}
+        }
+    }
+    if default_of(from).is_some() {
+        defaults.push(column_default::ColumnDefault {
+            column: from.to_string(),
+            expression: String::new(),
+            is_deleted: true,
+        });
+    }
+    for entry in &defaults {
+        column_default::append(io_schema.clone(), entry)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    let generated_of = |name: &str| schema.generated.iter().find(|g| named(&g.column, name));
+    let mut gens = Vec::new();
+    if let Some(to) = to {
+        match generated_of(from) {
+            Some(g) => gens.push(generated::GeneratedColumn {
+                column: to.to_string(),
+                expression: g.expression.clone(),
+                is_deleted: false,
+            }),
+            None if generated_of(to).is_some() => gens.push(generated::GeneratedColumn {
+                column: to.to_string(),
+                expression: String::new(),
+                is_deleted: true,
+            }),
+            None => {}
+        }
+    }
+    if generated_of(from).is_some() {
+        gens.push(generated::GeneratedColumn {
+            column: from.to_string(),
+            expression: String::new(),
+            is_deleted: true,
+        });
+    }
+    for entry in &gens {
+        generated::append(io_schema.clone(), entry)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    let modifier_of = |name: &str| {
+        schema
+            .type_modifiers
+            .iter()
+            .find(|m| named(&m.column, name) && !m.is_deleted)
+    };
+    let retired = |column: &str| type_modifier::TypeModifier {
+        column: column.to_string(),
+        precision: 0,
+        scale: 0,
+        is_deleted: true,
+    };
+    let mut modifiers = Vec::new();
+    if let Some(to) = to {
+        match modifier_of(from) {
+            Some(m) => modifiers.push(type_modifier::TypeModifier {
+                column: to.to_string(),
+                ..m.clone()
+            }),
+            None if modifier_of(to).is_some() => modifiers.push(retired(to)),
+            None => {}
+        }
+    }
+    if modifier_of(from).is_some() {
+        modifiers.push(retired(from));
+    }
+    for entry in &modifiers {
+        type_modifier::append(io_schema.clone(), entry)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(!(defaults.is_empty() && gens.is_empty() && modifiers.is_empty()))
+}
+
+/// `ALTER COLUMN … TYPE` naming the type a column already has, with what it
+/// says about a NUMERIC column's `(precision, scale)`.
+///
+/// The type names compare equal without their modifiers, so a scale change
+/// used to be reported as a no-op and kept the old scale: every later value
+/// was silently rounded to it. A decimal is stored as an integer at its
+/// column's scale, so on a table with rows a scale change is refused, as a
+/// width change is. On an empty one the new modifier is recorded. A changed
+/// precision at the same scale is only recorded. Returns whether anything was
+/// written.
+async fn retype_numeric_modifier<S: crate::core::storage_providers::traits::StorageIO>(
+    schema: &crate::core::row::schema::TableSchema,
+    column: &str,
+    declared: &str,
+    row_count: u64,
+    io_schema: Arc<S>,
+) -> Result<bool, String> {
+    use crate::core::rql::type_modifier::{self, TypeModifier};
+    let current = schema
+        .type_modifiers
+        .iter()
+        .find(|m| m.column.eq_ignore_ascii_case(column) && !m.is_deleted);
+    let wanted = match type_modifier::parse_numeric_modifier(declared) {
+        Some(Ok(pair)) => Some(pair),
+        Some(Err(e)) => return Err(e),
+        None => None,
+    };
+    let scale_now = current.map_or(type_modifier::DEFAULT_DECIMAL_SCALE, |m| m.scale);
+    let scale_wanted = wanted.map_or(type_modifier::DEFAULT_DECIMAL_SCALE, |(_, s)| s);
+    let entry = match (current, wanted) {
+        (None, None) => return Ok(false),
+        (Some(m), Some((p, s))) if m.precision == p && m.scale == s => return Ok(false),
+        (_, Some((precision, scale))) => TypeModifier {
+            column: column.to_string(),
+            precision,
+            scale,
+            is_deleted: false,
+        },
+        (Some(_), None) => TypeModifier {
+            column: column.to_string(),
+            precision: 0,
+            scale: 0,
+            is_deleted: true,
+        },
+    };
+    if scale_now != scale_wanted && row_count > 0 {
+        return Err(format!(
+            "ALTER COLUMN {} TYPE {} would rewrite every row from scale {} to scale {}, which is \
+             not supported yet",
+            column, declared, scale_now, scale_wanted
+        ));
+    }
+    if entry.is_deleted && scale_now == scale_wanted {
+        // Unconstrained at the scale it already stores: nothing to change.
+        return Ok(false);
+    }
+    type_modifier::append(io_schema, &entry)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+/// `expression` with every reference to column `from` spelled `to` instead.
+///
+/// For the stored text of a `CHECK` or a generation expression, which names
+/// the columns it reads: after `RENAME COLUMN` it named one that no longer
+/// existed, and the check was skipped as uncompilable — every row it forbids
+/// accepted — while the generated column refused every insert.
+///
+/// A scanner rather than a parser, but one that tracks what a word can sit
+/// inside. String literals (`'…'`, `E'…'`, `$tag$…$tag$`) and comments are
+/// copied untouched, so `CHECK (a <> 'a')` keeps its value. A quoted
+/// identifier is compared by its content. And a matching word is a column
+/// reference only when it is not a function name (followed by `(`), a cast's
+/// type (after `::`) or a qualifier (followed by `.`); after a `.` it is one
+/// only when the qualifier is the table itself.
+pub(crate) fn rename_column_references(expression: &str, table: &str, from: &str, to: &str) -> String {
+    let chars: Vec<char> = expression.chars().collect();
+    let len = chars.len();
+    let next_significant = |mut j: usize| {
+        while j < len && chars[j].is_whitespace() {
+            j += 1;
+        }
+        chars.get(j).copied()
+    };
+    // Copies the literal opening at `i`; returns the index after it.
+    let copy_literal = |mut i: usize, backslash: bool, out: &mut String| {
+        out.push('\'');
+        i += 1;
+        while i < len {
+            let c = chars[i];
+            out.push(c);
+            i += 1;
+            if backslash && c == '\\' {
+                if i < len {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+                continue;
+            }
+            if c == '\'' {
+                if chars.get(i) == Some(&'\'') {
+                    out.push('\'');
+                    i += 1;
+                    continue;
+                }
+                break;
+            }
+        }
+        i
+    };
+    let plain = to
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && to.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    let quoted = format!("\"{}\"", to.replace('"', "\"\""));
+
+    #[derive(PartialEq)]
+    enum Prev {
+        Other,
+        Cast,
+        // After a `.`: whether what stood before it was the table's name.
+        Dot(bool),
+    }
+    let mut prev = Prev::Other;
+    // The identifier just before, which a following `.` makes a qualifier.
+    let mut last_word: Option<String> = None;
+    let mut out = String::with_capacity(expression.len());
+    let mut i = 0;
+    while i < len {
+        let c = chars[i];
+        if c.is_whitespace() {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c == '-' && chars.get(i + 1) == Some(&'-') {
+            while i < len && chars[i] != '\n' {
+                out.push(chars[i]);
+                i += 1;
+            }
+            continue;
+        }
+        if c == '/' && chars.get(i + 1) == Some(&'*') {
+            out.push_str("/*");
+            i += 2;
+            while i < len && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
+                out.push(chars[i]);
+                i += 1;
+            }
+            if i < len {
+                out.push_str("*/");
+                i += 2;
+            }
+            continue;
+        }
+        if c == '\'' {
+            i = copy_literal(i, false, &mut out);
+            prev = Prev::Other;
+            last_word = None;
+            continue;
+        }
+        if c == '$' {
+            // `$tag$ … $tag$`, copied whole; a lone `$` is just a character.
+            let mut j = i + 1;
+            while j < len && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+                j += 1;
+            }
+            if j < len && chars[j] == '$' && !chars.get(i + 1).is_some_and(|d| d.is_ascii_digit()) {
+                let tag: String = chars[i..=j].iter().collect();
+                let body_start = j + 1;
+                let rest: String = chars[body_start..].iter().collect();
+                let end = rest
+                    .find(&tag)
+                    .map(|at| body_start + rest[..at].chars().count() + tag.chars().count())
+                    .unwrap_or(len);
+                out.extend(&chars[i..end]);
+                i = end;
+                prev = Prev::Other;
+                last_word = None;
+                continue;
+            }
+            out.push(c);
+            i += 1;
+            prev = Prev::Other;
+            last_word = None;
+            continue;
+        }
+        let word = if c == '"' {
+            let mut inner = String::new();
+            let mut j = i + 1;
+            while j < len {
+                if chars[j] == '"' {
+                    if chars.get(j + 1) == Some(&'"') {
+                        inner.push('"');
+                        j += 2;
+                        continue;
+                    }
+                    j += 1;
+                    break;
+                }
+                inner.push(chars[j]);
+                j += 1;
+            }
+            Some((inner, j, true))
+        } else if c.is_alphabetic() || c == '_' {
+            let mut j = i;
+            while j < len && (chars[j].is_alphanumeric() || chars[j] == '_' || chars[j] == '$') {
+                j += 1;
+            }
+            let text: String = chars[i..j].iter().collect();
+            // `E'…'`: a literal with backslash escapes, not a word.
+            if text.eq_ignore_ascii_case("e") && chars.get(j) == Some(&'\'') {
+                out.push(c);
+                i = copy_literal(j, true, &mut out);
+                prev = Prev::Other;
+                last_word = None;
+                continue;
+            }
+            Some((text, j, false))
+        } else {
+            None
+        };
+        if let Some((text, end, was_quoted)) = word {
+            let after = next_significant(end);
+            let is_reference = text.eq_ignore_ascii_case(from)
+                && prev != Prev::Cast
+                && after != Some('(')
+                && after != Some('.')
+                && prev != Prev::Dot(false);
+            if is_reference {
+                out.push_str(if plain && !was_quoted { to } else { &quoted });
+            } else {
+                out.extend(&chars[i..end]);
+            }
+            i = end;
+            prev = Prev::Other;
+            last_word = Some(text);
+            continue;
+        }
+        if c.is_ascii_digit() {
+            while i < len && (chars[i].is_ascii_alphanumeric() || chars[i] == '_' || chars[i] == '.')
+            {
+                out.push(chars[i]);
+                i += 1;
+            }
+            prev = Prev::Other;
+            last_word = None;
+            continue;
+        }
+        if c == ':' && chars.get(i + 1) == Some(&':') {
+            out.push_str("::");
+            i += 2;
+            prev = Prev::Cast;
+            last_word = None;
+            continue;
+        }
+        if c == '.' {
+            out.push(c);
+            i += 1;
+            prev = Prev::Dot(
+                last_word
+                    .take()
+                    .is_some_and(|w| w.eq_ignore_ascii_case(table)),
+            );
+            continue;
+        }
+        out.push(c);
+        i += 1;
+        prev = Prev::Other;
+        last_word = None;
+    }
+    out
+}
+
+/// The constraint records `RENAME COLUMN` has to rewrite: every by-name record
+/// outside the column's own declarations that mentions it.
+///
+/// Planned before the rename writes anything, so a rewrite that cannot be
+/// stored — an expression grown past its sidecar's limit — refuses the
+/// statement instead of leaving it half done.
+struct ColumnReferences {
+    unique_keys: Vec<crate::core::rql::unique_key::UniqueKey>,
+    /// `(table, io, record)` for each foreign key that names the column, on
+    /// this table as the child or on any table with this one as the parent.
+    foreign_keys: Vec<(
+        String,
+        Arc<crate::core::storage_providers::backend::DbStorageProvider>,
+        crate::core::rql::foreign_key::ForeignKey,
+    )>,
+    checks: Vec<crate::core::rql::check::CheckConstraint>,
+    generated: Vec<crate::core::rql::generated::GeneratedColumn>,
+}
+
+fn plan_column_references(
+    database: &Arc<Database>,
+    table: &str,
+    schema: &crate::core::row::schema::TableSchema,
+    from: &str,
+    to: &str,
+) -> Result<ColumnReferences, String> {
+    use crate::core::rql::{check, generated, unique_key};
+    let named = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
+
+    let unique_keys = schema
+        .unique_keys
+        .iter()
+        .filter(|k| !k.is_deleted && k.columns.iter().any(|c| named(c, from)))
+        .map(|k| unique_key::UniqueKey {
+            columns: k
+                .columns
+                .iter()
+                .map(|c| if named(c, from) { to.to_string() } else { c.clone() })
+                .collect(),
+            ..k.clone()
+        })
+        .collect();
+
+    // Every table's, since a parent's column is named in its children's
+    // sidecars. Collected before anything awaits: no map guard is held then.
+    let mut foreign_keys = Vec::new();
+    for entry in database.tables.iter() {
+        let owner = entry.key();
+        for fk in entry.value().schema.foreign_keys.iter().filter(|f| !f.is_deleted) {
+            let child_side = named(owner, table) && named(&fk.column, from);
+            let parent_side = named(&fk.parent_table, table) && named(&fk.parent_column, from);
+            if !(child_side || parent_side) {
+                continue;
+            }
+            let mut moved = fk.clone();
+            if child_side {
+                moved.column = to.to_string();
+            }
+            if parent_side {
+                moved.parent_column = to.to_string();
+            }
+            foreign_keys.push((owner.clone(), entry.value().io_schema.clone(), moved));
+        }
+    }
+
+    let mut checks = Vec::new();
+    for c in schema.checks.iter().filter(|c| !c.is_deleted) {
+        let expression = rename_column_references(&c.expression, table, from, to);
+        if expression == c.expression {
+            continue;
+        }
+        if expression.len() > check::MAX_EXPRESSION_LEN {
+            return Err(format!(
+                "cannot rename column {} to {}: check constraint {} would exceed {} characters",
+                from,
+                to,
+                c.name,
+                check::MAX_EXPRESSION_LEN
+            ));
+        }
+        checks.push(check::CheckConstraint {
+            name: c.name.clone(),
+            expression,
+            is_deleted: false,
+        });
+    }
+
+    let mut gens = Vec::new();
+    for g in schema.generated.iter().filter(|g| !g.is_deleted) {
+        let expression = rename_column_references(&g.expression, table, from, to);
+        if expression == g.expression {
+            continue;
+        }
+        if expression.len() > generated::MAX_EXPRESSION_LEN {
+            return Err(format!(
+                "cannot rename column {} to {}: the expression of generated column {} would \
+                 exceed {} characters",
+                from,
+                to,
+                g.column,
+                generated::MAX_EXPRESSION_LEN
+            ));
+        }
+        gens.push(generated::GeneratedColumn {
+            column: g.column.clone(),
+            expression,
+            is_deleted: false,
+        });
+    }
+
+    Ok(ColumnReferences {
+        unique_keys,
+        foreign_keys,
+        checks,
+        generated: gens,
+    })
+}
+
+/// Writes what [`plan_column_references`] planned, and returns the *other*
+/// tables whose sidecars changed, which the caller reopens.
+///
+/// A unique key or foreign key moves as an append of the renamed copy, then a
+/// tombstone on the original (the first live record of that name, which the
+/// copy is not). In that order a crash between the two leaves the original
+/// naming a column that no longer exists, which enforcement skips, rather
+/// than no record at all. A check or generation expression is superseded by
+/// appending, the newest record of its name winning.
+///
+/// `generated` is written after the column's own declarations moved, and none
+/// of it is filed under the renamed column itself, whose expression cannot
+/// read itself.
+async fn write_column_references(
+    references: ColumnReferences,
+    table: &str,
+    io_schema: Arc<crate::core::storage_providers::backend::DbStorageProvider>,
+) -> Result<Vec<String>, String> {
+    use crate::core::rql::{check, foreign_key, generated, unique_key};
+    let failed = |e: std::io::Error| e.to_string();
+
+    for key in &references.unique_keys {
+        unique_key::append(io_schema.clone(), key).await.map_err(failed)?;
+        unique_key::remove(io_schema.clone(), &key.name).await.map_err(failed)?;
+    }
+    let mut others = Vec::new();
+    for (owner, io, fk) in &references.foreign_keys {
+        foreign_key::append(io.clone(), fk).await.map_err(failed)?;
+        foreign_key::remove(io.clone(), &fk.name).await.map_err(failed)?;
+        if !owner.eq_ignore_ascii_case(table) && !others.contains(owner) {
+            others.push(owner.clone());
+        }
+    }
+    for c in &references.checks {
+        check::append(io_schema.clone(), c).await.map_err(failed)?;
+    }
+    for g in &references.generated {
+        generated::append(io_schema.clone(), g).await.map_err(failed)?;
+    }
+    Ok(others)
+}
+
 /// Every sequence a `nextval` default of a table in `database` other than
 /// `except` names, as [`crate::core::rql::sequence::named_by`] spells them.
 ///
@@ -7704,6 +8255,22 @@ async fn execute_alter_table_action(
                 .map(|e| !e.trim().eq_ignore_ascii_case("NULL"))
                 .unwrap_or(false);
 
+            // A declaration still filed under the name — a dead column's,
+            // from before drops retired theirs or from a power loss between a
+            // drop's separately durable writes — is retired first. Left, the
+            // new column inherited it: the old DEFAULT, or a generation
+            // expression, or a NUMERIC scale it silently rounded to.
+            match move_column_declarations(&schema, &name, None, io_schema.clone()).await {
+                // The rewrite below reads the open table's declarations.
+                Ok(true) if row_count > 0 => {
+                    if let Err(e) = database.reload_table(&plan.table_name).await {
+                        return ddl_error(&e.to_string());
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => return ddl_error(&e),
+            }
+
             if row_count > 0 {
                 if !is_nullable && !fills_existing {
                     // The existing rows have no value to put there. PostgreSQL
@@ -7798,6 +8365,17 @@ async fn execute_alter_table_action(
                 return ddl_error(&e);
             }
 
+            // A dropped column still holding this name — or its companion's —
+            // is retired first, exactly as `RENAME COLUMN` does. `add_field`
+            // skips a name the schema already holds, tombstones included, so
+            // `DROP COLUMN a` then `ADD COLUMN a` on an empty table reported
+            // success and added nothing: every later reference to `a` failed.
+            for taken in [name.clone(), nullable::flag_column_name(&name)] {
+                if let Err(e) = retire_tombstoned_name(&mut schema, &taken, io_schema.clone()).await {
+                    return ddl_error(&e);
+                }
+            }
+
             let default =
                 match json_default_reference(&database, &plan.table_name, &name, default, json, tx)
                     .await
@@ -7873,6 +8451,15 @@ async fn execute_alter_table_action(
             schema
                 .mark_field_as_deleted(&field.name, io_schema.clone())
                 .await;
+            // Its by-name declarations go with it. Left behind, they were
+            // picked up by the next column to take the name — the retype
+            // dance's renamed temporary, or a plain re-`ADD` — which then
+            // defaulted to the *dropped* column's value.
+            if let Err(e) =
+                move_column_declarations(&schema, &field.name, None, io_schema.clone()).await
+            {
+                return ddl_error(&e);
+            }
             if let Some(flag) = nullable::flag_field(&field.name, &schema.fields) {
                 let flag_name = flag.name.clone();
                 schema
@@ -7905,6 +8492,17 @@ async fn execute_alter_table_action(
                 return ddl_error(&format!("column '{}' already exists", to));
             }
 
+            // The constraints that name the column — composite UNIQUE keys,
+            // foreign keys on either side, CHECK and generation expressions —
+            // are by-name records too. Left naming `from`, each silently
+            // stopped being enforced (a parent's renamed key instead failed
+            // every DELETE from it). Planned here, before anything is written.
+            let references =
+                match plan_column_references(database, &plan.table_name, &schema, &from, &to) {
+                    Ok(references) => references,
+                    Err(e) => return ddl_error(&e),
+                };
+
             // A tombstone still holding the target name is retired first.
             //
             // Renaming *onto* a dropped column's name leaves two fields called
@@ -7928,6 +8526,28 @@ async fn execute_alter_table_action(
             // layout is keyed by write order.
             if let Err(e) = schema.rename_field(&from, &to, io_schema.clone()).await {
                 return ddl_error(&e);
+            }
+
+            // The column's DEFAULT, generation expression and NUMERIC scale
+            // are filed by name, so they follow it. Left under `from`, the
+            // renamed column silently lost all three — an omitted value stored
+            // NULL instead of its default, and every decimal was read at the
+            // engine's scale rather than its own.
+            if let Err(e) = move_column_declarations(&schema, &from, Some(&to), io_schema.clone()).await
+            {
+                return ddl_error(&e);
+            }
+            match write_column_references(references, &plan.table_name, io_schema.clone()).await {
+                Ok(others) => {
+                    // This table is reopened below; a child whose foreign key
+                    // named the renamed parent column is reopened here.
+                    for other in others {
+                        if let Err(e) = database.reload_table(&other).await {
+                            return ddl_error(&e.to_string());
+                        }
+                    }
+                }
+                Err(e) => return ddl_error(&e),
             }
 
             // The NULL companion is named after its column, so it has to move
@@ -8255,7 +8875,24 @@ async fn execute_alter_table_action(
                 }
                 let type_tokens: Vec<&str> = words[1..].to_vec();
                 return match crate::core::rql::lexer_alter::parse_column_type(&type_tokens) {
-                    Ok((db_type, _)) if db_type == field.db_type => ddl_ok(0),
+                    Ok((db_type, _)) if db_type == field.db_type => {
+                        match retype_numeric_modifier(
+                            &schema,
+                            &name,
+                            &type_tokens.join(" "),
+                            row_count,
+                            io_schema.clone(),
+                        )
+                        .await
+                        {
+                            Ok(false) => ddl_ok(0),
+                            Ok(true) => match database.reload_table(&plan.table_name).await {
+                                Ok(()) => ddl_ok(0),
+                                Err(e) => ddl_error(&e.to_string()),
+                            },
+                            Err(e) => ddl_error(&e),
+                        }
+                    }
                     // A real change still needs every row rewritten under the
                     // new width, which is the restriction `ADD COLUMN` names.
                     Ok((db_type, _)) => ddl_error(&format!(
