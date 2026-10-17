@@ -15,12 +15,14 @@
 //!    its constant as text, so `{"a": 1.0}` did not equal `{"a": 1}`, and a
 //!    NULL result compared as the word `NULL`.
 //!
-//! And two more of the first kind, found in review:
+//! And three more of the first kind, found in review:
 //!
 //! 4. An operator spelled as a word — `a.n BETWEEN 2 AND 4`, `s LIKE 'x%'`,
 //!    `flag IS TRUE` — was its first operand, aliased by the keyword.
 //! 5. A comparison ending in a quoted literal — `'x' = 'y'`, `s || 'x' =
 //!    'ax'` — was read as one string literal running from quote to quote.
+//! 6. A CTE or derived-table column with no value in any row was TEXT,
+//!    whatever it read, and an empty one could send garbage under `int8`.
 //!
 //! Every answer below is PostgreSQL 17's, labels and announced types included:
 //! the description is what a client decodes by, so a right value under a wrong
@@ -726,4 +728,75 @@ async fn a_comparison_between_quoted_literals_is_a_boolean() {
         }
     }
     assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// A CTE column that is NULL in every row keeps its source's type. It was
+/// created as TEXT, so a client decoding the declared `int4` rejected it, and
+/// `sum` and `COALESCE` over it were refused as type errors.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_all_null_cte_column_keeps_its_declared_type() {
+    let (_s, pool) = server().await;
+    for sql in [
+        "CREATE TABLE ct (id INT NOT NULL, n INT, b BIGINT, s TEXT)",
+        "INSERT INTO ct (id, n, b, s) VALUES (1, NULL, NULL, NULL), (2, NULL, NULL, 'z')",
+    ] {
+        pool.execute(sqlx::raw_sql(AssertSqlSafe(sql)))
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    check(
+        &pool,
+        &[
+            (
+                "WITH x AS (SELECT id, n FROM ct WHERE n IS NULL) SELECT id, n FROM x ORDER BY id",
+                "id:INT4|n:INT4",
+                &["1|<N>", "2|<N>"],
+            ),
+            (
+                "WITH x AS (SELECT id, n, b FROM ct) SELECT sum(n) AS s, COALESCE(max(b), 0) AS m FROM x",
+                "s:INT8|m:INT8",
+                &["<N>|0"],
+            ),
+            (
+                "WITH x AS (SELECT id, n FROM ct) SELECT id, COALESCE(n, 0) AS c FROM x ORDER BY id",
+                "id:INT4|c:INT4",
+                &["1|0", "2|0"],
+            ),
+            (
+                "WITH x AS (SELECT id, NULL::int AS ni, NULL::bigint AS nb FROM ct) \
+                 SELECT id, ni, nb FROM x ORDER BY id",
+                "id:INT4|ni:INT4|nb:INT8",
+                &["1|<N>|<N>", "2|<N>|<N>"],
+            ),
+            // No rows at all.
+            (
+                "WITH x AS (SELECT id, n FROM ct WHERE id > 5) SELECT COALESCE(sum(n), 0) AS t FROM x",
+                "t:INT8",
+                &["0"],
+            ),
+            // A derived table is materialised the same way.
+            (
+                "SELECT id, n, b FROM (SELECT id, n, b FROM ct) s ORDER BY id",
+                "id:INT4|n:INT4|b:INT8",
+                &["1|<N>|<N>", "2|<N>|<N>"],
+            ),
+            ("SELECT sum(n) AS s FROM (SELECT n FROM ct) q", "s:INT8", &["<N>"]),
+        ],
+    )
+    .await;
+    // A renamed column is typed by the column it reads, not by its new name.
+    // Simple protocol only: over the extended one a CTE that renames a plain
+    // column is described with no columns at all, whatever it holds, because
+    // a plain column's description carries its own name rather than its
+    // alias — a separate fault in the describe path, not this one.
+    check_over(
+        &pool,
+        &[(
+            "WITH x AS (SELECT id, n AS renamed, b FROM ct) SELECT id, renamed, b FROM x ORDER BY id",
+            "id:INT4|renamed:INT4|b:INT8",
+            &["1|<N>|<N>", "2|<N>|<N>"],
+        )],
+        &[true],
+    )
+    .await;
 }
