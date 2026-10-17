@@ -320,7 +320,7 @@ pub(super) fn infer(database: &Database, sql: &str, declared: &[i32]) -> Vec<i32
     }
 
     let rel = relations(&toks);
-    let insert_columns = insert_columns(&toks);
+    let insert_columns = insert_columns(database, &toks);
 
     let set = |n: usize, oid: Option<i32>, oids: &mut Vec<Option<i32>>| {
         if n == 0 || n > oids.len() || oids[n - 1].is_some() {
@@ -420,12 +420,37 @@ pub(super) fn infer(database: &Database, sql: &str, declared: &[i32]) -> Vec<i32
 
 /// For `INSERT INTO t (a, b) VALUES …`: the column names, and the index of the
 /// `VALUES` token.
-fn insert_columns(toks: &[Tok]) -> Option<(Vec<String>, usize)> {
+///
+/// `INSERT INTO t VALUES …` names no columns, and its tuple fills the table's
+/// writable columns in order, so those are the names. The order and the
+/// filter are the ones the executor uses when it supplies the list
+/// (`supply_insert_column_list`): left out here, every parameter of such an
+/// insert was described as `text`, and a client that encodes by the described
+/// type refused to bind an integer to it.
+fn insert_columns(database: &Database, toks: &[Tok]) -> Option<(Vec<String>, usize)> {
     if !toks.first()?.keyword("INSERT") {
         return None;
     }
     let into = toks.iter().position(|t| t.keyword("INTO"))?;
     let values = toks.iter().position(|t| t.keyword("VALUES"))?;
+    if values == into + 2 {
+        let Some(Tok::Ident(_, table)) = toks.get(into + 1) else {
+            return None;
+        };
+        let entry = database.tables.get(table)?;
+        let schema = &entry.value().schema;
+        let mut fields: Vec<_> = schema
+            .fields
+            .iter()
+            .filter(|f| {
+                !f.is_deleted
+                    && !crate::core::rql::nullable::is_hidden(&f.name)
+                    && crate::core::rql::generated::expression_for(&f.name, &schema.generated).is_none()
+            })
+            .collect();
+        fields.sort_by_key(|f| f.write_order);
+        return Some((fields.iter().map(|f| f.name.clone()).collect(), values));
+    }
     if toks.get(into + 2) != Some(&Tok::Open) {
         return None;
     }
