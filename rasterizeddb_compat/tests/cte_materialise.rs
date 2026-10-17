@@ -270,6 +270,81 @@ async fn a_materialised_column_keeps_its_declared_type() {
     assert_eq!(doc, serde_json::json!({"k": 1}));
 }
 
+/// #16: NUMERIC(p,s) keeps its scale through a body that holds a subquery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn numeric_scale_survives_a_subquery_in_the_body() {
+    let server = TestServer::start().await.expect("start");
+    let pool = server.connect_sqlx().await.expect("connect");
+    for sql in [
+        "CREATE TABLE np_parent (id INT PRIMARY KEY)",
+        "INSERT INTO np_parent (id) VALUES (1), (2)",
+        "CREATE TABLE np_child (id INT NOT NULL, parent_id INT NOT NULL, price NUMERIC(12,2) NOT NULL)",
+        "INSERT INTO np_child (id, parent_id, price) VALUES (1, 1, 339.50), (2, 2, 2.00), (3, 1, 3.25)",
+    ] {
+        run(&pool, sql).await;
+    }
+    let mut wrong = Wrong::default();
+    for (sql, want) in [
+        ("SELECT sum(price) FROM np_child WHERE parent_id IN (SELECT id FROM np_parent)", &["344.75"][..]),
+        ("WITH c AS (SELECT price FROM np_child WHERE parent_id IN (SELECT id FROM np_parent)) SELECT sum(price) FROM c", &["344.75"]),
+        ("SELECT sum(price) FROM (SELECT price FROM np_child WHERE parent_id IN (SELECT id FROM np_parent)) s", &["344.75"]),
+        ("WITH c AS (SELECT id, price FROM np_child WHERE id = 1 AND parent_id IN (SELECT id FROM np_parent)) SELECT id, price FROM c", &["1|339.50"]),
+        ("WITH c AS (SELECT id, price FROM np_child WHERE parent_id IN (1, 2)) SELECT sum(price) FROM c", &["344.75"]),
+        // Downstream of the relation: a window, a join, a grouping, min/max.
+        (
+            "WITH c AS (SELECT id, price FROM np_child WHERE parent_id IN (SELECT id FROM np_parent)) \
+             SELECT id, price, sum(price) OVER () AS total FROM c ORDER BY id",
+            &["1|339.50|344.75", "2|2.00|344.75", "3|3.25|344.75"],
+        ),
+        (
+            "WITH c AS (SELECT id, parent_id, price FROM np_child WHERE parent_id IN (SELECT id FROM np_parent)) \
+             SELECT c.id, c.price, p.id FROM c JOIN np_parent p ON p.id = c.parent_id ORDER BY c.id",
+            &["1|339.50|1", "2|2.00|2", "3|3.25|1"],
+        ),
+        (
+            "WITH c AS (SELECT price, parent_id FROM np_child WHERE parent_id IN (SELECT id FROM np_parent)) \
+             SELECT parent_id, sum(price) FROM c GROUP BY parent_id ORDER BY parent_id",
+            &["1|342.75", "2|2.00"],
+        ),
+        (
+            "WITH c AS (SELECT price FROM np_child WHERE parent_id IN (SELECT id FROM np_parent)) \
+             SELECT min(price), max(price) FROM c",
+            &["2.00|339.50"],
+        ),
+        (
+            "SELECT avg(price) FROM (SELECT price FROM np_child WHERE parent_id IN (SELECT id FROM np_parent)) s",
+            &["114.9166666666666667"],
+        ),
+        // An aggregate computed inside the body keeps every place it has.
+        (
+            "WITH c AS (SELECT avg(price) AS a, sum(price) AS s FROM np_child \
+             WHERE parent_id IN (SELECT id FROM np_parent)) SELECT a, s FROM c",
+            &["114.9166666666666667|344.75"],
+        ),
+        // The other subquery forms take the same path.
+        (
+            "SELECT id, price FROM (SELECT id, price FROM np_child WHERE EXISTS \
+             (SELECT 1 FROM np_parent WHERE np_parent.id = np_child.parent_id)) s ORDER BY id",
+            &["1|339.50", "2|2.00", "3|3.25"],
+        ),
+        (
+            "WITH c AS (SELECT id, price FROM np_child WHERE price > (SELECT min(price) FROM np_child)) \
+             SELECT id, price FROM c ORDER BY id",
+            &["1|339.50", "3|3.25"],
+        ),
+        // Last, since it writes: a data-modifying body publishes its
+        // RETURNING rows at their scale too.
+        (
+            "WITH x AS (INSERT INTO np_child (id, parent_id, price) VALUES (9, 2, 7.25) \
+             RETURNING id, price) SELECT id, price FROM x",
+            &["9|7.25"],
+        ),
+    ] {
+        wrong.check(&pool, sql, want).await;
+    }
+    wrong.assert_none();
+}
+
 async fn digits(pool: &sqlx::PgPool) {
     run(pool, "CREATE TABLE digit (n INT, one INT)").await;
     run(

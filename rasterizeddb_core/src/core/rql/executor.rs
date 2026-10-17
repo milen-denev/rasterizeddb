@@ -288,6 +288,26 @@ async fn run_subquery_scaled(
     let folded = fold_where_constants(sql);
     let sql = folded.as_str();
 
+    // A subquery inside this one is resolved here, before the statement is
+    // classified, rather than left to the executor. The scales below are read
+    // from the parsed select list, and the parser cannot read a predicate
+    // holding `IN (SELECT …)`: no scales came back, nothing was normalised, and
+    // a `NUMERIC(12,2)` cell of 339.50 was read at the engine scale as
+    // 0.000033950 by every CTE and derived table whose body had one. The
+    // top-level path in pgwire substitutes first for the same reason. A
+    // `UNION` keeps its own path, which runs each branch through here.
+    let substituted;
+    let sql = if crate::core::rql::join::split_union(sql).is_none()
+        && (crate::core::rql::subquery::find_in_subquery(sql).is_some()
+            || crate::core::rql::subquery::find_exists(sql).is_some()
+            || crate::core::rql::subquery::find_scalar_subquery(sql).is_some())
+    {
+        substituted = Box::pin(substitute_in_subqueries(sql, database, tx)).await?;
+        substituted.as_str()
+    } else {
+        sql
+    };
+
     let purpose =
         recognize_query_purpose(sql).ok_or_else(|| format!("cannot parse subquery '{}'", sql))?;
     if !matches!(purpose, QueryPurpose::QueryRows(_)) {
