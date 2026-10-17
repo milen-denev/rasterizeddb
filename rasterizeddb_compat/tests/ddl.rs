@@ -681,12 +681,10 @@ async fn an_unsupported_expression_names_itself_rather_than_blaming_the_schema()
 
     for (sql, expected) in [
         // Still unsupported, and each must name the construct rather than
-        // report a missing column. A cast in the select list works; one in a
-        // WHERE clause does not, and saying so is the difference between a
+        // report a missing column: saying so is the difference between a
         // reader fixing the query and a reader auditing a schema that is fine.
-        // A cast in a `WHERE` still is not supported. `CAST(v AS TEXT)` in the
-        // select list moved to the working list below when it was implemented.
-        ("SELECT id FROM ue WHERE v::TEXT = '10'", "cast"),
+        // `CAST(v AS TEXT)` in the select list, and a cast in a `WHERE`, moved
+        // to the working lists below when they were implemented.
         ("SELECT DISTINCT ON (id, v) id FROM ue", "distinct on"),
     ] {
         let err = run(&pool, sql).await.expect_err(sql).to_ascii_lowercase();
@@ -710,6 +708,14 @@ async fn an_unsupported_expression_names_itself_rather_than_blaming_the_schema()
     ] {
         run(&pool, sql).await.unwrap_or_else(|e| panic!("{} -> {}", sql, e));
     }
+    // A cast in a `WHERE` was on the list above too. It answers PostgreSQL's
+    // row now, rather than merely not failing.
+    let rows = sqlx::query("SELECT id FROM ue WHERE v::TEXT = '10'")
+        .fetch_all(&pool)
+        .await
+        .expect("a cast in WHERE");
+    let ids: Vec<i32> = rows.iter().map(|r| r.get(0)).collect();
+    assert_eq!(ids, vec![1], "SELECT id FROM ue WHERE v::TEXT = '10'");
 
     // A genuinely missing column must still say so — the check must not swallow
     // the ordinary case it sits in front of.

@@ -3658,7 +3658,25 @@ pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, Str
         }
         Expr::Cast(inner, target) => {
             let value = eval(inner, row, schema)?;
-            cast(value, target)?
+            // A NUMERIC rendered as text keeps the places PostgreSQL displays
+            // it with: a NUMERIC(5,2) 2.50 is '2.50'. The value is at the
+            // engine scale here, and the plain rendering trims its zeros, so
+            // `discount::text = '2.50'` matched nothing and the select list
+            // sent '2.5'.
+            match (target, display_scale(inner), &value) {
+                (DbType::STRING, Some(scale), Value::Data { bytes, db_type: DbType::DECIMAL })
+                    if bytes.len() == 16 =>
+                {
+                    let raw = i128::from_le_bytes(bytes.as_slice().try_into().expect("sixteen bytes"));
+                    let shown = round_decimal(raw, crate::core::value_codec::DECIMAL_SCALE, scale)
+                        .ok_or_else(|| "value overflows numeric format".to_string())?;
+                    Value::Data {
+                        bytes: crate::core::value_codec::format_decimal_scaled(shown, scale).into_bytes(),
+                        db_type: DbType::STRING,
+                    }
+                }
+                _ => cast(value, target)?,
+            }
         }
         Expr::NumericCast {
             value,

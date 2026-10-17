@@ -693,7 +693,9 @@ impl EvaluatedOperand {
     /// accepted. A `NUMERIC` is among them because the evaluator yields every
     /// one at the engine scale, a column's value lifted there as it is read;
     /// the comparison brings the other side to that scale (see
-    /// `QueryParser::decimal_operands`).
+    /// `QueryParser::decimal_operands`). A date and a timestamp are encoded as
+    /// their columns are, so a literal is re-encoded at the type and compared
+    /// on the same bytes.
     pub fn new(
         text: &str,
         schema: &[crate::core::row::schema::SchemaField],
@@ -719,6 +721,8 @@ impl EvaluatedOperand {
                 | DbType::BIT
                 | DbType::VARBIT
                 | DbType::DECIMAL
+                | DbType::DATE
+                | DbType::DATETIME
         );
         if !comparable {
             return Err(format!(

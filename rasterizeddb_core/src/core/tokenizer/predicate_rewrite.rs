@@ -2308,8 +2308,9 @@ pub fn rewrite_scan_where(
 }
 
 /// Whether `text` holds something only the expression evaluator can compute:
-/// a `CASE`, `||`, `%`, or a bit-string literal. Outside quotes, and `?|` is
-/// the JSONB operator, not half a concatenation.
+/// a `CASE`, `||`, `%`, a bit-string literal, or a cast over a column (see
+/// [`column_cast_at`]). Outside quotes, and `?|` is the JSONB operator, not
+/// half a concatenation.
 fn needs_evaluator(text: &str) -> bool {
     let bytes = text.as_bytes();
     let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b == b'.';
@@ -2330,6 +2331,15 @@ fn needs_evaluator(text: &str) -> bool {
             b'|' if bytes.get(i + 1) == Some(&b'|') && (i == 0 || bytes[i - 1] != b'?') => {
                 return true;
             }
+            // `(qty)::int`, `(a + b)::numeric`: the group is cast as a column
+            // is. A path in parentheses keeps its own cast, which the planner
+            // applies to what the path reaches.
+            b')' if evaluated_cast_after(&text[i + 1..]) => {
+                let group = &text[group_open(bytes, i)..i];
+                if !group.contains("->") && !group.contains("#>") {
+                    return true;
+                }
+            }
             _ if is_word(c) && (i == 0 || !is_word(bytes[i - 1])) => {
                 let mut end = i;
                 while end < bytes.len() && is_word(bytes[end]) {
@@ -2339,6 +2349,10 @@ fn needs_evaluator(text: &str) -> bool {
                 if word.eq_ignore_ascii_case("CASE")
                     || (word.eq_ignore_ascii_case("B") || word.eq_ignore_ascii_case("X"))
                         && bytes.get(end) == Some(&b'\'')
+                    || column_cast_at(text, word, end)
+                    // `CAST(qty AS bigint)`, the standard spelling of a cast,
+                    // which the rewrite has no form for.
+                    || word.eq_ignore_ascii_case("CAST") && text[end..].trim_start().starts_with('(')
                 {
                     return true;
                 }
@@ -2350,6 +2364,80 @@ fn needs_evaluator(text: &str) -> bool {
         i += 1;
     }
     false
+}
+
+/// Whether the word `word`, ending at `end` in `text`, is a column with a `::`
+/// cast after it to a number, text, a date or a timestamp: `qty::int`,
+/// `ts::date`, `price::numeric(10,2)`.
+///
+/// Such an operand goes to the evaluator, which converts it as a select list
+/// does: a NUMERIC rounded into an integer from its own scale, a timestamp cut
+/// to its day. The comparison's per-row conversion reads neither: it took a
+/// NUMERIC's stored integer at the engine scale, and `::date` as the timestamp
+/// it was. A literal, a parameter or a keyword before the cast is not a column.
+fn column_cast_at(text: &str, word: &str, end: usize) -> bool {
+    let first = word.as_bytes()[0];
+    if first.is_ascii_digit()
+        || first == b'.'
+        || first == b'$'
+        || ["NULL", "TRUE", "FALSE"].iter().any(|k| word.eq_ignore_ascii_case(k))
+    {
+        return false;
+    }
+    evaluated_cast_after(&text[end..])
+}
+
+/// Where the group that the `)` at `close` ends opens, found backwards, with
+/// quoted text stepped over; the start of `bytes` when it is not closed.
+fn group_open(bytes: &[u8], close: usize) -> usize {
+    let mut depth = 0usize;
+    let mut quote: Option<u8> = None;
+    for at in (0..=close).rev() {
+        let c = bytes[at];
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == b'\'' || c == b'"' => quote = Some(c),
+            None if c == b')' => depth += 1,
+            None if c == b'(' => {
+                depth -= 1;
+                if depth == 0 {
+                    return at;
+                }
+            }
+            None => {}
+        }
+    }
+    0
+}
+
+/// Whether `after` opens with a `::` cast to a type the evaluator converts to
+/// and a `WHERE` compares: an integer, a NUMERIC, a float, text, a boolean, a
+/// date or a timestamp. The other targets keep the comparison's own per-row
+/// conversion, which renders them correctly.
+fn evaluated_cast_after(after: &str) -> bool {
+    let Some(target) = after.trim_start().strip_prefix("::") else {
+        return false;
+    };
+    let target = target.trim_start();
+    let name_end = target
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(target.len());
+    use crate::core::db_type::DbType;
+    matches!(
+        crate::core::rql::expr::db_type_of_cast(&target[..name_end]),
+        Some(
+            DbType::I16
+                | DbType::I32
+                | DbType::I64
+                | DbType::DECIMAL
+                | DbType::F32
+                | DbType::F64
+                | DbType::STRING
+                | DbType::BOOL
+                | DbType::DATETIME
+        )
+    )
 }
 
 /// The words of `text` outside quotes, parentheses and `CASE` blocks, as
@@ -2630,6 +2718,21 @@ fn lift_comparison(
     } else {
         rest.trim_start()
     };
+    // `SIMILAR TO` in the one word the tokenizer reads as an operator, as the
+    // rewrite spells it over a column. Left as two words after a lifted
+    // operand, `SIMILAR` was refused as an unknown column.
+    let similar_to = |text: &str| -> String {
+        let words: Vec<&str> = text.split_whitespace().collect();
+        match words.as_slice() {
+            [similar, to, ..]
+                if similar.eq_ignore_ascii_case("SIMILAR") && to.eq_ignore_ascii_case("TO") =>
+            {
+                let pattern = text.trim_start()[similar.len()..].trim_start()[to.len()..].trim_start();
+                format!("SIMILARTO {}", pattern)
+            }
+            _ => text.to_string(),
+        }
+    };
     // `NOT LIKE` is `NOT` over the match, which the evaluator applies after
     // its NULL test: a NULL operand matches neither form.
     if negated
@@ -2637,10 +2740,10 @@ fn lift_comparison(
             .iter()
             .any(|k| upper.get(1) == Some(k))
     {
-        return Ok(format!("NOT {} {}", left, after_not));
+        return Ok(format!("NOT {} {}", left, similar_to(after_not)));
     }
     // `LIKE` and the rest compare the operand's value like any other.
-    Ok(format!("{} {}", left, rest.trim_start()))
+    Ok(format!("{} {}", left, similar_to(rest.trim_start())))
 }
 
 /// `left [NOT] IN (a, b)` and `left [NOT] BETWEEN a AND b`, as the comparisons
@@ -3143,11 +3246,19 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
                 // `hardware_status::text SIMILAR TO '101%'`. The cast travels
                 // with the column into the emitted text; the parser applies it
                 // per row.
-                let (kw_at, col) = match toks.get(kw_at) {
+                //
+                // Only into these two forms, under a name of its own. It used
+                // to replace `col` for the rest of this branch, so an ordinary
+                // comparison emitted `qty::int` and then the cast token again
+                // after it: the tokenizer read `qty::int ::int = 5`, and the
+                // plan was refused with "expected comparison operator, got
+                // Cast". The NULL guard is still the column's: its companion
+                // is found by the column's own name.
+                let (kw_at, cast_col) = match toks.get(kw_at) {
                     Some(Tok::Sym(sym)) if sym.starts_with("::") => {
                         (kw_at + 1, format!("{}{}", col, sym))
                     }
-                    _ => (kw_at, col),
+                    _ => (kw_at, col.clone()),
                 };
 
                 // `col [NOT] SIMILAR TO 'pattern'`. Two words, so it is
@@ -3185,7 +3296,7 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
                     // a NULL row matches neither form.
                     out.push(guard(
                         &col,
-                        &format!("{}{} SIMILARTO {}", if negated { "NOT " } else { "" }, col, literal),
+                        &format!("{}{} SIMILARTO {}", if negated { "NOT " } else { "" }, cast_col, literal),
                         schema,
                     ));
                     i = kw_at + 3;
@@ -3221,7 +3332,7 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
                     // NULL, so a NULL row is in neither answer.
                     out.push(guard(
                         &col,
-                        &format!("{}{} {} {}", if negated { "NOT " } else { "" }, col, op, literal),
+                        &format!("{}{} {} {}", if negated { "NOT " } else { "" }, cast_col, op, literal),
                         schema,
                     ));
                     i = next;
@@ -3996,6 +4107,16 @@ mod tests {
             rw("age >= 18 AND name = 'bob'"),
             "age >= 18 AND name = 'bob'"
         );
+    }
+
+    /// A cast after a column is emitted once. The cast used to be carried on
+    /// the column's name and emitted again after it, `id::text ::text = '5'`,
+    /// which the planner refused.
+    #[test]
+    fn a_cast_on_a_column_is_emitted_once() {
+        assert_eq!(rw("id::text = '5'"), "id ::text = '5'");
+        assert_eq!(rw("age::bigint > 6 AND id = 1"), "age ::bigint > 6 AND id = 1");
+        assert_eq!(rw("name::text LIKE 'a%'"), "name::text STARTSWITH 'a'");
     }
 
     #[test]

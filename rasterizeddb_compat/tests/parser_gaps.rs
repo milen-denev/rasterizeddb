@@ -690,3 +690,114 @@ async fn row_value_equality_inequality_and_in() {
     assert_eq!(joined(&pool, "SELECT id FROM fl ORDER BY id").await.unwrap(), "1,4,5");
     assert_eq!(joined(&pool, "SELECT k FROM fl WHERE id = 1").await.unwrap(), "99");
 }
+
+// ------------------------------------------------------- #15b column casts
+
+/// Order lines, one all NULL, one dated before 2000.
+async fn order_lines(pool: &sqlx::PgPool) {
+    run(
+        pool,
+        "CREATE TABLE od (id INT NOT NULL, qty INT, discount_pct NUMERIC(5,2), unit_price NUMERIC(12,2), \
+         big BIGINT, f FLOAT8, nm4 NUMERIC(10,4), t TEXT, d DATE, ts TIMESTAMP)",
+    )
+    .await
+    .unwrap();
+    run(
+        pool,
+        "INSERT INTO od VALUES (1, 5, 2.50, 10.25, 5, 2.5, 1.5000, '5', '2024-01-05', '2024-01-05 10:00:00'), \
+         (2, 12, 4.00, 3.10, 12, 4.0, 4.0000, '12', '2024-02-01', '2024-02-01 00:00:00'), \
+         (3, 7, 0.00, 1.00, 7, 0.0, 0.0000, '7', '2024-03-01', '2024-03-01 12:30:00'), \
+         (4, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL), \
+         (5, 20, 6.75, 2.00, 20, 6.75, 6.7500, '20', '2023-12-31', '2023-12-31 23:59:59'), \
+         (6, 3, 1.25, 0.50, 3, 0.5, 0.2500, '3', '1999-12-31', '1999-06-15 08:00:00')",
+    )
+    .await
+    .unwrap();
+}
+
+/// A `::` cast on a column in a `WHERE`, on either side, to a number, text, a
+/// date or a timestamp, converts as the select list's cast does.
+/// `qty::int = 5` failed to plan with "expected comparison operator, got
+/// Cast(I32)": the rewrite carried the cast on the column's name and then
+/// emitted the cast again after it. Under that, the per-row conversion read a
+/// NUMERIC's stored integer at the wrong scale, and `ts::date` as the whole
+/// timestamp, so `d = ts::date` matched nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn column_casts_in_where() {
+    let (_s, pool) = server().await;
+    order_lines(&pool).await;
+    let cases: &[(&str, &str)] = &[
+        // Integer targets.
+        ("SELECT id FROM od WHERE qty::int = 5 ORDER BY id", "1"),
+        ("SELECT id FROM od WHERE qty ::int = 5 ORDER BY id", "1"),
+        ("SELECT id FROM od WHERE (qty)::int = 5 ORDER BY id", "1"),
+        ("SELECT id FROM od WHERE qty::bigint > 6 ORDER BY id", "2,3,5"),
+        ("SELECT id FROM od WHERE 6 < qty::bigint ORDER BY id", "2,3,5"),
+        ("SELECT id FROM od WHERE qty::smallint <= 5 ORDER BY id", "1,6"),
+        ("SELECT id FROM od WHERE CAST(qty AS bigint) = 12 ORDER BY id", "2"),
+        // A NUMERIC into an integer rounds half away from zero: 2.50 is 3.
+        ("SELECT id FROM od WHERE discount_pct::int = 3 ORDER BY id", "1"),
+        ("SELECT id FROM od WHERE discount_pct::int = qty % 4 ORDER BY id", ""),
+        ("SELECT id FROM od WHERE unit_price::bigint > big ORDER BY id", "1"),
+        // Text into an integer, against a column on either side.
+        ("SELECT id FROM od WHERE t::int > 6 ORDER BY id", "2,3,5"),
+        ("SELECT id FROM od WHERE t::int = qty ORDER BY id", "1,2,3,5,6"),
+        ("SELECT id FROM od WHERE qty = t::int ORDER BY id", "1,2,3,5,6"),
+        // NUMERIC and float targets.
+        ("SELECT id FROM od WHERE qty::numeric = 7 ORDER BY id", "3"),
+        ("SELECT id FROM od WHERE qty::numeric(10,2) >= 7.5 ORDER BY id", "2,5"),
+        ("SELECT id FROM od WHERE discount_pct::numeric(4,1) = 6.8 ORDER BY id", "5"),
+        ("SELECT id FROM od WHERE f::numeric(10,1) = 6.8 ORDER BY id", "5"),
+        ("SELECT id FROM od WHERE t::numeric > 6.5 ORDER BY id", "2,3,5"),
+        ("SELECT id FROM od WHERE t::numeric(6,2) = discount_pct * 2 ORDER BY id", "1"),
+        ("SELECT id FROM od WHERE discount_pct::float8 > 2.4 ORDER BY id", "1,2,5"),
+        // Text targets, rendered as a client sees them: 2.50 keeps its scale.
+        ("SELECT id FROM od WHERE qty::text = '12' ORDER BY id", "2"),
+        ("SELECT id FROM od WHERE qty::varchar = '7' ORDER BY id", "3"),
+        ("SELECT id FROM od WHERE qty::text > '3' ORDER BY id", "1,3"),
+        ("SELECT id FROM od WHERE discount_pct::text = '2.50' ORDER BY id", "1"),
+        ("SELECT id FROM od WHERE nm4::text LIKE '%.2500' ORDER BY id", "6"),
+        ("SELECT id FROM od WHERE qty::text SIMILAR TO '(1|2)%' ORDER BY id", "2,5"),
+        ("SELECT id FROM od WHERE qty::text NOT LIKE '1%' ORDER BY id", "1,3,5,6"),
+        ("SELECT id FROM od WHERE d::text LIKE '2024-0%' ORDER BY id", "1,2,3"),
+        ("SELECT id FROM od WHERE ts::text LIKE '%12:30:00' ORDER BY id", "3"),
+        // The same rendering in the select list, which trimmed the zeros: 2.5.
+        ("SELECT discount_pct::text FROM od WHERE id = 1", "2.50"),
+        ("SELECT (discount_pct * 2)::text FROM od WHERE id = 1", "5.00"),
+        ("SELECT nm4::text || 'x' FROM od WHERE id = 6", "0.2500x"),
+        ("SELECT CAST(nm4 AS varchar) FROM od WHERE id = 1", "1.5000"),
+        // Date targets: the day, not the timestamp.
+        ("SELECT id FROM od WHERE ts::date = '2024-01-05' ORDER BY id", "1"),
+        ("SELECT id FROM od WHERE ts::date = d ORDER BY id", "1,2,3,5"),
+        ("SELECT id FROM od WHERE d = ts::date ORDER BY id", "1,2,3,5"),
+        ("SELECT id FROM od WHERE ts::date > d ORDER BY id", ""),
+        ("SELECT id FROM od WHERE ts::date < d ORDER BY id", "6"),
+        ("SELECT id FROM od WHERE ts::date < '2000-01-01' ORDER BY id", "6"),
+        ("SELECT id FROM od WHERE ts::date >= '2024-01-01' ORDER BY id", "1,2,3"),
+        ("SELECT id FROM od WHERE ts::date BETWEEN '2023-12-31' AND '2024-02-01' ORDER BY id", "1,2,5"),
+        ("SELECT id FROM od WHERE CAST(ts AS date) = '2024-03-01' ORDER BY id", "3"),
+        ("SELECT id FROM od WHERE ts::date::text = '2024-01-05' ORDER BY id", "1"),
+        // Timestamp targets.
+        ("SELECT id FROM od WHERE d::timestamp < '2024-02-01 00:00:01' ORDER BY id", "1,2,5,6"),
+        ("SELECT id FROM od WHERE d::timestamp = '2024-02-01 00:00:00' ORDER BY id", "2"),
+        ("SELECT id FROM od WHERE d::timestamp <= ts ORDER BY id", "1,2,3,5"),
+        ("SELECT id FROM od WHERE ts > d::timestamp ORDER BY id", "1,3,5"),
+        // The forms around a cast operand, with PostgreSQL's NULL answers.
+        ("SELECT id FROM od WHERE qty::int IS NULL ORDER BY id", "4"),
+        ("SELECT id FROM od WHERE qty::int IS NOT NULL ORDER BY id", "1,2,3,5,6"),
+        ("SELECT id FROM od WHERE qty::int IN (5, 7) ORDER BY id", "1,3"),
+        ("SELECT id FROM od WHERE qty::int NOT IN (5, 7) ORDER BY id", "2,5,6"),
+        ("SELECT id FROM od WHERE qty::int BETWEEN 6 AND 12 ORDER BY id", "2,3"),
+        ("SELECT id FROM od WHERE NOT (qty::int = 5) ORDER BY id", "2,3,5,6"),
+        ("SELECT id FROM od WHERE NOT (qty::int = 5 OR ts::date = '2024-02-01') ORDER BY id", "3,5,6"),
+        ("SELECT id FROM od WHERE qty::int > 4 AND d::text LIKE '2024%' ORDER BY id", "1,2,3"),
+    ];
+    let wrong = wrong_answers(&pool, cases).await;
+    assert!(wrong.is_empty(), "{} wrong answers:\n{}", wrong.len(), wrong.join("\n"));
+
+    // An UPDATE and a DELETE pick their rows the same way.
+    assert_eq!(run(&pool, "UPDATE od SET qty = 0 WHERE ts::date = '2024-02-01'").await, Ok(1));
+    assert_eq!(run(&pool, "DELETE FROM od WHERE discount_pct::int = 3").await, Ok(1));
+    assert_eq!(joined(&pool, "SELECT id FROM od WHERE qty::int = 0 ORDER BY id").await.unwrap(), "2");
+    assert_eq!(joined(&pool, "SELECT id FROM od ORDER BY id").await.unwrap(), "2,3,4,5,6");
+}
