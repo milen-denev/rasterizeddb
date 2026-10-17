@@ -764,7 +764,11 @@ pub async fn substitute_in_subqueries(
         // Membership ignores order, so an unbounded ORDER BY is not run.
         let rows =
             run_subquery_for(&found.inner_sql, database, tx, SubqueryNeed::Membership).await?;
-        let (list, had_null) = subquery::rows_to_value_list(&rows)?;
+        let document = crate::core::rql::cte::document_columns(&found.inner_sql, database)
+            .first()
+            .copied()
+            .unwrap_or(false);
+        let (list, had_null) = subquery::rows_to_value_list(&rows, document)?;
 
         // `x NOT IN (…, NULL)` is never true: x either equals a value (false)
         // or is compared against NULL (unknown). `x IN ()` expresses exactly
@@ -3419,10 +3423,42 @@ async fn execute_union(sql: &str, database: &Arc<Database>, tx: TxId) -> Vec<u8>
     let mut starts: Vec<usize> = Vec::new();
     let state = ahash::RandomState::new();
     let mut seen: hashbrown::HashTable<u32> = hashbrown::HashTable::new();
-    let row_at = |result: &[u8], starts: &[usize], i: u32| -> std::ops::Range<usize> {
-        let i = i as usize;
-        starts[i]..starts.get(i + 1).copied().unwrap_or(result.len())
+    // A document column is the exception to comparing bytes: `{"a":1}` and
+    // `{"a":1.0}` are one row. A position is a document column when any
+    // branch says so (PostgreSQL gives the column one type for all of them),
+    // and a cell typed `jsonb` is one wherever it is. Only a row holding one
+    // is keyed by value, and its key is kept beside it. The two kinds of key
+    // are marked apart, so a row keyed by its bytes never meets one keyed by
+    // value.
+    let documents: Vec<bool> = if all {
+        Vec::new()
+    } else {
+        branches.iter().fold(Vec::new(), |mut acc, branch| {
+            let here = crate::core::rql::cte::document_columns(branch, database);
+            acc.resize(acc.len().max(here.len()), false);
+            for (at, d) in here.into_iter().enumerate() {
+                acc[at] |= d;
+            }
+            acc
+        })
     };
+    let any_documents = documents.iter().any(|d| *d);
+    let mut value_keys: Vec<Option<Vec<u8>>> = Vec::new();
+    fn key_at<'a>(
+        result: &'a [u8],
+        starts: &[usize],
+        keys: &'a [Option<Vec<u8>>],
+        i: u32,
+    ) -> (bool, &'a [u8]) {
+        let i = i as usize;
+        match keys.get(i).and_then(|k| k.as_deref()) {
+            Some(k) => (true, k),
+            None => {
+                let end = starts.get(i + 1).copied().unwrap_or(result.len());
+                (false, &result[starts[i]..end])
+            }
+        }
+    }
 
     'branches: for branch in &branches {
         if branch.trim().is_empty() {
@@ -3444,16 +3480,34 @@ async fn execute_union(sql: &str, database: &Arc<Database>, tx: TxId) -> Vec<u8>
                 Err(e) => return ddl_error(&format!("a UNION branch's rows could not be read: {}", e)),
             };
             if !all {
-                let hash = state.hash_one(row);
+                let by_value = any_documents
+                    || crate::core::row::row::serialized_cells(row).is_ok_and(|mut cells| {
+                        cells.any(|c| {
+                            c.is_ok_and(|c| c.column_type == crate::core::db_type::DbType::JSONB)
+                        })
+                    });
+                let document = |at: usize| documents.get(at).copied().unwrap_or(false);
+                let value_key = by_value
+                    .then(|| crate::core::row::row::value_key(row, document))
+                    .flatten();
+                let key = match value_key.as_deref() {
+                    Some(k) => (true, k),
+                    None => (false, row),
+                };
+                let hash = state.hash_one(key);
                 if seen
-                    .find(hash, |i| &result[row_at(&result, &starts, *i)] == row)
+                    .find(hash, |i| key_at(&result, &starts, &value_keys, *i) == key)
                     .is_some()
                 {
                     continue;
                 }
                 seen.insert_unique(hash, starts.len() as u32, |i| {
-                    state.hash_one(&result[row_at(&result, &starts, *i)])
+                    state.hash_one(key_at(&result, &starts, &value_keys, *i))
                 });
+                if value_key.is_some() || !value_keys.is_empty() {
+                    value_keys.resize(starts.len(), None);
+                    value_keys.push(value_key);
+                }
             }
             starts.push(result.len());
             result.extend_from_slice(row);
@@ -11256,6 +11310,14 @@ pub(crate) async fn execute_query_rows(
     // here was a `Vec` and a `String` per column on every execution.
     let slot_schema: &[crate::core::row::schema::SchemaField] = &schema.fields;
     let has_literals = !value_slots.is_empty();
+    // The stored document columns, which `DISTINCT` keys by value. A scan
+    // types their cells as text, so only the schema can say which they are.
+    let document_ids: Vec<u64> = schema
+        .fields
+        .iter()
+        .filter(|f| !f.is_deleted && f.db_type == crate::core::db_type::DbType::JSONB)
+        .map(|f| f.write_order)
+        .collect();
 
     {
         match table
@@ -11740,13 +11802,34 @@ pub(crate) async fn execute_query_rows(
                                     // key of bytes alone merged NULL
                                     // with '' and answered two rows
                                     // for {NULL, '', 'a'}.
+                                    //
+                                    // A document is the exception: it
+                                    // is keyed by its value, so
+                                    // `{"a":1}` and `{"a":1.0}` are one
+                                    // row, as `=` says. A stored one
+                                    // arrives typed as text, so its
+                                    // column is known from the schema;
+                                    // a computed one carries `jsonb`.
                                     let mut key = Vec::new();
-                                    for c in &row.columns {
-                                        key.push(
-                                            (c.column_type
-                                                == crate::core::db_type::DbType::NULL)
-                                                as u8,
-                                        );
+                                    for (position, c) in row.columns.iter().enumerate() {
+                                        let is_null = c.column_type
+                                            == crate::core::db_type::DbType::NULL;
+                                        key.push(is_null as u8);
+                                        let document = !is_null
+                                            && (c.column_type
+                                                == crate::core::db_type::DbType::JSONB
+                                                || (!value_slots
+                                                    .iter()
+                                                    .any(|(p, ..)| *p == position)
+                                                    && document_ids
+                                                        .contains(&u64::from(c.schema_id))));
+                                        if document {
+                                            crate::core::jsonb::push_group_key(
+                                                c.data.into_slice(),
+                                                &mut key,
+                                            );
+                                            continue;
+                                        }
                                         key.extend_from_slice(
                                             &(c.data.into_slice().len() as u32)
                                                 .to_le_bytes(),

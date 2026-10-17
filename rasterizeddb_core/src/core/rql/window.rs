@@ -601,6 +601,8 @@ pub type WindowValue = Option<Vec<u8>>;
 /// range`, `numeric field overflow`, the grouped aggregate's wording. It used
 /// to answer NULL, which a client cannot tell from an all-NULL frame.
 pub fn assign(rows: &[Row], spec: &WindowSpec) -> Result<Vec<WindowValue>, String> {
+    // A document partitions by its value, as `=` compares it: `{"a":1}` and
+    // `{"a":1.0}` are one partition.
     let key_of = |row: &Row, fields: &[SchemaField]| -> Vec<Vec<u8>> {
         fields
             .iter()
@@ -608,7 +610,16 @@ pub fn assign(rows: &[Row], spec: &WindowSpec) -> Result<Vec<WindowValue>, Strin
                 row.columns
                     .iter()
                     .find(|c| u64::from(c.schema_id) == f.write_order)
-                    .map(|c| c.data.into_slice().to_vec())
+                    .map(|c| {
+                        let bytes = c.data.into_slice();
+                        if f.db_type == DbType::JSONB && !bytes.is_empty() {
+                            let mut key = Vec::new();
+                            crate::core::jsonb::push_group_key(bytes, &mut key);
+                            key
+                        } else {
+                            bytes.to_vec()
+                        }
+                    })
                     .unwrap_or_default()
             })
             .collect()

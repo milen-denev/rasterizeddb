@@ -782,6 +782,33 @@ fn declared_wide_types(
         .collect()
 }
 
+/// Which output columns of `query`, by position, are stored documents, for
+/// the callers that compare its rows by value: `UNION`'s duplicate check and
+/// `IN (subquery)`. A scan reports a stored document as text, so without this
+/// `{"a":1}` and `{"a":1.0}` were two rows to `UNION`, and an `IN` list was
+/// built from the stored bytes as if they were text.
+///
+/// The same resolution as [`declared_wide_types`]: bare columns of one
+/// relation. Anything it cannot resolve is `false` and compares as before.
+pub(crate) fn document_columns(query: &str, database: &Arc<Database>) -> Vec<bool> {
+    let Some(list) = select_list_of(query) else {
+        return Vec::new();
+    };
+    let list = list.trim_start();
+    let list = match list.get(.."DISTINCT ".len()) {
+        Some(head) if head.eq_ignore_ascii_case("DISTINCT ") => &list["DISTINCT ".len()..],
+        _ => list,
+    };
+    let labels: Vec<String> = crate::core::rql::lexer_ct::split_definitions(list)
+        .iter()
+        .map(|item| item_label(item).unwrap_or_default())
+        .collect();
+    declared_wide_types(query, &labels, database)
+        .into_iter()
+        .map(|t| t == Some(DbType::JSONB))
+        .collect()
+}
+
 pub async fn materialize_query(
     query: &str,
     alias: &str,

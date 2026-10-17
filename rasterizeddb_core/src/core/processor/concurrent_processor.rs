@@ -2878,17 +2878,20 @@ pub(crate) fn compare_bytes_as_type(
         // a meaningful order, but it is stable, which is what a sort needs.
         // `JSON` is reporting-only and never reaches storage, but a match has
         // to be exhaustive and a byte compare is the safe answer.
-        // `JSONB` compares by its encoded bytes, which is a *stable* order and
-        // not the one PostgreSQL defines for `jsonb`. Enough for a sort or a
-        // join key; a query that needs jsonb's own ordering does not have it.
         DbType::STRING
         | DbType::BYTEA
         | DbType::ARRAY
         | DbType::UNKNOWN
         | DbType::START
         | DbType::END
-        | DbType::JSON
-        | DbType::JSONB => a.cmp(b),
+        | DbType::JSON => a.cmp(b),
+        // PostgreSQL's `jsonb` order, by value. The encoded bytes used to be
+        // compared instead: stable, but `{"a":1}` and `{"a":1.0}` were two
+        // values to every sort, window and comparison, `ORDER BY doc` was not
+        // PostgreSQL's order, and `doc < '...'` answered a question about the
+        // encoding. Bytes that are not a document sort after every document,
+        // by their bytes, so the order stays total for a sort.
+        DbType::JSONB => crate::core::jsonb::order(a, b),
         // Fixed-width and big-endian by construction, so a plain byte compare
         // already yields canonical UUID order and address order.
         DbType::UUID | DbType::INET => a.cmp(b),

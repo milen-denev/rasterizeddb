@@ -76,14 +76,23 @@ pub fn perform_comparison_operation(
         // when it is encoded, so `1` and `1.0` differ as bytes and PostgreSQL
         // calls them equal, at any depth. A byte compare matched `doc = '1'`
         // against only one of the two. Bytes that are not an encoded document
-        // fall back to the byte compare, which is all they ever had. The
-        // *ordering* is still the bytes': stable, but not the one PostgreSQL
-        // defines for `jsonb`.
+        // fall back to the byte compare, which is all they ever had.
+        //
+        // The ordering operators follow PostgreSQL's `jsonb` order, the one
+        // `ORDER BY doc` sorts by, rather than the bytes': `doc < '{"a":2}'`
+        // asked whether one encoding precedes another, which put `{"a":10}`
+        // and `{"b":0}` on the wrong side and told nothing about the values.
         DbType::JSONB => match operation {
             ComparerOperation::Equals | ComparerOperation::NotEquals => {
                 let equal = crate::core::jsonb::values_equal(input1, input2)
                     .unwrap_or_else(|| input1 == input2);
                 Ok(equal == matches!(operation, ComparerOperation::Equals))
+            }
+            ComparerOperation::Greater
+            | ComparerOperation::GreaterOrEquals
+            | ComparerOperation::Less
+            | ComparerOperation::LessOrEquals => {
+                ordered_comparison(input1, input2, db_type, operation)
             }
             _ => Ok(string_comparison(input1, input2, operation)),
         },

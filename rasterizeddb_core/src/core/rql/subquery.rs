@@ -1120,14 +1120,19 @@ pub fn value_to_literal(db_type: &DbType, bytes: &[u8]) -> Option<String> {
 /// `NOT IN` it makes the predicate never true, which the caller expresses —
 /// rendered as a literal it reached the predicate parser as an unknown
 /// identifier.
-pub fn rows_to_value_list(rows: &[Row]) -> Result<(String, bool), String> {
+///
+/// `document` says the column is a stored document. A scan reports one as
+/// text, and rendered as text its encoded bytes made a literal no document
+/// parses from, so `doc IN (SELECT doc FROM t)` was refused outright. It is
+/// rendered as the document it is, and duplicates are found by value.
+pub fn rows_to_value_list(rows: &[Row], document: bool) -> Result<(String, bool), String> {
     let mut out = String::with_capacity(2 + rows.len() * 8);
     out.push('(');
     let mut had_null = false;
     let mut first = true;
     // Keyed by type tag and stored bytes, so equal values of different types
     // (a UNION can mix them) are never merged.
-    let mut seen: ahash::HashSet<(u8, &[u8])> =
+    let mut seen: ahash::HashSet<(u8, std::borrow::Cow<[u8]>)> =
         ahash::HashSet::with_capacity_and_hasher(rows.len(), Default::default());
 
     for row in rows {
@@ -1143,13 +1148,25 @@ pub fn rows_to_value_list(rows: &[Row]) -> Result<(String, bool), String> {
             continue;
         }
         let bytes = column.data.into_slice();
-        if !seen.insert((column.column_type.to_byte(), bytes)) {
+        let db_type = if document && column.column_type == DbType::STRING {
+            DbType::JSONB
+        } else {
+            column.column_type.clone()
+        };
+        let key = if db_type == DbType::JSONB {
+            let mut key = Vec::with_capacity(bytes.len() + 8);
+            crate::core::jsonb::push_group_key(bytes, &mut key);
+            std::borrow::Cow::Owned(key)
+        } else {
+            std::borrow::Cow::Borrowed(bytes)
+        };
+        if !seen.insert((db_type.to_byte(), key)) {
             continue;
         }
-        let literal = value_to_literal(&column.column_type, bytes).ok_or_else(|| {
+        let literal = value_to_literal(&db_type, bytes).ok_or_else(|| {
             format!(
                 "subquery returned a {} value that cannot be compared",
-                column.column_type
+                db_type
             )
         })?;
         if !first {
@@ -1424,6 +1441,6 @@ mod tests {
 
     #[test]
     fn empty_results_render_as_an_empty_list() {
-        assert_eq!(rows_to_value_list(&[]).unwrap(), ("()".to_string(), false));
+        assert_eq!(rows_to_value_list(&[], false).unwrap(), ("()".to_string(), false));
     }
 }

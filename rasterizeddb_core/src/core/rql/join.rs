@@ -544,6 +544,46 @@ fn sets(rels: Vec<Vec<Row>>) -> Vec<RowSet> {
 struct KeyColumn {
     write_order: u64,
     flag: Option<u64>,
+    /// Both sides are documents, so the key matches by value.
+    document: bool,
+}
+
+/// One key column's value as the join matches it: by bytes, or for two
+/// documents by value, so `{"a":1}` meets `{"a":1.0}` as `a.doc = b.doc`
+/// says it does. The hash agrees with the equality, since a document hashes
+/// by the key [`crate::core::jsonb::push_group_key`] gives it, which is equal
+/// exactly when the two are.
+#[derive(Clone, Copy)]
+struct KeyValue<'r> {
+    bytes: &'r [u8],
+    document: bool,
+}
+
+impl PartialEq for KeyValue<'_> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        if self.document && other.document {
+            crate::core::jsonb::values_equal(self.bytes, other.bytes)
+                .unwrap_or_else(|| self.bytes == other.bytes)
+        } else {
+            self.bytes == other.bytes
+        }
+    }
+}
+
+impl Eq for KeyValue<'_> {}
+
+impl std::hash::Hash for KeyValue<'_> {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        if self.document {
+            let mut key = Vec::with_capacity(self.bytes.len() + 8);
+            crate::core::jsonb::push_group_key(self.bytes, &mut key);
+            key.hash(state);
+        } else {
+            self.bytes.hash(state);
+        }
+    }
 }
 
 /// A key column's bytes, or `None` when the row holds no value there — the
@@ -553,7 +593,7 @@ struct KeyColumn {
 /// stored as its type's zeroes, so comparing the bytes alone matched a NULL
 /// integer key against a real `0` (and a NULL text against `''`).
 #[inline]
-fn key_bytes<'r>(row: RowRef<'r>, key: KeyColumn) -> Option<&'r [u8]> {
+fn key_bytes<'r>(row: RowRef<'r>, key: KeyColumn) -> Option<KeyValue<'r>> {
     let (bytes, ty) = row.column(key.write_order)?;
     if ty == DbType::NULL {
         return None;
@@ -566,7 +606,10 @@ fn key_bytes<'r>(row: RowRef<'r>, key: KeyColumn) -> Option<&'r [u8]> {
             return None;
         }
     }
-    Some(bytes)
+    Some(KeyValue {
+        bytes,
+        document: key.document,
+    })
 }
 
 /// Every key column of a row, or `None` if any is absent or NULL.
@@ -576,7 +619,7 @@ fn key_bytes<'r>(row: RowRef<'r>, key: KeyColumn) -> Option<&'r [u8]> {
 /// rather than a missed one. Inline for up to four columns, so a composite key
 /// allocates nothing per row.
 #[inline]
-fn composite_key<'r>(row: RowRef<'r>, keys: &[KeyColumn]) -> Option<SmallVec<[&'r [u8]; 4]>> {
+fn composite_key<'r>(row: RowRef<'r>, keys: &[KeyColumn]) -> Option<SmallVec<[KeyValue<'r>; 4]>> {
     keys.iter().map(|k| key_bytes(row, *k)).collect()
 }
 
@@ -851,20 +894,32 @@ pub fn combine<'a>(plan: &JoinPlan, scanned: &'a [RowSet]) -> Result<Joined<'a>,
                 .fetch_columns
                 .iter()
                 .find(|f| f.name.eq_ignore_ascii_case(left_name) && !f.is_deleted)
-                .map(|f| KeyColumn {
-                    write_order: f.write_order,
-                    flag: companion(left_relation, left_name),
+                .map(|f| {
+                    let key = KeyColumn {
+                        write_order: f.write_order,
+                        flag: companion(left_relation, left_name),
+                        document: false,
+                    };
+                    (key, f.db_type == DbType::JSONB)
                 });
             let r = relation
                 .fetch_columns
                 .iter()
                 .find(|f| f.name.eq_ignore_ascii_case(right_name) && !f.is_deleted)
-                .map(|f| KeyColumn {
-                    write_order: f.write_order,
-                    flag: companion(relation, right_name),
+                .map(|f| {
+                    let key = KeyColumn {
+                        write_order: f.write_order,
+                        flag: companion(relation, right_name),
+                        document: false,
+                    };
+                    (key, f.db_type == DbType::JSONB)
                 });
             match (l, r) {
-                (Some(l), Some(r)) => {
+                (Some((mut l, l_doc)), Some((mut r, r_doc))) => {
+                    // Matched by value only when both sides are documents;
+                    // anything else keeps matching by bytes.
+                    l.document = l_doc && r_doc;
+                    r.document = l_doc && r_doc;
                     left_keys.push(l);
                     right_keys.push(r);
                 }
@@ -1438,17 +1493,40 @@ pub fn project_serialized(plan: &JoinPlan, combined: &Joined<'_>, out: &mut Vec<
     // `STRING` — telling those apart is what keeps a NULL from collapsing into
     // an empty value. The first of each group is kept, so an `ORDER BY` that
     // has already run is not disturbed.
+    //
+    // A document column is the exception: two rows holding `{"a":1}` and
+    // `{"a":1.0}` there are the same row, so with one in the select list each
+    // row is keyed by `value_key` instead, built once per row.
     if plan.distinct {
         use std::hash::BuildHasher;
         let state = ahash::RandomState::new();
+        let document = |position: usize| {
+            plan.items
+                .get(position)
+                .is_some_and(|item| item.field.db_type == DbType::JSONB)
+        };
+        let value_keys: Option<Vec<Vec<u8>>> = (0..plan.items.len()).any(document).then(|| {
+            (0..starts.len() as u32)
+                .map(|i| {
+                    let row = row_at(i);
+                    crate::core::row::row::value_key(row, document).unwrap_or_else(|| row.to_vec())
+                })
+                .collect()
+        });
+        let key_at = |i: u32| -> &[u8] {
+            match value_keys.as_ref() {
+                Some(keys) => &keys[i as usize],
+                None => row_at(i),
+            }
+        };
         let mut seen: hashbrown::HashTable<u32> = hashbrown::HashTable::with_capacity(order.len());
         order.retain(|i| {
-            let row = row_at(*i);
+            let row = key_at(*i);
             let hash = state.hash_one(row);
-            if seen.find(hash, |j| row_at(*j) == row).is_some() {
+            if seen.find(hash, |j| key_at(*j) == row).is_some() {
                 return false;
             }
-            seen.insert_unique(hash, *i, |j| state.hash_one(row_at(*j)));
+            seen.insert_unique(hash, *i, |j| state.hash_one(key_at(*j)));
             true
         });
     }

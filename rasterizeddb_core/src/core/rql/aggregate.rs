@@ -1188,6 +1188,11 @@ fn decode_float(bytes: &[u8], ty: &DbType) -> Option<f64> {
 }
 
 pub(crate) fn compare_values(a: &[u8], b: &[u8], ty: &DbType) -> std::cmp::Ordering {
+    // Documents in PostgreSQL's `jsonb` order, as the ungrouped sort orders
+    // them; the byte fallback below would order the encodings.
+    if *ty == DbType::JSONB {
+        return crate::core::jsonb::order(a, b);
+    }
     // Decimals that carry their own scale (an `AVG` result) are compared as
     // numbers at a common scale; their bytes alone are not comparable.
     if *ty == DbType::DECIMAL && (a.len() == 17 || b.len() == 17) {
@@ -1384,6 +1389,17 @@ pub struct Folder<'p> {
     key: Vec<u8>,
     /// Each group's encoded key, in first-seen order — the emit order.
     keys: Vec<Box<[u8]>>,
+    /// Which key sources are documents, keyed by value rather than by bytes:
+    /// `{"a":1}` and `{"a":1.0}` are one group, as `=` says they are. A
+    /// computed key counts when its expression is typed `jsonb`, and then
+    /// only a row whose value is one is keyed by value.
+    document_keys: Vec<bool>,
+    /// Set when any key source may be a document. A document's key part is
+    /// then not the value the group shows, so each group also keeps its first
+    /// row's key in the plain form, and that is what is emitted.
+    shown: Option<Vec<Box<[u8]>>>,
+    /// The plain form of the row's key, built beside `key` when `shown` is.
+    plain: Vec<u8>,
     /// `stride` accumulators per group, group after group.
     accs: Vec<Acc>,
     index: hashbrown::HashTable<u32>,
@@ -1495,6 +1511,17 @@ impl<'p> Folder<'p> {
             }
             _ => None,
         };
+        let document_keys: Vec<bool> = key_sources
+            .iter()
+            .zip(plan.group_by.iter())
+            .map(|(source, f)| match source {
+                KeySource::Computed(k) => {
+                    crate::core::rql::expr::static_type(&k.expr) == DbType::JSONB
+                }
+                KeySource::Column(_) => f.db_type == DbType::JSONB,
+            })
+            .collect();
+        let shown = document_keys.iter().any(|d| *d).then(Vec::new);
 
         Folder {
             plan,
@@ -1511,6 +1538,9 @@ impl<'p> Folder<'p> {
             byte_groups: [u32::MAX; 257],
             key: Vec::new(),
             keys: Vec::new(),
+            document_keys,
+            shown,
+            plain: Vec::new(),
             accs: Vec::new(),
             index: hashbrown::HashTable::new(),
             state: ahash::RandomState::new(),
@@ -1527,6 +1557,9 @@ impl<'p> Folder<'p> {
         use std::hash::BuildHasher;
         let at = self.keys.len();
         self.keys.push(self.key.as_slice().into());
+        if let Some(shown) = self.shown.as_mut() {
+            shown.push(self.plain.as_slice().into());
+        }
         self.accs.extend(self.template.iter().cloned());
         match byte_cell {
             Some(cell) => self.byte_groups[cell] = at as u32,
@@ -1586,28 +1619,35 @@ impl<'p> Folder<'p> {
                 // under a non-text OID, which a typed client rejects outright
                 // rather than reading as NULL.
                 self.key.clear();
-                for source in &self.key_sources {
+                self.plain.clear();
+                // A document is keyed by its value, with its plain form kept
+                // beside it for what the group shows.
+                let mut plain = self.shown.is_some().then_some(&mut self.plain);
+                for (source, document) in self.key_sources.iter().zip(&self.document_keys) {
                     match source {
                         // A computed key has no scanned column: its bytes come
                         // from evaluating the expression against the row.
                         KeySource::Computed(k) => {
                             match crate::core::rql::expr::eval(&k.expr, row, &k.schema)? {
                                 crate::core::rql::expr::Value::Null => {
-                                    self.key.extend_from_slice(&u32::MAX.to_le_bytes())
+                                    push_key_part(&mut self.key, plain.as_deref_mut(), None, false)
                                 }
-                                crate::core::rql::expr::Value::Data { bytes, .. } => {
-                                    self.key.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-                                    self.key.extend_from_slice(&bytes);
+                                crate::core::rql::expr::Value::Data { bytes, db_type } => {
+                                    push_key_part(
+                                        &mut self.key,
+                                        plain.as_deref_mut(),
+                                        Some(&bytes),
+                                        *document && db_type == DbType::JSONB,
+                                    )
                                 }
                             }
                         }
-                        KeySource::Column(slot) => match self.positions.get(row, *slot) {
-                            Some(b) => {
-                                self.key.extend_from_slice(&(b.len() as u32).to_le_bytes());
-                                self.key.extend_from_slice(b);
-                            }
-                            None => self.key.extend_from_slice(&u32::MAX.to_le_bytes()),
-                        },
+                        KeySource::Column(slot) => push_key_part(
+                            &mut self.key,
+                            plain.as_deref_mut(),
+                            self.positions.get(row, *slot),
+                            *document,
+                        ),
                     }
                 }
                 self.group_for_key(byte_cell)
@@ -1635,6 +1675,11 @@ impl<'p> Folder<'p> {
         for (g, key) in other.keys.iter().enumerate() {
             self.key.clear();
             self.key.extend_from_slice(key);
+            // What the group shows comes along, for when it is new here.
+            if let Some(shown) = other.shown.as_ref() {
+                self.plain.clear();
+                self.plain.extend_from_slice(&shown[g]);
+            }
             let byte_cell = self.byte_slot.and_then(|_| one_byte_cell(key));
             let at = self.group_for_key(byte_cell);
             let theirs = &other.accs[g * other.stride..(g + 1) * other.stride];
@@ -1679,7 +1724,10 @@ impl<'p> Folder<'p> {
                 skip -= 1;
                 continue;
             }
-            let key_parts = decode_key_parts(key, self.key_sources.len());
+            let key_parts = decode_key_parts(
+                self.shown.as_ref().map_or(key, |s| &s[g]),
+                self.key_sources.len(),
+            );
             emit_group(plan, &key_parts, run, &self.computed_at)?.extend_serialized(out);
             take -= 1;
         }
@@ -1709,7 +1757,10 @@ impl<'p> Folder<'p> {
             }
             // Decoded here, once per emitted group, rather than kept decoded
             // for every group for the whole fold.
-            let key_parts = decode_key_parts(key, self.key_sources.len());
+            let key_parts = decode_key_parts(
+                self.shown.as_ref().map_or(key, |s| &s[g]),
+                self.key_sources.len(),
+            );
             out.push(emit_group(plan, &key_parts, run, &self.computed_at)?);
         }
 
@@ -1726,6 +1777,40 @@ impl<'p> Folder<'p> {
         }
 
         Ok(out)
+    }
+}
+
+/// Appends one grouping column's part of a key: its length and bytes, the
+/// NULL marker, or for a document what [`crate::core::jsonb::push_group_key`]
+/// keys it by. `plain`, when kept, gets the length and bytes either way.
+fn push_key_part(
+    key: &mut Vec<u8>,
+    plain: Option<&mut Vec<u8>>,
+    value: Option<&[u8]>,
+    document: bool,
+) {
+    let put = |out: &mut Vec<u8>, b: &[u8]| {
+        out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+        out.extend_from_slice(b);
+    };
+    match value {
+        Some(b) => {
+            if document {
+                crate::core::jsonb::push_group_key(b, key);
+            } else {
+                put(key, b);
+            }
+            if let Some(plain) = plain {
+                put(plain, b);
+            }
+        }
+        // The same marker in both, so NULL stays its own group.
+        None => {
+            key.extend_from_slice(&u32::MAX.to_le_bytes());
+            if let Some(plain) = plain {
+                plain.extend_from_slice(&u32::MAX.to_le_bytes());
+            }
+        }
     }
 }
 
@@ -4673,6 +4758,64 @@ mod fold_equivalence {
                 times[2],
                 (peak_rss_kb().saturating_sub(base)) / 1024
             );
+        }
+    }
+
+    /// A document key groups by value: `{"a":1}`, `{"a":1.0}` and `{"a":1e0}`
+    /// are one group, and `[1]` and `[1.0]` another, while NULL stays a group
+    /// of its own. A group shows its first row's document as written, not the
+    /// key it was grouped by. Folded whole, and folded in parts and merged,
+    /// the same groups come out in the same order showing the same documents.
+    #[test]
+    fn document_keys_group_by_value_whole_and_merged() {
+        let doc_field = field("doc", DbType::JSONB, 0);
+        let plan = AggregatePlan {
+            items: vec![
+                SelectItem::Column {
+                    field: doc_field.clone(),
+                    label: "doc".into(),
+                },
+                agg(AggFunc::Count, None, "n"),
+            ],
+            group_by: vec![doc_field],
+            computed_keys: vec![],
+            having: None,
+            order_by: vec![],
+            limit: None,
+            offset: None,
+        };
+        let doc = |t: &str| crate::core::jsonb::encode_text(t).unwrap();
+        let cells: Vec<Cell> = vec![
+            Some(Some(doc(r#"{"a":1.0}"#))),
+            Some(Some(doc("[1]"))),
+            Some(None),
+            Some(Some(doc(r#"{"a":1}"#))),
+            Some(Some(doc("[1.0]"))),
+            Some(Some(doc(r#"{"a":1e0}"#))),
+            Some(None),
+        ];
+        let rows: Vec<Row> = cells
+            .into_iter()
+            .map(|cell| build(&[(0, DbType::JSONB, cell)], None))
+            .collect();
+        let shown = |out: &[Row]| -> Vec<(Vec<u8>, i64)> {
+            out.iter()
+                .map(|r| {
+                    let n = r.columns[1].data.into_slice().try_into().unwrap();
+                    (r.columns[0].data.into_slice().to_vec(), i64::from_le_bytes(n))
+                })
+                .collect()
+        };
+        let want = vec![(doc(r#"{"a":1.0}"#), 3), (doc("[1]"), 2), (Vec::new(), 2)];
+        assert_eq!(shown(&fold(&plan, &rows).unwrap()), want);
+        for cut in 0..=rows.len() {
+            let (mut first, mut second) = (Folder::new(&plan), Folder::new(&plan));
+            for (i, row) in rows.iter().enumerate() {
+                let part = if i < cut { &mut first } else { &mut second };
+                part.push(row).unwrap();
+            }
+            first.merge(second);
+            assert_eq!(shown(&first.finish().unwrap()), want, "cut at {cut}");
         }
     }
 }

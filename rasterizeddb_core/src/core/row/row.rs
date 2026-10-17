@@ -424,6 +424,35 @@ pub fn serialized_rows(bytes: &[u8]) -> SerializedRows<'_> {
     SerializedRows { bytes, position: 0 }
 }
 
+/// What a serialized row is deduplicated by when some of its columns hold
+/// documents: each cell's id, type and bytes, as comparing the rows' bytes
+/// would see them, except that a document cell — one typed `jsonb`, or one
+/// `document(position)` names — is keyed by its value, so `{"a":1}` and
+/// `{"a":1.0}` are one row to `DISTINCT` and `UNION`, as `=` says they are. A
+/// document's type tag is left out of its key: a scan reports a stored
+/// document as text and a computed one as `jsonb`, and the two are the same
+/// value. A NULL keeps its tag, so it never meets a value.
+///
+/// `None` when the row cannot be read; the caller then compares its bytes.
+pub fn value_key(row: &[u8], document: impl Fn(usize) -> bool) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(row.len() + 16);
+    for (position, cell) in serialized_cells(row).ok()?.enumerate() {
+        let cell = cell.ok()?;
+        out.extend_from_slice(&cell.schema_id.to_le_bytes());
+        if cell.column_type == DbType::JSONB
+            || (cell.column_type != DbType::NULL && document(position))
+        {
+            out.push(u8::MAX);
+            crate::core::jsonb::push_group_key(cell.data, &mut out);
+        } else {
+            out.push(cell.column_type.to_byte());
+            out.extend_from_slice(&(cell.data.len() as u32).to_le_bytes());
+            out.extend_from_slice(cell.data);
+        }
+    }
+    Some(out)
+}
+
 /// Everything after the first `n` rows of a serialized result, as a subslice.
 ///
 /// What `OFFSET` needs when it is the only reason to touch the rows: the rows
