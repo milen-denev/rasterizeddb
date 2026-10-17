@@ -257,6 +257,25 @@ async fn run_subquery_for(
     tx: TxId,
     need: SubqueryNeed,
 ) -> Result<Vec<crate::core::row::row::Row>, String> {
+    run_subquery_scaled(sql, database, tx, need, true).await.map(|(rows, _)| rows)
+}
+
+/// [`run_subquery_for`], also returning the scale each output column's
+/// `DECIMAL` cells are stored at, when it is known. A materialised relation
+/// declares its columns at those scales, so `NUMERIC(12,2)` read through a
+/// CTE still prints two places.
+///
+/// With `normalize` false the cells are left at those scales rather than
+/// brought to the engine's, for a caller that writes each one at its own:
+/// rounding an `AVG`'s sixteen places to nine and storing the result at
+/// sixteen again read 114.9166666666666667 back as 114.9166666670000000.
+async fn run_subquery_scaled(
+    sql: &str,
+    database: &Arc<Database>,
+    tx: TxId,
+    need: SubqueryNeed,
+    normalize: bool,
+) -> Result<(Vec<crate::core::row::row::Row>, Option<Vec<u32>>), String> {
     // The inner query is executed exactly once, with no outer row in scope. A
     // correlated subquery would reference an outer column, which the inner
     // table's schema does not have, so it fails here by name rather than being
@@ -292,12 +311,12 @@ async fn run_subquery_for(
 
     let mut rows = crate::core::row::row::vec_into_rows(&response[1..])
         .map_err(|e| format!("subquery result could not be read: {}", e))?;
-    if let Some(scales) = recognize_query_purpose(sql)
-        .and_then(|purpose| query_output_scales(&purpose, database))
-    {
-        normalize_decimal_scales(&mut rows, &scales);
+    let scales = recognize_query_purpose(sql)
+        .and_then(|purpose| query_output_scales(&purpose, database));
+    if let Some(scales) = scales.as_ref().filter(|_| normalize) {
+        normalize_decimal_scales(&mut rows, scales);
     }
-    Ok(rows)
+    Ok((rows, scales))
 }
 
 /// The scale each output column's `DECIMAL` bytes are stored at, slot for
@@ -562,6 +581,16 @@ pub(crate) async fn run_query_rows(
     tx: TxId,
 ) -> Result<Vec<crate::core::row::row::Row>, String> {
     run_subquery(sql, database, tx).await
+}
+
+/// [`run_query_rows`], with its `DECIMAL` cells left at the scale each output
+/// column stores them at, and those scales — see [`run_subquery_scaled`].
+pub(crate) async fn run_query_rows_scaled(
+    sql: &str,
+    database: &Arc<Database>,
+    tx: TxId,
+) -> Result<(Vec<crate::core::row::row::Row>, Option<Vec<u32>>), String> {
+    run_subquery_scaled(sql, database, tx, SubqueryNeed::All, false).await
 }
 
 /// Runs a data-modifying statement and returns the rows its `RETURNING` clause

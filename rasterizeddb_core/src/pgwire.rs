@@ -3154,7 +3154,7 @@ fn has_placeholder(sql: &str) -> bool {
     false
 }
 
-async fn describe_query(
+pub(crate) async fn describe_query(
     database: &Arc<Database>,
     query: &str,
 ) -> io::Result<Option<(Vec<(String, DbType)>, bool)>> {
@@ -5067,13 +5067,7 @@ where
         // `RETURNING` sends rows too, and a returned column is read straight
         // from storage at its own scale. Without these arms every `RETURNING v`
         // over a `NUMERIC(p, s)` column was rendered at the engine default.
-        QueryPurpose::UpdateRow(sql) | QueryPurpose::DeleteRow(sql) => {
-            let skip = if matches!(purpose, QueryPurpose::UpdateRow(_)) { 1 } else { 2 };
-            let name = sql.split_whitespace().nth(skip).unwrap_or("").trim_matches('"').to_string();
-            returning_scales(database, &name, sql)
-        }
-        QueryPurpose::InsertRow(ir) => returning_scales(database, &ir.table_name, &ir.query),
-        _ => None,
+        other => purpose_returning_scales(database, other),
     };
 
     let select_fields = match &purpose {
@@ -7584,6 +7578,24 @@ fn text_from_bytes(bytes: &[u8]) -> String {
     match std::str::from_utf8(bytes) {
         Ok(text) => text.to_owned(),
         Err(_) => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
+/// The declared decimal scale of each `RETURNING` item of a write, for every
+/// reader of its rows: the client's, and a data-modifying CTE's relation,
+/// which read 7.25 in a `NUMERIC(12,2)` column as 0.000000725 without it.
+pub(crate) fn purpose_returning_scales(
+    database: &Arc<Database>,
+    purpose: &QueryPurpose,
+) -> Option<Vec<u32>> {
+    match purpose {
+        QueryPurpose::UpdateRow(sql) | QueryPurpose::DeleteRow(sql) => {
+            let skip = if matches!(purpose, QueryPurpose::UpdateRow(_)) { 1 } else { 2 };
+            let name = sql.split_whitespace().nth(skip).unwrap_or("").trim_matches('"').to_string();
+            returning_scales(database, &name, sql)
+        }
+        QueryPurpose::InsertRow(ir) => returning_scales(database, &ir.table_name, &ir.query),
+        _ => None,
     }
 }
 

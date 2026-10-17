@@ -250,6 +250,37 @@ fn returning_constants(body: &str) -> Option<Vec<String>> {
     Some(literals)
 }
 
+/// The output names of a `SELECT` that is about to be materialised.
+///
+/// Each item's own name, as PostgreSQL gives it. A list holding a `*` has
+/// no name per item, so its names are taken from the query's description,
+/// which expands the star the way the outer statement's describe will:
+/// `WITH x AS (SELECT * FROM t)` was refused as "a column this cannot name".
+async fn select_labels(query: &str, database: &Arc<Database>) -> Option<Vec<String>> {
+    let list = select_list_of(query)?;
+    let items = crate::core::rql::lexer_ct::split_definitions(list);
+    if let Some(labels) = items
+        .iter()
+        .map(|item| item_label(item))
+        .collect::<Option<Vec<String>>>()
+    {
+        return Some(labels);
+    }
+    let starred = items.iter().any(|item| {
+        let item = item.trim();
+        item == "*" || item.ends_with(".*")
+    });
+    if !starred {
+        return None;
+    }
+    match Box::pin(crate::pgwire::describe_query(database, query)).await {
+        Ok(Some((fields, true))) if !fields.is_empty() => {
+            Some(fields.into_iter().map(|(name, _)| name).collect())
+        }
+        _ => None,
+    }
+}
+
 /// The column names a data-modifying CTE exposes, taken from its `RETURNING`
 /// clause.
 ///
@@ -265,22 +296,58 @@ fn returning_labels(body: &str) -> Option<Vec<String>> {
 }
 
 /// The SQL type name that reads back as `db_type`, for the temporary table.
+///
+/// Every type is named as itself. A narrower integer or a `REAL` used to be
+/// widened, so the relation advertised `int4` or `float8` where the inner
+/// query's description said `int2` or `float4`, and a `REAL` of 0.1 read back
+/// as 0.10000000149011612.
 fn sql_type_of(db_type: &DbType) -> Option<&'static str> {
     Some(match db_type {
-        DbType::I8 | DbType::I16 | DbType::I32 => "INTEGER",
-        DbType::I64 | DbType::U8 | DbType::U16 | DbType::U32 => "BIGINT",
+        DbType::I8 => "TINYINT",
+        DbType::I16 => "SMALLINT",
+        DbType::I32 => "INTEGER",
+        DbType::I64 => "BIGINT",
+        DbType::U8 => "UTINYINT",
+        DbType::U16 => "USMALLINT",
+        DbType::U32 => "UINT",
         // Their own widths: as `BIGINT` a `UBIGINT` above `i64::MAX` read
         // back negative, a 16-byte integer was cut to eight, and the column
         // advertised `int8` where the base table's said `numeric`.
         DbType::U64 => "UBIGINT",
         DbType::I128 => "HUGEINT",
         DbType::U128 => "UHUGEINT",
-        DbType::F32 | DbType::F64 => "DOUBLE",
+        DbType::F32 => "REAL",
+        DbType::F64 => "DOUBLE",
         DbType::DECIMAL => "NUMERIC",
         DbType::BOOL => "BOOLEAN",
         DbType::UUID => "UUID",
         DbType::DATETIME => "TIMESTAMP",
-        DbType::STRING | DbType::CHAR => "TEXT",
+        DbType::STRING => "TEXT",
+        DbType::CHAR => "CHAR",
+        // The types stored in PostgreSQL's own layout. Without them a CTE
+        // over a date, a time, an interval, a MAC address or any geometry was
+        // refused as "a type that cannot be materialised".
+        DbType::DATE => "DATE",
+        DbType::TIME => "TIME",
+        DbType::TIMETZ => "TIMETZ",
+        DbType::INTERVAL => "INTERVAL",
+        DbType::MACADDR => "MACADDR",
+        DbType::MACADDR8 => "MACADDR8",
+        DbType::BIT => "BIT",
+        DbType::VARBIT => "VARBIT",
+        DbType::POINT => "POINT",
+        DbType::LINE => "LINE",
+        DbType::LSEG => "LSEG",
+        DbType::BOX => "BOX",
+        DbType::PATH => "PATH",
+        DbType::POLYGON => "POLYGON",
+        DbType::CIRCLE => "CIRCLE",
+        DbType::INT4RANGE => "INT4RANGE",
+        DbType::INT8RANGE => "INT8RANGE",
+        DbType::NUMRANGE => "NUMRANGE",
+        DbType::TSRANGE => "TSRANGE",
+        DbType::TSTZRANGE => "TSTZRANGE",
+        DbType::DATERANGE => "DATERANGE",
         // Every remaining stored type, named as `parse_column_type` accepts it.
         // A materialised subquery has to be able to hold whatever a select list
         // can produce: a `SELECT COUNT(*) FROM (SELECT …) AS sub_query` — which
@@ -296,6 +363,208 @@ fn sql_type_of(db_type: &DbType) -> Option<&'static str> {
         DbType::NULL => return None,
         _ => return None,
     })
+}
+
+/// One column of a materialised relation: what it is declared as, and the
+/// type its cells are written back as when a scan reports them physically.
+struct RelationColumn {
+    sql_type: String,
+    declared: Option<DbType>,
+    /// The scale this column's `DECIMAL` cells arrive at, when known.
+    scale: Option<u32>,
+}
+
+/// The column types of the relation `query` is materialised into.
+///
+/// Taken from the query's description, which is what the client is told the
+/// columns are and what pgwire renders their cells by — the same source the
+/// outer statement's describe resolves a CTE through, so the relation and its
+/// description cannot disagree. A scanned row cannot answer this: it reports
+/// the *physical* type, which is TEXT for a document, an array, a range, a bit
+/// string and a path, so a relation typed from the rows held a document's
+/// encoded bytes in a TEXT column. They came back non-NULL and unreadable, and
+/// `@>` refused the column as a string.
+///
+/// A sampled cell still wins where it disagrees physically with the
+/// description, because its bytes are what has to be written. The rows decide
+/// alone only when the query cannot be described, as before.
+async fn relation_columns(
+    query: &str,
+    labels: &[String],
+    rows: &[crate::core::row::row::Row],
+    scales: Option<&[u32]>,
+    database: &Arc<Database>,
+) -> Result<Vec<RelationColumn>, usize> {
+    let described: Vec<DbType> = match Box::pin(crate::pgwire::describe_query(database, query)).await {
+        Ok(Some((fields, _))) if fields.len() == labels.len() => {
+            fields.into_iter().map(|(_, ty)| ty).collect()
+        }
+        _ => Vec::new(),
+    };
+    let sampled_wide = declared_wide_types(query, labels, database);
+    let engine = crate::core::value_codec::DECIMAL_SCALE;
+
+    let mut columns = Vec::with_capacity(labels.len());
+    for index in 0..labels.len() {
+        // The first row that has a value here: a NULL is the absence of a
+        // value, not a type.
+        let sampled = rows
+            .iter()
+            .filter_map(|row| row.columns.get(index))
+            .map(|c| c.column_type.clone())
+            .find(|t| *t != DbType::NULL);
+        let described = described
+            .get(index)
+            .filter(|t| sql_type_of(t).is_some())
+            .cloned();
+        let declared = match (described, sampled) {
+            (Some(d), Some(s)) if s != d && s != d.physical() => Some(s),
+            (Some(d), _) => Some(d),
+            // Undescribable: the sampled type, with TEXT second-guessed from
+            // the schema for the bare-column case `declared_wide_types` reads.
+            (None, Some(DbType::STRING)) | (None, None) => sampled_wide
+                .get(index)
+                .cloned()
+                .flatten()
+                .or(Some(DbType::STRING)),
+            (None, Some(s)) => Some(s),
+        };
+        let scale = scales.and_then(|s| s.get(index)).copied();
+        let sql_type = match &declared {
+            // A decimal is declared at the scale its cells were stored at, so
+            // it prints the places it was written with rather than nine.
+            Some(DbType::DECIMAL) => match scale {
+                Some(scale) if scale != engine => format!("NUMERIC(38,{})", scale),
+                _ => "NUMERIC".to_string(),
+            },
+            Some(t) => sql_type_of(t).ok_or(index)?.to_string(),
+            None => "TEXT".to_string(),
+        };
+        columns.push(RelationColumn {
+            sql_type,
+            declared,
+            scale,
+        });
+    }
+    Ok(columns)
+}
+
+/// The literal one cell is written into a materialised relation as.
+///
+/// A cell a scan reports as `STRING` is read as the column's declared type
+/// when that type is stored as a string: the bytes are a document, an array
+/// or a range, and quoting them as text wrote their encoding back.
+fn cell_literal(column: &RelationColumn, cell: &crate::core::row::row::Column) -> Option<String> {
+    let as_type = match &column.declared {
+        Some(declared)
+            if cell.column_type == DbType::STRING && declared.physical() == DbType::STRING =>
+        {
+            declared.clone()
+        }
+        _ => cell.column_type.clone(),
+    };
+    // A decimal is written at the scale it arrived at. Its cells are not
+    // brought to the engine scale first (see `run_query_rows_scaled`), so a
+    // cell with no scale of its own is at its column's.
+    if as_type == DbType::DECIMAL {
+        if let (Some((v, None)), Some(scale)) = (
+            crate::core::value_codec::split_decimal_cell(cell.data.into_slice()),
+            column.scale,
+        ) {
+            return Some(crate::core::value_codec::format_decimal_scaled(v, scale));
+        }
+    }
+    crate::core::rql::subquery::value_to_literal(&as_type, cell.data.into_slice())
+}
+
+/// Creates `temp` with one column per label, typed by [`relation_columns`],
+/// and writes `rows` into it. `subject` names what is being materialised in
+/// an error: "the WITH clause 'x'" or "the subquery for 's'".
+///
+/// `created` is set as soon as the table exists, so a caller can drop it
+/// when the fill then fails: DDL is not transactional here.
+#[allow(clippy::too_many_arguments)]
+async fn build_relation(
+    query: &str,
+    temp: &str,
+    labels: &[String],
+    rows: &[crate::core::row::row::Row],
+    scales: Option<&[u32]>,
+    subject: &str,
+    database: &Arc<Database>,
+    tx: crate::core::mvcc::transaction::TxId,
+    created: &mut bool,
+) -> Result<(), String> {
+    // A scan fetches the columns its `WHERE` reads as well as the selected
+    // ones, so a row may carry more than the select list names. The visible
+    // columns come first, which is what `visible_columns` trims to elsewhere.
+    if let Some(row) = rows.first() {
+        if row.columns.len() < labels.len() {
+            return Err(format!(
+                "{} returned {} columns but names {}",
+                subject,
+                row.columns.len(),
+                labels.len()
+            ));
+        }
+    }
+    let columns = relation_columns(query, labels, rows, scales, database)
+        .await
+        .map_err(|index| {
+            format!(
+                "{} returned a type that cannot be materialised in column '{}'",
+                subject,
+                labels.get(index).map(String::as_str).unwrap_or("?")
+            )
+        })?;
+
+    let definitions: Vec<String> = labels
+        .iter()
+        .zip(columns.iter())
+        .map(|(name, column)| format!("{} {}", name, column.sql_type))
+        .collect();
+    crate::core::rql::executor::run_statement(
+        &format!("CREATE TABLE {} ({})", temp, definitions.join(", ")),
+        database,
+        tx,
+    )
+    .await
+    .map_err(|e| format!("could not materialise {}: {}", subject, e))?;
+    *created = true;
+
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut tuples: Vec<String> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut parts: Vec<String> = Vec::with_capacity(labels.len());
+        for (index, (cell, column)) in row.columns.iter().zip(columns.iter()).enumerate() {
+            parts.push(cell_literal(column, cell).ok_or_else(|| {
+                // Naming the type and the column is the difference between a
+                // five-minute fix and a hunt.
+                format!(
+                    "{} returned a {:?} value in column '{}' that cannot be stored",
+                    subject,
+                    column.declared.as_ref().unwrap_or(&cell.column_type),
+                    labels.get(index).map(String::as_str).unwrap_or("?"),
+                )
+            })?);
+        }
+        tuples.push(format!("({})", parts.join(", ")));
+    }
+    crate::core::rql::executor::run_statement(
+        &format!(
+            "INSERT INTO {} ({}) VALUES {}",
+            temp,
+            labels.join(", "),
+            tuples.join(", ")
+        ),
+        database,
+        tx,
+    )
+    .await
+    .map_err(|e| format!("could not fill {}: {}", subject, e))?;
+    Ok(())
 }
 
 /// The prefix every materialised CTE and derived table's name carries.
@@ -585,10 +854,16 @@ async fn materialize_inner(
             None => body.as_str(),
         };
 
-        let rows = if modifies {
-            crate::core::rql::executor::run_returning_rows(body, database, tx).await
+        let (rows, scales) = if modifies {
+            // Returned cells are read straight from storage, at the scales
+            // the client's copy of them is rendered by.
+            let scales = crate::core::rql::lexer_s1::recognize_query_purpose(body)
+                .and_then(|purpose| crate::pgwire::purpose_returning_scales(database, &purpose));
+            crate::core::rql::executor::run_returning_rows(body, database, tx)
+                .await
+                .map(|rows| (rows, scales))
         } else {
-            crate::core::rql::executor::run_query_rows(body, database, tx).await
+            crate::core::rql::executor::run_query_rows_scaled(body, database, tx).await
         }
         .map_err(|e| format!("the WITH clause '{}' failed: {}", def.name, e))?;
 
@@ -611,64 +886,18 @@ async fn materialize_inner(
                 )
             })?
         } else {
-            let list = select_list_of(&body)
-                .ok_or_else(|| format!("the WITH clause '{}' must be a SELECT", def.name))?;
-            crate::core::rql::lexer_ct::split_definitions(list)
-                .iter()
-                .map(|item| item_label(item))
-                .collect::<Option<Vec<String>>>()
-                .ok_or_else(|| {
-                    format!(
-                        "the WITH clause '{}' has a column this cannot name; alias it with AS",
-                        def.name
-                    )
-                })?
-        };
-
-        // Types come from the rows when there are any. An empty result still
-        // needs a table for the outer statement to parse against, and nothing
-        // is read from it, so TEXT is a safe placeholder.
-        let types: Vec<&'static str> = match rows.first() {
-            Some(row) => {
-                // A scan fetches the columns its `WHERE` reads as well as the
-                // selected ones, so a row may carry more than the select list
-                // names. The visible columns come first, which is what
-                // `visible_columns` trims to elsewhere.
-                if row.columns.len() < labels.len() {
-                    return Err(format!(
-                        "the WITH clause '{}' returned {} columns but names {}",
-                        def.name,
-                        row.columns.len(),
-                        labels.len()
-                    ));
-                }
-                row.columns
-                    .iter()
-                    .take(labels.len())
-                    .map(|c| sql_type_of(&c.column_type))
-                    .collect::<Option<Vec<_>>>()
-                    .ok_or_else(|| {
-                        format!(
-                            "the WITH clause '{}' returned a type that cannot be materialised",
-                            def.name
-                        )
-                    })?
+            if select_list_of(body).is_none() {
+                return Err(format!("the WITH clause '{}' must be a SELECT", def.name));
             }
-            None => labels.iter().map(|_| "TEXT").collect(),
+            select_labels(body, database).await.ok_or_else(|| {
+                format!(
+                    "the WITH clause '{}' has a column this cannot name; alias it with AS",
+                    def.name
+                )
+            })?
         };
 
         let temp = temp_name(&def.name, sql, index);
-        // A NUMERIC column keeps the scale the body reports for it.
-        let numeric = crate::core::rql::executor::materialised_numeric_types(body, database);
-        let columns: Vec<String> = labels
-            .iter()
-            .zip(types.iter())
-            .enumerate()
-            .map(|(i, (name, ty))| match numeric.get(i).cloned().flatten() {
-                Some(declared) if *ty == "NUMERIC" => format!("{} {}", name, declared),
-                _ => format!("{} {}", name, ty),
-            })
-            .collect();
 
         // Timed from here rather than from the top of the loop: the body has
         // already run, and a body containing its own derived table has already
@@ -677,48 +906,28 @@ async fn materialize_inner(
         #[cfg(feature = "query_stats")]
         let materialising = std::time::Instant::now();
 
-        let create = format!("CREATE TABLE {} ({})", temp, columns.join(", "));
-        crate::core::rql::executor::run_statement(&create, database, tx)
-            .await
-            .map_err(|e| {
-                format!(
-                    "could not materialise the WITH clause '{}': {}",
-                    def.name, e
-                )
-            })?;
-        // Recorded before the insert, so a failure part-way still gets cleaned
-        // up by the caller.
-        temps.push(temp.clone());
-
-        if !rows.is_empty() {
-            let mut tuples: Vec<String> = Vec::with_capacity(rows.len());
-            for row in &rows {
-                let mut parts: Vec<String> = Vec::with_capacity(labels.len());
-                for column in row.columns.iter().take(labels.len()) {
-                    let literal = crate::core::rql::subquery::value_to_literal(
-                        &column.column_type,
-                        column.data.into_slice(),
-                    )
-                    .ok_or_else(|| {
-                        format!(
-                            "the WITH clause '{}' returned a value that cannot be stored",
-                            def.name
-                        )
-                    })?;
-                    parts.push(literal);
-                }
-                tuples.push(format!("({})", parts.join(", ")));
-            }
-            let insert = format!(
-                "INSERT INTO {} ({}) VALUES {}",
-                temp,
-                labels.join(", "),
-                tuples.join(", ")
-            );
-            crate::core::rql::executor::run_statement(&insert, database, tx)
-                .await
-                .map_err(|e| format!("could not fill the WITH clause '{}': {}", def.name, e))?;
+        // Typed by the body's description rather than by its rows, which also
+        // types an empty result: a TEXT placeholder there made `@>` on an
+        // empty CTE's document column an error instead of no rows.
+        let mut created = false;
+        let built = build_relation(
+            body,
+            &temp,
+            &labels,
+            &rows,
+            scales.as_deref(),
+            &format!("the WITH clause '{}'", def.name),
+            database,
+            tx,
+            &mut created,
+        )
+        .await;
+        // Recorded whether or not the fill succeeded, so a failure part-way
+        // still gets cleaned up.
+        if created {
+            temps.push(temp.clone());
         }
+        built?;
 
         // One relation built. A CTE that failed part-way is not counted — the
         // `?` above carries the error out — which is the right answer: nothing
@@ -964,121 +1173,68 @@ async fn materialize_query_inner(
     database: &Arc<Database>,
     tx: crate::core::mvcc::transaction::TxId,
 ) -> Result<String, String> {
-    let rows = crate::core::rql::executor::run_query_rows(query, database, tx)
+    // A derived table may hold derived tables of its own, to any depth. Those
+    // are materialised first, so the query that runs here reads relations
+    // only. Without this the inner query reached the scan with `FROM (SELECT`
+    // still in it and failed as "Table not found". Each level drops what it
+    // built once its own relation is filled: the rows have been copied out.
+    let nested = Box::pin(materialize_derived(query, database, tx)).await?;
+    let result = match &nested {
+        Some(inner) => {
+            build_derived(&inner.rewritten, alias, statement, database, tx).await
+        }
+        None => build_derived(query, alias, statement, database, tx).await,
+    };
+    if let Some(inner) = &nested {
+        drop_temps(database, &inner.temps, tx).await;
+    }
+    result
+}
+
+/// [`materialize_query`] for a query that reads relations only.
+async fn build_derived(
+    query: &str,
+    alias: &str,
+    statement: &str,
+    database: &Arc<Database>,
+    tx: crate::core::mvcc::transaction::TxId,
+) -> Result<String, String> {
+    let (rows, scales) = crate::core::rql::executor::run_query_rows_scaled(query, database, tx)
         .await
         .map_err(|e| format!("the subquery for '{}' failed: {}", alias, e))?;
 
-    let list = select_list_of(query)
-        .ok_or_else(|| format!("the subquery for '{}' must be a SELECT", alias))?;
-    let labels: Vec<String> = crate::core::rql::lexer_ct::split_definitions(list)
-        .iter()
-        .map(|item| item_label(item))
-        .collect::<Option<Vec<String>>>()
-        .ok_or_else(|| {
-            format!(
-                "the subquery for '{}' has a column this cannot name; alias it with AS",
-                alias
-            )
-        })?;
-
-    // The type of each column, taken from the first row that actually has a
-    // value there.
-    //
-    // Sampling only `rows.first()` was not enough: a column that happens to be
-    // NULL in the first row arrives as `DbType::NULL`, which is the absence of
-    // a value rather than a type, and the whole statement failed on it. Every
-    // row is consulted, and a column that is NULL in all of them becomes TEXT —
-    // it holds nothing, so the choice cannot lose anything.
-    let declared = declared_wide_types(query, &labels, database);
-    let types: Vec<&'static str> = (0..labels.len())
-        .map(|index| {
-            let sampled = rows
-                .iter()
-                .filter_map(|row| row.columns.get(index))
-                .find_map(|c| sql_type_of(&c.column_type));
-            let widened = declared
-                .get(index)
-                .and_then(|w| w.as_ref())
-                .and_then(sql_type_of);
-            match sampled {
-                // `TEXT` is what a scan reports for every variable-width type,
-                // so it is the one answer worth second-guessing.
-                Some("TEXT") | None => widened.unwrap_or("TEXT"),
-                Some(other) => other,
-            }
-        })
-        .collect();
+    if select_list_of(query).is_none() {
+        return Err(format!("the subquery for '{}' must be a SELECT", alias));
+    }
+    let labels = select_labels(query, database).await.ok_or_else(|| {
+        format!(
+            "the subquery for '{}' has a column this cannot name; alias it with AS",
+            alias
+        )
+    })?;
 
     let temp = temp_name(alias, statement, 0);
-    // A NUMERIC column keeps the scale the query reports for it.
-    let numeric = crate::core::rql::executor::materialised_numeric_types(query, database);
-    let columns: Vec<String> = labels
-        .iter()
-        .zip(types.iter())
-        .enumerate()
-        .map(|(i, (name, ty))| match numeric.get(i).cloned().flatten() {
-            Some(declared) if *ty == "NUMERIC" => format!("{} {}", name, declared),
-            _ => format!("{} {}", name, ty),
-        })
-        .collect();
-    crate::core::rql::executor::run_statement(
-        &format!("CREATE TABLE {} ({})", temp, columns.join(", ")),
+    let mut created = false;
+    let built = build_relation(
+        query,
+        &temp,
+        &labels,
+        &rows,
+        scales.as_deref(),
+        &format!("the subquery for '{}'", alias),
         database,
         tx,
+        &mut created,
     )
-    .await
-    .map_err(|e| format!("could not materialise '{}': {}", alias, e))?;
-
-    if !rows.is_empty() {
-        let mut tuples: Vec<String> = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let mut parts: Vec<String> = Vec::with_capacity(labels.len());
-            for (index, column) in row.columns.iter().take(labels.len()).enumerate() {
-                // The literal has to be written in the same type the column was
-                // created as. A scan reports a stored document as `STRING`, so
-                // rendering it that way quoted the raw encoded bytes and the
-                // insert into the (correctly) `JSONB` column was refused as a
-                // schema mismatch — the type had to be recovered on both sides
-                // or on neither.
-                let as_type = match declared.get(index).and_then(|w| w.clone()) {
-                    Some(wide) if column.column_type == DbType::STRING => wide,
-                    _ => column.column_type.clone(),
-                };
-                parts.push(
-                    crate::core::rql::subquery::value_to_literal(
-                        &as_type,
-                        column.data.into_slice(),
-                    )
-                    .ok_or_else(|| {
-                        // Naming the type and the column is the difference
-                        // between a five-minute fix and a hunt: the message
-                        // without them says only that something, somewhere in
-                        // the select list, has no literal form.
-                        format!(
-                            "the subquery for '{}' returned a {:?} value in column '{}' that cannot be stored",
-                            alias,
-                            as_type,
-                            labels.get(index).map(String::as_str).unwrap_or("?"),
-                        )
-                    })?,
-                );
-            }
-            tuples.push(format!("({})", parts.join(", ")));
+    .await;
+    if let Err(e) = built {
+        // The caller is handed a name only on success, so a table created
+        // before the fill failed is dropped here.
+        if created {
+            drop_temps(database, std::slice::from_ref(&temp), tx).await;
         }
-        crate::core::rql::executor::run_statement(
-            &format!(
-                "INSERT INTO {} ({}) VALUES {}",
-                temp,
-                labels.join(", "),
-                tuples.join(", ")
-            ),
-            database,
-            tx,
-        )
-        .await
-        .map_err(|e| format!("could not fill '{}': {}", alias, e))?;
+        return Err(e);
     }
-
     Ok(temp)
 }
 
