@@ -494,6 +494,115 @@ async fn case_and_operators_in_update_and_delete_where() {
     assert_eq!(joined(&pool, "SELECT n FROM dg ORDER BY n").await.unwrap(), "7,8");
 }
 
+/// A computed operand meets a column of another type only where PostgreSQL
+/// has an operator for the pair. A `CASE` over quoted literals is text, and
+/// PostgreSQL has no `date = text` or `boolean = text`. Compared anyway, the
+/// text's first bytes were read as the date's, so `=` matched nothing and `<>`
+/// matched every row.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_computed_operand_and_a_column_of_another_type() {
+    let (_s, pool) = server().await;
+    run(
+        &pool,
+        "CREATE TABLE pd (k INT NOT NULL, d DATE, b BOOL, t TEXT, c CHAR(3), v VARCHAR(5), nm NUMERIC(10,2), i8 BIGINT, f FLOAT8)",
+    )
+    .await
+    .unwrap();
+    run(
+        &pool,
+        "INSERT INTO pd VALUES (1, '2024-01-01', true, 'x', 'ab', 'ab', 1.00, 1, 1.0), \
+         (2, '2024-02-01', false, 'y', 'cd', 'cd', 2.50, 2, 2.5), (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
+    )
+    .await
+    .unwrap();
+    run(&pool, "CREATE TABLE pe (k INT NOT NULL, c1 CHAR, bt BIT(4), vb VARBIT, j JSONB)").await.unwrap();
+    run(
+        &pool,
+        "INSERT INTO pe VALUES (1, 'a', B'1010', B'101', '{\"a\":1}'), (2, 'b', B'0101', B'11', '{\"a\":2}'), \
+         (3, NULL, NULL, NULL, NULL)",
+    )
+    .await
+    .unwrap();
+
+    let mut wrong = Vec::new();
+    for (sql, want) in [
+        (
+            "SELECT k FROM pd WHERE d = CASE WHEN k = 1 THEN '2024-01-01' ELSE '2024-02-01' END",
+            "operator does not exist: date = text",
+        ),
+        (
+            "SELECT k FROM pd WHERE CASE WHEN k = 1 THEN '2024-01-01' ELSE '2024-02-01' END < d",
+            "operator does not exist: text < date",
+        ),
+        (
+            "SELECT k FROM pd WHERE d <> 'x' || ''",
+            "operator does not exist: date <> text",
+        ),
+        (
+            "SELECT k FROM pd WHERE b = CASE WHEN k = 1 THEN 't' ELSE 'f' END",
+            "operator does not exist: boolean = text",
+        ),
+        ("SELECT k FROM pd WHERE t = k % 3", "operator does not exist: text = integer"),
+        ("SELECT k FROM pe WHERE bt = k % 2", "operator does not exist: bit = integer"),
+        // Pairs PostgreSQL does compare and the engine cannot yet. Its
+        // answers, in order: 1, 1, 2, 1, '' and 1,2. The `<` over a
+        // `character` column answered 1 before, and the rest failed per row
+        // with an operand-size error.
+        (
+            "SELECT k FROM pd WHERE nm = CASE WHEN k = 1 THEN 1 ELSE 3 END ORDER BY k",
+            "comparing a numeric value with a computed integer value is not supported yet",
+        ),
+        (
+            "SELECT k FROM pd WHERE nm = CASE WHEN k = 1 THEN 1.0 ELSE 3.0 END ORDER BY k",
+            "which a WHERE clause cannot compare yet",
+        ),
+        (
+            "SELECT k FROM pd WHERE nm > k % 3 ORDER BY k",
+            "comparing a numeric value with a computed integer value is not supported yet",
+        ),
+        (
+            "SELECT k FROM pe WHERE c1 = CASE WHEN k = 1 THEN 'a' ELSE 'z' END ORDER BY k",
+            "is not supported yet",
+        ),
+        (
+            "SELECT k FROM pe WHERE CASE WHEN k = 1 THEN 'a' ELSE 'z' END < c1 ORDER BY k",
+            "is not supported yet",
+        ),
+        (
+            "SELECT k FROM pe WHERE (j->>'a')::bigint = k % 3 ORDER BY k",
+            "comparing a bigint value with a computed integer value is not supported yet",
+        ),
+    ] {
+        match joined(&pool, sql).await {
+            Err(e) if e.contains(want) => {}
+            got => wrong.push(format!("{sql}\n    got  {got:?}\n    want {want:?}")),
+        }
+    }
+
+    // The pairs PostgreSQL compares, and the engine with it.
+    let cases: &[(&str, &str)] = &[
+        ("SELECT k FROM pd WHERE c = CASE WHEN k = 1 THEN 'ab' ELSE 'zz' END ORDER BY k", "1"),
+        ("SELECT k FROM pd WHERE v = CASE WHEN k = 1 THEN 'ab' ELSE 'zz' END ORDER BY k", "1"),
+        ("SELECT k FROM pd WHERE c = t || '' ORDER BY k", ""),
+        ("SELECT k FROM pd WHERE f = CASE WHEN k = 1 THEN 1 ELSE 3 END ORDER BY k", "1"),
+        ("SELECT k FROM pd WHERE i8 = k % 3 ORDER BY k", "1,2"),
+        ("SELECT k FROM pe WHERE bt = CASE WHEN k = 1 THEN B'1010' ELSE B'1111' END ORDER BY k", "1"),
+        ("SELECT k FROM pe WHERE vb = CASE WHEN k = 1 THEN B'101' ELSE B'1' END ORDER BY k", "1"),
+        ("SELECT k FROM pe WHERE j->>'a' = k || '' ORDER BY k", "1,2"),
+    ];
+    wrong.extend(wrong_answers(&pool, cases).await);
+    assert!(wrong.is_empty(), "{} wrong answers:\n{}", wrong.len(), wrong.join("\n"));
+
+    // With PostgreSQL's SQLSTATE, undefined_function.
+    let err = pool
+        .fetch_all(sqlx::raw_sql(AssertSqlSafe(
+            "SELECT k FROM pd WHERE b = CASE WHEN k = 1 THEN 't' ELSE 'f' END".to_string(),
+        )))
+        .await
+        .expect_err("boolean = text");
+    assert_eq!(err.as_database_error().and_then(|e| e.code()).as_deref(), Some("42883"), "{err}");
+}
+
 // -------------------------------------------- #13 IS DISTINCT FROM, row values
 
 async fn flags(pool: &sqlx::PgPool) {

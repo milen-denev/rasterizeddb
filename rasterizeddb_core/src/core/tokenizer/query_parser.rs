@@ -900,6 +900,11 @@ impl<'a, 'b> QueryParser<'a, 'b> {
         } else {
             (left_op, right_op, left_type, right_type)
         };
+        if let Some(message) =
+            Self::evaluated_type_mismatch(op_str, &left_op, &left_type, &right_op, &right_type)
+        {
+            return Err(message);
+        }
 
         let cmp = match op_str {
             "=" => ComparerOperation::Equals,
@@ -1000,6 +1005,69 @@ impl<'a, 'b> QueryParser<'a, 'b> {
             if op_str == "!=" { "<>" } else { op_str },
             name(right_op, right_type)
         ))
+    }
+
+    /// The refusal for a computed operand that is still of a different type
+    /// from the other side once reconciliation and numeric promotion are done,
+    /// or `None` when the types agree.
+    ///
+    /// The comparison reads both sides' bytes as the left side's type, so a
+    /// mismatch left here is answered on bytes of the wrong type: text read as
+    /// a date's four bytes matched nothing under `=` and everything under
+    /// `<>`. PostgreSQL has no operator between types of different categories
+    /// (`date = text`, `boolean = text`, `text = integer`), and gets the same
+    /// message. Within a category, PostgreSQL compares (`numeric = integer`,
+    /// `character = text`) and the engine cannot yet, so that pair is refused
+    /// as not supported rather than said not to exist.
+    fn evaluated_type_mismatch(
+        op_str: &str,
+        left_op: &ComparisonOperand,
+        left_type: &DbType,
+        right_op: &ComparisonOperand,
+        right_type: &DbType,
+    ) -> Option<String> {
+        let evaluated = |o: &ComparisonOperand| matches!(o, ComparisonOperand::Evaluated(..));
+        // `bit` and `bit varying` share one encoding and one comparator, so
+        // either reads the other's bytes as its own.
+        let bits = |t: &DbType| matches!(t, DbType::BIT | DbType::VARBIT);
+        if left_type == right_type
+            || (bits(left_type) && bits(right_type))
+            || !(evaluated(left_op) || evaluated(right_op))
+        {
+            return None;
+        }
+        let category = |t: &DbType| match t {
+            DbType::I8
+            | DbType::I16
+            | DbType::I32
+            | DbType::I64
+            | DbType::I128
+            | DbType::U8
+            | DbType::U16
+            | DbType::U32
+            | DbType::U64
+            | DbType::U128
+            | DbType::F32
+            | DbType::F64
+            | DbType::DECIMAL => Some("number"),
+            DbType::STRING | DbType::CHAR => Some("text"),
+            _ => None,
+        };
+        let name = crate::core::value_codec::pg_input_type_name;
+        let op = if op_str == "!=" { "<>" } else { op_str };
+        Some(match (category(left_type), category(right_type)) {
+            (Some(a), Some(b)) if a == b => format!(
+                "comparing a {} value with a computed {} value is not supported yet",
+                name(if evaluated(left_op) { right_type } else { left_type }),
+                name(if evaluated(left_op) { left_type } else { right_type }),
+            ),
+            _ => format!(
+                "operator does not exist: {} {} {}",
+                name(left_type),
+                op,
+                name(right_type)
+            ),
+        })
     }
 
     /// Records one comparison, with the left operand's type deciding how the

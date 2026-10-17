@@ -5456,6 +5456,12 @@ fn sqlstate_for(message: &str) -> &'static str {
     if has("invalid input syntax for type json") {
         return "22P02";
     }
+    // `undefined_function`: no operator between the two types. Decided before
+    // the "does not exist" branches below, which the names of the types could
+    // otherwise steer.
+    if has("operator does not exist") {
+        return "42883";
+    }
     // `57014` is `query_canceled`, which is what a driver watches for to tell
     // "the server gave up on this" apart from "this statement is wrong".
     if has("canceling statement") {
@@ -9131,6 +9137,11 @@ mod sqlstate_tests {
             ("relation 'nope' does not exist", "42P01"),
             ("Table not found", "42P01"),
             ("column 'nope' does not exist", "42703"),
+            ("operator does not exist: date = text", "42883"),
+            (
+                "could not compile the query plan: operator does not exist: jsonb = integer",
+                "42883",
+            ),
             ("Table already exists", "42P07"),
             ("column 'x' already exists", "42701"),
             ("constraint 'u' already exists on 'users'", "42710"),
