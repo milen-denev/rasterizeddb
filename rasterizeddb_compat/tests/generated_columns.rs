@@ -708,3 +708,72 @@ async fn expressions_postgres_refuses_are_refused_at_create_table() {
             .unwrap_or_else(|e| panic!("{} should not exist: {}", name, e));
     }
 }
+
+type StrictRow = (i32, Option<String>, Option<String>, Option<String>, Option<String>);
+
+async fn strict_rows(pool: &sqlx::PgPool) -> Vec<StrictRow> {
+    let mut v: Vec<StrictRow> = fetch(pool, "SELECT id, lc, uc, qi, tv FROM gc_strict")
+        .await
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4)))
+        .collect();
+    v.sort();
+    v
+}
+
+async fn count_of(pool: &sqlx::PgPool, sql: &str) -> i64 {
+    fetch(pool, sql).await[0].get(0)
+}
+
+/// `lower()`, `upper()`, `quote_ident()` and `to_tsvector()` are strict: a
+/// NULL argument gives NULL. Computed here as the text of nothing, they stored
+/// '' as a real value, so `lc IS NULL` missed the row and a unique index on
+/// `lc` refused a second row with no email as a duplicate.
+#[tokio::test(flavor = "multi_thread")]
+async fn strict_functions_of_a_null_input_store_null() {
+    let (_s, pool) = server().await;
+    run(
+        &pool,
+        "CREATE TABLE gc_strict (id INT, email TEXT,
+            lc TEXT GENERATED ALWAYS AS (lower(email)) STORED,
+            uc TEXT GENERATED ALWAYS AS (upper(email)) STORED,
+            qi TEXT GENERATED ALWAYS AS (quote_ident(email)) STORED,
+            tv TEXT GENERATED ALWAYS AS (to_tsvector('english', email)) STORED)",
+    )
+    .await
+    .expect("create");
+    run(&pool, "CREATE UNIQUE INDEX gc_strict_lc ON gc_strict (lc)").await.expect("index");
+
+    run(&pool, "INSERT INTO gc_strict (id) VALUES (1)").await.expect("insert 1");
+    run(&pool, "INSERT INTO gc_strict (id, email) VALUES (2, 'Bob')")
+        .await
+        .expect("insert 2");
+    // Two NULLs are not duplicates of each other.
+    run(&pool, "INSERT INTO gc_strict (id) VALUES (3)").await.expect("insert 3");
+
+    // PG 17: 1 NULL, 2 bob / BOB / "Bob" / 'bob':1, 3 NULL.
+    assert_eq!(
+        strict_rows(&pool).await,
+        vec![
+            (1, None, None, None, None),
+            (2, s("bob"), s("BOB"), s("\"Bob\""), s("'bob':1")),
+            (3, None, None, None, None),
+        ]
+    );
+    assert_eq!(count_of(&pool, "SELECT count(*) FROM gc_strict WHERE lc IS NULL").await, 2);
+    assert_eq!(count_of(&pool, "SELECT count(*) FROM gc_strict WHERE tv IS NULL").await, 2);
+
+    // The UPDATE recompute evaluates the same functions.
+    run(&pool, "UPDATE gc_strict SET email = NULL WHERE id = 2").await.expect("update 2");
+    run(&pool, "UPDATE gc_strict SET email = 'Carol' WHERE id = 3").await.expect("update 3");
+    assert_eq!(
+        strict_rows(&pool).await,
+        vec![
+            (1, None, None, None, None),
+            (2, None, None, None, None),
+            (3, s("carol"), s("CAROL"), s("\"Carol\""), s("'carol':1")),
+        ]
+    );
+    assert_eq!(count_of(&pool, "SELECT count(*) FROM gc_strict WHERE lc IS NULL").await, 2);
+    assert_eq!(count_of(&pool, "SELECT count(*) FROM gc_strict WHERE tv IS NULL").await, 2);
+}

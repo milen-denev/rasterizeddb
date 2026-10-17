@@ -2085,6 +2085,23 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
         db_type: DbType::STRING,
     };
 
+    // Strict in PostgreSQL: a NULL argument makes the result NULL. Read through
+    // `as_text`, NULL is the empty string, so `lower(NULL)` came back as '', a
+    // real value: a generated column stored it, `IS NULL` missed it, and a
+    // unique index refused a second NULL as its duplicate.
+    if matches!(
+        func,
+        TextFunc::Lower
+            | TextFunc::Upper
+            | TextFunc::QuoteIdent
+            | TextFunc::ToTsVector
+            | TextFunc::ToTsQuery
+            | TextFunc::PlainToTsQuery
+    ) && args.iter().any(|a| a.is_null())
+    {
+        return Ok(Value::Null);
+    }
+
     Ok(match func {
         // Always `public`: this engine has one schema, and reporting anything
         // else would make a qualified name the caller then builds unresolvable.
@@ -4298,6 +4315,25 @@ mod tests {
             text("quote_ident('public') || '.' || quote_ident('my table')"),
             "public.\"my table\""
         );
+    }
+
+    #[test]
+    fn the_strict_text_functions_give_null_for_a_null_argument() {
+        // PostgreSQL 17 answers NULL for each, where these used to give ''.
+        let s = schema();
+        let r = row_with(Some(1), "x");
+        for sql in [
+            "lower(NULL)",
+            "upper(NULL)",
+            "quote_ident(NULL)",
+            "to_tsvector('english', NULL)",
+            "to_tsvector(NULL, 'cat')",
+            "to_tsquery('english', NULL)",
+            "plainto_tsquery('english', NULL)",
+        ] {
+            let value = eval(&parse(sql, &s).unwrap(), &r, &s).unwrap();
+            assert!(value.is_null(), "{} gave {:?}", sql, as_text(&value));
+        }
     }
 
     #[test]
