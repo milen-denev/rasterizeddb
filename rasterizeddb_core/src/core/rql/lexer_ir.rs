@@ -517,10 +517,14 @@ fn split_values(list: &str) -> Vec<String> {
 /// list, so the ordinary insert path does the writing and there is no second
 /// write path to keep in step.
 ///
-/// `None` for an ordinary `VALUES` insert, and for `INSERT INTO t SELECT …`
-/// written without a column list — the first parenthesis then belongs to the
-/// query rather than to a column list, and guessing between the two would be
-/// worse than declining.
+/// `INSERT INTO t SELECT …` with no column list is split too, with the prefix
+/// ending at the table name. That is told by the word right after the name,
+/// not by where the first parenthesis is, so a parenthesis inside the query is
+/// never mistaken for a column list. The caller's rewrite then names no
+/// columns either, and the ordinary path supplies them from the schema as it
+/// does for `INSERT INTO t VALUES (…)`.
+///
+/// `None` for an ordinary `VALUES` insert.
 pub fn insert_select_source(sql: &str) -> Option<(&str, &str)> {
     const INSERT_INTO: &str = "INSERT INTO";
     let trimmed = sql.trim_start();
@@ -530,6 +534,47 @@ pub fn insert_select_source(sql: &str) -> Option<(&str, &str)> {
         || !trimmed.as_bytes()[..INSERT_INTO.len()].eq_ignore_ascii_case(INSERT_INTO.as_bytes())
     {
         return None;
+    }
+
+    // Matched as a whole word: a column list followed by a relation named
+    // `selection` must not read as a query.
+    let starts_word = |rest: &str, keyword: &str| {
+        rest.len() >= keyword.len()
+            && rest.as_bytes()[..keyword.len()].eq_ignore_ascii_case(keyword.as_bytes())
+            && rest.as_bytes()
+                .get(keyword.len())
+                .map_or(true, |c| c.is_ascii_whitespace() || *c == b'(')
+    };
+
+    // The table name, which may be quoted or qualified, ends at whitespace or
+    // at the column list's parenthesis. A query straight after it means there
+    // is no column list.
+    let bytes = trimmed.as_bytes();
+    let mut at = INSERT_INTO.len();
+    while bytes.get(at).is_some_and(|b| b.is_ascii_whitespace()) {
+        at += 1;
+    }
+    while let Some(&b) = bytes.get(at) {
+        if b == b'"' {
+            at += 1;
+            while bytes.get(at).is_some_and(|b| *b != b'"') {
+                at += 1;
+            }
+            at += 1;
+        } else if b.is_ascii_whitespace() || b == b'(' {
+            break;
+        } else {
+            at += 1;
+        }
+    }
+    let name_end = at.min(bytes.len());
+    while bytes.get(at).is_some_and(|b| b.is_ascii_whitespace()) {
+        at += 1;
+    }
+    if let Some(rest) = trimmed.get(at..) {
+        if name_end > INSERT_INTO.len() && (starts_word(rest, "SELECT") || starts_word(rest, "WITH")) {
+            return Some((&trimmed[..name_end], rest));
+        }
     }
 
     let open = trimmed.find('(')?;
@@ -548,16 +593,7 @@ pub fn insert_select_source(sql: &str) -> Option<(&str, &str)> {
     let offset = trimmed[after_columns..].find(|c: char| !c.is_whitespace())? + after_columns;
     let rest = &trimmed[offset..];
 
-    // Matched as a whole word: a column list followed by a relation named
-    // `selection` must not read as a query.
-    let starts_word = |keyword: &str| {
-        rest.len() >= keyword.len()
-            && rest.as_bytes()[..keyword.len()].eq_ignore_ascii_case(keyword.as_bytes())
-            && rest.as_bytes()
-                .get(keyword.len())
-                .map_or(true, |c| c.is_ascii_whitespace() || *c == b'(')
-    };
-    if !starts_word("SELECT") && !starts_word("WITH") {
+    if !starts_word(rest, "SELECT") && !starts_word(rest, "WITH") {
         return None;
     }
 
@@ -1270,10 +1306,21 @@ mod tests {
         }
 
         #[test]
-        fn a_missing_column_list_is_declined_rather_than_guessed() {
-            // The first parenthesis belongs to the query here, so there is no
-            // column list to split on and guessing would be worse.
-            assert!(insert_select_source("INSERT INTO t SELECT count(*) FROM u").is_none());
+        fn a_missing_column_list_ends_the_prefix_at_the_table_name() {
+            // The parenthesis belongs to the query here, and the word after the
+            // table name is what says so.
+            let (prefix, source) =
+                insert_select_source("INSERT INTO t SELECT count(*) FROM u").unwrap();
+            assert_eq!(prefix, "INSERT INTO t");
+            assert_eq!(source, "SELECT count(*) FROM u");
+            let (prefix, source) =
+                insert_select_source("INSERT INTO \"my t\"\n  WITH c AS (SELECT 1) SELECT * FROM c")
+                    .unwrap();
+            assert_eq!(prefix, "INSERT INTO \"my t\"");
+            assert!(source.starts_with("WITH c"));
+            // A relation whose name starts with the keyword is still not one.
+            assert!(insert_select_source("INSERT INTO t selection").is_none());
+            assert!(insert_select_source("INSERT INTO t VALUES ((SELECT 1))").is_none());
         }
 
         #[test]
