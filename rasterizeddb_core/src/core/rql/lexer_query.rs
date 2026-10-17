@@ -781,6 +781,37 @@ fn is_identifier(text: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Whether `word`, unquoted, is an SQL operator spelled as a word. Such a word
+/// after an operand continues the expression, so it can never be an alias:
+/// `a.n BETWEEN 2 AND 4` read as the column `a.n` aliased `BETWEEN` answered
+/// every row with the integer. Quoted, it is a name like any other.
+fn is_operator_keyword(word: &str) -> bool {
+    const KEYWORDS: [&str; 12] = [
+        "LIKE", "ILIKE", "AND", "OR", "BETWEEN", "IS", "IN", "NOT", "SIMILAR", "ISNULL",
+        "NOTNULL", "COLLATE",
+    ];
+    KEYWORDS.iter().any(|k| word.eq_ignore_ascii_case(k))
+}
+
+/// The alias written in `rest`, the text after an item's expression: nothing,
+/// `AS name`, or one bare name. `Err` when `rest` is anything else, which
+/// means the expression did not end where the caller cut it and the item has
+/// to be read whole.
+pub(crate) fn trailing_alias(rest: &str) -> Result<Option<String>, ()> {
+    let words: Vec<&str> = rest.split_whitespace().collect();
+    match words.as_slice() {
+        [] => Ok(None),
+        [as_kw, name] if as_kw.eq_ignore_ascii_case("AS") => Ok(Some(name.trim_matches('"').to_string())),
+        // Only a name can be an alias. An operator or a number is part of the
+        // expression, so `a + 1` must not come back as the column `a`
+        // aliased `+`, nor `s LIKE 'x%'` as `s` aliased `LIKE`.
+        [name] if is_identifier(name.trim_matches('"')) && !is_operator_keyword(name) => {
+            Ok(Some(name.trim_matches('"').to_string()))
+        }
+        _ => Err(()),
+    }
+}
+
 /// Offset of a top-level ` AS ` in `item`, ignoring quotes and parentheses.
 fn find_top_level_as(item: &str) -> Option<usize> {
     let bytes = item.as_bytes();
@@ -917,28 +948,15 @@ pub(crate) fn split_alias(item: &str) -> (&str, Option<String>) {
         if i < bytes.len() {
             let end = offset + i + 1;
             let expr = &item[..end];
-            let rest = item[end..].trim();
-            let alias = if rest.is_empty() {
-                None
-            } else {
-                let mut parts = rest.split_whitespace();
-                match parts.next() {
-                    Some(w) if w.eq_ignore_ascii_case("AS") => {
-                        parts.next().map(|a| a.trim_matches('"').to_string())
-                    }
-                    // Only a name can follow a literal as its alias. An
-                    // operator means the literal was the *start* of an
-                    // expression: `'utrn_' || replace(id, '-', '')` was read as
-                    // the literal `'utrn_'` aliased `||`, so every row answered
-                    // with the prefix and the rest was silently discarded.
-                    Some(w) if is_identifier(w.trim_matches('"')) => {
-                        Some(w.trim_matches('"').to_string())
-                    }
-                    Some(_) => return (item.trim(), None),
-                    None => None,
-                }
+            // Only a name can follow a literal as its alias. An operator means
+            // the literal was the *start* of an expression: `'utrn_' ||
+            // replace(id, '-', '')` was read as the literal `'utrn_'` aliased
+            // `||`, so every row answered with the prefix and the rest was
+            // silently discarded.
+            return match trailing_alias(&item[end..]) {
+                Ok(alias) => (expr, alias),
+                Err(()) => (item.trim(), None),
             };
-            return (expr, alias);
         }
     }
 
@@ -967,22 +985,10 @@ pub(crate) fn split_alias(item: &str) -> (&str, Option<String>) {
             .unwrap_or(trimmed_tail.len());
         let end = item.len() - trimmed_tail.len() + cast_len;
         let expr = item[..end].trim_end();
-        let rest = item[end..].trim();
-        let alias = if rest.is_empty() {
-            None
-        } else {
-            let mut parts = rest.split_whitespace();
-            match parts.next() {
-                Some(w) if w.eq_ignore_ascii_case("AS") => {
-                    parts.next().map(|a| a.trim_matches('"').to_string())
-                }
-                Some(w) if is_identifier(w.trim_matches('"')) => {
-                    Some(w.trim_matches('"').to_string())
-                }
-                _ => return (item.trim(), None),
-            }
+        return match trailing_alias(&item[end..]) {
+            Ok(alias) => (expr, alias),
+            Err(()) => (item.trim(), None),
         };
-        return (expr, alias);
     }
 
     let mut words = tail.split_whitespace();
@@ -995,7 +1001,8 @@ pub(crate) fn split_alias(item: &str) -> (&str, Option<String>) {
                 .trim_end(),
             Some(second.trim_matches('"').to_string()),
         ),
-        (Some(first), None) if tail_start > 0 => {
+        // `upper(t) ISNULL` is a test, not `upper(t)` aliased `ISNULL`.
+        (Some(first), None) if tail_start > 0 && !is_operator_keyword(first) => {
             // `COUNT(x) total`
             (
                 item[..tail_start].trim_end(),
@@ -1003,23 +1010,22 @@ pub(crate) fn split_alias(item: &str) -> (&str, Option<String>) {
             )
         }
         _ => {
-            // No parentheses: `col AS name` or `col name`.
+            // No parentheses: `col AS name` or `col name`, and nothing more.
+            // Every word after the alias used to be dropped, so `a.n BETWEEN 2
+            // AND 4` was the column `a.n` aliased `BETWEEN`, and a leading
+            // `NOT flag` the column `NOT` aliased `flag`. Anything longer, or
+            // led by an operator word, is one expression for the caller to
+            // evaluate or refuse.
             let mut parts = item.split_whitespace();
             let head = parts.next().unwrap_or(item);
-            let alias = match parts.next() {
-                Some(w) if w.eq_ignore_ascii_case("AS") => {
-                    parts.next().map(|a| a.trim_matches('"').to_string())
-                }
-                // Only a name can be an alias. An operator or a number is part
-                // of the expression, so `a + 1` must not come back as the
-                // column `a` aliased `+`.
-                Some(w) if is_identifier(w.trim_matches('"')) => {
-                    Some(w.trim_matches('"').to_string())
-                }
-                Some(_) => return (item.trim(), None),
-                None => None,
-            };
-            (head, alias)
+            if is_operator_keyword(head) {
+                return (item.trim(), None);
+            }
+            let rest = &item[item.find(head).map(|at| at + head.len()).unwrap_or(item.len())..];
+            match trailing_alias(rest) {
+                Ok(alias) => (head, alias),
+                Err(()) => (item.trim(), None),
+            }
         }
     }
 }
@@ -2535,6 +2541,37 @@ mod tests {
         let (expr, alias) = split_alias("(a + 1)::bigint total");
         assert_eq!(expr, "(a + 1)::bigint");
         assert_eq!(alias.as_deref(), Some("total"));
+    }
+
+    #[test]
+    fn an_operator_word_is_never_an_alias() {
+        // Each of these was its first operand aliased by the keyword, with
+        // the rest of the item dropped.
+        for item in [
+            "a.n BETWEEN 2 AND 4",
+            "s LIKE 'x%'",
+            "a.flag AND b.flag",
+            "a.n IS DISTINCT FROM b.n",
+            "flag IS TRUE",
+            "NOT flag",
+            "n ISNULL",
+            "upper(t) ISNULL",
+            "upper(t) LIKE 'X%'",
+            "'x' LIKE t",
+            "(n)::int BETWEEN 2 AND 4",
+            "a b c",
+        ] {
+            let (expr, alias) = split_alias(item);
+            assert_eq!((expr, alias), (item, None), "{item}");
+        }
+
+        // A name, bare or after `AS`, still is one, and quoted it may be
+        // spelled like a keyword.
+        assert_eq!(split_alias("flag x"), ("flag", Some("x".to_string())));
+        assert_eq!(split_alias("a.flag AS x"), ("a.flag", Some("x".to_string())));
+        assert_eq!(split_alias("flag \"like\""), ("flag", Some("like".to_string())));
+        assert_eq!(split_alias("'lit' x"), ("'lit'", Some("x".to_string())));
+        assert_eq!(split_alias("COUNT(x) total"), ("COUNT(x)", Some("total".to_string())));
     }
 
     #[test]

@@ -958,20 +958,14 @@ fn split_alias(item: &str) -> (&str, Option<String>) {
     let Some(close) = item.rfind(')') else {
         return (item.trim(), None);
     };
-    let tail = item[close + 1..].trim();
-    if tail.is_empty() {
-        return (item[..close + 1].trim(), None);
+    // Only an alias may follow the window clause. Anything else continues the
+    // expression — `rank() OVER (…) BETWEEN 1 AND 2` was the window value
+    // aliased `BETWEEN` — so the item is handed back whole, and `parse`
+    // refuses the text after the `OVER (…)`.
+    match crate::core::rql::lexer_query::trailing_alias(&item[close + 1..]) {
+        Ok(alias) => (item[..close + 1].trim(), alias),
+        Err(()) => (item.trim(), None),
     }
-    let mut words = tail.split_whitespace();
-    let alias = match words.next() {
-        Some(w) if w.eq_ignore_ascii_case("AS") => words.next(),
-        Some(w) => Some(w),
-        None => None,
-    };
-    (
-        item[..close + 1].trim(),
-        alias.map(|a| a.trim_matches('"').to_string()),
-    )
 }
 
 fn matching_paren(text: &str, open: usize) -> Option<usize> {

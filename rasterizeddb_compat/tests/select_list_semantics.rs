@@ -15,6 +15,11 @@
 //!    its constant as text, so `{"a": 1.0}` did not equal `{"a": 1}`, and a
 //!    NULL result compared as the word `NULL`.
 //!
+//! And one more of the first kind, found in review:
+//!
+//! 4. An operator spelled as a word — `a.n BETWEEN 2 AND 4`, `s LIKE 'x%'`,
+//!    `flag IS TRUE` — was its first operand, aliased by the keyword.
+//!
 //! Every answer below is PostgreSQL 17's, labels and announced types included:
 //! the description is what a client decodes by, so a right value under a wrong
 //! type is still a wrong answer.
@@ -38,6 +43,8 @@ const SETUP: &[&str] = &[
     "INSERT INTO pb (id, pa_id, m, u) VALUES (10, 1, 5, 'p'), (11, 2, NULL, 'q'), (12, 9, 4, NULL)",
     "CREATE TABLE d (id INT NOT NULL, v TEXT)",
     "INSERT INTO d (id, v) VALUES (1, 'a'), (2, NULL)",
+    "CREATE TABLE fl (id INT NOT NULL, flag BOOL)",
+    "INSERT INTO fl (id, flag) VALUES (1, true), (2, false), (3, NULL)",
 ];
 
 async fn setup(pool: &sqlx::PgPool) {
@@ -437,4 +444,209 @@ async fn correlated_update_from_compares_documents_by_value() {
         }
     }
     assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// An operator spelled as a word — `BETWEEN`, `LIKE`, `AND`, `IS TRUE` — over
+/// a join and over one table.
+///
+/// The alias split read the first word as the item and the keyword as its
+/// alias and dropped the rest, so `a.n BETWEEN 2 AND 4` came back as the
+/// integer `a.n` in a column labelled `BETWEEN`, and `flag IS TRUE` as `flag`.
+/// The `IS` tests are evaluated. The rest are refused for now: the condition
+/// grammar has no `LIKE`, `BETWEEN` or three-valued `NOT`, and a refusal is
+/// honest where the first operand is not. Each may answer only as PostgreSQL
+/// does, so the day one of them is evaluated it is held to PostgreSQL's value.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_keyword_operator_in_a_select_list_is_never_its_first_operand() {
+    let (_s, pool) = server().await;
+    setup(&pool).await;
+    check(
+        &pool,
+        &[
+            (
+                "SELECT a.id, a.flag IS TRUE FROM fl a JOIN fl b ON b.id = a.id ORDER BY a.id",
+                "id:INT4|?column?:BOOL",
+                &["1|t", "2|f", "3|f"],
+            ),
+            (
+                "SELECT a.id, a.flag IS NOT FALSE AS nf FROM fl a JOIN fl b ON b.id = a.id ORDER BY a.id",
+                "id:INT4|nf:BOOL",
+                &["1|t", "2|f", "3|t"],
+            ),
+            (
+                "SELECT id, flag IS TRUE FROM fl ORDER BY id",
+                "id:INT4|?column?:BOOL",
+                &["1|t", "2|f", "3|f"],
+            ),
+            (
+                "SELECT id, flag IS NOT TRUE AS nt FROM fl ORDER BY id",
+                "id:INT4|nt:BOOL",
+                &["1|f", "2|t", "3|t"],
+            ),
+            // A bare alias still names the column, and the window value.
+            (
+                "SELECT a.id, a.flag x FROM fl a JOIN fl b ON b.id = a.id ORDER BY a.id",
+                "id:INT4|x:BOOL",
+                &["1|t", "2|f", "3|<N>"],
+            ),
+            (
+                "SELECT id, rank() OVER (ORDER BY id) r FROM pa ORDER BY id",
+                "id:INT4|r:INT8",
+                &["1|1", "2|2", "3|3"],
+            ),
+        ],
+    )
+    .await;
+
+    let refusable: &[(&str, &str, &[&str])] = &[
+        (
+            "SELECT a.id, a.flag AND b.flag FROM fl a JOIN fl b ON b.id = a.id ORDER BY a.id",
+            "id:INT4|?column?:BOOL",
+            &["1|t", "2|f", "3|<N>"],
+        ),
+        (
+            "SELECT a.id, a.flag OR b.flag FROM fl a JOIN fl b ON b.id = a.id ORDER BY a.id",
+            "id:INT4|?column?:BOOL",
+            &["1|t", "2|f", "3|<N>"],
+        ),
+        (
+            "SELECT a.id, NOT a.flag FROM fl a JOIN fl b ON b.id = a.id ORDER BY a.id",
+            "id:INT4|?column?:BOOL",
+            &["1|f", "2|t", "3|<N>"],
+        ),
+        (
+            "SELECT a.id, a.t LIKE 'x%' FROM pa a JOIN pb b ON b.pa_id = a.id ORDER BY a.id",
+            "id:INT4|?column?:BOOL",
+            &["1|t", "2|<N>"],
+        ),
+        (
+            "SELECT a.id, a.t ILIKE 'X%' FROM pa a JOIN pb b ON b.pa_id = a.id ORDER BY a.id",
+            "id:INT4|?column?:BOOL",
+            &["1|t", "2|<N>"],
+        ),
+        (
+            "SELECT a.id, a.t NOT LIKE 'x%' FROM pa a JOIN pb b ON b.pa_id = a.id ORDER BY a.id",
+            "id:INT4|?column?:BOOL",
+            &["1|f", "2|<N>"],
+        ),
+        (
+            "SELECT a.id, a.t SIMILAR TO 'x' FROM pa a JOIN pb b ON b.pa_id = a.id ORDER BY a.id",
+            "id:INT4|?column?:BOOL",
+            &["1|t", "2|<N>"],
+        ),
+        (
+            "SELECT a.id, a.n BETWEEN 2 AND 4 FROM pa a JOIN pb b ON b.pa_id = a.id ORDER BY a.id",
+            "id:INT4|?column?:BOOL",
+            &["1|t", "2|<N>"],
+        ),
+        (
+            "SELECT a.id, a.n NOT BETWEEN 2 AND 4 FROM pa a JOIN pb b ON b.pa_id = a.id ORDER BY a.id",
+            "id:INT4|?column?:BOOL",
+            &["1|f", "2|<N>"],
+        ),
+        (
+            "SELECT a.id, a.n BETWEEN 2 AND 4 AS bt FROM pa a JOIN pb b ON b.pa_id = a.id ORDER BY a.id",
+            "id:INT4|bt:BOOL",
+            &["1|t", "2|<N>"],
+        ),
+        (
+            "SELECT a.id, a.n IN (3, 4) FROM pa a JOIN pb b ON b.pa_id = a.id ORDER BY a.id",
+            "id:INT4|?column?:BOOL",
+            &["1|t", "2|<N>"],
+        ),
+        (
+            "SELECT a.id, a.n IS DISTINCT FROM b.m FROM pa a JOIN pb b ON b.pa_id = a.id ORDER BY a.id",
+            "id:INT4|?column?:BOOL",
+            &["1|t", "2|f"],
+        ),
+        (
+            "SELECT a.id, a.n ISNULL FROM pa a JOIN pb b ON b.pa_id = a.id ORDER BY a.id",
+            "id:INT4|?column?:BOOL",
+            &["1|f", "2|t"],
+        ),
+        (
+            "SELECT a.id, upper(a.t) LIKE 'X%' FROM pa a JOIN pb b ON b.pa_id = a.id ORDER BY a.id",
+            "id:INT4|?column?:BOOL",
+            &["1|t", "2|<N>"],
+        ),
+        (
+            "SELECT a.id, 'x' LIKE a.t FROM pa a JOIN pb b ON b.pa_id = a.id ORDER BY a.id",
+            "id:INT4|?column?:BOOL",
+            &["1|t", "2|<N>"],
+        ),
+        (
+            "SELECT a.id, (a.n)::int BETWEEN 2 AND 4 FROM pa a JOIN pb b ON b.pa_id = a.id ORDER BY a.id",
+            "id:INT4|?column?:BOOL",
+            &["1|t", "2|<N>"],
+        ),
+        // One table.
+        ("SELECT id, t LIKE 'x%' FROM pa ORDER BY id", "id:INT4|?column?:BOOL", &["1|t", "2|<N>", "3|f"]),
+        ("SELECT id, t ILIKE 'X%' AS il FROM pa ORDER BY id", "id:INT4|il:BOOL", &["1|t", "2|<N>", "3|f"]),
+        ("SELECT id, n BETWEEN 2 AND 4 FROM pa ORDER BY id", "id:INT4|?column?:BOOL", &["1|t", "2|<N>", "3|f"]),
+        ("SELECT id, n IN (3, 4) FROM pa ORDER BY id", "id:INT4|?column?:BOOL", &["1|t", "2|<N>", "3|f"]),
+        ("SELECT id, n IS DISTINCT FROM 3 FROM pa ORDER BY id", "id:INT4|?column?:BOOL", &["1|f", "2|t", "3|t"]),
+        ("SELECT id, n ISNULL FROM pa ORDER BY id", "id:INT4|?column?:BOOL", &["1|f", "2|t", "3|f"]),
+        ("SELECT id, upper(t) LIKE 'X%' FROM pa ORDER BY id", "id:INT4|?column?:BOOL", &["1|t", "2|<N>", "3|f"]),
+        ("SELECT id, 'x' LIKE t FROM pa ORDER BY id", "id:INT4|?column?:BOOL", &["1|t", "2|<N>", "3|f"]),
+        (
+            "SELECT id, (n)::int BETWEEN 2 AND 4 FROM pa ORDER BY id",
+            "id:INT4|?column?:BOOL",
+            &["1|t", "2|<N>", "3|f"],
+        ),
+        ("SELECT id, flag AND true FROM fl ORDER BY id", "id:INT4|?column?:BOOL", &["1|t", "2|f", "3|<N>"]),
+        ("SELECT id, flag OR false FROM fl ORDER BY id", "id:INT4|?column?:BOOL", &["1|t", "2|f", "3|<N>"]),
+        ("SELECT id, NOT flag FROM fl ORDER BY id", "id:INT4|?column?:BOOL", &["1|f", "2|t", "3|<N>"]),
+        // After a window call, whose own splitter read the operator as the
+        // alias the same way.
+        (
+            "SELECT id, rank() OVER (ORDER BY id) BETWEEN 1 AND 2 FROM pa ORDER BY id",
+            "id:INT4|?column?:BOOL",
+            &["1|t", "2|t", "3|f"],
+        ),
+        (
+            "SELECT id, rank() OVER (ORDER BY id) + 1 AS r FROM pa ORDER BY id",
+            "id:INT4|r:INT8",
+            &["1|2", "2|3", "3|4"],
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (sql, header, rows) in refusable {
+        for simple in [false, true] {
+            let want: Vec<String> = rows.iter().map(|r| r.to_string()).collect();
+            if let Ok((got_header, got_rows)) = run(&pool, sql, simple).await {
+                if got_header != *header || got_rows != want {
+                    wrong.push(format!(
+                        "{sql} [simple={simple}]\n    want {header} {want:?} or a refusal\n    got  {got_header} {got_rows:?}"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+
+    // `INSERT … SELECT` over a join stores PostgreSQL's booleans or nothing.
+    // A text column takes whatever arrives, which is how the operand got in;
+    // PostgreSQL stores `true` and `false` there.
+    for sql in ["CREATE TABLE bsink (id INT, b BOOL)", "CREATE TABLE tsink (id INT, b TEXT)"] {
+        pool.execute(sqlx::raw_sql(AssertSqlSafe(sql)))
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    for (sink, want) in [
+        ("bsink", ["0|f", "1|f", "2|t", "3|t", "4|t", "5|f"]),
+        ("tsink", ["0|false", "1|false", "2|true", "3|true", "4|true", "5|false"]),
+    ] {
+        let insert = format!(
+            "INSERT INTO {sink} (id, b) SELECT a.n, a.n BETWEEN 2 AND 4 FROM digit a \
+             JOIN digit b ON b.one = a.one WHERE b.n = 0 AND a.n < 6"
+        );
+        let stored = pool.execute(sqlx::raw_sql(AssertSqlSafe(insert.as_str()))).await;
+        let (_, rows) = run(&pool, &format!("SELECT id, b FROM {sink} ORDER BY id"), true)
+            .await
+            .expect("read back");
+        match stored {
+            Ok(_) => assert_eq!(rows, want, "{insert}"),
+            Err(_) => assert!(rows.is_empty(), "{insert} failed but stored {rows:?}"),
+        }
+    }
 }
