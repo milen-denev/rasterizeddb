@@ -860,6 +860,25 @@ pub(crate) fn split_alias(item: &str) -> (&str, Option<String>) {
         if starts && ends {
             return (t, None);
         }
+        // A block that does not end the item is followed by an alias or by
+        // more of the expression: `CASE … END label`, `CASE … END || n`,
+        // `CASE … END * 2 + 1`. The whitespace split below took `CASE` for
+        // the expression and `WHEN` for its alias in every one of them.
+        if starts {
+            if let Some(end) = crate::core::rql::expr::case_block_end(t) {
+                let rest = t[end..].trim();
+                let mut words = rest.split_whitespace();
+                let alias = match (words.next(), words.next(), words.next()) {
+                    (Some(a), Some(name), None) if a.eq_ignore_ascii_case("AS") => Some(name),
+                    (Some(name), None, None) => Some(name),
+                    _ => None,
+                };
+                if let Some(name) = alias.filter(|n| is_identifier(n.trim_matches('"'))) {
+                    return (&t[..end], Some(name.trim_matches('"').to_string()));
+                }
+                return (t, None);
+            }
+        }
     }
 
     // A quoted string literal is a single token however many spaces it holds.

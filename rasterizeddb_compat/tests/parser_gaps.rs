@@ -61,6 +61,30 @@ async fn wrong_answers(pool: &sqlx::PgPool, cases: &[(&str, &str)]) -> Vec<Strin
     wrong
 }
 
+async fn digits(pool: &sqlx::PgPool, name: &str) {
+    run(pool, &format!("CREATE TABLE {name} (n INT, one INT)")).await.unwrap();
+    run(
+        pool,
+        &format!(
+            "INSERT INTO {name} (n, one) VALUES (0,1),(1,1),(2,1),(3,1),(4,1),(5,1),(6,1),(7,1),(8,1),(9,1)"
+        ),
+    )
+    .await
+    .unwrap();
+}
+
+/// A table with NULLs in both columns and a negative number, for the
+/// three-valued answers and for `%` on a negative operand.
+async fn nullable_numbers(pool: &sqlx::PgPool) {
+    run(pool, "CREATE TABLE pn (id INT NOT NULL, n INT, s TEXT)").await.unwrap();
+    run(
+        pool,
+        "INSERT INTO pn (id, n, s) VALUES (1, 1, 'a'), (2, 2, NULL), (3, NULL, 'c'), (4, 7, 'dd'), (5, 12, 'e'), (6, -3, 'f')",
+    )
+    .await
+    .unwrap();
+}
+
 // ---------------------------------------------------------------- #10 DELETE
 
 /// `DELETE FROM t` with no `WHERE` was "Cannot parse DELETE query". It deletes
@@ -167,6 +191,94 @@ async fn delete_without_where_follows_foreign_keys() {
     assert_eq!(joined(&pool, "SELECT count(*) FROM par2").await.unwrap(), "2");
     assert_eq!(run(&pool, "DELETE FROM kid_r").await, Ok(1));
     assert_eq!(run(&pool, "DELETE FROM par2").await, Ok(2));
+}
+
+// ------------------------------------------------------------------ #11 CASE
+
+/// `CASE` branches hold any expression: an unparenthesised `||` chain, `%`
+/// (binding tighter than `||`, so `'r' || n % 8` is `'r' || (n % 8)`), a
+/// bit-string literal, a nested `CASE`, and arithmetic or concatenation around
+/// the block itself. The first two were refused as "function 'CASE WHEN … ||'
+/// is not supported yet" and "uses CASE WHEN, which is not supported yet".
+#[tokio::test(flavor = "multi_thread")]
+async fn case_branches_hold_any_expression_in_the_select_list() {
+    let (_s, pool) = server().await;
+    digits(&pool, "digit").await;
+    nullable_numbers(&pool).await;
+
+    let cases: &[(&str, &str)] = &[
+        (
+            "SELECT CASE WHEN n % 3 = 0 THEN NULL ELSE 'r' || (n % 8) END FROM digit ORDER BY n",
+            "~,r1,r2,~,r4,r5,~,r7,r0,~",
+        ),
+        (
+            "SELECT CASE WHEN n % 3 = 0 THEN NULL ELSE 'r' || n % 8 END FROM digit ORDER BY n",
+            "~,r1,r2,~,r4,r5,~,r7,r0,~",
+        ),
+        (
+            "SELECT CASE WHEN n > 4 THEN B'1010' ELSE B'0101' END FROM digit ORDER BY n",
+            "0101,0101,0101,0101,0101,1010,1010,1010,1010,1010",
+        ),
+        (
+            "SELECT CASE WHEN n < 3 THEN 'lo' || '-' || n ELSE 'hi' || n * 2 END FROM digit ORDER BY n",
+            "lo-0,lo-1,lo-2,hi6,hi8,hi10,hi12,hi14,hi16,hi18",
+        ),
+        (
+            "SELECT CASE WHEN n > 4 THEN CASE WHEN n > 7 THEN 'huge' ELSE 'big' END ELSE 'small' END FROM digit ORDER BY n",
+            "small,small,small,small,small,big,big,big,huge,huge",
+        ),
+        (
+            "SELECT upper(CASE WHEN n % 2 = 0 THEN 'e' || n ELSE 'o' || n END) FROM digit ORDER BY n",
+            "E0,O1,E2,O3,E4,O5,E6,O7,E8,O9",
+        ),
+        (
+            "SELECT length(CASE WHEN n > 4 THEN 'xx' || n ELSE 'y' END) FROM digit ORDER BY n",
+            "1,1,1,1,1,3,3,3,3,3",
+        ),
+        (
+            "SELECT coalesce(CASE WHEN n > 5 THEN 'x' || n END, 'none') FROM digit ORDER BY n",
+            "none,none,none,none,none,none,x6,x7,x8,x9",
+        ),
+        (
+            "SELECT CASE WHEN n % 2 = 0 THEN n ELSE 0 END + 1 FROM digit ORDER BY n",
+            "1,1,3,1,5,1,7,1,9,1",
+        ),
+        (
+            "SELECT CASE WHEN n > 5 THEN n ELSE 0 END * 2 + 1 FROM digit ORDER BY n",
+            "1,1,1,1,1,1,13,15,17,19",
+        ),
+        (
+            "SELECT CASE WHEN n > 4 THEN 'b' ELSE 's' END || n FROM digit ORDER BY n",
+            "s0,s1,s2,s3,s4,b5,b6,b7,b8,b9",
+        ),
+        (
+            "SELECT '<' || CASE WHEN n > 4 THEN 'b' ELSE 's' END || '>' FROM digit ORDER BY n",
+            "<s>,<s>,<s>,<s>,<s>,<b>,<b>,<b>,<b>,<b>",
+        ),
+        (
+            "SELECT CASE WHEN n % 4 = 0 THEN n % 4 + 10 WHEN n % 4 = 1 THEN n * 100 % 7 ELSE 0 - n END FROM digit ORDER BY n",
+            "10,2,-2,-3,10,3,-6,-7,10,4",
+        ),
+        (
+            "SELECT CASE WHEN n > 4 THEN 1 ELSE 0 END + CASE WHEN n % 2 = 0 THEN 10 ELSE 0 END FROM digit ORDER BY n",
+            "10,0,10,0,10,1,11,1,11,1",
+        ),
+        (
+            "SELECT CASE WHEN (CASE WHEN n > 4 THEN 1 ELSE 0 END) = 1 THEN 'y' ELSE 'n' END FROM digit ORDER BY n",
+            "n,n,n,n,n,y,y,y,y,y",
+        ),
+        (
+            "SELECT CASE WHEN n IS NULL THEN 'null' WHEN n % 2 = 0 THEN 'even' ELSE 'odd' END FROM pn ORDER BY id",
+            "odd,even,null,odd,even,odd",
+        ),
+        ("SELECT 'r' || n % 8 FROM pn ORDER BY id", "r1,r2,~,r7,r4,r-3"),
+        (
+            "SELECT CASE WHEN s IS NULL THEN 'none' ELSE s || '/' || id END FROM pn ORDER BY id",
+            "a/1,none,c/3,dd/4,e/5,f/6",
+        ),
+    ];
+    let wrong = wrong_answers(&pool, cases).await;
+    assert!(wrong.is_empty(), "{} wrong answers:\n{}", wrong.len(), wrong.join("\n"));
 }
 
 // -------------------------------------------- #13 IS DISTINCT FROM, row values

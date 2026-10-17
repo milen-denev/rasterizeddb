@@ -428,32 +428,119 @@ fn cast_to(inner: Expr, target: &str) -> Result<Expr, String> {
 /// Position of a top-level `::`, if the expression ends in a cast.
 fn top_level_cast(text: &str) -> Option<usize> {
     let bytes = text.as_bytes();
-    let mut depth = 0usize;
-    let mut quote: Option<u8> = None;
+    let nesting = Nesting::of(text);
     let mut found = None;
     let mut i = 0usize;
     while i + 1 < bytes.len() {
-        let c = bytes[i];
-        match quote {
-            Some(q) => {
-                if c == q {
-                    quote = None;
-                }
-            }
-            None => match c {
-                b'\'' | b'"' => quote = Some(c),
-                b'(' => depth += 1,
-                b')' => depth = depth.saturating_sub(1),
-                b':' if depth == 0 && bytes[i + 1] == b':' => {
-                    found = Some(i);
-                    i += 1;
-                }
-                _ => {}
-            },
+        if bytes[i] == b':' && bytes[i + 1] == b':' && nesting.top_level(i) {
+            found = Some(i);
+            i += 1;
         }
         i += 1;
     }
     found
+}
+
+/// How deeply each byte of an expression is nested, counting parentheses and
+/// `CASE … END` blocks alike, and where its `CASE` keywords are.
+///
+/// A `CASE` block keeps its arms at parenthesis depth zero, so a scanner that
+/// counted only parentheses took an operator inside an arm for one outside the
+/// block: `CASE … ELSE 'r' || n END` was split at its `||` into two halves
+/// that each failed to parse, and a nested block ended at the first `END`.
+/// The `CASE` and `END` words sit at the depth of the block they open and
+/// close, so the block as a whole reads as one top-level term.
+pub(crate) struct Nesting {
+    /// The depth of each byte, `None` inside a quoted literal or identifier.
+    depth: Vec<Option<u32>>,
+    /// Each `CASE`, `WHEN`, `THEN`, `ELSE` and `END` outside quotes, as
+    /// `(start, end, depth)`, in order.
+    keywords: Vec<(usize, usize, u32)>,
+}
+
+impl Nesting {
+    pub(crate) fn of(text: &str) -> Nesting {
+        let bytes = text.as_bytes();
+        let mut depth: Vec<Option<u32>> = vec![None; bytes.len()];
+        let mut keywords = Vec::new();
+        let mut level = 0u32;
+        let mut quote: Option<u8> = None;
+        let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b == b'.';
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let c = bytes[i];
+            if let Some(q) = quote {
+                if c == q {
+                    quote = None;
+                }
+                i += 1;
+                continue;
+            }
+            match c {
+                b'\'' | b'"' => quote = Some(c),
+                b'(' => {
+                    depth[i] = Some(level);
+                    level += 1;
+                }
+                b')' => {
+                    level = level.saturating_sub(1);
+                    depth[i] = Some(level);
+                }
+                _ if is_word(c) && (i == 0 || !is_word(bytes[i - 1])) => {
+                    let mut end = i;
+                    while end < bytes.len() && is_word(bytes[end]) {
+                        end += 1;
+                    }
+                    let word = &text[i..end];
+                    let at = if word.eq_ignore_ascii_case("END") && level > 0 {
+                        level -= 1;
+                        Some(level)
+                    } else if word.eq_ignore_ascii_case("CASE") {
+                        level += 1;
+                        Some(level - 1)
+                    } else if ["WHEN", "THEN", "ELSE"].iter().any(|k| word.eq_ignore_ascii_case(k)) {
+                        Some(level)
+                    } else {
+                        None
+                    };
+                    let word_depth = at.unwrap_or(level);
+                    if at.is_some() {
+                        keywords.push((i, end, word_depth));
+                    }
+                    for d in &mut depth[i..end] {
+                        *d = Some(word_depth);
+                    }
+                    i = end;
+                    continue;
+                }
+                _ => depth[i] = Some(level),
+            }
+            i += 1;
+        }
+        Nesting { depth, keywords }
+    }
+
+    /// Whether the byte at `at` is outside every quote, parenthesis and
+    /// `CASE` block.
+    pub(crate) fn top_level(&self, at: usize) -> bool {
+        self.depth.get(at).copied().flatten() == Some(0)
+    }
+}
+
+/// The offset just past the `END` that closes a `CASE` opening `text`, or
+/// `None` when `text` does not begin with one or it never closes.
+pub(crate) fn case_block_end(text: &str) -> Option<usize> {
+    let nesting = Nesting::of(text);
+    let (start, _, depth) = *nesting.keywords.first()?;
+    if start != 0 || depth != 0 || !text[..4].eq_ignore_ascii_case("CASE") {
+        return None;
+    }
+    nesting
+        .keywords
+        .iter()
+        .skip(1)
+        .find(|(s, e, d)| *d == 0 && text[*s..*e].eq_ignore_ascii_case("END"))
+        .map(|(_, e, _)| *e)
 }
 
 /// Parses one expression against `schema`.
@@ -587,6 +674,20 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
             bytes: value.as_bytes().to_vec(),
             db_type: DbType::STRING,
         });
+    }
+
+    // `B'1010'` and `X'1f'`, PostgreSQL's bit-string literals, typed `bit`
+    // as there. Without this a `CASE` arm holding one could not be read, and
+    // the whole item was refused as an unsupported `CASE`.
+    if let Some(rest) = text.strip_prefix(['B', 'b', 'X', 'x']) {
+        if rest.len() >= 2 && rest.starts_with('\'') && is_one_literal(rest) {
+            let bytes = crate::core::pg_types::parse_bit_string(text, None)
+                .ok_or_else(|| format!("{} is not a valid bit string", text))?;
+            return Ok(Expr::Literal {
+                bytes,
+                db_type: DbType::BIT,
+            });
+        }
     }
 
     // A number. An integer constant is `int4` when it fits and `int8` when it
@@ -1057,18 +1158,32 @@ fn keyword_constant(text: &str) -> Option<Expr> {
 
 /// `CASE WHEN <cond> THEN <expr> [WHEN …] [ELSE <expr>] END`
 fn parse_case(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
-    use crate::core::rql::join::find_keyword;
-
-    let end_at = find_keyword(text, "END", 0).ok_or_else(|| "CASE has no END".to_string())?;
-    if text[end_at + 3..].trim() != "" {
+    let end = case_block_end(text).ok_or_else(|| "CASE has no END".to_string())?;
+    if text[end..].trim() != "" {
         return Err("trailing text after END".to_string());
     }
-    let body = &text[4..end_at];
+    let end_at = end - "END".len();
+
+    // The block's own keywords are the ones one level in. A nested block's
+    // sit deeper, so an inner `END` or `WHEN` no longer ends or splits this
+    // one — the first `END` anywhere used to be taken as this block's.
+    let keywords: Vec<(usize, usize, &str)> = Nesting::of(text)
+        .keywords
+        .into_iter()
+        .filter(|(s, _, d)| *d == 1 && *s > 0 && *s < end_at)
+        .map(|(s, e, _)| (s, e, &text[s..e]))
+        .filter(|(_, _, w)| ["WHEN", "THEN", "ELSE"].iter().any(|k| w.eq_ignore_ascii_case(k)))
+        .collect();
 
     // A `CASE <expr> WHEN …` compares against a value; only the searched form
     // is supported, and the difference is worth an explicit error.
-    let first_when = find_keyword(body, "WHEN", 0).ok_or_else(|| "CASE has no WHEN".to_string())?;
-    if !body[..first_when].trim().is_empty() {
+    let Some(&(first_when, _, first)) = keywords.first() else {
+        return Err("CASE has no WHEN".to_string());
+    };
+    if !first.eq_ignore_ascii_case("WHEN") {
+        return Err("CASE has no WHEN".to_string());
+    }
+    if !text[4..first_when].trim().is_empty() {
         return Err(
             "CASE <expression> WHEN … is not supported yet; use CASE WHEN <condition> …"
                 .to_string(),
@@ -1077,39 +1192,30 @@ fn parse_case(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
 
     let mut whens: Vec<(Cond, Expr)> = Vec::new();
     let mut otherwise: Option<Box<Expr>> = None;
-    let mut rest = &body[first_when..];
-
-    loop {
-        // rest starts at WHEN
-        let after_when = &rest["WHEN".len()..];
-        let then_at = find_keyword(after_when, "THEN", 0)
-            .ok_or_else(|| "CASE WHEN has no THEN".to_string())?;
-        let condition = parse_cond(&after_when[..then_at], schema)?;
-        let after_then = &after_when[then_at + "THEN".len()..];
-
-        let next_when = find_keyword(after_then, "WHEN", 0);
-        let next_else = find_keyword(after_then, "ELSE", 0);
-        let cut = match (next_when, next_else) {
-            (Some(w), Some(e)) => w.min(e),
-            (Some(w), None) => w,
-            (None, Some(e)) => e,
-            (None, None) => after_then.len(),
-        };
-        whens.push((condition, parse(&after_then[..cut], schema)?));
-
-        match (next_when, next_else) {
-            (Some(w), Some(e)) if w < e => {
-                rest = &after_then[w..];
+    // Where each arm's text ends: at the next keyword, or at the block's END.
+    let until = |k: usize| keywords.get(k + 1).map(|(s, _, _)| *s).unwrap_or(end_at);
+    let mut k = 0usize;
+    while k < keywords.len() {
+        let (_, after, word) = keywords[k];
+        if word.eq_ignore_ascii_case("ELSE") {
+            if k + 1 != keywords.len() {
+                return Err("CASE has text after its ELSE that is not part of it".to_string());
             }
-            (Some(w), None) => {
-                rest = &after_then[w..];
-            }
-            (_, Some(e)) => {
-                otherwise = Some(Box::new(parse(&after_then[e + "ELSE".len()..], schema)?));
-                break;
-            }
-            (None, None) => break,
+            otherwise = Some(Box::new(parse(&text[after..end_at], schema)?));
+            break;
         }
+        if !word.eq_ignore_ascii_case("WHEN") {
+            return Err(format!("CASE has a {} where a WHEN belongs", word.to_ascii_uppercase()));
+        }
+        let Some(&(then_at, then_end, then)) = keywords.get(k + 1) else {
+            return Err("CASE WHEN has no THEN".to_string());
+        };
+        if !then.eq_ignore_ascii_case("THEN") {
+            return Err("CASE WHEN has no THEN".to_string());
+        }
+        let condition = parse_cond(&text[after..then_at], schema)?;
+        whens.push((condition, parse(&text[then_end..until(k + 1)], schema)?));
+        k += 2;
     }
 
     check_branch_types(
@@ -2265,33 +2371,19 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
     })
 }
 
-/// Offset of a top-level `||`, ignoring quotes and parentheses.
+/// Offset of a top-level `||`, ignoring quotes, parentheses and the arms of
+/// a `CASE` block.
 fn top_level_concat(text: &str) -> Option<usize> {
     let bytes = text.as_bytes();
-    let mut depth = 0i32;
-    let mut quote: Option<u8> = None;
+    let nesting = Nesting::of(text);
     let mut found = None;
     let mut i = 0usize;
     while i < bytes.len() {
-        let b = bytes[i];
-        match quote {
-            Some(q) => {
-                if b == q {
-                    quote = None;
-                }
-            }
-            None => match b {
-                b'\'' | b'"' => quote = Some(b),
-                b'(' => depth += 1,
-                b')' => depth -= 1,
-                b'|' if depth == 0 && bytes.get(i + 1) == Some(&b'|') => {
-                    // The rightmost wins, so `a || b || c` groups left to right.
-                    found = Some(i);
-                    i += 2;
-                    continue;
-                }
-                _ => {}
-            },
+        if bytes[i] == b'|' && bytes.get(i + 1) == Some(&b'|') && nesting.top_level(i) {
+            // The rightmost wins, so `a || b || c` groups left to right.
+            found = Some(i);
+            i += 2;
+            continue;
         }
         i += 1;
     }
@@ -3052,9 +3144,11 @@ fn is_number_literal(text: &str) -> bool {
 }
 
 /// True when the text is one whole `CASE … END` block.
+///
+/// The block's own `END` has to be the last word. Starting with `CASE` and
+/// ending with `END` is not enough: `CASE … END + CASE … END` does both.
 fn is_case_block(text: &str) -> bool {
-    let upper = text.to_ascii_uppercase();
-    upper.starts_with("CASE") && upper.ends_with("END") && upper.len() > 7
+    case_block_end(text) == Some(text.len())
 }
 
 /// Finds the operator a binary arithmetic expression splits at, if any.
@@ -3064,30 +3158,23 @@ fn is_case_block(text: &str) -> bool {
 /// `a - (b - c)`. `+`/`-` are tried first because they bind loosest; only if
 /// there are none does it look for `*`, `/` or `%`.
 fn top_level_arith(text: &str) -> Option<(usize, ArithOp)> {
+    // Quotes, parentheses and `CASE` arms are all nesting here: a `+` inside
+    // `CASE … THEN n + 1 END` is the arm's, not the expression's.
+    let nesting = Nesting::of(text);
     for pass in 0..2 {
         let bytes = text.as_bytes();
-        let mut depth = 0i32;
-        let mut in_quote = false;
         // Right-to-left would have to re-derive quote and paren state, so the
         // scan runs forward and keeps the last candidate it saw.
         let mut found: Option<(usize, ArithOp)> = None;
         for (i, ch) in text.char_indices() {
-            if in_quote {
-                if ch == '\'' {
-                    in_quote = false;
-                }
-                continue;
-            }
+            let top = nesting.top_level(i);
             match ch {
-                '\'' => in_quote = true,
-                '(' => depth += 1,
-                ')' => depth -= 1,
                 // `->` and `->>` reach into a document. Their `-` follows a
                 // column name, so every test below would take it for a
                 // subtraction and split the expression through the middle of
                 // the operator.
-                '-' if depth == 0 && bytes.get(i + 1) == Some(&b'>') => continue,
-                '+' | '-' | '*' | '/' | '%' if depth == 0 => {
+                '-' if top && bytes.get(i + 1) == Some(&b'>') => continue,
+                '+' | '-' | '*' | '/' | '%' if top => {
                     let op = match ch {
                         '+' => ArithOp::Add,
                         '-' => ArithOp::Sub,
@@ -3099,7 +3186,7 @@ fn top_level_arith(text: &str) -> Option<(usize, ArithOp)> {
                     if (pass == 0) != wanted_additive {
                         continue;
                     }
-                    // `*` in `COUNT(*)` sits inside parens, so depth covers it.
+                    // `*` in `COUNT(*)` sits inside parens, so nesting covers it.
                     // A sign is only an operator when something can precede it:
                     // in `1 * -2` the `-` follows an operator and is part of the
                     // literal, not a subtraction.
@@ -5303,5 +5390,42 @@ mod column_value_bench {
             assert_eq!(s_old, s_eval);
             println!("round {round}: old {old:>9.2?}  new {new:>9.2?}  eval(a*b) {full:>9.2?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod case_nesting_tests {
+    use super::*;
+
+    /// The operators a `CASE` arm holds are the arm's: the block is one term
+    /// of what surrounds it, and an inner block's `END` closes only itself.
+    #[test]
+    fn a_case_block_nests_like_a_parenthesis() {
+        let text = "CASE WHEN a > 1 THEN 'r' || b ELSE CASE WHEN c THEN 1 END END";
+        assert!(is_case_block(text));
+        assert_eq!(top_level_concat(text), None);
+        assert!(!is_case_block("CASE WHEN a THEN 1 END + CASE WHEN b THEN 2 END"));
+        let sum = "CASE WHEN a THEN 1 END + CASE WHEN b THEN 2 END";
+        assert_eq!(top_level_arith(sum).map(|(at, _)| at), Some(sum.find(" + ").unwrap() + 1));
+        let concat = "'<' || CASE WHEN a THEN 'x' || 'y' END || '>'";
+        assert_eq!(top_level_concat(concat), Some(concat.rfind("||").unwrap()));
+        assert_eq!(case_block_end("CASE WHEN a THEN 'end' END x"), Some(26));
+        assert_eq!(top_level_cast("CASE WHEN a THEN 1::text END"), None);
+        assert_eq!(top_level_cast("(CASE WHEN a THEN 1 END)::text"), Some(24));
+    }
+
+    /// One literal, not two: `'DE', 'A'` opens and closes with a quote and is
+    /// still a list.
+    #[test]
+    fn only_one_quoted_literal_reads_as_a_string() {
+        assert!(is_one_literal("'DE'"));
+        assert!(is_one_literal("'it''s'"));
+        assert!(is_one_literal("''"));
+        assert!(!is_one_literal("'DE', 'A'"));
+        assert!(parse("'DE', 'A'", &[]).is_err());
+        assert!(matches!(
+            parse("B'1010'", &[]),
+            Ok(Expr::Literal { db_type: DbType::BIT, .. })
+        ));
     }
 }
