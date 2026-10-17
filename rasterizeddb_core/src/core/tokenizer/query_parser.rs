@@ -194,6 +194,13 @@ impl<'a, 'b> QueryParser<'a, 'b> {
                 ComparisonOperand::IntermediateCast(idx, db_type.clone(), DbType::DECIMAL),
                 None,
             )),
+            // An evaluated number — the `qty % 7` of `discount > qty % 7` —
+            // asked of the evaluator as a NUMERIC, which it converts at the
+            // engine scale. PostgreSQL promotes the integer the same way, and
+            // the pair was refused here.
+            ComparisonOperand::Evaluated(operand, _) if numeric => {
+                Ok((ComparisonOperand::Evaluated(operand, DbType::DECIMAL), None))
+            }
             _ => Err(format!(
                 "a {} operand cannot be combined with a NUMERIC one here",
                 db_type
@@ -286,11 +293,17 @@ impl<'a, 'b> QueryParser<'a, 'b> {
         // A NUMERIC arithmetic result against a float is a float, as
         // PostgreSQL resolves the pair; the result is converted per row. A
         // NUMERIC *column* is not, since its bytes are at its declared scale
-        // and the conversion reads the engine's.
+        // and the conversion reads the engine's. An evaluated NUMERIC is at
+        // the engine scale, as an arithmetic result is.
         let numeric_result = |o: &ComparisonOperand, t: &DbType, other: &DbType| {
             *t == DbType::DECIMAL
                 && float(other)
-                && matches!(o, ComparisonOperand::Intermediate(_) | ComparisonOperand::IntermediateCast(..))
+                && matches!(
+                    o,
+                    ComparisonOperand::Intermediate(_)
+                        | ComparisonOperand::IntermediateCast(..)
+                        | ComparisonOperand::Evaluated(..)
+                )
         };
         let numeric_left = numeric_result(&left, &left_type, &right_type);
         let numeric_right = numeric_result(&right, &right_type, &left_type);
@@ -762,7 +775,13 @@ impl<'a, 'b> QueryParser<'a, 'b> {
                 && left_op.is_column()
                 && right_op.is_column()
                 && self.scale_of(&left_op) != self.scale_of(&right_op);
-            if comparing && (arithmetic || mixed_columns || inexact_literal) {
+            // An evaluated operand is at the engine scale when it is a NUMERIC,
+            // and an integer one meeting a NUMERIC is promoted to it, so either
+            // way both sides meet there.
+            let evaluated = |o: &ComparisonOperand| matches!(o, ComparisonOperand::Evaluated(..));
+            let evaluated_numeric = (evaluated(&left_op) || evaluated(&right_op))
+                && (left_type == DbType::DECIMAL || right_type == DbType::DECIMAL);
+            if comparing && (arithmetic || mixed_columns || inexact_literal || evaluated_numeric) {
                 match self.decimal_operands(left_op, &left_type, right_op, &right_type)? {
                     Ok((l, r, ls, rs)) => {
                         operand_scales = (ls, rs);

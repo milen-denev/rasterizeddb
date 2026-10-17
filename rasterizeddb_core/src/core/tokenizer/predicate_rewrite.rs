@@ -2553,8 +2553,16 @@ fn lift_comparison(
     let left_text = &body[..at];
     let rest = &body[at..];
     if !needs_evaluator(left_text) {
-        // The operand is the tokenizer's own, and whatever follows is left
+        // The operand is the tokenizer's own. A list item or a bound that
+        // needs the evaluator is lifted on its own: `price BETWEEN qty % 7
+        // AND 10` was refused as "BETWEEN bounds must be separated by AND",
+        // the `%` unreadable to the rewrite. Whatever else follows is left
         // for the ordinary rewrite to read or refuse.
+        if needs_evaluator(rest) {
+            if let Some(spelled) = spell_out_list_or_range(left_text.trim(), rest, schema)? {
+                return Ok(spelled);
+            }
+        }
         return Ok(body.to_string());
     }
     // `(n % 2 = 0) IS NOT TRUE` tests a condition, not a value: the lift goes
@@ -2613,11 +2621,44 @@ fn lift_comparison(
         _ => {}
     }
 
-    // `[NOT] IN (a, b)` and `[NOT] BETWEEN a AND b`, as the comparisons they
-    // mean. Each comparison with the operand is NULL when it is, so the forms
-    // keep PostgreSQL's three-valued answers: a NULL operand is in no list and
-    // outside none.
+    if let Some(spelled) = spell_out_list_or_range(&left, rest, schema)? {
+        return Ok(spelled);
+    }
     let negated = upper.first() == Some(&"NOT");
+    let after_not = if negated {
+        rest.trim_start()[3..].trim_start()
+    } else {
+        rest.trim_start()
+    };
+    // `NOT LIKE` is `NOT` over the match, which the evaluator applies after
+    // its NULL test: a NULL operand matches neither form.
+    if negated
+        && ["LIKE", "ILIKE", "SIMILAR"]
+            .iter()
+            .any(|k| upper.get(1) == Some(k))
+    {
+        return Ok(format!("NOT {} {}", left, after_not));
+    }
+    // `LIKE` and the rest compare the operand's value like any other.
+    Ok(format!("{} {}", left, rest.trim_start()))
+}
+
+/// `left [NOT] IN (a, b)` and `left [NOT] BETWEEN a AND b`, as the comparisons
+/// they mean, each list item and bound lifted when it needs the evaluator; or
+/// `None` for any other form. `rest` begins at the operator.
+///
+/// Each comparison with the operand is NULL when it is, so the forms keep
+/// PostgreSQL's three-valued answers: a NULL operand is in no list and outside
+/// none.
+fn spell_out_list_or_range(
+    left: &str,
+    rest: &str,
+    schema: &SmallVec<[SchemaField; 20]>,
+) -> Result<Option<String>, String> {
+    let negated = rest
+        .split_whitespace()
+        .next()
+        .is_some_and(|w| w.eq_ignore_ascii_case("NOT"));
     let after_not = if negated {
         rest.trim_start()[3..].trim_start()
     } else {
@@ -2636,7 +2677,7 @@ fn lift_comparison(
                 for item in items {
                     parts.push(format!("{} {} {}", left, each, lift_side(item, schema)?));
                 }
-                return Ok(format!("({})", parts.join(join)));
+                return Ok(Some(format!("({})", parts.join(join))));
             }
         }
     }
@@ -2648,24 +2689,14 @@ fn lift_comparison(
         {
             let low = lift_side(&bounds[..s], schema)?;
             let high = lift_side(&bounds[e..], schema)?;
-            return Ok(if negated {
+            return Ok(Some(if negated {
                 format!("({} < {} OR {} > {})", left, low.trim(), left, high.trim())
             } else {
                 format!("({} >= {} AND {} <= {})", left, low.trim(), left, high.trim())
-            });
+            }));
         }
     }
-    // `NOT LIKE` is `NOT` over the match, which the evaluator applies after
-    // its NULL test: a NULL operand matches neither form.
-    if negated
-        && ["LIKE", "ILIKE", "SIMILAR"]
-            .iter()
-            .any(|k| upper.get(1) == Some(k))
-    {
-        return Ok(format!("NOT {} {}", left, after_not));
-    }
-    // `LIKE` and the rest compare the operand's value like any other.
-    Ok(format!("{} {}", left, rest.trim_start()))
+    Ok(None)
 }
 
 /// One side of a comparison: lifted when it needs the evaluator, and a bare

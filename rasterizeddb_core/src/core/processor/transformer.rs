@@ -690,10 +690,10 @@ impl EvaluatedOperand {
     /// Reads `text` as an expression over `schema`.
     ///
     /// Only the types whose comparison here is what PostgreSQL's is are
-    /// accepted. A `NUMERIC` is refused in particular: the evaluator carries a
-    /// column's value at the column's own scale and arithmetic at the engine's,
-    /// and a literal compared with either at the wrong one answers by a power
-    /// of ten — wrongly, and without an error.
+    /// accepted. A `NUMERIC` is among them because the evaluator yields every
+    /// one at the engine scale, a column's value lifted there as it is read;
+    /// the comparison brings the other side to that scale (see
+    /// `QueryParser::decimal_operands`).
     pub fn new(
         text: &str,
         schema: &[crate::core::row::schema::SchemaField],
@@ -718,6 +718,7 @@ impl EvaluatedOperand {
                 | DbType::F64
                 | DbType::BIT
                 | DbType::VARBIT
+                | DbType::DECIMAL
         );
         if !comparable {
             return Err(format!(

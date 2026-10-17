@@ -796,3 +796,109 @@ async fn unsigned_columns_widen_their_arithmetic() {
     .await;
     verdict(wrong);
 }
+
+// ---------------------------------------------------------------- bug #25
+
+/// Six order lines, one all NULL, one dated before 2000 (a date is stored as
+/// a signed day count from 2000-01-01, so that row's is negative).
+const ORDER_LINES: &[&str] = &[
+    "CREATE TABLE od (id INT NOT NULL, qty INT, discount_pct NUMERIC(5,2), unit_price NUMERIC(12,2), \
+     gross NUMERIC(14,2), big BIGINT, f FLOAT8, nm4 NUMERIC(10,4), t TEXT, d DATE, ts TIMESTAMP)",
+    "INSERT INTO od VALUES (1, 5, 2.50, 10.25, 51.25, 5, 2.5, 1.5000, '5', '2024-01-05', '2024-01-05 10:00:00'), \
+     (2, 12, 4.00, 3.10, 37.20, 12, 4.0, 4.0000, '12', '2024-02-01', '2024-02-01 00:00:00'), \
+     (3, 7, 0.00, 1.00, 7.00, 7, 0.0, 0.0000, '7', '2024-03-01', '2024-03-01 12:30:00'), \
+     (4, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL), \
+     (5, 20, 6.75, 2.00, 39.00, 20, 6.75, 6.7500, '20', '2023-12-31', '2023-12-31 23:59:59'), \
+     (6, 3, 1.25, 0.50, 1.50, 3, 0.5, 0.2500, '3', '1999-12-31', '1999-06-15 08:00:00')",
+];
+
+/// Runs `SELECT id FROM od WHERE <condition> ORDER BY id` for each
+/// `(condition, PostgreSQL's ids joined by commas)`.
+async fn expect_ids(db: &mut Db, wrong: &mut Vec<String>, cases: &[(&str, &str)]) {
+    for (condition, want) in cases {
+        let sql = format!("SELECT id FROM od WHERE {} ORDER BY id", condition);
+        match db.text(&sql).await {
+            Ok(got) if got.join(",") == *want => {}
+            Ok(got) => wrong.push(format!("{}\n    got  {:?}\n    want {:?}", sql, got.join(","), want)),
+            Err(e) => wrong.push(format!("{}\n    error {}\n    want {:?}", sql, e, want)),
+        }
+    }
+}
+
+/// An integer meeting a NUMERIC in a `WHERE` is promoted to NUMERIC, as
+/// PostgreSQL promotes it, whether the integer is a column, an arithmetic
+/// result or an expression only the evaluator computes (`qty % 7`, a `CASE`).
+/// `discount_pct + 0 > qty % 7` was refused with "a I32 operand cannot be
+/// combined with a NUMERIC one here", `discount_pct > qty % 7` with "comparing
+/// a numeric value with a computed integer value is not supported yet", and a
+/// `CASE` yielding a NUMERIC with "which a WHERE clause cannot compare yet".
+#[tokio::test(flavor = "multi_thread")]
+async fn integer_operands_are_promoted_to_numeric_in_where() {
+    let mut db = db(ORDER_LINES).await;
+    let mut wrong = Vec::new();
+    expect_ids(
+        &mut db,
+        &mut wrong,
+        &[
+            // The report's statement, and its mirror.
+            ("discount_pct + 0 > qty % 7", "5"),
+            ("qty % 7 < discount_pct + 0", "5"),
+            // Every comparison operator, both ways round.
+            ("discount_pct > qty % 7", "5"),
+            ("qty % 7 <= discount_pct", "3,5"),
+            ("discount_pct = qty % 7", "3"),
+            ("discount_pct <> qty % 7", "1,2,5,6"),
+            ("discount_pct >= qty % 7", "3,5"),
+            ("qty % 7 > discount_pct", "1,2,6"),
+            ("NOT (discount_pct > qty % 7)", "1,2,3,6"),
+            ("big % 7 > discount_pct", "1,2,6"),
+            // Arithmetic on both sides.
+            ("discount_pct * 2 >= qty % 7 + 1", "2,5"),
+            ("(discount_pct + 0) * qty > qty % 7", "1,2,5,6"),
+            ("qty % 7 > discount_pct + unit_price", "6"),
+            ("qty % 7 < discount_pct * unit_price", "1,2,5"),
+            ("discount_pct + qty % 7 > 8", "2,5"),
+            ("qty % 7 + discount_pct = 7.5", "1"),
+            // A computed integer against a NUMERIC(10,4) column.
+            ("nm4 = CASE WHEN id = 2 THEN 4 ELSE 9 END", "2"),
+            ("CASE WHEN id = 2 THEN 4 ELSE 9 END = nm4", "2"),
+            // The forms spelled out into comparisons, with the computed
+            // operand as a bound or a list item.
+            ("discount_pct BETWEEN qty % 7 AND 10", "3,5"),
+            ("discount_pct NOT BETWEEN qty % 7 AND 3", "1,2,5,6"),
+            ("discount_pct IN (qty % 7, 4)", "2,3"),
+            ("discount_pct NOT IN (qty % 7, 4)", "1,5,6"),
+            // A computed NUMERIC against an integer column, a literal, a
+            // NUMERIC column, a float column and an integer result.
+            ("qty = CASE WHEN id = 1 THEN 5.0 ELSE 7.5 END", "1"),
+            ("qty > CASE WHEN id < 3 THEN discount_pct * 2 ELSE 100 END", "2"),
+            ("CASE WHEN id < 3 THEN discount_pct ELSE 0 END > qty % 3", "1,2"),
+            ("CASE WHEN id < 3 THEN discount_pct ELSE 0 END = 2.5", "1"),
+            ("CASE WHEN id < 3 THEN discount_pct ELSE 0 END = '4.000'", "2"),
+            ("CASE WHEN id < 3 THEN discount_pct ELSE 0 END = discount_pct", "1,2,3"),
+            ("CASE WHEN id < 3 THEN unit_price END > nm4", "1"),
+            ("CASE WHEN id < 3 THEN discount_pct ELSE 0 END > f", ""),
+            ("CASE WHEN id < 3 THEN discount_pct ELSE 0 END < f", "5,6"),
+            ("CASE WHEN id < 3 THEN discount_pct END IS NULL", "3,4,5,6"),
+            ("f > qty % 7", "5"),
+        ],
+    )
+    .await;
+    // The select list already promoted; kept beside the WHERE forms so the
+    // two cannot drift apart.
+    expect_rows(
+        &mut db,
+        &mut wrong,
+        &[(
+            "SELECT id, discount_pct + qty % 7, qty % 7 * discount_pct, discount_pct - qty % 7 FROM od ORDER BY id",
+            &["1|7.50|12.50|-2.50", "2|9.00|20.00|-1.00", "3|0.00|0.00|0.00", "4|NULL|NULL|NULL", "5|12.75|40.50|0.75", "6|4.25|3.75|-1.75"],
+        )],
+    )
+    .await;
+    // UPDATE and DELETE read their WHERE the same way.
+    match db.text("DELETE FROM od WHERE discount_pct > qty % 7").await {
+        Ok(_) => expect_ids(&mut db, &mut wrong, &[("id > 0", "1,2,3,4,6")]).await,
+        Err(e) => wrong.push(format!("DELETE FROM od WHERE discount_pct > qty % 7\n    error {}", e)),
+    }
+    verdict(wrong);
+}

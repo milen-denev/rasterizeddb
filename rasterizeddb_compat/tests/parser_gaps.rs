@@ -545,21 +545,9 @@ async fn a_computed_operand_and_a_column_of_another_type() {
         ("SELECT k FROM pd WHERE t = k % 3", "operator does not exist: text = integer"),
         ("SELECT k FROM pe WHERE bt = k % 2", "operator does not exist: bit = integer"),
         // Pairs PostgreSQL does compare and the engine cannot yet. Its
-        // answers, in order: 1, 1, 2, 1, '' and 1,2. The `<` over a
-        // `character` column answered 1 before, and the rest failed per row
-        // with an operand-size error.
-        (
-            "SELECT k FROM pd WHERE nm = CASE WHEN k = 1 THEN 1 ELSE 3 END ORDER BY k",
-            "comparing a numeric value with a computed integer value is not supported yet",
-        ),
-        (
-            "SELECT k FROM pd WHERE nm = CASE WHEN k = 1 THEN 1.0 ELSE 3.0 END ORDER BY k",
-            "which a WHERE clause cannot compare yet",
-        ),
-        (
-            "SELECT k FROM pd WHERE nm > k % 3 ORDER BY k",
-            "comparing a numeric value with a computed integer value is not supported yet",
-        ),
+        // answers, in order: 1, '' and 1,2. The `<` over a `character`
+        // column answered 1 before, and the rest failed per row with an
+        // operand-size error.
         (
             "SELECT k FROM pe WHERE c1 = CASE WHEN k = 1 THEN 'a' ELSE 'z' END ORDER BY k",
             "is not supported yet",
@@ -581,6 +569,14 @@ async fn a_computed_operand_and_a_column_of_another_type() {
 
     // The pairs PostgreSQL compares, and the engine with it.
     let cases: &[(&str, &str)] = &[
+        // A NUMERIC column against a computed integer or NUMERIC, which were
+        // refused as not supported: the integer is promoted, as PostgreSQL
+        // promotes it.
+        ("SELECT k FROM pd WHERE nm = CASE WHEN k = 1 THEN 1 ELSE 3 END ORDER BY k", "1"),
+        ("SELECT k FROM pd WHERE nm <> CASE WHEN k = 1 THEN 1 ELSE 3 END ORDER BY k", "2"),
+        ("SELECT k FROM pd WHERE nm = CASE WHEN k = 1 THEN 1.0 ELSE 3.0 END ORDER BY k", "1"),
+        ("SELECT k FROM pd WHERE nm > k % 3 ORDER BY k", "2"),
+        ("SELECT k FROM pd WHERE k % 3 < nm ORDER BY k", "2"),
         ("SELECT k FROM pd WHERE c = CASE WHEN k = 1 THEN 'ab' ELSE 'zz' END ORDER BY k", "1"),
         ("SELECT k FROM pd WHERE v = CASE WHEN k = 1 THEN 'ab' ELSE 'zz' END ORDER BY k", "1"),
         ("SELECT k FROM pd WHERE c = t || '' ORDER BY k", ""),
