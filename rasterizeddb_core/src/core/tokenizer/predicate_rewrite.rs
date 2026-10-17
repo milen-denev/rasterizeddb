@@ -1918,6 +1918,72 @@ fn row_comparison(left: &[&str], right: &[&str], op: &str) -> String {
     )
 }
 
+/// `(a, b) [NOT] IN ((x, y), (z, w))` starting at `at`, just past the left
+/// row: its boolean form and the offset just past the list, or `None` when
+/// the text there is not that shape.
+///
+/// A row is in a list when it equals some member, so the form is an `OR` of
+/// row equalities, each the `AND` of its elements. `NOT IN` is the negation
+/// of that, which in three-valued logic is the `AND` of row inequalities, each
+/// the `OR` of its elements: a member holding NULL leaves the answer NULL
+/// rather than false, and the row out of both forms, as in PostgreSQL.
+fn row_in_list(
+    current: &str,
+    at: usize,
+    left: &[&str],
+) -> Result<Option<(String, usize)>, String> {
+    let word_at = |pos: usize, word: &str| {
+        current
+            .get(pos..pos + word.len())
+            .is_some_and(|w| w.eq_ignore_ascii_case(word))
+            && !current[pos + word.len()..]
+                .starts_with(|c: char| c.is_alphanumeric() || c == '_')
+    };
+    let skip_space = |pos: usize| pos + (current[pos..].len() - current[pos..].trim_start().len());
+    let (negated, in_at) = if word_at(at, "NOT") {
+        (true, skip_space(at + 3))
+    } else {
+        (false, at)
+    };
+    if !word_at(in_at, "IN") {
+        return Ok(None);
+    }
+    let open = skip_space(in_at + 2);
+    if current.as_bytes().get(open) != Some(&b'(') {
+        return Ok(None);
+    }
+    let Some(close) = matching_paren_at(current, open) else {
+        return Ok(None);
+    };
+    let mut members: Vec<String> = Vec::new();
+    for member in split_row_items(&current[open + 1..close]) {
+        // A list of plain values, or a subquery, is some other form.
+        if !member.starts_with('(') || matching_paren_at(member, 0) != Some(member.len() - 1) {
+            return Ok(None);
+        }
+        let right = split_row_items(&member[1..member.len() - 1]);
+        if right.len() != left.len() {
+            return Err(format!(
+                "a row IN list needs rows of {} values, but one has {}",
+                left.len(),
+                right.len()
+            ));
+        }
+        let (each, join) = if negated { ("<>", " OR ") } else { ("=", " AND ") };
+        let parts: Vec<String> = left
+            .iter()
+            .zip(right.iter())
+            .map(|(l, r)| format!("{l} {each} {r}"))
+            .collect();
+        members.push(format!("({})", parts.join(join)));
+    }
+    if members.is_empty() {
+        return Ok(None);
+    }
+    let joined = members.join(if negated { " AND " } else { " OR " });
+    Ok(Some((format!("({joined})"), close + 1)))
+}
+
 /// Rewrites SQL's row-value comparisons into the boolean form the planner can
 /// evaluate: `(a, b) > (c, d)` becomes `(a > c OR (a = c AND b > d))`.
 ///
@@ -1966,7 +2032,13 @@ fn expand_row_value_comparisons(clause: &str) -> Result<String, String> {
                                 let after = &current[close + 1..];
                                 let lead = after.len() - after.trim_start().len();
                                 let rest = after.trim_start();
-                                if let Some(op) = OPS.iter().find(|op| rest.starts_with(**op)) {
+                                if let Some((text, end)) =
+                                    row_in_list(&current, close + 1 + lead, &left_items)?
+                                {
+                                    replacement = Some((i, end, text));
+                                } else if let Some(op) =
+                                    OPS.iter().find(|op| rest.starts_with(**op))
+                                {
                                     let tail = rest[op.len()..].trim_start();
                                     let consumed = close
                                         + 1
@@ -2250,10 +2322,17 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
                         {
                             return Err("IS DISTINCT must be followed by FROM".to_string());
                         }
-                        let value_at = null_at + 2;
-                        let value = toks
-                            .get(value_at)
-                            .map(|t| t.render())
+                        // Read as a value, not as a raw token: `false` has to
+                        // become the `0` a boolean column stores, and `-1`
+                        // arrives as a sign and a number. Taken token by token
+                        // they reached the tokenizer as the column `false` and
+                        // as a stray `-`.
+                        if matches!(toks.get(null_at + 2), Some(Tok::LPar)) {
+                            return Err(
+                                "IS DISTINCT FROM an expression is not supported yet".to_string()
+                            );
+                        }
+                        let (value, after_value) = bound_at(&toks, null_at + 2)
                             .ok_or("IS DISTINCT FROM names no value")?;
 
                         // `IS DISTINCT FROM NULL` is exactly `IS NOT NULL`, and
@@ -2267,7 +2346,7 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
                                 None if negated => CONSTANT_FALSE.to_string(),
                                 None => CONSTANT_TRUE.to_string(),
                             });
-                            i = value_at + 1;
+                            i = after_value;
                             continue;
                         }
 
@@ -2301,7 +2380,7 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
                                 None => format!("({} = 1 OR {} != {})", other_flag, col, value),
                             };
                             out.push(fragment);
-                            i = value_at + 1;
+                            i = after_value;
                             continue;
                         }
 
@@ -2315,7 +2394,7 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
                             None if negated => format!("{} = {}", col, value),
                             None => format!("{} != {}", col, value),
                         });
-                        i = value_at + 1;
+                        i = after_value;
                         continue;
                     }
 

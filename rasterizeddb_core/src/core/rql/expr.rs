@@ -577,8 +577,11 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
         return parse_case(text, schema);
     }
 
-    // A quoted string.
-    if text.starts_with('\'') && text.ends_with('\'') && text.len() >= 2 {
+    // A quoted string — one, whose closing quote is the last character.
+    // Starting and ending with a quote is not enough: `'DE', 'A'` does both,
+    // and was read as the single string `DE', 'A`, which turned the row value
+    // `(country, grade) = ('DE', 'A')` into a comparison with that string.
+    if text.starts_with('\'') && text.ends_with('\'') && text.len() >= 2 && is_one_literal(text) {
         let value = crate::core::value_codec::unquote_sql(text);
         return Ok(Expr::Literal {
             bytes: value.as_bytes().to_vec(),
@@ -3021,6 +3024,25 @@ fn as_f64(value: &Value) -> Option<f64> {
         .ok(),
         _ => as_i64(value).map(|v| v as f64),
     }
+}
+
+/// True when `text`, which opens with a quote, is one string literal: the
+/// quote that closes it, a doubled quote being an escaped one, is the last
+/// character.
+fn is_one_literal(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut i = 1usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            if bytes.get(i + 1) == Some(&b'\'') {
+                i += 2;
+                continue;
+            }
+            return i == bytes.len() - 1;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// True when the whole text is a single numeric literal, sign and exponent

@@ -48,6 +48,19 @@ async fn joined(pool: &sqlx::PgPool, sql: &str) -> Result<String, String> {
     column(pool, sql).await.map(|v| v.join(","))
 }
 
+/// Runs each `(sql, expected)` and returns one line per wrong answer.
+async fn wrong_answers(pool: &sqlx::PgPool, cases: &[(&str, &str)]) -> Vec<String> {
+    let mut wrong = Vec::new();
+    for (sql, want) in cases {
+        match joined(pool, sql).await {
+            Ok(got) if got == *want => {}
+            Ok(got) => wrong.push(format!("{sql}\n    got  {got:?}\n    want {want:?}")),
+            Err(e) => wrong.push(format!("{sql}\n    error {e}\n    want  {want:?}")),
+        }
+    }
+    wrong
+}
+
 // ---------------------------------------------------------------- #10 DELETE
 
 /// `DELETE FROM t` with no `WHERE` was "Cannot parse DELETE query". It deletes
@@ -156,3 +169,89 @@ async fn delete_without_where_follows_foreign_keys() {
     assert_eq!(run(&pool, "DELETE FROM par2").await, Ok(2));
 }
 
+// -------------------------------------------- #13 IS DISTINCT FROM, row values
+
+async fn flags(pool: &sqlx::PgPool) {
+    run(
+        pool,
+        "CREATE TABLE fl (id INT NOT NULL, is_flagged BOOLEAN, other BOOLEAN, nn BOOLEAN NOT NULL, country TEXT, grade TEXT, k INT)",
+    )
+    .await
+    .unwrap();
+    run(
+        pool,
+        "INSERT INTO fl (id, is_flagged, other, nn, country, grade, k) VALUES \
+         (1, true, true, true, 'DE', 'A', 1), (2, false, NULL, false, 'DE', 'B', -1), \
+         (3, NULL, NULL, true, 'FR', 'A', NULL), (4, NULL, false, false, NULL, 'A', 4), \
+         (5, false, false, true, 'DE', NULL, -1)",
+    )
+    .await
+    .unwrap();
+}
+
+/// `IS [NOT] DISTINCT FROM` a boolean literal was "unknown identifier
+/// 'false'": the literal reached the tokenizer unconverted.
+#[tokio::test(flavor = "multi_thread")]
+async fn is_distinct_from_literals_and_columns() {
+    let (_s, pool) = server().await;
+    flags(&pool).await;
+    let cases: &[(&str, &str)] = &[
+        ("SELECT id FROM fl WHERE is_flagged IS NOT DISTINCT FROM false ORDER BY id", "2,5"),
+        ("SELECT id FROM fl WHERE is_flagged IS NOT DISTINCT FROM true ORDER BY id", "1"),
+        ("SELECT id FROM fl WHERE is_flagged IS DISTINCT FROM true ORDER BY id", "2,3,4,5"),
+        ("SELECT id FROM fl WHERE is_flagged IS DISTINCT FROM FALSE ORDER BY id", "1,3,4"),
+        ("SELECT id FROM fl WHERE is_flagged IS NOT DISTINCT FROM NULL ORDER BY id", "3,4"),
+        ("SELECT id FROM fl WHERE is_flagged IS DISTINCT FROM NULL ORDER BY id", "1,2,5"),
+        ("SELECT id FROM fl WHERE is_flagged IS DISTINCT FROM other ORDER BY id", "2,4"),
+        ("SELECT id FROM fl WHERE is_flagged IS NOT DISTINCT FROM other ORDER BY id", "1,3,5"),
+        ("SELECT id FROM fl WHERE nn IS DISTINCT FROM false ORDER BY id", "1,3,5"),
+        ("SELECT id FROM fl WHERE nn IS NOT DISTINCT FROM is_flagged ORDER BY id", "1,2"),
+        ("SELECT id FROM fl WHERE k IS NOT DISTINCT FROM -1 ORDER BY id", "2,5"),
+        ("SELECT id FROM fl WHERE k IS DISTINCT FROM -1 ORDER BY id", "1,3,4"),
+        ("SELECT id FROM fl WHERE country IS DISTINCT FROM 'DE' ORDER BY id", "3,4"),
+        ("SELECT id FROM fl WHERE id > 1 AND is_flagged IS NOT DISTINCT FROM false ORDER BY id", "2,5"),
+        ("SELECT id FROM fl WHERE NOT (is_flagged IS DISTINCT FROM false) ORDER BY id", "2,5"),
+    ];
+    let wrong = wrong_answers(&pool, cases).await;
+    assert!(wrong.is_empty(), "{} wrong answers:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// `(a, b) = ('DE', 'A')` was "expected closing parenthesis" whenever the
+/// right-hand row held only strings: the constant folder read `'DE', 'A'` as
+/// one literal. Row `IN` lists were not read at all. PostgreSQL: a row equals
+/// another when every element does, is unequal when any element is, and is
+/// NULL otherwise — so a NULL element keeps a row out of both answers.
+#[tokio::test(flavor = "multi_thread")]
+async fn row_value_equality_inequality_and_in() {
+    let (_s, pool) = server().await;
+    flags(&pool).await;
+    let cases: &[(&str, &str)] = &[
+        ("SELECT id FROM fl WHERE (country, grade) = ('DE', 'A') ORDER BY id", "1"),
+        ("SELECT id FROM fl WHERE (country, grade) <> ('DE', 'A') ORDER BY id", "2,3"),
+        ("SELECT id FROM fl WHERE (country, grade) != ('DE', 'B') ORDER BY id", "1,3,4"),
+        ("SELECT id FROM fl WHERE (grade, country) = ('A', 'FR') ORDER BY id", "3"),
+        ("SELECT id FROM fl WHERE (country, grade) IN (('DE', 'A'), ('FR', 'A')) ORDER BY id", "1,3"),
+        ("SELECT id FROM fl WHERE (country, grade) NOT IN (('DE', 'A'), ('FR', 'A')) ORDER BY id", "2"),
+        ("SELECT id FROM fl WHERE (country, k) IN (('DE', -1), ('XX', 4)) ORDER BY id", "2,5"),
+        ("SELECT id FROM fl WHERE (id, grade) IN ((1, 'A'), (4, 'A'), (5, 'A')) ORDER BY id", "1,4"),
+        ("SELECT id FROM fl WHERE (country, grade) = ('DE', NULL) ORDER BY id", ""),
+        ("SELECT id FROM fl WHERE (country, grade) <> ('DE', NULL) ORDER BY id", "3"),
+        (
+            "SELECT id FROM fl WHERE id < 5 AND (country, grade) = ('DE', 'A') OR (country, grade) = ('FR', 'A') ORDER BY id",
+            "1,3",
+        ),
+        ("SELECT id FROM fl WHERE NOT ((country, grade) = ('DE', 'A')) ORDER BY id", "2,3"),
+        ("SELECT id FROM fl WHERE (country, grade) IN (('DE', 'A')) ORDER BY id", "1"),
+    ];
+    let wrong = wrong_answers(&pool, cases).await;
+    assert!(wrong.is_empty(), "{} wrong answers:\n{}", wrong.len(), wrong.join("\n"));
+
+    // The same shapes pick the rows an UPDATE and a DELETE touch.
+    assert_eq!(run(&pool, "UPDATE fl SET k = 99 WHERE (country, grade) = ('DE', 'A')").await, Ok(1));
+    assert_eq!(
+        run(&pool, "DELETE FROM fl WHERE (country, grade) IN (('FR', 'A'), ('DE', 'B'))").await,
+        Ok(2)
+    );
+    assert_eq!(joined(&pool, "SELECT id FROM fl ORDER BY id").await.unwrap(), "1,4,5");
+    assert_eq!(joined(&pool, "SELECT k FROM fl WHERE id = 1").await.unwrap(), "99");
+}
