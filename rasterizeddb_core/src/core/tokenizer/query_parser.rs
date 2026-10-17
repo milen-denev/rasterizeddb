@@ -769,6 +769,20 @@ impl<'a, 'b> QueryParser<'a, 'b> {
             return Ok(());
         }
 
+        // A document is compared only with a document, or with a quoted
+        // literal, which is read as one. PostgreSQL has no `jsonb = integer`,
+        // `jsonb = boolean` or `jsonb = text`, and refuses them. Here the pair
+        // reached the evaluator as a document comparison of whatever bytes the
+        // other side held: an `i32` 1 begins with the tag of `false`, so
+        // `doc->'a' = 1` matched `{"a":false}`.
+        if comparing {
+            if let Some(message) =
+                Self::document_type_mismatch(op_str, &left_op, &left_type, &right_op, &right_type)
+            {
+                return Err(message);
+            }
+        }
+
         // A literal's type comes from how it was written, not from what it is
         // compared against: `200` is an `i32` and `'1111-…'` is text, even when
         // the column is a `DECIMAL` or a `UUID`. The evaluator does no
@@ -838,6 +852,54 @@ impl<'a, 'b> QueryParser<'a, 'b> {
             self.query_transformer.set_last_negated();
         }
         Ok(())
+    }
+
+    /// PostgreSQL's "operator does not exist" for a document compared with
+    /// anything but a document or a quoted literal, or `None` when the pair is
+    /// one PostgreSQL accepts.
+    ///
+    /// A quoted literal is text here, and is accepted because PostgreSQL
+    /// resolves an untyped literal as `jsonb`. A text *column* or expression is
+    /// not: `doc->'a' = t` is `jsonb = text`, which PostgreSQL refuses. The
+    /// engine's own internal types are let through, since they do not come
+    /// from anything a statement can write.
+    fn document_type_mismatch(
+        op_str: &str,
+        left_op: &ComparisonOperand,
+        left_type: &DbType,
+        right_op: &ComparisonOperand,
+        right_type: &DbType,
+    ) -> Option<String> {
+        let document = |t: &DbType| *t == DbType::JSONB;
+        if document(left_type) == document(right_type) {
+            return None;
+        }
+        let (other_op, other_type) = if document(left_type) {
+            (right_op, right_type)
+        } else {
+            (left_op, left_type)
+        };
+        let accepted = match other_type {
+            DbType::STRING => matches!(other_op, ComparisonOperand::Direct(_)),
+            DbType::JSON | DbType::NULL | DbType::UNKNOWN => true,
+            _ => false,
+        };
+        if accepted {
+            return None;
+        }
+        // A literal written with a fraction is a `numeric` to PostgreSQL; the
+        // engine parses it as a float.
+        let name = |op: &ComparisonOperand, t: &DbType| match t {
+            DbType::JSONB => "jsonb",
+            DbType::F32 | DbType::F64 if matches!(op, ComparisonOperand::Direct(_)) => "numeric",
+            _ => crate::core::value_codec::pg_input_type_name(t),
+        };
+        Some(format!(
+            "operator does not exist: {} {} {}",
+            name(left_op, left_type),
+            if op_str == "!=" { "<>" } else { op_str },
+            name(right_op, right_type)
+        ))
     }
 
     /// Records one comparison, with the left operand's type deciding how the

@@ -216,6 +216,57 @@ async fn a_literal_that_is_not_json_is_refused_against_a_document_path() {
     }
 }
 
+/// A document compared with a number, a boolean or a non-text column is a type
+/// error in PostgreSQL, not a comparison. Read as a document instead, the
+/// bytes of `1` begin with the tag of JSON `false`, and those of `2.5` with
+/// the tag of `null`, so `doc->'a' = 1` matched `{"a":false}`. PostgreSQL 17
+/// refuses every case below with "operator does not exist: jsonb = integer"
+/// (or `numeric`, `boolean`, `text`, `bigint`, or `integer = jsonb` when the
+/// document is on the right).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_document_against_a_number_or_a_non_text_column_is_refused() {
+    let (_s, pool) = server().await;
+    pool.execute(sqlx::raw_sql(
+        r#"INSERT INTO s VALUES (20,'{"a":false,"p":null}','x',1),(21,'{"a":true,"p":2.5}','y',2)"#,
+    ))
+    .await
+    .expect("seed");
+    let mut wrong = Vec::new();
+    // `(clause, the operator PostgreSQL names)`. Under a NOT the engine has
+    // already rewritten `=` to `<>`, and `true` to `1` (PostgreSQL says
+    // `jsonb = boolean`), so for those only the refusal itself is checked.
+    for (clause, operator) in [
+        ("doc->'a' = 1", "jsonb = integer"),
+        ("doc->'a' = 2", "jsonb = integer"),
+        ("doc->'a' <> 1", "jsonb <> integer"),
+        ("doc->'a' != 1", "jsonb <> integer"),
+        ("doc->'p' = 2.5", "jsonb = numeric"),
+        ("doc->'p' = 0.0", "jsonb = numeric"),
+        ("doc->'a' = true", ""),
+        ("doc->'a' > 0", "jsonb > integer"),
+        ("doc->'a' IN (1, 2)", "jsonb = integer"),
+        ("doc->'a' NOT IN (1, 2)", "jsonb <> integer"),
+        ("doc #> '{a}' = 1", "jsonb = integer"),
+        ("1 = doc->'a'", "integer = jsonb"),
+        ("doc->'a' = n", "jsonb = integer"),
+        ("n = doc->'a'", "integer = jsonb"),
+        ("doc->'a' = n + 1", "jsonb = integer"),
+        ("doc->'a' = t", "jsonb = text"),
+        ("doc = n", "jsonb = integer"),
+        ("doc = 1", "jsonb = integer"),
+        ("NOT (doc->'a' = 1)", ""),
+    ] {
+        match ids(&pool, clause).await {
+            Err(e) if e.contains(&format!("operator does not exist: {operator}")) => {}
+            got => wrong.push(format!("{clause:<25} PostgreSQL refuses this ({operator}), got {got:?}")),
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    // A document against a document or a quoted literal is still a comparison.
+    assert_eq!(ids(&pool, "doc->'a' = 'false'").await.as_deref(), Ok("20"));
+    assert_eq!(ids(&pool, "doc->'a' = doc->'a' AND id >= 20").await.as_deref(), Ok("20,21"));
+}
+
 /// `IS NULL` over a path in the select list is a boolean, not the extracted
 /// text. PostgreSQL 17: `SELECT id, doc->>'a' IS NULL FROM s ORDER BY id`.
 #[tokio::test(flavor = "multi_thread")]

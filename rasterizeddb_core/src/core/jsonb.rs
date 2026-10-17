@@ -964,6 +964,14 @@ fn scalar_eq(a: &[u8], b: &[u8]) -> Option<bool> {
     if ta > TAG_OBJ || tb > TAG_OBJ {
         return None;
     }
+    // A scalar is exactly as long as its tag says. Without this the four bytes
+    // of an `i32` 1 began with the tag of `false` and compared equal to it, and
+    // the eight bytes of an `f64` 2.5 equalled `null`. Every slice this is
+    // given — a column's value, a path's target, an element — is exact, so
+    // only bytes that are not a document fail it.
+    if !scalar_well_formed(a) || !scalar_well_formed(b) {
+        return None;
+    }
     let number = |t: u8| t == TAG_INT || t == TAG_NUM;
     Some(match (ta, tb) {
         (TAG_INT, TAG_INT) => a.get(1..9)? == b.get(1..9)?,
@@ -975,6 +983,20 @@ fn scalar_eq(a: &[u8], b: &[u8]) -> Option<bool> {
         (TAG_STR, TAG_STR) => read_len_prefixed(a).ok()?.0 == read_len_prefixed(b).ok()?.0,
         _ => ta == tb && matches!(ta, TAG_NULL | TAG_TRUE | TAG_FALSE),
     })
+}
+
+/// Whether `bytes` is one whole encoded scalar and nothing more. A container
+/// passes; its own header is checked where it is read.
+fn scalar_well_formed(bytes: &[u8]) -> bool {
+    match bytes.first() {
+        Some(&(TAG_NULL | TAG_FALSE | TAG_TRUE)) => bytes.len() == 1,
+        Some(&TAG_INT) => bytes.len() == 9,
+        Some(&(TAG_NUM | TAG_STR)) => {
+            matches!(read_len_prefixed(bytes), Ok((_, used)) if used == bytes.len())
+        }
+        Some(_) => true,
+        None => false,
+    }
 }
 
 /// The decimal text of an encoded number. An integer is formatted into `buf`.
@@ -2850,5 +2872,27 @@ mod gin_item_tests {
         assert_eq!(eq(r#""1""#, "1"), Some(false));
         // Bytes that are not a document are not compared as one.
         assert_eq!(values_equal(br#"{"a":1}"#, &encode_text(r#"{"a":1}"#).unwrap()), None);
+        // Nor are the bytes of a number or a boolean that happen to begin with
+        // a scalar's tag: `i32` 1 starts like `false`, `f64` 2.5 like `null`,
+        // `i32` 2 like `true`.
+        let doc = |t: &str| encode_text(t).unwrap();
+        assert_eq!(values_equal(&1i32.to_le_bytes(), &doc("false")), None);
+        assert_eq!(values_equal(&doc("false"), &1i32.to_le_bytes()), None);
+        assert_eq!(values_equal(&2.5f64.to_le_bytes(), &doc("null")), None);
+        assert_eq!(values_equal(&2i32.to_le_bytes(), &doc("true")), None);
+        assert_eq!(values_equal(&[3, 1, 0, 0, 0, 0, 0, 0, 0, 9], &doc("1")), None);
+        let mut long_text = doc(r#""x""#);
+        long_text.push(0);
+        assert_eq!(values_equal(&long_text, &doc(r#""x""#)), None);
+        // And the evaluator falls back to the bytes for them, which differ.
+        use crate::core::db_type::DbType;
+        use crate::core::processor::transformer::ComparerOperation;
+        use crate::core::row::logical::perform_comparison_operation;
+        let equals = |a: &[u8], b: &[u8]| {
+            perform_comparison_operation(a, b, &DbType::JSONB, &ComparerOperation::Equals).unwrap()
+        };
+        assert!(!equals(&doc("false"), &1i32.to_le_bytes()));
+        assert!(!equals(&doc("null"), &2.5f64.to_le_bytes()));
+        assert!(equals(&doc("false"), &doc("false")));
     }
 }
