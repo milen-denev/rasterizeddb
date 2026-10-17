@@ -632,6 +632,27 @@ impl StatusLog {
         Ok(())
     }
 
+    /// Makes every outcome recorded so far durable, including ones another
+    /// caller staged with [`StatusLog::flush_deferred`] and has not synced
+    /// yet: [`StatusLog::flush`] syncs only what it staged itself, and returns
+    /// at once when nothing is dirty, so an asynchronous commit's outcome can
+    /// still be waiting in the log's page cache when it does.
+    ///
+    /// For callers about to persist something that is only true if those
+    /// outcomes are: vacuum's filter clears.
+    pub fn flush_all(&self) -> io::Result<()> {
+        self.stage()?;
+        let wal = self.inner.lock().wal.as_ref().map(|(w, _)| w.clone());
+        match wal {
+            Some(wal) => {
+                wal.sync_pending()?;
+                self.apply_durable(&wal)
+            }
+            // No log: `stage` wrote and synced the file itself.
+            None => Ok(()),
+        }
+    }
+
     /// Copies over any staged range the log has since made durable.
     ///
     /// Call after the sync that [`StatusLog::flush_deferred`] left owed.

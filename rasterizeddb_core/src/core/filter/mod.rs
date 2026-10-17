@@ -38,6 +38,10 @@ mod integration_tests;
 mod nan_bounds_tests;
 #[cfg(test)]
 mod compact_failure_tests;
+#[cfg(test)]
+mod vacuum_clear_power_loss_tests;
+#[cfg(test)]
+mod vacuum_clear_runs_tests;
 
 use parking_lot::RwLock;
 use smallvec::SmallVec;
@@ -55,6 +59,10 @@ pub use settings::{FilterSettings, Overrides, Resolved, settings};
 pub use zonemap::SargOp;
 
 use column::ColumnFilter;
+
+/// Slots [`TableFilters::on_delete_runs_at`] clears under one hold of a
+/// column's lock.
+const CLEAR_CHUNK: u64 = 4096;
 
 /// A per-slot candidate bitmap. A set bit means "may match — fetch it".
 #[derive(Clone, Debug)]
@@ -875,6 +883,48 @@ impl TableFilters {
             }
             g.clear_unindexed_prefix();
         }
+        true
+    }
+
+    /// Clears every slot in `runs` (`(first, count)` pairs), unless the slots
+    /// were renumbered since `epoch` was read. Vacuum's deferred clears: the
+    /// slot numbers come from a sweep that read `epoch` before it started.
+    /// Returns whether the clears were applied.
+    ///
+    /// Each column's lock is yielded to waiting inserts and queries every
+    /// [`CLEAR_CHUNK`] slots, and the epoch checked again after each, so a
+    /// large scattered delete does not hold a column for the whole list. Any
+    /// clears applied before a `false` return are still sound: each chunk was
+    /// checked under the numbering it was written in, and the caller re-clears
+    /// on the next sweep.
+    pub fn on_delete_runs_at(&self, epoch: u64, runs: &[(u64, u64)]) -> bool {
+        for cell in &self.columns {
+            let mut g = cell.write();
+            if self.renumber_epoch() != epoch {
+                return false;
+            }
+            let mut in_chunk = 0u64;
+            for &(first, count) in runs {
+                let end = first + count;
+                let mut slot = first;
+                while slot < end {
+                    let stop = end.min(slot + (CLEAR_CHUNK - in_chunk));
+                    for s in slot..stop {
+                        g.set(s, None);
+                    }
+                    in_chunk += stop - slot;
+                    slot = stop;
+                    if in_chunk == CLEAR_CHUNK {
+                        in_chunk = 0;
+                        parking_lot::RwLockWriteGuard::bump(&mut g);
+                        if self.renumber_epoch() != epoch {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        self.note_writes(runs.iter().map(|r| r.1).sum());
         true
     }
 

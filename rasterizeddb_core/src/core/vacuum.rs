@@ -955,7 +955,9 @@ struct ScanResult {
     /// Extents of tombstoned rows. Always collected: they are the starting
     /// point for the capped path.
     dead: Vec<Extent>,
-    fingerprints_cleared: u64,
+    /// Slots whose fingerprints this sweep may clear, as `(first, count)`
+    /// runs. Collected, not cleared: see [`apply_filter_clears`].
+    clear_runs: Vec<(u64, u64)>,
     /// Set when the live map was abandoned for `max_tracked_live_extents`, so
     /// dead space is derived from tombstones rather than from the gaps between
     /// live rows — which does not recover the slack an in-place shrinking
@@ -1071,7 +1073,7 @@ async fn scan_pointers<S: StorageIO>(
         live: Vec::new(),
         dead: Vec::new(),
         live_map_dropped: false,
-        fingerprints_cleared: 0,
+        clear_runs: Vec::new(),
         frontier: 0,
         index_dead: Vec::new(),
     };
@@ -1116,14 +1118,15 @@ async fn scan_pointers<S: StorageIO>(
             // Establishing that nothing can reach it is exactly what this sweep
             // just did, so clearing them is now its job.
             //
+            // Collected here and cleared only after the scan, once the outcomes
+            // this decision read from memory are durable: see
+            // `apply_filter_clears`. Clearing here let a checkpoint persist the
+            // clear while the deleter's outcome could still be lost.
+            //
             // Safe even if this run is later deferred: deferral is about handing
             // out bytes, and this says only that no snapshot sees the version.
-            if let Some(filters) = ctx
-                .filters
-                .filter(|_| ctx.should_clear(pointer.xmax, previous_bound))
-            {
-                filters.on_delete(slot);
-                result.fingerprints_cleared += 1;
+            if ctx.should_clear(pointer.xmax, previous_bound) {
+                push_run(&mut result.clear_runs, slot);
             }
         } else {
             // Stamped by a deleter the horizon has not passed — in flight, or
@@ -1155,6 +1158,81 @@ async fn scan_pointers<S: StorageIO>(
     .await?;
 
     Ok(result)
+}
+
+/// Appends `slot` to a list of `(first, count)` runs, extending the last run
+/// when it is adjacent. Slots arrive in increasing order, so a bulk delete is
+/// one entry.
+fn push_run(runs: &mut Vec<(u64, u64)>, slot: u64) {
+    if let Some(last) = runs.last_mut() {
+        if last.0 + last.1 == slot {
+            last.1 += 1;
+            return;
+        }
+    }
+    runs.push((slot, 1));
+}
+
+/// Makes durable everything a sweep's reclaimability decisions read from
+/// memory: the deleters' stamps, in the table directory's log, and their
+/// outcomes, in the status log's (the root's, for a table on another storage
+/// location). Directory first, outcomes last, the order
+/// `Database::sync_durable` uses.
+///
+/// One `fdatasync` per log that owes one, and nothing when neither does.
+/// Taken once per sweep that found anything reclaimable, before any of it is
+/// acted on (see `run_once`).
+///
+/// Run under `block_in_place` on a multi-threaded runtime, so a slow disk
+/// (hundreds of ms per sync on ext4) hands this worker's other tasks to
+/// another thread instead of stalling them. Not `spawn_blocking`: the syncs
+/// stay on the calling thread, which is how the power-loss tests tell the
+/// sweep's syncs from the background log writer's.
+fn outcome_barrier<S: StorageIO>(io_pointers: &S, horizon: &VersionHorizon) -> std::io::Result<()> {
+    let wal = io_pointers
+        .get_location()
+        .and_then(|location| crate::core::wal::wal_for(&location));
+    let manager = horizon.manager.as_ref();
+    if wal.is_none() && manager.is_none() {
+        return Ok(());
+    }
+    let sync = || {
+        if let Some(wal) = wal.as_ref() {
+            wal.sync_pending()?;
+        }
+        if let Some(manager) = manager {
+            manager.flush_all()?;
+        }
+        Ok(())
+    };
+    match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(sync),
+        _ => sync(),
+    }
+}
+
+/// Clears the fingerprints a sweep found reclaimable, and returns how many,
+/// or `None` when none may be counted as cleared, so `cleared_below` must
+/// stay where it was and the next sweep finds them again.
+///
+/// Called only once [`outcome_barrier`] has succeeded. The decision that a
+/// version is reclaimable reads its deleter's outcome from memory, and a
+/// commit's outcome can still be in the page cache then (an asynchronous
+/// commit, or the window before its sync). A cleared slot reaches the
+/// filter's checkpoint, and for a table whose directory has its own log that
+/// checkpoint can be durable while the outcome is not. A power cut then
+/// undoes the delete, the row is visible again, and the trusted sidecar
+/// prunes it from every filtered query for good.
+///
+/// Nor when the slots were renumbered (`VACUUM FULL`) since the sweep began:
+/// its slot numbers then name other rows. `epoch` is the filter's
+/// renumbering epoch read before the sweep.
+fn apply_filter_clears(ctx: &ReclaimContext<'_>, epoch: Option<u64>, runs: &[(u64, u64)]) -> Option<u64> {
+    let n: u64 = runs.iter().map(|r| r.1).sum();
+    match (ctx.filters, epoch) {
+        (Some(filters), Some(epoch)) if n > 0 => filters.on_delete_runs_at(epoch, runs).then_some(n),
+        _ => Some(0),
+    }
 }
 
 /// Appends a reclaimable extent to the sweep's dead list, coalescing as it
@@ -1394,6 +1472,9 @@ pub async fn run_once<S: StorageIO>(
     // this, so clamping to it can only ever exclude bytes, never include ones a
     // pointer has since claimed.
     let rows_len = io_rows.get_len().await;
+    // Before the sweep reads a slot: clears are applied only if no
+    // renumbering began or ended since.
+    let clear_epoch = ctx.filters.map(|f| f.renumber_epoch());
     let scan = scan_pointers(
         io_pointers,
         free_space,
@@ -1405,11 +1486,38 @@ pub async fn run_once<S: StorageIO>(
     #[cfg(test)]
     run_once_test_hooks::reached(free_space, run_once_test_hooks::AFTER_SCAN).await;
 
-
-    // Only after the sweep has finished, so a crash part-way leaves the bound
-    // where it was and the next run re-clears rather than skipping.
-    ctx.cleared_below
-        .fetch_max(horizon.oldest_active(), Ordering::AcqRel);
+    // Everything below acts on the sweep's decisions as final: fingerprints
+    // cleared (and then checkpointed), extents handed to writers. Those
+    // decisions read outcomes from memory, so the outcomes are made durable
+    // first. Otherwise a power cut can undo a delete whose slot the filter's
+    // sidecar already prunes, or whose bytes a writer given the extent has
+    // already overwritten. When that fails, nothing is cleared or published,
+    // and the next sweep finds it all again.
+    let durable = scan.dead_rows == 0
+        || match outcome_barrier(io_pointers, horizon) {
+            Ok(()) => true,
+            Err(e) => {
+                log::error!(
+                    "Vacuum: the outcomes behind {} reclaimable versions could not be made \
+                     durable ({}); nothing is cleared or reclaimed this run",
+                    scan.dead_rows,
+                    e
+                );
+                false
+            }
+        };
+    let fingerprints_cleared = if durable {
+        apply_filter_clears(ctx, clear_epoch, &scan.clear_runs)
+    } else {
+        None
+    };
+    // Only after the sweep has finished and its clears are applied, so a crash
+    // part-way, a failed barrier or a renumbering leaves the bound where it was
+    // and the next run re-clears rather than skipping.
+    if fingerprints_cleared.is_some() {
+        ctx.cleared_below
+            .fetch_max(horizon.oldest_active(), Ordering::AcqRel);
+    }
 
     // Before anything below can publish an extent: these versions' bytes are
     // still theirs, so their keys read back true. Once published, the space
@@ -1456,10 +1564,17 @@ pub async fn run_once<S: StorageIO>(
         reclaimed_bytes: 0,
         extents: candidates.len() as u64,
         deferred: false,
-        fingerprints_cleared: scan.fingerprints_cleared,
+        fingerprints_cleared: fingerprints_cleared.unwrap_or(0),
         held_rows: scan.held_rows,
         held_min_xmax: scan.held_min_xmax,
     };
+
+    // See `outcome_barrier` above: nothing this run found is handed out.
+    // Reported as deferred, so the service sweeps again.
+    if !durable {
+        report.deferred = true;
+        return Ok(report);
+    }
 
     if !force {
         let ratio = report.dead_ratio();
@@ -3147,5 +3262,31 @@ mod tests {
             assert!(now >= last, "horizon went from {} back to {}", last, now);
             last = now;
         }
+    }
+}
+
+#[cfg(test)]
+mod push_run_tests {
+    use super::push_run;
+
+    fn runs_of(slots: &[u64]) -> Vec<(u64, u64)> {
+        let mut runs = Vec::new();
+        for &s in slots {
+            push_run(&mut runs, s);
+        }
+        runs
+    }
+
+    #[test]
+    fn only_adjacent_slots_merge() {
+        assert_eq!(runs_of(&[]), vec![]);
+        assert_eq!(runs_of(&[7]), vec![(7, 1)]);
+        assert_eq!(runs_of(&[0, 1, 2]), vec![(0, 3)]);
+        assert_eq!(
+            runs_of(&[10, 12, 13, 14, 40]),
+            vec![(10, 1), (12, 3), (40, 1)],
+            "a run spanned a gap, which clears the live slots inside it"
+        );
+        assert_eq!(runs_of(&[5, 7, 9]), vec![(5, 1), (7, 1), (9, 1)]);
     }
 }

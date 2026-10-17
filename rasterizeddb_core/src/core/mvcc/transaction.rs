@@ -1222,6 +1222,12 @@ impl TransactionManager {
         self.status.flush()
     }
 
+    /// Makes every outcome recorded so far durable, whoever staged it. See
+    /// [`StatusLog::flush_all`].
+    pub fn flush_all(&self) -> std::io::Result<()> {
+        self.status.flush_all()
+    }
+
     /// Writes the outcome records without syncing them.
     ///
     /// The sync is owed to the log, and the caller must take it — normally via

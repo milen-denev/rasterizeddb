@@ -235,6 +235,7 @@ fn a_renumbering_fences_off_work_that_read_slots_before_or_during_it() {
     let during = f.renumber_epoch();
     assert!(!f.backfill_batch_at(before, &rows(10)), "a stale backfill batch was applied");
     assert!(!f.clear_unindexed_prefix_at(before), "a stale backfill cleared the prefix");
+    assert!(!f.on_delete_runs_at(before, &[(3, 2)]), "a stale vacuum clear was applied");
     assert!(!f.is_complete());
 
     // A checkpoint taken now does not vouch for the renumbered slots.
@@ -446,4 +447,52 @@ async fn a_vacuum_sweep_overlapping_a_compaction_publishes_no_old_extents() {
 
     drop(db);
     crate::core::wal::remove_for(&path_str(base.path()));
+}
+
+/// Vacuum's deferred clears yield each column's lock every `CLEAR_CHUNK`
+/// slots. Runs that straddle those boundaries must clear exactly the slots a
+/// slot-at-a-time clear would, no more and no fewer.
+#[test]
+fn chunked_run_clears_match_clearing_slot_by_slot() {
+    use crate::core::db_type::DbType;
+    use crate::core::filter::{FilterConfig, TableFilters};
+    use crate::core::row::schema::SchemaField;
+    const N: u64 = 10_000;
+    // A text column: fingerprinted, so a cleared slot changes its plane.
+    let fields = vec![SchemaField::new("s".to_string(), DbType::STRING, 12, 0, 0, false)];
+    let f = TableFilters::new(&fields, FilterConfig::default());
+    let text_rows: Vec<(u64, smallvec::SmallVec<[(u32, Vec<u8>); 32]>)> = (0..N)
+        .map(|slot| {
+            let mut c: smallvec::SmallVec<[(u32, Vec<u8>); 32]> = smallvec::SmallVec::new();
+            c.push((0, format!("v{slot:08}").into_bytes()));
+            (slot, c)
+        })
+        .collect();
+    f.backfill_batch(&text_rows);
+    f.clear_unindexed_prefix();
+    let image = f.checkpoint_bytes(N);
+    let load = || TableFilters::from_checkpoint(&image, &fields, FilterConfig::default(), N).unwrap();
+    let (one_by_one, in_runs, one_short) = (load(), load(), load());
+    // The boundary counts slots cleared, not slot numbers: single slots, a
+    // run the first boundary falls inside (slot 4104, the 4096th cleared), a
+    // run that ends exactly on the second (8192 cleared), and runs after it.
+    let runs: Vec<(u64, u64)> = vec![(0, 1), (2, 1), (10, 4100), (5000, 4090), (9095, 1), (9100, 50)];
+    assert!(runs.iter().map(|r| r.1).sum::<u64>() > 2 * 4096, "the runs no longer cross two boundaries");
+    for &(first, count) in &runs {
+        for slot in first..first + count {
+            one_by_one.on_delete(slot);
+            if slot != 4104 {
+                one_short.on_delete(slot);
+            }
+        }
+    }
+    assert!(
+        one_by_one.checkpoint_bytes(N) != one_short.checkpoint_bytes(N),
+        "one slot's clear does not show in the checkpoint, so the comparison proves nothing"
+    );
+    assert!(in_runs.on_delete_runs_at(in_runs.renumber_epoch(), &runs));
+    assert!(
+        one_by_one.checkpoint_bytes(N) == in_runs.checkpoint_bytes(N),
+        "clearing in chunked runs cleared different slots than clearing one at a time"
+    );
 }
