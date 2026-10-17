@@ -72,6 +72,9 @@ struct CommitState {
     /// there is no portable way to make a real file's flush fail on demand.
     #[cfg(test)]
     fail_next_flush: AtomicBool,
+    /// When this file's handles came to be: the log refuses their records once
+    /// the file has been deleted since (see `Wal::forget_files`).
+    born: crate::core::wal::Incarnation,
 }
 
 /// Why a file stopped being durable.
@@ -1589,12 +1592,14 @@ impl StorageIO for LocalStorageProvider {
             .fetch_max(position + buffer.len() as u64, Ordering::AcqRel);
         let logged = crate::core::wal::with_wal_for(&self.location, |w| {
             let w = w?;
-            let mut outcome = w.log_in_place(txn, self.wal_file_id(), position, buffer);
+            let mut outcome =
+                w.log_in_place_from(txn, self.wal_file_id(), position, buffer, self.commit.born);
             if outcome.is_err() {
                 // The one failure that is not the log's: a file it has not
                 // been told about yet. Registered and tried once more.
                 w.register_file(self.wal_file_id(), &self.file_str);
-                outcome = w.log_in_place(txn, self.wal_file_id(), position, buffer);
+                outcome =
+                    w.log_in_place_from(txn, self.wal_file_id(), position, buffer, self.commit.born);
             }
             // The data file is deliberately untouched here; `commit_durable`
             // applies it once the record is durable. Overwriting first would
@@ -1692,7 +1697,7 @@ impl StorageIO for LocalStorageProvider {
             0
         } else {
             crate::core::wal::with_wal_for(&self.location, |w| match w {
-                Some(w) => match w.log(txn, self.wal_file_id(), offset, buffer) {
+                Some(w) => match w.log_from(txn, self.wal_file_id(), offset, buffer, self.commit.born) {
                     Ok(_) => txn,
                     // The `0` this falls back to is refused by
                     // `commit_durable` when the failure poisoned the log.

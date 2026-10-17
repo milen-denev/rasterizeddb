@@ -73,6 +73,14 @@ const FORMAT_VERSION: u8 = 1;
 /// id becomes eligible for replay.
 const FLAG_COMMIT: u8 = 1 << 0;
 
+/// Once its transaction commits, every record for this `file_id` logged before
+/// it is void: the file it described was deleted. See [`Wal::forget_files`].
+///
+/// A flag rather than a version bump. A build that predates it reads the
+/// record as a zero-length write and applies nothing, so its replay is the
+/// one it always did rather than a refusal to open the log at all.
+const FLAG_FORGET: u8 = 1 << 1;
+
 /// magic + version + flags + pad + txn + file_id + offset + len + crc
 const HEADER_LEN: usize = 4 + 1 + 1 + 2 + 8 + 8 + 8 + 4 + 4;
 /// Bytes of the header covered by the CRC (everything before the CRC field).
@@ -134,6 +142,33 @@ fn write_lsn_mark(wal_path: &Path, lsn: u64) -> io::Result<()> {
 /// Refuses absurd record lengths before allocating for them, so a corrupt header
 /// cannot make recovery try to reserve gigabytes.
 const MAX_RECORD_PAYLOAD: usize = 256 * 1024 * 1024;
+
+/// One process-wide order for writers coming to be and for fences being taken:
+/// see [`Incarnation`].
+static INCARNATIONS: AtomicU64 = AtomicU64::new(1);
+
+/// When a file's writer came to be, in the one order [`Wal::forget_files`]
+/// fences are taken in. A writer born before a fence of its file id writes to
+/// the deleted file, and the log refuses its records (see [`Wal::log_from`]):
+/// a record logged after the barrier is not voided by it, and the next open
+/// would write it into whatever file took the name since.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Incarnation(u64);
+
+impl Incarnation {
+    /// Exempt from every fence: for callers that are no file's writer.
+    pub const UNFENCED: Incarnation = Incarnation(u64::MAX);
+
+    pub fn new() -> Incarnation {
+        Incarnation(INCARNATIONS.fetch_add(1, Ordering::AcqRel))
+    }
+}
+
+impl Default for Incarnation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Name of the log inside a database directory.
 pub const DEFAULT_WAL_NAME: &str = "rasterized.wal";
@@ -213,8 +248,15 @@ pub struct RecoveryStats {
     pub rolled_back: u64,
     /// Records skipped because their `file_id` is not registered.
     pub unresolved: u64,
+    /// Records skipped because a later committed [`Wal::forget_files`]
+    /// barrier voided them: their file was deleted after they were logged.
+    pub forgotten: u64,
     /// Bytes of trailing garbage ignored — a partial record from a crash.
     pub truncated_tail: u64,
+    /// Highest transaction id any record in the log carries. A log that is
+    /// kept after recovery must not see these ids handed out again: its
+    /// commit markers would mark the new transactions committed.
+    pub last_txn: u64,
 }
 
 /// Trailing bytes a scan did not validate, given the log's length and how far
@@ -360,6 +402,11 @@ pub struct Wal {
     /// do not take that lock. `u64::MAX` when unset. Written under the writer
     /// lock.
     last_dirty: AtomicU64,
+    /// `file_id` -> the fence [`Wal::forget_files`] took for it: records from
+    /// writers born before it are refused. Written and read under the writer
+    /// lock, so a record is either framed before the barrier (and voided by
+    /// it) or refused. Never shrinks: one entry per name ever deleted.
+    fences: Mutex<HashMap<u64, u64>>,
 }
 
 /// See [`Wal::dirty`].
@@ -390,8 +437,9 @@ fn files_named_by_log(path: &Path) -> Option<HashSet<u64>> {
     let mut ids = HashSet::new();
     loop {
         match scan.next() {
-            // A commit marker names no file.
+            // A commit marker names no file, and a barrier describes no bytes.
             Ok(Some(h)) if h.flags & FLAG_COMMIT != 0 && h.file_id == 0 => {}
+            Ok(Some(h)) if h.flags & FLAG_FORGET != 0 => {}
             Ok(Some(h)) => {
                 ids.insert(h.file_id);
             }
@@ -473,6 +521,7 @@ impl Wal {
             break_granted_at: AtomicU64::new(0),
             dirty: Mutex::new(dirty),
             last_dirty: AtomicU64::new(u64::MAX),
+            fences: Mutex::new(HashMap::new()),
         })
     }
 
@@ -584,7 +633,20 @@ impl Wal {
     /// file when this returns but not yet on stable storage; pass the sequence
     /// to [`Wal::commit_through`] for that.
     pub fn log(&self, txn: u64, file_id: u64, offset: u64, bytes: &[u8]) -> io::Result<u64> {
-        self.log_at(txn, file_id, offset, bytes, None)
+        self.log_from(txn, file_id, offset, bytes, Incarnation::UNFENCED)
+    }
+
+    /// [`Wal::log`] for a file's writer born at `born`: refused, and nothing
+    /// logged, when the file was deleted since (see [`Wal::forget_files`]).
+    pub fn log_from(
+        &self,
+        txn: u64,
+        file_id: u64,
+        offset: u64,
+        bytes: &[u8],
+        born: Incarnation,
+    ) -> io::Result<u64> {
+        self.log_at(txn, file_id, offset, bytes, None, born)
             .map(|(seq, _)| seq)
     }
 
@@ -601,6 +663,7 @@ impl Wal {
         offset: u64,
         bytes: &[u8],
         pending_path: Option<PathBuf>,
+        born: Incarnation,
     ) -> io::Result<(u64, u64)> {
         if bytes.len() > MAX_RECORD_PAYLOAD {
             return Err(io::Error::new(
@@ -616,6 +679,17 @@ impl Wal {
         // no concurrent writer can interleave between them.
         let (seq, payload_at) = {
             let mut file = self.writer.lock();
+            // Under the writer lock, as the fence is taken: either this record
+            // precedes the barrier and is voided by it, or it is refused.
+            if let Some(&fence) = self.fences.lock().get(&file_id)
+                && born.0 <= fence
+            {
+                return Err(io::Error::other(format!(
+                    "refusing a log record for file id {file_id}: its file was deleted after \
+                     this writer opened it, and the record would replay into the next file \
+                     of that name"
+                )));
+            }
             let record_at = self.write_pos.load(Ordering::Relaxed);
             self.append_locked(&mut file, &mut [io::IoSlice::new(&header), io::IoSlice::new(bytes)])?;
             self.mark_dirty_locked(file_id);
@@ -680,6 +754,19 @@ impl Wal {
         offset: u64,
         bytes: &[u8],
     ) -> io::Result<u64> {
+        self.log_in_place_from(txn, file_id, offset, bytes, Incarnation::UNFENCED)
+    }
+
+    /// [`Wal::log_in_place`] for a file's writer born at `born`; see
+    /// [`Wal::log_from`].
+    pub fn log_in_place_from(
+        &self,
+        txn: u64,
+        file_id: u64,
+        offset: u64,
+        bytes: &[u8],
+        born: Incarnation,
+    ) -> io::Result<u64> {
         // Resolved before the record is written: failing afterwards would
         // leave a logged overwrite that nothing is tracking.
         let path = self.files.lock().get(&file_id).cloned();
@@ -689,7 +776,7 @@ impl Wal {
             )));
         };
 
-        let (seq, _) = self.log_at(txn, file_id, offset, bytes, Some(path))?;
+        let (seq, _) = self.log_at(txn, file_id, offset, bytes, Some(path), born)?;
         Ok(seq)
     }
 
@@ -1156,6 +1243,85 @@ impl Wal {
         // Owed to `sync_pending`, as `finish_txn` records a deferred commit.
         self.pending_sync.fetch_max(seq, Ordering::AcqRel);
         Ok(seq)
+    }
+
+    /// Voids every record this log holds for `file_ids`, for a caller about to
+    /// delete those files. Durable when it returns.
+    ///
+    /// A record names its file only by an id hashed from the file's name, so a
+    /// file deleted and later created again under that name (a dropped table
+    /// recreated, which an `ALTER … ADD COLUMN` rewrite does, or a table
+    /// created under a renamed table's old name) has the id and path the old
+    /// one had. A replay before the next checkpoint (and every open replays)
+    /// wrote the old file's records into the new one, and wherever the new
+    /// file was shorter the old bytes came back, rows included.
+    ///
+    /// Not a checkpoint, though one would void them too: a checkpoint declines
+    /// while any transaction holds an in-place write, the dropping one's
+    /// included, so it cannot be relied on, and it flushes every file written
+    /// since the last one. This is one header per file and one log sync.
+    ///
+    /// Positional: replay skips the records for these ids that precede the
+    /// barrier, whenever their transactions commit, and applies the ones after
+    /// it, which belong to whatever file takes the name next. A barrier whose
+    /// commit marker is lost voids nothing, which is the state before the call.
+    /// A failure that poisoned the log came after the append, so the barrier
+    /// may be durable; a failure that did not left nothing that can commit.
+    ///
+    /// The one sync also makes everything logged before it durable, so a
+    /// caller that needs an earlier record of this log durable first (a
+    /// catalogue tombstone) owes no sync of its own.
+    pub fn forget_files(&self, file_ids: &[u64]) -> io::Result<()> {
+        if file_ids.is_empty() {
+            return Ok(());
+        }
+        if unlikely(self.poisoned.load(Ordering::Acquire)) {
+            return Err(self.poisoned_error());
+        }
+        #[cfg(test)]
+        if test_hooks::FAIL_FORGET.with(|f| f.get())
+            && test_hooks::FORGETS_BEFORE_FAILING.with(|n| {
+                let left = n.get();
+                n.set(left.saturating_sub(1));
+                left == 0
+            })
+        {
+            test_hooks::FAIL_FORGET.with(|f| f.set(false));
+            return Err(io::Error::other("injected failure to log a barrier"));
+        }
+        let txn = self.begin();
+        let headers: Vec<[u8; HEADER_LEN]> =
+            file_ids.iter().map(|id| forget_header(txn, *id)).collect();
+        let framed = (headers.len() * HEADER_LEN) as u64;
+        {
+            let mut file = self.writer.lock();
+            let mut bufs: Vec<io::IoSlice<'_>> =
+                headers.iter().map(|h| io::IoSlice::new(h)).collect();
+            self.append_locked(&mut file, &mut bufs)?;
+            // Fenced from here, under the same lock: a writer that opened
+            // these files before now cannot log after the barrier, where it
+            // would not be voided. Only once the barrier is in the file: a
+            // failed append leaves the caller free to keep the table.
+            let fence = INCARNATIONS.fetch_add(1, Ordering::AcqRel);
+            let mut fences = self.fences.lock();
+            for id in file_ids {
+                fences.insert(*id, fence);
+            }
+            drop(fences);
+            // Not marked dirty: a barrier gives a checkpoint nothing to flush.
+            self.write_pos.fetch_add(framed, Ordering::Relaxed);
+            self.issued
+                .fetch_add(headers.len() as u64, Ordering::AcqRel);
+        }
+        self.bytes_since_checkpoint
+            .fetch_add(framed, Ordering::Relaxed);
+        #[cfg(test)]
+        if test_hooks::FAIL_BARRIER_SYNC.with(|f| f.replace(false)) {
+            self.log_commit_marker(txn)?;
+            self.poison("injected fdatasync failure".to_string());
+            return Err(io::Error::other("injected fdatasync failure"));
+        }
+        self.commit_txn(txn)
     }
 
     /// Bytes of in-place overwrites currently held back, across all open
@@ -1654,10 +1820,16 @@ impl Wal {
 
         // Pass 1: which transactions reached a commit record?
         let mut committed: HashSet<u64> = HashSet::new();
+        // `(txn, file_id, position)` of every barrier, committed or not.
+        let mut barriers: Vec<(u64, u64, u64)> = Vec::new();
         let valid_bytes;
         {
             let mut scan = LogScanner::open(path)?;
+            let mut ordinal = 0u64;
             while let Some(h) = scan.next()? {
+                let at = ordinal;
+                ordinal += 1;
+                stats.last_txn = stats.last_txn.max(h.txn);
                 if h.flags & FLAG_COMMIT != 0 {
                     // A marker carries its commit sequence in `offset`.
                     if upto.is_some_and(|ceiling| h.offset > ceiling) {
@@ -1665,24 +1837,46 @@ impl Wal {
                     }
                     committed.insert(h.txn);
                     stats.last_commit_lsn = stats.last_commit_lsn.max(h.offset);
+                } else if h.flags & FLAG_FORGET != 0 {
+                    barriers.push((h.txn, h.file_id, at));
                 }
             }
             valid_bytes = scan.consumed;
+        }
+
+        // Per file, the position of its last committed barrier: its records
+        // before that describe a file that was deleted, and the file under
+        // that name now, if any, is another one. Known only once pass 1 has
+        // seen every marker, since a barrier's commit comes after it.
+        let mut void_before: HashMap<u64, u64> = HashMap::new();
+        for (txn, file_id, at) in barriers {
+            if committed.contains(&txn) {
+                let before = void_before.entry(file_id).or_insert(0);
+                *before = (*before).max(at);
+            }
         }
 
         // Pass 2: apply the records those transactions own.
         let mut open_files: HashMap<u64, Option<File>> = HashMap::new();
         {
             let mut scan = LogScanner::open(path)?;
+            let mut ordinal = 0u64;
             while let Some(h) = scan.next()? {
-                // Commit markers are control records: they describe no bytes and
-                // must not be replayed as if they did.
-                if h.flags & FLAG_COMMIT != 0 {
+                let at = ordinal;
+                ordinal += 1;
+                // Commit markers and barriers are control records: they
+                // describe no bytes and must not be replayed as if they did.
+                if h.flags & (FLAG_COMMIT | FLAG_FORGET) != 0 {
                     continue;
                 }
 
                 if !committed.contains(&h.txn) {
                     stats.rolled_back += 1;
+                    continue;
+                }
+
+                if void_before.get(&h.file_id).is_some_and(|&before| at < before) {
+                    stats.forgotten += 1;
                     continue;
                 }
 
@@ -1863,6 +2057,39 @@ fn record_header(txn: u64, file_id: u64, offset: u64, bytes: &[u8]) -> [u8; HEAD
     header
 }
 
+/// The zero-payload record voiding `file_id`'s earlier records once `txn`
+/// commits. See [`Wal::forget_files`].
+#[inline]
+fn forget_header(txn: u64, file_id: u64) -> [u8; HEADER_LEN] {
+    let mut header = [0u8; HEADER_LEN];
+    header[0..4].copy_from_slice(&RECORD_MAGIC.to_le_bytes());
+    header[4] = FORMAT_VERSION;
+    header[5] = FLAG_FORGET;
+    header[8..16].copy_from_slice(&txn.to_le_bytes());
+    header[16..24].copy_from_slice(&file_id.to_le_bytes());
+
+    let mut digest = CRC.digest();
+    digest.update(&header[0..HEADER_CRC_LEN]);
+    header[HEADER_CRC_LEN..HEADER_LEN].copy_from_slice(&digest.finalize().to_le_bytes());
+    header
+}
+
+/// How many barrier records the log at `path` holds, committed or not: for
+/// tests that pin when a caller writes one.
+#[cfg(test)]
+pub(crate) fn barriers_in(path: &Path) -> usize {
+    let Ok(mut scan) = LogScanner::open(path) else {
+        return 0;
+    };
+    let mut n = 0;
+    while let Ok(Some(h)) = scan.next() {
+        if h.flags & FLAG_FORGET != 0 {
+            n += 1;
+        }
+    }
+    n
+}
+
 /// The zero-payload record that marks `txn` committed, carrying `lsn`.
 #[inline]
 fn marker_header(txn: u64, lsn: u64) -> [u8; HEADER_LEN] {
@@ -1908,6 +2135,20 @@ pub(crate) mod test_hooks {
         /// Makes the next commit marker written on this thread fail before
         /// touching the file, as a full disk would.
         pub static FAIL_COMMIT_MARKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+        /// Makes the next `Wal::forget_files` on this thread fail before
+        /// touching the file, as a full disk would.
+        pub static FAIL_FORGET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+        /// How many `Wal::forget_files` calls on this thread `FAIL_FORGET`
+        /// lets through before failing one: the second log of a drop.
+        pub static FORGETS_BEFORE_FAILING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+
+        /// Makes the next `Wal::forget_files` on this thread fail at its
+        /// sync, after the barrier and its commit marker are in the file, and
+        /// poison the log, as a failed `fdatasync` does. What a crash keeps
+        /// of those bytes is then undecided, which is the case to test.
+        pub static FAIL_BARRIER_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 
         /// Makes the next WAL write on this thread put only this many bytes
         /// in the file and then fail, as a full disk or EIO would.
@@ -2153,13 +2394,25 @@ pub fn open_and_recover(dir: &str) -> io::Result<(Arc<Wal>, RecoveryStats)> {
     // monotonic across restarts and can serve as a durable point-in-time token.
     wal.commit_lsn
         .fetch_max(stats.last_commit_lsn, Ordering::AcqRel);
+    // And transaction ids past every one in the log, which a log kept below
+    // still holds: pass 1 of the next recovery reads committed-ness by id
+    // alone, so an old marker would commit a new transaction's partial writes.
+    wal.next_txn
+        .fetch_max(stats.last_txn.saturating_add(1), Ordering::AcqRel);
 
-    if stats.applied > 0 || stats.rolled_back > 0 || stats.truncated_tail > 0 {
+    // A voided record never needs replaying again, so a log holding only those
+    // is done with as much as one whose records were applied.
+    if stats.applied > 0
+        || stats.rolled_back > 0
+        || stats.truncated_tail > 0
+        || stats.forgotten > 0
+    {
         log::info!(
-            "WAL recovery in {}: applied {}, rolled back {}, unresolved {}, discarded {} trailing bytes",
+            "WAL recovery in {}: applied {}, rolled back {}, voided {}, unresolved {}, discarded {} trailing bytes",
             dir,
             stats.applied,
             stats.rolled_back,
+            stats.forgotten,
             stats.unresolved,
             stats.truncated_tail
         );
@@ -2388,6 +2641,170 @@ mod tests {
         assert_eq!(stats.applied, 2);
         assert_eq!(read_file(&rows), b"ROWDATA");
         assert_eq!(read_file(&ptrs), b"PTR");
+    }
+
+    /// A committed barrier voids its file's earlier records and only those:
+    /// what comes after it, and every other file's records, still replay. A
+    /// file deleted and created again under one name has one id, so without
+    /// this the deleted file's bytes landed in the new one.
+    #[test]
+    fn a_barrier_voids_only_its_files_earlier_records() {
+        let dir = temp_dir();
+        let wal_path = dir.path().join(DEFAULT_WAL_NAME);
+        let reborn = dir.path().join("reborn.db");
+        let other = dir.path().join("other.db");
+        let reborn_id = file_id_for_name("reborn.db");
+        let other_id = file_id_for_name("other.db");
+
+        let wal = Wal::open(&wal_path).unwrap();
+        // The first incarnation, longer than the second will be. An uncommitted
+        // transaction spans the barrier and commits after it: voided too, as
+        // the bytes describe the deleted file whenever they commit.
+        let late = wal.begin();
+        wal.log(late, reborn_id, 12, b"LATE").unwrap();
+        wal.log_and_commit(reborn_id, 0, b"OLD-OLD-OLD-").unwrap();
+        wal.log_and_commit(other_id, 0, b"keep").unwrap();
+        wal.forget_files(&[reborn_id]).unwrap();
+        wal.commit_txn(late).unwrap();
+        // The second incarnation, deleted in turn: the last barrier is the one
+        // that counts, or a second rewrite before a checkpoint would bring
+        // this one's bytes into the third.
+        wal.log_and_commit(reborn_id, 0, b"MID-MID").unwrap();
+        wal.forget_files(&[reborn_id]).unwrap();
+        // The third.
+        wal.log_and_commit(reborn_id, 0, b"new").unwrap();
+        wal.log_and_commit(other_id, 4, b"!").unwrap();
+
+        let (r, o) = (reborn.clone(), other.clone());
+        let stats = Wal::recover(&wal_path, move |id| {
+            (id == reborn_id)
+                .then(|| r.clone())
+                .or_else(|| (id == other_id).then(|| o.clone()))
+        })
+        .unwrap();
+        assert_eq!(read_file(&reborn), b"new", "a voided record reached the file");
+        assert_eq!(read_file(&other), b"keep!", "another file's records were voided");
+        assert_eq!(stats.forgotten, 3);
+        assert_eq!(stats.applied, 3);
+    }
+
+    /// A log whose records were all voided is done with, like one whose
+    /// records were applied, and is truncated: kept, its old commit markers
+    /// would outlive the process that wrote them.
+    #[test]
+    fn a_log_of_only_voided_records_is_truncated_by_recovery() {
+        let dir = temp_dir();
+        let dir_str = dir.path().to_string_lossy().into_owned();
+        let wal_path = dir.path().join(DEFAULT_WAL_NAME);
+        let id = file_id_for_name("gone.db");
+        {
+            let wal = Wal::open(&wal_path).unwrap();
+            wal.log_and_commit(id, 0, b"gone").unwrap();
+            wal.forget_files(&[id]).unwrap();
+        }
+        let (_wal, stats) = open_and_recover(&dir_str).unwrap();
+        assert_eq!((stats.applied, stats.forgotten), (0, 1));
+        assert_eq!(
+            std::fs::metadata(&wal_path).unwrap().len(),
+            0,
+            "a log recovery finished with was kept"
+        );
+        remove_for(&dir_str);
+    }
+
+    /// A log recovery keeps (here, one naming a file that is not there) still
+    /// holds its commit markers, which name transactions by id. The next
+    /// process must not hand those ids out again: one of its transactions,
+    /// cut off by a crash before committing, read as committed by the old
+    /// marker and its partial writes were replayed.
+    #[test]
+    fn a_kept_log_does_not_commit_a_later_processs_transaction() {
+        let dir = temp_dir();
+        let dir_str = dir.path().to_string_lossy().into_owned();
+        let wal_path = dir.path().join(DEFAULT_WAL_NAME);
+        let data = dir.path().join("t.db");
+        std::fs::write(&data, b"").unwrap();
+        let missing = file_id_for_name("missing.db");
+        {
+            let wal = Wal::open(&wal_path).unwrap();
+            wal.log_and_commit(missing, 0, b"elsewhere").unwrap();
+        }
+        let (wal, stats) = open_and_recover(&dir_str).unwrap();
+        assert_eq!(stats.unresolved, 1);
+        assert!(
+            std::fs::metadata(&wal_path).unwrap().len() > 0,
+            "the log was truncated, so it no longer tests a kept one"
+        );
+        // A transaction cut off before its commit.
+        let txn = wal.begin();
+        wal.log(txn, file_id_for_name("t.db"), 0, b"torn").unwrap();
+        drop(wal);
+        remove_for(&dir_str);
+
+        let (_wal, stats) = open_and_recover(&dir_str).unwrap();
+        assert_eq!(read_file(&data), b"", "an uncommitted transaction was replayed");
+        assert_eq!(stats.applied, 0);
+        remove_for(&dir_str);
+    }
+
+    /// A barrier whose commit marker never reached the log voids nothing, and
+    /// recovery to a point before the barrier committed keeps what it voids:
+    /// the file still existed then.
+    #[test]
+    fn an_uncommitted_or_later_barrier_voids_nothing() {
+        let dir = temp_dir();
+        let wal_path = dir.path().join(DEFAULT_WAL_NAME);
+        let data = dir.path().join("t.db");
+        let id = file_id_for_name("t.db");
+
+        let wal = Wal::open(&wal_path).unwrap();
+        wal.log_and_commit(id, 0, b"kept").unwrap(); // commit sequence 1
+        let before_barrier = std::fs::metadata(&wal_path).unwrap().len();
+        wal.forget_files(&[id]).unwrap(); // commit sequence 2
+        let with_barrier = std::fs::read(&wal_path).unwrap();
+
+        // Cut just before the barrier's marker: a torn tail.
+        let torn = dir.path().join("torn.log");
+        std::fs::write(&torn, &with_barrier[..with_barrier.len() - HEADER_LEN]).unwrap();
+        assert!(with_barrier.len() as u64 > before_barrier + HEADER_LEN as u64);
+        let stats = Wal::recover(&torn, resolver(data.clone())).unwrap();
+        assert_eq!(read_file(&data), b"kept", "an uncommitted barrier voided a record");
+        assert_eq!(stats.forgotten, 0);
+
+        std::fs::remove_file(&data).unwrap();
+        let stats = Wal::recover_upto(&wal_path, resolver(data.clone()), Some(1)).unwrap();
+        assert_eq!(read_file(&data), b"kept", "a barrier past the ceiling voided a record");
+        assert_eq!(stats.forgotten, 0);
+
+        std::fs::remove_file(&data).unwrap();
+        let stats = Wal::recover(&wal_path, resolver(data.clone())).unwrap();
+        assert!(!data.exists(), "replay recreated a file whose records were all voided");
+        assert_eq!(stats.forgotten, 1);
+    }
+
+    /// A barrier names a file but describes no bytes, so a checkpoint owes the
+    /// file nothing for it.
+    #[test]
+    fn a_barrier_gives_a_checkpoint_nothing_to_flush() {
+        let dir = temp_dir();
+        let wal_path = dir.path().join(DEFAULT_WAL_NAME);
+        let data = dir.path().join("t.db");
+        std::fs::write(&data, b"").unwrap();
+        let id = file_id_for_name("t.db");
+
+        let wal = Wal::open(&wal_path).unwrap();
+        wal.register_file(id, &data);
+        wal.forget_files(&[id]).unwrap();
+        test_hooks::CHECKPOINT_SYNCS.with(|n| n.set(0));
+        assert!(wal.checkpoint().unwrap());
+        assert_eq!(test_hooks::CHECKPOINT_SYNCS.with(|n| n.get()), 0);
+        drop(wal);
+
+        // Nor does a log reopened with a barrier still in it.
+        let wal = Wal::open(&wal_path).unwrap();
+        wal.forget_files(&[id]).unwrap();
+        drop(wal);
+        assert_eq!(files_named_by_log(&wal_path), Some(HashSet::new()));
     }
 
     /// The write-ahead ordering: an overwrite must not reach the data file until

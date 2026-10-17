@@ -5,6 +5,17 @@ mod native_authz_tests;
 mod rename_tests;
 #[cfg(test)]
 mod recovery_refusal_tests;
+#[cfg(test)]
+mod drop_recreate_replay_tests;
+
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    thread_local! {
+        /// Fails the next catalogue tombstone on this thread before it is
+        /// written: the first step of a drop failing.
+        pub static FAIL_TOMBSTONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+}
 
 use std::{fmt, io, sync::atomic::AtomicU64};
 
@@ -215,6 +226,13 @@ const RENAMED_SUFFIXES: &[&str] = &[
     "_flt.db",
     "_seq.db",
 ];
+
+/// Every file a table of `name` may own: what its log records can name.
+fn table_file_names(name: &str) -> impl Iterator<Item = String> + '_ {
+    RENAMED_SUFFIXES
+        .iter()
+        .map(move |suffix| format!("{}{}", name, suffix))
+}
 
 /// Name of the marker recording a rename that has begun but not finished.
 const RENAME_INTENT_FILE: &str = "__rename.intent";
@@ -740,6 +758,15 @@ pub struct Database {
     /// same key/value table the same family. See [`SeedCache`].
     seeds: SeedCache,
 
+    /// Names whose files were kept because a log's records for them could not
+    /// be voided (a rename's old name; see [`forget_logged_files`]), until the
+    /// rename intent that also names them is finished at the next open. A
+    /// table created under one would open those files as its own, and the
+    /// next open would sweep them from under it, so `CREATE TABLE` and
+    /// `RENAME … TO` refuse them, and no further rename starts meanwhile (it
+    /// would overwrite the intent that finishes the job).
+    held_names: parking_lot::Mutex<Vec<String>>,
+
     /// The Redis-compatible key/value store (`KV …` statements and the RESP
     /// port). Built lazily: a database that never uses it allocates nothing.
     #[cfg(feature = "kv_cache")]
@@ -880,7 +907,7 @@ impl Database {
 
         // Before the table list, because what it resolves is which names that
         // list should contain.
-        recover_interrupted_rename(
+        let held = recover_interrupted_rename(
             &io_pointers,
             &io_rows,
             &io_schema,
@@ -964,7 +991,10 @@ impl Database {
             // would discard nothing. These leftovers predate that and are real
             // files in the database's own directory.
             if table_name.starts_with(crate::core::rql::cte::TEMP_TABLE_PREFIX) {
-                discard_files(&io_pointers, &table_name).await;
+                // Kept files keep their row too, so the next start tries again.
+                if !discard_files(&io_pointers, &storage, Some(location), &table_name).await {
+                    continue;
+                }
                 pool_forget(&storage, &table_name);
                 if let Err(e) =
                     tombstone_catalogue_row(&io_pointers, &io_rows, &io_schema, &table_name).await
@@ -1028,6 +1058,7 @@ impl Database {
             storage,
             kv: kv_stores,
             seeds,
+            held_names: parking_lot::Mutex::new(held.into_iter().collect()),
             #[cfg(feature = "kv_cache")]
             kv_cache: {
                 let handle = crate::core::kv_cache::KvCacheHandle::new((!in_memory).then_some(location));
@@ -1285,6 +1316,16 @@ impl Database {
     /// a sidecar names a shadow that names it back. Stopping is right in that
     /// case — leaking a table is recoverable, recursing forever is not.
     async fn drop_table_to_depth(&self, table_name: &str, depth: usize) -> io::Result<bool> {
+        // A held rename's intent names this table, and the next open settles
+        // the kept files by which of its two names the catalogue still holds.
+        // Dropped now, it would hold neither, the open would leave the kept
+        // files, and a table created under their name would take their rows.
+        if self.tables.contains_key(table_name) && self.held_names.lock().iter().any(|h| h == table_name) {
+            return Err(io::Error::other(format!(
+                "\"{table_name}\" is part of a rename whose old files could not be released yet; \
+                 restart before dropping it"
+            )));
+        }
         let Some((_, table)) = self.tables.remove(table_name) else {
             return Ok(false);
         };
@@ -1296,6 +1337,56 @@ impl Database {
             self.tables.insert(table_name.to_string(), table);
             error!("Could not remove {} from the catalogue: {}", table_name, e);
             return Err(e);
+        }
+
+        // Before any file goes, and after the catalogue row: see
+        // `forget_logged_files`. Records name files by a hash of the file
+        // name, so the next table of this name would otherwise have this one's
+        // records replayed into it at the next open, crash or not.
+        let mut unconfirmed = None;
+        if let Err(failure) = self.forget_dropped_files(&table.io_rows, table_name) {
+            if !failure.maybe_logged {
+                // No barrier reached any log: the row goes back, so a failed
+                // drop leaves the table as it was.
+                error!(
+                    "Could not void the log's records for {}, so it was not dropped: {}",
+                    table_name, failure.error
+                );
+                if let Err(restore) = self.remember_in_catalogue(table_name).await {
+                    error!(
+                        "... and could not put its catalogue row back ({}): it is open now \
+                         but will not be after a restart, though its files remain",
+                        restore
+                    );
+                }
+                self.tables.insert(table_name.to_string(), table);
+                return Err(failure.error);
+            }
+            // A barrier may be durable (the log failed past its append and is
+            // poisoned now), so the table cannot come back: a restart would
+            // open it with its unflushed records void. It is dropped, as
+            // asked, files included. Unlike feat/partitioning, which keeps
+            // the files and relies on its leftover-file name guard, this
+            // branch has no such guard, and a later table of this name would
+            // open kept files as its own. With the files gone, records a lost
+            // barrier left live resolve to nothing at the next open (replay
+            // resolves ids from the directory listing).
+            //
+            // And it is reported as the drop it is, unless the database's own
+            // log is poisoned: then not even the catalogue tombstone is known
+            // to be durable, and nothing after it can commit. An error here
+            // otherwise told the `ALTER` rewrites, which drop and then create
+            // again, that nothing happened, so they stopped between the two
+            // and lost the rows they held in memory, though a backup's log
+            // refusing its barrier while the database's own log took it is no
+            // reason to stop the create that follows.
+            error!(
+                "Dropped {} but could not make the void of its log records durable: {}",
+                table_name, failure.error
+            );
+            if self.own_log_poisoned() {
+                unconfirmed = Some(failure.error);
+            }
         }
 
         table.io_rows.drop_io();
@@ -1313,10 +1404,10 @@ impl Database {
         // one place to update when a sidecar is added, and one guard test
         // covering both directions.
         //
-        // Harmless for the files just released: `discard_files` tolerates a name
+        // Harmless for the files just released: `sweep_files` tolerates a name
         // that is not there, which is also what makes it usable for cleaning up
-        // a rename that never finished.
-        discard_files(
+        // a rename that never finished. The log was told above.
+        sweep_files_durably(
             &seed_in(
                 &self.db_io_pointers,
                 &self.storage,
@@ -1325,6 +1416,8 @@ impl Database {
                 table_name,
             )
             .await,
+            &self.storage,
+            self.location.as_deref(),
             table_name,
         )
         .await;
@@ -1364,8 +1457,135 @@ impl Database {
             );
         }
 
+        if let Some(e) = unconfirmed {
+            return Err(e);
+        }
         info!("Dropped table {}", table_name);
         Ok(true)
+    }
+
+    /// Whether the database's own log, which holds the catalogue, is poisoned.
+    fn own_log_poisoned(&self) -> bool {
+        self.location
+            .as_deref()
+            .and_then(crate::core::wal::wal_for)
+            .is_some_and(|wal| wal.is_poisoned())
+    }
+
+    /// [`forget_logged_files`] for a table being dropped, once its catalogue
+    /// tombstone is durable: a barrier that outlived the tombstone in a crash
+    /// would void the records of a table that still exists.
+    ///
+    /// The tombstone is an in-place write, whose commit already syncs the
+    /// database's own log, so the sync here is normally a no-op; it is asked
+    /// for rather than inherited because the barriers depend on it. Skipped
+    /// when the first barrier goes to the database's own log, whose commit
+    /// sync covers everything before it there anyway. Nothing at all for a
+    /// table with no log, which covers every statement-scoped relation: those
+    /// are dropped once per CTE, and a sync each is the cost their memory
+    /// backing exists to avoid.
+    fn forget_dropped_files(
+        &self,
+        io: &DbStorageProvider,
+        table_name: &str,
+    ) -> Result<(), ForgetFailure> {
+        let logs = logs_holding(io, &self.storage, self.location.as_deref());
+        if logs.is_empty() {
+            return Ok(());
+        }
+        if !self.leads_with_own_log(&logs) {
+            self.sync_own_log().map_err(|error| ForgetFailure {
+                error,
+                maybe_logged: false,
+            })?;
+        }
+        forget_logged_files(&logs, table_name)
+    }
+
+    /// Whether the first of `logs` is the database's own log, whose barrier
+    /// commit then syncs every catalogue change logged before it.
+    fn leads_with_own_log(&self, logs: &[StdArc<crate::core::wal::Wal>]) -> bool {
+        let own = self.location.as_deref().and_then(crate::core::wal::wal_for);
+        matches!((logs.first(), own), (Some(first), Some(own)) if StdArc::ptr_eq(first, &own))
+    }
+
+    /// Makes the database's own log durable: the catalogue's changes.
+    fn sync_own_log(&self) -> std::io::Result<()> {
+        let Some(location) = self.location.as_deref() else {
+            return Ok(()); // in-memory: nothing to sync
+        };
+        if let Some(wal) = crate::core::wal::wal_for(location) {
+            if let Err(e) = wal.sync_pending() {
+                error!("storage location {} could not be flushed: {}", location, e);
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuses `name` when a directory of this database already holds a
+    /// non-empty file the new table would take as its own.
+    ///
+    /// A drop's unlinks reach the disk only with a later directory sync (see
+    /// [`sweep_files_durably`]), so a power cut just after a drop can bring the
+    /// dropped table's files back while its catalogue row and the log's
+    /// barrier stay gone. A table created under the name opened them and
+    /// showed the dropped rows. The same holds for the files a rename that
+    /// could not finish leaves. Empty files are reused: a sweep creates each
+    /// missing file before deleting it, and an empty one holds nothing.
+    fn refuse_leftover_files(&self, name: &str) -> io::Result<()> {
+        // A statement-scoped relation lives in memory, and is created often.
+        if name.starts_with(crate::core::rql::cte::TEMP_TABLE_PREFIX) {
+            return Ok(());
+        }
+        let mut directories = pool_paths(&self.storage);
+        directories.extend(self.location.clone());
+        directories.sort();
+        directories.dedup();
+        for directory in &directories {
+            for file in table_file_names(name) {
+                for candidate in [file.clone(), format!("{file}.tmp")] {
+                    let path = std::path::Path::new(directory).join(&candidate);
+                    match std::fs::symlink_metadata(&path) {
+                        Ok(meta) if meta.len() == 0 && meta.is_file() => {}
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                        Ok(_) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::AlreadyExists,
+                                format!(
+                                    "table \"{name}\" would take over {}, which already exists \
+                                     and belongs to no table (left by a dropped or renamed one \
+                                     after a crash?); move it aside if it is not needed",
+                                    path.display()
+                                ),
+                            ));
+                        }
+                        Err(e) => {
+                            return Err(io::Error::other(format!(
+                                "table \"{name}\" cannot be checked for leftover files at {}: {e}",
+                                path.display()
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuses `name` while files kept under it still have live log records
+    /// (see `held_names`).
+    fn refuse_held_name(&self, name: &str) -> io::Result<()> {
+        if self.held_names.lock().iter().any(|held| held == name) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "the files of a table formerly named \"{name}\" are still on disk with log \
+                     records that could not be voided; the name is free again after a restart"
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Tombstones a table's row in the database catalogue.
@@ -1380,6 +1600,10 @@ impl Database {
     /// a table created before the catalogue existed, or one already forgotten,
     /// should still drop cleanly.
     async fn forget_in_catalogue(&self, table_name: &str) -> io::Result<bool> {
+        #[cfg(test)]
+        if test_hooks::FAIL_TOMBSTONE.with(|f| f.replace(false)) {
+            return Err(io::Error::other("injected catalogue tombstone failure"));
+        }
         tombstone_catalogue_row(
             &self.db_io_pointers,
             &self.db_io_rows,
@@ -1462,6 +1686,16 @@ impl Database {
                 "a table of that name already exists",
             ));
         }
+        self.refuse_held_name(new_name)?;
+        self.refuse_leftover_files(new_name)?;
+        // A rename whose old files are kept still has its intent on disk, and
+        // the next open finishes it from there; a new intent would replace it.
+        if let Some(held) = self.held_names.lock().first() {
+            return Err(io::Error::other(format!(
+                "an earlier rename has not finished (the files of \"{held}\" are kept until \
+                 the next open discards them); restart before renaming again"
+            )));
+        }
 
         // Recorded before anything moves, so a crash anywhere below is
         // recognisable on the next open rather than merely non-destructive.
@@ -1483,9 +1717,7 @@ impl Database {
             // Nothing has been committed, so the cleanest state is the one we
             // started in. The partial copies are dropped rather than left for
             // recovery: no catalogue row names them.
-            self.discard_table_files(new_name).await;
-            pool_forget(&self.storage, new_name);
-            self.clear_rename_intent().await;
+            self.abandon_copy(old_name, new_name).await;
             if let Some(table) = table {
                 self.tables.insert(old_name.to_string(), table);
             }
@@ -1494,9 +1726,7 @@ impl Database {
         }
 
         if let Err(e) = self.rewrite_schema_name(new_name).await {
-            self.discard_table_files(new_name).await;
-            pool_forget(&self.storage, new_name);
-            self.clear_rename_intent().await;
+            self.abandon_copy(old_name, new_name).await;
             if let Some(table) = table {
                 self.tables.insert(old_name.to_string(), table);
             }
@@ -1509,9 +1739,7 @@ impl Database {
 
         // The commit point. After this the new name is the real one.
         if let Err(e) = self.remember_in_catalogue(new_name).await {
-            self.discard_table_files(new_name).await;
-            pool_forget(&self.storage, new_name);
-            self.clear_rename_intent().await;
+            self.abandon_copy(old_name, new_name).await;
             if let Some(table) = table {
                 self.tables.insert(old_name.to_string(), table);
             }
@@ -1535,16 +1763,92 @@ impl Database {
             return Ok(());
         }
 
-        self.discard_table_files(old_name).await;
-        // Only now: until the old files are gone, the old name still describes
-        // something real, and a placement dropped earlier would send the sweep
-        // above to the wrong directory.
-        pool_forget(&self.storage, old_name);
-        self.clear_rename_intent().await;
+        // The barriers below void the old name's records, which only a
+        // durable catalogue makes safe: one that outlived the catalogue rows in
+        // a crash would leave the old name the table, its unflushed writes
+        // void. The old row's tombstone is an in-place write whose commit
+        // syncs the database's log, so this normally finds nothing owed; it
+        // is asked for rather than inherited because the barriers depend on
+        // it. Every other location first, so the catalogue never names a copy
+        // whose records are not durable. When the old name's first log is the
+        // database's own, the barrier's commit sync covers it all anyway.
+        //
+        // Without the barriers the old name's records stay live in the log
+        // after its files are deleted, and the next open replays them into
+        // whatever table takes the name next: `RENAME src TO dst; CREATE
+        // TABLE src` came back from a restart with `src` holding the old rows.
+        let old_seed = seed_in(
+            &self.db_io_pointers,
+            &self.storage,
+            &self.kv,
+            &self.seeds,
+            old_name,
+        )
+        .await;
+        let logs = logs_holding(&old_seed, &self.storage, self.location.as_deref());
+        if !logs.is_empty() && !self.leads_with_own_log(&logs) {
+            if let Err(e) = self.sync_durable() {
+                // The old files stay and so does the intent: once the
+                // catalogue is durable, the next open finishes the rename.
+                error!(
+                    "Renamed {} to {} but could not make it durable, so the old files \
+                     were kept: {}",
+                    old_name, new_name, e
+                );
+                self.hold_intent(old_name, new_name);
+                self.open_renamed_table(new_name).await;
+                return Err(e);
+            }
+        }
+
+        if discard_files(
+            &old_seed,
+            &self.storage,
+            self.location.as_deref(),
+            old_name,
+        )
+        .await
+        {
+            // Only now: until the old files are gone, the old name still
+            // describes something real, and a placement dropped earlier would
+            // send the sweep above to the wrong directory.
+            pool_forget(&self.storage, old_name);
+            self.clear_rename_intent().await;
+        } else {
+            // The intent stays, and the placement with it, so the next open
+            // finds the old files and discards them, barriers first. Until
+            // then the old name is refused: a table created under it would
+            // open the kept files as its own.
+            self.hold_intent(old_name, new_name);
+        }
         self.open_renamed_table(new_name).await;
 
         info!("Renamed table {} to {}", old_name, new_name);
         Ok(())
+    }
+
+    /// Drops a rename's copy that never reached the catalogue. If its files
+    /// cannot be released the intent stays, so the next open discards them.
+    async fn abandon_copy(&self, old_name: &str, new_name: &str) {
+        if self.discard_table_files(new_name).await {
+            pool_forget(&self.storage, new_name);
+            self.clear_rename_intent().await;
+        } else {
+            self.hold_intent(old_name, new_name);
+        }
+    }
+
+    /// Holds both names of a rename intent the next open has to finish: the
+    /// kept files' name is refused to `CREATE TABLE` and `RENAME … TO`, and
+    /// the table under the other is refused to `DROP`, since the open decides
+    /// what the kept files are by which of the two the catalogue holds.
+    fn hold_intent(&self, old_name: &str, new_name: &str) {
+        let mut held = self.held_names.lock();
+        for name in [old_name, new_name] {
+            if !held.iter().any(|h| h == name) {
+                held.push(name.to_string());
+            }
+        }
     }
     /// Copies every file derived from `old_name` to one derived from `new_name`.
     ///
@@ -1816,7 +2120,13 @@ impl Database {
                 // a table that is still there. Whatever partial bytes it holds
                 // are repaired at the next open, which rebuilds any backup
                 // whose length disagrees with its primary.
-                discard_files(&Arc::new(to.without_backups()), table_name).await;
+                discard_files(
+                &Arc::new(to.without_backups()),
+                &self.storage,
+                self.location.as_deref(),
+                table_name,
+            )
+            .await;
                 if let Some(table) = table {
                     self.tables.insert(table_name.to_string(), table);
                 }
@@ -1833,7 +2143,13 @@ impl Database {
         // The flip. Everything before it is reversible by deleting copies;
         // everything after it reads from the new backend.
         if let Err(e) = self.storage.pin_backend(table_name, destination) {
-            discard_files(&Arc::new(to.without_backups()), table_name).await;
+            discard_files(
+                &Arc::new(to.without_backups()),
+                &self.storage,
+                self.location.as_deref(),
+                table_name,
+            )
+            .await;
             if let Some(table) = table {
                 self.tables.insert(table_name.to_string(), table);
             }
@@ -1885,7 +2201,13 @@ impl Database {
                 self.seeds
                     .insert((current.as_spec(), table_name.to_string()), from.clone());
             }
-            discard_files(&Arc::new(to.without_backups()), table_name).await;
+            discard_files(
+                &Arc::new(to.without_backups()),
+                &self.storage,
+                self.location.as_deref(),
+                table_name,
+            )
+            .await;
 
             let mut restored = Table::new(table_name, from, Vec::new()).await;
             if rolled_back && !restored.schema_unreadable {
@@ -1917,7 +2239,13 @@ impl Database {
             .insert(table_name.to_string(), Arc::new(reopened));
 
         // The old primary's files, and only those — see `without_backups`.
-        discard_files(&Arc::new(from.without_backups()), table_name).await;
+        discard_files(
+                &Arc::new(from.without_backups()),
+                &self.storage,
+                self.location.as_deref(),
+                table_name,
+            )
+            .await;
 
         // Make the destination durable before reporting success.
         //
@@ -1960,11 +2288,12 @@ impl Database {
         Ok(copied)
     }
 
-    /// Releases every file derived from `name`.
+    /// Releases every file derived from `name`, and says whether they went
+    /// (see [`discard_files`]).
     ///
     /// Used both to clean up a failed copy and to drop the original once the
     /// rename has committed, so it must tolerate files that are not there.
-    async fn discard_table_files(&self, name: &str) {
+    async fn discard_table_files(&self, name: &str) -> bool {
         discard_files(
             &seed_in(
                 &self.db_io_pointers,
@@ -1974,6 +2303,8 @@ impl Database {
                 name,
             )
             .await,
+            &self.storage,
+            self.location.as_deref(),
             name,
         )
         .await
@@ -2120,7 +2451,7 @@ impl Database {
         io.truncate(0)
             .await
             .map_err(|e| io::Error::other(format!("{e:?}")))?;
-        io.append_data(format!("{}\n{}", old_name, new_name).as_bytes(), true)
+        io.append_data(encode_intent(old_name, new_name).as_bytes(), true)
             .await;
         let token = io.begin_txn();
         io.commit_durable(token)
@@ -2145,6 +2476,10 @@ impl Database {
                 "Table already exists",
             ));
         }
+        self.refuse_held_name(table_name)?;
+        // Before the catalogue row: a refusal after it would leave a row
+        // naming a table that was never built.
+        self.refuse_leftover_files(table_name)?;
 
         let mut name_mb = MEMORY_POOL.acquire(table_name.len());
         let name_data = name_mb.into_slice_mut();
@@ -2620,10 +2955,59 @@ async fn load_db_data_schema<S: StorageIO>(schema_io: Arc<S>) -> TableSchema {
 ///
 /// Free-standing for the same reason as `catalogue_has_row`: rename recovery
 /// needs it before there is a `Database` to call it on.
-/// Removes the marker recording a rename in progress.
+/// Removes the marker recording a rename in progress, voiding its log records
+/// first.
+///
+/// The marker is rewritten at offset 0 by every rename, so its records from
+/// one rename, left live, replayed under the next one's at the next open: a
+/// longer earlier intent showed through a shorter later one, and recovery
+/// acted on a name neither rename had. Callers clear it only once whatever the
+/// intent protected is durable, which the barrier's own sync also covers for
+/// everything this log holds before it.
 async fn clear_intent(io_pointers: &Arc<DbStorageProvider>) {
+    if let Some(wal) = io_pointers
+        .get_location()
+        .and_then(|dir| crate::core::wal::wal_for(&dir))
+        && let Err(e) =
+            wal.forget_files(&[crate::core::wal::file_id_for_name(RENAME_INTENT_FILE)])
+    {
+        // Deleted anyway: the next intent is checked whole when it is read
+        // (see `parse_intent`), so a stale record under it is refused, not
+        // acted on.
+        error!("Could not void the log's records for the rename intent: {}", e);
+    }
     let io = io_pointers.create_new(RENAME_INTENT_FILE.to_string()).await;
     io.drop_io();
+}
+
+/// The rename intent's bytes: both names and a checksum over them, each line
+/// terminated, so a record that is not exactly one intent does not parse.
+fn encode_intent(old_name: &str, new_name: &str) -> String {
+    let body = format!("{old_name}\n{new_name}");
+    format!("{body}\n{:016x}\n", crate::core::wal::file_id_for_name(&body))
+}
+
+/// The names an intent written by [`encode_intent`] holds, or by an older
+/// build (two lines and nothing else), or `None` for anything else: stale log
+/// records replayed under it, a torn write.
+fn parse_intent(text: &str) -> Option<(String, String)> {
+    let parts: Vec<&str> = text.split('\n').collect();
+    let (old_name, new_name) = match parts.as_slice() {
+        [old_name, new_name, sum, ""] => {
+            let body = format!("{old_name}\n{new_name}");
+            if *sum != format!("{:016x}", crate::core::wal::file_id_for_name(&body)) {
+                return None;
+            }
+            (*old_name, *new_name)
+        }
+        [old_name, new_name] => (*old_name, *new_name),
+        _ => return None,
+    };
+    let (old_name, new_name) = (old_name.trim(), new_name.trim());
+    if old_name.is_empty() || new_name.is_empty() {
+        return None;
+    }
+    Some((old_name.to_string(), new_name.to_string()))
 }
 
 /// Finishes or abandons a rename that a crash interrupted.
@@ -2643,11 +3027,11 @@ async fn recover_interrupted_rename(
     pool: &StoragePool,
     kv: &KvStores,
     seeds: &SeedCache,
-) {
+) -> Vec<String> {
     let io = io_pointers.create_new(RENAME_INTENT_FILE.to_string()).await;
     let len = io.get_len().await;
     if len == 0 {
-        return;
+        return Vec::new();
     }
 
     let mut buffer = vec![0u8; len as usize];
@@ -2658,24 +3042,21 @@ async fn recover_interrupted_rename(
         .is_err()
     {
         warn!("A rename intent record exists but could not be read; leaving it in place");
-        return;
+        return Vec::new();
     }
 
     let text = String::from_utf8_lossy(&buffer);
-    let mut parts = text.split('\n');
-    let (Some(old_name), Some(new_name)) = (parts.next(), parts.next()) else {
-        warn!("Malformed rename intent record; discarding it");
+    let Some((old_name, new_name)) = parse_intent(&text) else {
+        warn!("Malformed rename intent record {:?}; discarding it", text);
         clear_intent(io_pointers).await;
-        return;
+        return Vec::new();
     };
-    let (old_name, new_name) = (old_name.trim(), new_name.trim());
-    if old_name.is_empty() || new_name.is_empty() {
-        clear_intent(io_pointers).await;
-        return;
-    }
+    let (old_name, new_name) = (old_name.as_str(), new_name.as_str());
+    let held = || vec![old_name.to_string(), new_name.to_string()];
 
     let has_new = catalogue_has_row(io_pointers, io_rows, io_schema, new_name).await;
     let has_old = catalogue_has_row(io_pointers, io_rows, io_schema, old_name).await;
+    let root = io_pointers.get_location();
 
     match (has_old, has_new) {
         // Committed: the new row is there. Finish the tidy-up.
@@ -2687,22 +3068,39 @@ async fn recover_interrupted_rename(
             if tombstone_catalogue_row(io_pointers, io_rows, io_schema, old_name)
                 .await
                 .is_ok()
+                // Durable before the old name's records are voided below, on
+                // whichever log holds them: see `forget_logged_files`.
+                && root
+                    .as_deref()
+                    .and_then(crate::core::wal::wal_for)
+                    .is_none_or(|wal| wal.sync_pending().is_ok())
             {
-                discard_files(
+                // Files kept keep the intent, so the next open tries again.
+                if !discard_files(
                     &seed_in(io_pointers, pool, kv, seeds, old_name).await,
+                    pool,
+                    root.as_deref(),
                     old_name,
                 )
-                .await;
+                .await
+                {
+                    return held();
+                }
                 clear_intent(io_pointers).await;
             }
         }
         (false, true) => {
             // Committed and tombstoned; only the old files remain.
-            discard_files(
+            if !discard_files(
                 &seed_in(io_pointers, pool, kv, seeds, old_name).await,
+                pool,
+                root.as_deref(),
                 old_name,
             )
-            .await;
+            .await
+            {
+                return held();
+            }
             clear_intent(io_pointers).await;
         }
         // Never committed: the catalogue still names only the original, so
@@ -2712,11 +3110,16 @@ async fn recover_interrupted_rename(
                 "Abandoning an interrupted rename of {} to {}: it never reached the catalogue",
                 old_name, new_name
             );
-            discard_files(
+            if !discard_files(
                 &seed_in(io_pointers, pool, kv, seeds, new_name).await,
+                pool,
+                root.as_deref(),
                 new_name,
             )
-            .await;
+            .await
+            {
+                return held();
+            }
             clear_intent(io_pointers).await;
         }
         // Neither: nothing to reconcile against, so the safest act is none.
@@ -2731,6 +3134,7 @@ async fn recover_interrupted_rename(
             clear_intent(io_pointers).await;
         }
     }
+    Vec::new()
 }
 
 async fn tombstone_catalogue_row(
@@ -2874,8 +3278,155 @@ async fn copy_between(
     Ok(total)
 }
 
-/// Releases every file derived from `name`.
-async fn discard_files(io_pointers: &Arc<DbStorageProvider>, name: &str) {
+/// Why [`forget_logged_files`] failed, and whether a barrier may be in a log
+/// anyway: one of several already written, or this one, if the failure came
+/// after its append. Only a caller told `maybe_logged: false` may put the
+/// table back, since a durable barrier voids its unflushed records.
+struct ForgetFailure {
+    error: io::Error,
+    maybe_logged: bool,
+}
+
+/// The logs that can hold records for the files `io` reaches: its own
+/// directory's, and for a mirrored provider each backup directory's, since a
+/// backup copy's writes are logged there under the same ids and a sweep
+/// through `io` deletes those copies too. The database's own log (`own`, a
+/// directory) comes first when it is one of them; see
+/// [`Database::forget_dropped_files`]. Empty without a log anywhere: in
+/// memory, a statement-scoped relation, another backend.
+fn logs_holding(
+    io: &DbStorageProvider,
+    pool: &StoragePool,
+    own: Option<&str>,
+) -> Vec<StdArc<crate::core::wal::Wal>> {
+    let dirs = dirs_reached(io, pool);
+    let mut logs: Vec<StdArc<crate::core::wal::Wal>> = Vec::new();
+    for dir in &dirs {
+        if let Some(wal) = crate::core::wal::wal_for(dir)
+            && !logs.iter().any(|l| StdArc::ptr_eq(l, &wal))
+        {
+            logs.push(wal);
+        }
+    }
+    if let Some(own) = own.and_then(crate::core::wal::wal_for)
+        && let Some(at) = logs.iter().position(|l| StdArc::ptr_eq(l, &own))
+    {
+        logs.swap(0, at);
+    }
+    logs
+}
+
+/// The directories `io` reaches: its own, and for a mirrored provider each
+/// backup directory, whose copies a sweep through `io` deletes too.
+fn dirs_reached(io: &DbStorageProvider, pool: &StoragePool) -> Vec<String> {
+    let mut dirs: Vec<String> = io.get_location().into_iter().collect();
+    #[cfg(feature = "storage_pools")]
+    {
+        if matches!(io, DbStorageProvider::Mirror(_)) {
+            dirs.extend(pool.mirrors());
+        }
+    }
+    #[cfg(not(feature = "storage_pools"))]
+    let _ = pool;
+    dirs
+}
+
+/// Voids the records for every file a table of `name` owns in each of
+/// `logs` (see [`logs_holding`]), durably, in order. See
+/// [`crate::core::wal::Wal::forget_files`].
+///
+/// Records name files by a hash of the file name, so the next table of this
+/// name, or this one moved or renamed back, has the ids these records carry.
+/// Unvoided, the next open (a crash is not needed: every open replays the
+/// log) writes them into its files. Call it before the files are deleted and
+/// after the catalogue no longer names the table *durably*: voided while the
+/// table still exists, a crash would replay it without the writes its log was
+/// holding.
+fn forget_logged_files(
+    logs: &[StdArc<crate::core::wal::Wal>],
+    name: &str,
+) -> Result<(), ForgetFailure> {
+    let ids: Vec<u64> = table_file_names(name)
+        .map(|file| crate::core::wal::file_id_for_name(&file))
+        .collect();
+    let mut logged = false;
+    for wal in logs {
+        let was_poisoned = wal.is_poisoned();
+        if let Err(error) = wal.forget_files(&ids) {
+            // Poisoned by this call means it failed past the append, at the
+            // marker or the sync, and the barrier may be durable. Either
+            // other failure leaves nothing that can commit.
+            let maybe_logged = logged || (!was_poisoned && wal.is_poisoned());
+            return Err(ForgetFailure {
+                error,
+                maybe_logged,
+            });
+        }
+        logged = true;
+    }
+    Ok(())
+}
+
+/// Releases every file derived from `name`, voiding the logs' records for them
+/// first (see [`forget_logged_files`]). Returns whether the files went.
+///
+/// A failure to void keeps the files: deleted with their records live, the
+/// next open would replay those into a later table of that name. Kept, the
+/// caller holds the name (`Database::held_names`) and leaves whatever intent
+/// lets the next open try again: a space leak, not a corruption. The caller
+/// must already have made durable whatever stops the files being a live
+/// table's (see [`Database::rename_table`]).
+async fn discard_files(
+    io_pointers: &Arc<DbStorageProvider>,
+    pool: &StoragePool,
+    own: Option<&str>,
+    name: &str,
+) -> bool {
+    if let Err(failure) = forget_logged_files(&logs_holding(io_pointers, pool, own), name) {
+        error!(
+            "Could not void the log's records for {}'s files, so they were kept: {}",
+            name, failure.error
+        );
+        return false;
+    }
+    sweep_files_durably(io_pointers, pool, own, name).await;
+    true
+}
+
+/// [`sweep_files`], then a sync of each directory swept, so the deletions are
+/// on disk before the caller goes on.
+///
+/// An unlink reaches the disk with the directory's next sync, and the barrier
+/// and catalogue tombstone before it are already durable. A power cut in
+/// between kept the files, and the next table of the name opened them as its
+/// own. Only where a log reaches: a directory without one is in memory or
+/// another backend, and statement-scoped relations, dropped once per CTE,
+/// must not pay a sync each.
+async fn sweep_files_durably(
+    io_pointers: &Arc<DbStorageProvider>,
+    pool: &StoragePool,
+    own: Option<&str>,
+    name: &str,
+) {
+    sweep_files(io_pointers, name).await;
+    if logs_holding(io_pointers, pool, own).is_empty() {
+        return;
+    }
+    for dir in dirs_reached(io_pointers, pool) {
+        // Named by a swept file: `sync_parent_dir` syncs the directory a
+        // path is in.
+        let swept = std::path::Path::new(&dir).join(format!("{name}{}", RENAMED_SUFFIXES[0]));
+        if let Err(e) = crate::core::wal::sync_parent_dir(&swept) {
+            error!(
+                "Deleted {}'s files in {} but could not sync the directory: {}",
+                name, dir, e
+            );
+        }
+    }
+}
+
+/// Deletes every file derived from `name`, the log left as it is.
+async fn sweep_files(io_pointers: &Arc<DbStorageProvider>, name: &str) {
     for suffix in RENAMED_SUFFIXES {
         let io = io_pointers.create_new(format!("{}{}", name, suffix)).await;
         io.drop_io();

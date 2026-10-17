@@ -391,16 +391,16 @@ async fn a_renamed_table_takes_its_sequence_with_it() {
     assert_eq!(ids_by_n(&postgres, "src").await, vec![1, 2, 3]);
 }
 
-/// A table dropped, recreated and then reopened should come back as the
-/// recreated table — empty of the dropped one's rows — and count from 1.
+/// A table dropped, recreated and then reopened comes back as the recreated
+/// table — empty of the dropped one's rows — and counts from 1.
 ///
-/// It does not: the reopen brings the dropped table's rows back, and the
-/// recreated table's counter then seeds from them and skips ahead — the same
-/// silent wrong key this file is about, by another route. Switch this on when
-/// that is fixed. `ALTER TABLE t RENAME TO u` followed by `CREATE TABLE t` and
-/// a reopen shows the same thing: `t` comes back holding `u`'s rows.
+/// It used not to: the reopen replayed the dropped table's log records into
+/// the recreated table's files (records name files by a hash of the file
+/// name), bringing its rows back, and the recreated table's counter then
+/// seeded from them and skipped ahead — the same silent wrong key this file is
+/// about, by another route. A drop now voids its records in the log
+/// (`Wal::forget_files`). The rename case is the test after this one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "drop+recreate+reopen resurrects dropped rows"]
 async fn a_table_dropped_and_recreated_survives_a_restart_fresh() {
     init_globals();
     let root = tempfile::tempdir().unwrap();
@@ -433,5 +433,46 @@ async fn a_table_dropped_and_recreated_survives_a_restart_fresh() {
         add_tenants(&x, 1, 1).await,
         expected(1, 1),
         "the recreated table's counter seeded from the dropped table's rows"
+    );
+}
+
+/// The rename half of the test above: `RENAME src TO dst; CREATE TABLE src`,
+/// then a restart. `src` comes back as the new table, empty of `dst`'s rows,
+/// and counts from 1; `dst` keeps every row it had.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_table_created_under_a_renamed_tables_name_survives_a_restart_fresh() {
+    init_globals();
+    let root = tempfile::tempdir().unwrap();
+    let root_str = root.path().to_str().unwrap().to_string();
+
+    {
+        let catalog = DatabaseCatalog::open(Some(&root_str), "postgres")
+            .await
+            .unwrap();
+        let postgres = catalog.get("postgres").expect("the default database");
+        ok(&postgres, "CREATE TABLE src (id BIGSERIAL, n INT)").await;
+        for n in 1..=3 {
+            ok(&postgres, &format!("INSERT INTO src (n) VALUES ({})", n)).await;
+        }
+        ok(&postgres, "ALTER TABLE src RENAME TO dst").await;
+        ok(&postgres, "CREATE TABLE src (id BIGSERIAL, n INT)").await;
+        drop(postgres);
+        drop(catalog);
+    }
+
+    let catalog = DatabaseCatalog::open(Some(&root_str), "postgres")
+        .await
+        .unwrap();
+    let postgres = catalog.get("postgres").expect("the default database");
+    assert!(
+        ids_by_n(&postgres, "src").await.is_empty(),
+        "the reopened table under the old name holds the renamed table's rows"
+    );
+    assert_eq!(ids_by_n(&postgres, "dst").await, vec![1, 2, 3]);
+    ok(&postgres, "INSERT INTO src (n) VALUES (1)").await;
+    assert_eq!(
+        ids_by_n(&postgres, "src").await,
+        vec![1],
+        "the new table's counter seeded from the renamed table's rows"
     );
 }
