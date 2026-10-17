@@ -50,7 +50,20 @@
 //!   after)` also refuses any change of point (0A000). Installed on a
 //!   partition `Table` by `Table::open_partition`.
 //!
-//! Errors are `String`s, like the rest of the engine's DDL paths.
+//! - [`table::PartitionedTable`] (§1.1, §3, §4.3, §4.4): the logical table.
+//!   `create_files` writes a new table's map log and ids file; `open` replays
+//!   the log and opens every materialized partition, or leaves the table
+//!   broken (every data call returns why); `route_where(clause) -> Route`;
+//!   `materialized(epoch, route)` skips unmaterialized partitions by proof;
+//!   `insert_row_in_txn` routes a row and materializes its partition on first
+//!   write (§3.2's order). [`table::check_declared_cap`] is the 2,048 declared
+//!   partitions per database refusal, over `table::declared_in`, which
+//!   refuses while any table's count is unknown; [`table::DEFAULT_PARTITIONS`]
+//!   is 64. Pools with backup mirrors are refused, read from the pool at
+//!   create, open and materialize.
+//!
+//! Errors are `String`s, like the rest of the engine's DDL paths, except in
+//! `files` and `table`, which do IO and return `io::Error`s.
 
 pub mod files;
 pub mod guard;
@@ -58,6 +71,9 @@ pub mod key;
 pub mod log;
 pub mod map;
 pub mod route;
+pub mod table;
+#[cfg(test)]
+mod table_tests;
 pub mod xxh64;
 
 pub use key::{KeyFamily, KeyLevel, KeySpec};

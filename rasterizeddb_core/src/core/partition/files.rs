@@ -37,7 +37,8 @@
 //!
 //! The IO here is `pub(crate)`: it deletes files by uid, which is no API.
 
-// Nothing calls the IO until `PartitionedTable` (S3b) does; S3b removes this.
+// Only `PartitionedTable` calls the IO, and nothing builds one until
+// `Database` does (S4), which removes this.
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::HashSet;
