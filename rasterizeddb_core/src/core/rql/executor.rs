@@ -465,28 +465,6 @@ pub(crate) fn query_output_scales(
     }
 }
 
-/// The declared type a materialised CTE or derived table gives each output
-/// column of `query` that is `NUMERIC`: `NUMERIC(38, s)` where the query
-/// reports a scale below the engine's, so the temporary relation stores and
-/// renders the column at it. `None` keeps plain `NUMERIC`.
-///
-/// Without it the temporary column was an unconstrained `NUMERIC`, so a
-/// `NUMERIC(12,2)` read through a CTE came back as 552645.500000000. A scale
-/// above the engine's is not kept: the rows reach the relation at the engine
-/// scale, and more places would only render zeros that were never computed.
-pub(crate) fn materialised_numeric_types(query: &str, database: &Database) -> Vec<Option<String>> {
-    let Some(purpose) = crate::core::rql::lexer_s1::recognize_query_purpose(query) else {
-        return Vec::new();
-    };
-    query_output_scales(&purpose, database)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|scale| {
-            (scale < crate::core::value_codec::DECIMAL_SCALE).then(|| format!("NUMERIC(38, {})", scale))
-        })
-        .collect()
-}
-
 /// Brings every `DECIMAL` cell of a subquery's rows to the engine scale, from
 /// the scale [`query_output_scales`] says it is stored at.
 ///
@@ -591,21 +569,13 @@ async fn run_subquery_serialized(
     }
 }
 
-/// Runs a `SELECT` and returns its rows.
+/// Runs a `SELECT` and returns its rows, with its `DECIMAL` cells left at the
+/// scale each output column stores them at, and those scales — see
+/// [`run_subquery_scaled`].
 ///
 /// Shares `run_subquery`'s contract — the statement must be a `SELECT`, and it
 /// is executed with no outer row in scope — and exists so materialising a CTE
 /// does not need a second way to run a query.
-pub(crate) async fn run_query_rows(
-    sql: &str,
-    database: &Arc<Database>,
-    tx: TxId,
-) -> Result<Vec<crate::core::row::row::Row>, String> {
-    run_subquery(sql, database, tx).await
-}
-
-/// [`run_query_rows`], with its `DECIMAL` cells left at the scale each output
-/// column stores them at, and those scales — see [`run_subquery_scaled`].
 pub(crate) async fn run_query_rows_scaled(
     sql: &str,
     database: &Arc<Database>,
@@ -618,7 +588,7 @@ pub(crate) async fn run_query_rows_scaled(
 /// produced.
 ///
 /// A `WITH x AS (INSERT … RETURNING id)` runs its body for the effect *and*
-/// reads the result, so neither `run_query_rows` (which refuses anything but a
+/// reads the result, so neither `run_query_rows_scaled` (which refuses anything but a
 /// SELECT) nor `run_statement` (which discards rows) fits. A statement that
 /// succeeds without returning rows yields an empty vector rather than an error.
 pub(crate) async fn run_returning_rows(

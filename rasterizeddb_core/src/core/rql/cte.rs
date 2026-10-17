@@ -1290,49 +1290,6 @@ pub(crate) fn declared_item_types(query: &str, database: &Arc<Database>) -> Vec<
     declared_item_types_among(query, database, &[])
 }
 
-/// The type each of the first `count` output columns of `query` declares:
-/// [`declared_item_types`] for a bare column, and the target of a cast for
-/// an item that is one — `NULL::int AS ni` is an `int` — otherwise `None`.
-///
-/// What a materialised column falls back to when no row holds a value to
-/// sample. TEXT there described an `int` column as text, so a typed client
-/// refused it and `sum` or `COALESCE(n, 0)` over it was a type error.
-fn declared_or_cast_types(
-    query: &str,
-    count: usize,
-    database: &Arc<Database>,
-) -> Vec<Option<DbType>> {
-    let mut types = declared_item_types(query, database);
-    types.resize(count, None);
-    let Some(list) = select_list_of(query) else {
-        return types;
-    };
-    let list = list.trim_start();
-    let list = match list.get(.."DISTINCT ".len()) {
-        Some(head) if head.eq_ignore_ascii_case("DISTINCT ") => &list["DISTINCT ".len()..],
-        _ => list,
-    };
-    let items = crate::core::rql::lexer_ct::split_definitions(list);
-    for (index, item) in items.iter().enumerate().take(count) {
-        let item = item.trim();
-        // Past a `*`, no item is at the position its place in the list says.
-        if item == "*" || item.ends_with(".*") {
-            break;
-        }
-        if types[index].is_some() {
-            continue;
-        }
-        // Parsed with no schema, so an item reading a column fails here and
-        // stays `None`; what remains is a cast constant such as `NULL::int`.
-        if let Ok(crate::core::rql::expr::Expr::Cast(_, target)) =
-            crate::core::rql::expr::parse(split_alias(item).0, &[])
-        {
-            types[index] = Some(target);
-        }
-    }
-    types
-}
-
 /// [`declared_item_types`], where the relation read may also be one of
 /// `relations`: the CTEs and derived tables a describe resolved, which are
 /// not in `database.tables` until the statement is materialised to run.
