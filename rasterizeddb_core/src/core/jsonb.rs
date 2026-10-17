@@ -1709,8 +1709,11 @@ pub fn push_group_key(bytes: &[u8], out: &mut Vec<u8>) {
 /// scalar, and one with exactly one element sorts above it. Below the top
 /// level a scalar is just a scalar.
 ///
-/// `Equal` holds exactly when [`values_equal`] is `Some(true)`. `None` means a
-/// document is malformed, or is not an encoded document at all.
+/// `Equal` holds exactly when [`values_equal`] is `Some(true)`. `None` means
+/// the comparison reached something malformed, or a document that is not an
+/// encoded document at all. A container's count is read before anything in
+/// it, so one with an unreadable element or pair still compares by its count
+/// with a container of another size.
 pub fn compare_values(a: &[u8], b: &[u8]) -> Option<std::cmp::Ordering> {
     let mut clean = true;
     let ord = order_top(a, b, &mut clean);
@@ -1723,10 +1726,13 @@ pub fn compare_values(a: &[u8], b: &[u8]) -> Option<std::cmp::Ordering> {
 /// something no document has cannot simply fall back to its bytes: the same
 /// malformed value would then sort by value against one document and by bytes
 /// against the next. Instead what cannot be read is a kind of its own, above
-/// every real one, ordered among itself by its bytes. Each byte string reads
-/// as one tree, and the trees are ordered lexicographically, so the order is
-/// total; between documents it is exactly [`compare_values`]', and bytes that
-/// are not a document at all sort after every document, by their bytes.
+/// every real one, ordered among itself by its bytes. That holds where the
+/// value stands: an array element or object pair that cannot be read is such
+/// a kind inside a container that otherwise reads, so the container still
+/// orders by its count. Each byte string reads as one tree, and the trees are
+/// ordered lexicographically, so the order is total; between documents it is
+/// exactly [`compare_values`]', and bytes that are not a document at all sort
+/// after every document, by their bytes.
 pub fn order(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
     if a == b {
         return std::cmp::Ordering::Equal;
@@ -1743,10 +1749,12 @@ enum Kind<'a> {
     Num(&'a [u8]),
     Bool(bool),
     Arr(&'a [u8], Composite),
-    /// Key and value of each pair, in jsonb's key order.
-    Obj(smallvec::SmallVec<[(&'a [u8], &'a [u8]); 8]>),
+    /// The whole object and its header. Its pairs are read only when another
+    /// object of the same size needs them, through [`first_pair`] and
+    /// [`key_order`].
+    Obj(&'a [u8], Composite),
     /// What no document holds: an unknown tag, a scalar of the wrong length,
-    /// or a composite whose table points outside it.
+    /// or a composite whose header claims a table longer than its bytes.
     Corrupt(&'a [u8]),
 }
 
@@ -1771,27 +1779,10 @@ impl<'a> Kind<'a> {
                 Some(c) => Kind::Arr(bytes, c),
                 None => Kind::Corrupt(bytes),
             },
-            TAG_OBJ => {
-                // Every entry is read here, not lazily: the first pair in
-                // jsonb's key order can be anywhere in the stored order, so
-                // finding it needs every key anyway, and an object with an
-                // entry that cannot be read is then corrupt as a whole rather
-                // than corrupt only against the documents that reach it.
-                let Some(o) = Composite::of(bytes, OBJ_ENTRY) else {
-                    return Kind::Corrupt(bytes);
-                };
-                let mut pairs = smallvec::SmallVec::with_capacity(o.count);
-                for at in 0..o.count {
-                    match o.entry(bytes, at) {
-                        Some(pair) => pairs.push(pair),
-                        None => return Kind::Corrupt(bytes),
-                    }
-                }
-                // Stored bytewise, so a stable sort by length leaves keys of
-                // one length bytewise: jsonb's order.
-                pairs.sort_by_key(|(key, _): &(&[u8], &[u8])| key.len());
-                Kind::Obj(pairs)
-            }
+            TAG_OBJ => match Composite::of(bytes, OBJ_ENTRY) {
+                Some(c) => Kind::Obj(bytes, c),
+                None => Kind::Corrupt(bytes),
+            },
             _ => Kind::Corrupt(bytes),
         }
     }
@@ -1803,7 +1794,7 @@ impl<'a> Kind<'a> {
             Kind::Num(_) => 2,
             Kind::Bool(_) => 3,
             Kind::Arr(..) => 4,
-            Kind::Obj(_) => 5,
+            Kind::Obj(..) => 5,
             Kind::Corrupt(_) => 6,
         }
     }
@@ -1878,15 +1869,30 @@ fn order_kinds(x: Kind<'_>, y: Kind<'_>, clean: &mut bool) -> std::cmp::Ordering
             }
             Ordering::Equal
         }
-        (Kind::Obj(p), Kind::Obj(q)) => {
-            let by_count = p.len().cmp(&q.len());
-            if by_count != Ordering::Equal {
+        (Kind::Obj(p, pa), Kind::Obj(q, qa)) => {
+            // The counts are in the headers, so objects of different sizes,
+            // the usual case in a sort of varied documents, are ordered
+            // without reading a pair.
+            let by_count = pa.count.cmp(&qa.count);
+            if by_count != Ordering::Equal || pa.count == 0 {
                 return by_count;
             }
-            // Pair by pair, key then value. Keys compare as strings here, not
-            // by jsonb's length-first key order: `{"aa":1}` < `{"b":1}`.
-            for ((pk, pv), (qk, qv)) in p.iter().zip(q.iter()) {
-                let ord = pk.cmp(qk).then_with(|| order_nested(pv, qv, clean));
+            // Pair by pair in jsonb's key order, key then value. Keys compare
+            // as strings here, not by that length-first order:
+            // `{"aa":1}` < `{"b":1}`.
+            //
+            // The first pair usually decides, and finding it is one pass over
+            // the two tables, so the rest are put in order only when it ties.
+            let (x, y) = ((p, &pa), (q, &qa));
+            let ord = order_pair(x, first_pair(p, &pa), y, first_pair(q, &qa), clean);
+            if ord != Ordering::Equal || pa.count == 1 {
+                return ord;
+            }
+            let (mut po, mut qo) = (key_order(p, &pa), key_order(q, &qa));
+            po.sort_unstable();
+            qo.sort_unstable();
+            for (&i, &j) in po.iter().zip(qo.iter()).skip(1) {
+                let ord = order_pair(x, position(i), y, position(j), clean);
                 if ord != Ordering::Equal {
                     return ord;
                 }
@@ -1896,6 +1902,68 @@ fn order_kinds(x: Kind<'_>, y: Kind<'_>, clean: &mut bool) -> std::cmp::Ordering
         (Kind::Corrupt(p), Kind::Corrupt(q)) => p.cmp(q),
         _ => unreachable!("kinds of one rank"),
     }
+}
+
+/// Pair `i` of one object against pair `j` of another: key, then value.
+fn order_pair(
+    (p, pa): (&[u8], &Composite),
+    i: usize,
+    (q, qa): (&[u8], &Composite),
+    j: usize,
+    clean: &mut bool,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (pa.entry(p, i), qa.entry(q, j)) {
+        (Some((pk, pv)), Some((qk, qv))) => pk.cmp(qk).then_with(|| order_nested(pv, qv, clean)),
+        // A pair whose entry points outside its object is corrupt where it
+        // stands, as an array's element is: above every readable pair, and
+        // ordered among such by the entry.
+        (e, f) => {
+            *clean = false;
+            let entry = |c: &Composite, bytes: &[u8], at: usize| {
+                let at = c.table_at + at * OBJ_ENTRY;
+                bytes.get(at..at + OBJ_ENTRY).unwrap_or(&[]).to_vec()
+            };
+            match (e, f) {
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                _ => entry(pa, p, i).cmp(&entry(qa, q, j)),
+            }
+        }
+    }
+}
+
+/// Where pair `at` of an object falls in jsonb's key order, as one integer:
+/// sorting these is that order.
+///
+/// Keys are stored bytewise, so ordering positions by key length alone, ties
+/// kept in stored order, is jsonb's length-then-bytes order. The position is
+/// packed below its key's length, which makes a plain sort of the integers
+/// that stable sort, with nothing compared but integers. The length comes
+/// from the table, which [`Composite::of`] found in bounds, so this reads no
+/// key and needs no pair to be readable.
+#[inline]
+fn key_rank(bytes: &[u8], o: &Composite, at: usize) -> u64 {
+    let len = read_u32(bytes, o.table_at + at * OBJ_ENTRY + 4).unwrap_or(u32::MAX);
+    (u64::from(len) << 32) | at as u64
+}
+
+/// The table position a [`key_rank`] was made from.
+#[inline]
+fn position(rank: u64) -> usize {
+    rank as u32 as usize
+}
+
+/// The position of the first pair in jsonb's key order, found without
+/// ordering the rest.
+fn first_pair(bytes: &[u8], o: &Composite) -> usize {
+    position((0..o.count).map(|at| key_rank(bytes, o, at)).min().unwrap_or(0))
+}
+
+/// Every pair's [`key_rank`], unsorted. Up to 32 fit on the stack, so an
+/// ordinary object costs no allocation.
+fn key_order(bytes: &[u8], o: &Composite) -> smallvec::SmallVec<[u64; 32]> {
+    (0..o.count).map(|at| key_rank(bytes, o, at)).collect()
 }
 
 /// Two encoded numbers by value, as `numeric_cmp` orders them. A number whose
@@ -4409,6 +4477,307 @@ mod gin_item_tests {
         assert_eq!(order(b"hello", &doc), Ordering::Greater);
         assert_eq!(order(b"hello", b"help"), Ordering::Less);
         assert_eq!(compare_values(&1i32.to_le_bytes(), &doc), None);
+    }
+
+    /// `text` encoded, with entry `entry`'s value offset pointed past the end
+    /// of the object, so that pair cannot be read but the header can.
+    fn unreadable_pair(text: &str, entry: usize) -> Vec<u8> {
+        let mut doc = encode_text(text).unwrap();
+        let at = 5 + entry * OBJ_ENTRY + 8;
+        doc[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        doc
+    }
+
+    /// An object's pair count orders it before any pair is read, as an
+    /// array's element count already did. A sort compares each document many
+    /// times, and reading every pair first made each of those comparisons
+    /// decode and re-sort both objects even when their sizes alone decide.
+    /// So an unreadable pair is corrupt where it stands, above every readable
+    /// one, not a mark that makes the whole object corrupt.
+    #[test]
+    fn an_object_is_ordered_by_its_size_before_its_pairs_are_read() {
+        use std::cmp::Ordering;
+        let one = encode_text(r#"{"a":1}"#).unwrap();
+        let two = encode_text(r#"{"a":1,"b":2}"#).unwrap();
+        let three = encode_text(r#"{"a":1,"b":2,"c":3}"#).unwrap();
+        let broken = unreadable_pair(r#"{"a":1,"b":2}"#, 1);
+        assert_eq!(compare_values(&broken, &three), Some(Ordering::Less));
+        assert_eq!(compare_values(&three, &broken), Some(Ordering::Greater));
+        assert_eq!(compare_values(&broken, &one), Some(Ordering::Greater));
+        assert_eq!(order(&broken, &three), Ordering::Less);
+        // The first pair decides before the unreadable second one is reached.
+        let lower = encode_text(r#"{"a":0,"b":2}"#).unwrap();
+        let higher = encode_text(r#"{"a":2,"b":2}"#).unwrap();
+        assert_eq!(compare_values(&broken, &lower), Some(Ordering::Greater));
+        assert_eq!(compare_values(&broken, &higher), Some(Ordering::Less));
+        // Reaching it is refused, and in a sort it is above the readable pair.
+        assert_eq!(compare_values(&broken, &two), None);
+        assert_eq!(order(&broken, &two), Ordering::Greater);
+        assert_eq!(order(&two, &broken), Ordering::Less);
+        // Nested, the same holds: the outer pairs read, the inner count decides.
+        let mut nested = encode_text(r#"{"x":{"a":1,"b":2}}"#).unwrap();
+        let inner = encode_text(r#"{"a":1,"b":2}"#).unwrap();
+        let start = nested.len() - inner.len();
+        nested[start..].copy_from_slice(&broken);
+        let bigger = encode_text(r#"{"x":{"a":1,"b":2,"c":3}}"#).unwrap();
+        assert_eq!(compare_values(&nested, &bigger), Some(Ordering::Less));
+    }
+
+    /// Deciding by count before reading the pairs is only total if an object
+    /// with an unreadable pair stays an object of its size against every
+    /// document. Were it an object by count against objects of other sizes
+    /// but a kind above every document against its own size, then the empty
+    /// byte string < that object < a larger object < the empty byte string
+    /// (not a document, so above every one) would be a cycle, and a sort may
+    /// panic on one. Every triple of malformed and well-formed values is
+    /// checked here, so no such cycle can hide in a pair the random test never
+    /// draws.
+    #[test]
+    fn malformed_objects_order_totally_against_every_kind() {
+        use std::cmp::Ordering;
+        let mut values: Vec<Vec<u8>> = [
+            "{}", r#"{"a":1}"#, r#"{"b":0}"#, r#"{"aa":0}"#, r#"{"a":1,"b":2}"#,
+            r#"{"a":1,"bb":2}"#, r#"{"a":0,"b":2}"#, r#"{"a":1,"b":2,"c":3}"#,
+            r#"{"x":{"a":1,"b":2}}"#, "[]", "[1]", "[1,2]", "1", r#""x""#, "null", "true",
+        ]
+        .iter()
+        .map(|t| encode_text(t).unwrap())
+        .collect();
+        for (text, entry) in [
+            (r#"{"a":1}"#, 0),
+            (r#"{"a":1,"b":2}"#, 0),
+            (r#"{"a":1,"b":2}"#, 1),
+            (r#"{"a":1,"bb":2}"#, 0),
+            (r#"{"a":1,"bb":2}"#, 1),
+            (r#"{"a":1,"b":2,"c":3}"#, 2),
+        ] {
+            values.push(unreadable_pair(text, entry));
+            // The key unreadable instead of the value.
+            let mut doc = encode_text(text).unwrap();
+            let at = 5 + entry * OBJ_ENTRY;
+            doc[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+            values.push(doc);
+        }
+        let mut both = unreadable_pair(r#"{"a":1,"b":2}"#, 0);
+        both[5 + OBJ_ENTRY + 8..5 + OBJ_ENTRY + 12].copy_from_slice(&7u32.to_le_bytes());
+        values.push(both);
+        let mut inner = encode_text(r#"{"x":{"a":1,"b":2}}"#).unwrap();
+        let broken = unreadable_pair(r#"{"a":1,"b":2}"#, 1);
+        let start = inner.len() - broken.len();
+        inner[start..].copy_from_slice(&broken);
+        values.push(inner);
+        let mut element = encode_text("[1,2]").unwrap();
+        element[5..9].copy_from_slice(&u32::MAX.to_le_bytes());
+        values.push(element);
+        // A header whose table is missing, an unknown tag, nothing at all.
+        values.push(vec![TAG_OBJ, 2, 0, 0, 0]);
+        values.push(vec![TAG_OBJ]);
+        values.push(vec![0x08]);
+        values.push(b"hello".to_vec());
+        values.push(Vec::new());
+        for x in &values {
+            for y in &values {
+                let xy = order(x, y);
+                assert_eq!(xy, order(y, x).reverse(), "{x:?} vs {y:?}");
+                if let Some(c) = compare_values(x, y) {
+                    assert_eq!(c, xy, "{x:?} vs {y:?}");
+                }
+                for z in &values {
+                    if xy != Ordering::Greater && order(y, z) != Ordering::Greater {
+                        assert_ne!(order(x, z), Ordering::Greater, "{x:?} <= {y:?} <= {z:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A key from a pool whose lengths and bytes order differently, so that
+    /// jsonb's length-first key order is not the stored order.
+    fn mixed_key(r: &mut Rng) -> String {
+        const KEYS: &[&str] = &["", "a", "b", "aa", "ab", "ba", "abc", "é", "zz", "b0"];
+        match r.below(14) as usize {
+            i if i < KEYS.len() => KEYS[i].to_string(),
+            _ => format!("k{}", r.below(1000)),
+        }
+    }
+
+    /// Documents whose objects mix key lengths, and now and then hold more
+    /// pairs than [`key_order`] keeps on the stack.
+    fn mixed_value(r: &mut Rng, depth: u32) -> String {
+        if depth == 0 || r.below(3) == 0 {
+            return scalar(r);
+        }
+        if r.below(3) == 0 {
+            let items: Vec<String> = (0..r.below(4)).map(|_| mixed_value(r, depth - 1)).collect();
+            return format!("[{}]", items.join(","));
+        }
+        let wide = r.below(8) == 0;
+        let n = if wide { 30 + r.below(12) } else { r.below(6) };
+        let items: Vec<String> = (0..n)
+            .map(|_| {
+                let v = if wide { scalar(r) } else { mixed_value(r, depth - 1) };
+                format!("{}:{}", serde_json::Value::String(mixed_key(r)), v)
+            })
+            .collect();
+        format!("{{{}}}", items.join(","))
+    }
+
+    /// The order as it was first written: every pair of an object decoded,
+    /// then stably sorted by key length. Below objects and arrays it defers
+    /// to the order under test, which has no other key order to get wrong.
+    fn sorted_reference(a: &[u8], b: &[u8], top: bool) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        fn pairs(d: &[u8]) -> Vec<(&[u8], &[u8])> {
+            let c = Composite::of(d, OBJ_ENTRY).unwrap();
+            let mut v: Vec<(&[u8], &[u8])> = (0..c.count).map(|i| c.entry(d, i).unwrap()).collect();
+            v.sort_by_key(|(k, _)| k.len());
+            v
+        }
+        match (a[0], b[0]) {
+            (TAG_OBJ, TAG_OBJ) => {
+                let (p, q) = (pairs(a), pairs(b));
+                p.len().cmp(&q.len()).then_with(|| {
+                    p.iter()
+                        .zip(&q)
+                        .map(|((pk, pv), (qk, qv))| pk.cmp(qk).then_with(|| sorted_reference(pv, qv, false)))
+                        .find(|o| o.is_ne())
+                        .unwrap_or(Ordering::Equal)
+                })
+            }
+            (TAG_ARR, TAG_ARR) => {
+                let (x, y) = (Composite::of(a, ARR_ENTRY).unwrap(), Composite::of(b, ARR_ENTRY).unwrap());
+                x.count.cmp(&y.count).then_with(|| {
+                    (0..x.count)
+                        .map(|i| sorted_reference(x.element(a, i).unwrap(), y.element(b, i).unwrap(), false))
+                        .find(|o| o.is_ne())
+                        .unwrap_or(Ordering::Equal)
+                })
+            }
+            _ if top => compare_values(a, b).unwrap(),
+            _ => order_nested(a, b, &mut true),
+        }
+    }
+
+    /// The order without decoding agrees with decoding and sorting every
+    /// object, over keys whose length order and byte order disagree, objects
+    /// wide enough to leave the stack buffer, and pairs equal far enough in
+    /// to walk the whole object.
+    #[test]
+    fn object_order_matches_sorting_every_pair() {
+        let mut r = Rng(0x5011_d0c5);
+        let mut deep = 0;
+        for _ in 0..20_000 {
+            let a_text = mixed_value(&mut r, 3);
+            let b_text = match (r.below(3), serde_json::from_str::<serde_json::Value>(&a_text)) {
+                (0, _) | (_, Err(_)) => mixed_value(&mut r, 3),
+                (_, Ok(v)) => respell(&v, &mut r),
+            };
+            let (a, b) = (encode_text(&a_text).unwrap(), encode_text(&b_text).unwrap());
+            let want = sorted_reference(&a, &b, true);
+            deep += usize::from(want.is_eq() && a.first() == Some(&TAG_OBJ));
+            assert_eq!(compare_values(&a, &b), Some(want), "{a_text} vs {b_text}");
+            assert_eq!(order(&a, &b), want, "{a_text} vs {b_text}");
+        }
+        assert!(deep > 1_000, "too few equal objects to walk ({deep})");
+    }
+
+    /// Objects of one size whose first pair ties, so the order is decided
+    /// further into jsonb's key order, some wider than [`key_order`] keeps on
+    /// the stack. Ranks are PostgreSQL 17's `dense_rank() OVER (ORDER BY
+    /// t::jsonb) - 1` over exactly these texts, in a `LC_COLLATE 'C'`
+    /// database.
+    #[test]
+    fn wide_and_tied_objects_order_as_postgresql_orders_them() {
+        // `{"k0":0,…,"k33":33}`, with some values replaced and keys renamed.
+        let wide = |over: &[(&str, i64)], rename: &[(&str, &str)]| {
+            let items: Vec<String> = (0..34)
+                .map(|i| {
+                    let key = format!("k{i}");
+                    let value = over.iter().find(|(k, _)| *k == key).map_or(i, |(_, v)| *v);
+                    let key = rename.iter().find(|(k, _)| *k == key).map_or(key.clone(), |(_, n)| n.to_string());
+                    format!("\"{key}\":{value}")
+                })
+                .collect();
+            format!("{{{}}}", items.join(","))
+        };
+        let ranked: Vec<(u32, String)> = vec![
+            (3, r#"{"a":1,"bb":2,"c":3}"#.into()),
+            (4, r#"{"a":1,"bb":2,"d":3}"#.into()),
+            (2, r#"{"a":1,"c":3,"bb":1}"#.into()),
+            (1, r#"{"a":1,"c":3,"ab":5}"#.into()),
+            (0, r#"{"b":0,"a":1,"cc":0}"#.into()),
+            (5, r#"{"zz":0,"a":1,"yyy":2}"#.into()),
+            (3, r#"{"a":1,"bb":2,"c":3.0}"#.into()),
+            (6, wide(&[], &[])),
+            (7, wide(&[("k33", 99)], &[])),
+            (9, wide(&[("k5", 99)], &[])),
+            (10, wide(&[], &[("k0", "x")])),
+            (8, wide(&[], &[("k20", "k9a")])),
+        ];
+        for (ra, ta) in &ranked {
+            let a = encode_text(ta).unwrap();
+            for (rb, tb) in &ranked {
+                let b = encode_text(tb).unwrap();
+                assert_eq!(compare_values(&a, &b), Some(ra.cmp(rb)), "{ta} vs {tb}");
+                assert_eq!(order(&a, &b), ra.cmp(rb), "{ta} vs {tb}");
+            }
+        }
+    }
+
+    /// Time to sort 200k documents with [`order`], the comparator `ORDER BY`
+    /// on a jsonb column uses. Two sets: varied random documents, and records
+    /// that share one shape, so that object sizes tie and every comparison
+    /// walks into the pairs. To compare an older comparator, add it to
+    /// `comparators`; they run interleaved, round by round, so a busy machine
+    /// slows each alike. Run with
+    /// `cargo test --release -p rasterizeddb_core --lib -- --ignored jsonb_order_bench --nocapture`.
+    #[test]
+    #[ignore]
+    fn jsonb_order_bench() {
+        use std::time::Instant;
+        type Cmp = fn(&[u8], &[u8]) -> std::cmp::Ordering;
+        let comparators: &[(&str, Cmp)] = &[("order", order)];
+        let mut r = Rng(0x0b5e_55ed);
+        let varied: Vec<Vec<u8>> =
+            (0..200_000).map(|_| encode_text(&mixed_value(&mut r, 3)).unwrap()).collect();
+        let records: Vec<Vec<u8>> = (0..200_000)
+            .map(|_| {
+                let text = format!(
+                    r#"{{"id":{},"name":"user {}","email":"u{}@example.com","active":{},"score":{}.{},"tags":["t{}","t{}"],"created_at":"2026-10-{:02}"}}"#,
+                    r.below(1_000_000),
+                    r.below(5_000),
+                    r.below(5_000),
+                    r.below(2) == 0,
+                    r.below(100),
+                    r.below(100),
+                    r.below(20),
+                    r.below(20),
+                    1 + r.below(28),
+                );
+                encode_text(&text).unwrap()
+            })
+            .collect();
+        for (set, docs) in [("varied", &varied), ("records", &records)] {
+            let mut times: Vec<Vec<f64>> = vec![Vec::new(); comparators.len()];
+            let mut sorted: Vec<Vec<&[u8]>> = vec![Vec::new(); comparators.len()];
+            for _ in 0..7 {
+                for (at, (_, cmp)) in comparators.iter().enumerate() {
+                    let mut v: Vec<&[u8]> = docs.iter().map(|d| d.as_slice()).collect();
+                    let t = Instant::now();
+                    v.sort_by(|x, y| cmp(x, y));
+                    times[at].push(t.elapsed().as_secs_f64() * 1e3);
+                    sorted[at] = v;
+                }
+            }
+            for (at, (name, _)) in comparators.iter().enumerate() {
+                assert!(sorted[at] == sorted[0], "{name} sorted {set} differently");
+                times[at].sort_by(f64::total_cmp);
+                println!(
+                    "{set:<8} {name:<8} median {:>8.1} ms  min {:>8.1} ms  max {:>8.1} ms",
+                    times[at][3], times[at][0], times[at][6]
+                );
+            }
+        }
     }
 }
 
