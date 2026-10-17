@@ -186,6 +186,20 @@ pub struct JoinSelectItem {
     pub pending_expression: bool,
 }
 
+impl JoinSelectItem {
+    /// Whether this item reads a relation's column, rather than computing its
+    /// value. A computed item's `rel` and `field` are placeholders — relation
+    /// 0, write order 0 — so anything that finds an item by relation and write
+    /// order has to skip it, or it takes the computed value for that
+    /// relation's first column.
+    pub fn reads_column(&self) -> bool {
+        self.expr.is_none()
+            && self.literal.is_none()
+            && self.scalar.is_none()
+            && !self.pending_expression
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct JoinPlan {
     pub relations: Vec<Relation>,
@@ -1381,10 +1395,9 @@ pub fn project_serialized(plan: &JoinPlan, combined: &Joined<'_>, out: &mut Vec<
         .order_by
         .iter()
         .filter_map(|(rel, field, descending)| {
-            let idx = plan
-                .items
-                .iter()
-                .position(|i| i.rel == *rel && i.field.write_order == field.write_order)?;
+            let idx = plan.items.iter().position(|i| {
+                i.reads_column() && i.rel == *rel && i.field.write_order == field.write_order
+            })?;
             Some((idx, *descending, field.db_type.clone()))
         })
         .collect();
@@ -2557,12 +2570,12 @@ pub fn plan(
     };
 
     // --- select list ---------------------------------------------------
-    // Function calls are collected separately: they name columns to fetch, but
-    // the output column they produce belongs to the fold, not to the join.
-    let mut aggregate_calls: Vec<String> = Vec::new();
-    // `(position in `items`, the item as written)` for each select-list call
-    // that turns out not to be an aggregate.
-    let mut expression_items: Vec<(usize, String)> = Vec::new();
+    // `(position in `items`, the expression, its alias)` for each select-list
+    // item that is not a bare column: a call that turns out not to be an
+    // aggregate, or any other expression. Calls are kept apart from the
+    // columns because the output column they produce may belong to the fold
+    // rather than to the join.
+    let mut expression_items: Vec<(usize, String, Option<String>)> = Vec::new();
     let mut items: Vec<JoinSelectItem> = Vec::new();
     if select_list.trim() == "*" {
         for (i, s) in schemas.iter().enumerate() {
@@ -2596,11 +2609,16 @@ pub fn plan(
                 // column without grouping anything, so it must not push the
                 // statement onto the aggregate path — which would then demand
                 // every other column appear in GROUP BY.
-                let (expr, alias) = split_expr_alias(item);
+                //
+                // Only when the call is the whole item: `now() IS NOT NULL`
+                // was answered with `now()`, the rest of the item dropped.
+                let (expr, alias) = select_entry(item);
                 if let Some(open) = expr.find('(') {
                     let name = expr[..open].trim();
-                    if let Some((func, db_type)) =
-                        crate::core::rql::aggregate::ScalarFunc::parse(name)
+                    let whole_item = crate::core::rql::expr::matching_paren(&expr, open)
+                        == Some(expr.len() - 1);
+                    if let Some((func, db_type)) = crate::core::rql::aggregate::ScalarFunc::parse(name)
+                        .filter(|_| whole_item)
                     {
                         let close = expr
                             .rfind(')')
@@ -2646,48 +2664,28 @@ pub fn plan(
                 // `items.len()` is the index this item was written at, because
                 // `items` is filled in select-list order and nothing else
                 // inserts into it.
-                expression_items.push((items.len(), item.to_string()));
-                aggregate_calls.push(item.to_string());
-                continue;
-            }
-            // A constant reads no column: `SELECT a.id, 0, NULL FROM …`.
-            // Resolving it as a column reported "Column '0' not found".
-            if let Ok(parsed) = crate::core::rql::expr::parse(item, &[]) {
-                let (bytes, db_type) = match parsed {
-                    crate::core::rql::expr::Expr::Literal { bytes, db_type } => (bytes, db_type),
-                    crate::core::rql::expr::Expr::Null => (Vec::new(), DbType::STRING),
-                    _ => (Vec::new(), DbType::STRING),
-                };
-                items.push(JoinSelectItem {
-                    rel: 0,
-                    field: SchemaField::new(
-                        "?column?".to_string(),
-                        db_type.clone(),
-                        db_type.get_size(),
-                        0,
-                        0,
-                        false,
-                    ),
-                    label: "?column?".to_string(),
-                    scalar: None,
-                    literal: Some(bytes),
-                    expr: None,
-                    pending_expression: false,
-                });
+                let (expr, alias) = select_entry(item);
+                expression_items.push((items.len(), expr, alias));
                 continue;
             }
 
-            let mut parts = item.split_whitespace();
-            let head = parts.next().unwrap_or(item);
-            let alias = match parts.next() {
-                Some(w) if w.eq_ignore_ascii_case("AS") => parts.next(),
-                Some(w) => Some(w),
-                None => None,
-            };
-            let (rel, field) = resolve(head)?;
-            let label = alias
-                .map(|a| a.trim_matches('"').to_string())
-                .unwrap_or_else(|| field.name.clone());
+            // Anything but a bare column is an expression over the combined
+            // row, evaluated like the calls above: an operator, a cast, a JSON
+            // path, a comparison, a CASE, a constant.
+            //
+            // The item used to be split on whitespace and its first word
+            // resolved as a column, so `a.n * 10 + b.n AS k` came back as
+            // `a.n` labelled `*` — the first operand under the operator's name,
+            // with nothing reporting it, and `INSERT … SELECT` stored it. A
+            // constant was kept as bytes with no NULL of its own, so `NULL`
+            // went out as an empty string.
+            let (expr, alias) = select_entry(item);
+            if !is_column_reference(&expr) {
+                expression_items.push((items.len(), expr, alias));
+                continue;
+            }
+            let (rel, field) = resolve(&expr)?;
+            let label = alias.unwrap_or_else(|| field.name.clone());
             items.push(JoinSelectItem {
                 rel,
                 field,
@@ -2699,7 +2697,7 @@ pub fn plan(
             });
         }
     }
-    if items.is_empty() && aggregate_calls.is_empty() {
+    if items.is_empty() && expression_items.is_empty() {
         return Err("SELECT list is empty".to_string());
     }
 
@@ -3017,12 +3015,15 @@ pub fn plan(
         // point at.
         expression_items = expr_arguments
             .iter()
-            .map(|text| (0usize, text.clone()))
+            .map(|text| (0usize, text.clone(), None))
             .collect();
     } else {
-        for (offset, (position, text)) in expression_items.iter().enumerate() {
-            let (expr_text, alias) = split_expr_alias(text);
-            let label = alias.unwrap_or_else(|| expr_text.trim().to_string());
+        for (offset, (position, expr_text, alias)) in expression_items.iter().enumerate() {
+            // Named as PostgreSQL names it when there is no alias. The
+            // expression's own text was used, which no client asks for by
+            // name, and an ORDER BY of that text then matched the placeholder
+            // as though it were a column.
+            let label = alias.clone().unwrap_or_else(|| pg_column_name(expr_text));
             let at = (position + offset).min(items.len());
             items.insert(
                 at,
@@ -3071,9 +3072,8 @@ pub fn plan(
             split_top_level_commas(select_list)
                 .into_iter()
                 .map(|raw| {
-                    let item = raw.trim();
-                    let (expr, alias) = split_expr_alias(item);
-                    alias.unwrap_or_else(|| expr.trim().to_string())
+                    let (expr, alias) = select_entry(raw.trim());
+                    alias.unwrap_or(expr)
                 })
                 .collect()
         };
@@ -3096,14 +3096,21 @@ pub fn plan(
         if let Some(item) = items.iter().find(|i| {
             i.label.eq_ignore_ascii_case(&term.token) && i.scalar.is_none() && i.literal.is_none()
         }) {
+            // An expression's alias names a value the projection computes,
+            // not a column it copies, so it is sorted by evaluating the
+            // expression like any other computed key.
+            if !item.reads_column() {
+                needs_expressions = true;
+                break;
+            }
             order_keys.push((item.rel, item.field.clone(), term.descending));
             continue;
         }
         match resolve(&term.token) {
             Ok((rel, field))
-                if items
-                    .iter()
-                    .any(|i| i.rel == rel && i.field.write_order == field.write_order) =>
+                if items.iter().any(|i| {
+                    i.reads_column() && i.rel == rel && i.field.write_order == field.write_order
+                }) =>
             {
                 order_keys.push((rel, field, term.descending));
             }
@@ -3136,7 +3143,11 @@ pub fn plan(
             }
         };
 
-        for item in items.iter().filter(|it| it.rel == i) {
+        // Only the items that read a column: a computed item's field is a
+        // placeholder at write order 0, and fetching it put a column of the
+        // wrong name and type in that relation's slot, so the real column at
+        // write order 0 was never fetched.
+        for item in items.iter().filter(|it| it.rel == i && it.reads_column()) {
             push(&item.field, &mut fetch);
         }
         // This relation's own join key, and the key another relation joins to
@@ -3192,7 +3203,7 @@ pub fn plan(
         }
         // And for a select-list expression, which reads columns the projection
         // has no other reason to fetch.
-        for (_, text) in &expression_items {
+        for (_, text, _) in &expression_items {
             for field in schemas[i].iter() {
                 if term_names_column(text, &r.label, &r.table, &field.name) {
                     push(field, &mut fetch);
@@ -3328,14 +3339,16 @@ pub fn plan(
             .filter(|(_, item)| item.pending_expression)
             .map(|(at, _)| at)
             .collect();
-        for (position, (_, text)) in pending.iter().zip(expression_items.iter()) {
-            let (written, _) = split_expr_alias(text);
-            let mut rewritten = written.trim().to_string();
+        for (position, (_, text, _)) in pending.iter().zip(expression_items.iter()) {
+            let mut rewritten = text.trim().to_string();
             for (from, to) in &layout.renames {
                 rewritten = replace_qualified(&rewritten, from, to);
             }
-            let parsed =
-                crate::core::rql::expr::parse(&rewritten, &layout.schema).map_err(|e| {
+            // A comparison is a boolean value here, which the expression
+            // grammar does not read; it is tried only once that has failed.
+            let parsed = crate::core::rql::expr::parse(&rewritten, &layout.schema)
+                .or_else(|e| comparison_value(&rewritten, &layout.schema).ok_or(e))
+                .map_err(|e| {
                     format!(
                         "the SELECT list item '{}' could not be read as an expression \
                          over this join: {}",
@@ -3380,6 +3393,13 @@ pub fn plan(
                     && i.scalar.is_none()
                     && i.literal.is_none()
             }) {
+                // The alias of a select-list expression sorts by that
+                // expression, already parsed above.
+                Some(item) if item.expr.is_some() => {
+                    let expr = item.expr.clone().expect("checked");
+                    order_exprs.push((expr, term.descending, term.nulls_first));
+                    continue;
+                }
                 Some(item) => format!("{}.{}", out_relations[item.rel].label, item.field.name),
                 None => term.token.clone(),
             };
@@ -3872,10 +3892,9 @@ fn build_aggregate_stage(
     // Adds a column to the join's output if it is not already there, and
     // returns a field addressing it by position in the projected row.
     fn positional(rel: usize, field: SchemaField, items: &mut Vec<JoinSelectItem>) -> SchemaField {
-        let pos = match items
-            .iter()
-            .position(|i| i.rel == rel && i.field.write_order == field.write_order)
-        {
+        let pos = match items.iter().position(|i| {
+            i.reads_column() && i.rel == rel && i.field.write_order == field.write_order
+        }) {
             Some(p) => p,
             None => {
                 items.push(JoinSelectItem {
@@ -4327,69 +4346,238 @@ fn split_top_level(list: &str) -> Vec<String> {
 }
 
 /// Separates a select item from its output name.
+///
+/// The single-relation splitter, so a join reads an alias exactly as a plain
+/// `SELECT` does. This one had its own copy, which honoured `AS` only after
+/// the last `)`: `COALESCE(a.n, -1) + b.m AS s` kept `AS s` in the
+/// expression, and the item was refused as "'b__m AS s' is neither a column
+/// nor a value".
 fn split_expr_alias(entry: &str) -> (&str, Option<String>) {
-    let tail_start = entry.rfind(')').map(|i| i + 1).unwrap_or(0);
-    let tail = &entry[tail_start..];
+    crate::core::rql::lexer_query::split_alias(entry)
+}
 
-    // Nothing after the last `)` means there is no alias and the whole item is
-    // the expression. Without this the fall-through below split the item on
-    // whitespace, so `COALESCE(SUM(x), 0)` became `COALESCE(SUM(x),` with the
-    // alias `0)` — reported back as "unterminated call".
-    if tail_start > 0 && tail.trim().is_empty() {
-        return (entry.trim_end(), None);
+/// A select item's expression and alias, with a null test kept whole.
+///
+/// `a.n IS NULL` has no alias, but a whitespace split reads `IS` as one, and
+/// the item came back as the column `a.n` labelled `IS`.
+fn select_entry(item: &str) -> (String, Option<String>) {
+    if let Some((test, alias)) = crate::core::rql::lexer_query::null_test_item(item) {
+        return (test, alias);
     }
+    let (expr, alias) = split_expr_alias(item);
+    (expr.trim().to_string(), alias)
+}
 
-    // A cast after the last `)` belongs to the *expression*, not to the alias:
-    // `(AVG(x))::float8 AS avg` has the tail `::float8 AS avg`, whose first
-    // word is neither `AS` nor a name. Without this it fell through to the
-    // whitespace split below, which cut the item at its first space — inside
-    // `EXTRACT(EPOCH FROM …)` that produced `(AVG(EXTRACT(EPOCH` with the alias
-    // `FROM`.
-    let leading = tail.len() - tail.trim_start().len();
-    let trimmed_tail = tail.trim_start();
-    let (expr_end, tail) = if trimmed_tail.starts_with("::") {
-        let cast_len = trimmed_tail
-            .find(char::is_whitespace)
-            .unwrap_or(trimmed_tail.len());
-        (tail_start + leading + cast_len, &trimmed_tail[cast_len..])
-    } else {
-        (tail_start, tail)
+/// Whether a select item names a column — `n`, `a.n`, `"A"."N"` — rather than
+/// computing a value. `NULL`, `TRUE` and `FALSE` are spelled like names and
+/// are constants.
+fn is_column_reference(text: &str) -> bool {
+    let text = text.trim();
+    let starts_like_a_name = text
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_alphabetic() || c == '_' || c == '"');
+    starts_like_a_name
+        && text
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '"' | '*' | '$'))
+        && !["NULL", "TRUE", "FALSE"]
+            .iter()
+            .any(|keyword| text.eq_ignore_ascii_case(keyword))
+}
+
+/// A comparison used as a value — `a.n > b.m`, `x = 3`, `x IS NULL` — as the
+/// boolean expression it stands for, or `None` when `text` is not one.
+///
+/// SQL's comparison is three-valued: a NULL on either side makes it NULL, not
+/// false. A condition here evaluates to a plain `bool`, so for a comparison
+/// between two values the NULL cases are stated as arms ahead of it. A null
+/// test is never NULL and needs none.
+pub(crate) fn comparison_value(
+    text: &str,
+    schema: &[SchemaField],
+) -> Option<crate::core::rql::expr::Expr> {
+    use crate::core::rql::expr::{Cmp, Cond, Condition, Expr};
+    let condition = crate::core::rql::expr::parse_condition(text, schema).ok()?;
+    let boolean = |value: bool| Expr::Literal {
+        bytes: vec![value as u8],
+        db_type: DbType::BOOL,
     };
+    let is_null = |operand: &Expr| {
+        Cond::Cmp(Condition {
+            left: Box::new(operand.clone()),
+            cmp: Cmp::IsNull,
+            right: None,
+        })
+    };
+    let mut whens = Vec::new();
+    if let Some(right) = condition.right.as_deref() {
+        whens.push((is_null(&condition.left), Expr::Null));
+        whens.push((is_null(right), Expr::Null));
+    }
+    whens.push((Cond::Cmp(condition), boolean(true)));
+    Some(Expr::Case {
+        whens,
+        otherwise: Some(Box::new(boolean(false))),
+    })
+}
 
-    let mut words = tail.split_whitespace();
+/// The name PostgreSQL gives a select item written without an alias — its
+/// `FigureColname`.
+///
+/// A column is named after the column, a function call after the function, a
+/// `CASE` after its `ELSE` when that has a name and `case` otherwise, and a
+/// cast after what it casts or, when that has no name, the type. Anything else
+/// — an operator, a constant, a comparison, a JSON path — is `?column?`.
+fn pg_column_name(text: &str) -> String {
+    figure_column_name(text)
+        .map(|(name, _)| name)
+        .unwrap_or_else(|| "?column?".to_string())
+}
 
-    match (words.next(), words.next()) {
-        (Some(first), Some(second)) if first.eq_ignore_ascii_case("AS") => (
-            entry[..expr_end].trim_end(),
-            Some(second.trim_matches('"').to_string()),
-        ),
-        (Some(first), None) if tail_start > 0 => (
-            entry[..expr_end].trim_end(),
-            Some(first.trim_matches('"').to_string()),
-        ),
-        // A cast and nothing after it: the whole item is the expression.
-        (None, _) if expr_end > tail_start => (entry[..expr_end].trim_end(), None),
-        _ => {
-            let mut parts = entry.split_whitespace();
-            let head = parts.next().unwrap_or(entry);
-            let alias = match parts.next() {
-                Some(w) if w.eq_ignore_ascii_case("AS") => {
-                    parts.next().map(|a| a.trim_matches('"').to_string())
+/// The name and its strength, as PostgreSQL ranks them: 2 for a column or a
+/// call, 1 for a fallback such as `case` or a cast's type name. A cast or a
+/// `CASE` keeps its operand's name only when that is a strong one.
+fn figure_column_name(text: &str) -> Option<(String, u8)> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    // Parentheses group; they do not name anything.
+    if text.starts_with('(')
+        && crate::core::rql::expr::matching_paren(text, 0) == Some(text.len() - 1)
+    {
+        return figure_column_name(&text[1..text.len() - 1]);
+    }
+    if let Some((operand, type_name)) = crate::core::rql::expr::trailing_cast(text) {
+        // `a + b::int` casts `b` alone, so the item is the sum and unnamed.
+        if !is_single_operand(operand) {
+            return None;
+        }
+        return cast_name(figure_column_name(operand), type_name);
+    }
+    let upper = text.to_ascii_uppercase();
+    if upper.starts_with("CASE")
+        && upper[4..].starts_with(|c: char| c.is_ascii_whitespace())
+        && upper.ends_with("END")
+    {
+        // The `ELSE` result, when it is the last top-level one.
+        let else_at = find_keyword(text, "ELSE", 0).and_then(|mut at| {
+            while let Some(next) = find_keyword(text, "ELSE", at + 4) {
+                at = next;
+            }
+            Some(at)
+        });
+        let named = else_at
+            .and_then(|at| figure_column_name(&text[at + 4..text.len() - 3]))
+            .filter(|(_, strength)| *strength == 2);
+        return Some(named.unwrap_or_else(|| ("case".to_string(), 1)));
+    }
+    if text.eq_ignore_ascii_case("TRUE") || text.eq_ignore_ascii_case("FALSE") {
+        // PostgreSQL reads a boolean constant as a cast of a string to `bool`.
+        return Some(("bool".to_string(), 1));
+    }
+    if is_column_reference(text) {
+        let (_, column) = split_qualified(text);
+        return Some((column.trim_matches('"').to_string(), 2));
+    }
+    // A call: a name, then one parenthesised argument list that ends the item.
+    if let Some(open) = text.find('(') {
+        let name = text[..open].trim();
+        if crate::core::rql::expr::matching_paren(text, open) == Some(text.len() - 1)
+            && is_column_reference(name)
+            && !name.contains('"')
+        {
+            let (_, function) = split_qualified(name);
+            if function.eq_ignore_ascii_case("CAST") {
+                let inside = &text[open + 1..text.len() - 1];
+                let as_at = find_keyword(inside, "AS", 0)?;
+                let mut last = as_at;
+                while let Some(next) = find_keyword(inside, "AS", last + 2) {
+                    last = next;
                 }
-                // An operator is part of the expression, not a name for it.
-                Some(w)
-                    if w.chars()
-                        .next()
-                        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_') =>
-                {
-                    Some(w.trim_matches('"').to_string())
-                }
-                Some(_) => return (entry.trim(), None),
-                None => None,
-            };
-            (head, alias)
+                return cast_name(figure_column_name(&inside[..last]), &inside[last + 2..]);
+            }
+            return Some((function.to_ascii_lowercase(), 2));
         }
     }
+    None
+}
+
+/// A cast's name: its operand's when that is a strong one, else the type's.
+fn cast_name(operand: Option<(String, u8)>, type_name: &str) -> Option<(String, u8)> {
+    if let Some((name, 2)) = operand {
+        return Some((name, 2));
+    }
+    Some((pg_type_name(type_name), 1))
+}
+
+/// Whether `text` is one operand — a name, a constant, a call, a
+/// parenthesised group or a cast of one — rather than operators over several.
+fn is_single_operand(text: &str) -> bool {
+    let text = text.trim();
+    if text.is_empty() {
+        return false;
+    }
+    if text.starts_with('(')
+        && crate::core::rql::expr::matching_paren(text, 0) == Some(text.len() - 1)
+    {
+        return true;
+    }
+    if let Some((operand, _)) = crate::core::rql::expr::trailing_cast(text) {
+        return is_single_operand(operand);
+    }
+    if is_column_reference(text)
+        || text.parse::<f64>().is_ok()
+        || ["NULL", "TRUE", "FALSE"]
+            .iter()
+            .any(|keyword| text.eq_ignore_ascii_case(keyword))
+    {
+        return true;
+    }
+    if text.starts_with('\'') && text.ends_with('\'') && text.len() >= 2 {
+        // One literal, unless a quote inside it closes it early: `'a' || 'b'`.
+        let inner = &text[1..text.len() - 1];
+        return !inner.replace("''", "").contains('\'');
+    }
+    match text.find('(') {
+        Some(open) => {
+            crate::core::rql::expr::matching_paren(text, open) == Some(text.len() - 1)
+                && is_column_reference(text[..open].trim())
+        }
+        None => false,
+    }
+}
+
+/// The name PostgreSQL reports for a type as written in a cast: its internal
+/// name, without a length or precision.
+fn pg_type_name(written: &str) -> String {
+    let lower = written.trim().to_ascii_lowercase();
+    let base = lower
+        .split(['(', '['])
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let base = base.rsplit('.').next().unwrap_or("").trim_matches('"');
+    match base {
+        "int" | "integer" | "int4" => "int4",
+        "bigint" | "int8" => "int8",
+        "smallint" | "int2" => "int2",
+        "real" | "float4" => "float4",
+        "double precision" | "float" | "float8" => "float8",
+        "boolean" | "bool" => "bool",
+        "decimal" | "numeric" => "numeric",
+        "character varying" | "varchar" => "varchar",
+        "character" | "char" | "bpchar" => "bpchar",
+        "timestamp" | "timestamp without time zone" => "timestamp",
+        "timestamptz" | "timestamp with time zone" => "timestamptz",
+        "time" | "time without time zone" => "time",
+        "timetz" | "time with time zone" => "timetz",
+        other => other,
+    }
+    .to_string()
 }
 
 /// True when a `SELECT` statement's `FROM` clause contains a join.

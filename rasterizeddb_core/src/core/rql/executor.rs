@@ -119,9 +119,10 @@ async fn execute_join(sql: &str, database: Arc<Database>, tx: TxId) -> Vec<u8> {
     // A shredded JSON column projected through the join has to be hydrated in
     // the projected rows (below), which needs them decoded. Everything else is
     // serialized straight from the tuples, or folded straight from them.
+    // Only an item that reads a column: a computed one's field is named after
+    // its alias, which may match a shredded column it never read.
     let has_shadow_json = plan.items.iter().any(|item| {
-        item.literal.is_none()
-            && item.scalar.is_none()
+        item.reads_column()
             && plan.relations.get(item.rel).is_some_and(|relation| {
                 database.tables.get(&relation.table).is_some_and(|t| {
                     crate::core::rql::json_map::shadow_for(&item.field.name, &t.schema.json_columns)
@@ -162,7 +163,7 @@ async fn execute_join(sql: &str, database: Arc<Database>, tx: TxId) -> Vec<u8> {
     // single-table path does it — grouping must be on the document, not on a
     // reference that is unique per row.
     for (i, item) in plan.items.iter().enumerate() {
-        if item.literal.is_some() || item.scalar.is_some() {
+        if !item.reads_column() {
             continue;
         }
         let Some(relation) = plan.relations.get(item.rel) else {

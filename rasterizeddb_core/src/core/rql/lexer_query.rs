@@ -478,6 +478,18 @@ fn parse_select_items(
             }
         }
 
+        // A comparison is a boolean value — `n > 1`, `a = b` — which the
+        // expression grammar does not read. Before the constant test, which
+        // takes `'a' = 'b'` for one string literal.
+        if let Some(parsed) = crate::core::rql::join::comparison_value(expr, schema) {
+            out.push(SelectItem::RowExpr {
+                db_type: crate::core::rql::expr::static_type(&parsed),
+                expr: parsed,
+                label: alias.unwrap_or_else(|| "?column?".to_string()),
+            });
+            continue;
+        }
+
         // A constant reads no column: `SELECT 1`, or whatever a scalar
         // subquery was replaced with.
         if let Some((bytes, db_type)) = parse_constant(expr) {
@@ -807,7 +819,7 @@ fn find_top_level_as(item: &str) -> Option<usize> {
 /// A select item `<expr> IS [NOT] NULL [[AS] alias]`, as the test's text and
 /// the alias, or `None` when the item is not that shape. A `CASE` block holds
 /// its own `IS` and is left to the expression parser.
-fn null_test_item(item: &str) -> Option<(String, Option<String>)> {
+pub(crate) fn null_test_item(item: &str) -> Option<(String, Option<String>)> {
     if item.trim_start().to_ascii_uppercase().starts_with("CASE") {
         return None;
     }

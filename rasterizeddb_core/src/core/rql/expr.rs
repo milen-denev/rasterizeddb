@@ -1402,7 +1402,10 @@ fn find_operator(text: &str, op: &str) -> Option<usize> {
                 b'(' => depth += 1,
                 b')' => depth = depth.saturating_sub(1),
                 _ => {
-                    if depth == 0 && text[i..].starts_with(op) {
+                    // Compared as bytes: `i` steps through every byte, and
+                    // slicing the text at one inside a multi-byte character
+                    // (`naïve`) panicked.
+                    if depth == 0 && bytes[i..].starts_with(op.as_bytes()) {
                         // `::` is a cast, not two comparisons.
                         if op == "=" && i > 0 && matches!(bytes[i - 1], b'<' | b'>' | b'!') {
                             i += 1;
