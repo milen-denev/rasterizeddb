@@ -769,3 +769,30 @@ async fn quoted_literals_with_extra_places_compare_exactly() {
     .await;
     verdict(wrong);
 }
+
+/// Arithmetic over an unsigned column is done in the next signed type up,
+/// which holds every value the column can. `UINT + 1` was computed as
+/// `integer` and refused 3000000000 + 1 as out of range.
+#[tokio::test(flavor = "multi_thread")]
+async fn unsigned_columns_widen_their_arithmetic() {
+    let mut db = db(&[
+        "CREATE TABLE uq (id INT, ui UINT, us USMALLINT)",
+        "INSERT INTO uq (id, ui, us) VALUES (1, 3000000000, 40000)",
+    ])
+    .await;
+    let mut wrong = Vec::new();
+    if let Err(e) = db.pool.execute("UPDATE uq SET ui = ui + 1, us = us + 1 WHERE id = 1").await {
+        wrong.push(format!("UPDATE uq SET ui = ui + 1, us = us + 1: {}", e));
+    }
+    // PostgreSQL's answers for the same values held as bigint and integer.
+    expect_rows(
+        &mut db,
+        &mut wrong,
+        &[
+            ("SELECT ui, us FROM uq", &["3000000001|40001"]),
+            ("SELECT ui * 1, us + us, ui + ui FROM uq", &["3000000001|80002|6000000002"]),
+        ],
+    )
+    .await;
+    verdict(wrong);
+}

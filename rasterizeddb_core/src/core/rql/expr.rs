@@ -1584,10 +1584,11 @@ pub fn static_type(expr: &Expr) -> DbType {
         Expr::Arith(lhs, op, rhs) => {
             let ty = |e: &Expr| static_type(e);
             let timestamp = |e: &Expr| matches!(ty(e), DbType::DATETIME);
+            // The same ranks as `wider_integer`, unsigned types one up.
             let rank = |e: &Expr| match ty(e) {
                 DbType::I8 | DbType::U8 => 1,
-                DbType::I16 | DbType::U16 => 2,
-                DbType::I32 | DbType::U32 => 3,
+                DbType::I16 => 2,
+                DbType::I32 | DbType::U16 => 3,
                 _ => 4,
             };
             // An integer literal carries PostgreSQL's own type — `int4` when it
@@ -2973,12 +2974,16 @@ fn negate(inner: Expr) -> Result<Expr, String> {
 }
 
 /// The type an integer result takes: the wider of the two operands.
+///
+/// An unsigned type ranks with the signed type one wider, the narrowest that
+/// holds all its values, as `pg_input_type_name` names it: a `UINT` holding
+/// 3000000000 plus `1` was computed as `integer` and refused as out of range.
 fn wider_integer(a: &Value, b: &Value) -> DbType {
     let rank = |value: &Value| match value {
         Value::Data { db_type, .. } => match db_type {
             DbType::I8 | DbType::U8 => 1,
-            DbType::I16 | DbType::U16 => 2,
-            DbType::I32 | DbType::U32 => 3,
+            DbType::I16 => 2,
+            DbType::I32 | DbType::U16 => 3,
             _ => 4,
         },
         Value::Null => 0,
