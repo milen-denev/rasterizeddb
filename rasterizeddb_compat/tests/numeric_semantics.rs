@@ -427,6 +427,72 @@ async fn a_thousand_generated_rows_agree_with_their_inputs() {
     assert!(wrong.is_empty(), "{} rows stored wrongly:\n{}", wrong.len(), wrong.join("\n"));
 }
 
+// ---------------------------------------------------------------- bug #6
+
+/// `date ± integer` moves by days and stays a date; `date - date` is a day
+/// count. Interval arithmetic keeps working.
+#[tokio::test(flavor = "multi_thread")]
+async fn date_arithmetic_counts_days() {
+    let mut db = db(&[
+        DIGITS[0],
+        DIGITS[1],
+        "CREATE TABLE dd (id INT, d DATE, ts TIMESTAMP)",
+        "INSERT INTO dd (id, d, ts) VALUES (1, '2024-01-01', '2024-01-01 10:30:00'), (2, '2024-02-28', '2024-02-29 00:00:00')",
+    ])
+    .await;
+    let mut wrong = Vec::new();
+    expect_rows(
+        &mut db,
+        &mut wrong,
+        &[
+            // Added three microseconds: 2024-01-01 00:00:00.000003+00.
+            (
+                "SELECT '2024-01-01'::date + 3, '2024-01-01'::date - 3, 3 + '2024-01-01'::date FROM dg WHERE n = 1",
+                &["2024-01-04|2023-12-29|2024-01-04"],
+            ),
+            ("SELECT '2024-03-01'::date - '2024-01-01'::date FROM dg WHERE n = 1", &["60"]),
+            (
+                "SELECT id, d + 3, d - 3, d + 1 - d FROM dd ORDER BY id",
+                &["1|2024-01-04|2023-12-29|1", "2|2024-03-02|2024-02-25|1"],
+            ),
+            ("SELECT id, ts::date, d - ts::date FROM dd ORDER BY id", &["1|2024-01-01|0", "2|2024-02-29|-1"]),
+            (
+                "SELECT id, CASE WHEN ts::date = '2024-01-01'::date THEN 'y' ELSE 'n' END FROM dd ORDER BY id",
+                &["1|y", "2|n"],
+            ),
+            // `CURRENT_DATE + 1` is tomorrow, not a microsecond past midnight.
+            ("SELECT CURRENT_DATE + 1 - CURRENT_DATE FROM dg WHERE n = 1", &["1"]),
+        ],
+    )
+    .await;
+    for (sql, want) in [
+        ("SELECT '2024-01-01'::date + 3 FROM dg WHERE n = 1", vec!["DATE"]),
+        ("SELECT '2024-03-01'::date - '2024-01-01'::date FROM dg WHERE n = 1", vec!["INT4"]),
+        ("SELECT d + 3, ts::date FROM dd WHERE id = 1", vec!["DATE", "DATE"]),
+    ] {
+        match db.types(sql).await {
+            Ok(got) if got == want => {}
+            other => wrong.push(format!("{}: described as {:?}, want {:?}", sql, other, want)),
+        }
+    }
+    // A date plus an interval is a timestamp, and a timestamp plus one stays
+    // one. PostgreSQL's is `timestamp without time zone`; this engine has one
+    // timestamp type, which renders an offset, so the instant is what is
+    // compared.
+    for (sql, want) in [
+        ("SELECT '2024-01-01'::date + interval '1 day' FROM dg WHERE n = 1", "2024-01-02 00:00:00"),
+        ("SELECT '2024-01-01 10:00'::timestamp + interval '1 day' FROM dg WHERE n = 1", "2024-01-02 10:00:00"),
+        ("SELECT d + interval '1 month' FROM dd WHERE id = 2", "2024-03-28 00:00:00"),
+        ("SELECT interval '1 day' + d FROM dd WHERE id = 1", "2024-01-02 00:00:00"),
+    ] {
+        match db.text(sql).await {
+            Ok(got) if got.len() == 1 && got[0].starts_with(want) => {}
+            other => wrong.push(format!("{}: got {:?}, want {}", sql, other, want)),
+        }
+    }
+    verdict(wrong);
+}
+
 // ---------------------------------------------------------------- bug #14
 
 /// A cast to `numeric(p, s)` rounds to `s` and renders at it, and a

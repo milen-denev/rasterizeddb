@@ -336,7 +336,13 @@ pub(crate) fn matching_paren(text: &str, open: usize) -> Option<usize> {
 /// One definition of what a cast's type name means, so the predicate path and
 /// the expression evaluator cannot drift apart on it.
 pub fn db_type_of_cast(name: &str) -> Option<DbType> {
-    cast_target(name)
+    // The predicate tokenizer still reads `::date` and `DATE '…'` as a
+    // timestamp at midnight, which is what its comparisons are built on; only
+    // the expression evaluator has date arithmetic.
+    match cast_target(name)? {
+        DbType::DATE => Some(DbType::DATETIME),
+        other => Some(other),
+    }
 }
 
 /// The SQL type a `::` cast names.
@@ -356,9 +362,11 @@ fn cast_target(name: &str) -> Option<DbType> {
             "TEXT" | "VARCHAR" | "CHARACTER VARYING" => DbType::STRING,
             "BOOL" | "BOOLEAN" => DbType::BOOL,
             "UUID" => DbType::UUID,
-            // A date is a timestamp at midnight here: day precision is what the
-            // comparisons need, and the parser accepts a date-only literal.
-            "TIMESTAMP" | "TIMESTAMPTZ" | "DATE" => DbType::DATETIME,
+            "TIMESTAMP" | "TIMESTAMPTZ" => DbType::DATETIME,
+            // A real date, not a timestamp at midnight: `date + 3` is three
+            // days, and a timestamp plus 3 was three microseconds — the
+            // engine's interval unit — rendered as `00:00:00.000003+00`.
+            "DATE" => DbType::DATE,
             "NUMERIC" | "DECIMAL" => DbType::DECIMAL,
             "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" => DbType::F64,
             // `real` IS float4 — mapping it to F64 made the described type float8,
@@ -516,9 +524,9 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                 return Err(format!("'{}' has no right operand", op.symbol()));
             }
             return Ok(fold_float_literal_into_decimal(Expr::Arith(
-                Box::new(parse(lhs, schema)?),
+                Box::new(date_operand(parse(lhs, schema)?)),
                 op,
-                Box::new(parse(rhs, schema)?),
+                Box::new(date_operand(parse(rhs, schema)?)),
             )));
         }
 
@@ -694,9 +702,15 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                         )
                         .ok_or_else(|| "interval is too large".to_string())?;
                 }
+                // An interval, not a bare count of microseconds: a count is an
+                // integer, and an integer next to a date is a number of days.
                 return Ok(Expr::Literal {
-                    bytes: micros.to_le_bytes().to_vec(),
-                    db_type: DbType::I64,
+                    bytes: crate::core::pg_types::encode_interval(crate::core::pg_types::Interval {
+                        months: 0,
+                        days: 0,
+                        micros,
+                    }),
+                    db_type: DbType::INTERVAL,
                 });
             }
 
@@ -1583,6 +1597,20 @@ pub fn static_type(expr: &Expr) -> DbType {
             // value, which described that last product as `int4`; `eval`
             // computed it in `int8`, and the row went out as its low four
             // bytes.
+            let date = |e: &Expr| matches!(ty(e), DbType::DATE);
+            if date(lhs) || date(rhs) {
+                // Mirrors `date_arith`, and PostgreSQL's operators: a day
+                // count moves a date and leaves a date, two dates differ by a
+                // day count, and an interval or a time of day makes it a
+                // timestamp.
+                let other = if date(lhs) { ty(rhs) } else { ty(lhs) };
+                return match other {
+                    DbType::DATE => DbType::I32,
+                    DbType::DATETIME if matches!(op, ArithOp::Sub) => DbType::INTERVAL,
+                    DbType::DATETIME | DbType::INTERVAL => DbType::DATETIME,
+                    _ => DbType::DATE,
+                };
+            }
             if timestamp(lhs) && timestamp(rhs) && matches!(op, ArithOp::Sub) {
                 // The difference of two instants is a span, not a bigint. It
                 // was described as `int8` before the type existed, and a client
@@ -1730,6 +1758,10 @@ fn arith(a: &Value, op: ArithOp, b: &Value) -> Result<Value, String> {
             }
         )
     };
+
+    if matches!(a.db_type(), Some(DbType::DATE)) || matches!(b.db_type(), Some(DbType::DATE)) {
+        return date_arith(a, op, b);
+    }
 
     // Interval ± interval is an interval, with the three fields kept apart —
     // a month is not thirty days, and collapsing them here would make
@@ -1922,8 +1954,9 @@ fn as_text(value: &Value) -> String {
             // A number with a fraction has no integer reading, and its raw
             // bytes are not text: `'r' || 1.5` concatenated the float's eight
             // bytes.
-            DbType::DECIMAL | DbType::F32 | DbType::F64 => {
+            DbType::DECIMAL | DbType::F32 | DbType::F64 | DbType::DATE | DbType::DATETIME => {
                 crate::core::rql::subquery::value_to_literal(db_type, bytes)
+                    .map(|text| crate::core::value_codec::unquote_sql(&text).to_string())
                     .unwrap_or_else(|| String::from_utf8_lossy(bytes).to_string())
             }
             _ => match as_i64(value) {
@@ -2717,6 +2750,126 @@ pub(crate) fn rescale_decimal(raw: i128, from: u32, to: u32) -> Option<i128> {
     }
 }
 
+/// Microseconds in a day, the step between two consecutive dates.
+const DAY_US: i64 = 86_400_000_000;
+
+/// A date's day count from PostgreSQL's epoch, 2000-01-01.
+fn date_days(value: &Value) -> Option<i32> {
+    match value {
+        Value::Data {
+            bytes,
+            db_type: DbType::DATE,
+        } => Some(i32::from_be_bytes(bytes.as_slice().try_into().ok()?)),
+        _ => None,
+    }
+}
+
+fn date_value(days: i64) -> Result<Value, String> {
+    let days = i32::try_from(days).map_err(|_| "date out of range".to_string())?;
+    Ok(Value::Data {
+        bytes: days.to_be_bytes().to_vec(),
+        db_type: DbType::DATE,
+    })
+}
+
+/// A date or a timestamp as microseconds since the Unix epoch, which is how a
+/// timestamp is stored; a date is its midnight.
+fn instant_of(db_type: &DbType, bytes: &[u8]) -> Option<i64> {
+    match db_type {
+        DbType::DATE => {
+            let days = i32::from_be_bytes(bytes.try_into().ok()?);
+            (i64::from(days) + i64::from(crate::core::pg_types::PG_EPOCH_DAYS)).checked_mul(DAY_US)
+        }
+        DbType::DATETIME => Some(i64::from_le_bytes(bytes.try_into().ok()?)),
+        _ => None,
+    }
+}
+
+/// `CURRENT_DATE` is evaluated as a timestamp at midnight. As an operand of
+/// arithmetic it is the date it names, so `CURRENT_DATE + 1` is tomorrow and
+/// not one microsecond past midnight.
+fn date_operand(expr: Expr) -> Expr {
+    match expr {
+        Expr::Scalar(crate::core::rql::aggregate::ScalarFunc::CurrentDate) => {
+            Expr::Cast(Box::new(expr), DbType::DATE)
+        }
+        other => other,
+    }
+}
+
+/// Arithmetic with a date on either side, by PostgreSQL's operators:
+/// `date ± integer` and `integer + date` are a date that many days away,
+/// `date - date` is the day count between them (an `integer`), `date ±
+/// interval` is a timestamp, and a date against a timestamp is that
+/// timestamp's arithmetic with the date's midnight. Anything else is refused.
+fn date_arith(a: &Value, op: ArithOp, b: &Value) -> Result<Value, String> {
+    let integer = |v: &Value| {
+        matches!(
+            v.db_type(),
+            Some(DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::U8 | DbType::U16 | DbType::U32)
+        )
+    };
+    let refuse = || {
+        format!(
+            "operator does not exist: {} {} {}",
+            a.db_type().map(crate::core::value_codec::pg_input_type_name).unwrap_or("unknown"),
+            op.symbol(),
+            b.db_type().map(crate::core::value_codec::pg_input_type_name).unwrap_or("unknown")
+        )
+    };
+    let as_timestamp = |v: &Value| -> Value {
+        match v {
+            Value::Data {
+                bytes,
+                db_type: DbType::DATE,
+            } => match instant_of(&DbType::DATE, bytes) {
+                Some(us) => Value::Data {
+                    bytes: us.to_le_bytes().to_vec(),
+                    db_type: DbType::DATETIME,
+                },
+                None => v.clone(),
+            },
+            other => other.clone(),
+        }
+    };
+    match (date_days(a), date_days(b)) {
+        (Some(x), Some(y)) if matches!(op, ArithOp::Sub) => {
+            let diff = i64::from(x) - i64::from(y);
+            Ok(Value::Data {
+                bytes: (diff as i32).to_le_bytes().to_vec(),
+                db_type: DbType::I32,
+            })
+        }
+        (Some(x), None) if integer(b) && matches!(op, ArithOp::Add | ArithOp::Sub) => {
+            let n = as_i64(b).ok_or_else(refuse)?;
+            let n = if matches!(op, ArithOp::Sub) { n.checked_neg().ok_or_else(refuse)? } else { n };
+            date_value(i64::from(x).checked_add(n).ok_or_else(|| "date out of range".to_string())?)
+        }
+        (None, Some(y)) if integer(a) && matches!(op, ArithOp::Add) => {
+            let n = as_i64(a).ok_or_else(refuse)?;
+            date_value(i64::from(y).checked_add(n).ok_or_else(|| "date out of range".to_string())?)
+        }
+        // A date meeting an interval or a timestamp is its midnight; the
+        // timestamp arithmetic below takes it from there.
+        (Some(_), None)
+            if matches!(
+                (b.db_type(), op),
+                (Some(DbType::INTERVAL), ArithOp::Add | ArithOp::Sub) | (Some(DbType::DATETIME), ArithOp::Sub)
+            ) =>
+        {
+            arith(&as_timestamp(a), op, b)
+        }
+        (None, Some(_)) if matches!((a.db_type(), op), (Some(DbType::DATETIME), ArithOp::Sub)) => {
+            arith(a, op, &as_timestamp(b))
+        }
+        // `interval + date`, which the timestamp arithmetic reads date first.
+        (None, Some(_)) if matches!((a.db_type(), op), (Some(DbType::INTERVAL), ArithOp::Add)) => {
+            arith(&as_timestamp(b), op, a)
+        }
+        _ => Err(refuse()),
+    }
+}
+
 /// Unary minus, as `0 - x` with the zero typed like `x`, so the result keeps
 /// `x`'s type and its overflow check: `-(-2147483648)` is `integer out of
 /// range`, as it is in PostgreSQL, rather than a wider integer.
@@ -2955,6 +3108,16 @@ pub(crate) fn compare(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     else {
         return None;
     };
+    // A date against a date or a timestamp, as instants. A date's stored form
+    // is PostgreSQL's big-endian day count, which byte order does not sort,
+    // and against a timestamp it means midnight.
+    if let Value::Data { db_type: bt, .. } = b {
+        if *at == DbType::DATE || *bt == DbType::DATE {
+            if let (Some(x), Some(y)) = (instant_of(at, ab), instant_of(bt, bb)) {
+                return Some(x.cmp(&y));
+            }
+        }
+    }
     // Two numeric types: widened to a common one rather than reading `b`'s
     // bytes as `a`'s type, which made `compare(a, b)` and `compare(b, a)`
     // disagree for mixed widths (`COALESCE(bigint, int)`, `LEAST`, `CASE`) —
@@ -3962,7 +4125,11 @@ mod tests {
         let s = schema();
         let r = row_with(Some(1), "");
         let e = parse("make_interval(secs => '120')", &s).unwrap();
-        assert_eq!(as_i64(&eval(&e, &r, &s).unwrap()), Some(120_000_000));
+        let Value::Data { bytes, db_type } = eval(&e, &r, &s).unwrap() else {
+            panic!("make_interval gave NULL");
+        };
+        assert_eq!(db_type, DbType::INTERVAL);
+        assert_eq!(crate::core::pg_types::decode_interval(&bytes).map(|i| i.micros), Some(120_000_000));
         assert!(parse("INTERVAL '1 day'", &s).is_ok());
     }
 
