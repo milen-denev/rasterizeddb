@@ -3181,17 +3181,20 @@ async fn describe_query(
         let mut relations: Vec<(String, ScratchFields)> = Vec::new();
         for def in &defs {
             match Box::pin(describe_resolved(database, &def.body, &relations)).await? {
-                Some((columns, _)) => relations.push((def.name.clone(), scratch_fields(&columns))),
+                // A body that is itself a `UNION` is materialised with its rows
+                // widened, so its relation has the wider column too.
+                Some((columns, _)) => {
+                    let columns = widen_union_fields(database, &def.body, &relations, columns).await?;
+                    relations.push((def.name.clone(), scratch_fields(&columns)));
+                }
                 // A body this cannot resolve leaves the rest unresolvable too.
                 // The outer statement is still tried below: it may not read the
                 // CTE at all, which is the shape that always worked.
                 None => break,
             }
         }
-        if let Some(fields) = Box::pin(describe_resolved(database, &outer, &relations)).await? {
-            if fields.1 {
-                return Ok(Some(fields));
-            }
+        if let Some((fields, true)) = Box::pin(describe_resolved(database, &outer, &relations)).await? {
+            return Ok(Some((widen_union_fields(database, &outer, &relations, fields).await?, true)));
         }
     }
 
@@ -3224,13 +3227,14 @@ async fn describe_query(
     if let Some((start, end, inner, alias)) = crate::core::rql::cte::next_derived_table(stmt) {
         if !alias.is_empty() {
             if let Some((columns, _)) = Box::pin(describe_resolved(database, &inner, &[])).await? {
+                let columns = widen_union_fields(database, &inner, &[], columns).await?;
                 let fields = scratch_fields(&columns);
                 let rewritten = format!("{}{} {}{}", &stmt[..start], alias, alias, &stmt[end..]);
                 let relations = [(alias.clone(), fields)];
-                if let Some(described) =
+                if let Some((fields, is_select)) =
                     Box::pin(describe_resolved(database, &rewritten, &relations)).await?
                 {
-                    return Ok(Some(described));
+                    return Ok(Some((widen_union_fields(database, stmt, &[], fields).await?, is_select)));
                 }
             }
         }
@@ -3242,8 +3246,10 @@ async fn describe_query(
         Some(Ok(parts)) if stmt.starts_with('(') => parts.branches.into_iter().next(),
         _ => None,
     };
-    let described = describe_resolved(database, first_branch.as_deref().unwrap_or(stmt), &[]).await?;
-    Ok(described.map(|(fields, is_select)| (widen_union_fields(database, stmt, fields), is_select)))
+    match describe_resolved(database, first_branch.as_deref().unwrap_or(stmt), &[]).await? {
+        Some((fields, is_select)) => Ok(Some((widen_union_fields(database, stmt, &[], fields).await?, is_select))),
+        None => Ok(None),
+    }
 }
 
 /// A `UNION` is described by its first branch, but a column that is `int`
@@ -3251,24 +3257,71 @@ async fn describe_query(
 /// values as one. Described as the first branch's `int`, the wider values did
 /// not fit the description and went out as NULL. Anything but a `UNION` is
 /// returned as it is.
-fn widen_union_fields(
+///
+/// Every path of `describe_query` that can reach the executor's `UNION` comes
+/// through here, with the relations it resolved. The executor runs the
+/// statement after its CTEs and derived tables are materialised into real
+/// relations, and widens by their columns; a describe that did not see them
+/// said `int` for a column whose every value, the `int` rows too, was sent as
+/// a `bigint`. So the derived tables still inline in `sql` are resolved here
+/// as the executor materialises them, each under a name of its own: two
+/// branches may each read a derived table called `q`.
+///
+/// The branches are taken from the text whether or not its trailing clauses
+/// read: a prepared `LIMIT $1` is described with a stand-in that the `UNION`
+/// splitter refuses, and executed with a number it accepts.
+async fn widen_union_fields(
     database: &Arc<Database>,
     sql: &str,
+    relations: &[(String, ScratchFields)],
+    fields: Vec<(String, DbType)>,
+) -> io::Result<Vec<(String, DbType)>> {
+    if crate::core::rql::join::union_branches(sql).is_none() {
+        return Ok(fields);
+    }
+    let mut text = sql.to_string();
+    let mut relations = relations.to_vec();
+    // Bounded as the executor's materialisation is: each pass replaces one
+    // derived table with a name.
+    for index in 0..16usize {
+        let Some((start, end, inner, alias)) = crate::core::rql::cte::next_derived_table(&text) else {
+            break;
+        };
+        // One that cannot be resolved leaves its branch's columns unknown,
+        // which widens nothing there.
+        let Some((columns, _)) = Box::pin(describe_resolved(database, &inner, &relations)).await? else {
+            break;
+        };
+        let columns = Box::pin(widen_union_fields(database, &inner, &relations, columns)).await?;
+        let name = format!("__described_derived_{}", index);
+        text = format!("{}{} {}{}", &text[..start], name, alias, &text[end..]);
+        relations.push((name, scratch_fields(&columns)));
+    }
+    let Some(branches) = crate::core::rql::join::union_branches(&text) else {
+        return Ok(fields);
+    };
+    Ok(widen_fields_by(
+        crate::core::rql::set_ops::widened_branch_integers(&branches, database, &relations),
+        fields,
+    ))
+}
+
+/// Sets each field that [`crate::core::rql::set_ops::widened_integers`]
+/// widens to its wider type.
+fn widen_fields_by(
+    widened: Vec<Option<DbType>>,
     mut fields: Vec<(String, DbType)>,
 ) -> Vec<(String, DbType)> {
-    if let Some(Ok(parts)) = crate::core::rql::join::split_union(sql) {
-        let widened = crate::core::rql::set_ops::widened_integers(&parts, database);
-        for (field, wide) in fields.iter_mut().zip(widened) {
-            if let Some(wide) = wide {
-                field.1 = wide;
-            }
+    for (field, wide) in fields.iter_mut().zip(widened) {
+        if let Some(wide) = wide {
+            field.1 = wide;
         }
     }
     fields
 }
 
 /// The columns of a relation that exists only while one statement is described.
-type ScratchFields = smallvec::SmallVec<[crate::core::row::schema::SchemaField; 20]>;
+type ScratchFields = crate::core::rql::cte::ScratchFields;
 
 /// Turns a described column list into a schema the planner can resolve names
 /// against.
@@ -5215,7 +5268,15 @@ where
     // widened here as `describe_query` widens them, so they match the rows.
     let select_fields = match &purpose {
         QueryPurpose::QueryRows(qr) => {
-            select_fields.map(|fields| widen_union_fields(database, &qr.query, fields))
+            select_fields.map(|fields| match crate::core::rql::join::union_branches(&qr.query) {
+                // The statement runs as it is here, its CTEs and derived
+                // tables already materialised into real relations.
+                Some(branches) => widen_fields_by(
+                    crate::core::rql::set_ops::widened_branch_integers(&branches, database, &[]),
+                    fields,
+                ),
+                None => fields,
+            })
         }
         _ => select_fields,
     };
@@ -9535,5 +9596,63 @@ mod describe_rowless_family_tests {
                 "{sql} described with an empty column list"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod union_widening_tests {
+    use super::*;
+
+    async fn open() -> (tempfile::TempDir, Arc<Database>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(Database::new_named(&dir.path().to_string_lossy(), false, "uniontests").await);
+        for sql in [
+            "CREATE TABLE t32 (id INT, name TEXT, n INT)",
+            "CREATE TABLE t64 (a BIGINT, b BIGINT, c BIGINT, d BIGINT)",
+        ] {
+            let purpose = recognize_query_purpose(sql).expect(sql);
+            crate::core::rql::executor::execute(purpose, db.clone()).await;
+        }
+        (dir, db)
+    }
+
+    /// A prepared `LIMIT $1` is first described with the stand-in `LIMIT
+    /// NULL`, which `split_union` refuses. The widening was read only from a
+    /// split that succeeded, so this text kept the first branch's `int`, while
+    /// the statement executed with a bound number is widened to `bigint`. Only
+    /// the stand-in being refused further up kept that from the wire.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unreadable_union_tail_still_widens() {
+        let (_dir, db) = open().await;
+        for sql in [
+            "SELECT n FROM t32 UNION SELECT d FROM t64 ORDER BY 1 LIMIT NULL",
+            "SELECT n FROM t32 UNION SELECT d FROM t64 ORDER BY 1 LIMIT 10 OFFSET NULL",
+        ] {
+            let fields = vec![("n".to_string(), DbType::I32)];
+            let widened = widen_union_fields(&db, sql, &[], fields).await.expect(sql);
+            assert_eq!(widened, vec![("n".to_string(), DbType::I64)], "{sql}");
+        }
+    }
+
+    /// A `*` is several columns, so the items after it are not at the
+    /// positions their places in the list say. `SELECT *, n FROM t32` was
+    /// typed `[?, int]`, and paired with `t64`'s second column that widened
+    /// output column 1, `name`, a text column, to `bigint`. The engine refuses
+    /// `*` beside other items today, which is all that kept this from a
+    /// client; PostgreSQL 17 refuses the `UNION` itself, as text and bigint.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_star_does_not_shift_the_widening_onto_another_column() {
+        let (_dir, db) = open().await;
+        assert_eq!(crate::core::rql::cte::declared_item_types("SELECT *, n FROM t32", &db), vec![]);
+        assert_eq!(
+            crate::core::rql::cte::declared_item_types("SELECT n, *, id FROM t32", &db),
+            vec![Some(DbType::I32)],
+            "the items before the `*` are where they say",
+        );
+        let branches: Vec<String> =
+            crate::core::rql::join::union_branches("SELECT *, n FROM t32 UNION ALL SELECT a, b, c, d FROM t64")
+                .expect("a UNION");
+        let widened = crate::core::rql::set_ops::widened_branch_integers(&branches, &db, &[]);
+        assert!(widened.iter().all(Option::is_none), "{widened:?}");
     }
 }

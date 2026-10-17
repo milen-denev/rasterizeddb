@@ -16,6 +16,11 @@ use rclite::Arc;
 
 use crate::core::database::Database;
 use crate::core::db_type::DbType;
+use crate::core::row::schema::SchemaField;
+
+/// The columns of a relation that exists only while one statement is
+/// described: a CTE or a derived table, resolved from its own query.
+pub(crate) type ScratchFields = smallvec::SmallVec<[SchemaField; 20]>;
 
 /// One `name AS ( body )` definition.
 #[derive(Debug)]
@@ -768,6 +773,20 @@ fn declared_types(
     labels: &[String],
     database: &Arc<Database>,
 ) -> Vec<Option<DbType>> {
+    declared_types_among(query, labels, database, &[])
+}
+
+/// [`declared_types`], where the relation may also be one of `relations`:
+/// a CTE or a derived table a describe resolved from its own query. Those
+/// come first, as the statement reads them once it is materialised: a CTE
+/// is renamed to its temporary relation before the statement runs, so it
+/// stands in for a table of the same name.
+fn declared_types_among(
+    query: &str,
+    labels: &[String],
+    database: &Arc<Database>,
+    relations: &[(String, ScratchFields)],
+) -> Vec<Option<DbType>> {
     let none = vec![None; labels.len()];
     // A join has more than one relation behind its columns; this resolves only
     // the single-relation case rather than guessing which one a label meant.
@@ -787,20 +806,24 @@ fn declared_types(
     if name.is_empty() || name.contains('(') {
         return none;
     }
+    let types_in = |fields: &[SchemaField]| -> Vec<Option<DbType>> {
+        labels
+            .iter()
+            .map(|label| {
+                fields
+                    .iter()
+                    .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(label))
+                    .map(|field| field.db_type.clone())
+            })
+            .collect()
+    };
+    if let Some((_, fields)) = relations.iter().find(|(alias, _)| alias.eq_ignore_ascii_case(name)) {
+        return types_in(fields);
+    }
     let Some(table) = database.tables.get(name) else {
         return none;
     };
-    labels
-        .iter()
-        .map(|label| {
-            table
-                .schema
-                .fields
-                .iter()
-                .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(label))
-                .map(|field| field.db_type.clone())
-        })
-        .collect()
+    types_in(&table.schema.fields)
 }
 
 /// Which output columns of `query`, by position, are stored documents, for
@@ -833,6 +856,17 @@ pub(crate) fn document_columns(query: &str, database: &Arc<Database>) -> Vec<boo
 /// that is `int` in one branch and `bigint` in another the type `bigint`, and
 /// the rows and the description sent to the client have to agree on it.
 pub(crate) fn declared_item_types(query: &str, database: &Arc<Database>) -> Vec<Option<DbType>> {
+    declared_item_types_among(query, database, &[])
+}
+
+/// [`declared_item_types`], where the relation read may also be one of
+/// `relations`: the CTEs and derived tables a describe resolved, which are
+/// not in `database.tables` until the statement is materialised to run.
+pub(crate) fn declared_item_types_among(
+    query: &str,
+    database: &Arc<Database>,
+    relations: &[(String, ScratchFields)],
+) -> Vec<Option<DbType>> {
     let Some(list) = select_list_of(query) else {
         return Vec::new();
     };
@@ -841,11 +875,18 @@ pub(crate) fn declared_item_types(query: &str, database: &Arc<Database>) -> Vec<
         Some(head) if head.eq_ignore_ascii_case("DISTINCT ") => &list["DISTINCT ".len()..],
         _ => list,
     };
+    // A `*` is several columns, so no item after it is at the position its
+    // place in the list says, as `output_names` notes. `SELECT *, n` was typed
+    // `[?, int]`, and a `UNION` widened the column after the `*` by `n`'s
+    // type: a text column described as `bigint`. The items before the first
+    // `*` are where they say, and are kept.
     let labels: Vec<String> = crate::core::rql::lexer_ct::split_definitions(list)
         .iter()
-        .map(|item| bare_column(split_alias(item.trim()).0).unwrap_or_default())
+        .map(|item| item.trim())
+        .take_while(|item| !(*item == "*" || item.ends_with(".*")))
+        .map(|item| bare_column(split_alias(item).0).unwrap_or_default())
         .collect();
-    declared_types(query, &labels, database)
+    declared_types_among(query, &labels, database, relations)
 }
 
 /// The output name of each item in a `SELECT`'s list: its alias, or the

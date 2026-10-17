@@ -38,10 +38,21 @@ use crate::core::rql::join::UnionParts;
 /// The executor widens the rows by this and the wire layer the description,
 /// so both read it from here.
 pub fn widened_integers(parts: &UnionParts, database: &Arc<Database>) -> Vec<Option<DbType>> {
-    let declared: Vec<Vec<Option<DbType>>> = parts
-        .branches
+    widened_branch_integers(&parts.branches, database, &[])
+}
+
+/// [`widened_integers`] over the branches alone, where a branch may also read
+/// one of `relations`: the CTEs and derived tables a describe resolved. The
+/// executor runs the statement with those materialised into real relations,
+/// so the describe has to type them the same way to reach the same answer.
+pub fn widened_branch_integers(
+    branches: &[String],
+    database: &Arc<Database>,
+    relations: &[(String, crate::core::rql::cte::ScratchFields)],
+) -> Vec<Option<DbType>> {
+    let declared: Vec<Vec<Option<DbType>>> = branches
         .iter()
-        .map(|branch| crate::core::rql::cte::declared_item_types(branch, database))
+        .map(|branch| crate::core::rql::cte::declared_item_types_among(branch, database, relations))
         .collect();
     let width = declared.iter().map(Vec::len).min().unwrap_or(0);
     (0..width)

@@ -2202,6 +2202,35 @@ pub struct UnionParts {
 /// And until the trailing `ORDER BY` was lifted off too, it sorted only the
 /// last branch, and the `LIMIT` behind it was not found.
 pub fn split_union(sql: &str) -> Option<Result<UnionParts, String>> {
+    let (branches, distinct_prefix, tail) = union_pieces(sql)?;
+    let mut parts = UnionParts {
+        branches,
+        distinct_prefix,
+        order_by: None,
+        limit: None,
+        offset: 0,
+    };
+    if let Err(e) = read_union_tail(&tail, &mut parts) {
+        return Some(Err(e));
+    }
+    Some(Ok(parts))
+}
+
+/// The branches of a `UNION`, as [`split_union`] takes them apart, whether or
+/// not its trailing clauses can be read.
+///
+/// What a column's type depends on. A prepared `… LIMIT $1` is described with
+/// a stand-in, `LIMIT NULL`, that `split_union` refuses, and then executed
+/// with a whole number that it accepts; a description that read the branches
+/// only from a split that succeeded said `int` for a column the rows were
+/// sent as `bigint`.
+pub fn union_branches(sql: &str) -> Option<Vec<String>> {
+    union_pieces(sql).map(|(branches, _, _)| branches)
+}
+
+/// The branches, the length of the distinct prefix, and the trailing clauses
+/// lifted off the last branch, still unread.
+fn union_pieces(sql: &str) -> Option<(Vec<String>, usize, String)> {
     let mut branches: Vec<String> = Vec::new();
     let mut last_distinct: Option<usize> = None;
     let mut rest = sql;
@@ -2227,13 +2256,6 @@ pub fn split_union(sql: &str) -> Option<Result<UnionParts, String>> {
         return None;
     }
 
-    let mut parts = UnionParts {
-        branches: Vec::new(),
-        distinct_prefix: last_distinct.map_or(0, |at| at + 1),
-        order_by: None,
-        limit: None,
-        offset: 0,
-    };
     let last = branches.pop().unwrap_or_default();
     let tail_at = [
         find_phrase(&last, &["ORDER", "BY"], 0),
@@ -2247,12 +2269,9 @@ pub fn split_union(sql: &str) -> Option<Result<UnionParts, String>> {
         Some(at) => (last[..at].trim(), last[at..].trim()),
         None => (last.trim(), ""),
     };
-    if let Err(e) = read_union_tail(tail, &mut parts) {
-        return Some(Err(e));
-    }
     branches.push(body.to_string());
-    parts.branches = branches.iter().map(|b| unwrap_parentheses(b).to_string()).collect();
-    Some(Ok(parts))
+    let branches = branches.iter().map(|b| unwrap_parentheses(b).to_string()).collect();
+    Some((branches, last_distinct.map_or(0, |at| at + 1), tail.to_string()))
 }
 
 /// Reads `ORDER BY …`, `LIMIT n` and `OFFSET n`, in that order, any of them

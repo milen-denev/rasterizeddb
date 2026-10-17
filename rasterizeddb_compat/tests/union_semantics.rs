@@ -227,3 +227,77 @@ async fn a_widened_column_is_described_as_its_wider_type() {
         assert_eq!(got, want, "{sql}");
     }
 }
+
+/// The values of a widened column, read over the extended protocol, where
+/// each one is decoded by the description `Describe` returned.
+async fn widened_values(pool: &sqlx::PgPool, sql: &str, bind: Option<i64>) -> Result<Vec<Option<i64>>, String> {
+    let mut query = sqlx::query(AssertSqlSafe(sql));
+    if let Some(value) = bind {
+        query = query.bind(value);
+    }
+    let rows = query.fetch_all(pool).await.map_err(|e| e.to_string())?;
+    rows.iter().map(|r| r.try_get::<Option<i64>, _>(0).map_err(|e| e.to_string())).collect()
+}
+
+/// A branch that reads a CTE or a derived table runs against the temporary
+/// relation it is materialised into, whose column has the declared type, so
+/// the executor widened the column. `Describe` resolved those relations only
+/// to describe the first branch and never widened it, so the column was
+/// described as `int4` while every value in it, the `int` rows included, was
+/// sent as an 8-byte `bigint`, which a driver refuses to read as `int4`. The
+/// same held for a CTE or derived table whose own body is the `UNION`: its
+/// column was resolved as the first branch's `int`, and materialised as the
+/// `bigint` its rows were widened to.
+///
+/// Every statement here is PostgreSQL 17's column `-3, 1, 2, 3, 5,
+/// 5000000000, NULL`, over both protocols.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_union_over_a_cte_or_derived_table_is_described_widened() {
+    let (_s, pool) = server().await;
+    let want = vec![Some(-3i64), Some(1), Some(2), Some(3), Some(5), Some(5_000_000_000), None];
+    let mut wrong = Vec::new();
+    for sql in [
+        "WITH c AS (SELECT n FROM events) SELECT n FROM c UNION ALL SELECT n FROM w ORDER BY 1",
+        "SELECT n FROM (SELECT n FROM events) q UNION ALL SELECT n FROM w ORDER BY 1",
+        "SELECT n FROM events UNION ALL SELECT n FROM (SELECT n FROM w) q ORDER BY 1",
+        // Two derived tables of one name, one in each branch, are two relations.
+        "SELECT n FROM (SELECT n FROM events) q UNION ALL SELECT n FROM (SELECT n FROM w) q ORDER BY 1",
+        "WITH c AS (SELECT n FROM events UNION ALL SELECT n FROM w) SELECT n FROM c ORDER BY 1",
+        "SELECT n FROM (SELECT n FROM events UNION ALL SELECT n FROM w) q ORDER BY 1",
+    ] {
+        let got = widened_values(&pool, sql, None).await;
+        if got.as_ref() != Ok(&want) {
+            wrong.push(format!("{sql}\n    want {want:?}\n    got  {got:?}"));
+        }
+        let got = flat(&pool, sql, false).await;
+        if got.as_deref() != Ok("-3,1,2,3,5,5000000000,NULL") {
+            wrong.push(format!("{sql} (simple protocol)\n    got  {got:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// A placeholder in the trailing `LIMIT` or `OFFSET` is first described with
+/// the stand-in `LIMIT NULL`, which the `UNION` splitter refuses, and the
+/// widening was computed only from a split that succeeded. Today that
+/// stand-in is refused as a whole and the next one, `LIMIT 1`, describes the
+/// statement widened; this pins the end-to-end answer, PostgreSQL 17's, while
+/// `pgwire`'s own test pins the widening against the refused tail.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_placeholder_limit_does_not_undo_the_widening() {
+    let (_s, pool) = server().await;
+    for (sql, bind, want) in [
+        (
+            "SELECT n FROM events UNION SELECT n FROM w ORDER BY 1 LIMIT $1",
+            10i64,
+            vec![Some(-3i64), Some(1), Some(2), Some(3), Some(5), Some(5_000_000_000), None],
+        ),
+        (
+            "SELECT n FROM events UNION SELECT n FROM w ORDER BY 1 LIMIT 10 OFFSET $1",
+            2,
+            vec![Some(2), Some(3), Some(5), Some(5_000_000_000), None],
+        ),
+    ] {
+        assert_eq!(widened_values(&pool, sql, Some(bind)).await, Ok(want), "{sql}");
+    }
+}
