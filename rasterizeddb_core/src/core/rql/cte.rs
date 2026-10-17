@@ -514,7 +514,7 @@ async fn relation_columns(
         let sql_type = match &declared {
             // A decimal is declared at the scale its cells were stored at, so
             // it prints the places it was written with rather than nine.
-            Some(DbType::DECIMAL) => match scale {
+            Some(DbType::DECIMAL) => match self_scaled_width(rows, index, scale).or(scale) {
                 Some(scale) if scale != engine => format!("NUMERIC(38,{})", scale),
                 _ => "NUMERIC".to_string(),
             },
@@ -528,6 +528,51 @@ async fn relation_columns(
         });
     }
     Ok(columns)
+}
+
+/// The scale a `DECIMAL` column has to be declared at to hold every cell of
+/// it exactly, when any of those cells carries a scale of its own.
+///
+/// An `AVG` picks its scale per value, as PostgreSQL's numeric division does:
+/// twenty places for an average below 1, twelve from 10^4. The item's column
+/// scale is a fixed sixteen, so declaring the relation at it rounded
+/// `0.33333333333333333333` to sixteen places and padded `30000.5` to sixteen.
+/// The widest scale any cell carries loses nothing. A column holds one scale,
+/// so where the values differ the narrower ones print trailing zeros.
+///
+/// Narrowed to the most places a column may declare, which an average below
+/// 10^-12 exceeds, and so the widest integer part still fits the 38 digits a
+/// column holds, which only an average far below 1 sharing a column with a
+/// large one reaches. `None` when no cell carries its own scale, and the
+/// column's is then the item's.
+fn self_scaled_width(
+    rows: &[crate::core::row::row::Row],
+    index: usize,
+    column_scale: Option<u32>,
+) -> Option<u32> {
+    let arrival = column_scale.unwrap_or(crate::core::value_codec::DECIMAL_SCALE);
+    let mut self_scaled = false;
+    let mut widest = 0u32;
+    let mut integer_digits = 0u32;
+    for row in rows {
+        let Some(cell) = row.columns.get(index) else { continue };
+        if cell.column_type != DbType::DECIMAL {
+            continue;
+        }
+        let Some((v, own)) =
+            crate::core::value_codec::split_decimal_cell(cell.data.into_slice())
+        else {
+            continue;
+        };
+        self_scaled |= own.is_some();
+        let at = own.unwrap_or(arrival);
+        widest = widest.max(at);
+        let whole = 10u128.checked_pow(at).map_or(0, |f| v.unsigned_abs() / f);
+        let digits = if whole == 0 { 0 } else { whole.ilog10() + 1 };
+        integer_digits = integer_digits.max(digits);
+    }
+    let most = u32::from(crate::core::rql::type_modifier::MAX_DECIMAL_SCALE);
+    self_scaled.then(|| widest.min(most).min(38u32.saturating_sub(integer_digits)))
 }
 
 /// The literal one cell is written into a materialised relation as.

@@ -280,6 +280,8 @@ async fn numeric_scale_survives_a_subquery_in_the_body() {
         "INSERT INTO np_parent (id) VALUES (1), (2)",
         "CREATE TABLE np_child (id INT NOT NULL, parent_id INT NOT NULL, price NUMERIC(12,2) NOT NULL)",
         "INSERT INTO np_child (id, parent_id, price) VALUES (1, 1, 339.50), (2, 2, 2.00), (3, 1, 3.25)",
+        "CREATE TABLE av (g INT, x INT)",
+        "INSERT INTO av VALUES (1, 0), (1, 0), (1, 1), (2, 30000), (2, 30001)",
     ] {
         run(&pool, sql).await;
     }
@@ -320,6 +322,22 @@ async fn numeric_scale_survives_a_subquery_in_the_body() {
             "WITH c AS (SELECT avg(price) AS a, sum(price) AS s FROM np_child \
              WHERE parent_id IN (SELECT id FROM np_parent)) SELECT a, s FROM c",
             &["114.9166666666666667|344.75"],
+        ),
+        // An AVG picks its scale per value, as PostgreSQL's numeric division
+        // does: twenty places below 1, twelve from 10^4. The relation used to
+        // be declared at the fixed sixteen, so the first lost four digits and
+        // the second gained four zeros.
+        ("WITH c AS (SELECT avg(x) AS a FROM av WHERE g = 1) SELECT a FROM c", &["0.33333333333333333333"]),
+        ("SELECT a FROM (SELECT avg(x) AS a FROM av WHERE g = 1) s", &["0.33333333333333333333"]),
+        ("WITH c AS (SELECT avg(x) AS a FROM av WHERE g = 2) SELECT a FROM c", &["30000.500000000000"]),
+        ("SELECT a FROM (SELECT avg(x) AS a FROM av WHERE g = 2) s", &["30000.500000000000"]),
+        // Two groups at different scales share one column, which holds one
+        // scale, the wider: the twenty places of the first group survive it.
+        // (PostgreSQL also prints the second at twelve; here it shows twenty.)
+        (
+            "WITH c AS (SELECT g, avg(x) AS a FROM av GROUP BY g) SELECT g FROM c \
+             WHERE g = 1 AND a > 0.33333333333333333",
+            &["1"],
         ),
         // The other subquery forms take the same path.
         (
