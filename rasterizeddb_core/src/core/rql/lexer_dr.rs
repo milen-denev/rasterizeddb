@@ -132,7 +132,34 @@ fn parse_delete_row(
                 clause.to_string()
             }
         } else {
-            String::new()
+            // `DELETE FROM t` with no `WHERE` deletes every row, which is
+            // what PostgreSQL does with it. Only an alias may follow the
+            // table: anything else is a clause this parser did not
+            // recognise, and reading it as "no condition" would turn a
+            // misread statement into one that empties the table.
+            let rest: Vec<&str> = parts.collect();
+            let alias_only = match rest.as_slice() {
+                [] => true,
+                [alias] | [_, alias] => {
+                    (rest.len() == 1 || rest[0].eq_ignore_ascii_case("AS"))
+                        && !alias.eq_ignore_ascii_case("AS")
+                        && alias
+                            .trim_matches('"')
+                            .chars()
+                            .all(|c| c.is_alphanumeric() || c == '_')
+                }
+                _ => false,
+            };
+            if !alias_only || table_name.is_empty() {
+                return None;
+            }
+            return Some(DeleteRow {
+                table_name: table_name.to_string(),
+                where_clause: String::new(),
+                query_row_fetch: RowFetch {
+                    columns_fetching_data: SmallVec::new(),
+                },
+            });
         };
         if table_name.is_empty() || where_clause.is_empty() {
             return None;
@@ -231,10 +258,25 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_row_missing_where_should_fail() {
-        let sql = r#"DELETE FROM users"#;
-        let qp = QueryPurpose::DeleteRow(sql.to_string());
-        assert!(delete_row_from_query_purpose(&qp, &make_schema()).is_none());
+    fn test_delete_row_without_where_deletes_everything() {
+        for sql in ["DELETE FROM users", "DELETE FROM users u", "DELETE FROM users AS u"] {
+            let qp = QueryPurpose::DeleteRow(sql.to_string());
+            let result = delete_row_from_query_purpose(&qp, &make_schema())
+                .unwrap_or_else(|| panic!("{sql} should parse"));
+            assert_eq!(result.table_name, "users");
+            assert_eq!(result.where_clause, "");
+        }
+        // Anything after the table that is not an alias is a clause nobody
+        // parsed, and must not be read as "no condition".
+        for sql in [
+            "DELETE FROM users WHERE",
+            "DELETE FROM users u v",
+            "DELETE FROM users AS",
+            "DELETE FROM users id = 1",
+        ] {
+            let qp = QueryPurpose::DeleteRow(sql.to_string());
+            assert!(delete_row_from_query_purpose(&qp, &make_schema()).is_none(), "{sql}");
+        }
     }
 
     #[test]
