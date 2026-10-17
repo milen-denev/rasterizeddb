@@ -579,6 +579,28 @@ pub fn parse_decimal_scaled(text: &str, scale: u32) -> Option<i128> {
     Some(if negative { -unscaled } else { unscaled })
 }
 
+/// Parses a decimal literal at `scale`, rounding the places past it half away
+/// from zero — PostgreSQL's rule for a value assigned to `NUMERIC(p, s)` and
+/// for a cast to one. [`parse_decimal_scaled`] truncates instead, which is
+/// what a comparison has to see the literal's digits through, and was wrong
+/// for storage: `20.169` and `20.165` into `NUMERIC(12,2)` both stored 20.16.
+///
+/// Only the first dropped digit decides half away from zero, so the literal is
+/// read one place deeper than `scale` (two when that would land on the engine
+/// scale, whose reader refuses extra places rather than truncating them) and
+/// rounded from there.
+pub fn parse_decimal_rounded(text: &str, scale: u32) -> Option<i128> {
+    let deeper = if scale + 1 == DECIMAL_SCALE { scale + 2 } else { scale + 1 };
+    let raw = parse_decimal_scaled(text, deeper)?;
+    let divisor = 10i128.pow(deeper - scale);
+    let (quotient, remainder) = (raw / divisor, raw % divisor);
+    if remainder.unsigned_abs() * 2 >= divisor.unsigned_abs() {
+        quotient.checked_add(raw.signum())
+    } else {
+        Some(quotient)
+    }
+}
+
 /// Renders an unscaled value held at `scale`, keeping every declared place.
 ///
 /// `format_decimal` strips trailing zeros, so a `NUMERIC(10,4)` holding
@@ -1494,6 +1516,14 @@ pub fn coerce_literal(
                 .and_then(|v| encode_integer(v, to))
                 .or_else(|| encode_float(text.trim().parse::<f64>().ok()?, to)),
         };
+    }
+
+    // A NUMERIC at the engine scale read as a float, through its text so it
+    // is rounded once: NUMERIC arithmetic meeting a float column is float
+    // arithmetic, as in PostgreSQL.
+    if matches!(from, DbType::DECIMAL) && matches!(to, DbType::F32 | DbType::F64) {
+        let raw = i128::from_le_bytes(bytes.try_into().ok()?);
+        return encode_float(format_decimal(raw).parse::<f64>().ok()?, to);
     }
 
     // A numeric literal keeps its value and changes its width.

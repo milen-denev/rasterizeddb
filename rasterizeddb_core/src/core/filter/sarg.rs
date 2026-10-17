@@ -215,6 +215,17 @@ fn conjunct_to_pred(
         Some((_, scale)) if *db_type == DbType::DECIMAL => {
             let text = crate::core::rql::subquery::value_to_literal(&from, &raw)?;
             let text = crate::core::value_codec::unquote_sql(&text);
+            // A literal with more places than the column holds is compared at
+            // the engine scale by the evaluator, not at the column's; its
+            // truncation here would bound zones against a different number.
+            // Not pruning is always sound.
+            let places = text
+                .split_once('.')
+                .map(|(_, fraction)| fraction.trim_end_matches('0').len())
+                .unwrap_or(0);
+            if places as u32 > *scale {
+                return None;
+            }
             crate::core::value_codec::parse_decimal_scaled(&text, *scale)?
                 .to_le_bytes()
                 .to_vec()

@@ -76,6 +76,26 @@ impl<'a, 'b> QueryParser<'a, 'b> {
             .map(|(_, scale)| *scale)
     }
 
+    /// Whether a literal holds no more decimal places than `scale`, so that
+    /// re-encoding it there loses nothing. Anything that is not a numeric
+    /// literal answers `true`, leaving it to the paths that handled it before.
+    fn literal_exact_at(literal: &ComparisonOperand, from: &DbType, scale: u32) -> bool {
+        let ComparisonOperand::Direct(mb) = literal else {
+            return true;
+        };
+        if !matches!(from, DbType::F32 | DbType::F64) {
+            return true;
+        }
+        let Some(text) = crate::core::rql::subquery::value_to_literal(from, mb.into_slice()) else {
+            return true;
+        };
+        let places = text
+            .split_once('.')
+            .map(|(_, fraction)| fraction.trim_end_matches('0').len())
+            .unwrap_or(0);
+        places as u32 <= scale
+    }
+
     /// Re-encodes a literal at the scale the column it is compared against
     /// stores in.
     ///
@@ -178,7 +198,31 @@ impl<'a, 'b> QueryParser<'a, 'b> {
         Result<(ComparisonOperand, ComparisonOperand, Option<u32>, Option<u32>), (ComparisonOperand, ComparisonOperand)>,
         String,
     > {
-        if *left_type != DbType::DECIMAL && *right_type != DbType::DECIMAL {
+        let literal = |o: &ComparisonOperand| matches!(o, ComparisonOperand::Direct(_));
+        let float = |t: &DbType| matches!(t, DbType::F32 | DbType::F64);
+        // A float column makes the step a float one, as PostgreSQL resolves
+        // `numeric` against `float8`; `promote_numeric` converts the NUMERIC
+        // side. Float *arithmetic* is not counted: it is usually two written
+        // fractions (`v + 0.5 * 2`), which are `numeric` in PostgreSQL, and it
+        // is converted to NUMERIC as it always was.
+        if (float(left_type) && left.is_column()) || (float(right_type) && right.is_column()) {
+            return Ok(Err((left, right)));
+        }
+        // A written fraction is `numeric` in PostgreSQL, so against an integer
+        // column or an integer result it is NUMERIC arithmetic, which is exact:
+        // `n * 0.1 = 0.3` held for no row as a float, and `n * 1.37 = 12.33`
+        // missed 9. Two constants are left as they were, which keeps
+        // `f = 0.5 * 3` comparing a float column against a float.
+        let integer = |t: &DbType| {
+            matches!(
+                t,
+                DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::I128
+                    | DbType::U8 | DbType::U16 | DbType::U32 | DbType::U64 | DbType::U128
+            )
+        };
+        let fraction_meets_integer = (literal(&left) && float(left_type) && !literal(&right) && integer(right_type))
+            || (literal(&right) && float(right_type) && !literal(&left) && integer(left_type));
+        if *left_type != DbType::DECIMAL && *right_type != DbType::DECIMAL && !fraction_meets_integer {
             return Ok(Err((left, right)));
         }
         let (left, left_lift) = self.decimal_operand(left, left_type)?;
@@ -223,8 +267,22 @@ impl<'a, 'b> QueryParser<'a, 'b> {
         fn float(t: &DbType) -> bool {
             matches!(t, DbType::F32 | DbType::F64)
         }
+        // A NUMERIC arithmetic result against a float is a float, as
+        // PostgreSQL resolves the pair; the result is converted per row. A
+        // NUMERIC *column* is not, since its bytes are at its declared scale
+        // and the conversion reads the engine's.
+        let numeric_result = |o: &ComparisonOperand, t: &DbType, other: &DbType| {
+            *t == DbType::DECIMAL
+                && float(other)
+                && matches!(o, ComparisonOperand::Intermediate(_) | ComparisonOperand::IntermediateCast(..))
+        };
+        let numeric_left = numeric_result(&left, &left_type, &right_type);
+        let numeric_right = numeric_result(&right, &right_type, &left_type);
         let numeric = |t: &DbType| int(t) || float(t);
-        if left_type == right_type || !numeric(&left_type) || !numeric(&right_type) {
+        if left_type == right_type
+            || !(numeric(&left_type) || numeric_left)
+            || !(numeric(&right_type) || numeric_right)
+        {
             return (left, right, left_type, right_type);
         }
         let literal = |o: &ComparisonOperand| matches!(o, ComparisonOperand::Direct(_));
@@ -619,10 +677,26 @@ impl<'a, 'b> QueryParser<'a, 'b> {
         // scale, not the engine's default. Done before everything below,
         // because the ordinary reconciliation would otherwise encode the
         // literal at the default and the two would never compare equal.
+        //
+        // Only when the literal is exact at that scale. Re-encoding truncates
+        // the places past it, so `v = 2.251` over a `NUMERIC(10,2)` holding
+        // 2.25 matched, and `v < 2.251` did not. A literal with more places
+        // than the column is compared with both sides at the engine scale
+        // instead, below — which the filter index declines to prune, as it
+        // declines any literal it cannot encode exactly.
+        let mut inexact_literal = false;
         let (left_op, right_op, left_type, right_type) = {
             let left_scale = self.scale_of(&left_op);
             let right_scale = self.scale_of(&right_op);
             match (left_scale, right_scale) {
+                (Some(scale), None) if !Self::literal_exact_at(&right_op, &right_type, scale) => {
+                    inexact_literal = true;
+                    (left_op, right_op, left_type, right_type)
+                }
+                (None, Some(scale)) if !Self::literal_exact_at(&left_op, &left_type, scale) => {
+                    inexact_literal = true;
+                    (left_op, right_op, left_type, right_type)
+                }
                 (Some(scale), None) if right_type != DbType::DECIMAL || true => {
                     match Self::rescale_decimal_literal(&right_op, &right_type, scale) {
                         Some(rescaled) => (left_op, rescaled, left_type, DbType::DECIMAL),
@@ -662,7 +736,7 @@ impl<'a, 'b> QueryParser<'a, 'b> {
                 && left_op.is_column()
                 && right_op.is_column()
                 && self.scale_of(&left_op) != self.scale_of(&right_op);
-            if comparing && (arithmetic || mixed_columns) {
+            if comparing && (arithmetic || mixed_columns || inexact_literal) {
                 match self.decimal_operands(left_op, &left_type, right_op, &right_type)? {
                     Ok((l, r, ls, rs)) => {
                         operand_scales = (ls, rs);

@@ -563,7 +563,22 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
             },
         });
     }
+    // A constant with a point or an exponent is `numeric`, not `float8`, so
+    // arithmetic on it is exact: `14 * 1.37 + 0.99` is 20.17, where the float
+    // it used to be gave 20.169999999999998. A constant past nine places is
+    // rounded to the engine scale, and one too large for it stays a float.
     if let Ok(v) = text.parse::<f64>() {
+        if text.starts_with(|c: char| c.is_ascii_digit() || matches!(c, '.' | '-' | '+')) {
+            if let Some(units) = crate::core::value_codec::parse_decimal_rounded(
+                text,
+                crate::core::value_codec::DECIMAL_SCALE,
+            ) {
+                return Ok(Expr::Literal {
+                    bytes: units.to_le_bytes().to_vec(),
+                    db_type: DbType::DECIMAL,
+                });
+            }
+        }
         return Ok(Expr::Literal {
             bytes: v.to_le_bytes().to_vec(),
             db_type: DbType::F64,
@@ -1517,7 +1532,8 @@ pub fn static_type(expr: &Expr) -> DbType {
             .0
         }
         // Mirrors `arith`: a float on either side makes the result a float,
-        // and everything else is done in i64.
+        // then a NUMERIC on either side a NUMERIC, and everything else is
+        // done in i64.
         Expr::Arith(lhs, op, rhs) => {
             let ty = |e: &Expr| static_type(e);
             let timestamp = |e: &Expr| matches!(ty(e), DbType::DATETIME);
@@ -1544,12 +1560,12 @@ pub fn static_type(expr: &Expr) -> DbType {
                 DbType::DATETIME
             } else if matches!(ty(lhs), DbType::INTERVAL) && matches!(ty(rhs), DbType::INTERVAL) {
                 DbType::INTERVAL
-            } else if matches!(ty(lhs), DbType::DECIMAL) || matches!(ty(rhs), DbType::DECIMAL) {
-                DbType::DECIMAL
             } else if matches!(ty(lhs), DbType::F32 | DbType::F64)
                 || matches!(ty(rhs), DbType::F32 | DbType::F64)
             {
                 DbType::F64
+            } else if matches!(ty(lhs), DbType::DECIMAL) || matches!(ty(rhs), DbType::DECIMAL) {
+                DbType::DECIMAL
             } else {
                 // Mirrors `wider_integer`: the result keeps the wider operand's
                 // type rather than widening everything to `bigint`.
@@ -1560,6 +1576,82 @@ pub fn static_type(expr: &Expr) -> DbType {
                 }
             }
         }
+    }
+}
+
+/// The scale PostgreSQL displays a `NUMERIC` expression at, where it does not
+/// depend on the values: a constant's own places, a column's declared `s`, 0
+/// for an integer, the larger of the two for `+`, `-` and `%`, and their sum
+/// for `*`. `20.17` for `14 * 1.37 + 0.99`, and `1.650` for a `NUMERIC(10,2)`
+/// times `1.5`.
+///
+/// `None` where it is not known before the row is: a quotient (PostgreSQL
+/// picks its places from the operands' magnitudes), an unconstrained `NUMERIC`
+/// column (whose values each carry their own), anything that is not a
+/// `NUMERIC`. Those are evaluated, and rendered, at the engine scale.
+///
+/// A product is computed at the engine scale, so its places stop there. A
+/// constant's places are those its value needs, so `1.50` counts as `1.5`.
+pub fn display_scale(expr: &Expr) -> Option<u32> {
+    use crate::core::value_codec::DECIMAL_SCALE;
+    let integer = |t: &DbType| {
+        matches!(
+            t,
+            DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::U8 | DbType::U16 | DbType::U32 | DbType::U64
+        )
+    };
+    match expr {
+        Expr::Literal {
+            bytes,
+            db_type: DbType::DECIMAL,
+        } => {
+            let mut raw = i128::from_le_bytes(bytes.as_slice().try_into().ok()?);
+            let mut scale = DECIMAL_SCALE;
+            while scale > 0 && raw % 10 == 0 {
+                raw /= 10;
+                scale -= 1;
+            }
+            Some(scale)
+        }
+        Expr::Literal { db_type, .. } if integer(db_type) => Some(0),
+        Expr::Column(field) if field.db_type == DbType::DECIMAL => field.scale,
+        Expr::Column(field) if integer(&field.db_type) => Some(0),
+        Expr::Arith(lhs, op, rhs) if static_type(expr) == DbType::DECIMAL => {
+            let (l, r) = (display_scale(lhs)?, display_scale(rhs)?);
+            match op {
+                ArithOp::Add | ArithOp::Sub | ArithOp::Rem => Some(l.max(r)),
+                ArithOp::Mul => Some((l + r).min(DECIMAL_SCALE)),
+                ArithOp::Div => None,
+            }
+        }
+        Expr::Arith(..) if integer(&static_type(expr)) => Some(0),
+        Expr::Call(TextFunc::Abs, args) => args.first().and_then(display_scale),
+        _ => None,
+    }
+}
+
+/// A `NUMERIC` value, computed at the engine scale, brought to the display
+/// scale its expression was given; anything else unchanged. Exact for every
+/// scale [`display_scale`] gives, which never exceeds the engine's.
+pub fn at_display_scale(value: Value, scale: Option<u32>) -> Result<Value, String> {
+    use crate::core::value_codec::DECIMAL_SCALE;
+    let Some(scale) = scale.filter(|s| *s != DECIMAL_SCALE) else {
+        return Ok(value);
+    };
+    match value {
+        Value::Data {
+            bytes,
+            db_type: DbType::DECIMAL,
+        } if bytes.len() == 16 => {
+            let raw = i128::from_le_bytes(bytes.as_slice().try_into().expect("sixteen bytes"));
+            let shown = round_decimal(raw, DECIMAL_SCALE, scale)
+                .ok_or_else(|| "value overflows numeric format".to_string())?;
+            Ok(Value::Data {
+                bytes: shown.to_le_bytes().to_vec(),
+                db_type: DbType::DECIMAL,
+            })
+        }
+        other => Ok(other),
     }
 }
 
@@ -1697,10 +1789,11 @@ fn arith(a: &Value, op: ArithOp, b: &Value) -> Result<Value, String> {
     // integer path: adding two of them works, but multiplying leaves the
     // product scaled twice and dividing loses the scale entirely.
     //
-    // Ahead of the float path, as `static_type` already ranks it: `price * 1.5`
-    // pairs a NUMERIC with a float literal, and the float path cannot read a
-    // NUMERIC — it refused the expression as having non-numeric operands.
-    if is_decimal(a) || is_decimal(b) {
+    // After the float path, as PostgreSQL resolves `numeric` against a float:
+    // the result is `float8`. A written fraction is `numeric` itself now, so
+    // `price * 1.5` is two NUMERICs and never reaches the float path, while
+    // `price * 1.5::float8` is the float the author asked for.
+    if (is_decimal(a) || is_decimal(b)) && !float_operand(a) && !float_operand(b) {
         return decimal_arith(a, op, b);
     }
 
@@ -1787,6 +1880,13 @@ fn as_text(value: &Value) -> String {
         Value::Data { bytes, db_type } => match db_type {
             DbType::STRING | DbType::CHAR => String::from_utf8_lossy(bytes).to_string(),
             DbType::UUID => crate::core::value_codec::format_uuid(bytes),
+            // A number with a fraction has no integer reading, and its raw
+            // bytes are not text: `'r' || 1.5` concatenated the float's eight
+            // bytes.
+            DbType::DECIMAL | DbType::F32 | DbType::F64 => {
+                crate::core::rql::subquery::value_to_literal(db_type, bytes)
+                    .unwrap_or_else(|| String::from_utf8_lossy(bytes).to_string())
+            }
             _ => match as_i64(value) {
                 Some(v) => v.to_string(),
                 None => String::from_utf8_lossy(bytes).to_string(),
@@ -2386,9 +2486,41 @@ pub(crate) fn to_engine_scale(value: Value, field: &SchemaField) -> Result<Value
 /// from zero, as its `numeric → int` cast does.
 pub(crate) fn from_engine_scale(value: Value, field: &SchemaField) -> Result<Value, String> {
     use crate::core::value_codec::DECIMAL_SCALE;
+    let number = |v: &Value| {
+        matches!(
+            v.db_type(),
+            Some(
+                DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::U8 | DbType::U16 | DbType::U32
+                    | DbType::U64 | DbType::F32 | DbType::F64 | DbType::DECIMAL
+            )
+        )
+    };
+    // A float column takes any number as a float, as the assignment cast does.
+    // A written fraction is a NUMERIC now, and its sixteen bytes in an
+    // eight-byte slot would be read back as an unrelated float.
+    if matches!(field.db_type, DbType::F32 | DbType::F64) {
+        return if number(&value) { cast(value, &field.db_type) } else { Ok(value) };
+    }
     if field.db_type != DbType::DECIMAL {
         return to_integer_column(value, &field.db_type);
     }
+    // An integer or a float bound for a NUMERIC column becomes one at the
+    // engine scale first; its own bytes in the sixteen-byte slot were not a
+    // number at all.
+    let value = match &value {
+        Value::Data { db_type, .. } if number(&value) && *db_type != DbType::DECIMAL => {
+            let units = match db_type {
+                DbType::F32 | DbType::F64 => as_f64(&value).and_then(float_to_engine_decimal),
+                _ => as_i64(&value).and_then(|v| (v as i128).checked_mul(10i128.pow(DECIMAL_SCALE))),
+            }
+            .ok_or_else(|| format!("numeric field overflow for column \"{}\"", field.name))?;
+            Value::Data {
+                bytes: units.to_le_bytes().to_vec(),
+                db_type: DbType::DECIMAL,
+            }
+        }
+        _ => value,
+    };
     let Some(scale) = field.scale.filter(|s| *s != DECIMAL_SCALE) else {
         return Ok(value);
     };
@@ -2582,6 +2714,13 @@ fn as_f64(value: &Value) -> Option<f64> {
     match db_type {
         DbType::F32 => Some(f32::from_le_bytes(bytes.as_slice().try_into().ok()?) as f64),
         DbType::F64 => Some(f64::from_le_bytes(bytes.as_slice().try_into().ok()?)),
+        // Through its text, which `str::parse` reads to the nearest float: a
+        // division by the scale would round twice.
+        DbType::DECIMAL => crate::core::value_codec::format_decimal(i128::from_le_bytes(
+            bytes.as_slice().try_into().ok()?,
+        ))
+        .parse()
+        .ok(),
         _ => as_i64(value).map(|v| v as f64),
     }
 }
@@ -3975,12 +4114,23 @@ mod tests {
             }
             Value::Null => panic!("null"),
         };
-        assert_eq!(read(arith(&dec, ArithOp::Mul, &float(1.5)).unwrap()), 150 * factor);
-        // 0.1 is not exact as a float; it is exact as the digits written.
+        // A written fraction is a NUMERIC constant, so it stays exact: 0.1 is
+        // not exact as a float, and is as the digits written.
+        let literal = |text: &str| match parse(text, &[]).unwrap() {
+            Expr::Literal { bytes, db_type } => Value::Data { bytes, db_type },
+            other => panic!("{text} parsed as {other:?}"),
+        };
+        assert_eq!(read(arith(&dec, ArithOp::Mul, &literal("1.5")).unwrap()), 150 * factor);
         assert_eq!(
-            read(arith(&dec, ArithOp::Add, &float(0.1)).unwrap()),
+            read(arith(&dec, ArithOp::Add, &literal("0.1")).unwrap()),
             100 * factor + factor / 10
         );
+        // A float *value* against a NUMERIC is float arithmetic, as PostgreSQL
+        // resolves `numeric + float8`.
+        assert!(matches!(
+            arith(&dec, ArithOp::Add, &float(0.5)).unwrap(),
+            Value::Data { db_type: DbType::F64, .. }
+        ));
     }
 
     #[test]
@@ -4467,9 +4617,12 @@ mod float_literal_fold_tests {
             ("d * 1.5", vec![DbType::DECIMAL]),
             ("1.5 * d", vec![DbType::DECIMAL]),
             ("d * 2 * 1.5", vec![DbType::I32, DbType::DECIMAL]),
-            ("f * 1.5", vec![DbType::F64]),
-            ("i * 1.5", vec![DbType::F64]),
-            ("1.5 * 2.5", vec![DbType::F64, DbType::F64]),
+            // A written fraction is `numeric` wherever it stands, as in
+            // PostgreSQL; against a float column the arithmetic is still
+            // float, below.
+            ("f * 1.5", vec![DbType::DECIMAL]),
+            ("i * 1.5", vec![DbType::DECIMAL]),
+            ("1.5 * 2.5", vec![DbType::DECIMAL, DbType::DECIMAL]),
         ] {
             let mut got = Vec::new();
             literal_types(&parse(text, &s).unwrap(), &mut got);

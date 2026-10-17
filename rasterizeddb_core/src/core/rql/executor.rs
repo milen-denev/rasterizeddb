@@ -387,7 +387,23 @@ pub(crate) fn query_output_scales(
                         return plan.items.iter().map(item_scale).collect::<Vec<_>>();
                     }
                     if !parsed.select_items.is_empty() {
-                        return parsed.select_items.iter().map(item_scale).collect::<Vec<_>>();
+                        // A row expression with a known display scale is sent
+                        // at it — the select-list slot rounds the value there
+                        // (`expr::at_display_scale`) — so `v * 2` over a
+                        // `NUMERIC(10,2)` reads 2.20 as PostgreSQL's does,
+                        // not 2.200000000. Only on this path: an aggregate
+                        // plan's expression items are still at the engine
+                        // scale.
+                        return parsed
+                            .select_items
+                            .iter()
+                            .map(|item| match item {
+                                SelectItem::RowExpr { expr, .. } => {
+                                    crate::core::rql::expr::display_scale(expr).unwrap_or(engine)
+                                }
+                                other => item_scale(other),
+                            })
+                            .collect::<Vec<_>>();
                     }
                     parsed
                         .requested_row_fetch
@@ -2493,8 +2509,9 @@ enum SlotValue {
     Constant(Vec<u8>),
     /// A nullary function, evaluated once per row.
     Scalar(crate::core::rql::aggregate::ScalarFunc),
-    /// An expression over the row's own columns.
-    RowExpression(crate::core::rql::expr::Expr),
+    /// An expression over the row's own columns, and the scale its value is
+    /// sent at when it is a `NUMERIC` (see `expr::display_scale`).
+    RowExpression(crate::core::rql::expr::Expr, Option<u32>),
 }
 
 type DbTypeRef = crate::core::db_type::DbType;
@@ -11352,7 +11369,10 @@ pub(crate) async fn execute_query_rows(
                 .map(|(position, expr, db_type)| {
                     (
                         *position,
-                        SlotValue::RowExpression(expr.clone()),
+                        SlotValue::RowExpression(
+                            expr.clone(),
+                            crate::core::rql::expr::display_scale(expr),
+                        ),
                         db_type.clone(),
                     )
                 }),
@@ -11770,14 +11790,17 @@ pub(crate) async fn execute_query_rows(
                                             SlotValue::Constant(bytes) => {
                                                 (bytes.clone(), db_type.clone())
                                             }
-                                            SlotValue::RowExpression(expr) => {
+                                            SlotValue::RowExpression(expr, scale) => {
                                                 // Same rule as
                                                 // `RETURNING`: the
                                                 // value is re-encoded
                                                 // as the type the row
                                                 // description already
                                                 // announced for this
-                                                // slot.
+                                                // slot — and a NUMERIC
+                                                // at the scale
+                                                // `query_output_scales`
+                                                // announces for it.
                                                 match crate::core::rql::expr::eval(
                                                     expr,
                                                     &row,
@@ -11786,6 +11809,11 @@ pub(crate) async fn execute_query_rows(
                                                 .map(|v| {
                                                     crate::core::rql::expr::coerce_to(
                                                         v, db_type,
+                                                    )
+                                                })
+                                                .and_then(|v| {
+                                                    crate::core::rql::expr::at_display_scale(
+                                                        v, *scale,
                                                     )
                                                 }) {
                                                     Ok(crate::core::rql::expr::Value::Data {

@@ -213,3 +213,73 @@ async fn integer_assignments_refuse_overflow_instead_of_wrapping() {
     .await;
     verdict(wrong);
 }
+
+// ---------------------------------------------------------------- bug #3
+
+/// A decimal literal is `numeric`, so arithmetic on it is exact decimal: int
+/// with numeric is numeric, and only a float operand makes it a float.
+#[tokio::test(flavor = "multi_thread")]
+async fn decimal_literals_are_numeric_not_float() {
+    let mut db = db(&[
+        DIGITS[0],
+        DIGITS[1],
+        "CREATE TABLE nq (id INT, v NUMERIC(10,2))",
+        "INSERT INTO nq (id, v) VALUES (1, 1.10), (2, 2.25), (3, 0.30)",
+        "CREATE TABLE fq (id INT, i INT, f FLOAT8, u NUMERIC(10,2))",
+        "INSERT INTO fq (id, i, f, u) VALUES (1, 3, 0, 0)",
+        // A NUMERIC result assigned to a float column, and an integer one to a
+        // NUMERIC column, each in the column's own type.
+        "UPDATE fq SET f = i * 1.5, u = i * 2 WHERE id = 1",
+    ])
+    .await;
+    let mut wrong = Vec::new();
+    expect_rows(
+        &mut db,
+        &mut wrong,
+        &[
+            ("SELECT f, u FROM fq", &["4.5|6.00"]),
+            // NUMERIC against a float compares as floats.
+            ("SELECT id FROM fq WHERE f = i * 1.5", &["1"]),
+            ("SELECT id FROM fq WHERE f * 2 = i * 3", &["1"]),
+            ("SELECT 'r' || 1.5, 'r' || (i * 0.5) FROM fq", &["r1.5|r1.5"]),
+        ],
+    )
+    .await;
+    expect_rows(
+        &mut db,
+        &mut wrong,
+        &[
+            // 20.169999999999998 as a float8.
+            ("SELECT 14 * 1.37 + 0.99 FROM dg WHERE n = 1", &["20.17"]),
+            (
+                "SELECT n * 1.37 + 0.99, n * 1.5, n + 0.5, 1.5 * 2.25 FROM dg WHERE n = 9",
+                &["13.32|13.5|9.5|3.375"],
+            ),
+            ("SELECT 1.37::float8 * 2, n::float8 * 0.1 FROM dg WHERE n = 3", &["2.74|0.30000000000000004"]),
+            ("SELECT n FROM dg WHERE n * 1.37 = 12.33", &["9"]),
+            ("SELECT n FROM dg WHERE n * 0.1 = 0.3", &["3"]),
+            // A NUMERIC(10,2) column against a literal with more places
+            // compares exactly: the literal used to be truncated to the
+            // column's scale, so 2.25 = 2.251 held and 2.25 < 2.251 did not.
+            ("SELECT id FROM nq WHERE v < 2.251 ORDER BY id", &["1", "2", "3"]),
+            ("SELECT id FROM nq WHERE v = 2.251", &[]),
+            ("SELECT id FROM nq WHERE v >= 2.249 ORDER BY id", &["2"]),
+            (
+                "SELECT id, v * 2, v + 1, v * 1.5, v - 0.125 FROM nq ORDER BY id",
+                &["1|2.20|2.10|1.650|0.975", "2|4.50|3.25|3.375|2.125", "3|0.60|1.30|0.450|0.175"],
+            ),
+        ],
+    )
+    .await;
+    for (sql, want) in [
+        ("SELECT 14 * 1.37 + 0.99 FROM dg WHERE n = 1", vec!["NUMERIC"]),
+        ("SELECT n * 1.5 FROM dg WHERE n = 9", vec!["NUMERIC"]),
+        ("SELECT 1.37::float8 * 2, n::float8 * 0.1 FROM dg WHERE n = 3", vec!["FLOAT8", "FLOAT8"]),
+    ] {
+        match db.types(sql).await {
+            Ok(got) if got == want => {}
+            other => wrong.push(format!("{}: described as {:?}, want {:?}", sql, other, want)),
+        }
+    }
+    verdict(wrong);
+}
