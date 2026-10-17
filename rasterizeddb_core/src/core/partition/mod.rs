@@ -36,9 +36,18 @@
 //!   [`log::replay`]`(&[u8]) -> Result<Replay, String>` stops at a torn tail
 //!   and refuses anything else it cannot apply; [`log::MapState::apply`]
 //!   keeps a replayed state current.
+//! - [`files`] (§3.1, §3.2, §12): file names ([`files::data_stem`],
+//!   [`files::parse_name`]), and, crate-private, exclusive creation with one
+//!   directory fsync (`create_partition_files`, `create_parent_files`), the
+//!   never-creating `require_existing` (I9), `remove_all`, and `MapLogFile`,
+//!   whose appends carry a WAL record at append time, leave nothing behind
+//!   when they fail, and whose open keeps a cut torn tail as `.torn`
+//!   evidence. The one module here that does IO, and its errors are
+//!   `io::Error`s.
 //!
 //! Errors are `String`s, like the rest of the engine's DDL paths.
 
+pub mod files;
 pub mod key;
 pub mod log;
 pub mod map;
