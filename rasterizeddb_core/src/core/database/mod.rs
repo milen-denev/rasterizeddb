@@ -18,6 +18,12 @@ mod drop_recreate_replay_tests;
 mod cross_dir_commit_tests;
 #[cfg(test)]
 mod txid_reuse_tests;
+mod partitioned;
+#[cfg(test)]
+mod partitioned_tests;
+pub mod relation;
+
+pub use relation::Relation;
 
 #[cfg(test)]
 pub(crate) mod test_hooks {
@@ -35,6 +41,23 @@ pub(crate) mod test_hooks {
         /// a device error would, without poisoning the shared log: the error
         /// paths of every committer that syncs those logs before committing.
         pub static FAIL_POOL_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    type Park = (String, std::sync::Arc<tokio::sync::Notify>, std::sync::Arc<tokio::sync::Notify>);
+
+    /// `create_partitioned_table` calls of the named tables, parked after
+    /// their files and before their catalogue row: each signals its first
+    /// `Notify` and waits on its second. Process-wide, since a statement can
+    /// move threads; keyed by name so parallel tests do not meet.
+    pub static PARK_PARTITIONED_CREATE: std::sync::Mutex<Vec<Park>> = std::sync::Mutex::new(Vec::new());
+
+    pub(crate) fn take_partitioned_create_park(
+        name: &str,
+    ) -> Option<(std::sync::Arc<tokio::sync::Notify>, std::sync::Arc<tokio::sync::Notify>)> {
+        let mut parks = PARK_PARTITIONED_CREATE.lock().unwrap_or_else(|p| p.into_inner());
+        let at = parks.iter().position(|(n, _, _)| n == name)?;
+        let (_, parked, release) = parks.swap_remove(at);
+        Some((parked, release))
     }
 }
 
@@ -966,6 +989,18 @@ fn pool_forget(pool: &StoragePool, table_name: &str) {
 #[cfg(not(feature = "storage_pools"))]
 fn pool_forget(_pool: &StoragePool, _table_name: &str) {}
 
+/// The placement recorded for `table_name`, verbatim; `None` in a build
+/// without `storage_pools`, which records none.
+#[cfg(feature = "storage_pools")]
+fn pool_spec_of(pool: &StoragePool, table_name: &str) -> Option<String> {
+    pool.spec_of(table_name)
+}
+
+#[cfg(not(feature = "storage_pools"))]
+fn pool_spec_of(_pool: &StoragePool, _table_name: &str) -> Option<String> {
+    None
+}
+
 /// Carries a placement across a rename, which does not move a table.
 #[cfg(feature = "storage_pools")]
 fn pool_rename(pool: &StoragePool, old_name: &str, new_name: &str) {
@@ -1026,6 +1061,16 @@ fn pool_location_of(_pool: &StoragePool, _table_name: &str) -> Option<String> {
 
 pub struct Database {
     pub tables: DashMap<String, Arc<Table<DbStorageProvider>>, ahash::RandomState>,
+    /// Hash-partitioned tables by logical name. Each one's schema-only shell
+    /// is in `tables` too (unless its schema could not be read); resolve a
+    /// name through [`Database::relation`], which asks here first.
+    pub partitioned: DashMap<String, Arc<crate::core::partition::table::PartitionedTable>, ahash::RandomState>,
+    /// Names a CREATE or a partitioned DROP is working on (see
+    /// [`Database::claim_name`]).
+    name_claims: DashMap<String, (), ahash::RandomState>,
+    /// Serialises partitioned CREATE and DROP, so the per-database cap on
+    /// declared partitions counts what is really there.
+    partition_ddl: tokio::sync::Mutex<()>,
     pub db_io_pointers: Arc<DbStorageProvider>,
     pub db_io_rows: Arc<DbStorageProvider>,
     pub db_io_schema: Arc<DbStorageProvider>,
@@ -1269,6 +1314,15 @@ impl Database {
             tables_names
         );
 
+        // Before anything opens: which of two rows sharing a name would be
+        // served is the map's insert order, and the other's rows would vanish.
+        if let Err(e) = partitioned::catalogue_duplicates(&tables_names) {
+            if installed_root_log {
+                let _ = crate::core::wal::remove_for(location);
+            }
+            return Err(format!("refusing to open the database at {location}: {e}"));
+        }
+
         let tables = DashMap::with_hasher(ahash::RandomState::new());
 
         // Outcomes are durable for a file-backed database and need not be for
@@ -1312,7 +1366,17 @@ impl Database {
         // scope is fixed at construction.
         let id = next_database_id();
 
-        for (table_name, _) in tables_names {
+        // Opened after every plain table, so one that cannot open stops nothing
+        // else (§7.1).
+        let mut partitioned_rows: Vec<(String, u64)> = Vec::new();
+        for (table_name, clusters) in tables_names {
+            // First, ahead of the reap, the backend check, `seed_in` and
+            // `Table::new`: each of those would create `<name>*` files, and a
+            // partitioned table has none (its files are `__pt_<uid>_*`).
+            if clusters != 0 {
+                partitioned_rows.push((table_name, clusters));
+                continue;
+            }
             // A statement-scoped relation that survived to an open is garbage,
             // always, and is reaped here rather than reported.
             //
@@ -1401,10 +1465,13 @@ impl Database {
             );
         }
 
-        Ok(Database {
+        let database = Database {
             id,
             name: name.to_string(),
             tables,
+            partitioned: DashMap::with_hasher(ahash::RandomState::new()),
+            name_claims: DashMap::with_hasher(ahash::RandomState::new()),
+            partition_ddl: tokio::sync::Mutex::new(()),
             db_io_pointers: io_pointers,
             db_io_rows: io_rows,
             db_io_schema: io_schema,
@@ -1427,7 +1494,9 @@ impl Database {
                 handle.load_snapshot_if_present();
                 handle
             },
-        })
+        };
+        database.open_partitioned_rows(partitioned_rows).await;
+        Ok(database)
     }
 
     /// Releases the cached seed for a table that is gone.
@@ -1777,10 +1846,17 @@ impl Database {
                  restart before dropping it"
             )));
         }
-        // PARTITION-TODO(S5): a partitioned table drops through its
-        // partitions. Refused before the map is touched: taking the entry out
-        // and putting it back would let a concurrent statement see no table,
-        // or a concurrent CREATE of the same name slip in between.
+
+        // A partitioned table drops through its own order. Resolved before
+        // `tables` is touched: its shell is there too, and the plain path
+        // below would sweep `<name>*` files it never had.
+        if let Some(Relation::Partitioned(_)) = self.relation(table_name) {
+            return self.drop_partitioned(table_name).await;
+        }
+        // A shell with no partitioned table behind it is refused before the
+        // map is touched: taking the entry out and putting it back would let
+        // a concurrent statement see no table, or a concurrent CREATE of the
+        // same name slip in between.
         self.refuse_shell(table_name)?;
         // Through the sweep below: see `deletion_permit`. Taken before the
         // table leaves the map and the catalogue: a drop waiting for it with
@@ -1951,8 +2027,19 @@ impl Database {
     /// map entry with `Table::new`, so never reach `Table::data`: on a shell
     /// that would replace the partitioned table with an empty plain one. Called
     /// before the entry is removed, and the map guard is released on return.
+    /// Also errs for a partitioned table whose schema could not be read,
+    /// which has no shell in `tables`.
     // PARTITION-TODO(S5): replaced by dispatch on `relation()`.
     fn refuse_shell(&self, name: &str) -> io::Result<()> {
+        if self.partitioned.contains_key(name) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "relation \"{}\" is partitioned; this operation is not supported on partitioned tables yet",
+                    name
+                ),
+            ));
+        }
         match self.tables.get(name) {
             Some(table) => table.data().map(|_| ()),
             None => Ok(()),
@@ -2126,6 +2213,12 @@ impl Database {
         {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, reason));
         }
+        // Both names, held to the return, ahead of every check: a rename is a
+        // CREATE of the new name, whose row a concurrent CREATE could also be
+        // writing (a partitioned one has no `<name>*` files for the check below
+        // to find), and the old name leaves `tables` while its row is live.
+        let _new_claim = self.claim_name(new_name)?;
+        let _old_claim = self.claim_name(old_name)?;
         if !self.tables.contains_key(old_name) {
             return Err(io::Error::new(io::ErrorKind::NotFound, "Table not found"));
         }
@@ -2864,6 +2957,8 @@ impl Database {
     /// own directory is not scanned for leftovers: its files are there now and
     /// the drop sweeps them, so the create after it does not find them.
     pub fn check_recreatable(&self, name: &str) -> io::Result<()> {
+        // The rewrite drops it and creates a plain table in its place.
+        self.refuse_shell(name)?;
         if let Some(reason) = table_name_refusal(name) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, reason));
         }
@@ -3045,13 +3140,20 @@ impl Database {
     /// same record under a different name, and a second copy of it would be a
     /// second thing to keep in step with the catalogue's schema.
     async fn remember_in_catalogue(&self, table_name: &str) -> io::Result<()> {
+        self.write_catalogue_row(table_name, 0).await
+    }
+
+    /// The catalogue row itself: `table_name` and `clusters`, which is 0 for a
+    /// plain table and the uid of a partitioned one's files. Every row write
+    /// goes through here, so the record cannot drift between its writers.
+    pub(crate) async fn write_catalogue_row(&self, table_name: &str, clusters: u64) -> io::Result<()> {
         let mut name_mb = MEMORY_POOL.acquire(table_name.len());
         name_mb
             .into_slice_mut()
             .copy_from_slice(table_name.as_bytes());
 
         let mut clusters_mb = MEMORY_POOL.acquire(8);
-        clusters_mb.into_slice_mut().copy_from_slice(&[0u8; 8]);
+        clusters_mb.into_slice_mut().copy_from_slice(&clusters.to_le_bytes());
 
         let row_write = RowWrite {
             columns_writing_data: smallvec![
@@ -3138,11 +3240,31 @@ impl Database {
         let _changed =
             SchemaChanged::unless_internal(&self.schema_generation, &create_table.table_name);
         let table_name = &create_table.table_name;
+        // Held to the map insert, so a concurrent CREATE of the name cannot
+        // write a second catalogue row between the check and the insert.
+        let _claim = self.claim_name(table_name)?;
 
-        if self.tables.contains_key(table_name) {
+        if self.tables.contains_key(table_name) || self.partitioned.contains_key(table_name) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "Table already exists",
+            ));
+        }
+        // FKs onto a partitioned parent are phase 3's: the check would read
+        // the shell, which holds no rows.
+        if let Some(fk) = create_table.foreign_keys.iter().find(|fk| {
+            self.partitioned
+                .iter()
+                .any(|p| p.key().eq_ignore_ascii_case(&fk.parent_table))
+        }) {
+            // InvalidInput, which the CREATE arm reports with its text.
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "FOREIGN KEY {} references the partitioned table \"{}\"; a partitioned table as the \
+                     parent of a FOREIGN KEY is not supported yet",
+                    fk.name, fk.parent_table
+                ),
             ));
         }
         // Before the catalogue row: a refusal after it would leave a row naming
@@ -3161,93 +3283,11 @@ impl Database {
 
     /// `add_table` past its name checks. Separate so a test can make the
     /// tables older builds allowed, which the guards exist to keep out.
-    async fn add_table_unguarded(&self, create_table: CreateTable) -> io::Result<()> {
+    async fn add_table_unguarded(&self, mut create_table: CreateTable) -> io::Result<()> {
         let table_name = &create_table.table_name;
-        let columns = create_table.columns;
-        let unique_columns = create_table.unique_columns;
+        let columns = std::mem::take(&mut create_table.columns);
 
-        let mut name_mb = MEMORY_POOL.acquire(table_name.len());
-        let name_data = name_mb.into_slice_mut();
-        name_data.copy_from_slice(table_name.as_bytes());
-
-        let mut clusters_mb = MEMORY_POOL.acquire(8);
-        let clusters_data = clusters_mb.into_slice_mut();
-        clusters_data.copy_from_slice(&[0u8; 8]);
-
-        let row_write = RowWrite {
-            columns_writing_data: smallvec![
-                ColumnWritePayload {
-                    column_type: DbType::STRING,
-                    size: 8 + 4,
-                    data: name_mb,
-                    write_order: 0
-                },
-                ColumnWritePayload {
-                    column_type: DbType::U64,
-                    size: 8,
-                    data: clusters_mb,
-                    write_order: 1
-                }
-            ],
-        };
-
-        let mut pointer_iterator = RowPointerIterator::new(self.db_io_pointers.clone())
-            .await
-            .unwrap();
-
-        if let Some(row_pointer) = pointer_iterator.read_last().await {
-            // `id` widens to u128 under `enable_long_row`, but it is always
-            // allocated from this same AtomicU64, so it never exceeds u64.
-            let atomic_last_id = AtomicU64::new(row_pointer.id as u64);
-
-            let table_length = row_pointer.position;
-            let atomic_table_length = AtomicU64::new(table_length);
-
-            #[cfg(feature = "enable_long_row")]
-            let cluster = 0;
-
-            let result = RowPointer::write_row(
-                self.db_io_pointers.clone(),
-                self.db_io_rows.clone(),
-                &atomic_last_id,
-                &atomic_table_length,
-                #[cfg(feature = "enable_long_row")]
-                cluster,
-                &row_write,
-            )
-            .await;
-
-            if result.is_err() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "Failed to write row pointer.",
-                ));
-            }
-        } else {
-            let atomic_last_id = AtomicU64::new(0);
-            let atomic_table_length = AtomicU64::new(0);
-
-            #[cfg(feature = "enable_long_row")]
-            let cluster = 0;
-
-            let result = RowPointer::write_row(
-                self.db_io_pointers.clone(),
-                self.db_io_rows.clone(),
-                &atomic_last_id,
-                &atomic_table_length,
-                #[cfg(feature = "enable_long_row")]
-                cluster,
-                &row_write,
-            )
-            .await;
-
-            if result.is_err() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "Failed to write initial row pointer.",
-                ));
-            }
-        }
+        self.write_catalogue_row(table_name, 0).await?;
 
         // The directory is decided and recorded before a single file is
         // created there. A crash between the two leaves a placement pointing at
@@ -3264,130 +3304,16 @@ impl Database {
         .await;
 
         let mut table =
-            Table::new_with_constraints(&table_name, seed, columns, &unique_columns).await;
+            Table::new_with_constraints(table_name, seed, columns, &create_table.unique_columns).await;
         table.scope_cache_to_database(self.id);
 
-        // The declared `PRIMARY KEY`, recorded in the schema header rather than
-        // left implicit in the column's `UNIQUE NOT NULL` flags.
-        //
-        // Enforcement does not need it — a primary key is a unique constraint
-        // and is already enforced as one — but every client that addresses a
-        // single row does: "the column this table calls its key" and "some
-        // column that happens to be unique" are different questions, and only
-        // the first has one answer.
-        if let Some(primary_key) = &create_table.primary_key {
-            table.schema.set_primary_key(primary_key.clone());
-            if let Err(e) = table.schema.rewrite_header(table.io_schema.clone()).await {
-                error!("Failed to record primary key for {}: {}", table_name, e);
-                return Err(e);
-            }
-        }
-
-        // Written after the table exists so its sidecar sits beside the schema
-        // it belongs to, and kept in the loaded schema so the first statement
-        // after `CREATE TABLE` is already constrained.
-        for fk in &create_table.foreign_keys {
-            if let Err(e) = crate::core::rql::foreign_key::append(table.io_schema.clone(), fk).await
-            {
-                error!("Failed to persist foreign key {}: {}", fk.name, e);
-                return Err(e);
-            }
-            table.schema.foreign_keys.push(fk.clone());
-        }
-
-        for entry in &create_table.defaults {
-            if let Err(e) =
-                crate::core::rql::column_default::append(table.io_schema.clone(), entry).await
-            {
-                error!("Failed to persist default for {}: {}", entry.column, e);
-                return Err(e);
-            }
-            table.schema.defaults.push(entry.clone());
-        }
-
-        // Every column a constraint names has to exist, or the constraint would
-        // sit in the sidecar matching nothing and the table would look
-        // constrained while allowing duplicates.
-        for key in &create_table.unique_keys {
-            for column in &key.columns {
-                if !table
-                    .schema
-                    .fields
-                    .iter()
-                    .any(|f| f.name.eq_ignore_ascii_case(column) && !f.is_deleted)
-                {
-                    error!(
-                        "UNIQUE constraint {} names unknown column {}",
-                        key.name, column
-                    );
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!(
-                            "UNIQUE constraint {:?} names column {:?}, which the table does not have",
-                            key.name, column
-                        ),
-                    ));
-                }
-            }
-            if let Err(e) = crate::core::rql::unique_key::append(table.io_schema.clone(), key).await
-            {
-                error!("Failed to persist unique constraint {}: {}", key.name, e);
-                return Err(e);
-            }
-            table.register_unique_key(key.clone());
-        }
-
-        for entry in &create_table.type_modifiers {
-            if let Err(e) =
-                crate::core::rql::type_modifier::append(table.io_schema.clone(), entry).await
-            {
-                error!(
-                    "Failed to persist type modifier for {}: {}",
-                    entry.column, e
-                );
-                return Err(e);
-            }
-            table.schema.type_modifiers.push(entry.clone());
-            // Onto the field as well as into the sidecar. A table created in
-            // this process is never re-read from disk, so `TableSchema::load`'s
-            // copy of this never runs for it — and a planner that did not know
-            // the column's scale compared every literal against it a power of
-            // ten away, silently.
-            if let Some(field) = table
-                .schema
-                .fields
-                .iter_mut()
-                .find(|f| f.name.eq_ignore_ascii_case(&entry.column))
-            {
-                field.scale = Some(entry.scale as u32);
-            }
-        }
-
-        for entry in &create_table.generated {
-            if let Err(e) =
-                crate::core::rql::generated::append(table.io_schema.clone(), entry).await
-            {
-                error!("Failed to persist generated column {}: {}", entry.column, e);
-                return Err(e);
-            }
-            table.schema.generated.push(entry.clone());
-        }
-
-        for entry in &create_table.checks {
-            if let Err(e) = crate::core::rql::check::append(table.io_schema.clone(), entry).await {
-                error!("Failed to persist check constraint {}: {}", entry.name, e);
-                return Err(e);
-            }
-            table.schema.checks.push(entry.clone());
-        }
-
-        for entry in &create_table.json_columns {
-            if let Err(e) = crate::core::rql::json_map::append(table.io_schema.clone(), entry).await
-            {
-                error!("Failed to register JSON column {}: {}", entry.column, e);
-                return Err(e);
-            }
-            table.schema.json_columns.push(entry.clone());
+        // Through `register_unique_key`, which also arms the table's unique
+        // checks; the sidecars only record them.
+        let keys_before = table.schema.unique_keys.len();
+        write_schema_sidecars(table.io_schema.clone(), &mut table.schema, &create_table).await?;
+        let keys: Vec<_> = table.schema.unique_keys.drain(keys_before..).collect();
+        for key in keys {
+            table.register_unique_key(key);
         }
 
         table.enable_versioning(self.transactions.clone());
@@ -3604,6 +3530,140 @@ impl Database {
         self.tables.insert(table_name.to_string(), Arc::new(table));
         Ok(())
     }
+}
+
+/// Every schema sidecar a `CREATE TABLE` declares, written beside `io_schema`
+/// and pushed into `schema`: the `PRIMARY KEY` header, then FK, DEF, UK (each
+/// column checked to exist), TYP with each field's scale, GEN, CHK, JSON.
+/// One function for plain and partitioned tables, so their schemas cannot
+/// drift apart. Unique keys are recorded here only; a plain `Table` arms its
+/// checks with `register_unique_key`.
+async fn write_schema_sidecars(
+    io_schema: Arc<DbStorageProvider>,
+    schema: &mut TableSchema,
+    ct: &CreateTable,
+) -> io::Result<()> {
+    // The declared `PRIMARY KEY`, recorded in the schema header rather than
+    // left implicit in the column's `UNIQUE NOT NULL` flags.
+    //
+    // Enforcement does not need it — a primary key is a unique constraint
+    // and is already enforced as one — but every client that addresses a
+    // single row does: "the column this table calls its key" and "some
+    // column that happens to be unique" are different questions, and only
+    // the first has one answer.
+    if let Some(primary_key) = &ct.primary_key {
+        schema.set_primary_key(primary_key.clone());
+        if let Err(e) = schema.rewrite_header(io_schema.clone()).await {
+            error!("Failed to record primary key for {}: {}", schema.name, e);
+            return Err(e);
+        }
+    }
+
+    // Written after the table exists so its sidecar sits beside the schema
+    // it belongs to, and kept in the loaded schema so the first statement
+    // after `CREATE TABLE` is already constrained.
+    for fk in &ct.foreign_keys {
+        if let Err(e) = crate::core::rql::foreign_key::append(io_schema.clone(), fk).await
+        {
+            error!("Failed to persist foreign key {}: {}", fk.name, e);
+            return Err(e);
+        }
+        schema.foreign_keys.push(fk.clone());
+    }
+
+    for entry in &ct.defaults {
+        if let Err(e) =
+            crate::core::rql::column_default::append(io_schema.clone(), entry).await
+        {
+            error!("Failed to persist default for {}: {}", entry.column, e);
+            return Err(e);
+        }
+        schema.defaults.push(entry.clone());
+    }
+
+    // Every column a constraint names has to exist, or the constraint would
+    // sit in the sidecar matching nothing and the table would look
+    // constrained while allowing duplicates.
+    for key in &ct.unique_keys {
+        for column in &key.columns {
+            if !schema
+                .fields
+                .iter()
+                .any(|f| f.name.eq_ignore_ascii_case(column) && !f.is_deleted)
+            {
+                error!(
+                    "UNIQUE constraint {} names unknown column {}",
+                    key.name, column
+                );
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "UNIQUE constraint {:?} names column {:?}, which the table does not have",
+                        key.name, column
+                    ),
+                ));
+            }
+        }
+        if let Err(e) = crate::core::rql::unique_key::append(io_schema.clone(), key).await
+        {
+            error!("Failed to persist unique constraint {}: {}", key.name, e);
+            return Err(e);
+        }
+        schema.unique_keys.push(key.clone());
+    }
+
+    for entry in &ct.type_modifiers {
+        if let Err(e) =
+            crate::core::rql::type_modifier::append(io_schema.clone(), entry).await
+        {
+            error!(
+                "Failed to persist type modifier for {}: {}",
+                entry.column, e
+            );
+            return Err(e);
+        }
+        schema.type_modifiers.push(entry.clone());
+        // Onto the field as well as into the sidecar. A table created in
+        // this process is never re-read from disk, so `TableSchema::load`'s
+        // copy of this never runs for it — and a planner that did not know
+        // the column's scale compared every literal against it a power of
+        // ten away, silently.
+        if let Some(field) = schema
+            .fields
+            .iter_mut()
+            .find(|f| f.name.eq_ignore_ascii_case(&entry.column))
+        {
+            field.scale = Some(entry.scale as u32);
+        }
+    }
+
+    for entry in &ct.generated {
+        if let Err(e) =
+            crate::core::rql::generated::append(io_schema.clone(), entry).await
+        {
+            error!("Failed to persist generated column {}: {}", entry.column, e);
+            return Err(e);
+        }
+        schema.generated.push(entry.clone());
+    }
+
+    for entry in &ct.checks {
+        if let Err(e) = crate::core::rql::check::append(io_schema.clone(), entry).await {
+            error!("Failed to persist check constraint {}: {}", entry.name, e);
+            return Err(e);
+        }
+        schema.checks.push(entry.clone());
+    }
+
+    for entry in &ct.json_columns {
+        if let Err(e) = crate::core::rql::json_map::append(io_schema.clone(), entry).await
+        {
+            error!("Failed to register JSON column {}: {}", entry.column, e);
+            return Err(e);
+        }
+        schema.json_columns.push(entry.clone());
+    }
+    Ok(())
 }
 
 async fn load_db_data_schema<S: StorageIO>(schema_io: Arc<S>) -> TableSchema {
@@ -4200,12 +4260,22 @@ fn forget_logged_files(
     let ids: Vec<u64> = table_file_names(name)
         .map(|file| crate::core::wal::file_id_for_name(&file))
         .collect();
+    forget_logged_ids(logs, &ids, barrier)
+}
+
+/// [`forget_logged_files`] for files named by their log ids: a partitioned
+/// table's, which no single table name derives.
+fn forget_logged_ids(
+    logs: &[StdArc<crate::core::wal::Wal>],
+    ids: &[u64],
+    barrier: Barrier,
+) -> Result<(), ForgetFailure> {
     let mut logged = false;
     for wal in logs {
         let was_poisoned = wal.is_poisoned();
         let forgotten = match barrier {
-            Barrier::Drop => wal.forget_dropped_files(&ids),
-            Barrier::Relocation => wal.forget_files(&ids),
+            Barrier::Drop => wal.forget_dropped_files(ids),
+            Barrier::Relocation => wal.forget_files(ids),
         };
         if let Err(error) = forgotten {
             // Poisoned by this call means it failed past the append, at the

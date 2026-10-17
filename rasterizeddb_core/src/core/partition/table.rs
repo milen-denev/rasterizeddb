@@ -47,7 +47,7 @@
 //! read from the pool each time, since a mirror added at runtime never
 //! reaches the root seed.
 
-// Nothing outside the tests builds one until `Database` does (S4).
+// `Database` builds one (S4); part of the API is for later slices' callers.
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::io;
@@ -406,6 +406,36 @@ impl PartitionedTable {
         }
     }
 
+    /// A table refused before its map is read, for `why` (its schema file is
+    /// missing or unreadable, or the database cannot hold partitions). Every
+    /// data call returns `why`, and the cap counts it as unknown. `root` is
+    /// where its files are, so a DROP still deletes them; `shell` is whatever
+    /// stands in for the schema, never put into `Database.tables`.
+    pub(crate) fn refused(
+        ctx: OpenCtx<'_>,
+        name: &str,
+        uid: u64,
+        root: PathBuf,
+        shell: Arc<Table<DbStorageProvider>>,
+        why: &str,
+    ) -> Self {
+        let why = format!("partitioned table \"{name}\" ({uid:016x}) cannot be opened: {why}");
+        ::log::error!("{why}");
+        PartitionedTable {
+            name: name.to_string(),
+            uid,
+            root,
+            shell,
+            db_id: ctx.db_id,
+            transactions: ctx.transactions.clone(),
+            live: Err(why),
+            declared: None,
+            torn: None,
+            mirrored: ctx.mirrored,
+            dropped: AtomicBool::new(false),
+        }
+    }
+
     async fn open_live(
         ctx: &OpenCtx<'_>,
         root: &Path,
@@ -753,6 +783,18 @@ impl PartitionedTable {
     /// (skipped for a table whose log never opened), then every file of the
     /// uid, partitions first and the map log last. Works on a broken table.
     pub(crate) async fn drop_files(&self) -> io::Result<()> {
+        self.mark_dropped().await?;
+        if self.root.as_os_str().is_empty() {
+            return Ok(());
+        }
+        files::remove_all(&self.root, self.uid).map(|_| ())
+    }
+
+    /// §12's DROP step 3 alone: every data call refuses from here on, and the
+    /// map log ends in a durable `DROPPED` (skipped for a table whose log never
+    /// opened). For a caller that must void the log's records for the files
+    /// between this and deleting them, which `DROPPED` is itself one of.
+    pub(crate) async fn mark_dropped(&self) -> io::Result<()> {
         self.dropped.store(true, Ordering::Release);
         if let Ok(live) = &self.live {
             let mut state = live.state.lock().await;
@@ -763,9 +805,6 @@ impl PartitionedTable {
                 *state = next;
             }
         }
-        if self.root.as_os_str().is_empty() {
-            return Ok(());
-        }
-        files::remove_all(&self.root, self.uid).map(|_| ())
+        Ok(())
     }
 }

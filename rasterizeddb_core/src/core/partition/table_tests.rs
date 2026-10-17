@@ -116,7 +116,7 @@ fn insert_row(t: &PartitionedTable, tenant: &str, n: i32, label: &str) -> Option
         on_conflict_do_nothing: false,
         on_conflict_update: None,
     });
-    crate::core::rql::lexer_ir::insert_row_with_defaults(&qp, &t.shell().schema.fields, &[], &[])
+    crate::core::rql::lexer_ir::insert_row_with_defaults(&qp, &t.shell().schema.fields, &[], &[], 0)
 }
 
 fn row(t: &PartitionedTable, tenant: i64, n: i32) -> RowWrite {
