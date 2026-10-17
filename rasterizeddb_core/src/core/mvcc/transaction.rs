@@ -173,7 +173,7 @@ impl Snapshot {
 
     /// Whether `tx` is this transaction or one of its savepoints.
     #[inline]
-    fn is_mine(&self, tx: TxId) -> bool {
+    pub(crate) fn is_mine(&self, tx: TxId) -> bool {
         if self.own == NO_TX {
             return false;
         }

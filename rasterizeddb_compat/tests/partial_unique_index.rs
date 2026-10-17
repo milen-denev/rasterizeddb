@@ -156,6 +156,38 @@ async fn soft_delete_frees_the_key() {
     );
 }
 
+/// A soft delete and the insert that replaces it, in one transaction: the
+/// transaction sees its own delete, so the key is free to it.
+#[tokio::test(flavor = "multi_thread")]
+async fn replace_inside_one_transaction() {
+    let server = TestServer::start().await.expect("server");
+    let pool = server.connect_sqlx().await.expect("connect");
+    exec(&pool, "CREATE TABLE users (id INT PRIMARY KEY, email TEXT, deleted_at TIMESTAMPTZ)").await;
+    exec(&pool, "CREATE UNIQUE INDEX users_email_live ON users (email) WHERE deleted_at IS NULL").await;
+    exec(&pool, "INSERT INTO users VALUES (1, 'a', NULL)").await;
+    let mut tx = pool.begin().await.expect("begin");
+    tx.execute("UPDATE users SET deleted_at = '2024-01-01 00:00:00+00' WHERE id = 1").await.expect("soft delete");
+    tx.execute("INSERT INTO users VALUES (2, 'a', NULL)").await.expect("PostgreSQL accepts the replacement");
+    tx.commit().await.expect("commit");
+    // PostgreSQL: 2|a
+    assert_eq!(
+        pairs(&pool, "SELECT id, email FROM users WHERE deleted_at IS NULL ORDER BY id").await,
+        owned(&[(2, Some("a"))])
+    );
+    // The same with a hard delete, and with a duplicate the transaction did
+    // not free, which PostgreSQL refuses.
+    let mut tx = pool.begin().await.expect("begin");
+    tx.execute("DELETE FROM users WHERE id = 2").await.expect("delete");
+    tx.execute("INSERT INTO users VALUES (3, 'a', NULL)").await.expect("PostgreSQL accepts the replacement");
+    let e = tx.execute("INSERT INTO users VALUES (4, 'a', NULL)").await.expect_err("a second live 'a'");
+    assert_eq!(sqlstate(&e).as_deref(), Some("23505"), "{e}");
+    drop(tx);
+    assert_eq!(
+        pairs(&pool, "SELECT id, email FROM users WHERE deleted_at IS NULL ORDER BY id").await,
+        owned(&[(2, Some("a"))])
+    );
+}
+
 /// `UNIQUE (tenant_id, slug) WHERE active`: a composite key and a bare boolean.
 #[tokio::test(flavor = "multi_thread")]
 async fn tenant_slug_where_active() {

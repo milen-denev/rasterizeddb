@@ -2129,10 +2129,12 @@ impl<S: StorageIO> Table<S> {
                 (Some(manager), writer) if writer != crate::core::mvcc::transaction::NO_TX => {
                     use crate::core::mvcc::transaction::{NO_TX, TxOutcome};
                     let creator = manager.outcome(pointer.xmin);
+                    // A delete this transaction made has happened, for it.
                     let occupied = !pointer.deleted
                         && creator != TxOutcome::Aborted
                         && (pointer.xmax == NO_TX
-                            || manager.outcome(pointer.xmax) != TxOutcome::Committed);
+                            || (manager.outcome(pointer.xmax) != TxOutcome::Committed
+                                && !visibility.deleted_by_reader(pointer.xmax)));
                     if !occupied {
                         continue;
                     }
@@ -2549,10 +2551,14 @@ impl<S: StorageIO> Table<S> {
                 (Some(manager), writer) if writer != crate::core::mvcc::transaction::NO_TX => {
                     use crate::core::mvcc::transaction::{NO_TX, TxOutcome};
                     let creator = manager.outcome(pointer.xmin);
+                    // A delete this transaction made has happened, for it:
+                    // deleting a row and writing its key again in one
+                    // transaction was refused, where PostgreSQL allows it.
                     let occupied = !pointer.deleted
                         && creator != TxOutcome::Aborted
                         && (pointer.xmax == NO_TX
-                            || manager.outcome(pointer.xmax) != TxOutcome::Committed);
+                            || (manager.outcome(pointer.xmax) != TxOutcome::Committed
+                                && !visibility.deleted_by_reader(pointer.xmax)));
                     if !occupied {
                         continue;
                     }

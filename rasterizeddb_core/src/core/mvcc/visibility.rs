@@ -108,6 +108,23 @@ impl Visibility {
         }
     }
 
+    /// Whether `xmax` is a delete the reading transaction made itself, in it
+    /// or in a savepoint of it that has not been rolled back.
+    ///
+    /// Such a delete is uncommitted, so to everyone else the version still
+    /// stands, but to the reader it has happened: a uniqueness check for that
+    /// transaction must treat the key as free, or a transaction could not
+    /// delete a row and write its key again, which PostgreSQL allows.
+    /// `false` for [`Visibility::All`], which has no reader.
+    pub fn deleted_by_reader(&self, xmax: TxId) -> bool {
+        match self {
+            Visibility::All => false,
+            Visibility::AsOf { snapshot, manager } => {
+                xmax != NO_TX && snapshot.is_mine(xmax) && manager.outcome(xmax) != TxOutcome::Aborted
+            }
+        }
+    }
+
     /// True when this rule admits every untombstoned row without consulting the
     /// stamps. See [`Visibility::All`] for why a snapshot never reaches this.
     #[inline]
