@@ -5362,11 +5362,21 @@ async fn supply_insert_column_list(
         .filter(|f| crate::core::rql::generated::expression_for(&f.name, &generated).is_none())
         .collect();
     let rewritten = crate::core::rql::lexer_ir::supply_column_list(&row_data.query, &fields)?;
-    Some(
-        recognize_query_purpose(&rewritten).ok_or_else(|| {
-            "could not parse the statement after supplying its column list".to_string()
-        }),
-    )
+    let Some(mut purpose) = recognize_query_purpose(&rewritten) else {
+        return Some(Err(
+            "could not parse the statement after supplying its column list".to_string(),
+        ));
+    };
+    // `row_data.query` is the text with `ON CONFLICT` already cut off, so the
+    // re-parse cannot find the clause and it is carried across instead.
+    // Without this, `INSERT INTO t VALUES (…) ON CONFLICT DO NOTHING` raised
+    // the very violation it was written to skip.
+    InsertConflict {
+        do_nothing: row_data.on_conflict_do_nothing,
+        update: row_data.on_conflict_update.clone(),
+    }
+    .restore(&mut purpose);
+    Some(Ok(purpose))
 }
 
 /// Computes a table's `GENERATED ALWAYS AS (…) STORED` columns for one row and
