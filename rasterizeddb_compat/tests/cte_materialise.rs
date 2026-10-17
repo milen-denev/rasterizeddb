@@ -19,7 +19,7 @@
 //! Every expected answer is PostgreSQL 17's.
 
 use rasterizeddb_compat::TestServer;
-use sqlx::{AssertSqlSafe, Executor, Row, ValueRef};
+use sqlx::{AssertSqlSafe, Column, Executor, Row, ValueRef};
 
 /// Simple-protocol fetch, so every value arrives as the text a client sees,
 /// one row per string, columns joined with `|` and NULL spelled out.
@@ -478,4 +478,78 @@ async fn an_insert_takes_its_rows_from_a_with_query() {
     .await
     .expect("extended insert with a WITH source");
     assert_eq!(returned, vec![(7, "seven".to_string())]);
+}
+
+/// A join's `*` names a shared column twice, and so may an explicit list.
+///
+/// The relation was created with both names and the fill listed both, and the
+/// INSERT mapped each listed name to the first field called that: the second
+/// `id` was never written, `SELECT ja.id, jb.id` came back as one NULL per
+/// row, and a nullable pair failed to create. PostgreSQL answers these
+/// (`1|x|10|1`), but a relation here is a table and cannot hold two columns of
+/// one name, so they are refused with the fix named, as `*` over a join was
+/// before it could be named at all. The aliased forms give PostgreSQL's
+/// answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_join_with_a_shared_column_name_is_refused_not_misread() {
+    let server = TestServer::start().await.expect("start");
+    let pool = server.connect_sqlx().await.expect("connect");
+    for sql in [
+        "CREATE TABLE ja (id INT, v TEXT)",
+        "CREATE TABLE jb (id INT, aid INT)",
+        "INSERT INTO ja VALUES (1, 'x'), (2, 'y')",
+        "INSERT INTO jb VALUES (10, 1), (20, 2)",
+    ] {
+        run(&pool, sql).await;
+    }
+    let mut answered = Vec::new();
+    for sql in [
+        "WITH x AS (SELECT * FROM ja JOIN jb ON jb.aid = ja.id) SELECT * FROM x ORDER BY v",
+        "SELECT * FROM (SELECT * FROM ja JOIN jb ON jb.aid = ja.id) s ORDER BY v",
+        "SELECT count(*) FROM (SELECT * FROM ja JOIN jb ON jb.aid = ja.id) s",
+        "WITH x AS (SELECT * FROM ja JOIN jb ON jb.aid = ja.id) SELECT v, aid FROM x ORDER BY v",
+        "WITH x AS (SELECT ja.id, jb.id FROM ja JOIN jb ON jb.aid = ja.id) SELECT * FROM x ORDER BY 1",
+        "SELECT * FROM (SELECT ja.id, jb.id FROM ja JOIN jb ON jb.aid = ja.id) s ORDER BY 1",
+        "WITH w AS (SELECT 1 AS a, 2 AS a) SELECT * FROM w",
+    ] {
+        let got = rows(&pool, sql).await;
+        if !matches!(&got, Err(e) if e.contains("twice; alias one of them with AS")) {
+            answered.push(format!("{sql}\n    answered {got:?}"));
+        }
+    }
+    assert!(answered.is_empty(), "{} not refused:\n{}", answered.len(), answered.join("\n"));
+
+    let mut wrong = Wrong::default();
+    for (sql, want) in [
+        (
+            "WITH x AS (SELECT ja.id, jb.id AS bid, v, aid FROM ja JOIN jb ON jb.aid = ja.id) SELECT * FROM x ORDER BY v",
+            &["1|10|x|1", "2|20|y|2"][..],
+        ),
+        (
+            "SELECT * FROM (SELECT ja.id, jb.id AS bid, v, aid FROM ja JOIN jb ON jb.aid = ja.id) s ORDER BY v",
+            &["1|10|x|1", "2|20|y|2"],
+        ),
+        ("SELECT count(*) FROM (SELECT ja.id, jb.id AS bid FROM ja JOIN jb ON jb.aid = ja.id) s", &["2"]),
+        ("WITH w AS (SELECT 1 AS a, 2 AS b) SELECT * FROM w", &["1|2"]),
+        // Names that differ only in case are two columns of the relation here,
+        // and both are written, so this one is answered rather than refused.
+        (
+            "WITH x AS (SELECT ja.id, jb.id AS ID FROM ja JOIN jb ON jb.aid = ja.id) SELECT * FROM x ORDER BY 1",
+            &["1|10", "2|20"],
+        ),
+    ] {
+        wrong.check(&pool, sql, want).await;
+    }
+    wrong.assert_none();
+
+    // Over the extended protocol the aliased columns are described by name.
+    let row = sqlx::query(
+        "WITH x AS (SELECT ja.id, jb.id AS bid, v, aid FROM ja JOIN jb ON jb.aid = ja.id) SELECT * FROM x WHERE v = 'x'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("extended fetch");
+    let names: Vec<&str> = row.columns().iter().map(|c| c.name()).collect();
+    assert_eq!(names, ["id", "bid", "v", "aid"]);
+    assert_eq!((row.get::<i32, _>(0), row.get::<i32, _>(1), row.get::<i32, _>(3)), (1, 10, 1));
 }

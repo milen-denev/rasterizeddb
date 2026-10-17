@@ -603,6 +603,31 @@ fn cell_literal(column: &RelationColumn, cell: &crate::core::row::row::Column) -
     crate::core::rql::subquery::value_to_literal(&as_type, cell.data.into_slice())
 }
 
+/// Refuses a relation that would name one column twice.
+///
+/// A join's `*`, or `a.id, b.id`, names a shared column twice. The relation
+/// is a table and its fill names its columns, and the INSERT maps each name
+/// to the first field called that: the second value was never written, or a
+/// nullable pair's companion was declared twice and the CREATE failed.
+/// Refused rather than renamed, since a renamed column would reach the client
+/// under the new name and resolve a reference PostgreSQL calls ambiguous.
+///
+/// Compared exactly, as the INSERT matches: `id` and `ID` are two columns of
+/// the relation and each is written, so refusing them would only turn a right
+/// answer into an error.
+fn refuse_repeated_labels<S: AsRef<str>>(labels: &[S], subject: &str) -> Result<(), String> {
+    for (index, label) in labels.iter().enumerate() {
+        let label = label.as_ref();
+        if labels[..index].iter().any(|earlier| earlier.as_ref() == label) {
+            return Err(format!(
+                "{} names the column '{}' twice; alias one of them with AS",
+                subject, label
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Creates `temp` with one column per label, typed by [`relation_columns`],
 /// and writes `rows` into it. `subject` names what is being materialised in
 /// an error: "the WITH clause 'x'" or "the subquery for 's'".
@@ -621,6 +646,7 @@ async fn build_relation(
     tx: crate::core::mvcc::transaction::TxId,
     created: &mut bool,
 ) -> Result<(), String> {
+    refuse_repeated_labels(labels, subject)?;
     // A scan fetches the columns its `WHERE` reads as well as the selected
     // ones, so a row may carry more than the select list names. The visible
     // columns come first, which is what `visible_columns` trims to elsewhere.
@@ -998,6 +1024,7 @@ async fn materialize_inner(
                     .map(|c| format!("{} {}", c.label, c.sql_type))
                     .collect();
                 let labels: Vec<&str> = constants.iter().map(|c| c.label.as_str()).collect();
+                refuse_repeated_labels(&labels, &format!("the WITH clause '{}'", def.name))?;
                 let values: Vec<&str> = constants.iter().map(|c| c.value.as_str()).collect();
                 crate::core::rql::executor::run_statement(
                     &format!("CREATE TABLE {} ({})", temp, columns.join(", ")),
