@@ -4982,10 +4982,16 @@ where
     // happen before the result metadata is derived, because that derivation
     // plans the statement and would reject the subquery it has not yet seen
     // flattened.
+    //
+    // Not inside a generation expression, which PostgreSQL refuses to hold a
+    // subquery at all. Flattened here, `GENERATED ALWAYS AS (a + (SELECT
+    // max(a) FROM t))` was created with whatever the maximum was that moment
+    // baked in as a constant.
     let flattened;
-    let stmt = if crate::core::rql::subquery::find_in_subquery(stmt).is_some()
+    let stmt = if (crate::core::rql::subquery::find_in_subquery(stmt).is_some()
         || crate::core::rql::subquery::find_exists(stmt).is_some()
-        || crate::core::rql::subquery::find_scalar_subquery(stmt).is_some()
+        || crate::core::rql::subquery::find_scalar_subquery(stmt).is_some())
+        && !crate::core::rql::generated::declares_generated(stmt)
     {
         match crate::core::rql::executor::substitute_in_subqueries(
             stmt,
@@ -5529,6 +5535,15 @@ fn sqlstate_for(message: &str) -> &'static str {
         || has("malformed array literal")
     {
         "22P02"
+    } else if has("in column generation expression") && has("subquery") {
+        // PostgreSQL's own codes for a generation expression it refuses:
+        // a subquery is a missing feature, the rest a bad definition.
+        "0A000"
+    } else if has("generation expression") {
+        "42P17"
+    } else if has("can only be updated to default") || has("cannot insert a non-default value") {
+        // `generated_always`: a value written to a generated column.
+        "428C9"
     } else if has("not supported") || has("unsupported") {
         "0A000"
     } else if has("syntax error") || has("unexpected") || has("expected ") {

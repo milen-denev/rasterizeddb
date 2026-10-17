@@ -5449,7 +5449,19 @@ async fn supply_generated_values(
     }
 
     // What each column holds for this row: the literal written, or its default.
+    //
+    // A default is evaluated only for a column an expression reads, and the
+    // value it gave is then written into the statement, so the row stores the
+    // value the expression saw. Evaluating every default here and leaving the
+    // row writer to evaluate them again drew two values from a `BIGSERIAL`
+    // per insert, so the ids went 2, 4, 6, and an expression over `id` would
+    // have been computed from an id no row has.
+    let read: Vec<String> = generated
+        .iter()
+        .flat_map(|g| expression_columns(&g.expression, &fields))
+        .collect();
     let mut values: Vec<(String, String)> = assignments.clone();
+    let mut supplied_defaults: Vec<(String, String)> = Vec::new();
     for field in fields.iter().filter(|f| !f.is_deleted) {
         if values
             .iter()
@@ -5457,11 +5469,16 @@ async fn supply_generated_values(
         {
             continue;
         }
-        let literal = crate::core::rql::column_default::expression_for(&field.name, &defaults)
-            .and_then(|e| {
-                crate::core::rql::column_default::evaluate(e, &field.db_type, database.id).ok()
-            })
+        let literal = read
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(&field.name))
+            .then(|| crate::core::rql::column_default::expression_for(&field.name, &defaults))
+            .flatten()
+            .and_then(|e| crate::core::rql::column_default::evaluate(e, &field.db_type, database.id).ok())
             .unwrap_or_else(|| "NULL".to_string());
+        if !literal.eq_ignore_ascii_case("NULL") {
+            supplied_defaults.push((field.name.clone(), literal.clone()));
+        }
         values.push((field.name.clone(), literal));
     }
     // The expression reads each input as stored, after it is coerced to its
@@ -5486,9 +5503,10 @@ async fn supply_generated_values(
 
         // Folded against an empty row: every column reference is gone, so what
         // is left is a constant.
-        let literal = match crate::core::rql::expr::parse(&substituted, &[]).and_then(|expr| {
-            crate::core::rql::expr::eval(&expr, &crate::core::row::row::Row::default(), &[])
-        }) {
+        let literal = match crate::core::rql::generated::parse_expression(&substituted, &[])
+            .and_then(|expr| {
+                crate::core::rql::expr::eval(&expr, &crate::core::row::row::Row::default(), &[])
+            }) {
             Ok(crate::core::rql::expr::Value::Null) => "NULL".to_string(),
             Ok(crate::core::rql::expr::Value::Data { bytes, db_type }) => {
                 // Rendered at the *column's* type, not the arithmetic's: a sum
@@ -5520,7 +5538,8 @@ async fn supply_generated_values(
         computed.push((g.column.clone(), literal));
     }
 
-    let rewritten = match append_insert_values(&row_data.query, &computed) {
+    supplied_defaults.extend(computed);
+    let rewritten = match append_insert_values(&row_data.query, &supplied_defaults) {
         Some(sql) => sql,
         None => {
             return Some(Err(format!(
@@ -5537,45 +5556,179 @@ async fn supply_generated_values(
     }))
 }
 
-/// Why an `UPDATE` cannot be run against a table with generated columns, if it
-/// cannot.
+/// PostgreSQL's refusals of a `CREATE TABLE`'s generation expressions; see
+/// `generated::validate`. Its own function so its locals stay out of
+/// `execute_with_context`'s frame.
+fn validate_generated(
+    create_table: &crate::core::rql::lexer_ct::CreateTable,
+) -> Result<(), String> {
+    if create_table.generated.is_empty() {
+        return Ok(());
+    }
+    let columns: Vec<&str> = create_table.columns.iter().map(|c| c.name.as_str()).collect();
+    crate::core::rql::generated::validate(&create_table.generated, &columns)
+}
+
+/// An `UPDATE` on a table with generated columns, checked and put in the shape
+/// the update parser reads.
 ///
-/// `None` when the statement touches no input of any generated column, which is
-/// every `UPDATE` on a table that has none and most on a table that has.
-fn generated_update_conflict(
+/// Assigning a generated column is refused, as PostgreSQL refuses it, except
+/// to `DEFAULT`, which means "recompute it". The parser would try to store the
+/// word `DEFAULT` as a value, so that assignment is rewritten to `g = g`, a
+/// placeholder whose expression [`recompute_generated_in_update`] then
+/// replaces. `Ok(None)` when the statement needs no rewrite.
+fn generated_update_statement(
     query: &QueryPurpose,
     schema: &crate::core::row::schema::TableSchema,
-) -> Option<String> {
+) -> Result<Option<QueryPurpose>, String> {
     if schema.generated.is_empty() {
-        return None;
+        return Ok(None);
     }
     let QueryPurpose::UpdateRow(sql) = query else {
-        return None;
+        return Ok(None);
     };
-    let assignments = crate::core::rql::lexer_ur::assignments_of_update(sql)?;
-
-    for g in &schema.generated {
-        // Assigning the generated column itself is an error in PostgreSQL too.
-        if assignments
-            .iter()
-            .any(|(name, _)| name.eq_ignore_ascii_case(&g.column))
-        {
-            return Some(format!(
+    let Some(assignments) = crate::core::rql::lexer_ur::assignments_of_update(sql) else {
+        return Ok(None);
+    };
+    let mut defaulted = false;
+    for (name, value) in &assignments {
+        if crate::core::rql::generated::expression_for(name, &schema.generated).is_none() {
+            continue;
+        }
+        if !value.trim().eq_ignore_ascii_case("DEFAULT") {
+            return Err(format!(
                 "column \"{}\" can only be updated to DEFAULT: it is a generated column",
-                g.column
+                name
             ));
         }
-        let inputs = expression_columns(&g.expression, &schema.fields);
-        for (name, _) in &assignments {
-            if inputs.iter().any(|input| input.eq_ignore_ascii_case(name)) {
-                return Some(format!(
-                    "updating \"{}\" would leave the generated column \"{}\" stale, and                      recomputing it in an UPDATE is not supported yet; rewrite the row with                      DELETE and INSERT",
-                    name, g.column
-                ));
+        defaulted = true;
+    }
+    if !defaulted {
+        return Ok(None);
+    }
+
+    // The SET list is rebuilt with each `g = DEFAULT` replaced, and the rest
+    // of the statement kept as written. Found the same way
+    // `assignments_of_update` finds it, so the two read the same clause.
+    let (head, returning) = match crate::core::rql::lexer_ir::returning_split(sql) {
+        Some((head, tail)) => (head, Some(tail)),
+        None => (sql.as_str(), None),
+    };
+    let malformed = || "could not read the SET clause of the UPDATE".to_string();
+    let set_at = crate::core::rql::join::find_keyword(head, "SET", 0).ok_or_else(malformed)?;
+    let body_at = set_at + "SET".len();
+    let end = crate::core::rql::join::find_keyword(head, "WHERE", body_at).unwrap_or(head.len());
+    let sets: Vec<String> = crate::core::rql::lexer_ct::split_definitions(&head[body_at..end])
+        .into_iter()
+        .map(|assignment| {
+            let mut parts = assignment.splitn(2, '=');
+            let column = parts.next().unwrap_or("").trim().trim_matches('"').to_string();
+            let value = parts.next().unwrap_or("").trim();
+            if value.eq_ignore_ascii_case("DEFAULT")
+                && crate::core::rql::generated::expression_for(&column, &schema.generated).is_some()
+            {
+                format!("{} = {}", column, column)
+            } else {
+                assignment.trim().to_string()
             }
+        })
+        .collect();
+    let rewritten = format!(
+        "{} SET {} {}{}",
+        head[..set_at].trim_end(),
+        sets.join(", "),
+        head[end..].trim_start(),
+        returning
+            .map(|tail| format!(" RETURNING {}", tail))
+            .unwrap_or_default()
+    );
+    recognize_query_purpose(rewritten.trim_end())
+        .map(Some)
+        .ok_or_else(malformed)
+}
+
+/// Adds to an `UPDATE`'s plan the generated columns it has to recompute.
+///
+/// PostgreSQL computes a generated column from the row as updated. The plan's
+/// expressions are evaluated against the row as it was, so each assigned
+/// input is replaced in the generation expression by the expression assigned
+/// to it: `tot = q * p` under `SET q = 10` becomes `tot = (10) * p`, and under
+/// `SET p = p * 2` it becomes `tot = q * (p * 2)`. Unassigned columns read the
+/// same before and after, so they are left as columns.
+///
+/// This used to refuse any `UPDATE` of an input, because the stale value the
+/// alternative left behind would have reported success.
+fn recompute_generated_in_update(
+    plan: &mut crate::core::rql::lexer_ur::UpdateRow,
+    sql: &str,
+    schema: &crate::core::row::schema::TableSchema,
+) -> Result<(), String> {
+    if schema.generated.is_empty() {
+        return Ok(());
+    }
+    let Some(assignments) = crate::core::rql::lexer_ur::assignments_of_update(sql) else {
+        return Ok(());
+    };
+    // A generated column's own `g = g` placeholder is not an input of anything.
+    let inputs: Vec<(String, String)> = assignments
+        .into_iter()
+        .filter(|(name, _)| {
+            crate::core::rql::generated::expression_for(name, &schema.generated).is_none()
+        })
+        .collect();
+    let fields: Vec<crate::core::row::schema::SchemaField> = schema.fields.to_vec();
+
+    for g in schema.generated.iter().filter(|g| !g.is_deleted) {
+        let Some(field) = schema
+            .fields
+            .iter()
+            .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(&g.column))
+        else {
+            continue;
+        };
+        let write_order = field.write_order as u32;
+        let defaulted = plan.updates.iter().any(|u| u.write_order == write_order);
+        let read = expression_columns(&g.expression, &schema.fields);
+        let touched = inputs
+            .iter()
+            .any(|(name, _)| read.iter().any(|r| r.eq_ignore_ascii_case(name)));
+        if !touched && !defaulted {
+            continue;
+        }
+
+        let substituted = substitute_columns(&g.expression, &inputs)?;
+        let expression = crate::core::rql::generated::parse_expression(&substituted, &fields)
+            .map_err(|reason| {
+                format!(
+                    "the generated column \"{}\" could not be recomputed: {}",
+                    g.column, reason
+                )
+            })?;
+        // Cast to the column's type, which is what the insert path renders the
+        // value as. Arithmetic widens integers to int8 and folds into the
+        // engine's decimal, and either stored raw in a narrower column is
+        // another number.
+        let expression = if crate::core::rql::expr::static_type(&expression) == field.db_type {
+            expression
+        } else {
+            crate::core::rql::expr::Expr::Cast(Box::new(expression), field.db_type.clone())
+        };
+
+        plan.expressions.retain(|(wo, _)| *wo != write_order);
+        plan.expressions.push((write_order, expression));
+        if !defaulted {
+            // The placeholder holds the column's slot in the payload list until
+            // the row is seen, exactly as the update parser's own expression
+            // assignments do.
+            plan.updates.push(crate::core::row::row::ColumnWritePayload {
+                data: crate::memory_pool::MemoryBlock::default(),
+                write_order,
+                column_type: field.db_type.physical(),
+                size: field.size,
+            });
         }
     }
-    None
+    Ok(())
 }
 
 /// The schema columns an expression names.
@@ -5663,12 +5816,11 @@ fn substitute_columns(expression: &str, values: &[(String, String)]) -> Result<S
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case(word))
         {
-            // A NULL input makes the whole expression NULL, as it does in
-            // PostgreSQL — and saying so here beats folding `NULL + 5` into
-            // something that looks like a number.
-            Some((_, literal)) if literal.trim().eq_ignore_ascii_case("NULL") => {
-                return Ok("NULL".to_string());
-            }
+            // A NULL input is substituted as NULL and left to the evaluator,
+            // which is strict in NULL where PostgreSQL is: `NULL + 5` is NULL.
+            // Short-circuiting the whole expression to NULL here was wrong for
+            // everything that is not strict, so `COALESCE(s, 'x')`, `s IS
+            // NULL` and `NULL > 1 OR r = 3` all stored NULL.
             Some((_, literal)) => {
                 out.push('(');
                 out.push_str(literal.trim());
@@ -5724,8 +5876,12 @@ fn append_insert_values(sql: &str, extra: &[(String, String)]) -> Option<String>
     out.push_str(", ");
     out.push_str(&literals);
     out.push_str(&head[tuple_close..]);
+    // `returning_split` hands back the list without its keyword, so the keyword
+    // is written back here. Without it the list was left after the tuple as
+    // text the row parser ignores: the insert ran, the tag said INSERT 0 1,
+    // and RETURNING produced no rows.
     if let Some(returning) = returning {
-        out.push(' ');
+        out.push_str(" RETURNING ");
         out.push_str(&returning);
     }
     Some(out)
@@ -9499,7 +9655,10 @@ pub(crate) async fn insert_loaded_row(
         on_conflict_do_nothing: false,
         on_conflict_update: None,
     };
-    if supply_generated_values(&row_data, database).await.is_some() {
+    // Asked of the schema rather than by computing the values: computing them
+    // evaluates the defaults the expressions read, and a sequence advanced by
+    // a probe is an id no row gets.
+    if !schema.generated.is_empty() {
         return None;
     }
     let assignments = crate::core::rql::lexer_ir::assignments_of_insert(sql);
@@ -9900,6 +10059,10 @@ pub(crate) async fn execute_with_need(
             // Handle create table
             let (parsed, rejection) = crate::core::rql::lexer_ct::create_table_with_reason(&query);
             if let Some(reason) = rejection {
+                error!("Cannot create table: {}", reason);
+                return ddl_error(&reason);
+            }
+            if let Err(reason) = parsed.as_ref().map_or(Ok(()), validate_generated) {
                 error!("Cannot create table: {}", reason);
                 return ddl_error(&reason);
             }
@@ -10520,21 +10683,20 @@ pub(crate) async fn execute_with_need(
             };
 
             // A generated column is computed from the row, so an `UPDATE` to
-            // one of its inputs has to recompute it. This engine's `UPDATE`
-            // applies one value per column across the matched set and has no
-            // per-row evaluation to hang the recomputation on, so the statement
-            // is **refused** rather than allowed to leave a stale number
-            // behind.
-            //
-            // Refusing is the deliberate choice. The alternative — accept the
-            // update and let the generated column keep the value it had — is a
-            // wrong number that reports success, which is the failure this
-            // engine is most often bitten by. A loud limitation can be worked
-            // around; a quiet one is found in a report months later.
-            if let Some(reason) = generated_update_conflict(&query, &table.schema) {
-                error!("{}", reason);
-                return ddl_error(&reason);
-            }
+            // one of its inputs recomputes it; see
+            // `recompute_generated_in_update`, which adds it to the plan below.
+            // Here the statement is checked, and `SET g = DEFAULT` put in a
+            // shape the parser reads. The rewrite replaces `query` in place
+            // rather than being re-dispatched, as the INSERT arm's does, so
+            // the check sees only what the client wrote.
+            let generated_rewrite = match generated_update_statement(&query, &table.schema) {
+                Ok(rewrite) => rewrite,
+                Err(reason) => {
+                    error!("{}", reason);
+                    return ddl_error(&reason);
+                }
+            };
+            let query = generated_rewrite.as_ref().unwrap_or(&query);
 
             // A JSON document assigned by an UPDATE is stored in the table
             // backing its column and the statement rewritten to carry the
@@ -10585,7 +10747,7 @@ pub(crate) async fn execute_with_need(
                 .collect::<smallvec::SmallVec<[crate::core::row::schema::SchemaField; 20]>>();
 
             // As for DELETE: report what actually stopped the statement.
-            let update_plan = match crate::core::rql::lexer_ur::update_row_with_reason(
+            let mut update_plan = match crate::core::rql::lexer_ur::update_row_with_reason(
                 &query,
                 &schema_sv,
                 &table.schema.type_modifiers,
@@ -10597,6 +10759,14 @@ pub(crate) async fn execute_with_need(
                     return ddl_error(&message);
                 }
             };
+            // Before anything reads the plan, so the checks, RETURNING and the
+            // write all see the recomputed columns.
+            if let Err(e) =
+                recompute_generated_in_update(&mut update_plan, &query_sql(&query), &table.schema)
+            {
+                error!("{}", e);
+                return ddl_error(&e);
+            }
 
             // A `CHECK` the assignments can be judged against on their own.
             // The values are the ones the plan already encoded, so this reads
