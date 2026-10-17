@@ -5564,7 +5564,16 @@ fn sqlstate_for(message: &str) -> &'static str {
         // `40P01`, which drivers retry like `40001`: one party to the cycle
         // was failed so the others could proceed.
         "40P01"
-    } else if has("could not serialize access") || has("reclaimed while the query was reading") {
+    } else if has("could not serialize access")
+        || has("reclaimed while the query was reading")
+        // A uniqueness check that met another transaction's unfinished write
+        // of the same key, and outlasted the replays meant to wait it out.
+        // Nothing was applied, so re-running is the right response, and only
+        // `40001` tells a client so. Two blocks that each insert a key the
+        // other already wrote end here, where PostgreSQL would report a
+        // deadlock.
+        || has("is being written by another transaction")
+    {
         // The reclaimed-row guard is a serialisation failure in the sense that
         // matters to a client: the statement applied nothing and re-running it
         // is the correct response. `40001` says exactly that, and every
@@ -9253,6 +9262,17 @@ mod sqlstate_tests {
             // detail — the exact text `EvalError::RowMovedUnderScan` produces.
             (
                 "a row was reclaimed while the query was reading it; retry the statement",
+                "40001",
+            ),
+            // A uniqueness conflict with an unfinished write that the replays
+            // could not wait out. It reached clients as XX000, which no retry
+            // loop treats as retryable.
+            (
+                "UNIQUE column \"k\" is being written by another transaction",
+                "40001",
+            ),
+            (
+                "UNIQUE constraint users_email_live (email) is being written by another transaction",
                 "40001",
             ),
             ("relation 'nope' does not exist", "42P01"),
