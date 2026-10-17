@@ -3236,7 +3236,35 @@ async fn describe_query(
         }
     }
 
-    return describe_resolved(database, stmt, &[]).await;
+    // A parenthesised first branch of a `UNION` is described on its own, as
+    // the simple query path plans it.
+    let first_branch = match crate::core::rql::join::split_union(stmt) {
+        Some(Ok(parts)) if stmt.starts_with('(') => parts.branches.into_iter().next(),
+        _ => None,
+    };
+    let described = describe_resolved(database, first_branch.as_deref().unwrap_or(stmt), &[]).await?;
+    Ok(described.map(|(fields, is_select)| (widen_union_fields(database, stmt, fields), is_select)))
+}
+
+/// A `UNION` is described by its first branch, but a column that is `int`
+/// there and `bigint` in another is a `bigint`, and the executor sends its
+/// values as one. Described as the first branch's `int`, the wider values did
+/// not fit the description and went out as NULL. Anything but a `UNION` is
+/// returned as it is.
+fn widen_union_fields(
+    database: &Arc<Database>,
+    sql: &str,
+    mut fields: Vec<(String, DbType)>,
+) -> Vec<(String, DbType)> {
+    if let Some(Ok(parts)) = crate::core::rql::join::split_union(sql) {
+        let widened = crate::core::rql::set_ops::widened_integers(&parts, database);
+        for (field, wide) in fields.iter_mut().zip(widened) {
+            if let Some(wide) = wide {
+                field.1 = wide;
+            }
+        }
+    }
+    fields
 }
 
 /// The columns of a relation that exists only while one statement is described.
@@ -5056,7 +5084,16 @@ where
                     other => other.result_type(),
                 }
             };
-            match row_fetch_from_select_query(&purpose, &table.schema.fields) {
+            // A `UNION` is described by its first branch, planned on its own:
+            // a parenthesised one, `(SELECT … LIMIT 2) UNION …`, is not a
+            // statement the select parser reads whole.
+            let first_branch = match crate::core::rql::join::split_union(&qr.query) {
+                Some(Ok(parts)) if qr.query.trim_start().starts_with('(') => {
+                    parts.branches.first().and_then(|b| recognize_query_purpose(b))
+                }
+                _ => None,
+            };
+            match row_fetch_from_select_query(first_branch.as_ref().unwrap_or(&purpose), &table.schema.fields) {
                 Ok(parsed)
                     if parsed.select_items.iter().any(|i| {
                         matches!(
@@ -5173,6 +5210,14 @@ where
         #[cfg(feature = "s3_backup")]
         QueryPurpose::Backup(statement) => crate::core::rql::backup_exec::result_fields(statement),
         _ => None,
+    };
+    // A `UNION`'s fields come from its first branch; its integer columns are
+    // widened here as `describe_query` widens them, so they match the rows.
+    let select_fields = match &purpose {
+        QueryPurpose::QueryRows(qr) => {
+            select_fields.map(|fields| widen_union_fields(database, &qr.query, fields))
+        }
+        _ => select_fields,
     };
 
     crate::core::rql::prepared::note_description(&select_fields, &select_scales);

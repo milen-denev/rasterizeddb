@@ -2166,19 +2166,44 @@ pub fn find_phrase(sql: &str, words: &[&str], start: usize) -> Option<usize> {
     }
 }
 
+/// A `SELECT … UNION [ALL] SELECT …` taken apart: its branches, which of them
+/// are combined without duplicates, and the clauses that apply to the
+/// combined rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnionParts {
+    /// Each branch as a plain `SELECT`, the parentheses around it removed.
+    pub branches: Vec<String>,
+    /// How many leading branches are combined with duplicates removed.
+    ///
+    /// Set operators group from the left, so `A UNION B UNION ALL C` removes
+    /// duplicates from `A` and `B` together and keeps every row of `C`, while
+    /// `A UNION ALL B UNION C` removes them from all three. Either way the
+    /// distinct part is a prefix: everything up to the branch after the last
+    /// bare `UNION`. Zero when every operator is `UNION ALL`.
+    pub distinct_prefix: usize,
+    /// The text after a trailing `ORDER BY`, which sorts the combined rows.
+    pub order_by: Option<String>,
+    pub limit: Option<u64>,
+    pub offset: u64,
+}
+
 /// Splits `SELECT … UNION [ALL] SELECT …` into its branches, with any trailing
-/// top-level `LIMIT` lifted off because it applies to the combined result.
+/// top-level `ORDER BY`, `LIMIT` and `OFFSET` lifted off the last branch,
+/// because PostgreSQL applies them to the combined result. A branch that sorts
+/// or limits its own rows has to be parenthesised, and its clauses stay inside
+/// it.
 ///
-/// Returns `None` when there is no top-level `UNION`. The second element is
-/// `true` for `UNION ALL` (keep duplicates) and `false` for bare `UNION`
-/// (distinct), which is the difference PostgreSQL draws.
+/// Returns `None` when there is no top-level `UNION`, and `Some(Err)` when the
+/// trailing clauses cannot be read: leaving an unreadable `LIMIT` on the last
+/// branch would limit that branch alone, an answer rather than an error.
 ///
 /// Before this existed the parser simply stopped at `UNION` and answered with
 /// the first branch alone — a well-formed query silently returning a subset.
-pub fn split_union(sql: &str) -> Option<(Vec<String>, bool, Option<u64>)> {
+/// And until the trailing `ORDER BY` was lifted off too, it sorted only the
+/// last branch, and the `LIMIT` behind it was not found.
+pub fn split_union(sql: &str) -> Option<Result<UnionParts, String>> {
     let mut branches: Vec<String> = Vec::new();
-    let mut all = true;
-    let mut seen_union = false;
+    let mut last_distinct: Option<usize> = None;
     let mut rest = sql;
 
     loop {
@@ -2186,36 +2211,126 @@ pub fn split_union(sql: &str) -> Option<(Vec<String>, bool, Option<u64>)> {
             branches.push(rest.trim().to_string());
             break;
         };
-        seen_union = true;
         branches.push(rest[..at].trim().to_string());
         let after = rest[at + "UNION".len()..].trim_start();
         // `ALL` keeps duplicates; its absence means distinct.
         rest = match find_keyword(after, "ALL", 0) {
             Some(0) => &after["ALL".len()..],
             _ => {
-                all = false;
+                last_distinct = Some(branches.len());
                 after
             }
         };
     }
 
-    if !seen_union {
+    if branches.len() < 2 {
         return None;
     }
 
-    // A trailing LIMIT belongs to the union, not to its last branch.
-    let mut limit = None;
-    if let Some(last) = branches.last_mut() {
-        if let Some(at) = find_keyword(last, "LIMIT", 0) {
-            let tail = last[at + "LIMIT".len()..].trim();
-            if let Ok(n) = tail.split_whitespace().next().unwrap_or("").parse::<u64>() {
-                limit = Some(n);
-                *last = last[..at].trim().to_string();
-            }
+    let mut parts = UnionParts {
+        branches: Vec::new(),
+        distinct_prefix: last_distinct.map_or(0, |at| at + 1),
+        order_by: None,
+        limit: None,
+        offset: 0,
+    };
+    let last = branches.pop().unwrap_or_default();
+    let tail_at = [
+        find_phrase(&last, &["ORDER", "BY"], 0),
+        find_keyword(&last, "LIMIT", 0),
+        find_keyword(&last, "OFFSET", 0),
+    ]
+    .into_iter()
+    .flatten()
+    .min();
+    let (body, tail) = match tail_at {
+        Some(at) => (last[..at].trim(), last[at..].trim()),
+        None => (last.trim(), ""),
+    };
+    if let Err(e) = read_union_tail(tail, &mut parts) {
+        return Some(Err(e));
+    }
+    branches.push(body.to_string());
+    parts.branches = branches.iter().map(|b| unwrap_parentheses(b).to_string()).collect();
+    Some(Ok(parts))
+}
+
+/// Reads `ORDER BY …`, `LIMIT n` and `OFFSET n`, in that order, any of them
+/// absent.
+fn read_union_tail(tail: &str, parts: &mut UnionParts) -> Result<(), String> {
+    let limit_at = find_keyword(tail, "LIMIT", 0);
+    let offset_at = find_keyword(tail, "OFFSET", 0);
+    let order_end = limit_at.into_iter().chain(offset_at).min().unwrap_or(tail.len());
+    let unexpected = || format!("unexpected '{}' after the last branch of a UNION", tail);
+    match find_phrase(tail, &["ORDER", "BY"], 0) {
+        Some(0) => {
+            let clause = tail["ORDER".len()..order_end].trim_start();
+            parts.order_by = Some(clause["BY".len()..].trim().to_string());
+        }
+        // An `ORDER BY` behind the `LIMIT` is not PostgreSQL's grammar.
+        Some(_) => return Err(unexpected()),
+        None if order_end != 0 => return Err(unexpected()),
+        None => {}
+    }
+    // Each of `LIMIT` and `OFFSET` is its keyword and one word, so anything
+    // else after them is a clause this does not apply, and dropping it would
+    // answer a different question.
+    let mut words = 0usize;
+    for (at, keyword) in [(limit_at, "LIMIT"), (offset_at, "OFFSET")] {
+        let Some(at) = at else { continue };
+        words += 2;
+        let word = tail[at + keyword.len()..].split_whitespace().next().unwrap_or("");
+        // `LIMIT ALL` is no limit at all.
+        if keyword == "LIMIT" && word.eq_ignore_ascii_case("ALL") {
+            continue;
+        }
+        let n = word.parse::<u64>().map_err(|_| {
+            format!("the {} of a UNION must be a whole number, not '{}'", keyword, word)
+        })?;
+        if keyword == "LIMIT" {
+            parts.limit = Some(n);
+        } else {
+            parts.offset = n;
         }
     }
+    if tail[order_end..].split_whitespace().count() != words {
+        return Err(unexpected());
+    }
+    Ok(())
+}
 
-    Some((branches, all, limit))
+/// A branch without the parentheses that wrap all of it: `(SELECT … LIMIT 2)`
+/// is the branch `SELECT … LIMIT 2`. Parentheses that close before the end,
+/// as in `(a) + (b)`, are not one pair around the whole and are kept.
+fn unwrap_parentheses(branch: &str) -> &str {
+    let mut text = branch.trim();
+    while text.starts_with('(') && text.ends_with(')') {
+        let bytes = text.as_bytes();
+        let mut depth = 0usize;
+        let mut quote: Option<u8> = None;
+        let mut closes_at = None;
+        for (i, &c) in bytes.iter().enumerate() {
+            match quote {
+                Some(q) if c == q => quote = None,
+                Some(_) => {}
+                None if c == b'\'' || c == b'"' => quote = Some(c),
+                None if c == b'(' => depth += 1,
+                None if c == b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        closes_at = Some(i);
+                        break;
+                    }
+                }
+                None => {}
+            }
+        }
+        if closes_at != Some(bytes.len() - 1) {
+            break;
+        }
+        text = text[1..text.len() - 1].trim();
+    }
+    text
 }
 
 /// Splits a qualified name into `(qualifier, column)`.

@@ -170,9 +170,17 @@ pub fn find_scalar_subquery(sql: &str) -> Option<InSubquery> {
                 // was skipped and reached the parser as the word SELECT.
                 let derived_table = matches!(previous_word.as_str(), "FROM" | "JOIN")
                     && word_before_previous != "DISTINCT";
+                // A parenthesised branch of a `UNION` is a query of its own,
+                // not a value: `(SELECT … LIMIT 2) UNION (SELECT …)`. Taken for
+                // one, a branch of two rows was refused as "returned 2 rows".
+                // A branch opens the statement or follows `UNION [ALL]`.
+                let union_branch = (previous_word.is_empty() && sql[..open].trim().is_empty())
+                    || previous_word == "UNION"
+                    || (previous_word == "ALL" && word_before_previous == "UNION");
                 let is_select = upper[k..].starts_with("SELECT")
                     && !matches!(previous_word.as_str(), "IN" | "EXISTS")
-                    && !derived_table;
+                    && !derived_table
+                    && !union_branch;
 
                 let mut d = 1usize;
                 let mut m = i + 1;

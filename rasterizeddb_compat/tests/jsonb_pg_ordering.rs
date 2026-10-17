@@ -562,8 +562,8 @@ async fn an_alias_named_like_a_document_column_is_not_a_document() {
             wrong.push(format!("{sql}\n    want {want}\n    got  {got:?}"));
         }
     }
-    // Every blob begins with a scalar's tag byte. Sorted here, because a
-    // trailing `ORDER BY` is not applied to a `UNION`'s combined rows.
+    // Every blob begins with a scalar's tag byte. The statement leaves the
+    // order open, so the rows are sorted here.
     let sql = "SELECT blob AS doc FROM events UNION SELECT blob AS doc FROM events";
     let want = [r"\x0001", r"\x0002", r"\x0003", r"\x01ff"];
     match cells(&pool, sql).await {

@@ -755,6 +755,19 @@ fn declared_wide_types(
     labels: &[String],
     database: &Arc<Database>,
 ) -> Vec<Option<DbType>> {
+    declared_types(query, labels, database)
+        .into_iter()
+        .map(|t| t.filter(|t| matches!(t, DbType::JSONB | DbType::BYTEA | DbType::ARRAY)))
+        .collect()
+}
+
+/// The declared type of each of `labels`, read as a column of the one real
+/// relation `query` selects from, and `None` for a label that is not one.
+fn declared_types(
+    query: &str,
+    labels: &[String],
+    database: &Arc<Database>,
+) -> Vec<Option<DbType>> {
     let none = vec![None; labels.len()];
     // A join has more than one relation behind its columns; this resolves only
     // the single-relation case rather than guessing which one a label meant.
@@ -780,15 +793,12 @@ fn declared_wide_types(
     labels
         .iter()
         .map(|label| {
-            let field = table
+            table
                 .schema
                 .fields
                 .iter()
-                .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(label))?;
-            match field.db_type {
-                DbType::JSONB | DbType::BYTEA | DbType::ARRAY => Some(field.db_type.clone()),
-                _ => None,
-            }
+                .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(label))
+                .map(|field| field.db_type.clone())
         })
         .collect()
 }
@@ -808,6 +818,21 @@ fn declared_wide_types(
 /// and refused it, and `UNION` keyed a blob by its first byte and merged rows.
 /// `doc AS d`, the other way round, is the document column.
 pub(crate) fn document_columns(query: &str, database: &Arc<Database>) -> Vec<bool> {
+    declared_item_types(query, database)
+        .into_iter()
+        .map(|t| t == Some(DbType::JSONB))
+        .collect()
+}
+
+/// The declared type of each output column of `query`, by position, when the
+/// item is a bare column of the one relation it selects from; `None` for
+/// anything else. Looked up by the column read, not the output name, for the
+/// reason [`document_columns`] gives.
+///
+/// What a `UNION` widens its integer columns by: PostgreSQL gives a column
+/// that is `int` in one branch and `bigint` in another the type `bigint`, and
+/// the rows and the description sent to the client have to agree on it.
+pub(crate) fn declared_item_types(query: &str, database: &Arc<Database>) -> Vec<Option<DbType>> {
     let Some(list) = select_list_of(query) else {
         return Vec::new();
     };
@@ -820,10 +845,34 @@ pub(crate) fn document_columns(query: &str, database: &Arc<Database>) -> Vec<boo
         .iter()
         .map(|item| bare_column(split_alias(item.trim()).0).unwrap_or_default())
         .collect();
-    declared_wide_types(query, &labels, database)
-        .into_iter()
-        .map(|t| t == Some(DbType::JSONB))
-        .collect()
+    declared_types(query, &labels, database)
+}
+
+/// The output name of each item in a `SELECT`'s list: its alias, or the
+/// column it reads, and `None` for an item this cannot name (an expression,
+/// or a `*` that stands for several columns).
+///
+/// What a `UNION`'s trailing `ORDER BY` resolves a name against: PostgreSQL
+/// names the combined columns after the first branch.
+pub(crate) fn output_names(query: &str) -> Vec<Option<String>> {
+    let Some(list) = select_list_of(query) else {
+        return Vec::new();
+    };
+    let list = list.trim_start();
+    let list = match list.get(.."DISTINCT ".len()) {
+        Some(head) if head.eq_ignore_ascii_case("DISTINCT ") => &list["DISTINCT ".len()..],
+        _ => list,
+    };
+    let items = crate::core::rql::lexer_ct::split_definitions(list);
+    // A `*` is several columns, so no item after it is at the position its
+    // place in the list says. Naming none is better than naming the wrong one.
+    if items.iter().any(|item| {
+        let item = item.trim();
+        item == "*" || item.ends_with(".*")
+    }) {
+        return Vec::new();
+    }
+    items.iter().map(|item| item_label(item)).collect()
 }
 
 pub async fn materialize_query(

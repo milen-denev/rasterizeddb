@@ -545,6 +545,21 @@ fn recognize_core_statement(query_trimmed: &str, query_bytes: &[u8]) -> Option<Q
         } else {
             None
         }
+    } else if query_bytes.first() == Some(&b'(') {
+        // A `UNION` whose first branch is parenthesised, as it must be to sort
+        // or limit its own rows: `(SELECT … LIMIT 2) UNION SELECT …`. It is a
+        // query over the first branch's relation, like the unparenthesised
+        // form.
+        let Some(Ok(parts)) = crate::core::rql::join::split_union(query_trimmed) else {
+            return None;
+        };
+        match recognize_query_purpose(parts.branches.first()?)? {
+            QueryRows(first) => Some(QueryRows(QueryRowsData {
+                table_name: first.table_name,
+                query: query_trimmed.to_string(),
+            })),
+            _ => None,
+        }
     } else {
         None
     }

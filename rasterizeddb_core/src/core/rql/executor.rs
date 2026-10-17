@@ -3402,67 +3402,58 @@ fn constant_condition_holds(condition: &str) -> Result<bool, String> {
 
 /// Runs each branch of a `UNION` and combines the rows.
 ///
-/// `UNION ALL` concatenates; bare `UNION` removes duplicates, compared on the
-/// serialised row so two rows are equal exactly when every column is. A
-/// trailing `LIMIT` applies to the combined result, as PostgreSQL does.
+/// `UNION ALL` concatenates; bare `UNION` removes duplicates, compared by
+/// value as `=` compares them rather than by the serialized bytes, which
+/// carry the position of the column each value was read from. A trailing
+/// `ORDER BY`, `LIMIT` and `OFFSET` apply to the combined result, as
+/// PostgreSQL applies them. The combining is `set_ops::Combined`.
 ///
 /// Kept out of `execute_with_context`'s own frame: that function is one large
 /// match and its future is the sum of every arm's locals.
 async fn execute_union(sql: &str, database: &Arc<Database>, tx: TxId) -> Vec<u8> {
-    let Some((branches, all, limit)) = crate::core::rql::join::split_union(sql) else {
-        return ddl_error("not a UNION");
+    let parts = match crate::core::rql::join::split_union(sql) {
+        Some(Ok(parts)) => parts,
+        Some(Err(e)) => return ddl_error(&e),
+        None => return ddl_error("not a UNION"),
     };
 
-    // The branches' rows stay serialized from the subquery response to the
-    // result: no `Vec<Row>` (1.5 KB a row), and `UNION`'s duplicate check keeps
-    // a hash table of where each kept row starts in `result` rather than a byte
-    // copy of every row. Two rows are equal exactly when their serialized
-    // forms are, as before.
-    use std::hash::BuildHasher;
-    let mut result = vec![2u8];
-    let mut starts: Vec<usize> = Vec::new();
-    let state = ahash::RandomState::new();
-    let mut seen: hashbrown::HashTable<u32> = hashbrown::HashTable::new();
-    // A document column is the exception to comparing bytes: `{"a":1}` and
-    // `{"a":1.0}` are one row. A position is a document column when any
-    // branch says so (PostgreSQL gives the column one type for all of them),
-    // and a cell typed `jsonb` is one wherever it is. Only a row holding one
-    // is keyed by value, and its key is kept beside it. The two kinds of key
-    // are marked apart, so a row keyed by its bytes never meets one keyed by
-    // value.
-    let documents: Vec<bool> = if all {
-        Vec::new()
-    } else {
-        branches.iter().fold(Vec::new(), |mut acc, branch| {
-            let here = crate::core::rql::cte::document_columns(branch, database);
-            acc.resize(acc.len().max(here.len()), false);
-            for (at, d) in here.into_iter().enumerate() {
-                acc[at] |= d;
-            }
-            acc
-        })
-    };
-    let any_documents = documents.iter().any(|d| *d);
-    let mut value_keys: Vec<Option<Vec<u8>>> = Vec::new();
-    fn key_at<'a>(
-        result: &'a [u8],
-        starts: &[usize],
-        keys: &'a [Option<Vec<u8>>],
-        i: u32,
-    ) -> (bool, &'a [u8]) {
-        let i = i as usize;
-        match keys.get(i).and_then(|k| k.as_deref()) {
-            Some(k) => (true, k),
-            None => {
-                let end = starts.get(i + 1).copied().unwrap_or(result.len());
-                (false, &result[starts[i]..end])
-            }
+    // A document column compares by value, so `{"a":1}` and `{"a":1.0}` are
+    // one row. A position is a document column when any branch says so
+    // (PostgreSQL gives the column one type for all of them).
+    let documents: Vec<bool> = parts.branches.iter().fold(Vec::new(), |mut acc, branch| {
+        let here = crate::core::rql::cte::document_columns(branch, database);
+        acc.resize(acc.len().max(here.len()), false);
+        for (at, d) in here.into_iter().enumerate() {
+            acc[at] |= d;
         }
-    }
+        acc
+    });
+    // PostgreSQL names the combined columns after the first branch.
+    let names = parts
+        .branches
+        .first()
+        .map(|b| crate::core::rql::cte::output_names(b))
+        .unwrap_or_default();
+    let widen = crate::core::rql::set_ops::widened_integers(&parts, database);
+    let mut combined = match crate::core::rql::set_ops::Combined::new(
+        &parts,
+        documents,
+        widen,
+        &names,
+        vec![2u8],
+    ) {
+        Ok(combined) => combined,
+        Err(e) => return ddl_error(&e),
+    };
 
-    'branches: for branch in &branches {
+    // Each branch's rows stay serialized from the subquery response to the
+    // result: no `Vec<Row>` (1.5 KB a row).
+    for (at, branch) in parts.branches.iter().enumerate() {
         if branch.trim().is_empty() {
             return ddl_error("a UNION branch is empty");
+        }
+        if combined.is_full() {
+            break;
         }
         let branch_bytes = match run_subquery_serialized(branch, database, tx).await {
             Ok(bytes) => bytes,
@@ -3471,49 +3462,14 @@ async fn execute_union(sql: &str, database: &Arc<Database>, tx: TxId) -> Vec<u8>
                 return ddl_error(&e);
             }
         };
-        for row in crate::core::row::row::serialized_rows(&branch_bytes) {
-            if limit.is_some_and(|n| starts.len() as u64 >= n) {
-                break 'branches;
-            }
-            let row = match row {
-                Ok(row) => row,
-                Err(e) => return ddl_error(&format!("a UNION branch's rows could not be read: {}", e)),
-            };
-            if !all {
-                let by_value = any_documents
-                    || crate::core::row::row::serialized_cells(row).is_ok_and(|mut cells| {
-                        cells.any(|c| {
-                            c.is_ok_and(|c| c.column_type == crate::core::db_type::DbType::JSONB)
-                        })
-                    });
-                let document = |at: usize| documents.get(at).copied().unwrap_or(false);
-                let value_key = by_value
-                    .then(|| crate::core::row::row::value_key(row, document))
-                    .flatten();
-                let key = match value_key.as_deref() {
-                    Some(k) => (true, k),
-                    None => (false, row),
-                };
-                let hash = state.hash_one(key);
-                if seen
-                    .find(hash, |i| key_at(&result, &starts, &value_keys, *i) == key)
-                    .is_some()
-                {
-                    continue;
-                }
-                seen.insert_unique(hash, starts.len() as u32, |i| {
-                    state.hash_one(key_at(&result, &starts, &value_keys, *i))
-                });
-                if value_key.is_some() || !value_keys.is_empty() {
-                    value_keys.resize(starts.len(), None);
-                    value_keys.push(value_key);
-                }
-            }
-            starts.push(result.len());
-            result.extend_from_slice(row);
+        if let Err(e) = combined.push(&branch_bytes, at < parts.distinct_prefix) {
+            return ddl_error(&e);
         }
     }
-    result
+    match combined.finish() {
+        Ok(result) => result,
+        Err(e) => ddl_error(&e),
+    }
 }
 
 /// The column an implicit unique-constraint name refers to.
