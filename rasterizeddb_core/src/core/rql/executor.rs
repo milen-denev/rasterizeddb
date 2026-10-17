@@ -425,6 +425,28 @@ pub(crate) fn query_output_scales(
     }
 }
 
+/// The declared type a materialised CTE or derived table gives each output
+/// column of `query` that is `NUMERIC`: `NUMERIC(38, s)` where the query
+/// reports a scale below the engine's, so the temporary relation stores and
+/// renders the column at it. `None` keeps plain `NUMERIC`.
+///
+/// Without it the temporary column was an unconstrained `NUMERIC`, so a
+/// `NUMERIC(12,2)` read through a CTE came back as 552645.500000000. A scale
+/// above the engine's is not kept: the rows reach the relation at the engine
+/// scale, and more places would only render zeros that were never computed.
+pub(crate) fn materialised_numeric_types(query: &str, database: &Database) -> Vec<Option<String>> {
+    let Some(purpose) = crate::core::rql::lexer_s1::recognize_query_purpose(query) else {
+        return Vec::new();
+    };
+    query_output_scales(&purpose, database)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|scale| {
+            (scale < crate::core::value_codec::DECIMAL_SCALE).then(|| format!("NUMERIC(38, {})", scale))
+        })
+        .collect()
+}
+
 /// Brings every `DECIMAL` cell of a subquery's rows to the engine scale, from
 /// the scale [`query_output_scales`] says it is stored at.
 ///

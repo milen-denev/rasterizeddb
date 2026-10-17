@@ -426,3 +426,52 @@ async fn a_thousand_generated_rows_agree_with_their_inputs() {
     }
     assert!(wrong.is_empty(), "{} rows stored wrongly:\n{}", wrong.len(), wrong.join("\n"));
 }
+
+// ---------------------------------------------------------------- bug #14
+
+/// A cast to `numeric(p, s)` rounds to `s` and renders at it, and a
+/// `NUMERIC(p, s)` column keeps its scale through a CTE or a derived table.
+#[tokio::test(flavor = "multi_thread")]
+async fn cast_and_cte_keep_the_declared_scale() {
+    let mut db = db(&[
+        DIGITS[0],
+        DIGITS[1],
+        "CREATE TABLE cte_src (id INT, gross NUMERIC(12,2))",
+        "INSERT INTO cte_src (id, gross) VALUES (1, 552645.5), (2, 10)",
+    ])
+    .await;
+    let mut wrong = Vec::new();
+    expect_rows(
+        &mut db,
+        &mut wrong,
+        &[
+            // 4.500000000.
+            (
+                "SELECT (3 * 1.5)::numeric(10,2), CAST(3 * 1.5 AS numeric(10,3)), 2.5::numeric(10,0), \
+                 3.5::numeric(10,0), (-2.5)::numeric(10,0) FROM dg WHERE n = 1",
+                &["4.50|4.500|3|4|-3"],
+            ),
+            // 552645.500000000.
+            (
+                "WITH c AS (SELECT id, gross FROM cte_src) SELECT id, gross FROM c ORDER BY id",
+                &["1|552645.50", "2|10.00"],
+            ),
+            (
+                "SELECT id, gross FROM (SELECT id, gross FROM cte_src) s ORDER BY id",
+                &["1|552645.50", "2|10.00"],
+            ),
+            (
+                "WITH c AS (SELECT id, gross * 2 AS g2 FROM cte_src) SELECT id, g2 FROM c ORDER BY id",
+                &["1|1105291.00", "2|20.00"],
+            ),
+        ],
+    )
+    .await;
+    expect_out_of_range(
+        &db,
+        &mut wrong,
+        &[("SELECT 123.456::numeric(4,2) FROM dg WHERE n = 1", "numeric field overflow")],
+    )
+    .await;
+    verdict(wrong);
+}

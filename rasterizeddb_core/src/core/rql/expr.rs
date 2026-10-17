@@ -114,6 +114,15 @@ pub enum Expr {
     },
     /// `expr::type` — a change of type, not of value.
     Cast(Box<Expr>, DbType),
+    /// `expr::numeric(p, s)`: the value — a `Cast` to `NUMERIC` — rounded to
+    /// `s` places, refused past `p` digits. A `Cast` carries no modifier, so
+    /// `(3 * 1.5)::numeric(10,2)` was a plain cast and came back as
+    /// 4.500000000 where PostgreSQL gives 4.50.
+    NumericCast {
+        value: Box<Expr>,
+        precision: u32,
+        scale: u32,
+    },
     /// Binary arithmetic: `a + b`, `a * b`, and so on.
     Arith(Box<Expr>, ArithOp, Box<Expr>),
     /// `a || b` — string concatenation. Not arithmetic: its operands are text
@@ -383,6 +392,31 @@ fn cast_target(name: &str) -> Option<DbType> {
     )
 }
 
+/// A cast of `inner` to the type `target` names, keeping a `NUMERIC(p, s)`
+/// modifier as a [`Expr::NumericCast`].
+fn cast_to(inner: Expr, target: &str) -> Result<Expr, String> {
+    let db_type = cast_target(target)
+        .ok_or_else(|| format!("cast to '{}' is not supported yet", target.trim()))?;
+    let cast = Expr::Cast(Box::new(inner), db_type.clone());
+    if db_type == DbType::DECIMAL {
+        if let Some(modifier) = crate::core::rql::type_modifier::parse_numeric_modifier(target) {
+            let (precision, scale) = modifier?;
+            if u32::from(scale) > crate::core::value_codec::DECIMAL_SCALE {
+                return Err(format!(
+                    "a cast to numeric with more than {} places is not supported yet",
+                    crate::core::value_codec::DECIMAL_SCALE
+                ));
+            }
+            return Ok(Expr::NumericCast {
+                value: Box::new(cast),
+                precision: u32::from(precision),
+                scale: u32::from(scale),
+            });
+        }
+    }
+    Ok(cast)
+}
+
 /// Position of a top-level `::`, if the expression ends in a cast.
 fn top_level_cast(text: &str) -> Option<usize> {
     let bytes = text.as_bytes();
@@ -510,9 +544,7 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
     if let Some(at) = top_level_cast(text).filter(|_| !is_case_block(text)) {
         let inner = &text[..at];
         let target = &text[at + 2..];
-        let db_type = cast_target(target)
-            .ok_or_else(|| format!("cast to '{}' is not supported yet", target.trim()))?;
-        return Ok(Expr::Cast(Box::new(parse(inner, schema)?), db_type));
+        return cast_to(parse(inner, schema)?, target);
     }
 
     let upper = text.to_ascii_uppercase();
@@ -686,9 +718,7 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                 })?;
                 let value = parse(inner[..at].trim(), schema)?;
                 let type_name = inner[at + "AS".len()..].trim();
-                let target = cast_target(type_name)
-                    .ok_or_else(|| format!("cast to '{}' is not supported yet", type_name))?;
-                return Ok(Expr::Cast(Box::new(value), target));
+                return cast_to(value, type_name);
             }
 
             // `EXTRACT(EPOCH FROM x)` separates its two arguments with `FROM`,
@@ -1407,6 +1437,7 @@ pub fn columns_of(expr: &Expr) -> Vec<SchemaField> {
                 walk(b, out);
             }
             Expr::Cast(inner, _) => walk(inner, out),
+            Expr::NumericCast { value, .. } => walk(value, out),
             Expr::Case { whens, otherwise } => {
                 fn walk_cond(cond: &Cond, out: &mut Vec<SchemaField>) {
                     match cond {
@@ -1499,6 +1530,7 @@ pub fn static_type(expr: &Expr) -> DbType {
             crate::core::rql::aggregate::ScalarFunc::UuidV7 => DbType::UUID,
         },
         Expr::Cast(_, db_type) => db_type.clone(),
+        Expr::NumericCast { .. } => DbType::DECIMAL,
         Expr::Concat(_, _) => DbType::STRING,
         Expr::Call(TextFunc::ColumnSize | TextFunc::RelationSize, _) => DbType::I64,
         Expr::Call(TextFunc::DateTrunc, _) => DbType::DATETIME,
@@ -1626,6 +1658,13 @@ pub fn display_scale(expr: &Expr) -> Option<u32> {
         }
         Expr::Arith(..) if integer(&static_type(expr)) => Some(0),
         Expr::Call(TextFunc::Abs, args) => args.first().and_then(display_scale),
+        Expr::NumericCast { scale, .. } => Some(*scale),
+        // A cast to plain `numeric` keeps the places of an exact value.
+        Expr::Cast(inner, DbType::DECIMAL)
+            if matches!(static_type(inner), DbType::DECIMAL) || integer(&static_type(inner)) =>
+        {
+            display_scale(inner)
+        }
         _ => None,
     }
 }
@@ -2314,6 +2353,7 @@ fn always_decimal(expr: &Expr) -> bool {
     match expr {
         Expr::Column(field) => field.db_type == DbType::DECIMAL,
         Expr::Literal { db_type, .. } => *db_type == DbType::DECIMAL,
+        Expr::NumericCast { .. } => true,
         Expr::Arith(a, _, b) => always_decimal(a) || always_decimal(b),
         _ => false,
     }
@@ -3234,6 +3274,31 @@ pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, Str
         Expr::Cast(inner, target) => {
             let value = eval(inner, row, schema)?;
             cast(value, target)?
+        }
+        Expr::NumericCast {
+            value,
+            precision,
+            scale,
+        } => {
+            use crate::core::value_codec::DECIMAL_SCALE;
+            let Value::Data { bytes, .. } = eval(value, row, schema)? else {
+                return Ok(Value::Null);
+            };
+            let raw = i128::from_le_bytes(
+                bytes.as_slice().try_into().map_err(|_| "a numeric could not be read".to_string())?,
+            );
+            // Rounded half away from zero and checked at the target scale, as
+            // PostgreSQL's cast does, then carried on at the engine scale like
+            // every other NUMERIC value an expression produces.
+            let rounded = round_decimal(raw, DECIMAL_SCALE, *scale)
+                .ok_or_else(|| "value overflows numeric format".to_string())?;
+            crate::core::value_codec::check_numeric_precision(rounded, *precision, *scale)?;
+            let lifted = rescale_decimal(rounded, *scale, DECIMAL_SCALE)
+                .ok_or_else(|| "value overflows numeric format".to_string())?;
+            Value::Data {
+                bytes: lifted.to_le_bytes().to_vec(),
+                db_type: DbType::DECIMAL,
+            }
         }
     })
 }

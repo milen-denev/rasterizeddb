@@ -658,10 +658,16 @@ async fn materialize_inner(
         };
 
         let temp = temp_name(&def.name, sql, index);
+        // A NUMERIC column keeps the scale the body reports for it.
+        let numeric = crate::core::rql::executor::materialised_numeric_types(body, database);
         let columns: Vec<String> = labels
             .iter()
             .zip(types.iter())
-            .map(|(name, ty)| format!("{} {}", name, ty))
+            .enumerate()
+            .map(|(i, (name, ty))| match numeric.get(i).cloned().flatten() {
+                Some(declared) if *ty == "NUMERIC" => format!("{} {}", name, declared),
+                _ => format!("{} {}", name, ty),
+            })
             .collect();
 
         // Timed from here rather than from the top of the loop: the body has
@@ -1004,10 +1010,16 @@ async fn materialize_query_inner(
         .collect();
 
     let temp = temp_name(alias, statement, 0);
+    // A NUMERIC column keeps the scale the query reports for it.
+    let numeric = crate::core::rql::executor::materialised_numeric_types(query, database);
     let columns: Vec<String> = labels
         .iter()
         .zip(types.iter())
-        .map(|(name, ty)| format!("{} {}", name, ty))
+        .enumerate()
+        .map(|(i, (name, ty))| match numeric.get(i).cloned().flatten() {
+            Some(declared) if *ty == "NUMERIC" => format!("{} {}", name, declared),
+            _ => format!("{} {}", name, ty),
+        })
         .collect();
     crate::core::rql::executor::run_statement(
         &format!("CREATE TABLE {} ({})", temp, columns.join(", ")),
