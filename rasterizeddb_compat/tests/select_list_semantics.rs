@@ -15,10 +15,12 @@
 //!    its constant as text, so `{"a": 1.0}` did not equal `{"a": 1}`, and a
 //!    NULL result compared as the word `NULL`.
 //!
-//! And one more of the first kind, found in review:
+//! And two more of the first kind, found in review:
 //!
 //! 4. An operator spelled as a word — `a.n BETWEEN 2 AND 4`, `s LIKE 'x%'`,
 //!    `flag IS TRUE` — was its first operand, aliased by the keyword.
+//! 5. A comparison ending in a quoted literal — `'x' = 'y'`, `s || 'x' =
+//!    'ax'` — was read as one string literal running from quote to quote.
 //!
 //! Every answer below is PostgreSQL 17's, labels and announced types included:
 //! the description is what a client decodes by, so a right value under a wrong
@@ -649,4 +651,79 @@ async fn a_keyword_operator_in_a_select_list_is_never_its_first_operand() {
             Err(_) => assert!(rows.is_empty(), "{insert} failed but stored {rows:?}"),
         }
     }
+}
+
+/// A comparison whose right side is a quoted literal is a boolean, also when
+/// its left side is one or ends in a `||`.
+///
+/// The expression parser took any text that began and ended with a quote for
+/// one literal, so `'x' = 'y'` came back as the text `x' = 'y`, and
+/// `a.t || 'x' = 'xx'` as `a.t` concatenated with `x' = 'xx`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_comparison_between_quoted_literals_is_a_boolean() {
+    let (_s, pool) = server().await;
+    setup(&pool).await;
+    check(
+        &pool,
+        &[
+            (
+                "SELECT a.id, 'x' = 'y' AS f, 'x' = 'x', 'a''b' = 'a''b' AS q FROM pa a \
+                 JOIN pb b ON b.pa_id = a.id ORDER BY a.id",
+                "id:INT4|f:BOOL|?column?:BOOL|q:BOOL",
+                &["1|f|t|t", "2|f|t|t"],
+            ),
+            (
+                "SELECT a.id, a.t || 'x' = 'xx' AS c, b.u || 'x' <> 'px', a.t || b.u = 'xp' AS e \
+                 FROM pa a JOIN pb b ON b.pa_id = a.id ORDER BY a.id",
+                "id:INT4|c:BOOL|?column?:BOOL|e:BOOL",
+                &["1|t|f|t", "2|<N>|t|<N>"],
+            ),
+            (
+                "SELECT id, t || 'x' = 'xx' AS c, 'x' || t = 'xz', t || '' = 'x' AS e FROM pa ORDER BY id",
+                "id:INT4|c:BOOL|?column?:BOOL|e:BOOL",
+                &["1|t|f|t", "2|<N>|<N>|<N>", "3|f|t|f"],
+            ),
+            // A literal holding an escaped quote is still one literal.
+            (
+                "SELECT id, 'it''s' AS q, 'a' || 'b' AS ab FROM pa ORDER BY id",
+                "id:INT4|q:TEXT|ab:TEXT",
+                &["1|it's|ab", "2|it's|ab", "3|it's|ab"],
+            ),
+        ],
+    )
+    .await;
+
+    // An operator the select list cannot evaluate yet, between two literals:
+    // PostgreSQL's boolean or a refusal, never the text `x' LIKE 'x%`.
+    let mut wrong = Vec::new();
+    for (sql, want) in [
+        ("SELECT id, 'x' LIKE 'x%' FROM pa ORDER BY id", &["1|t", "2|t", "3|t"][..]),
+        ("SELECT a.id, 'x' LIKE 'x%' FROM pa a JOIN pb b ON b.pa_id = a.id ORDER BY a.id", &["1|t", "2|t"][..]),
+    ] {
+        for simple in [false, true] {
+            if let Ok((header, rows)) = run(&pool, sql, simple).await {
+                if header != "id:INT4|?column?:BOOL" || rows != want {
+                    wrong.push(format!("{sql} [simple={simple}]\n    got  {header} {rows:?}"));
+                }
+            }
+        }
+    }
+
+    // A bound parameter becomes a quoted literal before the item is read.
+    for sql in [
+        "SELECT id, $1 = 'admin' AS f FROM d ORDER BY id",
+        "SELECT a.id, $1 = 'admin' AS f FROM d a JOIN d b ON b.id = a.id ORDER BY a.id",
+    ] {
+        let want = vec![(1, Some(false)), (2, Some(false))];
+        match sqlx::query_as::<_, (i32, Option<bool>)>(AssertSqlSafe(sql))
+            .bind("user")
+            .fetch_all(&pool)
+            .await
+        {
+            Ok(got) if got == want => {}
+            Ok(got) => wrong.push(format!("{sql}\n    want {want:?}\n    got  {got:?}")),
+            Err(e) => wrong.push(format!("{sql}\n    error {e}")),
+        }
+    }
+    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
 }

@@ -300,6 +300,24 @@ fn split_args(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Index of the quote closing the string literal `text` opens with, reading
+/// `''` as an escaped quote inside it, or `None` when it never closes.
+pub(crate) fn closing_quote(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut i = 1usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            if bytes.get(i + 1) == Some(&b'\'') {
+                i += 2;
+                continue;
+            }
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Index of the parenthesis matching the one at `open`, ignoring quoted text.
 pub(crate) fn matching_paren(text: &str, open: usize) -> Option<usize> {
     let bytes = text.as_bytes();
@@ -664,10 +682,11 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
         return parse_case(text, schema);
     }
 
-    // A quoted string — one, whose closing quote is the last character.
-    // Starting and ending with a quote is not enough: `'DE', 'A'` does both,
-    // and was read as the single string `DE', 'A`, which turned the row value
-    // `(country, grade) = ('DE', 'A')` into a comparison with that string.
+    // A quoted string, and only when the opening quote's partner is the last
+    // byte. Starting and ending with a quote is not enough: `'DE', 'A'` was
+    // read as the single string `DE', 'A` (breaking the row value
+    // `(country, grade) = ('DE', 'A')`), `'x' = 'y'` as the one literal
+    // `x' = 'y`, and `a || 'x' = 'ax'` as `a` concatenated with `x' = 'ax`.
     if text.starts_with('\'') && text.ends_with('\'') && text.len() >= 2 && is_one_literal(text) {
         let value = crate::core::value_codec::unquote_sql(text);
         return Ok(Expr::Literal {
@@ -4201,6 +4220,27 @@ mod tests {
         // stand-in is an operator that still is not.
         assert!(parse("v ^ 1", &s).is_err());
         assert!(parse("v + ", &s).is_err());
+    }
+
+    #[test]
+    fn a_literal_is_one_only_when_its_quote_closes_at_the_end() {
+        let s = schema();
+        // Each begins and ends with a quote, and each was one string literal.
+        for text in ["'x' = 'y'", "'a''b' = 'a''b'", "t || 'x' = 'xx'", "'x' LIKE 'x%'"] {
+            let parsed = parse(text, &s);
+            assert!(
+                !matches!(&parsed, Ok(Expr::Literal { .. }))
+                    && !matches!(&parsed, Ok(Expr::Concat(_, right)) if matches!(**right, Expr::Literal { .. })),
+                "{text} parsed as {parsed:?}"
+            );
+        }
+        // A doubled quote inside one literal does not close it.
+        match parse("'it''s'", &s) {
+            Ok(Expr::Literal { bytes, .. }) => assert_eq!(bytes, b"it's"),
+            other => panic!("'it''s' parsed as {other:?}"),
+        }
+        assert_eq!(closing_quote("'it''s' = 'x'"), Some(6));
+        assert_eq!(closing_quote("'open"), None);
     }
 
     #[test]

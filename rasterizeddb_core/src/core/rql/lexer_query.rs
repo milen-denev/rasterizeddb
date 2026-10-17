@@ -1168,7 +1168,12 @@ fn parse_constant(expr: &str) -> Option<(Vec<u8>, crate::core::db_type::DbType)>
         return Some((vec![0u8], DbType::BOOL));
     }
 
-    if text.len() >= 2 && text.starts_with('\'') && text.ends_with('\'') {
+    // One literal only when its opening quote closes at the end: `'x' LIKE
+    // 'x%'` begins and ends with a quote too, and was the text `x' LIKE 'x%`.
+    if text.len() >= 2
+        && text.starts_with('\'')
+        && crate::core::rql::expr::closing_quote(text) == Some(text.len() - 1)
+    {
         // `unquote_sql` rather than a slice: a quote inside the literal is
         // written doubled and has to collapse back to one, exactly as on the
         // insert path.
