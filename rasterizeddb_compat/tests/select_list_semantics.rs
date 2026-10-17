@@ -1,6 +1,6 @@
 //! What a select list evaluates to, item by item, against PostgreSQL 17.
 //!
-//! Two silent wrong answers lived here:
+//! Three silent wrong answers lived here:
 //!
 //! 1. An expression in a join's select list returned its first operand.
 //!    `a.n * 10 + b.n AS k` came back as `a.n`, labelled `*`: the item was
@@ -11,6 +11,9 @@
 //!    constant was stored as empty text, which is a value, so the client saw
 //!    `''` where PostgreSQL sends NULL. A scalar subquery that found no row,
 //!    or found a NULL, is substituted as the same constant.
+//! 3. The correlated `UPDATE … FROM` path compared a subquery's document with
+//!    its constant as text, so `{"a": 1.0}` did not equal `{"a": 1}`, and a
+//!    NULL result compared as the word `NULL`.
 //!
 //! Every answer below is PostgreSQL 17's, labels and announced types included:
 //! the description is what a client decodes by, so a right value under a wrong
@@ -382,4 +385,56 @@ async fn a_null_in_a_select_list_is_null() {
         &[true],
     )
     .await;
+}
+
+/// Bug 3: the correlated `UPDATE … FROM` term `(SELECT doc …) <op> '<json>'`
+/// compares documents by value, as `jsonb` does, and a NULL result matches
+/// nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn correlated_update_from_compares_documents_by_value() {
+    let (_s, pool) = server().await;
+    for sql in [
+        "CREATE TABLE ut (id INT PRIMARY KEY, k INT NOT NULL, flag INT NOT NULL)",
+        "CREATE TABLE us (id INT NOT NULL, k INT NOT NULL)",
+        "CREATE TABLE ue (id INT NOT NULL, doc JSONB)",
+        "INSERT INTO ut (id, k, flag) VALUES (1, 1, 0), (2, 2, 0), (3, 3, 0), (4, 4, 0), (5, 5, 0)",
+        "INSERT INTO us (id, k) VALUES (1, 1), (2, 2), (3, 3), (4, 4), (5, 5)",
+        r#"INSERT INTO ue (id, doc) VALUES (1, '{"a":1}'), (2, '{"a":1.0}'), (3, '{"b":2,"a":1}'), (4, NULL), (5, '[1, 2]')"#,
+    ] {
+        pool.execute(sqlx::raw_sql(AssertSqlSafe(sql)))
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let mut wrong = Vec::new();
+    for (condition, want_count, want_ids) in [
+        (r#"= '{"a": 1}'"#, 2u64, "1,2"),
+        (r#"<> '{"a":1}'"#, 2, "3,5"),
+        (r#"> '{"a":1}'"#, 1, "3"),
+        ("= '[1.0, 2]'", 1, "5"),
+        (r#"= '{"a":1}'::jsonb"#, 2, "1,2"),
+    ] {
+        pool.execute("UPDATE ut SET flag = 0").await.expect("reset");
+        let sql = format!(
+            "UPDATE ut SET flag = 1 FROM us WHERE us.k = ut.k AND \
+             (SELECT doc FROM ue WHERE ue.id = ut.id) {condition}"
+        );
+        let count = match pool.execute(AssertSqlSafe(sql.as_str())).await {
+            Ok(done) => done.rows_affected(),
+            Err(e) => {
+                wrong.push(format!("{sql}\n    error {e}"));
+                continue;
+            }
+        };
+        let ids: Vec<i32> = sqlx::query_scalar("SELECT id FROM ut WHERE flag = 1 ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .expect("read back");
+        let ids = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+        if count != want_count || ids != want_ids {
+            wrong.push(format!(
+                "{sql}\n    want UPDATE {want_count} [{want_ids}]\n    got  UPDATE {count} [{ids}]"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
 }

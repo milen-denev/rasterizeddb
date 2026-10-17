@@ -3901,6 +3901,13 @@ fn substitute_outer_refs(sql: &str, bindings: &[(String, String)]) -> String {
 
 /// True when the scalar the subquery returned satisfies `<value> <op> <literal>`.
 fn scalar_comparison_holds(value: &str, op: &str, literal: &str) -> Result<bool, String> {
+    // A NULL on either side makes the comparison unknown, which is not true.
+    // `rows_to_scalar` writes a NULL as the bare word, never quoted, so with
+    // the quotes stripped below it compared as the text `NULL`: `<> 'x'` held
+    // for a subquery that found nothing.
+    if is_null_literal(value) || is_null_literal(literal) {
+        return Ok(false);
+    }
     let lhs = value.trim().trim_matches('\'');
     let rhs = literal.trim().trim_matches('\'');
 
@@ -3920,6 +3927,58 @@ fn scalar_comparison_holds(value: &str, op: &str, literal: &str) -> Result<bool,
         "<" => ordering == Less,
         "<=" => ordering != Greater,
         _ => return Err(format!("unsupported comparison '{}'", op)),
+    })
+}
+
+/// An unquoted `NULL`, as `rows_to_scalar` writes one.
+fn is_null_literal(text: &str) -> bool {
+    text.trim().eq_ignore_ascii_case("NULL")
+}
+
+/// [`scalar_comparison_holds`] for a subquery that returns a document: both
+/// sides compared as `jsonb` values, the way every other path compares them.
+///
+/// As text, `{"a": 1.0}` did not equal `{"a": 1}`, and spacing or key order
+/// decided an equality that PostgreSQL answers by value.
+fn document_comparison_holds(value: &str, op: &str, literal: &str) -> Result<bool, String> {
+    if is_null_literal(value) || is_null_literal(literal) {
+        return Ok(false);
+    }
+    // The constant may carry its cast: `= '{"a":1}'::jsonb`.
+    let document = |text: &str| -> Result<Vec<u8>, String> {
+        let text = text.trim();
+        let text = match crate::core::rql::expr::trailing_cast(text) {
+            Some((operand, ty))
+                if ty.eq_ignore_ascii_case("jsonb") || ty.eq_ignore_ascii_case("json") =>
+            {
+                operand
+            }
+            _ => text,
+        };
+        crate::core::jsonb::encode_text(&crate::core::value_codec::unquote_sql(text))
+    };
+    let (lhs, rhs) = (document(value)?, document(literal)?);
+    let malformed = || {
+        format!(
+            "cannot compare '{}' with '{}' as jsonb",
+            value.trim(),
+            literal.trim()
+        )
+    };
+    use std::cmp::Ordering::*;
+    Ok(match op {
+        "=" => crate::core::jsonb::values_equal(&lhs, &rhs).ok_or_else(malformed)?,
+        "!=" | "<>" => !crate::core::jsonb::values_equal(&lhs, &rhs).ok_or_else(malformed)?,
+        _ => {
+            let ordering = crate::core::jsonb::compare_values(&lhs, &rhs).ok_or_else(malformed)?;
+            match op {
+                ">" => ordering == Greater,
+                ">=" => ordering != Less,
+                "<" => ordering == Less,
+                "<=" => ordering != Greater,
+                _ => return Err(format!("unsupported comparison '{}'", op)),
+            }
+        }
     })
 }
 
@@ -4293,7 +4352,18 @@ async fn update_from_join(
     // ran 4 000 subqueries, each a scan, and now run four.
     let mut keep_row: Vec<bool> = vec![true; rows.len()];
     if !correlated.is_empty() {
-        let mut answers: std::collections::HashMap<String, String> =
+        // Whether each term's subquery reads a stored document, which a scan
+        // reports as text; asked of the schema once, not of every row.
+        let documents: Vec<bool> = correlated
+            .iter()
+            .map(|term| {
+                crate::core::rql::cte::document_columns(&term.inner_sql, database)
+                    .first()
+                    .copied()
+                    .unwrap_or(false)
+            })
+            .collect();
+        let mut answers: std::collections::HashMap<String, (String, bool)> =
             std::collections::HashMap::new();
         for (i, row) in rows.iter().enumerate() {
             let mut bindings: Vec<(String, String)> = Vec::with_capacity(carried.len());
@@ -4306,18 +4376,36 @@ async fn update_from_join(
                 .ok_or_else(|| "a joined value cannot be written".to_string())?;
                 bindings.push((reference.clone(), literal));
             }
-            for term in &correlated {
+            for (term, declared_document) in correlated.iter().zip(&documents) {
                 let resolved = substitute_outer_refs(&term.inner_sql, &bindings);
-                let value = match answers.get(&resolved) {
-                    Some(value) => value.clone(),
+                let (value, document) = match answers.get(&resolved) {
+                    Some(answer) => answer.clone(),
                     None => {
                         let produced = run_subquery(&resolved, database, tx).await?;
-                        let value = crate::core::rql::subquery::rows_to_scalar(&produced, false)?;
-                        answers.insert(resolved, value.clone());
-                        value
+                        // A computed document — `doc->'a'` — is reported as
+                        // one by the row itself.
+                        let document = *declared_document
+                            || produced.first().and_then(|r| r.columns.first()).is_some_and(
+                                |c| {
+                                    matches!(
+                                        c.column_type,
+                                        crate::core::db_type::DbType::JSON
+                                            | crate::core::db_type::DbType::JSONB
+                                    )
+                                },
+                            );
+                        let value =
+                            crate::core::rql::subquery::rows_to_scalar(&produced, document)?;
+                        answers.insert(resolved, (value.clone(), document));
+                        (value, document)
                     }
                 };
-                if !scalar_comparison_holds(&value, &term.op, &term.literal)? {
+                let holds = if document {
+                    document_comparison_holds(&value, &term.op, &term.literal)?
+                } else {
+                    scalar_comparison_holds(&value, &term.op, &term.literal)?
+                };
+                if !holds {
                     keep_row[i] = false;
                     break;
                 }
