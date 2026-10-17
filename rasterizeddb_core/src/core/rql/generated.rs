@@ -788,6 +788,12 @@ mod tests {
                 bytes,
                 db_type: DbType::I64,
             }) => i64::from_le_bytes(bytes.try_into().unwrap()).to_string(),
+            // An integer constant is int4 when it fits, as PostgreSQL types
+            // it, so small arithmetic answers in I32.
+            Ok(Value::Data {
+                bytes,
+                db_type: DbType::I32,
+            }) => i32::from_le_bytes(bytes.try_into().unwrap()).to_string(),
             other => panic!("{}: unexpected {:?}", text, other),
         }
     }
