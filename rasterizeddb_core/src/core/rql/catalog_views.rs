@@ -973,7 +973,10 @@ async fn build(
                         keys.push((field.name.clone(), true, false));
                     }
                 }
-                for key in table.schema.unique_keys.iter().filter(|k| !k.is_deleted) {
+                // A partial key is unique only under its predicate, and this
+                // view lists each column as unique outright, so it is left out
+                // rather than reported as a guarantee it does not give.
+                for key in table.schema.unique_keys.iter().filter(|k| !k.is_deleted && k.predicate.is_none()) {
                     if key.columns.len() == 1
                         && !keys
                             .iter()
@@ -1073,16 +1076,26 @@ async fn build(
                         )],
                         None => index.columns.iter().filter_map(|(wo, _)| column_name(*wo)).collect(),
                     };
+                    // A partial unique index is listed with its predicate, as
+                    // PostgreSQL lists it. The index underneath holds every
+                    // row; only the uniqueness is partial.
+                    let predicate = table
+                        .schema
+                        .unique_keys
+                        .iter()
+                        .find(|k| index.decl.unique && !k.is_deleted && k.name.eq_ignore_ascii_case(&index.decl.name))
+                        .and_then(|k| k.predicate_display());
                     defs.push((
                         index.decl.name.clone(),
                         format!(
-                            "CREATE {}INDEX {} ON {}.{} USING {} ({})",
+                            "CREATE {}INDEX {} ON {}.{} USING {} ({}){}",
                             if index.decl.unique { "UNIQUE " } else { "" },
                             index.decl.name,
                             SCHEMA,
                             name,
                             index.method().name(),
-                            columns.join(", ")
+                            columns.join(", "),
+                            predicate.map(|p| format!(" WHERE {}", p)).unwrap_or_default()
                         ),
                     ));
                 }

@@ -625,22 +625,32 @@ pub fn parse_drop_table(sql: &str) -> Result<(String, bool), String> {
 /// a duplicate insert succeeded after one had been created. Expressing it as
 /// the constraint the engine already enforces keeps one implementation.
 ///
-/// `None` when the statement is not one, or is a **partial** unique index
-/// (`… WHERE …`). Partial uniqueness cannot be expressed here, and enforcing it
-/// in full would reject rows PostgreSQL accepts — a stronger constraint is as
-/// wrong as a weaker one, so those stay a declared no-op.
+/// A **partial** unique index (`… WHERE pred`) keeps its predicate:
+/// `ALTER TABLE t ADD CONSTRAINT name UNIQUE (cols) WHERE pred`, which is not
+/// PostgreSQL syntax but is what [`crate::core::rql::unique_key::parse_clause`]
+/// reads as a key that holds among the rows `pred` is true for. It used to be
+/// a declared no-op, and a table that asked for one live account per email
+/// stored any number of them.
+///
+/// `None` when the statement is not one.
 pub fn unique_index_as_constraint(sql: &str) -> Option<String> {
     let trimmed = sql.trim().trim_end_matches(';');
     let upper = trimmed.to_ascii_uppercase();
     if !upper.starts_with("CREATE UNIQUE INDEX") {
         return None;
     }
-    // A partial index keeps the old behaviour.
-    if crate::core::rql::join::find_keyword(trimmed, "WHERE", 0).is_some() {
-        return None;
-    }
 
     let after = &trimmed["CREATE UNIQUE INDEX".len()..];
+    // `CONCURRENTLY` changes how PostgreSQL builds the index, not what it
+    // enforces.
+    let after = {
+        let t = after.trim_start();
+        if t.to_ascii_uppercase().starts_with("CONCURRENTLY ") {
+            &t["CONCURRENTLY".len()..]
+        } else {
+            t
+        }
+    };
     // `IF NOT EXISTS` is carried into the constraint rather than dropped.
     // Losing it made a re-run of a migration fail on the second pass with
     // "constraint already exists" — the exact outcome the clause is written to
@@ -661,25 +671,71 @@ pub fn unique_index_as_constraint(sql: &str) -> Option<String> {
         return None;
     }
 
-    let rest = after[on_at + "ON".len()..].trim_start();
+    let mut rest = after[on_at + "ON".len()..].trim_start();
+    if rest.to_ascii_uppercase().starts_with("ONLY ") {
+        rest = rest["ONLY".len()..].trim_start();
+    }
     let open = rest.find('(')?;
-    let table = rest[..open].trim().trim_matches('"');
+    // `ON t USING btree (…)`, which is how `pg_dump` writes every index. A
+    // unique index is a B-tree in PostgreSQL, so the method says nothing more.
+    let mut head = rest[..open].trim();
+    if let Some(using_at) = crate::core::rql::join::find_keyword(head, "USING", 0) {
+        head = head[..using_at].trim();
+    }
+    let table = head.trim_matches('"');
     if table.is_empty() {
         return None;
     }
-    let close = rest.rfind(')')?;
+    // The parenthesis that closes the column list, not the last one in the
+    // statement: a predicate has parentheses of its own, and `pg_dump` writes
+    // it as `WHERE (deleted_at IS NULL)`.
+    let close = open + matching_close(&rest[open..])?;
     let columns = rest[open + 1..close].trim();
     if columns.is_empty() {
         return None;
     }
+    let tail = rest[close + 1..].trim();
+    let predicate = match crate::core::rql::join::find_keyword(tail, "WHERE", 0) {
+        Some(at) => Some(tail[at + "WHERE".len()..].trim()).filter(|p| !p.is_empty()),
+        None => None,
+    };
 
     Some(format!(
-        "ALTER TABLE {} ADD CONSTRAINT {}{} UNIQUE ({})",
+        "ALTER TABLE {} ADD CONSTRAINT {}{} UNIQUE ({}){}",
         table,
         if if_not_exists { "IF NOT EXISTS " } else { "" },
         name,
-        columns
+        columns,
+        match predicate {
+            Some(p) => format!(" WHERE {}", p),
+            None => String::new(),
+        }
     ))
+}
+
+/// The offset of the `)` closing the `(` that `text` starts with, outside
+/// quotes.
+fn matching_close(text: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    for (i, c) in text.char_indices() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None => match c {
+                '\'' | '"' => quote = Some(c),
+                '(' => depth += 1,
+                ')' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+    None
 }
 
 /// Statements the engine accepts without acting on, with the reason.
@@ -706,6 +762,15 @@ pub fn no_op_reason(sql: &str) -> Option<&'static str> {
     // through to the no-op below.
     if crate::core::index::ddl::parse_create(sql).is_some() {
         return None;
+    }
+    // A partial index that is not unique only narrows an access path, so
+    // accepting it without building anything loses no guarantee: queries
+    // scan, or use another index, and return the same rows. Named apart from
+    // the rest so the log says which kind was set aside.
+    if upper.starts_with("CREATE INDEX")
+        && crate::core::rql::join::find_keyword(sql, "WHERE", 0).is_some()
+    {
+        return Some("partial index: accepted and not built; it constrains nothing, and queries answer the same without it");
     }
     if upper.starts_with("CREATE INDEX")
         || upper.starts_with("CREATE UNIQUE INDEX")
@@ -1105,13 +1170,36 @@ mod tests {
     }
 
     #[test]
-    fn a_partial_unique_index_stays_a_no_op() {
-        // Uniqueness over a subset cannot be expressed here, and enforcing it
-        // in full would reject rows PostgreSQL accepts — wrong in the other
-        // direction. So it stays declared rather than becoming a lie.
-        assert!(
-            unique_index_as_constraint("CREATE UNIQUE INDEX i ON t (a) WHERE b IS NULL").is_none()
+    fn a_partial_unique_index_keeps_its_predicate() {
+        // It used to be a declared no-op, so duplicates PostgreSQL rejects
+        // were stored. The predicate travels with the key now; enforcing the
+        // key over every row instead would reject rows PostgreSQL accepts.
+        assert_eq!(
+            unique_index_as_constraint("CREATE UNIQUE INDEX i ON t (a) WHERE b IS NULL").as_deref(),
+            Some("ALTER TABLE t ADD CONSTRAINT i UNIQUE (a) WHERE b IS NULL")
         );
-        assert!(no_op_reason("CREATE UNIQUE INDEX i ON t (a) WHERE b IS NULL").is_some());
+        assert!(no_op_reason("CREATE UNIQUE INDEX i ON t (a) WHERE b IS NULL").is_none());
+        // `pg_dump`'s spelling: a method, and a predicate in parentheses. The
+        // column list ends at its own parenthesis, not the predicate's.
+        assert_eq!(
+            unique_index_as_constraint(
+                "CREATE UNIQUE INDEX users_email_live ON public.users USING btree (email) WHERE (deleted_at IS NULL);"
+            )
+            .as_deref(),
+            Some("ALTER TABLE public.users ADD CONSTRAINT users_email_live UNIQUE (email) WHERE (deleted_at IS NULL)")
+        );
+        assert_eq!(
+            unique_index_as_constraint(
+                "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS p ON ONLY pages (tenant_id, slug) WHERE active"
+            )
+            .as_deref(),
+            Some("ALTER TABLE pages ADD CONSTRAINT IF NOT EXISTS p UNIQUE (tenant_id, slug) WHERE active")
+        );
+        // A plain partial index still constrains nothing and is set aside,
+        // saying so.
+        assert!(
+            no_op_reason("CREATE INDEX i ON t (a) WHERE b IS NULL")
+                .is_some_and(|r| r.starts_with("partial index"))
+        );
     }
 }

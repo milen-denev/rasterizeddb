@@ -148,9 +148,30 @@ fn split_on_conflict(query: &str) -> (String, bool, Option<ConflictUpdate>) {
         return (query.to_string(), false, None);
     };
 
-    // `ON CONFLICT (a, b) DO UPDATE …`
+    // `ON CONFLICT (a, b) DO UPDATE …`, or `ON CONFLICT (a) WHERE pred DO
+    // UPDATE …` naming a partial unique index. The column list ends at the
+    // parenthesis matching its own: the last one in the clause may be the
+    // predicate's, and reading up to it took `a) WHERE (pred` for a column.
+    // The predicate itself is not needed here; the executor finds the index
+    // from the columns (see `apply_conflict_update`).
     let arbiter_text = clause[..do_at].trim();
-    let arbiter = match (arbiter_text.find('('), arbiter_text.rfind(')')) {
+    let arbiter_close = arbiter_text.find('(').and_then(|open| {
+        let mut depth = 0usize;
+        arbiter_text[open..].char_indices().find_map(|(i, c)| {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some(open + i);
+                    }
+                }
+                _ => {}
+            }
+            None
+        })
+    });
+    let arbiter = match (arbiter_text.find('('), arbiter_close) {
         (Some(open), Some(close)) if close > open => arbiter_text[open + 1..close]
             .split(',')
             .map(|c| c.trim().trim_matches('"').to_string())

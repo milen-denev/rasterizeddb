@@ -4371,11 +4371,10 @@ async fn forgetting_under_concurrent_writes_and_reads_matches_a_reference_model(
 async fn concurrent_keyed_inserts_never_outrun_the_id_reservation() {
     let dir = tempfile::tempdir().unwrap();
     let mut t = open_table(dir.path(), "wp_id_reservation").await;
-    t.register_unique_key(crate::core::rql::unique_key::UniqueKey {
-        name: "wp_id_reservation_id_key".into(),
-        columns: vec!["id".into()],
-        is_deleted: false,
-    });
+    t.register_unique_key(crate::core::rql::unique_key::UniqueKey::new(
+        "wp_id_reservation_id_key".into(),
+        vec!["id".into()],
+    ));
     let t = Arc::new(t);
     let mut tasks = Vec::new();
     for task in 0..16u64 {

@@ -2334,6 +2334,7 @@ async fn rewrite_table_with_columns(
 
     let mut columns = existing_columns;
     columns.extend(new_columns);
+    let carries_unique_keys = unique_keys.iter().any(|k| !k.is_deleted);
 
     database
         .drop_table(table_name)
@@ -2367,7 +2368,13 @@ async fn rewrite_table_with_columns(
 
     // Index declarations go back before the rows do, so reopening builds the
     // (still empty) indexes and every reinserted row is indexed by its insert.
-    if !carried_indexes.is_empty() || !carried_path_indexes.is_empty() {
+    //
+    // Table-level unique keys reopen it too. `add_table` registers them on a
+    // table whose indexes were already built, so without a reopen their
+    // implicit indexes were missing until the next restart: `pg_indexes`
+    // stopped listing a partial unique index after `ADD COLUMN`, and a
+    // migration that checks there before creating it would have tried again.
+    if !carried_indexes.is_empty() || !carried_path_indexes.is_empty() || carries_unique_keys {
         let (io_schema, fields) = {
             let entry = database.tables.get(table_name);
             let Some(table) = entry.as_ref().clone() else {
@@ -4534,6 +4541,37 @@ async fn apply_conflict_update(
             ));
         };
         predicates.push(format!("{} = {}", key, literal));
+    }
+
+    // When the arbiter is a partial unique index, the row that conflicted is
+    // the one under its predicate. The key alone also matches every row
+    // outside it — the soft-deleted copies of an email — and the update would
+    // have rewritten all of them. An ordinary key over the same columns
+    // admits one row per value, so its presence makes the predicate moot.
+    if let Some(entry) = database.tables.get(table_name) {
+        let same_columns = |columns: &[String]| {
+            columns.len() == keys.len()
+                && columns.iter().all(|c| keys.iter().any(|k| k.eq_ignore_ascii_case(c)))
+        };
+        let schema = &entry.value().schema;
+        let full_key = schema.unique_keys.iter().any(|k| {
+            !k.is_deleted && k.predicate.is_none() && same_columns(&k.columns)
+        }) || (keys.len() == 1
+            && (schema.primary_key.as_deref().is_some_and(|p| p.eq_ignore_ascii_case(&keys[0]))
+                || schema
+                    .fields
+                    .iter()
+                    .any(|f| f.is_unique && !f.is_deleted && f.name.eq_ignore_ascii_case(&keys[0]))));
+        if !full_key {
+            if let Some(predicate) = schema
+                .unique_keys
+                .iter()
+                .find(|k| !k.is_deleted && same_columns(&k.columns))
+                .and_then(|k| k.predicate.as_deref())
+            {
+                predicates.push(format!("({})", predicate));
+            }
+        }
     }
 
     let resolve = |text: &str| -> Result<String, String> {
@@ -7428,6 +7466,20 @@ async fn existing_rows_break_unique(
         }
     }
 
+    // A partial key holds only among the rows its predicate is true for, so
+    // only those are compared, and its columns are fetched to judge that.
+    let condition = key.condition(schema)?;
+    if let Some(condition) = condition {
+        for field in crate::core::rql::expr::cond_columns(condition) {
+            let flag = crate::core::rql::nullable::flag_field(&field.name, &schema_sv).cloned();
+            for f in std::iter::once(field).chain(flag) {
+                if !fetch_fields.iter().any(|g| g.write_order == f.write_order) {
+                    fetch_fields.push(f);
+                }
+            }
+        }
+    }
+
     let fetch = crate::core::rql::join::fetch_for(&fetch_fields, schema);
     let empty = crate::core::rql::join::fetch_for(&[], schema);
     let rows = table
@@ -7443,6 +7495,11 @@ async fn existing_rows_break_unique(
     let mut seen: ahash::HashSet<Vec<u8>> =
         ahash::HashSet::with_capacity_and_hasher(rows.len(), Default::default());
     for row in &rows {
+        if let Some(condition) = condition {
+            if !crate::core::rql::expr::eval_cond(condition, row, schema)? {
+                continue;
+            }
+        }
         // Length-prefixed, so ('ab', 'c') and ('a', 'bc') are different tuples
         // rather than the same run of bytes.
         let mut encoded: Vec<u8> = Vec::new();
@@ -7507,8 +7564,11 @@ async fn existing_rows_break_unique(
                     .unwrap_or_else(|| "?".to_string());
                 values.push(rendered);
             }
+            // "duplicate key value" is what maps the refusal to 23505, the
+            // code PostgreSQL gives `could not create unique index`.
             return Ok(Some(format!(
-                "the table already holds duplicate values for ({}): first duplicate is ({})",
+                "duplicate key value: the table already holds duplicate values for ({}): \
+                 first duplicate is ({})",
                 key.columns.join(", "),
                 values.join(", ")
             )));
@@ -8767,6 +8827,12 @@ async fn execute_alter_table_action(
                             return ddl_error(&format!("column '{}' does not exist", column));
                         }
                     }
+                    // A partial unique index's predicate has to be one the
+                    // uniqueness check can judge. One it cannot is refused
+                    // here, rather than stored as a key nobody enforces.
+                    if let Err(e) = key.condition(&schema.fields) {
+                        return ddl_error(&e);
+                    }
                     if schema
                         .unique_keys
                         .iter()
@@ -9204,6 +9270,44 @@ async fn execute_drop_index(sql: &str, database: &Arc<Database>) -> Option<Vec<u
     };
     if let Err(e) = crate::core::index::decl::append(io_schema, &tombstone).await {
         return Some(ddl_error(&e.to_string()));
+    }
+    if let Err(e) = database.reload_table(&table_name).await {
+        return Some(ddl_error(&format!(
+            "the index was dropped but the table could not be reopened: {}",
+            e
+        )));
+    }
+    Some(ddl_ok(0))
+}
+
+/// `DROP INDEX` of a partial unique index, which is kept as a partial unique
+/// key. `None` when no table has one by that name, so the caller tries the
+/// other kinds.
+///
+/// Only partial keys answer to `DROP INDEX` here. A full unique index is
+/// stored the same way as `ADD CONSTRAINT … UNIQUE`, and the two cannot be told
+/// apart afterwards; PostgreSQL refuses to drop the latter's index, so that
+/// case is left to the constraint.
+async fn execute_drop_partial_unique(sql: &str, database: &Arc<Database>) -> Option<Vec<u8>> {
+    let (name, _if_exists) = crate::core::rql::path_index::parse_drop(sql)?;
+    let (table_name, io_schema) = database.tables.iter().find_map(|entry| {
+        entry
+            .value()
+            .schema
+            .unique_keys
+            .iter()
+            .any(|k| !k.is_deleted && k.predicate.is_some() && k.name.eq_ignore_ascii_case(&name))
+            .then(|| (entry.key().clone(), entry.value().io_schema.clone()))
+    })?;
+    match crate::core::rql::unique_key::remove(io_schema, &name).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return Some(ddl_error(&format!(
+                "index \"{}\" could not be found in the sidecar of '{}'",
+                name, table_name
+            )));
+        }
+        Err(e) => return Some(ddl_error(&e.to_string())),
     }
     if let Err(e) = database.reload_table(&table_name).await {
         return Some(ddl_error(&format!(
@@ -10144,10 +10248,12 @@ fn identifying_field(
         return Some(key);
     }
     // A composite key names no single column, so it cannot stand in for one.
+    // Nor can a partial one: rows outside its predicate share its values, and
+    // writing back by it would reach every one of them.
     schema
         .unique_keys
         .iter()
-        .filter(|k| !k.is_deleted && k.columns.len() == 1)
+        .filter(|k| !k.is_deleted && k.columns.len() == 1 && k.predicate.is_none())
         .find_map(|k| live(&k.columns[0]))
 }
 
@@ -10826,7 +10932,10 @@ pub(crate) async fn execute_with_need(
         QueryPurpose::DropIndex(sql) => {
             let response = match Box::pin(execute_drop_index(sql, &database)).await {
                 Some(response) => response,
-                None => Box::pin(execute_drop_path_index(sql, &database)).await,
+                None => match Box::pin(execute_drop_partial_unique(sql, &database)).await {
+                    Some(response) => response,
+                    None => Box::pin(execute_drop_path_index(sql, &database)).await,
+                },
             };
             if response.first() != Some(&3) {
                 note_write(&database, tx, depth, sql, None);

@@ -1287,6 +1287,10 @@ pub fn for_schema(schema: &crate::core::row::schema::TableSchema) -> TableIndexe
             &mut out,
         );
     }
+    // A partial unique key gets the same index as a full one, over every row,
+    // not only the rows its predicate holds for. That keeps it a superset for
+    // any query, so the planner may use it without knowing about predicates;
+    // only the uniqueness check reads the predicate.
     for uk in schema.unique_keys.iter().filter(|u| !u.is_deleted) {
         let columns: Option<Vec<u32>> = uk.columns.iter().map(|c| by_name(c)).collect();
         if let Some(columns) = columns.filter(|c| !c.is_empty() && c.len() <= decl::MAX_COLUMNS) {

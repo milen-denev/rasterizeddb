@@ -1920,14 +1920,30 @@ impl<S: StorageIO> Table<S> {
                 tuple.push((field, value));
             }
 
+            // A partial unique index constrains only the rows its predicate
+            // holds for; see `unique_key` for how that is judged.
+            let partial = match crate::core::rql::unique_key::partial_check(key, &self.schema.fields, row_write) {
+                Ok(partial) => partial,
+                Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)),
+            };
+            let Some((condition, predicate_columns)) = partial else {
+                continue;
+            };
+
             // Same rule as the column flags above: a constraint the statement
-            // does not write to cannot be violated by it.
-            if skip || tuple.is_empty() || !tuple.iter().any(|(f, _)| touches(f.write_order)) {
+            // does not write to cannot be violated by it. For a partial key,
+            // writing the predicate's columns counts: that is how an undelete
+            // brings a row back under the key.
+            if skip
+                || tuple.is_empty()
+                || !(tuple.iter().any(|(f, _)| touches(f.write_order))
+                    || predicate_columns.iter().any(|wo| touches(*wo)))
+            {
                 continue;
             }
 
             if let Some((existing, in_flight)) = self
-                .find_row_with_tuple(&tuple, exclude_id, visibility, written_by)
+                .find_row_with_tuple(&tuple, exclude_id, visibility, written_by, condition)
                 .await?
             {
                 // Another transaction's unfinished write: replayed, not
@@ -1995,6 +2011,9 @@ impl<S: StorageIO> Table<S> {
         // Whose write this is: see `find_row_with_value`, whose in-flight rule
         // this applies to a whole tuple.
         written_by: TxId,
+        // A partial key's predicate: a row holding the tuple conflicts only
+        // when the predicate holds for it too.
+        predicate: Option<&crate::core::rql::expr::Cond>,
     ) -> Result<Option<(u64, bool)>> {
         use crate::core::filter::sarg::{MaskExpr, SargPredicate, SargProgram};
         use crate::core::filter::zonemap::SargOp;
@@ -2072,6 +2091,24 @@ impl<S: StorageIO> Table<S> {
                 flag_ids.push(schema_id);
             }
         }
+        // The predicate's columns, each with its NULL flag: a value fetched
+        // without its flag reads as present, holding its type's zeroes.
+        if let Some(predicate) = predicate {
+            let read = crate::core::rql::expr::cond_columns(predicate);
+            let flags: Vec<SchemaField> = read.iter().filter_map(|f| self.null_companion(f).cloned()).collect();
+            for field in read.iter().chain(flags.iter()) {
+                let (column_offset, schema_id) =
+                    calc.calculate_schema_offset(&field.name, &self.schema.fields);
+                if !columns_fetching_data.iter().any(|c| c.schema_id == schema_id) {
+                    columns_fetching_data.push(ColumnFetchingData {
+                        column_offset,
+                        column_type: field.db_type.physical(),
+                        size: field.size,
+                        schema_id,
+                    });
+                }
+            }
+        }
         let fetch = RowFetch {
             columns_fetching_data,
         };
@@ -2136,9 +2173,17 @@ impl<S: StorageIO> Table<S> {
                             same_unique_value(&field.db_type, c.data.into_slice(), value)
                         })
                 });
-            if all_match {
-                return Ok(Some((pointer.row_id(), in_flight)));
+            if !all_match {
+                continue;
             }
+            if let Some(predicate) = predicate {
+                let covered = crate::core::rql::expr::eval_cond(predicate, &row, &self.schema.fields)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+                if !covered {
+                    continue;
+                }
+            }
+            return Ok(Some((pointer.row_id(), in_flight)));
         }
 
         Ok(None)
@@ -2312,6 +2357,11 @@ impl<S: StorageIO> Table<S> {
             }
         }
         for (position, key) in self.schema.unique_keys.iter().enumerate() {
+            // A partial key names no single row: every soft-deleted copy
+            // shares it. Its stripe is still taken through `lock_more`.
+            if key.predicate.is_some() {
+                continue;
+            }
             let fields = self.unique_key_fields(key)?;
             let values: Option<SmallVec<[(&SchemaField, &[u8]); 4]>> =
                 fields.iter().map(|f| eq(f.write_order as u32).map(|v| (*f, v))).collect();
