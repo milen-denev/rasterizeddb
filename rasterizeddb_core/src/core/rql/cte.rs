@@ -155,28 +155,39 @@ fn item_label(item: &str) -> Option<String> {
     if item.is_empty() {
         return None;
     }
-    // ` AS name` at the top level.
-    let upper = item.to_ascii_uppercase();
+    match split_alias(item) {
+        (_, Some(alias)) => Some(alias.to_string()),
+        (expression, None) => bare_column(expression),
+    }
+}
+
+/// One select-list item as its expression and its ` AS name` alias, if it has
+/// one at the top level.
+fn split_alias(item: &str) -> (&str, Option<&str>) {
+    let upper = item.as_bytes().to_ascii_uppercase();
     let mut depth = 0usize;
-    let bytes = item.as_bytes();
     let mut i = 0usize;
-    while i + 4 <= bytes.len() {
-        match bytes[i] {
+    while i + 4 <= upper.len() {
+        match upper[i] {
             b'(' => depth += 1,
             b')' => depth = depth.saturating_sub(1),
             _ => {}
         }
-        if depth == 0 && upper[i..].starts_with(" AS ") && i + 4 <= item.len() {
+        if depth == 0 && upper[i..].starts_with(b" AS ") {
             let name = item[i + 4..].trim().trim_matches('"');
             if !name.is_empty() {
-                return Some(name.to_string());
+                return (&item[..i], Some(name));
             }
         }
         i += 1;
     }
+    (item, None)
+}
 
-    // A bare or qualified column keeps its own name: `d.id` is `id`.
-    let bare = item.trim().trim_matches('"');
+/// The column an expression names when it is nothing but a bare or qualified
+/// column reference: `d.id` is `id`.
+fn bare_column(expression: &str) -> Option<String> {
+    let bare = expression.trim().trim_matches('"');
     if bare.contains('(') || bare.contains(' ') || bare == "*" {
         return None;
     }
@@ -790,6 +801,12 @@ fn declared_wide_types(
 ///
 /// The same resolution as [`declared_wide_types`]: bare columns of one
 /// relation. Anything it cannot resolve is `false` and compares as before.
+///
+/// Each item is looked up by the column it reads, not by its output name. An
+/// alias is only a name: `doc->>'tag' AS doc` and `tag AS doc` are text, and
+/// looking `doc` up made them documents, so `IN` read text as encoded bytes
+/// and refused it, and `UNION` keyed a blob by its first byte and merged rows.
+/// `doc AS d`, the other way round, is the document column.
 pub(crate) fn document_columns(query: &str, database: &Arc<Database>) -> Vec<bool> {
     let Some(list) = select_list_of(query) else {
         return Vec::new();
@@ -801,7 +818,7 @@ pub(crate) fn document_columns(query: &str, database: &Arc<Database>) -> Vec<boo
     };
     let labels: Vec<String> = crate::core::rql::lexer_ct::split_definitions(list)
         .iter()
-        .map(|item| item_label(item).unwrap_or_default())
+        .map(|item| bare_column(split_alias(item.trim()).0).unwrap_or_default())
         .collect();
     declared_wide_types(query, &labels, database)
         .into_iter()

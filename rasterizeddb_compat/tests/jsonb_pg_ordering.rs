@@ -522,3 +522,59 @@ async fn indexed_documents_answer_ranges_and_sorts_like_their_twin() {
     }
     assert!(checked > 5_000, "too few matching rows to test ({checked})");
 }
+
+/// A select-list item is compared as a document only when it is the document
+/// column itself, not when its alias happens to be that column's name.
+///
+/// `IN (subquery)` and `UNION` looked each item's output name up as a column
+/// of the relation, and the output name of `doc->>'tag' AS doc` is `doc`. So a
+/// text result was re-read as an encoded document, and the statement was
+/// refused as "a jsonb value that cannot be compared"; and in a `UNION`, a
+/// blob aliased `doc` whose first byte is a scalar's tag was keyed by that tag
+/// alone, so distinct blobs were one row and the rest were dropped. An alias
+/// over the document column still compares by value. PostgreSQL 17's answers.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_alias_named_like_a_document_column_is_not_a_document() {
+    let server = TestServer::start().await.expect("server");
+    let pool = server.connect_sqlx().await.expect("connect");
+    for sql in [
+        "CREATE TABLE events (id BIGINT PRIMARY KEY, doc JSONB, tag TEXT, blob BYTEA)",
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, tag TEXT)",
+        "CREATE TABLE r (id BIGINT PRIMARY KEY, doc JSONB)",
+        r#"INSERT INTO events VALUES (1,'{"tag":"paid"}','open','\x0001'),(2,'{"tag":"void"}','paid','\x0002'),(3,'{"n":1.0}','shut','\x01ff'),(4,'[1,2]','open','\x0003')"#,
+        "INSERT INTO t VALUES (1,'paid'),(2,'void'),(3,'open'),(4,'shut'),(5,'gone')",
+        r#"INSERT INTO r VALUES (1,'{"n":1}'),(2,'[1.0,2]'),(3,'{"tag":"paid"}'),(4,'{"n":2}')"#,
+    ] {
+        pool.execute(sqlx::raw_sql(AssertSqlSafe(sql.to_string())))
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let mut wrong = Vec::new();
+    for (sql, want) in [
+        ("SELECT id FROM t WHERE tag IN (SELECT doc->>'tag' AS doc FROM events) ORDER BY id", "1,2"),
+        ("SELECT id FROM t WHERE tag IN (SELECT tag AS doc FROM events) ORDER BY id", "1,3,4"),
+        // The document column under another name, or qualified, is still one.
+        ("SELECT id FROM r WHERE doc IN (SELECT doc AS other FROM events) ORDER BY id", "1,2,3"),
+        ("SELECT id FROM r WHERE doc IN (SELECT events.doc FROM events) ORDER BY id", "1,2,3"),
+    ] {
+        let got = flat(&pool, sql, false).await;
+        if got.as_deref() != Ok(want) {
+            wrong.push(format!("{sql}\n    want {want}\n    got  {got:?}"));
+        }
+    }
+    // Every blob begins with a scalar's tag byte. Sorted here, because a
+    // trailing `ORDER BY` is not applied to a `UNION`'s combined rows.
+    let sql = "SELECT blob AS doc FROM events UNION SELECT blob AS doc FROM events";
+    let want = [r"\x0001", r"\x0002", r"\x0003", r"\x01ff"];
+    match cells(&pool, sql).await {
+        Ok(rows) => {
+            let mut got: Vec<String> = rows.into_iter().map(|r| r[0].clone().unwrap_or_default()).collect();
+            got.sort();
+            if got != want {
+                wrong.push(format!("{sql}\n    want {want:?}\n    got  {got:?}"));
+            }
+        }
+        Err(e) => wrong.push(format!("{sql}\n    want {want:?}\n    got  {e}")),
+    }
+    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+}
