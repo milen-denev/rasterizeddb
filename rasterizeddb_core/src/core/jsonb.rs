@@ -101,6 +101,12 @@ pub enum Step {
     /// A position in an array. Negative counts from the end, as PostgreSQL's
     /// `->` does.
     Index(i64),
+    /// A `#>` path element that reads as an integer. What it addresses depends
+    /// on the container it meets, as in PostgreSQL: the key with exactly this
+    /// text in an object (`'1'`, `'01'` and `'-1'` are three keys), the
+    /// position it spells in an array, and nothing in a scalar. `->` decides by
+    /// the operand's type instead, so only `#>` makes these.
+    Either(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -1084,6 +1090,14 @@ pub fn get_path<'a>(bytes: &'a [u8], path: &[Step]) -> Option<&'a [u8]> {
         current = match step {
             Step::Key(key) => get_key(current, key)?,
             Step::Index(index) => get_index(current, *index)?,
+            Step::Either(text) => match current.first() {
+                Some(&TAG_OBJ) => get_key(current, text)?,
+                // PostgreSQL reads it with strtoint: optional leading space and
+                // sign, every character consumed, within a 32-bit int, or no
+                // element at all.
+                Some(&TAG_ARR) => get_index(current, i64::from(text.trim_start().parse::<i32>().ok()?))?,
+                _ => return None,
+            },
         };
     }
     Some(current)
@@ -1652,6 +1666,18 @@ pub fn canonical_key(bytes: &[u8], out: &mut Vec<u8>) -> Option<()> {
 /// `doc->'a'->>'b'`: a path written out, the last step with `->>` when
 /// `as_text`.
 pub fn path_text(column: &str, steps: &[Step], as_text: bool) -> String {
+    // A path with an element only `#>` can say is written back with `#>`.
+    if steps.iter().any(|s| matches!(s, Step::Either(_))) {
+        let elements: Vec<String> = steps
+            .iter()
+            .map(|s| match s {
+                Step::Key(k) | Step::Either(k) => brace_element(k),
+                Step::Index(n) => n.to_string(),
+            })
+            .collect();
+        let text = format!("{{{}}}", elements.join(","));
+        return format!("{column} {} '{}'", if as_text { "#>>" } else { "#>" }, text.replace('\'', "''"));
+    }
     let mut out = column.to_string();
     for (i, step) in steps.iter().enumerate() {
         out.push_str(if as_text && i + 1 == steps.len() { "->>" } else { "->" });
@@ -1662,9 +1688,23 @@ pub fn path_text(column: &str, steps: &[Step], as_text: bool) -> String {
                 out.push('\'');
             }
             Step::Index(n) => out.push_str(&n.to_string()),
+            Step::Either(_) => unreachable!("written with #> above"),
         }
     }
     out
+}
+
+/// One element of a `text[]` literal, quoted when it would otherwise not read
+/// back as itself.
+fn brace_element(text: &str) -> String {
+    let plain = !text.is_empty()
+        && !text.eq_ignore_ascii_case("null")
+        && !text.chars().any(|c| matches!(c, ',' | '{' | '}' | '"' | '\\') || c.is_whitespace());
+    if plain {
+        text.to_string()
+    } else {
+        format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2711,6 +2751,13 @@ impl PathExpr {
                     key.push_str("->");
                     key.push_str(&i.to_string());
                 }
+                // Neither `->'1'` nor `->1`: it can be either, and an index
+                // keyed alike would answer for a path that means something else.
+                Step::Either(t) => {
+                    key.push_str("#>'");
+                    key.push_str(&t.replace('\'', "''"));
+                    key.push('\'');
+                }
             }
         }
         key
@@ -2887,13 +2934,18 @@ fn parse_brace_array(text: &str) -> Option<Vec<String>> {
     )
 }
 
-/// A `#>` path element: digits are an array index, anything else a key.
+/// A `#>` path element.
 ///
-/// This is PostgreSQL's rule and it is genuinely ambiguous — a key that is all
-/// digits is unreachable through `#>`. `->'0'` addresses it unambiguously.
+/// PostgreSQL decides by the container, not by the element: in an object it
+/// is the key with exactly this text, in an array the position it spells. An
+/// element that cannot be a position can only ever be a key; one that could
+/// is kept as text and decided when the path meets a value (`Step::Either`).
+/// It used to be read as a position whenever it parsed as one, so the key
+/// `"1"` was unreachable through `#>` and `doc #>> '{a,1}'` was NULL where
+/// PostgreSQL finds it.
 fn step_from_text(part: &str) -> Step {
-    match part.parse::<i64>() {
-        Ok(index) => Step::Index(index),
+    match part.trim_start().parse::<i32>() {
+        Ok(_) => Step::Either(part.to_string()),
         Err(_) => Step::Key(part.to_string()),
     }
 }
@@ -2962,9 +3014,57 @@ mod path_tests {
         assert_eq!(p.steps, vec![key("a"), key("b")]);
         assert!(p.as_text);
 
+        // An element that spells a position may still be a key: what it
+        // addresses is decided by the container it meets.
         let p = parse_path_expression("doc#>'{a,2,c}'").expect("parses");
-        assert_eq!(p.steps, vec![key("a"), Step::Index(2), key("c")]);
+        assert_eq!(p.steps, vec![key("a"), Step::Either("2".into()), key("c")]);
         assert!(!p.as_text);
+    }
+
+    /// PostgreSQL 17: `#>` reads an element by the container it meets.
+    #[test]
+    fn a_hash_path_element_is_a_key_in_an_object_and_a_position_in_an_array() {
+        let at = |doc: &str, path: &str| {
+            let encoded = encode_text(doc).unwrap();
+            let p = parse_path_expression(&format!("doc#>>'{path}'")).unwrap();
+            get_path(&encoded, &p.steps).and_then(as_text)
+        };
+        assert_eq!(at(r#"{"arr":{"1":5}}"#, "{arr,1}").as_deref(), Some("5"));
+        assert_eq!(at(r#"{"1":7}"#, "{1}").as_deref(), Some("7"));
+        assert_eq!(at(r#"{"arr":{"-1":6}}"#, "{arr,-1}").as_deref(), Some("6"));
+        assert_eq!(at(r#"{"arr":{"01":4}}"#, "{arr,01}").as_deref(), Some("4"));
+        // '1' is not the key '01', nor '01' the key '1'.
+        assert_eq!(at(r#"{"arr":{"01":4}}"#, "{arr,1}"), None);
+        assert_eq!(at(r#"{"arr":{"1":5}}"#, "{arr,01}"), None);
+        // In an array the same text is a position, negative from the end, and
+        // `01` spells 1.
+        assert_eq!(at(r#"{"arr":[3,9]}"#, "{arr,1}").as_deref(), Some("9"));
+        assert_eq!(at(r#"{"arr":[3,9]}"#, "{arr,-1}").as_deref(), Some("9"));
+        assert_eq!(at(r#"{"arr":[3,9]}"#, "{arr,01}").as_deref(), Some("9"));
+        // Quoting changes nothing; a position past a 32-bit int is no element.
+        assert_eq!(at(r#"{"arr":{"1":5}}"#, r#"{"arr","1"}"#).as_deref(), Some("5"));
+        assert_eq!(at(r#"{"arr":[3,9]}"#, "{arr,4294967297}"), None);
+        assert_eq!(at(r#"{"arr":{"4294967297":2}}"#, "{arr,4294967297}").as_deref(), Some("2"));
+        // A scalar has no elements.
+        assert_eq!(at(r#"{"arr":7}"#, "{arr,0}"), None);
+    }
+
+    /// An index on `#>> '{a,1}'` is not one on `->'a'->>'1'` or `->'a'->>1`:
+    /// each addresses something the others do not.
+    #[test]
+    fn a_hash_path_element_keys_its_own_index() {
+        let keys: Vec<String> = ["doc #>> '{a,1}'", "doc->'a'->>'1'", "doc->'a'->>1"]
+            .iter()
+            .map(|e| parse_path_expression(e).unwrap().index_key())
+            .collect();
+        assert_ne!(keys[0], keys[1]);
+        assert_ne!(keys[0], keys[2]);
+        assert_ne!(keys[1], keys[2]);
+        // Written back as it can be read again.
+        let p = parse_path_expression("doc #>> '{a,1,\"x y\"}'").unwrap();
+        let text = path_text("doc", &p.steps, true);
+        let again = parse_path_expression(&text).unwrap_or_else(|| panic!("{text}"));
+        assert_eq!(again.steps, p.steps, "{text}");
     }
 
     #[test]
