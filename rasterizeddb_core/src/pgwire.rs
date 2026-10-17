@@ -2124,8 +2124,8 @@ struct StatementInfo {
     /// price of that before.
     sql: StdArc<str>,
     param_oids: Vec<i32>,
-    /// The column list this statement was last described with, and the schema
-    /// generation it was described at.
+    /// What the client was last told this statement returns, by a `Describe`
+    /// of the statement or of one of its portals. See [`ToldShape`].
     ///
     /// A driver caches the description and does not ask again, so an
     /// `ALTER TABLE` between the describe and a later execute leaves it
@@ -2134,9 +2134,12 @@ struct StatementInfo {
     /// place. PostgreSQL refuses that with "cached plan must not change result
     /// type" and drivers re-prepare; this is what makes that check possible.
     ///
-    /// The list is interned (`statement_intern`): every session described
-    /// with the same columns holds the same allocation.
-    described: Option<(u64, statement_intern::Fields)>,
+    /// Only a `Describe` sets it, never an `Execute`. An `Execute` that sends
+    /// a fresh `RowDescription` with its rows has not changed what the client
+    /// caches: sqlx applies that description to the one execution and keeps
+    /// the old one for the next, so treating it as told left every execute
+    /// after the first decoding against the old shape.
+    described: Option<ToldShape>,
     /// Remembered `Describe` answers, at most one per kind. See
     /// [`DescribeCacheEntry`].
     describe_cache: Vec<DescribeCacheEntry>,
@@ -2150,6 +2153,21 @@ struct StatementInfo {
     /// client declared none (`param_infer`). Bind decodes values as these: a
     /// client encodes each one as the type it was told.
     inferred_oids: Option<Vec<i32>>,
+}
+
+/// The column list a `Describe` gave the client, and how it was computed.
+#[derive(Clone, Debug)]
+struct ToldShape {
+    /// The schema generation the answer was computed at. While it is still
+    /// current, the answer is too, and `Execute` checks nothing.
+    generation: u64,
+    /// `S` or `P`. `Execute` describes the statement again the same way to
+    /// compare: a statement whose shape depends on its values would otherwise
+    /// look changed when only the way of asking had.
+    kind: u8,
+    /// Interned (`statement_intern`): every session described with the same
+    /// columns holds the same allocation.
+    fields: statement_intern::Fields,
 }
 
 /// One `Describe` answer, and everything it was computed from.
@@ -2552,39 +2570,7 @@ where
     let generation = database
         .schema_generation
         .load(std::sync::atomic::Ordering::Acquire);
-    let lookup = |state: &SessionState, text: Option<&str>| {
-        state.statements.get(&stmt_name).and_then(|info| {
-            info.describe_cache
-                .iter()
-                .find(|e| e.answers(kind, generation, text))
-                .map(|e| e.fields.clone())
-        })
-    };
-    // Decided once, at Parse: whether the values can change the answer.
-    let value_free = state.statements.get(&stmt_name).and_then(|s| s.value_free);
-    let same_shape = value_free == Some(ValueFreeShape::SameShape);
-    // A shape the values cannot change is answered before they are inlined:
-    // the inlined text is needed only to describe it afresh.
-    let early = if same_shape { lookup(state, None) } else { None };
-    let inlined = if bound.is_empty() || early.is_some() {
-        None
-    } else {
-        inline_params(&sql, &bound).ok()
-    };
-    let query: &str = inlined.as_deref().unwrap_or(&sql);
-    // What the answer is remembered under: the inlined text, unless the
-    // values cannot change it.
-    let cache_text = if same_shape { None } else { inlined.as_deref() };
-    let cached = early.or_else(|| lookup(state, cache_text));
-
-    let description = match cached {
-        Some(fields) => Some((fields, true)),
-        // Nothing to describe: the reply is `NoData` whatever the tables hold.
-        None if value_free == Some(ValueFreeShape::NoRows) => None,
-        None => describe_for_wire(database, query)
-            .await?
-            .map(|(fields, is_select)| (statement_intern::fields(&fields), is_select)),
-    };
+    let description = description_now(database, state, &stmt_name, kind, &sql, &bound, generation).await?;
 
     // A *statement* describe answers with ParameterDescription first. A
     // *portal* describe must not: its parameters are already bound, and the
@@ -2607,7 +2593,70 @@ where
         if let Some(info) = state.statements.get_mut(&stmt_name) {
             // Remembered so a later `Execute` can tell whether the shape the
             // client cached is still the shape the table has.
-            info.described = Some((generation, fields.clone()));
+            info.described = Some(ToldShape {
+                generation,
+                kind,
+                fields: fields.clone(),
+            });
+        }
+        send_row_description(stream, &fields, &result_formats).await?;
+        return Ok(());
+    }
+
+    send_message(stream, b'n', &[]).await
+}
+
+/// What a `Describe` of `kind` answers for `stmt_name` at schema generation
+/// `generation`: a remembered answer when one fits, otherwise described afresh
+/// and remembered. `bound` is the portal's values for `P`, empty for `S`.
+///
+/// `Execute` asks this too, after a schema change, so the shape it compares
+/// with what the client was told is computed exactly the way the telling was.
+async fn description_now(
+    database: &Arc<Database>,
+    state: &mut SessionState,
+    stmt_name: &str,
+    kind: u8,
+    sql: &str,
+    bound: &[BoundParam],
+    generation: u64,
+) -> io::Result<Option<(statement_intern::Fields, bool)>> {
+    let lookup = |state: &SessionState, text: Option<&str>| {
+        state.statements.get(stmt_name).and_then(|info| {
+            info.describe_cache
+                .iter()
+                .find(|e| e.answers(kind, generation, text))
+                .map(|e| e.fields.clone())
+        })
+    };
+    // Decided once, at Parse: whether the values can change the answer.
+    let value_free = state.statements.get(stmt_name).and_then(|s| s.value_free);
+    let same_shape = value_free == Some(ValueFreeShape::SameShape);
+    // A shape the values cannot change is answered before they are inlined:
+    // the inlined text is needed only to describe it afresh.
+    let early = if same_shape { lookup(state, None) } else { None };
+    let inlined = if bound.is_empty() || early.is_some() {
+        None
+    } else {
+        inline_params(sql, bound).ok()
+    };
+    let query: &str = inlined.as_deref().unwrap_or(sql);
+    // What the answer is remembered under: the inlined text, unless the
+    // values cannot change it.
+    let cache_text = if same_shape { None } else { inlined.as_deref() };
+    let cached = early.or_else(|| lookup(state, cache_text));
+
+    let description = match cached {
+        Some(fields) => Some((fields, true)),
+        // Nothing to describe: the reply is `NoData` whatever the tables hold.
+        None if value_free == Some(ValueFreeShape::NoRows) => None,
+        None => describe_for_wire(database, query)
+            .await?
+            .map(|(fields, is_select)| (statement_intern::fields(&fields), is_select)),
+    };
+
+    if let Some((fields, true)) = &description {
+        if let Some(info) = state.statements.get_mut(stmt_name) {
             if query.len() <= DESCRIBE_CACHE_MAX_TEXT
                 && !info
                     .describe_cache
@@ -2623,11 +2672,8 @@ where
                 });
             }
         }
-        send_row_description(stream, &fields, &result_formats).await?;
-        return Ok(());
     }
-
-    send_message(stream, b'n', &[]).await
+    Ok(description)
 }
 
 /// Describes `query` the way a `Describe` message must: with its unbound
@@ -2757,11 +2803,8 @@ where
 
     let mut schema_changed = false;
     // A schema change since this statement was described makes the client's
-    // cached column list wrong, and nothing on the wire would tell it. Refused
-    // the way PostgreSQL refuses it, which every driver answers by re-preparing
-    // — where silently sending rows of a different shape would have it decode
-    // them against the old one.
-    if let Some((generation, described)) = state
+    // cached column list wrong, and nothing on the wire would tell it.
+    if let Some(told) = state
         .statements
         .get(&stmt_name)
         .and_then(|info| info.described.clone())
@@ -2769,22 +2812,15 @@ where
         let now = database
             .schema_generation
             .load(std::sync::atomic::Ordering::Acquire);
-        if now != generation {
-            let current = describe_query(database, query)
+        if now != told.generation {
+            // Described the way the client was told, and remembered, so the
+            // executes after this one find the answer rather than describe.
+            let bound: &[BoundParam] = if told.kind == b'P' { &params } else { &[] };
+            let current = description_now(database, state, &stmt_name, told.kind, query, bound, now)
                 .await?
                 .filter(|(_, is_select)| *is_select)
                 .map(|(fields, _)| fields);
-            let changed = current.as_deref() != Some(&*described);
-            if let Some(info) = state.statements.get_mut(&stmt_name) {
-                info.described = Some((
-                    now,
-                    current
-                        .as_deref()
-                        .map(statement_intern::fields)
-                        .unwrap_or(described),
-                ));
-            }
-            if changed {
+            if current.as_deref() != Some(&*told.fields) {
                 // The rows go out with a fresh `RowDescription` in front of
                 // them, which `Execute` does not normally send.
                 //
@@ -2798,9 +2834,24 @@ where
                 // `ALTER TABLE` broke every later use of that statement rather
                 // than one.
                 //
-                // Only on the execute that first notices the change, so a
-                // client that never runs DDL never sees a second description.
+                // On every execute until the client describes again, not only
+                // the first. sqlx applies a description that comes with the
+                // rows to that execution alone and keeps the cached one, so
+                // the second execute was decoded against the old shape: a
+                // renamed column read under its old name, a dropped one's
+                // neighbour under the dropped one's. `told` is therefore left
+                // as it is. A client that never runs DDL still never sees a
+                // second description, and one whose statement kept its shape
+                // sees none.
                 schema_changed = true;
+            } else if let Some(info) = state.statements.get_mut(&stmt_name) {
+                // What the client was told is still the shape, so it is good
+                // at this generation too, and the executes after this one need
+                // not ask. Only the generation moves: the columns stay exactly
+                // the ones a `Describe` sent.
+                if let Some(t) = info.described.as_mut() {
+                    t.generation = now;
+                }
             }
         }
     }
@@ -2824,9 +2875,10 @@ where
         .get(..4)
         .is_some_and(|w| w.eq_ignore_ascii_case("COPY"));
     if max_rows <= 0 || is_copy {
-        // A prepared `SELECT` may run from its cached parse. Not after a
-        // schema change, whose fresh description only the text path sends.
-        if !is_copy && !schema_changed {
+        // A prepared `SELECT` may run from its cached parse, a fresh
+        // description included: a client that never describes again gets one
+        // on every execute, and would otherwise never run from it again.
+        if !is_copy {
             return execute_watched(
                 database,
                 state,
@@ -2835,6 +2887,7 @@ where
                 &query,
                 &params,
                 &result_formats,
+                !schema_changed,
             )
             .await;
         }
@@ -4210,6 +4263,7 @@ async fn execute_watched<S>(
     query: &str,
     params: &[BoundParam],
     result_formats: &[i16],
+    omit_description: bool,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -4282,9 +4336,9 @@ where
     match step {
         Step::Run(run) => {
             PREPARED_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            execute_recorded(database, state, stream, query, result_formats, true, Some(run)).await
+            execute_recorded(database, state, stream, query, result_formats, omit_description, Some(run)).await
         }
-        Step::Text => execute_recorded(database, state, stream, query, result_formats, true, None).await,
+        Step::Text => execute_recorded(database, state, stream, query, result_formats, omit_description, None).await,
         Step::Watch => {
             let (result, capture) = pr::capturing(execute_recorded(
                 database,
@@ -4292,7 +4346,7 @@ where
                 stream,
                 query,
                 result_formats,
-                true,
+                omit_description,
                 None,
             ))
             .await;
