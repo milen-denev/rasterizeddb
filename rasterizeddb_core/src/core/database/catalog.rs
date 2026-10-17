@@ -153,13 +153,15 @@ impl DatabaseCatalog {
         let in_memory = root.is_none();
         let location = root.unwrap_or("");
 
-        let default = Database::new_named(location, in_memory, default_name).await;
+        // Refusals come back as errors, so the server can say which database
+        // would not open and exit, rather than unwinding out of here.
+        let default = Database::try_new_named(location, in_memory, default_name).await?;
         databases.insert(default_name.to_string(), Entry::new(Arc::new(default)));
 
         if let Some(root) = root {
             for name in discover_databases(root, default_name).await {
                 let path = std::path::Path::new(root).join(&name);
-                let database = Database::new_named(&path.to_string_lossy(), false, &name).await;
+                let database = Database::try_new_named(&path.to_string_lossy(), false, &name).await?;
                 databases.insert(name, Entry::new(Arc::new(database)));
             }
         }
@@ -296,9 +298,11 @@ impl DatabaseCatalog {
                 tokio::fs::create_dir_all(&path)
                     .await
                     .map_err(|e| format!("could not create database \"{}\": {}", name, e))?;
-                Database::new_named(&path.to_string_lossy(), false, name).await
+                // Refused as an error, not a panic: a panic here ends the
+                // client's session where it should answer the statement.
+                Database::try_new_named(&path.to_string_lossy(), false, name).await?
             }
-            None => Database::new_named("", true, name).await,
+            None => Database::try_new_named("", true, name).await?,
         };
 
         let database = Arc::new(database);

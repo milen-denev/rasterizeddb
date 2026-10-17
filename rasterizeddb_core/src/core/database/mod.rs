@@ -3,6 +3,8 @@ pub mod catalog;
 mod native_authz_tests;
 #[cfg(test)]
 mod rename_tests;
+#[cfg(test)]
+mod recovery_refusal_tests;
 
 use std::{fmt, io, sync::atomic::AtomicU64};
 
@@ -279,16 +281,18 @@ fn open_kv_stores(_location: &str, _in_memory: bool) -> KvStores {}
 type SeedCache = DashMap<(String, String), Arc<DbStorageProvider>, ahash::RandomState>;
 
 #[cfg(feature = "storage_pools")]
-fn open_pool(location: &str, in_memory: bool) -> StoragePool {
-    StdArc::new(if in_memory {
+fn open_pool(location: &str, in_memory: bool) -> Result<StoragePool, String> {
+    Ok(StdArc::new(if in_memory {
         crate::core::storage::StorageManager::inert()
     } else {
-        crate::core::storage::StorageManager::open(location)
-    })
+        crate::core::storage::StorageManager::try_open(location)?
+    }))
 }
 
 #[cfg(not(feature = "storage_pools"))]
-fn open_pool(_location: &str, _in_memory: bool) -> StoragePool {}
+fn open_pool(_location: &str, _in_memory: bool) -> Result<StoragePool, String> {
+    Ok(())
+}
 
 /// The backup directories every write is mirrored into.
 #[cfg(feature = "storage_pools")]
@@ -756,7 +760,24 @@ impl Database {
     /// The name is not derived from the location: the default database lives at
     /// the catalogue root, whose directory is named for the whole installation
     /// rather than for that one database.
+    ///
+    /// Panics where [`Database::try_new_named`] errs: startup and tests have
+    /// nobody to hand the refusal to, and that is the fatal-startup convention.
     pub async fn new_named(location: &str, in_memory: bool, name: &str) -> Self {
+        Self::try_new_named(location, in_memory, name)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// [`Database::new_named`], refusing with an error rather than a panic.
+    ///
+    /// For callers that have somewhere to report it: `CREATE DATABASE` adopting
+    /// a directory, where a panic would drop the client's connection instead of
+    /// answering it, and the catalogue at startup. Every refusal comes before
+    /// anything is opened, and a root log installed here is uninstalled again,
+    /// so a refused open leaves nothing behind but the log it would not replay.
+    pub async fn try_new_named(location: &str, in_memory: bool, name: &str) -> Result<Self, String> {
+        let mut installed_root_log = false;
         if !in_memory {
             let dir_exists = tokio::fs::metadata(location).await.is_ok();
 
@@ -769,6 +790,12 @@ impl Database {
             // would otherwise observe the pre-recovery state. This runs whether
             // or not logging is currently enabled, so switching the feature off
             // cannot strand un-checkpointed writes.
+            //
+            // A log recovery refuses is left on disk, and opening without it is
+            // the one thing that must not happen: writes would land on the bytes
+            // its records describe, and the replay that runs once the cause is
+            // cleared would put the older records back over them, silently. So
+            // the open is refused, as the other fatal startup paths are.
             match crate::core::wal::open_and_recover(location) {
                 Ok((w, stats)) => {
                     if stats.applied > 0 || stats.rolled_back > 0 {
@@ -779,19 +806,34 @@ impl Database {
                     }
                     if crate::wal_enabled() {
                         crate::core::wal::install_for(location, w);
+                        installed_root_log = true;
                     }
                 }
-                Err(e) => error!(
-                    "WAL unavailable for {} ({}); falling back to per-file flushes",
-                    location, e
-                ),
+                Err(e) => {
+                    return Err(format!(
+                        "refusing to open the database at {location}: WAL recovery failed ({e}). \
+                         Its log was left as it was; the writes it holds are not on disk until \
+                         it replays. Resolve the cause and restart — deleting the log discards \
+                         those writes."
+                    ));
+                }
             }
         }
 
         // Before any file is opened: the pool decides which directories exist
         // for this database, recovers their logs, and says whether the
         // catalogue itself is mirrored.
-        let storage = open_pool(location, in_memory);
+        let storage = match open_pool(location, in_memory) {
+            Ok(storage) => storage,
+            Err(e) => {
+                // Nothing will use the root's log, and leaving it registered
+                // would make a later open of this directory skip its recovery.
+                if installed_root_log {
+                    let _ = crate::core::wal::remove_for(location);
+                }
+                return Err(format!("refusing to open the database at {location}: {e}"));
+            }
+        };
         let kv_stores = open_kv_stores(location, in_memory);
         let seeds: SeedCache = DashMap::default();
         let backups = pool_mirrors(&storage);
@@ -967,7 +1009,7 @@ impl Database {
             tables.insert(table_name, Arc::new(table));
         }
 
-        Database {
+        Ok(Database {
             id,
             name: name.to_string(),
             tables,
@@ -992,7 +1034,7 @@ impl Database {
                 handle.load_snapshot_if_present();
                 handle
             },
-        }
+        })
     }
 
     /// Releases the cached seed for a table that is gone.

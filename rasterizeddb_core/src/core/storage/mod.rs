@@ -333,7 +333,17 @@ impl StorageManager {
     /// which degrades to a single-directory database — every table then
     /// resolves to the root, and any table that is genuinely elsewhere reads as
     /// missing. That is loud in a way silently inventing placements is not.
+    ///
+    /// Panics where [`StorageManager::try_open`] errs, as a fatal startup path.
     pub fn open(root: &str) -> Self {
+        Self::try_open(root).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// [`StorageManager::open`], refusing with an error rather than a panic
+    /// when a location's log cannot be replayed. A log this call installed for
+    /// another location is uninstalled again on that error: nothing will use
+    /// it, and a registered log makes the next open skip that recovery.
+    pub fn try_open(root: &str) -> Result<Self, String> {
         let root = normalize(root);
         let manager = Self {
             root: Some(root.clone()),
@@ -370,8 +380,19 @@ impl StorageManager {
             Err(e) => error!("could not read {}: {}", path.display(), e),
         }
 
-        manager.prepare_locations();
-        manager
+        let unlogged: Vec<String> = manager
+            .all_paths()
+            .into_iter()
+            .skip(1)
+            .filter(|path| crate::core::wal::wal_for(path).is_none())
+            .collect();
+        if let Err(e) = manager.prepare_locations() {
+            for path in &unlogged {
+                let _ = crate::core::wal::remove_for(path);
+            }
+            return Err(e);
+        }
+        Ok(manager)
     }
 
     /// Whether this pool can place anything anywhere but the root.
@@ -422,7 +443,10 @@ impl StorageManager {
     /// roughly an order of magnitude slower than the group commit the root
     /// enjoys. Recovery runs here too, for the same reason it runs for the
     /// root: a log on disk means writes that may not have reached their files.
-    fn prepare_locations(&self) {
+    ///
+    /// A location whose log recovery refuses fails the whole call; see
+    /// [`recover_location`] for why carrying on without it is not an option.
+    fn prepare_locations(&self) -> Result<(), String> {
         let extra: Vec<String> = {
             let state = self.state.read();
             state
@@ -438,28 +462,9 @@ impl StorageManager {
                 error!("storage location {} is unusable: {}", path, e);
                 continue;
             }
-            if crate::core::wal::wal_for(&path).is_some() {
-                continue;
-            }
-            match crate::core::wal::open_and_recover(&path) {
-                Ok((wal, stats)) => {
-                    if stats.applied > 0 || stats.rolled_back > 0 {
-                        info!(
-                            "WAL recovery in {}: applied {}, rolled back {}",
-                            path, stats.applied, stats.rolled_back
-                        );
-                    }
-                    if crate::wal_enabled() {
-                        crate::core::wal::install_for(&path, wal);
-                    }
-                }
-                Err(e) => error!(
-                    "WAL unavailable for storage location {} ({}); \
-                     writes there fall back to per-file flushes",
-                    path, e
-                ),
-            }
+            recover_location(&path)?;
         }
+        Ok(())
     }
 
     /// Every directory this pool writes into, root first.
@@ -689,6 +694,10 @@ impl StorageManager {
             .map_err(|e| format!("{} is not writable by this server: {}", path, e))?;
         let _ = std::fs::remove_file(&probe);
 
+        // Before the location is recorded: a directory holding a log that
+        // cannot be replayed is refused here, not at the next restart.
+        recover_location(&path)?;
+
         self.state.write().locations.push(StorageLocation {
             path: path.clone(),
             role,
@@ -696,7 +705,9 @@ impl StorageManager {
             enabled,
         });
         self.persist();
-        self.prepare_locations();
+        self.prepare_locations().map_err(|e| {
+            format!("{path} was added to the pool, but another location is unusable: {e}")
+        })?;
         Ok(path)
     }
 
@@ -1319,6 +1330,36 @@ fn choose(state: &PoolState, root: &str) -> String {
             .map(|l| l.path.clone())
             .unwrap_or_else(|| root.to_string()),
     }
+}
+
+/// Replays `path`'s log and installs it, or says why the location cannot be used.
+///
+/// A log recovery refuses (a contested file id, one that cannot be read) is
+/// left on disk untouched, and carrying on without it is what must not happen:
+/// writes would land on the bytes its records describe, and the replay that
+/// runs once the cause is cleared would put the older records back over them.
+/// The caller refuses instead.
+fn recover_location(path: &str) -> Result<(), String> {
+    if crate::core::wal::wal_for(path).is_some() {
+        return Ok(());
+    }
+    let (wal, stats) = crate::core::wal::open_and_recover(path).map_err(|e| {
+        format!(
+            "storage location {path} cannot be used: WAL recovery failed ({e}). Its log \
+             was left as it was; the writes it holds are not on disk until it replays. \
+             Resolve the cause and retry — deleting the log discards those writes."
+        )
+    })?;
+    if stats.applied > 0 || stats.rolled_back > 0 {
+        info!(
+            "WAL recovery in {}: applied {}, rolled back {}",
+            path, stats.applied, stats.rolled_back
+        );
+    }
+    if crate::wal_enabled() {
+        crate::core::wal::install_for(path, wal);
+    }
+    Ok(())
 }
 
 /// Trims trailing separators so that `/mnt/b` and `/mnt/b/` are one location.

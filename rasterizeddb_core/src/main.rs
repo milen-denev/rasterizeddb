@@ -525,22 +525,29 @@ fn apply_storage_flags(config: &Configuration, location: &str) -> Result<(), Str
     // A pool opened purely to rewrite its file, then dropped. The database that
     // opens a moment later reads the result — which is the only ordering that
     // gets the catalogue's own files mirrored from the first start.
-    let pool = StorageManager::open(location);
+    let pool = StorageManager::try_open(location)?;
 
     for spec in &config.storage_locations {
         let (path, role, weight) = parse_location_spec(spec)?;
-        match pool.add_location(&path, role, weight, true) {
-            Ok(added) => log::info!(
-                "storage location {} ({}, weight {})",
-                added,
-                role.as_str(),
-                weight
-            ),
-            // Already present, or overlapping one that is. Reported at info
-            // rather than refused: the flag describes intent, and the intent is
-            // already satisfied.
-            Err(e) => log::info!("storage location {}: {}", path, e),
+        // Already present (the root included): reported at info rather than
+        // refused, since the flag describes intent and the intent is satisfied.
+        if pool.role_of(&path).is_some() {
+            log::info!("storage location {} is already in the pool", path);
+            continue;
         }
+        // Anything else that keeps it out is refused, as `open` refuses a
+        // recorded location: a log there that recovery would not replay, an
+        // overlap, a path that cannot be written. Starting without a disk the
+        // operator named is only noticed when the one that is left fills.
+        let added = pool
+            .add_location(&path, role, weight, true)
+            .map_err(|e| format!("--storage-location {}: {}", path, e))?;
+        log::info!(
+            "storage location {} ({}, weight {})",
+            added,
+            role.as_str(),
+            weight
+        );
     }
 
     if let Some(policy) = &config.storage_policy {
@@ -1245,4 +1252,64 @@ fn main() -> std::io::Result<()> {
     });
 
     Ok(())
+}
+
+#[cfg(all(test, feature = "storage_pools"))]
+mod storage_flag_tests {
+    use super::*;
+
+    fn config(locations: &[&str]) -> Configuration {
+        Configuration {
+            location: None,
+            batch_size: None,
+            concurrent_threads: None,
+            storage_locations: locations.iter().map(|s| s.to_string()).collect(),
+            storage_policy: None,
+            storage_min_free: None,
+            settle_status_at_open: None,
+        }
+    }
+
+    /// A flag naming a location that is already there is the service unit's
+    /// every-start case and passes; one that cannot be added stops startup
+    /// instead of starting without it.
+    #[test]
+    fn a_location_flag_refuses_unless_already_present() {
+        use rasterizeddb_core::core::storage::StorageManager;
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::Builder::new().prefix("rastdb_flags_").tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let disk = tmp.path().join("disk");
+        let bad = tmp.path().join("bad");
+        std::fs::create_dir_all(&root).unwrap();
+        let (root_s, disk_s, bad_s) = (
+            root.to_string_lossy().into_owned(),
+            disk.to_string_lossy().into_owned(),
+            bad.to_string_lossy().into_owned(),
+        );
+
+        apply_storage_flags(&config(&[&disk_s]), &root_s).expect("a new location");
+        apply_storage_flags(&config(&[&disk_s, &root_s]), &root_s).expect("already present");
+        assert!(apply_storage_flags(&config(&["relative/dir"]), &root_s).is_err());
+
+        // A directory whose log recovery cannot read: refused, not recorded,
+        // and the log left as it was.
+        std::fs::create_dir_all(&bad).unwrap();
+        let log = bad.join(rasterizeddb_core::core::wal::DEFAULT_WAL_NAME);
+        std::fs::write(&log, b"unreadable").unwrap();
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let refused = apply_storage_flags(&config(&[&bad_s]), &root_s);
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let message = refused.expect_err("a location whose log recovery refused was accepted");
+        assert!(message.contains(&bad_s), "{message}");
+        assert_eq!(std::fs::read(&log).unwrap(), b"unreadable");
+        let paths = StorageManager::open(&root_s).all_paths();
+        assert!(!paths.contains(&bad_s), "the refused location was recorded: {paths:?}");
+        assert!(paths.contains(&disk_s), "{paths:?}");
+
+        for dir in [&root_s, &disk_s] {
+            let _ = rasterizeddb_core::core::wal::remove_for(dir);
+        }
+    }
 }

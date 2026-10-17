@@ -1928,6 +1928,12 @@ pub(crate) mod test_hooks {
         pub static AFTER_CHECKPOINT_SYNC: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
             const { std::cell::RefCell::new(None) };
     }
+
+    /// Directories whose log `open_and_recover` refuses, as it refuses one it
+    /// cannot read, whatever the uid (a mode-000 log refuses nothing to root).
+    /// Keyed by path, not by thread: the opens under test run on their own.
+    pub static REFUSE_RECOVERY: parking_lot::Mutex<Vec<std::path::PathBuf>> =
+        parking_lot::Mutex::new(Vec::new());
 }
 
 /// Runs `f`, which may block on disk I/O, without parking a runtime worker.
@@ -2125,6 +2131,17 @@ pub fn register_directory(dir: &str, wal: &Wal) -> io::Result<usize> {
 /// means writes that may not have reached their data files, and skipping it
 /// because the feature was switched off would lose exactly those writes.
 pub fn open_and_recover(dir: &str) -> io::Result<(Arc<Wal>, RecoveryStats)> {
+    #[cfg(test)]
+    if test_hooks::REFUSE_RECOVERY
+        .lock()
+        .iter()
+        .any(|refused| refused.as_path() == Path::new(dir))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Permission denied (os error 13), injected: the log cannot be read",
+        ));
+    }
     let wal_path = Path::new(dir).join(DEFAULT_WAL_NAME);
     let wal = Arc::new(Wal::open(&wal_path)?);
     register_directory(dir, &wal)?;

@@ -3995,6 +3995,32 @@ where
     }
 }
 
+/// The SQLSTATE for a failed `CREATE DATABASE`.
+///
+/// Migration tools branch on the code: `42P04` means "already there, carry
+/// on", while a name this server will not accept is a different problem and
+/// must not be read as that. A valid name that still failed is the server's
+/// problem: its directory could not be made, or holds a log recovery refused.
+fn create_database_failure_code(exists: bool, name: &str) -> &'static str {
+    if exists {
+        "42P04"
+    } else if crate::core::database::catalog::validate_name(name).is_err() {
+        "42602"
+    } else {
+        "58000"
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn create_database_failure_codes() {
+    assert_eq!(create_database_failure_code(true, "taken"), "42P04");
+    assert_eq!(create_database_failure_code(false, "../escape"), "42602");
+    // A refused recovery is not a bad name: a tool told 42602 rewrites the
+    // name instead of looking at the server.
+    assert_eq!(create_database_failure_code(false, "adoptable"), "58000");
+}
+
 /// Answers `CREATE DATABASE`, `DROP DATABASE` and `SHOW DATABASES`.
 ///
 /// These act on the catalogue rather than on the database the session is
@@ -4038,15 +4064,9 @@ where
                         send_command_complete(stream, "CREATE DATABASE").await
                     }
                 }
-                // Migration tools branch on the code: `42P04` means "already
-                // there, carry on", while a name this server will not accept is
-                // a different problem and must not be read as that.
                 Err(e) => {
-                    let sqlstate = if state.catalog.get(&name).is_some() {
-                        "42P04"
-                    } else {
-                        "42602"
-                    };
+                    let exists = state.catalog.get(&name).is_some();
+                    let sqlstate = create_database_failure_code(exists, &name);
                     fail_statement(state, stream, sqlstate, &e).await
                 }
             }
