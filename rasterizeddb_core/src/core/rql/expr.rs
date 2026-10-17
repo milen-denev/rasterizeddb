@@ -2530,7 +2530,9 @@ pub(crate) fn from_engine_scale(value: Value, field: &SchemaField) -> Result<Val
             db_type: DbType::DECIMAL,
         } if bytes.len() == 16 => {
             let raw = i128::from_le_bytes(bytes.as_slice().try_into().unwrap());
-            let stored = rescale_decimal(raw, DECIMAL_SCALE, scale).ok_or_else(|| {
+            // Rounded half away from zero, as PostgreSQL rounds into a declared
+            // scale; truncating stored 20.26 for `SET p = p * 1.005` at 20.17.
+            let stored = round_decimal(raw, DECIMAL_SCALE, scale).ok_or_else(|| {
                 format!("numeric field overflow for column \"{}\"", field.name)
             })?;
             Ok(Value::Data {
@@ -2540,6 +2542,35 @@ pub(crate) fn from_engine_scale(value: Value, field: &SchemaField) -> Result<Val
         }
         other => Ok(other),
     }
+}
+
+/// Refuses a value [`from_engine_scale`] brought to a `NUMERIC(p, s)` column
+/// that the column's precision cannot hold — `numeric field overflow`. The
+/// precision lives in the type-modifier sidecar, not on the field, so the
+/// caller passes the table's modifiers.
+pub(crate) fn check_declared_precision(
+    value: &Value,
+    field: &SchemaField,
+    modifiers: &[crate::core::rql::type_modifier::TypeModifier],
+) -> Result<(), String> {
+    let Value::Data {
+        bytes,
+        db_type: DbType::DECIMAL,
+    } = value
+    else {
+        return Ok(());
+    };
+    let Some(precision) = crate::core::rql::type_modifier::precision_of(&field.name, modifiers) else {
+        return Ok(());
+    };
+    let Ok(raw) = <[u8; 16]>::try_from(bytes.as_slice()) else {
+        return Ok(());
+    };
+    crate::core::value_codec::check_numeric_precision(
+        i128::from_le_bytes(raw),
+        precision,
+        field.scale.unwrap_or(crate::core::value_codec::DECIMAL_SCALE),
+    )
 }
 
 /// A number assigned to an integer column, at that column's width or refused.

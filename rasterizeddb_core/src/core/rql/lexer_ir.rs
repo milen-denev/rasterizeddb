@@ -21,10 +21,17 @@ use crate::memory_pool::{MEMORY_POOL, MemoryBlock};
 ///
 /// A `NUMERIC(38,16)` column holds sixteen fractional digits; encoding at the
 /// engine's default nine would drop the last seven and report success.
+///
+/// The places past the scale round half away from zero, and a value past the
+/// declared precision is refused as `numeric field overflow` — the reason is
+/// left in [`REFUSAL`] for the caller to report. Both are what PostgreSQL's
+/// assignment does; this truncated, so `20.169` and `20.165` both stored 20.16,
+/// and took any number of integer digits.
 fn value_to_mb_scaled(
     value_str: &str,
     db_type: &DbType,
     scale: Option<u32>,
+    precision: Option<u32>,
 ) -> Option<MemoryBlock> {
     let value_str = crate::core::rql::column_default::strip_redundant_cast(value_str.trim());
     if let (DbType::DECIMAL, Some(scale)) = (db_type, scale) {
@@ -37,7 +44,13 @@ fn value_to_mb_scaled(
         // naming neither the column nor the value. A `numeric(18,8)` column
         // holding NULL is ordinary, so this refused ordinary rows.
         if !text.eq_ignore_ascii_case("NULL") {
-            let value = crate::core::value_codec::parse_decimal_scaled(text, scale)?;
+            let value = crate::core::value_codec::parse_decimal_rounded(text, scale)?;
+            if let Err(reason) =
+                crate::core::value_codec::check_numeric_precision(value, precision.unwrap_or(0), scale)
+            {
+                REFUSAL.with(|r| *r.borrow_mut() = Some(reason));
+                return None;
+            }
             let bytes = value.to_le_bytes();
             let mut mb = MEMORY_POOL.acquire(bytes.len());
             mb.into_slice_mut().copy_from_slice(&bytes);
@@ -1181,9 +1194,13 @@ pub fn insert_row_with_defaults(
                     value,
                     &schema_field.db_type,
                     declared_scale(&schema_field.name, modifiers),
+                    crate::core::rql::type_modifier::precision_of(&schema_field.name, modifiers),
                 )
                 .or_else(|| {
-                    note_refusal(&schema_field.name, &schema_field.db_type, value);
+                    // A reason already given — an overflow — is the real one.
+                    if REFUSAL.with(|r| r.borrow().is_none()) {
+                        note_refusal(&schema_field.name, &schema_field.db_type, value);
+                    }
                     None
                 })?,
                 &schema_field.db_type,
@@ -1258,6 +1275,7 @@ pub fn insert_row_with_defaults(
                             &literal,
                             &field.db_type,
                             declared_scale(&field.name, modifiers),
+                            crate::core::rql::type_modifier::precision_of(&field.name, modifiers),
                         )
                     })
             {

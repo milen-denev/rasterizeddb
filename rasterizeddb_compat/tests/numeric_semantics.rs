@@ -283,3 +283,55 @@ async fn decimal_literals_are_numeric_not_float() {
     }
     verdict(wrong);
 }
+
+// ---------------------------------------------------------------- bug #4
+
+/// Assignment to `NUMERIC(p, s)` rounds half away from zero and refuses a value
+/// past the precision.
+#[tokio::test(flavor = "multi_thread")]
+async fn numeric_assignment_rounds_and_checks_precision() {
+    let mut db = db(&["CREATE TABLE np (id INT, p NUMERIC(12,2))"]).await;
+    let mut wrong = Vec::new();
+    for sql in [
+        "INSERT INTO np (id, p) VALUES (1, 20.169), (2, 20.165), (3, -20.165), (4, 20.164), (5, 0.005), (6, -0.005)",
+        "INSERT INTO np (id, p) VALUES (9, 9999999999.994)",
+        "INSERT INTO np (id, p) VALUES (10, 14 * 1.37 + 0.99)",
+        "UPDATE np SET p = p * 1.005 WHERE id = 1",
+        "UPDATE np SET p = 2.345 WHERE id = 2",
+    ] {
+        if let Err(e) = db.pool.execute(sql).await {
+            wrong.push(format!("{}: {}", sql, e));
+        }
+    }
+    expect_out_of_range(
+        &db,
+        &mut wrong,
+        &[
+            ("INSERT INTO np (id, p) VALUES (7, 9999999999.995)", "numeric field overflow"),
+            ("INSERT INTO np (id, p) VALUES (8, 100000000000)", "numeric field overflow"),
+            ("UPDATE np SET p = p * 1000000000 WHERE id = 9", "numeric field overflow"),
+            ("UPDATE np SET p = 100000000000 WHERE id = 9", "numeric field overflow"),
+        ],
+    )
+    .await;
+    expect_rows(
+        &mut db,
+        &mut wrong,
+        &[(
+            "SELECT id, p FROM np ORDER BY id",
+            &[
+                // 20.169 * 1.005 = 20.27085
+                "1|20.27",
+                "2|2.35",
+                "3|-20.17",
+                "4|20.16",
+                "5|0.01",
+                "6|-0.01",
+                "9|9999999999.99",
+                "10|20.17",
+            ],
+        )],
+    )
+    .await;
+    verdict(wrong);
+}

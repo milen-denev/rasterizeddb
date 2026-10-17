@@ -140,23 +140,29 @@ fn declared_scale(
 /// caller pads a fixed-width column with zeroes — so `UPDATE t SET wide =
 /// 9.8765432109876543` on a `numeric(38,16)` reported success and stored `0`.
 /// A DECIMAL that fails to parse is named here instead.
+///
+/// The places past the scale round half away from zero and the declared
+/// precision is enforced, as PostgreSQL's assignment does; `SET p = 2.345` on
+/// a `NUMERIC(12,2)` stored 2.34, and any number of integer digits fitted.
 fn encode_assignment(
     value_str: &str,
     field: &SchemaField,
     scale: Option<u32>,
+    precision: Option<u32>,
 ) -> Result<MemoryBlock, String> {
     let trimmed = value_str.trim();
     if let (DbType::DECIMAL, Some(scale)) = (&field.db_type, scale) {
         if !trimmed.eq_ignore_ascii_case("NULL") {
             let text = trimmed.trim_matches('\'').trim_matches('"');
             let value =
-                crate::core::value_codec::parse_decimal_scaled(text, scale).ok_or_else(|| {
+                crate::core::value_codec::parse_decimal_rounded(text, scale).ok_or_else(|| {
                     format!(
                         "{} for column \"{}\"",
                         crate::core::value_codec::refusal_message(&DbType::DECIMAL, text),
                         field.name
                     )
                 })?;
+            crate::core::value_codec::check_numeric_precision(value, precision.unwrap_or(0), scale)?;
             let bytes = value.to_le_bytes();
             let mut mb = MEMORY_POOL.acquire(bytes.len());
             mb.into_slice_mut().copy_from_slice(&bytes);
@@ -611,7 +617,12 @@ fn parse_update_row(
                 }
             }
         } else {
-            match encode_assignment(value, field, declared_scale(&field.name, modifiers)) {
+            match encode_assignment(
+                value,
+                field,
+                declared_scale(&field.name, modifiers),
+                crate::core::rql::type_modifier::precision_of(&field.name, modifiers),
+            ) {
                 Ok(mb) => mb,
                 Err(reason) => {
                     rejection.replace(reason);

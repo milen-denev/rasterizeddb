@@ -601,6 +601,31 @@ pub fn parse_decimal_rounded(text: &str, scale: u32) -> Option<i128> {
     }
 }
 
+/// Refuses a value held at `scale` that a `NUMERIC(precision, scale)` column
+/// cannot hold: PostgreSQL's `numeric field overflow`, SQLSTATE 22003. The
+/// precision was recorded and never enforced, so `NUMERIC(12,2)` stored
+/// 100000000000.00, twelve integer digits where it declares room for ten.
+///
+/// Checked after rounding to the scale, as PostgreSQL checks it:
+/// `9999999999.995` rounds to 10000000000.00 and overflows, while
+/// `9999999999.994` fits. A precision this engine cannot represent, or one
+/// below the scale, is not checked.
+pub fn check_numeric_precision(unscaled: i128, precision: u32, scale: u32) -> Result<(), String> {
+    if precision == 0 || precision > 38 || precision < scale {
+        return Ok(());
+    }
+    if unscaled.unsigned_abs() >= 10u128.pow(precision) {
+        return Err(format!(
+            "numeric field overflow: a field with precision {}, scale {} must round to an \
+             absolute value less than 10^{}",
+            precision,
+            scale,
+            precision - scale
+        ));
+    }
+    Ok(())
+}
+
 /// Renders an unscaled value held at `scale`, keeping every declared place.
 ///
 /// `format_decimal` strips trailing zeros, so a `NUMERIC(10,4)` holding
@@ -2582,6 +2607,38 @@ mod scaled_decimal_tests {
     fn a_non_numeric_literal_is_still_refused() {
         assert!(parse_decimal_scaled("abc", 16).is_none());
         assert!(parse_decimal_scaled("", 16).is_none());
+    }
+
+    /// PostgreSQL's answers for `NUMERIC(12,2)`, `NUMERIC(10,8)` and the
+    /// engine scale: half away from zero, decided by the first dropped digit.
+    #[test]
+    fn an_assigned_literal_rounds_half_away_from_zero() {
+        for (text, scale, want) in [
+            ("20.169", 2, 2017),
+            ("20.165", 2, 2017),
+            ("-20.165", 2, -2017),
+            ("20.1649999", 2, 2016),
+            ("0.005", 2, 1),
+            ("-0.005", 2, -1),
+            ("1.5", 0, 2),
+            ("-2.5", 0, -3),
+            ("1.123456785", 8, 112345679),
+            ("0.1234567895", 9, 123456790),
+            ("7", 2, 700),
+        ] {
+            assert_eq!(parse_decimal_rounded(text, scale), Some(want), "{text} at {scale}");
+        }
+        assert!(parse_decimal_rounded("abc", 2).is_none());
+    }
+
+    #[test]
+    fn the_declared_precision_bounds_the_integer_digits() {
+        assert!(check_numeric_precision(999_999_999_999, 12, 2).is_ok());
+        let err = check_numeric_precision(1_000_000_000_000, 12, 2).unwrap_err();
+        assert!(err.starts_with("numeric field overflow"), "{err}");
+        assert!(check_numeric_precision(-1_000_000_000_000, 12, 2).is_err());
+        // Unchecked where nothing was declared.
+        assert!(check_numeric_precision(i128::MAX, 0, 2).is_ok());
     }
 }
 

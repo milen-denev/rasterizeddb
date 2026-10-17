@@ -136,6 +136,14 @@ pub fn scale_of(column: &str, modifiers: &[TypeModifier]) -> u16 {
         .unwrap_or(DEFAULT_DECIMAL_SCALE)
 }
 
+/// The precision a column declared, when it declared one.
+pub fn precision_of(column: &str, modifiers: &[TypeModifier]) -> Option<u32> {
+    modifiers
+        .iter()
+        .find(|m| m.column.eq_ignore_ascii_case(column) && !m.is_deleted)
+        .map(|m| m.precision as u32)
+}
+
 /// Splits `NUMERIC(38, 16)` into its precision and scale.
 ///
 /// Returns `None` when the type carries no modifier, which is the ordinary
