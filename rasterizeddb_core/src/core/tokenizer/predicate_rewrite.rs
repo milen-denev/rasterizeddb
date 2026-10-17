@@ -666,7 +666,7 @@ fn expand_not<'c>(
     if !clause.to_ascii_uppercase().contains("NOT") {
         return Ok(std::borrow::Cow::Borrowed(clause));
     }
-    let toks = lex(clause)?;
+    let toks = rewrap_casts(lex(clause)?);
     let mut out: Vec<String> = Vec::with_capacity(toks.len());
     let mut changed = false;
     let mut i = 0usize;
@@ -693,6 +693,36 @@ fn expand_not<'c>(
     } else {
         std::borrow::Cow::Borrowed(clause)
     })
+}
+
+/// Puts back the parentheses `lex` takes off a cast path.
+///
+/// `lex` reads `(doc->>'k')::int` as `doc ->> 'k' ::int`, which is what the
+/// planner needs. But this module renders tokens back to text, and that text
+/// is lexed again, where `'k' ::int` reads as a cast on the literal `'k'`. A
+/// cast on a literal is dropped by design, so the path was compared as text
+/// against a number and matched nothing, silently. That happened in every
+/// clause holding a `NOT` (the only kind rendered back) together with a cast
+/// path: `(doc->>'tier')::int = 2 AND NOT (qty = 5)` returned no rows.
+/// Wrapped again, the rendered text lexes back to the same cast.
+fn rewrap_casts(toks: Vec<Tok>) -> Vec<Tok> {
+    let is_path_op = |t: &Tok| matches!(t, Tok::Sym(s) if matches!(s.as_str(), "->" | "->>" | "#>" | "#>>"));
+    let mut out: Vec<Tok> = Vec::with_capacity(toks.len() + 4);
+    for t in toks {
+        if matches!(&t, Tok::Sym(sym) if sym.starts_with("::")) {
+            // Back over `-> 'key'` pairs to the column the path starts at.
+            let mut start = out.len();
+            while start >= 2 && is_path_op(&out[start - 2]) && matches!(out[start - 1], Tok::Str(_) | Tok::Word(_)) {
+                start -= 2;
+            }
+            if start < out.len() && start >= 1 && matches!(out[start - 1], Tok::Word(_)) {
+                out.insert(start - 1, Tok::LPar);
+                out.push(Tok::RPar);
+            }
+        }
+        out.push(t);
+    }
+    out
 }
 
 /// Whether the token at `at` begins a condition: the clause's start, or just
@@ -3989,5 +4019,38 @@ mod not_depth_tests {
         let too_deep = deep(100_000);
         let e = on_small_stack(move || expand_not(&too_deep, &schema()).map(|c| c.into_owned())).unwrap_err();
         assert!(e.contains("nested more than"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod cast_path_under_not_tests {
+    use super::*;
+    use crate::core::db_type::DbType;
+
+    fn schema() -> SmallVec<[SchemaField; 20]> {
+        let mut s = SmallVec::new();
+        for (i, (name, ty)) in [("qty", DbType::I32), ("active", DbType::BOOL), ("doc", DbType::JSONB)].into_iter().enumerate() {
+            s.push(SchemaField::new(name.to_string(), ty.clone(), ty.get_size(), 0, i as u64, false));
+        }
+        s
+    }
+
+    /// Rendered back for a `NOT`, a cast path keeps its cast: lexing the text
+    /// again must not read it as a cast on the key literal and drop it.
+    #[test]
+    fn a_cast_path_keeps_its_cast_when_a_not_is_rewritten() {
+        for clause in [
+            "(doc->>'tier')::int = 2 AND NOT (qty = 5)",
+            "NOT (qty = 5) AND (doc->>'tier')::int = 2",
+            "(doc->'a'->>'b')::int = 2 AND NOT active",
+            "NOT ((doc->>'tier')::int = 2)",
+            "(doc #>> '{a,b}')::bigint > 1 AND NOT (qty = 5 OR qty = 6)",
+        ] {
+            let once = expand_not(clause, &schema()).unwrap_or_else(|e| panic!("{clause}: {e}")).into_owned();
+            // What the rest of the rewrite does with it: lex it again.
+            let again = lex(&once).unwrap_or_else(|e| panic!("{once}: {e}"));
+            let casts = again.iter().filter(|t| matches!(t, Tok::Sym(s) if s.starts_with("::"))).count();
+            assert!(casts >= 1, "{clause} -> {once}: the cast was lost");
+        }
     }
 }
