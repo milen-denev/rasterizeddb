@@ -2294,6 +2294,7 @@ fn union_pieces(sql: &str) -> Option<(Vec<String>, usize, String)> {
         find_phrase(&last, &["ORDER", "BY"], 0),
         find_keyword(&last, "LIMIT", 0),
         find_keyword(&last, "OFFSET", 0),
+        find_fetch(&last),
     ]
     .into_iter()
     .flatten()
@@ -2307,12 +2308,25 @@ fn union_pieces(sql: &str) -> Option<(Vec<String>, usize, String)> {
     Some((branches, last_distinct.map_or(0, |at| at + 1), tail.to_string()))
 }
 
-/// Reads `ORDER BY …`, `LIMIT n` and `OFFSET n`, in that order, any of them
-/// absent.
+/// Where `FETCH FIRST` or `FETCH NEXT` opens at the top level of `text`, if
+/// it does: the SQL:2008 spelling of `LIMIT`.
+fn find_fetch(text: &str) -> Option<usize> {
+    let at = find_keyword(text, "FETCH", 0)?;
+    let next = text[at + "FETCH".len()..].split_whitespace().next()?;
+    (next.eq_ignore_ascii_case("FIRST") || next.eq_ignore_ascii_case("NEXT")).then_some(at)
+}
+
+/// Reads `ORDER BY …` and then the page — `LIMIT n`, `OFFSET n`, or the
+/// standard's `OFFSET n ROWS FETCH FIRST n ROWS ONLY` — any of them absent.
 fn read_union_tail(tail: &str, parts: &mut UnionParts) -> Result<(), String> {
     let limit_at = find_keyword(tail, "LIMIT", 0);
     let offset_at = find_keyword(tail, "OFFSET", 0);
-    let order_end = limit_at.into_iter().chain(offset_at).min().unwrap_or(tail.len());
+    let order_end = limit_at
+        .into_iter()
+        .chain(offset_at)
+        .chain(find_fetch(tail))
+        .min()
+        .unwrap_or(tail.len());
     let unexpected = || format!("unexpected '{}' after the last branch of a UNION", tail);
     match find_phrase(tail, &["ORDER", "BY"], 0) {
         Some(0) => {
@@ -2324,30 +2338,19 @@ fn read_union_tail(tail: &str, parts: &mut UnionParts) -> Result<(), String> {
         None if order_end != 0 => return Err(unexpected()),
         None => {}
     }
-    // Each of `LIMIT` and `OFFSET` is its keyword and one word, so anything
-    // else after them is a clause this does not apply, and dropping it would
-    // answer a different question.
-    let mut words = 0usize;
-    for (at, keyword) in [(limit_at, "LIMIT"), (offset_at, "OFFSET")] {
-        let Some(at) = at else { continue };
-        words += 2;
-        let word = tail[at + keyword.len()..].split_whitespace().next().unwrap_or("");
-        // `LIMIT ALL` is no limit at all.
-        if keyword == "LIMIT" && word.eq_ignore_ascii_case("ALL") {
-            continue;
-        }
-        let n = word.parse::<u64>().map_err(|_| {
-            format!("the {} of a UNION must be a whole number, not '{}'", keyword, word)
+    // The page is read by the reader a single statement's goes through, so
+    // `FETCH FIRST 2 ROWS ONLY` and `OFFSET 2 ROWS` mean here what they mean
+    // there. Read only as `LIMIT`/`OFFSET`, a `FETCH` was taken into the
+    // `ORDER BY` and refused there, or with no `ORDER BY` left on the last
+    // branch to limit that branch alone. Anything the reader does not take —
+    // a bound parameter, `WITH TIES`, a clause after the page — is refused:
+    // dropping it would answer a different question.
+    let (limit, offset) =
+        crate::core::tokenizer::pagination::read_page_clause(&tail[order_end..]).map_err(|e| {
+            format!("the page after the last branch of a UNION cannot be read: {}", e)
         })?;
-        if keyword == "LIMIT" {
-            parts.limit = Some(n);
-        } else {
-            parts.offset = n;
-        }
-    }
-    if tail[order_end..].split_whitespace().count() != words {
-        return Err(unexpected());
-    }
+    parts.limit = limit;
+    parts.offset = offset.unwrap_or(0);
     Ok(())
 }
 

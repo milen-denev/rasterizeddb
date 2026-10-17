@@ -301,3 +301,51 @@ async fn a_placeholder_limit_does_not_undo_the_widening() {
         assert_eq!(widened_values(&pool, sql, Some(bind)).await, Ok(want), "{sql}");
     }
 }
+
+/// The SQL:2008 spelling of a page, `[OFFSET n ROWS] FETCH FIRST n ROWS ONLY`,
+/// after the last branch applies to the whole result, as `LIMIT`/`OFFSET` do.
+/// It was left on the last branch, which it limited alone: `… UNION SELECT tag
+/// FROM t ORDER BY 1 FETCH FIRST 2 ROWS ONLY` returned every distinct tag of
+/// the first branch and two of the second.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_trailing_fetch_first_applies_to_the_whole_union() {
+    let (_s, pool) = server().await;
+    let mut wrong = Vec::new();
+    for (sql, want) in [
+        ("SELECT tag FROM events UNION SELECT tag FROM t ORDER BY 1 FETCH FIRST 2 ROWS ONLY", "gone,open"),
+        ("SELECT tag FROM events UNION SELECT tag FROM t ORDER BY 1 OFFSET 2 ROWS FETCH NEXT 2 ROWS ONLY", "paid,shut"),
+        ("SELECT tag FROM events UNION SELECT tag FROM t ORDER BY tag DESC FETCH FIRST ROW ONLY", "NULL"),
+        ("SELECT tag FROM events UNION SELECT tag FROM t ORDER BY tag DESC FETCH NEXT 1 ROW ONLY", "NULL"),
+        ("SELECT n FROM events UNION ALL SELECT n FROM t ORDER BY 1 OFFSET 3 ROWS", "2,3,5,5,7,NULL,NULL"),
+        ("SELECT n FROM events UNION ALL SELECT n FROM t ORDER BY 1 OFFSET 1 ROW FETCH FIRST 3 ROWS ONLY", "1,2,2"),
+        (
+            "SELECT n FROM events WHERE n > 1 UNION SELECT n FROM t WHERE n > 1 ORDER BY 1 FETCH FIRST 10 ROWS ONLY",
+            "2,3,5,7",
+        ),
+        (
+            "SELECT tag FROM events UNION SELECT tag FROM t UNION SELECT tag FROM u ORDER BY 1 DESC OFFSET 1 FETCH FIRST 3 ROWS ONLY",
+            "zeta,void,shut",
+        ),
+    ] {
+        let got = flat(&pool, sql, false).await;
+        if got.as_deref() != Ok(want) {
+            wrong.push(format!("{sql}\n    want {want}\n    got  {got:?}"));
+        }
+    }
+    // Without an ORDER BY the rows are any seven of the ten.
+    let sql = "SELECT tag FROM events UNION ALL SELECT tag FROM t FETCH FIRST 7 ROWS ONLY";
+    match flat(&pool, sql, false).await {
+        Ok(rows) if rows.split(',').count() == 7 => {}
+        got => wrong.push(format!("{sql}\n    want 7 rows\n    got  {got:?}")),
+    }
+    // PostgreSQL refuses both; neither may be dropped and answered.
+    for sql in [
+        "SELECT tag FROM events UNION SELECT tag FROM t ORDER BY 1 FETCH FIRST 2 ROWS WITH TIES",
+        "SELECT tag FROM events UNION SELECT tag FROM t ORDER BY 1 FETCH FIRST 2 ROWS",
+    ] {
+        if let Ok(rows) = flat(&pool, sql, false).await {
+            wrong.push(format!("{sql}\n    want an error\n    got  {rows}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+}

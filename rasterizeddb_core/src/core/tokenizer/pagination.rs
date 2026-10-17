@@ -292,6 +292,20 @@ fn starts_pagination(words: &[Word], index: usize) -> bool {
     }
 }
 
+/// The row cap and the offset a clause made only of pagination asks for, as
+/// `(limit, offset)`: `OFFSET 2 ROWS FETCH NEXT 3 ROWS ONLY` is `(Some(3),
+/// Some(2))`, and `LIMIT ALL` no cap. Anything else in the clause is an
+/// error, as it is at the end of a statement.
+///
+/// For a tail that has already been cut from its statement — a `UNION`'s,
+/// whose page applies to the combined rows — where [`normalize_pagination`]
+/// has no `FROM` to start its search after.
+pub fn read_page_clause(clause: &str) -> Result<(Option<u64>, Option<u64>), String> {
+    let trimmed = clause.trim().trim_end_matches(';').trim_end();
+    let page = parse_page(&top_level_words(trimmed))?;
+    Ok((page.limit, page.offset))
+}
+
 /// Rewrites a `SELECT`'s pagination clauses into the canonical
 /// `LIMIT n OFFSET m` tail, leaving the rest of the statement untouched.
 ///

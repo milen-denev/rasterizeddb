@@ -605,6 +605,14 @@ mod tests {
         assert_eq!((p.order_by, p.limit, p.offset), (None, None, 4));
         let p = split("SELECT a FROM x UNION SELECT a FROM y LIMIT ALL");
         assert_eq!(p.limit, None);
+        // The standard's spelling of the same page.
+        let p = split("SELECT a FROM x UNION SELECT a FROM y ORDER BY 1 OFFSET 2 ROWS FETCH NEXT 3 ROWS ONLY");
+        assert_eq!(p.branches, ["SELECT a FROM x", "SELECT a FROM y"]);
+        assert_eq!(p.order_by.as_deref(), Some("1"));
+        assert_eq!((p.limit, p.offset), (Some(3), 2));
+        let p = split("SELECT a FROM x UNION ALL SELECT a FROM y FETCH FIRST ROW ONLY");
+        assert_eq!(p.branches, ["SELECT a FROM x", "SELECT a FROM y"]);
+        assert_eq!((p.order_by, p.limit, p.offset), (None, Some(1), 0));
     }
 
     #[test]
@@ -621,6 +629,8 @@ mod tests {
             "SELECT a FROM x UNION SELECT a FROM y LIMIT $1",
             "SELECT a FROM x UNION SELECT a FROM y LIMIT 2 ORDER BY a",
             "SELECT a FROM x UNION SELECT a FROM y LIMIT 2 FOR UPDATE",
+            "SELECT a FROM x UNION SELECT a FROM y ORDER BY 1 FETCH FIRST 2 ROWS WITH TIES",
+            "SELECT a FROM x UNION SELECT a FROM y FETCH FIRST 2 ROWS",
         ] {
             assert!(crate::core::rql::join::split_union(sql).unwrap().is_err(), "{sql}");
         }
