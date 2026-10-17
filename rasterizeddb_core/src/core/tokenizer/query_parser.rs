@@ -1407,6 +1407,20 @@ impl<'a, 'b> QueryParser<'a, 'b> {
             // for symmetry and means nothing.
             Token::Op(ref op) if op == "-" || op == "+" => {
                 let negate = op == "-";
+                // A fraction beside a NUMERIC that a float cannot hold comes
+                // as its text (see the tokenizer's `number_token`), and takes
+                // its sign the same way.
+                if let Some(Token::StringLit(text)) = self.toks.get(self.pos).cloned() {
+                    if crate::core::value_codec::parse_decimal(&text).is_some() {
+                        self.pos += 1;
+                        let signed = match (negate, text.strip_prefix('-')) {
+                            (true, Some(positive)) => positive.to_string(),
+                            (true, None) => format!("-{}", text),
+                            (false, _) => text,
+                        };
+                        return Ok((ComparisonOperand::Direct(str_to_mb(&signed)), DbType::STRING));
+                    }
+                }
                 let Some(Token::Number(n)) = self.next() else {
                     return Err(format!("expected a number after '{}'", op));
                 };

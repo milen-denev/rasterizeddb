@@ -518,11 +518,16 @@ fn tokenize_inner<'a>(
                     parse_numeric_value(num_str, &current_field_context, &expression_type_context)?;
 
                 let num_type = numeric_value_to_db_type(&numeric_value);
+                let numeric_context = [
+                    expression_type_context.as_ref(),
+                    current_field_context.as_ref().map(|(_, t, _)| t),
+                ]
+                .contains(&Some(&DbType::DECIMAL));
                 if expression_type_context.is_none() {
                     expression_type_context = Some(num_type);
                 }
 
-                out.push(Token::Number(numeric_value));
+                out.push(number_token(num_str, numeric_value, numeric_context));
             }
 
             b'-' if is_negative_number_start(&out, bytes, i) => {
@@ -542,11 +547,16 @@ fn tokenize_inner<'a>(
                     parse_numeric_value(num_str, &current_field_context, &expression_type_context)?;
 
                 let num_type = numeric_value_to_db_type(&numeric_value);
+                let numeric_context = [
+                    expression_type_context.as_ref(),
+                    current_field_context.as_ref().map(|(_, t, _)| t),
+                ]
+                .contains(&Some(&DbType::DECIMAL));
                 if expression_type_context.is_none() {
                     expression_type_context = Some(num_type);
                 }
 
-                out.push(Token::Number(numeric_value));
+                out.push(number_token(num_str, numeric_value, numeric_context));
             }
 
             _ if is_id_start_fast(c) => {
@@ -865,6 +875,27 @@ fn parse_numeric_value<'a>(
     }
 
     parse_default(value_str)
+}
+
+/// The token for a numeric literal: the number as it was read, except a
+/// fraction beside a NUMERIC that a float cannot hold, which keeps its text.
+///
+/// A fraction is read as an `f64`, and the planner re-reads that at the
+/// column's scale. Past a float's digits the re-read is another number:
+/// `nm = 1234567890123456.78` compared `1234567890123456.80` and returned that
+/// row instead, and so did `nm IN (SELECT nm …)`, whose values are written into
+/// the statement as text and read again here. The text is compared exactly,
+/// as a quoted number is.
+fn number_token(text: &str, value: NumericValue, numeric_context: bool) -> Token {
+    if let NumericValue::F64(f) = value {
+        if numeric_context && text.contains('.') {
+            let exact = crate::core::value_codec::parse_decimal(text);
+            if exact.is_some() && exact != crate::core::value_codec::parse_decimal(&format!("{}", f)) {
+                return Token::StringLit(text.to_string());
+            }
+        }
+    }
+    Token::Number(value)
 }
 
 /// Parses the literal as the type of the column it is compared with.

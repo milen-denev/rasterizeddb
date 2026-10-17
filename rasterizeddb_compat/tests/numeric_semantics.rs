@@ -975,3 +975,41 @@ async fn join_expressions_keep_the_display_scale() {
     .await;
     verdict(wrong);
 }
+
+// ------------------------------------------- a literal past a float's digits
+
+/// A fraction compared with a NUMERIC keeps every digit it was written with.
+/// The tokenizer read it as an `f64`, and the planner re-read that at the
+/// column's scale, so past a float's precision it compared another number:
+/// `nm = 1234567890123456.78` returned the row holding 1234567890123456.80.
+/// An `IN (SELECT nm …)` writes the subquery's values into the statement as
+/// text and reads them again the same way, and answered the same.
+#[tokio::test(flavor = "multi_thread")]
+async fn long_decimal_literals_keep_their_digits() {
+    let mut db = db(&[
+        "CREATE TABLE lg (id INT, nm NUMERIC(20,2))",
+        "INSERT INTO lg VALUES (1, 1234567890123456.78), (2, 12.34), (3, 1234567890123456.80), (4, -1234567890123456.78)",
+    ])
+    .await;
+    let mut wrong = Vec::new();
+    expect_rows(
+        &mut db,
+        &mut wrong,
+        &[
+            ("SELECT id FROM lg WHERE nm = 1234567890123456.78 ORDER BY id", &["1"]),
+            ("SELECT id FROM lg WHERE nm > 1234567890123456.79 ORDER BY id", &["3"]),
+            ("SELECT id FROM lg WHERE nm = -1234567890123456.78 ORDER BY id", &["4"]),
+            ("SELECT id FROM lg WHERE nm < -1234567890123456.77 ORDER BY id", &["4"]),
+            ("SELECT id FROM lg WHERE nm IN (SELECT nm FROM lg WHERE id = 1) ORDER BY id", &["1"]),
+            ("SELECT id FROM lg WHERE nm IN (1234567890123456.78, 12.34) ORDER BY id", &["1", "2"]),
+            ("SELECT id FROM lg WHERE nm BETWEEN 1234567890123456.79 AND 1234567890123456.81 ORDER BY id", &["3"]),
+            ("SELECT id FROM lg WHERE nm - 0.01 = 1234567890123456.77 ORDER BY id", &["1"]),
+            (
+                "WITH c AS (SELECT id, nm FROM lg) SELECT id FROM c WHERE nm = 1234567890123456.78 ORDER BY id",
+                &["1"],
+            ),
+        ],
+    )
+    .await;
+    verdict(wrong);
+}
