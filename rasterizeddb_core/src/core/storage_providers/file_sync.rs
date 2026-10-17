@@ -201,6 +201,7 @@ impl CommitState {
         // needs its bytes and the new file size durable to be readable after a
         // crash. Forcing out mtime/ctime costs an extra journal transaction and
         // buys nothing here.
+        crate::core::sync_audit::note("file.data", Path::new(path));
         #[cfg(test)]
         let flushed = if self.fail_next_flush.swap(false, Ordering::AcqRel) {
             Err(io::Error::other("injected fdatasync failure"))
@@ -1145,6 +1146,7 @@ impl LocalStorageProvider {
             if mem.len() == len {
                 let mut main = self.append_file.write();
                 self.land_into_main(&mut main, &mem)?;
+                crate::core::sync_audit::note("file.data", Path::new(&self.file_str));
                 synced = main.sync_all();
                 // The mirror is deliberately NOT cleared yet. Until the length
                 // is published below, a read of these offsets is still served
@@ -1172,6 +1174,7 @@ impl LocalStorageProvider {
 
             let mut main = self.append_file.write();
             self.land_into_main(&mut main, &buf[..])?;
+            crate::core::sync_audit::note("file.data", Path::new(&self.file_str));
             synced = main.sync_all();
 
             // As above: the mirror is dropped after the length is published,
@@ -1769,6 +1772,7 @@ impl StorageIO for LocalStorageProvider {
         {
             let file = self.write_file.write();
             file.set_len(len)?;
+            crate::core::sync_audit::note("file.data", Path::new(&self.file_str));
             file.sync_all()?;
         }
         let _ = crate::core::wal::sync_parent_dir(Path::new(&self.file_str));
@@ -2046,7 +2050,10 @@ impl StorageIO for LocalStorageProvider {
             .seek(seek)
             .and_then(|_| file.write_all(buffer))
             .and_then(|()| file.flush())
-            .and_then(|()| file.sync_all());
+            .and_then(|()| {
+                crate::core::sync_audit::note("file.data", Path::new(&self.file_str));
+                file.sync_all()
+            });
         if let Err(e) = written {
             // Used to `unwrap()`. The trait gives this no way to return the
             // error and there is no old copy to restore, so the file is
@@ -2342,9 +2349,13 @@ impl StorageIO for LocalStorageProvider {
         };
 
         let file_str = format!("{}{}{}", self.location, delimiter, self.table_name);
+        // Not a sync: noted so a crash image can tell which deletions a later
+        // directory sync made durable.
+        crate::core::sync_audit::note("unlink", Path::new(&file_str));
         let _ = remove_file(Path::new(&file_str));
 
         // Also remove the companion temp staging file created by this provider.
+        crate::core::sync_audit::note("unlink", Path::new(&self.temp_file_str));
         let _ = remove_file(Path::new(&self.temp_file_str));
     }
 
