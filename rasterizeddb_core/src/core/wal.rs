@@ -196,7 +196,16 @@ pub const SEGMENT_PARTIAL_SUFFIX: &str = ".wseg.partial";
 /// Derived from the file name alone, so the id survives the directory being
 /// moved. Renaming a *table* would change it — the engine has no table rename,
 /// and if one is added it must rewrite or checkpoint the log first.
+///
+/// Two names can still share an id. [`Wal::register_file`] refuses the second
+/// one rather than let a replay write one file's records into the other.
 pub fn file_id_for_name(name: &str) -> u64 {
+    // A real 64-bit FNV-1a collision cannot be found by search, so the tests
+    // that need one name it.
+    #[cfg(test)]
+    if let Some(id) = test_hooks::FORCED_FILE_IDS.with(|m| m.borrow().get(name).copied()) {
+        return id;
+    }
     // 64-bit FNV-1a: wider than the CRC32 used for provider hashes, so ids do
     // not start colliding once a database has many files.
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -370,6 +379,14 @@ pub struct Wal {
     /// globally: ids are scoped to a directory, so a process holding two
     /// databases must not resolve one's ids against the other's files.
     files: Mutex<HashMap<u64, PathBuf>>,
+    /// Ids that more than one path has claimed, with every claimant. A record
+    /// carries only the id, so replay cannot tell whose it is: such an id takes
+    /// no new records, and a log already holding some is not replayed. Only
+    /// ever grows; changed under the `files` lock.
+    contested: Mutex<HashMap<u64, Vec<PathBuf>>>,
+    /// Set once `contested` is non-empty, so a record pays one load, not a
+    /// lock, to learn its id is not one of them.
+    any_contested: AtomicBool,
     /// Where a checkpoint hands the log's contents before discarding them.
     ///
     /// `None` — the default — is the historical behaviour: a checkpoint proves
@@ -514,6 +531,8 @@ impl Wal {
             pending_sync: AtomicU64::new(0),
             pending_bytes: AtomicU64::new(0),
             files: Mutex::new(HashMap::new()),
+            contested: Mutex::new(HashMap::new()),
+            any_contested: AtomicBool::new(false),
             archive_dir: Mutex::new(None),
             archive_seq: AtomicU64::new(0),
             staged_through_lsn: AtomicU64::new(0),
@@ -607,8 +626,84 @@ impl Wal {
     }
 
     /// Associates a data file's id with its path so replay can find it.
-    pub fn register_file(&self, file_id: u64, path: impl Into<PathBuf>) {
+    ///
+    /// Registering the path an id already has is a no-op. A *different* path
+    /// is an error, and the id is contested from then on: every record logged
+    /// under it is refused, and so is every later registration under it, the
+    /// first claimant's included. The refusal cannot stop at the newcomer — a
+    /// record names its file only by id, so the log cannot tell the two
+    /// writers apart, and either one's records would replay into whichever
+    /// file the id resolved to. Replacing the mapping, as this once did, sent
+    /// the earlier file's records into the later one.
+    pub fn register_file(&self, file_id: u64, path: impl Into<PathBuf>) -> io::Result<()> {
+        use std::collections::hash_map::Entry;
+        let path = path.into();
+        let mut files = self.files.lock();
+        if self.any_contested.load(Ordering::Acquire)
+            && let Some(claimants) = self.contested.lock().get_mut(&file_id)
+        {
+            if !claimants.contains(&path) {
+                claimants.push(path);
+            }
+            return Err(contested_error(file_id, claimants));
+        }
+        let held = match files.entry(file_id) {
+            Entry::Vacant(slot) => {
+                slot.insert(path);
+                return Ok(());
+            }
+            // Compared by component, so `dir//t.db` is `dir/t.db`.
+            Entry::Occupied(slot) if *slot.get() == path => return Ok(()),
+            Entry::Occupied(slot) => slot.get().clone(),
+        };
+        let mut contested = self.contested.lock();
+        let claimants = contested.entry(file_id).or_insert_with(|| vec![held]);
+        claimants.push(path);
+        self.any_contested.store(true, Ordering::Release);
+        Err(contested_error(file_id, claimants))
+    }
+
+    /// Points `file_id` at `path` whatever it pointed at before: what a test
+    /// standing a healthy file in for a failed one needs, and what
+    /// [`Wal::register_file`] exists to refuse.
+    #[cfg(test)]
+    pub(crate) fn repoint_file_for_tests(&self, file_id: u64, path: impl Into<PathBuf>) {
         self.files.lock().insert(file_id, path.into());
+    }
+
+    /// Refuses a record for an id two paths have claimed. See
+    /// [`Wal::register_file`].
+    #[inline]
+    fn refuse_if_contested(&self, file_id: u64) -> io::Result<()> {
+        if likely(!self.any_contested.load(Ordering::Acquire)) {
+            return Ok(());
+        }
+        match self.contested.lock().get(&file_id) {
+            None => Ok(()),
+            Some(claimants) => Err(contested_error(file_id, claimants)),
+        }
+    }
+
+    /// Contested ids and their claimants, sorted. See [`Wal::register_file`].
+    pub fn contested_files(&self) -> Vec<(u64, Vec<PathBuf>)> {
+        let mut out: Vec<_> = self
+            .contested
+            .lock()
+            .iter()
+            .map(|(id, paths)| (*id, paths.clone()))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The path replay writes `file_id`'s records to. Never one of a contested
+    /// id's claimants: a guess between them is the wrong file half the time.
+    fn resolve_for_replay(&self, file_id: u64) -> Option<PathBuf> {
+        let files = self.files.lock();
+        if self.contested.lock().contains_key(&file_id) {
+            return None;
+        }
+        files.get(&file_id).cloned()
     }
 
     pub fn registered_files(&self) -> Vec<(u64, PathBuf)> {
@@ -665,6 +760,7 @@ impl Wal {
         pending_path: Option<PathBuf>,
         born: Incarnation,
     ) -> io::Result<(u64, u64)> {
+        self.refuse_if_contested(file_id)?;
         if bytes.len() > MAX_RECORD_PAYLOAD {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1185,6 +1281,7 @@ impl Wal {
         if unlikely(self.poisoned.load(Ordering::Acquire)) {
             return Err(self.poisoned_error());
         }
+        self.refuse_if_contested(file_id)?;
         if bytes.len() > MAX_RECORD_PAYLOAD {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -2160,6 +2257,11 @@ pub(crate) mod test_hooks {
         /// poisons. No real file fails `ftruncate` on demand.
         pub static FAIL_WAL_ROLLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 
+        /// `file_id_for_name` answers these names with these ids on this
+        /// thread: the only way to get two names that share one.
+        pub static FORCED_FILE_IDS: std::cell::RefCell<std::collections::HashMap<String, u64>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+
         /// Data files a checkpoint on this thread has synced.
         pub static CHECKPOINT_SYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 
@@ -2338,8 +2440,35 @@ pub fn remove_for(dir: &str) -> Option<Arc<Wal>> {
     edit_wals(|m| m.remove(dir_key_str(dir)))
 }
 
+/// `a, b and c`, for an error naming the files that share an id.
+fn describe_paths(paths: &[PathBuf]) -> String {
+    let names: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+    match names.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {}", rest.join(", "), last),
+        _ => names.join(""),
+    }
+}
+
+/// See [`Wal::register_file`].
+fn contested_error(file_id: u64, claimants: &[PathBuf]) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "WAL file id {file_id:#018x} is claimed by {}; the log takes no \
+             records under it, since replay could not tell whose they were",
+            describe_paths(claimants)
+        ),
+    )
+}
+
 /// Registers every regular file in `dir` with `wal`, so a log left by a previous
 /// run can be resolved before any table has been opened.
+///
+/// Two names sharing an id leave it contested (see [`Wal::register_file`]),
+/// and only the first is counted. That is not an error here: which of them a
+/// listing returns first is arbitrary, so neither may be resolved, but a log
+/// naming neither can still be replayed. [`open_and_recover`] refuses one
+/// that does.
 pub fn register_directory(dir: &str, wal: &Wal) -> io::Result<usize> {
     let mut n = 0;
     let entries = match std::fs::read_dir(dir) {
@@ -2359,11 +2488,51 @@ pub fn register_directory(dir: &str, wal: &Wal) -> io::Result<usize> {
         if name == DEFAULT_WAL_NAME {
             continue;
         }
-        wal.register_file(file_id_for_name(&name), entry.path());
-        n += 1;
+        match wal.register_file(file_id_for_name(&name), entry.path()) {
+            Ok(()) => n += 1,
+            Err(e) => log::error!("WAL in {}: {}", dir, e),
+        }
     }
 
     Ok(n)
+}
+
+/// Refuses replay of a log holding records for a contested id.
+///
+/// The choice that loses nothing. Replaying them into either claimant writes
+/// one file's bytes into the other; skipping them drops committed writes, and
+/// [`open_and_recover`] then truncates the log, the only other copy. Refusing
+/// leaves the log and both files untouched. Settling it is a manual step:
+/// moving one file away uncontests the id, and replay then writes every record
+/// under it to the file that stayed, whichever file they came from. A
+/// contested id the log does not name blocks nothing here; it only refuses
+/// new records.
+fn refuse_ambiguous_replay(dir: &str, wal: &Wal) -> io::Result<()> {
+    let contested = wal.contested_files();
+    if contested.is_empty() {
+        return Ok(());
+    }
+    // `Wal::open` read these from the log's headers, up to where replay stops.
+    let named: Vec<(u64, Vec<PathBuf>)> = {
+        let dirty = wal.dirty.lock();
+        contested
+            .into_iter()
+            .filter(|(id, _)| dirty.all || dirty.ids.contains(id))
+            .collect()
+    };
+    if named.is_empty() {
+        return Ok(());
+    }
+    let which: Vec<String> = named
+        .iter()
+        .map(|(id, paths)| format!("{id:#018x} ({})", describe_paths(paths)))
+        .collect();
+    Err(io::Error::other(format!(
+        "WAL in {dir} holds records for file ids that more than one file claims: {}; \
+         replay could not tell which file they belong to, so nothing was replayed \
+         and the log was left as it was",
+        which.join("; ")
+    )))
 }
 
 /// Opens the log for `dir`, replaying anything left behind, and installs it.
@@ -2386,9 +2555,10 @@ pub fn open_and_recover(dir: &str) -> io::Result<(Arc<Wal>, RecoveryStats)> {
     let wal_path = Path::new(dir).join(DEFAULT_WAL_NAME);
     let wal = Arc::new(Wal::open(&wal_path)?);
     register_directory(dir, &wal)?;
+    refuse_ambiguous_replay(dir, &wal)?;
 
     let files = wal.clone();
-    let stats = Wal::recover(&wal_path, move |id| files.files.lock().get(&id).cloned())?;
+    let stats = Wal::recover(&wal_path, move |id| files.resolve_for_replay(id))?;
 
     // Resume the commit sequence where the previous run left off, so it stays
     // monotonic across restarts and can serve as a durable point-in-time token.
@@ -2819,7 +2989,7 @@ mod tests {
 
         let wal = Wal::open(&wal_path).unwrap();
         let id = file_id_for_name("table.db");
-        wal.register_file(id, &data);
+        wal.register_file(id, &data).unwrap();
 
         let txn = wal.begin();
         wal.log_in_place(txn, id, 0, b"NEW").unwrap();
@@ -2851,7 +3021,7 @@ mod tests {
         {
             let wal = Wal::open(&wal_path).unwrap();
             let id = file_id_for_name("table.db");
-            wal.register_file(id, &data);
+            wal.register_file(id, &data).unwrap();
 
             let txn = wal.begin();
             // Logged, flushed, but never committed - the process "dies" here.
@@ -2888,8 +3058,8 @@ mod tests {
 
         {
             let wal = Wal::open(&wal_path).unwrap();
-            wal.register_file(rows_id, &rows);
-            wal.register_file(ptrs_id, &ptrs);
+            wal.register_file(rows_id, &rows).unwrap();
+            wal.register_file(ptrs_id, &ptrs).unwrap();
 
             // One statement, eight rows, two files per row - and no commit.
             let txn = wal.begin();
@@ -3107,7 +3277,7 @@ mod tests {
             std::fs::write(&data, vec![0u8; 64]).unwrap();
             let wal = Wal::open(&wal_path).unwrap();
             let id = file_id_for_name("data.db");
-            wal.register_file(id, &data);
+            wal.register_file(id, &data).unwrap();
             wal.log_and_commit(id, 8, b"PRIOR").unwrap();
             let before = read_file(&wal_path).len();
 
@@ -3209,13 +3379,13 @@ mod tests {
 
         let wal = Wal::open(&wal_path).unwrap();
         let id = file_id_for_name("table.db");
-        wal.register_file(id, &data);
+        wal.register_file(id, &data).unwrap();
         wal.log_and_commit(id, 0, b"committed").unwrap();
 
         // A checkpoint syncs only the files records name, so the flaky file
         // gets one. Never committed, so replay leaves it out.
         let flaky = file_id_for_name("flaky.db");
-        wal.register_file(flaky, "/dev/null");
+        wal.register_file(flaky, "/dev/null").unwrap();
         wal.log(wal.begin(), flaky, 0, b"flaky").unwrap();
         let logged = std::fs::metadata(&wal_path).unwrap().len();
         assert!(logged > 0);
@@ -3224,7 +3394,7 @@ mod tests {
         assert!(wal.is_poisoned(), "a failed data-file flush must poison the log");
         assert!(wal.poison_reason().unwrap().contains("/dev/null"));
 
-        wal.register_file(flaky, &data);
+        wal.repoint_file_for_tests(flaky, &data);
         assert!(
             wal.checkpoint().is_err(),
             "a retried checkpoint must not succeed over the failed flush"
@@ -3265,7 +3435,7 @@ mod tests {
 
         let wal = Wal::open(&wal_path).unwrap();
         let id = file_id_for_name("not_a_file");
-        wal.register_file(id, &target);
+        wal.register_file(id, &target).unwrap();
 
         let txn = wal.begin();
         wal.log_in_place(txn, id, 0, b"OVERWRITE").unwrap();
@@ -3297,7 +3467,7 @@ mod tests {
         let data = dir.path().join("t.db");
         std::fs::write(&data, b"").unwrap();
         let id = file_id_for_name("t.db");
-        wal.register_file(id, &data);
+        wal.register_file(id, &data).unwrap();
         let txn = wal.begin();
         wal.log_in_place(txn, id, 0, b"held").unwrap();
         assert!(!wal.checkpoint().unwrap(), "a pending overwrite must hold the log");
@@ -3319,7 +3489,7 @@ mod tests {
         std::fs::write(&data, vec![0u8; 64]).unwrap();
         let wal = Arc::new(Wal::open(&wal_path).unwrap());
         let id = file_id_for_name("data.db");
-        wal.register_file(id, &data);
+        wal.register_file(id, &data).unwrap();
         wal.log_and_commit(id, 0, b"EARLY").unwrap();
 
         let late_marker = Arc::new(AtomicU64::new(0));
@@ -3506,7 +3676,7 @@ mod tests {
         let scratch = dir.path().join("scratch.db");
         std::fs::write(&scratch, vec![0u8; 16]).unwrap();
         let scratch_id = file_id_for_name("scratch.db");
-        wal.register_file(scratch_id, &scratch);
+        wal.register_file(scratch_id, &scratch).unwrap();
         let pending = wal.begin();
         wal.log_in_place(pending, scratch_id, 0, b"held").unwrap();
 
@@ -3552,7 +3722,7 @@ mod tests {
             let path = dir.path().join(&name);
             std::fs::write(&path, vec![0u8; 16]).unwrap();
             let id = file_id_for_name(&name);
-            wal.register_file(id, &path);
+            wal.register_file(id, &path).unwrap();
             ids.push((id, path));
         }
         let syncs = || test_hooks::CHECKPOINT_SYNCS.with(|n| n.replace(0));
@@ -3586,11 +3756,11 @@ mod tests {
         drop(wal);
         let reopened = Wal::open(&wal_path).unwrap();
         for (i, (id, path)) in ids.iter().enumerate() {
-            reopened.register_file(*id, path);
+            reopened.register_file(*id, path).unwrap();
             // What `register_directory` finds beside every table file.
             let tmp = dir.path().join(format!("t{i}.db.tmp"));
             std::fs::write(&tmp, b"staging").unwrap();
-            reopened.register_file(file_id_for_name(&format!("t{i}.db.tmp")), tmp);
+            reopened.register_file(file_id_for_name(&format!("t{i}.db.tmp")), tmp).unwrap();
         }
         syncs();
         assert!(reopened.checkpoint().unwrap());
@@ -3608,7 +3778,7 @@ mod tests {
         drop(garbage);
         let torn = Wal::open(&wal_path).unwrap();
         for (id, path) in &ids {
-            torn.register_file(*id, path);
+            torn.register_file(*id, path).unwrap();
         }
         syncs();
         assert!(torn.checkpoint().unwrap());
@@ -3619,7 +3789,7 @@ mod tests {
         drop(torn);
         let recovered = Wal::open(&wal_path).unwrap();
         for (id, path) in &ids {
-            recovered.register_file(*id, path);
+            recovered.register_file(*id, path).unwrap();
         }
         recovered.truncate().unwrap();
         syncs();
@@ -3645,7 +3815,7 @@ mod tests {
             if i == 0 {
                 first = id;
             }
-            wal.register_file(id, &path);
+            wal.register_file(id, &path).unwrap();
         }
         // Everything clean on disk before timing.
         for i in 0..2_000 {
@@ -3854,7 +4024,7 @@ mod tests {
         std::fs::write(&data, b"").unwrap();
 
         let wal = Wal::open(&wal_path).unwrap();
-        wal.register_file(file_id_for_name("table.db"), &data);
+        wal.register_file(file_id_for_name("table.db"), &data).unwrap();
         wal.log_and_commit(file_id_for_name("table.db"), 0, b"payload")
             .unwrap();
         assert!(wal.bytes_since_checkpoint() > 0);
@@ -3877,7 +4047,7 @@ mod tests {
 
         let wal = Wal::open(&wal_path).unwrap();
         let id = file_id_for_name("table.db");
-        wal.register_file(id, &data);
+        wal.register_file(id, &data).unwrap();
 
         let txn = wal.begin();
         wal.log_in_place(txn, id, 0, b"NEW").unwrap();
@@ -3922,7 +4092,7 @@ mod tests {
 
         let wal = Wal::open(&wal_path).unwrap();
         let id = file_id_for_name("sidecar.db");
-        wal.register_file(id, &data);
+        wal.register_file(id, &data).unwrap();
 
         let txn = wal.begin();
         wal.log_in_place(txn, id, 0, b"HELLO").unwrap();
@@ -3959,7 +4129,7 @@ mod tests {
 
         let wal = Wal::open(&wal_path).unwrap();
         let id = file_id_for_name("table.db");
-        wal.register_file(id, &data);
+        wal.register_file(id, &data).unwrap();
 
         // Push the log out to a non-trivial length, so a stale `write_pos`
         // lands well past the end of the truncated file rather than close
@@ -4028,7 +4198,7 @@ mod tests {
             let path = dir.path().join(&name);
             std::fs::write(&path, vec![b'.'; 8]).unwrap();
             let id = file_id_for_name(&name);
-            wal.register_file(id, &path);
+            wal.register_file(id, &path).unwrap();
             ids.push((id, path));
         }
 
@@ -4206,7 +4376,7 @@ mod tests {
         {
             let wal = Wal::open(dir.path().join(DEFAULT_WAL_NAME)).unwrap();
             let id = file_id_for_name("table.db");
-            wal.register_file(id, &data);
+            wal.register_file(id, &data).unwrap();
 
             assert_eq!(wal.commit_lsn(), 0);
             wal.log_and_commit(id, 0, b"AAAA").unwrap();
@@ -4227,7 +4397,7 @@ mod tests {
         );
 
         let id = file_id_for_name("table.db");
-        wal.register_file(id, &data);
+        wal.register_file(id, &data).unwrap();
         wal.log_and_commit(id, 8, b"CCCC").unwrap();
         assert!(wal.commit_lsn() > before);
     }
@@ -4250,7 +4420,7 @@ mod tests {
         let before;
         {
             let wal = Wal::open(dir.path().join(DEFAULT_WAL_NAME)).unwrap();
-            wal.register_file(id, &data);
+            wal.register_file(id, &data).unwrap();
             wal.log_and_commit(id, 0, b"AAAA").unwrap();
             wal.log_and_commit(id, 4, b"BBBB").unwrap();
             before = wal.commit_lsn();
@@ -4280,7 +4450,7 @@ mod tests {
             "the sequence must resume past everything already issued"
         );
 
-        wal.register_file(id, &data);
+        wal.register_file(id, &data).unwrap();
         wal.log_and_commit(id, 8, b"CCCC").unwrap();
         assert!(wal.commit_lsn() > before, "and keep going up from there");
     }
@@ -5118,6 +5288,148 @@ mod tests {
         let wal = Wal::open(dir.path().join(DEFAULT_WAL_NAME)).unwrap();
         let n = register_directory(&dir_str, &wal).unwrap();
         assert_eq!(n, 1, "the log must not be a replay target");
+    }
+
+    /// Makes `file_id_for_name` answer `names` with `id` on this thread until
+    /// dropped.
+    struct ForcedIds;
+    impl ForcedIds {
+        fn new(names: &[&str], id: u64) -> Self {
+            test_hooks::FORCED_FILE_IDS.with(|m| {
+                let mut m = m.borrow_mut();
+                for name in names {
+                    m.insert(name.to_string(), id);
+                }
+            });
+            ForcedIds
+        }
+    }
+    impl Drop for ForcedIds {
+        fn drop(&mut self) {
+            test_hooks::FORCED_FILE_IDS.with(|m| m.borrow_mut().clear());
+        }
+    }
+
+    /// Two paths under one id: the second is refused, and the log takes no
+    /// record under that id from either, since replay would send both to one.
+    #[test]
+    fn a_second_path_under_an_id_is_refused() {
+        let dir = temp_dir();
+        let a = dir.path().join("a.db");
+        let b = dir.path().join("b.db");
+        std::fs::write(&a, b"aaaa").unwrap();
+        std::fs::write(&b, b"bbbb").unwrap();
+        let wal = Wal::open(dir.path().join(DEFAULT_WAL_NAME)).unwrap();
+        let id = 0x5eed;
+        let other = 0xf00d;
+        wal.register_file(id, &a).unwrap();
+        wal.register_file(other, dir.path().join("c.db")).unwrap();
+
+        let err = wal.register_file(id, &b).expect_err("a second path took a held id");
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        let msg = err.to_string();
+        assert!(msg.contains("a.db") && msg.contains("b.db"), "{msg}");
+        assert_eq!(wal.registered_files().len(), 2, "the newcomer was registered");
+        assert!(wal.registered_files().contains(&(id, a.clone())));
+
+        // Neither file's records: the log cannot tell them apart.
+        assert!(wal.log(wal.begin(), id, 0, b"x").is_err());
+        assert!(wal.log_and_commit(id, 0, b"x").is_err());
+        assert!(wal.log_in_place(wal.begin(), id, 0, b"x").is_err());
+        assert!(wal.register_file(id, &a).is_err(), "the first claimant was re-admitted");
+        assert_eq!(wal.contested_files(), vec![(id, vec![a.clone(), b.clone()])]);
+        // Nothing reached the log, and other ids are unaffected.
+        assert_eq!(std::fs::metadata(wal.path()).unwrap().len(), 0);
+        wal.log_and_commit(other, 0, b"c").unwrap();
+        assert_eq!(read_file(&a), b"aaaa");
+        assert_eq!(read_file(&b), b"bbbb");
+    }
+
+    #[test]
+    fn registering_the_same_path_again_is_idempotent() {
+        let dir = temp_dir();
+        let data = dir.path().join("table.db");
+        std::fs::write(&data, b"").unwrap();
+        let wal = Wal::open(dir.path().join(DEFAULT_WAL_NAME)).unwrap();
+        let id = file_id_for_name("table.db");
+        wal.register_file(id, &data).unwrap();
+        wal.register_file(id, &data).unwrap();
+        // The form `LocalStorageProvider` builds, against the listing's.
+        let doubled = format!("{}//table.db", dir.path().display());
+        wal.register_file(id, &doubled).unwrap();
+        assert!(wal.contested_files().is_empty());
+        assert_eq!(wal.registered_files(), vec![(id, data.clone())]);
+        wal.log_and_commit(id, 0, b"row").unwrap();
+    }
+
+    /// Startup over two names sharing an id, with the log naming that id:
+    /// refused before anything is replayed, the log left whole.
+    #[test]
+    fn startup_refuses_a_log_naming_two_colliding_files() {
+        let dir = temp_dir();
+        let dir_str = dir.path().to_string_lossy().to_string();
+        let wal_path = dir.path().join(DEFAULT_WAL_NAME);
+        let (a, b, c) = (
+            dir.path().join("a.db"),
+            dir.path().join("b.db"),
+            dir.path().join("c.db"),
+        );
+        std::fs::write(&a, b"aaaa").unwrap();
+        std::fs::write(&b, b"bbbb").unwrap();
+        std::fs::write(&c, b"cccc").unwrap();
+        let _forced = ForcedIds::new(&["a.db", "b.db"], 0x5eed);
+
+        {
+            let wal = Wal::open(&wal_path).unwrap();
+            wal.log_and_commit(0x5eed, 0, b"XX").unwrap();
+            wal.log_and_commit(file_id_for_name("c.db"), 0, b"ZZ").unwrap();
+        }
+        let logged = read_file(&wal_path);
+        assert!(!logged.is_empty());
+
+        let err = open_and_recover(&dir_str)
+            .err()
+            .expect("replayed a log whose records two files claim");
+        let msg = err.to_string();
+        assert!(msg.contains("a.db") && msg.contains("b.db"), "{msg}");
+        assert_eq!(read_file(&wal_path), logged, "the log is the only copy");
+        assert_eq!(read_file(&a), b"aaaa");
+        assert_eq!(read_file(&b), b"bbbb");
+        assert_eq!(read_file(&c), b"cccc", "replay ran in part");
+    }
+
+    /// Colliding names the log does not mention cost nothing at startup, but
+    /// the id takes no records from then on.
+    #[test]
+    fn startup_with_colliding_files_the_log_does_not_name_replays_the_rest() {
+        let dir = temp_dir();
+        let dir_str = dir.path().to_string_lossy().to_string();
+        let wal_path = dir.path().join(DEFAULT_WAL_NAME);
+        let (a, b, c) = (
+            dir.path().join("a.db"),
+            dir.path().join("b.db"),
+            dir.path().join("c.db"),
+        );
+        std::fs::write(&a, b"aaaa").unwrap();
+        std::fs::write(&b, b"bbbb").unwrap();
+        std::fs::write(&c, b"cccc").unwrap();
+        let _forced = ForcedIds::new(&["a.db", "b.db"], 0x5eed);
+
+        {
+            let wal = Wal::open(&wal_path).unwrap();
+            wal.log_and_commit(file_id_for_name("c.db"), 0, b"ZZ").unwrap();
+        }
+
+        let (wal, stats) = open_and_recover(&dir_str).unwrap();
+        assert_eq!(stats.applied, 1);
+        assert_eq!(read_file(&c), b"ZZcc");
+        assert_eq!(wal.contested_files().len(), 1);
+        assert_eq!(wal.contested_files()[0].1.len(), 2);
+        assert!(wal.log_and_commit(0x5eed, 0, b"XX").is_err());
+        assert!(wal.register_file(0x5eed, &a).is_err());
+        assert!(wal.register_file(0x5eed, &b).is_err());
+        assert_eq!(read_file(&a), b"aaaa");
+        assert_eq!(read_file(&b), b"bbbb");
     }
 
     /// A deferred commit is replayable only once the sync is taken.

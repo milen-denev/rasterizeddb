@@ -802,7 +802,7 @@ e2e_test!(
         let scratch = live.join("scratch.db");
         std::fs::write(&scratch, vec![0u8; 64]).unwrap();
         let scratch_id = rasterizeddb_core::core::wal::file_id_for_name("scratch.db");
-        wal.register_file(scratch_id, &scratch);
+        wal.register_file(scratch_id, &scratch).unwrap();
 
         let pending = wal.begin();
         wal.log_in_place(pending, scratch_id, 0, b"held")

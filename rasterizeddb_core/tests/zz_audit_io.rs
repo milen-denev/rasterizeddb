@@ -242,7 +242,7 @@ fn audit_b_a_short_wal_write_leaves_no_partial_record() {
 
     let wal = Wal::open(&wal_path).unwrap();
     let id = file_id_for_name("data.db");
-    wal.register_file(id, &data_path);
+    wal.register_file(id, &data_path).unwrap();
 
     let t1 = wal.begin();
     wal.log(t1, id, 0, &[1u8; 100]).unwrap();
@@ -355,12 +355,12 @@ fn audit_e_checkpoint_claims_durability_for_records_it_discarded() {
     std::fs::write(&data_path, vec![0u8; 64]).unwrap();
     let wal = StdArc::new(Wal::open(&wal_path).unwrap());
     let id = file_id_for_name("data.db");
-    wal.register_file(id, &data_path);
+    wal.register_file(id, &data_path).unwrap();
     // Pad the registered set so the sync pass takes measurable time.
     for i in 0..400 {
         let p = dir.path().join(format!("pad{}.db", i));
         std::fs::write(&p, b"x").unwrap();
-        wal.register_file(file_id_for_name(&format!("pad{}.db", i)), &p);
+        wal.register_file(file_id_for_name(&format!("pad{}.db", i)), &p).unwrap();
     }
     let t1 = wal.begin();
     wal.log(t1, id, 0, &[1u8; 100]).unwrap();

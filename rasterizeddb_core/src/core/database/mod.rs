@@ -951,8 +951,10 @@ impl Database {
         };
         // Through the log, so a commit record survives whatever the data files
         // do. Nothing to attach for an in-memory database.
-        if let Some(wal) = crate::core::wal::wal_for(location) {
-            status.attach_wal(wal);
+        if let Some(wal) = crate::core::wal::wal_for(location)
+            && let Err(e) = status.attach_wal(wal)
+        {
+            error!("The transaction status log is not covered by the WAL: {}", e);
         }
         let transactions = StdArc::new(TransactionManager::new(status));
 

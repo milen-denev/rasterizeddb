@@ -2461,7 +2461,7 @@ mod tests {
         assert_eq!(metric("data_flush_failure"), "");
 
         // A checkpoint syncs the files records name, so one names it.
-        wal.register_file(7, "/dev/null");
+        wal.register_file(7, "/dev/null").expect("register the file");
         wal.log(wal.begin(), 7, 0, b"x").unwrap();
         assert!(wal.checkpoint().is_err());
 

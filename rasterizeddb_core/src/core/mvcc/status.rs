@@ -796,17 +796,22 @@ impl StatusLog {
     /// Registering the file is what lets replay write back into it. Without the
     /// registration the log would hold records addressed to a file it does not
     /// know how to open, and would drop them.
-    pub fn attach_wal(&self, wal: std::sync::Arc<Wal>) {
+    ///
+    /// Not attached when the registration fails — another file's name has the
+    /// same id, and the log would refuse every record under it anyway. The
+    /// file is then written and synced directly, as with no log.
+    pub fn attach_wal(&self, wal: std::sync::Arc<Wal>) -> std::io::Result<()> {
         let mut inner = self.inner.lock();
         let Some(path) = inner.path.clone() else {
-            return;
+            return Ok(());
         };
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            return;
+            return Ok(());
         };
         let file_id = crate::core::wal::file_id_for_name(name);
-        wal.register_file(file_id, path);
+        wal.register_file(file_id, path)?;
         inner.wal = Some((wal, file_id));
+        Ok(())
     }
 }
 
@@ -1875,7 +1880,7 @@ mod tests {
         let path = dir.path().join("status");
         let log = StatusLog::open(&path).expect("open");
         let wal = std::sync::Arc::new(Wal::open(dir.path().join("test.wal")).expect("wal"));
-        log.attach_wal(wal.clone());
+        log.attach_wal(wal.clone()).unwrap();
 
         // id 7 lives in byte 1, in the top two bits of it.
         log.record(7, TxOutcome::Committed);
@@ -1916,7 +1921,7 @@ mod tests {
         let path = dir.path().join("status");
         let log = StatusLog::open(&path).expect("open");
         let wal = std::sync::Arc::new(Wal::open(dir.path().join("test.wal")).expect("wal"));
-        log.attach_wal(wal);
+        log.attach_wal(wal).unwrap();
 
         log.record(7, TxOutcome::Committed);
         log.flush().expect("flush");
@@ -1938,7 +1943,7 @@ mod tests {
         let path = dir.path().join("status");
         let log = StatusLog::open(&path).expect("open");
         let wal = std::sync::Arc::new(Wal::open(dir.path().join("test.wal")).expect("wal"));
-        log.attach_wal(wal);
+        log.attach_wal(wal).unwrap();
 
         log.record(7, TxOutcome::Committed);
         log.flush_deferred().expect("deferred");

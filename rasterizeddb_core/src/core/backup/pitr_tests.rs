@@ -115,7 +115,7 @@ fn a_declined_checkpoint_stages_nothing_and_still_reports_success() {
     let data_path = root.join("rows.db");
     std::fs::write(&data_path, vec![0u8; 64]).unwrap();
     let id = file_id_for_name("rows.db");
-    wal.register_file(id, &data_path);
+    wal.register_file(id, &data_path).unwrap();
 
     // A committed append, so the log genuinely holds something worth archiving.
     commit_write(&wal, id, 0, b"aaaa");

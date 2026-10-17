@@ -1302,11 +1302,18 @@ impl LocalStorageProvider {
     }
 
     /// Publishes this file so a replay can find it by path.
+    ///
+    /// Fails only when another file's name has the same log id. The log then
+    /// refuses every record under that id, for both files: appends fall back
+    /// to flushing the file directly, each saying so, and in-place writes
+    /// fail. Said here as well, because the constructors cannot return it.
     #[inline]
     fn register_with_wal(&self) {
         crate::core::wal::with_wal_for(&self.location, |w| {
-            if let Some(w) = w {
-                w.register_file(self.wal_file_id(), &self.file_str);
+            if let Some(w) = w
+                && let Err(e) = w.register_file(self.wal_file_id(), &self.file_str)
+            {
+                error!("{} is not covered by the WAL: {}", self.file_str, e);
             }
         });
     }
@@ -1596,10 +1603,13 @@ impl StorageIO for LocalStorageProvider {
                 w.log_in_place_from(txn, self.wal_file_id(), position, buffer, self.commit.born);
             if outcome.is_err() {
                 // The one failure that is not the log's: a file it has not
-                // been told about yet. Registered and tried once more.
-                w.register_file(self.wal_file_id(), &self.file_str);
-                outcome =
-                    w.log_in_place_from(txn, self.wal_file_id(), position, buffer, self.commit.born);
+                // been told about yet. Registered and tried once more — unless
+                // the id is another file's, which no retry changes.
+                outcome = w
+                    .register_file(self.wal_file_id(), &self.file_str)
+                    .and_then(|()| {
+                        w.log_in_place_from(txn, self.wal_file_id(), position, buffer, self.commit.born)
+                    });
             }
             // The data file is deliberately untouched here; `commit_durable`
             // applies it once the record is durable. Overwriting first would
