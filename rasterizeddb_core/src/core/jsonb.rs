@@ -3796,12 +3796,34 @@ mod gin_item_tests {
         let mut equal = 0;
         for _ in 0..20_000 {
             let a_text = value(&mut r, 3);
-            let a_value: serde_json::Value = serde_json::from_str(&a_text).unwrap();
+            // The reference reads numbers as serde_json does, through f64. It
+            // refuses the ones past binary64 (`1e400`) the generator now
+            // writes, and rounds the ones past 2^53, so that
+            // `9007199254740993` looks equal to `9007199254740992`. A pair is
+            // judged only when the reference reads each side as the value it
+            // is. The rest are covered by
+            // `long_and_huge_numbers_key_like_they_compare`, and the
+            // equal-pair floor below fails if this skips too much.
+            let exact = |text: &str, value: &serde_json::Value| {
+                let (written, read) = (encode_text(text), encode_text(&value.to_string()));
+                matches!((written, read), (Ok(w), Ok(r)) if values_equal(&w, &r) == Some(true))
+            };
+            let Ok(a_value) = serde_json::from_str::<serde_json::Value>(&a_text) else {
+                continue;
+            };
+            if !exact(&a_text, &a_value) {
+                continue;
+            }
             let b_text = match r.below(3) {
                 0 => value(&mut r, 3),
                 _ => respell(&a_value, &mut r),
             };
-            let b_value: serde_json::Value = serde_json::from_str(&b_text).unwrap();
+            let Ok(b_value) = serde_json::from_str::<serde_json::Value>(&b_text) else {
+                continue;
+            };
+            if !exact(&b_text, &b_value) {
+                continue;
+            }
             let (a, b) = (encode_text(&a_text).unwrap(), encode_text(&b_text).unwrap());
             let want = reference_equal(&a_value, &b_value);
             equal += usize::from(want);
@@ -3869,5 +3891,49 @@ mod gin_item_tests {
         assert!(!equals(&doc("false"), &1i32.to_le_bytes()));
         assert!(!equals(&doc("null"), &2.5f64.to_le_bytes()));
         assert!(equals(&doc("false"), &doc("false")));
+    }
+}
+
+#[cfg(test)]
+mod number_key_tests {
+    use super::*;
+
+    /// Numbers the f64-based reference cannot read: exponents past binary64,
+    /// digits past 2^53, and the compact exponent form long numbers are
+    /// stored in. Within a group every spelling is the same value, so the
+    /// hash-index key (`canonical_key`) must agree; across groups it must
+    /// not. A key that split one value would drop rows from `doc = '...'`.
+    #[test]
+    fn long_and_huge_numbers_key_like_they_compare() {
+        let groups: &[&[&str]] = &[
+            &["1e131071", "10e131070", "0.1e131072"],
+            &["1.000e-45", "1000e-48", "0.000000000000000000000000000000000000000000001000"],
+            &["0e-45", "0", "-0.0e-44", "0.0"],
+            &["1e400", "10e399", "0.01e402"],
+            &["1.000000000000000000001", "1000000000000000000001e-21"],
+            &["9007199254740993", "9007199254740993.0", "9.007199254740993e15"],
+            &["100", "1e2", "100.0", "1.00e2"],
+            &["-1e-400", "-10e-401"],
+            &["123456789012345678901234567890", "1.2345678901234567890123456789e29"],
+        ];
+        let key = |text: &str| {
+            let bytes = encode_text(text).unwrap_or_else(|e| panic!("{text}: {e}"));
+            let mut k = Vec::new();
+            canonical_key(&bytes, &mut k).unwrap();
+            (bytes, k)
+        };
+        for (gi, g) in groups.iter().enumerate() {
+            for a in g.iter() {
+                let (xa, ka) = key(a);
+                for (hi, h) in groups.iter().enumerate() {
+                    for b in h.iter() {
+                        let (xb, kb) = key(b);
+                        let same = gi == hi;
+                        assert_eq!(values_equal(&xa, &xb), Some(same), "{a} = {b}");
+                        assert_eq!(ka == kb, same, "keys of {a} and {b}");
+                    }
+                }
+            }
+        }
     }
 }
