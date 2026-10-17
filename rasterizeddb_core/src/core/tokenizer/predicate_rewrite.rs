@@ -1696,6 +1696,27 @@ fn canonical_like_pattern(pieces: &[LikePiece]) -> String {
     out
 }
 
+/// The escape character a `LIKE` names, and where its clause ends.
+///
+/// `ESCAPE 'c'` picks the escape character and `ESCAPE ''` turns escaping off.
+/// The default is a backslash. `at` is the token just past the pattern.
+fn like_escape(toks: &[Tok], at: usize) -> Result<(Option<char>, usize), String> {
+    if !toks.get(at).is_some_and(|t| t.is_keyword("escape")) {
+        return Ok((Some('\\'), at));
+    }
+    let Some(escape_tok @ Tok::Str(_)) = toks.get(at + 1) else {
+        return Err("ESCAPE needs a quoted string".to_string());
+    };
+    let text = pattern_text(escape_tok);
+    let mut chars = text.chars();
+    let escape = match (chars.next(), chars.next()) {
+        (None, _) => None,
+        (Some(c), None) => Some(c),
+        _ => return Err("invalid escape string: it must be empty or one character".to_string()),
+    };
+    Ok((escape, at + 2))
+}
+
 fn like_to_operator(
     text: &str,
     escape: Option<char>,
@@ -2496,28 +2517,7 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
                             ));
                         }
                     }
-                    // `ESCAPE 'c'` picks the escape character; `ESCAPE ''`
-                    // turns escaping off. The default is a backslash.
-                    let mut next = kw_at + 2;
-                    let mut escape = Some('\\');
-                    if toks.get(next).is_some_and(|t| t.is_keyword("escape")) {
-                        let Some(escape_tok @ Tok::Str(_)) = toks.get(next + 1) else {
-                            return Err("ESCAPE needs a quoted string".to_string());
-                        };
-                        let text = pattern_text(escape_tok);
-                        let mut chars = text.chars();
-                        escape = match (chars.next(), chars.next()) {
-                            (None, _) => None,
-                            (Some(c), None) => Some(c),
-                            _ => {
-                                return Err(
-                                    "invalid escape string: it must be empty or one character"
-                                        .to_string(),
-                                );
-                            }
-                        };
-                        next += 2;
-                    }
+                    let (escape, next) = like_escape(&toks, kw_at + 2)?;
                     let (op, literal) =
                         like_to_operator(&pattern_text(pattern), escape, case_insensitive)?;
                     // `NOT LIKE` likewise, inside the guard: NOT of NULL is
@@ -2987,17 +2987,36 @@ fn path_sugar(
         return Ok(Some((text, after)));
     }
 
-    // `NOT LIKE`, `NOT ILIKE`, `NOT SIMILAR TO`: the match, negated inside
-    // the guard. The positive forms read through the ordinary comparison.
+    // `[NOT] LIKE` and `[NOT] ILIKE`, with an optional `ESCAPE`: the pattern
+    // is read here exactly as a column's is, so a pattern ending in its escape
+    // character is refused (22025) rather than matched as a literal, and the
+    // matcher is handed the backslash-escaped form it reads whatever escape
+    // the statement chose. The positive forms used to reach the matcher with
+    // the pattern unread.
+    if keyword.is_keyword("like") || keyword.is_keyword("ilike") {
+        let op = if keyword.is_keyword("ilike") { "ILIKE" } else { "LIKE" };
+        let Some(pattern @ Tok::Str(_)) = toks.get(kw_at + 1) else {
+            return Err(format!("{op} on a JSON path needs a quoted pattern"));
+        };
+        let (escape, after) = like_escape(toks, kw_at + 2)?;
+        let canonical = canonical_like_pattern(&like_pieces(&pattern_text(pattern), escape)?);
+        let fragment = format!(
+            "{}{} {} {}",
+            if negated { "NOT " } else { "" },
+            operand,
+            op,
+            quote_standard(&canonical)
+        );
+        return Ok(Some((guard(fragment), after)));
+    }
+
+    // `NOT SIMILAR TO`: the match, negated inside the guard. The positive
+    // form reads through the ordinary comparison.
     if negated {
         let similar = keyword.is_keyword("similar")
             && toks.get(kw_at + 1).is_some_and(|t| t.is_keyword("to"));
         let op = if similar {
             "SIMILARTO"
-        } else if keyword.is_keyword("like") {
-            "LIKE"
-        } else if keyword.is_keyword("ilike") {
-            "ILIKE"
         } else {
             return Ok(None);
         };
